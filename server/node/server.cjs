@@ -371,6 +371,20 @@ if (existsSync(jwtSecretPath)) {
 
 const authCodePath = path.join(process.cwd(), 'save', '__authcode')
 const inlayDir = path.join(savePath, 'inlays')
+const cachedIconsDir = path.join(savePath, 'cached-icons')
+
+// ── Read-only asset key ─────────────────────────────────────────────────────
+const assetReadonlyKeyPath = path.join(savePath, '__asset_readonly_key')
+let assetReadonlyKey
+if (existsSync(assetReadonlyKeyPath)) {
+    assetReadonlyKey = readFileSync(assetReadonlyKeyPath, 'utf-8').trim()
+} else {
+    assetReadonlyKey = nodeCrypto.randomBytes(32).toString('hex')
+    writeFileSync(assetReadonlyKeyPath, assetReadonlyKey, 'utf-8')
+}
+if (!existsSync(cachedIconsDir)) {
+    mkdirSync(cachedIconsDir, { recursive: true })
+}
 const inlayMigrationMarker = path.join(inlayDir, '.migrated_to_fs')
 const hexRegex = /^[0-9a-fA-F]+$/;
 const BACKUP_IMPORT_MAX_BYTES = Number(process.env.RISU_BACKUP_IMPORT_MAX_BYTES ?? '0');
@@ -2508,14 +2522,72 @@ async function generateThumbnail(buffer) {
         .toBuffer();
 }
 
-app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
+// ── Icon optimization (cached resized WebP) ─────────────────────────────────
+const ICON_VALID_SIZES = new Set(['128', '256'])
+
+async function getOrCreateCachedIcon(imageBuffer, sizeStr, hexKey) {
+    const size = parseInt(sizeStr, 10)
+    const safeKey = hexKey.replace(/[^0-9a-fA-F]/g, '')
+    const cacheFile = path.join(cachedIconsDir, `${safeKey}_${size}.webp`)
+
+    try {
+        const stat = await fs.stat(cacheFile)
+        if (stat.size > 0) {
+            return await fs.readFile(cacheFile)
+        }
+    } catch {
+        // Cache miss – generate below
+    }
+
+    const resized = await sharp(imageBuffer)
+        .resize(size, size, { fit: 'inside', withoutEnlargement: true })
+        .webp({ quality: 80 })
+        .toBuffer()
+
+    const tmpFile = cacheFile + '.tmp'
+    await fs.writeFile(tmpFile, resized)
+    await fs.rename(tmpFile, cacheFile)
+
+    return resized
+}
+
+// Asset read-only key middleware: allow access with ?rk=<key> query param
+function sessionOrReadonlyKeyMiddleware(req, res, next) {
+    const rk = req.query.rk
+    if (typeof rk === 'string' && rk.length > 0 && rk === assetReadonlyKey) {
+        return next()
+    }
+    return sessionAuthMiddleware(req, res, next)
+}
+
+app.get('/api/asset/:hexKey', sessionOrReadonlyKeyMiddleware, async (req, res) => {
     try {
         const key = Buffer.from(req.params.hexKey, 'hex').toString('utf-8')
+        const iconSize = req.query.icon
 
         if (key.startsWith('inlay/')) {
             const id = key.slice('inlay/'.length)
             const file = await readInlayFile(id)
             if (file) {
+                // Icon optimization: serve cached resized WebP
+                if (iconSize && ICON_VALID_SIZES.has(iconSize) && file.mime && file.mime.startsWith('image/')) {
+                    try {
+                        const iconEtag = `"icon-${iconSize}-${Math.floor(file.mtimeMs)}"`
+                        if (req.headers['if-none-match'] === iconEtag) {
+                            return res.status(304).end()
+                        }
+                        const iconBuffer = await getOrCreateCachedIcon(file.buffer, iconSize, req.params.hexKey)
+                        res.set({
+                            'Content-Type': 'image/webp',
+                            'Cache-Control': 'public, max-age=86400',
+                            'ETag': iconEtag,
+                        })
+                        return res.send(iconBuffer)
+                    } catch (iconErr) {
+                        console.error('[Asset] Icon generation failed for inlay, serving original:', iconErr.message)
+                    }
+                }
+
                 const etag = `"${Math.floor(file.mtimeMs)}"`
                 if (req.headers['if-none-match'] === etag) {
                     return res.status(304).set('Cache-Control', 'public, max-age=31536000, immutable').end()
@@ -2564,6 +2636,26 @@ app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
         if (!data) return res.status(404).set('Cache-Control', 'no-store').end()
 
         const { binary, contentType } = resolveAssetPayload(key, data)
+
+        // Icon optimization: serve cached resized WebP for KV assets
+        if (iconSize && ICON_VALID_SIZES.has(iconSize) && contentType && contentType.startsWith('image/')) {
+            try {
+                const iconEtag = `"icon-${iconSize}-${updatedAt}"`
+                if (req.headers['if-none-match'] === iconEtag) {
+                    return res.status(304).end()
+                }
+                const iconBuffer = await getOrCreateCachedIcon(binary, iconSize, req.params.hexKey)
+                res.set({
+                    'Content-Type': 'image/webp',
+                    'Cache-Control': 'public, max-age=86400',
+                    'ETag': iconEtag,
+                })
+                return res.send(iconBuffer)
+            } catch (iconErr) {
+                console.error('[Asset] Icon generation failed for KV asset, serving original:', iconErr.message)
+            }
+        }
+
         res.set({
             'Content-Type': contentType,
             'Cache-Control': 'public, max-age=31536000, immutable',
@@ -2574,6 +2666,11 @@ app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
         console.error('[Asset] Failed to serve asset:', error);
         res.status(500).end()
     }
+})
+
+// Read-only asset key retrieval (requires auth)
+app.get('/api/asset-readonly-key', sessionAuthMiddleware, (req, res) => {
+    res.json({ key: assetReadonlyKey })
 })
 
 app.post('/api/crypto', async (req, res) => {
@@ -3218,6 +3315,67 @@ app.post('/api/backup/import', async (req, res, next) => {
         if (req.socket.server && prevRequestTimeout !== undefined) {
             req.socket.server.requestTimeout = prevRequestTimeout;
         }
+    }
+});
+
+// ── Save chat backup to disk (per-character, per-chat) ──────────────────────
+app.post('/api/backup/save-chat', sessionAuthMiddleware, async (req, res, next) => {
+    try {
+        const { charName, chatName, messages } = req.body;
+        if (!charName || !chatName || !Array.isArray(messages)) {
+            res.status(400).json({ error: 'charName, chatName, and messages[] are required' });
+            return;
+        }
+
+        const zlib = require('zlib');
+        const { promisify } = require('util');
+        const gzip = promisify(zlib.gzip);
+
+        // Sanitize names for filesystem safety
+        const sanitize = (name) => String(name).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 200);
+        const safeCharName = sanitize(charName);
+        const safeChatName = sanitize(chatName);
+
+        const charDir = path.join(process.cwd(), 'backups', safeCharName);
+        if (!existsSync(charDir)) {
+            mkdirSync(charDir, { recursive: true });
+        }
+
+        const CHUNK_SIZE = 100;
+        const writtenFiles = [];
+
+        if (messages.length <= CHUNK_SIZE) {
+            // Single file
+            const json = JSON.stringify(messages);
+            const compressed = await gzip(Buffer.from(json, 'utf-8'));
+            const filename = `${safeChatName}.json.gz`;
+            writeFileSync(path.join(charDir, filename), compressed);
+            writtenFiles.push(filename);
+        } else {
+            // Split into chunks
+            const totalChunks = Math.ceil(messages.length / CHUNK_SIZE);
+            for (let i = 0; i < totalChunks; i++) {
+                const chunk = messages.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+                const json = JSON.stringify(chunk);
+                const compressed = await gzip(Buffer.from(json, 'utf-8'));
+                const filename = `${safeChatName}-${i + 1}.json.gz`;
+                writeFileSync(path.join(charDir, filename), compressed);
+                writtenFiles.push(filename);
+            }
+            // Clean up stale chunk files from previous backups with more chunks
+            const prefix = safeChatName + '-';
+            const existing = readdirSync(charDir).filter(f => f.startsWith(prefix) && f.endsWith('.json.gz'));
+            for (const f of existing) {
+                const num = parseInt(f.slice(prefix.length, f.length - '.json.gz'.length), 10);
+                if (num > totalChunks) {
+                    unlinkSync(path.join(charDir, f));
+                }
+            }
+        }
+
+        res.json({ success: true, files: writtenFiles });
+    } catch (error) {
+        next(error);
     }
 });
 

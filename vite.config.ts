@@ -12,6 +12,7 @@ export default defineConfig(({command, mode}) => {
   return {
     define: {
       '__APP_VERSION__': JSON.stringify(pkg.version),
+      'globalThis.__NODE__': 'true',
     },
     plugins: [
       svelte({

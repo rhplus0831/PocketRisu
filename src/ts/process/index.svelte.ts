@@ -25,6 +25,7 @@ import { runLuaEditTrigger } from "./scriptings";
 import { getModelInfo, LLMFlags } from "../model/modellist";
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
+import { backupChatAfterProcessing } from "./chatBackup";
 import { readImage } from "../globalApi.svelte";
 
 export interface OpenAIChat{
@@ -1864,6 +1865,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     if(lastMessageIndex >= 0 && DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo) {
         DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
     }
+
+    backupChatAfterProcessing(selectedChar, selectedChat)
 
     return true
 }

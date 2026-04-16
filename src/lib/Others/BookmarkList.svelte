@@ -181,7 +181,7 @@
                                         idx={msg.originalIndex}
                                         message={msg.data}
                                         name={msg.role === 'user' ? getUserName() : (msg.speaker?.name ?? chara.name)}
-                                        img={msg.role === 'user' ? getCharImage(getUserIcon(), 'css') : getCharImage(msg.speaker?.image ?? chara.image, 'css')}
+                                        img={msg.role === 'user' ? getCharImage(getUserIcon(), 'css', true) : getCharImage(msg.speaker?.image ?? chara.image, 'css', true)}
                                         role={msg.role}
                                         messageGenerationInfo={msg.generationInfo}
                                         rerollIcon={false}

@@ -13,6 +13,20 @@ export const nodeOnlySettingsItems: SettingItem[] = [
     { id: 'nodeonly.hideLoadout', type: 'check', labelKey: 'hideLoadout', bindKey: 'hideLoadout', helpKey: 'hideLoadout', classes: 'mt-4' },
     { id: 'nodeonly.hideEasyPanel', type: 'check', labelKey: 'hideEasyPanel', bindKey: 'hideEasyPanel', helpKey: 'hideEasyPanel', classes: 'mt-4' },
     { id: 'nodeonly.disableMobileDragDrop', type: 'check', labelKey: 'disableMobileDragDrop', bindKey: 'disableMobileDragDrop', helpKey: 'disableMobileDragDrop', classes: 'mt-4' },
+
+    // Icon Optimization
+    {
+        id: 'nodeonly.iconOptimization', type: 'select', labelKey: 'iconOptimization', bindKey: 'iconOptimization',
+        helpKey: 'iconOptimization', classes: 'mt-4',
+        options: {
+            selectOptions: [
+                { value: 'disabled', labelKey: 'disabled' },
+                { value: '128', label: '128x128' },
+                { value: '256', label: '256x256' },
+            ]
+        }
+    },
+
     {
         id: 'nodeonly.disableToggleBinding', type: 'check', labelKey: 'disableToggleBinding', bindKey: 'disableToggleBinding',
         helpKey: 'disableToggleBinding', classes: 'mt-4',

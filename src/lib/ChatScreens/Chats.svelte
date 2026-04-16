@@ -66,8 +66,8 @@
 
         let nextHash = 0;
         let currentHashes: Set<number> = new Set();
-        const charImage = getCharImage(currentCharacter.image, 'css')
-        const userImage = getCharImage(userIcon, 'css')
+        const charImage = getCharImage(currentCharacter.image, 'css', true)
+        const userImage = getCharImage(userIcon, 'css', true)
         const simpleChar = createSimpleCharacter(currentCharacter);
         let loadStart = messages.length - 1
         let loadEnd = messages.length - loadPages

@@ -31,6 +31,8 @@
     import Chats from './Chats.svelte';
     import Button from '../UI/GUI/Button.svelte';
     import PluginDefinedIcon from '../Others/PluginDefinedIcon.svelte';
+    import SelectCopyExport from './SelectCopyExport.svelte';
+    import { DownloadIcon } from "@lucide/svelte";
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -48,6 +50,7 @@
     let toggleStickers:boolean = $state(false)
     let fileInput:string[] = $state([])
     let showNewMessageButton = $state(false)
+    let selectCopyActive = $state(false)
     let showScrollNav = $state(false)
     let scrollNavTimer: ReturnType<typeof setTimeout> | null = null
     let chatsInstance: any = $state()
@@ -902,7 +905,7 @@
                     message={currentChatFmIndex === -1 ? DBState.db.characters[$selectedCharID].firstMessage :
                         DBState.db.characters[$selectedCharID].alternateGreetings[currentChatFmIndex]}
                     role='char'
-                    img={getCharImage(DBState.db.characters[$selectedCharID].image, 'css')}
+                    img={getCharImage(DBState.db.characters[$selectedCharID].image, 'css', true)}
                     idx={-1}
                     altGreeting={DBState.db.characters[$selectedCharID].alternateGreetings.length > 0 && DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length === 0}
                     largePortrait={DBState.db.characters[$selectedCharID].largePortrait}
@@ -1039,6 +1042,14 @@
                         <span class="ml-2">{language.screenshot}</span>
                     </div>
 
+                    <div class="flex items-center cursor-pointer hover:text-green-500 transition-colors" onclick={() => {
+                        selectCopyActive = true
+                        openMenu = false
+                    }}>
+                        <DownloadIcon />
+                        <span class="ml-2">{language.selectAndCopy || 'Select and Export'}</span>
+                    </div>
+
                     <div class="flex items-center cursor-pointer hover:text-green-500 transition-colors" onclick={async () => {
                         const results = await postChatFile(messageInput)
                         if(!results) return
@@ -1108,6 +1119,9 @@
         {/each}
     </div>
 {/if}
+
+<SelectCopyExport bind:active={selectCopyActive} onclose={() => { selectCopyActive = false }} />
+
 <style>
 
     .chat-process-stage-1{

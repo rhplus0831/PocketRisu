@@ -634,6 +634,7 @@ export function setDatabase(data:Database){
     data.showPresetInSidebar ??= true
     data.showPersonaInSidebar ??= true
     data.disableMobileDragDrop ??= false
+    data.iconOptimization ??= 'disabled'
     data.disableToggleBinding ??= false
     data.hideLoadout ??= true
     data.hideEasyPanel ??= true
@@ -1193,6 +1194,7 @@ export interface Database{
     showPresetInSidebar:boolean
     showPersonaInSidebar:boolean
     disableMobileDragDrop:boolean
+    iconOptimization: 'disabled' | '128' | '256'
     disableToggleBinding:boolean
     hideLoadout:boolean
     hideEasyPanel:boolean

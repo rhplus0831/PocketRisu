@@ -361,7 +361,7 @@
                 <div class="flex w-full items-start flex-wrap gap-2 justify-start">
                     {#each DBState.db.characters as char, i}
                         {#if char.image}
-                            {#await getCharImage(DBState.db.characters[i].image, 'css')}
+                            {#await getCharImage(DBState.db.characters[i].image, 'css', true)}
                                 <BarIcon onClick={() => {
                                     alertStore.set({type: 'none',msg: char.chaId})
                                 }}>

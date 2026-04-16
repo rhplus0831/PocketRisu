@@ -24,7 +24,7 @@ export function createNewCharacter() {
     return db.characters.length - 1
 }
 
-export async function getCharImage(loc:string, type:'plain'|'css'|'contain'|'lgcss') {
+export async function getCharImage(loc:string, type:'plain'|'css'|'contain'|'lgcss', icon?:boolean) {
     const db = getDatabase()
     
     // Return placeholder when hideAllImages is enabled
@@ -41,7 +41,14 @@ export async function getCharImage(loc:string, type:'plain'|'css'|'contain'|'lgc
         }
         return null
     }
-    const filesrc = await getFileSrc(loc)
+    let filesrc = await getFileSrc(loc)
+
+    // Append icon optimization query param when explicitly requested by UI component
+    if (icon && (globalThis as any).__NODE__ && db.iconOptimization && db.iconOptimization !== 'disabled') {
+        const separator = filesrc.includes('?') ? '&' : '?'
+        filesrc = `${filesrc}${separator}icon=${db.iconOptimization}`
+    }
+
     if(type === 'plain'){
         return filesrc
     }

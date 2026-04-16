@@ -68,7 +68,7 @@
                 changeChar(char.i)
                 endGrid()
             }}>
-                <BarIcon additionalStyle={getCharImage(char.image, 'css')}></BarIcon>
+                <BarIcon additionalStyle={getCharImage(char.image, 'css', true)}></BarIcon>
                 <div class="flex flex-1 w-full flex-col justify-start items-start text-start">
                     <span>{char.name}</span>
                     <div class="text-sm text-textcolor2 flex items-center w-full flex-wrap">
