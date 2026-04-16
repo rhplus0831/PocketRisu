@@ -463,7 +463,7 @@
                         }
                     }
                     img.removeAttribute('class')
-                    img.setAttribute('style', 'max-width:100%;max-height:400px;object-fit:cover;display:block;margin:4px auto;border-radius:8px;')
+                    img.setAttribute('style', 'max-width:100%;max-height:400px;object-fit:contain;display:block;margin:4px auto;border-radius:8px;')
                 })
 
                 // Convert divs with background-image into img tags (height: 400px)
@@ -477,7 +477,7 @@
                         }
                         const img = doc.createElement('img')
                         img.setAttribute('src', imgUrl)
-                        img.setAttribute('style', 'max-width:100%;max-height:400px;object-fit:cover;display:block;margin:4px auto;border-radius:8px;')
+                        img.setAttribute('style', 'max-width:100%;max-height:400px;object-fit:contain;display:block;margin:4px auto;border-radius:8px;')
                         div.replaceWith(img)
                     }
                 })
