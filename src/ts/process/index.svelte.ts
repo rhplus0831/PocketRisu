@@ -58,6 +58,7 @@ export const abortChat = writable(false)
 export let requestTokenParts:{[key:string]:requestTokenPart[]} = {}
 export let previewFormated:OpenAIChat[] = []
 export let previewBody:string = ''
+export let lastActualInputTokens:number = -1
 
 export async function sendChat(chatProcessIndex = -1,arg:{
     chatAdditonalTokens?:number,
@@ -1297,6 +1298,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     for(const chat of formated){
         inputTokens += await tokenizer.tokenizeChat(chat)
     }
+
+    lastActualInputTokens = inputTokens
 
     if(inputTokens > maxContextTokens){
         let pointer = 0

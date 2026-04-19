@@ -13,7 +13,7 @@
     import TextAreaInput from "../UI/GUI/TextAreaInput.svelte";
     import { HardDriveUploadIcon, PlusIcon, TrashIcon } from "@lucide/svelte";
     import { selectSingleFile } from "src/ts/util";
-    import { doingChat, previewFormated, previewBody, sendChat } from "src/ts/process/index.svelte";
+    import { doingChat, previewFormated, previewBody, sendChat, lastActualInputTokens } from "src/ts/process/index.svelte";
     import SelectInput from "../UI/GUI/SelectInput.svelte";
     import { applyChatTemplate, chatTemplates } from "src/ts/process/templates/chatTemplate";
     import OptionInput from "../UI/GUI/OptionInput.svelte";
@@ -147,6 +147,10 @@
             <span>Current Chat</span>
             <div class="p-2 text-center">{token} Tokens</div>
         {/await}
+        {#if lastActualInputTokens >= 0}
+            <span>Current Chat (Actual)</span>
+            <div class="p-2 text-center">{lastActualInputTokens} Tokens</div>
+        {/if}
         {#if DBState.db.promptTemplate}
             {#await tokenizePreset(DBState.db.promptTemplate)}
                 <span>Prompt Template</span>
