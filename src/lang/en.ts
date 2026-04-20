@@ -904,6 +904,7 @@ export const languageEnglish = {
     editInput: "Modify Input",
     editOutput: "Modify Output",
     editProcess: "Modify Request Data",
+    editProcessExcludeHypa: "Modify Request Data (Excluding Hypa)",
     loadLatest: "Load Latest Backup",
     loadOthers: "Load Other Backups",
     exampleMessage: "Example Message",

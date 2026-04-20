@@ -704,6 +704,7 @@ export const languageChinese = {
     "editInput": "修改输入",
     "editOutput": "修改输出",
     "editProcess": "修改请求数据",
+    "editProcessExcludeHypa": "修改请求数据（Hypa 除外）",
     "loadLatest": "读取最新的备份",
     "loadOthers": "读取其他备份",
     "exampleMessage": "示范消息",

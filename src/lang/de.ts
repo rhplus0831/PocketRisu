@@ -704,6 +704,7 @@ export const languageGerman = {
     "editInput": "Eingabe ändern",
     "editOutput": "Ausgabe ändern",
     "editProcess": "Anforderungsdaten ändern",
+    "editProcessExcludeHypa": "Anforderungsdaten ändern (ohne Hypa)",
     "loadLatest": "Neuestes Backup laden",
     "loadOthers": "Andere Backups laden",
     "exampleMessage": "Beispielnachricht",

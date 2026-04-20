@@ -945,6 +945,14 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
+    // Apply 'editprocess_nohypa' scripts after Hypa summarization
+    for(let i = 0; i < chats.length; i++){
+        if(chats[i].memo === 'supaMemory' || chats[i].memo === 'hypaMemory'){
+            continue
+        }
+        chats[i].content = (await processScriptFull(nowChatroom, chats[i].content, 'editprocess_nohypa', i)).data
+    }
+
     let biases:[string,number][] = DBState.db.bias.concat(currentChar.bias).map((v) => {
         return [risuChatParser(v[0].replaceAll("\\n","\n").replaceAll("\\r","\r").replaceAll("\\\\","\\"), {chara: currentChar}),v[1]]
     })

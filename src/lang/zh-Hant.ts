@@ -704,6 +704,7 @@ export const languageChineseTraditional = {
     "editInput": "修改輸入",
     "editOutput": "修改輸出",
     "editProcess": "修改請求資料",
+    "editProcessExcludeHypa": "修改請求資料（Hypa 除外）",
     "loadLatest": "讀取最新的備份",
     "loadOthers": "讀取其他備份",
     "exampleMessage": "示範訊息",

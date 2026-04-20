@@ -46,6 +46,7 @@ Regex Scripts are used to replace text in the chat based on regex patterns. Fiel
   - 'editinput': Modifies the user's input text.
   - 'editoutput': Modifies the character's output text.
   - 'editprocess': Modifies the text before sending the HTTP request.
+  - 'editprocess_nohypa': Same as editprocess, but excludes Hypa summarization data.
   - 'editdisplay': Modifies the text before displaying it in the chat.
   - 'edittrans': Modifies the text after translation.
 - 'in': The regex pattern to match, without the leading and trailing slashes and flags. Should be a valid ECMAScript regex.

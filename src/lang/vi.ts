@@ -704,6 +704,7 @@ export const languageVietnamese = {
     "editInput": "Sửa đổi đầu vào",
     "editOutput": "Sửa đổi đầu ra",
     "editProcess": "Sửa đổi dữ liệu yêu cầu",
+    "editProcessExcludeHypa": "Sửa đổi dữ liệu yêu cầu (Không bao gồm Hypa)",
     "loadLatest": "Tải bản sao lưu mới nhất",
     "loadOthers": "Tải các bản sao lưu khác",
     "exampleMessage": "Tin nhắn mẫu",

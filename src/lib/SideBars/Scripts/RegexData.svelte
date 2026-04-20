@@ -119,6 +119,7 @@ interface Props {
                 <OptionInput value="editinput">{language.editInput}</OptionInput>
                 <OptionInput value="editoutput">{language.editOutput}</OptionInput>
                 <OptionInput value="editprocess">{language.editProcess}</OptionInput>
+                <OptionInput value="editprocess_nohypa">{language.editProcessExcludeHypa}</OptionInput>
                 <OptionInput value="editdisplay">{language.editDisplay}</OptionInput>
                 <OptionInput value="edittrans">{language.editTranslationDisplay}</OptionInput>
                 <OptionInput value="disabled">{language.disabled}</OptionInput>

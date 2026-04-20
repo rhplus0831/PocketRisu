@@ -704,6 +704,7 @@ export const languageSpanish = {
     "editInput": "Modificar Entrada",
     "editOutput": "Modificar respuesta",
     "editProcess": "Modificar Datos de Solicitud",
+    "editProcessExcludeHypa": "Modificar Datos de Solicitud (Excluyendo Hypa)",
     "loadLatest": "Cargar Respaldo más Reciente",
     "loadOthers": "Cargar Otros Respaldos",
     "exampleMessage": "Mensaje de Ejemplo",

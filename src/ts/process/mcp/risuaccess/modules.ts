@@ -240,7 +240,7 @@ export class ModuleHandler extends MCPToolHandler {
             },
             type: {
               description: 'The hook where the regex is applied.',
-              enum: ['editdisplay', 'editinput', 'editoutput', 'editprocess'],
+              enum: ['editdisplay', 'editinput', 'editoutput', 'editprocess', 'editprocess_nohypa'],
               type: 'string',
             },
           },

@@ -15,7 +15,7 @@ import { runTrigger } from "./triggers";
 const dreg = /{{data}}/g
 const randomness = /\|\|\|/g
 
-export type ScriptMode = 'editinput'|'editoutput'|'editprocess'|'editdisplay'
+export type ScriptMode = 'editinput'|'editoutput'|'editprocess'|'editdisplay'|'editprocess_nohypa'
 
 type pScript = {
     script: customscript,
@@ -345,7 +345,7 @@ export async function processScriptFull(char:character|simpleCharacterArgument, 
 
     if(db.dynamicAssets && (char.type === 'simple' || char.type === 'character') && char.additionalAssets && char.additionalAssets.length > 0){
         if((!db.dynamicAssetsEditDisplay && mode === 'editdisplay')
-            || mode === 'editinput' || mode === 'editprocess'){
+            || mode === 'editinput' || mode === 'editprocess' || mode === 'editprocess_nohypa'){
             cacheScript(hash, data)
             return {data, emoChanged}
         }

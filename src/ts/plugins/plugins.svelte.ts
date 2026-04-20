@@ -472,6 +472,7 @@ export const pluginV2 = {
     editdisplay: new Set<EditFunction>(),
     editoutput: new Set<EditFunction>(),
     editprocess: new Set<EditFunction>(),
+    editprocess_nohypa: new Set<EditFunction>(),
     editinput: new Set<EditFunction>(),
     replacerbeforeRequest: new Set<ReplacerFunction>(),
     replacerafterRequest: new Set<(content: string, type: string) => string | Promise<string>>(),
@@ -822,6 +823,7 @@ export async function loadV2Plugin(plugins: RisuPlugin[]) {
         pluginV2.editdisplay.clear()
         pluginV2.editoutput.clear()
         pluginV2.editprocess.clear()
+        pluginV2.editprocess_nohypa.clear()
         pluginV2.editinput.clear()
     }
 

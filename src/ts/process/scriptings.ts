@@ -1373,6 +1373,7 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:char
             mode = 'editDisplay'
             break
         case 'editprocess':
+        case 'editprocess_nohypa':
             return content
     }
 

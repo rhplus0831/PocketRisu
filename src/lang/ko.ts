@@ -791,6 +791,7 @@ export const languageKorean = {
     "editInput": "입력문 수정",
     "editOutput": "출력문 수정",
     "editProcess": "리퀘스트 데이터 수정",
+    "editProcessExcludeHypa": "리퀘스트 데이터 수정 (Hypa 제외)",
     "loadLatest": "가장 최근 백업 불러오기",
     "loadOthers": "다른 백업 불러오기",
     "exampleMessage": "예시 대화",
