@@ -41,6 +41,7 @@ export const seedSetting: SettingItem = {
     condition: (ctx) => 
         ctx.db.aiModel.startsWith('gpt') || 
         ctx.db.aiModel === 'reverse_proxy' || 
+        ctx.db.aiModel === 'risuext' || 
         ctx.db.aiModel === 'openrouter',
     keywords: ['seed', 'random', 'deterministic'],
 };

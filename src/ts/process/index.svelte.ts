@@ -905,12 +905,14 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         currentTokens += await tokenizer.tokenizeChat(chat)
     }
     
+    let hypaResult: Awaited<ReturnType<typeof hypaMemoryV3>> | null = null
     if((currentChat.supaMemory ?? nowChatroom.supaMemory) && DBState.db.hypaV3){
         stageTimings.stage1Duration = Date.now() - stageTimings.stage1Start
         chatProcessStage.set(2)
         stageTimings.stage2Start = Date.now()
         console.log("Current chat's hypaV3 Data: ", currentChat.hypaV3Data)
         const sp = await hypaMemoryV3(chats, currentTokens, maxContextTokens, currentChat, nowChatroom, tokenizer)
+        hypaResult = sp
         if(sp.error){
             // Save new summary
             if (sp.memory) {
@@ -1025,7 +1027,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     //continue chat model
-    if(arg.continue && (DBState.db.aiModel.startsWith('claude') || DBState.db.aiModel.startsWith('gpt') || DBState.db.aiModel.startsWith('openrouter') || DBState.db.aiModel.startsWith('reverse_proxy'))){
+    if(arg.continue && (DBState.db.aiModel.startsWith('claude') || DBState.db.aiModel.startsWith('gpt') || DBState.db.aiModel.startsWith('openrouter') || DBState.db.aiModel.startsWith('reverse_proxy') || DBState.db.aiModel.startsWith('risuext'))){
         unformated.postEverything.push({
             role: 'system',
             content: '[Continue the last response]'
@@ -1037,7 +1039,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             if(!chat.content.trim() && !(chat.multimodals && chat.multimodals.length > 0)){
                 continue
             }
-            if(!(DBState.db.aiModel.startsWith('gpt') || DBState.db.aiModel.startsWith('claude') || DBState.db.aiModel === 'openrouter' || DBState.db.aiModel === 'reverse_proxy')){
+            if(!(DBState.db.aiModel.startsWith('gpt') || DBState.db.aiModel.startsWith('claude') || DBState.db.aiModel === 'openrouter' || DBState.db.aiModel === 'reverse_proxy' || DBState.db.aiModel === 'risuext')){
                 formated.push(chat)
                 continue
             }
@@ -1369,6 +1371,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         previewBody: arg.previewPrompt,
         escape: nowChatroom.type === 'character' && nowChatroom.escapeOutput,
         rememberToolUsage: DBState.db.rememberToolUsage,
+        risuExtensionData: {
+            lore: lorepmt,
+            hypa: hypaResult?.memory ?? null,
+            allHypa: currentChat.hypaV3Data?.summaries ?? [],
+            messageRaw: safeStructuredClone(unformated.chats),
+        },
     }, 'model', abortSignal)
 
     console.log(req)

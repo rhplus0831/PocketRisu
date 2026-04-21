@@ -51,6 +51,14 @@ interface requestDataArgument{
     rememberToolUsage?: boolean
     forceStreaming?: boolean
     blockPlugins?: boolean
+    risuExtensionData?: RisuExtensionData
+}
+
+export interface RisuExtensionData{
+    lore?: any
+    hypa?: any
+    allHypa?: any
+    messageRaw?: OpenAIChat[]
 }
 
 export interface RequestDataArgumentExtended extends requestDataArgument{
@@ -356,6 +364,12 @@ export async function requestChatDataMain(arg:requestDataArgument, model:ModelMo
     if(targ.aiModel === 'reverse_proxy'){
         targ.modelInfo.internalID = db.customProxyRequestModel
         targ.modelInfo.format = db.customAPIFormat
+        targ.customURL = db.forceReplaceUrl
+        targ.key = db.proxyKey
+    }
+    if(targ.aiModel === 'risuext'){
+        targ.modelInfo.internalID = db.customProxyRequestModel
+        targ.modelInfo.format = LLMFormat.OpenAICompatible
         targ.customURL = db.forceReplaceUrl
         targ.key = db.proxyKey
     }

@@ -5,6 +5,8 @@ export function getGenerationModelString(name?:string){
     switch (name ?? db.aiModel){
         case 'reverse_proxy':
             return 'custom-' + (db.reverseProxyOobaMode ? 'ooba' : db.customProxyRequestModel)
+        case 'risuext':
+            return 'risuext-' + db.customProxyRequestModel
         case 'openrouter':
             return 'openrouter-' + db.openrouterRequestModel
         case 'nanogpt': {

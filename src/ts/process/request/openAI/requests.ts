@@ -503,7 +503,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
         replacerURL = replacerURL.replace("risu::", '')
     }
 
-    if(aiModel === 'reverse_proxy' && db.autofillRequestUrl){
+    if((aiModel === 'reverse_proxy' || aiModel === 'risuext') && db.autofillRequestUrl){
         if(replacerURL.endsWith('v1')){
             replacerURL += '/chat/completions'
         }
@@ -521,7 +521,7 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
     }
 
     let headers = {
-        "Authorization": "Bearer " + (arg.key ?? (aiModel === 'nanogpt' ? db.nanogptKey : aiModel === 'reverse_proxy' ?  db.proxyKey : (aiModel === 'openrouter' ? db.openrouterKey : db.openAIKey))),
+        "Authorization": "Bearer " + (arg.key ?? (aiModel === 'nanogpt' ? db.nanogptKey : (aiModel === 'reverse_proxy' || aiModel === 'risuext') ?  db.proxyKey : (aiModel === 'openrouter' ? db.openrouterKey : db.openAIKey))),
         "Content-Type": "application/json"
     }
 
@@ -548,8 +548,8 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
         }
         body.n = db.genTime
     }
-    if(aiModel === 'reverse_proxy' || aiModel.startsWith('xcustom:::')){
-        let additionalParams = aiModel === 'reverse_proxy' ? db.additionalParams : []
+    if(aiModel === 'reverse_proxy' || aiModel === 'risuext' || aiModel.startsWith('xcustom:::')){
+        let additionalParams = (aiModel === 'reverse_proxy' || aiModel === 'risuext') ? db.additionalParams : []
 
         if(aiModel.startsWith('xcustom:::')){
             const found = db.customModels.find(m => m.id === aiModel)
@@ -613,6 +613,10 @@ export async function requestOpenAI(arg:RequestDataArgumentExtended):Promise<req
                 }
             }
         }
+    }
+
+    if(aiModel === 'risuext'){
+        body.risuExtension = arg.risuExtensionData ?? {}
     }
 
     if(arg.useStreaming){

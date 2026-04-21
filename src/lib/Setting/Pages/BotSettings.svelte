@@ -203,13 +203,14 @@
         <span class="text-textcolor">NovelAI Bearer Token</span>
         <TextInput bind:value={DBState.db.novelai.token}/>
     {/if}
-    {#if DBState.db.aiModel === 'reverse_proxy' || DBState.db.subModel === 'reverse_proxy'}
+    {#if DBState.db.aiModel === 'reverse_proxy' || DBState.db.subModel === 'reverse_proxy' || DBState.db.aiModel === 'risuext' || DBState.db.subModel === 'risuext'}
         <span class="text-textcolor mt-2">URL <Help key="forceUrl"/></span>
         <TextInput marginBottom={false} size={"sm"} bind:value={DBState.db.forceReplaceUrl} placeholder="https//..." />
         <span class="text-textcolor mt-4"> {language.proxyAPIKey}</span>
         <TextInput hideText={DBState.db.hideApiKey} marginBottom={false} size={"sm"} placeholder="leave it blank if it hasn't password" bind:value={DBState.db.proxyKey} />
         <span class="text-textcolor mt-4"> {language.proxyRequestModel}</span>
         <TextInput marginBottom={false} size={"sm"} bind:value={DBState.db.customProxyRequestModel} placeholder="Name" />
+        {#if DBState.db.aiModel === 'reverse_proxy' || DBState.db.subModel === 'reverse_proxy'}
         <span class="text-textcolor mt-4"> {language.format}</span>
         <SelectInput value={DBState.db.customAPIFormat.toString()} onchange={(e) => {
             DBState.db.customAPIFormat = parseInt(e.currentTarget.value) as LLMFormat
@@ -233,6 +234,7 @@
                 Cohere
             </OptionInput>
         </SelectInput>
+        {/if}
     {/if}
     {#if modelInfo.provider === LLMProvider.Cohere || subModelInfo.provider === LLMProvider.Cohere}
         <span class="text-textcolor mt-4">Cohere {language.apiKey}</span>
@@ -301,7 +303,7 @@
             <ModelGrid bind:value={DBState.db.openrouterRequestModel} items={(m ?? []).map(orToGridItem)} pinnedItems={openrouterPinnedItems} />
         {/await}
     {/if}
-    {#if DBState.db.aiModel === 'openrouter' || DBState.db.aiModel === 'reverse_proxy'}
+    {#if DBState.db.aiModel === 'openrouter' || DBState.db.aiModel === 'reverse_proxy' || DBState.db.aiModel === 'risuext'}
         <span class="text-textcolor">{language.tokenizer}</span>
         <SelectInput bind:value={DBState.db.customTokenizer}>
             {#each tokenizerList as entry}
