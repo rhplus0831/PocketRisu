@@ -559,6 +559,8 @@ export function setDatabase(data:Database){
     }
     if (data.botPresets) {
         for (const preset of data.botPresets) {
+            preset.customTokenizer ??= data.customTokenizer ?? 'tik'
+            preset.customAPIFormat ??= data.customAPIFormat ?? LLMFormat.OpenAICompatible
             preset.localNetworkMode ??= false
             preset.localNetworkTimeoutSec ??= 600
             if (typeof preset.localNetworkMode !== 'boolean') {
@@ -1566,6 +1568,7 @@ export interface botPreset{
     name?:string
     apiType?: string
     openAIKey?: string
+    customTokenizer?: string
     localNetworkMode?: boolean
     localNetworkTimeoutSec?: number
     mainPrompt: string
@@ -2067,6 +2070,7 @@ export const presetTemplate:botPreset = {
     name: "New Preset",
     apiType: "gemini-3-flash-preview",
     openAIKey: "",
+    customTokenizer: 'tik',
     localNetworkMode: false,
     localNetworkTimeoutSec: 600,
     mainPrompt: defaultMainPrompt,
@@ -2184,6 +2188,7 @@ export function saveCurrentPreset(){
         name: pres[db.botPresetsId].name,
         apiType: db.apiType,
         openAIKey: db.openAIKey,
+        customTokenizer: db.customTokenizer,
         localNetworkMode: db.localNetworkMode,
         localNetworkTimeoutSec: db.localNetworkTimeoutSec,
         mainPrompt:db.mainPrompt,
@@ -2298,6 +2303,7 @@ export function changeToPreset(id =0, savecurrent = true){
 
 export function setPreset(db:Database, newPres: botPreset){
     db.apiType = newPres.apiType ?? db.apiType
+    db.customTokenizer = newPres.customTokenizer ?? presetTemplate.customTokenizer
     db.localNetworkMode = newPres.localNetworkMode ?? db.localNetworkMode
     db.localNetworkTimeoutSec = newPres.localNetworkTimeoutSec ?? db.localNetworkTimeoutSec
     db.mainPrompt = newPres.mainPrompt ?? db.mainPrompt
