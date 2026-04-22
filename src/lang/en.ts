@@ -1806,22 +1806,6 @@ export const languageEnglish = {
     nanoGPTSelectFromList: "Select from List",
     nanoGPTManualInput: "Manual Input",
     nanoGPTManualModelSelect: "Manual Model Select",
-    // Remote Access (Cloudflare Quick Tunnel)
-    remoteAccess: "Remote Access",
-    remoteAccessDesc: "Use a remote access link to connect to this NodeOnly server from another device.",
-    remoteAccessOpen: "Open Remote Access",
-    remoteAccessClose: "Close Remote Access",
-    remoteAccessCloseConfirm: "Close remote access? The link will expire.",
-    remoteAccessDownloading: "Downloading cloudflared...",
-    remoteAccessStarting: "Starting tunnel...",
-    remoteAccessCopyUrl: "Copy URL",
-    remoteAccessCopied: "Copied!",
-    remoteAccessDisabled: "Remote access is disabled by server configuration.",
-    remoteAccessError: "Tunnel error",
-    remoteAccessRetry: "Retry",
-    remoteAccessQrHint: "Scan QR code to connect",
-    remoteAccessWarning: "Never share the QR code or link with others. Anyone with the link can freely access your server. If accidentally shared, close the connection and create a new one.",
-    remoteAccessInfo: "The link expires when you close remote access or restart the server. A new link is generated each time. The connection stays active even if you close this page or browser.",
 } satisfies I18nTranslation;
 
 type I18nTranslationFunction = (...args: any[]) => string;
