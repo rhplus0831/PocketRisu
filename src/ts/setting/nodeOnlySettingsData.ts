@@ -51,4 +51,10 @@ export const nodeOnlySettingsItems: SettingItem[] = [
             void loadPlugins();
         }
     },
+
+    // Tokenizer
+    {
+        id: 'nodeonly.disableServerTokenizer', type: 'check', labelKey: 'disableServerTokenizer',
+        bindKey: 'disableServerTokenizer', helpKey: 'disableServerTokenizer', classes: 'mt-4'
+    },
 ];

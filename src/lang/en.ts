@@ -292,6 +292,8 @@ export const languageEnglish = {
             "Higher values use more chat context to determine similarity.",
         useNodeOnlyScrollButton:
             "Shows navigation buttons to jump between chat messages while scrolling. Buttons appear on scroll and fade out after 1.5 seconds.",
+        disableServerTokenizer:
+            "Run all token counting in the browser instead of forwarding to the NodeOnly server over WebSocket. Turn this on if the server-side tokenizer is making chat preparation slower than the in-browser one.",
     },
     setup: {
         chooseProvider: "Choose AI Provider",
@@ -1699,6 +1701,7 @@ export const languageEnglish = {
     risuaiProTools: "Risuai Pro Tools",
     enableRisuaiProTools: "Enable Risuai Pro Tools",
     useNodeOnlyScrollButton: "Scroll Button",
+    disableServerTokenizer: "Disable Server-side Tokenizer",
     easyPanel: "Easy Panel",
     mainModel: "Main Model",
     epEnabled: "Easy Panel Override",

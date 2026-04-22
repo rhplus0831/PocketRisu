@@ -640,6 +640,7 @@ export function setDatabase(data:Database){
     data.disableToggleBinding ??= false
     data.hideLoadout ??= true
     data.hideEasyPanel ??= true
+    data.disableServerTokenizer ??= false
     data.hideAllImages ??= false
     data.hideMessagePageCount ??= false
     data.ImagenModel ??= 'imagen-4.0-generate-001'
@@ -1270,6 +1271,7 @@ export interface Database{
     }[]
     igpPrompt:string
     useTokenizerCaching:boolean
+    disableServerTokenizer:boolean
     showMenuHypaMemoryModal:boolean
     authRefreshes:{
         url:string

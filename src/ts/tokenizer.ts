@@ -13,10 +13,31 @@ import { LRUMap } from 'mnemonist';
 import { makeHashedStorageKey, readPersistentJson, writePersistentJson } from "./storage/persistentKv";
 import { tokenizeCountViaServer } from "./tokenizerWs";
 
-const MAX_CACHE_SIZE = 1500;
+// Token-count cache. Keyed on a fast 64-bit hash of (data + tokenizer config)
+// so we don't have to keep the full chat text in memory for every cached
+// entry. The cache is the dominant speedup once a chat grows: only freshly
+// edited / appended messages miss, everything else returns synchronously.
+const COUNT_CACHE_SIZE = 20000;
+const ENCODE_CACHE_SIZE = 1500;
 
-const encodeCache = new LRUMap<string, number[] | Uint32Array | Int32Array>(MAX_CACHE_SIZE);
-const countCache = new LRUMap<string, number>(MAX_CACHE_SIZE);
+const encodeCache = new LRUMap<string, number[] | Uint32Array | Int32Array>(ENCODE_CACHE_SIZE);
+const countCache = new LRUMap<string, number>(COUNT_CACHE_SIZE);
+
+// cyrb53 — small, fast, low-collision 53-bit string hash. Synchronous (unlike
+// SubtleCrypto) so it's cheap to call from the tokenisation hot path. Returns
+// a base36 string so the LRU map keys stay short.
+function cyrb53(str: string, seed = 0): string {
+    let h1 = 0xdeadbeef ^ seed;
+    let h2 = 0x41c6ce57 ^ seed;
+    for (let i = 0; i < str.length; i++) {
+        const ch = str.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761);
+        h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
 
 function getHash(
     data: string,
@@ -27,8 +48,10 @@ function getHash(
     modelInfo: LLMModel,
     pluginTokenizer: string
 ): string {
-    const combined = `${data}::${aiModel}::${customTokenizer}::${currentPluginProvider}::${googleClaudeTokenizing ? '1' : '0'}::${modelInfo.tokenizer}::${pluginTokenizer}`;
-    return combined;
+    // Hash the text portion separately from the (small) configuration suffix
+    // so we never allocate a giant concatenated string for every long message.
+    const textHash = cyrb53(data);
+    return `${textHash}|${data.length}|${aiModel}|${customTokenizer}|${currentPluginProvider}|${googleClaudeTokenizing ? 1 : 0}|${modelInfo.tokenizer}|${pluginTokenizer}`;
 }
 
 
@@ -280,7 +303,7 @@ export async function tokenizeCount(data: string): Promise<number> {
     }
 
     const staticKey = resolveStaticTokenizerKey();
-    if (staticKey) {
+    if (staticKey && !db.disableServerTokenizer) {
         const remoteCount = await tokenizeCountViaServer(data, staticKey);
         if (remoteCount !== null) {
             if (db.useTokenizerCaching) countCache.set(cacheKey, remoteCount);
