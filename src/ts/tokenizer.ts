@@ -11,10 +11,12 @@ import { pluginV2 } from "./plugins/plugins.svelte";
 import type { GemmaTokenizer } from "@huggingface/transformers";
 import { LRUMap } from 'mnemonist';
 import { makeHashedStorageKey, readPersistentJson, writePersistentJson } from "./storage/persistentKv";
+import { tokenizeCountViaServer } from "./tokenizerWs";
 
 const MAX_CACHE_SIZE = 1500;
 
 const encodeCache = new LRUMap<string, number[] | Uint32Array | Int32Array>(MAX_CACHE_SIZE);
+const countCache = new LRUMap<string, number>(MAX_CACHE_SIZE);
 
 function getHash(
     data: string,
@@ -179,6 +181,117 @@ export async function encode(data:string):Promise<(number[]|Uint32Array|Int32Arr
     }
 
     return result;
+}
+
+// ─── Server-assisted tokenisation ────────────────────────────────────────────
+//
+// For consumers that only need the token count (the common case: tokenize,
+// tokenizeAccurate, ChatTokenizer, ...) we try to forward the work to the Node
+// server over a WebSocket and only fall back to the heavier in-browser
+// tokenizer if the server is unavailable. This keeps the main thread snappy
+// once chats grow long.
+
+type StaticTokenizerKey =
+    | 'tik-cl100k' | 'tik-o200k'
+    | 'claude' | 'llama3' | 'gemma' | 'cohere' | 'deepseek';
+
+// NOTE: Some tokenizer types (mistral, llama, novelai, novellist) are
+// SentencePiece-based and not currently supported server-side, so the
+// resolver returns null for them and the in-browser tokenizer is used.
+function resolveStaticTokenizerKey(): StaticTokenizerKey | null {
+    const db = getDatabase();
+    const modelInfo = getModelInfo(db.aiModel);
+    const pluginTokenizer = pluginV2.providerOptions.get(db.currentPluginProvider)?.tokenizer ?? "none";
+
+    if (db.aiModel === 'openrouter' || db.aiModel === 'reverse_proxy' || db.aiModel === 'risuext') {
+        switch (db.customTokenizer) {
+            case 'mistral': return null;
+            case 'llama': return null;
+            case 'novelai': return null;
+            case 'claude': return 'claude';
+            case 'novellist': return null;
+            // Mirrors the existing local routing which intentionally uses the
+            // `llama` SentencePiece tokenizer for `llama3` choice → not
+            // supported server-side, fall back.
+            case 'llama3': return null;
+            case 'gemma': return 'gemma';
+            case 'cohere': return 'cohere';
+            case 'deepseek': return 'deepseek';
+            default: return 'tik-o200k';
+        }
+    }
+    if (db.aiModel === 'custom' && pluginTokenizer) {
+        switch (pluginTokenizer) {
+            case 'mistral': return null;
+            case 'llama': return null;
+            case 'novelai': return null;
+            case 'claude': return 'claude';
+            case 'novellist': return null;
+            case 'llama3': return null;
+            case 'gemma': return 'gemma';
+            case 'cohere': return 'cohere';
+            case 'o200k_base': return 'tik-o200k';
+            case 'cl100k_base': return 'tik-cl100k';
+            case 'custom': return null;
+            default: return 'tik-o200k';
+        }
+    }
+
+    switch (modelInfo.tokenizer) {
+        case LLMTokenizer.NovelList: return null;
+        case LLMTokenizer.Claude: return 'claude';
+        case LLMTokenizer.NovelAI: return null;
+        case LLMTokenizer.Mistral: return null;
+        case LLMTokenizer.Llama: return null;
+        case LLMTokenizer.tiktokenO200Base: return 'tik-o200k';
+        case LLMTokenizer.DeepSeek: return 'deepseek';
+        case LLMTokenizer.Cohere: return 'cohere';
+        case LLMTokenizer.Gemma: return 'gemma';
+        case LLMTokenizer.GoogleCloud:
+            return db.googleClaudeTokenizing ? null : 'gemma';
+        case LLMTokenizer.Local: return null;
+        default: return 'tik-cl100k';
+    }
+}
+
+export async function tokenizeCount(data: string): Promise<number> {
+    const db = getDatabase();
+    const modelInfo = getModelInfo(db.aiModel);
+    const pluginTokenizer = pluginV2.providerOptions.get(db.currentPluginProvider)?.tokenizer ?? "none";
+
+    let cacheKey = '';
+    if (db.useTokenizerCaching) {
+        cacheKey = getHash(
+            data,
+            db.aiModel,
+            db.customTokenizer,
+            db.currentPluginProvider,
+            db.googleClaudeTokenizing,
+            modelInfo,
+            pluginTokenizer
+        );
+        const cachedCount = countCache.get(cacheKey);
+        if (cachedCount !== undefined) return cachedCount;
+        const cachedTokens = encodeCache.get(cacheKey);
+        if (cachedTokens !== undefined) {
+            countCache.set(cacheKey, cachedTokens.length);
+            return cachedTokens.length;
+        }
+    }
+
+    const staticKey = resolveStaticTokenizerKey();
+    if (staticKey) {
+        const remoteCount = await tokenizeCountViaServer(data, staticKey);
+        if (remoteCount !== null) {
+            if (db.useTokenizerCaching) countCache.set(cacheKey, remoteCount);
+            return remoteCount;
+        }
+    }
+
+    const encoded = await encode(data);
+    const count = encoded.length;
+    if (db.useTokenizerCaching) countCache.set(cacheKey, count);
+    return count;
 }
 
 type tokenizerType = 'novellist'|'claude'|'novelai'|'llama'|'mistral'|'llama3'|'gemma'|'cohere'|'googleCloud'|'DeepSeek'
@@ -347,13 +460,11 @@ async function tokenizeWebTokenizers(text:string, type:tokenizerType) {
 }
 
 export async function tokenizerChar(char:character) {
-    const encoded = await encode(char.name + '\n' + char.firstMessage + '\n' + char.desc)
-    return encoded.length
+    return await tokenizeCount(char.name + '\n' + char.firstMessage + '\n' + char.desc)
 }
 
 export async function tokenize(data:string) {
-    const encoded = await encode(data)
-    return encoded.length
+    return await tokenizeCount(data)
 }
 
 export async function tokenizeAccurate(data:string | null | undefined, consistantChar?:boolean) {
@@ -361,8 +472,7 @@ export async function tokenizeAccurate(data:string | null | undefined, consistan
         tokenizeAccurate: true,
         consistantChar: consistantChar,
     })
-    const encoded = await encode(data)
-    return encoded.length
+    return await tokenizeCount(data)
 }
 
 
@@ -378,9 +488,9 @@ export class ChatTokenizer {
     async tokenizeChat(data:OpenAIChat, args:{
         countThoughts?:boolean,
     } = {}) {
-        let encoded = (await encode(data.content)).length + this.chatAdditionalTokens
+        let encoded = (await tokenizeCount(data.content)) + this.chatAdditionalTokens
         if(data.name && this.useName ==='name'){
-            encoded += (await encode(data.name)).length + 1
+            encoded += (await tokenizeCount(data.name)) + 1
         }
         if(data.multimodals && data.multimodals.length > 0){
             for(const multimodal of data.multimodals){
@@ -389,7 +499,7 @@ export class ChatTokenizer {
         }
         if(data.thoughts && data.thoughts.length > 0 && args.countThoughts){
             for(const thought of data.thoughts){
-                encoded += (await encode(thought)).length + 1
+                encoded += (await tokenizeCount(thought)) + 1
             }
         }
         return encoded

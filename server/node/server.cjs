@@ -1290,7 +1290,8 @@ function setupProxyStreamWebSocket(server) {
         try {
             const reqUrl = new URL(req.url, `http://${req.headers.host}`);
             if (!reqUrl.pathname.startsWith('/proxy-stream-jobs/') || !reqUrl.pathname.endsWith('/ws')) {
-                socket.destroy();
+                // Not a proxy-stream upgrade. Leave the socket alone so other
+                // upgrade listeners (e.g. the tokenizer WS) can handle it.
                 return;
             }
 
@@ -1352,6 +1353,86 @@ function setupProxyStreamWebSocket(server) {
         ws.on('error', () => {
             clearInterval(pingTimer);
         });
+    });
+}
+
+// --- Tokenizer service over WebSocket ---
+//
+// The browser would otherwise tokenise locally on the main thread, which gets
+// expensive once chats grow long. Clients connect to /ws/tokenize and send
+// `{ id, text, tokenizer, includeTokens? }` requests; the server responds with
+// `{ id, count, tokens? }` or `{ id, error }`. Connection failures on the
+// client are handled by falling back to the in-browser tokenizer.
+
+const tokenizerService = require('./tokenizer.cjs');
+
+function setupTokenizerWebSocket(server) {
+    const wsServer = new WebSocketServer({ noServer: true });
+
+    server.on('upgrade', async (req, socket, head) => {
+        try {
+            const reqUrl = new URL(req.url, `http://${req.headers.host}`);
+            if (reqUrl.pathname !== '/ws/tokenize') {
+                return;
+            }
+
+            const auth = reqUrl.searchParams.get('risu-auth') || normalizeAuthHeader(req.headers['risu-auth']);
+            if (!await isAuthorizedProxyRequest({ headers: { 'risu-auth': auth } })) {
+                socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+                socket.destroy();
+                return;
+            }
+
+            wsServer.handleUpgrade(req, socket, head, (ws) => {
+                wsServer.emit('connection', ws, req);
+            });
+        } catch (err) {
+            try {
+                socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+                socket.destroy();
+            } catch {}
+        }
+    });
+
+    wsServer.on('connection', (ws, req) => {
+        const remote = (req.socket && req.socket.remoteAddress) || 'unknown';
+        console.log(`[Tokenizer WS] Client connected from ${remote}`);
+
+        ws.on('message', async (raw) => {
+            let msg;
+            try {
+                msg = JSON.parse(raw.toString());
+            } catch {
+                return; // ignore malformed input
+            }
+            const id = msg && msg.id;
+            if (id === undefined || id === null) return;
+
+            try {
+                if (!msg.tokenizer || typeof msg.text !== 'string') {
+                    ws.send(JSON.stringify({ id, error: 'invalid_request' }));
+                    return;
+                }
+                if (!tokenizerService.isSupportedTokenizerKey(msg.tokenizer)) {
+                    ws.send(JSON.stringify({ id, error: 'unsupported_tokenizer' }));
+                    return;
+                }
+                const result = await tokenizerService.tokenizeText(
+                    msg.text,
+                    msg.tokenizer,
+                    { includeTokens: !!msg.includeTokens }
+                );
+                ws.send(JSON.stringify({ id, ...result }));
+            } catch (err) {
+                ws.send(JSON.stringify({ id, error: String(err && err.message ? err.message : err) }));
+            }
+        });
+
+        ws.on('close', () => {
+            // No per-connection state to clean up.
+        });
+
+        ws.on('error', () => {});
     });
 }
 
@@ -4577,6 +4658,7 @@ async function startServer() {
             // HTTPS
             server = https.createServer(httpsOptions, app);
             setupProxyStreamWebSocket(server);
+            setupTokenizerWebSocket(server);
             server.listen(port, () => {
                 console.log("[Server] HTTPS server is running.");
                 console.log(`[Server] https://localhost:${port}/`);
@@ -4585,6 +4667,7 @@ async function startServer() {
             // HTTP
             server = http.createServer(app);
             setupProxyStreamWebSocket(server);
+            setupTokenizerWebSocket(server);
             server.listen(port, () => {
                 console.log("[Server] HTTP server is running.");
                 console.log(`[Server] http://localhost:${port}/`);
