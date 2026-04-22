@@ -15,6 +15,7 @@ const { WebSocketServer } = require('ws')
 const sharp = require('sharp')
 const { kvGet, kvSet, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
+        kvRecordDeletion, kvRecordDeletionBulk, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
         db: sqliteDb } = require('./db.cjs');
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON } = require('./utils.cjs');
@@ -58,6 +59,7 @@ function queueStorageOperation(operation) {
 }
 
 const DB_HEX_KEY = Buffer.from('database/database.bin', 'utf-8').toString('hex');
+const LIST_DELTA_MAX_AGE_MS = 6 * 24 * 60 * 60 * 1000;
 
 // ─── Server-side database backup ─────────────────────────────────────────────
 const BACKUP_BUDGET_BYTES = 500 * 1024 * 1024; // 500 MB
@@ -85,7 +87,18 @@ function createBackupAndRotate() {
     const maxBackups = Math.min(20, Math.max(3, Math.floor(BACKUP_BUDGET_BYTES / dbSize)));
 
     while (backupKeys.length > maxBackups) {
-        kvDel(backupKeys.pop());
+        const oldBackupKey = backupKeys.pop();
+        if (!oldBackupKey) {
+            continue;
+        }
+        kvDel(oldBackupKey);
+        kvRecordDeletion(oldBackupKey);
+    }
+}
+
+function recordBulkDeletions(prefixes) {
+    for (const prefix of prefixes) {
+        kvRecordDeletionBulk(prefix);
     }
 }
 
@@ -1667,6 +1680,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     const importedSidecarIds = new Set();
     const explicitSidecarMap = new Map();
     const legacyInlayInfoMap = new Map();
+    const existingInlayKeys = (await listInlayFiles()).map((entry) => `inlay/${entry.id}`);
 
     const stagingDir = path.join(savePath, 'inlays_import_staging');
     const backupInlayDir = path.join(savePath, 'inlays_import_backup');
@@ -1709,6 +1723,18 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     sqliteDb.pragma('synchronous = OFF');
 
     sqliteDb.exec('BEGIN');
+    for (const key of existingInlayKeys) {
+        kvRecordDeletion(key);
+    }
+    recordBulkDeletions([
+        'assets/',
+        'inlay/',
+        'inlay_thumb/',
+        'inlay_meta/',
+        'inlay_info/',
+        'coldstorage/',
+    ]);
+    kvCleanupOldDeletions();
     kvDelPrefix('assets/');
     kvDelPrefix('inlay/');
     kvDelPrefix('inlay_thumb/');
@@ -2777,12 +2803,16 @@ app.get('/api/remove', async (req, res, next) => {
             kvDel(key);
             kvDel(`inlay_thumb/${id}`);
             kvDel(`inlay_info/${id}`);
+            kvRecordDeletion(key);
+            kvRecordDeletion(`inlay_thumb/${id}`);
+            kvRecordDeletion(`inlay_info/${id}`);
             return res.send({ success: true });
         }
         if (key.startsWith('inlay_info/')) {
             await fs.unlink(getInlaySidecarPath(key.slice('inlay_info/'.length))).catch(() => {});
         }
         kvDel(key);
+        kvRecordDeletion(key);
         res.send({ success: true });
     } catch (error) {
         next(error);
@@ -2794,18 +2824,53 @@ app.get('/api/list', async (req, res, next) => {
         return;
     }
     try {
-        const keyPrefix = req.headers['key-prefix'] || '';
-        let data;
-        if (keyPrefix === 'inlay/') {
-            const fileKeys = (await listInlayFiles()).map((entry) => `inlay/${entry.id}`);
-            data = [...new Set([
-                ...fileKeys,
-                ...kvList('inlay/'),
-            ])];
-        } else {
-            data = kvList(keyPrefix || undefined);
+        const keyPrefixHeader = req.headers['key-prefix'];
+        const lastSyncHeader = req.headers['x-last-sync'];
+        const keyPrefix = Array.isArray(keyPrefixHeader) ? keyPrefixHeader[0] : (keyPrefixHeader || '');
+        const lastSyncRaw = Array.isArray(lastSyncHeader) ? lastSyncHeader[0] : lastSyncHeader;
+        const lastSync = parseInt(lastSyncRaw || '0', 10) || 0;
+        const now = Date.now();
+
+        if (!lastSync || (now - lastSync) > LIST_DELTA_MAX_AGE_MS) {
+            let data;
+            if (keyPrefix === 'inlay/') {
+                const fileKeys = (await listInlayFiles()).map((entry) => `inlay/${entry.id}`);
+                data = [...new Set([
+                    ...fileKeys,
+                    ...kvList('inlay/'),
+                ])];
+            } else {
+                data = kvList(keyPrefix || undefined);
+            }
+            res.send({ success: true, content: data, timestamp: now, mode: 'full' });
+            return;
         }
-        res.send({ success: true, content: data });
+
+        let added;
+        let deleted;
+        if (keyPrefix === 'inlay/') {
+            const modifiedFileKeys = [];
+            const inlayFiles = await listInlayFiles();
+            for (const entry of inlayFiles) {
+                try {
+                    const stat = await fs.stat(entry.filePath);
+                    if (stat.mtimeMs >= lastSync) {
+                        modifiedFileKeys.push(`inlay/${entry.id}`);
+                    }
+                } catch {
+                    // Ignore transient stat failures and fall back to the next sync.
+                }
+            }
+
+            const modifiedKvKeys = kvListModifiedSince(lastSync, 'inlay/');
+            added = [...new Set([...modifiedFileKeys, ...modifiedKvKeys])];
+            deleted = kvGetDeletedSince(lastSync, 'inlay/');
+        } else {
+            added = kvListModifiedSince(lastSync, keyPrefix || undefined);
+            deleted = kvGetDeletedSince(lastSync, keyPrefix || undefined);
+        }
+
+        res.send({ success: true, added, deleted, timestamp: now, mode: 'delta' });
     } catch (error) {
         next(error);
     }
@@ -3903,6 +3968,14 @@ function scanHexFilesInDir(dirPath) {
 }
 
 function clearExistingData() {
+    recordBulkDeletions([
+        'assets/',
+        'inlay/',
+        'inlay_thumb/',
+        'inlay_meta/',
+        'inlay_info/',
+    ]);
+    kvCleanupOldDeletions();
     kvDelPrefix('assets/');
     kvDelPrefix('inlay/');
     kvDelPrefix('inlay_thumb/');
@@ -4758,5 +4831,11 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
         try { checkpointWal('RESTART'); }
         catch { /* non-fatal */ }
     }, 5 * 60 * 1000); // every 5 minutes
+
+    setInterval(() => {
+        try { kvCleanupOldDeletions(); }
+        catch { /* non-fatal */ }
+    }, 60 * 60 * 1000); // every hour
+    try { kvCleanupOldDeletions(); } catch { /* non-fatal */ }
 
 })();

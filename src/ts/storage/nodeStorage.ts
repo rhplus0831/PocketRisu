@@ -20,6 +20,61 @@ export class ConflictError extends Error {
     }
 }
 
+const LIST_CACHE_DB_NAME = 'risu-list-cache'
+const LIST_CACHE_STORE = 'lists'
+
+function listCacheKey(prefix: string): string {
+    return `list:${prefix}`
+}
+
+async function openListCacheDb(): Promise<IDBDatabase> {
+    return await new Promise((resolve, reject) => {
+        const req = indexedDB.open(LIST_CACHE_DB_NAME, 1)
+        req.onupgradeneeded = () => req.result.createObjectStore(LIST_CACHE_STORE)
+        req.onsuccess = () => resolve(req.result)
+        req.onerror = () => reject(req.error)
+    })
+}
+
+async function listCacheGet(prefix: string): Promise<{ keys: string[], timestamp: number } | null> {
+    try {
+        const db = await openListCacheDb()
+        const tx = db.transaction(LIST_CACHE_STORE, 'readonly')
+        const store = tx.objectStore(LIST_CACHE_STORE)
+        const result = await new Promise<any>((resolve, reject) => {
+            const req = store.get(listCacheKey(prefix))
+            req.onsuccess = () => resolve(req.result)
+            req.onerror = () => reject(req.error)
+        })
+        db.close()
+        if (result && Array.isArray(result.keys) && typeof result.timestamp === 'number') {
+            return {
+                keys: result.keys,
+                timestamp: result.timestamp,
+            }
+        }
+        return null
+    } catch {
+        return null
+    }
+}
+
+async function listCacheSet(prefix: string, keys: string[], timestamp: number): Promise<void> {
+    try {
+        const db = await openListCacheDb()
+        const tx = db.transaction(LIST_CACHE_STORE, 'readwrite')
+        const store = tx.objectStore(LIST_CACHE_STORE)
+        store.put({ keys, timestamp }, listCacheKey(prefix))
+        await new Promise<void>((resolve, reject) => {
+            tx.oncomplete = () => resolve()
+            tx.onerror = () => reject(tx.error)
+        })
+        db.close()
+    } catch {
+        // Cache failures should never break storage reads.
+    }
+}
+
 export class NodeStorage{
     private static readonly BULK_WRITE_CLIENT_BATCH = 20
 
@@ -225,6 +280,10 @@ export class NodeStorage{
         if (prefix) {
             headers['key-prefix'] = prefix
         }
+        const cached = await listCacheGet(prefix)
+        if (cached) {
+            headers['x-last-sync'] = String(cached.timestamp)
+        }
         const da = await this.authFetch('/api/list', {
             method: "GET",
             headers
@@ -236,7 +295,22 @@ export class NodeStorage{
         if(data.error){
             throw data.error
         }
-        return data.content
+
+        const serverTimestamp: number = data.timestamp ?? Date.now()
+        if (data.mode === 'delta' && cached) {
+            const addedSet = new Set((data.added as string[]) ?? [])
+            const deletedSet = new Set((data.deleted as string[]) ?? [])
+            const merged = cached.keys.filter((key) => !deletedSet.has(key) && !addedSet.has(key))
+            for (const key of addedSet) {
+                merged.push(key)
+            }
+            void listCacheSet(prefix, merged, serverTimestamp)
+            return merged
+        }
+
+        const content = data.content as string[]
+        void listCacheSet(prefix, content, serverTimestamp)
+        return content
     }
     async removeItem(key:string){
         const da = await this.authFetch('/api/remove', {

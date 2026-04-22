@@ -27,6 +27,13 @@ db.exec(`
     updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
   )
 `);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS deleted_keys (
+    key        TEXT    PRIMARY KEY,
+    deleted_at INTEGER NOT NULL
+  )
+`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_deleted_keys_at ON deleted_keys(deleted_at)`);
 
 // Entity tables (characters, chats, settings, presets, modules) were used in
 // a previous version. The tables are no longer created or used, but existing
@@ -91,6 +98,17 @@ const stmtKvUpdatedAt = db.prepare(`SELECT updated_at FROM kv WHERE key = ?`);
 const stmtKvCopy = db.prepare(
     `INSERT OR REPLACE INTO kv (key, value, updated_at) SELECT ?, value, ? FROM kv WHERE key = ?`
 );
+const stmtRecordDeletion = db.prepare(`INSERT OR REPLACE INTO deleted_keys (key, deleted_at) VALUES (?, ?)`);
+const stmtRemoveDeletion = db.prepare(`DELETE FROM deleted_keys WHERE key = ?`);
+const stmtDeletedSince = db.prepare(`SELECT key FROM deleted_keys WHERE deleted_at >= ?`);
+const stmtDeletedSincePrefix = db.prepare(`SELECT key FROM deleted_keys WHERE deleted_at >= ? AND key LIKE ? ESCAPE '\\'`);
+const stmtModifiedSince = db.prepare(`SELECT key FROM kv WHERE updated_at >= ?`);
+const stmtModifiedSincePrefix = db.prepare(`SELECT key FROM kv WHERE updated_at >= ? AND key LIKE ? ESCAPE '\\'`);
+const stmtCleanupDeletions = db.prepare(`DELETE FROM deleted_keys WHERE deleted_at < ?`);
+const stmtClearAllDeletions = db.prepare(`DELETE FROM deleted_keys`);
+const stmtRecordDeletionBulk = db.prepare(
+    `INSERT OR REPLACE INTO deleted_keys (key, deleted_at) SELECT key, ? FROM kv WHERE key LIKE ? ESCAPE '\\'`
+);
 
 function kvGet(key) {
     const row = stmtKvGet.get(key);
@@ -99,6 +117,7 @@ function kvGet(key) {
 
 function kvSet(key, value) {
     stmtKvSet.run(key, value, Date.now());
+    stmtRemoveDeletion.run(key);
 }
 
 function kvDel(key) {
@@ -150,10 +169,51 @@ function clearEntities() {
     }
 }
 
+const DELETION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+function kvRecordDeletion(key) {
+    stmtRecordDeletion.run(key, Date.now());
+}
+
+function kvRecordDeletionBulk(prefix) {
+    const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+    stmtRecordDeletionBulk.run(Date.now(), `${escaped}%`);
+}
+
+function kvListModifiedSince(since, prefix) {
+    if (prefix) {
+        const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+        return stmtModifiedSincePrefix.all(since, `${escaped}%`).map((row) => row.key);
+    }
+    return stmtModifiedSince.all(since).map((row) => row.key);
+}
+
+function kvGetDeletedSince(since, prefix) {
+    if (prefix) {
+        const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+        return stmtDeletedSincePrefix.all(since, `${escaped}%`).map((row) => row.key);
+    }
+    return stmtDeletedSince.all(since).map((row) => row.key);
+}
+
+function kvCleanupOldDeletions() {
+    stmtCleanupDeletions.run(Date.now() - DELETION_RETENTION_MS);
+}
+
+function kvClearAllDeletions() {
+    stmtClearAllDeletions.run();
+}
+
 module.exports = {
     db,
     // KV
     kvGet, kvSet, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue,
     clearEntities,
     checkpointWal,
+    kvRecordDeletion,
+    kvRecordDeletionBulk,
+    kvListModifiedSince,
+    kvGetDeletedSince,
+    kvCleanupOldDeletions,
+    kvClearAllDeletions,
 };
