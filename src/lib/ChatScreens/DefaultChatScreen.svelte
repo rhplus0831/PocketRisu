@@ -27,6 +27,7 @@
     import { postChatFile } from 'src/ts/process/files/multisend';
     import { getInlayAsset } from 'src/ts/process/files/inlays';
     import { quickMenu } from 'src/ts/hotkey';
+    import { shouldSendOnEnter } from 'src/ts/chat/sendHotkey';
 
     import Chats from './Chats.svelte';
     import Button from '../UI/GUI/Button.svelte';
@@ -679,14 +680,9 @@
                           bind:value={messageInput}
                           bind:this={inputEle}
                           onkeydown={(e) => {
-                        if(e.key.toLocaleLowerCase() === "enter" && !e.isComposing){
-                            if(DBState.db.sendWithEnter && (!e.shiftKey)){
-                                send()
-                                e.preventDefault()
-                            }else if(!DBState.db.sendWithEnter && e.shiftKey){
-                                send()
-                                e.preventDefault()
-                            }
+                        if(shouldSendOnEnter(DBState.db, e)){
+                            send()
+                            e.preventDefault()
                         }
                         if(e.key.toLocaleLowerCase() === "m" && (e.ctrlKey)){
                             reroll()
@@ -789,11 +785,9 @@
                               bind:value={messageInputTranslate}
                               bind:this={inputTranslateEle}
                               onkeydown={(e) => {
-                            if(e.key.toLocaleLowerCase() === "enter" && (!e.shiftKey)){
-                                if(DBState.db.sendWithEnter){
-                                    send()
-                                    e.preventDefault()
-                                }
+                            if(shouldSendOnEnter(DBState.db, e)){
+                                send()
+                                e.preventDefault()
                             }
                             if(e.key.toLocaleLowerCase() === "m" && (e.ctrlKey)){
                                 reroll()

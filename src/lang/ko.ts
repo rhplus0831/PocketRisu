@@ -840,6 +840,7 @@ export const languageKorean = {
     "globalRegexScript": "글로벌 정규식",
     "accessibility": "접근성",
     "sendWithEnter": "엔터키로 메세지 보내기(체크 해제시 Shift + Enter가 메세지 전송으로 변경.)",
+    "sendOnlyWithButton": "\uC5D4\uD130 \uC804\uC1A1 \uBE44\uD65C\uC131\uD654(\uBCF4\uB0B4\uAE30 \uBC84\uD2BC\uC73C\uB85C\uB9CC \uC804\uC1A1)",
     "fixedChatTextarea": "채팅창 하단 고정",
     "clickToEdit": "클릭해서 수정하기",
     "enableBlockPartialEdit": "블록 부분 수정 활성화 (블록에 마우스를 올려 개별 수정)",

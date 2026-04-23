@@ -954,6 +954,7 @@ export const languageEnglish = {
     globalRegexScript: "Global Regex",
     accessibility: "Accessibility",
     sendWithEnter: "Send with Enter Key",
+    sendOnlyWithButton: "Disable Enter send and use the send button only",
     fixedChatTextarea: "Fixed at the bottom of the chat window(When unchecked, Shift + Enter changes to send a message.)",
     clickToEdit: "Click Text to Edit",
     enableBlockPartialEdit: "Enable Block Partial Edit (Hover to edit individual blocks)",
