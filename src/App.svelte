@@ -30,7 +30,6 @@
     import PluginAlertModal from './lib/Others/PluginAlertModal.svelte';
     import LoadoutModal from './lib/Others/LoadoutModal.svelte';
     import PopupEditor from './lib/Others/PopupEditor.svelte';
-    import UpdatePopup from './lib/Others/UpdatePopup.svelte';
     import PopupList from './lib/UI/PopupList.svelte';
     import EasyPanel from './lib/Others/ProTools/EasyPanel.svelte';
     import LoadingOverlay from './lib/Others/LoadingOverlay.svelte';
@@ -236,7 +235,6 @@
     {/if}
     <PluginAlertModal />
     <LoadingOverlay />
-    <UpdatePopup />
     {#if popupStore.children}
         <PopupList />
     {/if}

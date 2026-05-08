@@ -408,8 +408,6 @@ const BACKUP_DISK_HEADROOM = 2;
 let importInProgress = false;
 
 // ── Update check ─────────────────────────────────────────────────────────────
-const UPDATE_CHECK_DISABLED = process.env.RISU_UPDATE_CHECK === 'false';
-const UPDATE_CHECK_URL = process.env.RISU_UPDATE_URL || 'https://risu-update-worker.nodridan.workers.dev/check';
 const PUBLIC_STATS_URL = (process.env.RISU_UPDATE_URL || 'https://risu-update-worker.nodridan.workers.dev/check').replace(/\/check$/, '/api/public-stats');
 
 const currentVersion = (() => {
@@ -777,25 +775,7 @@ async function migrateInlaysToFilesystem() {
 }
 
 async function fetchLatestRelease() {
-    if (UPDATE_CHECK_DISABLED) return null;
-    try {
-        const params = new URLSearchParams({
-            v: currentVersion,
-            d: deploymentType,
-            os: `${process.platform}-${process.arch}`,
-        });
-        const url = `${UPDATE_CHECK_URL}?${params}`;
-        const res = await fetch(url);
-        if (!res.ok) return null;
-        const data = await res.json();
-        if (data.hasUpdate) {
-            console.log(`[Update] New version available: v${data.latestVersion} (current: v${currentVersion}, ${data.severity})`);
-        }
-        return data;
-    } catch (e) {
-        console.error('[Update] Failed to check for updates:', e.message);
-        return null;
-    }
+    return null;
 }
 
 // ── Session store for direct asset URL auth (F-0) ──────────────────────────
@@ -4265,18 +4245,7 @@ app.get('/api/public-stats', async (req, res) => {
 
 // ── Update check endpoint ────────────────────────────────────────────────────
 app.get('/api/update-check', async (req, res) => {
-    if (UPDATE_CHECK_DISABLED) {
-        res.json({ currentVersion, hasUpdate: false, severity: 'none', disabled: true, deploymentType, canSelfUpdate: false });
-        return;
-    }
-    const result = await fetchLatestRelease();
-    const response = result || { currentVersion, hasUpdate: false, severity: 'none' };
-    response.deploymentType = deploymentType;
-    response.canSelfUpdate = deploymentType === 'portable'
-        && !!response.hasUpdate
-        && !response.manualOnly
-        && !!getSelfUpdateAssetInfo(response.latestVersion);
-    res.json(response);
+    res.json({ currentVersion, hasUpdate: false, severity: 'none', disabled: true, deploymentType, canSelfUpdate: false });
 });
 
 // ── Self-update endpoint (portable only) ─────────────────────────────────────

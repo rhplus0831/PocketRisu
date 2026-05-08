@@ -2,7 +2,6 @@ import { changeFullscreen, checkNullish } from "./util"
 import { v4 as uuidv4 } from 'uuid';
 import { get } from "svelte/store";
 import { setDatabase, defaultSdDataFunc, getDatabase } from "./storage/database.svelte";
-import { checkRisuUpdate } from "./update";
 import { fetchPublicStats } from "./publicStats";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState } from "./stores.svelte";
 import { loadPlugins } from "./plugins/plugins.svelte";
@@ -154,7 +153,6 @@ export async function loadData() {
             setTimeout(() => {
                 cleanChunks().catch(console.error)
             }, 5_000)
-            checkRisuUpdate()
             fetchPublicStats()
             if (import.meta.env.VITE_RISU_TOS === 'TRUE') {
                 alertTOS().then((a) => {
