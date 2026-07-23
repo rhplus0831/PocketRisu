@@ -16,6 +16,7 @@ const browserNavigator = navigator as BrowserNavigator
 
 export const isNodeServer: boolean = !!(globalThis as typeof globalThis & { __NODE__?: boolean }).__NODE__
 export const supportsPatchSync: boolean = !!(globalThis as typeof globalThis & { __PATCH_SYNC__?: boolean }).__PATCH_SYNC__
+export const allowInsecureContext: boolean = !!(globalThis as typeof globalThis & { __ALLOW_INSECURE_CONTEXT__?: boolean }).__ALLOW_INSECURE_CONTEXT__
 export const isMobile: boolean = /Android|iPhone|iPad|iPod|webOS/i.test(browserNavigator.userAgent);
 
 export const isFirefox: boolean = browserNavigator.userAgent.includes("Firefox")

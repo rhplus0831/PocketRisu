@@ -65,6 +65,11 @@ if (nodeMajor < 24) {
 
 // Configuration flags for patch-based sync
 const enablePatchSync = true;
+// Emergency escape hatch for remote plain-HTTP deployments. Only these exact
+// values allow the client to boot outside a browser secure context.
+const allowInsecureContext = process.env.POCKETRISU_ALLOW_INSECURE_CONTEXT === '1'
+    || process.env.POCKETRISU_ALLOW_INSECURE_CONTEXT === 'true';
+
 // In-memory database cache for patch-based sync
 // dbCache stores the STRIPPED (stubs-only) version matching what the client sees.
 // fullChatStore keeps the actual chat data keyed by chaId→chatId.
@@ -2607,7 +2612,7 @@ app.get('/', async (req, res, next) => {
         const mainIndex = await fs.readFile(path.join(process.cwd(), 'dist', 'index.html'))
         const root = htmlparser.parse(mainIndex)
         const head = root.querySelector('head')
-        head.innerHTML = `<script>globalThis.__NODE__ = true; globalThis.__PATCH_SYNC__ = ${enablePatchSync}</script>` + head.innerHTML
+        head.innerHTML = `<script>globalThis.__NODE__ = true; globalThis.__PATCH_SYNC__ = ${enablePatchSync}; globalThis.__ALLOW_INSECURE_CONTEXT__ = ${allowInsecureContext}</script>` + head.innerHTML
         
         res.send(root.toString())
     } catch (error) {

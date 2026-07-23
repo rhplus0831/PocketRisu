@@ -4,3 +4,7 @@
 // Service Workers, and other Permission-restricted Web APIs.
 export const isSecureContext: boolean =
     typeof window !== 'undefined' && window.isSecureContext;
+
+export function shouldBlockInsecureBoot(isSecure: boolean, allowFlag: boolean): boolean {
+    return !isSecure && !allowFlag;
+}

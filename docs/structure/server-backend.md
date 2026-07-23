@@ -61,6 +61,7 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `PORT` | HTTP/HTTPS port; default `6001` at `server/node/server.cjs:6183`. |
 | `POCKETRISU_CHUNK_THRESHOLD` | Overrides the default 16 MiB chunking threshold at `server/node/db.cjs:95`. |
 | `POCKETRISU_BACKUP_INTERVAL_MS` | Minimum interval between automatic DB snapshots; default five minutes at `server/node/server.cjs:127`. |
+| `POCKETRISU_ALLOW_INSECURE_CONTEXT` | Allows client boot outside HTTPS or localhost only when exactly `1` or `true`; bypasses the WebCrypto integrity gate at the operator's risk. |
 | `RISU_BACKUP_IMPORT_MAX_BYTES` | Maximum streamed backup/ZIP import size; `0` means unlimited at `server/node/server.cjs:863`. |
 | `BACKUP_NDJSON_HEARTBEAT_MS` | Backup-import keepalive interval, default 5 seconds and clamped to at least 100 ms at `server/node/server.cjs:871`. |
 | `RISU_TUNNEL_DISABLED` | Disables Quick Tunnel when exactly `true` at `server/node/server.cjs:879`. |

@@ -31,11 +31,76 @@ import {
 import { registerModelDynamic } from "./model/modellist";
 import { convertStubsToPlaceholders } from "./storage/chatStorage";
 import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelte";
+import { allowInsecureContext } from "./platform";
+import { isSecureContext, shouldBlockInsecureBoot } from "./secureContext";
+
+function renderInsecureContextFatalError() {
+    const overlay = document.createElement('div')
+    overlay.id = 'pocketrisu-insecure-context-error'
+    overlay.setAttribute('role', 'alert')
+    overlay.setAttribute('aria-live', 'assertive')
+    Object.assign(overlay.style, {
+        position: 'fixed',
+        inset: '0',
+        zIndex: '2147483647',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '24px',
+        background: '#111827',
+        color: '#f9fafb',
+        fontFamily: 'system-ui, sans-serif',
+    })
+
+    const panel = document.createElement('div')
+    Object.assign(panel.style, {
+        width: '100%',
+        maxWidth: '640px',
+        padding: '32px',
+        border: '1px solid #374151',
+        borderRadius: '12px',
+        background: '#1f2937',
+        boxShadow: '0 20px 40px rgba(0, 0, 0, 0.35)',
+    })
+
+    const title = document.createElement('h1')
+    title.textContent = 'Secure connection required'
+    Object.assign(title.style, {
+        margin: '0 0 20px',
+        fontSize: '24px',
+        fontWeight: '700',
+    })
+    panel.appendChild(title)
+
+    const paragraphs = [
+        'PocketRisu must be accessed over HTTPS or from localhost.',
+        'Remote plain HTTP is not a secure context. The browser disables WebCrypto, which breaks asset content-addressing and integrity.',
+        'Use the built-in Cloudflare Quick Tunnel or Tailscale for easy HTTPS access.',
+        'The server operator can set POCKETRISU_ALLOW_INSECURE_CONTEXT=1 to bypass this check at their own risk.',
+    ]
+    for (const message of paragraphs) {
+        const paragraph = document.createElement('p')
+        paragraph.textContent = message
+        Object.assign(paragraph.style, {
+            margin: '12px 0 0',
+            lineHeight: '1.6',
+        })
+        panel.appendChild(paragraph)
+    }
+
+    overlay.appendChild(panel)
+    document.body.appendChild(overlay)
+}
 
 /**
  * Loads the application data.
  */
 export async function loadData() {
+    if (shouldBlockInsecureBoot(isSecureContext, allowInsecureContext)) {
+        renderInsecureContextFatalError()
+        return
+    }
+
     const loaded = get(loadedStore)
     if (!loaded) {
         try {
