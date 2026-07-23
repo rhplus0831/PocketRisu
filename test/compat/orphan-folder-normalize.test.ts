@@ -4,7 +4,7 @@
  * Reproduces a database where a chat's folderId references a folder that no
  * longer exists in chatFolders — the symptom users see as "chat exists in
  * data but invisible in sidebar". The server should detect and clear orphan
- * folderIds during decodeDatabaseWithPersistentChatIds and persist the fix.
+ * folderIds during database ingestion and persist the fix.
  */
 import { describe, test, expect, afterAll } from 'vitest'
 import { Packr, Unpackr } from 'msgpackr'
@@ -93,8 +93,7 @@ describe('orphan folderId boot-time normalize', () => {
         const importResult = await client.importBackup(seed)
         expect(importResult.ok).toBe(true)
 
-        // Trigger /api/read so the server runs decodeDatabaseWithPersistentChatIds,
-        // which is where normalizeOrphanFolderIds lives.
+        // Read the stripped view after ingestion normalized the imported DB.
         const readRes = await client.fetch('/api/read', {
             headers: {
                 'file-path': Buffer.from('database/database.bin', 'utf-8').toString('hex'),

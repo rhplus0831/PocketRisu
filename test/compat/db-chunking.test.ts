@@ -2,8 +2,8 @@
  * Chunking lifecycle integration tests.
  *
  * Boots a real server with a LOW chunk threshold (POCKETRISU_CHUNK_THRESHOLD)
- * so the DB blob actually chunks, then drives the full lifecycle over HTTP:
- *   import (chunks) → stats (chunk-aware) → export → re-import (round-trip) →
+ * so large chat rows and full snapshots chunk, then drives the full lifecycle:
+ *   import (externalizes) → stats → export → re-import (round-trip) →
  *   snapshots/limits → optimize/gc, plus the save-folder import paths.
  *
  * The default compat fixtures use tiny DBs (< 16 MB) that never chunk, so this
@@ -15,6 +15,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { zipSync } from 'fflate'
 import { Packr } from 'msgpackr'
+import Database from 'better-sqlite3'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { createSeedBackup } from './helpers/seed.js'
@@ -28,6 +29,7 @@ function dbBlobFromExport(exported: Buffer): Buffer {
 
 // Chunk anything larger than 4 KB so a normal seed DB chunks.
 const CHUNK_ENV = { POCKETRISU_CHUNK_THRESHOLD: '4096' }
+const CHUNK_MARKER = Buffer.from('\x00RISUCHUNKED\x00', 'binary')
 
 const servers: ServerHandle[] = []
 afterAll(async () => { await Promise.allSettled(servers.map((s) => s.cleanup())) })
@@ -79,31 +81,63 @@ async function getStats(client: RisuClient): Promise<any> {
   return res.json()
 }
 
+function getStorageLayout(srv: ServerHandle): {
+  liveChunked: boolean
+  chatRows: number
+  chunkedChatRows: number
+  externalizationMarker: string | null
+  safetyBackups: number
+} {
+  const db = new Database(path.join(srv.cwd, 'save', 'risuai.db'), { readonly: true })
+  try {
+    const live = db.prepare("SELECT value FROM kv WHERE key = 'database/database.bin'").get() as { value: Buffer } | undefined
+    const chats = db.prepare("SELECT value FROM kv WHERE key LIKE 'chats/%'").all() as Array<{ value: Buffer }>
+    const marker = db.prepare("SELECT value FROM kv WHERE key = 'migration/chats-externalized'").get() as { value: Buffer } | undefined
+    const backups = db.prepare("SELECT COUNT(*) AS count FROM kv WHERE key LIKE 'migration-backup/pre-chat-externalization-%'").get() as { count: number }
+    return {
+      liveChunked: !!live && Buffer.from(live.value).equals(CHUNK_MARKER),
+      chatRows: chats.length,
+      chunkedChatRows: chats.filter(row => Buffer.from(row.value).equals(CHUNK_MARKER)).length,
+      externalizationMarker: marker ? Buffer.from(marker.value).toString('utf8') : null,
+      safetyBackups: backups.count,
+    }
+  } finally {
+    db.close()
+  }
+}
+
 describe('chunking lifecycle (real server, low threshold)', () => {
-  test('importing an oversized DB chunks the blob through the real server', async () => {
-    const { client } = await boot()
+  test('importing an oversized DB externalizes and chunks its large chat rows', async () => {
+    const { client, srv } = await boot()
     const r = await client.importBackup(oversizedSeed())
     expect(r.ok).toBe(true)
 
     const s = await getStats(client)
-    expect(s.chunks.liveChunked).toBe(true)
+    const layout = getStorageLayout(srv)
+    expect(s.chunks.liveChunked).toBe(false)
+    expect(layout.liveChunked).toBe(false)
+    expect(layout.chatRows).toBe(10)
+    expect(layout.chunkedChatRows).toBeGreaterThan(0)
+    expect(s.prefixes['chats/'].count).toBe(10)
+    expect(s.prefixes['chats/'].totalSize).toBeGreaterThan(10 * CHUNK_MARKER.length)
     expect(s.chunks.count).toBeGreaterThan(1)
     expect(s.chunks.bytes).toBeGreaterThan(0)
   })
 
-  test('chunked DB exports to standard .bin and round-trips into a fresh server', async () => {
+  test('externalized DB exports to standard full .bin and round-trips into a fresh server', async () => {
     const { client } = await boot()
     await client.importBackup(oversizedSeed())
 
     const exported = await client.exportBackup()
     expect(exported.byteLength).toBeGreaterThan(4096)
 
-    const { client: client2 } = await boot()
+    const { client: client2, srv: srv2 } = await boot()
     const r2 = await client2.importBackup(exported)
     expect(r2.ok).toBe(true)
 
     const s2 = await getStats(client2)
-    expect(s2.chunks.liveChunked).toBe(true)
+    expect(s2.chunks.liveChunked).toBe(false)
+    expect(getStorageLayout(srv2).chatRows).toBe(10)
     const charRes = await client2.fetch('/api/db/stats/characters')
     expect(charRes.status).toBe(200)
     const chars = await charRes.json()
@@ -139,21 +173,81 @@ describe('chunking lifecycle (real server, low threshold)', () => {
     const body = await res.json()
     expect(body.ok).toBe(true)
     expect(typeof body.chunksReclaimed).toBe('number')
+    expect(typeof body.orphanChatRowsDeleted).toBe('number')
+    expect(typeof body.orphanChatRowsSkippedRecent).toBe('number')
+  })
+
+  test('optimize sweeps old orphan chat rows but preserves recent transient rows', async () => {
+    const { client, srv } = await boot()
+    const strippedDb = {
+      characters: [{ chaId: 'gc-char', name: 'GC', chats: [] }],
+      apiType: 'openai',
+      personas: [],
+      botPresets: [],
+      botPresetsId: 0,
+      selectedCharacter: 0,
+    }
+    const write = await client.fetch('/api/write', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': DB_BLOB_HEX,
+      },
+      body: new Uint8Array(Buffer.concat([MAGIC_RAW, packr.encode(strippedDb)])),
+    })
+    expect(write.status).toBe(200)
+
+    for (const chatId of ['old-orphan', 'recent-orphan']) {
+      const chat = {
+        id: chatId,
+        name: chatId,
+        message: [{ role: 'user', data: chatId }],
+      }
+      const post = await client.fetch('/api/chat-content/gc-char/0', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-chat-id': chatId,
+        },
+        body: new Uint8Array(Buffer.concat([MAGIC_RAW, packr.encode(chat)])),
+      })
+      expect(post.status).toBe(200)
+    }
+
+    const sqlitePath = path.join(srv.cwd, 'save', 'risuai.db')
+    const db = new Database(sqlitePath)
+    db.prepare("UPDATE kv SET updated_at = ? WHERE key = 'chats/gc-char/old-orphan'")
+      .run(Date.now() - 2 * 60 * 60 * 1000)
+    db.close()
+
+    const optimize = await client.fetch('/api/db/optimize', { method: 'POST' })
+    expect(optimize.status).toBe(200)
+    const result = await optimize.json()
+    expect(result.orphanChatRowsDeleted).toBe(1)
+    expect(result.orphanChatRowsSkippedRecent).toBe(1)
+
+    const verifyDb = new Database(sqlitePath, { readonly: true })
+    const remaining = verifyDb.prepare("SELECT key FROM kv WHERE key LIKE 'chats/%' ORDER BY key")
+      .all()
+      .map((row: any) => row.key)
+    verifyDb.close()
+    expect(remaining).toEqual(['chats/gc-char/recent-orphan'])
   })
 
   // The two save-folder import paths were where the raw-bind regressions hid.
-  test('save-folder ZIP upload chunks an oversized DB blob (importHexEntries)', async () => {
-    const { client } = await boot()
+  test('save-folder ZIP upload externalizes and chunks chat rows (importHexEntries)', async () => {
+    const { client, srv } = await boot()
     const res = await uploadZip(client, bigDbBlob())
     expect(res.status).toBe(200)
     expect((await res.json()).ok).toBe(true)
 
     const s = await getStats(client)
-    expect(s.chunks.liveChunked).toBe(true)
+    expect(s.chunks.liveChunked).toBe(false)
+    expect(getStorageLayout(srv).chunkedChatRows).toBeGreaterThan(0)
     expect(s.chunks.count).toBeGreaterThan(1)
   })
 
-  test('save-folder directory import chunks an oversized DB blob (importHexFilesFromDir)', async () => {
+  test('save-folder directory import externalizes and chunks chat rows (importHexFilesFromDir)', async () => {
     const { client, srv } = await boot()
     const dir = path.join(srv.cwd, 'migrate-src')
     await mkdir(dir, { recursive: true })
@@ -168,7 +262,8 @@ describe('chunking lifecycle (real server, low threshold)', () => {
     expect((await res.json()).ok).toBe(true)
 
     const s = await getStats(client)
-    expect(s.chunks.liveChunked).toBe(true)
+    expect(s.chunks.liveChunked).toBe(false)
+    expect(getStorageLayout(srv).chunkedChatRows).toBeGreaterThan(0)
     expect(s.chunks.count).toBeGreaterThan(1)
   })
 
@@ -188,10 +283,10 @@ describe('chunking lifecycle (real server, low threshold)', () => {
     })
     expect(res.status).toBe(200)
 
-    // Live is now v1 again, still chunked and valid.
+    // Live is now v1 again, externalized and valid.
     const restored = dbBlobFromExport(await client.exportBackup())
     expect(restored.includes(Buffer.from('AAA'))).toBe(true)
-    expect((await getStats(client)).chunks.liveChunked).toBe(true)
+    expect((await getStats(client)).chunks.liveChunked).toBe(false)
   })
 
   test('optimize reclaims orphan chunks left by re-imports', async () => {
@@ -210,7 +305,7 @@ describe('chunking lifecycle (real server, low threshold)', () => {
     expect(after.chunks.orphanBytes).toBeLessThan(before.chunks.orphanBytes)
   })
 
-  test('pre-SQLite hex save folder migrates and chunks the DB blob (migrateFromSaveDir)', async () => {
+  test('pre-SQLite hex save folder migrates and externalizes chats (migrateFromSaveDir)', async () => {
     // Plant an old file-based save folder (hex-named files, no SQLite marker)
     // with an oversized database.bin before the server boots.
     const srv = await spawnServer({
@@ -222,18 +317,23 @@ describe('chunking lifecycle (real server, low threshold)', () => {
     servers.push(srv)
     const client = await createClient(srv.port, srv.password)
 
-    // Boot ran migrateFromSaveDir → the blob is now in SQLite, chunked.
+    // Boot ran migrateFromSaveDir followed by chat externalization.
     const s = await getStats(client)
-    expect(s.chunks.liveChunked).toBe(true)
+    const layout = getStorageLayout(srv)
+    expect(s.chunks.liveChunked).toBe(false)
+    expect(layout.chunkedChatRows).toBeGreaterThan(0)
+    expect(layout.externalizationMarker).toBe('done')
+    expect(layout.safetyBackups).toBe(1)
     expect(s.chunks.count).toBeGreaterThan(1)
     // And the migrated data is intact (exports the seeded content back out).
     expect(dbBlobFromExport(await client.exportBackup()).includes(Buffer.from('HEX'))).toBe(true)
   })
 
-  test('downgrade escape: a chunked DB exports a standard blob a non-chunking server reads', async () => {
-    const { client } = await boot()
+  test('downgrade escape: externalized rows export a standard blob a non-chunking server reads', async () => {
+    const { client, srv } = await boot()
     await uploadZip(client, bigDbBlob('XYZ'))
-    expect((await getStats(client)).chunks.liveChunked).toBe(true)
+    expect((await getStats(client)).chunks.liveChunked).toBe(false)
+    expect(getStorageLayout(srv).chunkedChatRows).toBeGreaterThan(0)
 
     // The export is the full reassembled DB (not a 13-byte marker) — readable by
     // any version, including one with no chunking at all.
