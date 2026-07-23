@@ -2078,7 +2078,10 @@ export const languageKorean = {
     "수동으로 export한 백업 파일. backups/ 폴더에 보관됩니다.",
   storageRowKvDatabase: "database.bin (활성)",
   storageRowKvDatabaseDesc:
-    "risuai.db 내부에 있는 단일 BLOB 행. 캐릭터 메타·채팅·설정이 통째로 들어갑니다. 2 GB 단일 BLOB 한계의 적용 대상.",
+    "캐릭터 메타데이터, 채팅 참조, 설정을 담는 스텁 전용 데이터베이스 행.",
+  storageRowKvChats: "채팅",
+  storageRowKvChatsDesc:
+    "전체 채팅 본문을 chats/{캐릭터}/{채팅} 개별 행으로 저장합니다.",
   storageRowKvDbBackups: "DB 백업 (인프로세스)",
   storageRowKvDbBackupsDesc:
     "risuai.db 내부에 자동으로 보관되는 database.bin 스냅샷. 약 500 MB 한도로 자동 로테이션.",

@@ -27,7 +27,13 @@
     import { language, getCurrentLocale } from 'src/lang'
 
     // ── Types ────────────────────────────────────────────────────────────────
-    interface PrefixInfo { totalSize: number; count: number }
+    interface PrefixInfo {
+        totalSize: number
+        count: number
+        physicalSize?: number
+        kvRowSize?: number
+        chunkBytes?: number
+    }
     interface Stats {
         files: { db: number; wal: number; shm: number }
         disk: { free: number | null; total: number | null }
@@ -227,7 +233,7 @@
     }
 
     // ── Disk usage rows ──────────────────────────────────────────────────────
-    // 10 distinct hues spanning the wheel — visually separable even at narrow
+    // Distinct hues spanning the wheel — visually separable even at narrow
     // bar widths, and intuitive grouping (red/orange = data, green/teal = media,
     // blue/violet = backups, gray = overhead).
     interface DiskRow {
@@ -247,6 +253,10 @@
         const assetFsBytes = stats.assetFsBytes ?? 0
         const assetTotal = get('assets/')
         const assetKvTotal = Math.max(0, assetTotal - assetFsBytes)
+        const chatTotal = get('chats/')
+        const chatPhysical = p['chats/']?.physicalSize ?? chatTotal
+        const chatKvRowSize = p['chats/']?.kvRowSize ?? chatTotal
+        const chatChunkBytes = p['chats/']?.chunkBytes ?? 0
         // Two separate quantities for inlay:
         //  - inlayKvTotal: bytes inside the SQLite kv table (counts against
         //    kvTotalBytes for uncategorized accounting).
@@ -266,12 +276,13 @@
         // chunked (not whether any chunks exist — snapshots may be chunked while a
         // shrunken live DB is raw).
         const rawDbBlob = stats.chunks?.liveChunked ? 0 : get('database/database.bin')
-        const dbRowSize = chunkedDbBytes + rawDbBlob
+        const dbRowSize = Math.max(0, chunkedDbBytes - chatChunkBytes) + rawDbBlob
         // Known kv prefixes I track explicitly — kv-side only. If anything
         // else lives in kv (test keys, migration leftovers), it shows up
         // under "uncategorized" so the bar always sums correctly.
         const knownKv =
-            assetKvTotal + inlayKvTotal + get('remotes/') + get('coldstorage/') + rawDbBlob
+            assetKvTotal + chatKvRowSize + inlayKvTotal
+            + get('remotes/') + get('coldstorage/') + rawDbBlob
         const uncategorizedKv = Math.max(0, stats.kvTotalBytes - knownKv)
         // SQLite overhead splits into "structural" (always present — indexes,
         // page headers, alignment) and "reclaimable" (the freelist, removable
@@ -281,6 +292,7 @@
         const structuralOverhead = Math.max(0, stats.files.db - stats.kvTotalBytes - chunkedDbBytes - reclaimable)
         const rows: DiskRow[] = [
             { id: 'kv-database',     label: language.storageRowKvDatabase,     desc: language.storageRowKvDatabaseDesc,     size: dbRowSize,                     color: 'bg-rose-500' },
+            { id: 'kv-chats',        label: language.storageRowKvChats,        desc: language.storageRowKvChatsDesc,        size: chatPhysical,                   color: 'bg-violet-500' },
             { id: 'kv-assets',       label: language.storageRowKvAssets,       desc: language.storageRowKvAssetsDesc,       size: assetTotal,                    color: 'bg-amber-500' },
             { id: 'kv-inlay',        label: language.storageRowKvInlay,        desc: language.storageRowKvInlayDesc,        size: inlayTotal,                    color: 'bg-emerald-500' },
             { id: 'kv-remotes',      label: language.storageRowKvRemotes,      desc: language.storageRowKvRemotesDesc,      size: get('remotes/'),               color: 'bg-cyan-500' },
