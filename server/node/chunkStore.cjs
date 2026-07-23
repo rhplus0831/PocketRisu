@@ -47,6 +47,13 @@ function cdcSplit(buf) {
 const CHUNK_MARKER = Buffer.from('\x00RISUCHUNKED\x00', 'binary');
 const DEFAULT_THRESHOLD = 16 * 1024 * 1024; // values larger than this get chunked
 
+function isChunkableKey(key) {
+    return typeof key === 'string'
+        && (key === 'database/database.bin'
+            || key.startsWith('database/dbbackup-')
+            || key.startsWith('chats/'));
+}
+
 // Bind chunk-aware get/put to a specific better-sqlite3 instance. db.cjs wires
 // the real DB; tests wire a :memory: DB. The kv table must already exist (it is
 // db.cjs's schema); this creates only the chunk/manifest tables.
@@ -71,17 +78,23 @@ function createChunkStore(db, opts = {}) {
     const delManifest = db.prepare('DELETE FROM manifest_chunks WHERE manifest_key = ?');
     const insManifest = db.prepare('INSERT INTO manifest_chunks (manifest_key, seq, hash) VALUES (?, ?, ?)');
     const selManifest = db.prepare('SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq');
+    const selManifestExists = db.prepare('SELECT 1 FROM manifest_chunks WHERE manifest_key = ? LIMIT 1');
     const selChunk = db.prepare('SELECT data FROM chunks WHERE hash = ?');
     const selSize = db.prepare(
         'SELECT SUM(LENGTH(c.data)) AS n FROM manifest_chunks m JOIN chunks c ON c.hash = m.hash WHERE m.manifest_key = ?',
     );
-    // Bytes of chunks referenced by `key` but NOT by `baseKey` — i.e. what `key`
-    // uniquely keeps alive beyond the base. Used to size snapshots for the disk
-    // limit by their real marginal cost, not their (shared) logical size.
-    const selMarginal = db.prepare(
+    // Physical bytes that deleting one manifest would make unreachable. Count
+    // each chunk hash once even if repeated within the logical value.
+    const selExclusive = db.prepare(
         `SELECT COALESCE(SUM(LENGTH(c.data)), 0) AS n FROM chunks c
-         WHERE c.hash IN (SELECT hash FROM manifest_chunks WHERE manifest_key = ?)
-           AND c.hash NOT IN (SELECT hash FROM manifest_chunks WHERE manifest_key = ?)`,
+         WHERE EXISTS (
+             SELECT 1 FROM manifest_chunks own
+             WHERE own.manifest_key = ? AND own.hash = c.hash
+         )
+           AND NOT EXISTS (
+             SELECT 1 FROM manifest_chunks other
+             WHERE other.manifest_key <> ? AND other.hash = c.hash
+         )`,
     );
     const copyManifest = db.prepare(
         'INSERT INTO manifest_chunks (manifest_key, seq, hash) SELECT ?, seq, hash FROM manifest_chunks WHERE manifest_key = ?',
@@ -151,14 +164,13 @@ function createChunkStore(db, opts = {}) {
         return row.value.length;
     }
 
-    // Marginal disk cost of a (snapshot) key relative to baseKey (the live blob):
-    // raw value → its full length; chunked → bytes of chunks not shared with base.
-    // A snapshot identical to base costs ~0; a divergent one costs its real delta.
-    function snapshotCost(key, baseKey) {
+    // Bytes deleting this key would free after chunk GC. Raw values own their row;
+    // chunked values own only chunks referenced by no other manifest.
+    function snapshotCostExclusive(key) {
         const row = kvGet.get(key);
         if (!row) return 0;
-        if (!isChunked(row.value)) return row.value.length;
-        return selMarginal.get(key, baseKey).n;
+        if (!isChunked(row.value) || !selManifestExists.get(key)) return row.value.length;
+        return selExclusive.get(key, key).n;
     }
 
     // Copy src's value to dst. For a chunked src, only the manifest (list of
@@ -202,7 +214,17 @@ function createChunkStore(db, opts = {}) {
         return !!row && isChunked(row.value);
     }
 
-    return { putValue, getValue, sizeValue, snapshotCost, snapshotValue, dropValue, gc, reclaimableBytes, isChunkedKey };
+    return {
+        putValue,
+        getValue,
+        sizeValue,
+        snapshotCostExclusive,
+        snapshotValue,
+        dropValue,
+        gc,
+        reclaimableBytes,
+        isChunkedKey,
+    };
 }
 
-module.exports = { cdcSplit, createChunkStore, CHUNK_MARKER };
+module.exports = { cdcSplit, createChunkStore, isChunkableKey, CHUNK_MARKER };

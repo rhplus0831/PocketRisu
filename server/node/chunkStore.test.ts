@@ -3,8 +3,9 @@ import { randomBytes } from 'node:crypto'
 import Database from 'better-sqlite3'
 import pkg from './chunkStore.cjs'
 
-const { cdcSplit, createChunkStore } = pkg as {
+const { cdcSplit, createChunkStore, isChunkableKey } = pkg as {
     cdcSplit: (buf: Buffer) => { hash: string; data: Buffer }[]
+    isChunkableKey: (key: string) => boolean
     createChunkStore: (
         db: any,
         opts?: { threshold?: number },
@@ -12,7 +13,7 @@ const { cdcSplit, createChunkStore } = pkg as {
         putValue: (key: string, value: Buffer) => void
         getValue: (key: string) => Buffer | null
         sizeValue: (key: string) => number | null
-        snapshotCost: (key: string, baseKey: string) => number
+        snapshotCostExclusive: (key: string) => number
         snapshotValue: (srcKey: string, dstKey: string) => void
         dropValue: (key: string) => void
         gc: () => number
@@ -93,6 +94,16 @@ describe('cdcSplit — content-defined chunking (pure)', () => {
 
 describe('createChunkStore — chunk-aware kv (injected :memory: db)', () => {
     const T = { threshold: 1024 } // small threshold so test buffers exercise chunking
+
+    it('B0: chunk gate includes live DB, snapshots, and chat rows only', () => {
+        expect(isChunkableKey('database/database.bin')).toBe(true)
+        expect(isChunkableKey('database/dbbackup-123.bin')).toBe(true)
+        expect(isChunkableKey('chats/character/chat')).toBe(true)
+        expect(isChunkableKey('database/other.bin')).toBe(false)
+        expect(isChunkableKey('assets/large.bin')).toBe(false)
+        expect(isChunkableKey('chats')).toBe(false)
+        expect(isChunkableKey(null as unknown as string)).toBe(false)
+    })
 
     it('B1: putValue(big) → getValue 바이트 동일 (라운드트립)', () => {
         const db = freshDb()
@@ -179,6 +190,7 @@ describe('createChunkStore — chunk-aware kv (injected :memory: db)', () => {
         // 청킹 안 거치고 마커와 동일한 바이트를 직접 박음 (천문학적 우연 시뮬)
         db.prepare('INSERT INTO kv (key, value, updated_at) VALUES (?, ?, 0)').run('k', marker)
         expect((store.getValue('k') as Buffer).equals(marker)).toBe(true)
+        expect(store.snapshotCostExclusive('k')).toBe(marker.length)
     })
 
     it('B9: isChunkedKey — 청킹 키 true, raw/없음 false, 마커가 raw로 덮이면 false', () => {
@@ -239,18 +251,53 @@ describe('snapshotValue — 조각 공유 스냅샷 (kvCopyValue 청크 인식)'
         expect((store.getValue('snap') as Buffer).length).toBe(300) // dst 그대로
     })
 
-    it('C5: snapshotCost — live와 같으면 ~0, 갈라지면 델타, raw는 full, 없으면 0', () => {
+    it('C5: snapshotCostExclusive — 다른 manifest와 공유하면 0, 단독이면 full, raw는 full', () => {
         const db = freshDb()
         const store = createChunkStore(db, T)
         const v0 = randomBytes(200_000)
         store.putValue('live', v0)
         store.snapshotValue('live', 'snap')
-        expect(store.snapshotCost('snap', 'live')).toBe(0) // 동일 → 공유라 0
+        expect(store.snapshotCostExclusive('snap')).toBe(0) // live와 전부 공유
         store.putValue('live', randomBytes(200_000)) // live 완전 교체 → snap 조각이 단독
-        expect(store.snapshotCost('snap', 'live')).toBeGreaterThan(150_000)
+        expect(store.snapshotCostExclusive('snap')).toBeGreaterThan(150_000)
         store.putValue('rawsnap', randomBytes(500)) // < 임계 → raw
-        expect(store.snapshotCost('rawsnap', 'live')).toBe(500)
-        expect(store.snapshotCost('missing', 'live')).toBe(0)
+        expect(store.snapshotCostExclusive('rawsnap')).toBe(500)
+        expect(store.snapshotCostExclusive('missing')).toBe(0)
+    })
+
+    it('C6: 두 snapshot의 공유 chunk는 둘 다 비용에서 제외되고 하나 삭제 시 다른 쪽 비용이 증가', () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const v0 = seededBytes(2_000_000, 41)
+        const at = 1_000_000
+        const v1 = Buffer.concat([v0.subarray(0, at), seededBytes(120, 99), v0.subarray(at)])
+
+        store.putValue('live', v0)
+        store.snapshotValue('live', 'snapA')
+        store.putValue('live', v1)
+        store.snapshotValue('live', 'snapB')
+        store.dropValue('live')
+
+        const physicalBytes = (key: string) => db.prepare(
+            `SELECT COALESCE(SUM(LENGTH(data)), 0) b FROM chunks
+             WHERE hash IN (SELECT hash FROM manifest_chunks WHERE manifest_key = ?)`,
+        ).get(key).b as number
+        const sharedBytes = db.prepare(
+            `SELECT COALESCE(SUM(LENGTH(data)), 0) b FROM chunks
+             WHERE hash IN (SELECT hash FROM manifest_chunks WHERE manifest_key = 'snapA')
+               AND hash IN (SELECT hash FROM manifest_chunks WHERE manifest_key = 'snapB')`,
+        ).get().b as number
+
+        const costA = store.snapshotCostExclusive('snapA')
+        const costB = store.snapshotCostExclusive('snapB')
+        expect(sharedBytes).toBeGreaterThan(0)
+        expect(costA).toBe(physicalBytes('snapA') - sharedBytes)
+        expect(costB).toBe(physicalBytes('snapB') - sharedBytes)
+        expect(costA).toBeGreaterThan(0)
+        expect(costB).toBeGreaterThan(0)
+
+        store.dropValue('snapA')
+        expect(store.snapshotCostExclusive('snapB')).toBe(costB + sharedBytes)
     })
 })
 

@@ -3,7 +3,7 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
-const { createChunkStore } = require('./chunkStore.cjs');
+const { createChunkStore, isChunkableKey } = require('./chunkStore.cjs');
 
 const saveDir = path.join(process.cwd(), 'save');
 if (!fs.existsSync(saveDir)) {
@@ -72,9 +72,9 @@ function migrateFromSaveDir() {
             }
             const key = Buffer.from(hexFiles[i], 'hex').toString('utf-8');
             const value = fs.readFileSync(path.join(savePath, hexFiles[i]));
-            // Route the DB blob through chunking so an oversized legacy
-            // database.bin migrates instead of hitting the BLOB bind limit.
-            if (key === DB_BLOB_KEY) chunkStore.putValue(key, value);
+            // Route every chunk-capable namespace through the same size gate so
+            // oversized legacy values cannot hit SQLite's BLOB bind limit.
+            if (isChunkableKey(key)) chunkStore.putValue(key, value);
             else insert.run(key, value, now);
         }
     });
@@ -85,12 +85,8 @@ function migrateFromSaveDir() {
     console.log(`[DB] To free disk space, remove migrated files via Settings > Clean Up Save Folder.`);
 }
 
-// Chunk-aware store for the full DB blob. The blob is split into
-// content-addressed chunks so a small change rewrites only the chunks that
-// changed (dedup) and no single value hits the SQLite BLOB limit. Scoped to the
-// DB blob: assets are already one row each, so chunking them would add overhead
-// with no benefit. Creates its own chunks/manifest tables (kv stays as-is).
-// Built before migrateFromSaveDir so legacy blob migration can chunk too.
+// Chunk-aware store for large database, snapshot, and chat values. Assets remain
+// one raw row each. Built before migrateFromSaveDir so legacy values can chunk.
 const DB_BLOB_KEY = 'database/database.bin';
 const chunkThreshold = process.env.POCKETRISU_CHUNK_THRESHOLD
     ? Number(process.env.POCKETRISU_CHUNK_THRESHOLD)
@@ -100,8 +96,8 @@ const chunkStore = createChunkStore(db, { threshold: chunkThreshold });
 migrateFromSaveDir();
 
 // ─── KV operations ────────────────────────────────────────────────────────────
-// kv reads/writes for the DB blob route through chunkStore (get/put/size/copy);
-// the statements below serve the remaining direct-row keys.
+// Chunk-capable writes route through chunkStore; reads/deletes/sizes/copies are
+// chunk-aware for every key. The statements below serve direct-row writes/lists.
 const stmtKvSet    = db.prepare(`INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)`);
 const stmtKvDel    = db.prepare(`DELETE FROM kv WHERE key = ?`);
 const stmtKvList   = db.prepare(`SELECT key FROM kv`);
@@ -116,8 +112,7 @@ function kvGet(key) {
 }
 
 function kvSet(key, value) {
-    // Only the DB blob is chunked; all other keys keep the exact prior path.
-    if (key === DB_BLOB_KEY) {
+    if (isChunkableKey(key)) {
         chunkStore.putValue(key, value);
     } else {
         stmtKvSet.run(key, value, Date.now());
@@ -189,11 +184,10 @@ function isDbBlobChunked() {
     return chunkStore.isChunkedKey(DB_BLOB_KEY);
 }
 
-// Marginal disk cost of a snapshot key vs the live DB blob (chunks it uniquely
-// keeps alive). Use this to size snapshots for the disk limit — kvSize/LENGTH
-// would report a chunked snapshot's shared logical size and over-trim.
+// Bytes deleting this snapshot would free: its raw row, or chunks referenced by
+// its manifest and no other manifest.
 function snapshotFootprint(key) {
-    return chunkStore.snapshotCost(key, DB_BLOB_KEY);
+    return chunkStore.snapshotCostExclusive(key);
 }
 
 function clearEntities() {
