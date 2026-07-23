@@ -9,7 +9,10 @@
  */
 import { describe, test, expect, afterAll } from 'vitest'
 import path from 'node:path'
-import { readFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { link, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import Database from 'better-sqlite3'
+import { zipSync } from 'fflate'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { createClient } from './helpers/client.js'
 import { createSeedBackup } from './helpers/seed.js'
@@ -22,6 +25,24 @@ const servers: ServerHandle[] = []
 afterAll(async () => {
   await Promise.allSettled(servers.map(s => s.cleanup()))
 })
+
+function hashAssetName(value: Buffer, ext = 'png'): string {
+  return `${createHash('sha256').update(value).digest('hex')}.${ext}`
+}
+
+function readKvValue(cwd: string, key: string): Buffer | null {
+  const db = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
+  try {
+    const row = db.prepare('SELECT value FROM kv WHERE key = ?').get(key) as { value: Buffer } | undefined
+    return row ? Buffer.from(row.value) : null
+  } finally {
+    db.close()
+  }
+}
+
+async function expectMissing(filePath: string): Promise<void> {
+  await expect(readFile(filePath)).rejects.toMatchObject({ code: 'ENOENT' })
+}
 
 // ─── Smoke ──────────────────────────────────────────────────────────────────
 
@@ -151,6 +172,181 @@ describe('asset round-trip', () => {
 
     // Both count and content (sha256) must match
     expect(afterFingerprints).toEqual(beforeFingerprints)
+  })
+
+  test('hash-named filesystem and unsafe KV assets preserve bytes and placement across servers', async () => {
+    const hashedValue = Buffer.from('hash-addressed png bytes')
+    const hashedName = hashAssetName(hashedValue)
+    const unsafeName = 'unsafe asset name.png'
+    const unsafeValue = Buffer.from('legacy unsafe asset bytes')
+    const seed = Buffer.concat([
+      createSeedBackup({ characterCount: 1 }),
+      encodeBackup([
+        { name: hashedName, data: hashedValue },
+        { name: unsafeName, data: unsafeValue },
+      ]),
+    ])
+
+    const srvA = await spawnServer()
+    servers.push(srvA)
+    const clientA = await createClient(srvA.port, srvA.password)
+    expect((await clientA.importBackup(seed)).ok).toBe(true)
+
+    expect(await readFile(path.join(srvA.cwd, 'save', 'assets', hashedName))).toEqual(hashedValue)
+    expect(readKvValue(srvA.cwd, `assets/${hashedName}`)).toBeNull()
+    await expectMissing(path.join(srvA.cwd, 'save', 'assets', unsafeName))
+    expect(readKvValue(srvA.cwd, `assets/${unsafeName}`)).toEqual(unsafeValue)
+
+    const exportA = await clientA.exportBackup()
+    const entriesA = new Map(decodeBackup(exportA).map((entry) => [entry.name, entry.data]))
+    expect(entriesA.get(hashedName)).toEqual(hashedValue)
+    expect(entriesA.get(unsafeName)).toEqual(unsafeValue)
+
+    const srvB = await spawnServer()
+    servers.push(srvB)
+    const clientB = await createClient(srvB.port, srvB.password)
+    expect((await clientB.importBackup(exportA)).ok).toBe(true)
+
+    expect(await readFile(path.join(srvB.cwd, 'save', 'assets', hashedName))).toEqual(hashedValue)
+    expect(readKvValue(srvB.cwd, `assets/${hashedName}`)).toBeNull()
+    await expectMissing(path.join(srvB.cwd, 'save', 'assets', unsafeName))
+    expect(readKvValue(srvB.cwd, `assets/${unsafeName}`)).toEqual(unsafeValue)
+
+    const entriesB = new Map(decodeBackup(await clientB.exportBackup()).map((entry) => [entry.name, entry.data]))
+    expect(entriesB.get(hashedName)).toEqual(hashedValue)
+    expect(entriesB.get(unsafeName)).toEqual(unsafeValue)
+  })
+
+  test('legacy directory and ZIP imports stage safe assets and keep unsafe names in KV', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const dbValue = decodeBackup(createSeedBackup({ characterCount: 1 }))
+      .find((entry) => entry.name === 'database.risudat')!.data
+    const hexName = (key: string) => Buffer.from(key, 'utf-8').toString('hex')
+
+    const dirSafeValue = Buffer.from('directory safe asset')
+    const dirSafeName = hashAssetName(dirSafeValue)
+    const dirUnsafeName = 'directory unsafe asset.png'
+    const dirUnsafeValue = Buffer.from('directory unsafe bytes')
+    const sourceDir = path.join(srv.cwd, 'legacy-save-source')
+    await mkdir(sourceDir, { recursive: true })
+    await writeFile(path.join(sourceDir, hexName('database/database.bin')), dbValue)
+    await writeFile(path.join(sourceDir, hexName(`assets/${dirSafeName}`)), dirSafeValue)
+    await writeFile(path.join(sourceDir, hexName(`assets/${dirUnsafeName}`)), dirUnsafeValue)
+
+    const directoryRes = await client.fetch('/api/migrate/save-folder/execute', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: sourceDir }),
+    })
+    expect(directoryRes.status).toBe(200)
+    expect(await readFile(path.join(srv.cwd, 'save', 'assets', dirSafeName))).toEqual(dirSafeValue)
+    expect(readKvValue(srv.cwd, `assets/${dirUnsafeName}`)).toEqual(dirUnsafeValue)
+
+    // A deliberately mismatched hash name is trusted on legacy import and
+    // must still be installed verbatim (with a server warning, not rejection).
+    const zipSafeName = `${'0'.repeat(64)}.webp`
+    const zipSafeValue = Buffer.from('trusted mismatched legacy asset')
+    const zipUnsafeName = 'zip unsafe asset.webp'
+    const zipUnsafeValue = Buffer.from('zip unsafe bytes')
+    const zip = Buffer.from(zipSync({
+      [hexName('database/database.bin')]: new Uint8Array(dbValue),
+      [hexName(`assets/${zipSafeName}`)]: new Uint8Array(zipSafeValue),
+      [hexName(`assets/${zipUnsafeName}`)]: new Uint8Array(zipUnsafeValue),
+    }))
+    const zipRes = await client.fetch('/api/migrate/save-folder/upload', {
+      method: 'POST',
+      headers: { 'content-type': 'application/zip' },
+      body: new Uint8Array(zip),
+    })
+    expect(zipRes.status).toBe(200)
+
+    await expectMissing(path.join(srv.cwd, 'save', 'assets', dirSafeName))
+    expect(readKvValue(srv.cwd, `assets/${dirUnsafeName}`)).toBeNull()
+    expect(await readFile(path.join(srv.cwd, 'save', 'assets', zipSafeName))).toEqual(zipSafeValue)
+    expect(readKvValue(srv.cwd, `assets/${zipSafeName}`)).toBeNull()
+    expect(readKvValue(srv.cwd, `assets/${zipUnsafeName}`)).toEqual(zipUnsafeValue)
+  })
+})
+
+describe('asset upload hash verification', () => {
+  test('/api/write rejects mismatches and preserves the inode on an idempotent matching write', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const value = Buffer.from('public upload bytes')
+    const name = hashAssetName(value, 'webp')
+    const key = `assets/${name}`
+    const filePath = path.join(srv.cwd, 'save', 'assets', name)
+    const encodedKey = Buffer.from(key, 'utf-8').toString('hex')
+
+    const mismatchRes = await client.fetch('/api/write', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': encodedKey,
+      },
+      body: new Uint8Array(Buffer.from('wrong bytes')),
+    })
+    expect(mismatchRes.status).toBe(400)
+    const mismatch = await mismatchRes.json() as {
+      error: string; key: string; expected: string; actual: string
+    }
+    expect(mismatch.error).toBe('asset content does not match its SHA-256 name')
+    expect(mismatch.key).toBe(key)
+    expect(mismatch.expected).toBe(name.slice(0, 64))
+    expect(mismatch.actual).toHaveLength(64)
+    await expectMissing(filePath)
+
+    const write = () => client.fetch('/api/write', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': encodedKey,
+      },
+      body: new Uint8Array(value),
+    })
+    expect((await write()).status).toBe(200)
+    const linkedPath = path.join(srv.cwd, 'save', 'linked-upload.webp')
+    await link(filePath, linkedPath)
+    const before = await stat(filePath)
+
+    expect((await write()).status).toBe(200)
+    expect((await stat(filePath)).ino).toBe(before.ino)
+    expect((await stat(linkedPath)).ino).toBe(before.ino)
+    expect(await readFile(linkedPath)).toEqual(value)
+  })
+
+  test('/api/assets/bulk-write validates every entry before writing any', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const validValue = Buffer.from('valid bulk bytes')
+    const invalidValue = Buffer.from('invalid bulk bytes')
+    const validName = hashAssetName(validValue)
+    const invalidName = `${'0'.repeat(64)}.png`
+    const secondInvalidName = `${'1'.repeat(64)}.jpg`
+
+    const res = await client.fetch('/api/assets/bulk-write', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify([
+        { key: `assets/${validName}`, value: validValue.toString('base64') },
+        { key: `assets/${invalidName}`, value: invalidValue.toString('base64') },
+        { key: `assets/${secondInvalidName}`, value: invalidValue.toString('base64') },
+      ]),
+    })
+    expect(res.status).toBe(400)
+    const body = await res.json() as { keys: string[]; mismatches: Array<{ key: string }> }
+    expect(body.keys).toEqual([
+      `assets/${invalidName}`,
+      `assets/${secondInvalidName}`,
+    ])
+    expect(body.mismatches.map((entry) => entry.key)).toEqual(body.keys)
+    await expectMissing(path.join(srv.cwd, 'save', 'assets', validName))
+    await expectMissing(path.join(srv.cwd, 'save', 'assets', invalidName))
+    await expectMissing(path.join(srv.cwd, 'save', 'assets', secondInvalidName))
   })
 })
 
@@ -433,6 +629,7 @@ describe('ndjson streaming import', () => {
 
     const badBackup = encodeBackup([
       { name: 'some-random-asset.png', data: Buffer.from('not-a-real-png') },
+      { name: 'failed unsafe asset.png', data: Buffer.from('must roll back from KV') },
     ])
 
     const ndjson = await importViaNdjson(client, badBackup)
@@ -443,6 +640,8 @@ describe('ndjson streaming import', () => {
     const after = normalizeBackup(afterExport)
     expect(after.normalized.characterCount).toBe(before.normalized.characterCount)
     expect(after.normalized.characters).toEqual(before.normalized.characters)
+    await expectMissing(path.join(srv.cwd, 'save', 'assets', 'some-random-asset.png'))
+    expect(readKvValue(srv.cwd, 'assets/failed unsafe asset.png')).toBeNull()
   })
 
   // T5 — progress events are the contract the UI relies on to drive its
@@ -569,14 +768,27 @@ describe('malformed import safety', () => {
     const client = await createClient(srv.port, srv.password)
 
     // Seed valid data first
-    const seed = createSeedBackup({ characterCount: 1 })
+    const preservedValue = Buffer.from('pre-import asset bytes')
+    const preservedName = hashAssetName(preservedValue)
+    const preservedUnsafeName = 'pre import unsafe.png'
+    const preservedUnsafeValue = Buffer.from('pre-import unsafe bytes')
+    const seed = Buffer.concat([
+      createSeedBackup({ characterCount: 1 }),
+      encodeBackup([
+        { name: preservedName, data: preservedValue },
+        { name: preservedUnsafeName, data: preservedUnsafeValue },
+      ]),
+    ])
     await client.importBackup(seed)
     const beforeExport = await client.exportBackup()
     const before = normalizeBackup(beforeExport)
+    expect(await readFile(path.join(srv.cwd, 'save', 'assets', preservedName))).toEqual(preservedValue)
+    expect(readKvValue(srv.cwd, `assets/${preservedUnsafeName}`)).toEqual(preservedUnsafeValue)
 
     // Try importing a backup with no database.risudat
     const badBackup = encodeBackup([
       { name: 'some-random-asset.png', data: Buffer.from('not-a-real-png') },
+      { name: 'failed unsafe asset.png', data: Buffer.from('must roll back from KV') },
     ])
 
     // The server should reject this (importBackupFromSource validates database presence)
@@ -595,6 +807,10 @@ describe('malformed import safety', () => {
     const after = normalizeBackup(afterExport)
     expect(after.normalized.characterCount).toBe(before.normalized.characterCount)
     expect(after.normalized.characters).toEqual(before.normalized.characters)
+    expect(await readFile(path.join(srv.cwd, 'save', 'assets', preservedName))).toEqual(preservedValue)
+    expect(readKvValue(srv.cwd, `assets/${preservedUnsafeName}`)).toEqual(preservedUnsafeValue)
+    await expectMissing(path.join(srv.cwd, 'save', 'assets', 'some-random-asset.png'))
+    expect(readKvValue(srv.cwd, 'assets/failed unsafe asset.png')).toBeNull()
   })
 
   test('import rejects truncated backup', async () => {

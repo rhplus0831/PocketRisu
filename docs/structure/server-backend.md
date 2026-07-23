@@ -7,7 +7,7 @@
 
 The server backend turns the built Svelte SPA into a self-hosted, single-user PocketRisu instance. The production implementation is the Express executable in `server/node/server.cjs`: it serves `dist/`, authenticates clients, persists RisuAI-compatible save data and assets, lazily hydrates chats, proxies model traffic, manages backups and storage maintenance, checks for updates, and controls Cloudflare Quick Tunnels.
 
-Persistent application data is primarily stored in SQLite through a binary-compatible key/value abstraction, with large database blobs deduplicated through content-defined chunking. Inlays and server-created backup files are stored separately on the filesystem. `server/hono/` is only an early multi-runtime scaffold; it does not implement the Node backend’s APIs, authentication, or storage.
+Persistent application data is primarily stored in SQLite through a binary-compatible key/value abstraction, with large database blobs deduplicated through content-defined chunking. Assets (`save/assets/`, one immutable file per safe-named `assets/*` key, written temp-file+rename so cross-instance hardlink dedup is safe), inlays, and server-created backup files are stored separately on the filesystem; unsafe-named assets remain KV rows (dual-source reads via `server/node/assetStore.cjs`). `server/hono/` is only an early multi-runtime scaffold; it does not implement the Node backend’s APIs, authentication, or storage.
 
 ## 2. Key files
 
@@ -77,6 +77,9 @@ The server reads configuration directly from `process.env`; it does not load `.e
 │   ├── risuai.db-wal / -shm           # SQLite WAL sidecars
 │   ├── logs.db                        # bounded client/server log database
 │   ├── logs.db-wal / -shm
+│   ├── assets/
+│   │   ├── <name>                     # one file per safe-named assets/* key
+│   │   └── .migrated_to_fs
 │   ├── inlays/
 │   │   ├── <id>.<ext>                 # image/signature payload
 │   │   ├── <id>.meta.json             # type, extension, name, dimensions
@@ -149,7 +152,7 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 
 #### Assets and inlays
 
-- Ordinary assets remain raw `assets/*` KV rows.
+- Ordinary assets are filesystem files in `save/assets/` when the key's basename is a safe filename (`server/node/assetStore.cjs`); unsafe names stay as raw `assets/*` KV rows. Reads/lists/stats/backups merge both sources. Writes are temp-file + rename (never in place — files may be hardlinked across instances by `scripts/dedup-assets.sh`). Uploads whose name matches `assets/<64-hex>.<ext>` are SHA-256-verified against their content on `/api/write` and `/api/assets/bulk-write` (400 on mismatch; identical re-uploads are skipped to preserve hardlinks); backup/legacy imports log mismatches but import verbatim. A one-time startup migration (`migrateAssetsToFilesystem()`) moves safe-named KV assets to files, marker `save/assets/.migrated_to_fs`.
 - Inlays are migrated from legacy `inlay/*` KV JSON to `save/inlays/<id>.<ext>` plus a sidecar by `migrateInlaysToFilesystem()` at `server/node/server.cjs:1302`.
 - Legacy key/value APIs synthesize the old JSON payload when reading inlays through `readInlayAssetPayload()` at `server/node/server.cjs:1282`.
 - `GET /api/asset/:hexKey` serves assets with a cookie-authenticated direct URL, MIME detection, immutable caching, and `updated_at` or filesystem-mtime ETags at `server/node/server.cjs:3083`.
@@ -250,6 +253,8 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 - **Cold-storage formats are another upstream compatibility boundary.** Canonical runtime rows are gzipped `coldstorage/<uuid>`, while backup entries are plain JSON named `coldstorage/<uuid>.json`; normalization is at `server/node/server.cjs:1973`. Failed character restores are converted to safe blank characters but retain a recovery breadcrumb at `server/node/server.cjs:4401`.
 
 - **Inlay payloads no longer live in SQLite.** Storage stats and backups must explicitly include `save/inlays`; `sumInlayFsBytes()` exists because KV prefix totals underreport them at `server/node/server.cjs:4943`.
+
+- **Asset payloads mostly no longer live in SQLite either.** Safe-named `assets/*` values are files in `save/assets/`; only unsafe names remain KV rows. Never write an asset file in place — always temp-file + rename (`writeAssetFile()`), or an externally hardlinked copy in another instance would be corrupted. Anything enumerating or deleting assets must use the merged dual-source helpers (`listAssetEntriesWithSizes()`, `readAssetValue()`, `deleteAssetValue()`, `clearAllAssets()`), not `kvListWithSizes('assets/')` alone. Backup import stages asset files in `save/assets_import_staging/` and swaps atomically with rollback.
 
 - **Chunk-aware deletion matters.** `kvDel()` must go through `chunkStore.dropValue()` so snapshot manifests stop pinning chunks (`server/node/db.cjs:127`). Direct SQL deletion of a chunked logical key leaves a stale manifest until GC repairs it.
 
