@@ -94,11 +94,11 @@ When `supportsPatchSync` is enabled (`src/ts/platform.ts:18`):
 - An ETag conflict fetches the latest server database, overlays tracked local state, reinstalls it with `setDatabase()`, rebuilds encoder/patcher baselines, and retries (`:712-777`).
 - A successful full write is decoded again to reinitialize the patcher from exactly what was transmitted (`:1031-1036`).
 
-The server acknowledges a patch before SQLite persistence: it debounces the merged disk write by five seconds (`server/node/server.cjs:56`, `:3690-3725`). Reads flush pending work first (`:3274-3279`), and the client’s page-hide `/api/db/flush` provides another best-effort durability boundary.
+The server acknowledges a patch before SQLite persistence: it debounces the stubs-only database write by five seconds (`server/node/server.cjs:78`, `:3683`). Chat-body POSTs are write-through. Reads flush pending work first (`server/node/server.cjs:3331`), and the client’s page-hide `/api/db/flush` provides another best-effort durability boundary.
 
 ### Lazy chat storage and hydration
 
-The server persists a full database but returns a stripped copy to the browser. `/api/read` decodes the stored database, fills its in-memory chat store, replaces chats with stubs, and returns the stripped legacy-encoded database plus an ETag (`server/node/server.cjs:3292-3316`).
+**Chat storage externalization.** The server persists `database/database.bin` as the same stubs-only shape sent to the browser, while each full body is a separate `chats/<chaId>/<chatId>` SQLite KV row. `/api/read` therefore decodes and caches the small stripped row directly; monolith imports, snapshots, and backups are split or assembled only at explicit boundaries (`server/node/server.cjs:3331`; `server/node/chatRows.cjs:289`).
 
 A stub contains only `id`, `name`, optional `lastDate`, `folderId`, `modules`, and `_stub: true` (`src/ts/storage/chatStub.ts:13-20`). At boot, `convertStubsToPlaceholders()` changes it into a type-compatible `Chat` with empty `message`, `note`, and `localLore`, plus `_placeholder: true` (`src/ts/storage/chatStorage.ts:17-30`, `:63-71`). Runtime code therefore normally sees `Chat`, never `ChatStub`.
 
@@ -110,7 +110,7 @@ Opening a placeholder invokes this flow:
 4. After the fetch, hydration re-finds the chat by ID so an index shift cannot write into the wrong slot (`src/ts/storage/chatStorage.ts:159-168`).
 5. It yields one animation frame, replaces the placeholder, waits one Svelte tick, and clears hydration suppression (`:170-185`).
 
-The server also verifies `x-chat-id` if it falls back to index lookup, returning 409 on an index mismatch (`server/node/server.cjs:4514-4528`). Saving a chat updates the server’s `fullChatStore` and schedules the same five-second merged persist (`:4540-4578`).
+The server also verifies `x-chat-id` if it falls back to index lookup, returning 409 on an index mismatch (`server/node/server.cjs:4628`). Saving a chat writes its row synchronously; it does not wait for or schedule the database debounce (`server/node/server.cjs:4676`).
 
 ### Message rendering pagination
 
@@ -160,7 +160,7 @@ Drafts deliberately do not modify `Chat`, so typing does not re-upload a chat bo
 - `msgpackr` supplies legacy MessagePack encoding; `fflate` and browser compression streams supply compressed variants (`src/ts/storage/risuSave.ts:1-14`, `:26-67`).
 - `fast-json-patch` is loaded lazily by `RisuSavePatcher.set()` (`src/ts/storage/risuSave.ts:927-930`).
 - `NodeStorage` calls Express endpoints for auth, KV, patching, chat bodies, backups, assets, and save-folder migration.
-- `server/node/server.cjs` owns SQLite persistence, ETags, session locking, full-chat merging, backup framing, and the server-side copies of chat guards.
+- `server/node/server.cjs` owns SQLite persistence, ETags, session locking, chat-row routing, backup framing, and the server-side copies of chat guards; `server/node/chatRows.cjs` owns split/assembly and row semantics.
 - `streamSaver` is used for large streamed downloads (`src/ts/drive/backuplocal.ts:20-23`; `src/ts/globalApi.svelte.ts:1742-1745`).
 
 ## 5. Conventions & gotchas
@@ -171,13 +171,13 @@ Drafts deliberately do not modify `Chat`, so typing does not re-upload a chat bo
 
 - `Database.characters` is typed as `character[]` and `character.chats` as `Chat[]`, even though decoded wire data temporarily contains `ChatStub`. Boot must perform stub-to-placeholder conversion before ordinary runtime consumers execute.
 
-- `_stub` is a persisted/wire marker; `_placeholder` is runtime-only. Never persist a placeholder as if it were a real chat, and never use `_placeholder` as the server merge signal.
+- `_stub` is a persisted/wire marker; `_placeholder` is runtime-only. Never persist a placeholder as if it were a real chat, and never use `_placeholder` for server row lookup or assembly.
 
 - A real stub requires both `_stub === true` and the absence of a `message` array (`src/ts/storage/chatStub.ts:22-39`). Legacy hybrid objects with `_stub: true` and full chat fields must be treated as full chats so their messages are not discarded.
 
 - `convertStubsToPlaceholders()` self-heals hybrids by removing `_stub` and retaining the payload (`src/ts/storage/chatStorage.ts:57-70`). Changing this behavior can turn historical corruption into actual message loss.
 
-- `chatToStub()` and `stubToPlaceholder()` preserve whether `lastDate`, `folderId`, and `modules` keys exist, even when their value is `null` or `undefined` (`src/ts/storage/chatStorage.ts:12-15`, `:27-29`, `:36-49`). Server merging uses `in` semantics so “explicitly cleared” differs from “not supplied” (`server/node/server.cjs:425-431`).
+- `chatToStub()` and `stubToPlaceholder()` preserve whether `lastDate`, `folderId`, and `modules` keys exist, even when their value is `null` or `undefined` (`src/ts/storage/chatStorage.ts:12-15`, `:27-29`, `:36-49`). Server snapshot/backup assembly uses the same `in` semantics so “explicitly cleared” differs from “not supplied” (`server/node/chatRows.cjs:150`).
 
 - Keep the stub metadata allowlist synchronized across `chatToStub()`, client `STUB_METADATA_FIELDS`, and server `STUB_METADATA_FIELDS` (`src/ts/storage/risuSave.ts:1172-1176`; `server/node/server.cjs:567-571`).
 
@@ -195,9 +195,9 @@ Drafts deliberately do not modify `Chat`, so typing does not re-upload a chat bo
 
 - `exportAsDataset()` does not hydrate placeholders before reading `chat.message` (`src/ts/storage/exportAsDataset.ts:10-18`). On the normal lazy-loaded runtime database, unopened chats therefore export as empty message arrays. Any correctness fix should follow the hydrate-or-abort pattern used by `exportAllChats()` and partial backup.
 
-- Client partial backup must hydrate all placeholders because it serializes browser memory. Normal server backup/export does not need client hydration because the server’s persistent database contains full chats.
+- Client partial backup must hydrate all placeholders because it serializes browser memory. Normal server backup/export does not need client hydration because the server assembles its persistent chat rows with the stubs-only database.
 
-- Ordinary server persistence re-encodes a full legacy MessagePack database even when the browser submits a RISUSAVE block stream. Do not assume the client’s stub-only encoder representation is the final on-disk representation.
+- Ordinary patch persistence legacy-encodes the stubs-only cache. A normal full write with no embedded chat payloads preserves the client bytes verbatim; only payload extraction forces a stripped re-encode.
 
 - `decodeRisuSave()` supports raw, fflate-compressed, gzip-stream, RISUSAVE block-stream, headerless MessagePack, old `\0\0RISU` data, compressed JSON, and compressed MessagePack fallbacks (`src/ts/storage/risuSave.ts:598-641`, `:644-690`). Removing fallback paths can strand upstream or historical backups.
 
@@ -229,7 +229,7 @@ Drafts deliberately do not modify `Chat`, so typing does not re-upload a chat bo
 
 - To add a required chat field, update `Chat`, `normalizeChat()`, chat creation sites, and hydration tests (`src/ts/storage/database.svelte.ts:2025-2072`).
 
-- To change the stub metadata schema, update `chatStub.ts`, both conversion functions, both client/server allowlists, and merge semantics (`src/ts/storage/chatStub.ts:13`; `src/ts/storage/chatStorage.ts:17-50`; `src/ts/storage/risuSave.ts:1172`; `server/node/server.cjs:408`, `:567`).
+- To change the stub metadata schema, update `chatStub.ts`, both conversion functions, both client/server allowlists, and row-assembly semantics (`src/ts/storage/chatStub.ts:13`; `src/ts/storage/chatStorage.ts:17-50`; `src/ts/storage/risuSave.ts:1181`; `server/node/server.cjs:412`; `server/node/chatRows.cjs:150`).
 
 - To change when edits save, inspect the reactive effects and 500 ms debounce in `saveDb()` (`src/ts/globalApi.svelte.ts:465-640`).
 
@@ -263,7 +263,7 @@ Drafts deliberately do not modify `Chat`, so typing does not re-upload a chat bo
 
 ## Out of scope, noticed
 
-- `server/node/server.cjs` is the authoritative counterpart for SQLite KV storage, full-chat merging, ETags, server-side guards, debounced persistence, and backup framing.
+- `server/node/server.cjs` is the authoritative counterpart for SQLite KV routing, ETags, server-side guards, debounced stub persistence, and backup framing; `server/node/chatRows.cjs` owns server chat-row storage and assembly.
 - `src/ts/stores.svelte.ts` owns the actual `$state` container and selection/loading stores.
 - `src/lib/ChatScreens/DefaultChatScreen.svelte` and `Chats.svelte` own chat hydration UX, drafts, and render pagination.
 - `src/ts/characters.ts`, `characterCards.ts`, `persona.ts`, and `process/modules.ts` are major model consumers/import-export subsystems that must respect storage hydration and ID invariants.

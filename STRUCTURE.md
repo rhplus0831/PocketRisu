@@ -22,9 +22,9 @@ with upstream.
 ```text
 Browser SPA (src/)                          Node server (server/node/)
 ┌──────────────────────────┐   HTTP/WS   ┌─────────────────────────────┐
-│ index.html → src/main.ts │ ─────────── │ server.cjs (Express, ~6.2k) │
-│ → App.svelte             │  /api/*     │ ├ db.cjs      → save/risuai.db (SQLite kv)
-│   store-driven screens,  │  /proxy2    │ ├ chunkStore  → CDC-chunked database.bin
+│ index.html → src/main.ts │ ─────────── │ server.cjs (Express, ~6.4k) │
+│ → App.svelte             │  /api/*     │ ├ db.cjs      → SQLite kv: stub DB + chats/*
+│   store-driven screens,  │  /proxy2    │ ├ chunkStore  → CDC chunks: chats/snapshots
 │   no URL router          │  /proxy-    │ ├ logs.cjs    → save/logs.db
 │ NodeStorage (HTTP client)│  stream-jobs│ ├ inlays      → save/inlays/*.ext + sidecars
 │ forageStorage = server KV│             │ └ backups     → backups/*.bin
@@ -73,7 +73,7 @@ Browser SPA (src/)                          Node server (server/node/)
 
 | Doc | Scope |
 |---|---|
-| [server-backend](docs/structure/server-backend.md) | Express server: HTTP route catalog, JWT/session auth, SQLite kv + content-defined chunk store, lazy-chat store, patch sync, backups/snapshots, storage dashboard, proxies, Quick Tunnel, self-update. |
+| [server-backend](docs/structure/server-backend.md) | Express server: HTTP route catalog, JWT/session auth, stubs-only database + externalized chat rows in SQLite KV, content-defined chunking, patch sync, assembled backups/snapshots, orphan GC, storage dashboard, proxies, Quick Tunnel, self-update. |
 | [client-storage](docs/structure/client-storage.md) | The `Database` model and `setDatabase()` defaults, `NodeStorage` HTTP adapter, reactive save loop in `globalApi.svelte.ts`, RisuSave codecs + JSON-Patch sync, chat stub/placeholder hydration, drafts, `.bin` backups, bootstrap ordering. |
 | [chat-pipeline](docs/structure/chat-pipeline.md) | `sendChat()` end to end: prompt buckets and prompt-card templates, token budgeting, attachment/multimodal conversion, streaming, regenerate/continue, post-processing, suggestions, slash commands. |
 | [model-providers](docs/structure/model-providers.md) | Legacy `LLMModel` registry (`format` dispatch, flags) and provider wire code (OpenAI/Anthropic/Google/NovelAI/Horde/…), ModelPreset adapter path, streaming contracts, proxy/local-network transport, how to add a model or provider. |
@@ -96,8 +96,8 @@ loop persists the mutation. Details: chat-pipeline, model-providers.
 **Persist data** — mutate `DBState.db` (that's the convention — no explicit save call)
 → `$effect`s in `saveDb()` (`src/ts/globalApi.svelte.ts`) mark dirty state → changed
 full chats are POSTed to `/api/chat-content` first, then the stub-only database syncs
-via `/api/patch` (JSON Patch + hash) or ETag-guarded `/api/write` → server merges stubs
-with its `fullChatStore` and debounce-writes SQLite. Details: client-storage,
+via `/api/patch` (JSON Patch + hash) or ETag-guarded `/api/write` → the server writes
+chat rows through immediately and debounce-writes the stubs-only database. Details: client-storage,
 server-backend.
 
 **Extend behavior** — CBS expressions expand during prompt building and display; regex
