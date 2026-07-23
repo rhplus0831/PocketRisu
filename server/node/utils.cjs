@@ -299,6 +299,9 @@ class RisuSaveDecoder {
                         break;
                     }
                     case RisuSaveType.PLUGIN_STORAGE: {
+                        // Optimized clients still emit this compatibility block,
+                        // but it is empty; values remain in pluginsave/ KV and
+                        // are folded inline only by backup export.
                         db.pluginCustomStorage = JSON.parse(this.blocks[key].content);
                         break;
                     }

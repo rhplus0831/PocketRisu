@@ -2230,6 +2230,65 @@ function listColdStorageBackupEntries() {
     });
 }
 
+const PLUGIN_SAVE_PREFIX = 'pluginsave/';
+const PLUGIN_SAVE_META_PREFIX = 'pluginsave-meta/';
+
+function decodePluginSaveStorageKey(storageKey, prefix) {
+    if (!storageKey.startsWith(prefix) || !storageKey.endsWith('.json')) {
+        throw new Error(`Invalid external plugin storage key: ${storageKey}`);
+    }
+    const encoded = storageKey.slice(prefix.length, -'.json'.length);
+    if (!/^[A-Za-z0-9_-]*$/.test(encoded)) {
+        throw new Error(`Invalid encoded plugin storage key: ${storageKey}`);
+    }
+    const decoded = Buffer.from(encoded, 'base64url').toString('utf-8');
+    if (Buffer.from(decoded, 'utf-8').toString('base64url') !== encoded) {
+        throw new Error(`Non-canonical plugin storage key: ${storageKey}`);
+    }
+    return decoded;
+}
+
+function parsePluginSaveJson(storageKey) {
+    const value = kvGet(storageKey);
+    if (!value) {
+        throw new Error(`Missing external plugin storage value: ${storageKey}`);
+    }
+    try {
+        return JSON.parse(value.toString('utf-8'));
+    } catch (error) {
+        throw new Error(`Invalid JSON in ${storageKey}: ${error.message}`);
+    }
+}
+
+/**
+ * Backups carry one upstream-compatible representation: database.risudat with
+ * plugin save data folded inline. Raw pluginsave/ entries are intentionally
+ * omitted from the archive.
+ */
+async function buildSelfContainedBackupDatabase() {
+    const raw = kvGet('database/database.bin');
+    if (!raw) return null;
+
+    const valueKeys = kvList(PLUGIN_SAVE_PREFIX);
+    const metaKeys = kvList(PLUGIN_SAVE_META_PREFIX);
+    if (valueKeys.length === 0 && metaKeys.length === 0) {
+        return raw;
+    }
+
+    const dbObj = await decodeRisuSave(raw);
+    dbObj.pluginCustomStorage ??= {};
+    for (const storageKey of valueKeys) {
+        const key = decodePluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
+        dbObj.pluginCustomStorage[key] = parsePluginSaveJson(storageKey);
+    }
+    if (metaKeys.length > 0) dbObj.pluginStorageMeta ??= {};
+    for (const storageKey of metaKeys) {
+        const key = decodePluginSaveStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
+        dbObj.pluginStorageMeta[key] = parsePluginSaveJson(storageKey);
+    }
+    return Buffer.from(encodeRisuSaveLegacy(dbObj, 'compression'));
+}
+
 function resolveBackupStorageKey(name) {
     if (Buffer.byteLength(name, 'utf-8') > BACKUP_ENTRY_NAME_MAX_BYTES) {
         throw new Error(`Backup entry name too long: ${name.slice(0, 64)}`);
@@ -2379,6 +2438,11 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         kvDelPrefix('inlay_meta/');
         kvDelPrefix('inlay_info/');
         kvDelPrefix('coldstorage/');
+        // Externalized plugin save data is folded into database.risudat during
+        // export. Wipe the old user's copies so they cannot shadow imported
+        // inline data before the client reconciles the imported mode flag.
+        kvDelPrefix(PLUGIN_SAVE_PREFIX);
+        kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
         // Composer drafts are session/device-local and not carried in the backup;
         // wipe stale ones so an old snapshot's chats don't resurrect later drafts.
         kvDelPrefix('drafts/');
@@ -4115,6 +4179,7 @@ app.get('/api/backup/export', async (req, res, next) => {
         const target = req.query.target === 'upstream' ? 'upstream' : 'nodeonly';
         // Flush any pending patches to ensure export includes latest data
         await flushPendingDb();
+        const backupDbValue = await buildSelfContainedBackupDatabase();
         const inlayFiles = target === 'upstream' ? [] : await listInlayFiles();
         const inlayEntries = await Promise.all(inlayFiles.map(async (entry) => {
             const stat = await fs.stat(entry.filePath);
@@ -4161,7 +4226,7 @@ app.get('/api/backup/export', async (req, res, next) => {
             ...inlayEntries,
             ...sidecarEntries.filter(Boolean),
         ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
-        const dbSize = kvSize('database/database.bin');
+        const dbSize = backupDbValue?.length ?? 0;
         const totalBytes = namespacedEntries.reduce((sum, entry) => {
             return sum + 8 + Buffer.byteLength(entry.backupName, 'utf-8') + entry.size;
         }, 0) + (dbSize ? 8 + Buffer.byteLength('database.risudat', 'utf-8') + dbSize : 0);
@@ -4208,9 +4273,8 @@ app.get('/api/backup/export', async (req, res, next) => {
         }
 
         if (!closed && dbSize) {
-            const dbValue = kvGet('database/database.bin');
-            if (dbValue) {
-                const ok = res.write(encodeBackupEntry('database.risudat', dbValue));
+            if (backupDbValue) {
+                const ok = res.write(encodeBackupEntry('database.risudat', backupDbValue));
                 if (!ok) {
                     await waitForDrain();
                 }
@@ -4358,6 +4422,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     try {
         await flushPendingDb();
+        const backupDbValue = await buildSelfContainedBackupDatabase();
 
         // Pre-flight disk check — bail before streaming if the target dir
         // can't fit the backup. Avoids wasted minutes + half-written tmp files.
@@ -4402,7 +4467,8 @@ app.post('/api/backup/server/save', async (req, res, next) => {
         ];
 
         const totalEntries = namespacedEntries.length + 1; // +1 for database
-        const totalBytes = namespacedEntries.reduce((sum, e) => sum + e.size, 0);
+        const totalBytes = namespacedEntries.reduce((sum, e) => sum + e.size, 0)
+            + (backupDbValue?.length ?? 0);
 
         // Stream progress as NDJSON
         res.setHeader('content-type', 'application/x-ndjson');
@@ -4445,11 +4511,10 @@ app.post('/api/backup/server/save', async (req, res, next) => {
                         }
                     }
                     if (closed) throw new Error('Client disconnected during backup save');
-                    const dbValue = kvGet('database/database.bin');
-                    if (dbValue) {
-                        const ok = writeStream.write(encodeBackupEntry('database.risudat', dbValue));
+                    if (backupDbValue) {
+                        const ok = writeStream.write(encodeBackupEntry('database.risudat', backupDbValue));
                         if (!ok) await new Promise(r => writeStream.once('drain', r));
-                        bytesWritten += dbValue.length;
+                        bytesWritten += backupDbValue.length;
                     }
                     res.write(JSON.stringify({ type: 'progress', current: totalEntries, total: totalEntries, bytes: bytesWritten, totalBytes }) + '\n');
                     writeStream.end(resolve);
@@ -4918,6 +4983,8 @@ function clearExistingData() {
     kvDelPrefix('inlay_thumb/');
     kvDelPrefix('inlay_meta/');
     kvDelPrefix('inlay_info/');
+    kvDelPrefix(PLUGIN_SAVE_PREFIX);
+    kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
     // Composer drafts aren't part of a save folder; clear stale ones on import.
     kvDelPrefix('drafts/');
     // Drop the previous user's remote payloads. The new save folder usually
@@ -5267,6 +5334,11 @@ async function sumInlayFsBytes() {
 async function estimateServerBackupSize() {
     let total = 0;
     total += kvSize(DB_BLOB_KEY) || 0;
+    // The final database blob folds these JSON values inline. Counting their
+    // raw sizes keeps the pre-flight estimate conservative enough without
+    // decoding/re-encoding the full database on every dashboard refresh.
+    for (const it of kvListWithSizes(PLUGIN_SAVE_PREFIX)) total += it.size;
+    for (const it of kvListWithSizes(PLUGIN_SAVE_META_PREFIX)) total += it.size;
     for (const it of listAssetEntriesWithSizes()) total += it.size;
     for (const it of kvListWithSizes('inlay_meta/')) total += it.size;
     for (const e of listColdStorageBackupEntries()) total += e.size;

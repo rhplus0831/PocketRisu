@@ -349,7 +349,10 @@ interface DatabaseSubset {
     personas?: Persona[];
     /** Plugin instances */
     plugins?: RisuPlugin[];
-    /** Plugin custom storage object */
+    /**
+     * Legacy inline plugin storage object. This is empty while optimized
+     * plugin memory is enabled; use the pluginStorage API for mode-aware access.
+     */
     pluginCustomStorage?: {[key: string]: any};
     /** AI temperature setting (0-100) */
     temperature?: number;

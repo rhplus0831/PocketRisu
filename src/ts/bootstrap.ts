@@ -10,7 +10,7 @@ import { loadPlugins } from "./plugins/plugins.svelte";
 import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertInput } from "./alert";
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
-import { decodeRisuSave, encodeRisuSaveLegacy } from "./storage/risuSave";
+import { decodeRisuSave, encodeRisuSaveLegacy, RisuSaveEncoder } from "./storage/risuSave";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { applyEarlyLanguage, changeLanguage, language } from "src/lang";
@@ -33,6 +33,27 @@ import { convertStubsToPlaceholders } from "./storage/chatStorage";
 import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelte";
 import { allowInsecureContext } from "./platform";
 import { isSecureContext, shouldBlockInsecureBoot } from "./secureContext";
+import { reconcilePluginStorageMode } from "./plugins/pluginSaveStorage";
+
+async function persistBootPluginStorageReconcile(): Promise<void> {
+    // saveDb() is intentionally started near the end of boot, so its immediate
+    // save hook does not exist yet. Encode the same stub-only block format here
+    // and refresh the future patch baseline after the migration write.
+    const encoder = new RisuSaveEncoder();
+    await encoder.init(getDatabase(), {
+        compression: false,
+        skipRemoteSavingOnCharacters: false,
+    });
+    const encoded = encoder.encode();
+    if (!encoded) throw new Error("Failed to encode plugin storage migration");
+    const data = new Uint8Array(encoded);
+    await forageStorage.setItem(
+        "database/database.bin",
+        data,
+        forageStorage.getDbEtag() ?? undefined,
+    );
+    setPatchSyncBaseline(await decodeRisuSave(data));
+}
 
 function renderInsecureContextFatalError() {
     const overlay = document.createElement('div')
@@ -141,6 +162,13 @@ export async function loadData() {
                         throw "Forage: Your save file is corrupted"
                     }
                 }
+
+                LoadingStatusState.text = "Reconciling Plugin Storage..."
+                await reconcilePluginStorageMode({
+                    dependencies: {
+                        persistDatabase: persistBootPluginStorageReconcile,
+                    },
+                })
 
                 if (getDatabase().didFirstSetup) {
                     characterURLImport()

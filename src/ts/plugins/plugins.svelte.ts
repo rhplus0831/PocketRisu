@@ -1,7 +1,7 @@
 import { get, writable } from "svelte/store";
 import { language } from "../../lang";
 import { getCurrentCharacter, getDatabase, setDatabase, setDatabaseLite } from "../storage/database.svelte";
-import { alertConfirm, alertError, alertPluginConfirm } from "../alert";
+import { alertConfirm, alertError, alertPluginConfirm, notifyWarning } from "../alert";
 import { selectSingleFile, sleep } from "../util";
 import type { OpenAIChat } from "../process/index.svelte";
 import { fetchNative, globalFetch, readImage, requestImmediateSave, saveAsset, toGetter } from "../globalApi.svelte";
@@ -11,6 +11,10 @@ import { checkCodeSafety } from "./pluginSafety";
 import { SafeDocument, SafeIdbFactory, SafeLocalStorage } from "./pluginSafeClass";
 import { loadV3Plugins } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
+import {
+    canEnablePlugin,
+    shouldDisableImportedPlugin,
+} from "./pluginMemoryOptimization";
 
 export const customProviderStore = writable([] as string[])
 
@@ -375,6 +379,10 @@ export async function importPlugin(code:string|null = null, argu:{
             return
         }
         
+        const disabledForMemoryOptimization = shouldDisableImportedPlugin(
+            apiInternalVersion,
+            db.optimizePluginMemory,
+        );
         let pluginData: RisuPlugin = {
             name: name,
             script: jsFile,
@@ -387,7 +395,7 @@ export async function importPlugin(code:string|null = null, argu:{
             versionOfPlugin: versionOfPlugin,
             updateURL: updateURL,
             allowedIPC: ipcList,
-            enabled: true
+            enabled: !disabledForMemoryOptimization
         }
 
         db.plugins ??= []
@@ -419,6 +427,9 @@ export async function importPlugin(code:string|null = null, argu:{
         }
 
         console.log(`Imported plugin: ${pluginData.name} (API v${apiVersion})`)
+        if (disabledForMemoryOptimization) {
+            notifyWarning(language.optimizePluginMemoryImportDisabled)
+        }
         setDatabaseLite(db)
         void requestImmediateSave()
 
@@ -437,7 +448,17 @@ export async function loadPlugins() {
     let db = getDatabase()
 
 
-    const enabledPlugins = safeStructuredClone(db.plugins).filter((p: RisuPlugin) => p.enabled)
+    const enabledPlugins = safeStructuredClone(db.plugins).filter((p: RisuPlugin) => {
+        if (!p.enabled) return false
+        if (!canEnablePlugin(p, db.optimizePluginMemory)) {
+            // Defensive runtime gate for databases modified outside the normal
+            // import/toggle UI. The plugin remains visibly enabled so the user
+            // can turn it off, but its synchronous V2 code is never executed.
+            console.warn(`[Plugins] ${p.name} was not loaded because optimized plugin memory requires V3.`)
+            return false
+        }
+        return true
+    })
     const pluginV2 = enabledPlugins.filter((a: RisuPlugin) => a.version === 2 || a.version === '2.1')
     const pluginV3 = enabledPlugins.filter((a: RisuPlugin) => a.version === '3.0')
 
@@ -664,6 +685,9 @@ export const getV2PluginAPIs = () => {
         },
         apiVersion: "2.1",
         apiVersionCompatibleWith: ["2.0","2.1"],
+        // The proxy and pluginStorage object below are the synchronous
+        // V2/V2.1 compatibility surface. Optimized mode prevents those plugins
+        // from loading; V3 uses the async mode-aware aliases in v3.svelte.ts.
         getDatabase: () => {
             const db = DBState?.db
             if(!db){
@@ -746,6 +770,9 @@ export const getV2PluginAPIs = () => {
             }
         },
         setDatabaseLite: (newDb: any) => {
+            // This API is exposed only to V2/V2.1 plugins. Those plugins are
+            // never loaded while optimizePluginMemory is enabled, so its
+            // synchronous pluginCustomStorage redirect is unreachable then.
             const db = getDatabase();
             db.pluginCustomStorage ??= {}
             for (const key of Object.keys(newDb)) {
@@ -759,6 +786,8 @@ export const getV2PluginAPIs = () => {
             DBState.db = db;
         },
         setDatabase: async (newDb: any) => {
+            // V2-only compatibility path; see setDatabaseLite above. Plugin
+            // installation delegated below accepts V3 plugins only.
             const db = getDatabase();
             db.pluginCustomStorage ??= {}
             for (const key of Object.keys(newDb)) {
@@ -940,6 +969,8 @@ export async function handlePluginInstallViaPlugin(plugins: RisuPlugin[]){
     for(const plugin of plugins){
         if(!DBState.db.plugins.find((p: RisuPlugin) => p.name === plugin.name && p.script === plugin.script)){
 
+            // This programmatic install path has always accepted V3 only, so it
+            // cannot introduce an enabled V2 plugin in optimized-memory mode.
             if(plugin.version !== '3.0'){
                 console.warn(`Plugin "${plugin.name}" has version "${plugin.version}", which is not supported for installation via plugin. Only API version 3.0 plugins can be installed via plugin. Skipping installation of this plugin.`)
                 continue

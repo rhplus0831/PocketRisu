@@ -161,6 +161,9 @@ export class RisuSaveEncoder {
             type: RisuSaveType.PLUGINS,
             name: 'plugins'
         });
+        // In optimized mode the reconciler keeps this object empty; retaining
+        // the normal block keeps the save format compatible without pulling
+        // any pluginsave/ KV values back into client memory.
         this.blocks['pluginStorage'] = await this.encodeBlock({
             compression,
             data: JSON.stringify(data.pluginCustomStorage),
@@ -281,6 +284,8 @@ export class RisuSaveEncoder {
         }
 
         if(toSave.pluginCustomStorage){
+            // Mode transitions mark this block dirty so externalization writes
+            // an empty block and internalization writes the restored inline map.
             this.blocks['pluginStorage'] = await this.encodeBlock({
                 compression: this.compression,
                 data: JSON.stringify(data.pluginCustomStorage),

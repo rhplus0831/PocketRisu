@@ -2,7 +2,16 @@
     import { PlusIcon, TrashIcon, LinkIcon, CodeXmlIcon, PowerIcon, PowerOffIcon, ShieldIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import SettingPage from "src/lib/UI/GUI/SettingPage.svelte";
-    import { alertConfirm, alertMd, alertSelect, notifySuccess } from "src/ts/alert";
+    import {
+        alertClear,
+        alertConfirm,
+        alertMd,
+        alertSelect,
+        alertWait,
+        notifyError,
+        notifySuccess,
+        notifyWarning,
+    } from "src/ts/alert";
     import { TriangleAlert } from '@lucide/svelte';
 
     import { DBState, hotReloading } from "src/ts/stores.svelte";
@@ -16,12 +25,100 @@
     import CheckInput from "src/lib/UI/GUI/CheckInput.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
     import { hotReloadPluginFiles } from "src/ts/plugins/apiV3/developMode";
+    import ShBadge from "src/lib/UI/GUI/ShBadge.svelte";
+    import {
+        canEnablePlugin,
+        canOptimizePluginMemory,
+    } from "src/ts/plugins/pluginMemoryOptimization";
+    import {
+        countExternalizedPluginStorageEntries,
+        reconcilePluginStorageMode,
+    } from "src/ts/plugins/pluginSaveStorage";
 
     let showParams = $state([])
+    let reconcilingPluginStorage = $state(false)
+    const optimizePluginMemoryEligible = $derived(
+        canOptimizePluginMemory(DBState.db.plugins),
+    )
+
+    async function togglePluginMemoryOptimization(enabled: boolean) {
+        if (reconcilingPluginStorage || !optimizePluginMemoryEligible) return
+
+        const db = DBState.db
+        const previous = db.optimizePluginMemory === true
+        reconcilingPluginStorage = true
+        let blockingAlert = false
+
+        try {
+            const total = enabled
+                ? Object.keys(db.pluginCustomStorage ?? {}).length
+                    + Object.keys(db.pluginStorageMeta ?? {}).length
+                : await countExternalizedPluginStorageEntries()
+            // Key values can be arbitrarily large, so count alone is not a
+            // reliable size threshold. Block whenever data actually moves.
+            blockingAlert = total > 0
+            db.optimizePluginMemory = enabled
+
+            if (blockingAlert) {
+                alertWait(language.optimizePluginMemoryProgress(0, total))
+            }
+            const result = await reconcilePluginStorageMode({
+                onProgress: ({ completed, total: progressTotal }) => {
+                    if (blockingAlert) {
+                        alertWait(language.optimizePluginMemoryProgress(completed, progressTotal))
+                    }
+                },
+            })
+            // A flag-only toggle has no values for the reconciler to move, but
+            // the new mode still needs to travel with the save.
+            if (result.direction === "none") {
+                await requestImmediateSave({ forceFullWrite: true })
+            }
+            notifySuccess(
+                enabled
+                    ? language.optimizePluginMemoryEnabled
+                    : language.optimizePluginMemoryDisabled,
+            )
+        } catch (error) {
+            // Return to the prior mode through the same crash-safe reconciler.
+            // This recovers keys already moved by a partial failed attempt.
+            db.optimizePluginMemory = previous
+            try {
+                const rollback = await reconcilePluginStorageMode()
+                if (rollback.direction === "none") {
+                    await requestImmediateSave({ forceFullWrite: true })
+                }
+            } catch (rollbackError) {
+                console.error("[Plugin storage] mode rollback failed", rollbackError)
+            }
+            notifyError(language.optimizePluginMemoryFailed(
+                error instanceof Error ? error.message : String(error),
+            ))
+        } finally {
+            if (blockingAlert) alertClear()
+            reconcilingPluginStorage = false
+        }
+    }
 </script>
 
 <SettingPage title={language.plugin}>
 <span class="text-draculared text-xs mb-4">{language.pluginWarn}</span>
+
+<div class="my-4 rounded border border-darkborderc bg-darkbg/40 p-3">
+    <CheckInput
+        check={DBState.db.optimizePluginMemory === true}
+        onChange={togglePluginMemoryOptimization}
+        disabled={!optimizePluginMemoryEligible || reconcilingPluginStorage}
+        margin={false}
+        name={language.optimizePluginMemory}
+    >
+        <ShBadge variant="warning">Beta</ShBadge>
+    </CheckInput>
+    <p class="mt-1 text-xs text-textcolor2">{language.optimizePluginMemoryDesc}</p>
+    {#if !optimizePluginMemoryEligible}
+        <p class="mt-1 text-xs text-yellow-400">{language.optimizePluginMemoryV3Only}</p>
+    {/if}
+</div>
 
 <div class="text-textcolor2 mb-2 flex gap-2 justify-end">
     <button
@@ -134,7 +231,13 @@
             <button
                 class="textcolor2 hover:gray-200 cursor-pointer"
                 onclick={async (e) => {
-                    plugin.enabled = !plugin.enabled
+                    const nextEnabled = !plugin.enabled
+                    if (nextEnabled && !canEnablePlugin(plugin, DBState.db.optimizePluginMemory)) {
+                        notifyWarning(language.optimizePluginMemoryEnableBlocked)
+                        e.preventDefault()
+                        return
+                    }
+                    plugin.enabled = nextEnabled
                     DBState.db.plugins[i] = plugin
                     loadPlugins()
                     void requestImmediateSave()

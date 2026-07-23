@@ -3,6 +3,15 @@ import { SandboxHost } from "./factory";
 import { getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
+import {
+    clearPluginSaveStorage,
+    getPluginSaveStorageItem,
+    getPluginSaveStorageKey,
+    getPluginSaveStorageKeys,
+    getPluginSaveStorageLength,
+    removePluginSaveStorageItem,
+    setPluginSaveStorageItem,
+} from "../pluginSaveStorage";
 import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
@@ -1310,24 +1319,27 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             
             return v;
         },
-        _getPluginStorage: oldApis.pluginStorage.getItem,
-        // Wrapped (not aliased) so we can record the originating plugin into the
-        // sidecar meta map. The value write is unchanged; reads stay aliased.
-        _setPluginStorage: (key: string, value: any) => {
-            oldApis.pluginStorage.setItem(key, value)
-            recordOwner('save', key, plugin.name)
+        // V3 calls cross the async iframe bridge, so these can switch between
+        // inline save data and the on-demand pluginsave/ KV backend without an
+        // observable API change. V2 keeps using oldApis.pluginStorage directly.
+        _getPluginStorage: (key: string) => {
+            return getPluginSaveStorageItem(key)
         },
-        _removePluginStorage: (key: string) => {
-            oldApis.pluginStorage.removeItem(key)
-            removeOwner('save', key)
+        _setPluginStorage: async (key: string, value: any) => {
+            await setPluginSaveStorageItem(key, value)
+            await recordOwner('save', key, plugin.name)
         },
-        _clearPluginStorage: () => {
-            oldApis.pluginStorage.clear()
-            clearOwners('save')
+        _removePluginStorage: async (key: string) => {
+            await removePluginSaveStorageItem(key)
+            await removeOwner('save', key)
         },
-        _keyPluginStorage: oldApis.pluginStorage.key,
-        _keysPluginStorage: oldApis.pluginStorage.keys,
-        _lengthPluginStorage: oldApis.pluginStorage.length,
+        _clearPluginStorage: async () => {
+            await clearPluginSaveStorage()
+            await clearOwners('save')
+        },
+        _keyPluginStorage: (index: number) => getPluginSaveStorageKey(index),
+        _keysPluginStorage: () => getPluginSaveStorageKeys(),
+        _lengthPluginStorage: () => getPluginSaveStorageLength(),
         _getSafeLocalStorage: oldApis.safeLocalStorage.getItem,
         _setSafeLocalStorage: (key: string, value: string) => {
             oldApis.safeLocalStorage.setItem(key, value)

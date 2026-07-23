@@ -558,6 +558,9 @@ export async function saveDb() {
             saveTimeoutExecute()
         })
         $effect(() => {
+            // In optimized mode this remains an empty compatibility map except
+            // during a reconciler transition; tracking it is what persists the
+            // final empty/restored pluginStorage save block.
             deepTouch(DBState.db.pluginCustomStorage)
             if (!didInitPluginStorageEffect) {
                 didInitPluginStorageEffect = true
@@ -732,6 +735,16 @@ export async function saveDb() {
             }
             if (toSave.modules) {
                 mergedDb.modules = safeStructuredClone(localDb.modules)
+            }
+            if (toSave.plugins) {
+                mergedDb.plugins = safeStructuredClone(localDb.plugins)
+            }
+            if (toSave.pluginCustomStorage) {
+                // Optimized mode normally leaves this empty; the branch still
+                // matters while the reconciler internalizes/externalizes data.
+                // Without it a concurrent-write rebase could resurrect inline
+                // values or discard the newly internalized copy.
+                mergedDb.pluginCustomStorage = safeStructuredClone(localDb.pluginCustomStorage)
             }
 
             const trackedCharIds = new Set<string>(toSave.character.filter(Boolean))

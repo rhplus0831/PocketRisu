@@ -8,9 +8,10 @@
 // value are untouched, so existing plugins keep working.
 //
 // The sidecar must live in the SAME backend as the data it describes, so its
-// lifecycle/travel matches (save → travels with the save file; local/idb →
+// lifecycle/travel matches (save → travels with the save; local/idb →
 // device-local). Hence one store per backend:
-//   - save  → db.pluginStorageMeta (persisted in the save's ROOT block)
+//   - save  → db.pluginStorageMeta, or pluginsave-meta/ KV entries while
+//             optimizePluginMemory is enabled
 //   - local → a single localStorage JSON blob (not safe_plugin_* prefixed, so
 //             it never shows up in the viewer's local listing)
 //   - idb   → persistentKv under a dedicated prefix (separate from the data
@@ -26,6 +27,10 @@ import {
     removePersistentKey,
     clearPersistentPrefix,
 } from "../storage/persistentKv";
+import {
+    PLUGIN_SAVE_META_PREFIX,
+    withPluginSaveStorageLock,
+} from "./pluginSaveStorage";
 
 export type PluginStorageBackend = "save" | "local" | "idb";
 export interface PluginOwnerRecord {
@@ -56,10 +61,18 @@ export function recordOwner(backend: PluginStorageBackend, key: string, plugin: 
     if (!plugin) return;
     const record: PluginOwnerRecord = { plugin, updatedAt: Date.now() };
     if (backend === "save") {
-        const db = getDatabase();
-        db.pluginStorageMeta ??= {};
-        db.pluginStorageMeta[key] = record;
-        return;
+        return withPluginSaveStorageLock(async () => {
+            const db = getDatabase();
+            if (db.optimizePluginMemory) {
+                await writePersistentJson(
+                    makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, key),
+                    record,
+                );
+                return;
+            }
+            db.pluginStorageMeta ??= {};
+            db.pluginStorageMeta[key] = record;
+        });
     }
     if (backend === "local") {
         const map = readLocalMeta();
@@ -72,9 +85,14 @@ export function recordOwner(backend: PluginStorageBackend, key: string, plugin: 
 
 export function removeOwner(backend: PluginStorageBackend, key: string): void | Promise<void> {
     if (backend === "save") {
-        const db = getDatabase();
-        if (db.pluginStorageMeta) delete db.pluginStorageMeta[key];
-        return;
+        return withPluginSaveStorageLock(async () => {
+            const db = getDatabase();
+            if (db.optimizePluginMemory) {
+                await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, key));
+                return;
+            }
+            if (db.pluginStorageMeta) delete db.pluginStorageMeta[key];
+        });
     }
     if (backend === "local") {
         const map = readLocalMeta();
@@ -87,9 +105,14 @@ export function removeOwner(backend: PluginStorageBackend, key: string): void | 
 
 export function clearOwners(backend: PluginStorageBackend): void | Promise<void> {
     if (backend === "save") {
-        const db = getDatabase();
-        db.pluginStorageMeta = {};
-        return;
+        return withPluginSaveStorageLock(async () => {
+            const db = getDatabase();
+            if (db.optimizePluginMemory) {
+                await clearPersistentPrefix(PLUGIN_SAVE_META_PREFIX);
+                return;
+            }
+            db.pluginStorageMeta = {};
+        });
     }
     if (backend === "local") {
         writeLocalMeta({});
@@ -103,11 +126,25 @@ export function clearOwners(backend: PluginStorageBackend): void | Promise<void>
 export async function getOwners(backend: PluginStorageBackend): Promise<Record<string, string>> {
     const out: Record<string, string> = {};
     if (backend === "save") {
-        const meta = getDatabase({ snapshot: true }).pluginStorageMeta ?? {};
-        for (const key of Object.keys(meta)) {
-            if (meta[key]?.plugin) out[key] = meta[key].plugin;
-        }
-        return out;
+        return withPluginSaveStorageLock(async () => {
+            const db = getDatabase();
+            if (!db.optimizePluginMemory) {
+                const meta = getDatabase({ snapshot: true }).pluginStorageMeta ?? {};
+                for (const key of Object.keys(meta)) {
+                    if (meta[key]?.plugin) out[key] = meta[key].plugin;
+                }
+                return out;
+            }
+            const storageKeys = await listPersistentKeys(PLUGIN_SAVE_META_PREFIX);
+            for (const fullKey of storageKeys) {
+                if (!fullKey.endsWith(".json")) continue;
+                const encoded = fullKey.slice(PLUGIN_SAVE_META_PREFIX.length, -".json".length);
+                const rawKey = decodeStorageKeyComponent(encoded);
+                const record = await readPersistentJson<PluginOwnerRecord>(fullKey);
+                if (record?.plugin) out[rawKey] = record.plugin;
+            }
+            return out;
+        });
     }
     if (backend === "local") {
         const map = readLocalMeta();

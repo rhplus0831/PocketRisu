@@ -3,7 +3,8 @@
     // "plugin-storage-viewer" plugin. Plugin data is stored in a single global
     // namespace (not per-plugin), so this is a flat key/value manager over the
     // three backends a plugin can write to:
-    //   - save:  db.pluginCustomStorage  (travels with the save file)
+    //   - save:  db.pluginCustomStorage, or on-demand pluginsave/ KV entries
+    //            while optimized (both travel with backups)
     //   - local: localStorage `safe_plugin_*`  (device-local, strings only)
     //   - idb:   SafeLocalPluginStorage  (IndexedDB, device-local, JSON)
     // Origin plugin is best-effort: new V3 writes are tagged into a sidecar
@@ -22,10 +23,15 @@
         SaveIcon,
     } from '@lucide/svelte'
     import { alertConfirm, notifyError, notifySuccess } from 'src/ts/alert'
-    import { getDatabase } from 'src/ts/storage/database.svelte'
     import { SafeLocalStorage, SafeLocalPluginStorage } from 'src/ts/plugins/pluginSafeClass'
     import { getOwners, removeOwner } from 'src/ts/plugins/pluginStorageMeta'
     import { language } from 'src/lang'
+    import {
+        getPluginSaveStorageItem,
+        getPluginSaveStorageKeys,
+        removePluginSaveStorageItem,
+        setPluginSaveStorageItem,
+    } from 'src/ts/plugins/pluginSaveStorage'
 
     type BackendId = 'save' | 'local' | 'idb'
 
@@ -137,9 +143,7 @@
     // ── backend access ───────────────────────────────────────────────────────
     async function backendSet(key: string, value: unknown): Promise<void> {
         if (backend === 'save') {
-            const db = getDatabase()
-            db.pluginCustomStorage ??= {}
-            db.pluginCustomStorage[key] = value
+            await setPluginSaveStorageItem(key, value)
             return
         }
         if (backend === 'local') {
@@ -154,9 +158,7 @@
         // dangling entry. (The idb instance here has no owner, so its own
         // removeItem won't touch meta — we clean it explicitly.)
         if (backend === 'save') {
-            const db = getDatabase()
-            db.pluginCustomStorage ??= {}
-            delete db.pluginCustomStorage[key]
+            await removePluginSaveStorageItem(key)
         } else if (backend === 'local') {
             safeLocal.removeItem(key)
         } else {
@@ -180,9 +182,8 @@
             let keys: string[]
             let read: (key: string) => unknown | Promise<unknown>
             if (backend === 'save') {
-                const store = $state.snapshot(getDatabase().pluginCustomStorage ?? {}) as Record<string, unknown>
-                keys = Object.keys(store)
-                read = (k) => store[k] ?? null
+                keys = await getPluginSaveStorageKeys()
+                read = (k) => getPluginSaveStorageItem(k)
             } else if (backend === 'local') {
                 keys = safeLocal.keys()
                 read = (k) => safeLocal.getItem(k)
@@ -311,16 +312,7 @@
         if (!ok) return
 
         try {
-            if (backend === 'save') {
-                // Drop all values in one pass to avoid re-resolving the reactive
-                // DB per key, then clean up the origin records.
-                const db = getDatabase()
-                db.pluginCustomStorage ??= {}
-                for (const e of targets) delete db.pluginCustomStorage[e.key]
-                for (const e of targets) await removeOwner('save', e.key)
-            } else {
-                for (const e of targets) await backendRemove(e.key)
-            }
+            for (const e of targets) await backendRemove(e.key)
             detailOpen = false
             await load()
             notifySuccess(language.pluginStorageBulkDeleted(targets.length))

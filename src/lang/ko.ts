@@ -1765,6 +1765,21 @@ export const languageKorean = {
   resetPluginPermissionDone: '"{}"의 권한 응답을 초기화했습니다',
   pluginV2Warning:
     "플러그인 V2 및 V2.1은 안전하지 않다고 간주되며, 향후 버전에서는 동작이 중단됩니다. **이 버전의 플러그인을 사용하지 마세요.** 이 플러그인의 개발자라면 가능한 한 빨리 V3로 업데이트해주세요.",
+  optimizePluginMemory: "플러그인 메모리 사용량 최적화",
+  optimizePluginMemoryDesc:
+    "플러그인 세이브 데이터를 database.bin과 클라이언트 메모리에 두지 않고 필요할 때 불러오는 서버 항목으로 저장합니다.",
+  optimizePluginMemoryV3Only:
+    "활성화된 모든 플러그인이 V3여야 합니다. 먼저 V2/V2.1 플러그인을 모두 비활성화하세요.",
+  optimizePluginMemoryImportDisabled:
+    "플러그인 메모리 최적화 중에는 활성화된 모든 플러그인이 V3여야 하므로 V2/V2.1 플러그인을 비활성 상태로 가져왔습니다.",
+  optimizePluginMemoryEnableBlocked:
+    "V2/V2.1 플러그인을 활성화하려면 먼저 ‘플러그인 메모리 사용량 최적화’를 끄세요.",
+  optimizePluginMemoryEnabled: "플러그인 메모리 최적화를 켰습니다.",
+  optimizePluginMemoryDisabled: "플러그인 메모리 최적화를 껐습니다.",
+  optimizePluginMemoryProgress: (completed: number, total: number) =>
+    `플러그인 저장소 이동 중… ${completed} / ${total}`,
+  optimizePluginMemoryFailed: (message: string) =>
+    `플러그인 저장 방식을 변경하지 못했습니다: ${message}`,
   partialBackupFirstConfirm:
     "⚠️ 경고: 부분 로컬 백업 ⚠️\n\n이 백업은 최소한의 필수 정보만 빠르게 저장하는 기능입니다.\n\n포함되는 것:\n- 데이터베이스 (채팅 기록, 캐릭터, 모듈, 플러그인, 프롬프트, 설정 등)\n- 캐릭터 프로필 아이콘 (메인 이미지)\n- 사용자 아이콘 및 커스텀 배경\n- 페르소나 아이콘\n- 폴더 이미지\n- 봇 프리셋 이미지\n\n⚠️ 포함되지 않는 것:\n- 감정 이미지\n- 추가 캐릭터 에셋\n- VITS 음성 파일\n- 기타 모든 추가 미디어 파일\n\n이 백업 파일에는 모든 캐릭터 에셋이 포함되지 않습니다!\n완전한 백업이 필요하다면 일반 로컬 백업을 사용하세요.\n\n그래도 계속하시겠습니까?",
   partialBackupSecondConfirm:

@@ -724,6 +724,8 @@ export function setDatabase(data:Database){
     if (typeof data.localNetworkMode !== 'boolean') data.localNetworkMode = false
     data.localNetworkTimeoutSec ??= 600
     if (typeof data.localNetworkTimeoutSec !== 'number' || Number.isNaN(data.localNetworkTimeoutSec)) data.localNetworkTimeoutSec = 600
+    // Optimized mode deliberately retains only this empty compatibility map;
+    // V3 values are read on demand from pluginsave/ by pluginSaveStorage.ts.
     data.pluginCustomStorage ??= {}
     data.longPressToPopupEditor ??= false
     data.showInputActionBar ??= true
@@ -1423,11 +1425,16 @@ export interface Database{
     verbosity:number
     dynamicOutput?:DynamicOutput
     hubServerType?:string
+    // Beta: move save-backed plugin KV values out of database.bin and into
+    // on-demand pluginsave/ server entries. V2/V2.1 plugins require the
+    // synchronous inline representation and therefore cannot run in this mode.
+    optimizePluginMemory?: boolean
     pluginCustomStorage:{[key:string]:any}
     // Best-effort "which plugin last wrote this key" sidecar for the save-file
     // plugin storage. Additive metadata only — never wraps the value itself, so
-    // existing plugins read their keys unchanged. Populated for new V3 writes;
-    // legacy/V2 keys stay unrecorded. See pluginStorageMeta.ts.
+    // existing plugins read their keys unchanged. Externalized to
+    // pluginsave-meta/ alongside the values when optimizePluginMemory is on.
+    // Populated for new V3 writes; legacy/V2 keys stay unrecorded.
     pluginStorageMeta?:{[key:string]:{plugin:string,updatedAt:number}}
     longPressToPopupEditor?: boolean
     showInputActionBar?: boolean
