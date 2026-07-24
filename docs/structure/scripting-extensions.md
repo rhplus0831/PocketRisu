@@ -1,11 +1,11 @@
 # scripting-extensions
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Generated 2026-07-23 from codebase analysis. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-25 against `c87235b0`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
 
 ## 1. Purpose & overview
 
-PocketRisu exposes four overlapping extension mechanisms: CBS template expressions, regex/Lua/trigger scripts, JavaScript plugins, and Model Context Protocol tools. They run at different points in chat construction, request dispatch, response storage, and display rendering, with several compatibility layers inherited from RisuAI. Plugins can intercept those same pipelines, register complete model providers, add UI and TTS hooks, or publish MCP tools. Most persistent extension data lives in the main database or module records, while plugin safety metadata, permissions, MCP call history, and some plugin storage use the persistent key-value layer.
+PocketRisu exposes four overlapping extension mechanisms: CBS template expressions, regex/Lua/trigger scripts, JavaScript plugins, and Model Context Protocol tools. They run at different points in chat construction, request dispatch, response storage, and display rendering, with several compatibility layers inherited from RisuAI. Plugins can intercept those same pipelines, register complete model providers, add UI and TTS hooks, or publish MCP tools. Most persistent extension data lives in the main database or module records. With the optional plugin-memory optimization enabled, save-backed plugin values and ownership metadata move into individual `pluginsave/` and `pluginsave-meta/` server KV rows; permissions, MCP call history, and other persistent plugin state use additional KV namespaces.
 
 ## 2. Key files
 
@@ -72,7 +72,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
 
 ### Plugin framework
 
-- `src/ts/plugins/plugins.svelte.ts` — approximately 958 lines.
+- `src/ts/plugins/plugins.svelte.ts` — approximately 989 lines.
   - `RisuPlugin` stores source, metadata headers, arguments, API version, update URL, enablement, and IPC allowlist (`src/ts/plugins/plugins.svelte.ts:17`, `src/ts/plugins/plugins.svelte.ts:36`).
   - `importPlugin()` parses plugin headers, optionally transpiles TypeScript, applies V2.1 safety checks, and persists/reloads the plugin (`src/ts/plugins/plugins.svelte.ts:129`).
   - Supported API headers are `2.0`, `2.1`, and `3.0`; missing `//@api` defaults to 2.0 behavior (`src/ts/plugins/plugins.svelte.ts:182`, `src/ts/plugins/plugins.svelte.ts:193`).
@@ -95,9 +95,17 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - `tagWhitelist` controls DOM element creation (`src/ts/plugins/pluginSafeClass.ts:126`).
   - The V2 `SafeDocument` restricts element creation, anchors, and event names, although many query operations still return underlying DOM objects (`src/ts/plugins/pluginSafeClass.ts:304`).
 
-- `src/ts/plugins/pluginStorageMeta.ts` — approximately 127 lines.
+- `src/ts/plugins/pluginMemoryOptimization.ts` — 31 lines.
+  - Encodes the compatibility gate for `optimizePluginMemory`: enabled V2/V2.1 plugins block the mode, imports of those versions are disabled while it is active, and attempts to enable them are refused. V3 plugins remain compatible because their save API is asynchronous.
+
+- `src/ts/plugins/pluginSaveStorage.ts` — approximately 273 lines.
+  - Routes save-backed plugin values to inline `Database.pluginCustomStorage` or external encoded `pluginsave/*.json` rows based on `optimizePluginMemory`.
+  - Serializes V3/viewer operations and mode transitions through one promise queue. `reconcilePluginStorageMode()` externalizes rows before removing inline copies, or saves complete inline copies before deleting rows, so interrupted transitions leave duplicates rather than data loss.
+  - Externalized reads opt into the verified browser resource cache; key names use reversible unpadded base64url components shared with the server backup/ingest code.
+
+- `src/ts/plugins/pluginStorageMeta.ts` — approximately 164 lines.
   - Maintains sidecar ownership metadata without changing stored plugin values (`src/ts/plugins/pluginStorageMeta.ts:1`).
-  - `recordOwner()`, `removeOwner()`, `clearOwners()`, and `getOwners()` operate across save-local, browser-local, and persistent-IDB backends (`src/ts/plugins/pluginStorageMeta.ts:55`, `src/ts/plugins/pluginStorageMeta.ts:73`, `src/ts/plugins/pluginStorageMeta.ts:88`, `src/ts/plugins/pluginStorageMeta.ts:103`).
+  - Save-local ownership follows the same inline versus `pluginsave-meta/` backend as plugin values; local and persistent-IDB plugin stores keep their established metadata paths.
 
 - `src/ts/plugins/apiV3/factory.ts` — approximately 654 lines.
   - `GUEST_BRIDGE_SCRIPT` constructs the iframe-side `risuai`/`Risuai` proxy and RPC protocol (`src/ts/plugins/apiV3/factory.ts:38`).
@@ -258,6 +266,14 @@ Lua edit listeners register through `listenEdit(type, func)` and are called thro
 7. Request dispatch recognizes `LLMFormat.Plugin`, resolves the provider name, and invokes its callback with formatted messages, model parameters, and the abort signal (`src/ts/process/request/request.ts:459`, `src/ts/process/request/request.ts:1336`).
 8. Provider output may be a string or `ReadableStream<string>` and is adapted back into PocketRisu’s request result format (`src/ts/process/request/request.ts:1374`, `src/ts/process/request/request.ts:1388`).
 
+### Optimized plugin save storage
+
+The persisted `Database.optimizePluginMemory` flag changes only the save-backed plugin storage API. When false, values and ownership metadata remain in `pluginCustomStorage`/`pluginStorageMeta` inside the main database. When true, each value becomes `pluginsave/<base64url(key)>.json` and each owner record becomes `pluginsave-meta/<base64url(key)>.json`; external value reads may use the verified browser cache.
+
+`reconcilePluginStorageMode()` runs at boot and after a settings toggle. Externalization writes each KV row before deleting its inline copy, then full-writes the stub-only database. Internalization loads all rows into the database, full-writes that durable inline copy, and only then removes the rows. Server ingestion and backup assembly understand the same split: Node-only archives may carry byte-preserving per-row entries, while upstream-target exports fold them back into ordinary database maps.
+
+V2/V2.1 plugins cannot participate because their save-storage facade is synchronous. The UI refuses this optimization while any legacy plugin is enabled, disables an imported legacy plugin when the mode is active, and prevents later enablement. V3 storage remains asynchronous and uses the serialized `pluginSaveStorage` path.
+
 ### MCP-to-model flow
 
 1. Every `requestChatData()` call resolves tools from `arg.tools` or `getTools()` before retries begin (`src/ts/process/request/request.ts:120`, `src/ts/process/request/request.ts:123`).
@@ -357,6 +373,12 @@ Lua edit listeners register through `listenEdit(type, func)` and are called thro
 
 - Plugin storage namespaces are shared, not intrinsically isolated per plugin. Ownership records are best-effort sidecars for new writes and cannot reconstruct legacy ownership (`src/ts/plugins/pluginStorageMeta.ts:1`).
 
+- `optimizePluginMemory` changes a compatibility boundary, not just performance. Enabled V2/V2.1 plugins must keep it off because their synchronous storage proxy still points at inline `pluginCustomStorage`; V3 callers use asynchronous helpers and can use external rows.
+
+- Plugin-storage mode transitions intentionally prefer duplicates over loss. Externalize row-first then save the empty inline maps; internalize and save the complete maps before deleting rows. Server-side defensive re-externalization follows the same row-first ordering.
+
+- `pluginsave/` and `pluginsave-meta/` key encoding is shared with the server: reversible unpadded base64url plus `.json`. Changing it requires coordinated client, server ingest/backup, viewer, and compatibility-test updates.
+
 - V3 plugins can register MCP callbacks, but an identifier must begin with `plugin:` and the corresponding URL must still be present in an enabled module before `initializeMCPs()` activates it (`src/ts/process/mcp/pluginmcp.ts:45`, `src/ts/process/mcp/mcp.ts:20`).
 
 - MCP tool names are not namespaced at model level. `callMCPTool()` scans `MCPs` and executes the first matching name (`src/ts/process/mcp/mcp.ts:164`). Avoid duplicate names across enabled servers.
@@ -416,6 +438,8 @@ Lua edit listeners register through `listenEdit(type, func)` and are called thro
 - To add a plugin-supplied model, follow `addProvider()` at `src/ts/plugins/apiV3/v3.svelte.ts:794`, model discovery at `src/ts/model/modellist.ts:752`, and dispatch at `src/ts/process/request/request.ts:1336`.
 
 - To add a plugin edit hook, use the registry API at `src/ts/plugins/plugins.svelte.ts:537`; execution is at `src/ts/process/scripts.ts:124`.
+
+- To change optimized plugin storage, update `pluginSaveStorage.ts`, `pluginStorageMeta.ts`, `pluginMemoryOptimization.ts`, the settings/viewer UI, boot reconciliation, and the server `pluginsave/` ingest/backup helpers together.
 
 - To add a plugin request-body or response replacer, inspect registration at `src/ts/plugins/plugins.svelte.ts:553` and execution at `src/ts/process/request/request.ts:154` and `src/ts/process/request/request.ts:220`.
 

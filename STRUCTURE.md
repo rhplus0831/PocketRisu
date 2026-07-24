@@ -5,36 +5,40 @@ detail doc under [docs/structure/](docs/structure/) — each one covers a subsys
 files, runtime flows, cross-subsystem edges, invariants/gotchas, and "to change X, look
 at Y" hints with `file:line` references.
 
-Generated 2026-07-23. Line numbers in the detail docs drift as code changes; verify with
-`rg` before relying on them.
+Audited 2026-07-25 against `c87235b0`. Line numbers in the detail docs drift as code
+changes; verify with `rg` before relying on them.
 
 ## What PocketRisu is
 
 A self-hosted fork of [RisuAI](https://github.com/kwaroran/RisuAI) (AI roleplay chat):
 one Node server on your PC/homeserver, accessed from any browser. Frontend is a Svelte 5
-+ Vite SPA (`src/`); backend is an Express server (`server/node/server.cjs`) storing all
-data in a single SQLite database. **RisuAI ecosystem compatibility is a hard
-constraint** — character cards, presets, modules, and `.bin` backups must round-trip
-with upstream.
++ Vite SPA (`src/`); backend is an Express server (`server/node/server.cjs`) with a
+SQLite KV core plus filesystem stores for assets, inlays, and backup archives.
+**RisuAI ecosystem compatibility is a hard constraint** — character cards, presets,
+modules, and `.bin` backups must round-trip with upstream.
 
 ## Runtime topology
 
 ```text
 Browser SPA (src/)                          Node server (server/node/)
-┌──────────────────────────┐   HTTP/WS   ┌─────────────────────────────┐
-│ index.html → src/main.ts │ ─────────── │ server.cjs (Express, ~6.4k) │
-│ → App.svelte             │  /api/*     │ ├ db.cjs      → SQLite kv: stub DB + chats/*
-│   store-driven screens,  │  /proxy2    │ ├ chunkStore  → CDC chunks: chats/snapshots
-│   no URL router          │  /proxy-    │ ├ logs.cjs    → save/logs.db
-│ NodeStorage (HTTP client)│  stream-jobs│ ├ inlays      → save/inlays/*.ext + sidecars
-│ forageStorage = server KV│             │ └ backups     → backups/*.bin
-└──────────────────────────┘             └─────────────────────────────┘
+┌────────────────────────────┐   HTTP/WS   ┌────────────────────────────────┐
+│ index.html → src/main.ts   │ ─────────── │ server.cjs (Express, ~6.8k)    │
+│ → App.svelte               │  /api/*     │ ├ db.cjs     → SQLite KV       │
+│   store-driven screens,    │  /proxy2    │ │  stub DB + chats/* + chunks │
+│   no URL router            │  /proxy-    │ ├ logs.cjs   → save/logs.db    │
+│ NodeStorage (HTTP client)  │  stream-jobs│ ├ assets/inlays → save/* files│
+│ forageStorage = server KV  │             │ └ backups → .bin + chat history│
+│ optional verified IDB cache│             │                                │
+└────────────────────────────┘             └────────────────────────────────┘
 ```
 
 - The client holds the whole `Database` object in memory (`DBState.db`, a Svelte 5
   `$state` rune) with chats **stubbed out**; full chat bodies are fetched lazily and
   saved individually. A reactive save loop syncs changes to the server via JSON Patch
   (`/api/patch`) with full-write fallback (`/api/write`).
+- An opt-in, disposable IndexedDB resource cache can reuse SHA-256-verified database
+  segments, chat rows, and optimized plugin values. The server remains authoritative;
+  every cache hit is hash-negotiated and locally re-verified.
 - Model API calls go direct from the browser when possible, otherwise through the
   server's `/proxy2`; streaming local-network requests use WebSocket proxy jobs.
 - `server/hono/` is a **non-functional scaffold** (only `GET /`), not an alternate
@@ -73,8 +77,8 @@ Browser SPA (src/)                          Node server (server/node/)
 
 | Doc | Scope |
 |---|---|
-| [server-backend](docs/structure/server-backend.md) | Express server: HTTP route catalog, JWT/session auth, stubs-only database + externalized chat rows in SQLite KV, content-defined chunking, patch sync, assembled backups/snapshots, orphan GC, storage dashboard, proxies, self-update. |
-| [client-storage](docs/structure/client-storage.md) | The `Database` model and `setDatabase()` defaults, `NodeStorage` HTTP adapter, reactive save loop in `globalApi.svelte.ts`, RisuSave codecs + JSON-Patch sync, chat stub/placeholder hydration, drafts, `.bin` backups, bootstrap ordering. |
+| [server-backend](docs/structure/server-backend.md) | Express server: HTTP route catalog, JWT/session auth, stubs-only database + externalized chat rows in SQLite KV, content-defined chunking, cached/delta read protocols, patch sync, assembled backups/snapshots, per-chat pre-image history, orphan GC, storage dashboard, proxies, self-update. |
+| [client-storage](docs/structure/client-storage.md) | The `Database` model and `setDatabase()` defaults, `NodeStorage` HTTP adapter, verified IndexedDB resource cache, reactive save loop in `globalApi.svelte.ts`, RisuSave codecs + JSON-Patch sync, chat stub/placeholder hydration, drafts, chat-version recovery, `.bin` backups, bootstrap ordering. |
 | [chat-pipeline](docs/structure/chat-pipeline.md) | `sendChat()` end to end: prompt buckets and prompt-card templates, token budgeting, attachment/multimodal conversion, streaming, regenerate/continue, post-processing, suggestions, slash commands. |
 | [model-providers](docs/structure/model-providers.md) | Legacy `LLMModel` registry (`format` dispatch, flags) and provider wire code (OpenAI/Anthropic/Google/NovelAI/Horde/…), ModelPreset adapter path, streaming contracts, proxy/local-network transport, how to add a model or provider. |
 | [presets-profiles](docs/structure/presets-profiles.md) | The three-concept split: registry `ModelProfile` → installed `ModelPreset` (frozen snapshot + adapters) vs upstream-compatible `botPreset` (prompt preset, `.risup`). Registries, custom profiles, key pool, Gemini context cache. |
@@ -95,10 +99,11 @@ loop persists the mutation. Details: chat-pipeline, model-providers.
 
 **Persist data** — mutate `DBState.db` (that's the convention — no explicit save call)
 → `$effect`s in `saveDb()` (`src/ts/globalApi.svelte.ts`) mark dirty state → changed
-full chats are POSTed to `/api/chat-content` first, then the stub-only database syncs
-via `/api/patch` (JSON Patch + hash) or ETag-guarded `/api/write` → the server writes
-chat rows through immediately and debounce-writes the stubs-only database. Details: client-storage,
-server-backend.
+full chats are POSTed to `/api/chat-content` first (deferred while a generation is
+streaming), then the stub-only database syncs via `/api/patch` (JSON Patch + hash) or
+ETag-guarded `/api/write` → the server captures an eligible chat pre-image, writes the
+chat row through immediately, and debounce-writes the stubs-only database. Details:
+client-storage, server-backend.
 
 **Extend behavior** — CBS expressions expand during prompt building and display; regex
 scripts run at `editinput`/`editoutput`/`editprocess`/`editdisplay`; triggers fire at
@@ -126,6 +131,10 @@ string: Lua listeners → display triggers → plugin handlers → CBS → regex
   key resolution) are implemented separately in both.
 - **Streaming contract**: providers emit *cumulative* text snapshots, not deltas;
   `editoutput` hooks run on every snapshot and must be repeat-safe.
+- **Browser caches are disposable and non-authoritative**: `resourceCache.ts` stores
+  only hash-addressed wire bytes. Cache negotiation, database segment assembly, and
+  list deltas must always fall back to a full authoritative server read on malformed,
+  missing, stale, or unverifiable state.
 - **RisuAI compat quirks are intentional**: the misspelled `extentions` field, RPack
   obfuscation, legacy save-format fallbacks, `GET /api/remove`, index-based
   `botPresetsId`. Don't "fix" them without a coordinated compat plan (`test/compat/`

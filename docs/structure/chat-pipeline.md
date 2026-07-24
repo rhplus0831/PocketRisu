@@ -1,7 +1,7 @@
 # chat-pipeline
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Generated 2026-07-23 from codebase analysis. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-25 against `c87235b0`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
 
 ## 1. Purpose & overview
 
@@ -11,10 +11,10 @@ The subsystem also contains prompt-card types and preset conversion, legacy text
 
 ## 2. Key files
 
-- `src/ts/process/index.svelte.ts` — ~1,934 lines; the main send/generation state machine.
+- `src/ts/process/index.svelte.ts` — ~1,937 lines; the main send/generation state machine.
   - Defines the provider-neutral `OpenAIChat` and `MultiModal` request-message shapes at `src/ts/process/index.svelte.ts:31` and `src/ts/process/index.svelte.ts:43`.
   - Exposes UI coordination stores `doingChat`, `chatProcessStage`, and `abortChat` at `src/ts/process/index.svelte.ts:55`.
-  - Exposes preview/debug state at `src/ts/process/index.svelte.ts:58`.
+  - Exposes preview/debug state plus `lastActualInputTokens` at `src/ts/process/index.svelte.ts:58`. The developer sidebar displays this most recent final-prompt count alongside broader character/chat estimates.
   - `sendChat()` begins at `src/ts/process/index.svelte.ts:62`.
   - `systemizeChat()` converts user/assistant history into system messages for compatible prompt templates at `src/ts/process/index.svelte.ts:1918`.
 
@@ -196,6 +196,8 @@ Budgeting happens in two passes:
 
 2. After final prompt-card ordering and Lua request edits, all final messages are re-tokenized as `inputTokens`; oldest messages marked `removable` are blanked until the input fits (`src/ts/process/index.svelte.ts:1340`).
 
+The pre-trim total from that second pass is stored in `lastActualInputTokens` and shown as “Current Chat (Actual)” in `DevTool.svelte`. It is more representative than `getChatToken()` because it counts the constructed request, but it is captured before overflow correction removes `removable` messages and is still tokenizer-derived rather than provider-reported billing usage.
+
 If HypaV3 is enabled for the character/chat, `hypaMemoryV3()` receives the prepared history, current token count, context limit, and tokenizer and returns replacement chats plus updated memory (`src/ts/process/index.svelte.ts:953`). Otherwise, oldest prepared history items are removed until the early budget fits (`src/ts/process/index.svelte.ts:979`).
 
 The final estimated output allowance is clamped to `maxContextTokens - inputTokens`, and generation metadata is constructed at `src/ts/process/index.svelte.ts:1365`.
@@ -308,6 +310,8 @@ Legacy multi-speaker history compatibility remains: character messages may carry
 - The exported `abortChat` writable at `src/ts/process/index.svelte.ts:57` is not the active cancellation mechanism. The UI uses a local `AbortController` at `src/lib/ChatScreens/DefaultChatScreen.svelte:542`.
 
 - `requestTokenParts` is exported at `src/ts/process/index.svelte.ts:58` but has no current consumers. Do not assume it reflects actual token accounting.
+
+- `lastActualInputTokens` is module-global debug state from the most recent send/preview. It is set before final overflow trimming, is not keyed by character/chat/generation, and is not authoritative provider usage despite the UI's “Actual” label.
 
 - `chatProcessIndex` mostly relaxes the concurrent-send guard and suppresses random `presetChain` selection for scripted/dev sequences; ordinary UI calls use `-1`.
 

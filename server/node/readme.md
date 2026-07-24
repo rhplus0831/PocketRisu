@@ -1,5 +1,9 @@
-# Risuai Node Server
+# PocketRisu Node Server
 
-> Warning: Node server may be deprecated in future versions, replaced with [Hono](https://hono.dev/) based server which could run in multiple environments including nodejs, deno, and serverless platforms such as Cloudflare Workers, Vercel Edge Functions, etc.
+This is PocketRisu's production self-hosted backend. It serves the built SPA, owns
+authentication and persistence, and implements the APIs documented in
+[`docs/structure/server-backend.md`](../../docs/structure/server-backend.md).
 
-This is the Node.js server for Risuai, for self-hosting purposes, who want to run Risuai on their own server remotely, without using official server for privacy or other reasons.
+Run it from the repository/application root with `pnpm run runserver`; storage and
+runtime paths are resolved from the current working directory. The sibling Hono tree
+is an incomplete scaffold and is not a compatible replacement.

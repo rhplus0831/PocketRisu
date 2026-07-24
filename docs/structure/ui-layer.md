@@ -1,7 +1,7 @@
 # ui-layer
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Generated 2026-07-23 from codebase analysis. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-25 against `c87235b0`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
 
 ## 1. Purpose & overview
 
@@ -75,16 +75,18 @@ The `src/lib/` tree combines major feature screens, desktop and mobile shells, s
 
 | File | Approx. size | Role and important symbols |
 |---|---:|---|
-| `src/lib/Setting/Settings.svelte` | 322 lines | Settings navigation and page switch. Menu entries mutate numeric `SettingsMenuIndex` (`src/lib/Setting/Settings.svelte:52`); page rendering is the branch at `src/lib/Setting/Settings.svelte:245`; mobile/narrow back behavior is at `src/lib/Setting/Settings.svelte:299`. |
+| `src/lib/Setting/Settings.svelte` | 310 lines | Settings navigation and page switch. Menu entries mutate numeric `SettingsMenuIndex`; page rendering is the main branch near the bottom; mobile/narrow back behavior returns to the menu. The former built-in Remote Access settings page/route has been removed; remote setup is documented externally. |
 | `src/lib/Setting/SettingRenderer.svelte` | 65 lines | Renders declarative `SettingItem[]`, builds model-aware `SettingContext`, evaluates conditions, and dispatches through `settingRegistry` (`src/lib/Setting/SettingRenderer.svelte:22`, `src/lib/Setting/SettingRenderer.svelte:29`, `src/lib/Setting/SettingRenderer.svelte:37`). |
 | `src/lib/Setting/Pages/DisplaySettings.svelte` | 56 lines | Representative declarative settings page: theme, size/speed, and grouped “other” tabs are built from setting-data arrays (`src/lib/Setting/Pages/DisplaySettings.svelte:27`, `src/lib/Setting/Pages/DisplaySettings.svelte:36`). |
 | `src/lib/Setting/Pages/BotSettings.svelte` | 547 lines | Main model/parameter/custom-model settings page, mixing direct controls with declarative parameter items. Its page tabs begin at `src/lib/Setting/Pages/BotSettings.svelte:116`. |
 | `src/lib/Setting/Pages/Model/ModelPresetSettings.svelte` | 523 lines | Model preset list/editor, profile registry synchronization, credentials, schema-driven fields, capabilities, and request testing (`src/lib/Setting/Pages/Model/ModelPresetSettings.svelte:29`, `src/lib/Setting/Pages/Model/ModelPresetSettings.svelte:47`, `src/lib/Setting/Pages/Model/ModelPresetSettings.svelte:106`). |
-| `src/lib/Setting/Pages/SystemSettings.svelte` | 618 lines | Dashboard, backup, logs, and plugin-storage tabs. Its cross-page tab state comes from `SystemSubmenuIndex` (`src/lib/Setting/Pages/SystemSettings.svelte:11`); plugin storage is selected at `src/lib/Setting/Pages/SystemSettings.svelte:615`. |
+| `src/lib/Setting/Pages/SystemSettings.svelte` | 618 lines | Dashboard, backup, logs, and plugin-storage tabs. Its cross-page tab state comes from `SystemSubmenuIndex` (`src/lib/Setting/Pages/SystemSettings.svelte:11`); the dashboard includes browser resource-cache stats/clear controls, and Backups mounts both server/portable controls and the per-chat recovery browser. |
+| `src/lib/Setting/ChatBackupList.svelte` | 277 lines | Expands server-captured chat histories, resolves live/deleted character and chat labels, fetches a selected version, chooses a target character, and imports it as a new chat through the storage subsystem. |
+| `src/lib/Setting/Pages/Advanced/ResourceCacheSettings.svelte` | 59 lines | Toggles the opt-in verified IndexedDB resource cache and shows current entry/byte usage when supported. |
 | `src/lib/UI/GUI/SettingPage.svelte` | 16 lines | Standard page title/body wrapper (`src/lib/UI/GUI/SettingPage.svelte:13`). |
 | `src/lib/UI/GUI/SettingTabs.svelte` | 43 lines | Bindable numeric tab row used by settings pages (`src/lib/UI/GUI/SettingTabs.svelte:7`, `src/lib/UI/GUI/SettingTabs.svelte:16`). |
 | `src/lib/UI/GUI/ShDialog.svelte` | 133 lines | Main `bits-ui` dialog wrapper, with explicit size and z-index tiers (`src/lib/UI/GUI/ShDialog.svelte:4`, `src/lib/UI/GUI/ShDialog.svelte:40`, `src/lib/UI/GUI/ShDialog.svelte:64`). |
-| `src/lib/UI/MainMenu.svelte` | 193 lines | Desktop no-character home screen, including update/state information, recent Realm cards, related links, and Realm navigation (`src/lib/UI/MainMenu.svelte:23`, `src/lib/UI/MainMenu.svelte:57`, `src/lib/UI/MainMenu.svelte:185`). |
+| `src/lib/UI/MainMenu.svelte` | 197 lines | Desktop no-character home screen, including version/build identity, update/state information, recent Realm cards, related links, and Realm navigation. Non-empty `__APP_BRANCH__` produces a custom-build badge whose tooltip includes `__APP_COMMIT__`; Vite gets these from `APP_BRANCH`/`APP_COMMIT` or local Git. |
 | `src/lib/UI/Realm/RealmMain.svelte` | 213 lines | Searchable/paged Realm catalog. `getHub()` is at `src/lib/UI/Realm/RealmMain.svelte:21`; mobile/desktop filter layouts diverge at `src/lib/UI/Realm/RealmMain.svelte:76`. |
 | `src/lib/Mobile/MobileBody.svelte` | 55 lines | Mobile screen switch: active-chat side panels, chat screen, Realm, characters, or settings (`src/lib/Mobile/MobileBody.svelte:17`, `src/lib/Mobile/MobileBody.svelte:37`). |
 | `src/lib/Mobile/MobileHeader.svelte` | 46 lines | Contextual back/menu/search header; settings back resets `SettingsMenuIndex` to `SettingsRoute.None` (`src/lib/Mobile/MobileHeader.svelte:11`, `src/lib/Mobile/MobileHeader.svelte:32`). |
@@ -183,7 +185,7 @@ The toggle-preset chooser intentionally uses `togglePresetsOpenStore`, not the s
 - `DBState.db` is the canonical live data model, not a disposable UI copy (`src/ts/stores.svelte.ts:144`). Most inputs bind directly into it; replacing or cloning subobjects casually can interfere with references and persistence tracking.
 - Persistence effects depend on deep reactive reads. `deepTouch()` is deliberately used instead of `$state.snapshot()` to avoid cloning large characters/modules (`src/ts/gui/deepTouch.svelte.ts:1`). Adding non-plain objects to persisted data can force the slower snapshot fallback.
 - General navigation is not represented in the browser URL. Adding a screen normally requires a store value and a render branch, not a route configuration.
-- Settings route numbers are a compatibility surface. Adding or reordering a page requires synchronized edits in the menu, render switch, and `SettingsRoute`; the comments explicitly warn against magic numbers (`src/ts/routing.ts:3`). Existing gaps are meaningful: route 5 renders Files without a visible menu button, while sound uses index 7 but currently lacks a `SettingsRoute` constant.
+- Settings route numbers are a compatibility surface. Adding or reordering a page requires synchronized edits in the menu, render switch, and `SettingsRoute`; the comments explicitly warn against magic numbers (`src/ts/routing.ts:3`). Existing gaps are meaningful: route 5 renders Files without a visible menu button, sound uses index 7 but currently lacks a `SettingsRoute` constant, and the removed Remote Access page left index 21 unused.
 - Narrow settings use `SettingsMenuIndex === -1` as the menu/list state. Closing a page under 700px returns to that state rather than closing settings (`src/lib/Setting/Settings.svelte:299`).
 - `DynamicGUI` and `MobileGUI` are not synonyms. The former changes sidebar presentation at 1024px on resize; the latter is a boot-selected alternate application shell.
 - `Settings.svelte` also uses direct `window.innerWidth` thresholds of 700 and 900 (`src/lib/Setting/Settings.svelte:39`, `src/lib/Setting/Settings.svelte:46`). These are separate from both global responsive stores.
@@ -207,6 +209,8 @@ The toggle-preset chooser intentionally uses `togglePresetsOpenStore`, not the s
 - Lorebook and regex lists let SortableJS mutate the DOM, then reconstruct data/recreate the Sortable instance to return authority to Svelte (`src/lib/SideBars/LoreBook/LoreBookList.svelte:113`, `src/lib/SideBars/Scripts/RegexList.svelte:19`). Directly simplifying this can desynchronize DOM and database order.
 - Trigger-format switching is destructive and confirmation-protected. V1/V2/Lua identification depends on sentinel effect types in the first trigger entry (`src/lib/SideBars/Scripts/TriggerList.svelte:18`).
 - The Dev Panel is compiled into production but hidden unless a local-storage flag was present at Settings mount time; changing the flag requires reload (`src/lib/Setting/Settings.svelte:32`).
+
+- The home-screen build badge is compile-time metadata, not runtime Git detection. `vite.config.ts` prefers builder-supplied `APP_BRANCH`/`APP_COMMIT`, falls back to `git rev-parse`, and hides the badge when no branch is available. Keep `src/vite-env.d.ts` declarations synchronized with new constants.
 
 ## 6. Navigation hints
 
@@ -237,6 +241,7 @@ The toggle-preset chooser intentionally uses `togglePresetsOpenStore`, not the s
 - To add non-blocking feedback, use or extend the `notify*` family at `src/ts/alert.ts:223` and leave rendering to the root `Toaster`.
 - To change global keyboard actions, edit the action switch at `src/ts/hotkey.ts:34` and the configured hotkey definitions in the hotkey/data subsystem.
 - To change the home screen, edit `src/lib/UI/MainMenu.svelte:23`; to change the full Realm catalog, edit `src/lib/UI/Realm/RealmMain.svelte:21`.
+- To change custom-build identity, update `vite.config.ts` defines, `src/vite-env.d.ts`, and the badge in `MainMenu.svelte` together; hosted archive builds must pass `APP_BRANCH`/`APP_COMMIT` because `.git` may be absent.
 - To add a Playground tool, allocate a `PlaygroundStore` value in the menu buttons and matching render branch in `src/lib/Playground/PlaygroundMenu.svelte:53`.
 
 ### Out of scope, noticed
