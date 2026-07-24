@@ -63,6 +63,28 @@ function readKvValue(cwd: string, key: string): Buffer | null {
   }
 }
 
+function listKvKeys(cwd: string, prefix: string): string[] {
+  const database = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
+  try {
+    return (database.prepare('SELECT key FROM kv WHERE key LIKE ? ORDER BY key').all(`${prefix}%`) as
+      Array<{ key: string }>).map(row => row.key)
+  } finally {
+    database.close()
+  }
+}
+
+function expectExternalPluginRows(
+  cwd: string,
+  prefix: 'pluginsave/' | 'pluginsave-meta/',
+  values: Record<string, unknown>,
+): void {
+  for (const [rawKey, value] of Object.entries(values)) {
+    const row = readKvValue(cwd, pluginStorageKey(prefix, rawKey))
+    expect(row).toEqual(Buffer.from(JSON.stringify(value), 'utf-8'))
+    expect(JSON.parse(row!.toString('utf-8'))).toEqual(value)
+  }
+}
+
 function entriesByName(backup: Buffer): Map<string, Buffer> {
   return new Map(decodeBackup(backup).map(entry => [entry.name, entry.data]))
 }
@@ -73,6 +95,7 @@ describe('external plugin rows in backup archives', () => {
     servers.push(source)
     const sourceClient = await createClient(source.port, source.password)
     const seed = withDatabaseFields(createSeedBackup({ characterCount: 1 }), {
+      optimizePluginMemory: true,
       pluginCustomStorage: {},
     })
     expect((await sourceClient.importBackup(seed)).ok).toBe(true)
@@ -122,6 +145,27 @@ describe('external plugin rows in backup archives', () => {
       '유니코드 키': { plugin: 'Plugin B', updatedAt: 20 },
     })
 
+    const upstreamDestination = await spawnServer()
+    servers.push(upstreamDestination)
+    const upstreamDestinationClient = await createClient(
+      upstreamDestination.port,
+      upstreamDestination.password,
+    )
+    expect((await upstreamDestinationClient.importBackup(upstreamBackup)).ok).toBe(true)
+    expectExternalPluginRows(upstreamDestination.cwd, 'pluginsave/', {
+      'plain/key': { value: 1 },
+      '유니코드 키': ['alpha', 2],
+    })
+    expectExternalPluginRows(upstreamDestination.cwd, 'pluginsave-meta/', {
+      'plain/key': { plugin: 'Plugin A', updatedAt: 10 },
+      '유니코드 키': { plugin: 'Plugin B', updatedAt: 20 },
+    })
+    const upstreamStoredDatabase = decodeRisuDat(
+      readKvValue(upstreamDestination.cwd, 'database/database.bin')!,
+    )
+    expect(upstreamStoredDatabase.pluginCustomStorage).toEqual({})
+    expect(upstreamStoredDatabase.pluginStorageMeta).toBeUndefined()
+
     const saveResponse = await sourceClient.fetch('/api/backup/server/save', { method: 'POST' })
     expect(saveResponse.status).toBe(200)
     const saveEvents = (await saveResponse.text())
@@ -169,7 +213,7 @@ describe('external plugin rows in backup archives', () => {
     expect(storedDatabase.pluginStorageMeta).toBeUndefined()
   })
 
-  test('legacy backups retain folded plugin storage and clear stale external rows', async () => {
+  test('legacy optimized backups externalize folded plugin storage and clear stale rows', async () => {
     const server = await spawnServer()
     servers.push(server)
     const client = await createClient(server.port, server.password)
@@ -178,9 +222,16 @@ describe('external plugin rows in backup archives', () => {
     await writeKv(client, staleValueKey, Buffer.from('1'))
     await writeKv(client, staleMetaKey, Buffer.from('{}'))
 
-    const legacyValues = { legacy: { nested: ['value'] } }
-    const legacyMeta = { legacy: { plugin: 'Legacy Plugin', updatedAt: 123 } }
+    const legacyValues = {
+      'legacy/key': { nested: ['value'], enabled: true },
+      '유니코드 키': ['alpha', 2],
+    }
+    const legacyMeta = {
+      'legacy/key': { plugin: 'Legacy Plugin', updatedAt: 123 },
+      '유니코드 키': { plugin: 'Unicode Plugin', updatedAt: 456 },
+    }
     const legacyBackup = withDatabaseFields(createSeedBackup(), {
+      optimizePluginMemory: true,
       pluginCustomStorage: legacyValues,
       pluginStorageMeta: legacyMeta,
     })
@@ -188,19 +239,47 @@ describe('external plugin rows in backup archives', () => {
 
     expect(readKvValue(server.cwd, staleValueKey)).toBeNull()
     expect(readKvValue(server.cwd, staleMetaKey)).toBeNull()
+    expectExternalPluginRows(server.cwd, 'pluginsave/', legacyValues)
+    expectExternalPluginRows(server.cwd, 'pluginsave-meta/', legacyMeta)
     const storedDatabase = decodeRisuDat(readKvValue(server.cwd, 'database/database.bin')!)
-    expect(storedDatabase.pluginCustomStorage).toEqual(legacyValues)
-    expect(storedDatabase.pluginStorageMeta).toEqual(legacyMeta)
+    expect(storedDatabase.pluginCustomStorage).toEqual({})
+    expect(storedDatabase.pluginStorageMeta).toBeUndefined()
+    expect((storedDatabase.characters as Array<any>)[0].chats[0]).toMatchObject({
+      id: 'chat-0-0',
+      _stub: true,
+    })
+    expect((storedDatabase.characters as Array<any>)[0].chats[0].message).toBeUndefined()
 
     const exported = await client.exportBackup()
     const exportedEntries = decodeBackup(exported)
-    expect(exportedEntries.some(entry => entry.name.startsWith('pluginsave/'))).toBe(false)
-    expect(exportedEntries.some(entry => entry.name.startsWith('pluginsave-meta/'))).toBe(false)
+    expect(exportedEntries.some(entry => entry.name.startsWith('pluginsave/'))).toBe(true)
+    expect(exportedEntries.some(entry => entry.name.startsWith('pluginsave-meta/'))).toBe(true)
     const exportedDatabase = decodeRisuDat(
       exportedEntries.find(entry => entry.name === 'database.risudat')!.data,
     )
-    expect(exportedDatabase.pluginCustomStorage).toEqual(legacyValues)
-    expect(exportedDatabase.pluginStorageMeta).toEqual(legacyMeta)
+    expect(exportedDatabase.pluginCustomStorage).toEqual({})
+    expect(exportedDatabase.pluginStorageMeta).toBeUndefined()
+  })
+
+  test('legacy inline-mode backups retain folded plugin storage and create no rows', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const legacyValues = { inline: { nested: ['value'] } }
+    const legacyMeta = { inline: { plugin: 'Inline Plugin', updatedAt: 123 } }
+    const legacyBackup = withDatabaseFields(createSeedBackup(), {
+      optimizePluginMemory: false,
+      pluginCustomStorage: legacyValues,
+      pluginStorageMeta: legacyMeta,
+    })
+
+    expect((await client.importBackup(legacyBackup)).ok).toBe(true)
+
+    expect(listKvKeys(server.cwd, 'pluginsave/')).toEqual([])
+    expect(listKvKeys(server.cwd, 'pluginsave-meta/')).toEqual([])
+    const storedDatabase = decodeRisuDat(readKvValue(server.cwd, 'database/database.bin')!)
+    expect(storedDatabase.pluginCustomStorage).toEqual(legacyValues)
+    expect(storedDatabase.pluginStorageMeta).toEqual(legacyMeta)
   })
 
   test('backup import rejects non-canonical plugin row names', async () => {
@@ -276,5 +355,108 @@ describe('external plugin rows in backup archives', () => {
     expect(readKvValue(server.cwd, directoryMetaKey)).toBeNull()
     expect(readKvValue(server.cwd, zipValueKey)).toEqual(zipValue)
     expect(readKvValue(server.cwd, zipMetaKey)).toEqual(zipMeta)
+  })
+
+  test('save-folder import externalizes a folded optimized monolith', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const legacyValues = { 'save-folder/key': { from: 'directory', count: 3 } }
+    const legacyMeta = {
+      'save-folder/key': { plugin: 'Save Folder Plugin', updatedAt: 789 },
+    }
+    const databaseValue = decodeBackup(withDatabaseFields(createSeedBackup(), {
+      optimizePluginMemory: true,
+      pluginCustomStorage: legacyValues,
+      pluginStorageMeta: legacyMeta,
+    })).find(entry => entry.name === 'database.risudat')!.data
+    const sourceDir = path.join(server.cwd, 'folded-plugin-save-source')
+    const databaseHexName = Buffer.from('database/database.bin', 'utf-8').toString('hex')
+    await mkdir(sourceDir, { recursive: true })
+    await writeFile(path.join(sourceDir, databaseHexName), databaseValue)
+
+    const response = await client.fetch('/api/migrate/save-folder/execute', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: sourceDir }),
+    })
+    expect(response.status).toBe(200)
+    expectExternalPluginRows(server.cwd, 'pluginsave/', legacyValues)
+    expectExternalPluginRows(server.cwd, 'pluginsave-meta/', legacyMeta)
+    const storedDatabase = decodeRisuDat(readKvValue(server.cwd, 'database/database.bin')!)
+    expect(storedDatabase.pluginCustomStorage).toEqual({})
+    expect(storedDatabase.pluginStorageMeta).toBeUndefined()
+  })
+
+  test('/api/write externalizes folded optimized plugin storage defensively', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const legacyValues = { 'write/key': { from: 'full-write' } }
+    const legacyMeta = { 'write/key': { plugin: 'Write Plugin', updatedAt: 654 } }
+    const databaseValue = decodeBackup(withDatabaseFields(createSeedBackup(), {
+      optimizePluginMemory: true,
+      pluginCustomStorage: legacyValues,
+      pluginStorageMeta: legacyMeta,
+    })).find(entry => entry.name === 'database.risudat')!.data
+
+    await writeKv(client, 'database/database.bin', databaseValue)
+
+    expectExternalPluginRows(server.cwd, 'pluginsave/', legacyValues)
+    expectExternalPluginRows(server.cwd, 'pluginsave-meta/', legacyMeta)
+    const storedDatabase = decodeRisuDat(readKvValue(server.cwd, 'database/database.bin')!)
+    expect(storedDatabase.pluginCustomStorage).toEqual({})
+    expect(storedDatabase.pluginStorageMeta).toBeUndefined()
+  })
+
+  test('boot externalizes folded optimized plugin storage seeded directly in SQLite', async () => {
+    const legacyValues = { 'boot/key': { nested: ['boot'], enabled: true } }
+    const legacyMeta = { 'boot/key': { plugin: 'Boot Plugin', updatedAt: 987 } }
+    const databaseValue = decodeBackup(withDatabaseFields(createSeedBackup(), {
+      optimizePluginMemory: true,
+      pluginCustomStorage: legacyValues,
+      pluginStorageMeta: legacyMeta,
+    })).find(entry => entry.name === 'database.risudat')!.data
+
+    const server = await spawnServer({
+      seedSave: async (saveDir) => {
+        const database = new Database(path.join(saveDir, 'risuai.db'))
+        try {
+          database.exec(`
+            CREATE TABLE kv (
+              key TEXT PRIMARY KEY,
+              value BLOB NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+          `)
+          database.prepare(
+            'INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+          ).run('database/database.bin', databaseValue, Date.now())
+          database.prepare(
+            'INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+          ).run(
+            pluginStorageKey('pluginsave/', 'boot/key'),
+            Buffer.from(JSON.stringify({ stale: true }), 'utf-8'),
+            Date.now(),
+          )
+          database.prepare(
+            'INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+          ).run(
+            pluginStorageKey('pluginsave-meta/', 'boot/key'),
+            Buffer.from(JSON.stringify({ plugin: 'Stale Plugin', updatedAt: 1 }), 'utf-8'),
+            Date.now(),
+          )
+        } finally {
+          database.close()
+        }
+      },
+    })
+    servers.push(server)
+
+    expectExternalPluginRows(server.cwd, 'pluginsave/', legacyValues)
+    expectExternalPluginRows(server.cwd, 'pluginsave-meta/', legacyMeta)
+    const storedDatabase = decodeRisuDat(readKvValue(server.cwd, 'database/database.bin')!)
+    expect(storedDatabase.pluginCustomStorage).toEqual({})
+    expect(storedDatabase.pluginStorageMeta).toBeUndefined()
   })
 })

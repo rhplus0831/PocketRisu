@@ -7,7 +7,7 @@
 
 The server backend turns the built Svelte SPA into a self-hosted, single-user PocketRisu instance. The production implementation is the Express executable in `server/node/server.cjs`: it serves `dist/`, authenticates clients, persists RisuAI-compatible save data and assets, lazily hydrates chats, proxies model traffic, manages backups and storage maintenance, checks for updates, and controls Cloudflare Quick Tunnels.
 
-Persistent application data is primarily stored in SQLite through a binary-compatible key/value abstraction. `database/database.bin` contains character/settings data plus chat stubs, while full chat bodies live in individual `chats/<chaId>/<chatId>` rows. Large chat rows and full database snapshots are deduplicated through content-defined chunking. Assets (`save/assets/`, one immutable file per safe-named `assets/*` key, written temp-file+rename so cross-instance hardlink dedup is safe), inlays, and server-created backup files are stored separately on the filesystem; unsafe-named assets remain KV rows (dual-source reads via `server/node/assetStore.cjs`). `server/hono/` is only an early multi-runtime scaffold; it does not implement the Node backend’s APIs, authentication, or storage.
+Persistent application data is primarily stored in SQLite through a binary-compatible key/value abstraction. `database/database.bin` contains character/settings data plus chat stubs; full chat bodies live in individual `chats/<chaId>/<chatId>` rows, and optimized plugin save data lives in `pluginsave/` plus `pluginsave-meta/` JSON rows. Large chat rows and full database snapshots are deduplicated through content-defined chunking. Assets (`save/assets/`, one immutable file per safe-named `assets/*` key, written temp-file+rename so cross-instance hardlink dedup is safe), inlays, and server-created backup files are stored separately on the filesystem; unsafe-named assets remain KV rows (dual-source reads via `server/node/assetStore.cjs`). `server/hono/` is only an early multi-runtime scaffold; it does not implement the Node backend’s APIs, authentication, or storage.
 
 ## 2. Key files
 
@@ -51,7 +51,7 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 2. CommonJS evaluation first loads `db.cjs` and `logs.cjs` at `server/node/server.cjs:26`. Those modules synchronously create/open their SQLite files before route registration.
 3. `db.cjs` creates `save/`, opens `save/risuai.db`, enables WAL, and applies performance and lock pragmas at `server/node/db.cjs:8`. It creates the `kv` table at `server/node/db.cjs:28`, initializes the chunk store at `server/node/db.cjs:94`, then attempts legacy save-folder migration at `server/node/db.cjs:100`.
 4. `server.cjs` installs fatal logging handlers before the rest of its initialization at `server/node/server.cjs:39`. It then creates `save/`, reads or creates the password/JWT/instance files, loads persisted direct-asset sessions, initializes the backup directory, and registers middleware and routes.
-5. `startServer()` migrates assets and inlays, externalizes monolithic chats, and converts any RisuSave `REMOTE` blocks before listening at `server/node/server.cjs:6343`. The chat migration first copies the old blob to `migration-backup/pre-chat-externalization-<timestamp>.bin`, then records `migration/chats-externalized`; the wrapper is at `server/node/server.cjs:389`.
+5. `startServer()` migrates assets and inlays, externalizes monolithic chats, defensively re-externalizes folded optimized plugin storage even when the chat marker already exists, and converts any RisuSave `REMOTE` blocks before listening. The chat migration first copies the old blob to `migration-backup/pre-chat-externalization-<timestamp>.bin`, then records `migration/chats-externalized`; the wrapper is at `server/node/server.cjs:401`.
 6. TLS is enabled only when both `server/node/ssl/certificate/server.key` and `server.crt` can be read; otherwise it starts plain HTTP.
 7. Both HTTP and HTTPS servers install the proxy-job WebSocket upgrade handler before listening.
 8. Shutdown handlers flush debounced database writes, stop the tunnel, and truncate-checkpoint WAL. A background checkpoint runs every five minutes.
@@ -113,6 +113,8 @@ Important KV namespaces include:
 
 - `database/database.bin`: canonical stubs-only database save; chat bodies are not stored inline.
 - `chats/<encodeURIComponent(chaId)>/<encodeURIComponent(chatId)>`: one legacy-encoded full chat body per row, managed by `server/node/chatRows.cjs`.
+- `pluginsave/<base64url(rawKey)>.json`: one UTF-8 `JSON.stringify` value per optimized plugin save key.
+- `pluginsave-meta/<base64url(rawKey)>.json`: matching optimized plugin ownership metadata rows.
 - `database/dbbackup-<timestamp/100>.bin`: full, assembled DB-only automatic snapshots, created by `createBackupAndRotate()` at `server/node/server.cjs:231`.
 - `assets/`: binary application assets.
 - `remotes/`: retained upstream `REMOTE`-block payloads.
@@ -135,8 +137,8 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 - `bootstrap.loadData()` initializes `AutoStorage`, then requests `database/database.bin` at `src/ts/bootstrap.ts:38`.
 - `AutoStorage` always selects `NodeStorage` at `src/ts/storage/autoStorage.ts:27`.
 - `NodeStorage.getItem()` hex-encodes the logical key into the `file-path` header and calls `GET /api/read` at `src/ts/storage/nodeStorage.ts:216`.
-- `/api/read` flushes pending saves, decodes and normalizes the stubs-only live row, caches it, and sends the legacy-encoded stripped database plus `x-db-etag` at `server/node/server.cjs:3331`. If a full chat payload leaked into the live row, it defensively routes that object through `ingestDatabase()` first.
-- Monolith-shaped inputs from boot migration, backup/snapshot restore, save-folder import, or defensive route recovery all pass through `chatRowStore.ingestFullDatabase()`: decode, ID/cold-storage/folder normalization, split, then one transaction writes the stripped DB and chat rows, deletes stale rows, and sets the migration marker (`server/node/server.cjs:361`; `server/node/chatRows.cjs:289`).
+- `/api/read` flushes pending saves, decodes and normalizes the stubs-only live row, caches it, and sends the legacy-encoded stripped database plus `x-db-etag`. If a full chat payload or folded optimized plugin storage leaked into the live row, it defensively routes that object through `ingestDatabase()` first.
+- Monolith-shaped inputs from boot migration, backup/snapshot restore, save-folder import, or defensive route recovery pass through `ingestDatabase()`. For `optimizePluginMemory === true`, `externalizePluginStorageIfNeeded()` first writes every folded value and metadata entry as a JSON KV row, then replaces the inline map with `{}` and removes `pluginStorageMeta`; chat ingestion subsequently normalizes and splits the same object before writing the combined stripped DB. Rows precede the monolith rewrite, so interruption leaves duplicates and a retry overwrites rows from the inline copy.
 - The HTML root injects `globalThis.__NODE__` and `globalThis.__PATCH_SYNC__` at `server/node/server.cjs:2474`; `src/ts/platform.ts:17` turns those into frontend feature flags.
 
 #### Patch save and full-write fallback
@@ -144,9 +146,9 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 - `persistTrackedChanges()` first saves changed full chats individually, then encodes `database.bin` with chat stubs at `src/ts/globalApi.svelte.ts:779`.
 - When patch sync is enabled, it calls `NodeStorage.patchItem()` through `forageStorage` at `src/ts/globalApi.svelte.ts:996`.
 - `/api/patch` loads or reuses the stripped `dbCache`, checks the client’s compositional hash, validates chat paths, applies RFC 6902 operations to a clone, externalizes any whole-chat payload operations, deletes rows for removed stubs, updates the stripped-view ETag, and schedules persistence after five seconds at `server/node/server.cjs:3683`.
-- The timer calls `persistDbCache()`, which encodes and writes only the stubs-only cache at `server/node/server.cjs:516`.
+- The timer calls `persistDbCache()`, which defensively re-externalizes any folded optimized plugin data before encoding and writing the stripped cache.
 - Patch conflicts or chat-guard rejections cause the frontend to fall back to `NodeStorage.setItem()` and `/api/write` at `src/ts/globalApi.svelte.ts:1014`.
-- `/api/write` checks the stripped-view ETag, validates the incoming object, externalizes any payload-bearing chats, writes a stubs-only row, and performs targeted row cleanup when the prior stripped cache is available at `server/node/server.cjs:3527`. A normal stubs-only write preserves the client bytes verbatim.
+- `/api/write` checks the stripped-view ETag, validates the incoming object, externalizes folded optimized plugin data and any payload-bearing chats, writes one combined stripped row, and performs targeted chat-row cleanup when the prior stripped cache is available. A normal already-stripped write preserves the client bytes verbatim.
 - Storage mutations run through the promise-based `queueStorageOperation()` serialization point at `server/node/server.cjs:102`.
 
 #### Externalized chat content
@@ -171,9 +173,9 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 - The binary backup framing is `[nameLength:u32LE][UTF-8 name][dataLength:u32LE][data]`, encoded by `encodeBackupEntry()` at `server/node/server.cjs:1893` and parsed incrementally by `parseBackupChunk()` at `server/node/server.cjs:2145`.
 - Portable and server backups never contain `chats/` entries. `buildSelfContainedBackupDatabase()` assembles the stubs-only live row with its chat rows. Node-only exports keep `pluginsave/` and `pluginsave-meta/` values as byte-preserving per-row archive entries, while `?target=upstream` folds those rows into `database.risudat` for compatibility.
 - `/api/backup/export` flushes pending data and streams the assembled DB, assets, cold storage, plugin rows, and filesystem inlays. `?target=upstream` deliberately omits all Node-only slashed namespaces (plugin rows and inlays), because upstream treats them as asset paths.
-- `/api/backup/import` streams directly from the request, stages filesystem data, replaces current namespaces, and passes the imported `database.risudat` through `ingestDatabase()` after commit (`importBackupFromSource()` at `server/node/server.cjs:2172`).
+- `/api/backup/import` streams directly from the request, stages filesystem data, replaces current namespaces, and passes the imported `database.risudat` through `ingestDatabase()` after commit. Legacy and `?target=upstream` monoliths are therefore re-split into plugin JSON rows when optimized mode is set; inline mode remains folded.
 - Server-side backups use the same format but write `risu-backup-<timestamp>.bin` under the configured backup directory; save/list/restore/delete/download begin at `server/node/server.cjs:4224`.
-- Legacy save folders consist of files whose filenames are hex-encoded logical KV keys. Successful imports externalize their live DB through the same ingest boundary at `server/node/server.cjs:4776`.
+- Legacy save folders consist of files whose filenames are hex-encoded logical KV keys. Successful directory and ZIP imports externalize chat payloads and folded optimized plugin storage through the same ingest boundary.
 - Automatic snapshots assemble a full monolith from the current stubs and chat rows, legacy-encode it, and store it under `database/dbbackup-*` at `server/node/server.cjs:231`. Rotation recomputes exclusive chunk footprints after each deletion (`server/node/server.cjs:192`).
 - Snapshot restore copies the full snapshot into the live key, clears the remote-block marker, and immediately re-ingests it into stubs plus chat rows at `server/node/server.cjs:5618`.
 
@@ -254,6 +256,8 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 
 - **Downgrading after chat externalization is unsupported.** Older servers interpret the live stubs-only blob as the whole database. Recovery for a downgrade is the boot-created `migration-backup/pre-chat-externalization-*` copy or another full pre-migration snapshot; boot migration and safety copy are at `server/node/server.cjs:389`.
 
+- **Optimized folded plugin storage is split with rows first.** `externalizePluginStorageIfNeeded()` uses unpadded canonical base64url keys and exact UTF-8 `JSON.stringify(value)` bytes. It writes or overwrites all rows before callers persist the `{ pluginCustomStorage: {} }` stub and deleted `pluginStorageMeta`; preserve that ordering so a crash leaves a recoverable inline copy. A falsy `optimizePluginMemory` is legitimate inline mode and must not be split.
+
 - **Patch persistence is debounced.** `/api/patch` acknowledges after mutating memory, then writes five seconds later (`server/node/server.cjs:3792`). Failures cannot be returned on the triggering request, so `recordPersistFailure()` surfaces them on the next patch response (`server/node/server.cjs:119`). Reads, backups, maintenance, shutdown, and the browser keepalive route explicitly flush pending data.
 
 - **ETags describe the stripped client view.** This now matches the stubs-only live row, but not assembled snapshots or portable backups. Full writes and patches must preserve that convention or clients will report false concurrent-modification conflicts; see `/api/read` at `server/node/server.cjs:3331` and `/api/write` at `server/node/server.cjs:3527`.
@@ -332,7 +336,7 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 
 - To change RisuAI save-format compatibility, inspect format detection/decoding at `server/node/utils.cjs:154`, `server/node/utils.cjs:204`, and `server/node/utils.cjs:369`; compare coordinated client behavior before changing constants.
 
-- To change monolith ingestion or boot chat migration, inspect `ingestDatabase()` at `server/node/server.cjs:361`, `ingestFullDatabase()` at `server/node/chatRows.cjs:289`, and `migrateChatsToRowsIfNeeded()` at `server/node/server.cjs:389`.
+- To change monolith ingestion, optimized plugin re-externalization, or boot chat migration, inspect `ingestDatabase()`, `externalizePluginStorageIfNeeded()`, `server/node/chatRows.cjs`'s `ingestFullDatabase()`, and `migrateChatsToRowsIfNeeded()`.
 
 - To change legacy remote-block migration, inspect `migrateRemoteBlocksIfNeeded()` at `server/node/server.cjs:303`.
 

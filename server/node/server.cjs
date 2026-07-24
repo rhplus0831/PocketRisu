@@ -371,11 +371,19 @@ async function migrateRemoteBlocksIfNeeded() {
 }
 
 async function ingestDatabase(raw, { createBackup = false } = {}) {
-    const result = await chatRowStore.ingestFullDatabase(raw, {
-        beforeDecode: async () => {
-            const migration = await migrateRemoteBlocksIfNeeded();
-            return migration.ran ? kvGet('database/database.bin') : undefined;
-        },
+    const migration = await migrateRemoteBlocksIfNeeded();
+    const source = migration.ran ? kvGet('database/database.bin') : raw;
+    const decoded = Buffer.isBuffer(source) || source instanceof Uint8Array
+        ? await decodeRisuSave(source)
+        : source;
+    const dbObj = normalizeJSON(decoded);
+
+    // Plugin rows commit before chat ingestion rewrites database.bin. If the
+    // process stops between those steps, the inline monolith remains the
+    // authoritative copy and a later pass overwrites any partial/stale rows.
+    externalizePluginStorageIfNeeded(dbObj);
+
+    const result = await chatRowStore.ingestFullDatabase(dbObj, {
         restoreColdStorageCharacters: (dbObj) => {
             const coldRestoreResult = restoreColdStorageCharactersInDb(dbObj);
             if (coldRestoreResult.failed > 0) {
@@ -393,8 +401,15 @@ async function ingestDatabase(raw, { createBackup = false } = {}) {
 
 async function loadStrippedDatabase(raw, source) {
     const decoded = normalizeJSON(await decodeRisuSave(raw));
-    if (!hasChatPayloads(decoded)) return decoded;
-    logger.warn(`[${source}] Chat payload found in database.bin; externalizing defensively`);
+    const hasChats = hasChatPayloads(decoded);
+    const hasPluginStorage = hasExternalizablePluginStorage(decoded);
+    if (!hasChats && !hasPluginStorage) return decoded;
+    if (hasChats) {
+        logger.warn(`[${source}] Chat payload found in database.bin; externalizing defensively`);
+    }
+    if (hasPluginStorage) {
+        logger.warn(`[${source}] Folded plugin storage found in database.bin; externalizing defensively`);
+    }
     return (await ingestDatabase(decoded)).strippedDb;
 }
 
@@ -544,6 +559,10 @@ async function persistDbCache(filePath, decodedKey) {
             delete dbCache[filePath];
             throw err;
         }
+    }
+
+    if (decodedKey === 'database/database.bin') {
+        externalizePluginStorageIfNeeded(strippedDb);
     }
 
     const data = Buffer.from(encodeRisuSaveLegacy(strippedDb));
@@ -2069,6 +2088,67 @@ function decodePluginSaveStorageKey(storageKey, prefix) {
         throw new Error(`Non-canonical plugin storage key: ${storageKey}`);
     }
     return decoded;
+}
+
+function encodePluginSaveStorageKey(rawKey, prefix) {
+    const encoded = Buffer.from(rawKey, 'utf-8').toString('base64url');
+    const storageKey = `${prefix}${encoded}.json`;
+    // Keep generated names subject to the same canonical-form contract as
+    // imported backup entries.
+    decodePluginSaveStorageKey(storageKey, prefix);
+    return storageKey;
+}
+
+function hasExternalizablePluginStorage(dbObj) {
+    if (!dbObj || dbObj.optimizePluginMemory !== true) return false;
+    const inlineValues = dbObj.pluginCustomStorage;
+    const hasValues = inlineValues !== null
+        && typeof inlineValues === 'object'
+        && Object.keys(inlineValues).length > 0;
+    const hasMetaField = Object.prototype.hasOwnProperty.call(dbObj, 'pluginStorageMeta');
+    return hasValues || hasMetaField;
+}
+
+/**
+ * Re-externalize folded plugin storage from an optimized database object.
+ *
+ * Rows are committed before the caller is allowed to encode the mutated stub.
+ * A crash can therefore leave duplicates, never a stub without its rows. The
+ * source object is left untouched if any row write fails, and a later run
+ * overwrites rows from the still-inline values (inline wins).
+ */
+function externalizePluginStorageIfNeeded(dbObj) {
+    if (!hasExternalizablePluginStorage(dbObj)) {
+        return { changed: false, values: 0, meta: 0 };
+    }
+
+    const valueEntries = Object.entries(dbObj.pluginCustomStorage ?? {});
+    const metaEntries = Object.entries(dbObj.pluginStorageMeta ?? {});
+    const rows = [
+        ...valueEntries.map(([rawKey, value]) => ({
+            storageKey: encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_PREFIX),
+            value,
+        })),
+        ...metaEntries.map(([rawKey, value]) => ({
+            storageKey: encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX),
+            value,
+        })),
+    ];
+
+    const writeRows = sqliteDb.transaction(() => {
+        for (const row of rows) {
+            kvSet(row.storageKey, Buffer.from(JSON.stringify(row.value), 'utf-8'));
+        }
+    });
+    writeRows();
+
+    dbObj.pluginCustomStorage = {};
+    delete dbObj.pluginStorageMeta;
+    return {
+        changed: true,
+        values: valueEntries.length,
+        meta: metaEntries.length,
+    };
 }
 
 function parsePluginSaveJson(storageKey) {
@@ -3665,8 +3745,9 @@ app.post('/api/write', async (req, res, next) => {
                         return;
                     }
 
+                    const pluginExternalization = externalizePluginStorageIfNeeded(incomingDb);
                     const extracted = chatRowStore.extractPayloadChats(incomingDb);
-                    if (extracted > 0) {
+                    if (extracted > 0 || pluginExternalization.changed) {
                         persistedDatabaseContent = Buffer.from(encodeRisuSaveLegacy(incomingDb));
                     }
                     kvSet(key, persistedDatabaseContent);
@@ -3674,7 +3755,7 @@ app.post('/api/write', async (req, res, next) => {
                         chatRowStore.deleteRemovedChatRows(previousStrippedDb, incomingDb);
                     }
                 } catch (e) {
-                    logger.error('[Write] Failed to externalize database chats:', e.message);
+                    logger.error('[Write] Failed to externalize database payloads:', e.message);
                     res.status(500).json({ error: 'Database write failed' });
                     return;
                 }
@@ -3824,6 +3905,9 @@ app.post('/api/patch', async (req, res, next) => {
                 throw patchErr;
             }
             if (decodedKey === 'database/database.bin') {
+                // Keep dbCache and the ETag on the same optimized stub shape
+                // that the debounced persist will write.
+                externalizePluginStorageIfNeeded(snapshot);
                 chatRowStore.extractPayloadChats(snapshot);
                 chatRowStore.deleteRemovedChatRows(dbCache[filePath], snapshot);
             }
@@ -6454,6 +6538,11 @@ async function startServer() {
         migrateAssetsToFilesystem();
         await migrateInlaysToFilesystem();
         await migrateChatsToRowsIfNeeded();
+        // The chat marker can already exist on databases restored by older
+        // Node-only versions, so independently inspect the steady-state stub
+        // for folded optimized plugin storage before accepting clients.
+        const bootDatabase = kvGet('database/database.bin');
+        if (bootDatabase) await loadStrippedDatabase(bootDatabase, 'Migration');
         await migrateRemoteBlocksIfNeeded();
         const port = process.env.PORT || 6001;
         const httpsOptions = await getHttpsOptions();
