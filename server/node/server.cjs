@@ -6670,6 +6670,9 @@ async function startServer() {
         if (bootDatabase) await loadStrippedDatabase(bootDatabase, 'Migration');
         await migrateRemoteBlocksIfNeeded();
         const port = process.env.PORT || 6001;
+        // HOST limits the bind address (e.g. 127.0.0.1 behind a reverse
+        // proxy). Unset keeps the historical all-interfaces behavior.
+        const host = process.env.HOST || undefined;
         const httpsOptions = await getHttpsOptions();
         let server;
 
@@ -6677,17 +6680,17 @@ async function startServer() {
             // HTTPS
             server = https.createServer(httpsOptions, app);
             setupProxyStreamWebSocket(server);
-            server.listen(port, () => {
+            server.listen(port, host, () => {
                 console.log("[Server] HTTPS server is running.");
-                console.log(`[Server] https://localhost:${port}/`);
+                console.log(`[Server] https://${host || 'localhost'}:${port}/`);
             });
         } else {
             // HTTP
             server = http.createServer(app);
             setupProxyStreamWebSocket(server);
-            server.listen(port, () => {
+            server.listen(port, host, () => {
                 console.log("[Server] HTTP server is running.");
-                console.log(`[Server] http://localhost:${port}/`);
+                console.log(`[Server] http://${host || 'localhost'}:${port}/`);
             });
         }
     } catch (error) {
