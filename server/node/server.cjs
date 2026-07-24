@@ -6,7 +6,16 @@ const path = require('path');
 const net = require('net');
 const compression = require('compression');
 const htmlparser = require('node-html-parser');
-const { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, unlinkSync } = require('fs');
+const {
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    writeFileSync,
+    readdirSync,
+    unlinkSync,
+    createReadStream,
+    createWriteStream,
+} = require('fs');
 const fs = require('fs/promises')
 const nodeCrypto = require('crypto')
 const zlib = require('zlib')
@@ -51,6 +60,7 @@ const {
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks } = require('./utils.cjs');
 const { createChatRowStore, hasChatPayloads } = require('./chatRows.cjs');
+const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
 const { createChatBackupStore, resolveChatBackupMaxBytes } = require('./chatBackups.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
@@ -251,8 +261,14 @@ async function createBackupAndRotate() {
     const raw = kvGet('database/database.bin');
     if (!raw) return;
     const strippedDb = dbCache[DB_HEX_KEY] || await loadStrippedDatabase(raw, 'snapshot');
-    const fullDb = await chatRowStore.assembleFullDb(strippedDb);
-    kvSet(backupKey, Buffer.from(encodeRisuSaveLegacy(fullDb)));
+    const backupDbSpool = await spoolSelfContainedBackupDatabase(strippedDb);
+    try {
+        // SQLite's KV API still needs one Buffer, but the chat object tree is
+        // never materialized alongside it.
+        kvSet(backupKey, await fs.readFile(backupDbSpool.filePath));
+    } finally {
+        await fs.unlink(backupDbSpool.filePath).catch(() => {});
+    }
     trimSnapshotsToLimits();
 }
 
@@ -628,7 +644,7 @@ app.use((req, res, next) => {
     return express.raw({ type: 'application/octet-stream', limit: '2gb' })(req, res, next);
 });
 app.use(express.text({ limit: '100mb' }));
-const {pipeline} = require('stream/promises')
+const { pipeline, finished } = require('stream/promises')
 const sslPath = path.join(process.cwd(), 'server/node/ssl/certificate');
 const hubURL = 'https://sv.risuai.xyz';
 
@@ -1922,17 +1938,61 @@ function setupProxyStreamWebSocket(server) {
     });
 }
 
-function encodeBackupEntry(name, data) {
+function encodeBackupEntryHeader(name, dataSize) {
     const encodedName = Buffer.from(name, 'utf-8');
     const nameLength = Buffer.allocUnsafe(4);
     nameLength.writeUInt32LE(encodedName.length, 0);
     const dataLength = Buffer.allocUnsafe(4);
-    dataLength.writeUInt32LE(data.length, 0);
-    return Buffer.concat([nameLength, encodedName, dataLength, data]);
+    dataLength.writeUInt32LE(dataSize, 0);
+    return Buffer.concat([nameLength, encodedName, dataLength]);
+}
+
+function encodeBackupEntry(name, data) {
+    return Buffer.concat([encodeBackupEntryHeader(name, data.length), data]);
 }
 
 function backupEntrySize(name, dataSize) {
     return 8 + Buffer.byteLength(name, 'utf-8') + dataSize;
+}
+
+async function writeWithBackpressure(writable, chunk, isClosed = () => false) {
+    if (isClosed()) return false;
+    if (writable.write(chunk)) return true;
+    return new Promise((resolve, reject) => {
+        function cleanup() {
+            writable.removeListener('drain', onDrain);
+            writable.removeListener('error', onError);
+            writable.removeListener('close', onClose);
+        }
+        function onDrain() {
+            cleanup();
+            resolve(true);
+        }
+        function onError(error) {
+            cleanup();
+            reject(error);
+        }
+        function onClose() {
+            cleanup();
+            if (isClosed()) resolve(false);
+            else reject(new Error('Backup destination closed before draining'));
+        }
+        writable.once('drain', onDrain);
+        writable.once('error', onError);
+        writable.once('close', onClose);
+    });
+}
+
+async function streamFileToWritable(filePath, writable, isClosed = () => false) {
+    const input = createReadStream(filePath, { highWaterMark: 256 * 1024 });
+    try {
+        for await (const chunk of input) {
+            if (!await writeWithBackpressure(writable, chunk, isClosed)) return false;
+        }
+        return !isClosed();
+    } finally {
+        input.destroy();
+    }
 }
 
 function isInvalidBackupPathSegment(name) {
@@ -2164,35 +2224,63 @@ function parsePluginSaveJson(storageKey) {
 }
 
 /**
+ * Spool an assembled legacy database to disk. Chat and optional plugin rows
+ * are decoded and encoded one at a time; strippedDb is never mutated.
+ */
+async function spoolSelfContainedBackupDatabase(
+    strippedDb,
+    { foldPluginStorage = false, shouldAbort = () => false } = {}
+) {
+    const finalPath = path.join(
+        backupsDir,
+        `.database-risudat-${process.pid}-${nodeCrypto.randomUUID()}`
+    );
+    const filePath = finalPath + '.tmp';
+    const pluginStorage = foldPluginStorage
+        ? {
+            valueRows: kvList(PLUGIN_SAVE_PREFIX).map((storageKey) => ({
+                key: decodePluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX),
+                source: storageKey,
+            })),
+            metaRows: kvList(PLUGIN_SAVE_META_PREFIX).map((storageKey) => ({
+                key: decodePluginSaveStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX),
+                source: storageKey,
+            })),
+            readRow: parsePluginSaveJson,
+        }
+        : null;
+
+    try {
+        return await streamRisuSaveToFile({
+            dbObj: strippedDb,
+            filePath,
+            readChatRow: (chaId, chatId) => chatRowStore.readChatRow(chaId, chatId),
+            pluginStorage,
+            shouldAbort,
+        });
+    } catch (error) {
+        await fs.unlink(filePath).catch(() => {});
+        throw error;
+    }
+}
+
+/**
  * Chat rows are always assembled into database.risudat. Upstream exports also
  * fold external plugin rows into that database; Node-only exports keep them as
  * independent archive entries so large plugin stores are never monolithized.
  */
-async function buildSelfContainedBackupDatabase({ foldPluginStorage = true } = {}) {
+async function buildSelfContainedBackupDatabase({
+    foldPluginStorage = true,
+    shouldAbort = () => false,
+} = {}) {
     const raw = kvGet('database/database.bin');
     if (!raw) return null;
 
     const strippedDb = await loadStrippedDatabase(raw, 'Backup');
-    const dbObj = await chatRowStore.assembleFullDb(strippedDb);
-    if (!foldPluginStorage) {
-        return Buffer.from(encodeRisuSaveLegacy(dbObj));
-    }
-
-    const valueKeys = kvList(PLUGIN_SAVE_PREFIX);
-    const metaKeys = kvList(PLUGIN_SAVE_META_PREFIX);
-    if (valueKeys.length > 0) {
-        dbObj.pluginCustomStorage ??= {};
-        for (const storageKey of valueKeys) {
-            const key = decodePluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
-            dbObj.pluginCustomStorage[key] = parsePluginSaveJson(storageKey);
-        }
-    }
-    if (metaKeys.length > 0) dbObj.pluginStorageMeta ??= {};
-    for (const storageKey of metaKeys) {
-        const key = decodePluginSaveStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
-        dbObj.pluginStorageMeta[key] = parsePluginSaveJson(storageKey);
-    }
-    return Buffer.from(encodeRisuSaveLegacy(dbObj));
+    return spoolSelfContainedBackupDatabase(strippedDb, {
+        foldPluginStorage,
+        shouldAbort,
+    });
 }
 
 function listPluginBackupEntries() {
@@ -4102,6 +4190,9 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
 
 app.get('/api/backup/export', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
+    let backupDbSpool = null;
+    let closed = false;
+    res.once('close', () => { closed = true; });
     try {
         // ?target=upstream excludes NodeOnly-only slashed namespaces: plugin
         // rows plus inlay/, inlay_sidecar/, and inlay_meta/. Upstream RisuAI's
@@ -4110,9 +4201,11 @@ app.get('/api/backup/export', async (req, res, next) => {
         const target = req.query.target === 'upstream' ? 'upstream' : 'nodeonly';
         // Flush any pending patches to ensure export includes latest data
         await flushPendingDb();
-        const backupDbValue = await buildSelfContainedBackupDatabase({
+        backupDbSpool = await buildSelfContainedBackupDatabase({
             foldPluginStorage: target === 'upstream',
+            shouldAbort: () => closed,
         });
+        if (closed) return;
         const inlayFiles = target === 'upstream' ? [] : await listInlayFiles();
         const inlayEntries = await Promise.all(inlayFiles.map(async (entry) => {
             const stat = await fs.stat(entry.filePath);
@@ -4161,7 +4254,7 @@ app.get('/api/backup/export', async (req, res, next) => {
             ...inlayEntries,
             ...sidecarEntries.filter(Boolean),
         ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
-        const dbSize = backupDbValue?.length ?? 0;
+        const dbSize = backupDbSpool?.size ?? 0;
         const totalBytes = namespacedEntries.reduce((sum, entry) => {
             return sum + backupEntrySize(entry.backupName, entry.size);
         }, 0) + (dbSize ? backupEntrySize('database.risudat', dbSize) : 0);
@@ -4171,22 +4264,6 @@ app.get('/api/backup/export', async (req, res, next) => {
         res.setHeader('content-disposition', `attachment; filename="risu-backup-${Date.now()}${filenameSuffix}.bin"`);
         res.setHeader('content-length', totalBytes);
         res.setHeader('x-risu-backup-assets', namespacedEntries.length);
-
-        let closed = false;
-        res.once('close', () => { closed = true; });
-
-        function waitForDrain() {
-            if (closed) return Promise.resolve();
-            return new Promise(resolve => {
-                function done() {
-                    res.removeListener('drain', done);
-                    res.removeListener('close', done);
-                    resolve();
-                }
-                res.once('drain', done);
-                res.once('close', done);
-            });
-        }
 
         for (const entry of namespacedEntries) {
             if (closed) break;
@@ -4199,25 +4276,27 @@ app.get('/api/backup/export', async (req, res, next) => {
                     : await fs.readFile(entry.sourcePath);
             if (closed) break;
             if (value) {
-                const ok = res.write(encodeBackupEntry(entry.backupName, value));
-                if (!ok) {
-                    await waitForDrain();
-                    if (closed) break;
-                }
+                if (!await writeWithBackpressure(
+                    res,
+                    encodeBackupEntry(entry.backupName, value),
+                    () => closed
+                )) break;
             }
         }
 
-        if (!closed && dbSize) {
-            if (backupDbValue) {
-                const ok = res.write(encodeBackupEntry('database.risudat', backupDbValue));
-                if (!ok) {
-                    await waitForDrain();
-                }
+        if (!closed && dbSize && backupDbSpool) {
+            const header = encodeBackupEntryHeader('database.risudat', dbSize);
+            if (await writeWithBackpressure(res, header, () => closed)) {
+                await streamFileToWritable(backupDbSpool.filePath, res, () => closed);
             }
         }
         if (!closed) res.end();
     } catch (error) {
-        next(error);
+        if (!closed) next(error);
+    } finally {
+        if (backupDbSpool) {
+            await fs.unlink(backupDbSpool.filePath).catch(() => {});
+        }
     }
 });
 
@@ -4355,9 +4434,16 @@ app.post('/api/backup/import', async (req, res, next) => {
 app.post('/api/backup/server/save', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
     if (!checkActiveSession(req, res)) return;
+    let backupDbSpool = null;
+    let closed = false;
+    res.once('close', () => { closed = true; });
     try {
         await flushPendingDb();
-        const backupDbValue = await buildSelfContainedBackupDatabase({ foldPluginStorage: false });
+        backupDbSpool = await buildSelfContainedBackupDatabase({
+            foldPluginStorage: false,
+            shouldAbort: () => closed,
+        });
+        if (closed) return;
 
         // Pre-flight disk check — bail before streaming if the target dir
         // can't fit the backup. Avoids wasted minutes + half-written tmp files.
@@ -4406,8 +4492,8 @@ app.post('/api/backup/server/save', async (req, res, next) => {
         const totalBytes = namespacedEntries.reduce(
             (sum, entry) => sum + backupEntrySize(entry.backupName, entry.size),
             0
-        ) + (backupDbValue
-            ? backupEntrySize('database.risudat', backupDbValue.length)
+        ) + (backupDbSpool
+            ? backupEntrySize('database.risudat', backupDbSpool.size)
             : 0);
 
         // Stream progress as NDJSON
@@ -4417,51 +4503,48 @@ app.post('/api/backup/server/save', async (req, res, next) => {
         const filename = `risu-backup-${Date.now()}.bin`;
         const finalPath = path.join(backupsDir, filename);
         const tmpPath = finalPath + '.tmp';
-        const { createWriteStream: createFsWriteStream } = require('fs');
-        const writeStream = createFsWriteStream(tmpPath);
+        const writeStream = createWriteStream(tmpPath);
+        const writeStreamFinished = finished(writeStream);
+        writeStreamFinished.catch(() => {});
 
-        let closed = false;
         let writeComplete = false;
-        res.once('close', () => { closed = true; });
 
         try {
-            await new Promise((resolve, reject) => {
-                writeStream.on('error', reject);
-
-                (async () => {
-                    let written = 0;
-                    let bytesWritten = 0;
-                    for (const entry of namespacedEntries) {
-                        if (closed) break;
-                        const value = entry.kind === 'asset'
-                            ? readAssetValue(entry.key)
-                            : entry.kind === 'kv'
-                                ? kvGet(entry.key)
-                            : entry.kind === 'buffer'
-                                ? entry.buffer
-                                : await fs.readFile(entry.sourcePath);
-                        if (value) {
-                            const encodedEntry = encodeBackupEntry(entry.backupName, value);
-                            const ok = writeStream.write(encodedEntry);
-                            if (!ok) await new Promise(r => writeStream.once('drain', r));
-                            bytesWritten += encodedEntry.length;
-                        }
-                        written++;
-                        if (written % 50 === 0 || written === namespacedEntries.length) {
-                            res.write(JSON.stringify({ type: 'progress', current: written, total: totalEntries, bytes: bytesWritten, totalBytes }) + '\n');
-                        }
-                    }
-                    if (closed) throw new Error('Client disconnected during backup save');
-                    if (backupDbValue) {
-                        const encodedEntry = encodeBackupEntry('database.risudat', backupDbValue);
-                        const ok = writeStream.write(encodedEntry);
-                        if (!ok) await new Promise(r => writeStream.once('drain', r));
-                        bytesWritten += encodedEntry.length;
-                    }
-                    res.write(JSON.stringify({ type: 'progress', current: totalEntries, total: totalEntries, bytes: bytesWritten, totalBytes }) + '\n');
-                    writeStream.end(resolve);
-                })().catch(reject);
-            });
+            let written = 0;
+            let bytesWritten = 0;
+            for (const entry of namespacedEntries) {
+                if (closed) break;
+                const value = entry.kind === 'asset'
+                    ? readAssetValue(entry.key)
+                    : entry.kind === 'kv'
+                        ? kvGet(entry.key)
+                    : entry.kind === 'buffer'
+                        ? entry.buffer
+                        : await fs.readFile(entry.sourcePath);
+                if (value) {
+                    const encodedEntry = encodeBackupEntry(entry.backupName, value);
+                    if (!await writeWithBackpressure(writeStream, encodedEntry, () => closed)) break;
+                    bytesWritten += encodedEntry.length;
+                }
+                written++;
+                if (written % 50 === 0 || written === namespacedEntries.length) {
+                    res.write(JSON.stringify({ type: 'progress', current: written, total: totalEntries, bytes: bytesWritten, totalBytes }) + '\n');
+                }
+            }
+            if (closed) throw new Error('Client disconnected during backup save');
+            if (backupDbSpool) {
+                const header = encodeBackupEntryHeader('database.risudat', backupDbSpool.size);
+                if (!await writeWithBackpressure(writeStream, header, () => closed)) {
+                    throw new Error('Client disconnected during backup save');
+                }
+                if (!await streamFileToWritable(backupDbSpool.filePath, writeStream, () => closed)) {
+                    throw new Error('Client disconnected during backup save');
+                }
+                bytesWritten += header.length + backupDbSpool.size;
+            }
+            res.write(JSON.stringify({ type: 'progress', current: totalEntries, total: totalEntries, bytes: bytesWritten, totalBytes }) + '\n');
+            writeStream.end();
+            await writeStreamFinished;
 
             // Atomic rename: only expose the file after successful write
             await fs.rename(tmpPath, finalPath);
@@ -4474,16 +4557,24 @@ app.post('/api/backup/server/save', async (req, res, next) => {
         } catch (innerError) {
             // Clean up incomplete temp file
             if (!writeComplete) {
+                writeStream.destroy();
+                await writeStreamFinished.catch(() => {});
                 await fs.unlink(tmpPath).catch(() => {});
             }
             throw innerError;
         }
     } catch (error) {
-        if (!res.headersSent) {
+        if (closed) {
+            return;
+        } else if (!res.headersSent) {
             next(error);
         } else {
             res.write(JSON.stringify({ type: 'error', message: error.message }) + '\n');
             res.end();
+        }
+    } finally {
+        if (backupDbSpool) {
+            await fs.unlink(backupDbSpool.filePath).catch(() => {});
         }
     }
 });

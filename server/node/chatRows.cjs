@@ -364,6 +364,7 @@ module.exports = {
     chatRowKey,
     parseChatRowKey,
     chatToStub,
+    mergeChatStubWithFullChat,
     hasChatPayloads,
     referencedChatRowKeys,
     extractPayloadChats,
