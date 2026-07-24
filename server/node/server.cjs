@@ -61,6 +61,7 @@ const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks } = require('./utils.cjs');
 const { createChatRowStore, hasChatPayloads } = require('./chatRows.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
+const { inspectRisuSaveSource, shouldStreamRisuSave } = require('./streamRisuLoad.cjs');
 const { createChatBackupStore, resolveChatBackupMaxBytes } = require('./chatBackups.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
@@ -389,6 +390,14 @@ async function migrateRemoteBlocksIfNeeded() {
 async function ingestDatabase(raw, { createBackup = false } = {}) {
     const migration = await migrateRemoteBlocksIfNeeded();
     const source = migration.ran ? kvGet('database/database.bin') : raw;
+    if (Buffer.isBuffer(source) || source instanceof Uint8Array) {
+        const inspection = await inspectRisuSaveSource(source);
+        if (await shouldStreamRisuSave(source, { inspection })) {
+            const result = await ingestDatabaseStreaming(source, { inspection });
+            if (createBackup) await createBackupAndRotate();
+            return result;
+        }
+    }
     const decoded = Buffer.isBuffer(source) || source instanceof Uint8Array
         ? await decodeRisuSave(source)
         : source;
@@ -415,7 +424,43 @@ async function ingestDatabase(raw, { createBackup = false } = {}) {
     return result;
 }
 
+function logColdStorageRestoreFailures(result) {
+    if (!result || result.failed <= 0) return;
+    logger.error(`[ColdStorage] ${result.failed} character(s) could not be restored and were converted to safe blank characters. Cold storage KV data is preserved.`);
+    for (const name of result.failedNames) {
+        logger.error(`[ColdStorage]   - "${name}"`);
+    }
+}
+
+async function ingestDatabaseStreaming(source, { inspection = null } = {}) {
+    const result = await chatRowStore.ingestStreamingDatabase(source, {
+        inspection: inspection ?? await inspectRisuSaveSource(source),
+        tempDir: savePath,
+        onPluginStorageEntry: ({ field, key, value }) => {
+            const prefix = field === 'pluginStorageMeta'
+                ? PLUGIN_SAVE_META_PREFIX
+                : PLUGIN_SAVE_PREFIX;
+            kvSet(
+                encodePluginSaveStorageKey(key, prefix),
+                Buffer.from(JSON.stringify(value), 'utf-8')
+            );
+        },
+        restoreColdStorageCharacters: (dbObj) => {
+            const coldRestoreResult = restoreColdStorageCharactersInDb(dbObj);
+            logColdStorageRestoreFailures(coldRestoreResult);
+            return coldRestoreResult;
+        },
+    });
+    return result;
+}
+
 async function loadStrippedDatabase(raw, source) {
+    const inspection = await inspectRisuSaveSource(raw);
+    if (kvGet(CHAT_EXTERNALIZATION_MARKER_KEY) === null
+        && await shouldStreamRisuSave(raw, { inspection })) {
+        logger.warn(`[${source}] Large supported database.bin found; externalizing through the streaming ingest path`);
+        return (await ingestDatabaseStreaming(raw, { inspection })).strippedDb;
+    }
     const decoded = normalizeJSON(await decodeRisuSave(raw));
     const hasChats = hasChatPayloads(decoded);
     const hasPluginStorage = hasExternalizablePluginStorage(decoded);
@@ -2354,41 +2399,14 @@ function resolveBackupStorageKey(name) {
     return `assets/${name}`;
 }
 
-function parseBackupChunk(buffer, onEntry) {
-    let offset = 0;
-    while (offset + 4 <= buffer.length) {
-        const nameLength = buffer.readUInt32LE(offset);
-        if (offset + 4 + nameLength > buffer.length) {
-            break;
-        }
-        const nameStart = offset + 4;
-        const nameEnd = nameStart + nameLength;
-        const name = buffer.subarray(nameStart, nameEnd).toString('utf-8');
-        if (nameEnd + 4 > buffer.length) {
-            break;
-        }
-        const dataLength = buffer.readUInt32LE(nameEnd);
-        const dataStart = nameEnd + 4;
-        const dataEnd = dataStart + dataLength;
-        if (dataEnd > buffer.length) {
-            break;
-        }
-        onEntry(name, buffer.subarray(dataStart, dataEnd));
-        offset = dataEnd;
-    }
-    return buffer.subarray(offset);
-}
-
 // ─── Shared backup import logic ─────────────────────────────────────────────
 // Accepts any async iterable of Buffer chunks (HTTP request body, file stream, etc.)
 async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0, onProgress = null } = {}) {
-    // Defer Buffer.concat until enough bytes for the next entry are buffered.
-    // Concatenating on every chunk arrival is O(n²) when a single entry (e.g.
-    // database.risudat) far exceeds chunk size.
-    let pendingChunks = [];
-    let pendingTotal = 0;
-    let nextEntryThreshold = 8;
     let hasDatabase = false;
+    let databaseSpool = null;
+    let databaseWriteStream = null;
+    let databaseWriteFinished = null;
+    let streamingDatabaseIngestion = null;
     let assetsRestored = 0;
     let bytesReceived = 0;
     const seenEntryNames = new Set();
@@ -2440,6 +2458,81 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         writeFileSync(stagingSidecarPath(id), JSON.stringify(sidecar));
     }
 
+    function importBufferedEntry(name, data) {
+        const inlayRaw = parseInlayBackupName(name);
+        const inlaySidecar = parseInlaySidecarBackupName(name);
+
+        if (inlayRaw) {
+            importedInlayIds.add(inlayRaw.id);
+            if (inlayRaw.ext) {
+                writeStagingInlayFileSync(inlayRaw.id, inlayRaw.ext, data, legacyInlayInfoMap.get(inlayRaw.id) || { ext: inlayRaw.ext, name: inlayRaw.id, type: 'image' });
+            } else if (data.length > 0 && data[0] === 0x7b) {
+                const parsed = JSON.parse(data.toString('utf-8'));
+                const type = typeof parsed?.type === 'string' ? parsed.type : 'image';
+                const ext = normalizeInlayExt(parsed?.ext);
+                const buffer = type === 'signature'
+                    ? Buffer.from(typeof parsed?.data === 'string' ? parsed.data : '', 'utf-8')
+                    : decodeDataUri(parsed?.data).buffer;
+                writeStagingInlayFileSync(inlayRaw.id, ext, buffer, legacyInlayInfoMap.get(inlayRaw.id) || {
+                    ext,
+                    name: typeof parsed?.name === 'string' ? parsed.name : inlayRaw.id,
+                    type,
+                    height: typeof parsed?.height === 'number' ? parsed.height : undefined,
+                    width: typeof parsed?.width === 'number' ? parsed.width : undefined,
+                });
+            } else {
+                writeStagingInlayFileSync(inlayRaw.id, 'bin', data, legacyInlayInfoMap.get(inlayRaw.id) || {
+                    ext: 'bin',
+                    name: inlayRaw.id,
+                    type: 'image',
+                });
+            }
+            if (explicitSidecarMap.has(inlayRaw.id)) {
+                writeStagingSidecarSync(inlayRaw.id, explicitSidecarMap.get(inlayRaw.id));
+            } else if (!importedSidecarIds.has(inlayRaw.id)) {
+                const legacyInfo = legacyInlayInfoMap.get(inlayRaw.id);
+                if (legacyInfo) writeStagingSidecarSync(inlayRaw.id, legacyInfo);
+            }
+            assetsRestored += 1;
+        } else if (inlaySidecar) {
+            const parsed = JSON.parse(data.toString('utf-8'));
+            explicitSidecarMap.set(inlaySidecar.id, parsed);
+            writeStagingSidecarSync(inlaySidecar.id, parsed);
+            importedSidecarIds.add(inlaySidecar.id);
+        } else if (name.startsWith('inlay_info/')) {
+            const id = name.slice('inlay_info/'.length);
+            if (!isSafeInlayId(id)) {
+                throw new Error(`Invalid legacy inlay info entry name: ${name}`);
+            }
+            const parsed = JSON.parse(data.toString('utf-8'));
+            legacyInlayInfoMap.set(id, {
+                ext: normalizeInlayExt(parsed?.ext),
+                name: typeof parsed?.name === 'string' ? parsed.name : id,
+                type: typeof parsed?.type === 'string' ? parsed.type : 'image',
+                height: typeof parsed?.height === 'number' ? parsed.height : undefined,
+                width: typeof parsed?.width === 'number' ? parsed.width : undefined,
+            });
+            if (importedInlayIds.has(id) && !importedSidecarIds.has(id)) {
+                writeStagingSidecarSync(id, legacyInlayInfoMap.get(id));
+            }
+        } else if (name.startsWith('inlay_thumb/')) {
+            // Skip deprecated thumbnail entries from legacy backups.
+        } else {
+            const storageKey = resolveBackupStorageKey(name);
+            const storageValue = storageKey.startsWith('coldstorage/')
+                ? encodeColdStorageCanonicalBuffer(
+                    parseColdStorageJsonBuffer(data, name, { allowPlainJson: true }).coldData
+                )
+                : data;
+            if (storageKey.startsWith('assets/')) {
+                writeImportedAsset(assetStage, storageKey, storageValue, 'Backup import');
+            } else {
+                kvSet(storageKey, storageValue);
+            }
+            assetsRestored += 1;
+        }
+    }
+
     await flushPendingDb();
     await createBackupAndRotate();
 
@@ -2456,7 +2549,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         kvDelPrefix('inlay_info/');
         kvDelPrefix('coldstorage/');
         // Chat rows are per-database payloads and are never carried as backup
-        // entries; imported database.risudat recreates them after commit.
+        // entries; imported database.risudat recreates them before commit.
         for (const key of chatRowStore.listAllChatRowKeys()) kvDel(key);
         // Plugin rows belong to the imported database. New Node-only backups
         // repopulate them as entries below; legacy/upstream backups keep their
@@ -2480,6 +2573,8 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         kvDel(CHAT_EXTERNALIZATION_MARKER_KEY);
         clearEntities();
 
+        let pending = Buffer.alloc(0);
+        let currentEntry = null;
         for await (const chunk of dataSource) {
             bytesReceived += chunk.length;
             if (maxBytes > 0 && bytesReceived > maxBytes) {
@@ -2487,128 +2582,112 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
             }
             if (onProgress) onProgress(bytesReceived, totalBytes);
 
-            pendingChunks.push(Buffer.from(chunk));
-            pendingTotal += chunk.length;
-            if (pendingTotal < nextEntryThreshold) continue;
+            let buffer = pending.length > 0
+                ? Buffer.concat([pending, Buffer.from(chunk)])
+                : Buffer.from(chunk);
+            pending = Buffer.alloc(0);
 
-            const buffer = pendingChunks.length === 1
-                ? pendingChunks[0]
-                : Buffer.concat(pendingChunks, pendingTotal);
-            pendingChunks = [];
-            pendingTotal = 0;
+            while (buffer.length > 0) {
+                if (!currentEntry) {
+                    if (buffer.length < 4) {
+                        pending = Buffer.from(buffer);
+                        break;
+                    }
+                    const nameLength = buffer.readUInt32LE(0);
+                    if (nameLength > BACKUP_ENTRY_NAME_MAX_BYTES) {
+                        throw new Error(`Backup entry name exceeds ${BACKUP_ENTRY_NAME_MAX_BYTES} bytes`);
+                    }
+                    const headerLength = 4 + nameLength + 4;
+                    if (buffer.length < headerLength) {
+                        pending = Buffer.from(buffer);
+                        break;
+                    }
 
-            const remaining = parseBackupChunk(buffer, (name, data) => {
-                if (seenEntryNames.has(name)) {
-                    throw new Error(`Duplicate backup entry: ${name}`);
+                    const name = buffer.subarray(4, 4 + nameLength).toString('utf-8');
+                    const dataLength = buffer.readUInt32LE(4 + nameLength);
+                    buffer = buffer.subarray(headerLength);
+
+                    if (seenEntryNames.has(name)) {
+                        throw new Error(`Duplicate backup entry: ${name}`);
+                    }
+                    seenEntryNames.add(name);
+                    if (name === 'encryption.risudat') {
+                        throw new Error('Encrypted risuai.xyz account backups cannot be imported. Re-export the backup without account encryption and try again.');
+                    }
+
+                    currentEntry = {
+                        name,
+                        remaining: dataLength,
+                        chunks: name === 'database.risudat' ? null : [],
+                        total: 0,
+                    };
+                    if (name === 'database.risudat') {
+                        const filePath = path.join(
+                            savePath,
+                            `.database-import-${process.pid}-${nodeCrypto.randomUUID()}.tmp`
+                        );
+                        databaseSpool = { filePath, size: dataLength };
+                        databaseWriteStream = createWriteStream(filePath, { flags: 'wx' });
+                        databaseWriteFinished = finished(databaseWriteStream);
+                        databaseWriteFinished.catch(() => {});
+                    }
                 }
-                seenEntryNames.add(name);
 
-                const inlayRaw = parseInlayBackupName(name);
-                const inlaySidecar = parseInlaySidecarBackupName(name);
-
-                if (inlayRaw) {
-                    importedInlayIds.add(inlayRaw.id);
-                    if (inlayRaw.ext) {
-                        writeStagingInlayFileSync(inlayRaw.id, inlayRaw.ext, data, legacyInlayInfoMap.get(inlayRaw.id) || { ext: inlayRaw.ext, name: inlayRaw.id, type: 'image' });
-                    } else if (data.length > 0 && data[0] === 0x7b) {
-                        const parsed = JSON.parse(data.toString('utf-8'));
-                        const type = typeof parsed?.type === 'string' ? parsed.type : 'image';
-                        const ext = normalizeInlayExt(parsed?.ext);
-                        const buffer = type === 'signature'
-                            ? Buffer.from(typeof parsed?.data === 'string' ? parsed.data : '', 'utf-8')
-                            : decodeDataUri(parsed?.data).buffer;
-                        writeStagingInlayFileSync(inlayRaw.id, ext, buffer, legacyInlayInfoMap.get(inlayRaw.id) || {
-                            ext,
-                            name: typeof parsed?.name === 'string' ? parsed.name : inlayRaw.id,
-                            type,
-                            height: typeof parsed?.height === 'number' ? parsed.height : undefined,
-                            width: typeof parsed?.width === 'number' ? parsed.width : undefined,
-                        });
-                    } else {
-                        writeStagingInlayFileSync(inlayRaw.id, 'bin', data, legacyInlayInfoMap.get(inlayRaw.id) || {
-                            ext: 'bin',
-                            name: inlayRaw.id,
-                            type: 'image',
-                        });
-                    }
-                    if (explicitSidecarMap.has(inlayRaw.id)) {
-                        writeStagingSidecarSync(inlayRaw.id, explicitSidecarMap.get(inlayRaw.id));
-                    } else if (!importedSidecarIds.has(inlayRaw.id)) {
-                        const legacyInfo = legacyInlayInfoMap.get(inlayRaw.id);
-                        if (legacyInfo) {
-                            writeStagingSidecarSync(inlayRaw.id, legacyInfo);
+                const take = Math.min(currentEntry.remaining, buffer.length);
+                if (take > 0) {
+                    const piece = buffer.subarray(0, take);
+                    if (currentEntry.name === 'database.risudat') {
+                        if (!await writeWithBackpressure(databaseWriteStream, piece)) {
+                            throw new Error('Database spool closed during backup import');
                         }
-                    }
-                    assetsRestored += 1;
-                } else if (inlaySidecar) {
-                    const parsed = JSON.parse(data.toString('utf-8'));
-                    explicitSidecarMap.set(inlaySidecar.id, parsed);
-                    writeStagingSidecarSync(inlaySidecar.id, parsed);
-                    importedSidecarIds.add(inlaySidecar.id);
-                } else if (name.startsWith('inlay_info/')) {
-                    const id = name.slice('inlay_info/'.length);
-                    if (!isSafeInlayId(id)) {
-                        throw new Error(`Invalid legacy inlay info entry name: ${name}`);
-                    }
-                    const parsed = JSON.parse(data.toString('utf-8'));
-                    legacyInlayInfoMap.set(id, {
-                        ext: normalizeInlayExt(parsed?.ext),
-                        name: typeof parsed?.name === 'string' ? parsed.name : id,
-                        type: typeof parsed?.type === 'string' ? parsed.type : 'image',
-                        height: typeof parsed?.height === 'number' ? parsed.height : undefined,
-                        width: typeof parsed?.width === 'number' ? parsed.width : undefined,
-                    });
-                    if (importedInlayIds.has(id) && !importedSidecarIds.has(id)) {
-                        writeStagingSidecarSync(id, legacyInlayInfoMap.get(id));
-                    }
-                } else if (name.startsWith('inlay_thumb/')) {
-                    // Skip deprecated thumbnail entries from legacy backups
-                } else {
-                    const storageKey = resolveBackupStorageKey(name);
-                    const storageValue = storageKey.startsWith('coldstorage/')
-                        ? encodeColdStorageCanonicalBuffer(
-                            parseColdStorageJsonBuffer(data, name, { allowPlainJson: true }).coldData
-                        )
-                        : data;
-                    if (storageKey.startsWith('assets/')) {
-                        writeImportedAsset(assetStage, storageKey, storageValue, 'Backup import');
                     } else {
-                        kvSet(storageKey, storageValue);
+                        currentEntry.chunks.push(Buffer.from(piece));
+                        currentEntry.total += piece.length;
                     }
-                    if (storageKey === 'database/database.bin') {
+                    currentEntry.remaining -= take;
+                    buffer = buffer.subarray(take);
+                }
+
+                if (currentEntry.remaining === 0) {
+                    if (currentEntry.name === 'database.risudat') {
+                        databaseWriteStream.end();
+                        await databaseWriteFinished;
+                        databaseWriteStream = null;
+                        databaseWriteFinished = null;
                         hasDatabase = true;
                     } else {
-                        assetsRestored += 1;
+                        const data = currentEntry.chunks.length === 1
+                            ? currentEntry.chunks[0]
+                            : Buffer.concat(currentEntry.chunks, currentEntry.total);
+                        importBufferedEntry(currentEntry.name, data);
                     }
-                }
-
-            });
-
-            if (remaining.length === 0) {
-                nextEntryThreshold = 8;
-            } else {
-                pendingChunks.push(remaining);
-                pendingTotal = remaining.length;
-                if (remaining.length < 4) {
-                    nextEntryThreshold = 8;
-                } else {
-                    const nameLen = remaining.readUInt32LE(0);
-                    const headerEnd = 4 + nameLen + 4;
-                    if (remaining.length < headerEnd) {
-                        nextEntryThreshold = headerEnd;
-                    } else {
-                        const dataLen = remaining.readUInt32LE(4 + nameLen);
-                        nextEntryThreshold = headerEnd + dataLen;
-                    }
+                    currentEntry = null;
                 }
             }
         }
 
-        if (pendingTotal > 0) {
+        if (pending.length > 0 || currentEntry) {
             throw new Error('Backup stream ended with incomplete entry');
         }
         if (!hasDatabase) {
             throw new Error('Backup does not contain database.risudat');
+        }
+
+        const databaseSource = {
+            filePath: databaseSpool.filePath,
+            size: databaseSpool.size,
+        };
+        const databaseInspection = await inspectRisuSaveSource(databaseSource);
+        if (await shouldStreamRisuSave(databaseSource, { inspection: databaseInspection })) {
+            streamingDatabaseIngestion = await ingestDatabaseStreaming(databaseSource, {
+                inspection: databaseInspection,
+            });
+            // Supported legacy/gzip saves cannot contain REMOTE blocks.
+            markRemoteMigrationDone();
+        } else {
+            // Exotic/small formats retain the historical monolith + post-commit
+            // decoder path so their behavior remains unchanged.
+            kvSet(DB_BLOB_KEY, await fs.readFile(databaseSpool.filePath));
         }
         for (const [id, info] of legacyInlayInfoMap.entries()) {
             if (importedInlayIds.has(id) && !importedSidecarIds.has(id)) {
@@ -2650,6 +2729,13 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         throw error;
     } finally {
         sqliteDb.pragma('synchronous = NORMAL');
+        if (databaseWriteStream) {
+            databaseWriteStream.destroy();
+            await databaseWriteFinished?.catch(() => {});
+        }
+        if (databaseSpool) {
+            await fs.unlink(databaseSpool.filePath).catch(() => {});
+        }
     }
 
     try { assetSwap.finalize(); } catch (error) {
@@ -2661,10 +2747,10 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
 
     invalidateDbCache();
 
-    // Externalize the imported monolith and include cold-storage failures in the
-    // streamed import result.
-    const dbRaw = kvGet('database/database.bin');
-    let coldStorageFailed = 0;
+    // Small/exotic formats still externalize after commit through the legacy
+    // decoder. Supported large formats were ingested inside the import transaction.
+    let coldStorageFailed = streamingDatabaseIngestion?.stats.failed || 0;
+    const dbRaw = streamingDatabaseIngestion ? null : kvGet(DB_BLOB_KEY);
     if (dbRaw) {
         const ingestion = await ingestDatabase(dbRaw);
         coldStorageFailed = ingestion.stats.failed || 0;
@@ -5059,9 +5145,15 @@ function clearExistingData() {
 
 async function importLegacySaveEntries(sources, missingDatabaseMessage) {
     if (sources.length === 0) return { imported: 0 };
-    if (!sources.some((entry) => entry.key === DB_BLOB_KEY)) {
+    const databaseEntry = sources.find((entry) => entry.key === DB_BLOB_KEY);
+    if (!databaseEntry) {
         throw new Error(missingDatabaseMessage);
     }
+    const databaseSource = databaseEntry.streamSource ?? databaseEntry.read();
+    const databaseInspection = await inspectRisuSaveSource(databaseSource);
+    const streamDatabase = await shouldStreamRisuSave(databaseSource, {
+        inspection: databaseInspection,
+    });
     await flushPendingDb();
     await createBackupAndRotate();
     invalidateDbCache();
@@ -5072,13 +5164,17 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
     );
     const now = Date.now();
     let assetSwap = null;
+    let streamingIngestion = null;
 
     try {
         sqliteDb.exec('BEGIN');
         clearExistingData();
         for (const source of sources) {
             const { key } = source;
-            const value = source.read();
+            if (key === DB_BLOB_KEY && streamDatabase) continue;
+            const value = key === DB_BLOB_KEY && !source.streamSource
+                ? databaseSource
+                : source.read();
             if (key.startsWith('assets/')) {
                 writeImportedAsset(
                     assetStage,
@@ -5099,6 +5195,13 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
                 continue;
             }
             insert.run(key, value, now);
+        }
+
+        if (streamDatabase) {
+            streamingIngestion = await ingestDatabaseStreaming(databaseSource, {
+                inspection: databaseInspection,
+            });
+            markRemoteMigrationDone();
         }
 
         assetSwap = swapAssetDirectoryFromStaging(
@@ -5122,7 +5225,7 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
         logger.warn('[Save-folder Import] Failed to remove previous asset directory:', error);
     }
 
-    const importedDbRaw = kvGet(DB_BLOB_KEY);
+    const importedDbRaw = streamingIngestion ? null : kvGet(DB_BLOB_KEY);
     if (importedDbRaw) {
         await ingestDatabase(importedDbRaw);
     }
@@ -5136,9 +5239,13 @@ async function importHexFilesFromDir(dirPath) {
     if (!hasDatabase) throw new Error('Save folder does not contain database/database.bin');
     const sources = hexFiles.map((hexFile) => {
         const key = Buffer.from(hexFile, 'hex').toString('utf-8');
+        const filePath = path.join(dirPath, hexFile);
         return {
             key,
-            read: () => readFileSync(path.join(dirPath, hexFile)),
+            streamSource: key === DB_BLOB_KEY
+                ? { filePath, size: require('fs').statSync(filePath).size }
+                : null,
+            read: () => readFileSync(filePath),
         };
     });
     return importLegacySaveEntries(
@@ -5150,6 +5257,7 @@ async function importHexFilesFromDir(dirPath) {
 async function importHexEntries(entries) {
     const sources = entries.map(({ key, value }) => ({
         key,
+        streamSource: key === DB_BLOB_KEY ? value : null,
         read: () => value,
     }));
     return importLegacySaveEntries(
@@ -5895,10 +6003,10 @@ app.delete('/api/db/snapshots', async (req, res, next) => {
     } catch (err) { next(err); }
 });
 
-// Restore a snapshot server-side: copy the full snapshot → live blob, then
-// externalize it before exposing the new stripped ETag. Client-side reload is
-// racy because the patch-sync save loop is debounced and the reload can fire
-// before the snapshot data lands on disk.
+// Restore a snapshot server-side. Supported large snapshots ingest directly
+// into chat rows + the stripped live blob; legacy formats retain copy-then-
+// ingest. Client-side reload is racy because the patch-sync save loop is
+// debounced and the reload can fire before the snapshot data lands on disk.
 app.post('/api/db/snapshots/restore', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
@@ -5916,15 +6024,26 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             // /api/db/optimize. Without this, an in-flight save could land
             // after kvCopyValue and overwrite the restored snapshot.
             await flushPendingDb();
-            kvCopyValue(key, DB_BLOB_KEY);
-            // Snapshot may pre-date the remote-block migration. Clear the marker
-            // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
-            // bytes instead of skipping based on the prior post-migration state.
-            kvDel(REMOTE_MIGRATION_MARKER_KEY);
-            invalidateDbCache();
-            const raw = kvGet(DB_BLOB_KEY);
-            if (raw) {
-                const ingestion = await ingestDatabase(raw);
+            const inspection = await inspectRisuSaveSource(blob);
+            let ingestion;
+            if (await shouldStreamRisuSave(blob, { inspection })) {
+                // Avoid copying the snapshot monolith into the live key. The
+                // streaming ingest atomically writes rows + stripped DB instead.
+                kvDel(REMOTE_MIGRATION_MARKER_KEY);
+                invalidateDbCache();
+                ingestion = await ingestDatabaseStreaming(blob, { inspection });
+                markRemoteMigrationDone();
+            } else {
+                kvCopyValue(key, DB_BLOB_KEY);
+                // Snapshot may pre-date the remote-block migration. Clear the marker
+                // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
+                // bytes instead of skipping based on the prior post-migration state.
+                kvDel(REMOTE_MIGRATION_MARKER_KEY);
+                invalidateDbCache();
+                const raw = kvGet(DB_BLOB_KEY);
+                if (raw) ingestion = await ingestDatabase(raw);
+            }
+            if (ingestion) {
                 const strippedBytes = Buffer.from(encodeRisuSaveLegacy(ingestion.strippedDb));
                 dbEtag = computeBufferEtag(strippedBytes);
             }

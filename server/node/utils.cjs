@@ -579,6 +579,7 @@ module.exports = {
     encodeRisuSaveLegacy,
     calculateHash,
     normalizeJSON,
+    ensureBotPresetIds,
     checkHeader,
     checkCompressionStreams,
     hasRemoteBlocks,

@@ -6,6 +6,7 @@ const {
     encodeRisuSaveLegacy,
     normalizeJSON,
 } = require('./utils.cjs');
+const { walkRisuSave } = require('./streamRisuLoad.cjs');
 
 const DB_BLOB_KEY = 'database/database.bin';
 const CHAT_PREFIX = 'chats/';
@@ -44,15 +45,19 @@ function chatToStub(chat) {
     return stub;
 }
 
-function assignMissingChatIds(dbObj) {
+function assignMissingChatId(chat, makeId = nodeCrypto.randomUUID) {
+    if (!chat || chat._stub || chat.id) return false;
+    chat.id = makeId();
+    return true;
+}
+
+function assignMissingChatIds(dbObj, makeId = nodeCrypto.randomUUID) {
     let changed = false;
     if (!dbObj?.characters) return changed;
     for (const char of dbObj.characters) {
         if (!char?.chats) continue;
         for (const chat of char.chats) {
-            if (!chat || chat._stub || chat.id) continue;
-            chat.id = nodeCrypto.randomUUID();
-            changed = true;
+            if (assignMissingChatId(chat, makeId)) changed = true;
         }
     }
     return changed;
@@ -65,14 +70,16 @@ function normalizeOrphanFolderIds(dbObj) {
         if (!char?.chats) continue;
         const validIds = new Set((char.chatFolders ?? []).map(f => f?.id).filter(Boolean));
         for (const chat of char.chats) {
-            if (!chat) continue;
-            if (chat.folderId && !validIds.has(chat.folderId)) {
-                chat.folderId = null;
-                changed = true;
-            }
+            if (normalizeChatOrphanFolderId(chat, validIds)) changed = true;
         }
     }
     return changed;
+}
+
+function normalizeChatOrphanFolderId(chat, validIds) {
+    if (!chat || !chat.folderId || validIds.has(chat.folderId)) return false;
+    chat.folderId = null;
+    return true;
 }
 
 function hasChatPayloads(dbObj) {
@@ -98,40 +105,47 @@ function referencedChatRowKeys(dbObj) {
     return keys;
 }
 
-function extractPayloadChats(dbObj, onPayload) {
+function createChatExternalizer(chaId, onPayload, makeId = nodeCrypto.randomUUID) {
+    const seenChatIds = new Set();
+    return function externalizeChat(chat) {
+        if (!chat) return { chat, extracted: false };
+        if (!Array.isArray(chat.message)) {
+            if (chat.id) seenChatIds.add(chat.id);
+            return { chat, extracted: false };
+        }
+
+        const payload = { ...chat };
+        if (payload._stub === true) delete payload._stub;
+        if (!payload.id || seenChatIds.has(payload.id)) {
+            do {
+                payload.id = makeId();
+            } while (seenChatIds.has(payload.id));
+        }
+        seenChatIds.add(payload.id);
+
+        onPayload(chaId, payload.id, payload);
+        return { chat: chatToStub(payload), extracted: true };
+    };
+}
+
+function extractPayloadChats(dbObj, onPayload, makeId = nodeCrypto.randomUUID) {
     let extracted = 0;
     if (!dbObj?.characters) return extracted;
 
     for (const char of dbObj.characters) {
         if (!char?.chaId || !char.chats) continue;
-        const seenChatIds = new Set();
+        const externalizeChat = createChatExternalizer(char.chaId, onPayload, makeId);
         for (let index = 0; index < char.chats.length; index++) {
-            const chat = char.chats[index];
-            if (!chat) continue;
-            if (!Array.isArray(chat.message)) {
-                if (chat.id) seenChatIds.add(chat.id);
-                continue;
-            }
-
-            const payload = { ...chat };
-            if (payload._stub === true) delete payload._stub;
-            if (!payload.id || seenChatIds.has(payload.id)) {
-                do {
-                    payload.id = nodeCrypto.randomUUID();
-                } while (seenChatIds.has(payload.id));
-            }
-            seenChatIds.add(payload.id);
-
-            onPayload(char.chaId, payload.id, payload);
-            char.chats[index] = chatToStub(payload);
-            extracted++;
+            const result = externalizeChat(char.chats[index]);
+            char.chats[index] = result.chat;
+            if (result.extracted) extracted++;
         }
     }
 
     return extracted;
 }
 
-function splitFullDb(dbObj) {
+function splitFullDb(dbObj, makeId = nodeCrypto.randomUUID) {
     const chatEntries = [];
     if (!dbObj?.characters) return { strippedDb: dbObj, chatEntries };
 
@@ -142,7 +156,7 @@ function splitFullDb(dbObj) {
     });
     extractPayloadChats(strippedDb, (chaId, chatId, chat) => {
         chatEntries.push({ chaId, chatId, chat });
-    });
+    }, makeId);
 
     return { strippedDb, chatEntries };
 }
@@ -172,6 +186,7 @@ function createChatRowStore(options) {
         kvList,
         kvListWithSizes,
         kvGetUpdatedAt = () => null,
+        randomUUID = nodeCrypto.randomUUID,
     } = options;
 
     async function readChatRow(chaId, chatId) {
@@ -219,7 +234,7 @@ function createChatRowStore(options) {
     }
 
     function extractAndWritePayloadChats(dbObj) {
-        return extractPayloadChats(dbObj, writeChatRow);
+        return extractPayloadChats(dbObj, writeChatRow, randomUUID);
     }
 
     function deleteRemovedChatRows(oldStrippedDb, newStrippedDb) {
@@ -297,7 +312,7 @@ function createChatRowStore(options) {
             ? await decodeRisuSave(source)
             : source;
         const dbObj = normalizeJSON(decoded);
-        const assignedMissingChatIds = assignMissingChatIds(dbObj);
+        const assignedMissingChatIds = assignMissingChatIds(dbObj, randomUUID);
 
         let restoreResult;
         if (opts.restoreColdStorageCharacters) {
@@ -305,7 +320,7 @@ function createChatRowStore(options) {
         }
 
         const normalizedOrphanFolderIds = normalizeOrphanFolderIds(dbObj);
-        const { strippedDb, chatEntries } = splitFullDb(dbObj);
+        const { strippedDb, chatEntries } = splitFullDb(dbObj, randomUUID);
         const referencedKeys = referencedChatRowKeys(strippedDb);
 
         const staleKeys = listAllChatRowKeys().filter(key => !referencedKeys.has(key));
@@ -333,6 +348,101 @@ function createChatRowStore(options) {
         };
     }
 
+    async function ingestStreamingDatabase(source, opts = {}) {
+        // A standalone snapshot/defensive ingest owns its transaction. Backup
+        // and save-folder imports already hold a broader transaction, in which
+        // case all row writes naturally join that atomic unit.
+        const canOwnTransaction = typeof db?.exec === 'function';
+        const ownsTransaction = canOwnTransaction && !db.inTransaction;
+        if (ownsTransaction) db.exec('BEGIN');
+
+        let assignedMissingChatIds = false;
+        let streamedOrphanFolderIds = false;
+        let streamedChats = 0;
+        const processors = new WeakMap();
+        const validFolderIds = new WeakMap();
+
+        try {
+            const walked = await walkRisuSave(source, {
+                inspection: opts.inspection,
+                tempDir: opts.tempDir,
+                externalizePluginStorage: typeof opts.onPluginStorageEntry === 'function',
+                onPluginStorageEntry: opts.onPluginStorageEntry,
+                retainCharacterChats: (character) => Boolean(
+                    opts.restoreColdStorageCharacters && character?.coldstorage
+                ),
+                onMissingChatId: () => {
+                    assignedMissingChatIds = true;
+                    return randomUUID();
+                },
+                onChat: ({ character, chat, externalizable }) => {
+                    if (!externalizable) return chat;
+
+                    let validIds = validFolderIds.get(character);
+                    if (!validIds) {
+                        validIds = new Set(
+                            (character.chatFolders ?? []).map(folder => folder?.id).filter(Boolean)
+                        );
+                        validFolderIds.set(character, validIds);
+                    }
+                    if (normalizeChatOrphanFolderId(chat, validIds)) {
+                        streamedOrphanFolderIds = true;
+                    }
+
+                    let processChat = processors.get(character);
+                    if (!processChat) {
+                        processChat = createChatExternalizer(
+                            character.chaId,
+                            writeChatRow,
+                            randomUUID
+                        );
+                        processors.set(character, processChat);
+                    }
+                    const result = processChat(chat);
+                    if (result.extracted) streamedChats++;
+                    return result.chat;
+                },
+            });
+            const dbObj = walked.remainder;
+
+            let restoreResult;
+            if (opts.restoreColdStorageCharacters) {
+                restoreResult = await opts.restoreColdStorageCharacters(dbObj);
+            }
+
+            const normalizedOrphanFolderIds = normalizeOrphanFolderIds(dbObj)
+                || streamedOrphanFolderIds;
+            // Ordinary characters already contain stubs. This second shared
+            // pass handles chats introduced by cold-storage restoration and is
+            // otherwise a no-op, preserving the legacy operation order.
+            const restoredChats = extractPayloadChats(dbObj, writeChatRow, randomUUID);
+            const referencedKeys = referencedChatRowKeys(dbObj);
+            const staleKeys = listAllChatRowKeys().filter(key => !referencedKeys.has(key));
+
+            kvSet(DB_BLOB_KEY, Buffer.from(encodeRisuSaveLegacy(dbObj)));
+            for (const key of staleKeys) kvDel(key);
+            kvSet(EXTERNALIZATION_MARKER_KEY, EXTERNALIZATION_MARKER_VALUE);
+
+            if (ownsTransaction) db.exec('COMMIT');
+            return {
+                strippedDb: dbObj,
+                pluginStats: walked.pluginStats,
+                stats: {
+                    ...(restoreResult || {}),
+                    chats: streamedChats + restoredChats,
+                    deletedStale: staleKeys.length,
+                    assignedMissingChatIds,
+                    normalizedOrphanFolderIds,
+                },
+            };
+        } catch (error) {
+            if (ownsTransaction) {
+                try { db.exec('ROLLBACK'); } catch (_) {}
+            }
+            throw error;
+        }
+    }
+
     return {
         chatRowKey,
         parseChatRowKey,
@@ -356,6 +466,7 @@ function createChatRowStore(options) {
         assignMissingChatIds,
         normalizeOrphanFolderIds,
         ingestFullDatabase,
+        ingestStreamingDatabase,
     };
 }
 
@@ -369,6 +480,8 @@ module.exports = {
     referencedChatRowKeys,
     extractPayloadChats,
     splitFullDb,
+    assignMissingChatId,
     assignMissingChatIds,
+    createChatExternalizer,
     normalizeOrphanFolderIds,
 };
