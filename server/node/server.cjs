@@ -34,7 +34,10 @@ const getVips = () => {
 }
 const { kvGet, kvSet, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
+        kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
+        kvGetListEpoch, kvBumpListEpoch,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, db: sqliteDb } = require('./db.cjs');
+const { buildListResponse } = require('./listDelta.cjs');
 const {
     assetDir,
     migrationMarkerPath: assetMigrationMarker,
@@ -1044,6 +1047,7 @@ async function writeInlayFile(id, ext, buffer, info = null) {
         ...(info || {}),
         ext: normalizedExt,
     });
+    kvClearDeletion(`inlay/${id}`);
 }
 
 function writeInlayFileSync(id, ext, buffer, info = null) {
@@ -1055,6 +1059,7 @@ function writeInlayFileSync(id, ext, buffer, info = null) {
         ...(info || {}),
         ext: normalizedExt,
     });
+    kvClearDeletion(`inlay/${id}`);
 }
 
 async function deleteInlayRawFile(id) {
@@ -1162,6 +1167,7 @@ async function migrateInlaysToFilesystem() {
             kvDel(key);
             kvDel(`inlay_thumb/${id}`);
             kvDel(`inlay_info/${id}`);
+            kvClearDeletion(key);
             continue;
         }
         const value = kvGet(key);
@@ -1187,6 +1193,7 @@ async function migrateInlaysToFilesystem() {
             kvDel(key);
             kvDel(`inlay_thumb/${id}`);
             kvDel(`inlay_info/${id}`);
+            kvClearDeletion(key);
         } catch (error) {
             logger.warn(`[InlayFS] Failed to migrate ${key}:`, error?.message || error);
         }
@@ -1223,6 +1230,9 @@ function writeAssetValue(key, value, options = {}) {
         // A crash between the file rename and this delete is harmless: reads
         // prefer the file, and the startup migration removes the duplicate.
         kvDel(key);
+        // kvDel records logical removals automatically, but this delete only
+        // removes the shadow kv row; the freshly written file remains live.
+        kvClearDeletion(key);
         return wrote;
     }
     kvSet(key, value);
@@ -1287,6 +1297,7 @@ function writeImportedAsset(assetStage, key, value, source, writeKv = kvSet) {
     const name = assetNameForKey(key);
     if (name !== null && isSafeAssetName(name)) {
         assetStage.store.writeAssetFile(name, value);
+        kvClearDeletion(key);
         return 'fs';
     }
     writeKv(key, value);
@@ -1310,7 +1321,10 @@ function migrateAssetsToFilesystem() {
             }
             return value;
         },
-        deleteValue: kvDel,
+        deleteValue: (key) => {
+            kvDel(key);
+            kvClearDeletion(key);
+        },
         store: {
             isSafeAssetName,
             writeAssetFileIfSizeDiffers,
@@ -2343,6 +2357,10 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     const importedSidecarIds = new Set();
     const explicitSidecarMap = new Map();
     const legacyInlayInfoMap = new Map();
+    const existingInlayKeys = (await listInlayFiles()).map((entry) => `inlay/${entry.id}`);
+    const existingAssetKeys = listAssetEntriesWithSizes()
+        .filter((entry) => entry.source === 'fs')
+        .map((entry) => entry.key);
 
     const stagingDir = path.join(savePath, 'inlays_import_staging');
     const backupInlayDir = path.join(savePath, 'inlays_import_backup');
@@ -2422,6 +2440,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                 const legacyInfo = legacyInlayInfoMap.get(inlayRaw.id);
                 if (legacyInfo) writeStagingSidecarSync(inlayRaw.id, legacyInfo);
             }
+            kvClearDeletion(`inlay/${inlayRaw.id}`);
             assetsRestored += 1;
         } else if (inlaySidecar) {
             const parsed = JSON.parse(data.toString('utf-8'));
@@ -2471,6 +2490,11 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     let inlaySwap = null;
     try {
         sqliteDb.exec('BEGIN');
+        // Prefix deletes can only journal kv rows. Record filesystem-backed
+        // logical keys before replacing their directories; imported keys clear
+        // their records as they are staged below.
+        for (const key of existingAssetKeys) kvRecordDeletion(key);
+        for (const key of existingInlayKeys) kvRecordDeletion(key);
         kvDelPrefix('assets/');
         kvDelPrefix('inlay/');
         kvDelPrefix('inlay_thumb/');
@@ -2638,6 +2662,10 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
             stagingDir,
             backupDir: backupInlayDir,
         });
+        // Publish the new epoch only once the replacement directories and all
+        // logical writes are ready. A list served mid-import is then invalidated
+        // when this transaction commits.
+        kvBumpListEpoch();
         sqliteDb.exec('COMMIT');
     } catch (error) {
         try { sqliteDb.exec('ROLLBACK'); } catch (_) {}
@@ -3710,24 +3738,28 @@ app.get('/api/list', async (req, res, next) => {
         return;
     }
     try {
-        const keyPrefix = req.headers['key-prefix'] || '';
-        let data;
-        if (keyPrefix === 'inlay/') {
-            const fileKeys = (await listInlayFiles()).map((entry) => `inlay/${entry.id}`);
-            data = [...new Set([
-                ...fileKeys,
-                ...kvList('inlay/'),
-            ])];
-        } else {
-            const fileKeys = listAssetEntriesWithSizes()
-                .map((entry) => entry.key)
-                .filter((key) => key.startsWith(keyPrefix));
-            data = [...new Set([
-                ...fileKeys,
-                ...kvList(keyPrefix || undefined),
-            ])];
-        }
-        res.send({ success: true, content: data });
+        const firstHeader = (value) => Array.isArray(value) ? value[0] : value;
+        const keyPrefixHeader = firstHeader(req.headers['key-prefix']);
+        const lastSyncHeader = firstHeader(req.headers['x-last-sync']);
+        const epochHeader = firstHeader(req.headers['x-list-epoch']);
+        const keyPrefix = typeof keyPrefixHeader === 'string' ? keyPrefixHeader : '';
+        const parsedLastSync = Number(lastSyncHeader);
+        const lastSync = Number.isSafeInteger(parsedLastSync) ? parsedLastSync : 0;
+        const serverEpoch = kvGetListEpoch();
+        const response = await buildListResponse({
+            keyPrefix,
+            lastSync,
+            clientEpoch: typeof epochHeader === 'string' ? epochHeader : '',
+            serverEpoch,
+            now: Date.now(),
+            listKv: kvList,
+            listModifiedKv: kvListModifiedSince,
+            listDeletedKv: kvGetDeletedSince,
+            listAssetEntries: listAssetEntriesWithSizes,
+            listInlayEntries: listInlayFiles,
+            statFile: fs.stat,
+        });
+        res.send({ success: true, ...response });
     } catch (error) {
         next(error);
     }
@@ -3864,6 +3896,7 @@ app.post('/api/write', async (req, res, next) => {
                 kvDel(key);
                 kvDel(`inlay_thumb/${id}`);
                 kvDel(`inlay_info/${id}`);
+                kvClearDeletion(key);
             } else if (key.startsWith('inlay_info/')) {
                 const id = key.slice('inlay_info/'.length)
                 const parsed = JSON.parse(Buffer.from(fileContent).toString('utf-8'));
@@ -5149,17 +5182,16 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
     await flushPendingDb();
     await createBackupAndRotate();
     invalidateDbCache();
+    const existingAssetKeys = listAssetEntriesWithSizes()
+        .filter((entry) => entry.source === 'fs')
+        .map((entry) => entry.key);
     const assetStage = await prepareAssetImportStage();
-
-    const insert = sqliteDb.prepare(
-        `INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)`
-    );
-    const now = Date.now();
     let assetSwap = null;
     let streamingIngestion = null;
 
     try {
         sqliteDb.exec('BEGIN');
+        for (const key of existingAssetKeys) kvRecordDeletion(key);
         clearExistingData();
         for (const source of sources) {
             const { key } = source;
@@ -5172,8 +5204,7 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
                     assetStage,
                     key,
                     value,
-                    'Save-folder import',
-                    (assetKey, assetValue) => insert.run(assetKey, assetValue, now)
+                    'Save-folder import'
                 );
                 continue;
             }
@@ -5186,7 +5217,7 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
                 kvSet(key, value);
                 continue;
             }
-            insert.run(key, value, now);
+            kvSet(key, value);
         }
 
         if (streamDatabase) {
@@ -5200,6 +5231,7 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
             assetImportStagingDir,
             assetImportBackupDir
         );
+        kvBumpListEpoch();
         sqliteDb.exec('COMMIT');
     } catch (error) {
         try { sqliteDb.exec('ROLLBACK'); } catch (_) {}
@@ -6039,6 +6071,9 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                 const strippedBytes = Buffer.from(encodeRisuSaveLegacy(ingestion.strippedDb));
                 dbEtag = computeBufferEtag(strippedBytes);
             }
+            // A restore can replace a broad logical database state. Force every
+            // browser list cache to take one full snapshot after it completes.
+            kvBumpListEpoch();
         });
         res.json({ ok: true });
     } catch (err) { next(err); }
@@ -6672,6 +6707,9 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 }
 
 (async () => {
+    try { kvCleanupOldDeletions(); }
+    catch (error) { logger.warn('[ListDelta] Initial deletion cleanup failed:', error?.message || error); }
+
     // Proxy stream job garbage collection
     setInterval(() => {
         const now = Date.now();
@@ -6708,5 +6746,10 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
         try { checkpointWal('TRUNCATE'); }
         catch { /* non-fatal */ }
     }, 5 * 60 * 1000); // every 5 minutes
+
+    setInterval(() => {
+        try { kvCleanupOldDeletions(); }
+        catch { /* non-fatal */ }
+    }, 60 * 60 * 1000); // every hour
 
 })();

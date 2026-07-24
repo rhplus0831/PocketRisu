@@ -76,6 +76,78 @@ export interface PatchItemResult {
     chatGuardRejected?: boolean
 }
 
+const LIST_CACHE_DB_NAME = 'risu-list-cache'
+const LIST_CACHE_STORE = 'lists'
+
+interface ListCacheEntry {
+    keys: string[]
+    timestamp: number
+    epoch: string
+}
+
+function listCacheKey(prefix: string): string {
+    return `list:${prefix}`
+}
+
+async function openListCacheDb(): Promise<IDBDatabase> {
+    return await new Promise((resolve, reject) => {
+        const request = globalThis.indexedDB.open(LIST_CACHE_DB_NAME, 1)
+        request.onupgradeneeded = () => {
+            if (!request.result.objectStoreNames.contains(LIST_CACHE_STORE)) {
+                request.result.createObjectStore(LIST_CACHE_STORE)
+            }
+        }
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+    })
+}
+
+async function listCacheGet(prefix: string): Promise<ListCacheEntry | null> {
+    let db: IDBDatabase | null = null
+    try {
+        db = await openListCacheDb()
+        const transaction = db.transaction(LIST_CACHE_STORE, 'readonly')
+        const result = await new Promise<unknown>((resolve, reject) => {
+            const request = transaction.objectStore(LIST_CACHE_STORE).get(listCacheKey(prefix))
+            request.onsuccess = () => resolve(request.result)
+            request.onerror = () => reject(request.error)
+        })
+        if (result && typeof result === 'object') {
+            const entry = result as Partial<ListCacheEntry>
+            if (Array.isArray(entry.keys)
+                && entry.keys.every((key) => typeof key === 'string')
+                && typeof entry.timestamp === 'number'
+                && Number.isSafeInteger(entry.timestamp)
+                && typeof entry.epoch === 'string') {
+                return { keys: entry.keys, timestamp: entry.timestamp, epoch: entry.epoch }
+            }
+        }
+        return null
+    } catch {
+        return null
+    } finally {
+        db?.close()
+    }
+}
+
+async function listCacheSet(prefix: string, entry: ListCacheEntry): Promise<void> {
+    let db: IDBDatabase | null = null
+    try {
+        db = await openListCacheDb()
+        const transaction = db.transaction(LIST_CACHE_STORE, 'readwrite')
+        transaction.objectStore(LIST_CACHE_STORE).put(entry, listCacheKey(prefix))
+        await new Promise<void>((resolve, reject) => {
+            transaction.oncomplete = () => resolve()
+            transaction.onerror = () => reject(transaction.error)
+            transaction.onabort = () => reject(transaction.error)
+        })
+    } catch {
+        // The server remains authoritative; cache failures never break keys().
+    } finally {
+        db?.close()
+    }
+}
+
 export class NodeStorage{
     private static readonly BULK_WRITE_CLIENT_BATCH = 20
 
@@ -390,10 +462,14 @@ export class NodeStorage{
         }
     }
     async keys(prefix: string = ''):Promise<string[]>{
-        const headers: Record<string, string> = {
-        }
+        const headers: Record<string, string> = {}
         if (prefix) {
             headers['key-prefix'] = prefix
+        }
+        const cached = await listCacheGet(prefix)
+        if (cached) {
+            headers['x-last-sync'] = String(cached.timestamp)
+            headers['x-list-epoch'] = cached.epoch
         }
         const da = await this.authFetch('/api/list', {
             method: "GET",
@@ -406,7 +482,32 @@ export class NodeStorage{
         if(data.error){
             throw data.error
         }
-        return data.content
+
+        const serverTimestamp = data.timestamp
+        const serverEpoch = data.epoch
+        if (data.mode === 'delta'
+            && cached
+            && serverEpoch === cached.epoch
+            && Array.isArray(data.added)
+            && Array.isArray(data.deleted)) {
+            const added = new Set<string>(data.added)
+            const deleted = new Set<string>(data.deleted)
+            const merged = cached.keys.filter((key) => !deleted.has(key) && !added.has(key))
+            merged.push(...added)
+            if (Number.isSafeInteger(serverTimestamp) && typeof serverEpoch === 'string') {
+                void listCacheSet(prefix, { keys: merged, timestamp: serverTimestamp, epoch: serverEpoch })
+            }
+            return merged
+        }
+
+        if (!Array.isArray(data.content)) {
+            throw new Error('Invalid list response')
+        }
+        const content = data.content as string[]
+        if (Number.isSafeInteger(serverTimestamp) && typeof serverEpoch === 'string') {
+            void listCacheSet(prefix, { keys: content, timestamp: serverTimestamp, epoch: serverEpoch })
+        }
+        return content
     }
     async removeItem(key:string){
         const da = await this.authFetch('/api/remove', {
