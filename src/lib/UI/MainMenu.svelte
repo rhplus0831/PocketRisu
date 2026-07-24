@@ -21,7 +21,15 @@
 <div class="h-full w-full flex flex-col overflow-y-auto items-center">
     {#if !$OpenRealmStore}
       <Title />
-      <h3 class="text-textcolor2 mt-1">v{getVersionString()}</h3>
+      <h3 class="text-textcolor2 mt-1 flex items-center gap-2">
+        v{getVersionString()}
+        {#if __APP_BRANCH__}
+          <span
+            class="px-2 py-0.5 rounded-full text-xs bg-darkbg border border-selected cursor-default"
+            title="Custom PocketRisu build ({__APP_BRANCH__}@{__APP_COMMIT__}) — not identical to upstream RisuAI"
+          >{__APP_BRANCH__}</span>
+        {/if}
+      </h3>
       {#if $updateInfoStore?.hasUpdate}
         <button
           class="mt-1.5 px-3 py-1 rounded-full text-sm font-medium transition-colors
