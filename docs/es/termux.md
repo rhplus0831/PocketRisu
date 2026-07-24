@@ -132,13 +132,4 @@ Si las dependencias cambiaron, `pnpm install` se ejecuta automáticamente como p
 
 ---
 
-## 6. Limitaciones
-
-**Quick Tunnel (túnel automático de Cloudflare) no funciona en Termux.** El binario `cloudflared` no es compatible con el entorno DNS y TLS de Termux.
-
-PocketRisu detecta automáticamente el entorno Termux y muestra una advertencia en el menú de Acceso Remoto, ocultando el botón de inicio.
-
-
----
-
 ← [Volver al README](../../i18n/README.es.md)

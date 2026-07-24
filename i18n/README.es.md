@@ -70,7 +70,7 @@ Para migrar desde una instalación existente de RisuAI, consulta la [guía de mi
 - **Scripts regex y plugins**: Modifica la salida del modelo y extiende la funcionalidad
 - **TTS y recursos adicionales**: Síntesis de voz, imágenes / audio / video integrados en el chat
 - **Autoactualización**: Detección automática de versiones; las distribuciones portátiles se actualizan desde la interfaz web
-- **Acceso remoto móvil**: Quick Tunnel (URL + QR) o Tailscale
+- **Acceso remoto móvil**: Tailscale
 - **Interfaz multilingüe**: Coreano, inglés, japonés, chino y más
 
 

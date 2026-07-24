@@ -68,7 +68,7 @@ For migration from an existing RisuAI installation, see the [migration guide](do
 - **Regex scripts & plugins**: Modify model output and extend functionality
 - **TTS & additional assets**: Voice synthesis, embedded images / audio / video in chat
 - **Self-update**: Automatic version detection; portable distributions update from the web UI
-- **Mobile remote access**: Quick Tunnel (URL + QR) or Tailscale
+- **Mobile remote access**: Tailscale
 - **Multilingual UI**: Korean, English, Japanese, Chinese, and more
 
 

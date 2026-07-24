@@ -1964,33 +1964,10 @@ export const languageKorean = {
   scrollButtonTypeFour: "4버튼",
   scrollButtonTypeTwo: "2버튼",
   scrollButtonTypeOff: "사용 안 함",
-  // 원격 접속 (Cloudflare Quick Tunnel)
-  remoteAccess: "원격 접속",
-  remoteAccessDesc:
-    "원격 접속 링크를 사용하여 다른 기기에서 이 포켓리스 서버에 접속할 수 있습니다.",
-  remoteAccessOpen: "원격 접속 열기",
-  remoteAccessClose: "원격 접속 닫기",
-  remoteAccessCloseConfirm: "원격 접속을 닫을까요? 링크가 만료됩니다.",
-  remoteAccessDownloading: "cloudflared 다운로드 중...",
-  remoteAccessStarting: "터널 시작 중...",
-  remoteAccessCopyUrl: "URL 복사",
-  remoteAccessCopied: "복사됨!",
-  remoteAccessDisabled: "서버 설정에 의해 원격 접속이 비활성화되어 있습니다.",
-  remoteAccessError: "터널 오류",
-  remoteAccessRetry: "재시도",
-  remoteAccessQrHint: "QR 코드를 스캔하여 접속하세요",
-  remoteAccessWarning:
-    "QR 코드와 원격 링크를 절대로 다른 사람과 공유하지 마세요. 링크를 가진 누구나 서버에 자유롭게 접근할 수 있습니다. 실수로 공유한 경우, 원격 접속을 닫고 새 링크를 생성하세요.",
-  remoteAccessInfo:
-    "원격 접속을 닫거나 서버를 종료/재시작하면 링크가 만료되며, 다시 연결하면 새로운 링크가 생성됩니다. 이 페이지나 브라우저를 닫아도 원격 접속은 유지됩니다.",
-  remoteAccessTermuxWarning:
-    "Termux 환경에서는 Cloudflare Quick Tunnel을 사용할 수 없습니다. Tailscale 등 다른 원격 접속 도구를 사용해 주세요.",
-
   // 비보안(HTTP) 접속 안내
   httpInsecureWarningTitle: "HTTP로 접속 중",
   httpInsecureWarningBody:
-    "플러그인 등 일부 기능이 동작하지 않을 수 있습니다. 원격 접속 기능을 사용하면 HTTPS로 연결할 수 있습니다.",
-  httpInsecureOpenRemoteAccess: "설정 열기",
+    "플러그인 등 일부 기능이 동작하지 않을 수 있습니다. 서버에 HTTPS를 설정하거나 Tailscale을 사용하세요.",
 
   // 시스템 페이지
   system: "시스템",

@@ -68,7 +68,7 @@ PocketRisu는 [RisuAI](https://github.com/kwaroran/RisuAI)에서 파생되어, �
 - **정규식 스크립트·플러그인**: 출력 가공, 기능 확장
 - **TTS·추가 에셋**: 음성 변환, 채팅 내 이미지·오디오·비디오 임베드
 - **셀프 업데이트**: 새 버전 자동 감지, 포터블 배포는 웹 UI에서 업데이트
-- **모바일 원격 접속**: Quick Tunnel(URL+QR), Tailscale 권장
+- **모바일 원격 접속**: Tailscale 권장
 - **다국어 UI**: 한국어, 영어, 일본어, 중국어 등
 
 

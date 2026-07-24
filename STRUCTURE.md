@@ -73,7 +73,7 @@ Browser SPA (src/)                          Node server (server/node/)
 
 | Doc | Scope |
 |---|---|
-| [server-backend](docs/structure/server-backend.md) | Express server: HTTP route catalog, JWT/session auth, stubs-only database + externalized chat rows in SQLite KV, content-defined chunking, patch sync, assembled backups/snapshots, orphan GC, storage dashboard, proxies, Quick Tunnel, self-update. |
+| [server-backend](docs/structure/server-backend.md) | Express server: HTTP route catalog, JWT/session auth, stubs-only database + externalized chat rows in SQLite KV, content-defined chunking, patch sync, assembled backups/snapshots, orphan GC, storage dashboard, proxies, self-update. |
 | [client-storage](docs/structure/client-storage.md) | The `Database` model and `setDatabase()` defaults, `NodeStorage` HTTP adapter, reactive save loop in `globalApi.svelte.ts`, RisuSave codecs + JSON-Patch sync, chat stub/placeholder hydration, drafts, `.bin` backups, bootstrap ordering. |
 | [chat-pipeline](docs/structure/chat-pipeline.md) | `sendChat()` end to end: prompt buckets and prompt-card templates, token budgeting, attachment/multimodal conversion, streaming, regenerate/continue, post-processing, suggestions, slash commands. |
 | [model-providers](docs/structure/model-providers.md) | Legacy `LLMModel` registry (`format` dispatch, flags) and provider wire code (OpenAI/Anthropic/Google/NovelAI/Horde/…), ModelPreset adapter path, streaming contracts, proxy/local-network transport, how to add a model or provider. |

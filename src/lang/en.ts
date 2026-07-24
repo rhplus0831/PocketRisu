@@ -1811,28 +1811,9 @@ export const languageEnglish = {
     nanoGPTSelectFromList: "Select from List",
     nanoGPTManualInput: "Manual Input",
     nanoGPTManualModelSelect: "Manual Model Select",
-    // Remote Access (Cloudflare Quick Tunnel)
-    remoteAccess: "Remote Access",
-    remoteAccessDesc: "Use a remote access link to connect to this PocketRisu server from another device.",
-    remoteAccessOpen: "Open Remote Access",
-    remoteAccessClose: "Close Remote Access",
-    remoteAccessCloseConfirm: "Close remote access? The link will expire.",
-    remoteAccessDownloading: "Downloading cloudflared...",
-    remoteAccessStarting: "Starting tunnel...",
-    remoteAccessCopyUrl: "Copy URL",
-    remoteAccessCopied: "Copied!",
-    remoteAccessDisabled: "Remote access is disabled by server configuration.",
-    remoteAccessError: "Tunnel error",
-    remoteAccessRetry: "Retry",
-    remoteAccessQrHint: "Scan QR code to connect",
-    remoteAccessWarning: "Never share the QR code or link with others. Anyone with the link can freely access your server. If accidentally shared, close the connection and create a new one.",
-    remoteAccessInfo: "The link expires when you close remote access or restart the server. A new link is generated each time. The connection stays active even if you close this page or browser.",
-    remoteAccessTermuxWarning: "Cloudflare Quick Tunnel does not work on Termux. Use Tailscale or another remote access tool instead.",
-
     // Insecure (HTTP) connection warning
     httpInsecureWarningTitle: "Connected over HTTP",
-    httpInsecureWarningBody: "Some features such as plugins may not work. Use the Remote Access feature for an HTTPS connection.",
-    httpInsecureOpenRemoteAccess: "Open settings",
+    httpInsecureWarningBody: "Some features such as plugins may not work. Configure HTTPS on the server or use Tailscale for secure remote access.",
 
     // System page
     system: "System",

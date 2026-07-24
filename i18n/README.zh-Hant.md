@@ -70,7 +70,7 @@ PocketRisu 衍生自 [RisuAI](https://github.com/kwaroran/RisuAI),針對自託�
 - **正則指令碼 & 外掛**:修改模型輸出,擴展功能
 - **TTS & 附加資源**:語音合成、聊天中嵌入圖像/音訊/影片
 - **自我更新**:自動偵測新版本,可攜版可透過網頁介面更新
-- **行動裝置遠端存取**:Quick Tunnel(URL + QR)或 Tailscale
+- **行動裝置遠端存取**: Tailscale
 - **多語言介面**:韓語、英語、日語、中文等
 
 

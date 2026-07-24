@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, CodeIcon, CogIcon, ContactIcon, FlaskConicalIcon, ImageIcon, LanguagesIcon, MonitorIcon, MonitorSmartphoneIcon, Sailboat, ScrollTextIcon, UserIcon, CircleXIcon, KeyboardIcon, TruckIcon, FileBoxIcon, Volume2Icon } from "@lucide/svelte";
+    import { AccessibilityIcon, ActivityIcon, PackageIcon, BotIcon, CodeIcon, CogIcon, ContactIcon, FlaskConicalIcon, ImageIcon, LanguagesIcon, MonitorIcon, Sailboat, ScrollTextIcon, UserIcon, CircleXIcon, KeyboardIcon, TruckIcon, FileBoxIcon, Volume2Icon } from "@lucide/svelte";
     import { language } from "src/lang";
     import DisplaySettings from "./Pages/DisplaySettings.svelte";
     import NotificationSoundSettings from "./Pages/NotificationSoundSettings.svelte";
@@ -25,7 +25,6 @@
   import { isLite } from "src/ts/lite";
     import HotkeySettings from "./Pages/HotkeySettings.svelte";
     import InlayImageGallery from "./Pages/InlayImageGallery.svelte";
-    import RemoteAccessSettings from "./Pages/RemoteAccessSettings.svelte";
     import PluginDefinedIcon from "../Others/PluginDefinedIcon.svelte";
     import DevPanel from "src/lib/_dev/DevPanel.svelte";
 
@@ -182,15 +181,6 @@
                         <span>{language.playground.inlayImageGallery}</span>
                     </button>
                     <button class="flex gap-2 items-center hover:text-textcolor"
-                        class:text-textcolor={$SettingsMenuIndex === 21}
-                        class:text-textcolor2={$SettingsMenuIndex !== 21}
-                        onclick={() => {
-                        $SettingsMenuIndex = 21
-                    }}>
-                        <MonitorSmartphoneIcon />
-                        <span>{language.remoteAccess}</span>
-                    </button>
-                    <button class="flex gap-2 items-center hover:text-textcolor"
                         class:text-textcolor={$SettingsMenuIndex === 6}
                         class:text-textcolor2={$SettingsMenuIndex !== 6}
                         onclick={() => {
@@ -286,8 +276,6 @@
                             <PromptPresetSettings/>
                         {:else if $SettingsMenuIndex === 23}
                             <InlayImageGallery/>
-                        {:else if $SettingsMenuIndex === 21}
-                            <RemoteAccessSettings/>
                         {:else if $SettingsMenuIndex === 22}
                             <SystemSettings/>
                         {:else if $SettingsMenuIndex === 99 && devPanelEnabled}

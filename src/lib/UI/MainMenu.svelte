@@ -12,8 +12,6 @@
     import { updateInfoStore, updatePopupStore } from "src/ts/update";
     import { publicStatsStore } from "src/ts/publicStats";
     import { isSecureContext } from "src/ts/secureContext";
-    import { openSettings, SettingsRoute } from "src/ts/routing";
-    import ShButton from "./GUI/ShButton.svelte";
 
     let realmOpen = $state(!DBState.db.hideRealm);
 
@@ -64,9 +62,6 @@
               <span class="leading-relaxed text-sm opacity-90">{language.httpInsecureWarningBody}</span>
             </div>
           </div>
-          <ShButton variant="outline" size="sm" onclick={() => openSettings(SettingsRoute.RemoteAccess)}>
-            {language.httpInsecureOpenRemoteAccess}
-          </ShButton>
         </div>
       {/if}
       <div class="mt-4 mb-4 w-full border-t border-t-selected"></div>

@@ -70,7 +70,7 @@ Für die Migration von einer bestehenden RisuAI-Installation siehe den [Migratio
 - **Regex-Skripte & Plugins**: Modellausgabe ändern und Funktionalität erweitern
 - **TTS & zusätzliche Assets**: Sprachsynthese, eingebettete Bilder / Audio / Video im Chat
 - **Selbstaktualisierung**: Automatische Versionserkennung; portable Distributionen aktualisieren sich über die Web-UI
-- **Mobiler Fernzugriff**: Quick Tunnel (URL + QR) oder Tailscale
+- **Mobiler Fernzugriff**: Tailscale
 - **Mehrsprachige UI**: Koreanisch, Englisch, Japanisch, Chinesisch und mehr
 
 

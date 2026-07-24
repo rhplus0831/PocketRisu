@@ -6,25 +6,9 @@
 
 > 🌐 此指南由機器翻譯生成。如需獲取最準確的資訊,請參閱 [English](../en/remote.md) 或 [한국어](../ko/remote.md) 版本。
 
-從其他裝置(智慧型手機、平板、其他 PC)存取執行於 PC 上的 PocketRisu 有兩種方式。
+使用 Tailscale 可透過 HTTPS 從其他裝置(智慧型手機、平板或其他 PC)存取執行於 PC 上的 PocketRisu。
 
-- [1. Quick Tunnel](#1-quick-tunnel) — PocketRisu 內建功能。無需額外應用程式。伺服器重啟時 URL 會變更。
-- [2. Tailscale](#2-tailscale) — 基於私人網路(VPN)。URL 固定。
-
-
-## 1. Quick Tunnel
-
-PocketRisu 內建的臨時遠端存取 URL 發放功能。
-
-1. 在 PC 上 PocketRisu 中:設定 > 遠端存取 > "開啟遠端存取"
-2. 用智慧型手機相機掃描顯示的 QR Code,或在其他裝置的瀏覽器中直接輸入 URL。
-
-> 伺服器重啟時 URL 會變更。如需固定 URL,請使用 [Tailscale](#2-tailscale)。
-
-
----
-
-## 2. Tailscale
+## Tailscale
 
 建構僅能從使用同一帳號登入的裝置存取的私人網路(VPN)。即使伺服器重啟,URL 仍保持不變。
 

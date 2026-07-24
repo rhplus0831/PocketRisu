@@ -6,25 +6,9 @@
 
 > 🌐 此指南由机器翻译生成。如需获取最准确的信息,请参阅 [English](../en/remote.md) 或 [한국어](../ko/remote.md) 版本。
 
-从其他设备(智能手机、平板、其他 PC)访问运行在 PC 上的 PocketRisu 有两种方式。
+使用 Tailscale 可以通过 HTTPS 从其他设备(智能手机、平板或其他 PC)访问运行在 PC 上的 PocketRisu。
 
-- [1. Quick Tunnel](#1-quick-tunnel) — PocketRisu 内置功能。无需额外应用。服务器重启时 URL 变更。
-- [2. Tailscale](#2-tailscale) — 基于私有网络(VPN)。URL 固定。
-
-
-## 1. Quick Tunnel
-
-PocketRisu 内置的临时远程访问 URL 发放功能。
-
-1. 在 PC 上 PocketRisu 中:设置 > 远程访问 > "打开远程访问"
-2. 用智能手机相机扫描显示的二维码,或在其他设备的浏览器中直接输入 URL。
-
-> 服务器重启时 URL 会变更。如需固定 URL,请使用 [Tailscale](#2-tailscale)。
-
-
----
-
-## 2. Tailscale
+## Tailscale
 
 构建只能从使用同一账号登录的设备访问的私有网络(VPN)。即使服务器重启,URL 也保持不变。
 

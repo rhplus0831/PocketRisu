@@ -1332,11 +1332,8 @@ export const languageSpanish = {
     nanoGPTManualInput: "Entrada manual",
     nanoGPTManualModelSelect: "Selección manual de modelo",
 
-    remoteAccessTermuxWarning: "Cloudflare Quick Tunnel no funciona en Termux. Utiliza Tailscale u otra herramienta de acceso remoto.",
-
     httpInsecureWarningTitle: "Conectado mediante HTTP",
-    httpInsecureWarningBody: "Algunas funciones como los plugins pueden no funcionar. Usa la función de Acceso Remoto para una conexión HTTPS.",
-    httpInsecureOpenRemoteAccess: "Abrir configuración",
+    httpInsecureWarningBody: "Algunas funciones como los plugins pueden no funcionar. Configura HTTPS en el servidor o usa Tailscale para un acceso remoto seguro.",
 
     selectBotHint: "Selecciona un bot para empezar a chatear",
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;

@@ -1332,11 +1332,8 @@ export const languageChinese = {
     nanoGPTManualInput: "手动输入",
     nanoGPTManualModelSelect: "手动模式选择",
 
-    remoteAccessTermuxWarning: "Cloudflare Quick Tunnel 在 Termux 上无法使用。请改用 Tailscale 或其他远程访问工具。",
-
     httpInsecureWarningTitle: "通过 HTTP 连接",
-    httpInsecureWarningBody: "插件等部分功能可能无法使用。请使用远程访问功能以建立 HTTPS 连接。",
-    httpInsecureOpenRemoteAccess: "打开设置",
+    httpInsecureWarningBody: "插件等部分功能可能无法使用。请在服务器上配置 HTTPS，或使用 Tailscale 进行安全的远程访问。",
 
     selectBotHint: "选择一个机器人开始聊天",
 } satisfies DeepPartial<typeof import('./en').languageEnglish>;

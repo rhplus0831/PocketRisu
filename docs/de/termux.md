@@ -132,13 +132,4 @@ Wenn sich Abhängigkeiten geändert haben, wird `pnpm install` automatisch als T
 
 ---
 
-## 6. Einschränkungen
-
-**Quick Tunnel (Cloudflare Auto-Tunnel) funktioniert nicht auf Termux.** Das `cloudflared`-Binary ist nicht mit der DNS- und TLS-Umgebung von Termux kompatibel.
-
-PocketRisu erkennt die Termux-Umgebung automatisch und zeigt eine Warnung im Menü Fernzugriff an, wobei die Start-Schaltfläche ausgeblendet wird.
-
-
----
-
 ← [Zurück zur README](../../i18n/README.de.md)

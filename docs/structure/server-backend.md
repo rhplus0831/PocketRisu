@@ -5,7 +5,7 @@
 
 ## 1. Purpose & overview
 
-The server backend turns the built Svelte SPA into a self-hosted, single-user PocketRisu instance. The production implementation is the Express executable in `server/node/server.cjs`: it serves `dist/`, authenticates clients, persists RisuAI-compatible save data and assets, lazily hydrates chats, proxies model traffic, manages backups and storage maintenance, checks for updates, and controls Cloudflare Quick Tunnels.
+The server backend turns the built Svelte SPA into a self-hosted, single-user PocketRisu instance. The production implementation is the Express executable in `server/node/server.cjs`: it serves `dist/`, authenticates clients, persists RisuAI-compatible save data and assets, lazily hydrates chats, proxies model traffic, manages backups and storage maintenance, and checks for updates.
 
 Persistent application data is primarily stored in SQLite through a binary-compatible key/value abstraction. `database/database.bin` contains character/settings data plus chat stubs; full chat bodies live in individual `chats/<chaId>/<chatId>` rows, and optimized plugin save data lives in `pluginsave/` plus `pluginsave-meta/` JSON rows. Large chat rows and full database snapshots are deduplicated through content-defined chunking. Assets (`save/assets/`, one immutable file per safe-named `assets/*` key, written temp-file+rename so cross-instance hardlink dedup is safe), inlays, and server-created backup files are stored separately on the filesystem; unsafe-named assets remain KV rows (dual-source reads via `server/node/assetStore.cjs`). `server/hono/` is only an early multi-runtime scaffold; it does not implement the Node backend’s APIs, authentication, or storage.
 
@@ -56,7 +56,7 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 5. `startServer()` migrates assets and inlays, externalizes monolithic chats, defensively re-externalizes folded optimized plugin storage even when the chat marker already exists, and converts any RisuSave `REMOTE` blocks before listening. The chat migration first copies the old blob to `migration-backup/pre-chat-externalization-<timestamp>.bin`, then records `migration/chats-externalized`; the wrapper is at `server/node/server.cjs:401`.
 6. TLS is enabled only when both `server/node/ssl/certificate/server.key` and `server.crt` can be read; otherwise it starts plain HTTP.
 7. Both HTTP and HTTPS servers install the proxy-job WebSocket upgrade handler before listening.
-8. Shutdown handlers flush debounced database writes, stop the tunnel, and truncate-checkpoint WAL. A background checkpoint runs every five minutes.
+8. Shutdown handlers flush debounced database writes and truncate-checkpoint WAL. A background checkpoint runs every five minutes.
 
 The server reads configuration directly from `process.env`; it does not load `.env` itself:
 
@@ -69,7 +69,6 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `RISU_BACKUP_IMPORT_MAX_BYTES` | Maximum streamed backup/ZIP import size; `0` means unlimited at `server/node/server.cjs:863`. |
 | `RISU_STREAM_INGEST_MIN_BYTES` | Minimum supported `database.risudat` size for disk-backed ingest; default 32 MiB. Set to `1` to force the path for compatibility tests. |
 | `BACKUP_NDJSON_HEARTBEAT_MS` | Backup-import keepalive interval, default 5 seconds and clamped to at least 100 ms at `server/node/server.cjs:871`. |
-| `RISU_TUNNEL_DISABLED` | Disables Quick Tunnel when exactly `true` at `server/node/server.cjs:879`. |
 | `RISU_UPDATE_CHECK` | Disables update checks when exactly `false` at `server/node/server.cjs:974`. |
 | `RISU_UPDATE_URL` | Replaces the update worker `/check` endpoint and derives `/api/public-stats` from it at `server/node/server.cjs:975`. |
 
@@ -203,7 +202,6 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 | DB snapshots | `GET/PUT /api/db/snapshots/limits`, `GET/DELETE /api/db/snapshots`, and `POST /api/db/snapshots/restore`. Routes begin at `server/node/server.cjs:5529`. | `SystemBackup.svelte` at `src/lib/Setting/Pages/SystemBackup.svelte:100`. |
 | Inlay maintenance | Cookie-authenticated `POST /api/inlays/compress`, streamed as SSE. Route: `server/node/server.cjs:5572`. | `src/lib/Setting/Pages/Advanced/InlayCompressButton.svelte:23`. |
 | Public/update | Unauthenticated `GET /api/public-stats` and `GET /api/update-check`; authenticated `POST /api/self-update`. Routes begin at `server/node/server.cjs:5645`. | `src/ts/publicStats.ts:12` and `src/ts/update.ts:35`. |
-| Quick Tunnel | Authenticated `GET /api/tunnel/status`, `POST /api/tunnel/start`, and `POST /api/tunnel/stop`. Routes begin at `server/node/server.cjs:6034`. | `RemoteAccessSettings.svelte` at `src/lib/Setting/Pages/RemoteAccessSettings.svelte:26`. |
 
 ## 4. Entry points & dependencies
 
@@ -212,7 +210,7 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 - Production/self-hosted startup is `pnpm run runserver` → `server/node/server.cjs`, declared at `package.json:19`.
 - Portable launchers and Termux scripts also execute the same file; `server.cjs` assumes `process.cwd()` is the PocketRisu application root.
 - The frontend storage entry is the singleton `forageStorage = new AutoStorage()` at `src/ts/globalApi.svelte.ts:31`. `AutoStorage` constructs `NodeStorage`, which owns the HTTP contract.
-- Direct settings-page fetches bypass `NodeStorage.authFetch()` for storage dashboards, snapshots, log viewing, tunnel controls, update UI, and some backup preferences; their route references are listed above.
+- Direct settings-page fetches bypass `NodeStorage.authFetch()` for storage dashboards, snapshots, log viewing, update UI, and some backup preferences; their route references are listed above.
 - The Hono entry points are runtime-specific exports or executables: `server/hono/src/bun.ts:1`, `server/hono/src/cf.ts:1`, and `server/hono/src/node.ts:1`.
 
 ### Outbound dependencies
@@ -223,8 +221,8 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 - Express, `compression`, `express-rate-limit`, and `node-html-parser` provide HTTP routing, response compression, login throttling, and root-page flag injection.
 - `ws` supplies the proxy-job WebSocket server at `server/node/server.cjs:14`.
 - `wasm-vips` generates thumbnails and compresses inlays at `server/node/server.cjs:15`.
-- Native `fetch` calls arbitrary authenticated proxy targets, `https://sv.risuai.xyz` for Hub traffic, Google OAuth, the configured PocketRisu update worker, GitHub release assets, and Cloudflare’s `cloudflared` release downloads.
-- `child_process.spawn()` runs `cloudflared` and restart helpers; `execSync()` invokes platform archive tools during tunnel download and self-update.
+- Native `fetch` calls arbitrary authenticated proxy targets, `https://sv.risuai.xyz` for Hub traffic, Google OAuth, the configured PocketRisu update worker, and GitHub release assets.
+- `child_process.spawn()` runs restart helpers; `execSync()` invokes platform archive tools during self-update.
 - `server/hono/` depends only on Hono and `@hono/node-server`, declared at `server/hono/package.json:11`; it does not reuse the Node database, serialization, or route code.
 
 ## 5. Conventions & gotchas
@@ -295,9 +293,7 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 
 - **`/hub-proxy/*` is not universally guarded by `checkAuth()`.** It checks PocketRisu auth only for the special `X-Node-Server-Auth` flow at `server/node/server.cjs:2801`; changes to its target/header behavior need a deliberate compatibility and security review.
 
-- **Quick Tunnel is ephemeral process state.** `cloudflared` is found in `bin/` or `PATH`, otherwise downloaded from GitHub at `server/node/server.cjs:897`. The URL is parsed from stderr and lost when the server or subprocess exits (`server/node/server.cjs:6080`).
-
-- **Tailscale has no backend implementation.** It is an external reverse-access recommendation using `tailscale serve --bg http://localhost:6001`, documented at `docs/en/remote.md:25`. Only Cloudflare Quick Tunnel has API/UI integration.
+- **Tailscale has no backend implementation.** It is an external reverse-access recommendation using `tailscale serve --bg http://localhost:6001`, documented in `docs/en/remote.md`.
 
 - **Self-update is portable-only and mutates the installation tree.** Deployment type is inferred at `server/node/server.cjs:990`, and only a `.portable` deployment can call the replacement flow at `server/node/server.cjs:5676`. The keep sets, rollback staging, Windows locked-binary handling, and restart logic are data-safety behavior.
 
@@ -362,8 +358,6 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 - To change logging retention, filtering, or masking, inspect `server/node/logs.cjs:8`, `server/node/logs.cjs:62`, and `server/node/logs.cjs:257`.
 
 - To change local-network model streaming, inspect URL validation at `server/node/server.cjs:1553`, job execution at `server/node/server.cjs:1807`, WebSockets at `server/node/server.cjs:1859`, and the frontend transport at `src/ts/globalApi.svelte.ts:2156`.
-
-- To change Quick Tunnel behavior, inspect binary discovery/download at `server/node/server.cjs:897`, API routes at `server/node/server.cjs:6034`, and process lifecycle at `server/node/server.cjs:6080`.
 
 - To change update checks, inspect `fetchLatestRelease()` at `server/node/server.cjs:1348` and `src/ts/update.ts:35`.
 

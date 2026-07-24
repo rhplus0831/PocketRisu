@@ -132,13 +132,4 @@ NODE_OPTIONS="--max-old-space-size=2048" pnpm build
 
 ---
 
-## 6. 限制
-
-**Quick Tunnel(Cloudflare 自動隧道)在 Termux 上無法使用。** `cloudflared` 二進位檔與 Termux 的 DNS 和 TLS 環境不相容。
-
-PocketRisu 會自動偵測 Termux 環境,在遠端存取選單中顯示警告並隱藏啟動按鈕。
-
-
----
-
 ← [返回 README](../../i18n/README.zh-Hant.md)

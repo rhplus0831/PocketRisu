@@ -130,13 +130,4 @@ If dependencies changed, `pnpm install` runs automatically as part of the build.
 
 ---
 
-## 6. Limitations
-
-**Quick Tunnel (Cloudflare auto tunnel) does not work on Termux.** The `cloudflared` binary is incompatible with Termux's DNS and TLS environment.
-
-PocketRisu detects the Termux environment automatically and shows a warning in the Remote Access menu, hiding the start button.
-
-
----
-
 ← [Back to README](../../README.md)

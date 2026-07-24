@@ -6,25 +6,9 @@
 
 > 🌐 Esta guía está traducida por máquina. Para obtener la información más precisa, consulte la versión en [inglés](../en/remote.md) o [coreano](../ko/remote.md).
 
-Hay dos formas de acceder a PocketRisu que se ejecuta en tu PC desde otro dispositivo (smartphone, tablet, otro PC).
+Usa Tailscale para acceder mediante HTTPS a PocketRisu, que se ejecuta en tu PC, desde otro dispositivo (smartphone, tablet u otro PC).
 
-- [1. Quick Tunnel](#1-quick-tunnel) — Integrado en PocketRisu. No requiere app adicional. La URL cambia al reiniciar el servidor.
-- [2. Tailscale](#2-tailscale) — Basado en red privada (VPN). URL persistente.
-
-
-## 1. Quick Tunnel
-
-Una función integrada en PocketRisu que emite una URL temporal de acceso remoto.
-
-1. En tu PC, en PocketRisu: Configuración > Acceso Remoto > "Abrir Acceso Remoto"
-2. Escanea el código QR mostrado con la cámara de tu smartphone o introduce la URL directamente en el navegador de otro dispositivo.
-
-> La URL cambia cada vez que se reinicia el servidor. Para una URL persistente, usa [Tailscale](#2-tailscale).
-
-
----
-
-## 2. Tailscale
+## Tailscale
 
 Construye una red privada (VPN) accesible solo desde dispositivos conectados con la misma cuenta. La URL persiste a través de reinicios del servidor.
 

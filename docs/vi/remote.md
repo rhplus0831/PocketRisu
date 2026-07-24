@@ -6,25 +6,9 @@
 
 > 🌐 Hướng dẫn này được dịch bằng máy. Để có thông tin chính xác nhất, vui lòng tham khảo phiên bản [tiếng Anh](../en/remote.md) hoặc [tiếng Hàn](../ko/remote.md).
 
-Có hai cách để truy cập PocketRisu đang chạy trên PC của bạn từ thiết bị khác (điện thoại thông minh, máy tính bảng, PC khác).
+Sử dụng Tailscale để truy cập PocketRisu đang chạy trên PC của bạn qua HTTPS từ thiết bị khác (điện thoại thông minh, máy tính bảng hoặc PC khác).
 
-- [1. Quick Tunnel](#1-quick-tunnel) — Tính năng tích hợp trong PocketRisu. Không cần ứng dụng bổ sung. URL thay đổi khi khởi động lại máy chủ.
-- [2. Tailscale](#2-tailscale) — Dựa trên mạng riêng (VPN). URL cố định.
-
-
-## 1. Quick Tunnel
-
-Tính năng tích hợp của PocketRisu để cấp URL truy cập từ xa tạm thời.
-
-1. Trên PC, trong PocketRisu: Cài đặt > Truy cập từ xa > "Mở truy cập từ xa"
-2. Quét mã QR hiển thị bằng camera điện thoại thông minh hoặc nhập URL trực tiếp vào trình duyệt của thiết bị khác.
-
-> URL thay đổi mỗi khi máy chủ khởi động lại. Để có URL cố định, hãy sử dụng [Tailscale](#2-tailscale).
-
-
----
-
-## 2. Tailscale
+## Tailscale
 
 Xây dựng một mạng riêng (VPN) chỉ có thể truy cập từ các thiết bị đăng nhập cùng tài khoản. URL được duy trì sau khi máy chủ khởi động lại.
 

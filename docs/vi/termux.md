@@ -132,13 +132,4 @@ Nếu các phụ thuộc thay đổi, `pnpm install` sẽ tự động chạy nh
 
 ---
 
-## 6. Hạn chế
-
-**Quick Tunnel (đường hầm tự động của Cloudflare) không hoạt động trên Termux.** Tệp nhị phân `cloudflared` không tương thích với môi trường DNS và TLS của Termux.
-
-PocketRisu tự động phát hiện môi trường Termux và hiển thị cảnh báo trong menu Truy cập từ xa, ẩn nút khởi động.
-
-
----
-
 ← [Quay lại README](../../i18n/README.vi.md)

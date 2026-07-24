@@ -103,7 +103,7 @@ function renderInsecureContextFatalError() {
     const paragraphs = [
         'PocketRisu must be accessed over HTTPS or from localhost.',
         'Remote plain HTTP is not a secure context. The browser disables WebCrypto, which breaks asset content-addressing and integrity.',
-        'Use the built-in Cloudflare Quick Tunnel or Tailscale for easy HTTPS access.',
+        'Configure HTTPS on the server or use Tailscale for secure remote access.',
         'The server operator can set POCKETRISU_ALLOW_INSECURE_CONTEXT=1 to bypass this check at their own risk.',
     ]
     for (const message of paragraphs) {

@@ -1,6 +1,6 @@
 // ── NodeOnly: server-side JWT ────────────────────────────────────────────────
 // Upstream uses client-side ECDSA JWT (crypto.subtle) which requires Secure
-// Context (HTTPS/localhost). NodeOnly needs HTTP remote access, so JWT
+// Context (HTTPS/localhost). NodeOnly serves over HTTP, so JWT
 // signing is moved to the server. The client only caches and forwards
 // server-issued tokens. If upstream changes its auth flow, sync manually.
 // Server counterpart: server/node/server.cjs (createServerJwt, checkAuth,

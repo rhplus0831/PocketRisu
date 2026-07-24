@@ -130,13 +130,4 @@ NODE_OPTIONS="--max-old-space-size=2048" pnpm build
 
 ---
 
-## 6. 제한사항
-
-설정 → 원격 접속 메뉴의 **Quick Tunnel은 Termux에서 사용할 수 없습니다**. cloudflared 바이너리가 Termux의 DNS·TLS 환경과 호환되지 않습니다.
-
-PocketRisu UI는 Termux 환경을 자동 감지하여 해당 메뉴에 경고를 표시하고 버튼을 숨깁니다.
-
-
----
-
 ← [PocketRisu README로 돌아가기](../../i18n/README.ko.md)

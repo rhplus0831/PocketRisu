@@ -70,7 +70,7 @@ PocketRisu được phát triển từ [RisuAI](https://github.com/kwaroran/Risu
 - **Script regex & plugin**: Sửa đổi đầu ra của mô hình và mở rộng chức năng
 - **TTS & tài nguyên bổ sung**: Tổng hợp giọng nói, nhúng hình ảnh / âm thanh / video trong trò chuyện
 - **Tự cập nhật**: Tự động phát hiện phiên bản; các bản phân phối portable cập nhật từ giao diện web
-- **Truy cập từ xa di động**: Quick Tunnel (URL + QR) hoặc Tailscale
+- **Truy cập từ xa di động**: Tailscale
 - **Giao diện đa ngôn ngữ**: Tiếng Hàn, tiếng Anh, tiếng Nhật, tiếng Trung và nhiều hơn
 
 

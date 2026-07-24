@@ -70,7 +70,7 @@ PocketRisu 派生自 [RisuAI](https://github.com/kwaroran/RisuAI),针对自托�
 - **正则脚本 & 插件**:修改模型输出,扩展功能
 - **TTS & 附加资源**:语音合成、聊天中嵌入图像/音频/视频
 - **自我更新**:自动检测新版本,便携版可通过网页界面更新
-- **移动远程访问**:Quick Tunnel(URL + QR)或 Tailscale
+- **移动远程访问**: Tailscale
 - **多语言界面**:韩语、英语、日语、中文等
 
 
