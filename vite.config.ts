@@ -9,13 +9,18 @@ import { execSync } from 'child_process';
 const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'));
 
 const git = (() => {
+  // Hosted release builds unpack a `git archive` tarball, so there is no .git
+  // to probe — the builder passes the metadata it already resolved instead.
+  if (process.env.APP_BRANCH) {
+    return { branch: process.env.APP_BRANCH, commit: process.env.APP_COMMIT ?? '' };
+  }
   try {
     return {
       branch: execSync('git rev-parse --abbrev-ref HEAD', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(),
       commit: execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(),
     };
   } catch {
-    // no git available (e.g. tarball build) — badge hides itself
+    // no git available and nothing passed in — badge hides itself
     return { branch: '', commit: '' };
   }
 })();
