@@ -1,0 +1,280 @@
+import { afterAll, describe, expect, test } from 'vitest'
+import path from 'node:path'
+import { mkdir, writeFile } from 'node:fs/promises'
+import Database from 'better-sqlite3'
+import { Packr } from 'msgpackr'
+import { zipSync } from 'fflate'
+import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
+import { createClient, type RisuClient } from './helpers/client.js'
+import { createSeedBackup } from './helpers/seed.js'
+import { decodeBackup } from './helpers/decode.js'
+import { encodeBackup } from './helpers/encode.js'
+import { decodeRisuDat } from './helpers/normalize.js'
+
+const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
+const packr = new Packr({ useRecords: false })
+const servers: ServerHandle[] = []
+
+afterAll(async () => {
+  await Promise.allSettled(servers.map(server => server.cleanup()))
+})
+
+function pluginStorageKey(prefix: 'pluginsave/' | 'pluginsave-meta/', rawKey: string): string {
+  return `${prefix}${Buffer.from(rawKey, 'utf-8').toString('base64url')}.json`
+}
+
+function encodeRisuDat(database: Record<string, unknown>): Buffer {
+  return Buffer.concat([MAGIC_RAW, Buffer.from(packr.encode(database))])
+}
+
+function withDatabaseFields(
+  backup: Buffer,
+  fields: Record<string, unknown>,
+): Buffer {
+  return encodeBackup(decodeBackup(backup).map((entry) => {
+    if (entry.name !== 'database.risudat') return entry
+    const database = decodeRisuDat(entry.data)
+    Object.assign(database, fields)
+    return { ...entry, data: encodeRisuDat(database) }
+  }))
+}
+
+async function writeKv(client: RisuClient, key: string, value: Buffer): Promise<void> {
+  const response = await client.fetch('/api/write', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'file-path': Buffer.from(key, 'utf-8').toString('hex'),
+    },
+    body: new Uint8Array(value),
+  })
+  expect(response.status).toBe(200)
+}
+
+function readKvValue(cwd: string, key: string): Buffer | null {
+  const database = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
+  try {
+    const row = database.prepare('SELECT value FROM kv WHERE key = ?').get(key) as
+      | { value: Buffer }
+      | undefined
+    return row ? Buffer.from(row.value) : null
+  } finally {
+    database.close()
+  }
+}
+
+function entriesByName(backup: Buffer): Map<string, Buffer> {
+  return new Map(decodeBackup(backup).map(entry => [entry.name, entry.data]))
+}
+
+describe('external plugin rows in backup archives', () => {
+  test('Node-only exports and server saves stream rows, upstream folds them, and import restores bytes', async () => {
+    const source = await spawnServer()
+    servers.push(source)
+    const sourceClient = await createClient(source.port, source.password)
+    const seed = withDatabaseFields(createSeedBackup({ characterCount: 1 }), {
+      pluginCustomStorage: {},
+    })
+    expect((await sourceClient.importBackup(seed)).ok).toBe(true)
+
+    const valueRows = new Map<string, Buffer>([
+      [pluginStorageKey('pluginsave/', 'plain/key'), Buffer.from('{\n  "value": 1\n}\n')],
+      [pluginStorageKey('pluginsave/', '유니코드 키'), Buffer.from('["alpha",2]')],
+    ])
+    const metaRows = new Map<string, Buffer>([
+      [pluginStorageKey('pluginsave-meta/', 'plain/key'), Buffer.from('{"plugin":"Plugin A","updatedAt":10}')],
+      [pluginStorageKey('pluginsave-meta/', '유니코드 키'), Buffer.from('{"plugin":"Plugin B","updatedAt":20}')],
+    ])
+    for (const [key, value] of [...valueRows, ...metaRows]) {
+      await writeKv(sourceClient, key, value)
+    }
+
+    const nodeResponse = await sourceClient.fetch('/api/backup/export')
+    expect(nodeResponse.status).toBe(200)
+    const declaredLength = Number(nodeResponse.headers.get('content-length'))
+    const nodeBackup = Buffer.from(await nodeResponse.arrayBuffer())
+    expect(declaredLength).toBe(nodeBackup.length)
+
+    const nodeEntries = entriesByName(nodeBackup)
+    for (const [key, value] of [...valueRows, ...metaRows]) {
+      expect(nodeEntries.get(key)).toEqual(value)
+    }
+    const nodeDatabase = decodeRisuDat(nodeEntries.get('database.risudat')!)
+    expect(nodeDatabase.pluginCustomStorage).toEqual({})
+    expect(nodeDatabase.pluginStorageMeta).toBeUndefined()
+
+    const upstreamResponse = await sourceClient.fetch('/api/backup/export?target=upstream')
+    expect(upstreamResponse.status).toBe(200)
+    const upstreamBackup = Buffer.from(await upstreamResponse.arrayBuffer())
+    expect(Number(upstreamResponse.headers.get('content-length'))).toBe(upstreamBackup.length)
+    const upstreamEntries = decodeBackup(upstreamBackup)
+    expect(upstreamEntries.some(entry => entry.name.startsWith('pluginsave/'))).toBe(false)
+    expect(upstreamEntries.some(entry => entry.name.startsWith('pluginsave-meta/'))).toBe(false)
+    const upstreamDatabase = decodeRisuDat(
+      upstreamEntries.find(entry => entry.name === 'database.risudat')!.data,
+    )
+    expect(upstreamDatabase.pluginCustomStorage).toEqual({
+      'plain/key': { value: 1 },
+      '유니코드 키': ['alpha', 2],
+    })
+    expect(upstreamDatabase.pluginStorageMeta).toEqual({
+      'plain/key': { plugin: 'Plugin A', updatedAt: 10 },
+      '유니코드 키': { plugin: 'Plugin B', updatedAt: 20 },
+    })
+
+    const saveResponse = await sourceClient.fetch('/api/backup/server/save', { method: 'POST' })
+    expect(saveResponse.status).toBe(200)
+    const saveEvents = (await saveResponse.text())
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map(line => JSON.parse(line))
+    const done = saveEvents.find(event => event.type === 'done') as
+      | { filename: string; size: number }
+      | undefined
+    const finalProgress = [...saveEvents].reverse().find(event => event.type === 'progress') as
+      | { current: number; total: number; bytes: number; totalBytes: number }
+      | undefined
+    expect(done).toBeTruthy()
+    expect(finalProgress).toBeTruthy()
+    const downloadResponse = await sourceClient.fetch(`/api/backup/server/download/${done!.filename}`)
+    expect(downloadResponse.status).toBe(200)
+    const savedBackup = Buffer.from(await downloadResponse.arrayBuffer())
+    expect(done!.size).toBe(savedBackup.length)
+    expect(finalProgress).toMatchObject({
+      current: finalProgress!.total,
+      bytes: savedBackup.length,
+      totalBytes: savedBackup.length,
+    })
+    const savedEntries = entriesByName(savedBackup)
+    for (const [key, value] of [...valueRows, ...metaRows]) {
+      expect(savedEntries.get(key)).toEqual(value)
+    }
+    expect(decodeRisuDat(savedEntries.get('database.risudat')!).pluginCustomStorage).toEqual({})
+
+    const destination = await spawnServer()
+    servers.push(destination)
+    const destinationClient = await createClient(destination.port, destination.password)
+    expect((await destinationClient.importBackup(createSeedBackup())).ok).toBe(true)
+    const staleKey = pluginStorageKey('pluginsave/', 'stale')
+    await writeKv(destinationClient, staleKey, Buffer.from('"stale"'))
+
+    expect((await destinationClient.importBackup(nodeBackup)).ok).toBe(true)
+    expect(readKvValue(destination.cwd, staleKey)).toBeNull()
+    for (const [key, value] of [...valueRows, ...metaRows]) {
+      expect(readKvValue(destination.cwd, key)).toEqual(value)
+    }
+    const storedDatabase = decodeRisuDat(readKvValue(destination.cwd, 'database/database.bin')!)
+    expect(storedDatabase.pluginCustomStorage).toEqual({})
+    expect(storedDatabase.pluginStorageMeta).toBeUndefined()
+  })
+
+  test('legacy backups retain folded plugin storage and clear stale external rows', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const staleValueKey = pluginStorageKey('pluginsave/', 'stale')
+    const staleMetaKey = pluginStorageKey('pluginsave-meta/', 'stale')
+    await writeKv(client, staleValueKey, Buffer.from('1'))
+    await writeKv(client, staleMetaKey, Buffer.from('{}'))
+
+    const legacyValues = { legacy: { nested: ['value'] } }
+    const legacyMeta = { legacy: { plugin: 'Legacy Plugin', updatedAt: 123 } }
+    const legacyBackup = withDatabaseFields(createSeedBackup(), {
+      pluginCustomStorage: legacyValues,
+      pluginStorageMeta: legacyMeta,
+    })
+    expect((await client.importBackup(legacyBackup)).ok).toBe(true)
+
+    expect(readKvValue(server.cwd, staleValueKey)).toBeNull()
+    expect(readKvValue(server.cwd, staleMetaKey)).toBeNull()
+    const storedDatabase = decodeRisuDat(readKvValue(server.cwd, 'database/database.bin')!)
+    expect(storedDatabase.pluginCustomStorage).toEqual(legacyValues)
+    expect(storedDatabase.pluginStorageMeta).toEqual(legacyMeta)
+
+    const exported = await client.exportBackup()
+    const exportedEntries = decodeBackup(exported)
+    expect(exportedEntries.some(entry => entry.name.startsWith('pluginsave/'))).toBe(false)
+    expect(exportedEntries.some(entry => entry.name.startsWith('pluginsave-meta/'))).toBe(false)
+    const exportedDatabase = decodeRisuDat(
+      exportedEntries.find(entry => entry.name === 'database.risudat')!.data,
+    )
+    expect(exportedDatabase.pluginCustomStorage).toEqual(legacyValues)
+    expect(exportedDatabase.pluginStorageMeta).toEqual(legacyMeta)
+  })
+
+  test('backup import rejects non-canonical plugin row names', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const invalidBackup = Buffer.concat([
+      createSeedBackup(),
+      encodeBackup([{
+        name: 'pluginsave/YQ==.json',
+        data: Buffer.from('1'),
+      }]),
+    ])
+
+    const result = await client.importBackup(invalidBackup)
+    expect(result.ok).not.toBe(true)
+    expect(result.error).toContain('Invalid encoded plugin storage key')
+    expect(readKvValue(server.cwd, 'database/database.bin')).toBeNull()
+  })
+
+  test('save-folder scan, directory import, and ZIP upload preserve external plugin rows', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const databaseValue = decodeBackup(withDatabaseFields(createSeedBackup(), {
+      pluginCustomStorage: {},
+    })).find(entry => entry.name === 'database.risudat')!.data
+    const hexName = (key: string) => Buffer.from(key, 'utf-8').toString('hex')
+
+    const directoryValueKey = pluginStorageKey('pluginsave/', 'directory')
+    const directoryMetaKey = pluginStorageKey('pluginsave-meta/', 'directory')
+    const directoryValue = Buffer.from('{"from":"directory"}')
+    const directoryMeta = Buffer.from('{"plugin":"Directory","updatedAt":1}')
+    const sourceDir = path.join(server.cwd, 'plugin-save-source')
+    await mkdir(sourceDir, { recursive: true })
+    await writeFile(path.join(sourceDir, hexName('database/database.bin')), databaseValue)
+    await writeFile(path.join(sourceDir, hexName(directoryValueKey)), directoryValue)
+    await writeFile(path.join(sourceDir, hexName(directoryMetaKey)), directoryMeta)
+
+    const scanResponse = await client.fetch('/api/migrate/save-folder/scan', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: sourceDir }),
+    })
+    expect(scanResponse.status).toBe(200)
+    expect(await scanResponse.json()).toMatchObject({ count: 3, hasDatabase: true })
+
+    const directoryResponse = await client.fetch('/api/migrate/save-folder/execute', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: sourceDir }),
+    })
+    expect(directoryResponse.status).toBe(200)
+    expect(readKvValue(server.cwd, directoryValueKey)).toEqual(directoryValue)
+    expect(readKvValue(server.cwd, directoryMetaKey)).toEqual(directoryMeta)
+
+    const zipValueKey = pluginStorageKey('pluginsave/', 'zip')
+    const zipMetaKey = pluginStorageKey('pluginsave-meta/', 'zip')
+    const zipValue = Buffer.from('{"from":"zip"}')
+    const zipMeta = Buffer.from('{"plugin":"Zip","updatedAt":2}')
+    const zip = Buffer.from(zipSync({
+      [hexName('database/database.bin')]: new Uint8Array(databaseValue),
+      [hexName(zipValueKey)]: new Uint8Array(zipValue),
+      [hexName(zipMetaKey)]: new Uint8Array(zipMeta),
+    }))
+    const uploadResponse = await client.fetch('/api/migrate/save-folder/upload', {
+      method: 'POST',
+      headers: { 'content-type': 'application/zip' },
+      body: new Uint8Array(zip),
+    })
+    expect(uploadResponse.status).toBe(200)
+    expect(readKvValue(server.cwd, directoryValueKey)).toBeNull()
+    expect(readKvValue(server.cwd, directoryMetaKey)).toBeNull()
+    expect(readKvValue(server.cwd, zipValueKey)).toEqual(zipValue)
+    expect(readKvValue(server.cwd, zipMetaKey)).toEqual(zipMeta)
+  })
+})

@@ -1912,6 +1912,10 @@ function encodeBackupEntry(name, data) {
     return Buffer.concat([nameLength, encodedName, dataLength, data]);
 }
 
+function backupEntrySize(name, dataSize) {
+    return 8 + Buffer.byteLength(name, 'utf-8') + dataSize;
+}
+
 function isInvalidBackupPathSegment(name) {
     return (
         !name ||
@@ -2080,16 +2084,20 @@ function parsePluginSaveJson(storageKey) {
 }
 
 /**
- * Backups carry one upstream-compatible representation: database.risudat with
- * plugin save data folded inline. Raw pluginsave/ entries are intentionally
- * omitted from the archive.
+ * Chat rows are always assembled into database.risudat. Upstream exports also
+ * fold external plugin rows into that database; Node-only exports keep them as
+ * independent archive entries so large plugin stores are never monolithized.
  */
-async function buildSelfContainedBackupDatabase() {
+async function buildSelfContainedBackupDatabase({ foldPluginStorage = true } = {}) {
     const raw = kvGet('database/database.bin');
     if (!raw) return null;
 
     const strippedDb = await loadStrippedDatabase(raw, 'Backup');
     const dbObj = await chatRowStore.assembleFullDb(strippedDb);
+    if (!foldPluginStorage) {
+        return Buffer.from(encodeRisuSaveLegacy(dbObj));
+    }
+
     const valueKeys = kvList(PLUGIN_SAVE_PREFIX);
     const metaKeys = kvList(PLUGIN_SAVE_META_PREFIX);
     if (valueKeys.length > 0) {
@@ -2105,6 +2113,18 @@ async function buildSelfContainedBackupDatabase() {
         dbObj.pluginStorageMeta[key] = parsePluginSaveJson(storageKey);
     }
     return Buffer.from(encodeRisuSaveLegacy(dbObj));
+}
+
+function listPluginBackupEntries() {
+    return [PLUGIN_SAVE_PREFIX, PLUGIN_SAVE_META_PREFIX].flatMap((prefix) => (
+        kvListWithSizes(prefix).map((entry) => ({
+            kind: 'kv',
+            key: entry.key,
+            backupName: entry.key,
+            sortKey: entry.key,
+            size: entry.size,
+        }))
+    ));
 }
 
 function resolveBackupStorageKey(name) {
@@ -2139,6 +2159,17 @@ function resolveBackupStorageKey(name) {
         if (!parsed) {
             throw new Error(`Invalid inlay sidecar backup entry name: ${name}`);
         }
+        return name;
+    }
+
+    if (
+        name.startsWith(PLUGIN_SAVE_PREFIX) ||
+        name.startsWith(PLUGIN_SAVE_META_PREFIX)
+    ) {
+        const prefix = name.startsWith(PLUGIN_SAVE_PREFIX)
+            ? PLUGIN_SAVE_PREFIX
+            : PLUGIN_SAVE_META_PREFIX;
+        decodePluginSaveStorageKey(name, prefix);
         return name;
     }
 
@@ -2259,9 +2290,9 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         // Chat rows are per-database payloads and are never carried as backup
         // entries; imported database.risudat recreates them after commit.
         for (const key of chatRowStore.listAllChatRowKeys()) kvDel(key);
-        // Externalized plugin save data is folded into database.risudat during
-        // export. Wipe the old user's copies so they cannot shadow imported
-        // inline data before the client reconciles the imported mode flag.
+        // Plugin rows belong to the imported database. New Node-only backups
+        // repopulate them as entries below; legacy/upstream backups keep their
+        // values folded in database.risudat. Either way, stale rows must go.
         kvDelPrefix(PLUGIN_SAVE_PREFIX);
         kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
         // Composer drafts are session/device-local and not carried in the backup;
@@ -3988,15 +4019,16 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
 app.get('/api/backup/export', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
     try {
-        // ?target=upstream excludes NodeOnly-only inlay namespaces (inlay/,
-        // inlay_sidecar/, inlay_meta/). Their entry names contain a slash,
-        // which upstream RisuAI's import treats as a path under assets/ and
-        // fails with ENOENT. The export becomes lossy on inlay images but
-        // imports cleanly into upstream.
+        // ?target=upstream excludes NodeOnly-only slashed namespaces: plugin
+        // rows plus inlay/, inlay_sidecar/, and inlay_meta/. Upstream RisuAI's
+        // import treats those names as paths under assets/ and fails with
+        // ENOENT. Plugin rows are folded inline; inlay images remain lossy.
         const target = req.query.target === 'upstream' ? 'upstream' : 'nodeonly';
         // Flush any pending patches to ensure export includes latest data
         await flushPendingDb();
-        const backupDbValue = await buildSelfContainedBackupDatabase();
+        const backupDbValue = await buildSelfContainedBackupDatabase({
+            foldPluginStorage: target === 'upstream',
+        });
         const inlayFiles = target === 'upstream' ? [] : await listInlayFiles();
         const inlayEntries = await Promise.all(inlayFiles.map(async (entry) => {
             const stat = await fs.stat(entry.filePath);
@@ -4030,6 +4062,7 @@ app.get('/api/backup/export', async (req, res, next) => {
             sortKey: entry.key,
             size: entry.size,
         }));
+        const pluginEntries = target === 'upstream' ? [] : listPluginBackupEntries();
         const namespacedEntries = [
             ...listAssetEntriesWithSizes().map((entry) => ({
                 kind: 'asset',
@@ -4039,14 +4072,15 @@ app.get('/api/backup/export', async (req, res, next) => {
                 size: entry.size,
             })),
             ...listColdStorageBackupEntries(),
+            ...pluginEntries,
             ...inlayMetaEntries,
             ...inlayEntries,
             ...sidecarEntries.filter(Boolean),
         ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
         const dbSize = backupDbValue?.length ?? 0;
         const totalBytes = namespacedEntries.reduce((sum, entry) => {
-            return sum + 8 + Buffer.byteLength(entry.backupName, 'utf-8') + entry.size;
-        }, 0) + (dbSize ? 8 + Buffer.byteLength('database.risudat', 'utf-8') + dbSize : 0);
+            return sum + backupEntrySize(entry.backupName, entry.size);
+        }, 0) + (dbSize ? backupEntrySize('database.risudat', dbSize) : 0);
 
         const filenameSuffix = target === 'upstream' ? '-upstream' : '';
         res.setHeader('content-type', 'application/octet-stream');
@@ -4239,7 +4273,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     try {
         await flushPendingDb();
-        const backupDbValue = await buildSelfContainedBackupDatabase();
+        const backupDbValue = await buildSelfContainedBackupDatabase({ foldPluginStorage: false });
 
         // Pre-flight disk check — bail before streaming if the target dir
         // can't fit the backup. Avoids wasted minutes + half-written tmp files.
@@ -4278,14 +4312,19 @@ app.post('/api/backup/server/save', async (req, res, next) => {
         const namespacedEntries = [
             ...listAssetEntriesWithSizes().map((e) => ({ kind: 'asset', key: e.key, backupName: path.basename(e.key), size: e.size })),
             ...listColdStorageBackupEntries(),
+            ...listPluginBackupEntries(),
             ...kvListWithSizes('inlay_meta/').map((e) => ({ kind: 'kv', key: e.key, backupName: e.key, size: e.size })),
             ...inlayEntries,
             ...sidecarEntries,
         ];
 
         const totalEntries = namespacedEntries.length + 1; // +1 for database
-        const totalBytes = namespacedEntries.reduce((sum, e) => sum + e.size, 0)
-            + (backupDbValue?.length ?? 0);
+        const totalBytes = namespacedEntries.reduce(
+            (sum, entry) => sum + backupEntrySize(entry.backupName, entry.size),
+            0
+        ) + (backupDbValue
+            ? backupEntrySize('database.risudat', backupDbValue.length)
+            : 0);
 
         // Stream progress as NDJSON
         res.setHeader('content-type', 'application/x-ndjson');
@@ -4318,9 +4357,10 @@ app.post('/api/backup/server/save', async (req, res, next) => {
                                 ? entry.buffer
                                 : await fs.readFile(entry.sourcePath);
                         if (value) {
-                            const ok = writeStream.write(encodeBackupEntry(entry.backupName, value));
+                            const encodedEntry = encodeBackupEntry(entry.backupName, value);
+                            const ok = writeStream.write(encodedEntry);
                             if (!ok) await new Promise(r => writeStream.once('drain', r));
-                            bytesWritten += value.length;
+                            bytesWritten += encodedEntry.length;
                         }
                         written++;
                         if (written % 50 === 0 || written === namespacedEntries.length) {
@@ -4329,9 +4369,10 @@ app.post('/api/backup/server/save', async (req, res, next) => {
                     }
                     if (closed) throw new Error('Client disconnected during backup save');
                     if (backupDbValue) {
-                        const ok = writeStream.write(encodeBackupEntry('database.risudat', backupDbValue));
+                        const encodedEntry = encodeBackupEntry('database.risudat', backupDbValue);
+                        const ok = writeStream.write(encodedEntry);
                         if (!ok) await new Promise(r => writeStream.once('drain', r));
-                        bytesWritten += backupDbValue.length;
+                        bytesWritten += encodedEntry.length;
                     }
                     res.write(JSON.stringify({ type: 'progress', current: totalEntries, total: totalEntries, bytes: bytesWritten, totalBytes }) + '\n');
                     writeStream.end(resolve);
@@ -4873,8 +4914,9 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
                 );
                 continue;
             }
-            // Modern save folders may also contain externalized chat rows.
-            // Route every chunk-capable namespace through the safe bind path.
+            // Modern save folders may also contain externalized chat and plugin
+            // rows. Plugin rows use the generic raw-row insert below; route the
+            // chunk-capable namespaces through the safe bind path.
             if (key === DB_BLOB_KEY
                 || key.startsWith('database/dbbackup-')
                 || key.startsWith('chats/')) {
@@ -5182,9 +5224,8 @@ async function sumInlayFsBytes() {
 async function estimateServerBackupSize() {
     let total = 0;
     total += kvSize(DB_BLOB_KEY) || 0;
-    // The final database blob folds these JSON values inline. Counting their
-    // raw sizes keeps the pre-flight estimate conservative enough without
-    // decoding/re-encoding the full database on every dashboard refresh.
+    // Server backups carry plugin values as individual archive entries. Count
+    // their raw payload sizes without reading or decoding them.
     for (const it of kvListWithSizes(PLUGIN_SAVE_PREFIX)) total += it.size;
     for (const it of kvListWithSizes(PLUGIN_SAVE_META_PREFIX)) total += it.size;
     for (const it of listAssetEntriesWithSizes()) total += it.size;

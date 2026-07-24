@@ -169,8 +169,8 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 #### Backup and migration flow
 
 - The binary backup framing is `[nameLength:u32LE][UTF-8 name][dataLength:u32LE][data]`, encoded by `encodeBackupEntry()` at `server/node/server.cjs:1893` and parsed incrementally by `parseBackupChunk()` at `server/node/server.cjs:2145`.
-- Portable and server backups never contain `chats/` entries. `buildSelfContainedBackupDatabase()` assembles the stubs-only live row with its chat rows, folds plugin-save values inline, and emits one upstream-compatible `database.risudat` at `server/node/server.cjs:2074`.
-- `/api/backup/export` flushes pending data and streams the assembled DB, assets, cold storage, and filesystem inlays at `server/node/server.cjs:3975`. `?target=upstream` deliberately omits Node-only inlay namespaces.
+- Portable and server backups never contain `chats/` entries. `buildSelfContainedBackupDatabase()` assembles the stubs-only live row with its chat rows. Node-only exports keep `pluginsave/` and `pluginsave-meta/` values as byte-preserving per-row archive entries, while `?target=upstream` folds those rows into `database.risudat` for compatibility.
+- `/api/backup/export` flushes pending data and streams the assembled DB, assets, cold storage, plugin rows, and filesystem inlays. `?target=upstream` deliberately omits all Node-only slashed namespaces (plugin rows and inlays), because upstream treats them as asset paths.
 - `/api/backup/import` streams directly from the request, stages filesystem data, replaces current namespaces, and passes the imported `database.risudat` through `ingestDatabase()` after commit (`importBackupFromSource()` at `server/node/server.cjs:2172`).
 - Server-side backups use the same format but write `risu-backup-<timestamp>.bin` under the configured backup directory; save/list/restore/delete/download begin at `server/node/server.cjs:4224`.
 - Legacy save folders consist of files whose filenames are hex-encoded logical KV keys. Successful imports externalize their live DB through the same ingest boundary at `server/node/server.cjs:4776`.
