@@ -42,6 +42,7 @@
         chunkBytes?: number
     }
     interface Stats {
+        hubHosting?: boolean
         files: { db: number; wal: number; shm: number }
         disk: { free: number | null; total: number | null }
         backupDisk?: { free: number | null; total: number | null; path?: string; sameAsSaveDir?: boolean }
@@ -140,7 +141,9 @@
             const auth = await forageStorage.createAuth()
             const res = await fetch('/api/db/stats', { headers: { 'risu-auth': auth } })
             if (!res.ok) throw new Error(`HTTP ${res.status}`)
-            stats = await res.json()
+            const nextStats: Stats = await res.json()
+            stats = nextStats
+            if (nextStats.hubHosting) showFullDisk = false
         } catch (err) {
             loadError = err instanceof Error ? err.message : String(err)
         } finally {
@@ -597,14 +600,16 @@
             {/if}
         </div>
 
-        <!-- Footer: internal-only switch -->
-        <div class="flex items-center justify-between gap-2 mt-3 pt-3 border-t border-darkborderc/50">
-            <label class="flex items-center gap-2 cursor-pointer select-none">
-                <ShSwitch bind:checked={showFullDisk} />
-                <span class="text-textcolor text-sm">{language.storageInternalOnly}</span>
-            </label>
-            <span class="text-textcolor2 text-xs hidden sm:inline">{language.storageInternalOnlyHint}</span>
-        </div>
+        {#if !stats.hubHosting}
+            <!-- Footer: internal-only switch -->
+            <div class="flex items-center justify-between gap-2 mt-3 pt-3 border-t border-darkborderc/50">
+                <label class="flex items-center gap-2 cursor-pointer select-none">
+                    <ShSwitch bind:checked={showFullDisk} />
+                    <span class="text-textcolor text-sm">{language.storageInternalOnly}</span>
+                </label>
+                <span class="text-textcolor2 text-xs hidden sm:inline">{language.storageInternalOnlyHint}</span>
+            </div>
+        {/if}
     </div>
 
     <!-- ② Manual WAL cleanup ────────────────────────────────────────────── -->

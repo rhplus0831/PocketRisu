@@ -73,6 +73,7 @@
     let diskFree = $state<number | null>(null)
     let diskTotal = $state<number | null>(null)
     let estimatedBackupSize = $state<number | null>(null)
+    let hubHosting = $state<boolean | null>(null)
 
     const diskUsedPct = $derived(
         diskFree != null && diskTotal != null && diskTotal > 0
@@ -180,6 +181,8 @@
 
     async function submitLimits() {
         if (!limits) return
+        // Hub instances pin the byte cap server-side — only send the count.
+        const isHub = hubHosting === true
         const c = Math.floor(Number(limitsDraftCount))
         const mb = Math.floor(Number(limitsDraftMB))
         const minC = limits.bounds.minCount
@@ -190,7 +193,7 @@
             limitsDialogError = language.backupSnapshotLimitsCountRange(minC, maxC)
             return
         }
-        if (!Number.isFinite(mb) || mb < minMB || mb > maxMB) {
+        if (!isHub && (!Number.isFinite(mb) || mb < minMB || mb > maxMB)) {
             limitsDialogError = language.backupSnapshotLimitsBytesRange(minMB, maxMB)
             return
         }
@@ -201,7 +204,7 @@
             const res = await fetch('/api/db/snapshots/limits', {
                 method: 'PUT',
                 headers: { 'risu-auth': auth, 'content-type': 'application/json' },
-                body: JSON.stringify({ maxCount: c, maxBytes: mb * 1024 * 1024 }),
+                body: JSON.stringify(isHub ? { maxCount: c } : { maxCount: c, maxBytes: mb * 1024 * 1024 }),
             })
             const json = await res.json().catch(() => ({}))
             if (!res.ok) {
@@ -270,19 +273,26 @@
     }
 
     // ── Stats (for disk warnings + insufficient guard) ──────────────────────
-    async function loadStats() {
+    async function loadStats(): Promise<boolean> {
         try {
             const auth = await forageStorage.createAuth()
             const res = await fetch('/api/db/stats', { headers: { 'risu-auth': auth } })
-            if (!res.ok) return
+            if (!res.ok) throw new Error(`HTTP ${res.status}`)
             const json = await res.json()
+            hubHosting = json?.hubHosting === true
             // Prefer backupDisk (mounts to actual backup destination); fall
             // back to disk for older servers that don't yet expose it.
             const d = json?.backupDisk ?? json?.disk
             if (typeof d?.free === 'number') diskFree = d.free
             if (typeof d?.total === 'number') diskTotal = d.total
             if (typeof json?.estimatedBackupSize === 'number') estimatedBackupSize = json.estimatedBackupSize
-        } catch { /* non-fatal */ }
+            return hubHosting
+        } catch {
+            // Stats are advisory. Preserve the existing server-backup UI when
+            // an older server or a transient failure cannot report the flag.
+            hubHosting = false
+            return false
+        }
     }
 
     // ── Boot reminder ────────────────────────────────────────────────────────
@@ -339,18 +349,24 @@
         LoadLocalBackup()
     }
 
+    async function loadServerBackupState() {
+        const isHubHosting = await loadStats()
+        if (!isHubHosting) {
+            await Promise.all([loadPath(), loadBootReminder()])
+        }
+    }
+
     $effect(() => {
         loadSnapshots()
-        loadPath()
         loadLimits()
-        loadBootReminder()
-        loadStats()
+        loadServerBackupState()
     })
 </script>
 
 <p class="text-textcolor2 text-sm mb-4">{language.backupTabDesc}</p>
 
 <!-- Server backup section ────────────────────────────────────────────────── -->
+{#if hubHosting === false}
 <div class="border border-darkborderc bg-darkbg/40 rounded-md p-4 mb-4">
     <div class="flex items-center justify-between gap-2 mb-3 flex-wrap">
         <div class="flex items-center gap-2 text-textcolor">
@@ -412,6 +428,7 @@
 
     <ServerBackupList bind:this={backupListEl} />
 </div>
+{/if}
 
 <!-- Snapshot section ─────────────────────────────────────────────────────── -->
 <div class="border border-darkborderc bg-darkbg/40 rounded-md p-4 mb-4">
@@ -552,19 +569,21 @@
                     {language.backupSnapshotLimitsCountRange(limits.bounds.minCount, limits.bounds.maxCount)}
                 </span>
             </label>
-            <label class="flex flex-col gap-1">
-                <span class="text-textcolor2 text-sm">{language.backupSnapshotLimitsBytes}</span>
-                <ShInput type="number" bind:value={limitsDraftMB}
-                    min={Math.round(limits.bounds.minBytes / 1024 / 1024)}
-                    max={Math.round(limits.bounds.maxBytes / 1024 / 1024)}
-                    step={10} />
-                <span class="text-textcolor2 text-xs opacity-70">
-                    {language.backupSnapshotLimitsBytesRange(
-                        Math.round(limits.bounds.minBytes / 1024 / 1024),
-                        Math.round(limits.bounds.maxBytes / 1024 / 1024)
-                    )}
-                </span>
-            </label>
+            {#if hubHosting !== true}
+                <label class="flex flex-col gap-1">
+                    <span class="text-textcolor2 text-sm">{language.backupSnapshotLimitsBytes}</span>
+                    <ShInput type="number" bind:value={limitsDraftMB}
+                        min={Math.round(limits.bounds.minBytes / 1024 / 1024)}
+                        max={Math.round(limits.bounds.maxBytes / 1024 / 1024)}
+                        step={10} />
+                    <span class="text-textcolor2 text-xs opacity-70">
+                        {language.backupSnapshotLimitsBytesRange(
+                            Math.round(limits.bounds.minBytes / 1024 / 1024),
+                            Math.round(limits.bounds.maxBytes / 1024 / 1024)
+                        )}
+                    </span>
+                </label>
+            {/if}
         </div>
     {/if}
     {#if limitsDialogError}

@@ -101,6 +101,7 @@ const enablePatchSync = true;
 // values allow the client to boot outside a browser secure context.
 const allowInsecureContext = process.env.POCKETRISU_ALLOW_INSECURE_CONTEXT === '1'
     || process.env.POCKETRISU_ALLOW_INSECURE_CONTEXT === 'true';
+const HUB_HOSTING_MODE = ['true', '1'].includes(String(process.env.POCKETRISU_HUB_HOSTING ?? '').trim().toLowerCase());
 
 // In-memory database cache for patch-based sync
 // dbCache stores the STRIPPED (stubs-only) version matching what the client sees.
@@ -196,6 +197,17 @@ const SNAPSHOT_LIMIT_MIN_COUNT = 1;
 const SNAPSHOT_LIMIT_MAX_COUNT = 100;
 const SNAPSHOT_LIMIT_MIN_BYTES = 10 * 1024 * 1024;        // 10 MB
 const SNAPSHOT_LIMIT_MAX_BYTES = 50 * 1024 * 1024 * 1024; // 50 GB
+// Hub-mode snapshot byte cap. POCKETRISU_HUB_SNAPSHOT_CAP_MB (in MB) replaces
+// the tenant-stored value everywhere the cap is read (endpoints and trim
+// rotation); unset/invalid falls back to the 500 MB default, clamped to the
+// same safety bounds as a PUT. null outside hub mode.
+const HUB_SNAPSHOT_CAP_BYTES = (() => {
+    if (!HUB_HOSTING_MODE) return null;
+    const mb = Number(process.env.POCKETRISU_HUB_SNAPSHOT_CAP_MB);
+    if (!Number.isFinite(mb) || mb <= 0) return SNAPSHOT_LIMIT_DEFAULT_BYTES;
+    const bytes = Math.floor(mb * 1024 * 1024);
+    return Math.min(SNAPSHOT_LIMIT_MAX_BYTES, Math.max(SNAPSHOT_LIMIT_MIN_BYTES, bytes));
+})();
 const BACKUP_INTERVAL_MS = process.env.POCKETRISU_BACKUP_INTERVAL_MS
     ? Number(process.env.POCKETRISU_BACKUP_INTERVAL_MS)
     : 5 * 60 * 1000; // 5 minutes (override for tests to force snapshot creation)
@@ -217,7 +229,7 @@ function getSnapshotLimits() {
             SNAPSHOT_LIMIT_COUNT_KEY, SNAPSHOT_LIMIT_DEFAULT_COUNT,
             SNAPSHOT_LIMIT_MIN_COUNT, SNAPSHOT_LIMIT_MAX_COUNT,
         ),
-        maxBytes: readSnapshotConfigInt(
+        maxBytes: HUB_SNAPSHOT_CAP_BYTES ?? readSnapshotConfigInt(
             SNAPSHOT_LIMIT_BYTES_KEY, SNAPSHOT_LIMIT_DEFAULT_BYTES,
             SNAPSHOT_LIMIT_MIN_BYTES, SNAPSHOT_LIMIT_MAX_BYTES,
         ),
@@ -766,7 +778,7 @@ function isManagedBackupPath(absPath) {
 }
 
 let backupsDir = readBackupsDirConfig();
-if(!existsSync(backupsDir)){
+if(!HUB_HOSTING_MODE && !existsSync(backupsDir)){
     try { mkdirSync(backupsDir, { recursive: true }); }
     catch { backupsDir = DEFAULT_BACKUPS_DIR; mkdirSync(backupsDir, { recursive: true }); }
 }
@@ -4534,6 +4546,7 @@ app.post('/api/backup/import', async (req, res, next) => {
 app.post('/api/backup/server/save', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
     if (!checkActiveSession(req, res)) return;
+    if (HUB_HOSTING_MODE) return res.status(403).json({ error: 'Server backups are disabled on this instance' });
     let backupDbSpool = null;
     let closed = false;
     res.once('close', () => { closed = true; });
@@ -4682,6 +4695,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
 // List backup files on the server
 app.get('/api/backup/server/list', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
+    if (HUB_HOSTING_MODE) return res.status(403).json({ error: 'Server backups are disabled on this instance' });
     try {
         let entries;
         try {
@@ -4712,6 +4726,7 @@ app.get('/api/backup/server/list', async (req, res, next) => {
 app.post('/api/backup/server/restore', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
     if (!checkActiveSession(req, res)) return;
+    if (HUB_HOSTING_MODE) return res.status(403).json({ error: 'Server backups are disabled on this instance' });
 
     if (importInProgress) {
         res.status(409).json({ error: 'Another import is already in progress' });
@@ -4782,6 +4797,7 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
 app.delete('/api/backup/server/:filename', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
     if (!checkActiveSession(req, res)) return;
+    if (HUB_HOSTING_MODE) return res.status(403).json({ error: 'Server backups are disabled on this instance' });
     try {
         const filename = req.params.filename;
         if (!BACKUP_FILENAME_REGEX.test(filename)) {
@@ -4807,6 +4823,7 @@ app.delete('/api/backup/server/:filename', async (req, res, next) => {
 // Download a server backup file
 app.get('/api/backup/server/download/:filename', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
+    if (HUB_HOSTING_MODE) return res.status(403).json({ error: 'Server backups are disabled on this instance' });
     try {
         const filename = req.params.filename;
         if (!BACKUP_FILENAME_REGEX.test(filename)) {
@@ -5556,7 +5573,9 @@ app.get('/api/db/stats', async (req, res, next) => {
             shm: statSafe(shmPath)?.size ?? 0,
         };
 
-        const disk = await diskFreeStat(saveDir);
+        const disk = HUB_HOSTING_MODE
+            ? { free: null, total: null }
+            : await diskFreeStat(saveDir);
         // Backup destination disk — same as save/ in the default config but
         // can diverge when the user points backupsDir at a different mount.
         // Surfaced separately so backup-side warnings target the right disk.
@@ -5564,17 +5583,19 @@ app.get('/api/db/stats', async (req, res, next) => {
         // (compared by Stat.dev). Dashboard uses this to decide whether to
         // count file backups against the save/ disk in the storage chart.
         let backupDisk;
-        if (backupsDir === DEFAULT_BACKUPS_DIR) {
-            backupDisk = { ...disk, path: backupsDir, sameAsSaveDir: true };
-        } else {
-            const bDisk = await diskFreeStat(backupsDir);
-            let sameAsSaveDir = false;
-            try {
-                const saveStat = require('fs').statSync(saveDir);
-                const bStat = require('fs').statSync(backupsDir);
-                sameAsSaveDir = saveStat.dev === bStat.dev;
-            } catch { /* non-fatal */ }
-            backupDisk = { ...bDisk, path: backupsDir, sameAsSaveDir };
+        if (!HUB_HOSTING_MODE) {
+            if (backupsDir === DEFAULT_BACKUPS_DIR) {
+                backupDisk = { ...disk, path: backupsDir, sameAsSaveDir: true };
+            } else {
+                const bDisk = await diskFreeStat(backupsDir);
+                let sameAsSaveDir = false;
+                try {
+                    const saveStat = require('fs').statSync(saveDir);
+                    const bStat = require('fs').statSync(backupsDir);
+                    sameAsSaveDir = saveStat.dev === bStat.dev;
+                } catch { /* non-fatal */ }
+                backupDisk = { ...bDisk, path: backupsDir, sameAsSaveDir };
+            }
         }
 
         const pageSize = sqliteDb.pragma('page_size', { simple: true });
@@ -5643,18 +5664,20 @@ app.get('/api/db/stats', async (req, res, next) => {
         const kvTotalBytes = sqliteDb.prepare('SELECT COALESCE(SUM(LENGTH(value)), 0) AS s FROM kv').get().s;
 
         let fileBackups = { count: 0, totalSize: 0, oldest: null, newest: null };
-        try {
-            const entries = await fs.readdir(backupsDir, { withFileTypes: true });
-            for (const e of entries) {
-                if (!e.isFile() || !BACKUP_FILENAME_REGEX.test(e.name)) continue;
-                const st = await fs.stat(path.join(backupsDir, e.name));
-                fileBackups.count++;
-                fileBackups.totalSize += st.size;
-                const ts = st.mtimeMs;
-                if (!fileBackups.oldest || ts < fileBackups.oldest) fileBackups.oldest = ts;
-                if (!fileBackups.newest || ts > fileBackups.newest) fileBackups.newest = ts;
-            }
-        } catch { /* backups dir may not exist */ }
+        if (!HUB_HOSTING_MODE) {
+            try {
+                const entries = await fs.readdir(backupsDir, { withFileTypes: true });
+                for (const e of entries) {
+                    if (!e.isFile() || !BACKUP_FILENAME_REGEX.test(e.name)) continue;
+                    const st = await fs.stat(path.join(backupsDir, e.name));
+                    fileBackups.count++;
+                    fileBackups.totalSize += st.size;
+                    const ts = st.mtimeMs;
+                    if (!fileBackups.oldest || ts < fileBackups.oldest) fileBackups.oldest = ts;
+                    if (!fileBackups.newest || ts > fileBackups.newest) fileBackups.newest = ts;
+                }
+            } catch { /* backups dir may not exist */ }
+        }
 
         // Quick estimates from in-memory cache only — never decode the BLOB just for stats.
         let trashed = { count: 0, expiredCount: 0, available: false };
@@ -5682,7 +5705,9 @@ app.get('/api/db/stats', async (req, res, next) => {
             orphan.available = true;
         }
 
-        const estimatedBackupSize = await estimateServerBackupSize();
+        const estimatedBackupSize = HUB_HOSTING_MODE
+            ? undefined
+            : await estimateServerBackupSize();
         // Inlay payload now lives on the filesystem (post-migration) rather
         // than in kv `inlay/*` prefixes. Surface explicitly so the dashboard
         // chart can include it in the inlay slice instead of underreporting.
@@ -5690,15 +5715,16 @@ app.get('/api/db/stats', async (req, res, next) => {
         const assetFsBytes = sumAssetFsBytes();
 
         res.json({
+            hubHosting: HUB_HOSTING_MODE,
             files,
             disk,
-            backupDisk,
+            ...(backupDisk ? { backupDisk } : {}),
             sqlite: { pageSize, pageCount, freelistCount, reclaimable, journalMode, autoVacuum },
             chunks: { count: chunkStat.c, bytes: chunkStat.b, orphanBytes: orphanChunkBytes, liveChunked },
             prefixes,
             kvRows,
             kvTotalBytes,
-            estimatedBackupSize,
+            ...(typeof estimatedBackupSize === 'number' ? { estimatedBackupSize } : {}),
             assetFsBytes,
             inlayFsBytes,
             backups: {
@@ -5972,17 +5998,24 @@ app.put('/api/db/snapshots/limits', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     try {
         const rawCount = Number(req.body?.maxCount);
-        const rawBytes = Number(req.body?.maxBytes);
         if (!Number.isFinite(rawCount) || rawCount < SNAPSHOT_LIMIT_MIN_COUNT || rawCount > SNAPSHOT_LIMIT_MAX_COUNT) {
             return res.status(400).json({ error: `maxCount out of range (${SNAPSHOT_LIMIT_MIN_COUNT}-${SNAPSHOT_LIMIT_MAX_COUNT})` });
         }
-        if (!Number.isFinite(rawBytes) || rawBytes < SNAPSHOT_LIMIT_MIN_BYTES || rawBytes > SNAPSHOT_LIMIT_MAX_BYTES) {
-            return res.status(400).json({ error: `maxBytes out of range` });
-        }
         const maxCount = Math.floor(rawCount);
-        const maxBytes = Math.floor(rawBytes);
+        // Hub instances pin the byte cap server-side — only the snapshot count
+        // is tenant-tunable, so a crafted request can't grow host disk usage.
+        let maxBytes;
+        if (HUB_HOSTING_MODE) {
+            maxBytes = getSnapshotLimits().maxBytes;
+        } else {
+            const rawBytes = Number(req.body?.maxBytes);
+            if (!Number.isFinite(rawBytes) || rawBytes < SNAPSHOT_LIMIT_MIN_BYTES || rawBytes > SNAPSHOT_LIMIT_MAX_BYTES) {
+                return res.status(400).json({ error: `maxBytes out of range` });
+            }
+            maxBytes = Math.floor(rawBytes);
+            kvSet(SNAPSHOT_LIMIT_BYTES_KEY, Buffer.from(String(maxBytes), 'utf-8'));
+        }
         kvSet(SNAPSHOT_LIMIT_COUNT_KEY, Buffer.from(String(maxCount), 'utf-8'));
-        kvSet(SNAPSHOT_LIMIT_BYTES_KEY, Buffer.from(String(maxBytes), 'utf-8'));
         const trim = trimSnapshotsToLimits();
         const usage = snapshotUsage();
         res.json({
@@ -6093,6 +6126,7 @@ function readBootReminder() {
 
 app.get('/api/backup/boot-reminder', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
+    if (HUB_HOSTING_MODE) return res.json({ enabled: false });
     try {
         res.json({ enabled: readBootReminder() });
     } catch (err) { next(err); }
@@ -6101,6 +6135,7 @@ app.get('/api/backup/boot-reminder', async (req, res, next) => {
 app.put('/api/backup/boot-reminder', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
+    if (HUB_HOSTING_MODE) return res.status(403).json({ error: 'Server backups are disabled on this instance' });
     try {
         const enabled = !!req.body?.enabled;
         kvSet(BOOT_REMINDER_KEY, Buffer.from(enabled ? '1' : '0', 'utf-8'));
@@ -6112,6 +6147,7 @@ app.put('/api/backup/boot-reminder', async (req, res, next) => {
 
 app.get('/api/backup/server/path', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
+    if (HUB_HOSTING_MODE) return res.status(403).json({ error: 'Server backups are disabled on this instance' });
     try {
         res.json({
             path: backupsDir,
@@ -6124,6 +6160,7 @@ app.get('/api/backup/server/path', async (req, res, next) => {
 app.put('/api/backup/server/path', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
+    if (HUB_HOSTING_MODE) return res.status(403).json({ error: 'Server backups are disabled on this instance' });
     try {
         const next = typeof req.body?.path === 'string' ? req.body.path.trim() : '';
         if (!next) {
