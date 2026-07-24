@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import {
     RESOURCE_CACHE_LOCAL_STORAGE_KEY,
+    RESOURCE_CACHE_MAX_DB_HASHES_PER_MANIFEST,
     formatHashBytes,
     isResourceCacheEnabled,
     mergeResourceManifestHashes,
     planResourceCacheRetention,
+    resourceCacheManifestHashLimit,
     selectResidentManifestHashes,
     setResourceCacheEnabled,
     sha256Bytes,
@@ -75,6 +77,19 @@ describe('byte resource cache helpers', () => {
         expect(plan.manifests.map(({ key }) => key)).toEqual(['chat:one'])
         expect(plan.manifestDeletes).toEqual(['chat:two', 'chat:three'])
         expect(plan.entryDeletes).toEqual([hash(2)])
+    })
+
+    it('keeps database manifests large while chat manifests stay capped at four', () => {
+        const hashes = Array.from({ length: 12 }, (_, index) => hash(index + 1))
+        const records = [
+            { key: 'db:characters', hashes, sizes: hashes.map(() => 1), updatedAt: 20 },
+            { key: 'chat:char/chat', hashes, sizes: hashes.map(() => 1), updatedAt: 10 },
+        ]
+        const plan = planResourceCacheRetention(records, hashes)
+
+        expect(resourceCacheManifestHashLimit('database')).toBe(RESOURCE_CACHE_MAX_DB_HASHES_PER_MANIFEST)
+        expect(plan.manifests.find(({ key }) => key === 'db:characters')?.hashes).toHaveLength(12)
+        expect(plan.manifests.find(({ key }) => key === 'chat:char/chat')?.hashes).toHaveLength(4)
     })
 
     it('stays disabled when IndexedDB is unavailable', async () => {

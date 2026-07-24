@@ -67,6 +67,14 @@ const {
     parseCachedHashesHeader,
     sha256Hex,
 } = require('./utils.cjs');
+const {
+    computeBufferEtag,
+    parseDbCacheInventory,
+    prepareDatabaseReadPayload,
+    encodeDatabaseSegments,
+    buildCachedDbReadEnvelope,
+    encodeCachedDbReadEnvelope,
+} = require('./dbCachedRead.cjs');
 const { createChatRowStore, hasChatPayloads } = require('./chatRows.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
 const { inspectRisuSaveSource, shouldStreamRisuSave } = require('./streamRisuLoad.cjs');
@@ -109,10 +117,6 @@ const chatRowStore = createChatRowStore({
 
 // ETag for database.bin
 let dbEtag = null;
-
-function computeBufferEtag(buffer) {
-    return nodeCrypto.createHash('md5').update(buffer).digest('hex');
-}
 
 function computeDatabaseEtagFromObject(databaseObject) {
     return computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(databaseObject)));
@@ -482,6 +486,14 @@ async function loadStrippedDatabase(raw, source) {
     return (await ingestDatabase(decoded)).strippedDb;
 }
 
+async function prepareLiveDatabaseRead(raw, source) {
+    const strippedDatabase = await loadStrippedDatabase(raw, source);
+    dbCache[DB_HEX_KEY] = strippedDatabase;
+    const prepared = prepareDatabaseReadPayload(strippedDatabase);
+    dbEtag = prepared.etag;
+    return prepared;
+}
+
 async function migrateChatsToRowsIfNeeded() {
     if (kvGet(CHAT_EXTERNALIZATION_MARKER_KEY) !== null) return;
     const raw = kvGet('database/database.bin');
@@ -690,7 +702,11 @@ app.use('/assets', express.static(path.join(process.cwd(), 'dist/assets'), {
     immutable: true,
 }));
 app.use(express.static(path.join(process.cwd(), 'dist'), {index: false, maxAge: 0}));
-app.use(express.json({ limit: '100mb' }));
+const defaultJsonParser = express.json({ limit: '100mb' });
+app.use((req, res, next) => {
+    if (req.path === '/api/db/read-cached') return next();
+    return defaultJsonParser(req, res, next);
+});
 app.use((req, res, next) => {
     // Skip express.raw() for backup import — it must stream, not buffer into memory
     if (req.path === '/api/backup/import') return next();
@@ -3672,17 +3688,13 @@ app.get('/api/read', async (req, res, next) => {
             // ever leaks a payload into the live row.
             if (key === 'database/database.bin') {
                 try {
-                    const stripped = await loadStrippedDatabase(value, 'Read');
-                    // Populate dbCache so patch endpoint uses the same data
-                    dbCache[filePath] = stripped;
-                    value = Buffer.from(encodeRisuSaveLegacy(stripped));
+                    value = (await prepareLiveDatabaseRead(value, 'Read')).fullBlob;
                 } catch (e) {
                     // Log the Error itself (not just e.message) so logger.*
                     // tags it and the Express middleware won't re-log after next().
                     logger.error('[Read] Failed to load database.bin', e);
                     return next(e);
                 }
-                dbEtag = computeBufferEtag(value);
                 if (req.headers['if-none-match'] === dbEtag) {
                     return res.status(304).end();
                 }
@@ -3691,6 +3703,52 @@ app.get('/api/read', async (req, res, next) => {
             res.setHeader('Content-Type', 'application/octet-stream');
             res.send(value);
         }
+    } catch (error) {
+        next(error);
+    }
+});
+
+const cachedDbReadJsonParser = express.json({ limit: '1mb' });
+
+app.post('/api/db/read-cached', (req, res, next) => {
+    cachedDbReadJsonParser(req, res, (error) => {
+        if (!error) return next();
+        const status = error.type === 'entity.too.large' ? 413 : 400;
+        return res.status(status).json({ error: error.message });
+    });
+}, async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+
+    let inventory;
+    try {
+        inventory = parseDbCacheInventory(req.body);
+    } catch (error) {
+        return res.status(400).json({ error: error.message });
+    }
+
+    try {
+        await flushPendingDb();
+        const raw = kvGet('database/database.bin');
+        if (raw === null) return res.status(404).json({ error: 'Database not found' });
+
+        let prepared;
+        try {
+            prepared = await prepareLiveDatabaseRead(raw, 'ReadCached');
+        } catch (error) {
+            logger.error('[ReadCached] Failed to load database.bin', error);
+            return next(error);
+        }
+
+        let encodedSegments;
+        try {
+            encodedSegments = encodeDatabaseSegments(prepared.strippedDatabase);
+        } catch (error) {
+            return res.status(409).json({ error: error.message });
+        }
+        const envelope = buildCachedDbReadEnvelope(encodedSegments, inventory, prepared.etag);
+        res.setHeader('x-db-etag', prepared.etag);
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.send(encodeCachedDbReadEnvelope(envelope));
     } catch (error) {
         next(error);
     }

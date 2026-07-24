@@ -7,7 +7,7 @@ import { checkRisuUpdate } from "./update";
 import { fetchPublicStats } from "./publicStats";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, bootBackupPromptStore } from "./stores.svelte";
 import { loadPlugins } from "./plugins/plugins.svelte";
-import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertInput } from "./alert";
+import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertConfirmMulti, alertInput } from "./alert";
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy, RisuSaveEncoder } from "./storage/risuSave";
@@ -34,6 +34,13 @@ import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelt
 import { allowInsecureContext } from "./platform";
 import { isSecureContext, shouldBlockInsecureBoot } from "./secureContext";
 import { reconcilePluginStorageMode } from "./plugins/pluginSaveStorage";
+import {
+    isResourceCacheEnabled,
+    isResourceCacheSupported,
+    setResourceCacheEnabled,
+} from "./storage/resourceCache";
+
+const RESOURCE_CACHE_ANNOUNCED_KEY = 'pocketrisu-resource-cache-announced'
 
 async function persistBootPluginStorageReconcile(): Promise<void> {
     // saveDb() is intentionally started near the end of boot, so its immediate
@@ -131,15 +138,20 @@ export async function loadData() {
                 await forageStorage.Init()
 
                 LoadingStatusState.text = "Loading Local Save File..."
-                let gotStorage: Uint8Array = await forageStorage.getItem('database/database.bin') as unknown as Uint8Array
+                const databaseRead = await forageStorage.readDatabaseForBoot()
+                let gotStorage: Uint8Array | null = databaseRead.kind === 'bytes'
+                    ? databaseRead.bytes as unknown as Uint8Array
+                    : null
                 LoadingStatusState.text = "Decoding Local Save File..."
-                if (checkNullish(gotStorage)) {
+                if (databaseRead.kind === 'bytes' && checkNullish(gotStorage)) {
                     createdFreshDatabase = true
                     gotStorage = encodeRisuSaveLegacy({})
                     await forageStorage.setItem('database/database.bin', gotStorage)
                 }
                 try {
-                    const decoded = await decodeRisuSave(gotStorage)
+                    const decoded = databaseRead.kind === 'decoded'
+                        ? databaseRead.database
+                        : await decodeRisuSave(gotStorage)
                     setPatchSyncBaseline(safeStructuredClone(decoded))
                     console.log(decoded)
                     setDatabase(decoded)
@@ -246,10 +258,13 @@ export async function loadData() {
                 initMobileGesture()
                 MobileGUI.set(true)
             }
-            // Boot-time backup reminder. If the user has enabled it, we block
-            // the load briefly to ask whether to back up now. Errors here are
-            // non-fatal — boot must always proceed even if the reminder fetch
-            // or backup itself fails.
+            // Startup prompts are deliberately awaited in sequence so the
+            // resource-cache announcement and backup reminder never stack.
+            try {
+                await maybeAnnounceResourceCache()
+            } catch (err) {
+                console.warn('[bootstrap] resource cache announcement failed:', err)
+            }
             try {
                 await maybeRunBootBackupReminder()
             } catch (err) {
@@ -279,6 +294,26 @@ export async function loadData() {
             alertError(error)
         }
     }
+}
+
+async function maybeAnnounceResourceCache() {
+    if (!isResourceCacheSupported()) return
+    try {
+        if (localStorage.getItem(RESOURCE_CACHE_ANNOUNCED_KEY) === 'true') return
+        if (isResourceCacheEnabled()) {
+            localStorage.setItem(RESOURCE_CACHE_ANNOUNCED_KEY, 'true')
+            return
+        }
+        localStorage.setItem(RESOURCE_CACHE_ANNOUNCED_KEY, 'true')
+    } catch {
+        return
+    }
+
+    const choice = await alertConfirmMulti(language.resourceCacheAnnouncement, [
+        { label: language.resourceCacheAnnouncementEnable, variant: 'primary' },
+        { label: language.resourceCacheAnnouncementNotNow, variant: 'outline' },
+    ])
+    if (choice === 0) await setResourceCacheEnabled(true)
 }
 
 

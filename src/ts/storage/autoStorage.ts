@@ -12,6 +12,10 @@ export class AutoStorage{
     async getItem(key:string):Promise<Buffer> {
         return await this.realStorage.getItem(key)
     }
+    async readDatabaseForBoot() {
+        await this.Init()
+        return await this.realStorage.readDatabaseForBoot()
+    }
     async keys(prefix: string = ''):Promise<string[]>{
         await this.Init()
         return await this.realStorage.keys(prefix)

@@ -88,6 +88,7 @@ export function createSeedBackup(opts: SeedOptions = {}): Buffer {
     PresensePenalty: 70,
     personas: [{ name: 'Default', icon: '', personaPrompt: '' }],
     botPresets: [],
+    modules: [],
     botPresetsId: 0,
     moduleIntergration: [],
     selectedCharacter: 0,

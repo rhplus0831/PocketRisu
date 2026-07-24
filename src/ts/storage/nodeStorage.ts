@@ -10,13 +10,26 @@ import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
 import { normalizeChat, type Chat } from "./database.svelte"
 import {
+    DB_CACHE_GROUPS,
+    DB_CACHE_MAX_HASHES,
+    decodeAndAssembleCachedDbRead,
+    type DbCacheInventory,
+} from "./dbCachedRead"
+import {
     getManifestHashes,
+    getVerifiedManifestSnapshot,
     getVerifiedCachedBytes,
     isResourceCacheEnabled,
     isSha256Hex,
+    persistResourceCacheManifests,
     sha256Bytes,
     storeBytes,
+    touchResourceCacheManifest,
 } from "./resourceCache"
+
+export type BootDatabaseReadResult =
+    | { kind: 'bytes', bytes: Buffer | null }
+    | { kind: 'decoded', database: Record<string, any> }
 
 export interface ChatBackupSummary {
     chaId: string
@@ -261,6 +274,59 @@ export class NodeStorage{
         }
 
         return data
+    }
+
+    async readDatabaseForBoot(): Promise<BootDatabaseReadResult> {
+        if (!isResourceCacheEnabled()) {
+            return { kind: 'bytes', bytes: await this.getItem('database/database.bin') }
+        }
+
+        try {
+            const inventory = Object.fromEntries(
+                DB_CACHE_GROUPS.map((group) => [group, []]),
+            ) as DbCacheInventory
+            const residentBytes = new Map<string, Uint8Array>()
+            let remainingHashes = DB_CACHE_MAX_HASHES
+            for (const group of DB_CACHE_GROUPS) {
+                const snapshot = await getVerifiedManifestSnapshot(`db:${group}`)
+                if (!snapshot) throw new Error('Database resource cache is unavailable')
+                const selected = snapshot.hashes.slice(0, remainingHashes)
+                inventory[group] = selected
+                remainingHashes -= selected.length
+                for (const hash of selected) {
+                    const bytes = snapshot.bytesByHash.get(hash)
+                    if (!bytes) throw new Error('Verified database cache entry is unavailable')
+                    residentBytes.set(hash, bytes)
+                }
+            }
+
+            const response = await this.authFetch('/api/db/read-cached', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ cache: { version: 1, hashes: inventory } }),
+            })
+            if (response.status < 200 || response.status >= 300) {
+                throw new Error(`cached database read error: ${response.status}`)
+            }
+            const responseEtag = response.headers.get('x-db-etag')
+            if (!responseEtag) throw new Error('Cached database response is missing its ETag')
+
+            const encodedEnvelope = new Uint8Array(await response.arrayBuffer())
+            const assembled = await decodeAndAssembleCachedDbRead(
+                encodedEnvelope,
+                inventory,
+                async (hash) => residentBytes.get(hash) ?? null,
+            )
+            if (assembled.etag !== responseEtag) {
+                throw new Error('Cached database response ETag mismatch')
+            }
+            this._lastDbEtag = responseEtag
+            await persistResourceCacheManifests(assembled.updates)
+            return { kind: 'decoded', database: assembled.database }
+        } catch {
+            // The universal full read is authoritative and never seeds segments.
+            return { kind: 'bytes', bytes: await this.getItem('database/database.bin') }
+        }
     }
     async keys(prefix: string = ''):Promise<string[]>{
         const headers: Record<string, string> = {
@@ -721,7 +787,9 @@ export class NodeStorage{
                 }
                 const cachedBytes = await getVerifiedCachedBytes(contentHash)
                 if (!cachedBytes) throw new Error('Cached chat bytes are unavailable')
-                return normalizeChat(await decodeRisuSave(cachedBytes))
+                const chat = normalizeChat(await decodeRisuSave(cachedBytes))
+                void touchResourceCacheManifest(resourceKey)
+                return chat
             } catch {
                 da = await this.authFetch(url, {
                     headers: { 'x-chat-id': chatId },
@@ -732,11 +800,9 @@ export class NodeStorage{
         if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
         const buffer = new Uint8Array(await da.arrayBuffer())
         const chat = normalizeChat(await decodeRisuSave(buffer))
-        try {
-            await storeBytes(resourceKey, buffer)
-        } catch {
+        void storeBytes(resourceKey, buffer).catch(() => {
             // IndexedDB, quota, and Web Crypto anomalies are non-authoritative.
-        }
+        })
         return chat
     }
 
