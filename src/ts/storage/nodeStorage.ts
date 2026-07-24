@@ -8,7 +8,25 @@
 import { language } from "src/lang"
 import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
-import { normalizeChat } from "./database.svelte"
+import { normalizeChat, type Chat } from "./database.svelte"
+
+export interface ChatBackupSummary {
+    chaId: string
+    chatId: string
+    versionCount: number
+    newestTs: number
+    oldestTs: number
+    totalBytes: number
+}
+
+export interface ChatBackupVersion {
+    versionId: string
+    ts: number
+    reason: string
+    size: number
+    storage: 'loose' | 'bundle'
+    bundleFile?: string
+}
 
 // Custom error class for database conflict detection
 export class ConflictError extends Error {
@@ -626,6 +644,39 @@ export class NodeStorage{
         return da
     }
 
+    // ── Chat backups ──────────────────────────────────────────────────────────
+
+    async listChatBackupChats(): Promise<{chats: ChatBackupSummary[]}> {
+        const da = await this.authFetch('/api/chat-backups')
+        if (da.status < 200 || da.status >= 300) throw new Error(`chat backup list error: ${da.status}`)
+        return da.json()
+    }
+
+    async listChatBackupVersions(
+        chaId: string,
+        chatId: string,
+    ): Promise<{versions: ChatBackupVersion[]}> {
+        const da = await this.authFetch(
+            `/api/chat-backups/${encodeURIComponent(chaId)}/${encodeURIComponent(chatId)}`
+        )
+        if (da.status < 200 || da.status >= 300) throw new Error(`chat backup version list error: ${da.status}`)
+        return da.json()
+    }
+
+    async fetchChatBackupVersion(
+        chaId: string,
+        chatId: string,
+        versionId: string,
+    ): Promise<Chat | null> {
+        const da = await this.authFetch(
+            `/api/chat-backups/${encodeURIComponent(chaId)}/${encodeURIComponent(chatId)}/${encodeURIComponent(versionId)}`
+        )
+        if (da.status === 404) return null
+        if (da.status < 200 || da.status >= 300) throw new Error(`chat backup fetch error: ${da.status}`)
+        const buffer = new Uint8Array(await da.arrayBuffer())
+        return normalizeChat(await decodeRisuSave(buffer))
+    }
+
     // ── Chat content (runtime lazy load) ────────────────────────────────────
 
     async fetchChatContent(chaId: string, chatIndex: number, chatId: string): Promise<any | null> {
@@ -638,14 +689,18 @@ export class NodeStorage{
         return normalizeChat(await decodeRisuSave(buffer))
     }
 
-    async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any): Promise<void> {
+    async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any, backupReason?: string): Promise<void> {
         const encoded = encodeRisuSaveLegacy(chat)
+        const headers: Record<string, string> = {
+            'content-type': 'application/octet-stream',
+            'x-chat-id': chatId,
+        }
+        if (backupReason !== undefined) {
+            headers['x-chat-backup-reason'] = backupReason
+        }
         const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
             method: 'POST',
-            headers: {
-                'content-type': 'application/octet-stream',
-                'x-chat-id': chatId,
-            },
+            headers,
             body: encoded,
         })
         if (da.status < 200 || da.status >= 300) throw new Error(`saveChatContent error: ${da.status}`)

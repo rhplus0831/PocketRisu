@@ -1,6 +1,9 @@
-import { forageStorage } from "../globalApi.svelte"
-import { type Chat, type ChatStub, type ChatOrStub, isChatStub } from "./database.svelte"
+import { forageStorage, markCharacterDirty } from "../globalApi.svelte"
+import { type Chat, type ChatStub, type ChatOrStub, getDatabase, isChatStub } from "./database.svelte"
+import { language } from "../../lang"
+import { safeStructuredClone } from "../polyfill"
 import { tick } from "svelte"
+import { v4 } from "uuid"
 
 // ── Stub ↔ Placeholder conversion ───────────────────────────────────────────
 
@@ -94,6 +97,19 @@ function chatKey(chaId: string, chatId: string): string {
     return `${chaId}/${chatId}`
 }
 
+const pendingChatBackupReasons = new Map<string, string>()
+
+export function setChatBackupReason(chaId: string, chatId: string, reason: string): void {
+    pendingChatBackupReasons.set(chatKey(chaId, chatId), reason)
+}
+
+export function consumeChatBackupReason(chaId: string, chatId: string): string | undefined {
+    const key = chatKey(chaId, chatId)
+    const reason = pendingChatBackupReasons.get(key)
+    pendingChatBackupReasons.delete(key)
+    return reason
+}
+
 /** Hydration in progress — suppress dirty tracking */
 export const hydrationInFlight = new Set<string>()
 
@@ -112,7 +128,42 @@ export async function fetchChatFromServer(chaId: string, chatIndex: number, chat
 
 export async function saveChatToServer(chaId: string, chatIndex: number, chatId: string, chat: Chat): Promise<void> {
     const storage = forageStorage.realStorage
-    await storage.saveChatContent(chaId, chatIndex, chatId, chat)
+    const backupReason = consumeChatBackupReason(chaId, chatId)
+    await storage.saveChatContent(chaId, chatIndex, chatId, chat, backupReason)
+}
+
+// ── Backup import ───────────────────────────────────────────────────────────
+
+export function transformChatBackupForImport(backup: Chat, restoredAt = Date.now()): Chat {
+    const restored = safeStructuredClone(backup) as Chat & {
+        _stub?: boolean
+        _placeholder?: boolean
+    }
+    delete restored._stub
+    delete restored._placeholder
+    if (!Array.isArray(restored.message)) restored.message = []
+
+    const originalName = typeof restored.name === 'string' && restored.name.trim()
+        ? restored.name
+        : language.chatBackupUntitledChat
+    restored.id = v4()
+    restored.name = `${originalName} ${language.chatBackupRestoredSuffix(
+        new Date(restoredAt).toLocaleString()
+    )}`
+    restored.lastDate = restoredAt
+    return restored
+}
+
+export function importChatBackup(targetChaId: string, backup: Chat): Chat {
+    const target = getDatabase().characters.find(character => character.chaId === targetChaId)
+    if (!target) throw new Error(language.chatBackupTargetMissing)
+
+    const restored = transformChatBackupForImport(backup)
+    target.chats = [...(Array.isArray(target.chats) ? target.chats : []), restored]
+    // Imports usually target a character that isn't selected, which the
+    // reactive dirty tracker never watches — mark it dirty by hand.
+    markCharacterDirty(targetChaId)
+    return restored
 }
 
 // ── Hydration ───────────────────────────────────────────────────────────────

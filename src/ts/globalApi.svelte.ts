@@ -25,6 +25,7 @@ import { deepTouch } from "./gui/deepTouch.svelte";
 import { updateLorebooks } from "./characters";
 import { initMobileGesture } from "./hotkey";
 import { moduleUpdate } from "./process/modules";
+import { doingChat } from "./process/index.svelte";
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 
@@ -251,6 +252,7 @@ export let requiresFullEncoderReload = $state({
 let requestImmediateSaveImpl: ((options?: {
     forceFullWrite?: boolean
 }) => Promise<void> | void) = () => {}
+let markCharacterDirtyImpl: ((chaId: string) => void) = () => {}
 let patchSyncBaseline: Database | null = null
 
 // Surfaces server-side persist failures (Stage 1 visibility — see issues.md).
@@ -360,6 +362,13 @@ export function requestImmediateSave(options?: {
     return requestImmediateSaveImpl(options)
 }
 
+// The reactive dirty tracker only watches the selected character, so code that
+// mutates a non-selected character (e.g. chat backup import from settings)
+// must mark it dirty explicitly or the change never persists.
+export function markCharacterDirty(chaId: string) {
+    markCharacterDirtyImpl(chaId)
+}
+
 export function setPatchSyncBaseline(data: Database | null) {
     patchSyncBaseline = data ? safeStructuredClone(data) as Database : null
 }
@@ -369,6 +378,7 @@ export async function saveDb() {
     let gotChannel = false
     const sessionID = v4()
     let saveInFlight: Promise<void> | null = null
+    let doingChatState = get(doingChat)
     const knownChatIdsByCharacter = new Map<string, Set<string>>(
         (getDatabase()?.characters ?? [])
             .filter(character => character?.chaId)
@@ -490,6 +500,14 @@ export async function saveDb() {
             }, debounceTime);
         }
 
+        doingChat.subscribe((isDoingChat) => {
+            const wasDoingChat = doingChatState
+            doingChatState = isDoingChat
+            if (wasDoingChat && !isDoingChat) {
+                saveTimeoutExecute()
+            }
+        })
+
         // Start a best-effort save immediately when the page is hidden/unloaded.
         function flushImmediate() {
             if (saveTimeout) {
@@ -499,6 +517,7 @@ export async function saveDb() {
             changed = true;
             void triggerSave({
                 skipBroadcast: true,
+                forceChatPersist: true,
             })
             void flushServerDbKeepalive()
         }
@@ -643,10 +662,9 @@ export async function saveDb() {
         })
     })
 
-    function requeueTrackedChanges(toSave: toSaveType) {
-        changeTracker.character = [...new Set([...toSave.character, ...changeTracker.character])]
+    function requeueChatChanges(chats: [string, string][]) {
         const chatSeen = new Set<string>()
-        changeTracker.chat = [...toSave.chat, ...changeTracker.chat].filter((chatPair) => {
+        changeTracker.chat = [...chats, ...changeTracker.chat].filter((chatPair) => {
             const key = `${chatPair?.[0] ?? ''}|${chatPair?.[1] ?? ''}`
             if (chatSeen.has(key)) {
                 return false
@@ -654,6 +672,11 @@ export async function saveDb() {
             chatSeen.add(key)
             return true
         })
+    }
+
+    function requeueTrackedChanges(toSave: toSaveType) {
+        changeTracker.character = [...new Set([...toSave.character, ...changeTracker.character])]
+        requeueChatChanges(toSave.chat)
         changeTracker.botPreset = changeTracker.botPreset || toSave.botPreset
         changeTracker.modules = changeTracker.modules || toSave.modules
         changeTracker.plugins = changeTracker.plugins || toSave.plugins
@@ -794,6 +817,7 @@ export async function saveDb() {
         options?: {
             forceFullWrite?: boolean
             skipBroadcast?: boolean
+            forceChatPersist?: boolean
         }
     ): Promise<'saved' | 'retry' | 'noop'> {
         if (gotChannel) {
@@ -813,19 +837,25 @@ export async function saveDb() {
 
         // ── Save changed chat content to server ─────────────────────────
         const failedChats: [string, string][] = []
-        for (const [chaId, chatId] of collectChatsToPersist(db, toSave)) {
-            const char = db.characters.find(c => c.chaId === chaId)
-            if (!char) continue
-            const chatIndex = char.chats.findIndex(c => c.id === chatId)
-            if (chatIndex === -1) continue
-            const chat = char.chats[chatIndex]
-            // Skip placeholders — they have no real data to save
-            if (!chat || chat._placeholder) continue
-            try {
-                await saveChatToServer(chaId, chatIndex, chatId, chat)
-            } catch (e) {
-                console.error(`[Save] Failed to save chat ${chaId}/${chatId}:`, e)
-                failedChats.push([chaId, chatId])
+        const chatsToPersist = collectChatsToPersist(db, toSave)
+        if (doingChatState && !options?.forceChatPersist) {
+            requeueChatChanges(chatsToPersist)
+        }
+        else {
+            for (const [chaId, chatId] of chatsToPersist) {
+                const char = db.characters.find(c => c.chaId === chaId)
+                if (!char) continue
+                const chatIndex = char.chats.findIndex(c => c.id === chatId)
+                if (chatIndex === -1) continue
+                const chat = char.chats[chatIndex]
+                // Skip placeholders — they have no real data to save
+                if (!chat || chat._placeholder) continue
+                try {
+                    await saveChatToServer(chaId, chatIndex, chatId, chat)
+                } catch (e) {
+                    console.error(`[Save] Failed to save chat ${chaId}/${chatId}:`, e)
+                    failedChats.push([chaId, chatId])
+                }
             }
         }
         if (failedChats.length > 0) {
@@ -1062,8 +1092,13 @@ export async function saveDb() {
     async function triggerSave(options?: {
         forceFullWrite?: boolean
         skipBroadcast?: boolean
-    }) {
+        forceChatPersist?: boolean
+    }): Promise<void> {
         if (saveInFlight) {
+            if (options?.forceChatPersist) {
+                await saveInFlight
+                return triggerSave(options)
+            }
             return saveInFlight
         }
 
@@ -1109,6 +1144,12 @@ export async function saveDb() {
         await triggerSave({
             forceFullWrite: options?.forceFullWrite,
         })
+    }
+
+    markCharacterDirtyImpl = (chaId) => {
+        if (!chaId) return
+        changeTracker.character = [chaId, ...changeTracker.character.filter(id => id !== chaId)]
+        changed = true
     }
 
     let savetrys = 0

@@ -1,19 +1,49 @@
-import { describe, test, expect, vi } from 'vitest'
+import { beforeEach, describe, test, expect, vi } from 'vitest'
 
 // Stub out the heavy reactive modules so loading chatStorage.ts doesn't trigger
 // unrelated $effect chains that fail in a stripped-down test environment.
 // Mirror the production isChatStub semantics including the hybrid guard so
 // the chat-data-loss tests below exercise the real intent.
-vi.mock('../globalApi.svelte', () => ({ forageStorage: { realStorage: null } }))
+const { mockSaveChatContent, mockMarkCharacterDirty, mockDbState } = vi.hoisted(() => ({
+    mockSaveChatContent: vi.fn(),
+    mockMarkCharacterDirty: vi.fn(),
+    mockDbState: { characters: [] as any[] },
+}))
+
+vi.mock('../globalApi.svelte', () => ({
+    forageStorage: {
+        realStorage: {
+            saveChatContent: mockSaveChatContent,
+        },
+    },
+    markCharacterDirty: mockMarkCharacterDirty,
+}))
 vi.mock('./database.svelte', () => ({
+    getDatabase: () => mockDbState,
     isChatStub: (chat: any) => chat
         && chat._stub === true
         && !Array.isArray(chat.message),
 }))
 
-const { chatToStub, stubToPlaceholder, convertStubsToPlaceholders, classifyChat } = await import('./chatStorage')
+const {
+    chatToStub,
+    stubToPlaceholder,
+    convertStubsToPlaceholders,
+    classifyChat,
+    consumeChatBackupReason,
+    importChatBackup,
+    saveChatToServer,
+    setChatBackupReason,
+    transformChatBackupForImport,
+} = await import('./chatStorage')
 type Chat = any
 type ChatStub = any
+
+beforeEach(() => {
+    mockSaveChatContent.mockReset()
+    mockMarkCharacterDirty.mockReset()
+    mockDbState.characters = []
+})
 
 // Round-trip tests for stub ↔ placeholder conversions. The server merge layer
 // relies on key presence ('in' semantics) to distinguish "user cleared this
@@ -28,6 +58,98 @@ const blankChat = (overrides: Partial<Chat> = {}): Chat => ({
     localLore: [],
     id: 'c1',
     ...overrides,
+})
+
+describe('pending chat backup reasons', () => {
+    test('stores reasons per chat and consumes each one once', () => {
+        setChatBackupReason('char-a', 'chat-1', 'reroll')
+        setChatBackupReason('char-a', 'chat-2', 'edit-message')
+
+        expect(consumeChatBackupReason('char-a', 'chat-1')).toBe('reroll')
+        expect(consumeChatBackupReason('char-a', 'chat-1')).toBeUndefined()
+        expect(consumeChatBackupReason('char-a', 'chat-2')).toBe('edit-message')
+    })
+
+    test('passes a pending reason only to the next server save', async () => {
+        const chat = blankChat()
+        setChatBackupReason('char-b', chat.id, 'delete-message')
+
+        await saveChatToServer('char-b', 0, chat.id, chat)
+        await saveChatToServer('char-b', 0, chat.id, chat)
+
+        expect(mockSaveChatContent).toHaveBeenNthCalledWith(
+            1,
+            'char-b',
+            0,
+            chat.id,
+            chat,
+            'delete-message',
+        )
+        expect(mockSaveChatContent).toHaveBeenNthCalledWith(
+            2,
+            'char-b',
+            0,
+            chat.id,
+            chat,
+            undefined,
+        )
+    })
+})
+
+describe('chat backup import transformation', () => {
+    test('clones into a full chat with a fresh id and restored-name suffix', () => {
+        const original = blankChat({
+            id: 'original-chat-id',
+            name: 'Recovered conversation',
+            message: [{ role: 'user', data: 'keep me' }] as any,
+            lastDate: 123,
+            _placeholder: true,
+            _stub: true,
+        } as any)
+
+        const restored = transformChatBackupForImport(original, 1_700_000_000_000)
+
+        expect(restored).not.toBe(original)
+        expect(restored.message).not.toBe(original.message)
+        expect(restored.message).toEqual(original.message)
+        expect(restored.id).not.toBe(original.id)
+        expect(restored.id).toMatch(/^[0-9a-f-]{36}$/)
+        expect(restored.name).toContain('Recovered conversation')
+        expect(restored.name).toContain('(restored ')
+        expect(restored.lastDate).toBe(1_700_000_000_000)
+        expect(restored).not.toHaveProperty('_stub')
+        expect(restored).not.toHaveProperty('_placeholder')
+        expect(original).toHaveProperty('_stub', true)
+        expect(original).toHaveProperty('_placeholder', true)
+    })
+
+    test('replaces a missing message list with an empty array', () => {
+        const restored = transformChatBackupForImport(
+            blankChat({ message: undefined as any }),
+            1_700_000_000_000,
+        )
+
+        expect(restored.message).toEqual([])
+    })
+
+    test('import appends to the target character and marks it dirty', () => {
+        const target = { chaId: 'char-t', chats: [blankChat({ id: 'existing' })] }
+        mockDbState.characters = [target]
+
+        const restored = importChatBackup('char-t', blankChat({ id: 'backup-id' }))
+
+        expect(target.chats).toHaveLength(2)
+        expect(target.chats[1]).toBe(restored)
+        expect(restored.id).not.toBe('backup-id')
+        // Without the explicit dirty mark, imports into non-selected
+        // characters never persist — see markCharacterDirty in globalApi.
+        expect(mockMarkCharacterDirty).toHaveBeenCalledWith('char-t')
+    })
+
+    test('import throws when the target character is missing', () => {
+        expect(() => importChatBackup('missing', blankChat())).toThrow()
+        expect(mockMarkCharacterDirty).not.toHaveBeenCalled()
+    })
 })
 
 describe('chatToStub', () => {

@@ -51,6 +51,7 @@ const {
 const { applyPatch } = require('fast-json-patch');
 const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks } = require('./utils.cjs');
 const { createChatRowStore, hasChatPayloads } = require('./chatRows.cjs');
+const { createChatBackupStore, resolveChatBackupMaxBytes } = require('./chatBackups.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -104,6 +105,17 @@ function queueStorageOperation(operation) {
     storageOperationQueue = operationRun.catch(() => {});
     return operationRun;
 }
+
+// Captures run inside the endpoint's storage operation. Reconcile enters the
+// same queue through runStorageOperation, so neither can observe half-written
+// backup state or race a chat-row overwrite.
+const chatBackupStore = createChatBackupStore({
+    getBackupsRoot: () => backupsDir,
+    logger,
+    readChatRowRaw: (chaId, chatId) => chatRowStore.readChatRowRaw(chaId, chatId),
+    getByteBudget: () => resolveChatBackupMaxBytes({ kvGet }),
+    runStorageOperation: queueStorageOperation,
+});
 
 const DB_HEX_KEY = Buffer.from('database/database.bin', 'utf-8').toString('hex');
 const CHAT_EXTERNALIZATION_MARKER_KEY = 'migration/chats-externalized';
@@ -653,6 +665,7 @@ if(!existsSync(backupsDir)){
 }
 writeBackupPathMarker(backupsDir);
 const BACKUP_FILENAME_REGEX = /^risu-backup-\d+\.bin$/;
+const CHAT_BACKUP_VERSION_ID_REGEX = /^v-\d+-\d+-[a-z0-9_-]{1,24}$/;
 
 const passwordPath = path.join(process.cwd(), 'save', '__password')
 if(existsSync(passwordPath)){
@@ -4502,6 +4515,54 @@ app.get('/api/backup/server/download/:filename', async (req, res, next) => {
     }
 });
 
+// ── Chat backup endpoints ──────────────────────────────────────────────────
+
+app.get('/api/chat-backups', async (req, res, next) => {
+    if (!await checkAuth(req, res)) { return; }
+    try {
+        const chats = await queueStorageOperation(
+            () => chatBackupStore.listChatBackupChats()
+        );
+        res.json({ chats });
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.get('/api/chat-backups/:chaId/:chatId', async (req, res, next) => {
+    if (!await checkAuth(req, res)) { return; }
+    try {
+        const versions = await queueStorageOperation(
+            () => chatBackupStore.listChatBackups(req.params.chaId, req.params.chatId)
+        );
+        res.json({ versions });
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.get('/api/chat-backups/:chaId/:chatId/:versionId', async (req, res, next) => {
+    if (!await checkAuth(req, res)) { return; }
+    const { chaId, chatId, versionId } = req.params;
+    if (!CHAT_BACKUP_VERSION_ID_REGEX.test(versionId)) {
+        res.status(400).json({ error: 'Invalid chat backup version ID' });
+        return;
+    }
+    try {
+        const raw = await queueStorageOperation(
+            () => chatBackupStore.readChatBackup(chaId, chatId, versionId)
+        );
+        if (!raw) {
+            res.status(404).json({ error: 'Chat backup version not found' });
+            return;
+        }
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.send(raw);
+    } catch (error) {
+        next(error);
+    }
+});
+
 // ── Chat content endpoints (runtime lazy load) ─────────────────────────────
 
 // Cold storage compatibility: restore data stored in coldstorage/ KV entries
@@ -4707,6 +4768,13 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                 healedHybrid = true;
             }
 
+            // This must remain immediately before the row write: every version
+            // is the exact state the incoming save was about to replace.
+            await chatBackupStore.captureChatPreImage({
+                chaId,
+                chatId: expectedChatId,
+                reason: req.headers['x-chat-backup-reason'],
+            });
             if (isRawBinary && !healedHybrid) {
                 chatRowStore.writeChatRowRaw(chaId, expectedChatId, req.body);
             } else {
@@ -6403,6 +6471,16 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     }, PROXY_STREAM_GC_INTERVAL_MS);
 
     await startServer();
+
+    chatBackupStore.reconcileChatBackups()
+        .then((result) => {
+            logger.info(
+                `[ChatBackups] Startup reconcile complete: `
+                + `${result.gzipped} gzip, ${result.bundlesCreated} bundle, `
+                + `${result.budgetItemsRemoved} budget eviction(s)`
+            );
+        })
+        .catch(error => logger.error('[ChatBackups] Startup reconcile failed:', error));
 
     // Periodically checkpoint WAL to reclaim disk space.
     // TRUNCATE (vs RESTART) shrinks the -wal file on disk, not just the writer

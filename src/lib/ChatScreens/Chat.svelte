@@ -18,6 +18,7 @@
     import { ParseMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
     import { getLLMCache, setLLMCache } from "../../ts/translator/translator"
     import { getCurrentCharacter, getCurrentChat, setCurrentChat, type MessageGenerationInfo } from "../../ts/storage/database.svelte"
+    import { setChatBackupReason } from "../../ts/storage/chatStorage"
     import { selectedCharID } from "../../ts/stores.svelte"
     import { HideIconStore, ReloadGUIPointer, selIdState } from "../../ts/stores.svelte"
     import AutoresizeArea from "../UI/GUI/TextAreaResizable.svelte"
@@ -84,6 +85,14 @@
     let translated = $state(false)
     let partialEditEnabled = $state(true)
 
+    function setCurrentChatBackupReason(reason: string) {
+        const character = DBState.db.characters[selIdState.selId]
+        const chat = character?.chats?.[character.chatPage]
+        if (character?.chaId && chat?.id) {
+            setChatBackupReason(character.chaId, chat.id, reason)
+        }
+    }
+
     async function rm(){
         const messages = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message
         const cascadeCount = messages.length - idx
@@ -99,6 +108,7 @@
         }
         const sel = await alertConfirmMulti(language.removeChat, actions)
         if(sel < 0) return
+        setCurrentChatBackupReason('delete-message')
         let msg = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message
         if(sel === 1){
             msg = msg.slice(0, idx)
@@ -112,6 +122,7 @@
     }
 
     async function edit(){
+        setCurrentChatBackupReason('edit-message')
         const msg = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx]
         msg.data = message
         if (msg.swipes && msg.swipeId !== undefined) {
@@ -121,6 +132,7 @@
 
     function handlePartialEditSave(e: CustomEvent<{ newData: string }>) {
         if (idx >= 0) {
+            setCurrentChatBackupReason('edit-message')
             message = e.detail.newData
             const msg = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx]
             msg.data = e.detail.newData

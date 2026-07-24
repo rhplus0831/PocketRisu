@@ -75,6 +75,11 @@ export class AutoStorage{
     async deleteServerBackup(filename: string) { await this.Init(); return this.realStorage.deleteServerBackup(filename) }
     async downloadServerBackup(filename: string) { await this.Init(); return this.realStorage.downloadServerBackup(filename) }
 
+    // ── Chat backups ─────────────────────────────────────────────────────────
+    async listChatBackupChats() { await this.Init(); return this.realStorage.listChatBackupChats() }
+    async listChatBackupVersions(chaId: string, chatId: string) { await this.Init(); return this.realStorage.listChatBackupVersions(chaId, chatId) }
+    async fetchChatBackupVersion(chaId: string, chatId: string, versionId: string) { await this.Init(); return this.realStorage.fetchChatBackupVersion(chaId, chatId, versionId) }
+
     // ── Save-folder migration ─────────────────────────────────────────────────
     async scanSaveFolder(folderPath?: string) { await this.Init(); return this.realStorage.scanSaveFolder(folderPath) }
     async executeSaveFolderImport(folderPath?: string) { await this.Init(); return this.realStorage.executeSaveFolderImport(folderPath) }

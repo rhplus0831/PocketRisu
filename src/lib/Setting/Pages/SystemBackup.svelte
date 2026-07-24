@@ -8,6 +8,7 @@
     import ShInput from 'src/lib/UI/GUI/ShInput.svelte'
     import ShSwitch from 'src/lib/UI/GUI/ShSwitch.svelte'
     import Help from 'src/lib/Others/Help.svelte'
+    import ChatBackupList from 'src/lib/Setting/ChatBackupList.svelte'
     import ServerBackupList from 'src/lib/Setting/ServerBackupList.svelte'
     import {
         CameraIcon,
@@ -476,6 +477,8 @@
         </div>
     {/if}
 </div>
+
+<ChatBackupList formatBytes={fmtBytes} />
 
 <!-- Local backup section ────────────────────────────────────────────────── -->
 <div class="border border-darkborderc bg-darkbg/40 rounded-md p-4 mb-4">

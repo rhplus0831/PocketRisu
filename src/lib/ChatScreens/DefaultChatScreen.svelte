@@ -14,7 +14,7 @@
     import { DBState } from 'src/ts/stores.svelte';
     import { getCharImage } from "../../ts/characters";
     import { chatProcessStage, doingChat, sendChat } from "../../ts/process/index.svelte";
-    import { ensureCurrentChatReady } from "../../ts/storage/chatStorage";
+    import { ensureCurrentChatReady, setChatBackupReason } from "../../ts/storage/chatStorage";
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
     import { isExpTranslator, translate } from "../../ts/translator/translator";
@@ -476,6 +476,9 @@ import { isMobile } from 'src/ts/platform'
             let msg = cha.pop()
             if(!msg) return
         }
+        const rerollCharacter = DBState.db.characters[$selectedCharID]
+        const rerollChat = rerollCharacter.chats[rerollCharacter.chatPage]
+        setChatBackupReason(rerollCharacter.chaId, rerollChat.id, 'reroll')
         DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message = cha
         const generated = await sendChatMain()
 

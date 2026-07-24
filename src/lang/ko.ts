@@ -2218,7 +2218,7 @@ export const languageKorean = {
 
   // 시스템 → 백업 탭
   systemBackups: "백업",
-  backupTabDesc: "스냅샷, 백업, 로컬 백업을 한곳에서 관리합니다.",
+  backupTabDesc: "스냅샷, 전체 백업, 채팅 백업, 로컬 백업을 한곳에서 관리합니다.",
 
   backupSnapshot: "스냅샷 (DB만)",
   backupSnapshotEmpty: "스냅샷이 없습니다.",
@@ -2289,6 +2289,34 @@ export const languageKorean = {
   backupServerPathInputLabel: "절대 경로",
   backupServerPathSuccess: "보관 위치가 변경되었습니다.",
   backupServerPathFailed: "보관 위치 변경 실패",
+
+  chatBackups: "채팅 백업",
+  chatBackupsDesc:
+    "채팅이 변경되기 전에 자동으로 저장된 버전을 확인합니다. 가져오기는 원본을 덮어쓰지 않고 새 채팅을 만듭니다.",
+  chatBackupsLoading: "채팅 백업을 불러오는 중...",
+  chatBackupsEmpty: "채팅 백업이 없습니다.",
+  chatBackupsRefresh: "채팅 백업 새로고침",
+  chatBackupsLoadFailed: "채팅 백업을 불러오지 못했습니다",
+  chatBackupUnnamedCharacter: "이름 없는 캐릭터",
+  chatBackupDeletedCharacter: (id: string) => `삭제된 캐릭터 · ${id}`,
+  chatBackupDeletedChat: (id: string) => `삭제된 채팅 · ${id}`,
+  chatBackupVersionCount: (count: number) => `${count}개 버전`,
+  chatBackupNewest: (date: string) => `최신: ${date}`,
+  chatBackupVersionsLoading: "버전을 불러오는 중...",
+  chatBackupVersionsEmpty: "저장된 버전이 없습니다.",
+  chatBackupReason: (reason: string) => `사유: ${reason}`,
+  chatBackupImportAsNew: "새 채팅으로 가져오기",
+  chatBackupImportIntoOriginal: (name: string) => `${name}(으)로 가져오기`,
+  chatBackupImportAnother: "다른 캐릭터로 가져오기",
+  chatBackupSelectTarget: "복원된 채팅을 받을 캐릭터를 선택하세요.",
+  chatBackupNoCharacters: "채팅 백업을 가져오기 전에 캐릭터를 만들어 주세요.",
+  chatBackupNoOtherCharacters: "가져올 수 있는 다른 캐릭터가 없습니다.",
+  chatBackupVersionMissing: "해당 채팅 백업 버전은 더 이상 사용할 수 없습니다.",
+  chatBackupImportSuccess: (name: string) => `"${name}"을(를) 새 채팅으로 가져왔습니다.`,
+  chatBackupImportFailed: "채팅 백업 가져오기 실패",
+  chatBackupRestoredSuffix: (date: string) => `(복원 ${date})`,
+  chatBackupUntitledChat: "이름 없는 채팅",
+  chatBackupTargetMissing: "선택한 캐릭터가 더 이상 존재하지 않습니다.",
 
   backupLocal: "로컬 백업",
   backupLocalDesc:
