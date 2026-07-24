@@ -9,6 +9,14 @@ import { language } from "src/lang"
 import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
 import { normalizeChat, type Chat } from "./database.svelte"
+import {
+    getManifestHashes,
+    getVerifiedCachedBytes,
+    isResourceCacheEnabled,
+    isSha256Hex,
+    sha256Bytes,
+    storeBytes,
+} from "./resourceCache"
 
 export interface ChatBackupSummary {
     chaId: string
@@ -680,17 +688,64 @@ export class NodeStorage{
     // ── Chat content (runtime lazy load) ────────────────────────────────────
 
     async fetchChatContent(chaId: string, chatIndex: number, chatId: string): Promise<any | null> {
-        const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
-            headers: { 'x-chat-id': chatId },
-        })
+        const url = `/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`
+        if (!isResourceCacheEnabled()) {
+            const da = await this.authFetch(url, {
+                headers: { 'x-chat-id': chatId },
+            })
+            if (da.status === 404) return null
+            if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
+            const buffer = new Uint8Array(await da.arrayBuffer())
+            return normalizeChat(await decodeRisuSave(buffer))
+        }
+
+        const resourceKey = `chat:${chaId}/${chatId}`
+        let manifestHashes: string[] = []
+        try {
+            manifestHashes = await getManifestHashes(resourceKey)
+        } catch {
+            // Cache failures must not block an authoritative chat read.
+        }
+        const headers: Record<string, string> = { 'x-chat-id': chatId }
+        if (manifestHashes.length > 0) {
+            headers['x-cached-hashes'] = manifestHashes.join(',')
+        }
+
+        let da = await this.authFetch(url, { headers })
         if (da.status === 404) return null
+        if (da.status === 204) {
+            try {
+                const contentHash = da.headers.get('x-content-hash')
+                if (!isSha256Hex(contentHash) || !manifestHashes.includes(contentHash)) {
+                    throw new Error('Invalid cached chat response')
+                }
+                const cachedBytes = await getVerifiedCachedBytes(contentHash)
+                if (!cachedBytes) throw new Error('Cached chat bytes are unavailable')
+                return normalizeChat(await decodeRisuSave(cachedBytes))
+            } catch {
+                da = await this.authFetch(url, {
+                    headers: { 'x-chat-id': chatId },
+                })
+                if (da.status === 404) return null
+            }
+        }
         if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
         const buffer = new Uint8Array(await da.arrayBuffer())
-        return normalizeChat(await decodeRisuSave(buffer))
+        const chat = normalizeChat(await decodeRisuSave(buffer))
+        try {
+            await storeBytes(resourceKey, buffer)
+        } catch {
+            // IndexedDB, quota, and Web Crypto anomalies are non-authoritative.
+        }
+        return chat
     }
 
     async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any, backupReason?: string): Promise<void> {
         const encoded = encodeRisuSaveLegacy(chat)
+        const cacheEnabled = isResourceCacheEnabled()
+        const requestHash = cacheEnabled
+            ? sha256Bytes(encoded).catch(() => null)
+            : null
         const headers: Record<string, string> = {
             'content-type': 'application/octet-stream',
             'x-chat-id': chatId,
@@ -704,6 +759,16 @@ export class NodeStorage{
             body: encoded,
         })
         if (da.status < 200 || da.status >= 300) throw new Error(`saveChatContent error: ${da.status}`)
+        if (!cacheEnabled || !requestHash) return
+
+        const response = await da.json().catch(() => null)
+        const encodedHash = await requestHash
+        if (!encodedHash || response?.hash !== encodedHash) return
+        try {
+            await storeBytes(`chat:${chaId}/${chatId}`, encoded)
+        } catch {
+            // The server write succeeded; cache persistence is best-effort.
+        }
     }
 
     // ── Save-folder migration ─────────────────────────────────────────────────

@@ -544,6 +544,8 @@ export const languageKorean = {
   presensePenalty: "프리센스 패널티",
   advancedSettings: "고급 설정",
   advancedSettingsWarn: "어떤 설정인지 모르겠으면, 만지지 마세요!",
+  resourceCache: "브라우저 채팅 캐시",
+  resourceCacheDesc: "이 기기에 저장된 검증된 채팅 데이터를 재사용해 채팅을 다시 열 때 다운로드를 줄입니다. 비활성화하면 캐시된 채팅 데이터가 모두 삭제됩니다.",
   formatingOrder: "포맷 순서",
   authorNote: "작가의 노트",
   firstMessage: "첫 메시지",

@@ -58,7 +58,15 @@ const {
     logger, installProcessHandlers, expressErrorMiddleware,
 } = require('./logs.cjs');
 const { applyPatch } = require('fast-json-patch');
-const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON, hasRemoteBlocks } = require('./utils.cjs');
+const {
+    decodeRisuSave,
+    encodeRisuSaveLegacy,
+    calculateHash,
+    normalizeJSON,
+    hasRemoteBlocks,
+    parseCachedHashesHeader,
+    sha256Hex,
+} = require('./utils.cjs');
 const { createChatRowStore, hasChatPayloads } = require('./chatRows.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
 const { inspectRisuSaveSource, shouldStreamRisuSave } = require('./streamRisuLoad.cjs');
@@ -5028,6 +5036,12 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             encoded = chatRowStore.readChatRowRaw(chaId, chatId)
                 || Buffer.from(encodeRisuSaveLegacy(chat));
         }
+        const contentHash = sha256Hex(encoded);
+        res.setHeader('x-content-hash', contentHash);
+        const cachedHashes = parseCachedHashesHeader(req.headers['x-cached-hashes']);
+        if (cachedHashes.includes(contentHash)) {
+            return res.status(204).end();
+        }
         res.setHeader('Content-Type', 'application/octet-stream');
         res.send(encoded);
     } catch (error) {
@@ -5082,9 +5096,14 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             } else {
                 chatRowStore.writeChatRow(chaId, expectedChatId, chatData);
             }
+            const storedBytes = chatRowStore.readChatRowRaw(chaId, expectedChatId);
+            if (!storedBytes) {
+                throw new Error('Stored chat row could not be read');
+            }
+            const hash = sha256Hex(storedBytes);
             await createBackupAndRotate();
 
-            res.json({ success: true });
+            res.json({ success: true, hash });
         });
     } catch (error) {
         next(error);

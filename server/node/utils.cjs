@@ -1,6 +1,6 @@
 const { Packr, Unpackr, decode } = require('msgpackr');
 const fflate = require('fflate');
-const { randomUUID } = require('crypto');
+const { createHash, randomUUID } = require('crypto');
 const { logger } = require('./logs.cjs');
 
 // Magic headers for different save formats
@@ -34,6 +34,33 @@ const unpackr = new Unpackr({
     int64AsType: 'number',
     useRecords: false
 });
+
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
+const MAX_CACHED_HASHES = 8;
+
+/**
+ * Parse the bounded chat-resource cache inventory header. Invalid values are
+ * ignored, and only the first eight comma-separated entries are considered.
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+function parseCachedHashesHeader(value) {
+    if (typeof value !== 'string') return [];
+    const hashes = [];
+    const seen = new Set();
+    for (const entry of value.split(',', MAX_CACHED_HASHES)) {
+        const hash = entry.trim();
+        if (!SHA256_HEX_PATTERN.test(hash) || seen.has(hash)) continue;
+        hashes.push(hash);
+        seen.add(hash);
+    }
+    return hashes;
+}
+
+/** @param {string | Buffer | Uint8Array} value */
+function sha256Hex(value) {
+    return createHash('sha256').update(value).digest('hex');
+}
 
 /**
  * Ensure every bot preset in a decoded database has a stable string id.
@@ -579,6 +606,8 @@ module.exports = {
     encodeRisuSaveLegacy,
     calculateHash,
     normalizeJSON,
+    parseCachedHashesHeader,
+    sha256Hex,
     ensureBotPresetIds,
     checkHeader,
     checkCompressionStreams,

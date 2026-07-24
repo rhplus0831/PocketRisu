@@ -480,6 +480,8 @@ export const languageEnglish = {
     presensePenalty: "Presense Penalty",
     advancedSettings: "Advanced Settings",
     advancedSettingsWarn: "Warn: If you don't know what the option does, don't change it!",
+    resourceCache: "Browser chat cache",
+    resourceCacheDesc: "Reuse verified chat data stored on this device to reduce downloads when reopening chats. Disabling this clears all cached chat data.",
     formatingOrder: "Formating Order",
     authorNote: "Author's Note",
     firstMessage: "First Message",

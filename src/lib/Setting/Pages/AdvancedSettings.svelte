@@ -3,8 +3,10 @@
     import SettingRenderer from "../SettingRenderer.svelte";
     import SettingPage from "src/lib/UI/GUI/SettingPage.svelte";
     import { language } from "src/lang";
+    import ResourceCacheSettings from "./Advanced/ResourceCacheSettings.svelte";
 </script>
 
 <SettingPage title={language.advancedSettings}>
 <SettingRenderer items={advancedSettingsItems} />
+<ResourceCacheSettings />
 </SettingPage>
