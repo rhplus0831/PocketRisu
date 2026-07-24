@@ -224,6 +224,11 @@ export class NodeStorage{
     }
 
     async setItem(key:string, value:Uint8Array, etag?:string) {
+        const shouldSeedResourceCache = isResourceCacheEnabled() && key.startsWith('pluginsave/')
+        const requestBytes = shouldSeedResourceCache ? new Uint8Array(value) : value
+        const requestHash = shouldSeedResourceCache
+            ? sha256Bytes(requestBytes).catch(() => null)
+            : null
         const headers: Record<string, string> = {
             'content-type': 'application/octet-stream',
             'file-path': Buffer.from(key, 'utf-8').toString('hex')
@@ -233,7 +238,7 @@ export class NodeStorage{
         }
         const da = await this.authFetch('/api/write', {
             method: "POST",
-            body: value as any,
+            body: requestBytes as any,
             headers
         })
         if(da.status === 409){
@@ -250,6 +255,16 @@ export class NodeStorage{
         const nextEtag = data.etag as string | undefined
         if (key === 'database/database.bin' && nextEtag) {
             this._lastDbEtag = nextEtag
+        }
+        if (requestHash && isSha256Hex(data.hash)) {
+            const encodedHash = await requestHash
+            if (encodedHash === data.hash) {
+                try {
+                    await storeBytes(`kv:${key}`, requestBytes)
+                } catch {
+                    // The authoritative write succeeded; cache seeding is best-effort.
+                }
+            }
         }
     }
     async getItem(key:string):Promise<Buffer> {
@@ -274,6 +289,52 @@ export class NodeStorage{
         }
 
         return data
+    }
+
+    async getItemCached(key: string): Promise<Buffer | null> {
+        if (!isResourceCacheEnabled() || key === 'database/database.bin') {
+            return await this.getItem(key)
+        }
+
+        const resourceKey = `kv:${key}`
+        let manifestHashes: string[] = []
+        try {
+            manifestHashes = (await getVerifiedManifestSnapshot(resourceKey))?.hashes ?? []
+        } catch {
+            // Cache failures degrade to the ordinary read below.
+        }
+
+        const plainHeaders: Record<string, string> = {
+            'file-path': Buffer.from(key, 'utf-8').toString('hex'),
+        }
+        const headers: Record<string, string> = { ...plainHeaders }
+        if (manifestHashes.length > 0) {
+            headers['x-cached-hashes'] = manifestHashes.join(',')
+        }
+
+        let response = await this.authFetch('/api/read', { method: 'GET', headers })
+        if (response.status === 204) {
+            try {
+                const contentHash = response.headers.get('x-content-hash')
+                if (!isSha256Hex(contentHash) || !manifestHashes.includes(contentHash)) {
+                    throw new Error('Invalid cached KV response')
+                }
+                const cachedBytes = await getVerifiedCachedBytes(contentHash)
+                if (!cachedBytes) throw new Error('Cached KV bytes are unavailable')
+                void touchResourceCacheManifest(resourceKey)
+                return cachedBytes.byteLength === 0 ? null : Buffer.from(cachedBytes)
+            } catch {
+                response = await this.authFetch('/api/read', { method: 'GET', headers: plainHeaders })
+            }
+        }
+        if (response.status < 200 || response.status >= 300) throw new Error(`getItemCached error: ${response.status}`)
+
+        const bytes = Buffer.from(await response.arrayBuffer())
+        if (bytes.length === 0) return null
+        void storeBytes(resourceKey, bytes).catch(() => {
+            // IndexedDB, quota, and Web Crypto anomalies are non-authoritative.
+        })
+        return bytes
     }
 
     async readDatabaseForBoot(): Promise<BootDatabaseReadResult> {

@@ -69,6 +69,63 @@ describe('cached database read route', () => {
     }
   })
 
+  test('negotiates generic KV reads while database.bin ignores the cache header', async () => {
+    const key = `pluginsave/${Buffer.from('cache-test').toString('base64url')}.json`
+    const encodedKey = Buffer.from(key).toString('hex')
+    const value = Buffer.from('{"unicode":"캐시","items":[1,2,3]}')
+    const contentHash = sha256(value)
+
+    const writeResponse = await client.fetch('/api/write', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': encodedKey,
+      },
+      body: new Uint8Array(value),
+    })
+    expect(writeResponse.status).toBe(200)
+    await expect(writeResponse.json()).resolves.toMatchObject({ success: true, hash: contentHash })
+
+    const ordinary = await client.fetch('/api/read', { headers: { 'file-path': encodedKey } })
+    expect(ordinary.status).toBe(200)
+    expect(ordinary.headers.get('x-content-hash')).toBeNull()
+    expect(Buffer.from(await ordinary.arrayBuffer())).toEqual(value)
+
+    const malformedInventory = await client.fetch('/api/read', {
+      headers: { 'file-path': encodedKey, 'x-cached-hashes': 'not-a-hash' },
+    })
+    expect(malformedInventory.status).toBe(200)
+    expect(malformedInventory.headers.get('x-content-hash')).toBeNull()
+    expect(Buffer.from(await malformedInventory.arrayBuffer())).toEqual(value)
+
+    const miss = await client.fetch('/api/read', {
+      headers: { 'file-path': encodedKey, 'x-cached-hashes': '0'.repeat(64) },
+    })
+    expect(miss.status).toBe(200)
+    expect(miss.headers.get('x-content-hash')).toBe(contentHash)
+    expect(Buffer.from(await miss.arrayBuffer())).toEqual(value)
+
+    const hit = await client.fetch('/api/read', {
+      headers: { 'file-path': encodedKey, 'x-cached-hashes': contentHash },
+    })
+    expect(hit.status).toBe(204)
+    expect(hit.headers.get('x-content-hash')).toBe(contentHash)
+    expect((await hit.arrayBuffer()).byteLength).toBe(0)
+
+    const fullDatabase = await client.fetch('/api/read', { headers: { 'file-path': DB_PATH_HEX } })
+    expect(fullDatabase.status).toBe(200)
+    const fullDatabaseBytes = Buffer.from(await fullDatabase.arrayBuffer())
+    const databaseWithCacheHeader = await client.fetch('/api/read', {
+      headers: {
+        'file-path': DB_PATH_HEX,
+        'x-cached-hashes': sha256(fullDatabaseBytes),
+      },
+    })
+    expect(databaseWithCacheHeader.status).toBe(200)
+    expect(databaseWithCacheHeader.headers.get('x-content-hash')).toBeNull()
+    expect(Buffer.from(await databaseWithCacheHeader.arrayBuffer())).toEqual(fullDatabaseBytes)
+  })
+
   test('returns 400 for malformed and oversized inventories', async () => {
     const invalidJson = await client.fetch('/api/db/read-cached', {
       method: 'POST',

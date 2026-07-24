@@ -3,6 +3,7 @@ import {
     RESOURCE_CACHE_LOCAL_STORAGE_KEY,
     RESOURCE_CACHE_MAX_DB_HASHES_PER_MANIFEST,
     formatHashBytes,
+    getResourceCacheStats,
     isResourceCacheEnabled,
     mergeResourceManifestHashes,
     planResourceCacheRetention,
@@ -79,23 +80,33 @@ describe('byte resource cache helpers', () => {
         expect(plan.entryDeletes).toEqual([hash(2)])
     })
 
-    it('keeps database manifests large while chat manifests stay capped at four', () => {
+    it('keeps database manifests large while chat and KV items stay capped at four', () => {
         const hashes = Array.from({ length: 12 }, (_, index) => hash(index + 1))
         const records = [
             { key: 'db:characters', hashes, sizes: hashes.map(() => 1), updatedAt: 20 },
             { key: 'chat:char/chat', hashes, sizes: hashes.map(() => 1), updatedAt: 10 },
+            { key: 'kv:pluginsave/value.json', hashes, sizes: hashes.map(() => 1), updatedAt: 5 },
         ]
         const plan = planResourceCacheRetention(records, hashes)
 
         expect(resourceCacheManifestHashLimit('database')).toBe(RESOURCE_CACHE_MAX_DB_HASHES_PER_MANIFEST)
+        expect(resourceCacheManifestHashLimit('item')).toBe(4)
         expect(plan.manifests.find(({ key }) => key === 'db:characters')?.hashes).toHaveLength(12)
         expect(plan.manifests.find(({ key }) => key === 'chat:char/chat')?.hashes).toHaveLength(4)
+        expect(plan.manifests.find(({ key }) => key === 'kv:pluginsave/value.json')?.hashes).toHaveLength(4)
     })
 
     it('stays disabled when IndexedDB is unavailable', async () => {
         localStorage.setItem(RESOURCE_CACHE_LOCAL_STORAGE_KEY, 'true')
         expect(globalThis.indexedDB).toBeUndefined()
         expect(isResourceCacheEnabled()).toBe(false)
+        await expect(getResourceCacheStats()).resolves.toEqual({
+            enabled: false,
+            supported: false,
+            manifestCount: 0,
+            entryCount: 0,
+            totalBytes: 0,
+        })
 
         await setResourceCacheEnabled(false)
         expect(localStorage.getItem(RESOURCE_CACHE_LOCAL_STORAGE_KEY)).toBeNull()

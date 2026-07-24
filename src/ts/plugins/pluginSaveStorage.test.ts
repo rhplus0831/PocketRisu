@@ -21,6 +21,7 @@ vi.mock("../storage/persistentKv", () => {
 });
 
 const {
+    getPluginSaveStorageItem,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_SAVE_PREFIX,
     reconcilePluginStorageMode,
@@ -35,6 +36,20 @@ beforeEach(() => {
         optimizePluginMemory: false,
         pluginCustomStorage: {},
     };
+});
+
+describe("plugin save storage transport", () => {
+    test("opts only externalized plugin values into cached persistent reads", async () => {
+        database.optimizePluginMemory = true;
+        const { readPersistentJson } = await import("../storage/persistentKv");
+        vi.mocked(readPersistentJson).mockResolvedValueOnce({ value: 1 });
+
+        await expect(getPluginSaveStorageItem("alpha")).resolves.toEqual({ value: 1 });
+        expect(readPersistentJson).toHaveBeenCalledWith(
+            encoded(PLUGIN_SAVE_PREFIX, "alpha"),
+            { cached: true },
+        );
+    });
 });
 
 describe("reconcilePluginStorageMode", () => {
@@ -114,13 +129,19 @@ describe("reconcilePluginStorageMode", () => {
             [metaKey, { plugin: "Test", updatedAt: 1 }],
         ]);
         const operations: string[] = [];
+        const readCalls: Array<[string, { cached?: boolean } | undefined]> = [];
+        async function readPersistentJson<T>(
+            key: string,
+            options?: { cached?: boolean },
+        ): Promise<T> {
+            readCalls.push([key, options]);
+            return persistent.get(key) as T;
+        }
         const dependencies = {
             listPersistentKeys: vi.fn(async (prefix: string) =>
                 [...persistent.keys()].filter((key) => key.startsWith(prefix))
             ),
-            readPersistentJson: async function <T>(key: string): Promise<T> {
-                return persistent.get(key) as T;
-            },
+            readPersistentJson,
             removePersistentKey: vi.fn(async (key: string) => {
                 operations.push(`remove:${key}`);
                 persistent.delete(key);
@@ -141,6 +162,8 @@ describe("reconcilePluginStorageMode", () => {
         });
         expect(operations[0]).toBe("persist");
         expect(persistent.size).toBe(0);
+        expect(readCalls).toContainEqual([valueKey, { cached: true }]);
+        expect(readCalls).toContainEqual([metaKey, undefined]);
 
         await expect(reconcilePluginStorageMode({ dependencies })).resolves.toEqual({
             direction: "none",

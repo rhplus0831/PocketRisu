@@ -29,9 +29,18 @@ function decodeKeyComponent(value: string) {
     return Buffer.from(padded, "base64").toString("utf-8");
 }
 
-export async function readPersistentJson<T>(storageKey: string): Promise<T | null> {
+export interface PersistentJsonReadOptions {
+    cached?: boolean;
+}
+
+export async function readPersistentJson<T>(
+    storageKey: string,
+    options: PersistentJsonReadOptions = {},
+): Promise<T | null> {
     await ensureStorageReady();
-    const data = await forageStorage.getItem(storageKey);
+    const data = options.cached
+        ? await forageStorage.getItemCached(storageKey)
+        : await forageStorage.getItem(storageKey);
     if (!data) {
         return null;
     }

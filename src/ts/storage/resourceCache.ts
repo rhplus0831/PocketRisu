@@ -14,7 +14,16 @@ const RESOURCE_CACHE_MANIFEST_VERSION = 1 as const
 const RESOURCE_CACHE_HASH_PATTERN = /^[0-9a-f]{64}$/
 const HASH_BATCH_SIZE = 32
 
-export type ResourceCacheManifestKind = 'chat' | 'database'
+// Manifest kind selects only an in-memory retention bound. It is not persisted.
+export type ResourceCacheManifestKind = 'item' | 'database'
+
+export interface ResourceCacheStats {
+    enabled: boolean
+    supported: boolean
+    manifestCount: number
+    entryCount: number
+    totalBytes: number
+}
 
 export interface ResourceCacheByteEntry {
     hash: string
@@ -85,7 +94,7 @@ export function resourceCacheManifestHashLimit(kind: ResourceCacheManifestKind):
 }
 
 function resourceCacheManifestKind(resourceKey: string): ResourceCacheManifestKind {
-    return resourceKey.startsWith('db:') ? 'database' : 'chat'
+    return resourceKey.startsWith('db:') ? 'database' : 'item'
 }
 
 export function formatHashBytes(bytes: Uint8Array): string {
@@ -136,6 +145,58 @@ export async function setResourceCacheEnabled(enabled: boolean): Promise<void> {
         // Clearing IndexedDB is still useful even if localStorage is blocked.
     }
     await clearResourceCache()
+}
+
+/** Return best-effort browser-cache usage without surfacing IndexedDB failures. */
+export async function getResourceCacheStats(): Promise<ResourceCacheStats> {
+    const empty = (): ResourceCacheStats => ({
+        enabled: isResourceCacheEnabled(),
+        supported: isResourceCacheSupported(),
+        manifestCount: 0,
+        entryCount: 0,
+        totalBytes: 0,
+    })
+
+    try {
+        const unavailable = empty()
+        if (!unavailable.enabled || !unavailable.supported) return unavailable
+        const database = await openResourceCacheDatabase()
+        if (!database) return unavailable
+
+        try {
+            const transaction = database.transaction(
+                [RESOURCE_CACHE_ENTRY_STORE, RESOURCE_CACHE_MANIFEST_STORE],
+                'readonly',
+            )
+            const done = transactionComplete(transaction)
+            const entries = transaction.objectStore(RESOURCE_CACHE_ENTRY_STORE)
+            const manifests = transaction.objectStore(RESOURCE_CACHE_MANIFEST_STORE)
+            const [manifestCount, entryCount, totalBytes] = await Promise.all([
+                requestResult(manifests.count()),
+                requestResult(entries.count()),
+                sumResourceCacheEntryBytes(entries.openCursor()),
+            ])
+            await done
+            return {
+                enabled: true,
+                supported: true,
+                manifestCount,
+                entryCount,
+                totalBytes,
+            }
+        } catch {
+            discardResourceCacheDatabase(database)
+            return unavailable
+        }
+    } catch {
+        return {
+            enabled: false,
+            supported: false,
+            manifestCount: 0,
+            entryCount: 0,
+            totalBytes: 0,
+        }
+    }
 }
 
 /** Return a de-duplicated newest-first manifest capped to a few revisions. */
@@ -793,6 +854,22 @@ function requestResult<T>(request: IDBRequest<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
         request.onsuccess = () => resolve(request.result)
         request.onerror = () => reject(request.error ?? new Error('IndexedDB request failed'))
+    })
+}
+
+function sumResourceCacheEntryBytes(request: IDBRequest<IDBCursorWithValue | null>): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+        let totalBytes = 0
+        request.onsuccess = () => {
+            const cursor = request.result
+            if (!cursor) {
+                resolve(totalBytes)
+                return
+            }
+            totalBytes += readStoredBytes(cursor.value)?.byteLength ?? 0
+            cursor.continue()
+        }
+        request.onerror = () => reject(request.error ?? new Error('IndexedDB cursor failed'))
     })
 }
 

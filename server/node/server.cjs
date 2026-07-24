@@ -3699,6 +3699,15 @@ app.get('/api/read', async (req, res, next) => {
                     return res.status(304).end();
                 }
                 res.setHeader('x-db-etag', dbEtag);
+            } else {
+                const cachedHashes = parseCachedHashesHeader(req.headers['x-cached-hashes']);
+                if (cachedHashes.length > 0) {
+                    const contentHash = sha256Hex(value);
+                    res.setHeader('x-content-hash', contentHash);
+                    if (cachedHashes.includes(contentHash)) {
+                        return res.status(204).end();
+                    }
+                }
             }
             res.setHeader('Content-Type', 'application/octet-stream');
             res.send(value);
@@ -4021,7 +4030,8 @@ app.post('/api/write', async (req, res, next) => {
 
             res.send({
                 success: true,
-                etag: key === 'database/database.bin' ? dbEtag : undefined
+                etag: key === 'database/database.bin' ? dbEtag : undefined,
+                hash: key.startsWith(PLUGIN_SAVE_PREFIX) ? sha256Hex(fileContent) : undefined,
             });
         });
     } catch (error) {

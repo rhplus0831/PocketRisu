@@ -17,6 +17,7 @@
         BlocksIcon,
         ShieldCheckIcon,
         SaveIcon,
+        Trash2Icon,
     } from '@lucide/svelte'
     import { alertConfirm, alertMd, notifyError, notifySuccess } from 'src/ts/alert'
     import { forageStorage } from 'src/ts/globalApi.svelte'
@@ -25,6 +26,12 @@
     import { changeChar } from 'src/ts/characters'
     import { SystemTab } from 'src/ts/routing'
     import { language, getCurrentLocale } from 'src/lang'
+    import {
+        clearResourceCache,
+        getResourceCacheStats,
+        isResourceCacheSupported,
+        type ResourceCacheStats,
+    } from 'src/ts/storage/resourceCache'
 
     // ── Types ────────────────────────────────────────────────────────────────
     interface PrefixInfo {
@@ -76,6 +83,9 @@
     let stats = $state<Stats | null>(null)
     let loading = $state(false)
     let loadError = $state<string | null>(null)
+    const resourceCacheSupported = isResourceCacheSupported()
+    let resourceCacheStats = $state<ResourceCacheStats | null>(null)
+    let resourceCacheClearing = $state(false)
 
     let characters = $state<CharStats | null>(null)
     let charLoading = $state(false)
@@ -135,6 +145,22 @@
             loadError = err instanceof Error ? err.message : String(err)
         } finally {
             loading = false
+        }
+    }
+
+    async function loadResourceCacheStats() {
+        resourceCacheStats = await getResourceCacheStats()
+    }
+
+    async function clearBrowserCache() {
+        if (!await alertConfirm(language.resourceCacheClearConfirm)) return
+        resourceCacheClearing = true
+        try {
+            await clearResourceCache()
+            await loadResourceCacheStats()
+            notifySuccess(language.resourceCacheCleared)
+        } finally {
+            resourceCacheClearing = false
         }
     }
 
@@ -380,13 +406,19 @@
         alertMd(`### ${label}\n\n${fmtBytes(size)}\n\n${desc}`)
     }
 
-    $effect(() => { loadStats() })
+    $effect(() => {
+        void loadStats()
+        if (resourceCacheSupported) void loadResourceCacheStats()
+    })
 </script>
 
 <p class="text-textcolor2 text-sm mb-4">{language.storageDashboardDesc}</p>
 
 <div class="flex justify-end mb-3">
-    <ShButton variant="outline" size="default" onclick={loadStats} disabled={loading}>
+    <ShButton variant="outline" size="default" onclick={() => {
+        void loadStats()
+        if (resourceCacheSupported) void loadResourceCacheStats()
+    }} disabled={loading}>
         <RefreshCwIcon size={16} class={loading ? 'animate-spin' : ''} />
         <span class="hidden sm:inline">{loading ? language.storageLoading : language.storageRefresh}</span>
     </ShButton>
@@ -397,6 +429,46 @@
         {#snippet icon()}<TriangleAlertIcon />{/snippet}
         {language.storageFailedLoad}: {loadError}
     </ShAlert>
+{/if}
+
+{#if resourceCacheSupported && resourceCacheStats}
+    <div class="border border-darkborderc bg-darkbg/40 rounded-md p-4 mb-4">
+        <div class="flex items-center justify-between gap-2 mb-2">
+            <div class="flex items-center gap-2 text-textcolor">
+                <HardDriveIcon size={16} />
+                <span class="font-medium">{language.resourceCache}</span>
+            </div>
+            <ShBadge variant={resourceCacheStats.enabled ? 'success' : 'secondary'}>
+                {resourceCacheStats.enabled ? language.resourceCacheEnabled : language.resourceCacheDisabled}
+            </ShBadge>
+        </div>
+        <p class="text-textcolor2 text-sm leading-relaxed mb-3">{language.resourceCacheDashboardDesc}</p>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-3">
+            <div class="rounded-md border border-darkborderc/50 bg-bgcolor/40 px-3 py-2">
+                <div class="text-textcolor2 text-xs">{language.resourceCacheEntries}</div>
+                <div class="text-textcolor tabular-nums">{resourceCacheStats.entryCount.toLocaleString()}</div>
+            </div>
+            <div class="rounded-md border border-darkborderc/50 bg-bgcolor/40 px-3 py-2">
+                <div class="text-textcolor2 text-xs">{language.resourceCacheManifests}</div>
+                <div class="text-textcolor tabular-nums">{resourceCacheStats.manifestCount.toLocaleString()}</div>
+            </div>
+            <div class="rounded-md border border-darkborderc/50 bg-bgcolor/40 px-3 py-2">
+                <div class="text-textcolor2 text-xs">{language.resourceCacheSize}</div>
+                <div class="text-textcolor tabular-nums">{fmtBytes(resourceCacheStats.totalBytes)}</div>
+            </div>
+        </div>
+        <div class="flex justify-end">
+            <ShButton
+                variant="destructive"
+                size="sm"
+                onclick={clearBrowserCache}
+                disabled={resourceCacheClearing}
+            >
+                <Trash2Icon size={16} />
+                {language.resourceCacheClear}
+            </ShButton>
+        </div>
+    </div>
 {/if}
 
 {#if stats}

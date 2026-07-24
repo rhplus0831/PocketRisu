@@ -47,7 +47,7 @@ export async function getPluginSaveStorageItem<T>(key: string): Promise<T | null
         if (!db.optimizePluginMemory) {
             return (db.pluginCustomStorage?.[key] as T) ?? null;
         }
-        return await readPersistentJson<T>(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key));
+        return await readPersistentJson<T>(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key), { cached: true });
     });
 }
 
@@ -238,7 +238,7 @@ export async function reconcilePluginStorageMode(
         for (const storageKey of valueStorageKeys) {
             const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
             if (key === null) continue;
-            db.pluginCustomStorage[key] = await deps.readPersistentJson(storageKey);
+            db.pluginCustomStorage[key] = await deps.readPersistentJson(storageKey, { cached: true });
             options.onProgress?.({
                 direction: "internalize",
                 completed: ++completed,
