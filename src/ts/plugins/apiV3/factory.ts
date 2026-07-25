@@ -1,3 +1,5 @@
+import { safeStructuredClone } from "../../polyfill";
+
 type MsgType =
     | 'CALL_ROOT'
     | 'CALL_INSTANCE'
@@ -588,8 +590,19 @@ export class SandboxHost {
                 console.log("Original request:", data);
                 console.log('Original response:', response, transferables);
                 try {
-                    this.iframe.contentWindow?.postMessage(response, '*', transferables);                    
+                    this.iframe.contentWindow?.postMessage(response, '*', transferables);
                 } catch (error) {
+                    // Reactive $state proxies reject structured cloning. When
+                    // nothing needs to be transferred, a plain deep copy of the
+                    // response is equivalent — retry with that before failing.
+                    if ((error as Error)?.name === 'DataCloneError' && transferables.length === 0) {
+                        try {
+                            this.iframe.contentWindow?.postMessage(safeStructuredClone(response), '*');
+                            return;
+                        } catch (retryError) {
+                            error = retryError;
+                        }
+                    }
                     this.iframe.contentWindow?.postMessage({
                         type: 'RESPONSE',
                         reqId: data.reqId,

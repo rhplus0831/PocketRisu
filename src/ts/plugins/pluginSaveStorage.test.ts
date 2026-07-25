@@ -180,6 +180,20 @@ describe("plugin save storage transport", () => {
         expect(readPersistentJson).not.toHaveBeenCalled();
     });
 
+    test("inline reads return a structured-cloneable copy, not the reactive proxy", async () => {
+        // db values live in Svelte $state, whose proxies make postMessage /
+        // structuredClone throw DataCloneError when crossing the V3 iframe
+        // bridge. A bare Proxy reproduces that rejection.
+        const stored = new Proxy({ nested: { value: 1 } }, {});
+        expect(() => structuredClone(stored)).toThrow();
+        database.pluginCustomStorage.alpha = stored;
+
+        const read = await getPluginSaveStorageItem("alpha");
+        expect(read).toEqual({ nested: { value: 1 } });
+        expect(() => structuredClone(read)).not.toThrow();
+        expect(read).not.toBe(stored);
+    });
+
     test("a literal replacement-character key round-trips through optimized storage", async () => {
         database.optimizePluginMemory = true;
         const value = { exact: "replacement-character" };

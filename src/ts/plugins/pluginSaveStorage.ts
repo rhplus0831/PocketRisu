@@ -72,7 +72,13 @@ export async function getPluginSaveStorageItem<T>(key: string): Promise<T | null
     return withPluginSaveStorageLock(async () => {
         const db = getDatabase();
         if (!db.optimizePluginMemory) {
-            return (db.pluginCustomStorage?.[key] as T) ?? null;
+            const value = db.pluginCustomStorage?.[key];
+            if (value === undefined || value === null) return null;
+            // db is reactive $state, so inline values are Svelte proxies.
+            // postMessage/structuredClone reject proxies (DataCloneError), and
+            // this value crosses the V3 iframe bridge — return the same plain
+            // JSON round-trip the optimized branch produces.
+            return JSON.parse(JSON.stringify(value)) as T;
         }
         return await readPersistentJson<T>(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key), { cached: true });
     });
