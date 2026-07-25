@@ -33,7 +33,7 @@ const getVips = () => {
     }
     return _vipsPromise
 }
-const { kvGet, kvSet, kvDel, kvList,
+const { kvGet, kvSet, kvSetFromFile, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
         kvGetListEpoch, kvBumpListEpoch,
@@ -99,6 +99,7 @@ const { inspectRisuSaveSource, shouldStreamRisuSave } = require('./streamRisuLoa
 const {
     PLUGIN_SAVE_PREFIX,
     PLUGIN_SAVE_META_PREFIX,
+    PLUGIN_STORAGE_FOLDED_MARKER,
     decodePluginSaveStorageKey,
     encodePluginSaveStorageKey,
 } = require('./pluginSaveKeys.cjs');
@@ -322,15 +323,15 @@ async function createBackupAndRotate() {
         if (!raw) return;
         const strippedDb = dbCache[DB_HEX_KEY] || await loadStrippedDatabase(raw, 'snapshot');
         backupDbSpool = await spoolSelfContainedBackupDatabase(strippedDb, {
+            foldPluginStorage: true,
+            markPluginStorageFolded: true,
             onMissingChatRow: (chaId, chatId) => {
                 logger.warn(
                     `[Snapshot] Missing referenced chat row ${chaId}/${chatId}; preserving bare stub`
                 );
             },
         });
-        // SQLite's KV API still needs one Buffer, but the chat object tree is
-        // never materialized alongside it.
-        kvSet(backupKey, await fs.readFile(backupDbSpool.filePath));
+        kvSetFromFile(backupKey, backupDbSpool.filePath);
         lastBackupTime = Date.now();
         trimSnapshotsToLimits();
     } catch (error) {
@@ -518,6 +519,10 @@ async function ingestDatabaseStreaming(source, { inspection = null } = {}) {
     const result = await chatRowStore.ingestStreamingDatabase(source, {
         inspection: inspection ?? await inspectRisuSaveSource(source),
         tempDir: savePath,
+        onPluginStorageFolded: () => {
+            kvDelPrefix(PLUGIN_SAVE_PREFIX);
+            kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
+        },
         onPluginStorageEntry: ({ field, key, value }) => {
             const prefix = field === 'pluginStorageMeta'
                 ? PLUGIN_SAVE_META_PREFIX
@@ -2325,7 +2330,9 @@ function listColdStorageBackupEntries(options = {}) {
 }
 
 function hasExternalizablePluginStorage(dbObj) {
-    if (!dbObj || dbObj.optimizePluginMemory !== true) return false;
+    if (!dbObj) return false;
+    if (dbObj[PLUGIN_STORAGE_FOLDED_MARKER] === true) return true;
+    if (dbObj.optimizePluginMemory !== true) return false;
     const inlineValues = dbObj.pluginCustomStorage;
     const hasValues = inlineValues !== null
         && typeof inlineValues === 'object'
@@ -2335,8 +2342,31 @@ function hasExternalizablePluginStorage(dbObj) {
 }
 
 function preparePluginStorageExternalization(dbObj) {
+    const hasMarkerField = Boolean(dbObj)
+        && Object.prototype.hasOwnProperty.call(dbObj, PLUGIN_STORAGE_FOLDED_MARKER);
     if (!hasExternalizablePluginStorage(dbObj)) {
-        return { strippedDb: dbObj, rows: [], changed: false, values: 0, meta: 0 };
+        if (!hasMarkerField) {
+            return {
+                strippedDb: dbObj,
+                rows: [],
+                changed: false,
+                externalized: false,
+                clearExisting: false,
+                values: 0,
+                meta: 0,
+            };
+        }
+        const strippedDb = { ...dbObj };
+        delete strippedDb[PLUGIN_STORAGE_FOLDED_MARKER];
+        return {
+            strippedDb,
+            rows: [],
+            changed: true,
+            externalized: false,
+            clearExisting: false,
+            values: 0,
+            meta: 0,
+        };
     }
 
     const valueEntries = Object.entries(dbObj.pluginCustomStorage ?? {});
@@ -2353,10 +2383,13 @@ function preparePluginStorageExternalization(dbObj) {
     ];
     const strippedDb = { ...dbObj, pluginCustomStorage: {} };
     delete strippedDb.pluginStorageMeta;
+    delete strippedDb[PLUGIN_STORAGE_FOLDED_MARKER];
     return {
         strippedDb,
         rows,
         changed: true,
+        externalized: true,
+        clearExisting: dbObj[PLUGIN_STORAGE_FOLDED_MARKER] === true,
         values: valueEntries.length,
         meta: metaEntries.length,
     };
@@ -2377,12 +2410,19 @@ function externalizePluginStorageIfNeeded(dbObj) {
     }
 
     const writeRows = sqliteDb.transaction(() => {
+        if (prepared.clearExisting) {
+            kvDelPrefix(PLUGIN_SAVE_PREFIX);
+            kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
+        }
         writePluginStorageRows(prepared.rows);
     });
     writeRows();
 
-    dbObj.pluginCustomStorage = {};
-    delete dbObj.pluginStorageMeta;
+    if (prepared.externalized) {
+        dbObj.pluginCustomStorage = {};
+        delete dbObj.pluginStorageMeta;
+    }
+    delete dbObj[PLUGIN_STORAGE_FOLDED_MARKER];
     return {
         changed: true,
         values: prepared.values,
@@ -2410,6 +2450,7 @@ async function spoolSelfContainedBackupDatabase(
     strippedDb,
     {
         foldPluginStorage = false,
+        markPluginStorageFolded = false,
         shouldAbort = () => false,
         reader = { kvGet, kvList },
         onMissingChatRow,
@@ -2443,6 +2484,7 @@ async function spoolSelfContainedBackupDatabase(
                 return value === null ? null : decodeRisuSave(value);
             },
             pluginStorage,
+            markPluginStorageFolded,
             shouldAbort,
             onMissingChatRow,
         });

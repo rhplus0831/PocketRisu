@@ -1,5 +1,8 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, afterAll } from 'vitest'
 import { randomBytes } from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import Database from 'better-sqlite3'
 import pkg from './chunkStore.cjs'
 
@@ -11,6 +14,7 @@ const { cdcSplit, createChunkStore, isChunkableKey } = pkg as {
         opts?: { threshold?: number },
     ) => {
         putValue: (key: string, value: Buffer) => void
+        putValueFromFile: (key: string, filePath: string) => void
         getValue: (key: string) => Buffer | null
         sizeValue: (key: string) => number | null
         snapshotCostExclusive: (key: string) => number
@@ -431,5 +435,59 @@ describe('gc — mark-sweep (참조 없는 조각만 삭제)', () => {
         expect(countManifest(db, 'snap')).toBe(0)
         expect(countChunks(db)).toBeLessThan(before)
         expect((store.getValue('live') as Buffer).length).toBeGreaterThan(0)
+    })
+})
+
+describe('putValueFromFile — 파일 스트리밍 쓰기 (putValue와 저장 동일성)', () => {
+    const T = { threshold: 1024 }
+    const fileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'risu-chunk-file-'))
+    afterAll(() => fs.rmSync(fileDir, { recursive: true, force: true }))
+
+    function writeTemp(name: string, bytes: Buffer): string {
+        const filePath = path.join(fileDir, name)
+        fs.writeFileSync(filePath, bytes)
+        return filePath
+    }
+    const tableDump = (db: any, key: string) => ({
+        kv: db.prepare('SELECT value FROM kv WHERE key = ?').get(key)?.value,
+        manifest: db.prepare(
+            'SELECT seq, hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq',
+        ).all(key),
+        chunks: db.prepare('SELECT hash, LENGTH(data) len FROM chunks ORDER BY hash').all(),
+    })
+
+    it('E1: 큰 파일 → putValue와 동일한 조각·manifest·바이트 (윈도우 경계 무관)', () => {
+        // MAX_SIZE(65536)의 배수와 비배수 크기 모두 — 마지막 윈도우가 잘리는
+        // 경우와 정확히 맞는 경우의 경계 동등성을 함께 검증한다.
+        for (const size of [65536 * 3, 300_000]) {
+            const bytes = seededBytes(size, size)
+            const viaBuffer = freshDb()
+            createChunkStore(viaBuffer, T).putValue('k', bytes)
+            const viaFile = freshDb()
+            const store = createChunkStore(viaFile, T)
+            store.putValueFromFile('k', writeTemp(`big-${size}`, bytes))
+
+            expect(tableDump(viaFile, 'k')).toEqual(tableDump(viaBuffer, 'k'))
+            expect((store.getValue('k') as Buffer).equals(bytes)).toBe(true)
+        }
+    })
+
+    it('E2: 임계 이하 파일은 평범한 행 — 청크 0, 바이트 동일', () => {
+        const bytes = seededBytes(1024, 7)
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        store.putValueFromFile('k', writeTemp('small', bytes))
+        expect(countChunks(db)).toBe(0)
+        expect((store.getValue('k') as Buffer).equals(bytes)).toBe(true)
+    })
+
+    it('E3: 기존 청킹 값 덮어쓰기 — manifest 교체 후 정확 반환', () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        store.putValue('k', seededBytes(200_000, 1))
+        const replacement = seededBytes(50_000, 2)
+        store.putValueFromFile('k', writeTemp('replace', replacement))
+        expect((store.getValue('k') as Buffer).equals(replacement)).toBe(true)
+        expect(countManifest(db, 'k')).toBeGreaterThan(0)
     })
 })

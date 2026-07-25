@@ -1,5 +1,6 @@
 const PLUGIN_SAVE_PREFIX = 'pluginsave/';
 const PLUGIN_SAVE_META_PREFIX = 'pluginsave-meta/';
+const PLUGIN_STORAGE_FOLDED_MARKER = 'pluginStorageFolded';
 
 function decodePluginSaveStorageKey(storageKey, prefix) {
     if (!storageKey.startsWith(prefix) || !storageKey.endsWith('.json')) {
@@ -33,6 +34,7 @@ function encodePluginSaveStorageKey(rawKey, prefix) {
 module.exports = {
     PLUGIN_SAVE_PREFIX,
     PLUGIN_SAVE_META_PREFIX,
+    PLUGIN_STORAGE_FOLDED_MARKER,
     decodePluginSaveStorageKey,
     encodePluginSaveStorageKey,
 };

@@ -483,6 +483,7 @@ function createChatRowStore(options) {
                 tempDir: opts.tempDir,
                 externalizePluginStorage: typeof opts.onPluginStorageEntry === 'function',
                 onPluginStorageEntry: opts.onPluginStorageEntry,
+                onPluginStorageFolded: opts.onPluginStorageFolded,
                 retainCharacterChats: (character) => Boolean(
                     opts.restoreColdStorageCharacters && character?.coldstorage
                 ),

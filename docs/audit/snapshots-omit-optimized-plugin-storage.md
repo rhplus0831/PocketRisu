@@ -1,9 +1,9 @@
 # Automatic snapshots do not version optimized plugin storage
 
-- Status: Open
+- Status: Fixed
 - Severity: High
 - Commit: `e2bc8e5b` (made explicit by the spool path in `f410c8a6`)
-- Affected code: `server/node/server.cjs:281-300`, `server/node/server.cjs:2230-2263`, `server/node/server.cjs:6067-6112`
+- Affected code: `server/node/server.cjs` (`createBackupAndRotate`, `spoolSelfContainedBackupDatabase`, `/api/db/snapshots/restore`), `server/node/streamRisuLoad.cjs`, `server/node/streamRisuSave.cjs`
 
 ## Risk
 
@@ -19,9 +19,15 @@ Restoring such a snapshot restores the database and chats but does not restore p
 4. The snapshot is restored.
 5. The logical database returns to the snapshot time, but plugin storage remains at the post-snapshot state.
 
-## Required fix and coverage
+## Fix
 
-Either fold plugin values and metadata into every automatic snapshot, or version their external rows as part of the same snapshot object. Restore must atomically clear and repopulate plugin prefixes so post-snapshot keys do not leak into the recovered state. The streaming ingest path can re-externalize folded values after restore.
+- **Creation** — `createBackupAndRotate` now folds external plugin rows into every automatic snapshot (`foldPluginStorage: true`) and stamps the assembled database with a `pluginStorageFolded: true` top-level marker when the source database is optimized. The marker is present even when zero plugin rows exist, so a folded-empty snapshot is distinguishable from a pre-fix stub snapshot. The fold streams rows one at a time through the disk spool, and the spool file is persisted with `kvSetFromFile` (chunk-streaming write in `db.cjs`/`chunkStore.cjs`), so large plugin stores are never materialized as one Buffer.
+- **Restore** — both ingest paths act on the marker and atomically clear-and-repopulate the plugin prefixes:
+  - Streaming: `walkRisuSave` detects the marker, invokes `onPluginStorageFolded` (wired to `kvDelPrefix` on both prefixes) before emitting entries, all inside the transaction owned by `ingestStreamingDatabase`. The marker is always stripped from the walk remainder so it never persists into the live `database.bin`.
+  - Legacy: `externalizePluginStorageIfNeeded` treats a marked database as externalizable (even with empty maps), clears both prefixes inside its write transaction before re-writing the rows, and drops the marker. Because `hasExternalizablePluginStorage` recognizes the marker, a crash mid-restore is completed by the defensive boot externalization.
+- **Backward compatibility** — snapshots created before the fix carry no marker. Restoring one keeps the previous behavior (plugin rows left untouched) deliberately: an unmarked stub snapshot has no plugin data to repopulate from, so clearing would destroy the only surviving copy.
 
-Add a regression that snapshots `V1`, changes it to `V2`, deletes one old key, adds one new key, restores, and requires the exact snapshot-time key set and values.
+## Regression coverage
 
+- `server/node/snapshotPluginStorage.e2e.test.ts` — end-to-end against the real server: the audit scenario (`V1` → snapshot → `V2`/delete/add → restore → exact snapshot-time key set and values) on both the legacy and streaming restore paths, folded-empty snapshot restore clearing later rows, and pre-fix stub snapshot restore leaving current rows untouched.
+- `server/node/chunkStore.test.ts` (E1–E3) — `putValueFromFile` stores byte- and manifest-identical representations to `putValue` across window boundaries, threshold-sized values, and overwrites.

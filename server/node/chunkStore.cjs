@@ -7,6 +7,7 @@
 // schema. See .agent/notes/db-storage-chunking-plan.md.
 
 const crypto = require('crypto');
+const fs = require('fs');
 
 // Gear table for the rolling hash (FastCDC-style). Deterministic so chunk
 // boundaries depend only on content — identical content always cuts the same
@@ -193,6 +194,47 @@ function createChunkStore(db, opts = {}) {
         kvSet.run(key, CHUNK_MARKER, Date.now());
     });
 
+    function readFileRange(fd, length, position) {
+        const buffer = Buffer.allocUnsafe(length);
+        let offset = 0;
+        while (offset < length) {
+            const bytesRead = fs.readSync(fd, buffer, offset, length - offset, position + offset);
+            if (bytesRead === 0) {
+                throw new Error(`Unexpected end of file at byte ${position + offset}`);
+            }
+            offset += bytesRead;
+        }
+        return buffer;
+    }
+
+    // Keep only one CDC window resident while producing the same chunks and
+    // manifest as putValue. A raw value still needs one Buffer for SQLite's
+    // direct-row bind, but values above the threshold never become monolithic.
+    const putValueFromFile = db.transaction((key, filePath) => {
+        const fd = fs.openSync(filePath, 'r');
+        try {
+            const size = fs.fstatSync(fd).size;
+            delManifest.run(key);
+            if (size <= threshold) {
+                kvSet.run(key, readFileRange(fd, size, 0), Date.now());
+                return;
+            }
+
+            let position = 0;
+            let sequence = 0;
+            while (position < size) {
+                const window = readFileRange(fd, Math.min(MAX_SIZE, size - position), position);
+                const chunk = cdcSplit(window)[0];
+                insChunk.run(chunk.hash, chunk.data);
+                insManifest.run(key, sequence++, chunk.hash);
+                position += chunk.data.length;
+            }
+            kvSet.run(key, CHUNK_MARKER, Date.now());
+        } finally {
+            fs.closeSync(fd);
+        }
+    });
+
     function getValue(key) {
         const row = kvGet.get(key);
         if (!row) return null;
@@ -267,6 +309,7 @@ function createChunkStore(db, opts = {}) {
 
     return {
         putValue,
+        putValueFromFile,
         getValue,
         sizeValue,
         snapshotCostExclusive,

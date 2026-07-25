@@ -16,6 +16,7 @@ const {
     magicStreamCompressedHeader,
     normalizeJSON,
 } = require('./utils.cjs');
+const { PLUGIN_STORAGE_FOLDED_MARKER } = require('./pluginSaveKeys.cjs');
 
 const DEFAULT_STREAM_INGEST_MIN_BYTES = 32 * 1024 * 1024;
 const CURSOR_CACHE_BYTES = 256 * 1024;
@@ -586,6 +587,10 @@ async function walkRisuSave(input, options = {}) {
                 options.onMissingChatId
             )
             : new Map();
+        const foldedMarkerEntry = byKey.get(PLUGIN_STORAGE_FOLDED_MARKER);
+        const pluginStorageFolded = foldedMarkerEntry
+            ? normalizeJSON(await decodeDescriptor(source, foldedMarkerEntry.descriptor)) === true
+            : false;
         let externalizePlugins = false;
         if (options.externalizePluginStorage) {
             const optimizeEntry = byKey.get('optimizePluginMemory');
@@ -611,13 +616,24 @@ async function walkRisuSave(input, options = {}) {
                 hasMetaField = kind === 'map'
                     || normalizeJSON(await decodeDescriptor(source, metaEntry.descriptor)) !== undefined;
             }
-            externalizePlugins = optimize === true && (hasValues || hasMetaField);
+            externalizePlugins = pluginStorageFolded
+                || (optimize === true && (hasValues || hasMetaField));
+            if (pluginStorageFolded) {
+                if (typeof options.onPluginStorageFolded !== 'function') {
+                    throw new TypeError(
+                        'onPluginStorageFolded is required for a folded plugin storage snapshot'
+                    );
+                }
+                await options.onPluginStorageFolded();
+            }
         }
 
         const remainder = {};
         const pluginStats = { changed: externalizePlugins, values: 0, meta: 0 };
         for (const entry of rootEntries) {
-            if (entry.key === 'characters') {
+            if (entry.key === PLUGIN_STORAGE_FOLDED_MARKER) {
+                continue;
+            } else if (entry.key === 'characters') {
                 assignNormalizedProperty(
                     remainder,
                     entry.key,
@@ -670,6 +686,10 @@ async function walkRisuSave(input, options = {}) {
                     decoded
                 );
             }
+        }
+        if (externalizePlugins
+            && !Object.prototype.hasOwnProperty.call(remainder, 'pluginCustomStorage')) {
+            remainder.pluginCustomStorage = {};
         }
 
         return {

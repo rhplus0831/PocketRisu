@@ -7,6 +7,7 @@ const { finished } = require('stream/promises');
 const { Packr } = require('msgpackr');
 const { magicHeader } = require('./utils.cjs');
 const { mergeChatStubWithFullChat } = require('./chatRows.cjs');
+const { PLUGIN_STORAGE_FOLDED_MARKER } = require('./pluginSaveKeys.cjs');
 
 const packr = new Packr({ useRecords: false });
 
@@ -89,6 +90,7 @@ async function streamRisuSaveToFile({
     filePath,
     readChatRow,
     pluginStorage = null,
+    markPluginStorageFolded = false,
     shouldAbort = () => false,
     onMissingChatRow = throwMissingChatRow,
 }) {
@@ -109,7 +111,10 @@ async function streamRisuSaveToFile({
         throw new TypeError('pluginStorage.readRow must be a function when rows are present');
     }
 
-    const topKeys = Object.keys(dbObj);
+    const shouldMarkPluginStorageFolded = markPluginStorageFolded
+        && pluginStorage !== null
+        && dbObj.optimizePluginMemory === true;
+    const topKeys = Object.keys(dbObj).filter(key => key !== PLUGIN_STORAGE_FOLDED_MARKER);
     const characters = dbObj.characters;
     if (Array.isArray(characters) && !topKeys.includes('characters')) {
         topKeys.push('characters');
@@ -119,6 +124,9 @@ async function streamRisuSaveToFile({
     }
     if (metaRows.length > 0 && !topKeys.includes('pluginStorageMeta')) {
         topKeys.push('pluginStorageMeta');
+    }
+    if (shouldMarkPluginStorageFolded) {
+        topKeys.push(PLUGIN_STORAGE_FOLDED_MARKER);
     }
 
     const valuePlan = valueRows.length > 0
@@ -206,6 +214,8 @@ async function streamRisuSaveToFile({
                 await writePluginMap(valuePlan);
             } else if (key === 'pluginStorageMeta' && metaPlan) {
                 await writePluginMap(metaPlan);
+            } else if (key === PLUGIN_STORAGE_FOLDED_MARKER) {
+                await writeValue(true);
             } else {
                 await writeValue(dbObj[key]);
             }

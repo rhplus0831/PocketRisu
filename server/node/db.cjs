@@ -169,7 +169,7 @@ function kvGet(key) {
     return chunkStore.getValue(key);
 }
 
-function kvSet(key, value) {
+function checkKvSetFailpoint(key) {
     if (kvSetFailpoint) {
         if (kvSetFailpoint.type === 'key' && key === kvSetFailpoint.key) {
             throw new Error(`Injected kvSet failure for key ${key}`);
@@ -181,6 +181,10 @@ function kvSet(key, value) {
             }
         }
     }
+}
+
+function kvSet(key, value) {
+    checkKvSetFailpoint(key);
     if (isChunkableKey(key)) {
         chunkStore.putValue(key, value);
     } else {
@@ -189,6 +193,16 @@ function kvSet(key, value) {
     // Deliberately a separate tiny indexed statement. If a reader or crash lands
     // between these statements, the key appears in both added and deleted; the
     // client merge gives added precedence, so it remains live.
+    stmtRemoveDeletion.run(key);
+}
+
+function kvSetFromFile(key, filePath) {
+    checkKvSetFailpoint(key);
+    if (isChunkableKey(key)) {
+        chunkStore.putValueFromFile(key, filePath);
+    } else {
+        stmtKvSet.run(key, fs.readFileSync(filePath), Date.now());
+    }
     stmtRemoveDeletion.run(key);
 }
 
@@ -352,7 +366,7 @@ function clearEntities() {
 module.exports = {
     db,
     // KV
-    kvGet, kvSet, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue,
+    kvGet, kvSet, kvSetFromFile, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue,
     kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
     kvGetListEpoch, kvBumpListEpoch,
     createKvSnapshot,
