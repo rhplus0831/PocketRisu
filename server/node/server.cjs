@@ -6,6 +6,7 @@ const path = require('path');
 const net = require('net');
 const compression = require('compression');
 const htmlparser = require('node-html-parser');
+const fsSync = require('fs');
 const {
     existsSync,
     mkdirSync,
@@ -15,7 +16,7 @@ const {
     unlinkSync,
     createReadStream,
     createWriteStream,
-} = require('fs');
+} = fsSync;
 const fs = require('fs/promises')
 const nodeCrypto = require('crypto')
 const zlib = require('zlib')
@@ -57,6 +58,13 @@ const {
     migrateAssetRowsToFilesystem,
     verifyAssetHash,
 } = require('./assetStore.cjs');
+const {
+    writeImportJournal,
+    readImportJournal,
+    clearImportJournal,
+    fsyncDirectoryTree,
+    recoverImportSwap,
+} = require('./importJournal.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
     logger, installProcessHandlers, expressErrorMiddleware,
@@ -918,6 +926,8 @@ if (existsSync(instanceIdPath)) {
 const authCodePath = path.join(process.cwd(), 'save', '__authcode')
 const inlayDir = path.join(savePath, 'inlays')
 const inlayMigrationMarker = path.join(inlayDir, '.migrated_to_fs')
+const IMPORT_JOURNAL_PATH = path.join(savePath, 'import_journal.json')
+const IMPORT_JOURNAL_MARKER_KEY = 'import_journal/marker'
 const hexRegex = /^[0-9a-fA-F]+$/;
 const BACKUP_IMPORT_MAX_BYTES = Number(process.env.RISU_BACKUP_IMPORT_MAX_BYTES ?? '0');
 const BACKUP_ENTRY_NAME_MAX_BYTES = 1024;
@@ -933,6 +943,30 @@ const BACKUP_NDJSON_HEARTBEAT_MS = Math.max(
 );
 
 let importInProgress = false;
+
+function recoverPendingImportSwap(source) {
+    const journal = readImportJournal(IMPORT_JOURNAL_PATH);
+    if (!journal) return null;
+
+    const markerValue = kvGet(IMPORT_JOURNAL_MARKER_KEY);
+    const markerPresent = markerValue !== null
+        && Buffer.from(markerValue).toString('utf-8') === journal.id;
+    const summary = recoverImportSwap({ journal, markerPresent, fs: fsSync });
+    logger.warn(
+        `[Import Recovery] ${source}: ${summary.action} ${summary.directories} `
+        + `directory swap(s) for journal ${journal.id} `
+        + `(phase=${journal.phase}, markerPresent=${markerPresent})`
+    );
+
+    // Once backups have been finalized, marker deletion must not make a
+    // repeated recovery interpret the imported live directories as uncommitted.
+    if (summary.action === 'finalized' && journal.phase !== 'committed') {
+        writeImportJournal(IMPORT_JOURNAL_PATH, { ...journal, phase: 'committed' });
+    }
+    if (markerValue !== null) kvDel(IMPORT_JOURNAL_MARKER_KEY);
+    clearImportJournal(IMPORT_JOURNAL_PATH);
+    return summary;
+}
 
 // ── Update check ─────────────────────────────────────────────────────────────
 const UPDATE_CHECK_DISABLED = process.env.RISU_UPDATE_CHECK === 'false';
@@ -1385,6 +1419,7 @@ const assetImportStagingDir = path.join(savePath, 'assets_import_staging');
 const assetImportBackupDir = path.join(savePath, 'assets_import_backup');
 
 async function prepareAssetImportStage() {
+    recoverPendingImportSwap('Asset import preparation');
     await fs.rm(assetImportStagingDir, { recursive: true, force: true });
     await fs.rm(assetImportBackupDir, { recursive: true, force: true });
     const store = createAssetStore({ assetDir: assetImportStagingDir });
@@ -2503,6 +2538,7 @@ function resolveBackupStorageKey(name) {
 // ─── Shared backup import logic ─────────────────────────────────────────────
 // Accepts any async iterable of Buffer chunks (HTTP request body, file stream, etc.)
 async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0, onProgress = null } = {}) {
+    recoverPendingImportSwap('Backup import preparation');
     let hasDatabase = false;
     let databaseSpool = null;
     let databaseWriteStream = null;
@@ -2522,6 +2558,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
 
     const stagingDir = path.join(savePath, 'inlays_import_staging');
     const backupInlayDir = path.join(savePath, 'inlays_import_backup');
+    recoverPendingImportSwap('Inlay import preparation');
     await fs.rm(stagingDir, { recursive: true, force: true });
     await fs.rm(backupInlayDir, { recursive: true, force: true });
     await fs.mkdir(stagingDir, { recursive: true });
@@ -2646,6 +2683,8 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
 
     let assetSwap = null;
     let inlaySwap = null;
+    let journal = null;
+    let transactionCommitted = false;
     try {
         sqliteDb.exec('BEGIN');
         // Prefix deletes can only journal kv rows. Record filesystem-backed
@@ -2811,6 +2850,28 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
             'utf-8'
         );
 
+        fsyncDirectoryTree(assetImportStagingDir);
+        fsyncDirectoryTree(stagingDir);
+        journal = {
+            id: nodeCrypto.randomUUID(),
+            phase: 'swapped',
+            dirs: [
+                {
+                    liveDir: assetDir,
+                    backupDir: assetImportBackupDir,
+                    stagingDir: assetImportStagingDir,
+                    liveExisted: fsSync.existsSync(assetDir),
+                },
+                {
+                    liveDir: inlayDir,
+                    backupDir: backupInlayDir,
+                    stagingDir,
+                    liveExisted: fsSync.existsSync(inlayDir),
+                },
+            ],
+        };
+        kvSet(IMPORT_JOURNAL_MARKER_KEY, Buffer.from(journal.id, 'utf-8'));
+        writeImportJournal(IMPORT_JOURNAL_PATH, journal);
         assetSwap = swapAssetDirectoryFromStaging(
             assetImportStagingDir,
             assetImportBackupDir
@@ -2825,21 +2886,58 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         // when this transaction commits.
         kvBumpListEpoch();
         sqliteDb.exec('COMMIT');
+        transactionCommitted = true;
+
+        sqliteDb.pragma('synchronous = NORMAL');
+        checkpointWal('TRUNCATE');
+        journal = { ...journal, phase: 'committed' };
+        writeImportJournal(IMPORT_JOURNAL_PATH, journal);
+        assetSwap.finalize();
+        inlaySwap.finalize();
+        kvDel(IMPORT_JOURNAL_MARKER_KEY);
+        clearImportJournal(IMPORT_JOURNAL_PATH);
     } catch (error) {
-        try { sqliteDb.exec('ROLLBACK'); } catch (_) {}
-        if (inlaySwap) {
-            try { inlaySwap.rollback(); } catch (rollbackError) {
-                logger.error('[Backup Import] Failed to restore previous inlay directory:', rollbackError);
+        if (!transactionCommitted) {
+            let rollbackSucceeded = !error?.restoreError;
+            try {
+                sqliteDb.exec('ROLLBACK');
+            } catch (rollbackError) {
+                rollbackSucceeded = false;
+                logger.error('[Backup Import] Failed to roll back SQLite transaction:', rollbackError);
             }
-        } else {
-            await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => {});
-        }
-        if (assetSwap) {
-            try { assetSwap.rollback(); } catch (rollbackError) {
-                logger.error('[Backup Import] Failed to restore previous asset directory:', rollbackError);
+            if (inlaySwap) {
+                try { inlaySwap.rollback(); } catch (rollbackError) {
+                    rollbackSucceeded = false;
+                    logger.error('[Backup Import] Failed to restore previous inlay directory:', rollbackError);
+                }
+            } else {
+                try {
+                    await fs.rm(stagingDir, { recursive: true, force: true });
+                } catch (cleanupError) {
+                    rollbackSucceeded = false;
+                    logger.error('[Backup Import] Failed to remove inlay staging directory:', cleanupError);
+                }
             }
-        } else {
-            await fs.rm(assetImportStagingDir, { recursive: true, force: true }).catch(() => {});
+            if (assetSwap) {
+                try { assetSwap.rollback(); } catch (rollbackError) {
+                    rollbackSucceeded = false;
+                    logger.error('[Backup Import] Failed to restore previous asset directory:', rollbackError);
+                }
+            } else {
+                try {
+                    await fs.rm(assetImportStagingDir, { recursive: true, force: true });
+                } catch (cleanupError) {
+                    rollbackSucceeded = false;
+                    logger.error('[Backup Import] Failed to remove asset staging directory:', cleanupError);
+                }
+            }
+            if (journal && rollbackSucceeded) {
+                try {
+                    clearImportJournal(IMPORT_JOURNAL_PATH);
+                } catch (cleanupError) {
+                    logger.error('[Backup Import] Failed to clear rolled-back import journal:', cleanupError);
+                }
+            }
         }
         throw error;
     } finally {
@@ -2851,13 +2949,6 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         if (databaseSpool) {
             await fs.unlink(databaseSpool.filePath).catch(() => {});
         }
-    }
-
-    try { assetSwap.finalize(); } catch (error) {
-        logger.warn('[Backup Import] Failed to remove previous asset directory:', error);
-    }
-    try { inlaySwap.finalize(); } catch (error) {
-        logger.warn('[Backup Import] Failed to remove previous inlay directory:', error);
     }
 
     invalidateDbCache();
@@ -5402,6 +5493,7 @@ function clearExistingData() {
 }
 
 async function importLegacySaveEntries(sources, missingDatabaseMessage) {
+    recoverPendingImportSwap('Save-folder import preparation');
     if (sources.length === 0) return { imported: 0 };
     const databaseEntry = sources.find((entry) => entry.key === DB_BLOB_KEY);
     if (!databaseEntry) {
@@ -5421,6 +5513,8 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
     const assetStage = await prepareAssetImportStage();
     let assetSwap = null;
     let streamingIngestion = null;
+    let journal = null;
+    let transactionCommitted = false;
 
     try {
         sqliteDb.exec('BEGIN');
@@ -5460,26 +5554,64 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
             markRemoteMigrationDone();
         }
 
+        fsyncDirectoryTree(assetImportStagingDir);
+        journal = {
+            id: nodeCrypto.randomUUID(),
+            phase: 'swapped',
+            dirs: [{
+                liveDir: assetDir,
+                backupDir: assetImportBackupDir,
+                stagingDir: assetImportStagingDir,
+                liveExisted: fsSync.existsSync(assetDir),
+            }],
+        };
+        kvSet(IMPORT_JOURNAL_MARKER_KEY, Buffer.from(journal.id, 'utf-8'));
+        writeImportJournal(IMPORT_JOURNAL_PATH, journal);
         assetSwap = swapAssetDirectoryFromStaging(
             assetImportStagingDir,
             assetImportBackupDir
         );
         kvBumpListEpoch();
         sqliteDb.exec('COMMIT');
+        transactionCommitted = true;
+
+        checkpointWal('TRUNCATE');
+        journal = { ...journal, phase: 'committed' };
+        writeImportJournal(IMPORT_JOURNAL_PATH, journal);
+        assetSwap.finalize();
+        kvDel(IMPORT_JOURNAL_MARKER_KEY);
+        clearImportJournal(IMPORT_JOURNAL_PATH);
     } catch (error) {
-        try { sqliteDb.exec('ROLLBACK'); } catch (_) {}
-        if (assetSwap) {
-            try { assetSwap.rollback(); } catch (rollbackError) {
-                logger.error('[Save-folder Import] Failed to restore previous asset directory:', rollbackError);
+        if (!transactionCommitted) {
+            let rollbackSucceeded = !error?.restoreError;
+            try {
+                sqliteDb.exec('ROLLBACK');
+            } catch (rollbackError) {
+                rollbackSucceeded = false;
+                logger.error('[Save-folder Import] Failed to roll back SQLite transaction:', rollbackError);
             }
-        } else {
-            await fs.rm(assetImportStagingDir, { recursive: true, force: true }).catch(() => {});
+            if (assetSwap) {
+                try { assetSwap.rollback(); } catch (rollbackError) {
+                    rollbackSucceeded = false;
+                    logger.error('[Save-folder Import] Failed to restore previous asset directory:', rollbackError);
+                }
+            } else {
+                try {
+                    await fs.rm(assetImportStagingDir, { recursive: true, force: true });
+                } catch (cleanupError) {
+                    rollbackSucceeded = false;
+                    logger.error('[Save-folder Import] Failed to remove asset staging directory:', cleanupError);
+                }
+            }
+            if (journal && rollbackSucceeded) {
+                try {
+                    clearImportJournal(IMPORT_JOURNAL_PATH);
+                } catch (cleanupError) {
+                    logger.error('[Save-folder Import] Failed to clear rolled-back import journal:', cleanupError);
+                }
+            }
         }
         throw error;
-    }
-
-    try { assetSwap.finalize(); } catch (error) {
-        logger.warn('[Save-folder Import] Failed to remove previous asset directory:', error);
     }
 
     const importedDbRaw = streamingIngestion ? null : kvGet(DB_BLOB_KEY);
@@ -6952,6 +7084,7 @@ async function getHttpsOptions() {
 
 async function startServer() {
     try {
+        recoverPendingImportSwap('Startup');
         migrateAssetsToFilesystem();
         await migrateInlaysToFilesystem();
         await migrateChatsToRowsIfNeeded();
