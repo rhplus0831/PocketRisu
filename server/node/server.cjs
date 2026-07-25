@@ -45,7 +45,7 @@ const {
     ensureAssetDir,
     isSafeAssetName,
     writeAssetFile,
-    writeAssetFileIfSizeDiffers,
+    writeAssetFileIfChanged,
     readAssetFile,
     assetFileMtimeMs,
     deleteAssetFile,
@@ -1230,12 +1230,12 @@ function readAssetValue(key) {
 }
 
 function writeAssetValue(key, value, options = {}) {
-    const { skipIfSameSize = false } = options;
+    const { skipIfUnchanged = false } = options;
     const name = assetNameForKey(key);
     if (name !== null && isSafeAssetName(name)) {
         let wrote = true;
-        if (skipIfSameSize) {
-            wrote = writeAssetFileIfSizeDiffers(name, value);
+        if (skipIfUnchanged) {
+            wrote = writeAssetFileIfChanged(name, value);
         } else {
             writeAssetFile(name, value);
         }
@@ -1339,7 +1339,7 @@ function migrateAssetsToFilesystem() {
         },
         store: {
             isSafeAssetName,
-            writeAssetFileIfSizeDiffers,
+            writeAssetFileIfChanged,
         },
         onProgress: ({ index, total, migrated }) => {
             if (migrated % 100 === 0 || index === total - 1) {
@@ -3960,7 +3960,7 @@ app.post('/api/write', async (req, res, next) => {
                 }
             } else if (key.startsWith('assets/')) {
                 writeAssetValue(key, fileContent, {
-                    skipIfSameSize: assetVerification.claimed !== null,
+                    skipIfUnchanged: assetVerification.claimed !== null,
                 });
             } else {
                 kvSet(key, fileContent);
@@ -4287,7 +4287,7 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
                 for(const { key, buffer, verification } of batch){
                     if (typeof key === 'string' && key.startsWith('assets/')) {
                         writeAssetValue(key, buffer, {
-                            skipIfSameSize: verification.claimed !== null,
+                            skipIfUnchanged: verification.claimed !== null,
                         });
                     } else {
                         kvSet(key, buffer);

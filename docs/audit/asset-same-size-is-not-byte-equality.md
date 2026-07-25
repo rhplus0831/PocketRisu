@@ -1,6 +1,6 @@
 # Same-size asset files are treated as byte-identical
 
-- Status: Open
+- Status: Fixed
 - Severity: High
 - Commit: `7f853d93`
 - Affected code: `server/node/assetStore.cjs:163-167`, `server/node/assetStore.cjs:274-300`, `server/node/server.cjs:1319-1350`
@@ -26,4 +26,15 @@ Hash-named asset uploads have the same repair failure. The incoming bytes are ch
 Compare bytes or a cryptographic digest before treating the destination as identical. For hash-named assets, verify the existing file against the claimed digest; for legacy names, compare the destination to the incoming bytes. Delete the SQLite row only after equality is proven or a replacement has completed durably.
 
 Add regressions for a same-length/different-content migration and for repairing a same-length corrupt hash-named destination through both single and bulk writes.
+
+## Resolution
+
+`writeAssetFileIfSizeDiffers()` was renamed to `writeAssetFileIfChanged()` and now treats the length match only as a fast path: when lengths are equal it reads the destination and byte-compares it against the incoming value, rewriting unless the bytes are proven identical. The extra file read happens only in the size-equal case.
+
+This closes both call paths at once:
+
+- Startup migration (`migrateAssetRowsToFilesystem`) still deletes the SQLite row unconditionally after the write call, which is now safe — the call either proved the destination byte-identical or durably replaced it (fsync, atomic rename, directory fsync).
+- The single (`/api/write`) and bulk (`/api/assets/bulk-write`) upload endpoints both delegate to `writeAssetValue({ skipIfUnchanged })`, so a valid re-upload of a hash-named asset now repairs a same-length corrupt destination instead of skipping it.
+
+Regression coverage in `server/node/assetStore.test.ts`: a same-length/different-content row must overwrite the stale file during migration before its row is deleted; a same-length corrupt hash-named destination must be repaired by `writeAssetFileIfChanged()` (the shared path behind both upload endpoints, which have no HTTP-level harness); byte-identical writes are still skipped, preserving mtime and existing hardlinks.
 

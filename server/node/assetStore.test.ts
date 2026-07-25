@@ -35,7 +35,7 @@ interface AssetStore {
     isSafeAssetName: (name: unknown) => boolean
     assetPathFor: (name: string) => string
     writeAssetFile: (name: string, buffer: Buffer) => void
-    writeAssetFileIfSizeDiffers: (name: string, buffer: Buffer) => boolean
+    writeAssetFileIfChanged: (name: string, buffer: Buffer) => boolean
     readAssetFile: (name: string) => Buffer | null
     assetFileExists: (name: string) => boolean
     assetFileSize: (name: string) => number | null
@@ -214,7 +214,7 @@ describe('asset file operations', () => {
         expect(store.assetFileMtimeMs('one.bin')).toBe(mtime.getTime())
     })
 
-    it('skips a same-size write and preserves the existing hardlink', () => {
+    it('skips a byte-identical write and preserves the existing hardlink', () => {
         const store = makeStore()
         const value = Buffer.from('same bytes')
         store.writeAssetFile('hashed.png', value)
@@ -222,14 +222,25 @@ describe('asset file operations', () => {
         fs.linkSync(store.assetPathFor('hashed.png'), linkedCopy)
         const before = fs.statSync(store.assetPathFor('hashed.png'))
 
-        expect(store.writeAssetFileIfSizeDiffers('hashed.png', value)).toBe(false)
+        expect(store.writeAssetFileIfChanged('hashed.png', value)).toBe(false)
         const afterSkip = fs.statSync(store.assetPathFor('hashed.png'))
         expect(afterSkip.ino).toBe(before.ino)
         expect(fs.statSync(linkedCopy).ino).toBe(before.ino)
 
-        expect(store.writeAssetFileIfSizeDiffers('hashed.png', Buffer.from('different length'))).toBe(true)
+        expect(store.writeAssetFileIfChanged('hashed.png', Buffer.from('different length'))).toBe(true)
         expect(fs.statSync(store.assetPathFor('hashed.png')).ino).not.toBe(before.ino)
         expect(fs.readFileSync(linkedCopy)).toEqual(value)
+    })
+
+    it('repairs a same-length hash-named destination whose bytes differ', () => {
+        const store = makeStore()
+        const good = Buffer.from('good bytes')
+        const corrupt = Buffer.from('BAD! bytes')
+        const name = `${createHash('sha256').update(good).digest('hex')}.png`
+        store.writeAssetFile(name, corrupt)
+
+        expect(store.writeAssetFileIfChanged(name, good)).toBe(true)
+        expect(store.readAssetFile(name)).toEqual(good)
     })
 
     it('clears asset and temp files while preserving the migration marker', () => {
@@ -290,13 +301,15 @@ describe('asset directory staging', () => {
 })
 
 describe('asset row migration core', () => {
-    it('moves safe rows, leaves unsafe rows, and skips same-size rewrites', () => {
+    it('moves safe rows, leaves unsafe rows, and skips byte-identical rewrites', () => {
         const store = makeStore()
-        store.writeAssetFile('existing.bin', Buffer.from('disk'))
-        const beforeMtime = store.assetFileMtimeMs('existing.bin')
+        store.writeAssetFile('identical.bin', Buffer.from('same'))
+        store.writeAssetFile('stale.bin', Buffer.from('disk'))
+        const beforeMtime = store.assetFileMtimeMs('identical.bin')
         const rows = new Map<string, Buffer>([
             ['assets/new.png', Buffer.from('new value')],
-            ['assets/existing.bin', Buffer.from('same')],
+            ['assets/identical.bin', Buffer.from('same')],
+            ['assets/stale.bin', Buffer.from('true')],
             ['assets/unsafe name.png', Buffer.from('legacy')],
         ])
         const deleted: string[] = []
@@ -311,11 +324,13 @@ describe('asset row migration core', () => {
             store,
         })
 
-        expect(result).toEqual({ migrated: 2, skippedUnsafe: 1 })
+        expect(result).toEqual({ migrated: 3, skippedUnsafe: 1 })
         expect(store.readAssetFile('new.png')).toEqual(Buffer.from('new value'))
-        expect(store.readAssetFile('existing.bin')).toEqual(Buffer.from('disk'))
-        expect(store.assetFileMtimeMs('existing.bin')).toBe(beforeMtime)
-        expect(deleted).toEqual(['assets/new.png', 'assets/existing.bin'])
+        expect(store.readAssetFile('identical.bin')).toEqual(Buffer.from('same'))
+        expect(store.assetFileMtimeMs('identical.bin')).toBe(beforeMtime)
+        // Same length as the stale disk bytes: the row must still win.
+        expect(store.readAssetFile('stale.bin')).toEqual(Buffer.from('true'))
+        expect(deleted).toEqual(['assets/new.png', 'assets/identical.bin', 'assets/stale.bin'])
         expect(rows.has('assets/unsafe name.png')).toBe(true)
     })
 })

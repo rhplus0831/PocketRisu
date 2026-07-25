@@ -160,9 +160,14 @@ function createAssetStore(options = {}) {
         }
     }
 
-    function writeAssetFileIfSizeDiffers(name, buffer) {
+    function writeAssetFileIfChanged(name, buffer) {
         const data = Buffer.from(buffer);
-        if (assetFileSize(name) === data.length) return false;
+        if (assetFileSize(name) === data.length) {
+            // Equal length is only a fast path: stale or corrupt files keep
+            // their length, so equality must be proven on the actual bytes.
+            const existing = readAssetFile(name);
+            if (existing !== null && existing.equals(data)) return false;
+        }
         writeAssetFile(name, data);
         return true;
     }
@@ -258,7 +263,7 @@ function createAssetStore(options = {}) {
         isSafeAssetName,
         assetPathFor,
         writeAssetFile,
-        writeAssetFileIfSizeDiffers,
+        writeAssetFileIfChanged,
         readAssetFile,
         assetFileExists,
         assetFileSize,
@@ -291,7 +296,9 @@ function migrateAssetRowsToFilesystem(options) {
         }
         const value = getValue(key);
         if (value === null) continue;
-        store.writeAssetFileIfSizeDiffers(name, value);
+        // Safe to drop the row afterwards: writeAssetFileIfChanged either
+        // proved the destination byte-identical or durably replaced it.
+        store.writeAssetFileIfChanged(name, value);
         deleteValue(key);
         migrated++;
         if (onProgress) onProgress({ index, total: keys.length, key, migrated });
