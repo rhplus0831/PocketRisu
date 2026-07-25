@@ -65,6 +65,7 @@ const {
     fsyncDirectoryTree,
     recoverImportSwap,
 } = require('./importJournal.cjs');
+const { createImportBarrier } = require('./importBarrier.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
     logger, installProcessHandlers, expressErrorMiddleware,
@@ -943,6 +944,7 @@ const BACKUP_NDJSON_HEARTBEAT_MS = Math.max(
 );
 
 let importInProgress = false;
+const importBarrier = createImportBarrier();
 
 function recoverPendingImportSwap(source) {
     const journal = readImportJournal(IMPORT_JOURNAL_PATH);
@@ -2905,6 +2907,11 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                 rollbackSucceeded = false;
                 logger.error('[Backup Import] Failed to roll back SQLite transaction:', rollbackError);
             }
+            try {
+                kvBumpListEpoch();
+            } catch (epochError) {
+                logger.error('[Backup Import] Failed to bump list epoch after rollback:', epochError);
+            }
             if (inlaySwap) {
                 try { inlaySwap.rollback(); } catch (rollbackError) {
                     rollbackSucceeded = false;
@@ -3994,6 +4001,7 @@ app.get('/api/list', async (req, res, next) => {
         const keyPrefix = typeof keyPrefixHeader === 'string' ? keyPrefixHeader : '';
         const parsedLastSync = Number(lastSyncHeader);
         const lastSync = Number.isSafeInteger(parsedLastSync) ? parsedLastSync : 0;
+        await importBarrier.waitUntilIdle();
         const serverEpoch = kvGetListEpoch();
         const response = await buildListResponse({
             keyPrefix,
@@ -4746,21 +4754,23 @@ app.post('/api/backup/import', async (req, res, next) => {
         return;
     }
     importInProgress = true;
-
-    // Disable timeouts for large backup uploads
-    const prevRequestTimeout = req.socket.server?.requestTimeout;
-    req.socket.setTimeout(0);
-    req.socket.setKeepAlive(true);
-    if (req.socket.server) req.socket.server.requestTimeout = 0;
-
-    // NDJSON streaming keeps the response socket alive during long
-    // post-upload work (WAL checkpoint, cold-storage migration). Without it
-    // a reverse proxy in front of the server can hit its response timeout
-    // and bounce the request back to the client as 502 Bad Gateway.
-    const wantsNdjson = String(req.headers['accept'] ?? '').includes('application/x-ndjson');
+    const releaseImportBarrier = await importBarrier.acquire();
+    let prevRequestTimeout;
+    let wantsNdjson = false;
     let heartbeatTimer = null;
 
     try {
+        // Disable timeouts for large backup uploads
+        prevRequestTimeout = req.socket.server?.requestTimeout;
+        req.socket.setTimeout(0);
+        req.socket.setKeepAlive(true);
+        if (req.socket.server) req.socket.server.requestTimeout = 0;
+
+        // NDJSON streaming keeps the response socket alive during long
+        // post-upload work (WAL checkpoint, cold-storage migration). Without it
+        // a reverse proxy in front of the server can hit its response timeout
+        // and bounce the request back to the client as 502 Bad Gateway.
+        wantsNdjson = String(req.headers['accept'] ?? '').includes('application/x-ndjson');
         const contentType = String(req.headers['content-type'] ?? '');
         if (contentType && !contentType.includes('application/x-risu-backup') && !contentType.includes('application/octet-stream')) {
             res.status(415).json({ error: 'Unsupported backup content-type' });
@@ -4825,6 +4835,7 @@ app.post('/api/backup/import', async (req, res, next) => {
     } finally {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         importInProgress = false;
+        releaseImportBarrier();
         if (req.socket.server && prevRequestTimeout !== undefined) {
             req.socket.server.requestTimeout = prevRequestTimeout;
         }
@@ -5040,6 +5051,7 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
         return;
     }
     importInProgress = true;
+    const releaseImportBarrier = await importBarrier.acquire();
 
     try {
         const filename = req.body?.filename;
@@ -5097,6 +5109,7 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
         }
     } finally {
         importInProgress = false;
+        releaseImportBarrier();
     }
 });
 
@@ -5590,6 +5603,11 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
                 rollbackSucceeded = false;
                 logger.error('[Save-folder Import] Failed to roll back SQLite transaction:', rollbackError);
             }
+            try {
+                kvBumpListEpoch();
+            } catch (epochError) {
+                logger.error('[Save-folder Import] Failed to bump list epoch after rollback:', epochError);
+            }
             if (assetSwap) {
                 try { assetSwap.rollback(); } catch (rollbackError) {
                     rollbackSucceeded = false;
@@ -5686,6 +5704,7 @@ app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
         return;
     }
     importInProgress = true;
+    const releaseImportBarrier = await importBarrier.acquire();
     try {
         const folderPath = req.body?.path || savePath;
         const resolved = path.resolve(folderPath);
@@ -5705,6 +5724,7 @@ app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
         res.status(400).json({ error: error.message || 'Import failed' });
     } finally {
         importInProgress = false;
+        releaseImportBarrier();
     }
 });
 
@@ -5716,13 +5736,15 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
         return;
     }
     importInProgress = true;
-
-    req.socket.setTimeout(0);
-    req.socket.setKeepAlive(true);
-    const prevRequestTimeout = req.socket.server?.requestTimeout;
-    if (req.socket.server) req.socket.server.requestTimeout = 0;
+    const releaseImportBarrier = await importBarrier.acquire();
+    let prevRequestTimeout;
 
     try {
+        req.socket.setTimeout(0);
+        req.socket.setKeepAlive(true);
+        prevRequestTimeout = req.socket.server?.requestTimeout;
+        if (req.socket.server) req.socket.server.requestTimeout = 0;
+
         const chunks = [];
         let totalSize = 0;
         for await (const chunk of req) {
@@ -5766,6 +5788,7 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
         res.status(400).json({ error: error.message || 'Import failed' });
     } finally {
         importInProgress = false;
+        releaseImportBarrier();
         if (req.socket.server && prevRequestTimeout !== undefined) {
             req.socket.server.requestTimeout = prevRequestTimeout;
         }
@@ -6457,36 +6480,48 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             return res.status(404).json({ error: 'Snapshot not found' });
         }
         await queueStorageOperation(async () => {
-            // Drain any pending debounced persist first — same pattern as
-            // /api/db/optimize. Without this, an in-flight save could land
-            // after kvCopyValue and overwrite the restored snapshot.
-            await flushPendingDb();
-            const inspection = await inspectRisuSaveSource(blob);
-            let ingestion;
-            if (await shouldStreamRisuSave(blob, { inspection })) {
-                // Avoid copying the snapshot monolith into the live key. The
-                // streaming ingest atomically writes rows + stripped DB instead.
-                kvDel(REMOTE_MIGRATION_MARKER_KEY);
-                invalidateDbCache();
-                ingestion = await ingestDatabaseStreaming(blob, { inspection });
-                markRemoteMigrationDone();
-            } else {
-                kvCopyValue(key, DB_BLOB_KEY);
-                // Snapshot may pre-date the remote-block migration. Clear the marker
-                // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
-                // bytes instead of skipping based on the prior post-migration state.
-                kvDel(REMOTE_MIGRATION_MARKER_KEY);
-                invalidateDbCache();
-                const raw = kvGet(DB_BLOB_KEY);
-                if (raw) ingestion = await ingestDatabase(raw);
+            const releaseImportBarrier = await importBarrier.acquire();
+            try {
+                // Drain any pending debounced persist first — same pattern as
+                // /api/db/optimize. Without this, an in-flight save could land
+                // after kvCopyValue and overwrite the restored snapshot.
+                await flushPendingDb();
+                const inspection = await inspectRisuSaveSource(blob);
+                let ingestion;
+                if (await shouldStreamRisuSave(blob, { inspection })) {
+                    // Avoid copying the snapshot monolith into the live key. The
+                    // streaming ingest atomically writes rows + stripped DB instead.
+                    kvDel(REMOTE_MIGRATION_MARKER_KEY);
+                    invalidateDbCache();
+                    ingestion = await ingestDatabaseStreaming(blob, { inspection });
+                    markRemoteMigrationDone();
+                } else {
+                    kvCopyValue(key, DB_BLOB_KEY);
+                    // Snapshot may pre-date the remote-block migration. Clear the marker
+                    // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
+                    // bytes instead of skipping based on the prior post-migration state.
+                    kvDel(REMOTE_MIGRATION_MARKER_KEY);
+                    invalidateDbCache();
+                    const raw = kvGet(DB_BLOB_KEY);
+                    if (raw) ingestion = await ingestDatabase(raw);
+                }
+                if (ingestion) {
+                    const strippedBytes = Buffer.from(encodeRisuSaveLegacy(ingestion.strippedDb));
+                    dbEtag = computeBufferEtag(strippedBytes);
+                }
+                // A restore can replace a broad logical database state. Force every
+                // browser list cache to take one full snapshot after it completes.
+                kvBumpListEpoch();
+            } catch (error) {
+                try {
+                    kvBumpListEpoch();
+                } catch (epochError) {
+                    logger.error('[Snapshot Restore] Failed to bump list epoch after restore failure:', epochError);
+                }
+                throw error;
+            } finally {
+                releaseImportBarrier();
             }
-            if (ingestion) {
-                const strippedBytes = Buffer.from(encodeRisuSaveLegacy(ingestion.strippedDb));
-                dbEtag = computeBufferEtag(strippedBytes);
-            }
-            // A restore can replace a broad logical database state. Force every
-            // browser list cache to take one full snapshot after it completes.
-            kvBumpListEpoch();
         });
         res.json({ ok: true });
     } catch (err) { next(err); }
@@ -7085,6 +7120,8 @@ async function getHttpsOptions() {
 async function startServer() {
     try {
         recoverPendingImportSwap('Startup');
+        kvBumpListEpoch();
+        logger.info('[ListDelta] Bumped list epoch at startup');
         migrateAssetsToFilesystem();
         await migrateInlaysToFilesystem();
         await migrateChatsToRowsIfNeeded();
