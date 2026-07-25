@@ -184,10 +184,31 @@ function createChatBackupStore(options) {
         const temp = `${destination}.${process.pid}-${tempCounter++}.tmp`;
         try {
             fs.writeFileSync(temp, data);
+            let fileFd;
+            try {
+                fileFd = fs.openSync(temp, 'r');
+                fs.fsyncSync(fileFd);
+            } finally {
+                if (fileFd !== undefined) fs.closeSync(fileFd);
+            }
             fs.renameSync(temp, destination);
         } catch (error) {
             try { fs.unlinkSync(temp); } catch {}
             throw error;
+        }
+
+        // Directory fsync is not supported on every platform, but makes the
+        // rename durable where it is available.
+        let directoryFd;
+        try {
+            directoryFd = fs.openSync(path.dirname(destination), 'r');
+            fs.fsyncSync(directoryFd);
+        } catch {
+            // The file itself is already durable and published at this point.
+        } finally {
+            if (directoryFd !== undefined) {
+                try { fs.closeSync(directoryFd); } catch {}
+            }
         }
     }
 
@@ -434,8 +455,17 @@ function createChatBackupStore(options) {
             const source = path.join(chatDir, filename);
             const destination = `${source}.gz`;
             try {
-                if (!fs.existsSync(destination)) {
-                    const compressed = zlib.gzipSync(fs.readFileSync(source));
+                const raw = fs.readFileSync(source);
+                let destinationMatches = false;
+                if (fs.existsSync(destination)) {
+                    try {
+                        destinationMatches = zlib.gunzipSync(
+                            fs.readFileSync(destination),
+                        ).equals(raw);
+                    } catch {}
+                }
+                if (!destinationMatches) {
+                    const compressed = zlib.gzipSync(raw);
                     writeFileAtomic(destination, compressed);
                 }
                 fs.unlinkSync(source);
@@ -482,6 +512,7 @@ function createChatBackupStore(options) {
         const bundlePath = path.join(chatDir, bundleFile);
         const metaPath = path.join(chatDir, metaFile);
 
+        let regenerate = true;
         if (fs.existsSync(bundlePath) && fs.existsSync(metaPath)) {
             const existing = readBundleMeta(chatDir, bundleFile);
             const sameEntries = existing
@@ -492,11 +523,23 @@ function createChatBackupStore(options) {
             if (!sameEntries) {
                 throw new Error(`Bundle name collision for ${bundleFile}`);
             }
-        } else {
+
+            try {
+                const uncompressed = zlib.gunzipSync(fs.readFileSync(bundlePath));
+                regenerate = !existing.entries.every((entry, index) => {
+                    const end = entry.offset + entry.size;
+                    return Number.isSafeInteger(end)
+                        && end <= uncompressed.length
+                        && uncompressed.subarray(entry.offset, end).equals(rawEntries[index]);
+                });
+            } catch {
+                regenerate = true;
+            }
+        }
+
+        if (regenerate) {
             // An orphaned half of an atomic pair is regenerable while loose
             // inputs remain, so replace it rather than treating it as authority.
-            try { fs.unlinkSync(bundlePath); } catch {}
-            try { fs.unlinkSync(metaPath); } catch {}
             const bundle = zlib.gzipSync(Buffer.concat(rawEntries));
             const meta = {
                 format: 'pocketrisu-chat-backup-bundle-v1',
@@ -537,12 +580,63 @@ function createChatBackupStore(options) {
 
     function removeBundledLooseDuplicates(chatDir) {
         const scan = scanChatDirectory(chatDir);
-        const bundledIds = new Set(
-            scan.bundles.flatMap(bundle => bundle.entries.map(entry => entry.versionId)),
-        );
+        const claimsByVersion = new Map();
+        const looseIds = new Set(scan.loose.map(entry => entry.versionId));
+        for (const bundle of scan.bundles) {
+            for (const entry of bundle.entries) {
+                if (!looseIds.has(entry.versionId)) continue;
+                const claims = claimsByVersion.get(entry.versionId) || [];
+                claims.push({ bundle, entry });
+                claimsByVersion.set(entry.versionId, claims);
+            }
+        }
+
+        const uncompressedBundles = new Map();
+        function loadBundle(bundle) {
+            if (uncompressedBundles.has(bundle.bundleFile)) {
+                return uncompressedBundles.get(bundle.bundleFile);
+            }
+            try {
+                const raw = zlib.gunzipSync(
+                    fs.readFileSync(path.join(chatDir, bundle.bundleFile)),
+                );
+                uncompressedBundles.set(bundle.bundleFile, raw);
+                return raw;
+            } catch (error) {
+                uncompressedBundles.set(bundle.bundleFile, null);
+                log('warn', `[ChatBackups] Failed to validate ${bundle.bundleFile}:`, error);
+                return null;
+            }
+        }
+
         for (const entry of scan.loose) {
-            if (!bundledIds.has(entry.versionId)) continue;
-            try { fs.unlinkSync(path.join(chatDir, entry.filename)); } catch {}
+            const claims = claimsByVersion.get(entry.versionId);
+            if (!claims) continue;
+
+            const loosePath = path.join(chatDir, entry.filename);
+            let looseRaw;
+            try {
+                const contents = fs.readFileSync(loosePath);
+                looseRaw = entry.compressed ? zlib.gunzipSync(contents) : contents;
+            } catch (error) {
+                log('warn', `[ChatBackups] Failed to validate loose version ${entry.versionId}:`, error);
+                continue;
+            }
+
+            const matchesBundle = claims.some(({ bundle, entry: bundledEntry }) => {
+                const uncompressed = loadBundle(bundle);
+                if (!uncompressed) return false;
+                const end = bundledEntry.offset + bundledEntry.size;
+                return Number.isSafeInteger(end)
+                    && end <= uncompressed.length
+                    && uncompressed.subarray(bundledEntry.offset, end).equals(looseRaw);
+            });
+            if (!matchesBundle) continue;
+            try {
+                fs.unlinkSync(loosePath);
+            } catch (error) {
+                log('warn', `[ChatBackups] Failed to remove bundled duplicate ${loosePath}:`, error);
+            }
         }
     }
 

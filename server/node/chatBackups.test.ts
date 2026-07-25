@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import zlib from 'node:zlib'
 import chatBackupsPkg from './chatBackups.cjs'
 import utilsPkg from './utils.cjs'
 
@@ -110,6 +111,57 @@ function recursiveSnapshot(directory: string, base = directory): Array<{
             }]
         })
         .sort((a, b) => a.name.localeCompare(b.name))
+}
+
+interface LooseFixture {
+    filename: string
+    versionId: string
+    ts: number
+    raw: Buffer
+}
+
+function gzipCapturedRawFiles(directory: string): LooseFixture[] {
+    return fs.readdirSync(directory)
+        .filter(filename => filename.endsWith('.bin'))
+        .map((filename) => {
+            const rawPath = path.join(directory, filename)
+            const raw = fs.readFileSync(rawPath)
+            const compressedFilename = `${filename}.gz`
+            fs.writeFileSync(path.join(directory, compressedFilename), zlib.gzipSync(raw))
+            fs.unlinkSync(rawPath)
+            const versionId = filename.slice(0, -'.bin'.length)
+            return {
+                filename: compressedFilename,
+                versionId,
+                ts: Number(/^v-(\d+)-/.exec(versionId)?.[1]),
+                raw,
+            }
+        })
+        .sort((a, b) => a.ts - b.ts)
+}
+
+function writeCorruptBundleClaim(directory: string, loose: LooseFixture[]) {
+    const bundleFile = `archive-${loose[0].ts}-${loose.at(-1)?.ts}.bundle`
+    const bundlePath = path.join(directory, bundleFile)
+    const corruptBundle = Buffer.from('garbage')
+    let offset = 0
+    const entries = loose.map((entry) => {
+        const metaEntry = {
+            versionId: entry.versionId,
+            offset,
+            size: entry.raw.length,
+        }
+        offset += entry.raw.length
+        return metaEntry
+    })
+    fs.writeFileSync(bundlePath, corruptBundle)
+    fs.writeFileSync(bundlePath.replace(/\.bundle$/, '.meta.json'), `${JSON.stringify({
+        format: 'pocketrisu-chat-backup-bundle-v1',
+        entryCount: entries.length,
+        compressedSize: corruptBundle.length,
+        entries,
+    })}\n`)
+    return bundlePath
 }
 
 function makeHarness(options: {
@@ -421,6 +473,99 @@ describe('chat backup reconcile and reads', () => {
             expect(
                 harness.store.readChatBackup('char', 'chat', entry.versionId)
                     ?.equals(expected.get(entry.ts) as Buffer),
+            ).toBe(true)
+        }
+    })
+
+    it.each([
+        {
+            state: 'non-gzip garbage',
+            derivative: () => Buffer.from('garbage'),
+        },
+        {
+            state: 'a valid gzip of the wrong bytes',
+            derivative: () => zlib.gzipSync(Buffer.from('wrong backup bytes')),
+        },
+        {
+            state: 'an empty rename-published gzip',
+            derivative: () => Buffer.alloc(0),
+        },
+    ])('regenerates $state instead of deleting its good raw source', async ({ derivative }) => {
+        const harness = makeHarness()
+        const expected = rawChat(70)
+        harness.setRow('char', 'chat', expected)
+        await harness.store.captureChatPreImage({
+            chaId: 'char',
+            chatId: 'chat',
+            reason: 'save',
+        })
+
+        const directory = chatDir(harness.root, 'char', 'chat')
+        const rawFilename = fs.readdirSync(directory).find(name => name.endsWith('.bin')) as string
+        const versionId = rawFilename.slice(0, -'.bin'.length)
+        const gzipPath = path.join(directory, `${rawFilename}.gz`)
+        fs.writeFileSync(gzipPath, derivative())
+
+        await harness.store.reconcileChatBackups()
+
+        expect(harness.store.readChatBackup('char', 'chat', versionId)?.equals(expected)).toBe(true)
+        expect(zlib.gunzipSync(fs.readFileSync(gzipPath)).equals(expected)).toBe(true)
+    })
+
+    it('keeps loose versions when a corrupt bundle claims them below the threshold', async () => {
+        const harness = makeHarness({ now: 30_000, versionsPerBundle: 3 })
+        for (let index = 0; index < 2; index++) {
+            harness.setRow('char', 'chat', rawChat(80 + index))
+            await harness.store.captureChatPreImage({
+                chaId: 'char',
+                chatId: 'chat',
+                reason: 'save',
+            })
+            harness.advance()
+        }
+
+        const directory = chatDir(harness.root, 'char', 'chat')
+        const loose = gzipCapturedRawFiles(directory)
+        writeCorruptBundleClaim(directory, loose)
+
+        await harness.store.reconcileChatBackups()
+
+        for (const entry of loose) {
+            expect(fs.existsSync(path.join(directory, entry.filename))).toBe(true)
+            expect(
+                harness.store.readChatBackup('char', 'chat', entry.versionId)?.equals(entry.raw),
+            ).toBe(true)
+        }
+    })
+
+    it('regenerates a corrupt bundle that claims a full loose batch', async () => {
+        const harness = makeHarness({ now: 40_000, versionsPerBundle: 3 })
+        for (let index = 0; index < 3; index++) {
+            harness.setRow('char', 'chat', rawChat(90 + index))
+            await harness.store.captureChatPreImage({
+                chaId: 'char',
+                chatId: 'chat',
+                reason: 'save',
+            })
+            harness.advance()
+        }
+
+        const directory = chatDir(harness.root, 'char', 'chat')
+        const loose = gzipCapturedRawFiles(directory)
+        const bundlePath = writeCorruptBundleClaim(directory, loose)
+
+        const result = await harness.store.reconcileChatBackups()
+
+        expect(result.bundlesCreated).toBe(1)
+        expect(
+            zlib.gunzipSync(fs.readFileSync(bundlePath)).equals(
+                Buffer.concat(loose.map(entry => entry.raw)),
+            ),
+        ).toBe(true)
+        for (const entry of loose) {
+            expect(fs.existsSync(path.join(directory, entry.filename))).toBe(false)
+            expect(
+                harness.store.readChatBackup('char', 'chat', entry.versionId)?.equals(entry.raw),
             ).toBe(true)
         }
     })
