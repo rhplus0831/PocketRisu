@@ -25,7 +25,7 @@ The `/api/write` database branch now prepares every representation before any mu
 
 `db.cjs` gained a test-only failure hook, `POCKETRISU_TEST_FAILPOINT`, parsed once at startup and inert when unset: `key:<exact-key>` fails a `kvSet` of that key, `prefix:<prefix>:<n>` fails the nth write under a prefix.
 
-`../../../test/compat/database-write-atomicity.test.ts` boots a real seeded server and covers the demanded scenarios: a failure injected on the final `database.bin` write after multiple chat and plugin rows were prepared, and a failure injected midway through the chat-row writes. Both assert HTTP 500 and byte-identical `database.bin`, `chats/`, `pluginsave/`, and `pluginsave-meta/` rows via direct read-only SQLite inspection, plus a happy-path test asserting the committed stripped database, rows, and ETag. All four failure assertions fail against the pre-fix code.
+`../../test/compat/database-write-atomicity.test.ts` boots a real seeded server and covers the demanded scenarios: a failure injected on the final `database.bin` write after multiple chat and plugin rows were prepared, and a failure injected midway through the chat-row writes. Both assert HTTP 500 and byte-identical `database.bin`, `chats/`, `pluginsave/`, and `pluginsave-meta/` rows via direct read-only SQLite inspection, plus a happy-path test asserting the committed stripped database, rows, and ETag. All four failure assertions fail against the pre-fix code.
 
 The chat pre-image feature still applies only to `/api/chat-content`. With the write now atomic, a failed full write can no longer overwrite rows behind a 500; overwrites by a *successful* full write remain unversioned, which is a separate, lower-severity gap.
 

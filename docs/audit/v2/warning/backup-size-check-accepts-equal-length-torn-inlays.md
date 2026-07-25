@@ -12,7 +12,7 @@ queue, revalidating only that each file still has its planned length. Inlay
 IDs are stable (not content-addressed), so a concurrent `/api/write` that
 replaces payload and sidecar between the two reads produces an archive mixing
 old payload with new metadata — undetected when lengths happen to match. The
-v1 fix (`docs/audit/v1/concurrent-plugin-write-can-corrupt-export.md`) added
+v1 fix (`../../../../.archived-docs/v1/concurrent-plugin-write-can-corrupt-export.md`) added
 the exact-size check; equal-length replacements remain a hole. Requires a
 concurrent write with matching sizes during an export, hence Low.
 

@@ -3,7 +3,7 @@
 - Status: Fixed
 - Severity: High
 - Commit: `e2bc8e5b` (made explicit by the spool path in `f410c8a6`)
-- Affected code: `../../../server/node/server.cjs` (`createBackupAndRotate`, `spoolSelfContainedBackupDatabase`, `/api/db/snapshots/restore`), `../../../server/node/streamRisuLoad.cjs`, `../../../server/node/streamRisuSave.cjs`
+- Affected code: `../../server/node/server.cjs` (`createBackupAndRotate`, `spoolSelfContainedBackupDatabase`, `/api/db/snapshots/restore`), `../../server/node/streamRisuLoad.cjs`, `../../server/node/streamRisuSave.cjs`
 
 ## Risk
 
@@ -29,5 +29,5 @@ Restoring such a snapshot restores the database and chats but does not restore p
 
 ## Regression coverage
 
-- `../../../server/node/snapshotPluginStorage.e2e.test.ts` — end-to-end against the real server: the audit scenario (`V1` → snapshot → `V2`/delete/add → restore → exact snapshot-time key set and values) on both the legacy and streaming restore paths, folded-empty snapshot restore clearing later rows, and pre-fix stub snapshot restore leaving current rows untouched.
-- `../../../server/node/chunkStore.test.ts` (E1–E3) — `putValueFromFile` stores byte- and manifest-identical representations to `putValue` across window boundaries, threshold-sized values, and overwrites.
+- `../../server/node/snapshotPluginStorage.e2e.test.ts` — end-to-end against the real server: the audit scenario (`V1` → snapshot → `V2`/delete/add → restore → exact snapshot-time key set and values) on both the legacy and streaming restore paths, folded-empty snapshot restore clearing later rows, and pre-fix stub snapshot restore leaving current rows untouched.
+- `../../server/node/chunkStore.test.ts` (E1–E3) — `putValueFromFile` stores byte- and manifest-identical representations to `putValue` across window boundaries, threshold-sized values, and overwrites.

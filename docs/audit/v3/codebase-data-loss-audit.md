@@ -1,7 +1,7 @@
 # Codebase data-loss audit (v3)
 
 - Audit point: `1a7952f1` (branch `serve`, clean tree)
-- Prior audits: [v1](../v1/serve-branch-data-loss-audit.md) — 16 findings, all fixed at
+- Prior audits: [v1](../../../.archived-docs/v1/serve-branch-data-loss-audit.md) — 16 findings, all fixed at
   `2e3d4f05` · [v2](../v2/codebase-data-loss-audit.md) — 36 findings, open/deferred
 - Current status: **41 new findings** — 6 fatal, 35 warning
 
