@@ -29,6 +29,7 @@ import { moduleUpdate } from "./process/modules";
 import { doingChat } from "./process/index.svelte";
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
+import { capturePreTrackingPluginStorageChanges } from "./plugins/pluginStorageTracking";
 
 export const forageStorage = new AutoStorage()
 
@@ -427,6 +428,12 @@ export async function saveDb() {
         pluginCustomStorage: false
     }
 
+    // Bootstrap loads plugins before starting saveDb(). Keep the server-read
+    // baseline so inline plugin writes made during plugin initialization are
+    // not mistaken for the save tracker's initial clean state.
+    const initialSaveBaseline = patchSyncBaseline
+        ?? safeStructuredClone(getDatabase()) as Database
+
     let encoder = new RisuSaveEncoder()
     await encoder.init(getDatabase(), {
         compression: false
@@ -434,8 +441,15 @@ export async function saveDb() {
 
     let patcher = new RisuSavePatcher()
     if (supportsPatchSync) {
-        await patcher.init(patchSyncBaseline ?? getDatabase())
+        await patcher.init(initialSaveBaseline)
         patchSyncBaseline = null
+    }
+    if (capturePreTrackingPluginStorageChanges(
+        changeTracker,
+        getDatabase(),
+        initialSaveBaseline,
+    )) {
+        changed = true
     }
 
     function hasTrackedChanges(toSave: toSaveType) {

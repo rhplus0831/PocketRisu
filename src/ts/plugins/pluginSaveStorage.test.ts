@@ -460,4 +460,37 @@ describe("reconcilePluginStorageMode", () => {
         expect(persistent.get(valueKey)).toBe(42);
         expect(removePersistentKey).not.toHaveBeenCalled();
     });
+
+    test("internalized data survives a simulated refresh after external rows are deleted", async () => {
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "alpha");
+        persistent.set(valueKey, { value: 1 });
+        persistent.set(metaKey, { plugin: "Test", updatedAt: 1 });
+        let persistedDatabase: any = null;
+        const dependencies = {
+            persistDatabase: vi.fn(async () => {
+                persistedDatabase = structuredClone(database);
+            }),
+        };
+
+        await expect(reconcilePluginStorageMode({ dependencies })).resolves.toEqual({
+            direction: "internalize",
+            values: 1,
+            meta: 1,
+        });
+        expect(persistent.size).toBe(0);
+
+        database = structuredClone(persistedDatabase);
+        await expect(reconcilePluginStorageMode({ dependencies })).resolves.toEqual({
+            direction: "none",
+            values: 0,
+            meta: 0,
+        });
+        expect(database.pluginCustomStorage.alpha).toEqual({ value: 1 });
+        expect(database.pluginStorageMeta.alpha).toEqual({
+            plugin: "Test",
+            updatedAt: 1,
+        });
+        expect(dependencies.persistDatabase).toHaveBeenCalledTimes(1);
+    });
 });
