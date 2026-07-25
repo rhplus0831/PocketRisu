@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
 import { spawnServer } from './helpers/spawnServer.js'
 import { createClient } from './helpers/client.js'
 
@@ -30,6 +32,33 @@ describe('hub hosting mode', () => {
       const saveResponse = await client.fetch('/api/backup/server/save', { method: 'POST' })
       expect(saveResponse.status).toBe(403)
       await expect(saveResponse.json()).resolves.toEqual(DISABLED_ERROR)
+
+      for (const version of ['old', 'new']) {
+        const chatWrite = await client.fetch('/api/chat-content/hub-char/0', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-chat-id': 'hub-chat' },
+          body: JSON.stringify({
+            id: 'hub-chat',
+            name: version,
+            message: [{ role: 'user', data: `${version} hub message` }],
+          }),
+        })
+        expect(chatWrite.status).toBe(200)
+      }
+      const historyResponse = await client.fetch('/api/chat-backups/hub-char/hub-chat')
+      expect(historyResponse.status).toBe(200)
+      const history = await historyResponse.json() as { versions: Array<{ versionId: string }> }
+      expect(history.versions).toHaveLength(1)
+      const versionResponse = await client.fetch(
+        `/api/chat-backups/hub-char/hub-chat/${history.versions[0].versionId}`,
+      )
+      expect(versionResponse.status).toBe(200)
+      expect((await versionResponse.arrayBuffer()).byteLength).toBeGreaterThan(0)
+      expect(fs.existsSync(path.join(server.cwd, 'save', 'chat-backups'))).toBe(true)
+      expect(fs.existsSync(path.join(server.cwd, 'backups', 'chat-backups'))).toBe(false)
+      const statsAfterCapture = await (await client.fetch('/api/db/stats')).json() as Record<string, any>
+      expect(statsAfterCapture.chatBackupFsBytes).toBeGreaterThan(0)
+      expect(statsAfterCapture.chatBackupSameAsSaveDir).toBe(true)
 
       // Snapshot retention: the byte cap is pinned server-side (500 MB default
       // when POCKETRISU_HUB_SNAPSHOT_CAP_MB is unset); only count is tunable.

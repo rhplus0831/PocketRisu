@@ -56,7 +56,7 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 1. `pnpm run runserver` invokes `node server/node/server.cjs` through `package.json:19`.
 2. CommonJS evaluation first loads `db.cjs` and `logs.cjs` at `server/node/server.cjs:26`. Those modules synchronously create/open their SQLite files before route registration.
 3. `db.cjs` creates `save/`, opens `save/risuai.db`, enables WAL, and applies performance and lock pragmas at `server/node/db.cjs:8`. It creates the `kv` table at `server/node/db.cjs:28`, initializes the chunk store at `server/node/db.cjs:94`, then attempts legacy save-folder migration at `server/node/db.cjs:100`.
-4. `server.cjs` installs fatal logging handlers before the rest of its initialization at `server/node/server.cjs:39`. It then creates `save/`, reads or creates the password/JWT/instance files, loads persisted direct-asset sessions, initializes the backup directory, and registers middleware and routes.
+4. `server.cjs` installs fatal logging handlers before the rest of its initialization at `server/node/server.cjs:39`. It then creates `save/`, resolves the independent chat-history root, migrates legacy history from the configured server-backup directory, reads or creates the password/JWT/instance files, loads persisted direct-asset sessions, initializes the server-backup directory, and registers middleware and routes.
 5. `startServer()` migrates assets and inlays, externalizes monolithic chats, defensively re-externalizes folded optimized plugin storage even when the chat marker already exists, and converts any RisuSave `REMOTE` blocks before listening. The chat migration first copies the old blob to `migration-backup/pre-chat-externalization-<timestamp>.bin`, then records `migration/chats-externalized`; the wrapper is at `server/node/server.cjs:512`.
 6. TLS is enabled only when both `server/node/ssl/certificate/server.key` and `server.crt` can be read; otherwise it starts plain HTTP.
 7. Both HTTP and HTTPS servers install the proxy-job WebSocket upgrade handler before listening.
@@ -73,6 +73,7 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `POCKETRISU_ALLOW_INSECURE_CONTEXT` | Allows client boot outside HTTPS or localhost only when exactly `1` or `true`; bypasses the WebCrypto integrity gate at the operator's risk. |
 | `POCKETRISU_HUB_HOSTING` | Enables shared/multi-instance hub hosting when set to `TRUE`/`true` or `1`. It hides host-disk statistics from `/api/db/stats`, disables the file-based server-backup feature with `403` responses, and pins the snapshot retention byte cap to `POCKETRISU_HUB_SNAPSHOT_CAP_MB` (only the snapshot count stays adjustable). |
 | `POCKETRISU_HUB_SNAPSHOT_CAP_MB` | Hub-mode snapshot byte cap in MB, applied to both the limits endpoints and trim rotation; unset or invalid falls back to 500 MB, clamped to the 10 MB–50 GB safety bounds. Ignored outside hub mode. |
+| `POCKETRISU_CHAT_BACKUP_DIR` | Overrides the final chat-history directory. Absolute paths are used directly; relative paths resolve from `process.cwd()`. The default is `<savePath>/chat-backups` (normally `save/chat-backups`, or `/app/save/chat-backups` in Docker). This operator setting also applies in hub mode and is independent of the server-file-backup path/API. |
 | `POCKETRISU_CHAT_BACKUP_MAX_BYTES` | Overrides the global per-chat-history budget in bytes. Default 50 MiB; clamped to 1 MiB–50 GiB. It takes precedence over the `config/chat-backup-max-bytes` KV setting. |
 | `RISU_BACKUP_IMPORT_MAX_BYTES` | Maximum streamed backup/ZIP import size; `0` means unlimited. |
 | `RISU_STREAM_INGEST_MIN_BYTES` | Minimum supported `database.risudat` size for disk-backed ingest; default 32 MiB. Set to `1` to force the path for compatibility tests. |
@@ -97,6 +98,11 @@ The server reads configuration directly from `process.env`; it does not load `.e
 │   │   ├── <id>.<ext>                 # image/signature payload
 │   │   ├── <id>.meta.json             # type, extension, name, dimensions
 │   │   └── .migrated_to_fs
+│   ├── chat-backups/
+│   │   └── <chaId>/<chatId>/           # encoded path components
+│   │       ├── v-<ts>-<seq>-<reason>.bin.gz
+│   │       ├── archive-<first>-<last>.bundle
+│   │       └── archive-<first>-<last>.meta.json
 │   ├── __password
 │   ├── __jwt_secret
 │   ├── __instance_id
@@ -104,14 +110,10 @@ The server reads configuration directly from `process.env`; it does not load `.e
 │   ├── __authcode                     # optional proxy registration token
 │   ├── __sionyw_client_data.json       # optional hub OAuth refresh data
 │   ├── __backup_path                  # updater-visible backup path marker
+│   ├── __chat_backup_path             # updater-visible chat-history path marker
 │   └── .migrated_to_sqlite             # legacy hex-file migration marker
 ├── backups/
-│   ├── risu-backup-<timestamp>.bin     # default server-side backup destination
-│   └── chat-backups/
-│       └── <chaId>/<chatId>/           # encoded path components
-│           ├── v-<ts>-<seq>-<reason>.bin.gz
-│           ├── archive-<first>-<last>.bundle
-│           └── archive-<first>-<last>.meta.json
+│   └── risu-backup-<timestamp>.bin     # default server-side backup destination
 └── server/node/ssl/certificate/
     ├── server.key
     └── server.crt
@@ -203,7 +205,7 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 - Legacy save folders consist of files whose filenames are hex-encoded logical KV keys. Successful directory and ZIP imports externalize chat payloads and folded optimized plugin storage through the same ingest boundary; directory imports walk the database file directly, while ZIP imports walk its already off-heap Buffer. Supported large inputs skip the monolithic live-KV write.
 - Automatic snapshots use the same row-at-a-time disk spool, then read only the completed encoded file into a Buffer required by `kvSet()` and store it under `database/dbbackup-*` at `server/node/server.cjs:231`. This retains the final encoded-buffer allocation but removes the simultaneous full chat object tree. Rotation recomputes exclusive chunk footprints after each deletion (`server/node/server.cjs:192`).
 - Snapshot restore walks a supported large snapshot Buffer directly and atomically replaces the live stripped DB plus chat rows without first copying the monolith into the live key. Small and exotic snapshots retain the copy-then-legacy-ingest path. Server-backup restore uses the same disk-spooled archive importer as upload restore.
-- Chat version history is a separate recovery mechanism and is not embedded in portable/server `.bin` archives. Each eligible chat overwrite captures the pre-image under `<backupsDir>/chat-backups/<chaId>/<chatId>` at most once per 45 seconds. Reconciliation gzip-compresses loose versions, combines each 25 into a solid gzip bundle with a metadata sidecar, retains four bundles per chat, and evicts oldest non-latest items to satisfy the global budget. The settings UI lists versions even for deleted characters/chats and imports one as a new chat ID through the normal client save pipeline.
+- Chat version history is a separate recovery mechanism and is not embedded in portable/server `.bin` archives. Each eligible chat overwrite captures the pre-image under `<savePath>/chat-backups/<chaId>/<chatId>` by default, or the final directory selected by `POCKETRISU_CHAT_BACKUP_DIR`, at most once per 45 seconds. Startup migrates files from the legacy `<backupsDir>/chat-backups` tree before reconciliation, using per-file renames with a copy-and-unlink fallback across filesystems; conflicting destination bytes leave the legacy source untouched. Reconciliation gzip-compresses loose versions, combines each 25 into a solid gzip bundle with a metadata sidecar, retains four bundles per chat, and evicts oldest non-latest items to satisfy the global budget. The settings UI lists versions even for deleted characters/chats and imports one as a new chat ID through the normal client save pipeline.
 
 ### HTTP API route catalog
 

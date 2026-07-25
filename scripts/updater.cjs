@@ -38,12 +38,11 @@ function getCurrentVersion() {
     }
 }
 
-// If the user moved the server-backup directory to a custom location *inside*
-// ROOT (e.g. <ROOT>/data/backups), the server writes the absolute path here so
-// the updater can preserve the top-level segment instead of wiping it.
-// Outside-ROOT paths return null (updater never touches them anyway).
-function getCustomBackupKeepEntry() {
-    const markerPath = path.join(ROOT, 'save', '__backup_path');
+// If a filesystem-backed recovery directory lives inside ROOT, the server
+// writes its absolute path under save/ so the updater can preserve the
+// top-level segment instead of wiping it. Outside-ROOT paths need no keep.
+function getCustomDataKeepEntry(markerName, label) {
+    const markerPath = path.join(ROOT, 'save', markerName);
     try {
         if (!fs.existsSync(markerPath)) return null;
         const raw = fs.readFileSync(markerPath, 'utf-8').trim();
@@ -52,11 +51,11 @@ function getCustomBackupKeepEntry() {
         const rel = path.relative(ROOT, abs);
         if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
         if (!rel) {
-            error('Custom backup directory points at the PocketRisu app root. Move it to a separate folder before updating.');
+            error(`${label} points at the PocketRisu app root. Move it to a separate folder before updating.`);
         }
         const top = rel.split(path.sep)[0];
         if (MANAGED_BACKUP_PATH_ROOTS.has(top)) {
-            error(`Custom backup directory is inside PocketRisu app files (${rel}). Move it to a separate folder such as data/backups before updating.`);
+            error(`${label} is inside PocketRisu app files (${rel}). Move it to a separate folder such as data/backups before updating.`);
         }
         return top || null;
     } catch {
@@ -269,10 +268,15 @@ async function main() {
     log('Replacing files...');
     const keep = new Set(['save', 'backups', '.installed-version', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
     if (isWin || skipBinReplacement) keep.add('bin');
-    const customBackupKeep = getCustomBackupKeepEntry();
-    if (customBackupKeep && !keep.has(customBackupKeep)) {
-        log(`Preserving custom backup directory: ${customBackupKeep}/`);
-        keep.add(customBackupKeep);
+    for (const [markerName, label] of [
+        ['__backup_path', 'Server-backup directory'],
+        ['__chat_backup_path', 'Chat-backup directory'],
+    ]) {
+        const customKeep = getCustomDataKeepEntry(markerName, label);
+        if (customKeep && !keep.has(customKeep)) {
+            log(`Preserving ${label.toLowerCase()}: ${customKeep}/`);
+            keep.add(customKeep);
+        }
     }
     const backupDir = path.join(tmpDir, 'backup');
     fs.mkdirSync(backupDir, { recursive: true });

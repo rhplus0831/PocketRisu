@@ -49,12 +49,21 @@ interface ChatBackupStore {
 
 const {
     createChatBackupStore,
+    migrateLegacyChatBackups,
+    resolveChatBackupDir,
     resolveChatBackupMaxBytes,
     sanitizeBackupReason,
     CHAT_BACKUP_MAX_BYTES_KEY,
     COLD_STORAGE_HEADER,
 } = chatBackupsPkg as {
     createChatBackupStore: (options: any) => ChatBackupStore
+    migrateLegacyChatBackups: (options: any) => {
+        moved: number
+        deduplicated: number
+        conflicts: number
+        failed: number
+    }
+    resolveChatBackupDir: (options?: any) => string
     resolveChatBackupMaxBytes: (options?: any) => number
     sanitizeBackupReason: (reason?: unknown) => string
     CHAT_BACKUP_MAX_BYTES_KEY: string
@@ -183,7 +192,7 @@ function makeHarness(options: {
         error: vi.fn(),
     }
     const store = createChatBackupStore({
-        getBackupsRoot: () => root,
+        getChatBackupsRoot: () => path.join(root, 'chat-backups'),
         readChatRowRaw: (chaId: string, chatId: string) => (
             rows.get(rowKey(chaId, chatId)) ?? null
         ),
@@ -218,6 +227,176 @@ function makeHarness(options: {
         },
     }
 }
+
+describe('chat backup root and legacy migration', () => {
+    it('resolves the default inside save and accepts absolute or cwd-relative overrides', () => {
+        const cwd = path.join(os.tmpdir(), 'pocketrisu-root-resolution')
+        const savePath = path.join(cwd, 'save')
+
+        expect(resolveChatBackupDir({ cwd, savePath, env: {} }))
+            .toBe(path.join(savePath, 'chat-backups'))
+        expect(resolveChatBackupDir({
+            cwd,
+            savePath,
+            env: { POCKETRISU_CHAT_BACKUP_DIR: 'persistent/chat-history' },
+        })).toBe(path.join(cwd, 'persistent', 'chat-history'))
+        expect(resolveChatBackupDir({
+            cwd,
+            savePath,
+            env: { POCKETRISU_CHAT_BACKUP_DIR: '/mnt/pocketrisu-history' },
+        })).toBe(path.resolve('/mnt/pocketrisu-history'))
+    })
+
+    it('survives container recreation when only save is retained', async () => {
+        const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-container-'))
+        tempRoots.push(appRoot)
+        const savePath = path.join(appRoot, 'save')
+        fs.mkdirSync(savePath)
+        fs.mkdirSync(path.join(appRoot, 'backups'))
+        fs.writeFileSync(path.join(appRoot, 'ephemeral-app-file'), 'old container')
+        const rows = new Map<string, Buffer>()
+        const expected = rawChat(200, 'persistent pre-image')
+        rows.set(rowKey('char', 'chat'), expected)
+
+        const createStore = () => createChatBackupStore({
+            getChatBackupsRoot: () => resolveChatBackupDir({
+                cwd: appRoot,
+                savePath,
+                env: {},
+            }),
+            readChatRowRaw: (chaId: string, chatId: string) => (
+                rows.get(rowKey(chaId, chatId)) ?? null
+            ),
+            cooldownMs: 0,
+            autoReconcile: false,
+        }) as ChatBackupStore
+
+        const initial = createStore()
+        stores.push(initial)
+        expect(await initial.captureChatPreImage({ chaId: 'char', chatId: 'chat' }))
+            .toBe('captured')
+        const [before] = initial.listChatBackups('char', 'chat')
+        initial.close()
+
+        for (const entry of fs.readdirSync(appRoot)) {
+            if (entry !== 'save') {
+                fs.rmSync(path.join(appRoot, entry), { recursive: true, force: true })
+            }
+        }
+
+        const replacement = createStore()
+        stores.push(replacement)
+        expect(replacement.listChatBackups('char', 'chat').map(version => version.versionId))
+            .toEqual([before.versionId])
+        expect(replacement.readChatBackup('char', 'chat', before.versionId)?.equals(expected))
+            .toBe(true)
+    })
+
+    it('captures in hub mode with a read-only app root when save remains writable', async () => {
+        const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-hub-root-'))
+        tempRoots.push(appRoot)
+        const savePath = path.join(appRoot, 'save')
+        fs.mkdirSync(savePath, { mode: 0o700 })
+        const expected = rawChat(201, 'hub pre-image')
+        const canEnforceReadOnly = typeof process.getuid === 'function' && process.getuid() !== 0
+        if (canEnforceReadOnly) fs.chmodSync(appRoot, 0o500)
+
+        try {
+            const root = resolveChatBackupDir({
+                cwd: appRoot,
+                savePath,
+                env: { POCKETRISU_HUB_HOSTING: 'true' },
+            })
+            const store = createChatBackupStore({
+                getChatBackupsRoot: () => root,
+                readChatRowRaw: () => expected,
+                cooldownMs: 0,
+                autoReconcile: false,
+            }) as ChatBackupStore
+            stores.push(store)
+
+            expect(await store.captureChatPreImage({ chaId: 'hub-char', chatId: 'hub-chat' }))
+                .toBe('captured')
+            const [version] = store.listChatBackups('hub-char', 'hub-chat')
+            expect(store.readChatBackup('hub-char', 'hub-chat', version.versionId)?.equals(expected))
+                .toBe(true)
+            expect(root).toBe(path.join(savePath, 'chat-backups'))
+            if (canEnforceReadOnly) expect(fs.existsSync(path.join(appRoot, 'backups'))).toBe(false)
+        } finally {
+            if (canEnforceReadOnly) fs.chmodSync(appRoot, 0o700)
+        }
+    })
+
+    it('migrates legacy versions with the EXDEV copy fallback before reconcile', async () => {
+        const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-migration-'))
+        tempRoots.push(appRoot)
+        const legacyRoot = path.join(appRoot, 'backups', 'chat-backups')
+        const destinationRoot = path.join(appRoot, 'save', 'chat-backups')
+        const expected = rawChat(202, 'legacy pre-image')
+        const legacyStore = createChatBackupStore({
+            getChatBackupsRoot: () => legacyRoot,
+            readChatRowRaw: () => expected,
+            cooldownMs: 0,
+            autoReconcile: false,
+        }) as ChatBackupStore
+        stores.push(legacyStore)
+        expect(await legacyStore.captureChatPreImage({ chaId: 'char', chatId: 'chat' }))
+            .toBe('captured')
+        const [legacyVersion] = legacyStore.listChatBackups('char', 'chat')
+        legacyStore.close()
+
+        const exdev = Object.assign(new Error('cross-device link'), { code: 'EXDEV' })
+        const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => {
+            throw exdev
+        })
+        let result
+        try {
+            result = migrateLegacyChatBackups({
+                legacyRoot,
+                destinationRoot,
+                logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+            })
+        } finally {
+            renameSpy.mockRestore()
+        }
+
+        expect(result).toMatchObject({ moved: 1, conflicts: 0, failed: 0 })
+        expect(fs.existsSync(legacyRoot)).toBe(false)
+        const migratedStore = createChatBackupStore({
+            getChatBackupsRoot: () => destinationRoot,
+            readChatRowRaw: () => null,
+            autoReconcile: false,
+        }) as ChatBackupStore
+        stores.push(migratedStore)
+        expect(migratedStore.listChatBackups('char', 'chat').map(version => version.versionId))
+            .toEqual([legacyVersion.versionId])
+        expect(migratedStore.readChatBackup('char', 'chat', legacyVersion.versionId)?.equals(expected))
+            .toBe(true)
+    })
+
+    it('deduplicates identical destinations but preserves divergent legacy files', () => {
+        const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-migration-conflict-'))
+        tempRoots.push(appRoot)
+        const legacyRoot = path.join(appRoot, 'legacy')
+        const destinationRoot = path.join(appRoot, 'destination')
+        fs.mkdirSync(legacyRoot)
+        fs.mkdirSync(destinationRoot)
+        fs.writeFileSync(path.join(legacyRoot, 'identical.bin'), 'same')
+        fs.writeFileSync(path.join(destinationRoot, 'identical.bin'), 'same')
+        fs.writeFileSync(path.join(legacyRoot, 'conflict.bin'), 'legacy')
+        fs.writeFileSync(path.join(destinationRoot, 'conflict.bin'), 'destination')
+        const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+
+        const result = migrateLegacyChatBackups({ legacyRoot, destinationRoot, logger })
+
+        expect(result).toMatchObject({ deduplicated: 1, conflicts: 1, failed: 0 })
+        expect(fs.existsSync(path.join(legacyRoot, 'identical.bin'))).toBe(false)
+        expect(fs.readFileSync(path.join(legacyRoot, 'conflict.bin'), 'utf-8')).toBe('legacy')
+        expect(fs.readFileSync(path.join(destinationRoot, 'conflict.bin'), 'utf-8'))
+            .toBe('destination')
+        expect(logger.warn).toHaveBeenCalled()
+    })
+})
 
 describe('chat backup capture', () => {
     it('skips a new chat and copies each old row before it is overwritten', async () => {
@@ -295,7 +474,7 @@ describe('chat backup capture', () => {
         harness.store.close()
 
         const restarted = createChatBackupStore({
-            getBackupsRoot: () => harness.root,
+            getChatBackupsRoot: () => path.join(harness.root, 'chat-backups'),
             readChatRowRaw: (chaId: string, chatId: string) => (
                 harness.rows.get(rowKey(chaId, chatId)) ?? null
             ),
@@ -370,7 +549,7 @@ describe('chat backup capture', () => {
         tempRoots.push(root)
         const logger = { error: vi.fn(), warn: vi.fn() }
         const store = createChatBackupStore({
-            getBackupsRoot: () => root,
+            getChatBackupsRoot: () => path.join(root, 'chat-backups'),
             readChatRowRaw: () => {
                 throw new Error('row read failed')
             },

@@ -82,7 +82,13 @@ const {
 const { createChatRowStore, chatRowKey, hasChatPayloads } = require('./chatRows.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
 const { inspectRisuSaveSource, shouldStreamRisuSave } = require('./streamRisuLoad.cjs');
-const { createChatBackupStore, resolveChatBackupMaxBytes } = require('./chatBackups.cjs');
+const {
+    CHAT_BACKUP_DIRNAME,
+    createChatBackupStore,
+    migrateLegacyChatBackups,
+    resolveChatBackupDir,
+    resolveChatBackupMaxBytes,
+} = require('./chatBackups.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -138,7 +144,7 @@ function queueStorageOperation(operation) {
 // same queue through runStorageOperation, so neither can observe half-written
 // backup state or race a chat-row overwrite.
 const chatBackupStore = createChatBackupStore({
-    getBackupsRoot: () => backupsDir,
+    getChatBackupsRoot: () => chatBackupsDir,
     logger,
     readChatRowRaw: (chaId, chatId) => chatRowStore.readChatRowRaw(chaId, chatId),
     getByteBudget: () => resolveChatBackupMaxBytes({ kvGet }),
@@ -758,6 +764,7 @@ const MANAGED_BACKUP_PATH_ROOTS = new Set(['server', 'dist', 'scripts', 'bin', '
 // during in-place updates. KV lives inside the SQLite DB so the updater (which
 // runs without npm deps) can't read it; this marker bridges that gap.
 const BACKUP_PATH_MARKER = path.join(savePath, '__backup_path');
+const CHAT_BACKUP_PATH_MARKER = path.join(savePath, '__chat_backup_path');
 
 function readBackupsDirConfig() {
     try {
@@ -770,10 +777,41 @@ function readBackupsDirConfig() {
 
 function writeBackupPathMarker(absPath) {
     try {
-        require('fs').writeFileSync(BACKUP_PATH_MARKER, absPath, 'utf-8');
+        require('fs').writeFileSync(BACKUP_PATH_MARKER, path.resolve(absPath), 'utf-8');
     } catch {
         // Best-effort; marker absence only means the updater falls back to the
         // hard-coded `backups` keep — same as before this feature existed.
+    }
+}
+
+function writeChatBackupPathMarker(absPath) {
+    try {
+        require('fs').writeFileSync(CHAT_BACKUP_PATH_MARKER, path.resolve(absPath), 'utf-8');
+    } catch {
+        // Best-effort. The default is already under save/, which every updater
+        // preserves; this marker protects an in-tree operator override.
+    }
+}
+
+function updaterKeepEntryFromMarker(markerPath, label) {
+    try {
+        if (!existsSync(markerPath)) return null;
+        const raw = readFileSync(markerPath, 'utf-8').trim();
+        if (!raw) return null;
+        const absolute = path.resolve(raw);
+        const relative = path.relative(process.cwd(), absolute);
+        if (relative.startsWith('..') || path.isAbsolute(relative)) return null;
+        if (!relative) {
+            throw new Error(`${label} points at the PocketRisu app root; relocate it before updating.`);
+        }
+        const top = relative.split(path.sep)[0];
+        if (MANAGED_BACKUP_PATH_ROOTS.has(top)) {
+            throw new Error(`${label} is inside managed app files (${relative}); relocate it before updating.`);
+        }
+        return top || null;
+    } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        throw error;
     }
 }
 
@@ -790,6 +828,20 @@ if(!HUB_HOSTING_MODE && !existsSync(backupsDir)){
     catch { backupsDir = DEFAULT_BACKUPS_DIR; mkdirSync(backupsDir, { recursive: true }); }
 }
 writeBackupPathMarker(backupsDir);
+const chatBackupsDir = resolveChatBackupDir({ savePath });
+writeChatBackupPathMarker(chatBackupsDir);
+try {
+    mkdirSync(chatBackupsDir, { recursive: true });
+} catch (error) {
+    // Capture/reconcile remain best-effort. In particular, an invalid operator
+    // override must not make the authoritative database unavailable.
+    logger.error('[ChatBackups] Could not create the chat-backup directory:', error?.message || error);
+}
+migrateLegacyChatBackups({
+    legacyRoot: path.join(path.resolve(backupsDir), CHAT_BACKUP_DIRNAME),
+    destinationRoot: chatBackupsDir,
+    logger,
+});
 const BACKUP_FILENAME_REGEX = /^risu-backup-\d+\.bin$/;
 const CHAT_BACKUP_VERSION_ID_REGEX = /^v-\d+-\d+-[a-z0-9_-]{1,24}$/;
 
@@ -5576,6 +5628,25 @@ async function sumInlayFsBytes() {
     return total;
 }
 
+async function sumDirectoryFsBytes(directory) {
+    let entries = [];
+    try {
+        entries = await fs.readdir(directory, { withFileTypes: true });
+    } catch {
+        return 0;
+    }
+    const sizes = await Promise.all(entries.map(async (entry) => {
+        const entryPath = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+            return sumDirectoryFsBytes(entryPath);
+        } else if (entry.isFile()) {
+            try { return (await fs.stat(entryPath)).size; } catch {}
+        }
+        return 0;
+    }));
+    return sizes.reduce((total, size) => total + size, 0);
+}
+
 // Estimated server-backup size — mirrors the enumeration in
 // /api/backup/server/save without writing anything. Inlay files live on the
 // filesystem (post-migration), so we have to fs.stat them rather than read
@@ -5619,18 +5690,14 @@ app.get('/api/db/stats', async (req, res, next) => {
         // count file backups against the save/ disk in the storage chart.
         let backupDisk;
         if (!HUB_HOSTING_MODE) {
-            if (backupsDir === DEFAULT_BACKUPS_DIR) {
-                backupDisk = { ...disk, path: backupsDir, sameAsSaveDir: true };
-            } else {
-                const bDisk = await diskFreeStat(backupsDir);
-                let sameAsSaveDir = false;
-                try {
-                    const saveStat = require('fs').statSync(saveDir);
-                    const bStat = require('fs').statSync(backupsDir);
-                    sameAsSaveDir = saveStat.dev === bStat.dev;
-                } catch { /* non-fatal */ }
-                backupDisk = { ...bDisk, path: backupsDir, sameAsSaveDir };
-            }
+            const bDisk = await diskFreeStat(backupsDir);
+            let sameAsSaveDir = false;
+            try {
+                const saveStat = require('fs').statSync(saveDir);
+                const bStat = require('fs').statSync(backupsDir);
+                sameAsSaveDir = saveStat.dev === bStat.dev;
+            } catch { /* non-fatal */ }
+            backupDisk = { ...bDisk, path: backupsDir, sameAsSaveDir };
         }
 
         const pageSize = sqliteDb.pragma('page_size', { simple: true });
@@ -5748,6 +5815,16 @@ app.get('/api/db/stats', async (req, res, next) => {
         // chart can include it in the inlay slice instead of underreporting.
         const inlayFsBytes = await sumInlayFsBytes();
         const assetFsBytes = sumAssetFsBytes();
+        const chatBackupFsBytes = await sumDirectoryFsBytes(chatBackupsDir);
+        let chatBackupSameAsSaveDir = true;
+        try {
+            const saveStat = require('fs').statSync(saveDir);
+            const chatBackupStat = require('fs').statSync(chatBackupsDir);
+            chatBackupSameAsSaveDir = saveStat.dev === chatBackupStat.dev;
+        } catch {
+            const relative = path.relative(saveDir, chatBackupsDir);
+            chatBackupSameAsSaveDir = !relative.startsWith('..') && !path.isAbsolute(relative);
+        }
 
         res.json({
             hubHosting: HUB_HOSTING_MODE,
@@ -5762,6 +5839,8 @@ app.get('/api/db/stats', async (req, res, next) => {
             ...(typeof estimatedBackupSize === 'number' ? { estimatedBackupSize } : {}),
             assetFsBytes,
             inlayFsBytes,
+            chatBackupFsBytes,
+            chatBackupSameAsSaveDir,
             backups: {
                 kv: { count: backupKeys.length, totalSize: backupTotal, oldest: backupOldest, newest: backupNewest },
                 file: fileBackups,
@@ -6493,6 +6572,13 @@ app.post('/api/self-update', async (req, res) => {
         // Keep set — matches updater.cjs + user data/config that must survive updates
         const keep = new Set(['save', 'backups', '.installed-version', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
         if (isWin) keep.add('bin');
+        for (const [markerPath, label] of [
+            [BACKUP_PATH_MARKER, 'Server-backup directory'],
+            [CHAT_BACKUP_PATH_MARKER, 'Chat-backup directory'],
+        ]) {
+            const customKeep = updaterKeepEntryFromMarker(markerPath, label);
+            if (customKeep) keep.add(customKeep);
+        }
 
         // Phase 1: move old files to backup — rollback immediately on any failure
         const backupDir = path.join(updateTmp, 'backup');

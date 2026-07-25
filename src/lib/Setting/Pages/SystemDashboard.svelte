@@ -56,6 +56,8 @@
         kvTotalBytes: number
         assetFsBytes?: number
         inlayFsBytes?: number
+        chatBackupFsBytes?: number
+        chatBackupSameAsSaveDir?: boolean
         backups: {
             kv: { count: number; totalSize: number; oldest: number | null; newest: number | null }
             file: { count: number; totalSize: number; oldest: number | null; newest: number | null }
@@ -331,6 +333,9 @@
             { id: 'reclaimable',     label: language.storageRowReclaimablePages, desc: language.storageRowReclaimablePagesDesc, size: reclaimable,               color: 'bg-yellow-500' },
             { id: 'wal',             label: language.storageRowWal,            desc: language.storageRowWalDesc,            size: stats.files.wal,               color: 'bg-sky-500' },
             { id: 'shm',             label: language.storageRowShm,            desc: language.storageRowShmDesc,            size: stats.files.shm,               color: 'bg-lime-500' },
+            ...(stats.chatBackupSameAsSaveDir !== false
+                ? [{ id: 'chat-backup', label: language.storageRowChatBackups, desc: language.storageRowChatBackupsDesc, size: stats.chatBackupFsBytes ?? 0, color: 'bg-indigo-500' }]
+                : []),
             // File backups are only on the same disk as save/ when sameAsSaveDir
             // is true. If user pointed backupsDir at a different mount, those
             // bytes don't belong in this chart's geometry — they're shown in
@@ -351,6 +356,7 @@
               + (stats.backupDisk?.sameAsSaveDir !== false ? stats.backups.file.totalSize : 0)
               + (stats.assetFsBytes ?? 0)
               + (stats.inlayFsBytes ?? 0)
+              + (stats.chatBackupSameAsSaveDir !== false ? (stats.chatBackupFsBytes ?? 0) : 0)
             : 0
     )
 

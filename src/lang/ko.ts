@@ -2068,6 +2068,9 @@ export const languageKorean = {
   storageRowFileBackups: "디스크 백업 (.bin)",
   storageRowFileBackupsDesc:
     "수동으로 export한 백업 파일. backups/ 폴더에 보관됩니다.",
+  storageRowChatBackups: "채팅 복구 기록",
+  storageRowChatBackupsDesc:
+    "채팅을 덮어쓰기 전에 캡처하며 기본적으로 save/chat-backups에 저장되는 이전 버전입니다.",
   storageRowKvDatabase: "database.bin (활성)",
   storageRowKvDatabaseDesc:
     "캐릭터 메타데이터, 채팅 참조, 설정을 담는 스텁 전용 데이터베이스 행.",

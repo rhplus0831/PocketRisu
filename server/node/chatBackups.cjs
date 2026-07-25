@@ -16,6 +16,7 @@ const zlib = require('node:zlib');
 const { decodeRisuSave } = require('./utils.cjs');
 
 const CHAT_BACKUP_DIRNAME = 'chat-backups';
+const CHAT_BACKUP_DIR_ENV = 'POCKETRISU_CHAT_BACKUP_DIR';
 const CHAT_BACKUP_MAX_BYTES_KEY = 'config/chat-backup-max-bytes';
 const CHAT_BACKUP_MAX_BYTES_ENV = 'POCKETRISU_CHAT_BACKUP_MAX_BYTES';
 const CHAT_BACKUP_DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
@@ -61,6 +62,225 @@ function resolveChatBackupMaxBytes(options = {}) {
         result = clampInteger(String(envValue).trim(), result, minBytes, maxBytes);
     }
     return result;
+}
+
+function resolveChatBackupDir(options = {}) {
+    const cwd = path.resolve(String(options.cwd ?? process.cwd()));
+    const savePath = path.resolve(cwd, String(options.savePath ?? path.join(cwd, 'save')));
+    const env = options.env ?? process.env;
+    const configured = env?.[CHAT_BACKUP_DIR_ENV];
+    if (configured !== null && configured !== undefined && String(configured).trim() !== '') {
+        return path.resolve(cwd, String(configured).trim());
+    }
+    return path.join(savePath, CHAT_BACKUP_DIRNAME);
+}
+
+function migrationLog(logger, level, message, error) {
+    try {
+        const method = typeof logger?.[level] === 'function'
+            ? logger[level]
+            : logger?.log;
+        if (typeof method !== 'function') return;
+        if (error === undefined) method.call(logger, message);
+        else method.call(logger, message, error?.message || error);
+    } catch {
+        // A logger failure must not block startup migration or server startup.
+    }
+}
+
+function filesHaveIdenticalBytes(firstPath, secondPath) {
+    let firstFd;
+    let secondFd;
+    try {
+        const firstStat = fs.statSync(firstPath);
+        const secondStat = fs.statSync(secondPath);
+        if (!firstStat.isFile() || !secondStat.isFile() || firstStat.size !== secondStat.size) {
+            return false;
+        }
+        firstFd = fs.openSync(firstPath, 'r');
+        secondFd = fs.openSync(secondPath, 'r');
+        const firstChunk = Buffer.allocUnsafe(64 * 1024);
+        const secondChunk = Buffer.allocUnsafe(64 * 1024);
+        let offset = 0;
+        while (offset < firstStat.size) {
+            const length = Math.min(firstChunk.length, firstStat.size - offset);
+            const firstRead = fs.readSync(firstFd, firstChunk, 0, length, offset);
+            const secondRead = fs.readSync(secondFd, secondChunk, 0, length, offset);
+            if (firstRead === 0 || firstRead !== secondRead
+                || !firstChunk.subarray(0, firstRead).equals(secondChunk.subarray(0, secondRead))) {
+                return false;
+            }
+            offset += firstRead;
+        }
+        return true;
+    } catch {
+        return false;
+    } finally {
+        if (firstFd !== undefined) {
+            try { fs.closeSync(firstFd); } catch {}
+        }
+        if (secondFd !== undefined) {
+            try { fs.closeSync(secondFd); } catch {}
+        }
+    }
+}
+
+function migrateLegacyChatBackups(options = {}) {
+    const logger = options.logger ?? console;
+    const stats = {
+        moved: 0,
+        deduplicated: 0,
+        conflicts: 0,
+        failed: 0,
+    };
+    let legacyRoot;
+    let destinationRoot;
+    try {
+        if (options.legacyRoot === null || options.legacyRoot === undefined
+            || options.destinationRoot === null || options.destinationRoot === undefined) {
+            throw new TypeError('legacyRoot and destinationRoot are required');
+        }
+        legacyRoot = path.resolve(String(options.legacyRoot));
+        destinationRoot = path.resolve(String(options.destinationRoot));
+    } catch (error) {
+        stats.failed++;
+        migrationLog(logger, 'error', '[ChatBackups] Legacy migration paths are invalid:', error);
+        return stats;
+    }
+
+    if (legacyRoot === destinationRoot || !fs.existsSync(legacyRoot)) return stats;
+
+    const destinationRelativeToLegacy = path.relative(legacyRoot, destinationRoot);
+    if (destinationRelativeToLegacy
+        && !destinationRelativeToLegacy.startsWith('..')
+        && !path.isAbsolute(destinationRelativeToLegacy)) {
+        stats.failed++;
+        migrationLog(
+            logger,
+            'error',
+            `[ChatBackups] Refusing to migrate ${legacyRoot} into its own descendant ${destinationRoot}`,
+        );
+        return stats;
+    }
+
+    function pruneIfEmpty(directory) {
+        try {
+            if (fs.readdirSync(directory).length === 0) fs.rmdirSync(directory);
+        } catch (error) {
+            if (error?.code !== 'ENOENT' && error?.code !== 'ENOTEMPTY') {
+                stats.failed++;
+                migrationLog(logger, 'warn', `[ChatBackups] Could not prune legacy directory ${directory}:`, error);
+            }
+        }
+    }
+
+    function copyAcrossDevices(source, destination) {
+        let destinationCreated = false;
+        try {
+            fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+            destinationCreated = true;
+            let destinationFd;
+            try {
+                destinationFd = fs.openSync(destination, 'r');
+                fs.fsyncSync(destinationFd);
+            } catch {
+                // Byte verification below is authoritative; fsync is best-effort.
+            } finally {
+                if (destinationFd !== undefined) {
+                    try { fs.closeSync(destinationFd); } catch {}
+                }
+            }
+            if (!filesHaveIdenticalBytes(source, destination)) {
+                throw new Error('copied bytes did not match the legacy source');
+            }
+            fs.unlinkSync(source);
+            stats.moved++;
+        } catch (error) {
+            stats.failed++;
+            migrationLog(logger, 'error', `[ChatBackups] Could not copy legacy file ${source} to ${destination}:`, error);
+            if (destinationCreated && fs.existsSync(source)) {
+                try { fs.unlinkSync(destination); } catch {}
+            }
+        }
+    }
+
+    function moveDirectory(sourceDirectory, destinationDirectory) {
+        let entries;
+        try {
+            entries = fs.readdirSync(sourceDirectory, { withFileTypes: true });
+            fs.mkdirSync(destinationDirectory, { recursive: true });
+        } catch (error) {
+            stats.failed++;
+            migrationLog(logger, 'error', `[ChatBackups] Could not prepare legacy directory ${sourceDirectory}:`, error);
+            return;
+        }
+
+        for (const entry of entries) {
+            const source = path.join(sourceDirectory, entry.name);
+            const destination = path.join(destinationDirectory, entry.name);
+            if (entry.isDirectory()) {
+                moveDirectory(source, destination);
+                pruneIfEmpty(source);
+                continue;
+            }
+            if (!entry.isFile()) {
+                stats.failed++;
+                migrationLog(logger, 'warn', `[ChatBackups] Leaving unsupported legacy entry in place: ${source}`);
+                continue;
+            }
+
+            if (fs.existsSync(destination)) {
+                if (filesHaveIdenticalBytes(source, destination)) {
+                    try {
+                        fs.unlinkSync(source);
+                        stats.deduplicated++;
+                    } catch (error) {
+                        stats.failed++;
+                        migrationLog(logger, 'warn', `[ChatBackups] Could not remove duplicate legacy file ${source}:`, error);
+                    }
+                } else {
+                    stats.conflicts++;
+                    migrationLog(
+                        logger,
+                        'warn',
+                        `[ChatBackups] Legacy file conflicts with the destination and was left in place: ${source}`,
+                    );
+                }
+                continue;
+            }
+
+            try {
+                fs.renameSync(source, destination);
+                stats.moved++;
+            } catch (error) {
+                if (error?.code === 'EXDEV') copyAcrossDevices(source, destination);
+                else {
+                    stats.failed++;
+                    migrationLog(logger, 'error', `[ChatBackups] Could not move legacy file ${source} to ${destination}:`, error);
+                }
+            }
+        }
+        pruneIfEmpty(sourceDirectory);
+    }
+
+    try {
+        moveDirectory(legacyRoot, destinationRoot);
+        pruneIfEmpty(legacyRoot);
+    } catch (error) {
+        stats.failed++;
+        migrationLog(logger, 'error', '[ChatBackups] Unexpected legacy migration failure:', error);
+    }
+
+    if (stats.moved || stats.deduplicated || stats.conflicts || stats.failed) {
+        migrationLog(
+            logger,
+            stats.conflicts || stats.failed ? 'warn' : 'info',
+            `[ChatBackups] Legacy migration complete: ${stats.moved} moved, `
+            + `${stats.deduplicated} duplicate(s) removed, ${stats.conflicts} conflict(s), `
+            + `${stats.failed} failure(s)`,
+        );
+    }
+    return stats;
 }
 
 function sanitizeBackupReason(reason) {
@@ -119,7 +339,7 @@ function compareVersionsOldest(a, b) {
 function createChatBackupStore(options) {
     const config = options || {};
     const {
-        getBackupsRoot,
+        getChatBackupsRoot,
         readChatRowRaw,
         logger = console,
         now = Date.now,
@@ -141,8 +361,8 @@ function createChatBackupStore(options) {
         ?? config.byteBudgetGetter
         ?? (() => CHAT_BACKUP_DEFAULT_MAX_BYTES);
 
-    if (typeof getBackupsRoot !== 'function') {
-        throw new TypeError('getBackupsRoot must be a function');
+    if (typeof getChatBackupsRoot !== 'function') {
+        throw new TypeError('getChatBackupsRoot must be a function');
     }
     if (typeof readChatRowRaw !== 'function') {
         throw new TypeError('readChatRowRaw must be a function');
@@ -169,7 +389,7 @@ function createChatBackupStore(options) {
     }
 
     function backupsTreeRoot() {
-        return path.join(path.resolve(String(getBackupsRoot())), CHAT_BACKUP_DIRNAME);
+        return path.resolve(String(getChatBackupsRoot()));
     }
 
     function chatDirectory(chaId, chatId) {
@@ -890,9 +1110,12 @@ function createChatBackupStore(options) {
 
 module.exports = {
     createChatBackupStore,
+    migrateLegacyChatBackups,
+    resolveChatBackupDir,
     resolveChatBackupMaxBytes,
     sanitizeBackupReason,
     CHAT_BACKUP_DIRNAME,
+    CHAT_BACKUP_DIR_ENV,
     CHAT_BACKUP_MAX_BYTES_KEY,
     CHAT_BACKUP_MAX_BYTES_ENV,
     CHAT_BACKUP_DEFAULT_MAX_BYTES,

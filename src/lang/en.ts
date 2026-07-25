@@ -1904,6 +1904,8 @@ export const languageEnglish = {
     storageRowShmDesc: "SQLite's shared memory index for the WAL. Tiny, transient, regenerated as needed.",
     storageRowFileBackups: "Disk backups (.bin)",
     storageRowFileBackupsDesc: "Manual export backups stored on disk under the backups/ folder.",
+    storageRowChatBackups: "Chat recovery history",
+    storageRowChatBackupsDesc: "Pre-image versions captured before chat overwrites and stored under save/chat-backups by default.",
     storageRowKvDatabase: "database.bin (live)",
     storageRowKvDatabaseDesc: "The stubs-only database row containing character metadata, chat references, and settings.",
     storageRowKvChats: "Chats",
