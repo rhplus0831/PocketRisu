@@ -2,6 +2,7 @@
   "compilerOptions": {
     /* Language & Environment */
     "target": "es2023",
+    "lib": ["ES2024", "DOM", "DOM.Iterable"],
     "module": "es2022",
     "useDefineForClassFields": true,
 

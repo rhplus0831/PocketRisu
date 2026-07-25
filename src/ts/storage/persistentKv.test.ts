@@ -9,7 +9,7 @@ const storage = vi.hoisted(() => ({
 vi.mock('../globalApi.svelte', () => ({ forageStorage: storage }))
 vi.mock('../parser/parser.svelte', () => ({ hasher: vi.fn() }))
 
-const { readPersistentJson } = await import('./persistentKv')
+const { makeEncodedStorageKey, readPersistentJson } = await import('./persistentKv')
 
 beforeEach(() => {
     storage.getItem.mockClear()
@@ -28,5 +28,16 @@ describe('persistent JSON read transport', () => {
             .resolves.toEqual({ source: 'cached' })
         expect(storage.getItemCached).toHaveBeenCalledWith('pluginsave/value')
         expect(storage.getItem).not.toHaveBeenCalled()
+    })
+})
+
+describe('encoded storage keys', () => {
+    it('rejects lone surrogates before UTF-8 encoding', () => {
+        expect(() => makeEncodedStorageKey('pluginsave/', '\uD800'))
+            .toThrow('well-formed Unicode')
+    })
+
+    it('encodes a literal replacement character normally', () => {
+        expect(makeEncodedStorageKey('pluginsave/', '�')).toBe('pluginsave/77-9.json')
     })
 })

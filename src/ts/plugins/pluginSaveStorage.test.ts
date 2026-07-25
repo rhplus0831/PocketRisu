@@ -1,43 +1,92 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 let database: any;
+const persistent = vi.hoisted(() => new Map<string, unknown>());
 
 vi.mock("../storage/database.svelte", () => ({
     getDatabase: () => database,
 }));
 
 vi.mock("../storage/persistentKv", () => {
-    const encode = (value: string) => Buffer.from(value, "utf-8").toString("base64url");
+    const encode = (value: string) => {
+        if (!value.isWellFormed()) {
+            throw new Error(
+                `Plugin storage keys must be well-formed Unicode (no unpaired surrogates): ${JSON.stringify(value)}`,
+            );
+        }
+        return Buffer.from(value, "utf-8").toString("base64url");
+    };
     const decode = (value: string) => Buffer.from(value, "base64url").toString("utf-8");
     return {
-        clearPersistentPrefix: vi.fn(),
+        clearPersistentPrefix: vi.fn(async (prefix: string) => {
+            for (const key of persistent.keys()) {
+                if (key.startsWith(prefix)) persistent.delete(key);
+            }
+        }),
         decodeStorageKeyComponent: decode,
-        listPersistentKeys: vi.fn(),
-        makeEncodedStorageKey: (prefix: string, key: string) => `${prefix}${encode(key)}.json`,
-        readPersistentJson: vi.fn(),
-        removePersistentKey: vi.fn(),
-        writePersistentJson: vi.fn(),
+        listPersistentKeys: vi.fn(async (prefix: string) =>
+            [...persistent.keys()].filter((key) => key.startsWith(prefix))
+        ),
+        makeEncodedStorageKey: vi.fn(
+            (prefix: string, key: string) => `${prefix}${encode(key)}.json`,
+        ),
+        readPersistentJson: vi.fn(async (key: string) => persistent.get(key) ?? null),
+        removePersistentKey: vi.fn(async (key: string) => {
+            persistent.delete(key);
+        }),
+        writePersistentJson: vi.fn(async (key: string, value: unknown) => {
+            persistent.set(key, value);
+        }),
     };
 });
 
 const {
     getPluginSaveStorageItem,
+    getPluginSaveStorageKeys,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_SAVE_PREFIX,
     readExternalizedPluginStorage,
     reconcilePluginStorageMode,
+    removePluginSaveStorageItem,
+    setPluginSaveStorageItem,
 } = await import("./pluginSaveStorage");
 
 function encoded(prefix: string, key: string) {
     return `${prefix}${Buffer.from(key, "utf-8").toString("base64url")}.json`;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
     vi.clearAllMocks();
+    persistent.clear();
     database = {
         optimizePluginMemory: false,
         pluginCustomStorage: {},
     };
+    const {
+        listPersistentKeys,
+        makeEncodedStorageKey,
+        readPersistentJson,
+        removePersistentKey,
+        writePersistentJson,
+    } = vi.mocked(await import("../storage/persistentKv"));
+    listPersistentKeys.mockImplementation(async (prefix: string) =>
+        [...persistent.keys()].filter((key) => key.startsWith(prefix))
+    );
+    makeEncodedStorageKey.mockImplementation((prefix: string, key: string) => {
+        if (!key.isWellFormed()) {
+            throw new Error(
+                `Plugin storage keys must be well-formed Unicode (no unpaired surrogates): ${JSON.stringify(key)}`,
+            );
+        }
+        return encoded(prefix, key);
+    });
+    readPersistentJson.mockImplementation(async (key: string) => persistent.get(key) ?? null);
+    removePersistentKey.mockImplementation(async (key: string) => {
+        persistent.delete(key);
+    });
+    writePersistentJson.mockImplementation(async (key: string, value: unknown) => {
+        persistent.set(key, value);
+    });
 });
 
 describe("readExternalizedPluginStorage", () => {
@@ -116,6 +165,32 @@ describe("plugin save storage transport", () => {
             { cached: true },
         );
     });
+
+    test("optimized reads and writes reject lone-surrogate keys without touching KV", async () => {
+        database.optimizePluginMemory = true;
+        const { readPersistentJson, writePersistentJson } = await import("../storage/persistentKv");
+
+        await expect(setPluginSaveStorageItem("\uD800", { value: 1 }))
+            .rejects.toThrow("well-formed Unicode");
+        await expect(getPluginSaveStorageItem("\uD800"))
+            .rejects.toThrow("well-formed Unicode");
+
+        expect(persistent.size).toBe(0);
+        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(readPersistentJson).not.toHaveBeenCalled();
+    });
+
+    test("a literal replacement-character key round-trips through optimized storage", async () => {
+        database.optimizePluginMemory = true;
+        const value = { exact: "replacement-character" };
+
+        await setPluginSaveStorageItem("�", value);
+        await expect(getPluginSaveStorageItem("�")).resolves.toEqual(value);
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["�"]);
+        await removePluginSaveStorageItem("�");
+
+        expect(persistent.has(encoded(PLUGIN_SAVE_PREFIX, "�"))).toBe(false);
+    });
 });
 
 describe("reconcilePluginStorageMode", () => {
@@ -185,6 +260,129 @@ describe("reconcilePluginStorageMode", () => {
         expect(persistent.get(encoded(PLUGIN_SAVE_PREFIX, "first"))).toBe(1);
         expect(database.pluginCustomStorage.first).toBeUndefined();
         expect(database.pluginCustomStorage.second).toBe(2);
+    });
+
+    test("rejects colliding lone-surrogate value keys before any mutation", async () => {
+        database = {
+            optimizePluginMemory: true,
+            pluginCustomStorage: {
+                ["\uD800"]: "high-surrogate-0",
+                ["\uD801"]: "high-surrogate-1",
+                "�": "replacement-character",
+            },
+        };
+        const writePersistentJson = vi.fn();
+        const persistDatabase = vi.fn();
+
+        await expect(reconcilePluginStorageMode({
+            dependencies: { writePersistentJson, persistDatabase },
+        })).rejects.toThrow("well-formed Unicode");
+
+        expect(database.pluginCustomStorage).toEqual({
+            ["\uD800"]: "high-surrogate-0",
+            ["\uD801"]: "high-surrogate-1",
+            "�": "replacement-character",
+        });
+        expect(persistent.size).toBe(0);
+        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(persistDatabase).not.toHaveBeenCalled();
+    });
+
+    test("rejects an invalid metadata key before writing valid values", async () => {
+        database = {
+            optimizePluginMemory: true,
+            pluginCustomStorage: { safe: { value: 1 } },
+            pluginStorageMeta: {
+                ["\uD800"]: { plugin: "Test", updatedAt: 1 },
+            },
+        };
+        const writePersistentJson = vi.fn();
+        const persistDatabase = vi.fn();
+
+        await expect(reconcilePluginStorageMode({
+            dependencies: { writePersistentJson, persistDatabase },
+        })).rejects.toThrow("well-formed Unicode");
+
+        expect(database.pluginCustomStorage).toEqual({ safe: { value: 1 } });
+        expect(database.pluginStorageMeta).toEqual({
+            ["\uD800"]: { plugin: "Test", updatedAt: 1 },
+        });
+        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(persistDatabase).not.toHaveBeenCalled();
+    });
+
+    test("checks every precomputed destination for collisions before mutation", async () => {
+        const { makeEncodedStorageKey } = await import("../storage/persistentKv");
+        vi.mocked(makeEncodedStorageKey).mockImplementation(
+            (prefix: string) => `${prefix}forced-collision.json`,
+        );
+        database = {
+            optimizePluginMemory: true,
+            pluginCustomStorage: { first: 1, second: 2 },
+        };
+        const writePersistentJson = vi.fn();
+        const persistDatabase = vi.fn();
+
+        await expect(reconcilePluginStorageMode({
+            dependencies: { writePersistentJson, persistDatabase },
+        })).rejects.toThrow("Plugin storage key collision");
+
+        expect(database.pluginCustomStorage).toEqual({ first: 1, second: 2 });
+        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(persistDatabase).not.toHaveBeenCalled();
+    });
+
+    test("well-formed keys externalize and internalize without changing identity", async () => {
+        const originalValues = {
+            normal: { value: 1 },
+            "�": { value: 2 },
+            "키🔑": ["unicode"],
+        };
+        const originalMeta = {
+            "�": { plugin: "Replacement", updatedAt: 2 },
+            "키🔑": { plugin: "Unicode", updatedAt: 3 },
+        };
+        database = {
+            optimizePluginMemory: true,
+            pluginCustomStorage: structuredClone(originalValues),
+            pluginStorageMeta: structuredClone(originalMeta),
+        };
+        const persistDatabase = vi.fn(async () => undefined);
+        const dependencies = {
+            listPersistentKeys: vi.fn(async (prefix: string) =>
+                [...persistent.keys()].filter((key) => key.startsWith(prefix))
+            ),
+            readPersistentJson: async function <T>(key: string): Promise<T> {
+                return persistent.get(key) as T;
+            },
+            removePersistentKey: vi.fn(async (key: string) => {
+                persistent.delete(key);
+            }),
+            writePersistentJson: vi.fn(async (key: string, value: unknown) => {
+                persistent.set(key, value);
+            }),
+            persistDatabase,
+        };
+
+        await expect(reconcilePluginStorageMode({ dependencies })).resolves.toEqual({
+            direction: "externalize",
+            values: 3,
+            meta: 2,
+        });
+        expect(database.pluginCustomStorage).toEqual({});
+        expect(database.pluginStorageMeta).toBeUndefined();
+
+        database.optimizePluginMemory = false;
+        await expect(reconcilePluginStorageMode({ dependencies })).resolves.toEqual({
+            direction: "internalize",
+            values: 3,
+            meta: 2,
+        });
+
+        expect(database.pluginCustomStorage).toEqual(originalValues);
+        expect(database.pluginStorageMeta).toEqual(originalMeta);
+        expect(persistent.size).toBe(0);
+        expect(persistDatabase).toHaveBeenCalledTimes(2);
     });
 
     test("internalizes and saves before deleting external keys", async () => {

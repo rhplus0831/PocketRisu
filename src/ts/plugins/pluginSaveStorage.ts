@@ -205,13 +205,27 @@ export async function reconcilePluginStorageMode(
                 return { direction: "none", values: 0, meta: 0 };
             }
 
+            const destinationStorageKeys = new Set<string>();
+            const prepareEntries = <T>(entries: Array<[string, T]>, prefix: string) => (
+                entries.map(([key, value]) => {
+                    const storageKey = makeEncodedStorageKey(prefix, key);
+                    if (destinationStorageKeys.has(storageKey)) {
+                        throw new Error(
+                            `Plugin storage key collision while externalizing: ${JSON.stringify(key)}`,
+                        );
+                    }
+                    destinationStorageKeys.add(storageKey);
+                    return { key, storageKey, value };
+                })
+            );
+            // Validate every destination before writing or deleting anything.
+            const preparedValueEntries = prepareEntries(valueEntries, PLUGIN_SAVE_PREFIX);
+            const preparedMetaEntries = prepareEntries(metaEntries, PLUGIN_SAVE_META_PREFIX);
+
             let completed = 0;
-            for (const [key, value] of valueEntries) {
+            for (const { key, storageKey, value } of preparedValueEntries) {
                 // Inline wins if a previous partial run left a duplicate.
-                await deps.writePersistentJson(
-                    makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key),
-                    value,
-                );
+                await deps.writePersistentJson(storageKey, value);
                 delete db.pluginCustomStorage[key];
                 options.onProgress?.({
                     direction: "externalize",
@@ -219,11 +233,8 @@ export async function reconcilePluginStorageMode(
                     total,
                 });
             }
-            for (const [key, record] of metaEntries) {
-                await deps.writePersistentJson(
-                    makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, key),
-                    record,
-                );
+            for (const { key, storageKey, value: record } of preparedMetaEntries) {
+                await deps.writePersistentJson(storageKey, record);
                 if (db.pluginStorageMeta) delete db.pluginStorageMeta[key];
                 options.onProgress?.({
                     direction: "externalize",
