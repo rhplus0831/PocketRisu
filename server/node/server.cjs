@@ -162,6 +162,50 @@ function queueStorageOperation(operation) {
     return operationRun;
 }
 
+let importInProgress = false;
+// Imports keep one raw transaction open across streamed decompression, msgpack
+// walking and directory swaps. The barrier drains this queue before an import
+// begins, so mutations either land entirely before BEGIN or are refused —
+// never acknowledged and then discarded by the import's ROLLBACK.
+const importBarrier = createImportBarrier({
+    drainMutations: () => queueStorageOperation(() => {}),
+});
+
+class ImportInProgressError extends Error {
+    constructor() {
+        super('An import is in progress; the write was not applied');
+        this.name = 'ImportInProgressError';
+        this.importInProgress = true;
+    }
+}
+
+// Every KV/chat-row/asset mutation must run through this, not through
+// queueStorageOperation directly. The barrier check has to happen inside the
+// queued callback: the serial FIFO order is what makes the boundary airtight.
+function queueStorageMutation(operation) {
+    return queueStorageOperation(() => {
+        if (importBarrier.isHeld()) throw new ImportInProgressError();
+        return operation();
+    });
+}
+
+function isImportInProgressError(error) {
+    return Boolean(error && error.importInProgress === true);
+}
+
+// 503 + Retry-After: the client may safely reissue the same write once the
+// import finishes. Anything else would let the caller treat a dropped write as
+// applied.
+function sendImportBusy(res) {
+    if (res.headersSent) return;
+    res.setHeader('Retry-After', '5');
+    res.status(503).json({
+        error: 'An import is in progress; retry this write after it completes',
+        code: 'IMPORT_IN_PROGRESS',
+        retryable: true,
+    });
+}
+
 // Captures run inside the endpoint's storage operation. Reconcile enters the
 // same queue through runStorageOperation, so neither can observe half-written
 // backup state or race a chat-row overwrite.
@@ -994,9 +1038,6 @@ const BACKUP_NDJSON_HEARTBEAT_MS = Math.max(
     100,
     Number(process.env.BACKUP_NDJSON_HEARTBEAT_MS ?? '5000') || 5000,
 );
-
-let importInProgress = false;
-const importBarrier = createImportBarrier();
 
 function recoverPendingImportSwap(source) {
     const journal = readImportJournal(IMPORT_JOURNAL_PATH);
@@ -4028,25 +4069,28 @@ app.get('/api/remove', async (req, res, next) => {
         return;
     }
     try {
-        const key = Buffer.from(filePath, 'hex').toString('utf-8');
-        if (key.startsWith('inlay/')) {
-            const id = key.slice('inlay/'.length)
-            await deleteInlayFile(id)
-            kvDel(key);
-            kvDel(`inlay_thumb/${id}`);
-            kvDel(`inlay_info/${id}`);
-            return res.send({ success: true });
-        }
-        if (key.startsWith('inlay_info/')) {
-            await fs.unlink(getInlaySidecarPath(key.slice('inlay_info/'.length))).catch(() => {});
-        }
-        if (key.startsWith('assets/')) {
-            deleteAssetValue(key);
-        } else {
-            kvDel(key);
-        }
-        res.send({ success: true });
+        await queueStorageMutation(async () => {
+            const key = Buffer.from(filePath, 'hex').toString('utf-8');
+            if (key.startsWith('inlay/')) {
+                const id = key.slice('inlay/'.length)
+                await deleteInlayFile(id)
+                kvDel(key);
+                kvDel(`inlay_thumb/${id}`);
+                kvDel(`inlay_info/${id}`);
+                return res.send({ success: true });
+            }
+            if (key.startsWith('inlay_info/')) {
+                await fs.unlink(getInlaySidecarPath(key.slice('inlay_info/'.length))).catch(() => {});
+            }
+            if (key.startsWith('assets/')) {
+                deleteAssetValue(key);
+            } else {
+                kvDel(key);
+            }
+            res.send({ success: true });
+        });
     } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
         next(error);
     }
 });
@@ -4169,7 +4213,7 @@ app.post('/api/write', async (req, res, next) => {
         return;
     }
     try {
-        await queueStorageOperation(async () => {
+        await queueStorageMutation(async () => {
             const key = Buffer.from(filePath, 'hex').toString('utf-8');
             let persistedDatabaseContent = fileContent;
             const assetVerification = key.startsWith('assets/')
@@ -4317,6 +4361,7 @@ app.post('/api/write', async (req, res, next) => {
             });
         });
     } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
         next(error);
     }
 });
@@ -4324,7 +4369,7 @@ app.post('/api/write', async (req, res, next) => {
 app.post('/api/db/flush', sessionAuthMiddleware, async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     try {
-        await queueStorageOperation(async () => {
+        await queueStorageMutation(async () => {
             await flushPendingDb();
             res.send({
                 success: true,
@@ -4332,6 +4377,7 @@ app.post('/api/db/flush', sessionAuthMiddleware, async (req, res, next) => {
             });
         });
     } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
         next(error);
     }
 });
@@ -4360,7 +4406,7 @@ app.post('/api/patch', async (req, res, next) => {
     }
 
     try {
-        await queueStorageOperation(async () => {
+        await queueStorageMutation(async () => {
             const decodedKey = Buffer.from(filePath, 'hex').toString('utf-8');
 
             // Load database into memory if not already cached
@@ -4451,7 +4497,7 @@ app.post('/api/patch', async (req, res, next) => {
                 clearTimeout(saveTimers[filePath]);
             }
             const saveTimer = setTimeout(() => {
-                queueStorageOperation(async () => {
+                queueStorageMutation(async () => {
                     if (saveTimers[filePath] !== saveTimer) return;
                     try {
                         if (decodedKey === 'database/database.bin') {
@@ -4484,6 +4530,13 @@ app.post('/api/patch', async (req, res, next) => {
                         if (saveTimers[filePath] === saveTimer) delete saveTimers[filePath];
                     }
                 }).catch((error) => {
+                    if (saveTimers[filePath] === saveTimer) delete saveTimers[filePath];
+                    if (isImportInProgressError(error)) {
+                        // The import replaces this key wholesale and drops dbCache,
+                        // so the superseded debounced save is not a persist failure.
+                        logger.info(`[Patch] Skipped debounced save for ${decodedKey}: import in progress`);
+                        return;
+                    }
                     logger.error(`[Patch] Storage queue failed for ${decodedKey}:`, error);
                 });
             }, SAVE_INTERVAL);
@@ -4506,6 +4559,7 @@ app.post('/api/patch', async (req, res, next) => {
             res.send(responsePayload);
         });
     } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
         logger.error(`[Patch] Error applying patch to ${filePath}:`, error.name);
         res.status(500).send({
             error: 'Patch application failed: ' + (error && error.message ? error.message : error)
@@ -4620,23 +4674,30 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
             return;
         }
 
-        for(let i = 0; i < decodedEntries.length; i += BULK_BATCH){
-            const batch = decodedEntries.slice(i, i + BULK_BATCH);
-            const writeBatch = sqliteDb.transaction(() => {
-                for(const { key, buffer, verification } of batch){
-                    if (typeof key === 'string' && key.startsWith('assets/')) {
-                        writeAssetValue(key, buffer, {
-                            skipIfUnchanged: verification.claimed !== null,
-                        });
-                    } else {
-                        kvSet(key, buffer);
+        // One mutation for every batch: a partially-applied bulk write must not
+        // straddle the point where an import claims the barrier.
+        await queueStorageMutation(() => {
+            for(let i = 0; i < decodedEntries.length; i += BULK_BATCH){
+                const batch = decodedEntries.slice(i, i + BULK_BATCH);
+                const writeBatch = sqliteDb.transaction(() => {
+                    for(const { key, buffer, verification } of batch){
+                        if (typeof key === 'string' && key.startsWith('assets/')) {
+                            writeAssetValue(key, buffer, {
+                                skipIfUnchanged: verification.claimed !== null,
+                            });
+                        } else {
+                            kvSet(key, buffer);
+                        }
                     }
-                }
-            });
-            writeBatch();
-        }
+                });
+                writeBatch();
+            }
+        });
         res.json({ success: true, count: entries.length });
-    } catch(error){ next(error); }
+    } catch(error){
+        if (isImportInProgressError(error)) return sendImportBusy(res);
+        next(error);
+    }
 });
 
 app.get('/api/backup/export', async (req, res, next) => {
@@ -5435,7 +5496,12 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
         }
         let encoded;
         if (needsRehydration) {
-            chatRowStore.writeChatRow(chaId, chatId, chat);
+            // Cache-fill only, so it can be skipped rather than gated: writing it
+            // during an import would either be rolled back or strand a row under a
+            // chaId the import just cleared. The next read rehydrates again.
+            if (!importBarrier.isHeld()) {
+                chatRowStore.writeChatRow(chaId, chatId, chat);
+            }
             encoded = Buffer.from(encodeRisuSaveLegacy(chat));
         } else {
             encoded = chatRowStore.readChatRowRaw(chaId, chatId)
@@ -5459,7 +5525,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
     if (!checkActiveSession(req, res)) return;
     try {
-        await queueStorageOperation(async () => {
+        await queueStorageMutation(async () => {
             const chaId = req.params.chaId;
             const expectedChatId = req.headers['x-chat-id'];
             let chatData;
@@ -5511,6 +5577,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             res.json({ success: true, hash });
         });
     } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
         next(error);
     }
 });
@@ -6364,7 +6431,9 @@ app.post('/api/db/optimize', async (req, res, next) => {
             });
         }
 
-        const result = await queueStorageOperation(async () => {
+        // VACUUM cannot run inside another request's transaction, and the orphan
+        // sweep would delete rows an in-flight import is still publishing.
+        const result = await queueStorageMutation(async () => {
             await flushPendingDb();
             const t0 = Date.now();
             const rawDb = kvGet(DB_BLOB_KEY);
@@ -6402,7 +6471,10 @@ app.post('/api/db/optimize', async (req, res, next) => {
             };
         });
         res.json(result);
-    } catch (err) { next(err); }
+    } catch (err) {
+        if (isImportInProgressError(err)) return sendImportBusy(res);
+        next(err);
+    }
 });
 
 app.post('/api/db/wal-checkpoint', async (req, res, next) => {
@@ -6413,7 +6485,8 @@ app.post('/api/db/wal-checkpoint', async (req, res, next) => {
         const walFilePath = path.join(saveDir, 'risuai.db-wal');
         const preWalSize = statSafe(walFilePath)?.size ?? 0;
 
-        const result = await queueStorageOperation(async () => {
+        // A checkpoint cannot truncate past an import's open transaction.
+        const result = await queueStorageMutation(async () => {
             await flushPendingDb();
             const t0 = Date.now();
             checkpointWal('TRUNCATE');
@@ -6428,7 +6501,10 @@ app.post('/api/db/wal-checkpoint', async (req, res, next) => {
             };
         });
         res.json(result);
-    } catch (err) { next(err); }
+    } catch (err) {
+        if (isImportInProgressError(err)) return sendImportBusy(res);
+        next(err);
+    }
 });
 
 // ── Snapshot list (database/dbbackup-* keys) ─────────────────────────────────
@@ -6478,11 +6554,14 @@ app.put('/api/db/snapshots/limits', async (req, res, next) => {
                 return res.status(400).json({ error: `maxBytes out of range` });
             }
             maxBytes = Math.floor(rawBytes);
-            kvSet(SNAPSHOT_LIMIT_BYTES_KEY, Buffer.from(String(maxBytes), 'utf-8'));
         }
-        kvSet(SNAPSHOT_LIMIT_COUNT_KEY, Buffer.from(String(maxCount), 'utf-8'));
-        const trim = trimSnapshotsToLimits();
-        const usage = snapshotUsage();
+        const { trim, usage } = await queueStorageMutation(() => {
+            if (!HUB_HOSTING_MODE) {
+                kvSet(SNAPSHOT_LIMIT_BYTES_KEY, Buffer.from(String(maxBytes), 'utf-8'));
+            }
+            kvSet(SNAPSHOT_LIMIT_COUNT_KEY, Buffer.from(String(maxCount), 'utf-8'));
+            return { trim: trimSnapshotsToLimits(), usage: snapshotUsage() };
+        });
         res.json({
             maxCount, maxBytes,
             currentCount: usage.count,
@@ -6490,7 +6569,10 @@ app.put('/api/db/snapshots/limits', async (req, res, next) => {
             logicalBytes: usage.logicalBytes,
             removed: trim.removed,
         });
-    } catch (err) { next(err); }
+    } catch (err) {
+        if (isImportInProgressError(err)) return sendImportBusy(res);
+        next(err);
+    }
 });
 
 app.get('/api/db/snapshots', async (req, res, next) => {
@@ -6520,9 +6602,12 @@ app.delete('/api/db/snapshots', async (req, res, next) => {
         if (!key.startsWith(DB_BACKUP_PREFIX)) {
             return res.status(400).json({ error: 'Invalid snapshot key' });
         }
-        kvDel(key);
+        await queueStorageMutation(() => kvDel(key));
         res.json({ ok: true });
-    } catch (err) { next(err); }
+    } catch (err) {
+        if (isImportInProgressError(err)) return sendImportBusy(res);
+        next(err);
+    }
 });
 
 // Restore a snapshot server-side. Supported large snapshots ingest directly
@@ -6541,9 +6626,11 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
         if (!blob) {
             return res.status(404).json({ error: 'Snapshot not found' });
         }
-        await queueStorageOperation(async () => {
-            const releaseImportBarrier = await importBarrier.acquire();
-            try {
+        // Acquire before entering the storage queue: acquire() drains that same
+        // queue, so holding a slot while waiting for it would deadlock.
+        const releaseImportBarrier = await importBarrier.acquire();
+        try {
+            await queueStorageOperation(async () => {
                 // Drain any pending debounced persist first — same pattern as
                 // /api/db/optimize. Without this, an in-flight save could land
                 // after kvCopyValue and overwrite the restored snapshot.
@@ -6574,17 +6661,17 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                 // A restore can replace a broad logical database state. Force every
                 // browser list cache to take one full snapshot after it completes.
                 kvBumpListEpoch();
-            } catch (error) {
-                try {
-                    kvBumpListEpoch();
-                } catch (epochError) {
-                    logger.error('[Snapshot Restore] Failed to bump list epoch after restore failure:', epochError);
-                }
-                throw error;
-            } finally {
-                releaseImportBarrier();
+            });
+        } catch (error) {
+            try {
+                kvBumpListEpoch();
+            } catch (epochError) {
+                logger.error('[Snapshot Restore] Failed to bump list epoch after restore failure:', epochError);
             }
-        });
+            throw error;
+        } finally {
+            releaseImportBarrier();
+        }
         res.json({ ok: true });
     } catch (err) { next(err); }
 });
@@ -6615,9 +6702,14 @@ app.put('/api/backup/boot-reminder', async (req, res, next) => {
     if (HUB_HOSTING_MODE) return res.status(403).json({ error: 'Server backups are disabled on this instance' });
     try {
         const enabled = !!req.body?.enabled;
-        kvSet(BOOT_REMINDER_KEY, Buffer.from(enabled ? '1' : '0', 'utf-8'));
+        await queueStorageMutation(() => {
+            kvSet(BOOT_REMINDER_KEY, Buffer.from(enabled ? '1' : '0', 'utf-8'));
+        });
         res.json({ enabled });
-    } catch (err) { next(err); }
+    } catch (err) {
+        if (isImportInProgressError(err)) return sendImportBusy(res);
+        next(err);
+    }
 });
 
 // ── Backup directory configuration ──────────────────────────────────────────
@@ -6662,8 +6754,10 @@ app.put('/api/backup/server/path', async (req, res, next) => {
             return res.status(400).json({ error: 'Path is not writable: ' + (e?.message || String(e)) });
         }
         const previous = backupsDir;
+        await queueStorageMutation(() => {
+            kvSet(BACKUP_PATH_CONFIG_KEY, Buffer.from(resolved, 'utf-8'));
+        });
         backupsDir = resolved;
-        kvSet(BACKUP_PATH_CONFIG_KEY, Buffer.from(resolved, 'utf-8'));
         writeBackupPathMarker(resolved);
         res.json({
             path: backupsDir,
@@ -6671,7 +6765,10 @@ app.put('/api/backup/server/path', async (req, res, next) => {
             default: DEFAULT_BACKUPS_DIR,
             isDefault: backupsDir === DEFAULT_BACKUPS_DIR,
         });
-    } catch (err) { next(err); }
+    } catch (err) {
+        if (isImportInProgressError(err)) return sendImportBusy(res);
+        next(err);
+    }
 });
 
 // ── Inlay bulk compression endpoint ──────────────────────────────────────────
@@ -6679,6 +6776,15 @@ const COMPRESS_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp']);
 
 app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
     if (!checkActiveSession(req, res)) return;
+    // Rewrites inlay files an in-flight import is about to replace wholesale.
+    if (importBarrier.isHeld()) {
+        res.setHeader('Retry-After', '5');
+        return res.status(503).json({
+            error: 'An import is in progress; retry compression after it completes',
+            code: 'IMPORT_IN_PROGRESS',
+            retryable: true,
+        });
+    }
     const quality = typeof req.body?.quality === 'number' ? req.body.quality : 85;
 
     res.writeHead(200, {
@@ -6727,14 +6833,25 @@ app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
                     const info = sidecar || {};
                     await writeInlayFile(entry.id, 'webp', webpBuf, { ...info, ext: 'webp' });
                     // invalidate thumbnail cache
-                    kvDel(`inlay_thumb/${entry.id}`);
+                    await queueStorageMutation(() => kvDel(`inlay_thumb/${entry.id}`));
                     const saved = original.length - webpBuf.length;
                     totalSaved += saved;
                     compressed++;
                 } else {
                     skipped++;
                 }
-            } catch {
+            } catch (entryError) {
+                // An import that claimed the barrier mid-run must stop the sweep,
+                // not be counted as a per-image skip: the remaining files are
+                // about to be replaced anyway.
+                if (isImportInProgressError(entryError)) {
+                    send({
+                        type: 'error',
+                        message: 'An import started; compression stopped. Retry after it completes.',
+                    });
+                    res.end();
+                    return;
+                }
                 skipped++;
             }
 

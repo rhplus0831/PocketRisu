@@ -317,6 +317,12 @@ export class NodeStorage{
             const data = await da.json()
             throw new ConflictError(data.error, data.currentEtag)
         }
+        // The server refuses writes while an import holds the database, so this
+        // key was NOT written. Surface it as retryable instead of a generic
+        // failure — the save loop reissues on the next cycle.
+        if(da.status === 503){
+            throw "setItem skipped: an import is in progress on the server"
+        }
         if(da.status < 200 || da.status >= 300){
             throw "setItem Error"
         }
