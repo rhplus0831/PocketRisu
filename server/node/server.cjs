@@ -79,7 +79,12 @@ const {
     buildCachedDbReadEnvelope,
     encodeCachedDbReadEnvelope,
 } = require('./dbCachedRead.cjs');
-const { createChatRowStore, chatRowKey, hasChatPayloads } = require('./chatRows.cjs');
+const {
+    createChatRowStore,
+    chatRowKey,
+    hasChatPayloads,
+    findDuplicateChaIds,
+} = require('./chatRows.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
 const { inspectRisuSaveSource, shouldStreamRisuSave } = require('./streamRisuLoad.cjs');
 const {
@@ -460,6 +465,7 @@ async function ingestDatabase(raw, { createBackup = false } = {}) {
             return coldRestoreResult;
         },
     });
+    logDuplicateCharacterIdReassignments(result);
     if (createBackup) await createBackupAndRotate();
     return result;
 }
@@ -469,6 +475,13 @@ function logColdStorageRestoreFailures(result) {
     logger.error(`[ColdStorage] ${result.failed} character(s) could not be restored and were converted to safe blank characters. Cold storage KV data is preserved.`);
     for (const name of result.failedNames) {
         logger.error(`[ColdStorage]   - "${name}"`);
+    }
+}
+
+function logDuplicateCharacterIdReassignments(result) {
+    const count = result?.stats?.reassignedDuplicateChaIds ?? 0;
+    if (count > 0) {
+        logger.warn(`[ChatRows] Reassigned ${count} duplicate character ID(s) before externalizing chats`);
     }
 }
 
@@ -491,6 +504,7 @@ async function ingestDatabaseStreaming(source, { inspection = null } = {}) {
             return coldRestoreResult;
         },
     });
+    logDuplicateCharacterIdReassignments(result);
     return result;
 }
 
@@ -4031,6 +4045,19 @@ app.post('/api/write', async (req, res, next) => {
                             + `would silently strip messages on disk. sample=[${sample}]`
                         );
                         recordPersistFailure(err, '/api/write:stub-flag-loss');
+                        logger.error(`[Write] ${err.message}`);
+                        res.status(500).json({ error: 'Write aborted: chat data integrity check failed' });
+                        return;
+                    }
+
+                    const duplicateChaIds = findDuplicateChaIds(incomingDb);
+                    if (duplicateChaIds.length > 0) {
+                        const sample = duplicateChaIds.slice(0, 3).join(', ');
+                        const err = new Error(
+                            `write aborted: ${duplicateChaIds.length} duplicate chaId value(s) — `
+                            + `would collapse distinct chat rows. sample=[${sample}]`
+                        );
+                        recordPersistFailure(err, '/api/write:duplicate-cha-ids');
                         logger.error(`[Write] ${err.message}`);
                         res.status(500).json({ error: 'Write aborted: chat data integrity check failed' });
                         return;

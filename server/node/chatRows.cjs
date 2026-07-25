@@ -91,6 +91,60 @@ function hasChatPayloads(dbObj) {
     return false;
 }
 
+function findDuplicateChaIds(dbObj) {
+    const duplicates = [];
+    const seen = new Set();
+    const reported = new Set();
+    if (!Array.isArray(dbObj?.characters)) return duplicates;
+
+    for (const character of dbObj.characters) {
+        const chaId = character?.chaId;
+        if (!chaId) continue;
+        if (seen.has(chaId) && !reported.has(chaId)) {
+            duplicates.push(chaId);
+            reported.add(chaId);
+        }
+        seen.add(chaId);
+    }
+    return duplicates;
+}
+
+function dedupeCharacterIds(dbObj, makeId = nodeCrypto.randomUUID, state = {}) {
+    const usedChaIds = state.usedChaIds ?? new Set();
+    const seenCharacters = state.seenCharacters ?? new WeakSet();
+    const reassignments = [];
+    if (!Array.isArray(dbObj?.characters)) {
+        return { reassignedDuplicateChaIds: 0, reassignments, usedChaIds, seenCharacters };
+    }
+
+    for (const character of dbObj.characters) {
+        if (!character || (typeof character !== 'object' && typeof character !== 'function')) {
+            continue;
+        }
+        if (seenCharacters.has(character)) continue;
+        seenCharacters.add(character);
+
+        const oldChaId = character.chaId;
+        if (!oldChaId) continue;
+        if (usedChaIds.has(oldChaId)) {
+            let newChaId;
+            do {
+                newChaId = makeId();
+            } while (!newChaId || usedChaIds.has(newChaId));
+            character.chaId = newChaId;
+            reassignments.push({ character, oldChaId, newChaId });
+        }
+        usedChaIds.add(character.chaId);
+    }
+
+    return {
+        reassignedDuplicateChaIds: reassignments.length,
+        reassignments,
+        usedChaIds,
+        seenCharacters,
+    };
+}
+
 function referencedChatRowKeys(dbObj) {
     const keys = new Set();
     if (!dbObj?.characters) return keys;
@@ -237,6 +291,21 @@ function createChatRowStore(options) {
         return extractPayloadChats(dbObj, writeChatRow, randomUUID);
     }
 
+    function collectReassignedStubRowCopies(reassignments) {
+        const copies = [];
+        for (const { character, oldChaId, newChaId } of reassignments) {
+            if (!Array.isArray(character?.chats)) continue;
+            for (const chat of character.chats) {
+                if (chat?._stub !== true || !chat.id) continue;
+                const value = readChatRowRaw(oldChaId, chat.id);
+                if (value !== null) {
+                    copies.push({ newChaId, chatId: chat.id, value: Buffer.from(value) });
+                }
+            }
+        }
+        return copies;
+    }
+
     function deleteRemovedChatRows(oldStrippedDb, newStrippedDb) {
         const oldKeys = referencedChatRowKeys(oldStrippedDb);
         const newKeys = referencedChatRowKeys(newStrippedDb);
@@ -319,6 +388,8 @@ function createChatRowStore(options) {
             restoreResult = await opts.restoreColdStorageCharacters(dbObj);
         }
 
+        const dedupeResult = dedupeCharacterIds(dbObj, randomUUID);
+        const stubRowCopies = collectReassignedStubRowCopies(dedupeResult.reassignments);
         const normalizedOrphanFolderIds = normalizeOrphanFolderIds(dbObj);
         const { strippedDb, chatEntries } = splitFullDb(dbObj, randomUUID);
         const referencedKeys = referencedChatRowKeys(strippedDb);
@@ -328,6 +399,9 @@ function createChatRowStore(options) {
         // implements it as a savepoint, so one failure still rolls back all rows.
         const persist = db.transaction(() => {
             kvSet(DB_BLOB_KEY, Buffer.from(encodeRisuSaveLegacy(strippedDb)));
+            for (const copy of stubRowCopies) {
+                writeChatRowRaw(copy.newChaId, copy.chatId, copy.value);
+            }
             for (const entry of chatEntries) {
                 writeChatRow(entry.chaId, entry.chatId, entry.chat);
             }
@@ -344,6 +418,7 @@ function createChatRowStore(options) {
                 deletedStale: staleKeys.length,
                 assignedMissingChatIds,
                 normalizedOrphanFolderIds,
+                reassignedDuplicateChaIds: dedupeResult.reassignedDuplicateChaIds,
             },
         };
     }
@@ -359,8 +434,48 @@ function createChatRowStore(options) {
         let assignedMissingChatIds = false;
         let streamedOrphanFolderIds = false;
         let streamedChats = 0;
+        let reassignedDuplicateChaIds = 0;
         const processors = new WeakMap();
         const validFolderIds = new WeakMap();
+        const usedChaIds = new Set();
+        const seenCharacters = new WeakSet();
+        const reassignments = [];
+        const reassignmentsByCharacter = new WeakMap();
+        const reassignmentsByNewChaId = new Map();
+        const copiedStubIds = new WeakMap();
+        const externalizedReassignmentIds = new Set();
+        const skipStubCopySweep = new WeakSet();
+        const streamedCharacterChaIds = new WeakMap();
+
+        const repairCharacterId = (character) => {
+            const result = dedupeCharacterIds(
+                { characters: [character] },
+                randomUUID,
+                { usedChaIds, seenCharacters }
+            );
+            reassignedDuplicateChaIds += result.reassignedDuplicateChaIds;
+            for (const reassignment of result.reassignments) {
+                reassignments.push(reassignment);
+                reassignmentsByCharacter.set(character, reassignment);
+                reassignmentsByNewChaId.set(reassignment.newChaId, reassignment);
+            }
+        };
+
+        const copyStubRowForReassignedCharacter = (character, chat) => {
+            if (chat?._stub !== true || !chat.id) return;
+            const reassignment = reassignmentsByCharacter.get(character);
+            if (!reassignment) return;
+            let copiedIds = copiedStubIds.get(character);
+            if (!copiedIds) {
+                copiedIds = new Set();
+                copiedStubIds.set(character, copiedIds);
+            }
+            if (copiedIds.has(chat.id)) return;
+            const value = readChatRowRaw(reassignment.oldChaId, chat.id);
+            if (value === null) return;
+            writeChatRowRaw(reassignment.newChaId, chat.id, value);
+            copiedIds.add(chat.id);
+        };
 
         try {
             const walked = await walkRisuSave(source, {
@@ -376,6 +491,12 @@ function createChatRowStore(options) {
                     return randomUUID();
                 },
                 onChat: ({ character, chat, externalizable }) => {
+                    repairCharacterId(character);
+                    const reassignment = reassignmentsByCharacter.get(character);
+                    if (externalizable && reassignment) {
+                        externalizedReassignmentIds.add(reassignment.newChaId);
+                    }
+                    copyStubRowForReassignedCharacter(character, chat);
                     if (!externalizable) return chat;
 
                     let validIds = validFolderIds.get(character);
@@ -405,9 +526,57 @@ function createChatRowStore(options) {
             });
             const dbObj = walked.remainder;
 
+            // walkRisuSave normalizes its remainder into fresh objects. Bind
+            // their streamed state before the shared post-walk sweep.
+            for (const character of dbObj.characters ?? []) {
+                if (!Array.isArray(character?.chats) || character.chats.length === 0) continue;
+                seenCharacters.add(character);
+                streamedCharacterChaIds.set(character, character.chaId);
+                const reassignment = reassignmentsByNewChaId.get(character.chaId);
+                if (!reassignment) continue;
+                const copiedIds = copiedStubIds.get(reassignment.character);
+                reassignment.character = character;
+                reassignmentsByCharacter.set(character, reassignment);
+                if (copiedIds) copiedStubIds.set(character, copiedIds);
+                if (externalizedReassignmentIds.has(reassignment.newChaId)) {
+                    skipStubCopySweep.add(character);
+                }
+            }
+
             let restoreResult;
             if (opts.restoreColdStorageCharacters) {
                 restoreResult = await opts.restoreColdStorageCharacters(dbObj);
+            }
+
+            for (const character of dbObj.characters ?? []) {
+                if (streamedCharacterChaIds.has(character)) {
+                    character.chaId = streamedCharacterChaIds.get(character);
+                }
+            }
+            for (const reassignment of reassignments) {
+                reassignment.character.chaId = reassignment.newChaId;
+            }
+            // Characters without chats are first observed here, so streaming
+            // cannot always preserve array-order ownership of a duplicate ID.
+            const sweepResult = dedupeCharacterIds(
+                dbObj,
+                randomUUID,
+                { usedChaIds, seenCharacters }
+            );
+            reassignedDuplicateChaIds += sweepResult.reassignedDuplicateChaIds;
+            for (const reassignment of sweepResult.reassignments) {
+                reassignments.push(reassignment);
+                reassignmentsByCharacter.set(reassignment.character, reassignment);
+                reassignmentsByNewChaId.set(reassignment.newChaId, reassignment);
+            }
+            // Payload chats streamed above are now stubs too; only copy stubs
+            // that still represent pre-existing rows under the old chaId.
+            for (const { character } of reassignments) {
+                if (skipStubCopySweep.has(character)) continue;
+                if (!Array.isArray(character?.chats)) continue;
+                for (const chat of character.chats) {
+                    copyStubRowForReassignedCharacter(character, chat);
+                }
             }
 
             const normalizedOrphanFolderIds = normalizeOrphanFolderIds(dbObj)
@@ -433,6 +602,7 @@ function createChatRowStore(options) {
                     deletedStale: staleKeys.length,
                     assignedMissingChatIds,
                     normalizedOrphanFolderIds,
+                    reassignedDuplicateChaIds,
                 },
             };
         } catch (error) {
@@ -464,6 +634,8 @@ function createChatRowStore(options) {
         splitFullDb,
         assembleFullDb,
         assignMissingChatIds,
+        dedupeCharacterIds,
+        findDuplicateChaIds,
         normalizeOrphanFolderIds,
         ingestFullDatabase,
         ingestStreamingDatabase,
@@ -482,6 +654,8 @@ module.exports = {
     splitFullDb,
     assignMissingChatId,
     assignMissingChatIds,
+    dedupeCharacterIds,
+    findDuplicateChaIds,
     createChatExternalizer,
     normalizeOrphanFolderIds,
 };

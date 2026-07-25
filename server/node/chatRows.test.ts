@@ -31,6 +31,11 @@ interface ChatRowStore {
     }
     assembleFullDb: (strippedDb: any) => Promise<any>
     assignMissingChatIds: (dbObj: any) => boolean
+    dedupeCharacterIds: (
+        dbObj: any,
+        makeId?: () => string,
+    ) => { reassignedDuplicateChaIds: number }
+    findDuplicateChaIds: (dbObj: any) => string[]
     normalizeOrphanFolderIds: (dbObj: any) => boolean
     ingestFullDatabase: (
         raw: Buffer | object,
@@ -45,6 +50,23 @@ interface ChatRowStore {
             deletedStale: number
             assignedMissingChatIds: boolean
             normalizedOrphanFolderIds: boolean
+            reassignedDuplicateChaIds: number
+            [key: string]: any
+        }
+    }>
+    ingestStreamingDatabase: (
+        source: Buffer | { filePath: string },
+        opts?: {
+            restoreColdStorageCharacters?: (dbObj: any) => any
+        },
+    ) => Promise<{
+        strippedDb: any
+        stats: {
+            chats: number
+            deletedStale: number
+            assignedMissingChatIds: boolean
+            normalizedOrphanFolderIds: boolean
+            reassignedDuplicateChaIds: number
             [key: string]: any
         }
     }>
@@ -57,6 +79,7 @@ const {
     chatToStub,
     hasChatPayloads,
     splitFullDb,
+    findDuplicateChaIds,
 } = chatRowsPkg as {
     createChatRowStore: (options: any) => ChatRowStore
     chatRowKey: (chaId: string, chatId: string) => string
@@ -64,6 +87,7 @@ const {
     chatToStub: (chat: any) => any
     hasChatPayloads: (dbObj: any) => boolean
     splitFullDb: ChatRowStore['splitFullDb']
+    findDuplicateChaIds: ChatRowStore['findDuplicateChaIds']
 }
 const { createChunkStore, isChunkableKey } = chunkStorePkg as {
     createChunkStore: (db: any, opts?: { threshold?: number }) => {
@@ -82,6 +106,7 @@ const { decodeRisuSave, encodeRisuSaveLegacy, normalizeJSON } = utilsPkg as {
 function makeHarness(options: {
     threshold?: number
     beforeSet?: (key: string, value: Buffer) => void
+    randomUUID?: () => string
 } = {}) {
     const db = new Database(':memory:')
     db.exec(
@@ -126,6 +151,7 @@ function makeHarness(options: {
         kvList,
         kvListWithSizes,
         kvGetUpdatedAt,
+        randomUUID: options.randomUUID,
     })
     return { db, store, kvGet, kvSet }
 }
@@ -143,6 +169,32 @@ describe('chat row keys', () => {
         expect(parseChatRowKey(key)).toEqual({ chaId, chatId })
         expect(parseChatRowKey('chats/bad/%E0%A4%A')).toBeNull()
         expect(parseChatRowKey('assets/a/b')).toBeNull()
+    })
+})
+
+describe('findDuplicateChaIds', () => {
+    it('returns each duplicated truthy character id once in encounter order', () => {
+        expect(findDuplicateChaIds({
+            characters: [
+                { chaId: 'dup' },
+                { chaId: '' },
+                { chaId: 'other' },
+                { chaId: 'dup' },
+                { chaId: 'dup' },
+                { chaId: 'other' },
+                {},
+            ],
+        })).toEqual(['dup', 'other'])
+    })
+
+    it('is pure and tolerates missing character arrays', () => {
+        const dbObj = { characters: [{ chaId: 'same' }, { chaId: 'same' }] }
+        const before = structuredClone(dbObj)
+
+        expect(findDuplicateChaIds(dbObj)).toEqual(['same'])
+        expect(dbObj).toEqual(before)
+        expect(findDuplicateChaIds({})).toEqual([])
+        expect(findDuplicateChaIds(null)).toEqual([])
     })
 })
 
@@ -458,6 +510,94 @@ describe('chat row orphan deletion', () => {
 })
 
 describe('ingestFullDatabase', () => {
+    it('reassigns duplicate character ids before writing colliding chat rows', async () => {
+        let nextId = 0
+        const { store } = makeHarness({
+            randomUUID: () => `fresh-character-${++nextId}`,
+        })
+        const result = await store.ingestFullDatabase({
+            characters: [
+                {
+                    chaId: 'dup-cha',
+                    name: 'A',
+                    chats: [{ id: 'chat-1', name: 'A chat', message: [{ data: 'A' }] }],
+                },
+                {
+                    chaId: 'dup-cha',
+                    name: 'B',
+                    chats: [{ id: 'chat-1', name: 'B chat', message: [{ data: 'B' }] }],
+                },
+            ],
+        })
+
+        const characterIds = result.strippedDb.characters.map((character: any) => character.chaId)
+        expect(characterIds).toEqual(['dup-cha', 'fresh-character-1'])
+        expect(store.listAllChatRowKeys().sort()).toEqual([
+            store.chatRowKey('dup-cha', 'chat-1'),
+            store.chatRowKey('fresh-character-1', 'chat-1'),
+        ].sort())
+        const assembled = await store.assembleFullDb(result.strippedDb)
+        expect(assembled.characters.map((character: any) => character.chats[0].message[0].data))
+            .toEqual(['A', 'B'])
+        expect(result.stats.reassignedDuplicateChaIds).toBe(1)
+    })
+
+    it('preserves a reassigned character stub by copying its existing row', async () => {
+        const { store } = makeHarness({ randomUUID: () => 'moved-character' })
+        const storedChat = {
+            id: 'stored-chat',
+            name: 'Stored payload',
+            message: [{ data: 'survives reassignment' }],
+        }
+        store.writeChatRow('dup-cha', 'stored-chat', storedChat)
+        const oldRaw = store.readChatRowRaw('dup-cha', 'stored-chat')
+
+        const result = await store.ingestFullDatabase({
+            characters: [
+                {
+                    chaId: 'dup-cha',
+                    name: 'Keeper',
+                    chats: [{ id: 'stored-chat', name: 'Keeper stub', _stub: true }],
+                },
+                {
+                    chaId: 'dup-cha',
+                    name: 'Moved',
+                    chats: [{ id: 'stored-chat', name: 'Moved stub', _stub: true }],
+                },
+            ],
+        })
+
+        expect(result.stats.reassignedDuplicateChaIds).toBe(1)
+        expect(store.readChatRowRaw('dup-cha', 'stored-chat')?.equals(oldRaw as Buffer)).toBe(true)
+        expect(store.readChatRowRaw('moved-character', 'stored-chat')?.equals(oldRaw as Buffer))
+            .toBe(true)
+        const assembled = await store.assembleFullDb(result.strippedDb)
+        expect(assembled.characters[1].chats[0]).toMatchObject({
+            name: 'Moved stub',
+            message: [{ data: 'survives reassignment' }],
+        })
+    })
+
+    it('reassigns every later occurrence when three characters share one id', async () => {
+        let nextId = 0
+        const { store } = makeHarness({ randomUUID: () => `unique-${++nextId}` })
+        const result = await store.ingestFullDatabase({
+            characters: ['A', 'B', 'C'].map(data => ({
+                chaId: 'triplicate',
+                chats: [{ id: 'same-chat', message: [{ data }] }],
+            })),
+        })
+
+        const characterIds = result.strippedDb.characters.map((character: any) => character.chaId)
+        expect(characterIds).toEqual(['triplicate', 'unique-1', 'unique-2'])
+        expect(new Set(characterIds).size).toBe(3)
+        expect(store.listAllChatRowKeys()).toHaveLength(3)
+        const assembled = await store.assembleFullDb(result.strippedDb)
+        expect(assembled.characters.map((character: any) => character.chats[0].message[0].data))
+            .toEqual(['A', 'B', 'C'])
+        expect(result.stats.reassignedDuplicateChaIds).toBe(2)
+    })
+
     it('writes object input, removes stale rows, preserves stub-referenced rows, and sets marker', async () => {
         const { store, kvGet } = makeHarness()
         const survivor = { id: 'survivor', name: 'Stored', message: [{ data: 'old' }] }
@@ -479,6 +619,7 @@ describe('ingestFullDatabase', () => {
         })
 
         expect(result.stats).toMatchObject({ chats: 1, deletedStale: 1 })
+        expect(result.stats.reassignedDuplicateChaIds).toBe(0)
         expect(await store.readChatRow('char', 'survivor')).toEqual(survivor)
         expect(await store.readChatRow('char', 'stale')).toBeNull()
         expect(await store.readChatRow('char', 'new')).toMatchObject({ id: 'new' })
@@ -556,5 +697,98 @@ describe('ingestFullDatabase', () => {
         expect(db.prepare('SELECT COUNT(*) n FROM kv').get().n).toBe(0)
         expect(db.prepare('SELECT COUNT(*) n FROM manifest_chunks').get().n).toBe(0)
         expect(db.prepare('SELECT COUNT(*) n FROM chunks').get().n).toBe(0)
+    })
+})
+
+describe('ingestStreamingDatabase', () => {
+    it('reassigns duplicate character ids before streaming colliding chat rows', async () => {
+        let nextId = 0
+        const { store } = makeHarness({
+            randomUUID: () => `stream-character-${++nextId}`,
+        })
+        const source = Buffer.from(encodeRisuSaveLegacy({
+            characters: [
+                {
+                    chats: [{ id: 'chat-1', name: 'A chat', message: [{ data: 'A' }] }],
+                    chaId: 'dup-cha',
+                    name: 'A',
+                },
+                {
+                    chats: [{ id: 'chat-1', name: 'B chat', message: [{ data: 'B' }] }],
+                    chaId: 'dup-cha',
+                    name: 'B',
+                },
+            ],
+        }))
+
+        const result = await store.ingestStreamingDatabase(source)
+        const characterIds = result.strippedDb.characters.map((character: any) => character.chaId)
+        expect(new Set(characterIds).size).toBe(2)
+        expect(store.listAllChatRowKeys().sort()).toEqual(characterIds.map((chaId: string) => (
+            store.chatRowKey(chaId, 'chat-1')
+        )).sort())
+        const assembled = await store.assembleFullDb(result.strippedDb)
+        expect(assembled.characters.map((character: any) => character.chats[0].message[0].data))
+            .toEqual(['A', 'B'])
+        expect(result.stats.reassignedDuplicateChaIds).toBe(1)
+    })
+
+    it('copies an existing stub row when its character id is reassigned mid-walk', async () => {
+        const { store } = makeHarness({ randomUUID: () => 'stream-moved-character' })
+        const storedChat = {
+            id: 'stored-chat',
+            name: 'Stored payload',
+            message: [{ data: 'streaming stub survives' }],
+        }
+        store.writeChatRow('dup-cha', 'stored-chat', storedChat)
+        const oldRaw = store.readChatRowRaw('dup-cha', 'stored-chat')
+        const source = Buffer.from(encodeRisuSaveLegacy({
+            characters: [
+                {
+                    chaId: 'dup-cha',
+                    chats: [{ id: 'stored-chat', name: 'Keeper stub', _stub: true }],
+                },
+                {
+                    chaId: 'dup-cha',
+                    chats: [{ id: 'stored-chat', name: 'Moved stub', _stub: true }],
+                },
+            ],
+        }))
+
+        const result = await store.ingestStreamingDatabase(source)
+
+        expect(result.stats.reassignedDuplicateChaIds).toBe(1)
+        expect(store.readChatRowRaw('dup-cha', 'stored-chat')?.equals(oldRaw as Buffer)).toBe(true)
+        expect(
+            store.readChatRowRaw('stream-moved-character', 'stored-chat')?.equals(oldRaw as Buffer),
+        ).toBe(true)
+        const assembled = await store.assembleFullDb(result.strippedDb)
+        expect(assembled.characters[1].chats[0]).toMatchObject({
+            name: 'Moved stub',
+            message: [{ data: 'streaming stub survives' }],
+        })
+    })
+
+    it('sweeps chatless characters with the same duplicate-id state', async () => {
+        let nextId = 0
+        const { store } = makeHarness({ randomUUID: () => `swept-${++nextId}` })
+        const source = Buffer.from(encodeRisuSaveLegacy({
+            characters: [
+                { chaId: 'dup-cha', name: 'Chatless', chats: [] },
+                {
+                    chaId: 'dup-cha',
+                    name: 'Streamed',
+                    chats: [{ id: 'chat-1', message: [{ data: 'kept' }] }],
+                },
+            ],
+        }))
+
+        const result = await store.ingestStreamingDatabase(source)
+        const characterIds = result.strippedDb.characters.map((character: any) => character.chaId)
+
+        expect(new Set(characterIds).size).toBe(2)
+        expect(result.stats.reassignedDuplicateChaIds).toBe(1)
+        const assembled = await store.assembleFullDb(result.strippedDb)
+        expect(assembled.characters[1].chats[0].message).toEqual([{ data: 'kept' }])
     })
 })
