@@ -13,6 +13,7 @@ import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEncoder, RisuSavePatcher, type toSaveType } from "./storage/risuSave";
 import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat } from "./storage/chatStorage";
+import { prepareChatPersistStage } from "./storage/chatPersistStage";
 import { AutoStorage } from "./storage/autoStorage";
 import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
 import { supportsPatchSync } from "./platform";
@@ -387,6 +388,7 @@ export async function saveDb() {
                 new Set((character.chats ?? []).map(chat => chat?.id).filter(Boolean)),
             ])
     )
+    const generationChatCheckpoints = new Map<string, number>()
     let channel: BroadcastChannel
     if (window.BroadcastChannel) {
         channel = new BroadcastChannel('risu-db')
@@ -503,6 +505,9 @@ export async function saveDb() {
         doingChat.subscribe((isDoingChat) => {
             const wasDoingChat = doingChatState
             doingChatState = isDoingChat
+            if (!wasDoingChat && isDoingChat) {
+                generationChatCheckpoints.clear()
+            }
             if (wasDoingChat && !isDoingChat) {
                 saveTimeoutExecute()
             }
@@ -684,57 +689,6 @@ export async function saveDb() {
         changeTracker.root = changeTracker.root || toSave.root
     }
 
-    function collectChatsToPersist(db: Database, toSave: toSaveType): [string, string][] {
-        const chatsToPersist: [string, string][] = []
-        const seen = new Set<string>()
-        const pushChat = (chaId: string, chatId: string) => {
-            if (!chaId || !chatId) return
-            const key = `${chaId}|${chatId}`
-            if (seen.has(key)) return
-            seen.add(key)
-            chatsToPersist.push([chaId, chatId])
-        }
-
-        for (const [chaId, chatId] of toSave.chat) {
-            pushChat(chaId, chatId)
-        }
-
-        for (const chaId of toSave.character) {
-            const char = db.characters.find(c => c?.chaId === chaId)
-            if (!char) continue
-            const knownChatIds = knownChatIdsByCharacter.get(chaId) ?? new Set<string>()
-            for (const chat of char.chats ?? []) {
-                if (!chat?.id || chat._placeholder) continue
-                if (!knownChatIds.has(chat.id)) {
-                    pushChat(chaId, chat.id)
-                }
-            }
-        }
-
-        return chatsToPersist
-    }
-
-    function updateKnownChatsAfterSuccessfulSave(db: Database, toSave: toSaveType) {
-        for (const chaId of toSave.character) {
-            const char = db.characters.find(c => c?.chaId === chaId)
-            if (!char) {
-                knownChatIdsByCharacter.delete(chaId)
-                continue
-            }
-            knownChatIdsByCharacter.set(
-                chaId,
-                new Set((char.chats ?? []).map(chat => chat?.id).filter(Boolean))
-            )
-        }
-
-        for (const [chaId, chatId] of toSave.chat) {
-            if (!chaId || !chatId) continue
-            const knownChatIds = knownChatIdsByCharacter.get(chaId) ?? new Set<string>()
-            knownChatIds.add(chatId)
-            knownChatIdsByCharacter.set(chaId, knownChatIds)
-        }
-    }
-
     async function rebaseTrackedLocalChangesOnLatestServerDb(conflictEtag: string | null, db: Database, toSave: toSaveType) {
         forageStorage.setDbEtag(conflictEtag ?? null)
         const latestData = await forageStorage.getItem('database/database.bin') as unknown as Uint8Array
@@ -835,39 +789,26 @@ export async function saveDb() {
             return 'noop'
         }
 
-        // ── Save changed chat content to server ─────────────────────────
-        const failedChats: [string, string][] = []
-        const chatsToPersist = collectChatsToPersist(db, toSave)
-        if (doingChatState && !options?.forceChatPersist) {
-            requeueChatChanges(chatsToPersist)
-        }
-        else {
-            for (const [chaId, chatId] of chatsToPersist) {
-                const char = db.characters.find(c => c.chaId === chaId)
-                if (!char) continue
-                const chatIndex = char.chats.findIndex(c => c.id === chatId)
-                if (chatIndex === -1) continue
-                const chat = char.chats[chatIndex]
-                // Skip placeholders — they have no real data to save
-                if (!chat || chat._placeholder) continue
-                try {
-                    await saveChatToServer(chaId, chatIndex, chatId, chat)
-                } catch (e) {
-                    console.error(`[Save] Failed to save chat ${chaId}/${chatId}:`, e)
-                    failedChats.push([chaId, chatId])
-                }
-            }
-        }
-        if (failedChats.length > 0) {
-            throw new Error(`Failed to save ${failedChats.length} chat${failedChats.length === 1 ? '' : 's'}`)
-        }
+        const chatPersistStage = await prepareChatPersistStage({
+            db,
+            toSave,
+            doingChat: doingChatState,
+            forceChatPersist: options?.forceChatPersist,
+            knownChatIdsByCharacter,
+            generationCheckpoints: generationChatCheckpoints,
+            saveChat: saveChatToServer,
+            requeueChats: requeueChatChanges,
+            onRowWriteFailure: (chaId, chatId, error) => {
+                console.error(`[Save] Failed to save chat ${chaId}/${chatId}:`, error)
+            },
+        })
 
         // ── database.bin: exclude chat payload (stubs only via encoder) ──
         await encoder.set(db, safeStructuredClone(toSave))
         const encoded = encoder.encode()
         if (!encoded) {
             await sleep(1000)
-            return 'noop'
+            return chatPersistStage.completeStubCommit({ committed: false, result: 'noop' })
         }
         const dbData = new Uint8Array(encoded)
 
@@ -1066,7 +1007,7 @@ export async function saveDb() {
                     console.warn('[Save] Full-write conflict detected, rebasing tracked local changes on latest server DB...')
                     await rebaseTrackedLocalChangesOnLatestServerDb(conflictErr.currentEtag ?? null, db, toSave)
                     await sleep(Math.min(500 * (savetrys + 1), 3000))
-                    return 'retry'
+                    return chatPersistStage.completeStubCommit({ committed: false, result: 'retry' })
                 }
                 throw conflictErr
             }
@@ -1079,14 +1020,11 @@ export async function saveDb() {
             }
         }
 
-        updateKnownChatsAfterSuccessfulSave(db, toSave)
-
         if (newEtag) {
             forageStorage.setDbEtag(newEtag)
         }
 
-
-        return 'saved'
+        return chatPersistStage.completeStubCommit({ committed: true, result: 'saved' })
     }
 
     async function triggerSave(options?: {
