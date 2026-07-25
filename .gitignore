@@ -61,3 +61,4 @@ Cargo.lock
 test/fixtures/
 
 CLAUDE.local.md
+AGENTS.override.md
