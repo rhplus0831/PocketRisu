@@ -44,6 +44,8 @@ async function getFreePort(): Promise<number> {
 export interface SpawnServerOptions {
   /** Extra env vars to pass to the spawned server process. */
   env?: Record<string, string>
+  /** Skip the optional server-file-backup destination for hub-mode coverage. */
+  createBackupsDir?: boolean
   /**
    * Seed files into the temp `save/` directory BEFORE the server boots — e.g.
    * to plant an old hex-named save folder and exercise migrateFromSaveDir.
@@ -55,7 +57,9 @@ export interface SpawnServerOptions {
 export async function spawnServer(opts: SpawnServerOptions = {}): Promise<ServerHandle> {
   const tempDir = await mkdtemp(path.join(tmpdir(), 'risu-compat-'))
   await mkdir(path.join(tempDir, 'save'), { recursive: true })
-  await mkdir(path.join(tempDir, 'backups'), { recursive: true })
+  if (opts.createBackupsDir !== false) {
+    await mkdir(path.join(tempDir, 'backups'), { recursive: true })
+  }
   await writeFile(path.join(tempDir, 'save', '__password'), TEST_PASSWORD, 'utf-8')
   if (opts.seedSave) await opts.seedSave(path.join(tempDir, 'save'))
 

@@ -240,6 +240,7 @@ const BACKUP_INTERVAL_MS = process.env.POCKETRISU_BACKUP_INTERVAL_MS
     ? Number(process.env.POCKETRISU_BACKUP_INTERVAL_MS)
     : 5 * 60 * 1000; // 5 minutes (override for tests to force snapshot creation)
 let lastBackupTime = null;
+let backupCreationInFlight = false;
 
 function readSnapshotConfigInt(key, fallback, min, max) {
     try {
@@ -311,27 +312,38 @@ async function createBackupAndRotate() {
     if (lastBackupTime && now - lastBackupTime < BACKUP_INTERVAL_MS) {
         return;
     }
-    lastBackupTime = now;
+    if (backupCreationInFlight) return;
 
-    const backupKey = `${DB_BACKUP_PREFIX}${(now / 100).toFixed()}.bin`;
-    const raw = kvGet('database/database.bin');
-    if (!raw) return;
-    const strippedDb = dbCache[DB_HEX_KEY] || await loadStrippedDatabase(raw, 'snapshot');
-    const backupDbSpool = await spoolSelfContainedBackupDatabase(strippedDb, {
-        onMissingChatRow: (chaId, chatId) => {
-            logger.warn(
-                `[Snapshot] Missing referenced chat row ${chaId}/${chatId}; preserving bare stub`
-            );
-        },
-    });
+    backupCreationInFlight = true;
+    let backupDbSpool = null;
     try {
+        const backupKey = `${DB_BACKUP_PREFIX}${(now / 100).toFixed()}.bin`;
+        const raw = kvGet('database/database.bin');
+        if (!raw) return;
+        const strippedDb = dbCache[DB_HEX_KEY] || await loadStrippedDatabase(raw, 'snapshot');
+        backupDbSpool = await spoolSelfContainedBackupDatabase(strippedDb, {
+            onMissingChatRow: (chaId, chatId) => {
+                logger.warn(
+                    `[Snapshot] Missing referenced chat row ${chaId}/${chatId}; preserving bare stub`
+                );
+            },
+        });
         // SQLite's KV API still needs one Buffer, but the chat object tree is
         // never materialized alongside it.
         kvSet(backupKey, await fs.readFile(backupDbSpool.filePath));
+        lastBackupTime = Date.now();
+        trimSnapshotsToLimits();
+    } catch (error) {
+        logger.error(
+            `[Snapshot] Failed to create database snapshot using spool ${databaseSpoolDir}:`,
+            error
+        );
     } finally {
-        await fs.unlink(backupDbSpool.filePath).catch(() => {});
+        if (backupDbSpool) {
+            await fs.unlink(backupDbSpool.filePath).catch(() => {});
+        }
+        backupCreationInFlight = false;
     }
-    trimSnapshotsToLimits();
 }
 
 async function flushPendingDb() {
@@ -806,6 +818,35 @@ let password = ''
 const savePath = path.join(process.cwd(), "save")
 if(!existsSync(savePath)){
     mkdirSync(savePath)
+}
+
+const DATABASE_SPOOL_FILE_PREFIX = '.database-risudat-';
+// POCKETRISU_SPOOL_DIR may relocate temporary database assembly. The default
+// remains on the writable save volume and is independent of server backups.
+const configuredDatabaseSpoolDir = String(process.env.POCKETRISU_SPOOL_DIR ?? '').trim();
+const databaseSpoolDir = configuredDatabaseSpoolDir
+    ? path.resolve(configuredDatabaseSpoolDir)
+    : path.join(savePath, '.spool');
+let databaseSpoolReady = true;
+try {
+    mkdirSync(databaseSpoolDir, { recursive: true });
+} catch (error) {
+    databaseSpoolReady = false;
+    logger.error(`[Backup] Could not create database spool directory ${databaseSpoolDir}:`, error);
+}
+if (databaseSpoolReady) {
+    try {
+        for (const entry of readdirSync(databaseSpoolDir, { withFileTypes: true })) {
+            if (!entry.isFile() || !entry.name.startsWith(DATABASE_SPOOL_FILE_PREFIX)) continue;
+            try {
+                unlinkSync(path.join(databaseSpoolDir, entry.name));
+            } catch (error) {
+                logger.warn(`[Backup] Could not remove orphaned spool file ${entry.name}:`, error);
+            }
+        }
+    } catch (error) {
+        logger.warn(`[Backup] Could not sweep database spool directory ${databaseSpoolDir}:`, error);
+    }
 }
 
 // Server-side backup directory (outside save/ to avoid bloating updater copies).
@@ -2375,8 +2416,8 @@ async function spoolSelfContainedBackupDatabase(
     } = {}
 ) {
     const finalPath = path.join(
-        backupsDir,
-        `.database-risudat-${process.pid}-${nodeCrypto.randomUUID()}`
+        databaseSpoolDir,
+        `${DATABASE_SPOOL_FILE_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}`
     );
     const filePath = finalPath + '.tmp';
     const pluginStorage = foldPluginStorage
