@@ -108,6 +108,28 @@ const chunkThreshold = process.env.POCKETRISU_CHUNK_THRESHOLD
     : undefined;
 const chunkStore = createChunkStore(db, { threshold: chunkThreshold });
 
+// Test-only kvSet failure injection, parsed once at startup:
+//   key:<exact-key> or prefix:<key-prefix>:<nth-write>
+function parseKvSetFailpoint(raw) {
+    if (!raw) return null;
+    if (raw.startsWith('key:')) {
+        const key = raw.slice('key:'.length);
+        return key ? { type: 'key', key } : null;
+    }
+    if (raw.startsWith('prefix:')) {
+        const value = raw.slice('prefix:'.length);
+        const separator = value.lastIndexOf(':');
+        if (separator <= 0) return null;
+        const prefix = value.slice(0, separator);
+        const nth = Number(value.slice(separator + 1));
+        if (!Number.isInteger(nth) || nth < 1) return null;
+        return { type: 'prefix', prefix, nth, seen: 0 };
+    }
+    return null;
+}
+
+const kvSetFailpoint = parseKvSetFailpoint(process.env.POCKETRISU_TEST_FAILPOINT);
+
 // ─── KV operations ────────────────────────────────────────────────────────────
 // Chunk-capable writes route through chunkStore; reads/deletes/sizes/copies are
 // chunk-aware for every key. The statements below serve direct-row writes/lists.
@@ -148,6 +170,17 @@ function kvGet(key) {
 }
 
 function kvSet(key, value) {
+    if (kvSetFailpoint) {
+        if (kvSetFailpoint.type === 'key' && key === kvSetFailpoint.key) {
+            throw new Error(`Injected kvSet failure for key ${key}`);
+        }
+        if (kvSetFailpoint.type === 'prefix' && key.startsWith(kvSetFailpoint.prefix)) {
+            kvSetFailpoint.seen++;
+            if (kvSetFailpoint.seen === kvSetFailpoint.nth) {
+                throw new Error(`Injected kvSet failure for ${key} at prefix write ${kvSetFailpoint.nth}`);
+            }
+        }
+    }
     if (isChunkableKey(key)) {
         chunkStore.putValue(key, value);
     } else {

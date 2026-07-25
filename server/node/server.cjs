@@ -119,6 +119,7 @@ const HUB_HOSTING_MODE = ['true', '1'].includes(String(process.env.POCKETRISU_HU
 // dbCache stores the STRIPPED (stubs-only) version matching what the client sees.
 let dbCache = {};
 let saveTimers = {};
+const pendingChatRowDeletions = new Set();
 const SAVE_INTERVAL = 5000;
 
 const chatRowStore = createChatRowStore({
@@ -332,6 +333,7 @@ async function flushPendingDb() {
 
 function invalidateDbCache() {
     delete dbCache[DB_HEX_KEY];
+    pendingChatRowDeletions.clear();
     if (saveTimers[DB_HEX_KEY]) {
         clearTimeout(saveTimers[DB_HEX_KEY]);
         delete saveTimers[DB_HEX_KEY];
@@ -660,18 +662,27 @@ function findStubFlagLossChats(dbObj) {
     return losses;
 }
 
+function trackPendingChatRowDeletions(oldStrippedDb, newStrippedDb) {
+    const oldKeys = chatRowStore.referencedChatRowKeys(oldStrippedDb);
+    const newKeys = chatRowStore.referencedChatRowKeys(newStrippedDb);
+    for (const key of oldKeys) {
+        if (!newKeys.has(key)) pendingChatRowDeletions.add(key);
+    }
+    for (const key of newKeys) pendingChatRowDeletions.delete(key);
+}
+
 /**
  * Persist the stubs-only patch cache.
  */
 async function persistDbCache(filePath, decodedKey) {
-    const strippedDb = dbCache[filePath];
-    if (!strippedDb) return;
+    const cachedDb = dbCache[filePath];
+    if (!cachedDb) return;
 
     // Disk protection guard: abort persist on metadata-only chats.
     // Invalidate dbCache so the next request re-reads from disk and rebuilds a
     // consistent stub view; client receives 409 on next /api/patch via hash mismatch.
     if (decodedKey === 'database/database.bin') {
-        const losses = findStubFlagLossChats(strippedDb);
+        const losses = findStubFlagLossChats(cachedDb);
         if (losses.length > 0) {
             const sample = losses.slice(0, 3).map(l => `${l.chaId}/${l.chatId ?? l.chatIndex}`).join(', ');
             const err = new Error(
@@ -679,18 +690,29 @@ async function persistDbCache(filePath, decodedKey) {
                 + `would silently strip messages on disk. sample=[${sample}]`
             );
             recordPersistFailure(err, 'persistDbCache:stub-flag-loss');
-            delete dbCache[filePath];
+            invalidateDbCache();
             throw err;
         }
     }
 
-    if (decodedKey === 'database/database.bin') {
-        externalizePluginStorageIfNeeded(strippedDb);
-    }
-
+    const pluginExternalization = decodedKey === 'database/database.bin'
+        ? preparePluginStorageExternalization(cachedDb)
+        : { strippedDb: cachedDb, rows: [], changed: false };
+    const strippedDb = pluginExternalization.strippedDb;
     const data = Buffer.from(encodeRisuSaveLegacy(strippedDb));
+    const referencedChatRows = decodedKey === 'database/database.bin'
+        ? chatRowStore.referencedChatRowKeys(strippedDb)
+        : new Set();
+    const chatRowsToDelete = decodedKey === 'database/database.bin'
+        ? [...pendingChatRowDeletions].filter(key => !referencedChatRows.has(key))
+        : [];
     try {
-        kvSet(decodedKey, data);
+        // Must stay synchronous: better-sqlite3 commits when this callback returns.
+        sqliteDb.transaction(() => {
+            writePluginStorageRows(pluginExternalization.rows);
+            kvSet(decodedKey, data);
+            for (const key of chatRowsToDelete) kvDel(key);
+        })();
     } catch (err) {
         // Tag with BLOB size so the visibility layer can surface it to the user.
         // The dominant failure mode (better-sqlite3 INT_MAX) is size-driven.
@@ -698,6 +720,10 @@ async function persistDbCache(filePath, decodedKey) {
             try { err.attemptedSize = data.length; } catch {}
         }
         throw err;
+    }
+    if (decodedKey === 'database/database.bin') {
+        dbCache[filePath] = strippedDb;
+        pendingChatRowDeletions.clear();
     }
 }
 
@@ -2251,17 +2277,9 @@ function hasExternalizablePluginStorage(dbObj) {
     return hasValues || hasMetaField;
 }
 
-/**
- * Re-externalize folded plugin storage from an optimized database object.
- *
- * Rows are committed before the caller is allowed to encode the mutated stub.
- * A crash can therefore leave duplicates, never a stub without its rows. The
- * source object is left untouched if any row write fails, and a later run
- * overwrites rows from the still-inline values (inline wins).
- */
-function externalizePluginStorageIfNeeded(dbObj) {
+function preparePluginStorageExternalization(dbObj) {
     if (!hasExternalizablePluginStorage(dbObj)) {
-        return { changed: false, values: 0, meta: 0 };
+        return { strippedDb: dbObj, rows: [], changed: false, values: 0, meta: 0 };
     }
 
     const valueEntries = Object.entries(dbObj.pluginCustomStorage ?? {});
@@ -2269,18 +2287,40 @@ function externalizePluginStorageIfNeeded(dbObj) {
     const rows = [
         ...valueEntries.map(([rawKey, value]) => ({
             storageKey: encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_PREFIX),
-            value,
+            value: Buffer.from(JSON.stringify(value), 'utf-8'),
         })),
         ...metaEntries.map(([rawKey, value]) => ({
             storageKey: encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX),
-            value,
+            value: Buffer.from(JSON.stringify(value), 'utf-8'),
         })),
     ];
+    const strippedDb = { ...dbObj, pluginCustomStorage: {} };
+    delete strippedDb.pluginStorageMeta;
+    return {
+        strippedDb,
+        rows,
+        changed: true,
+        values: valueEntries.length,
+        meta: metaEntries.length,
+    };
+}
+
+function writePluginStorageRows(rows) {
+    for (const row of rows) kvSet(row.storageKey, row.value);
+}
+
+/**
+ * Re-externalize folded plugin storage from an optimized database object.
+ * The source object is left untouched if any row write fails.
+ */
+function externalizePluginStorageIfNeeded(dbObj) {
+    const prepared = preparePluginStorageExternalization(dbObj);
+    if (!prepared.changed) {
+        return { changed: false, values: 0, meta: 0 };
+    }
 
     const writeRows = sqliteDb.transaction(() => {
-        for (const row of rows) {
-            kvSet(row.storageKey, Buffer.from(JSON.stringify(row.value), 'utf-8'));
-        }
+        writePluginStorageRows(prepared.rows);
     });
     writeRows();
 
@@ -2288,8 +2328,8 @@ function externalizePluginStorageIfNeeded(dbObj) {
     delete dbObj.pluginStorageMeta;
     return {
         changed: true,
-        values: valueEntries.length,
-        meta: metaEntries.length,
+        values: prepared.values,
+        meta: prepared.meta,
     };
 }
 
@@ -4063,15 +4103,31 @@ app.post('/api/write', async (req, res, next) => {
                         return;
                     }
 
-                    const pluginExternalization = externalizePluginStorageIfNeeded(incomingDb);
-                    const extracted = chatRowStore.extractPayloadChats(incomingDb);
-                    if (extracted > 0 || pluginExternalization.changed) {
-                        persistedDatabaseContent = Buffer.from(encodeRisuSaveLegacy(incomingDb));
+                    const splitDatabase = chatRowStore.splitFullDb(incomingDb);
+                    const chatRows = splitDatabase.chatEntries.map(entry => ({
+                        ...entry,
+                        value: Buffer.from(encodeRisuSaveLegacy(entry.chat)),
+                    }));
+                    const pluginExternalization = preparePluginStorageExternalization(
+                        splitDatabase.strippedDb
+                    );
+                    const strippedDb = pluginExternalization.strippedDb;
+                    if (chatRows.length > 0 || pluginExternalization.changed) {
+                        persistedDatabaseContent = Buffer.from(encodeRisuSaveLegacy(strippedDb));
                     }
-                    kvSet(key, persistedDatabaseContent);
-                    if (previousStrippedDb) {
-                        chatRowStore.deleteRemovedChatRows(previousStrippedDb, incomingDb);
-                    }
+
+                    // Must stay synchronous: every external row and the stub graph
+                    // commit or roll back together with database.bin.
+                    sqliteDb.transaction(() => {
+                        writePluginStorageRows(pluginExternalization.rows);
+                        for (const row of chatRows) {
+                            chatRowStore.writeChatRowRaw(row.chaId, row.chatId, row.value);
+                        }
+                        kvSet(key, persistedDatabaseContent);
+                        if (previousStrippedDb) {
+                            chatRowStore.deleteRemovedChatRows(previousStrippedDb, strippedDb);
+                        }
+                    })();
                 } catch (e) {
                     logger.error('[Write] Failed to externalize database payloads:', e.message);
                     res.status(500).json({ error: 'Database write failed' });
@@ -4087,11 +4143,7 @@ app.post('/api/write', async (req, res, next) => {
 
             // Update ETag, backup, and invalidate cache after database.bin write
             if (key === 'database/database.bin') {
-                delete dbCache[DB_HEX_KEY];
-                if (saveTimers[DB_HEX_KEY]) {
-                    clearTimeout(saveTimers[DB_HEX_KEY]);
-                    delete saveTimers[DB_HEX_KEY];
-                }
+                invalidateDbCache();
                 // ETag based on stripped version (what client sees)
                 dbEtag = computeBufferEtag(persistedDatabaseContent);
                 await createBackupAndRotate();
@@ -4220,7 +4272,8 @@ app.post('/api/patch', async (req, res, next) => {
                 result = applyPatch(snapshot, patch, true);
             } catch (patchErr) {
                 // Invalidate corrupted cache entry to force reload on next request
-                delete dbCache[filePath];
+                if (decodedKey === 'database/database.bin') invalidateDbCache();
+                else delete dbCache[filePath];
                 throw patchErr;
             }
             if (decodedKey === 'database/database.bin') {
@@ -4228,7 +4281,7 @@ app.post('/api/patch', async (req, res, next) => {
                 // that the debounced persist will write.
                 externalizePluginStorageIfNeeded(snapshot);
                 chatRowStore.extractPayloadChats(snapshot);
-                chatRowStore.deleteRemovedChatRows(dbCache[filePath], snapshot);
+                trackPendingChatRowDeletions(dbCache[filePath], snapshot);
             }
             dbCache[filePath] = snapshot;
 
