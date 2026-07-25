@@ -36,7 +36,8 @@ const { kvGet, kvSet, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
         kvGetListEpoch, kvBumpListEpoch,
-        gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, db: sqliteDb } = require('./db.cjs');
+        gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, createKvSnapshot,
+        db: sqliteDb } = require('./db.cjs');
 const { buildListResponse } = require('./listDelta.cjs');
 const {
     assetDir,
@@ -78,7 +79,7 @@ const {
     buildCachedDbReadEnvelope,
     encodeCachedDbReadEnvelope,
 } = require('./dbCachedRead.cjs');
-const { createChatRowStore, hasChatPayloads } = require('./chatRows.cjs');
+const { createChatRowStore, chatRowKey, hasChatPayloads } = require('./chatRows.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
 const { inspectRisuSaveSource, shouldStreamRisuSave } = require('./streamRisuLoad.cjs');
 const { createChatBackupStore, resolveChatBackupMaxBytes } = require('./chatBackups.cjs');
@@ -289,7 +290,13 @@ async function createBackupAndRotate() {
     const raw = kvGet('database/database.bin');
     if (!raw) return;
     const strippedDb = dbCache[DB_HEX_KEY] || await loadStrippedDatabase(raw, 'snapshot');
-    const backupDbSpool = await spoolSelfContainedBackupDatabase(strippedDb);
+    const backupDbSpool = await spoolSelfContainedBackupDatabase(strippedDb, {
+        onMissingChatRow: (chaId, chatId) => {
+            logger.warn(
+                `[Snapshot] Missing referenced chat row ${chaId}/${chatId}; preserving bare stub`
+            );
+        },
+    });
     try {
         // SQLite's KV API still needs one Buffer, but the chat object tree is
         // never materialized alongside it.
@@ -2211,8 +2218,8 @@ function externalizePluginStorageIfNeeded(dbObj) {
     };
 }
 
-function parsePluginSaveJson(storageKey) {
-    const value = kvGet(storageKey);
+function parsePluginSaveJson(storageKey, readValue = kvGet) {
+    const value = readValue(storageKey);
     if (!value) {
         throw new Error(`Missing external plugin storage value: ${storageKey}`);
     }
@@ -2229,7 +2236,12 @@ function parsePluginSaveJson(storageKey) {
  */
 async function spoolSelfContainedBackupDatabase(
     strippedDb,
-    { foldPluginStorage = false, shouldAbort = () => false } = {}
+    {
+        foldPluginStorage = false,
+        shouldAbort = () => false,
+        reader = { kvGet, kvList },
+        onMissingChatRow,
+    } = {}
 ) {
     const finalPath = path.join(
         backupsDir,
@@ -2238,15 +2250,15 @@ async function spoolSelfContainedBackupDatabase(
     const filePath = finalPath + '.tmp';
     const pluginStorage = foldPluginStorage
         ? {
-            valueRows: kvList(PLUGIN_SAVE_PREFIX).map((storageKey) => ({
+            valueRows: reader.kvList(PLUGIN_SAVE_PREFIX).map((storageKey) => ({
                 key: decodePluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX),
                 source: storageKey,
             })),
-            metaRows: kvList(PLUGIN_SAVE_META_PREFIX).map((storageKey) => ({
+            metaRows: reader.kvList(PLUGIN_SAVE_META_PREFIX).map((storageKey) => ({
                 key: decodePluginSaveStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX),
                 source: storageKey,
             })),
-            readRow: parsePluginSaveJson,
+            readRow: (storageKey) => parsePluginSaveJson(storageKey, reader.kvGet),
         }
         : null;
 
@@ -2254,9 +2266,13 @@ async function spoolSelfContainedBackupDatabase(
         return await streamRisuSaveToFile({
             dbObj: strippedDb,
             filePath,
-            readChatRow: (chaId, chatId) => chatRowStore.readChatRow(chaId, chatId),
+            readChatRow: async (chaId, chatId) => {
+                const value = reader.kvGet(chatRowKey(chaId, chatId));
+                return value === null ? null : decodeRisuSave(value);
+            },
             pluginStorage,
             shouldAbort,
+            onMissingChatRow,
         });
     } catch (error) {
         await fs.unlink(filePath).catch(() => {});
@@ -2273,14 +2289,24 @@ async function buildSelfContainedBackupDatabase({
     foldPluginStorage = true,
     shouldAbort = () => false,
 } = {}) {
-    const raw = kvGet('database/database.bin');
-    if (!raw) return null;
+    let snapshot = null;
+    try {
+        snapshot = await queueStorageOperation(async () => {
+            await flushPendingDb();
+            return createKvSnapshot();
+        });
+        const raw = snapshot.kvGet('database/database.bin');
+        if (!raw) return null;
 
-    const strippedDb = await loadStrippedDatabase(raw, 'Backup');
-    return spoolSelfContainedBackupDatabase(strippedDb, {
-        foldPluginStorage,
-        shouldAbort,
-    });
+        const strippedDb = await loadStrippedDatabase(raw, 'Backup');
+        return await spoolSelfContainedBackupDatabase(strippedDb, {
+            foldPluginStorage,
+            shouldAbort,
+            reader: snapshot,
+        });
+    } finally {
+        snapshot?.close();
+    }
 }
 
 function listPluginBackupEntries() {
@@ -4117,38 +4143,44 @@ app.post('/api/patch', async (req, res, next) => {
             if (saveTimers[filePath]) {
                 clearTimeout(saveTimers[filePath]);
             }
-            saveTimers[filePath] = setTimeout(async () => {
-                try {
-                    if (decodedKey === 'database/database.bin') {
-                        await persistDbCache(filePath, decodedKey);
-                    } else {
-                        const data = Buffer.from(encodeRisuSaveLegacy(dbCache[filePath]));
-                        try {
-                            kvSet(decodedKey, data);
-                        } catch (err) {
-                            if (err && typeof err === 'object') {
-                                try { err.attemptedSize = data.length; } catch {}
+            const saveTimer = setTimeout(() => {
+                queueStorageOperation(async () => {
+                    if (saveTimers[filePath] !== saveTimer) return;
+                    try {
+                        if (decodedKey === 'database/database.bin') {
+                            await persistDbCache(filePath, decodedKey);
+                        } else {
+                            const data = Buffer.from(encodeRisuSaveLegacy(dbCache[filePath]));
+                            try {
+                                kvSet(decodedKey, data);
+                            } catch (err) {
+                                if (err && typeof err === 'object') {
+                                    try { err.attemptedSize = data.length; } catch {}
+                                }
+                                throw err;
                             }
-                            throw err;
                         }
-                    }
-                    // Persist succeeded — clear before backup so a backup-only
-                    // failure isn't attributed to data loss.
-                    clearPersistFailure();
-                    if (decodedKey === 'database/database.bin') {
-                        try {
-                            await createBackupAndRotate();
-                        } catch (backupErr) {
-                            logger.warn(`[Patch] Backup rotation failed for ${decodedKey}:`, backupErr);
+                        // Persist succeeded — clear before backup so a backup-only
+                        // failure isn't attributed to data loss.
+                        clearPersistFailure();
+                        if (decodedKey === 'database/database.bin') {
+                            try {
+                                await createBackupAndRotate();
+                            } catch (backupErr) {
+                                logger.warn(`[Patch] Backup rotation failed for ${decodedKey}:`, backupErr);
+                            }
                         }
+                    } catch (error) {
+                        logger.error(`[Patch] Error saving ${decodedKey}:`, error);
+                        recordPersistFailure(error, `patch:${decodedKey}`);
+                    } finally {
+                        if (saveTimers[filePath] === saveTimer) delete saveTimers[filePath];
                     }
-                } catch (error) {
-                    logger.error(`[Patch] Error saving ${decodedKey}:`, error);
-                    recordPersistFailure(error, `patch:${decodedKey}`);
-                } finally {
-                    delete saveTimers[filePath];
-                }
+                }).catch((error) => {
+                    logger.error(`[Patch] Storage queue failed for ${decodedKey}:`, error);
+                });
             }, SAVE_INTERVAL);
+            saveTimers[filePath] = saveTimer;
 
             // Update ETag after successful patch (based on stripped version)
             if (decodedKey === 'database/database.bin') {
@@ -4311,8 +4343,6 @@ app.get('/api/backup/export', async (req, res, next) => {
         // import treats those names as paths under assets/ and fails with
         // ENOENT. Plugin rows are folded inline; inlay images remain lossy.
         const target = req.query.target === 'upstream' ? 'upstream' : 'nodeonly';
-        // Flush any pending patches to ensure export includes latest data
-        await flushPendingDb();
         backupDbSpool = await buildSelfContainedBackupDatabase({
             foldPluginStorage: target === 'upstream',
             shouldAbort: () => closed,
@@ -4404,7 +4434,11 @@ app.get('/api/backup/export', async (req, res, next) => {
         }
         if (!closed) res.end();
     } catch (error) {
-        if (!closed) next(error);
+        if (!closed && error?.code === 'BACKUP_MISSING_CHAT_ROW') {
+            res.status(500).json({ error: error.message, code: error.code });
+        } else if (!closed) {
+            next(error);
+        }
     } finally {
         if (backupDbSpool) {
             await fs.unlink(backupDbSpool.filePath).catch(() => {});
@@ -4551,7 +4585,6 @@ app.post('/api/backup/server/save', async (req, res, next) => {
     let closed = false;
     res.once('close', () => { closed = true; });
     try {
-        await flushPendingDb();
         backupDbSpool = await buildSelfContainedBackupDatabase({
             foldPluginStorage: false,
             shouldAbort: () => closed,
@@ -4679,6 +4712,8 @@ app.post('/api/backup/server/save', async (req, res, next) => {
     } catch (error) {
         if (closed) {
             return;
+        } else if (!res.headersSent && error?.code === 'BACKUP_MISSING_CHAT_ROW') {
+            res.status(500).json({ error: error.message, code: error.code });
         } else if (!res.headersSent) {
             next(error);
         } else {

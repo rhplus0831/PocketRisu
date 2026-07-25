@@ -47,6 +47,12 @@ function abortError() {
     return error;
 }
 
+function throwMissingChatRow(chaId, chatId) {
+    const error = new Error(`Backup cannot read referenced chat row: ${chaId}/${chatId}`);
+    error.code = 'BACKUP_MISSING_CHAT_ROW';
+    throw error;
+}
+
 function buildPluginMapPlan(baseValue, rows, readRow) {
     const base = baseValue == null ? {} : baseValue;
     if (!base || typeof base !== 'object' || Array.isArray(base)) {
@@ -84,12 +90,16 @@ async function streamRisuSaveToFile({
     readChatRow,
     pluginStorage = null,
     shouldAbort = () => false,
+    onMissingChatRow = throwMissingChatRow,
 }) {
     if (!dbObj || typeof dbObj !== 'object' || Array.isArray(dbObj)) {
         throw new TypeError('Streaming Risu save root must be an object');
     }
     if (typeof readChatRow !== 'function') {
         throw new TypeError('readChatRow must be a function');
+    }
+    if (typeof onMissingChatRow !== 'function') {
+        throw new TypeError('onMissingChatRow must be a function');
     }
 
     const valueRows = pluginStorage?.valueRows ?? [];
@@ -154,6 +164,7 @@ async function streamRisuSaveToFile({
         for (const chat of char.chats) {
             if (chat && chat._stub === true && chat.id) {
                 const fullChat = await readChatRow(char.chaId, chat.id);
+                if (fullChat == null) await onMissingChatRow(char.chaId, chat.id);
                 await writeValue(mergeChatStubWithFullChat(chat, fullChat));
             } else {
                 await writeValue(chat);

@@ -1,6 +1,6 @@
 # Backup assembly is not a consistent snapshot of chat rows
 
-- Status: Open
+- Status: Fixed
 - Severity: High
 - Commits: `9cb0086d`, retained by `f410c8a6`
 - Affected code: `server/node/server.cjs:4303-4319`, `server/node/server.cjs:4545-4558`, `server/node/streamRisuSave.cjs:152-161`, `server/node/chatRows.cjs:164-166`
@@ -19,3 +19,8 @@ Hold the storage-operation barrier from stub capture through completion of every
 
 Add a deterministic test that pauses the spooler between stub capture and a row read, concurrently removes that row, and requires either a complete pre-delete backup or a complete post-delete backup. A successful archive containing a bare referenced stub must fail the test.
 
+## Fix
+
+Exports now flush and pin a chunk-aware readonly WAL snapshot inside the storage queue, then assemble database and plugin rows from that snapshot after releasing the queue. A missing referenced chat row raises `BACKUP_MISSING_CHAT_ROW`; periodic snapshots warn and retain the stub so persistence is not blocked.
+
+The debounced persist and rotation callback now runs through the storage queue and skips when an earlier flush consumed its timer. Coverage pins snapshot reads across live updates and deletes, gates assembly across a row deletion, and verifies export failure versus non-blocking snapshot behavior for pre-existing damage.

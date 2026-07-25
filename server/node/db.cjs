@@ -4,7 +4,7 @@ const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
-const { createChunkStore, isChunkableKey } = require('./chunkStore.cjs');
+const { createChunkStore, createSnapshotReader, isChunkableKey } = require('./chunkStore.cjs');
 
 const saveDir = path.join(process.cwd(), 'save');
 if (!fs.existsSync(saveDir)) {
@@ -245,6 +245,37 @@ function kvBumpListEpoch() {
     return epoch;
 }
 
+function createKvSnapshot() {
+    const snapshotDb = new Database(dbPath, { readonly: true });
+    let transactionOpen = false;
+    let closed = false;
+    try {
+        snapshotDb.pragma('busy_timeout = 5000');
+        snapshotDb.exec('BEGIN');
+        transactionOpen = true;
+        snapshotDb.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get();
+        const reader = createSnapshotReader(snapshotDb);
+        return {
+            ...reader,
+            close() {
+                if (closed) return;
+                closed = true;
+                try {
+                    if (transactionOpen) snapshotDb.exec('ROLLBACK');
+                } catch {}
+                transactionOpen = false;
+                try { snapshotDb.close(); } catch {}
+            },
+        };
+    } catch (error) {
+        try {
+            if (transactionOpen) snapshotDb.exec('ROLLBACK');
+        } catch {}
+        try { snapshotDb.close(); } catch {}
+        throw error;
+    }
+}
+
 migrateFromSaveDir();
 
 function checkpointWal(mode = 'TRUNCATE') {
@@ -291,6 +322,7 @@ module.exports = {
     kvGet, kvSet, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue,
     kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
     kvGetListEpoch, kvBumpListEpoch,
+    createKvSnapshot,
     clearEntities,
     checkpointWal,
     gcChunks,

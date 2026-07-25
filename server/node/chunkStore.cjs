@@ -54,6 +54,41 @@ function isChunkableKey(key) {
             || key.startsWith('chats/'));
 }
 
+function isChunked(value) {
+    return Buffer.isBuffer(value) && value.equals(CHUNK_MARKER);
+}
+
+// Read-only chunk-aware bindings for a pinned SQLite snapshot. Keep this
+// separate from createChunkStore so readonly connections prepare no writes.
+function createSnapshotReader(db) {
+    const selKv = db.prepare('SELECT value FROM kv WHERE key = ?');
+    const selKvList = db.prepare('SELECT key FROM kv');
+    const selKvPrefix = db.prepare(`SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\'`);
+    const selManifest = db.prepare('SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq');
+    const selChunk = db.prepare('SELECT data FROM chunks WHERE hash = ?');
+
+    function kvGet(key) {
+        const row = selKv.get(key);
+        if (!row) return null;
+        if (isChunked(row.value)) {
+            const rows = selManifest.all(key);
+            if (rows.length === 0) return row.value;
+            return Buffer.concat(rows.map((entry) => selChunk.get(entry.hash).data));
+        }
+        return row.value;
+    }
+
+    function kvList(prefix) {
+        if (prefix) {
+            const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+            return selKvPrefix.all(`${escaped}%`).map((row) => row.key);
+        }
+        return selKvList.all().map((row) => row.key);
+    }
+
+    return { kvGet, kvList };
+}
+
 // Bind chunk-aware get/put to a specific better-sqlite3 instance. db.cjs wires
 // the real DB; tests wire a :memory: DB. The kv table must already exist (it is
 // db.cjs's schema); this creates only the chunk/manifest tables.
@@ -124,8 +159,6 @@ function createChunkStore(db, opts = {}) {
          (SELECT hash FROM manifest_chunks mc
           WHERE EXISTS (SELECT 1 FROM kv WHERE kv.key = mc.manifest_key AND kv.value = ?))`,
     );
-
-    const isChunked = (value) => Buffer.isBuffer(value) && value.equals(CHUNK_MARKER);
 
     // Atomic: clearing the old manifest, inserting new chunks, and writing the
     // marker all commit together. Orphaned chunks from a prior version are left
@@ -227,4 +260,10 @@ function createChunkStore(db, opts = {}) {
     };
 }
 
-module.exports = { cdcSplit, createChunkStore, isChunkableKey, CHUNK_MARKER };
+module.exports = {
+    cdcSplit,
+    createChunkStore,
+    createSnapshotReader,
+    isChunkableKey,
+    CHUNK_MARKER,
+};
