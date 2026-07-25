@@ -1,7 +1,7 @@
 # scripting-extensions
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `c87235b0`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
 
 ## 1. Purpose & overview
 
@@ -98,10 +98,11 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
 - `src/ts/plugins/pluginMemoryOptimization.ts` — 31 lines.
   - Encodes the compatibility gate for `optimizePluginMemory`: enabled V2/V2.1 plugins block the mode, imports of those versions are disabled while it is active, and attempts to enable them are refused. V3 plugins remain compatible because their save API is asynchronous.
 
-- `src/ts/plugins/pluginSaveStorage.ts` — approximately 273 lines.
+- `src/ts/plugins/pluginSaveStorage.ts` — approximately 311 lines.
   - Routes save-backed plugin values to inline `Database.pluginCustomStorage` or external encoded `pluginsave/*.json` rows based on `optimizePluginMemory`.
   - Serializes V3/viewer operations and mode transitions through one promise queue. `reconcilePluginStorageMode()` externalizes rows before removing inline copies, or saves complete inline copies before deleting rows, so interrupted transitions leave duplicates rather than data loss.
   - Externalized reads opt into the verified browser resource cache; key names use reversible unpadded base64url components shared with the server backup/ingest code.
+  - Before externalization mutates either backend, it validates every value/metadata destination and rejects ill-formed Unicode or an encoded collision (`src/ts/plugins/pluginSaveStorage.ts:208-224`; `src/ts/storage/persistentKv.ts:16-27`).
 
 - `src/ts/plugins/pluginStorageMeta.ts` — approximately 164 lines.
   - Maintains sidecar ownership metadata without changing stored plugin values (`src/ts/plugins/pluginStorageMeta.ts:1`).
@@ -227,7 +228,7 @@ Pipeline call sites are:
 - `editprocess`: each stored history message and the first greeting while constructing the model prompt (`src/ts/process/index.svelte.ts:772`, `src/ts/process/index.svelte.ts:801`).
 - `editoutput`: every streaming update and completed response before it is stored (`src/ts/process/index.svelte.ts:1482`, `src/ts/process/index.svelte.ts:1533`).
 - `editdisplay`: every rendered chat message through `ParseMarkdown()`, without intending to mutate stored content (`src/ts/parser/parser.svelte.ts:921`).
-- `editinput`: supported by the engine and plugin API, but no current production call into `processScriptFull(..., 'editinput')` exists in `src/ts`; do not assume user input is presently transformed through this path.
+- `editinput`: `DefaultChatScreen.sendMain()` calls the `processScript()` wrapper for non-empty character-chat input immediately before appending the user message (`src/lib/ChatScreens/DefaultChatScreen.svelte:368-380`).
 
 ### Trigger flow and versions
 
@@ -245,7 +246,7 @@ Runtime event points are:
 - `display`: from `processScriptFull()` while rendering (`src/ts/process/scripts.ts:104`).
 - `request`: on every request attempt after plugin before-replacers and before provider dispatch (`src/ts/process/request/request.ts:154`, `src/ts/process/request/request.ts:164`, `src/ts/process/request/request.ts:183`).
 - `manual`: from `/trigger` and recursive run-trigger effects (`src/ts/process/command.ts:220`, `src/ts/process/triggers.ts:1373`).
-- `input`: declared but no current external production call site was found.
+- `input`: `DefaultChatScreen.sendMain()` invokes the character trigger before `editinput` and before appending the user message (`src/lib/ChatScreens/DefaultChatScreen.svelte:368-380`).
 
 Character triggers inherit the character’s `lowLevelAccess`; module triggers inherit their module’s flag (`src/ts/process/triggers.ts:1054`, `src/ts/process/triggers.ts:1062`, `src/ts/process/modules.ts:465`). Display/request modes operate on temporary state and explicit allowlists, preventing most chat, network, UI, and model side effects (`src/ts/process/triggers.ts:1171`, `src/ts/process/triggers.ts:1301`).
 
@@ -270,7 +271,9 @@ Lua edit listeners register through `listenEdit(type, func)` and are called thro
 
 The persisted `Database.optimizePluginMemory` flag changes only the save-backed plugin storage API. When false, values and ownership metadata remain in `pluginCustomStorage`/`pluginStorageMeta` inside the main database. When true, each value becomes `pluginsave/<base64url(key)>.json` and each owner record becomes `pluginsave-meta/<base64url(key)>.json`; external value reads may use the verified browser cache.
 
-`reconcilePluginStorageMode()` runs at boot and after a settings toggle. Externalization writes each KV row before deleting its inline copy, then full-writes the stub-only database. Internalization loads all rows into the database, full-writes that durable inline copy, and only then removes the rows. Server ingestion and backup assembly understand the same split: Node-only archives may carry byte-preserving per-row entries, while upstream-target exports fold them back into ordinary database maps.
+`reconcilePluginStorageMode()` runs at boot and after a settings toggle. Externalization first encodes and collision-checks every destination, then writes each KV row before deleting its inline copy and full-writing the stub-only database. Internalization loads all rows into the database, full-writes that durable inline copy, and only then removes the rows. Keys must be well-formed Unicode before UTF-8/base64url encoding; lone UTF-16 surrogates are rejected rather than collapsing to U+FFFD.
+
+Server ingestion and backup assembly understand the same split. Node-only portable/server archives carry byte-preserving per-row entries, while upstream-target and selective client exports fold rows into ordinary database maps. Automatic server snapshots also fold the rows, including a deliberately empty key set, and stamp `pluginStorageFolded: true`; restore uses that marker to atomically replace the external prefixes instead of retaining newer plugin state. Pre-marker snapshots preserve existing external rows because they cannot prove what the historical key set was.
 
 V2/V2.1 plugins cannot participate because their save-storage facade is synchronous. The UI refuses this optimization while any legacy plugin is enabled, disables an imported legacy plugin when the mode is active, and prevents later enablement. V3 storage remains asynchronous and uses the serialized `pluginSaveStorage` path.
 
@@ -379,6 +382,10 @@ V2/V2.1 plugins cannot participate because their save-storage facade is synchron
 
 - `pluginsave/` and `pluginsave-meta/` key encoding is shared with the server: reversible unpadded base64url plus `.json`. Changing it requires coordinated client, server ingest/backup, viewer, and compatibility-test updates.
 
+- Reversible plugin key encoding accepts only well-formed Unicode. Keep client `makeEncodedStorageKey()` and server `encodePluginSaveStorageKey()`/canonical decoding aligned; validate a whole transition before the first mutation so a rejected key cannot leave a half-externalized map.
+
+- `pluginStorageFolded` is a recovery marker, not application/plugin data. Snapshot restore strips it after atomically clear-and-repopulate of `pluginsave/` and `pluginsave-meta/`; an unmarked historical snapshot must not clear those rows.
+
 - V3 plugins can register MCP callbacks, but an identifier must begin with `plugin:` and the corresponding URL must still be present in an enabled module before `initializeMCPs()` activates it (`src/ts/process/mcp/pluginmcp.ts:45`, `src/ts/process/mcp/mcp.ts:20`).
 
 - MCP tool names are not namespaced at model level. `callMCPTool()` scans `MCPs` and executes the first matching name (`src/ts/process/mcp/mcp.ts:164`). Avoid duplicate names across enabled servers.
@@ -413,7 +420,7 @@ V2/V2.1 plugins cannot participate because their save-storage facade is synchron
 
 - To change where regex modes run in the chat lifecycle, inspect `src/ts/process/index.svelte.ts:772`, `src/ts/process/index.svelte.ts:801`, `src/ts/process/index.svelte.ts:1482`, and `src/ts/parser/parser.svelte.ts:921`.
 
-- To activate or implement `editinput`, add an explicit call at the user-message ingestion boundary; the supported mode already exists at `src/ts/process/scripts.ts:18`.
+- To change input-trigger or `editinput` ordering, inspect `sendMain()` at `src/lib/ChatScreens/DefaultChatScreen.svelte:328-400` and the `processScript()` wrapper at `src/ts/process/scripts.ts:26`.
 
 - To add a Lua host API, declare it inside the engine-creation branch of `runScripted()` beginning at `src/ts/process/scriptings.ts:84`, then add a Lua wrapper if structured JSON/await behavior is needed near `src/ts/process/scriptings.ts:1211`.
 
@@ -439,7 +446,7 @@ V2/V2.1 plugins cannot participate because their save-storage facade is synchron
 
 - To add a plugin edit hook, use the registry API at `src/ts/plugins/plugins.svelte.ts:537`; execution is at `src/ts/process/scripts.ts:124`.
 
-- To change optimized plugin storage, update `pluginSaveStorage.ts`, `pluginStorageMeta.ts`, `pluginMemoryOptimization.ts`, the settings/viewer UI, boot reconciliation, and the server `pluginsave/` ingest/backup helpers together.
+- To change optimized plugin storage, update `pluginSaveStorage.ts`, `pluginStorageMeta.ts`, `pluginMemoryOptimization.ts`, `persistentKv.ts`, the settings/viewer UI, boot reconciliation, partial-backup folding, and the server `pluginSaveKeys.cjs` plus `pluginsave/` ingest/backup/snapshot helpers together.
 
 - To add a plugin request-body or response replacer, inspect registration at `src/ts/plugins/plugins.svelte.ts:553` and execution at `src/ts/process/request/request.ts:154` and `src/ts/process/request/request.ts:220`.
 

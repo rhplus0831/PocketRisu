@@ -1,7 +1,7 @@
 # memory-lorebook
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `c87235b0`; no subsystem-level drift found. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
 
 ## 1. Purpose & overview
 
@@ -80,7 +80,7 @@ The memory-lorebook subsystem builds context that is not simply the recent chat 
 - `src/ts/process/index.svelte.ts` — approximately 1,934 lines. Main prompt pipeline; calls additional-text retrieval, lorebook matching, and Hypa V3 (`src/ts/process/index.svelte.ts:401`, `src/ts/process/index.svelte.ts:422`, `src/ts/process/index.svelte.ts:953`).
 - `src/ts/storage/database.svelte.ts` — approximately 3,058 lines. Defines `loreBook`, `character.globalLore`, `Chat.localLore`, module references, memory settings, and `Chat.hypaV3Data` (`src/ts/storage/database.svelte.ts:1513`, `src/ts/storage/database.svelte.ts:1549`, `src/ts/storage/database.svelte.ts:2034`).
 - `src/ts/process/transformers.ts` — approximately 196 lines. Runs browser-local embedding models with mean pooling and normalization (`src/ts/process/transformers.ts:61`).
-- `src/ts/storage/persistentKv.ts` — approximately 72 lines. Stores hashed vector-cache JSON through `forageStorage` (`src/ts/storage/persistentKv.ts:32`, `src/ts/storage/persistentKv.ts:41`, `src/ts/storage/persistentKv.ts:61`).
+- `src/ts/storage/persistentKv.ts` — approximately 87 lines. Stores hashed vector-cache JSON through `forageStorage`; reads/writes begin at `src/ts/storage/persistentKv.ts:41` and `:55`, and hashed-key construction is at `:75`.
 
 ## 3. Architecture & data flow
 
@@ -405,7 +405,7 @@ Each projection is consumed independently:
 
 - To add another contextual embedding provider, implement `ContextualEmbeddingProvider` and extend `isContextModel()`/`getContextProvider()` at `src/ts/process/memory/contextualEmbedding.ts:5`.
 
-- To change embedding cache identity or persistence, inspect `src/ts/process/memory/hypamemory.ts:43`, `src/ts/process/memory/hypamemoryv2.ts:365`, and `src/ts/storage/persistentKv.ts:61`.
+- To change embedding cache identity or persistence, inspect `src/ts/process/memory/hypamemory.ts:43`, `src/ts/process/memory/hypamemoryv2.ts:365`, and `src/ts/storage/persistentKv.ts:41-77`.
 
 - To change when history gets summarized, modify token reservation and batch selection in `src/ts/process/memory/hypav3.ts:235` for experimental mode and `src/ts/process/memory/hypav3.ts:1015` for default mode.
 

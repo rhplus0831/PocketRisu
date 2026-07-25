@@ -1,5 +1,9 @@
 # Serve branch data-loss audit
 
+- Original audit point: `1c0f5257`
+- Remediation audit point: `2e3d4f05`
+- Current status: All 16 substantiated findings fixed
+
 ## Scope
 
 This audit covers the persistence, recovery, and communication changes called out in commits `7f853d93` through `41ab5bb5`, plus the three cache commits `b4ddaf2b`, `0263ce63`, and `d2ef38c6`. The code reviewed is the `serve` branch at `1c0f5257`, relative to `origin/main` at `63832a13`.
@@ -7,6 +11,12 @@ This audit covers the persistence, recovery, and communication changes called ou
 ## Result
 
 Sixteen data-loss or recovery-integrity risks were substantiated:
+
+The table below records the original findings. Their individual documents now include
+the implemented resolution and regression coverage; all were rechecked as fixed at
+`2e3d4f05`. The remaining note on long-running streamed import transactions is an
+operational/WAL-growth tradeoff, not an acknowledged-write loss after the exclusive
+import barrier.
 
 | Commit(s) | Finding | Class |
 |---|---|---|
@@ -36,4 +46,3 @@ Sixteen data-loss or recovery-integrity risks were substantiated:
 - `b4ddaf2b`: conditional chat reads bind cache hits to the server's exact bytes with SHA-256; the client rehashes them and falls back on any failure.
 - `0263ce63`: cached database segments are individually verified; missing or malformed segments fall back to a full authoritative read.
 - `d2ef38c6`: conditional KV hits and write-seeded entries are exact-byte hash verified. The persistent enumeration failure is in `6792dc7f`, not the value cache.
-

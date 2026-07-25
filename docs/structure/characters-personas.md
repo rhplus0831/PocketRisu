@@ -1,7 +1,7 @@
 # characters-personas
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `c87235b0`; no subsystem-level drift found. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
 
 ## 1. Purpose & overview
 
@@ -150,11 +150,11 @@ Character metadata lives inside the main database object, while image and other 
   - `getFileSrc()` uses `/api/asset/<hex-key>` in Node mode at `src/ts/globalApi.svelte.ts:113`.
   - `readImage()` reads an opaque asset key at `src/ts/globalApi.svelte.ts:191`.
   - `saveAsset()` hashes bytes and stores them under `assets/<hash>.<extension>` at `src/ts/globalApi.svelte.ts:203`.
-  - `getUncleanables()` protects character/persona/module asset references from cleanup at `src/ts/globalApi.svelte.ts:1458`.
+  - `getUncleanables()` protects character/persona/module asset references from cleanup at `src/ts/globalApi.svelte.ts:1450`.
 
-- `server/node/db.cjs` stores those keys as BLOBs in `save/risuai.db`; database creation and the `kv` table are at `server/node/db.cjs:8` and `server/node/db.cjs:28`.
+- `server/node/db.cjs` stores unsafe/legacy asset keys as BLOBs in `save/risuai.db`; database creation and the `kv` table are at `server/node/db.cjs:9-14` and `server/node/db.cjs:29`.
 
-- `server/node/server.cjs` serves asset keys through the authenticated direct-asset endpoint at `server/node/server.cjs:3023` and proxies `/hub-proxy/*` to `https://sv.risuai.xyz` at `server/node/server.cjs:2773`.
+- `server/node/server.cjs` serves asset keys through the authenticated direct-asset endpoint at `server/node/server.cjs:3747` and proxies `/hub-proxy/*` to `https://sv.risuai.xyz` at `server/node/server.cjs:3436-3546`.
 
 ## 3. Architecture & data flow
 
@@ -200,7 +200,7 @@ A persona exists twice while selected:
 - Persona `icon`: one asset key.
 - VITS files: a name-to-asset-key mapping.
 
-In the self-hosted Node build, `NodeStorage.setItem()` sends the key and bytes to `/api/write` (`src/ts/storage/nodeStorage.ts:187`), and SQLite retains the raw BLOB. Rendering passes the key to `getFileSrc()`, which returns an authenticated `/api/asset/<hex-key>` URL rather than loading a base64 URL into JavaScript.
+In the self-hosted Node build, `NodeStorage.setItem()` sends the key and bytes to `/api/write` (`src/ts/storage/nodeStorage.ts:298`). Safe content-addressed `assets/*` keys are stored as immutable files under `save/assets/`; unsafe names retain the SQLite BLOB fallback. Rendering passes the key to `getFileSrc()`, which returns an authenticated `/api/asset/<hex-key>` URL rather than loading a base64 URL into JavaScript.
 
 Changing a portrait with `selectCharImg()` first moves the previous `image` into `ccAssets` through `dumpCharImage()`. `changeCharImage()` performs the inverse swap, so alternate V3 icons are not discarded.
 
@@ -303,7 +303,7 @@ Existing-character import ignores the packaged character card itself and appends
 7. Character ordering is repaired, and `goCharacterOnImport` or `forceRedirect` selects the imported character.
 8. Startup deep links use `?realm=<id>`; `characterURLImport()` removes the parameter and fills `showRealmInfoStore`.
 
-The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streaming response bodies (`server/node/server.cjs:2773`).
+The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streaming response bodies (`server/node/server.cjs:3436-3546`).
 
 ## 4. Entry points & dependencies
 
@@ -380,7 +380,7 @@ The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streami
 - Package persona import does not currently copy the manifest’s `largePortrait` value into newly appended personas, despite exporting it.
 - If new-character package import fails after adding personas or inlays, rollback explicitly removes only the newly created character at `src/ts/characterPackage.ts:690`; associated writes may remain.
 - License restrictions are enforced by the character-config UI, not by `exportCharacterPackage()` itself. Restricted licenses disable ordinary card export and force `includeCharacter: false` at `src/lib/SideBars/CharConfig.svelte:630`.
-- Any new character/persona asset-reference field must be added to both client cleanup protection (`getUncleanables()`) and the server mirror (`buildUncleanableSet()` at `server/node/server.cjs:4900`) or cleanup can delete live binaries.
+- Any new character/persona asset-reference field must be added to both client cleanup protection (`getUncleanables()`) and the server mirror (`buildUncleanableSet()` at `server/node/server.cjs:5980`) or cleanup can delete live binaries.
 
 ## 6. Navigation hints
 
@@ -395,7 +395,7 @@ The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streami
 - To change the character portrait/alternate-icon swap behavior, inspect `src/ts/characters.ts:61`, `src/ts/characters.ts:107`, and `src/ts/characters.ts:124`.
 - To change emotion upload behavior, inspect `src/ts/characters.ts:137` and its UI at `src/lib/SideBars/CharConfig.svelte:399`.
 - To change additional-asset upload and tuple semantics, inspect `src/lib/SideBars/CharConfig.svelte:485` and `src/ts/characterCards.ts:1440`.
-- To change how asset binaries are named or stored, edit `src/ts/globalApi.svelte.ts:203`; also audit cleanup references at `src/ts/globalApi.svelte.ts:1458` and `server/node/server.cjs:4900`.
+- To change how asset binaries are named or stored, edit `src/ts/globalApi.svelte.ts:203`; also audit cleanup references at `src/ts/globalApi.svelte.ts:1450` and `server/node/server.cjs:5980`.
 - To change CharX members or streaming behavior, inspect `src/ts/process/processzip.ts:46`, `src/ts/process/processzip.ts:160`, and V3 archive writing at `src/ts/characterCards.ts:1389`.
 - To change the Risu-specific module embedded in CharX, inspect `src/ts/characterCards.ts:1389` and `src/ts/process/modules.ts:61`.
 - To change `.risum` compatibility framing, edit `src/ts/process/modules.ts:61` and its inverse at `src/ts/process/modules.ts:125`.
@@ -411,7 +411,7 @@ The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streami
 - To change Realm catalog queries, edit `src/ts/characterCards.ts:1598` and `src/lib/UI/Realm/RealmMain.svelte:21`.
 - To change Realm download/import behavior, edit `src/ts/characterCards.ts:1627`.
 - To change Realm deep-link handling, inspect `src/ts/characterCards.ts:341`, `src/ts/characterCards.ts:356`, and startup invocation at `src/ts/bootstrap.ts:80`.
-- To change Realm proxying, inspect `server/node/server.cjs:2773`.
+- To change Realm proxying, inspect `server/node/server.cjs:3436-3546`.
 - To change export-format warnings or choices, inspect `src/lib/Others/AlertComp.svelte:471`.
 - To change character-package license gating, inspect `src/lib/SideBars/CharConfig.svelte:630`.
 

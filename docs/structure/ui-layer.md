@@ -1,7 +1,7 @@
 # ui-layer
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `c87235b0`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
 
 ## 1. Purpose & overview
 

@@ -1,30 +1,31 @@
 # client-storage
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `c87235b0`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
 
 ## 1. Purpose & overview
 
-The client-storage subsystem owns PocketRisu’s canonical `Database` model, its Svelte 5 reactive instance, save-format encoding/decoding, server-backed key/value access, and startup migrations. It splits large chat bodies from `database.bin`: the database sent to the browser contains lightweight chat stubs, while full chats are fetched and saved separately through server endpoints. A reactive save loop observes database mutations, writes changed chats first, then synchronizes the stub-only database through JSON Patch or an ETag-protected full write. An opt-in IndexedDB resource cache reuses SHA-256-verified database segments, chats, and optimized plugin values without becoming authoritative. The subsystem also provides composer drafts, render-only message pagination, per-chat version recovery, internal snapshots, `.bin` backup import/export, and compatibility paths for older RisuAI save formats.
+The client-storage subsystem owns PocketRisu’s canonical `Database` model, its Svelte 5 reactive instance, save-format encoding/decoding, server-backed key/value access, and startup migrations. It splits large chat bodies from `database.bin`: the database sent to the browser contains lightweight chat stubs, while full chats are fetched and saved separately through server endpoints. A staged reactive save loop observes database mutations, establishes durable chat rows before their stubs can commit, checkpoints active generations, then synchronizes the stub-only database through JSON Patch or an ETag-protected full write. An opt-in IndexedDB resource cache reuses SHA-256-verified database segments, chats, and optimized plugin values without becoming authoritative. The subsystem also provides composer drafts, render-only message pagination, per-chat version recovery, internal snapshots, partial/portable `.bin` backup import/export, and compatibility paths for older RisuAI save formats.
 
 ## 2. Key files
 
 | File | Approx. size | Role and important symbols |
 |---|---:|---|
 | `src/ts/storage/database.svelte.ts` | 3,065 lines | Canonical data model, defaults, Svelte-state accessors, preset/theme helpers. `setDatabase()` fills defaults and normalizes imported data; `setDatabaseLite()` only assigns `DBState.db`; `getDatabase()` can return a `$state.snapshot`. The model now includes `optimizePluginMemory` and its inline/external ownership metadata. |
-| `src/ts/globalApi.svelte.ts` | 2,829 lines; storage pipeline mainly `:237-1170` | Creates the process-wide `forageStorage` adapter and implements database persistence. `requestImmediateSave()` delegates to the save loop, `markCharacterDirty()` bridges non-selected-character mutations, and `saveDb()` installs reactive effects and runs the permanent save loop. Chat persistence pauses during active generation except for forced page-hide flushes. Also contains `LocalWriter` and internal-backup helpers. |
-| `src/ts/storage/nodeStorage.ts` | 1,107 lines | HTTP client for the Node Express storage API. Besides JWT/session auth, ordinary KV and patch methods, it owns hash-aware KV/chat reads, segmented database boot reads, full/delta key-list caching, portable/server backups, chat-version listing/import bytes, and save-folder migration. `NodeStorage` starts at `:151`; boot reads at `:412`; key listing at `:464`; chat-version methods at `:885`; chat content at `:918`. |
+| `src/ts/globalApi.svelte.ts` | 2,767 lines; storage pipeline mainly `:239-1111` | Creates the process-wide `forageStorage` adapter and implements database persistence. `requestImmediateSave()` delegates to the save loop, `markCharacterDirty()` bridges non-selected-character mutations, and `saveDb()` installs reactive effects and runs the permanent save loop. It delegates row-before-stub durability and generation checkpoint decisions to `chatPersistStage.ts`. Also contains `LocalWriter` and internal-backup helpers. |
+| `src/ts/storage/nodeStorage.ts` | 1,113 lines | HTTP client for the Node Express storage API. Besides JWT/session auth, ordinary KV and patch methods, it owns hash-aware KV/chat reads, segmented database boot reads, full/delta key-list caching, portable/server backups, chat-version listing/import bytes, and save-folder migration. `NodeStorage` starts at `:151`; boot reads at `:412`; key listing at `:464`; chat-version methods at `:891`; chat content at `:924`. A server-side import refusal fails the save attempt so tracked changes can be retried instead of being reported as written. |
 | `src/ts/storage/autoStorage.ts` | 97 lines | Thin compatibility facade that always selects `NodeStorage`. `Init()` constructs it lazily (`:35`); cached reads, database boot reads, and key listing initialize before forwarding, while core set/get/patch paths still assume bootstrap already initialized storage. |
 | `src/ts/storage/risuSave.ts` | 1,241 lines | All save codecs, incremental block encoding, normalization, patch generation, and client chat guards. Legacy encoders are at `:39` and `:56`; `RisuSaveEncoder` starts at `:109`; `RisuSaveDecoder` at `:411`; format-dispatching `decodeRisuSave()` at `:598`. `normalizeJSON()` is at `:745`, `diffArrayWithIdGuard()` at `:807`, `RisuSavePatcher` at `:840`, and `findDangerousChatOps()` at `:1203`. There are no separate production `normalizeJSON`, `risuSavePatcher`, or `chatGuards` files. |
 | `src/ts/storage/chatStub.ts` | 40 lines | Runtime-independent stub type and predicate. `ChatStub` contains only identity/display metadata plus `_stub: true` (`:13`); `isChatStub()` additionally requires that no `message` array exists (`:36`). |
 | `src/ts/storage/chatStorage.ts` | 252 lines | Stub/placeholder conversion, lazy hydration, chat-backup reason tags, and version import. `setChatBackupReason()` records one-shot reasons (`:102`); `saveChatToServer()` consumes them (`:129`); `importChatBackup()` clones a recovered version under a fresh chat ID and explicitly dirties its target character (`:157`); `ensureChatHydrated()` begins at `:184`. |
+| `src/ts/storage/chatPersistStage.ts` | 212 lines | Testable row-persistence stage used by `saveDb()`. It discovers changed/new chats, requires authoritative row writes before stub commit, checkpoints a generating chat at most once per 20 seconds, requeues it for the final post-generation save, and updates the known-chat baseline only after a committed stub database. `prepareChatPersistStage()` starts at `:136`. |
 | `src/ts/chatLoadPages.ts` | 23 lines | Validates message-render limits. Defaults are 30 initially and 15 additionally (`:1-2`); normalization is at `:4`; database-facing getters are at `:17` and `:21`. Despite the names, these values count messages, not server pages. |
 | `src/ts/storage/chatDraft.ts` | 153 lines | Stores per-chat unsent composer text outside `Chat`. `ChatDraft` is defined at `:17`; keys use `drafts/<chaId>/<chatId>` (`:27`). Loading is at `:91`, debounced save at `:110`, immediate flush at `:121`, removal at `:128`, and boot-time orphan sweeping at `:140`. |
-| `src/ts/storage/persistentKv.ts` | 81 lines | Generic JSON-over-KV helpers using `forageStorage`, despite the historical “forage” naming. Reads can opt into verified resource caching; write/remove/list and hashed/reversible encoded key builders remain the common plugin/MCP storage primitives. |
+| `src/ts/storage/persistentKv.ts` | 87 lines | Generic JSON-over-KV helpers using `forageStorage`, despite the historical “forage” naming. Reads can opt into verified resource caching; write/remove/list and hashed/reversible encoded key builders remain the common plugin/MCP storage primitives. Reversible keys reject strings that are not well-formed Unicode before UTF-8/base64url encoding. |
 | `src/ts/storage/resourceCache.ts` | 890 lines | Disposable SHA-256-addressed IndexedDB cache for wire bytes and manifests. It owns enable/support checks, strict entry/manifest validation, verified reads, batched hashing, retention planning, write serialization, stats, pruning, and clearing. Limits include 64 MiB total, 32 MiB per value, 512 ordinary manifests, and 32,768 entries. |
 | `src/ts/storage/dbCachedRead.ts` | 159 lines | Client half of the segmented boot protocol. It decodes the raw MessagePack envelope, rejects unexpected shapes/unadvertised hits, re-hashes resident entries, assembles root plus array groups, and returns manifest updates with the server ETag. `rawMsgpack.ts` provides the record-free MessagePack decoder. |
 | `src/ts/bootstrap.ts` | 708 lines | Orders the secure-context gate, storage initialization, cached/full boot read, decode/defaults, optimized-plugin reconciliation, migrations, placeholder conversion, cache announcement, UI initialization, ID repair, and save-loop startup. The entry point is `loadData()` (`:126`); structural migrations live in `checkNewFormat()` (`:433`); `assignIds()` repairs missing or duplicate character/chat IDs (`:681`). |
-| `src/ts/drive/backuplocal.ts` | 347 lines | Client UI operations for streamed server backups and compatibility imports. Normal and upstream-target exports are `SaveLocalBackup()` (`:47`) and `SaveLocalBackupForUpstream()` (`:59`). `SavePartialLocalBackup()` creates a selective client-side backup (`:81`); `LoadLocalBackup()` uploads `.bin` files to the server (`:229`); server-side backup creation is exposed by `SaveServerBackup()` (`:334`). |
+| `src/ts/drive/backuplocal.ts` | 360 lines | Client UI operations for streamed server backups and compatibility imports. Normal and upstream-target exports are `SaveLocalBackup()` (`:48`) and `SaveLocalBackupForUpstream()` (`:60`). `SavePartialLocalBackup()` creates a selective client-side backup and folds externalized plugin values/ownership metadata into its database (`:82`, `:207`); `LoadLocalBackup()` uploads `.bin` files to the server (`:242`); server-side backup creation is exposed by `SaveServerBackup()` (`:347`). |
 | `src/ts/storage/exportAsDataset.ts` | 26 lines | Produces a JSON array containing character identity, description, each chat’s messages, and lorebook. The sole entry point is `exportAsDataset()` (`:6`). |
 | `src/ts/storage/defaultPrompts.ts` | 28 lines | Supplies prompt defaults consumed by `setDatabase()`, including `defaultMainPrompt`, `defaultJailbreak`, and `defaultAutoSuggestPrompt` (`:3-7`). |
 | `src/ts/interchangeability.ts` | 191 lines | Schema conversion among characters, personas, and modules. Character/module conversions are at `:6` and `:54`; character/persona conversions at `:121` and `:135`; persona/module conversions at `:146` and `:173`. This is object-schema compatibility, not the `.bin` codec. |
@@ -37,6 +38,8 @@ Relevant regression coverage:
 - `src/ts/storage/risuSavePatcher.test.ts` is a large patch round-trip and fast-path suite; the main round-trip section begins at `:440`.
 - `src/ts/storage/normalizeJSON.test.ts` checks path-based circular-reference handling (`:11`).
 - `src/ts/storage/chatDraft.test.ts` covers write ordering, orphan cleanup, and round trips (`:48`, `:78`, `:90`).
+- `src/ts/storage/chatPersistStage.test.ts` covers row-before-stub ordering, failed-row rejection, generation throttling, forced/final saves, durable known-chat promotion, and placeholder handling.
+- `src/ts/drive/backuplocal.test.ts` verifies partial backups preserve inline plugin state, fold optimized external rows, and abort rather than silently omitting unreadable plugin storage.
 - `src/ts/chatLoadPages.test.ts` covers normalization and defaults (`:10`).
 - `src/ts/storage/resourceCache.test.ts` covers hashing, validation, cache limits, retention, corruption rejection, and multi-entry database manifests.
 - `src/ts/storage/persistentKv.test.ts` verifies that cached JSON reads use the hash-aware adapter without changing ordinary reads.
@@ -78,33 +81,34 @@ Structural/versioned migrations that need broader context live separately in `bo
 
 ### Client-to-server save loop
 
-`saveDb()` creates a long-lived save coordinator (`src/ts/globalApi.svelte.ts:367`):
+`saveDb()` creates a long-lived save coordinator (`src/ts/globalApi.svelte.ts:377`):
 
 1. A `toSaveType` tracker separates root, character, chat, bot-preset, module, plugin, and plugin-storage changes (`:408-416`; type at `src/ts/storage/risuSave.ts:70`).
 2. Svelte effects `deepTouch` the relevant state branches. Initial effect runs are suppressed so loading itself is not treated as an edit (`src/ts/globalApi.svelte.ts:465-605`).
 3. Root collections are tracked separately for efficient patching. Character tracking deliberately excludes full `chats`; it observes character fields plus chat ordering/stub metadata (`:510-605`).
 4. A second effect deeply observes only the active chat. Switching chat establishes a baseline, and hydration activity is ignored (`:607-640`).
-5. Normal edits set `changed` after a 500 ms debounce (`:477-491`). The permanent loop polls every 200 ms, serializes through `saveInFlight`, and retries failures with bounded backoff (`:1049-1117`).
-6. `requestImmediateSave()` bypasses the edit debounce by setting `changed`, waiting one Svelte tick, and calling the same serialized trigger (`:1093-1099`).
-7. While `doingChat` is true, the database/stub portion may continue but collected full-chat writes are requeued so streaming snapshots do not churn rows and pre-image history. Transitioning back to idle schedules the queued chat save.
-8. `visibilitychange` and `pagehide` invoke an immediate, non-broadcast save with `forceChatPersist`, then a keepalive `/api/db/flush` request so leaving mid-generation still has a durability attempt.
+5. Normal edits set `changed` after a 500 ms debounce (`:477-503`). The permanent loop polls every 200 ms, serializes through `saveInFlight`, and retries failures with bounded backoff (`:1030-1110`).
+6. `requestImmediateSave()` bypasses the edit debounce by setting `changed`, waiting one Svelte tick, and calling the same serialized trigger (`:1079-1085`).
+7. On a `doingChat` false→true transition, the per-generation checkpoint tracker is cleared. A save during generation always writes the first dirty row, then suppresses rewrites until 20 seconds have elapsed; candidates stay requeued so true→false schedules an unconditional final-row save (`src/ts/storage/chatPersistStage.ts:136-204`; `src/ts/globalApi.svelte.ts:505-513`). The server’s 45-second pre-image cooldown prevents a history version for every checkpoint.
+8. `visibilitychange` and `pagehide` invoke an immediate, non-broadcast save with `forceChatPersist`, then a keepalive `/api/db/flush` request so leaving mid-generation still has a best-effort row and metadata durability attempt (`:516-532`).
 
-Before database metadata is written, `persistTrackedChanges()` saves each changed or newly discovered full chat through `/api/chat-content` (`:801-820`). Only after all chat writes succeed does it call `RisuSaveEncoder.set()`, whose character blocks replace every chat with `chatToStub()` (`:822-829`; `src/ts/storage/risuSave.ts:219-235`).
+Before database metadata is written, `persistTrackedChanges()` calls `prepareChatPersistStage()`, which saves each eligible changed or newly discovered full chat through `/api/chat-content` and rejects if any row write fails (`:769-804`). Only after the row stage succeeds does it call `RisuSaveEncoder.set()`, whose character blocks replace every chat with `chatToStub()` (`:806-813`; `src/ts/storage/risuSave.ts:219-235`). The stage’s `completeStubCommit()` promotes newly discovered chat IDs into the known baseline only after patch/full-write commit; no-op, conflict, and retry paths retain the dirty proof instead of creating a phantom known stub.
 
 When `supportsPatchSync` is enabled (`src/ts/platform.ts:18`):
 
 - `RisuSavePatcher.set()` generates an RFC 6902 patch and an expected hash against the captured stub-only baseline (`src/ts/globalApi.svelte.ts:834-842`; `src/ts/storage/risuSave.ts:927`).
 - `findDangerousChatOps()` rejects field-level operations outside the stub metadata allowlist before they leave the browser (`src/ts/globalApi.svelte.ts:842-855`).
-- `/api/patch` applies the patch to the server’s stripped cache; the response updates the cached ETag and may surface deferred persistence warnings (`:995-1011`).
-- Any patch rejection or conflict falls through to a full `database.bin` write using the last ETag (`:1014-1029`).
-- An ETag conflict fetches the latest server database, overlays tracked local state, reinstalls it with `setDatabase()`, rebuilds encoder/patcher baselines, and retries (`:712-777`).
-- A successful full write is decoded again to reinitialize the patcher from exactly what was transmitted (`:1031-1036`).
+- `/api/patch` applies the patch to the server’s stripped cache; the response updates the cached ETag and may surface deferred persistence warnings (`:980-996`).
+- Any patch rejection or conflict falls through to a full `database.bin` write using the last ETag (`:998-1021`).
+- An ETag conflict fetches the latest server database, overlays tracked local state, reinstalls it with `setDatabase()`, rebuilds encoder/patcher baselines, and retries without promoting the row stage as a committed stub save (`:692-767`, `:1005-1010`).
+- A successful full write is decoded again to reinitialize the patcher from exactly what was transmitted (`:1015-1020`).
+- If an import owns the server mutation barrier, `/api/write` returns `503 IMPORT_IN_PROGRESS`; `NodeStorage.setItem()` fails the attempt and the save coordinator requeues the tracked changes for a later cycle (`src/ts/storage/nodeStorage.ts:298-327`).
 
-The server acknowledges a patch before SQLite persistence: it debounces the stubs-only database write by five seconds (`server/node/server.cjs:110`, `:4116`). Chat-body POSTs are write-through. Reads flush pending work first (`server/node/server.cjs:3598-3616`), and the client’s page-hide `/api/db/flush` provides another best-effort durability boundary.
+The server acknowledges a patch before SQLite persistence: it debounces the stubs-only database write by five seconds. Chat-body POSTs are write-through. At the debounce boundary, the server commits the new stubs-only row and any now-unreferenced chat-row deletions in one SQLite transaction; a full `/api/write` likewise commits payload rows, plugin rows, `database.bin`, and targeted chat deletions atomically. Reads flush pending work first, and the client’s page-hide `/api/db/flush` provides another best-effort durability boundary (`server/node/server.cjs:741-804`, `server/node/server.cjs:4268-4335`, `server/node/server.cjs:4385-4558`).
 
 ### Lazy chat storage and hydration
 
-**Chat storage externalization.** The server persists `database/database.bin` as the same stubs-only shape sent to the browser, while each full body is a separate `chats/<chaId>/<chatId>` SQLite KV row. `/api/read` therefore decodes and caches the small stripped row directly; monolith imports, snapshots, and backups are split or assembled only at explicit boundaries (`server/node/server.cjs:3598`; `server/node/chatRows.cjs:278`).
+**Chat storage externalization.** The server persists `database/database.bin` as the same stubs-only shape sent to the browser, while each full body is a separate `chats/<chaId>/<chatId>` SQLite KV row. `/api/read` therefore decodes and caches the small stripped row directly; monolith imports, snapshots, and backups are split or assembled only at explicit boundaries (`server/node/server.cjs:3945`; `server/node/chatRows.cjs:347`).
 
 A stub contains only `id`, `name`, optional `lastDate`, `folderId`, `modules`, and `_stub: true` (`src/ts/storage/chatStub.ts:13-20`). At boot, `convertStubsToPlaceholders()` changes it into a type-compatible `Chat` with empty `message`, `note`, and `localLore`, plus `_placeholder: true` (`src/ts/storage/chatStorage.ts:17-30`, `:63-71`). Runtime code therefore normally sees `Chat`, never `ChatStub`.
 
@@ -112,11 +116,11 @@ Opening a placeholder invokes this flow:
 
 1. `changeChatTo()` detects `_placeholder` and shows a cancellable loading overlay (`src/ts/globalApi.svelte.ts:2720-2750`).
 2. `ensureChatHydrated()` deduplicates concurrent requests by `chaId/chatId` (`src/ts/storage/chatStorage.ts:184-201`).
-3. `NodeStorage.fetchChatContent()` calls `/api/chat-content/<chaId>/<index>` with `x-chat-id`. With the optional resource cache enabled it also advertises verified resident hashes; a matching server `204` reuses locally re-hashed bytes, while any cache anomaly retries an unconditional read. Returned bytes are decoded and passed through `normalizeChat()` (`src/ts/storage/nodeStorage.ts:918`).
+3. `NodeStorage.fetchChatContent()` calls `/api/chat-content/<chaId>/<index>` with `x-chat-id`. With the optional resource cache enabled it also advertises verified resident hashes; a matching server `204` reuses locally re-hashed bytes, while any cache anomaly retries an unconditional read. Returned bytes are decoded and passed through `normalizeChat()` (`src/ts/storage/nodeStorage.ts:924`).
 4. After the fetch, hydration re-finds the chat by ID so an index shift cannot write into the wrong slot (`src/ts/storage/chatStorage.ts:210-220`).
 5. It yields one animation frame, replaces the placeholder, waits one Svelte tick, and clears hydration suppression (`:221-230`).
 
-The server also verifies `x-chat-id` if it falls back to index lookup, returning 409 on an index mismatch (`server/node/server.cjs:5022`). Saving a chat captures an eligible pre-image, writes its row synchronously, returns its content hash for cache seeding, and does not wait for or schedule the database debounce (`server/node/server.cjs:5076`).
+The server also verifies `x-chat-id` if it falls back to index lookup, returning 409 on an index mismatch (`server/node/server.cjs:5465`). Saving a chat captures an eligible pre-image, writes its row synchronously, returns its content hash for cache seeding, and does not wait for or schedule the database debounce (`server/node/server.cjs:5524`).
 
 ### Verified browser resource cache
 
@@ -130,7 +134,7 @@ Three protocols consume it:
 
 Retention is deliberately bounded and best-effort. IndexedDB/quota/WebCrypto errors become misses; database cache manifests may hold thousands of ordered hashes, while ordinary resource manifests retain only recent versions. Settings → Advanced toggles the feature, and the System dashboard reports/clears it.
 
-`NodeStorage.keys()` uses a separate `risu-list-cache` IndexedDB store. Each prefix remembers its full key set, server timestamp, and list epoch. `/api/list` may return `added`/`deleted` deltas; the client merges additions with precedence, persists the new snapshot asynchronously, and accepts a full response whenever the server cannot prove the delta window.
+`NodeStorage.keys()` uses a separate `risu-list-cache` IndexedDB store. Each prefix remembers its full key set, server timestamp, and list epoch. `/api/list` may return `added`/`deleted` deltas; the client merges additions with precedence, persists the new snapshot asynchronously, and accepts a full response whenever the server cannot prove the delta window. The server waits for an active import to finish before listing and changes the epoch on boot and on every import commit/rollback, so a transactional replacement cannot publish a cacheable intermediate key set.
 
 ### Message rendering pagination
 
@@ -146,14 +150,14 @@ Drafts deliberately do not modify `Chat`, so typing does not re-upload a chat bo
 
 ### Backup flows
 
-- `SaveLocalBackup()` requests `/api/backup/export` and streams the response to disk without buffering the entire backup (`src/ts/drive/backuplocal.ts:15-51`).
-- `SaveLocalBackupForUpstream()` adds `target=upstream` (`:59-63`; `src/ts/storage/nodeStorage.ts:417-423`).
-- The server flushes pending database changes before export and frames assets plus full `database.risudat` entries (`server/node/server.cjs:3844-3855`, `:3928-3954`).
-- The upstream target omits NodeOnly `inlay/`, `inlay_sidecar/`, and `inlay_meta/` namespaces because upstream import treats slash-containing names as asset paths and fails (`server/node/server.cjs:3847-3855`).
-- `LoadLocalBackup()` uploads a selected `.bin` to `/api/backup/import`, reports upload/server progress, then reloads the app (`src/ts/drive/backuplocal.ts:229-257`; `src/ts/storage/nodeStorage.ts:442-515`).
-- `SavePartialLocalBackup()` selects only identity assets, hydrates every placeholder, aborts if any full chat is missing, and writes compressed full database data as `database.risudat` (`src/ts/drive/backuplocal.ts:104-210`).
+- `SaveLocalBackup()` requests `/api/backup/export` and streams the response to disk without buffering the entire backup (`src/ts/drive/backuplocal.ts:16-58`).
+- `SaveLocalBackupForUpstream()` adds `target=upstream` (`:60-69`; `src/ts/storage/nodeStorage.ts:417-423`).
+- The server flushes pending database changes, pins a read-only KV snapshot, assembles full `database.risudat`, and frames it with the planned asset entries (`server/node/server.cjs:4703-4785`).
+- The upstream target folds optimized plugin rows and omits NodeOnly `inlay/`, `inlay_sidecar/`, and `inlay_meta/` namespaces because upstream import treats slash-containing names as asset paths and fails (`server/node/server.cjs:4715-4759`).
+- `LoadLocalBackup()` uploads a selected `.bin` to `/api/backup/import`, reports upload/server progress, then reloads the app (`src/ts/drive/backuplocal.ts:242-270`; `src/ts/storage/nodeStorage.ts:442-515`).
+- `SavePartialLocalBackup()` selects only identity assets, hydrates every placeholder, aborts if any full chat is missing, folds optimized `pluginsave/` values and ownership metadata into the copied database, and writes compressed full database data as `database.risudat` (`src/ts/drive/backuplocal.ts:105-224`).
 - `LocalWriter.writeBackup()` uses the legacy backup framing of 32-bit name length, basename, 32-bit data length, and data (`src/ts/globalApi.svelte.ts:1754-1762`).
-- Server-side backups are initiated through `SaveServerBackup()` and do not route database contents through browser memory (`src/ts/drive/backuplocal.ts:334-346`).
+- Server-side backups are initiated through `SaveServerBackup()` and do not route database contents through browser memory (`src/ts/drive/backuplocal.ts:347-359`).
 - System → Backups also lists server-captured chat pre-images through `ChatBackupList.svelte`. Fetching a version decodes and normalizes it, `importChatBackup()` removes wire-only markers, assigns a fresh ID/name/timestamp, appends it to the chosen character, and calls `markCharacterDirty()` because that character may not be selected. The normal save pipeline persists the new chat; recovery never overwrites the current chat in place.
 
 ## 4. Entry points & dependencies
@@ -201,21 +205,23 @@ Drafts deliberately do not modify `Chat`, so typing does not re-upload a chat bo
 
 - `convertStubsToPlaceholders()` self-heals hybrids by removing `_stub` and retaining the payload (`src/ts/storage/chatStorage.ts:57-70`). Changing this behavior can turn historical corruption into actual message loss.
 
-- `chatToStub()` and `stubToPlaceholder()` preserve whether `lastDate`, `folderId`, and `modules` keys exist, even when their value is `null` or `undefined` (`src/ts/storage/chatStorage.ts:12-15`, `:27-29`, `:36-49`). Server snapshot/backup assembly uses the same `in` semantics so “explicitly cleared” differs from “not supplied” (`server/node/chatRows.cjs:150`).
+- `chatToStub()` and `stubToPlaceholder()` preserve whether `lastDate`, `folderId`, and `modules` keys exist, even when their value is `null` or `undefined` (`src/ts/storage/chatStorage.ts:12-15`, `:27-29`, `:36-49`). Server snapshot/backup assembly uses the same `in` semantics so “explicitly cleared” differs from “not supplied” (`server/node/chatRows.cjs:218-231`).
 
-- Keep the stub metadata allowlist synchronized across `chatToStub()`, client `STUB_METADATA_FIELDS`, and server `STUB_METADATA_FIELDS` (`src/ts/storage/risuSave.ts:1172-1176`; `server/node/server.cjs:567-571`).
+- Keep the stub metadata allowlist synchronized across `chatToStub()`, client `STUB_METADATA_FIELDS`, and server `STUB_METADATA_FIELDS` (`src/ts/storage/risuSave.ts:1177-1181`; `server/node/server.cjs:636-640`).
 
 - `_stub` may only be added or replaced with literal `true`; removing it or writing a falsy value is a data-loss vector. `move`, `copy`, and `test` operations touching chat-internal paths are rejected (`src/ts/storage/risuSave.ts:1182-1237`).
 
-- Chat protection is layered: the client refuses dangerous patch operations, the patch endpoint returns 409 for anything the client missed, and the server disk boundary refuses metadata-only chats that have neither `_stub` nor `message` (`src/ts/globalApi.svelte.ts:834-855`, `:1005-1011`; `server/node/server.cjs:3629-3659`, `:682-699`).
+- Chat protection is layered: the client refuses dangerous patch operations, the patch endpoint returns 409 for anything the client missed, and both debounced and full-write disk boundaries refuse metadata-only chats that have neither `_stub` nor `message` (`src/ts/globalApi.svelte.ts:834-855`, `:1005-1011`; `server/node/server.cjs:708-772`, `:4276-4295`).
 
 - Hydration must be suppressed from dirty tracking. `hydrationInFlight` covers the network phase and `hydrationJustApplied` covers the Svelte tick after replacement (`src/ts/storage/chatStorage.ts:113-120`, `:201-240`).
 
 - Hydration is keyed by stable `chaId/chatId`, not only array index. Preserve chat IDs across reorder/import operations; both client and server use the ID to prevent applying data to a shifted index.
 
-- Full chat content is saved before its database stub/metadata. Reversing that order could leave a new stub pointing to chat content that was never accepted by the server (`src/ts/globalApi.svelte.ts:801-829`).
+- Full chat content is saved before its database stub/metadata. A row failure blocks the stub commit, and a new chat becomes “known” only after row durability proof plus a committed stub database (`src/ts/storage/chatPersistStage.ts:49-96`, `:131-204`; `src/ts/globalApi.svelte.ts:792-813`).
 
-- Generation deliberately delays ordinary chat-row persistence while `doingChat` is true. This prevents each streamed snapshot from becoming a server write and consuming chat-backup cooldown slots. Page-hide forces a chat persist; the idle transition schedules the normal queued write.
+- Generation chat persistence is throttled, not disabled. The first save in a generation writes the dirty row, later saves write only after the 20-second checkpoint interval, every candidate remains dirty for the final idle-transition save, and page-hide forces a row write. The server’s independent 45-second pre-image cooldown limits recovery-history churn.
+
+- Optimized plugin keys must be well-formed Unicode before reversible UTF-8/base64url encoding. Mode externalization precomputes and collision-checks every value and metadata destination before its first write or inline deletion (`src/ts/storage/persistentKv.ts:16-27`; `src/ts/plugins/pluginSaveStorage.ts:208-224`).
 
 - Backup-reason tags are one-shot. `saveChatToServer()` consumes the pending reason before the network call, so a failed write will not automatically reuse it on retry. Reasons are descriptive recovery metadata, not durability controls.
 
@@ -251,7 +257,7 @@ Drafts deliberately do not modify `Chat`, so typing does not re-upload a chat bo
 
 - The save coordinator uses both `BroadcastChannel('risu-db')` for same-browser tabs and the server’s `x-session-id` lock for other devices (`src/ts/globalApi.svelte.ts:380-406`; `src/ts/storage/nodeStorage.ts:43-45`, `:162-175`). A 423 response deactivates the page and prompts reload.
 
-- Patch conflict rebasing currently restores local root fields, bot presets, modules, and tracked characters, but excludes `plugins` and `pluginCustomStorage` from the root copy without explicitly restoring their local versions (`src/ts/globalApi.svelte.ts:720-762`). Treat this existing asymmetry carefully when modifying conflict resolution.
+- Patch conflict rebasing treats `plugins` and `pluginCustomStorage` as tracked branches instead of generic root fields; when their flags are dirty it explicitly overlays the local copies alongside bot presets, modules, and tracked characters (`src/ts/globalApi.svelte.ts:692-765`). Preserve those explicit branches when changing the merge.
 
 - The physical `botPresetsId` index remains part of upstream RisuAI compatibility even though new code prefers stable preset UUID helpers (`src/ts/storage/database.svelte.ts:1025-1030`, `:2341-2402`).
 
@@ -263,19 +269,21 @@ Drafts deliberately do not modify `Chat`, so typing does not re-upload a chat bo
 
 - To add a required chat field, update `Chat`, `normalizeChat()`, chat creation sites, and hydration tests (`src/ts/storage/database.svelte.ts:2025-2072`).
 
-- To change the stub metadata schema, update `chatStub.ts`, both conversion functions, both client/server allowlists, and row-assembly semantics (`src/ts/storage/chatStub.ts:13`; `src/ts/storage/chatStorage.ts:20-53`; `src/ts/storage/risuSave.ts:1181`; `server/node/server.cjs:535`; `server/node/chatRows.cjs:164`).
+- To change the stub metadata schema, update `chatStub.ts`, both conversion functions, both client/server allowlists, and row-assembly semantics (`src/ts/storage/chatStub.ts:13`; `src/ts/storage/chatStorage.ts:20-53`; `src/ts/storage/risuSave.ts:1181`; `server/node/server.cjs:640`; `server/node/chatRows.cjs:218`).
 
 - To change when edits save, inspect the reactive effects and 500 ms debounce in `saveDb()` (`src/ts/globalApi.svelte.ts:465-640`).
 
-- To add an explicit durability point after a bulk operation, call or extend `requestImmediateSave()` (`src/ts/globalApi.svelte.ts:357`, `:1093-1099`).
+- To change generation checkpoint timing, durable-known-chat promotion, or row failure behavior, start in `src/ts/storage/chatPersistStage.ts`; its production integration is `src/ts/globalApi.svelte.ts:769-804`.
 
-- To change patch/full-write conflict behavior, inspect `rebaseTrackedLocalChangesOnLatestServerDb()` and `persistTrackedChanges()` (`src/ts/globalApi.svelte.ts:712`, `:779`).
+- To add an explicit durability point after a bulk operation, call or extend `requestImmediateSave()` (`src/ts/globalApi.svelte.ts:360`, `:1079-1085`).
+
+- To change patch/full-write conflict behavior, inspect `rebaseTrackedLocalChangesOnLatestServerDb()` and `persistTrackedChanges()` (`src/ts/globalApi.svelte.ts:692`, `:769`).
 
 - To change structural array diffing for modules or presets, start at `diffArrayWithIdGuard()` and its regression suite (`src/ts/storage/risuSave.ts:807`; `src/ts/storage/risuSavePatcher.test.ts:29`).
 
 - To diagnose unexpected chat-field patches, start at `findDangerousChatOps()` and enable the guarded diagnostic path around the patch call (`src/ts/storage/risuSave.ts:1203`; `src/ts/globalApi.svelte.ts:842-993`).
 
-- To change lazy chat loading, inspect `ensureChatHydrated()` and the NodeStorage chat endpoints (`src/ts/storage/chatStorage.ts:184`; `src/ts/storage/nodeStorage.ts:918`).
+- To change lazy chat loading, inspect `ensureChatHydrated()` and the NodeStorage chat endpoints (`src/ts/storage/chatStorage.ts:184`; `src/ts/storage/nodeStorage.ts:924`).
 
 - To change database boot caching, update `NodeStorage.readDatabaseForBoot()`, `src/ts/storage/dbCachedRead.ts`, `src/ts/storage/rawMsgpack.ts`, `server/node/dbCachedRead.cjs`, and `/api/db/read-cached` as one protocol.
 
@@ -291,11 +299,11 @@ Drafts deliberately do not modify `Chat`, so typing does not re-upload a chat bo
 
 - To change draft timing or ordering, inspect `DEBOUNCE_MS`, the serialized `writeChain`, and flush paths (`src/ts/storage/chatDraft.ts:24-25`, `:54-79`, `:109-131`).
 
-- To add a new standalone JSON KV namespace, use the helpers in `src/ts/storage/persistentKv.ts:32-70`; choose hashed keys when the raw key must not appear in the storage path and encoded keys when reversibility is required.
+- To add a new standalone JSON KV namespace, use the helpers in `src/ts/storage/persistentKv.ts:37-86`; choose hashed keys when the raw key must not appear in the storage path and encoded keys when reversibility is required. Encoded keys reject ill-formed Unicode.
 
-- To modify normal or upstream-compatible `.bin` export, start at `SaveLocalBackup()`/`SaveLocalBackupForUpstream()` and the server export route (`src/ts/drive/backuplocal.ts:47-69`; `server/node/server.cjs:3844`).
+- To modify normal or upstream-compatible `.bin` export, start at `SaveLocalBackup()`/`SaveLocalBackupForUpstream()` and the server export route (`src/ts/drive/backuplocal.ts:48-69`; `server/node/server.cjs:4703`).
 
-- To modify selective client-side backup contents, edit asset collection and the hydrate-or-abort loop in `SavePartialLocalBackup()` (`src/ts/drive/backuplocal.ts:104-206`).
+- To modify selective client-side backup contents, edit asset collection, the hydrate-or-abort loop, and optimized-plugin fold in `SavePartialLocalBackup()` (`src/ts/drive/backuplocal.ts:105-224`).
 
 - To add a startup schema migration, decide whether it is an idempotent field default for `setDatabase()` or a versioned/structural migration for `checkNewFormat()` (`src/ts/storage/database.svelte.ts:37`; `src/ts/bootstrap.ts:305`).
 

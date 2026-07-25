@@ -1,7 +1,7 @@
 # model-providers
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `c87235b0`; no subsystem-level drift found. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
 
 ## 1. Purpose & overview
 
@@ -246,13 +246,13 @@ Streaming adapters yield deltas. `pumpPresetStream()` accumulates response and r
 
 Two transport functions outside this directory are central:
 
-- JSON-style `globalFetch()` chooses direct browser fetch only for local known hosts, `db.usePlainFetch`, or `plainFetchForce`; otherwise it uses a userscript fetch when available or `/proxy2` (`src/ts/globalApi.svelte.ts:1256`).
-- Stream-capable `fetchNative()` attempts direct fetch, then falls back to `/proxy2` on a CORS/network exception (`src/ts/globalApi.svelte.ts:2000`, `src/ts/globalApi.svelte.ts:2102`).
+- JSON-style `globalFetch()` chooses direct browser fetch only for local known hosts, `db.usePlainFetch`, or `plainFetchForce`; otherwise it uses a userscript fetch when available or `/proxy2` (`src/ts/globalApi.svelte.ts:1248-1256`).
+- Stream-capable `fetchNative()` attempts direct fetch, then falls back to `/proxy2` on a CORS/network exception (`src/ts/globalApi.svelte.ts:1992`, `:2094`).
 
 Explicit local-network routing changes the behavior:
 
 1. `getLocalNetworkRequestOptions()` enables it only for recognized local URLs and classic OpenAI-compatible calls when local-network mode is enabled or forced (`src/ts/process/request/openAI/requests.ts:16`).
-2. A streaming classic OpenAI request has the `openai_streaming` interceptor, so `fetchNative()` first creates `/proxy-stream-jobs` and opens the job WebSocket (`src/ts/globalApi.svelte.ts:2076`, `src/ts/globalApi.svelte.ts:2156`).
+2. A streaming classic OpenAI request has the `openai_streaming` interceptor, so `fetchNative()` first creates `/proxy-stream-jobs` and opens the job WebSocket (`src/ts/globalApi.svelte.ts:2068-2080`, `:2148-2181`).
 3. WebSocket `upstream_headers` resolves a synthetic `Response`; `chunk` events enqueue decoded bytes; abort/cancel deletes the server job (`src/ts/globalApi.svelte.ts:2231`).
 4. Job setup failure falls back to `/proxy2`.
 5. Non-streaming local requests always use `/proxy2`.
@@ -397,7 +397,7 @@ ModelPreset requests mark local URLs for server routing, but `makeProxiedFetch()
 
 - To change LAN detection, edit `isLocalNetworkHost()` (`src/ts/network/localNetwork.ts:74`) and keep the Node server’s independent validation aligned.
 
-- To change WebSocket job event parsing or timeout messages, edit `src/ts/network/proxyJobWs.ts:1`; to change client job lifecycle, inspect `src/ts/globalApi.svelte.ts:2156`.
+- To change WebSocket job event parsing or timeout messages, edit `src/ts/network/proxyJobWs.ts:1`; to change client job lifecycle, inspect `src/ts/globalApi.svelte.ts:2148`.
 
 - To change browser-local chat generation, inspect `requestWebLLM()` (`src/ts/process/request/request.ts:1868`) and `runTransformers()` (`src/ts/process/transformers.ts:38`), not the MLC helper.
 

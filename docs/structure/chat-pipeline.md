@@ -1,7 +1,7 @@
 # chat-pipeline
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `c87235b0`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
 
 ## 1. Purpose & overview
 
@@ -254,7 +254,7 @@ After the response body is stored:
 - Optional IGP and emotion/image follow-up requests occur after the main message is stored (`src/ts/process/index.svelte.ts:1620`, `src/ts/process/index.svelte.ts:1703`).
 - Stage timing metadata is finalized on the last message at `src/ts/process/index.svelte.ts:1901`.
 
-There is no explicit database write in `sendChat()`. Message-array mutations are observed through Svelte’s deep `DBState` tracking; the active chat is marked dirty at `src/ts/globalApi.svelte.ts:607`, debounced by 500 ms at `src/ts/globalApi.svelte.ts:477`, and eventually persisted through the save loop at `src/ts/globalApi.svelte.ts:1101`.
+There is no explicit database write in `sendChat()`. Message-array mutations are observed through Svelte’s deep `DBState` tracking; the active chat is marked dirty at `src/ts/globalApi.svelte.ts:634`, debounced by 500 ms at `src/ts/globalApi.svelte.ts:477`, and eventually persisted through the save loop. `prepareChatPersistStage()` writes the first dirty row of a generation before its stub may commit, permits later checkpoints after 20 seconds, and keeps the chat requeued so the `doingChat` true→false transition writes the final response (`src/ts/storage/chatPersistStage.ts:136-204`; `src/ts/globalApi.svelte.ts:505-513`, `:769-804`).
 
 Output translation is not part of persisted response post-processing. `ChatBody.svelte` translates parsed or pre-parsed text only for display at `src/lib/ChatScreens/ChatBody.svelte:104`. Composer translation similarly updates `messageInput` before send through `updateInputTransateMessage()` at `src/lib/ChatScreens/DefaultChatScreen.svelte:685`.
 
@@ -361,6 +361,8 @@ Legacy multi-speaker history compatibility remains: character messages may carry
 
 - `processScriptFull()` is run against each cumulative streamed snapshot, not only once at stream completion. Output regex/Lua/plugin hooks must be deterministic and safe to repeat.
 
+- Generation persistence is checkpointed independently of the provider stream. Do not restore a blanket `doingChat` save skip: it can make a new durable stub point at no chat row or leave an existing row at its pre-turn state. The checkpoint stage throttles writes while preserving row-before-stub ordering and a final idle save.
+
 - Aborting a stream clears `isStreaming` but does not remove the already-created partial character message (`src/ts/process/index.svelte.ts:1492`). A normal aborted send can leave partial output in history.
 
 - The `multiline` response path processes all alternatives but stores only the first; the local `mrerolls` array is never applied to message swipes (`src/ts/process/index.svelte.ts:1528`). UI reroll/swipes are a separate mechanism.
@@ -425,7 +427,7 @@ Legacy multi-speaker history compatibility remains: character messages may carry
 
 - To change output translation, use the display pipeline at `src/lib/ChatScreens/ChatBody.svelte:104`; translated output is not stored by `sendChat()`.
 
-- To change when generated messages reach SQLite-backed persistence, inspect active-chat tracking at `src/ts/globalApi.svelte.ts:607`, not the model pipeline.
+- To change when generated messages reach SQLite-backed persistence, inspect active-chat tracking at `src/ts/globalApi.svelte.ts:634` and row staging in `src/ts/storage/chatPersistStage.ts`, not the model pipeline.
 
 ## Out of scope, noticed
 

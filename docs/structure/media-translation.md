@@ -1,7 +1,7 @@
 # media-translation
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `c87235b0`; no subsystem-level drift found. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
 
 ## 1. Purpose & overview
 
@@ -150,28 +150,28 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
   - `resolveInlayPlaceholders()` uses an `IntersectionObserver` with a 200-pixel root margin (`src/ts/parser/parser.svelte.ts:847`).
   - Missing type data can be fetched in batches; direct media URLs are `/api/asset/<hex key>` (`src/ts/parser/parser.svelte.ts:746`).
 
-- `src/ts/storage/nodeStorage.ts` — approximately 759 lines; authenticated client for server storage.
+- `src/ts/storage/nodeStorage.ts` — approximately 1,113 lines; authenticated client for server storage.
 
-  - `setItem`, `getItem`, `keys`, and `removeItem` use `/api/write`, `/api/read`, `/api/list`, and `/api/remove` (`src/ts/storage/nodeStorage.ts:187`, `src/ts/storage/nodeStorage.ts:216`, `src/ts/storage/nodeStorage.ts:239`, `src/ts/storage/nodeStorage.ts:258`).
-  - `getItems()` and `setItems()` use the bulk asset endpoints (`src/ts/storage/nodeStorage.ts:366`, `src/ts/storage/nodeStorage.ts:399`).
-  - `/api/session` establishes the cookie required for direct `<img>`, `<audio>`, and `<video>` URLs (`src/ts/storage/nodeStorage.ts:63`).
+  - `setItem`, `getItem`, `keys`, and `removeItem` use `/api/write`, `/api/read`, `/api/list`, and `/api/remove` (`src/ts/storage/nodeStorage.ts:298`, `:348`, `:470`, `:518`).
+  - `getItems()` and `setItems()` use the bulk asset endpoints (`src/ts/storage/nodeStorage.ts:626`, `:659`).
+  - `/api/session` establishes the cookie required for direct `<img>`, `<audio>`, and `<video>` URLs (`src/ts/storage/nodeStorage.ts:185`).
 
-- `server/node/server.cjs` — approximately 6,249 lines overall; relevant storage code is distributed through the server.
+- `server/node/server.cjs` — approximately 7,399 lines overall; relevant storage code is distributed through the server.
 
-  - Current inlays are stored under `save/inlays` (`server/node/server.cjs:860`).
-  - Safe ID/extension validation and filesystem path construction start at `server/node/server.cjs:1018`.
-  - Raw inlay read/write and sidecar helpers are at `server/node/server.cjs:1089`, `server/node/server.cjs:1149`, and `server/node/server.cjs:1188`.
-  - `/api/session` issues the direct-asset cookie (`server/node/server.cjs:3003`).
-  - `/api/asset/:hexKey` serves assets and inlays with MIME, ETag, and immutable caching (`server/node/server.cjs:3083`).
-  - `/api/read`, `/api/remove`, `/api/list`, and `/api/write` special-case inlay payloads and sidecars (`server/node/server.cjs:3260`, `server/node/server.cjs:3323`, `server/node/server.cjs:3356`, `server/node/server.cjs:3447`).
-  - `/api/assets/bulk-read` and `/api/assets/bulk-write` support batched metadata/KV access (`server/node/server.cjs:3754`, `server/node/server.cjs:3822`).
-  - `/api/inlays/compress` recompresses eligible filesystem images to WebP and streams progress as SSE (`server/node/server.cjs:5572`).
+  - Current inlays are stored under `save/inlays` (`server/node/server.cjs:1024`).
+  - Safe ID/extension validation and filesystem path construction start at `server/node/server.cjs:1111`.
+  - Raw inlay read/write and sidecar helpers are at `server/node/server.cjs:1182`, `:1242`, and `:1281`.
+  - `/api/session` issues the direct-asset cookie (`server/node/server.cjs:3666`).
+  - `/api/asset/:hexKey` serves assets and inlays with MIME, ETag, and immutable caching (`server/node/server.cjs:3747`).
+  - `/api/read`, `/api/remove`, `/api/list`, and `/api/write` special-case inlay payloads and sidecars (`server/node/server.cjs:3945`, `:4058`, `:4098`, `:4200`).
+  - `/api/assets/bulk-read` and `/api/assets/bulk-write` support batched metadata/KV access (`server/node/server.cjs:4573`, `:4645`).
+  - `/api/inlays/compress` recompresses eligible filesystem images to WebP and streams progress as SSE (`server/node/server.cjs:6777`).
 
-- `server/node/db.cjs` — approximately 218 lines; SQLite KV implementation.
+- `server/node/db.cjs` — approximately 379 lines; SQLite KV implementation.
 
-  - It opens `save/risuai.db` with `better-sqlite3` (`server/node/db.cjs:3`, `server/node/db.cjs:12`).
-  - The `kv` table stores key, BLOB value, and update timestamp (`server/node/db.cjs:28`).
-  - Generic assets, `inlay_meta`, translation cache entries, and other storage keys use direct KV rows; only the main database blob is chunked (`server/node/db.cjs:88`, `server/node/db.cjs:118`).
+  - It opens `save/risuai.db` with `better-sqlite3` (`server/node/db.cjs:3`, `:13-16`).
+  - The `kv` table stores key, BLOB value, and update timestamp (`server/node/db.cjs:29-36`).
+  - Generic unsafe/legacy assets, `inlay_meta`, translation cache entries, and other ordinary storage keys use direct KV rows. Large live database, automatic-snapshot, and chat-row values use the chunk store (`server/node/db.cjs:103-109`; `server/node/chunkStore.cjs:51-55`).
 
 ## 3. Architecture & data flow
 
@@ -202,7 +202,7 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
    - an in-memory `Map<string,string>` (`src/ts/translator/translator.ts:28`);
    - persistent `cache/llm-translate/<hash>.json` entries containing the original key and value (`src/ts/translator/translator.ts:31`).
 
-6. Persistent cache operations use `forageStorage`, which is backed by `NodeStorage` in PocketRisu and therefore by server storage (`src/ts/storage/persistentKv.ts:32`, `src/ts/storage/autoStorage.ts:27`).
+6. Persistent cache operations use `forageStorage`, which is backed by `NodeStorage` in PocketRisu and therefore by server storage (`src/ts/storage/persistentKv.ts:41-68`, `src/ts/storage/autoStorage.ts:27`).
 7. `regenerate=true` bypasses reads but writes the new result back to both tiers (`src/ts/translator/translator.ts:520`, `src/ts/translator/translator.ts:594`).
 8. A translation-complete notification is played only when an LLM request was actually made rather than served from cache (`src/ts/translator/translator.ts:305`).
 
@@ -231,12 +231,12 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
    - display/type data under `inlay_info/<id>`;
    - timestamps and optional character/chat ownership under `inlay_meta/<id>`.
 
-4. On `/api/write`, the Node server decodes an `inlay/<id>` data URI and writes `save/inlays/<id>.<ext>` plus `<id>.meta.json`; `inlay_meta` remains a SQLite KV record (`server/node/server.cjs:3478`).
+4. On `/api/write`, the Node server decodes an `inlay/<id>` data URI and writes `save/inlays/<id>.<ext>` plus `<id>.meta.json`; `inlay_meta` remains a SQLite KV record (`server/node/server.cjs:4244-4267`).
 5. Chats store only tokens. Composer attachments become `{{inlayed::<id>}}` before the user message is appended (`src/lib/ChatScreens/DefaultChatScreen.svelte:349`). Generated inline images normally use `{{inlay::<id>}}` (`src/ts/process/inlayScreen.ts:29`).
 6. When preparing model input, user-message inlays become multimodal parts if supported. Images fall back to image captioning for non-vision models; audio/video become multimodal parts; assistant-side handling retains only `inlayeddata` tokens as model input (`src/ts/process/index.svelte.ts:819`, `src/ts/process/index.svelte.ts:841`).
 7. Rendering calls `parseInlayAssets()`, producing placeholders when type/URL data is not already cached. `ChatBody` invokes `resolveInlayPlaceholders()` after the Svelte HTML block is mounted (`src/lib/ChatScreens/ChatBody.svelte:244`, `src/lib/ChatScreens/ChatBody.svelte:252`).
 8. Near-viewport placeholders are resolved in batches of 20, classified from `inlay_info` unless image-priority mode is enabled, and replaced with `<img>`, `<video>`, or `<audio>` pointing to `/api/asset/<hex("inlay/<id>")>` (`src/ts/parser/parser.svelte.ts:739`, `src/ts/parser/parser.svelte.ts:746`, `src/ts/parser/parser.svelte.ts:768`).
-9. The server authenticates direct tags through the `risu-session` cookie and streams the raw file with its detected MIME type (`server/node/server.cjs:1407`, `server/node/server.cjs:3083`).
+9. The server authenticates direct tags through the `risu-session` cookie and streams the raw file with its detected MIME type (`server/node/server.cjs:1647`, `:3747`).
 
 ### Image generation and view screens
 
@@ -268,7 +268,7 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 - Bergamot depends on `@browsermt/bergamot-translator`, IndexedDB, Mozilla model registries, and `fflate`.
 - TTS depends on Web Speech, Web Audio, provider APIs, `runVITS`, uploaded GPT-SoVITS reference assets, and optional translation.
 - Inlays depend on database/model metadata, `NodeStorage`, browser Blob/canvas APIs, and the parser/model-request pipelines.
-- Server image compression and thumbnails depend on `wasm-vips` (`server/node/server.cjs:15`, `server/node/server.cjs:3069`).
+- Server image compression and thumbnails depend on `wasm-vips` (`server/node/server.cjs:25`, `:3734`, `:6777`).
 - Uploaded notification sounds use the ordinary `assets/<hash>.<ext>` path created by `saveAsset()` (`src/ts/globalApi.svelte.ts:203`).
 - The Hono alternative does not implement these storage routes; it currently only exposes a CSRF-protected hello route (`server/hono/src/app/index.ts:4`, `server/hono/src/app/index.ts:8`).
 
@@ -300,9 +300,9 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 - Upload extension matching is lowercase and case-sensitive; callers should normalize extensions before expanding format support.
 - `compressImage()` can route GIF through canvas recompression, which collapses animated input to a rasterized frame.
 - Current inlay payloads are filesystem files, despite the client-facing `NodeStorage` KV abstraction. Explorer info is mirrored in sidecars; ownership/time metadata remains in SQLite.
-- The server still reads and migrates legacy SQLite `inlay/<id>` JSON records (`server/node/server.cjs:1302`). Preserve this fallback when changing storage format.
-- Direct asset URLs use one-year `immutable` caching (`server/node/server.cjs:3095`). Reusing and overwriting an explicit inlay ID can leave a browser with a stale cached URL; new content normally needs a new ID.
-- Inlay IDs are validated against separators and traversal components before filesystem access (`server/node/server.cjs:1018`).
+- The server still reads and migrates legacy SQLite `inlay/<id>` JSON records (`server/node/server.cjs:1352-1433`). Preserve this fallback when changing storage format.
+- Direct asset URLs use one-year `immutable` caching (`server/node/server.cjs:3755-3762`). Reusing and overwriting an explicit inlay ID can leave a browser with a stale cached URL; new content normally needs a new ID.
+- Inlay IDs are validated against separators and traversal components before filesystem access (`server/node/server.cjs:1111-1139`).
 - `/api/asset/:hexKey` requires the session cookie, not the normal `risu-auth` request header. Initialization of `/api/session` is part of asset rendering, not merely login housekeeping.
 - `src/ts/3d/threeload.ts` is legacy and has no current consumers. Do not treat it as the live 3D rendering entry point.
 - Most image providers follow the inlay-vs-`CharEmotion` return contract, but branches are not perfectly uniform; verify a provider branch before relying on its return value.
@@ -314,7 +314,7 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 - To change when messages auto-translate, inspect `src/lib/ChatScreens/ChatBody.svelte:61`.
 - To change Markdown-before/after-translation behavior, inspect `src/lib/ChatScreens/ChatBody.svelte:111` and `translateHTML()` (`src/ts/translator/translator.ts:273`).
 - To alter the LLM translation prompt/request, inspect `src/ts/translator/translator.ts:520` and `src/ts/translator/presets.ts:25`.
-- To change cache keying or persistence, inspect `src/ts/translator/translator.ts:28` and `src/ts/storage/persistentKv.ts:61`.
+- To change cache keying or persistence, inspect `src/ts/translator/translator.ts:28` and `src/ts/storage/persistentKv.ts:41-77`.
 - To change translator preset migration or file format, inspect `src/ts/translator/presets.ts:104` and `src/ts/translator/presets.ts:171`.
 - To add a TTS provider, add a mode under `src/ts/process/tts.ts:113` and its character settings under `src/lib/SideBars/CharConfig.svelte:700`.
 - To change TTS text normalization, inspect `src/ts/process/tts.ts:91`.
@@ -327,10 +327,10 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 - To change lazy media rendering, inspect `src/ts/parser/parser.svelte.ts:692` and `src/ts/parser/parser.svelte.ts:735`.
 - To change how uploaded inlays become chat references, inspect `src/lib/ChatScreens/DefaultChatScreen.svelte:349`.
 - To change which inlays are sent to models, inspect `src/ts/process/index.svelte.ts:819`.
-- To change server-side inlay layout, inspect `server/node/server.cjs:1018`, `server/node/server.cjs:1149`, and `server/node/server.cjs:3447`.
-- To change direct asset authentication or caching, inspect `server/node/server.cjs:1373`, `server/node/server.cjs:3003`, and `server/node/server.cjs:3083`.
-- To change bulk gallery metadata loading, inspect `src/ts/process/files/inlays.ts:572` and `server/node/server.cjs:3754`.
-- To change server-side batch inlay compression, inspect `server/node/server.cjs:5569`.
+- To change server-side inlay layout, inspect `server/node/server.cjs:1111`, `:1182`, `:1281`, and the `/api/write` branch at `:4244`.
+- To change direct asset authentication or caching, inspect `server/node/server.cjs:1647`, `:3666`, and `:3747`.
+- To change bulk gallery metadata loading, inspect `src/ts/process/files/inlays.ts:572` and `server/node/server.cjs:4573`.
+- To change server-side batch inlay compression, inspect `server/node/server.cjs:6777`.
 - To add or alter an image-generation provider, inspect `generateAIImage()` (`src/ts/process/stableDiff.ts:63`).
 - To change model-emitted `<ImgGen>` behavior, inspect `src/ts/process/inlayScreen.ts:5` and `src/ts/process/inlayScreen.ts:15`.
 - To change completion sounds or add bundled presets, inspect `src/ts/notificationSound.ts:27` and `src/ts/notificationSound.ts:49`.

@@ -1,7 +1,7 @@
 # presets-profiles
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `c87235b0`; no subsystem-level drift found. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
 
 ## 1. Purpose & overview
 
@@ -391,5 +391,5 @@ Model profiles instead use plain `.profile.json` fragments (`modelProfileBrowser
 
 - `src/ts/process/request/` owns the broader classic-versus-preset request pipeline, streaming presentation, tool execution, and request-status reporting.
 - `src/ts/process/index.svelte.ts` owns full prompt assembly, memory/lore/template processing, and token trimming.
-- `server/node/server.cjs:3161` implements the authenticated Node-side Google service-account JWT signing and OAuth exchange endpoint.
+- `server/node/server.cjs:3853` implements the authenticated Node-side Google service-account JWT signing and OAuth exchange endpoint.
 - `src/ts/process/prompt.ts` contains SillyTavern/parameter-preset conversion logic beyond the `.risup` compatibility entry points documented above.
