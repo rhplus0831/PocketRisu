@@ -6,7 +6,13 @@ import { describe, test, expect, vi, beforeEach } from 'vitest'
 // commits but whose response is lost.
 const { mockStore, mockState } = vi.hoisted(() => ({
     mockStore: new Map<string, Uint8Array>(),
-    mockState: { setItemDelay: 0, setItemThrowsAfterStore: false },
+    mockState: {
+        setItemDelay: 0,
+        setItemThrowsAfterStore: false,
+        getItemThrows: false,
+        getItemGate: null as Promise<void> | null,
+        onGetItem: null as (() => void) | null,
+    },
 }))
 
 vi.mock('../globalApi.svelte', () => ({
@@ -20,6 +26,9 @@ vi.mock('../globalApi.svelte', () => ({
             if (mockState.setItemThrowsAfterStore) throw new Error('response lost') // ...but the response is dropped
         },
         async getItem(key: string) {
+            mockState.onGetItem?.()
+            if (mockState.getItemGate) await mockState.getItemGate
+            if (mockState.getItemThrows) throw new Error('read failed')
             return mockStore.get(key) ?? null
         },
         async removeItem(key: string) {
@@ -34,12 +43,16 @@ const {
     removeChatDraft,
     sweepOrphanDrafts,
     chatDraftKey,
+    ChatDraftSession,
 } = await import('./chatDraft')
 
 beforeEach(() => {
     mockStore.clear()
     mockState.setItemDelay = 0
     mockState.setItemThrowsAfterStore = false
+    mockState.getItemThrows = false
+    mockState.getItemGate = null
+    mockState.onGetItem = null
 })
 
 // Each test uses a distinct character id so the module-level index cannot leak
@@ -51,7 +64,7 @@ describe('chatDraft write ordering', () => {
         flushChatDraft('ser', 'c1', { m: 'hello', t: '' })
         removeChatDraft('ser', 'c1') // sent: must still win the race
         const loaded = await loadChatDraft('ser', 'c1') // drains the queue, then reads
-        expect(loaded).toBeNull()
+        expect(loaded).toEqual({ status: 'absent' })
         expect(mockStore.has(chatDraftKey('ser', 'c1'))).toBe(false)
     })
 
@@ -60,7 +73,7 @@ describe('chatDraft write ordering', () => {
         removeChatDraft('ser2', 'c1') // message sent
         flushChatDraft('ser2', 'c1', { m: 'second', t: '' }) // user types again
         const loaded = await loadChatDraft('ser2', 'c1')
-        expect(loaded).toEqual({ m: 'second', t: '' })
+        expect(loaded).toEqual({ status: 'found', draft: { m: 'second', t: '' } })
     })
 
     test('send removes a draft whose save response was lost (server has it, index does not)', async () => {
@@ -91,11 +104,62 @@ describe('chatDraft round trip', () => {
     test('load returns a saved draft including the translate buffer', async () => {
         flushChatDraft('load', 'c1', { m: 'remember me', t: 'tr' })
         const loaded = await loadChatDraft('load', 'c1')
-        expect(loaded).toEqual({ m: 'remember me', t: 'tr' })
+        expect(loaded).toEqual({ status: 'found', draft: { m: 'remember me', t: 'tr' } })
     })
 
-    test('load returns null for a chat with no draft', async () => {
+    test('load reports an absent chat draft', async () => {
         const loaded = await loadChatDraft('empty', 'c1')
-        expect(loaded).toBeNull()
+        expect(loaded).toEqual({ status: 'absent' })
+    })
+})
+
+describe('ChatDraftSession load safety', () => {
+    test('a failed read does not remove the saved server draft', async () => {
+        const chaId = 'read-failure'
+        flushChatDraft(chaId, 'c1', { m: 'keep this', t: '' })
+        expect(await loadChatDraft(chaId, 'c1')).toEqual({
+            status: 'found',
+            draft: { m: 'keep this', t: '' },
+        })
+
+        mockState.getItemThrows = true
+        const session = new ChatDraftSession(chaId, 'c1')
+        expect(await session.load()).toEqual({ status: 'error' })
+        session.schedule({ m: '', t: '' })
+        session.flush({ m: '', t: '' })
+        session.close({ m: '', t: '' })
+
+        mockState.getItemThrows = false
+        expect(await loadChatDraft(chaId, 'c1')).toEqual({
+            status: 'found',
+            draft: { m: 'keep this', t: '' },
+        })
+    })
+
+    test('closing before the load resolves leaves the saved server draft intact', async () => {
+        const chaId = 'close-during-load'
+        flushChatDraft(chaId, 'c1', { m: 'still saved', t: '' })
+        expect(await loadChatDraft(chaId, 'c1')).toEqual({
+            status: 'found',
+            draft: { m: 'still saved', t: '' },
+        })
+
+        let releaseGetItem!: () => void
+        mockState.getItemGate = new Promise<void>((resolve) => { releaseGetItem = resolve })
+        const getItemStarted = new Promise<void>((resolve) => { mockState.onGetItem = resolve })
+        const session = new ChatDraftSession(chaId, 'c1')
+        const pendingLoad = session.load()
+        await getItemStarted
+
+        session.close({ m: '', t: '' })
+        releaseGetItem()
+        expect(await pendingLoad).toBeNull()
+
+        mockState.getItemGate = null
+        mockState.onGetItem = null
+        expect(await loadChatDraft(chaId, 'c1')).toEqual({
+            status: 'found',
+            draft: { m: 'still saved', t: '' },
+        })
     })
 })

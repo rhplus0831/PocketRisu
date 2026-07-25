@@ -1,9 +1,9 @@
 # A draft read failure or a quick chat switch deletes the saved draft
 
-- Status: Open
+- Status: Fixed
 - Severity: High
 - Area: client drafts
-- Affected code: `src/lib/ChatScreens/DefaultChatScreen.svelte:98-127` (inputs cleared before async load; unmount cleanup flushes current inputs), `src/lib/ChatScreens/DefaultChatScreen.svelte:131-138` (debounced save effect keyed on `draftLoading`), `src/ts/storage/chatDraft.ts:91-107` (`loadChatDraft` converts every failure to `null`), `src/ts/storage/chatDraft.ts:62-79` (empty draft → `persistRemove` deletes the server row)
+- Affected code: `src/lib/ChatScreens/DefaultChatScreen.svelte:99-142` (composer draft session lifecycle), `src/ts/storage/chatDraft.ts:43-196` (load outcomes, persistence queue, and session safety)
 
 ## Risk
 
@@ -36,3 +36,18 @@ state.
 
 Cover with tests: (a) failed read must not remove the server draft; (b)
 mount→unmount before load resolution must leave the draft intact.
+
+## Resolution
+
+`loadChatDraft()` now returns distinct `found`, `absent`, and `error` results.
+A failed prefix-list request also leaves the index uninitialized so later
+operations retry instead of treating the failure as proof that no drafts exist.
+
+`ChatDraftSession` now owns each mounted composer's load and persistence state.
+An empty composer is authoritative only after a successful `found` or `absent`
+load. While loading or after an error, non-empty text the user typed may still be
+saved, but temporary empty inputs cannot schedule or flush a removal. Closing the
+session invalidates a late load result without writing those cleared inputs.
+
+Regression tests cover both a failed read and closing a session before its
+blocked read resolves; each verifies that the saved server draft remains intact.

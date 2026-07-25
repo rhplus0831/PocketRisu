@@ -2,7 +2,7 @@
 
 - Audit point: `bbe0e024` (branch `serve`, clean tree)
 - Prior audit: [v1](../../../.archived-docs/v1/serve-branch-data-loss-audit.md) — 16 findings, all fixed at `2e3d4f05`
-- Current status: **36 open findings** — 13 fatal, 23 warning
+- Current status: **35 open findings** — 12 fatal, 23 warning; 1 fixed
 
 ## Scope and method
 
@@ -40,7 +40,7 @@ fixing.
 | file mgmt | [The inlay orphan scan classifies referenced inlays as deletable](fatal/inlay-orphan-scan-classifies-referenced-inlays-as-deletable.md) | Direct loss |
 | file mgmt | [Automatic boot GC deletes plugin-owned assets](fatal/boot-asset-gc-deletes-plugin-owned-assets.md) | Direct loss |
 | file stores | [Inlay replacement unlinks the only copy before publishing](fatal/inlay-replacement-unlinks-before-publish.md) | Direct loss |
-| drafts | [A draft read failure or quick chat switch deletes the saved draft](fatal/draft-load-race-deletes-saved-drafts.md) | Direct loss |
+| drafts | [A draft read failure or quick chat switch deletes the saved draft](../../../.archived-docs/v2/fatal/draft-load-race-deletes-saved-drafts.md) | Direct loss (fixed) |
 | chat flows | [Sending can replace another chat's history after an async trigger gap](fatal/send-input-race-replaces-another-chats-history.md) | Direct loss |
 | chat flows | [Reroll completion targets the currently selected chat](fatal/reroll-failure-restores-into-the-current-chat.md) | Direct loss |
 | chat flows | [Reroll can leave no durable copy of the discarded response](fatal/reroll-discards-the-only-copy-within-preimage-cooldown.md) | Direct loss |

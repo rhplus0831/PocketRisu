@@ -21,6 +21,11 @@ export interface ChatDraft {
     t: string
 }
 
+export type ChatDraftLoadResult =
+    | { status: 'found'; draft: ChatDraft }
+    | { status: 'absent' }
+    | { status: 'error' }
+
 const PREFIX = 'drafts/'
 const DEBOUNCE_MS = 800
 
@@ -40,7 +45,12 @@ async function ensureIndex(): Promise<void> {
     if (!indexLoading) {
         indexLoading = forageStorage.keys(PREFIX)
             .then((keys) => { draftKeys = new Set(keys) })
-            .catch(() => { draftKeys = new Set() })
+            .catch((error) => {
+                // A failed list is not proof that no drafts exist. Leave the
+                // index uninitialized so the next operation can retry it.
+                indexLoading = null
+                throw error
+            })
     }
     await indexLoading
 }
@@ -87,22 +97,25 @@ function cancelPending() {
     }
 }
 
-/** Load a chat's draft, or null if none. No round trip when the index says none. */
-export async function loadChatDraft(chaId: string, chatId: string): Promise<ChatDraft | null> {
-    if (!chaId || !chatId) return null
-    const key = chatDraftKey(chaId, chatId)
-    await ensureIndex()
-    // Let any in-flight writes land first so a quick leave→return reads the value
-    // we just saved, not a stale one.
-    await writeChain
-    if (!draftKeys!.has(key)) return null
+/** Load a chat's draft. No round trip when the index says it is absent. */
+export async function loadChatDraft(chaId: string, chatId: string): Promise<ChatDraftLoadResult> {
+    if (!chaId || !chatId) return { status: 'absent' }
     try {
+        const key = chatDraftKey(chaId, chatId)
+        await ensureIndex()
+        // Let any in-flight writes land first so a quick leave→return reads the value
+        // we just saved, not a stale one.
+        await writeChain
+        if (!draftKeys!.has(key)) return { status: 'absent' }
         const buf = await forageStorage.getItem(key)
-        if (!buf || buf.length === 0) return null
+        if (!buf || buf.length === 0) return { status: 'absent' }
         const obj = JSON.parse(new TextDecoder().decode(buf))
-        return { m: obj.m ?? '', t: obj.t ?? '' }
+        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error('Invalid chat draft')
+        if (typeof obj.m !== 'string') throw new Error('Invalid chat draft message')
+        if (typeof obj.t !== 'string') throw new Error('Invalid chat draft translation')
+        return { status: 'found', draft: { m: obj.m, t: obj.t } }
     } catch {
-        return null
+        return { status: 'error' }
     }
 }
 
@@ -129,6 +142,57 @@ export function removeChatDraft(chaId: string, chatId: string): void {
     if (!chaId || !chatId) return
     cancelPending()
     enqueue(() => persistRemove(chatDraftKey(chaId, chatId)))
+}
+
+type ChatDraftSessionState = 'loading' | 'ready' | 'error' | 'closed'
+
+/**
+ * Owns the load/persist lifecycle for one mounted chat composer. Empty input is
+ * authoritative only after a successful found/absent load. While a load is in
+ * flight, or after it fails, non-empty user input may still be saved but the
+ * stored draft must never be removed based on the temporary empty UI state.
+ */
+export class ChatDraftSession {
+    private state: ChatDraftSessionState = 'loading'
+
+    constructor(
+        private readonly chaId: string,
+        private readonly chatId: string,
+    ) {}
+
+    matches(chaId: string, chatId: string): boolean {
+        return this.chaId === chaId && this.chatId === chatId
+    }
+
+    async load(): Promise<ChatDraftLoadResult | null> {
+        const result = await loadChatDraft(this.chaId, this.chatId)
+        if (this.state === 'closed') return null
+        this.state = result.status === 'error' ? 'error' : 'ready'
+        return result
+    }
+
+    schedule(draft: ChatDraft): void {
+        if (!this.canPersist(draft)) return
+        scheduleSaveChatDraft(this.chaId, this.chatId, draft)
+    }
+
+    flush(draft: ChatDraft): void {
+        if (!this.canPersist(draft)) return
+        flushChatDraft(this.chaId, this.chatId, draft)
+    }
+
+    close(draft: ChatDraft): void {
+        if (this.state === 'closed') return
+        const shouldPersist = this.canPersist(draft)
+        this.state = 'closed'
+        if (shouldPersist) flushChatDraft(this.chaId, this.chatId, draft)
+    }
+
+    private canPersist(draft: ChatDraft): boolean {
+        if (this.state === 'closed') return false
+        if (this.state === 'ready') return true
+        return Boolean(draft.m || draft.t)
+    }
 }
 
 /**

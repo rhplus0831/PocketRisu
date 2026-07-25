@@ -34,7 +34,7 @@ import { isMobile } from 'src/ts/platform'
     import { postChatFile } from 'src/ts/process/files/multisend';
     import { getInlayAsset } from 'src/ts/process/files/inlays';
     import { quickMenu } from 'src/ts/hotkey';
-    import { loadChatDraft, scheduleSaveChatDraft, flushChatDraft, removeChatDraft } from 'src/ts/storage/chatDraft';
+    import { ChatDraftSession, removeChatDraft } from 'src/ts/storage/chatDraft';
 
     import Chats from './Chats.svelte';
     import Button from '../UI/GUI/Button.svelte';
@@ -88,9 +88,10 @@ import { isMobile } from 'src/ts/platform'
     let draftChaId = $derived(currentCharacter?.chaId ?? '')
     let draftChatId = $derived(currentChatSlot?.id ?? '')
     let draftLoading = $state(false)
+    let activeDraftSession: ChatDraftSession | null = null
 
     function persistDraftNow() {
-        flushChatDraft(draftChaId, draftChatId, { m: messageInput, t: messageInputTranslate })
+        activeDraftSession?.flush({ m: messageInput, t: messageInputTranslate })
     }
 
     // Load on chat enter (keyed by id, so no wait for hydration); flush the
@@ -99,30 +100,31 @@ import { isMobile } from 'src/ts/platform'
         const chaId = draftChaId
         const chatId = draftChatId
         if (!chaId || !chatId) return
+        const session = new ChatDraftSession(chaId, chatId)
+        activeDraftSession = session
         untrack(() => { messageInput = ''; messageInputTranslate = ''; draftLoading = true })
-        let active = true
         ;(async () => {
-            const draft = await loadChatDraft(chaId, chatId)
-            if (!active) return
+            const result = await session.load()
+            if (!result || activeDraftSession !== session) return
             untrack(() => {
                 // Don't clobber text the user began typing during the load.
-                if (draft && messageInput === '' && messageInputTranslate === '') {
-                    messageInput = draft.m
-                    messageInputTranslate = draft.t
+                if (result.status === 'found' && messageInput === '' && messageInputTranslate === '') {
+                    messageInput = result.draft.m
+                    messageInputTranslate = result.draft.t
                 }
                 draftLoading = false
             })
             // Resize the textarea to fit the cleared/loaded text (height is
             // updated imperatively, not reactively to messageInput).
             await tick()
-            if (active) updateInputSizeAll()
+            if (activeDraftSession === session) updateInputSizeAll()
         })()
         return () => {
-            active = false
-            flushChatDraft(chaId, chatId, {
+            session.close({
                 m: untrack(() => messageInput),
                 t: untrack(() => messageInputTranslate),
             })
+            if (activeDraftSession === session) activeDraftSession = null
         }
     })
 
@@ -134,7 +136,9 @@ import { isMobile } from 'src/ts/platform'
         const m = messageInput
         const t = messageInputTranslate
         if (!chaId || !chatId || draftLoading) return
-        scheduleSaveChatDraft(chaId, chatId, { m, t })
+        const session = activeDraftSession
+        if (!session?.matches(chaId, chatId)) return
+        session.schedule({ m, t })
     })
 
     // Best-effort persist on tab hide / unload (refresh, app switch): the
