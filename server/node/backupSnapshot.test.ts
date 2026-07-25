@@ -18,6 +18,7 @@ const { createChunkStore, createSnapshotReader } = chunkStorePkg as {
     createSnapshotReader: (db: Database.Database) => {
         kvGet: (key: string) => Buffer | null
         kvList: (prefix?: string) => string[]
+        kvListWithSizes: (prefix: string) => Array<{ key: string; size: number }>
     }
 }
 const { streamRisuSaveToFile } = streamSavePkg as {
@@ -76,6 +77,8 @@ describe('backup snapshot assembly', () => {
                 deleted: snapshot.kvGet('deleted/value').toString(),
                 added: snapshot.kvGet('new/value'),
                 escapedList: snapshot.kvList('literal%_\\/'),
+                escapedSizes: snapshot.kvListWithSizes('literal%_\\/'),
+                chunkSizes: snapshot.kvListWithSizes('database/'),
             };
             snapshot.close();
             snapshot.close();
@@ -98,6 +101,8 @@ describe('backup snapshot assembly', () => {
             deleted: 'present',
             added: null,
             escapedList: ['literal%_\\/one'],
+            escapedSizes: [{ key: 'literal%_\\/one', size: 7 }],
+            chunkSizes: [{ key: 'database/database.bin', size: 200000 }],
             liveRaw: 'after',
             liveChunk: true,
             liveKeys: ['new/value'],

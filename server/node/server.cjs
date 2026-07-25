@@ -1279,13 +1279,13 @@ function assetNameForKey(key) {
         : null;
 }
 
-function readAssetValue(key) {
+function readAssetValue(key, reader = { kvGet }) {
     const name = assetNameForKey(key);
     if (name !== null && isSafeAssetName(name)) {
         const fileValue = readAssetFile(name);
         if (fileValue !== null) return fileValue;
     }
-    return kvGet(key);
+    return reader.kvGet(key);
 }
 
 function writeAssetValue(key, value, options = {}) {
@@ -1318,7 +1318,7 @@ function deleteAssetValue(key) {
     kvDel(key);
 }
 
-function listAssetEntriesWithSizes() {
+function listAssetEntriesWithSizes(reader = { kvListWithSizes }) {
     const entries = new Map();
     for (const file of listAssetFiles()) {
         entries.set(`assets/${file.name}`, {
@@ -1328,7 +1328,7 @@ function listAssetEntriesWithSizes() {
             source: 'fs',
         });
     }
-    for (const row of kvListWithSizes('assets/')) {
+    for (const row of reader.kvListWithSizes('assets/')) {
         if (!entries.has(row.key)) {
             entries.set(row.key, {
                 key: row.key,
@@ -2134,15 +2134,19 @@ function encodeColdStorageCanonicalBuffer(coldData) {
 }
 
 function readColdStorageJsonEntry(nameOrKey, options = {}) {
-    const { migrateLegacy = false, allowPlainJsonFallback = false } = options;
+    const {
+        migrateLegacy = false,
+        allowPlainJsonFallback = false,
+        reader = { kvGet },
+    } = options;
     const canonicalKey = normalizeColdStorageStorageKey(nameOrKey);
     const legacyBackupKey = `${canonicalKey}.json`;
 
     let storageKey = canonicalKey;
-    let value = kvGet(canonicalKey);
+    let value = reader.kvGet(canonicalKey);
     if (!value) {
         storageKey = legacyBackupKey;
-        value = kvGet(legacyBackupKey);
+        value = reader.kvGet(legacyBackupKey);
     }
     if (!value) {
         return null;
@@ -2167,15 +2171,20 @@ function readColdStorageJsonEntry(nameOrKey, options = {}) {
     };
 }
 
-function listColdStorageBackupEntries() {
+function listColdStorageBackupEntries(options = {}) {
+    const {
+        reader = { kvGet, kvList },
+        migrateLegacy = true,
+    } = options;
     const canonicalKeys = Array.from(new Set(
-        kvList('coldstorage/').map((key) => normalizeColdStorageStorageKey(key))
+        reader.kvList('coldstorage/').map((key) => normalizeColdStorageStorageKey(key))
     )).sort((a, b) => a.localeCompare(b));
 
     return canonicalKeys.map((storageKey) => {
         const entry = readColdStorageJsonEntry(storageKey, {
-            migrateLegacy: true,
+            migrateLegacy,
             allowPlainJsonFallback: true,
+            reader,
         });
         if (!entry) {
             throw new Error(`[ColdStorage] missing cold storage entry while exporting: ${storageKey}`);
@@ -2340,13 +2349,18 @@ async function spoolSelfContainedBackupDatabase(
 async function buildSelfContainedBackupDatabase({
     foldPluginStorage = true,
     shouldAbort = () => false,
+    snapshot: externalSnapshot = null,
 } = {}) {
-    let snapshot = null;
+    let snapshot = externalSnapshot;
+    let ownsSnapshot = false;
     try {
-        snapshot = await queueStorageOperation(async () => {
-            await flushPendingDb();
-            return createKvSnapshot();
-        });
+        if (!snapshot) {
+            snapshot = await queueStorageOperation(async () => {
+                await flushPendingDb();
+                return createKvSnapshot();
+            });
+            ownsSnapshot = true;
+        }
         const raw = snapshot.kvGet('database/database.bin');
         if (!raw) return null;
 
@@ -2357,13 +2371,13 @@ async function buildSelfContainedBackupDatabase({
             reader: snapshot,
         });
     } finally {
-        snapshot?.close();
+        if (ownsSnapshot) snapshot?.close();
     }
 }
 
-function listPluginBackupEntries() {
+function listPluginBackupEntries(reader = { kvListWithSizes }) {
     return [PLUGIN_SAVE_PREFIX, PLUGIN_SAVE_META_PREFIX].flatMap((prefix) => (
-        kvListWithSizes(prefix).map((entry) => ({
+        reader.kvListWithSizes(prefix).map((entry) => ({
             kind: 'kv',
             key: entry.key,
             backupName: entry.key,
@@ -4387,9 +4401,15 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
 app.get('/api/backup/export', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
     let backupDbSpool = null;
+    let backupSnapshot = null;
     let closed = false;
     res.once('close', () => { closed = true; });
     try {
+        backupSnapshot = await queueStorageOperation(async () => {
+            await flushPendingDb();
+            return createKvSnapshot();
+        });
+
         // ?target=upstream excludes NodeOnly-only slashed namespaces: plugin
         // rows plus inlay/, inlay_sidecar/, and inlay_meta/. Upstream RisuAI's
         // import treats those names as paths under assets/ and fails with
@@ -4398,6 +4418,7 @@ app.get('/api/backup/export', async (req, res, next) => {
         backupDbSpool = await buildSelfContainedBackupDatabase({
             foldPluginStorage: target === 'upstream',
             shouldAbort: () => closed,
+            snapshot: backupSnapshot,
         });
         if (closed) return;
         const inlayFiles = target === 'upstream' ? [] : await listInlayFiles();
@@ -4426,23 +4447,26 @@ app.get('/api/backup/export', async (req, res, next) => {
                 return null;
             }
         }));
-        const inlayMetaEntries = target === 'upstream' ? [] : kvListWithSizes('inlay_meta/').map((entry) => ({
+        const inlayMetaEntries = target === 'upstream' ? [] : backupSnapshot.kvListWithSizes('inlay_meta/').map((entry) => ({
             kind: 'kv',
             key: entry.key,
             backupName: entry.key,
             sortKey: entry.key,
             size: entry.size,
         }));
-        const pluginEntries = target === 'upstream' ? [] : listPluginBackupEntries();
+        const pluginEntries = target === 'upstream' ? [] : listPluginBackupEntries(backupSnapshot);
         const namespacedEntries = [
-            ...listAssetEntriesWithSizes().map((entry) => ({
+            ...listAssetEntriesWithSizes(backupSnapshot).map((entry) => ({
                 kind: 'asset',
                 key: entry.key,
                 backupName: path.basename(entry.key),
                 sortKey: entry.key,
                 size: entry.size,
             })),
-            ...listColdStorageBackupEntries(),
+            ...listColdStorageBackupEntries({
+                reader: backupSnapshot,
+                migrateLegacy: false,
+            }),
             ...pluginEntries,
             ...inlayMetaEntries,
             ...inlayEntries,
@@ -4462,20 +4486,29 @@ app.get('/api/backup/export', async (req, res, next) => {
         for (const entry of namespacedEntries) {
             if (closed) break;
             const value = entry.kind === 'asset'
-                ? readAssetValue(entry.key)
+                ? readAssetValue(entry.key, backupSnapshot)
                 : entry.kind === 'kv'
-                    ? kvGet(entry.key)
+                    ? backupSnapshot.kvGet(entry.key)
                 : entry.kind === 'buffer'
                     ? entry.buffer
                     : await fs.readFile(entry.sourcePath);
             if (closed) break;
-            if (value) {
-                if (!await writeWithBackpressure(
-                    res,
-                    encodeBackupEntry(entry.backupName, value),
-                    () => closed
-                )) break;
+            if (value === null || value?.length !== entry.size) {
+                const actualSize = value === null ? 'missing' : value?.length;
+                const error = new Error(
+                    `Backup entry changed while exporting: ${entry.backupName} `
+                    + `(planned ${entry.size} bytes, found ${actualSize})`
+                );
+                logger.error('[Backup Export] Aborting inconsistent stream', error);
+                closed = true;
+                res.destroy(error);
+                return;
             }
+            if (!await writeWithBackpressure(
+                res,
+                encodeBackupEntry(entry.backupName, value),
+                () => closed
+            )) break;
         }
 
         if (!closed && dbSize && backupDbSpool) {
@@ -4492,6 +4525,7 @@ app.get('/api/backup/export', async (req, res, next) => {
             next(error);
         }
     } finally {
+        backupSnapshot?.close();
         if (backupDbSpool) {
             await fs.unlink(backupDbSpool.filePath).catch(() => {});
         }
@@ -4634,19 +4668,25 @@ app.post('/api/backup/server/save', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     if (HUB_HOSTING_MODE) return res.status(403).json({ error: 'Server backups are disabled on this instance' });
     let backupDbSpool = null;
+    let backupSnapshot = null;
     let closed = false;
     res.once('close', () => { closed = true; });
     try {
+        backupSnapshot = await queueStorageOperation(async () => {
+            await flushPendingDb();
+            return createKvSnapshot();
+        });
         backupDbSpool = await buildSelfContainedBackupDatabase({
             foldPluginStorage: false,
             shouldAbort: () => closed,
+            snapshot: backupSnapshot,
         });
         if (closed) return;
 
         // Pre-flight disk check — bail before streaming if the target dir
         // can't fit the backup. Avoids wasted minutes + half-written tmp files.
         try {
-            const estimate = await estimateServerBackupSize();
+            const estimate = await estimateServerBackupSize(backupSnapshot);
             const required = Math.ceil(estimate * 1.05); // 5% safety margin
             const sf = await fs.statfs(backupsDir);
             const free = sf.bsize * sf.bavail;
@@ -4678,10 +4718,13 @@ app.post('/api/backup/server/save', async (req, res, next) => {
         }))).filter(Boolean);
 
         const namespacedEntries = [
-            ...listAssetEntriesWithSizes().map((e) => ({ kind: 'asset', key: e.key, backupName: path.basename(e.key), size: e.size })),
-            ...listColdStorageBackupEntries(),
-            ...listPluginBackupEntries(),
-            ...kvListWithSizes('inlay_meta/').map((e) => ({ kind: 'kv', key: e.key, backupName: e.key, size: e.size })),
+            ...listAssetEntriesWithSizes(backupSnapshot).map((e) => ({ kind: 'asset', key: e.key, backupName: path.basename(e.key), size: e.size })),
+            ...listColdStorageBackupEntries({
+                reader: backupSnapshot,
+                migrateLegacy: false,
+            }),
+            ...listPluginBackupEntries(backupSnapshot),
+            ...backupSnapshot.kvListWithSizes('inlay_meta/').map((e) => ({ kind: 'kv', key: e.key, backupName: e.key, size: e.size })),
             ...inlayEntries,
             ...sidecarEntries,
         ];
@@ -4713,17 +4756,22 @@ app.post('/api/backup/server/save', async (req, res, next) => {
             for (const entry of namespacedEntries) {
                 if (closed) break;
                 const value = entry.kind === 'asset'
-                    ? readAssetValue(entry.key)
+                    ? readAssetValue(entry.key, backupSnapshot)
                     : entry.kind === 'kv'
-                        ? kvGet(entry.key)
+                        ? backupSnapshot.kvGet(entry.key)
                     : entry.kind === 'buffer'
                         ? entry.buffer
                         : await fs.readFile(entry.sourcePath);
-                if (value) {
-                    const encodedEntry = encodeBackupEntry(entry.backupName, value);
-                    if (!await writeWithBackpressure(writeStream, encodedEntry, () => closed)) break;
-                    bytesWritten += encodedEntry.length;
+                if (value === null || value?.length !== entry.size) {
+                    const actualSize = value === null ? 'missing' : value?.length;
+                    throw new Error(
+                        `Backup entry changed while saving: ${entry.backupName} `
+                        + `(planned ${entry.size} bytes, found ${actualSize})`
+                    );
                 }
+                const encodedEntry = encodeBackupEntry(entry.backupName, value);
+                if (!await writeWithBackpressure(writeStream, encodedEntry, () => closed)) break;
+                bytesWritten += encodedEntry.length;
                 written++;
                 if (written % 50 === 0 || written === namespacedEntries.length) {
                     res.write(JSON.stringify({ type: 'progress', current: written, total: totalEntries, bytes: bytesWritten, totalBytes }) + '\n');
@@ -4773,6 +4821,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
             res.end();
         }
     } finally {
+        backupSnapshot?.close();
         if (backupDbSpool) {
             await fs.unlink(backupDbSpool.filePath).catch(() => {});
         }
@@ -5651,16 +5700,21 @@ async function sumDirectoryFsBytes(directory) {
 // /api/backup/server/save without writing anything. Inlay files live on the
 // filesystem (post-migration), so we have to fs.stat them rather than read
 // kvSize. Cost: ~5-50 ms typical, ~200 ms for users with thousands of inlays.
-async function estimateServerBackupSize() {
+async function estimateServerBackupSize(reader = null) {
     let total = 0;
-    total += kvSize(DB_BLOB_KEY) || 0;
+    total += reader
+        ? (reader.kvListWithSizes(DB_BLOB_KEY).find((it) => it.key === DB_BLOB_KEY)?.size ?? 0)
+        : (kvSize(DB_BLOB_KEY) || 0);
     // Server backups carry plugin values as individual archive entries. Count
     // their raw payload sizes without reading or decoding them.
-    for (const it of kvListWithSizes(PLUGIN_SAVE_PREFIX)) total += it.size;
-    for (const it of kvListWithSizes(PLUGIN_SAVE_META_PREFIX)) total += it.size;
-    for (const it of listAssetEntriesWithSizes()) total += it.size;
-    for (const it of kvListWithSizes('inlay_meta/')) total += it.size;
-    for (const e of listColdStorageBackupEntries()) total += e.size;
+    const sizeReader = reader || { kvListWithSizes };
+    for (const it of sizeReader.kvListWithSizes(PLUGIN_SAVE_PREFIX)) total += it.size;
+    for (const it of sizeReader.kvListWithSizes(PLUGIN_SAVE_META_PREFIX)) total += it.size;
+    for (const it of listAssetEntriesWithSizes(sizeReader)) total += it.size;
+    for (const it of sizeReader.kvListWithSizes('inlay_meta/')) total += it.size;
+    for (const e of reader
+        ? listColdStorageBackupEntries({ reader, migrateLegacy: false })
+        : listColdStorageBackupEntries()) total += e.size;
     total += await sumInlayFsBytes();
     return total;
 }

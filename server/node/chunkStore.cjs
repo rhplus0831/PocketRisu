@@ -64,8 +64,15 @@ function createSnapshotReader(db) {
     const selKv = db.prepare('SELECT value FROM kv WHERE key = ?');
     const selKvList = db.prepare('SELECT key FROM kv');
     const selKvPrefix = db.prepare(`SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\'`);
+    const selKvPrefixSizes = db.prepare(
+        `SELECT key, LENGTH(value) AS size, value = @chunkMarker AS is_chunked
+         FROM kv WHERE key LIKE @pattern ESCAPE '\\'`,
+    );
     const selManifest = db.prepare('SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq');
     const selChunk = db.prepare('SELECT data FROM chunks WHERE hash = ?');
+    const selSize = db.prepare(
+        'SELECT SUM(LENGTH(c.data)) AS n FROM manifest_chunks m JOIN chunks c ON c.hash = m.hash WHERE m.manifest_key = ?',
+    );
 
     function kvGet(key) {
         const row = selKv.get(key);
@@ -86,7 +93,18 @@ function createSnapshotReader(db) {
         return selKvList.all().map((row) => row.key);
     }
 
-    return { kvGet, kvList };
+    function kvListWithSizes(prefix) {
+        const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+        return selKvPrefixSizes.all({
+            chunkMarker: CHUNK_MARKER,
+            pattern: `${escaped}%`,
+        }).map((row) => ({
+            key: row.key,
+            size: row.is_chunked ? (selSize.get(row.key).n ?? row.size) : row.size,
+        }));
+    }
+
+    return { kvGet, kvList, kvListWithSizes };
 }
 
 // Bind chunk-aware get/put to a specific better-sqlite3 instance. db.cjs wires
