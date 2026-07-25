@@ -41,6 +41,33 @@ async function listDecodedStorageKeys(prefix: string): Promise<string[]> {
     return keys;
 }
 
+export async function readExternalizedPluginStorage(): Promise<{
+    values: Record<string, unknown>;
+    meta: NonNullable<Database["pluginStorageMeta"]>;
+}> {
+    return withPluginSaveStorageLock(async () => {
+        const [listedValueKeys, listedMetaKeys] = await Promise.all([
+            listPersistentKeys(PLUGIN_SAVE_PREFIX),
+            listPersistentKeys(PLUGIN_SAVE_META_PREFIX),
+        ]);
+        const values: Record<string, unknown> = {};
+        const meta: NonNullable<Database["pluginStorageMeta"]> = {};
+
+        for (const storageKey of listedValueKeys) {
+            const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
+            if (key === null) continue;
+            values[key] = await readPersistentJson(storageKey, { cached: true });
+        }
+        for (const storageKey of listedMetaKeys) {
+            const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
+            if (key === null) continue;
+            meta[key] = await readPersistentJson(storageKey);
+        }
+
+        return { values, meta };
+    });
+}
+
 export async function getPluginSaveStorageItem<T>(key: string): Promise<T | null> {
     return withPluginSaveStorageLock(async () => {
         const db = getDatabase();

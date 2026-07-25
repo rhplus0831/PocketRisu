@@ -24,6 +24,7 @@ const {
     getPluginSaveStorageItem,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_SAVE_PREFIX,
+    readExternalizedPluginStorage,
     reconcilePluginStorageMode,
 } = await import("./pluginSaveStorage");
 
@@ -32,10 +33,75 @@ function encoded(prefix: string, key: string) {
 }
 
 beforeEach(() => {
+    vi.clearAllMocks();
     database = {
         optimizePluginMemory: false,
         pluginCustomStorage: {},
     };
+});
+
+describe("readExternalizedPluginStorage", () => {
+    test("reads and decodes values and metadata with their respective cache modes", async () => {
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "plain key");
+        const unicodeValueKey = encoded(PLUGIN_SAVE_PREFIX, "키🔑");
+        const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "키🔑");
+        const persistent = new Map<string, unknown>([
+            [valueKey, { value: 1 }],
+            [unicodeValueKey, ["external"]],
+            [metaKey, { plugin: "Test", updatedAt: 7 }],
+        ]);
+        const { listPersistentKeys, readPersistentJson } = await import("../storage/persistentKv");
+        vi.mocked(listPersistentKeys).mockImplementation(async (prefix: string) =>
+            [...persistent.keys()].filter((key) => key.startsWith(prefix))
+        );
+        vi.mocked(readPersistentJson).mockImplementation(async (key: string) => persistent.get(key));
+
+        await expect(readExternalizedPluginStorage()).resolves.toEqual({
+            values: {
+                "plain key": { value: 1 },
+                "키🔑": ["external"],
+            },
+            meta: {
+                "키🔑": { plugin: "Test", updatedAt: 7 },
+            },
+        });
+        expect(listPersistentKeys).toHaveBeenCalledWith(PLUGIN_SAVE_PREFIX);
+        expect(listPersistentKeys).toHaveBeenCalledWith(PLUGIN_SAVE_META_PREFIX);
+        expect(readPersistentJson).toHaveBeenCalledWith(valueKey, { cached: true });
+        expect(readPersistentJson).toHaveBeenCalledWith(unicodeValueKey, { cached: true });
+        expect(readPersistentJson).toHaveBeenCalledWith(metaKey);
+    });
+
+    test("skips listed keys with the wrong prefix or without a json suffix", async () => {
+        const validValueKey = encoded(PLUGIN_SAVE_PREFIX, "valid");
+        const validMetaKey = encoded(PLUGIN_SAVE_META_PREFIX, "valid");
+        const { listPersistentKeys, readPersistentJson } = await import("../storage/persistentKv");
+        vi.mocked(listPersistentKeys).mockImplementation(async (prefix: string) => {
+            if (prefix === PLUGIN_SAVE_PREFIX) {
+                return [
+                    validValueKey,
+                    encoded("wrong-prefix/", "wrong"),
+                    validValueKey.slice(0, -".json".length),
+                ];
+            }
+            return [
+                validMetaKey,
+                encoded("wrong-meta-prefix/", "wrong"),
+                validMetaKey.slice(0, -".json".length),
+            ];
+        });
+        vi.mocked(readPersistentJson).mockImplementation(async (key: string) =>
+            key === validValueKey ? 42 : { plugin: "Test", updatedAt: 9 }
+        );
+
+        await expect(readExternalizedPluginStorage()).resolves.toEqual({
+            values: { valid: 42 },
+            meta: { valid: { plugin: "Test", updatedAt: 9 } },
+        });
+        expect(readPersistentJson).toHaveBeenCalledTimes(2);
+        expect(readPersistentJson).toHaveBeenCalledWith(validValueKey, { cached: true });
+        expect(readPersistentJson).toHaveBeenCalledWith(validMetaKey);
+    });
 });
 
 describe("plugin save storage transport", () => {

@@ -4,6 +4,7 @@ import { encodeRisuSaveLegacy } from "../storage/risuSave";
 import { getDatabase, type Chat } from "../storage/database.svelte";
 import { fetchChatFromServer } from "../storage/chatStorage";
 import { language } from "src/lang";
+import { readExternalizedPluginStorage } from "../plugins/pluginSaveStorage";
 
 function formatBytes(bytes: number): string {
     if (bytes < 1024) return `${bytes} B`
@@ -201,6 +202,18 @@ export async function SavePartialLocalBackup(){
                     throw new Error(`Chat data missing for "${char.name}" / "${chat.name}" (${chat.id}). Backup aborted to prevent data loss.`)
                 }
             }
+        }
+    }
+    if (db.optimizePluginMemory) {
+        alertWait(`Saving partial local backup... (Assembling plugin storage)`)
+        const external = await readExternalizedPluginStorage()
+        // Fold external rows for the archive; optimized imports externalize them again.
+        dbCopy.pluginCustomStorage = { ...external.values, ...dbCopy.pluginCustomStorage }
+        const pluginStorageMeta = { ...external.meta, ...dbCopy.pluginStorageMeta }
+        if (Object.keys(pluginStorageMeta).length > 0) {
+            dbCopy.pluginStorageMeta = pluginStorageMeta
+        } else {
+            delete dbCopy.pluginStorageMeta
         }
     }
     const dbData = encodeRisuSaveLegacy(dbCopy, 'compression')
