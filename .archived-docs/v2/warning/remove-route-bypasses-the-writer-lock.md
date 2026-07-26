@@ -1,6 +1,6 @@
 # /api/remove bypasses the single-writer session check
 
-- Status: Open
+- Status: Fixed
 - Severity: Medium
 - Area: server persistence core
 - Affected code: `server/node/server.cjs:4058-4096` (`/api/remove` checks auth only), `server/node/server.cjs:1690-1697` (`checkActiveSession` exists), `server/node/server.cjs:4200-4205` (`/api/write` enforces it)
@@ -22,3 +22,16 @@ Apply `checkActiveSession` to `/api/remove` and every other destructive
 route. For value stores where stale deletion matters (plugin keys), consider
 a conditional delete (expected content hash). Test: displaced session's
 remove must return 423.
+
+## Resolution
+
+`/api/remove` now calls `checkActiveSession()` immediately after authentication,
+before decoding the key or entering `queueStorageMutation()`. A displaced client
+therefore receives `423 Session deactivated` without deleting KV or filesystem
+state, while the active writer and compatibility clients without a session ID
+retain the existing route behavior.
+
+Regression coverage in `../../../test/compat/writer-session-lock.test.ts` starts
+two authenticated sessions against a real server, lets the second session replace
+a plugin value, and verifies that the displaced session cannot remove that newer
+value. It also confirms that the active writer can still remove it.
