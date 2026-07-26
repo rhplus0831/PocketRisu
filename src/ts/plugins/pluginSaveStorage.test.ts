@@ -305,6 +305,29 @@ vi.mock("../storage/persistentKv", () => {
             generation,
             manifestRevision: `sha256:${"d".repeat(64)}`,
         })),
+        readPersistentPluginStorageViewerPage: vi.fn(async (
+            generation: string,
+            options: { page: number; pageSize: number },
+        ) => ({
+            generation,
+            manifestRevision: `sha256:${"d".repeat(64)}`,
+            databaseRevision: "e".repeat(32),
+            pageToken: `sha256:${"f".repeat(64)}`,
+            page: options.page,
+            pageSize: options.pageSize,
+            pageCount: 1,
+            total: 0,
+            ownerFacets: [],
+            unknownOwnerCount: 0,
+            ownerFacetTotal: 0,
+            entries: [],
+            metrics: {
+                manifestParses: 1,
+                valueReads: 0,
+                ownerReads: 0,
+                maxRowParses: 0,
+            },
+        })),
         readPersistentPluginStorageState: vi.fn(async (valueKey: string) => {
             if (!persistent.has(valueKey)) {
                 return { status: "missing" as const, value: null, revision: null, generation: null };
@@ -386,6 +409,7 @@ const {
     getPluginSaveStorageKeys,
     getPluginSaveStorageLength,
     getPluginSaveStorageOwners,
+    getPluginSaveStorageViewerPage,
     PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_SAVE_PREFIX,
@@ -1692,6 +1716,131 @@ describe("plugin save storage transport", () => {
         await setPluginSaveStorageItem(pageKeys[0], { page: 100 });
         await expect(getPluginSaveStorageItem(pageKeys[49])).resolves.toEqual({ page: 49 });
         expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledTimes(2);
+    });
+
+    test("optimized viewer uses one bounded page transport without inventory or per-row reads", async () => {
+        database.optimizePluginMemory = true;
+        database.pluginStorageGeneration = "viewer-page-generation";
+        const {
+            listPersistentKeys,
+            readPersistentJson,
+            readPersistentPluginStorageManifestSnapshot,
+            readPersistentPluginStorageViewerPage,
+        } = vi.mocked(await import("../storage/persistentKv"));
+        readPersistentPluginStorageViewerPage.mockResolvedValueOnce({
+            generation: "viewer-page-generation",
+            manifestRevision: `sha256:${"a".repeat(64)}`,
+            databaseRevision: "b".repeat(32),
+            pageToken: `sha256:${"c".repeat(64)}`,
+            page: 123,
+            pageSize: 50,
+            pageCount: 200,
+            total: 10_000,
+            ownerFacets: [{ owner: "Owner", count: 10_000 }],
+            unknownOwnerCount: 0,
+            ownerFacetTotal: 10_000,
+            entries: Array.from({ length: 50 }, (_, index) => ({
+                key: `key-${index}`,
+                owner: "Owner",
+                text: JSON.stringify({ index }),
+                size: 16,
+                valueType: "object",
+                revision: `sha256:${index.toString(16).padStart(64, "0")}`,
+                contentHash: `sha256:${(index + 1).toString(16).padStart(64, "0")}`,
+            })),
+            metrics: {
+                manifestParses: 1,
+                valueReads: 50,
+                ownerReads: 50,
+                maxRowParses: 1,
+            },
+        });
+        const controller = new AbortController();
+
+        const result = await getPluginSaveStorageViewerPage({
+            page: 123,
+            keyQuery: "key-",
+            ownerQuery: "Owner",
+            signal: controller.signal,
+        });
+
+        expect(result.entries).toHaveLength(50);
+        expect(result.total).toBe(10_000);
+        expect(readPersistentPluginStorageViewerPage).toHaveBeenCalledOnce();
+        expect(readPersistentPluginStorageViewerPage).toHaveBeenCalledWith(
+            "viewer-page-generation",
+            { page: 123, pageSize: 50, keyQuery: "key-", ownerQuery: "Owner" },
+            controller.signal,
+            undefined,
+        );
+        expect(readPersistentPluginStorageManifestSnapshot).not.toHaveBeenCalled();
+        expect(readPersistentJson).not.toHaveBeenCalled();
+        expect(listPersistentKeys).not.toHaveBeenCalled();
+    });
+
+    test("inline viewer returns whole-publication owner facets and authoritative owner pages", async () => {
+        database.optimizePluginMemory = false;
+        database.pluginCustomStorage = {
+            "10": { key: "ten" },
+            "2": { key: "two" },
+            alpha: { key: "alpha" },
+            unknown: { key: "unknown" },
+        };
+        database.pluginStorageMeta = {
+            "10": { plugin: "Owner B", updatedAt: 1 },
+            "2": { plugin: "Owner A", updatedAt: 1 },
+            alpha: { plugin: "Owner A", updatedAt: 1 },
+        };
+
+        const owned = await getPluginSaveStorageViewerPage({
+            page: 1,
+            pageSize: 1,
+            ownerQuery: "Owner A",
+        });
+        expect(owned.entries.map(entry => entry.key)).toEqual(["alpha"]);
+        expect(owned).toMatchObject({
+            page: 1,
+            pageCount: 2,
+            total: 2,
+            ownerFacets: [
+                { owner: "Owner A", count: 2 },
+                { owner: "Owner B", count: 1 },
+            ],
+            unknownOwnerCount: 1,
+            ownerFacetTotal: 4,
+        });
+
+        const unknown = await getPluginSaveStorageViewerPage({
+            page: 0,
+            unknownOwner: true,
+        });
+        expect(unknown.total).toBe(1);
+        expect(unknown.entries.map(entry => entry.key)).toEqual(["unknown"]);
+
+        const firstCollisionTuple = await getPluginSaveStorageViewerPage({
+            page: 0,
+            keyQuery: "a\0b",
+            ownerQuery: "c",
+        });
+        const secondCollisionTuple = await getPluginSaveStorageViewerPage({
+            page: 0,
+            keyQuery: "a",
+            ownerQuery: "b\0c",
+        });
+        expect(firstCollisionTuple.total).toBe(0);
+        expect(secondCollisionTuple.total).toBe(0);
+        expect(firstCollisionTuple.pageToken).not.toBe(secondCollisionTuple.pageToken);
+
+        const controller = new AbortController();
+        const progress = vi.fn(() => {
+            controller.abort(new DOMException("cancelled by final progress", "AbortError"));
+        });
+        await expect(getPluginSaveStorageViewerPage({
+            page: 0,
+            signal: controller.signal,
+            onProgress: progress,
+        })).rejects.toMatchObject({ name: "AbortError" });
+        expect(progress).toHaveBeenCalledOnce();
     });
 
     test("ordinary optimized set uses one value mutation and no ownership read", async () => {

@@ -125,6 +125,9 @@ function storageWithResponse(next: Response | Error): InstanceType<typeof NodeSt
 beforeEach(() => {
     cache.enabled = true
     cache.sha256OwnedBytes.mockClear()
+    cache.sha256OwnedBytes.mockImplementation(async (bytes: Uint8Array) => (
+        createHash('sha256').update(bytes).digest('hex')
+    ))
     cache.applyOwnedResourceCacheMutations.mockClear()
     cache.storeBytes.mockClear()
     cache.storeOwnedBytesWithKnownHash.mockClear()
@@ -1194,5 +1197,248 @@ describe('NodeStorage plugin manifest snapshots', () => {
         await expect(storage.getPluginStorageManifestSnapshot(generation)).rejects.toMatchObject({
             code: 'STORAGE_RESPONSE_ERROR',
         })
+    })
+})
+
+describe('NodeStorage plugin viewer pages', () => {
+    const generation = 'viewer-generation'
+    const revision = `sha256:${'a'.repeat(64)}`
+    const databaseRevision = 'b'.repeat(32)
+
+    function viewerEvents(
+        count = 50,
+        keyQuery = '',
+        ownerQuery?: string,
+        unknownOwner = false,
+    ): string[] {
+        const ownerFacets = [{ owner: 'Owner', count: 5_000 }]
+        const unknownOwnerCount = 5_000
+        const pageTokenEntries: string[][] = []
+        const lines = [JSON.stringify({
+            event: 'meta',
+            version: 1,
+            generation,
+            manifestRevision: revision,
+            databaseRevision,
+            page: 2,
+            pageSize: 50,
+            pageCount: 200,
+            total: 10_000,
+            ownerFacets,
+            unknownOwnerCount,
+            ownerFacetTotal: 10_000,
+        })]
+        for (let index = 0; index < count; index++) {
+            const text = JSON.stringify({ index, body: '한글' })
+            const entryRevision = `sha256:${index.toString(16).padStart(64, '0')}`
+            const key = `key-${index.toString().padStart(5, '0')}`
+            const owner = index % 2 === 0 ? 'Owner' : null
+            const size = new TextEncoder().encode(text).byteLength
+            const contentHash = `sha256:${createHash('sha256').update(JSON.stringify([
+                key,
+                owner,
+                text,
+                size,
+                'object',
+                entryRevision,
+            ])).digest('hex')}`
+            pageTokenEntries.push([key, contentHash])
+            lines.push(JSON.stringify({
+                event: 'entry',
+                key,
+                owner,
+                text,
+                size,
+                valueType: 'object',
+                revision: entryRevision,
+                contentHash,
+            }))
+        }
+        const pageTokenMaterial = JSON.stringify([
+            'pocketrisu-plugin-storage-viewer-page-v2',
+            generation,
+            revision,
+            databaseRevision,
+            2,
+            50,
+            keyQuery,
+            ownerQuery ?? null,
+            unknownOwner,
+            ownerFacets.map(facet => [facet.owner, facet.count]),
+            unknownOwnerCount,
+            pageTokenEntries,
+        ])
+        lines.push(JSON.stringify({
+            event: 'done',
+            pageToken: `sha256:${createHash('sha256').update(pageTokenMaterial).digest('hex')}`,
+            metrics: {
+                manifestParses: 1,
+                valueReads: count,
+                ownerReads: Math.ceil(count / 2),
+                maxRowParses: count > 0 ? 1 : 0,
+            },
+        }))
+        return lines
+    }
+
+    test('streams one bounded 10k-key page from one request with fragmented UTF-8', async () => {
+        const bytes = new TextEncoder().encode(`${viewerEvents(50, 'key-').join('\n')}\n`)
+        const chunks: Uint8Array[] = []
+        for (let offset = 0; offset < bytes.length; offset += 7) {
+            chunks.push(bytes.slice(offset, Math.min(bytes.length, offset + 7)))
+        }
+        const body = new ReadableStream<Uint8Array>({
+            pull(controller) {
+                const chunk = chunks.shift()
+                if (chunk) controller.enqueue(chunk)
+                else controller.close()
+            },
+        })
+        const storage = storageWithResponse(new Response(body, {
+            status: 200,
+            headers: { 'content-type': 'application/x-ndjson' },
+        }))
+        const progress: Array<[number, number]> = []
+
+        const result = await storage.getPluginStorageViewerPage(
+            generation,
+            { page: 2, pageSize: 50, keyQuery: 'key-' },
+            undefined,
+            (completed, total) => progress.push([completed, total]),
+        )
+
+        expect(result.entries).toHaveLength(50)
+        expect(result.total).toBe(10_000)
+        expect(result.metrics).toEqual({
+            manifestParses: 1,
+            valueReads: 50,
+            ownerReads: 25,
+            maxRowParses: 1,
+        })
+        expect(progress.at(-1)).toEqual([50, 50])
+        expect((storage as any).authFetch).toHaveBeenCalledOnce()
+        const [url, init] = (storage as any).authFetch.mock.calls[0]
+        expect(url).toContain('/api/plugin-storage/viewer-page?')
+        expect(url).toContain('page=2')
+        expect(url).toContain('pageSize=50')
+        expect(url).toContain('key=key-')
+        expect(init.headers['x-plugin-storage-generation']).toBe(generation)
+    })
+
+    test('an actual abort cancels a pending body read and returns no partial page', async () => {
+        let cancelReason: unknown
+        let release!: () => void
+        const held = new Promise<void>(resolve => { release = resolve })
+        const encoder = new TextEncoder()
+        let sentMeta = false
+        const body = new ReadableStream<Uint8Array>({
+            async pull(controller) {
+                if (!sentMeta) {
+                    sentMeta = true
+                    controller.enqueue(encoder.encode(`${viewerEvents(0)[0]}\n`))
+                    return
+                }
+                await held
+            },
+            cancel(reason) {
+                cancelReason = reason
+                release()
+            },
+        })
+        const storage = storageWithResponse(new Response(body, { status: 200 }))
+        const controller = new AbortController()
+        const pending = storage.getPluginStorageViewerPage(
+            generation,
+            { page: 2, pageSize: 50 },
+            controller.signal,
+        )
+        await vi.waitFor(() => expect(sentMeta).toBe(true))
+        controller.abort(new DOMException('superseded page', 'AbortError'))
+
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+        await vi.waitFor(() => expect(cancelReason).toBeTruthy())
+    })
+
+    test.each([
+        ['entry content', 1],
+        ['page token', 51],
+    ])('an abort during post-EOF %s hashing prevents later hashes and return', async (
+        _label,
+        heldCall,
+    ) => {
+        let release!: () => void
+        const held = new Promise<void>(resolve => { release = resolve })
+        let calls = 0
+        cache.sha256OwnedBytes.mockImplementation(async (bytes: Uint8Array) => {
+            calls += 1
+            if (calls === heldCall) await held
+            return createHash('sha256').update(bytes).digest('hex')
+        })
+        const storage = storageWithResponse(new Response(`${viewerEvents().join('\n')}\n`))
+        const controller = new AbortController()
+        const pending = storage.getPluginStorageViewerPage(
+            generation,
+            { page: 2, pageSize: 50 },
+            controller.signal,
+        )
+        await vi.waitFor(() => expect(calls).toBe(heldCall))
+
+        controller.abort(new DOMException('superseded during hashing', 'AbortError'))
+        release()
+
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+        expect(calls).toBe(heldCall)
+    })
+
+    test('rejects a completed page whose read metrics exceed the page bound', async () => {
+        const lines = viewerEvents()
+        const done = JSON.parse(lines.at(-1)!)
+        done.metrics.valueReads = 51
+        lines[lines.length - 1] = JSON.stringify(done)
+        const storage = storageWithResponse(new Response(`${lines.join('\n')}\n`))
+
+        await expect(storage.getPluginStorageViewerPage(
+            generation,
+            { page: 2, pageSize: 50 },
+        )).rejects.toMatchObject({ code: 'STORAGE_RESPONSE_ERROR' })
+    })
+
+    test.each([
+        ['a blank NDJSON record', (lines: string[]) => lines.splice(1, 0, '')],
+        ['an extra meta property', (lines: string[]) => {
+            const meta = JSON.parse(lines[0]); meta.extra = true; lines[0] = JSON.stringify(meta)
+        }],
+        ['an extra entry property', (lines: string[]) => {
+            const entry = JSON.parse(lines[1]); entry.extra = true; lines[1] = JSON.stringify(entry)
+        }],
+        ['an extra done property', (lines: string[]) => {
+            const done = JSON.parse(lines.at(-1)!); done.extra = true; lines[lines.length - 1] = JSON.stringify(done)
+        }],
+        ['a forged content hash', (lines: string[]) => {
+            const entry = JSON.parse(lines[1]); entry.contentHash = `sha256:${'f'.repeat(64)}`; lines[1] = JSON.stringify(entry)
+        }],
+        ['noncanonical numeric entry order', (lines: string[]) => {
+            const first = JSON.parse(lines[1]); first.key = '10'; lines[1] = JSON.stringify(first)
+            const second = JSON.parse(lines[2]); second.key = '2'; lines[2] = JSON.stringify(second)
+        }],
+        ['a negative metric', (lines: string[]) => {
+            const done = JSON.parse(lines.at(-1)!); done.metrics.ownerReads = -1; lines[lines.length - 1] = JSON.stringify(done)
+        }],
+        ['noncanonical facet order', (lines: string[]) => {
+            const meta = JSON.parse(lines[0]);
+            meta.ownerFacets = [{ owner: 'z', count: 2_500 }, { owner: 'a', count: 2_500 }]
+            lines[0] = JSON.stringify(meta)
+        }],
+        ['a forged page token', (lines: string[]) => {
+            const done = JSON.parse(lines.at(-1)!); done.pageToken = `sha256:${'f'.repeat(64)}`; lines[lines.length - 1] = JSON.stringify(done)
+        }],
+    ])('rejects %s', async (_label, mutate) => {
+        const lines = viewerEvents()
+        mutate(lines)
+        const storage = storageWithResponse(new Response(`${lines.join('\n')}\n`))
+        await expect(storage.getPluginStorageViewerPage(
+            generation,
+            { page: 2, pageSize: 50 },
+        )).rejects.toMatchObject({ code: 'STORAGE_RESPONSE_ERROR' })
     })
 })

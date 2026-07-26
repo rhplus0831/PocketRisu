@@ -19,9 +19,38 @@ export class PluginStorageViewerLoadCancelled extends Error {
     }
 }
 
+export interface PluginStorageViewerLoadLease {
+    signal: AbortSignal
+    isCurrent: () => boolean
+    finish: () => void
+}
+
+/** Owns the one live viewer request and rejects late bodies by identity. */
+export class PluginStorageViewerLoadCoordinator {
+    private active: AbortController | null = null
+
+    start(reason = 'Plugin storage viewer load superseded'): PluginStorageViewerLoadLease {
+        this.active?.abort(new DOMException(reason, 'AbortError'))
+        const controller = new AbortController()
+        this.active = controller
+        return {
+            signal: controller.signal,
+            isCurrent: () => this.active === controller && !controller.signal.aborted,
+            finish: () => {
+                if (this.active === controller) this.active = null
+            },
+        }
+    }
+
+    dispose(): void {
+        this.active?.abort(new DOMException('Plugin storage viewer unmounted', 'AbortError'))
+        this.active = null
+    }
+}
+
 const encoder = new TextEncoder()
 
-function valueToText(value: unknown): string {
+export function valueToPluginStorageViewerText(value: unknown): string {
     if (typeof value === 'string') return value
     if (value === null || value === undefined) return ''
     try {
@@ -31,7 +60,7 @@ function valueToText(value: unknown): string {
     }
 }
 
-function detectType(value: unknown, text: string): string {
+export function detectPluginStorageViewerType(value: unknown, text: string): string {
     if (value === null) return 'object'
     if (value === undefined || text === '') return 'empty'
     if (Array.isArray(value)) return 'array'
@@ -48,13 +77,15 @@ export async function loadPluginStorageViewerPage({
     page,
     pageSize = PLUGIN_STORAGE_VIEWER_PAGE_SIZE,
     read,
+    signal,
     cancelled = () => false,
     onProgress,
 }: {
     keys: PluginStorageViewerKey[]
     page: number
     pageSize?: number
-    read: (key: string) => unknown | Promise<unknown>
+    read: (key: string, signal?: AbortSignal | null) => unknown | Promise<unknown>
+    signal?: AbortSignal | null
     cancelled?: () => boolean
     onProgress?: (completed: number, total: number) => void
 }): Promise<{
@@ -72,17 +103,23 @@ export async function loadPluginStorageViewerPage({
         Math.min(keys.length, (boundedPage + 1) * pageSize),
     )
     const entries: PluginStorageViewerEntry[] = []
+    const throwIfCancelled = () => {
+        if (signal?.aborted) {
+            throw signal.reason ?? new DOMException('Aborted', 'AbortError')
+        }
+        if (cancelled()) throw new PluginStorageViewerLoadCancelled()
+    }
     try {
         for (const descriptor of pageKeys) {
-            if (cancelled()) throw new PluginStorageViewerLoadCancelled()
-            const value = await read(descriptor.key)
-            if (cancelled()) throw new PluginStorageViewerLoadCancelled()
-            const text = valueToText(value)
+            throwIfCancelled()
+            const value = await read(descriptor.key, signal)
+            throwIfCancelled()
+            const text = valueToPluginStorageViewerText(value)
             entries.push({
                 ...descriptor,
                 text,
                 size: encoder.encode(text).byteLength,
-                type: detectType(value, text),
+                type: detectPluginStorageViewerType(value, text),
             })
             onProgress?.(entries.length, pageKeys.length)
         }

@@ -282,13 +282,43 @@ preserves plugin rows as independent archive entries
 
 ### Resolution
 
-**Fixed 2026-07-27.** The Plugin Storage viewer now retains one 50-value page,
-reads values serially, and stores only their display serialization; changing
-pages, cancellation, or errors discard the prior page. Partial local export now
-pins a server-side SQLite snapshot and folds external values into the streamed
-`database.risudat` spool one row at a time. Its selected-asset archive remains
-upstream compatible, omits account data, and applies the same BR4 archive-key
-validation as other folded exports.
+**Fixed 2026-07-27.** The Plugin Storage viewer now retains one page of at most
+50 display strings and never constructs a repository-wide value array. In
+optimized mode, one viewer-specific request passes the import/read barrier only
+long enough to flush and pin a read-only SQLite snapshot. The response is then
+streamed outside that queue, so a slow viewer cannot hold PM4 mutations. The
+server parses the active generation and ownership manifest once, orders keys by
+the canonical plugin-record rule (array indexes numerically, then raw UTF-16
+code units), selects the page, and reads value and owner bodies serially. At
+most 50 value bodies and 50 owner bodies are touched; only one row is parsed at
+a time. Owner chips, unknown-owner counts, filtered totals, and page counts are
+derived from the same complete publication through a transactionally maintained
+owner index, rather than inferred from the resident page.
+
+Every streamed page is point-in-time and self-verifying. Its metadata carries
+the exact generation, manifest revision, database revision, page, global
+facets, and counts. NDJSON records have exact schemas; blank records, duplicate
+or noncanonical keys, invalid metrics, byte-size/type mismatches, and extra
+fields are rejected. Each entry has a content hash covering key, owner, display
+text, UTF-8 size, type, and value/owner revision. The page token uses injective
+canonical JSON framing (including embedded U+0000 in filters) and binds the
+snapshot metadata, filters, global facets, unknown count, ordered keys, and
+entry content hashes. A body, owner, filter, ordering, or revision change
+therefore cannot reuse the token.
+
+Each UI load owns an `AbortController`. Page, backend, key-filter, or
+owner-filter changes synchronously abort the superseded request; unmount aborts
+the remaining request. Identity checks reject late bodies even if a transport
+resolves after observing abort. Cancellation is checked during body reads,
+before and after every post-EOF content hash, around page-token hashing, after
+the final progress callback, and before publication. On the server, request
+abort or response close stops before the next row, releases backpressure
+listeners, rolls back the read transaction, and closes the snapshot.
+
+Partial local export now pins a server-side SQLite snapshot and folds external
+values into the streamed `database.risudat` spool one row at a time. Its
+selected-asset archive remains upstream compatible, omits account data, and
+applies the same BR4 archive-key validation as other folded exports.
 
 Snapshot restore now queries only publication metadata up front, then spools a
 raw row through SQLite `substr()` pages or a chunked row through completed
@@ -381,6 +411,17 @@ proxy-generated `2xx`, and a mismatched echo remain commit-outcome unknown.
 They are never replayed automatically: Settings presents a distinct warning
 and hard-reloads only to reconcile server state, while boot recovery stops
 without selecting an older snapshot.
+
+Production server viewer tests load a real 10,000-key publication and assert one
+50-value page, one manifest parse, serial row parsing, exact global owner facets,
+canonical mixed numeric/composed/decomposed/BMP/astral ordering, and distinct
+tokens for formerly colliding U+0000 filter tuples. A 10,000-key same-membership
+mutation race proves a page is entirely pre- or post-publication while the PM4
+mutation completes without waiting for the viewer. A paused real HTTP response
+reaches backpressure, disconnects, reads fewer than 50 rows, releases its
+snapshot, and permits the next mutation. Client tests exercise fragmented UTF-8,
+strict negative NDJSON/token cases, aborts during body and post-EOF hashing, and
+a mounted UI filter change whose obsolete late response cannot commit.
 
 Coverage uses deterministic bounds rather than raw-heap timing: a 10,000-key
 viewer asserts a 50-value page and one in-flight read; partial folding exercises

@@ -25,22 +25,25 @@
         ChevronRightIcon,
     } from '@lucide/svelte'
     import { alertConfirm, notifyError, notifySuccess } from 'src/ts/alert'
+    import { onDestroy } from 'svelte'
     import { SafeLocalStorage, SafeLocalPluginStorage } from 'src/ts/plugins/pluginSafeClass'
     import { getOwners, removeOwner } from 'src/ts/plugins/pluginStorageMeta'
     import { language } from 'src/lang'
     import {
         clearOwnedPluginSaveStorage,
-        getPluginSaveStorageItem,
-        getPluginSaveStorageKeys,
+        getPluginSaveStorageViewerPage,
         removeOwnedPluginSaveStorageItem,
         setPluginSaveStorageItem,
     } from 'src/ts/plugins/pluginSaveStorage'
     import {
         loadPluginStorageViewerPage,
+        PluginStorageViewerLoadCoordinator,
         PluginStorageViewerLoadCancelled,
         type PluginStorageViewerEntry,
         type PluginStorageViewerKey,
+        type PluginStorageViewerLoadLease,
     } from 'src/ts/plugins/pluginStorageViewerPage'
+    import { comparePluginStorageKeys } from 'src/ts/plugins/pluginStorageRecord'
 
     type BackendId = 'save' | 'local' | 'idb'
 
@@ -64,13 +67,14 @@
     let entries = $state<Entry[]>([])
     let page = $state(0)
     let pageCount = $state(1)
+    let totalCount = $state(0)
+    let saveOwnerFacets = $state<{ owner: string; count: number }[]>([])
+    let saveUnknownOwnerCount = $state(0)
     let loading = $state(false)
     let loadError = $state<string | null>(null)
     let loadProgress = $state(0)
     let loadTotal = $state(0)
-    // Monotonic token: a newer load() invalidates any in-flight older one
-    // (e.g. when the user switches backend tabs mid-load).
-    let loadToken = 0
+    const loadCoordinator = new PluginStorageViewerLoadCoordinator()
     let searchKey = $state('')
     let searchVal = $state('')
     let ownerFilter = $state('')   // '' = all; UNKNOWN = no recorded origin; else plugin name
@@ -96,9 +100,11 @@
     // large repositories.
     const filtered = $derived.by(() => {
         const value = searchVal.trim().toLowerCase()
-        return value
-            ? entries.filter((entry) => entry.text.toLowerCase().includes(value))
-            : entries
+        const owner = ownerFilter
+        return entries.filter((entry) => (
+            (!value || entry.text.toLowerCase().includes(value))
+            && (!owner || (owner === UNKNOWN ? !entry.owner : entry.owner === owner))
+        ))
     })
 
     // True when any search/owner filter narrows the list — drives the bulk
@@ -109,17 +115,20 @@
 
     // Distinct origin plugins present in the current backend, for the filter.
     const ownerOptions = $derived.by(() => {
+        if (backend === 'save') return saveOwnerFacets.map((facet) => facet.owner)
         const set = new Set<string>()
         for (const e of keyEntries) if (e.owner) set.add(e.owner)
-        return [...set].sort((a, b) => a.localeCompare(b))
+        return [...set].sort((a, b) => a < b ? -1 : a > b ? 1 : 0)
     })
-    const hasUnknown = $derived(keyEntries.some((e) => !e.owner))
+    const hasUnknown = $derived(
+        backend === 'save' ? saveUnknownOwnerCount > 0 : keyEntries.some((e) => !e.owner),
+    )
     const bulkTargetCount = $derived(
         !isFiltered
-            ? keyEntries.length
+            ? totalCount
             : searchVal.trim() !== ''
                 ? filtered.length
-                : filteredKeys.length,
+                : backend === 'save' ? filtered.length : filteredKeys.length,
     )
 
     // ── helpers ────────────────────────────────────────────────────────────
@@ -166,13 +175,15 @@
     }
 
     // ── actions ────────────────────────────────────────────────────────────
-    function readBackendValue(key: string): unknown | Promise<unknown> {
-        if (backend === 'save') return getPluginSaveStorageItem(key)
-        if (backend === 'local') return safeLocal.getItem(key)
-        return idb.getItem(key)
+    function isCancelledLoad(error: unknown, lease: PluginStorageViewerLoadLease): boolean {
+        return !lease.isCurrent()
+            || error instanceof PluginStorageViewerLoadCancelled
+            || (error instanceof DOMException && error.name === 'AbortError')
+            || (error instanceof Error && error.name === 'AbortError')
     }
 
-    async function loadPage(nextPage = page, token = ++loadToken) {
+    function beginLoad(): PluginStorageViewerLoadLease {
+        const lease = loadCoordinator.start()
         loading = true
         loadError = null
         loadProgress = 0
@@ -180,61 +191,115 @@
         entries = []
         selected = null
         detailOpen = false
-        try {
-            const result = await loadPluginStorageViewerPage({
-                keys: filteredKeys,
+        return lease
+    }
+
+    async function readPage(
+        nextPage: number,
+        selectedBackend: BackendId,
+        keys: PluginStorageViewerKey[],
+        lease: PluginStorageViewerLoadLease,
+    ) {
+        const reportProgress = (completed: number, total: number) => {
+            if (!lease.isCurrent()) return
+            loadProgress = completed
+            loadTotal = total
+        }
+        if (selectedBackend === 'save') {
+            const result = await getPluginSaveStorageViewerPage({
                 page: nextPage,
-                read: readBackendValue,
-                cancelled: () => token !== loadToken,
-                onProgress: (completed, total) => {
-                    if (token !== loadToken) return
-                    loadProgress = completed
-                    loadTotal = total
-                },
+                keyQuery: searchKey.trim(),
+                ...(ownerFilter === UNKNOWN
+                    ? { unknownOwner: true }
+                    : ownerFilter
+                        ? { ownerQuery: ownerFilter }
+                        : {}),
+                signal: lease.signal,
+                onProgress: reportProgress,
             })
-            if (token !== loadToken) return
+            if (!lease.isCurrent()) return
             entries = result.entries
+            keyEntries = result.entries.map(({ key, owner }) => ({ key, owner }))
             page = result.page
             pageCount = result.pageCount
+            totalCount = result.total
+            saveOwnerFacets = result.ownerFacets
+            saveUnknownOwnerCount = result.unknownOwnerCount
+            return
+        }
+        const result = await loadPluginStorageViewerPage({
+            keys,
+            page: nextPage,
+            signal: lease.signal,
+            read: (key, signal) => selectedBackend === 'local'
+                ? safeLocal.getItem(key)
+                : idb.getItem(key, signal ?? undefined),
+            onProgress: reportProgress,
+        })
+        if (!lease.isCurrent()) return
+        entries = result.entries
+        page = result.page
+        pageCount = result.pageCount
+        totalCount = keys.length
+    }
+
+    async function loadPage(nextPage = page) {
+        const selectedBackend = backend
+        const keys = filteredKeys.slice()
+        const lease = beginLoad()
+        try {
+            await readPage(nextPage, selectedBackend, keys, lease)
         } catch (e) {
-            if (token !== loadToken || e instanceof PluginStorageViewerLoadCancelled) return
+            if (isCancelledLoad(e, lease)) return
             loadError = e instanceof Error ? e.message : String(e)
             entries = []
         } finally {
-            if (token === loadToken) loading = false
+            if (lease.isCurrent()) loading = false
+            lease.finish()
         }
     }
 
     async function load() {
-        const token = ++loadToken
-        loading = true
-        loadError = null
-        loadProgress = 0
-        loadTotal = 0
-        entries = []
+        const selectedBackend = backend
+        const lease = beginLoad()
         keyEntries = []
         page = 0
         pageCount = 1
+        totalCount = 0
+        saveOwnerFacets = []
+        saveUnknownOwnerCount = 0
         try {
-            let keys: string[]
-            if (backend === 'save') keys = await getPluginSaveStorageKeys()
-            else if (backend === 'local') keys = safeLocal.keys()
-            else keys = await idb.keys()
-            if (token !== loadToken) return
-
-            const owners = await getOwners(backend)
-            if (token !== loadToken) return
-            keyEntries = keys
+            if (selectedBackend === 'save') {
+                await readPage(0, selectedBackend, [], lease)
+                return
+            }
+            const keys = selectedBackend === 'local'
+                ? safeLocal.keys()
+                : await idb.keys(lease.signal)
+            if (!lease.isCurrent()) return
+            const owners = await getOwners(selectedBackend, lease.signal)
+            if (!lease.isCurrent()) return
+            const descriptors = keys
                 .map((key) => ({ key, owner: owners[key] }))
-                .sort((a, b) => a.key.localeCompare(b.key))
-            await loadPage(0, token)
+                .sort((a, b) => comparePluginStorageKeys(a.key, b.key))
+            keyEntries = descriptors
+            totalCount = descriptors.length
+            const keyQuery = searchKey.trim().toLowerCase()
+            const owner = ownerFilter
+            const filteredDescriptors = descriptors.filter((entry) => (
+                (!keyQuery || entry.key.toLowerCase().includes(keyQuery))
+                && (!owner || (owner === UNKNOWN ? !entry.owner : entry.owner === owner))
+            ))
+            await readPage(0, selectedBackend, filteredDescriptors, lease)
         } catch (e) {
-            if (token !== loadToken || e instanceof PluginStorageViewerLoadCancelled) return
+            if (isCancelledLoad(e, lease)) return
             loadError = e instanceof Error ? e.message : String(e)
             entries = []
             keyEntries = []
+            totalCount = 0
         } finally {
-            if (token === loadToken) loading = false
+            if (lease.isCurrent()) loading = false
+            lease.finish()
         }
     }
 
@@ -318,10 +383,11 @@
         if (targets.length === 0) return
 
         const isAll = !isFiltered
+        const targetCount = backend === 'save' && isAll ? totalCount : targets.length
         const backendLabel = BACKENDS[backendIndex].label()
         const msg = isAll
-            ? language.pluginStorageBulkDeleteAllConfirm(backendLabel, targets.length)
-            : language.pluginStorageBulkDeleteConfirm(backendLabel, targets.length)
+            ? language.pluginStorageBulkDeleteAllConfirm(backendLabel, targetCount)
+            : language.pluginStorageBulkDeleteConfirm(backendLabel, targetCount)
         const ok = await alertConfirm(msg)
         if (!ok) return
 
@@ -336,7 +402,7 @@
             }
             detailOpen = false
             await load()
-            notifySuccess(language.pluginStorageBulkDeleted(targets.length))
+            notifySuccess(language.pluginStorageBulkDeleted(targetCount))
         } catch (e) {
             notifyError(e instanceof Error ? e.message : String(e))
             // Re-sync the UI to whatever actually got removed on partial failure.
@@ -346,6 +412,7 @@
 
     // Load on mount and whenever the backend tab changes; reset search per tab.
     let loadedIndex = -1
+    let filterSignature = ''
     $effect(() => {
         const idx = backendIndex
         if (idx === loadedIndex) return
@@ -353,16 +420,19 @@
         searchKey = ''
         searchVal = ''
         ownerFilter = ''
+        filterSignature = `${idx}\u0000\u0000`
         load()
     })
 
-    let filterSignature = ''
     $effect(() => {
         const signature = `${backendIndex}\u0000${searchKey.trim()}\u0000${ownerFilter}`
         if (signature === filterSignature) return
+        if (loadedIndex !== backendIndex) return
         filterSignature = signature
-        if (loadedIndex === backendIndex && keyEntries.length > 0) loadPage(0)
+        loadPage(0)
     })
+
+    onDestroy(() => loadCoordinator.dispose())
 </script>
 
 <p class="text-textcolor2 text-sm mb-4">{language.pluginStorageDesc}</p>
@@ -416,7 +486,7 @@
 <div class="flex items-center justify-between mb-2">
     <span class="text-textcolor2 text-xs">
         <ShBadge variant="secondary">{filtered.length}</ShBadge>
-        {language.pluginStoragePageCount(page + 1, pageCount, filteredKeys.length)}
+        {language.pluginStoragePageCount(page + 1, pageCount, totalCount)}
     </span>
     <div class="flex items-center gap-1">
         <ShButton

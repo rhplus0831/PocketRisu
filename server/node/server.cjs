@@ -384,11 +384,40 @@ const pluginStorageBatchAcknowledgementDelayMs = process.env.NODE_ENV === 'test'
 const pluginStorageStateFailpoint = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_PLUGIN_STATE_FAILPOINT ?? '').trim()
     : '';
+const pluginStorageViewerTestGateDir = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_PLUGIN_VIEWER_GATE_DIR ?? '').trim()
+    : '';
 
 function hitPluginStorageBatchFailpoint(boundary) {
     if (pluginStorageBatchFailpoint === boundary) {
         throw new Error(`Injected plugin storage batch failure at ${boundary}`);
     }
+}
+
+async function waitAtPluginStorageViewerTestGate(isClosed) {
+    if (!pluginStorageViewerTestGateDir) return;
+    const holdPath = path.join(pluginStorageViewerTestGateDir, 'hold');
+    if (!existsSync(holdPath)) return;
+    await fs.mkdir(pluginStorageViewerTestGateDir, { recursive: true });
+    await fs.writeFile(
+        path.join(pluginStorageViewerTestGateDir, 'entered'),
+        'snapshot-pinned',
+        'utf-8',
+    );
+    const releasePath = path.join(pluginStorageViewerTestGateDir, 'release');
+    while (!isClosed() && existsSync(holdPath) && !existsSync(releasePath)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+}
+
+async function reportPluginStorageViewerTestProgress(metrics, fileName = 'progress.json') {
+    if (!pluginStorageViewerTestGateDir) return;
+    await fs.mkdir(pluginStorageViewerTestGateDir, { recursive: true });
+    await fs.writeFile(
+        path.join(pluginStorageViewerTestGateDir, fileName),
+        JSON.stringify(metrics),
+        'utf-8',
+    );
 }
 
 function parsePluginStorageOwnerRecord(bytes) {
@@ -440,6 +469,29 @@ function pluginStorageRevision(valueBytes, ownerBytes) {
     digest.update('\0', 'utf-8');
     digest.update(valueBytes);
     return `sha256:${digest.digest('hex')}`;
+}
+
+const MAX_PLUGIN_STORAGE_ARRAY_INDEX = 0xffff_ffff;
+
+function pluginStorageArrayIndex(key) {
+    const index = Number(key);
+    return Number.isInteger(index)
+        && index >= 0
+        && index < MAX_PLUGIN_STORAGE_ARRAY_INDEX
+        && String(index) === key
+        ? index
+        : null;
+}
+
+function comparePluginStorageRecordKeys(left, right) {
+    const leftIndex = pluginStorageArrayIndex(left);
+    const rightIndex = pluginStorageArrayIndex(right);
+    if (leftIndex !== null || rightIndex !== null) {
+        if (leftIndex === null) return 1;
+        if (rightIndex === null) return -1;
+        return leftIndex - rightIndex;
+    }
+    return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function readPluginStorageState(valueKey, ownerKey) {
@@ -2934,31 +2986,60 @@ function backupEntrySize(name, dataSize) {
     return 8 + Buffer.byteLength(name, 'utf-8') + dataSize;
 }
 
-async function writeWithBackpressure(writable, chunk, isClosed = () => false) {
+async function writeWithBackpressure(
+    writable,
+    chunk,
+    isClosed = () => false,
+    onBackpressure = null,
+) {
     if (isClosed()) return false;
     if (writable.write(chunk)) return true;
     return new Promise((resolve, reject) => {
+        let settled = false;
+        let drained = false;
+        let reported = !onBackpressure;
         function cleanup() {
             writable.removeListener('drain', onDrain);
             writable.removeListener('error', onError);
             writable.removeListener('close', onClose);
         }
-        function onDrain() {
+        function settle(value, error = null) {
+            if (settled) return;
+            settled = true;
             cleanup();
-            resolve(true);
+            if (error) reject(error);
+            else resolve(value);
+        }
+        function maybeResolve() {
+            if (drained && reported) settle(true);
+        }
+        function onDrain() {
+            drained = true;
+            maybeResolve();
         }
         function onError(error) {
-            cleanup();
-            reject(error);
+            settle(false, error);
         }
         function onClose() {
-            cleanup();
-            if (isClosed()) resolve(false);
-            else reject(new Error('Backup destination closed before draining'));
+            if (isClosed()) settle(false);
+            else settle(false, new Error('Backup destination closed before draining'));
         }
         writable.once('drain', onDrain);
         writable.once('error', onError);
         writable.once('close', onClose);
+        if (isClosed()) {
+            onClose();
+            return;
+        }
+        if (onBackpressure) {
+            Promise.resolve()
+                .then(onBackpressure)
+                .then(() => {
+                    reported = true;
+                    if (isClosed()) onClose();
+                    else maybeResolve();
+                }, onError);
+        }
     });
 }
 
@@ -5822,6 +5903,298 @@ app.get('/api/storage/capacity', async (req, res, next) => {
  * one generation-bound snapshot. Clients use this instead of issuing two list
  * requests plus a separate manifest read for every batch or enumeration.
  */
+app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    const firstHeader = (value) => Array.isArray(value) ? value[0] : value;
+    const requestedGeneration = firstHeader(req.headers['x-plugin-storage-generation']);
+    const pageText = Array.isArray(req.query.page) ? req.query.page[0] : req.query.page;
+    const pageSizeText = Array.isArray(req.query.pageSize)
+        ? req.query.pageSize[0]
+        : req.query.pageSize;
+    const keyQueryValue = Array.isArray(req.query.key) ? req.query.key[0] : req.query.key;
+    const ownerQueryValue = Array.isArray(req.query.owner) ? req.query.owner[0] : req.query.owner;
+    const unknownOwnerValue = Array.isArray(req.query.unknownOwner)
+        ? req.query.unknownOwner[0]
+        : req.query.unknownOwner;
+    const page = pageText === undefined || pageText === '' ? 0 : Number(pageText);
+    const pageSize = pageSizeText === undefined || pageSizeText === '' ? 50 : Number(pageSizeText);
+    const keyQuery = keyQueryValue === undefined ? '' : String(keyQueryValue).trim();
+    const ownerQuery = ownerQueryValue === undefined ? '' : String(ownerQueryValue);
+    const unknownOwner = unknownOwnerValue === '1';
+    if (typeof requestedGeneration !== 'string' || requestedGeneration.length === 0
+        || !Number.isSafeInteger(page) || page < 0
+        || !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 50
+        || keyQuery.length > 1024 || !keyQuery.isWellFormed()
+        || ownerQuery.length > 1024 || !ownerQuery.isWellFormed()
+        || (ownerQueryValue !== undefined && ownerQuery.length === 0)
+        || (unknownOwnerValue !== undefined && unknownOwnerValue !== '1')
+        || (unknownOwner && ownerQueryValue !== undefined)) {
+        return res.status(400).json({
+            success: false,
+            error: 'Plugin storage viewer requires a generation, a non-negative page, and a page size from 1 to 50.',
+            code: 'INVALID_PLUGIN_STORAGE_VIEWER_PAGE',
+        });
+    }
+
+    let snapshot = null;
+    let closed = false;
+    let completed = false;
+    const metrics = {
+        manifestParses: 0,
+        valueReads: 0,
+        ownerReads: 0,
+        maxRowParses: 0,
+    };
+    const isClosed = () => closed || req.aborted || res.destroyed;
+    const onClose = () => {
+        if (!completed) closed = true;
+    };
+    req.once('aborted', onClose);
+    res.once('close', onClose);
+    try {
+        // Pin the SQLite view while holding the ordinary import/read queue only
+        // long enough to flush and open it. Row streaming happens outside the
+        // queue, so a slow or abandoned viewer cannot block PM4 mutations.
+        snapshot = await queueStorageReadAfterImports(async () => {
+            await flushPendingDb();
+            return createKvSnapshot();
+        });
+        if (isClosed()) return;
+
+        const rawDatabase = snapshot.kvGet('database/database.bin');
+        const dbObj = rawDatabase ? await decodeRisuSave(rawDatabase) : null;
+        const generation = pluginStorageGeneration(dbObj);
+        const manifestState = readPluginStorageManifestState(snapshot.kvGet);
+        metrics.manifestParses = 1;
+        const pinnedState = sessionPluginStorageReadState(req);
+        const activeManifest = generation
+            && dbObj?.optimizePluginMemory === true
+            && manifestState.valid
+            && manifestState.manifest?.generation === generation
+            ? manifestState.manifest
+            : null;
+        if (generation !== requestedGeneration
+            || !activeManifest
+            || (pinnedState && (
+                pinnedState.optimized !== true
+                || pinnedState.generation !== requestedGeneration
+            ))) {
+            throw pluginStorageNamespaceConflict(
+                'Plugin storage generation changed before the viewer page could be read',
+            );
+        }
+
+        const physicalValues = new Set(snapshot.kvList(PLUGIN_SAVE_PREFIX));
+        const physicalMeta = new Set(snapshot.kvList(PLUGIN_SAVE_META_PREFIX));
+        const manifestMeta = new Set(activeManifest.metaKeys);
+        const normalizedQuery = keyQuery.toLowerCase();
+        const keyMatchedValues = activeManifest.valueKeys
+            .filter((storageKey) => physicalValues.has(storageKey))
+            .map((storageKey) => ({
+                storageKey,
+                key: decodePluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX),
+            }))
+            .filter(({ key }) => !normalizedQuery || key.toLowerCase().includes(normalizedQuery))
+            .sort((left, right) => comparePluginStorageRecordKeys(left.key, right.key));
+        const candidateOwnerStorageKeys = keyMatchedValues
+            .map(({ key }) => encodePluginSaveStorageKey(key, PLUGIN_SAVE_META_PREFIX))
+            .filter((storageKey) => manifestMeta.has(storageKey) && physicalMeta.has(storageKey));
+        const ownerFacets = snapshot.kvListPluginStorageOwnerFacets(candidateOwnerStorageKeys)
+            .sort((left, right) => left.owner < right.owner ? -1 : left.owner > right.owner ? 1 : 0);
+        const knownOwnerCount = ownerFacets.reduce((sum, facet) => sum + facet.count, 0);
+        const unknownOwnerCount = keyMatchedValues.length - knownOwnerCount;
+        const matchingOwnerStorageKeys = ownerQueryValue !== undefined || unknownOwner
+            ? new Set(snapshot.kvListPluginStorageOwnerKeys(
+                candidateOwnerStorageKeys,
+                ownerQueryValue !== undefined ? ownerQuery : null,
+            ))
+            : null;
+        const ownedValues = keyMatchedValues.filter(({ key }) => (
+            unknownOwner
+                ? !matchingOwnerStorageKeys.has(encodePluginSaveStorageKey(
+                    key,
+                    PLUGIN_SAVE_META_PREFIX,
+                ))
+                : ownerQueryValue !== undefined
+                    ? matchingOwnerStorageKeys.has(encodePluginSaveStorageKey(
+                        key,
+                        PLUGIN_SAVE_META_PREFIX,
+                    ))
+                    : true
+        ));
+        const total = ownedValues.length;
+        const pageCount = Math.max(1, Math.ceil(total / pageSize));
+        const boundedPage = Math.min(page, pageCount - 1);
+        const pageRows = ownedValues.slice(
+            boundedPage * pageSize,
+            Math.min(total, (boundedPage + 1) * pageSize),
+        );
+        const databaseRevision = computeBufferEtag(rawDatabase);
+        const pageTokenEntries = [];
+        let activeRowParses = 0;
+        const parseOneRow = (operation) => {
+            activeRowParses += 1;
+            metrics.maxRowParses = Math.max(metrics.maxRowParses, activeRowParses);
+            try {
+                return operation();
+            } finally {
+                activeRowParses -= 1;
+            }
+        };
+
+        res.status(200);
+        res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
+        res.setHeader('cache-control', 'no-store');
+        res.setHeader('x-accel-buffering', 'no');
+        res.flushHeaders();
+        if (!await writeWithBackpressure(res, `${JSON.stringify({
+            event: 'meta',
+            version: 1,
+            generation,
+            manifestRevision: manifestState.revision,
+            databaseRevision,
+            page: boundedPage,
+            pageSize,
+            pageCount,
+            total,
+            ownerFacets,
+            unknownOwnerCount,
+            ownerFacetTotal: keyMatchedValues.length,
+        })}\n`, isClosed)) return;
+
+        await waitAtPluginStorageViewerTestGate(isClosed);
+        for (const descriptor of pageRows) {
+            // Yield between rows so a fetch abort is observed before another
+            // value/owner body is touched, even when SQLite reads are hot.
+            await new Promise((resolve) => setImmediate(resolve));
+            if (isClosed()) return;
+            const valueBytes = snapshot.kvGet(descriptor.storageKey);
+            metrics.valueReads += 1;
+            if (valueBytes === null) {
+                throw pluginStorageNamespaceConflict(
+                    'A plugin storage viewer row disappeared from its pinned snapshot',
+                );
+            }
+            const value = parseOneRow(() => (
+                validatePluginStorageRow(descriptor.storageKey, valueBytes)
+            ));
+            const ownerStorageKey = encodePluginSaveStorageKey(
+                descriptor.key,
+                PLUGIN_SAVE_META_PREFIX,
+            );
+            let ownerBytes = null;
+            let owner = null;
+            if (manifestMeta.has(ownerStorageKey) && physicalMeta.has(ownerStorageKey)) {
+                ownerBytes = snapshot.kvGet(ownerStorageKey);
+                metrics.ownerReads += 1;
+                const ownerRecord = parseOneRow(() => parsePluginStorageOwnerRecord(ownerBytes));
+                if (ownerRecord
+                    && typeof ownerRecord.plugin === 'string'
+                    && ownerRecord.plugin.length > 0
+                    && ownerRecord.plugin.isWellFormed()) {
+                    owner = ownerRecord.plugin;
+                }
+            }
+            await reportPluginStorageViewerTestProgress(metrics);
+            if (isClosed()) return;
+            const text = typeof value === 'string'
+                ? value
+                : value === null || value === undefined
+                    ? ''
+                    : JSON.stringify(value);
+            const valueType = value === null
+                ? 'object'
+                : value === undefined || text === ''
+                    ? 'empty'
+                    : Array.isArray(value)
+                        ? 'array'
+                        : typeof value;
+            const revision = pluginStorageRevision(valueBytes, ownerBytes);
+            const size = Buffer.byteLength(text, 'utf-8');
+            const contentHash = `sha256:${sha256Hex(Buffer.from(JSON.stringify([
+                descriptor.key,
+                owner,
+                text,
+                size,
+                valueType,
+                revision,
+            ]), 'utf-8'))}`;
+            pageTokenEntries.push([descriptor.key, contentHash]);
+            if (!await writeWithBackpressure(res, `${JSON.stringify({
+                event: 'entry',
+                key: descriptor.key,
+                owner,
+                text,
+                size,
+                valueType,
+                revision,
+                contentHash,
+            })}\n`, isClosed, () => reportPluginStorageViewerTestProgress(
+                metrics,
+                'backpressure.json',
+            ))) return;
+        }
+        if (isClosed()) return;
+        // Canonical JSON arrays make every string boundary injective, including
+        // embedded NUL characters that would collide in delimiter framing.
+        const pageTokenMaterial = JSON.stringify([
+            'pocketrisu-plugin-storage-viewer-page-v2',
+            generation,
+            manifestState.revision,
+            databaseRevision,
+            boundedPage,
+            pageSize,
+            keyQuery,
+            ownerQueryValue === undefined ? null : ownerQuery,
+            unknownOwner,
+            ownerFacets.map((facet) => [facet.owner, facet.count]),
+            unknownOwnerCount,
+            pageTokenEntries,
+        ]);
+        const pageToken = `sha256:${sha256Hex(Buffer.from(pageTokenMaterial, 'utf-8'))}`;
+        if (!await writeWithBackpressure(res, `${JSON.stringify({
+            event: 'done',
+            pageToken,
+            metrics,
+        })}\n`, isClosed)) return;
+        completed = true;
+        res.end();
+    } catch (error) {
+        if (isClosed()) return;
+        if (error?.pluginStorageNamespaceConflict && !res.headersSent) {
+            return res.status(409).json({
+                success: false,
+                error: error.message,
+                code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
+            });
+        }
+        if (res.headersSent) {
+            try {
+                res.write(`${JSON.stringify({
+                    event: 'error',
+                    message: error instanceof Error ? error.message : String(error),
+                })}\n`);
+                res.end();
+            } catch {}
+            return;
+        }
+        next(error);
+    } finally {
+        req.removeListener('aborted', onClose);
+        res.removeListener('close', onClose);
+        snapshot?.close();
+        if (pluginStorageViewerTestGateDir) {
+            try {
+                await fs.writeFile(
+                    path.join(pluginStorageViewerTestGateDir, 'result.json'),
+                    JSON.stringify({ ...metrics, aborted: !completed }),
+                    'utf-8',
+                );
+            } catch {}
+        }
+    }
+});
+
 app.get('/api/plugin-storage/manifest', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     const firstHeader = (value) => Array.isArray(value) ? value[0] : value;

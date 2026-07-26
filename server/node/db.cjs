@@ -56,6 +56,11 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS plugin_storage_usage (
     id    INTEGER PRIMARY KEY CHECK (id = 1),
     bytes INTEGER NOT NULL CHECK (bytes >= 0)
+  );
+
+  CREATE TABLE IF NOT EXISTS plugin_storage_owners (
+    storage_key TEXT PRIMARY KEY,
+    owner       TEXT NOT NULL
   )
 `);
 db.prepare(`INSERT OR IGNORE INTO sync_meta (id, list_epoch) VALUES (1, ?)`).run(crypto.randomUUID());
@@ -173,8 +178,44 @@ const stmtGetListEpoch = db.prepare(`SELECT list_epoch FROM sync_meta WHERE id =
 const stmtSetListEpoch = db.prepare(`UPDATE sync_meta SET list_epoch = ? WHERE id = 1`);
 const stmtGetPluginStorageUsage = db.prepare(`SELECT bytes FROM plugin_storage_usage WHERE id = 1`);
 const stmtSetPluginStorageUsage = db.prepare(`UPDATE plugin_storage_usage SET bytes = ? WHERE id = 1`);
+const stmtSetPluginStorageOwner = db.prepare(
+    `INSERT OR REPLACE INTO plugin_storage_owners (storage_key, owner) VALUES (?, ?)`,
+);
+const stmtDeletePluginStorageOwner = db.prepare(
+    `DELETE FROM plugin_storage_owners WHERE storage_key = ?`,
+);
+const stmtDeletePluginStorageOwnerPrefix = db.prepare(
+    `DELETE FROM plugin_storage_owners WHERE storage_key LIKE ? ESCAPE '\\'`,
+);
 
 const DELETION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const PLUGIN_STORAGE_META_PREFIX = 'pluginsave-meta/';
+
+function pluginStorageOwnerFromBytes(key, value) {
+    if (!key.startsWith(PLUGIN_STORAGE_META_PREFIX) || !Buffer.isBuffer(value)) return null;
+    try {
+        const text = value.toString('utf-8');
+        if (!Buffer.from(text, 'utf-8').equals(value)) return null;
+        const parsed = JSON.parse(text);
+        return parsed
+            && typeof parsed === 'object'
+            && !Array.isArray(parsed)
+            && typeof parsed.plugin === 'string'
+            && parsed.plugin.length > 0
+            && parsed.plugin.isWellFormed()
+            ? parsed.plugin
+            : null;
+    } catch {
+        return null;
+    }
+}
+
+function updatePluginStorageOwnerIndex(key, value) {
+    if (!key.startsWith(PLUGIN_STORAGE_META_PREFIX)) return;
+    const owner = pluginStorageOwnerFromBytes(key, value);
+    if (owner === null) stmtDeletePluginStorageOwner.run(key);
+    else stmtSetPluginStorageOwner.run(key, owner);
+}
 
 function getPluginStorageUsage() {
     return stmtGetPluginStorageUsage.get().bytes;
@@ -262,6 +303,7 @@ const runKvSet = db.transaction((key, value) => {
     if (isChunkableKey(key)) chunkStore.putValue(key, value);
     else stmtKvSet.run(key, value, Date.now());
     if (!quotaPlanned) updatePluginStorageUsageForWrite(key, value.length, previousSize);
+    updatePluginStorageOwnerIndex(key, value);
     stmtRemoveDeletion.run(key);
 });
 
@@ -269,9 +311,16 @@ const runKvSetFromFile = db.transaction((key, filePath, size) => {
     const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
     const quotaPlanned = consumePluginStorageQuotaPlan(key, size);
     if (!quotaPlanned) assertPluginWriteWithinLimits(key, size, previousSize);
+    let ownerBytes = null;
     if (isChunkableKey(key)) chunkStore.putValueFromFile(key, filePath);
-    else stmtKvSet.run(key, fs.readFileSync(filePath), Date.now());
+    else {
+        ownerBytes = fs.readFileSync(filePath);
+        stmtKvSet.run(key, ownerBytes, Date.now());
+    }
     if (!quotaPlanned) updatePluginStorageUsageForWrite(key, size, previousSize);
+    if (key.startsWith(PLUGIN_STORAGE_META_PREFIX)) {
+        updatePluginStorageOwnerIndex(key, ownerBytes ?? fs.readFileSync(filePath));
+    }
     stmtRemoveDeletion.run(key);
 });
 
@@ -279,6 +328,7 @@ const runKvDel = db.transaction((key) => {
     const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
     const quotaPlanned = consumePluginStorageQuotaPlan(key, 0);
     chunkStore.dropValue(key);
+    if (key.startsWith(PLUGIN_STORAGE_META_PREFIX)) stmtDeletePluginStorageOwner.run(key);
     if (!quotaPlanned && previousSize > 0) {
         stmtSetPluginStorageUsage.run(Math.max(0, getPluginStorageUsage() - previousSize));
     }
@@ -298,6 +348,7 @@ const runKvDelPrefix = db.transaction((prefix, pattern) => {
     stmtManifestMetaDelPrefix.run(pattern);
     stmtManifestPublicationDelPrefix.run(pattern);
     stmtKvDelPrefix.run(pattern);
+    stmtDeletePluginStorageOwnerPrefix.run(pattern);
     if (removedPluginBytes > 0) {
         stmtSetPluginStorageUsage.run(Math.max(0, getPluginStorageUsage() - removedPluginBytes));
     }
@@ -441,8 +492,43 @@ function createKvSnapshot() {
         transactionOpen = true;
         snapshotDb.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get();
         const reader = createSnapshotReader(snapshotDb);
+        const listPluginStorageOwnerFacets = snapshotDb.prepare(`
+            WITH requested(storage_key) AS (
+                SELECT value FROM json_each(?)
+            )
+            SELECT owners.owner AS owner, COUNT(*) AS count
+              FROM plugin_storage_owners AS owners
+              JOIN requested ON requested.storage_key = owners.storage_key
+             GROUP BY owners.owner
+             ORDER BY owners.owner
+        `);
+        const listPluginStorageOwnerKeys = snapshotDb.prepare(`
+            WITH requested(storage_key) AS (
+                SELECT value FROM json_each(?)
+            )
+            SELECT owners.storage_key AS storageKey
+              FROM plugin_storage_owners AS owners
+              JOIN requested ON requested.storage_key = owners.storage_key
+             WHERE (? IS NULL OR owners.owner = ?)
+        `);
+        const getPluginStorageOwner = snapshotDb.prepare(
+            'SELECT owner FROM plugin_storage_owners WHERE storage_key = ?',
+        );
         return {
             ...reader,
+            kvListPluginStorageOwnerFacets(storageKeys) {
+                if (storageKeys.length === 0) return [];
+                return listPluginStorageOwnerFacets.all(JSON.stringify(storageKeys));
+            },
+            kvListPluginStorageOwnerKeys(storageKeys, owner = null) {
+                if (storageKeys.length === 0) return [];
+                return listPluginStorageOwnerKeys
+                    .all(JSON.stringify(storageKeys), owner, owner)
+                    .map((row) => row.storageKey);
+            },
+            kvGetPluginStorageOwner(storageKey) {
+                return getPluginStorageOwner.get(storageKey)?.owner ?? null;
+            },
             close() {
                 if (closed) return;
                 closed = true;
@@ -472,12 +558,24 @@ function reconcilePluginStorageUsage() {
     return bytes;
 }
 
+function reconcilePluginStorageOwners() {
+    const rows = db.prepare(
+        `SELECT key, value FROM kv WHERE key LIKE 'pluginsave-meta/%'`,
+    ).all();
+    const reconcile = db.transaction(() => {
+        db.prepare('DELETE FROM plugin_storage_owners').run();
+        for (const row of rows) updatePluginStorageOwnerIndex(row.key, row.value);
+    });
+    reconcile();
+}
+
 // The counter is an optimization, not an authority. Rebuild it on every boot
 // so older servers, interrupted upgrades, and direct maintenance cannot leave
 // quota accounting stale.
 reconcilePluginStorageUsage();
 migrateFromSaveDir();
 reconcilePluginStorageUsage();
+reconcilePluginStorageOwners();
 
 function checkpointWal(mode = 'TRUNCATE') {
     return db.pragma(`wal_checkpoint(${mode})`);

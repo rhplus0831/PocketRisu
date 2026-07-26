@@ -103,17 +103,19 @@ function pluginStorageArrayIndex(key: string): number | null {
  * ECMAScript array-index property names come first numerically; all remaining
  * keys use deterministic UTF-16 code-unit order.
  */
+export function comparePluginStorageKeys(left: string, right: string): number {
+    const leftIndex = pluginStorageArrayIndex(left);
+    const rightIndex = pluginStorageArrayIndex(right);
+    if (leftIndex !== null || rightIndex !== null) {
+        if (leftIndex === null) return 1;
+        if (rightIndex === null) return -1;
+        return leftIndex - rightIndex;
+    }
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
 export function orderPluginStorageKeys(keys: Iterable<string>): string[] {
-    return [...new Set(keys)].sort((left, right) => {
-        const leftIndex = pluginStorageArrayIndex(left);
-        const rightIndex = pluginStorageArrayIndex(right);
-        if (leftIndex !== null || rightIndex !== null) {
-            if (leftIndex === null) return 1;
-            if (rightIndex === null) return -1;
-            return leftIndex - rightIndex;
-        }
-        return left < right ? -1 : left > right ? 1 : 0;
-    });
+    return [...new Set(keys)].sort(comparePluginStorageKeys);
 }
 
 export function copyPluginStorageRecord<T>(

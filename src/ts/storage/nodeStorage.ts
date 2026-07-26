@@ -56,6 +56,7 @@ import {
 } from "./pluginStorageBatch"
 import { PLUGIN_VALUE_STREAM_THRESHOLD_BYTES } from "./pluginStorageLimits"
 import type { BootInternalSnapshot } from "./bootSnapshotRecovery"
+import { comparePluginStorageKeys } from "../plugins/pluginStorageRecord"
 
 export const AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS = 15_000
 /** Snapshot ingestion can legitimately stream hundreds of MiB from chunk storage. */
@@ -190,6 +191,37 @@ export interface PluginStorageManifestSnapshotTransport {
 export interface PluginStorageManifestStateTransport {
     generation: string
     manifestRevision: string
+}
+
+export interface PluginStorageViewerEntryTransport {
+    key: string
+    owner: string | null
+    text: string
+    size: number
+    valueType: string
+    revision: string
+    contentHash: string
+}
+
+export interface PluginStorageViewerPageTransport {
+    generation: string
+    manifestRevision: string
+    databaseRevision: string
+    pageToken: string
+    page: number
+    pageSize: number
+    pageCount: number
+    total: number
+    ownerFacets: { owner: string, count: number }[]
+    unknownOwnerCount: number
+    ownerFacetTotal: number
+    entries: PluginStorageViewerEntryTransport[]
+    metrics: {
+        manifestParses: number
+        valueReads: number
+        ownerReads: number
+        maxRowParses: number
+    }
 }
 
 export interface PluginStorageMutationTransport {
@@ -1902,6 +1934,329 @@ export class NodeStorage{
             AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
             externalSignal,
         )
+    }
+
+    async getPluginStorageViewerPage(
+        generation: string,
+        options: {
+            page: number
+            pageSize: number
+            keyQuery?: string
+            ownerQuery?: string
+            unknownOwner?: boolean
+        },
+        externalSignal?: AbortSignal | null,
+        onProgress?: (completed: number, total: number) => void,
+    ): Promise<PluginStorageViewerPageTransport> {
+        return runBoundedAuthoritativeStorageOperation(
+            signal => this.getPluginStorageViewerPageAuthoritative(
+                generation,
+                options,
+                signal,
+                onProgress,
+            ),
+            'list',
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+    }
+
+    private async getPluginStorageViewerPageAuthoritative(
+        generation: string,
+        options: {
+            page: number
+            pageSize: number
+            keyQuery?: string
+            ownerQuery?: string
+            unknownOwner?: boolean
+        },
+        signal: AbortSignal,
+        onProgress?: (completed: number, total: number) => void,
+    ): Promise<PluginStorageViewerPageTransport> {
+        if (typeof generation !== 'string' || generation.length === 0) {
+            throw new TypeError('Plugin storage generation must be a non-empty string')
+        }
+        if (!Number.isInteger(options.page) || options.page < 0) {
+            throw new RangeError('Plugin storage viewer page must be a non-negative integer')
+        }
+        if (!Number.isInteger(options.pageSize) || options.pageSize < 1 || options.pageSize > 50) {
+            throw new RangeError('Plugin storage viewer page size must be between 1 and 50')
+        }
+        if ((options.ownerQuery !== undefined && options.unknownOwner)
+            || (options.ownerQuery !== undefined && !options.ownerQuery.isWellFormed())) {
+            throw new TypeError('Plugin storage viewer owner filter is invalid')
+        }
+        const query = new URLSearchParams({
+            page: String(options.page),
+            pageSize: String(options.pageSize),
+        })
+        if (options.keyQuery) query.set('key', options.keyQuery)
+        if (options.ownerQuery !== undefined) query.set('owner', options.ownerQuery)
+        if (options.unknownOwner) query.set('unknownOwner', '1')
+        const response = await this.requestStorage(
+            'plugin-storage/viewer-page',
+            'list',
+            false,
+            () => this.authFetch(`/api/plugin-storage/viewer-page?${query.toString()}`, {
+                method: 'GET',
+                headers: {
+                    accept: 'application/x-ndjson',
+                    'x-plugin-storage-generation': generation,
+                },
+                signal,
+            }),
+            [],
+            signal,
+        )
+        if (!response.body) {
+            throw new StorageError('Plugin storage viewer response omitted its body.', {
+                code: 'STORAGE_RESPONSE_ERROR', operation: 'list', retryable: true,
+            })
+        }
+
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder('utf-8', { fatal: true })
+        let buffer = ''
+        let meta: Omit<PluginStorageViewerPageTransport, 'entries' | 'pageToken' | 'metrics'> | null = null
+        let done: Pick<PluginStorageViewerPageTransport, 'pageToken' | 'metrics'> | null = null
+        const entries: PluginStorageViewerEntryTransport[] = []
+        const seenKeys = new Set<string>()
+        const textEncoder = new TextEncoder()
+        const malformed = () => new StorageError('Plugin storage viewer response was malformed.', {
+            code: 'STORAGE_RESPONSE_ERROR', operation: 'list', retryable: true,
+        })
+        const exactKeys = (record: Record<string, unknown>, expected: readonly string[]) => (
+            Object.keys(record).length === expected.length
+            && expected.every(key => Object.hasOwn(record, key))
+        )
+        const parseLine = (line: string) => {
+            let value: unknown
+            try {
+                value = JSON.parse(line)
+            } catch {
+                throw malformed()
+            }
+            if (!value || typeof value !== 'object' || Array.isArray(value)) throw malformed()
+            const record = value as Record<string, unknown>
+            if (record.event === 'meta') {
+                const ownerFacets = record.ownerFacets
+                const validOwnerFacets = Array.isArray(ownerFacets)
+                    && ownerFacets.every((facet, index) => {
+                        if (!facet || typeof facet !== 'object' || Array.isArray(facet)) return false
+                        const candidate = facet as Record<string, unknown>
+                        return exactKeys(candidate, ['owner', 'count'])
+                            && typeof candidate.owner === 'string'
+                            && candidate.owner.length > 0
+                            && candidate.owner.isWellFormed()
+                            && Number.isSafeInteger(candidate.count)
+                            && (candidate.count as number) > 0
+                            && (index === 0
+                                || (ownerFacets[index - 1] as { owner: string }).owner < candidate.owner)
+                    })
+                const facetCount = validOwnerFacets
+                    ? ownerFacets.reduce((sum, facet) => sum + (facet as { count: number }).count, 0)
+                    : -1
+                if (meta || done || entries.length > 0 || !exactKeys(record, [
+                    'event', 'version', 'generation', 'manifestRevision', 'databaseRevision',
+                    'page', 'pageSize', 'pageCount', 'total', 'ownerFacets',
+                    'unknownOwnerCount', 'ownerFacetTotal',
+                ])
+                    || record.version !== 1
+                    || record.generation !== generation
+                    || typeof record.manifestRevision !== 'string'
+                    || !/^sha256:[0-9a-f]{64}$/.test(record.manifestRevision)
+                    || typeof record.databaseRevision !== 'string'
+                    || !/^[0-9a-f]{32}$/.test(record.databaseRevision)
+                    || !Number.isSafeInteger(record.page) || (record.page as number) < 0
+                    || !Number.isSafeInteger(record.pageSize)
+                    || (record.pageSize as number) < 1 || (record.pageSize as number) > 50
+                    || !Number.isSafeInteger(record.pageCount) || (record.pageCount as number) < 1
+                    || !Number.isSafeInteger(record.total) || (record.total as number) < 0
+                    || !validOwnerFacets
+                    || !Number.isSafeInteger(record.unknownOwnerCount)
+                    || (record.unknownOwnerCount as number) < 0
+                    || !Number.isSafeInteger(record.ownerFacetTotal)
+                    || !Number.isSafeInteger(facetCount)
+                    || record.ownerFacetTotal !== facetCount + (record.unknownOwnerCount as number)
+                    || record.pageSize !== options.pageSize
+                    || record.pageCount !== Math.max(1, Math.ceil(
+                        (record.total as number) / (record.pageSize as number),
+                    ))
+                    || record.page !== Math.min(options.page, (record.pageCount as number) - 1)
+                    || (options.unknownOwner && record.total !== record.unknownOwnerCount)
+                    || (options.ownerQuery !== undefined && record.total !== (
+                        (ownerFacets as Array<{ owner: string, count: number }>)
+                            .find(facet => facet.owner === options.ownerQuery)?.count ?? 0
+                    ))
+                    || (!options.unknownOwner && options.ownerQuery === undefined
+                        && record.total !== record.ownerFacetTotal)) {
+                    throw malformed()
+                }
+                meta = {
+                    generation,
+                    manifestRevision: record.manifestRevision,
+                    databaseRevision: record.databaseRevision,
+                    page: record.page as number,
+                    pageSize: record.pageSize as number,
+                    pageCount: record.pageCount as number,
+                    total: record.total as number,
+                    ownerFacets: (ownerFacets as Array<{ owner: string, count: number }>)
+                        .map(facet => ({ ...facet })),
+                    unknownOwnerCount: record.unknownOwnerCount as number,
+                    ownerFacetTotal: record.ownerFacetTotal as number,
+                }
+                onProgress?.(0, Math.min(meta.pageSize, Math.max(0, meta.total - meta.page * meta.pageSize)))
+                return
+            }
+            if (record.event === 'entry') {
+                if (!meta || done || !exactKeys(record, [
+                    'event', 'key', 'owner', 'text', 'size', 'valueType', 'revision', 'contentHash',
+                ])
+                    || typeof record.key !== 'string' || !record.key.isWellFormed()
+                    || (record.owner !== null
+                        && (typeof record.owner !== 'string'
+                            || record.owner.length === 0
+                            || !record.owner.isWellFormed()))
+                    || typeof record.text !== 'string'
+                    || !Number.isSafeInteger(record.size) || (record.size as number) < 0
+                    || textEncoder.encode(record.text as string).byteLength !== record.size
+                    || typeof record.valueType !== 'string'
+                    || !['object', 'array', 'string', 'number', 'boolean', 'empty'].includes(record.valueType)
+                    || typeof record.revision !== 'string'
+                    || !/^sha256:[0-9a-f]{64}$/.test(record.revision)
+                    || typeof record.contentHash !== 'string'
+                    || !/^sha256:[0-9a-f]{64}$/.test(record.contentHash)
+                    || entries.length >= meta.pageSize
+                    || seenKeys.has(record.key)
+                    || (entries.length > 0
+                        && comparePluginStorageKeys(entries[entries.length - 1].key, record.key) >= 0)
+                    || (options.keyQuery
+                        && !record.key.toLowerCase().includes(options.keyQuery.trim().toLowerCase()))
+                    || (options.unknownOwner && record.owner !== null)
+                    || (options.ownerQuery !== undefined && record.owner !== options.ownerQuery)) {
+                    throw malformed()
+                }
+                seenKeys.add(record.key)
+                entries.push({
+                    key: record.key,
+                    owner: record.owner as string | null,
+                    text: record.text,
+                    size: record.size as number,
+                    valueType: record.valueType,
+                    revision: record.revision,
+                    contentHash: record.contentHash,
+                })
+                onProgress?.(entries.length, Math.min(
+                    meta.pageSize,
+                    Math.max(0, meta.total - meta.page * meta.pageSize),
+                ))
+                return
+            }
+            if (record.event === 'done') {
+                const metrics = record.metrics as Record<string, unknown> | undefined
+                if (!meta || done || !exactKeys(record, ['event', 'pageToken', 'metrics'])
+                    || typeof record.pageToken !== 'string'
+                    || !/^sha256:[0-9a-f]{64}$/.test(record.pageToken)
+                    || !metrics || Array.isArray(metrics)
+                    || !exactKeys(metrics, [
+                        'manifestParses', 'valueReads', 'ownerReads', 'maxRowParses',
+                    ])
+                    || !Object.values(metrics).every(value => (
+                        Number.isSafeInteger(value) && (value as number) >= 0
+                    ))) {
+                    throw malformed()
+                }
+                done = {
+                    pageToken: record.pageToken,
+                    metrics: metrics as PluginStorageViewerPageTransport['metrics'],
+                }
+                return
+            }
+            if (record.event === 'error'
+                && meta
+                && !done
+                && exactKeys(record, ['event', 'message'])
+                && typeof record.message === 'string'
+                && record.message.length > 0
+                && record.message.isWellFormed()) {
+                throw new StorageError(record.message, {
+                    code: 'STORAGE_RESPONSE_ERROR', operation: 'list', retryable: true,
+                })
+            }
+            throw malformed()
+        }
+
+        try {
+            while (true) {
+                throwIfAborted(signal)
+                const chunk = await awaitWithAbort(reader.read(), signal)
+                if (chunk.done) break
+                buffer += decoder.decode(chunk.value, { stream: true })
+                let newline = buffer.indexOf('\n')
+                while (newline >= 0) {
+                    const line = buffer.slice(0, newline)
+                    buffer = buffer.slice(newline + 1)
+                    parseLine(line)
+                    newline = buffer.indexOf('\n')
+                }
+            }
+            buffer += decoder.decode()
+            if (buffer) parseLine(buffer)
+        } catch (error) {
+            void reader.cancel(error).catch(() => undefined)
+            throw error
+        }
+        if (!meta || !done
+            || entries.length !== Math.min(
+                meta.pageSize,
+                Math.max(0, meta.total - meta.page * meta.pageSize),
+            )
+            || done.metrics.manifestParses !== 1
+            || done.metrics.valueReads !== entries.length
+            || done.metrics.ownerReads < 0
+            || done.metrics.ownerReads > entries.length
+            || done.metrics.maxRowParses !== (entries.length > 0 ? 1 : 0)) {
+            throw malformed()
+        }
+        for (const entry of entries) {
+            throwIfAborted(signal)
+            const expectedContentHash = `sha256:${await sha256OwnedBytes(
+                textEncoder.encode(JSON.stringify([
+                    entry.key,
+                    entry.owner,
+                    entry.text,
+                    entry.size,
+                    entry.valueType,
+                    entry.revision,
+                ])),
+            )}`
+            throwIfAborted(signal)
+            if (entry.contentHash !== expectedContentHash) throw malformed()
+        }
+        throwIfAborted(signal)
+        // Canonical JSON arrays preserve string boundaries even when a key or
+        // owner filter contains U+0000; delimiter concatenation cannot.
+        const pageTokenMaterial = JSON.stringify([
+            'pocketrisu-plugin-storage-viewer-page-v2',
+            generation,
+            meta.manifestRevision,
+            meta.databaseRevision,
+            meta.page,
+            meta.pageSize,
+            options.keyQuery?.trim() ?? '',
+            options.ownerQuery ?? null,
+            options.unknownOwner ?? false,
+            meta.ownerFacets.map(facet => [facet.owner, facet.count]),
+            meta.unknownOwnerCount,
+            entries.map(entry => [entry.key, entry.contentHash]),
+        ])
+        const expectedPageToken = `sha256:${await sha256OwnedBytes(
+            textEncoder.encode(pageTokenMaterial),
+        )}`
+        throwIfAborted(signal)
+        if (done.pageToken !== expectedPageToken) throw malformed()
+        throwIfAborted(signal)
+        return { ...meta, ...done, entries }
     }
 
     async getPluginStorageManifestState(

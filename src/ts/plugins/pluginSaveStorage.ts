@@ -16,6 +16,7 @@ import {
     preparePersistentJson,
     readPersistentPluginStorageManifestSnapshot,
     readPersistentPluginStorageManifestState,
+    readPersistentPluginStorageViewerPage,
     readPersistentPluginStorageState,
     readPersistentPluginStorageTransitionRow,
     readPersistentJson,
@@ -79,6 +80,11 @@ import {
     type PublicPluginStorageConfirmedRemoveOutcome,
     type PublicPluginStorageMutationOutcome,
 } from "./pluginStorageMutationOutcome";
+import {
+    detectPluginStorageViewerType,
+    valueToPluginStorageViewerText,
+    type PluginStorageViewerEntry,
+} from "./pluginStorageViewerPage";
 
 export { PLUGIN_SAVE_META_PREFIX, PLUGIN_SAVE_PREFIX };
 export const PLUGIN_STORAGE_MANIFEST_KEY = "plugin-storage/manifest.json";
@@ -2017,6 +2023,184 @@ async function getPluginSaveStorageEnumerationSnapshot(
         }
         return [...orderedKeys];
     }, signal);
+}
+
+export interface PluginSaveStorageViewerPage {
+    entries: PluginStorageViewerEntry[];
+    generation: string | null;
+    manifestRevision: string | null;
+    databaseRevision: string | null;
+    pageToken: string;
+    page: number;
+    pageSize: number;
+    pageCount: number;
+    total: number;
+    ownerFacets: { owner: string; count: number }[];
+    unknownOwnerCount: number;
+    ownerFacetTotal: number;
+    metrics: {
+        manifestParses: number;
+        valueReads: number;
+        ownerReads: number;
+        maxRowParses: number;
+    };
+}
+
+/**
+ * Read one point-in-time viewer page. Optimized mode delegates inventory,
+ * owner and body selection to one pinned server snapshot; inline mode captures
+ * only the selected values synchronously before yielding.
+ */
+export async function getPluginSaveStorageViewerPage(
+    options: {
+        page: number;
+        pageSize?: number;
+        keyQuery?: string;
+        ownerQuery?: string;
+        unknownOwner?: boolean;
+        signal?: AbortSignal | null;
+        onProgress?: (completed: number, total: number) => void;
+    },
+): Promise<PluginSaveStorageViewerPage> {
+    const pageSize = options.pageSize ?? 50;
+    if (!Number.isInteger(options.page) || options.page < 0
+        || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 50) {
+        throw new RangeError("Plugin storage viewer pages must contain between 1 and 50 rows.");
+    }
+    if ((options.ownerQuery !== undefined && options.unknownOwner)
+        || (options.ownerQuery !== undefined
+            && (!options.ownerQuery || !options.ownerQuery.isWellFormed()))) {
+        throw new TypeError("Plugin storage viewer owner filter is invalid.");
+    }
+    return withPluginSaveStorageScope("viewer", async () => {
+        throwIfAborted(options.signal);
+        const db = getDatabase();
+        if (db.optimizePluginMemory === true) {
+            const generation = db.pluginStorageGeneration;
+            if (!generation) {
+                throw new StorageError(
+                    "Optimized plugin storage has no active generation; reload to reconcile it.",
+                    {
+                        code: "PLUGIN_STORAGE_GENERATION_CONFLICT",
+                        operation: "list",
+                        retryable: true,
+                    },
+                );
+            }
+            const result = await readPersistentPluginStorageViewerPage(
+                generation,
+                {
+                    page: options.page,
+                    pageSize,
+                    ...(options.keyQuery ? { keyQuery: options.keyQuery } : {}),
+                    ...(options.ownerQuery !== undefined ? { ownerQuery: options.ownerQuery } : {}),
+                    ...(options.unknownOwner ? { unknownOwner: true } : {}),
+                },
+                options.signal,
+                options.onProgress,
+            );
+            return {
+                ...result,
+                entries: result.entries.map(entry => ({
+                    key: entry.key,
+                    ...(entry.owner ? { owner: entry.owner } : {}),
+                    text: entry.text,
+                    size: entry.size,
+                    type: entry.valueType,
+                })),
+            };
+        }
+
+        const values = db.pluginCustomStorage ?? createDatabasePluginStorageRecord();
+        const meta = db.pluginStorageMeta ?? createDatabasePluginStorageRecord();
+        const query = options.keyQuery?.trim().toLowerCase() ?? "";
+        const keyMatched = orderPluginStorageKeys(getPluginStorageRecordKeys(values))
+            .filter(key => !query || key.toLowerCase().includes(query));
+        const ownerFacetCounts = new Map<string, number>();
+        let unknownOwnerCount = 0;
+        for (const key of keyMatched) {
+            const owner = meta[key]?.plugin;
+            if (typeof owner === "string" && owner) {
+                ownerFacetCounts.set(owner, (ownerFacetCounts.get(owner) ?? 0) + 1);
+            } else {
+                unknownOwnerCount += 1;
+            }
+        }
+        const ownerFacets = [...ownerFacetCounts]
+            .map(([owner, count]) => ({ owner, count }))
+            .sort((left, right) => left.owner < right.owner ? -1 : left.owner > right.owner ? 1 : 0);
+        const keys = keyMatched.filter((key) => {
+            const owner = meta[key]?.plugin;
+            if (options.unknownOwner) return typeof owner !== "string" || !owner;
+            if (options.ownerQuery !== undefined) return owner === options.ownerQuery;
+            return true;
+        });
+        const total = keys.length;
+        const pageCount = Math.max(1, Math.ceil(total / pageSize));
+        const page = Math.min(options.page, pageCount - 1);
+        const selectedKeys = keys.slice(
+            page * pageSize,
+            Math.min(total, (page + 1) * pageSize),
+        );
+        // No await occurs while these rows are detached, so every selected
+        // value and owner belongs to the same in-memory publication turn.
+        const entries = selectedKeys.map((key) => {
+            const value = snapshotJsonValue(values[key]);
+            const text = valueToPluginStorageViewerText(value);
+            const owner = meta[key]?.plugin;
+            return {
+                key,
+                ...(typeof owner === "string" && owner ? { owner } : {}),
+                text,
+                size: new TextEncoder().encode(text).byteLength,
+                type: detectPluginStorageViewerType(value, text),
+            };
+        });
+        throwIfAborted(options.signal);
+        const pageToken = `sha256:${await sha256OwnedBytes(new TextEncoder().encode(
+            stringifyJsonValue([
+                "pocketrisu-inline-plugin-storage-viewer-page-v2",
+                page,
+                pageSize,
+                options.keyQuery?.trim() ?? "",
+                options.ownerQuery ?? null,
+                options.unknownOwner ?? false,
+                ownerFacets.map(facet => [facet.owner, facet.count]),
+                unknownOwnerCount,
+                total,
+                entries.map(entry => [
+                    entry.key,
+                    entry.owner ?? null,
+                    entry.text,
+                    entry.size,
+                    entry.type,
+                ]),
+            ]),
+        ))}`;
+        throwIfAborted(options.signal);
+        options.onProgress?.(entries.length, entries.length);
+        throwIfAborted(options.signal);
+        return {
+            entries,
+            generation: null,
+            manifestRevision: null,
+            databaseRevision: null,
+            pageToken,
+            page,
+            pageSize,
+            pageCount,
+            total,
+            ownerFacets,
+            unknownOwnerCount,
+            ownerFacetTotal: keyMatched.length,
+            metrics: {
+                manifestParses: 0,
+                valueReads: entries.length,
+                ownerReads: 0,
+                maxRowParses: entries.length > 0 ? 1 : 0,
+            },
+        };
+    }, options.signal);
 }
 
 export async function getPluginSaveStorageKeys(signal?: AbortSignal | null): Promise<string[]> {

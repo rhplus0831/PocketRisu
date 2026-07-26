@@ -5,6 +5,7 @@ import {
     type PluginStorageStagedTransitionBegin,
     type PluginStorageManifestSnapshotTransport,
     type PluginStorageManifestStateTransport,
+    type PluginStorageViewerPageTransport,
     type PluginStorageTransitionTransport,
     type StorageReadOptions,
 } from "./nodeStorage"
@@ -137,6 +138,27 @@ export class AutoStorage{
     ): Promise<PluginStorageManifestStateTransport> {
         await this.Init()
         return await this.realStorage.getPluginStorageManifestState(generation, signal)
+    }
+
+    async getPluginStorageViewerPage(
+        generation: string,
+        options: {
+            page: number
+            pageSize: number
+            keyQuery?: string
+            ownerQuery?: string
+            unknownOwner?: boolean
+        },
+        signal?: AbortSignal | null,
+        onProgress?: (completed: number, total: number) => void,
+    ): Promise<PluginStorageViewerPageTransport> {
+        await this.Init()
+        return await this.realStorage.getPluginStorageViewerPage(
+            generation,
+            options,
+            signal,
+            onProgress,
+        )
     }
 
     async checkAccountSync(){

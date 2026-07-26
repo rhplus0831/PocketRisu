@@ -1,8 +1,26 @@
 import { describe, expect, test } from 'vitest'
 import {
     loadPluginStorageViewerPage,
+    PluginStorageViewerLoadCoordinator,
     PluginStorageViewerLoadCancelled,
 } from './pluginStorageViewerPage'
+import {
+    comparePluginStorageKeys,
+    orderPluginStorageKeys,
+} from './pluginStorageRecord'
+
+describe('plugin storage canonical ordering', () => {
+    test('uses array-index order followed by raw UTF-16 code-unit order', () => {
+        const composed = '\u00e9'
+        const decomposed = 'e\u0301'
+        expect(orderPluginStorageKeys([
+            composed, '10', '01', '\ue000', '2', decomposed, '0', '\ud83d\ude00', '4294967295',
+        ])).toEqual([
+            '0', '2', '10', '01', '4294967295', decomposed, composed, '\ud83d\ude00', '\ue000',
+        ])
+        expect(comparePluginStorageKeys(composed, decomposed)).not.toBe(0)
+    })
+})
 
 describe('loadPluginStorageViewerPage', () => {
     test('high-cardinality repositories retain and read only the requested page', async () => {
@@ -67,5 +85,50 @@ describe('loadPluginStorageViewerPage', () => {
             },
         })).rejects.toThrow('injected read failure')
         expect(reads).toEqual(['key-0', 'key-1', 'key-2', 'key-3', 'key-4'])
+    })
+
+    test('passes one abort signal through serial reads and stops before the next body', async () => {
+        const controller = new AbortController()
+        const seenSignals: Array<AbortSignal | null | undefined> = []
+        let reads = 0
+        const pending = loadPluginStorageViewerPage({
+            keys: Array.from({ length: 50 }, (_, index) => ({ key: `key-${index}` })),
+            page: 0,
+            signal: controller.signal,
+            read: async (_key, signal) => {
+                seenSignals.push(signal)
+                reads += 1
+                if (reads === 3) controller.abort(new DOMException('stop page', 'AbortError'))
+                return { body: 'x'.repeat(1024 * 1024) }
+            },
+        })
+
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+        expect(reads).toBe(3)
+        expect(seenSignals.every(signal => signal === controller.signal)).toBe(true)
+    })
+})
+
+describe('PluginStorageViewerLoadCoordinator', () => {
+    test('a newer load aborts its predecessor and keeps an identity guard', () => {
+        const coordinator = new PluginStorageViewerLoadCoordinator()
+        const first = coordinator.start()
+        const second = coordinator.start()
+
+        expect(first.signal.aborted).toBe(true)
+        expect(first.isCurrent()).toBe(false)
+        expect(second.signal.aborted).toBe(false)
+        expect(second.isCurrent()).toBe(true)
+        first.finish()
+        expect(second.isCurrent()).toBe(true)
+    })
+
+    test('dispose aborts the active load and prevents a late commit', () => {
+        const coordinator = new PluginStorageViewerLoadCoordinator()
+        const load = coordinator.start()
+        coordinator.dispose()
+
+        expect(load.signal.aborted).toBe(true)
+        expect(load.isCurrent()).toBe(false)
     })
 })

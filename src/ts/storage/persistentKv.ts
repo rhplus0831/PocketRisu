@@ -21,6 +21,7 @@ import type {
     PluginStorageStagedTransitionAbortTombstone,
     PluginStorageStagedTransitionStatus,
     PluginStorageTransitionTransport,
+    PluginStorageViewerPageTransport,
 } from "./nodeStorage";
 import {
     PLUGIN_VALUE_MAX_BYTES,
@@ -372,6 +373,28 @@ export async function readPersistentPluginStorageManifestState(
     throwIfAborted(signal);
     await ensureStorageReady(signal);
     return await forageStorage.getPluginStorageManifestState(generation, signal);
+}
+
+export async function readPersistentPluginStorageViewerPage(
+    generation: string,
+    options: {
+        page: number;
+        pageSize: number;
+        keyQuery?: string;
+        ownerQuery?: string;
+        unknownOwner?: boolean;
+    },
+    signal?: AbortSignal | null,
+    onProgress?: (completed: number, total: number) => void,
+): Promise<PluginStorageViewerPageTransport> {
+    throwIfAborted(signal);
+    await ensureStorageReady(signal);
+    return await forageStorage.getPluginStorageViewerPage(
+        generation,
+        options,
+        signal,
+        onProgress,
+    );
 }
 
 export async function listPersistentKeys(

@@ -148,7 +148,12 @@ failures stop conservatively. Settings and corrupt boot share one strict
 session-fenced restore call: exact key and echoed commit
 schema, a finite large-restore timeout, no mutation retry, definitive `423`
 classification before body I/O, and warning-plus-hard-reload reconciliation
-only for genuinely unknown outcomes.
+only for genuinely unknown outcomes. The point-in-time max-50 viewer uses one
+read-only SQLite snapshot,
+canonical key order and publication-wide owner facets, strict content-bound
+NDJSON/page tokens, a 10,000-key same-membership race, real response
+backpressure/disconnect cleanup, complete load supersession/unmount/hash aborts,
+and generation-owned partial folding.
 PM4 additionally covers compact manifest CAS, exact server value hashes,
 50-row snapshot reuse, canonical manifest-key validation and cancellation,
 donated 128-row and four-by-2-MiB batches, one IndexedDB mutation transaction,
