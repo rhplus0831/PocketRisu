@@ -48,6 +48,15 @@ export class AutoStorage{
         await this.Init()
         return await this.realStorage.readDatabaseForBoot()
     }
+    async restoreInternalSnapshotForBoot(
+        key: string,
+        signal?: AbortSignal | null,
+    ) {
+        await this.Init()
+        return signal
+            ? await this.realStorage.restoreInternalSnapshotForBoot(key, signal)
+            : await this.realStorage.restoreInternalSnapshotForBoot(key)
+    }
     async keys(prefix: string = '', signal?: AbortSignal | null):Promise<string[]>{
         await this.Init()
         return signal

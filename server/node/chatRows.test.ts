@@ -17,6 +17,7 @@ interface ChatRowStore {
     listAllChatRowKeys: () => string[]
     chatBytesForChar: (chaId: string) => number
     chatToStub: (chat: any) => any
+    validateDatabaseShape: (dbObj: any) => any
     hasChatPayloads: (dbObj: any) => boolean
     referencedChatRowKeys: (dbObj: any) => Set<string>
     extractPayloadChats: (dbObj: any) => number
@@ -77,6 +78,7 @@ const {
     chatRowKey,
     parseChatRowKey,
     chatToStub,
+    validateDatabaseShape,
     hasChatPayloads,
     splitFullDb,
     findDuplicateChaIds,
@@ -85,6 +87,7 @@ const {
     chatRowKey: (chaId: string, chatId: string) => string
     parseChatRowKey: (key: string) => { chaId: string; chatId: string } | null
     chatToStub: (chat: any) => any
+    validateDatabaseShape: ChatRowStore['validateDatabaseShape']
     hasChatPayloads: (dbObj: any) => boolean
     splitFullDb: ChatRowStore['splitFullDb']
     findDuplicateChaIds: ChatRowStore['findDuplicateChaIds']
@@ -278,6 +281,32 @@ describe('chatToStub', () => {
 })
 
 describe('splitFullDb and assembleFullDb', () => {
+    it.each([
+        ['null root', null],
+        ['array root', []],
+        ['non-array characters', { characters: 'not-an-array' }],
+        ['non-array chats', { characters: [{ chats: {} }] }],
+        ['non-array chat folders', { characters: [{ chatFolders: {} }] }],
+        ['non-array message', { characters: [{ chats: [{ message: 'not-an-array' }] }] }],
+    ])('rejects the %s traversal shape before splitting', (_label, value) => {
+        expect(() => validateDatabaseShape(value)).toThrow(TypeError)
+        expect(() => splitFullDb(value)).toThrow(TypeError)
+    })
+
+    it('accepts the legacy fresh-install empty database envelope', () => {
+        const value = {}
+        expect(validateDatabaseShape(value)).toBe(value)
+        expect(splitFullDb(value)).toEqual({ strippedDb: value, chatEntries: [] })
+    })
+
+    it('preserves legacy null character, chat, and folder placeholders', () => {
+        const value = {
+            characters: [null, { chats: [null], chatFolders: [null] }],
+        }
+        expect(validateDatabaseShape(value)).toBe(value)
+        expect(splitFullDb(value).strippedDb.characters).toEqual(value.characters)
+    })
+
     it('extracts payload chats into rows and replaces them with unique, healed stubs', async () => {
         const { store } = makeHarness()
         const dbObj = {

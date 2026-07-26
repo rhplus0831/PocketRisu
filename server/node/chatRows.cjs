@@ -45,6 +45,52 @@ function chatToStub(chat) {
     return stub;
 }
 
+function isOrdinaryObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Validate the structural contract traversed by chat externalization without
+ * mutating the decoded database. Keep this shared between startup preflight
+ * and the ingest/split boundary so a newly added traversal cannot silently
+ * make preflight weaker than publication.
+ */
+function validateDatabaseShape(dbObj) {
+    if (!isOrdinaryObject(dbObj)) {
+        throw new TypeError('Database root must be a non-null object');
+    }
+    // Bootstrap's first durable save is the legacy empty `{}` envelope. An
+    // absent characters field means an empty collection; a present non-array
+    // field is structural corruption because migrations will iterate it.
+    if (dbObj.characters === undefined) return dbObj;
+    if (!Array.isArray(dbObj.characters)) {
+        throw new TypeError('Database characters must be an array');
+    }
+    for (let characterIndex = 0; characterIndex < dbObj.characters.length; characterIndex++) {
+        const character = dbObj.characters[characterIndex];
+        // Legacy saves may contain null placeholders. Every migration traversal
+        // already skips those via optional access; validate only structures it
+        // will actually iterate.
+        if (!isOrdinaryObject(character)) continue;
+        if (character.chats !== undefined && !Array.isArray(character.chats)) {
+            throw new TypeError(`Database character ${characterIndex} chats must be an array`);
+        }
+        if (character.chatFolders !== undefined && !Array.isArray(character.chatFolders)) {
+            throw new TypeError(`Database character ${characterIndex} chatFolders must be an array`);
+        }
+        for (let chatIndex = 0; chatIndex < (character.chats?.length ?? 0); chatIndex++) {
+            const chat = character.chats[chatIndex];
+            if (!isOrdinaryObject(chat)) continue;
+            if (chat.message !== undefined && !Array.isArray(chat.message)) {
+                throw new TypeError(
+                    `Database character ${characterIndex} chat ${chatIndex} message must be an array`
+                );
+            }
+        }
+    }
+    return dbObj;
+}
+
 function assignMissingChatId(chat, makeId = nodeCrypto.randomUUID) {
     if (!chat || chat._stub || chat.id) return false;
     chat.id = makeId();
@@ -200,8 +246,9 @@ function extractPayloadChats(dbObj, onPayload, makeId = nodeCrypto.randomUUID) {
 }
 
 function splitFullDb(dbObj, makeId = nodeCrypto.randomUUID) {
+    validateDatabaseShape(dbObj);
     const chatEntries = [];
-    if (!dbObj?.characters) return { strippedDb: dbObj, chatEntries };
+    if (dbObj.characters === undefined) return { strippedDb: dbObj, chatEntries };
 
     const strippedDb = { ...dbObj };
     strippedDb.characters = dbObj.characters.map(char => {
@@ -381,6 +428,7 @@ function createChatRowStore(options) {
             ? await decodeRisuSave(source)
             : source;
         const dbObj = normalizeJSON(decoded);
+        validateDatabaseShape(dbObj);
         const assignedMissingChatIds = assignMissingChatIds(dbObj, randomUUID);
 
         let restoreResult;
@@ -526,6 +574,7 @@ function createChatRowStore(options) {
                 },
             });
             const dbObj = walked.remainder;
+            validateDatabaseShape(dbObj);
             if (typeof opts.onPluginStorageComplete === 'function') {
                 await opts.onPluginStorageComplete({
                     dbObj,
@@ -633,6 +682,7 @@ function createChatRowStore(options) {
         listAllChatRowKeys,
         chatBytesForChar,
         chatToStub,
+        validateDatabaseShape,
         hasChatPayloads,
         referencedChatRowKeys,
         extractPayloadChats: extractAndWritePayloadChats,
@@ -654,6 +704,7 @@ module.exports = {
     chatRowKey,
     parseChatRowKey,
     chatToStub,
+    validateDatabaseShape,
     mergeChatStubWithFullChat,
     hasChatPayloads,
     referencedChatRowKeys,

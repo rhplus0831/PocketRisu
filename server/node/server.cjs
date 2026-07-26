@@ -98,6 +98,7 @@ const {
     chatRowKey,
     hasChatPayloads,
     findDuplicateChaIds,
+    validateDatabaseShape,
 } = require('./chatRows.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
 const { inspectRisuSaveSource, shouldStreamRisuSave } = require('./streamRisuLoad.cjs');
@@ -247,6 +248,13 @@ const pluginStorageClearFailpoint = process.env.NODE_ENV === 'test'
 // acknowledgement-loss.
 const pluginStorageMutationFailpoint = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_PLUGIN_MUTATION_FAILPOINT ?? '').trim()
+    : '';
+
+// Test-only recovery transaction/acknowledgement boundaries. Both are after
+// snapshot validation; before-commit must roll back every publication row,
+// while response simulates an acknowledgement lost after COMMIT.
+const snapshotRestoreFailpoint = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_SNAPSHOT_RESTORE_FAILPOINT ?? '').trim()
     : '';
 
 function hitPluginStorageMutationFailpoint(boundary) {
@@ -769,6 +777,27 @@ async function migrateRemoteBlocksIfNeeded() {
     return { ran: true, characterCount, backupKey };
 }
 
+/**
+ * Prove that the live monolith is decodable before any ordinary boot
+ * migration is allowed to publish markers, backups, or rewritten rows.
+ *
+ * This deliberately has no storage writes. REMOTE-backed legacy databases
+ * are resolved from their existing rows so a valid pre-migration source does
+ * not get mistaken for corruption, while optimized plugin JSON receives the
+ * same strict validation used by ingest.
+ */
+async function preflightBootDatabase(raw) {
+    const decoded = await decodeRisuSave(raw, {
+        resolveRemote: async (name) => {
+            const value = kvGet(`remotes/${name}.local.bin`);
+            return value || null;
+        },
+    });
+    const normalized = normalizeJSON(decoded);
+    validateDatabaseShape(normalized);
+    snapshotOptimizedPluginStorageFields(decoded);
+}
+
 async function ingestDatabase(raw, { createBackup = false } = {}) {
     const migration = await migrateRemoteBlocksIfNeeded();
     const source = migration.ran ? kvGet('database/database.bin') : raw;
@@ -784,6 +813,7 @@ async function ingestDatabase(raw, { createBackup = false } = {}) {
         ? await decodeRisuSave(source)
         : source;
     const dbObj = normalizeJSON(decoded);
+    validateDatabaseShape(dbObj);
     const strictPluginStorage = snapshotOptimizedPluginStorageFields(decoded);
     if (strictPluginStorage) {
         dbObj.pluginCustomStorage = strictPluginStorage.values;
@@ -831,14 +861,24 @@ async function ingestDatabaseStreaming(source, { inspection = null } = {}) {
     const streamedPluginValueKeys = new Set();
     const streamedPluginMetaKeys = new Set();
     let foldedPluginStorage = false;
+    // Capture the live ownership proof before the streaming parser can write a
+    // target row whose key overlaps the current manifest. Defer a validation
+    // error until the folded marker is actually observed so unmarked imports
+    // retain their non-destructive legacy behavior.
+    let priorOwnership = null;
+    let priorOwnershipError = null;
+    try {
+        priorOwnership = readStrictPluginStorageOwnershipBoundary();
+    } catch (error) {
+        priorOwnershipError = error;
+    }
     const result = await chatRowStore.ingestStreamingDatabase(source, {
         inspection: inspection ?? await inspectRisuSaveSource(source),
         tempDir: savePath,
         onPluginStorageFolded: () => {
             foldedPluginStorage = true;
-            kvDelPrefix(PLUGIN_SAVE_PREFIX);
-            kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
-            kvDel(PLUGIN_STORAGE_MANIFEST_KEY);
+            if (priorOwnershipError) throw priorOwnershipError;
+            deleteOwnedPluginStorageRows(priorOwnership);
         },
         onPluginStorageEntry: ({ field, key, value }) => {
             const prefix = field === 'pluginStorageMeta'
@@ -883,6 +923,7 @@ async function loadStrippedDatabase(raw, source) {
     }
     const rawDecoded = await decodeRisuSave(raw);
     const decoded = normalizeJSON(rawDecoded);
+    validateDatabaseShape(decoded);
     const strictPluginStorage = snapshotOptimizedPluginStorageFields(rawDecoded);
     if (strictPluginStorage) {
         decoded.pluginCustomStorage = strictPluginStorage.values;
@@ -1411,7 +1452,8 @@ async function findActivePluginTransition(req, excludeTransitionId = null) {
     return null;
 }
 
-if (databaseSpoolReady) {
+function sweepStalePluginTransitionStages() {
+    if (!databaseSpoolReady) return;
     try {
         const now = Date.now();
         for (const entry of readdirSync(pluginTransitionStageDir, { withFileTypes: true })) {
@@ -3135,6 +3177,48 @@ function readPluginStorageManifestState(readValue = kvGet) {
     }
 }
 
+function readStrictPluginStorageOwnershipBoundary(readValue = kvGet) {
+    const raw = readValue(PLUGIN_STORAGE_MANIFEST_KEY);
+    if (!raw) return { manifest: null, valueKeys: [], metaKeys: [] };
+
+    let parsed;
+    try {
+        parsed = JSON.parse(Buffer.from(raw).toString('utf-8'));
+    } catch {
+        throw new TypeError('The live plugin storage manifest is malformed');
+    }
+    const manifest = parsePluginStorageManifest(parsed);
+    if (!manifest) {
+        throw new TypeError('The live plugin storage manifest is invalid');
+    }
+    // parsePluginStorageManifest canonicalizes duplicate entries for ordinary
+    // reads. Destructive replacement needs a stronger ownership proof: a
+    // duplicate declaration is ambiguous input, not permission to delete.
+    if (
+        new Set(parsed.valueKeys).size !== parsed.valueKeys.length
+        || new Set(parsed.metaKeys).size !== parsed.metaKeys.length
+    ) {
+        throw new TypeError('The live plugin storage manifest contains duplicate entries');
+    }
+    for (const storageKey of [...manifest.valueKeys, ...manifest.metaKeys]) {
+        const value = readValue(storageKey);
+        if (!value) {
+            throw new TypeError('The live plugin storage manifest references a missing row');
+        }
+        validatePluginStorageRow(storageKey, value);
+    }
+    return {
+        manifest,
+        valueKeys: manifest.valueKeys,
+        metaKeys: manifest.metaKeys,
+    };
+}
+
+function deleteOwnedPluginStorageRows(ownership) {
+    for (const storageKey of ownership.valueKeys) kvDel(storageKey);
+    for (const storageKey of ownership.metaKeys) kvDel(storageKey);
+}
+
 function pluginStorageGeneration(dbObj) {
     return typeof dbObj?.[PLUGIN_STORAGE_GENERATION_FIELD] === 'string'
         && dbObj[PLUGIN_STORAGE_GENERATION_FIELD].length > 0
@@ -3415,10 +3499,16 @@ function externalizePluginStorageIfNeeded(dbObj) {
         return { changed: false, values: 0, meta: 0 };
     }
 
+    // A folded source proves its own exact target set, but it does not prove
+    // that every physical row in the shared prefix belongs to the publication
+    // being replaced. Delete only the rows named by a strict, complete live
+    // ownership boundary; foreign/quarantined rows remain untouched.
+    const priorOwnership = prepared.clearExisting
+        ? readStrictPluginStorageOwnershipBoundary()
+        : null;
     const writeRows = sqliteDb.transaction(() => {
         if (prepared.clearExisting) {
-            kvDelPrefix(PLUGIN_SAVE_PREFIX);
-            kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
+            deleteOwnedPluginStorageRows(priorOwnership);
         }
         writePluginStorageRows(prepared.rows);
         writePluginStorageManifest(prepared.manifest);
@@ -5097,6 +5187,26 @@ app.post('/api/db/read-cached', (req, res, next) => {
     }
 });
 
+// Bootstrap needs one decode-free path to the authoritative monolith. The
+// ordinary database read intentionally normalizes/externalizes its payload;
+// when those bytes are corrupt that normalization fails before the browser can
+// select an internal recovery snapshot. This endpoint performs no publication
+// work and remains behind auth plus the import read barrier.
+app.get('/api/db/read-raw-for-boot', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        await flushPendingDb();
+        await importBarrier.waitUntilIdle();
+        const raw = kvGet('database/database.bin');
+        if (raw === null) return res.status(404).json({ error: 'Database not found' });
+        res.setHeader('x-db-etag', computeBufferEtag(raw));
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.send(raw);
+    } catch (error) {
+        next(error);
+    }
+});
+
 /**
  * Clear optimized plugin save values and their owner sidecars as one logical
  * mutation. The namespace is intentionally fixed server-side: this is the
@@ -6427,13 +6537,18 @@ async function refreshPluginTransitionStageState(stage) {
 
 /**
  * A process can exit after the SQLite publication commits but before its
- * private receipt is rewritten. Keep fresh ready/uploading receipts during
- * the early filesystem sweep, then resolve them against authoritative state
- * once the database is available. Unpublished stages are removed before the
- * server begins accepting clients.
+ * private receipt is rewritten. Keep fresh ready/uploading receipts until the
+ * live database passes boot preflight, then resolve them against authoritative
+ * state. Unpublished stages are removed before the server begins accepting
+ * clients on a healthy boot; recovery-mode startup leaves private receipts
+ * untouched until the database is repaired.
  */
 async function reconcilePluginTransitionStagesAtStartup() {
     if (!databaseSpoolReady) return;
+    // Keep the early module load read-only with respect to private transition
+    // receipts. Startup calls this only after database preflight, so corrupt
+    // recovery boots cannot discard a staged authoritative source.
+    sweepStalePluginTransitionStages();
     for (const entry of readdirSync(pluginTransitionStageDir, { withFileTypes: true })) {
         if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
         const match = entry.name.match(
@@ -9982,24 +10097,31 @@ app.delete('/api/db/snapshots', async (req, res, next) => {
 app.post('/api/db/snapshots/restore', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
+    let restoreCommitted = false;
     try {
         const key = typeof req.body?.key === 'string' ? req.body.key : '';
         if (!key.startsWith(DB_BACKUP_PREFIX)) {
             return res.status(400).json({ error: 'Invalid snapshot key' });
         }
-        const blob = kvGet(key);
-        if (!blob) {
-            return res.status(404).json({ error: 'Snapshot not found' });
-        }
         // Acquire before entering the storage queue: acquire() drains that same
         // queue, so holding a slot while waiting for it would deadlock.
         const releaseImportBarrier = await importBarrier.acquire();
+        let snapshotFound = true;
+        let committedPublication = null;
         try {
             await queueStorageOperation(async () => {
                 // Drain any pending debounced persist first — same pattern as
                 // /api/db/optimize. Without this, an in-flight save could land
                 // after kvCopyValue and overwrite the restored snapshot.
                 await flushPendingDb();
+                // Read only after the import barrier is held. The importer uses
+                // this same SQLite connection, so an earlier kvGet could observe
+                // its uncommitted snapshot rows and publish transient state.
+                const blob = kvGet(key);
+                if (!blob) {
+                    snapshotFound = false;
+                    return;
+                }
                 const inspection = await inspectRisuSaveSource(blob);
                 const streamRestore = await shouldStreamRisuSave(blob, { inspection });
                 let restoreTransactionOpen = false;
@@ -10028,14 +10150,20 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                     }
                     if (ingestion) {
                         const strippedBytes = Buffer.from(encodeRisuSaveLegacy(ingestion.strippedDb));
-                        dbEtag = computeBufferEtag(strippedBytes);
-                        rememberSessionPluginStorageState(req, ingestion.strippedDb);
+                        committedPublication = {
+                            strippedBytes,
+                            strippedDb: ingestion.strippedDb,
+                        };
                     }
                     // A restore can replace a broad logical database state. Force every
                     // browser list cache to take one full snapshot after it completes.
                     kvBumpListEpoch();
+                    if (snapshotRestoreFailpoint === 'before-commit') {
+                        throw new Error('Injected snapshot restore failure before commit');
+                    }
                     sqliteDb.exec('COMMIT');
                     restoreTransactionOpen = false;
+                    restoreCommitted = true;
                 } catch (error) {
                     if (restoreTransactionOpen) {
                         try { sqliteDb.exec('ROLLBACK'); } catch (rollbackError) {
@@ -10048,18 +10176,72 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                     throw error;
                 }
             });
-        } catch (error) {
-            try {
-                kvBumpListEpoch();
-            } catch (epochError) {
-                logger.error('[Snapshot Restore] Failed to bump list epoch after restore failure:', epochError);
-            }
-            throw error;
         } finally {
             releaseImportBarrier();
         }
-        res.json({ ok: true });
-    } catch (err) { next(err); }
+        if (!snapshotFound) {
+            return res.status(404).json({ error: 'Snapshot not found' });
+        }
+        if (committedPublication) {
+            dbEtag = computeBufferEtag(committedPublication.strippedBytes);
+            try {
+                rememberSessionPluginStorageState(req, committedPublication.strippedDb);
+            } catch (error) {
+                // Session pinning is disposable process state. The SQLite
+                // publication has committed; a pin failure must not turn its
+                // acknowledgement into a false rollback report.
+                logger.error('[Snapshot Restore] Failed to refresh session read state:', error);
+            }
+        }
+        if (snapshotRestoreFailpoint === 'response') {
+            res.destroy();
+            return;
+        }
+        res.json({
+            ok: true,
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+        });
+    } catch (err) {
+        if (restoreCommitted) {
+            logger.error('[Snapshot Restore] Commit succeeded but acknowledgement failed:', err);
+            if (!res.headersSent) {
+                res.status(500).json({
+                    error: 'Snapshot restore committed, but acknowledgement failed',
+                    code: 'SNAPSHOT_RESTORE_COMMIT_UNKNOWN',
+                    retryable: false,
+                    commitOutcome: 'unknown',
+                    commitOutcomeUnknown: true,
+                });
+            } else {
+                res.destroy();
+            }
+            return;
+        }
+        const diagnostic = pluginStorageValidationDiagnostic(err);
+        if (diagnostic) return res.status(400).json(diagnostic);
+        if (isImportInProgressError(err)) return sendImportBusy(res);
+        if (err instanceof PluginStorageLimitError) {
+            return res.status(413).json({
+                error: err.message,
+                code: err.code,
+                limit: err.limit,
+                actual: err.actual,
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            });
+        }
+        logger.error('[Snapshot Restore] Transaction was not committed:', err);
+        res.status(500).json({
+            error: 'Snapshot restore was not committed',
+            code: 'SNAPSHOT_RESTORE_NOT_COMMITTED',
+            retryAfter: 0,
+            retryable: true,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        });
+    }
 });
 
 // ── Boot-time backup reminder ───────────────────────────────────────────────
@@ -10704,18 +10886,48 @@ async function getHttpsOptions() {
 async function startServer() {
     try {
         recoverPendingImportSwap('Startup');
-        kvBumpListEpoch();
-        logger.info('[ListDelta] Bumped list epoch at startup');
-        migrateAssetsToFilesystem();
-        await migrateInlaysToFilesystem();
-        await migrateChatsToRowsIfNeeded();
-        // The chat marker can already exist on databases restored by older
-        // Node-only versions, so independently inspect the steady-state stub
-        // for folded optimized plugin storage before accepting clients.
-        const bootDatabase = kvGet('database/database.bin');
-        if (bootDatabase) await loadStrippedDatabase(bootDatabase, 'Migration');
-        await migrateRemoteBlocksIfNeeded();
-        await reconcilePluginTransitionStagesAtStartup();
+        let bootDatabaseValidated = true;
+        try {
+            // Migration helpers are intentionally mutation-heavy: they publish
+            // completion markers, safety backups, external rows, and rewritten
+            // live bytes. Validate first so a corrupt monolith enters recovery
+            // mode without changing even the list epoch.
+            const bootDatabase = kvGet('database/database.bin');
+            if (bootDatabase) await preflightBootDatabase(bootDatabase);
+        } catch (error) {
+            bootDatabaseValidated = false;
+            // A damaged live monolith must not make every recovery API
+            // unreachable. Preserve it and every physical plugin row byte-for-
+            // byte; authenticated bootstrap can now inspect internal snapshots
+            // and publish a selected one through /api/db/snapshots/restore.
+            invalidateDbCache();
+            dbEtag = null;
+            const diagnostic = pluginStorageValidationDiagnostic(error);
+            logger.error(
+                '[BootRecovery] Live database could not be normalized; '
+                + 'starting in snapshot-recovery mode without changing storage'
+                + (diagnostic
+                    ? ` (${diagnostic.code}: ${diagnostic.encodedKey})`
+                    : ` (${error?.name || 'decode error'})`),
+            );
+        }
+        if (bootDatabaseValidated) {
+            kvBumpListEpoch();
+            logger.info('[ListDelta] Bumped list epoch at startup');
+            migrateAssetsToFilesystem();
+            await migrateInlaysToFilesystem();
+            await migrateChatsToRowsIfNeeded();
+            // The chat marker can already exist on databases restored by older
+            // Node-only versions, so independently inspect the steady-state stub
+            // for folded optimized plugin storage before accepting clients.
+            const bootDatabase = kvGet('database/database.bin');
+            if (bootDatabase) await loadStrippedDatabase(bootDatabase, 'Migration');
+            await migrateRemoteBlocksIfNeeded();
+            // Private transition stages are ordinary migration state. Reconcile
+            // them only after the authoritative live database has passed the
+            // same read-only preflight, so a corrupt boot remains byte-exact.
+            await reconcilePluginTransitionStagesAtStartup();
+        }
         // A prior process may have exited while the snapshot cooldown was
         // deferring an already-committed plugin publication.
         schedulePluginRecoverySnapshot();

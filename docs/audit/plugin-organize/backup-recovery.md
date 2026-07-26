@@ -151,9 +151,8 @@ Regression coverage exercises optimized mutation and both transition
 directions, source-CAS conflicts, rollback at database/manifest/row
 failpoints, session-pinned and generation-bound reads, bootstrap and
 just-disabled ownership, export/viewer filtering, generic route and JSON Patch
-attacks, exact bytes after flush, and process restart recovery. **BR3 remains
-separate and open:** corrupt-database boot fallback still needs to honor a
-marked snapshot's exact row set through its own restore path.
+attacks, exact bytes after flush, and process restart recovery. BR3's separate
+corrupt-database fallback boundary is fixed below.
 
 <a id="br3"></a>
 ## BR3 — Corrupt-database boot fallback ignores a marked snapshot's exact row set
@@ -200,6 +199,61 @@ the boot-fallback/full-write path drops its semantics.
   inline map, so clearing at that point would also erase the restored values.
 - Restore a marked non-empty and a marked-empty snapshot over newer external
   keys through the boot fallback, then require exact prefix equality.
+
+### Resolution
+
+**Fixed 2026-07-27.** Bootstrap no longer installs an internal snapshot in
+browser memory and later persists it through the generic full-write path. A
+decode-free authenticated boot read returns the authoritative monolith behind
+the import barrier. If the client cannot decode it, each internal candidate is
+validated and then submitted to the same server-side snapshot restore/ingest
+boundary used by an explicit Settings restore. The browser installs only the
+committed stripped database read back from the server, never the folded
+ingest-only snapshot object.
+
+Corrupt boot is nonmutating until a recovery point is selected. Before the
+list epoch or any asset, inlay, chat, or REMOTE migration can publish a marker,
+safety backup, row, or rewritten database, the server performs a read-only
+decode plus strict plugin-JSON and database-shape validation. The shared shape
+validator covers the root and every array traversed by chat migration while
+retaining the legacy fresh-install `{}` envelope and tolerated null
+placeholders. Raw corruption and structurally invalid but decodable databases
+therefore start authenticated recovery APIs without changing any KV value or
+timestamp; repeated failed boots do not leak migration markers or backups, and
+a repaired database runs the deferred migrations normally.
+
+PM2 private transition receipts follow the same preflight boundary.
+Recovery-mode startup leaves every receipt byte and timestamp untouched; only a healthy
+boot sweeps stale stages and reconciles a receipt against the authoritative
+database. This preserves a staged source while the live monolith is corrupt,
+then performs the deferred cleanup once that source is repaired.
+
+Marked restore is one exclusive SQLite transaction covering the live
+database, chats, migration markers, exact plugin value/owner publication,
+manifest, and list epoch. Before destructive replacement, the current
+manifest must be canonical, duplicate-free, and complete, and every row it
+owns must exist and contain valid JSON. A missing row, duplicate entry,
+malformed owned row, invalid selected snapshot, or injected pre-commit failure
+rolls the whole transaction back without publishing even a new epoch. A valid
+marked non-empty or marked-empty snapshot removes only the prior
+manifest-owned rows, writes its exact selected set and generation, and leaves
+foreign/unowned physical rows preserved but quarantined. Unmarked snapshots
+remain non-destructive because they cannot prove ownership.
+PM1 per-row and aggregate limits remain authoritative inside the restore
+transaction: an over-limit selected set rolls back and returns the definitive
+non-committed 413 envelope rather than a generic retryable restore failure.
+
+ETag and authenticated-session generation state are published only after
+COMMIT. The success envelope is strict and explicit; a lost response after
+COMMIT remains `COMMIT_OUTCOME_UNKNOWN`. Bootstrap stops immediately on that
+outcome, or on any post-commit read failure, instead of replaying an older
+candidate over a possibly committed restore. Regression coverage includes
+marked non-empty and empty exact sets, long keys, extra/foreign/malformed rows,
+generation and manifest mismatches, missing and duplicate manifest ownership,
+legacy and streaming ingest, raw and structural corrupt boots, fresh install,
+active imports, PM2 private-stage preservation/source invalidation, PM1 quota
+rollback, pre-commit rollback, response loss after COMMIT, restart durability,
+and no-older-candidate replay.
 
 <a id="br4"></a>
 ## BR4 — Valid long keys produce Node backups the same server refuses to import

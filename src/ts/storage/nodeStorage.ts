@@ -1833,7 +1833,7 @@ export class NodeStorage{
 
     async readDatabaseForBoot(): Promise<BootDatabaseReadResult> {
         if (!isResourceCacheEnabled()) {
-            return { kind: 'bytes', bytes: await this.getItem('database/database.bin') }
+            return { kind: 'bytes', bytes: await this.readRawDatabaseForBoot() }
         }
 
         try {
@@ -1879,9 +1879,106 @@ export class NodeStorage{
             await persistResourceCacheManifests(assembled.updates)
             return { kind: 'decoded', database: assembled.database }
         } catch {
-            // The universal full read is authoritative and never seeds segments.
-            return { kind: 'bytes', bytes: await this.getItem('database/database.bin') }
+            // The boot-only raw read intentionally does not decode or externalize
+            // database.bin on the server. A corrupt live monolith must still
+            // reach bootstrap so it can select an internal snapshot and route
+            // that snapshot through the server's atomic restore transaction.
+            return { kind: 'bytes', bytes: await this.readRawDatabaseForBoot() }
         }
+    }
+
+    private async readRawDatabaseForBoot(
+        externalSignal?: AbortSignal | null,
+    ): Promise<Buffer | null> {
+        return runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const response = await this.requestStorage(
+                'database/database.bin',
+                'read',
+                false,
+                () => this.authFetch('/api/db/read-raw-for-boot', {
+                    method: 'GET',
+                    signal,
+                }),
+                [404],
+                signal,
+            )
+            if (response.status === 404) {
+                this._lastDbEtag = null
+                return null
+            }
+            const bytes = Buffer.from(await awaitWithAbort(response.arrayBuffer(), signal))
+            const responseEtag = response.headers.get('x-db-etag')
+            this._lastDbEtag = responseEtag && /^[0-9a-f]{32}$/.test(responseEtag)
+                ? responseEtag
+                : null
+            return bytes.length === 0 ? null : bytes
+        }, 'read', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+    }
+
+    /**
+     * Publish one internal snapshot through the same exclusive transaction as
+     * the Settings restore flow. This is a mutation even though bootstrap uses
+     * it while reading: an interrupted response must remain commit-unknown so
+     * callers never blindly replay an older snapshot over a possibly committed
+     * recovery point.
+     */
+    async restoreInternalSnapshotForBoot(
+        key: string,
+        externalSignal?: AbortSignal | null,
+    ): Promise<'committed'> {
+        if (!/^database\/dbbackup-\d+\.bin$/.test(key)) {
+            throw new TypeError('Invalid internal snapshot key')
+        }
+        return runBoundedAuthoritativeStorageOperation<'committed'>(async (signal, outcome) => {
+            const response = await this.requestStorage(
+                key,
+                'transition',
+                true,
+                () => this.authFetch('/api/db/snapshots/restore', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ key }),
+                    signal,
+                }, true, outcome),
+                [],
+                signal,
+                outcome,
+            )
+
+            // Consume and validate the commit envelope before making the
+            // acknowledgement definitive. A proxy-generated 2xx or a truncated
+            // body after COMMIT cannot be mistaken for a known outcome.
+            outcome.markRequestDispatched()
+            let payload: StorageFailurePayload & { ok?: unknown } = {}
+            try {
+                const parsed = await awaitWithAbort(response.clone().json(), signal) as unknown
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    payload = parsed as StorageFailurePayload & { ok?: unknown }
+                }
+            } catch {
+                // Invalid success acknowledgements remain commit-unknown.
+            }
+            if (
+                payload.ok !== true
+                || payload.commitOutcome !== 'committed'
+                || payload.commitOutcomeUnknown !== false
+            ) {
+                throw new StorageError('Snapshot recovery returned an invalid commit acknowledgement', {
+                    status: response.status,
+                    code: 'COMMIT_OUTCOME_UNKNOWN',
+                    retryable: false,
+                    commitOutcomeUnknown: true,
+                    operation: 'transition',
+                })
+            }
+            outcome.markDefinitiveResponse()
+            this._lastDbEtag = null
+            void listCacheDelete([''])
+            for (const group of DB_CACHE_GROUPS) {
+                void invalidateResourceCacheManifest(`db:${group}`)
+            }
+            return 'committed'
+        }, 'transition', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
     }
     async keys(prefix: string = '', externalSignal?: AbortSignal | null):Promise<string[]>{
         return runBoundedAuthoritativeStorageOperation(

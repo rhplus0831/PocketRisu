@@ -41,6 +41,7 @@ import {
     isResourceCacheSupported,
     setResourceCacheEnabled,
 } from "./storage/resourceCache";
+import { recoverDatabaseFromInternalSnapshots } from "./storage/bootSnapshotRecovery";
 
 const RESOURCE_CACHE_ANNOUNCED_KEY = 'pocketrisu-resource-cache-announced'
 
@@ -160,21 +161,17 @@ export async function loadData() {
                 } catch (error) {
                     console.error(error)
                     const backups = await getDbBackups()
-                    let backupLoaded = false
-                    for (const backup of backups) {
-                        try {
-                            LoadingStatusState.text = `Reading Backup File ${backup}...`
-                            const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
-                            const backupDecoded = await decodeRisuSave(backupData)
-                            setPatchSyncBaseline(backupDecoded)
-                            setDatabase(backupDecoded)
-                            backupLoaded = true
-                            break
-                        } catch (error) { }
-                    }
-                    if (!backupLoaded) {
+                    const restoredDecoded = await recoverDatabaseFromInternalSnapshots({
+                        backups,
+                        storage: forageStorage,
+                        decode: decodeRisuSave,
+                        onStatus: (status) => { LoadingStatusState.text = status },
+                    })
+                    if (!restoredDecoded) {
                         throw "Forage: Your save file is corrupted"
                     }
+                    setPatchSyncBaseline(restoredDecoded)
+                    setDatabase(restoredDecoded)
                 }
 
                 LoadingStatusState.text = "Reconciling Plugin Storage..."

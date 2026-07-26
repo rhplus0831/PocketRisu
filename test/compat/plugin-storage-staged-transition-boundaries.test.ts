@@ -851,6 +851,61 @@ describe('staged plugin transition verifier boundaries (real server)', () => {
     expect(readSqliteValue(server, MANIFEST_KEY)).toBeNull()
   }, 30_000)
 
+  test('rejects a ready stage after snapshot restore replaces its authoritative source', async () => {
+    const rawKey = 'restore/source-binding'
+    const valueKey = encodeStorageKey(VALUE_PREFIX, rawKey)
+    const currentValue = Buffer.from('{"version":"current"}')
+    const snapshotKey = 'database/dbbackup-123456789.bin'
+    const currentDatabase = {
+      characters: [],
+      optimizePluginMemory: false,
+      pluginCustomStorage: { [rawKey]: { version: 'current' } },
+    }
+    const snapshotDatabase = {
+      characters: [],
+      optimizePluginMemory: false,
+      pluginCustomStorage: { [rawKey]: { version: 'snapshot' } },
+    }
+    const server = await trackedServer({
+      seedSave: async saveDir => seedPublication(saveDir, {
+        database: currentDatabase,
+        rows: [{ key: snapshotKey, value: encodeDatabase(snapshotDatabase) }],
+      }),
+    })
+    const client = await createClient(server.port, server.password)
+    const live = await readPublication(client)
+    const begun = await beginTransition(client, {
+      source: sourceOf(live.database, null),
+      targetOptimized: true,
+      rows: [{ storageKey: valueKey, size: currentValue.length }],
+      expectedEtag: live.etag,
+    })
+    expect(begun.response.status).toBe(200)
+    await begun.response.arrayBuffer()
+    expect((await uploadRow(client, begun.transitionId, valueKey, currentValue)).status).toBe(200)
+
+    const restore = await client.fetch('/api/db/snapshots/restore', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ key: snapshotKey }),
+    })
+    expect(restore.status).toBe(200)
+    await expect(restore.json()).resolves.toMatchObject({
+      ok: true,
+      commitOutcome: 'committed',
+      commitOutcomeUnknown: false,
+    })
+
+    const rejected = await finalize(client, begun.transitionId)
+    expect(rejected.status).toBe(409)
+    await expect(rejected.json()).resolves.toMatchObject({
+      error: 'Database changed during transition',
+    })
+    const after = await readPublication(client)
+    expect(after.database).toMatchObject(snapshotDatabase)
+    expect((await abort(client, begun.transitionId)).status).toBe(200)
+  }, 30_000)
+
   test('preserves stubs and authoritative chat rows in both transition directions', async () => {
     const chaId = 'staged-chat-character'
     const chatId = 'staged-chat'

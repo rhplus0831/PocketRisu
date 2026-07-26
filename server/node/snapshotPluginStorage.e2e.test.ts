@@ -190,6 +190,23 @@ function openFixtureDatabase(cwd: string) {
     return raw
 }
 
+function readExactKvState(cwd: string): Array<{
+    key: string
+    valueHex: string
+    updatedAt: number
+}> {
+    const raw = openFixtureDatabase(cwd)
+    const rows = raw.prepare(
+        'SELECT key, value, updated_at AS updatedAt FROM kv ORDER BY key',
+    ).all() as Array<{ key: string; value: Buffer; updatedAt: number }>
+    raw.close()
+    return rows.map((row) => ({
+        key: row.key,
+        valueHex: Buffer.from(row.value).toString('hex'),
+        updatedAt: row.updatedAt,
+    }))
+}
+
 function replacePluginPublicationOutsideServer(
     cwd: string,
     {
@@ -2364,6 +2381,68 @@ describe('automatic snapshots × optimized plugin storage', () => {
         }
     })
 
+    it('rolls back an over-quota marked restore with the PM1 definitive limit envelope', async () => {
+        const cwd = makeWorkDir()
+        const limit = 16
+        const extraEnv = { POCKETRISU_PLUGIN_STORAGE_MAX_BYTES: String(limit) }
+        let server = await startServer(cwd, extraEnv)
+        let auth = await authenticate(server)
+        const liveDatabase = { characters: [], restoreQuotaState: 'live' }
+        expect((await writeKeyResponse(
+            server,
+            auth,
+            'database/database.bin',
+            Buffer.from(encodeRisuSaveLegacy(liveDatabase)),
+        )).status).toBe(200)
+        await stopServer(server)
+
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+        const rawKey = 'restore-over-quota'
+        const oversizedValue = '01234567890123456789'
+        const raw = openFixtureDatabase(cwd)
+        raw.prepare(
+            'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+        ).run(
+            snapshotKey,
+            Buffer.from(encodeRisuSaveLegacy({
+                characters: [],
+                optimizePluginMemory: true,
+                pluginStorageFolded: true,
+                pluginCustomStorage: { [rawKey]: oversizedValue },
+            })),
+            Date.now(),
+        )
+        raw.close()
+
+        server = await startServer(cwd, extraEnv)
+        auth = await authenticate(server)
+        const response = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(response.status).toBe(413)
+        await expect(response.json()).resolves.toEqual({
+            error: `Optimized plugin storage would use ${JSON.stringify(oversizedValue).length} bytes; the aggregate limit is ${limit} bytes. Remove old records or split data across another storage backend.`,
+            code: 'PLUGIN_STORAGE_TOTAL_TOO_LARGE',
+            limit,
+            actual: JSON.stringify(oversizedValue).length,
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        })
+        expect(await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )).toEqual(liveDatabase)
+        await stopServer(server)
+        const after = openFixtureDatabase(cwd)
+        expect(after.prepare('SELECT value FROM kv WHERE key = ?')
+            .get(valueRowKey(rawKey))).toBeUndefined()
+        expect(after.prepare('SELECT value FROM kv WHERE key = ?')
+            .get(PLUGIN_STORAGE_MANIFEST_KEY)).toBeUndefined()
+        after.close()
+    })
+
     it('restores snapshot-time plugin rows exactly (legacy ingest path)', async () => {
         await runRoundTrip({})
     })
@@ -2577,4 +2656,700 @@ describe('automatic snapshots × optimized plugin storage', () => {
         afterRestore.close()
         expect(JSON.parse(Buffer.from(physical.value).toString('utf-8'))).toBe('V2')
     })
+})
+
+describe('corrupt database boot snapshot recovery', () => {
+    function seedRecoveryFixture(
+        cwd: string,
+        snapshotKey: string,
+        snapshot: Uint8Array,
+        rows: Array<{ key: string; value: Buffer }>,
+    ): void {
+        const raw = openFixtureDatabase(cwd)
+        const insert = raw.prepare(
+            'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+        )
+        raw.transaction(() => {
+            const now = Date.now()
+            insert.run('database/database.bin', Buffer.from('corrupt-live-database'), now)
+            insert.run('migration/chats-externalized', Buffer.from('done'), now)
+            insert.run('migration/disable-remote-saving', Buffer.from('done'), now)
+            insert.run(snapshotKey, Buffer.from(snapshot), now)
+            for (const row of rows) insert.run(row.key, row.value, now)
+        })()
+        raw.close()
+    }
+
+    it('accepts the fresh-install empty database envelope and boots it after restart', async () => {
+        const cwd = makeWorkDir()
+        let server = await startServer(cwd)
+        let auth = await authenticate(server)
+        const freshBytes = Buffer.from(encodeRisuSaveLegacy({}))
+
+        const write = await writeKeyResponse(
+            server,
+            auth,
+            'database/database.bin',
+            freshBytes,
+        )
+        expect(write.status).toBe(200)
+        await stopServer(server)
+
+        server = await startServer(cwd)
+        expect(server.logs()).not.toContain('starting in snapshot-recovery mode')
+        auth = await authenticate(server)
+        expect(await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )).toEqual({})
+    }, 30_000)
+
+    it('leaves every KV byte and timestamp unchanged across repeated corrupt boots before migration markers exist', async () => {
+        const cwd = makeWorkDir()
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+        const ownedKey = valueRowKey('preflight-owned')
+        const transitionId = '00000000-0000-4000-8000-000000000123'
+        const transitionDir = path.join(cwd, 'save', '.plugin-transition-staging')
+        const transitionPath = path.join(
+            transitionDir,
+            `.plugin-transition-stage-${transitionId}.json`,
+        )
+        fs.mkdirSync(transitionDir, { recursive: true })
+        fs.writeFileSync(transitionPath, JSON.stringify({
+            version: 1,
+            transitionId,
+            state: 'aborted',
+            rows: [],
+            createdAt: 1,
+            updatedAt: 1,
+        }))
+        const transitionBefore = {
+            bytes: fs.readFileSync(transitionPath),
+            mtimeMs: fs.statSync(transitionPath).mtimeMs,
+        }
+        const raw = openFixtureDatabase(cwd)
+        const insert = raw.prepare(
+            'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+        )
+        raw.transaction(() => {
+            const now = Date.now()
+            insert.run('database/database.bin', Buffer.from('corrupt-before-migrations'), now)
+            insert.run(snapshotKey, Buffer.from(encodeRisuSaveLegacy({ characters: [] })), now)
+            insert.run(ownedKey, Buffer.from(JSON.stringify('unchanged')), now)
+            insert.run(
+                PLUGIN_STORAGE_MANIFEST_KEY,
+                manifestBytes('preflight-generation', [ownedKey]),
+                now,
+            )
+        })()
+        raw.close()
+        const before = readExactKvState(cwd)
+
+        let server = await startServer(cwd)
+        expect(server.logs()).toContain('starting in snapshot-recovery mode')
+        expect(readExactKvState(cwd)).toEqual(before)
+        expect(fs.readFileSync(transitionPath)).toEqual(transitionBefore.bytes)
+        expect(fs.statSync(transitionPath).mtimeMs).toBe(transitionBefore.mtimeMs)
+        await stopServer(server)
+
+        server = await startServer(cwd)
+        expect(server.logs()).toContain('starting in snapshot-recovery mode')
+        expect(readExactKvState(cwd)).toEqual(before)
+        expect(fs.readFileSync(transitionPath)).toEqual(transitionBefore.bytes)
+        expect(fs.statSync(transitionPath).mtimeMs).toBe(transitionBefore.mtimeMs)
+        await stopServer(server)
+
+        const afterCorruptBoots = openFixtureDatabase(cwd)
+        expect(afterCorruptBoots.prepare('SELECT value FROM kv WHERE key = ?')
+            .get('migration/chats-externalized')).toBeUndefined()
+        expect(afterCorruptBoots.prepare('SELECT value FROM kv WHERE key = ?')
+            .get('migration/disable-remote-saving')).toBeUndefined()
+        expect(afterCorruptBoots.prepare(
+            "SELECT key FROM kv WHERE key LIKE 'migration-backup/%'",
+        ).all()).toEqual([])
+        afterCorruptBoots.prepare(
+            'UPDATE kv SET value = ?, updated_at = ? WHERE key = ?',
+        ).run(
+            Buffer.from(encodeRisuSaveLegacy({ characters: [] })),
+            Date.now() + 1,
+            'database/database.bin',
+        )
+        afterCorruptBoots.close()
+
+        // Once the source is actually repaired, the deferred migrations run;
+        // neither completion marker was leaked from either corrupt boot.
+        server = await startServer(cwd)
+        expect(server.logs()).not.toContain('starting in snapshot-recovery mode')
+        await stopServer(server)
+        expect(fs.existsSync(transitionPath)).toBe(false)
+        const afterRepair = openFixtureDatabase(cwd)
+        expect(Buffer.from((afterRepair.prepare('SELECT value FROM kv WHERE key = ?')
+            .get('migration/chats-externalized') as { value: Buffer }).value).toString())
+            .toBe('done')
+        expect(Buffer.from((afterRepair.prepare('SELECT value FROM kv WHERE key = ?')
+            .get('migration/disable-remote-saving') as { value: Buffer }).value).toString())
+            .toBe('done')
+        afterRepair.close()
+    }, 30_000)
+
+    it('treats an encoded but structurally invalid database as nonmutating recovery state', async () => {
+        const cwd = makeWorkDir()
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+        const raw = openFixtureDatabase(cwd)
+        const insert = raw.prepare(
+            'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+        )
+        raw.transaction(() => {
+            const now = Date.now()
+            insert.run('database/database.bin', Buffer.from(encodeRisuSaveLegacy({
+                characters: 'not-an-array',
+            })), now)
+            insert.run(snapshotKey, Buffer.from(encodeRisuSaveLegacy({ characters: [] })), now)
+        })()
+        raw.close()
+        const before = readExactKvState(cwd)
+
+        let server = await startServer(cwd)
+        expect(server.logs()).toContain('starting in snapshot-recovery mode')
+        expect(readExactKvState(cwd)).toEqual(before)
+        await stopServer(server)
+
+        server = await startServer(cwd)
+        expect(server.logs()).toContain('starting in snapshot-recovery mode')
+        expect(readExactKvState(cwd)).toEqual(before)
+        await stopServer(server)
+
+        const repaired = openFixtureDatabase(cwd)
+        expect(repaired.prepare('SELECT value FROM kv WHERE key = ?')
+            .get('migration/chats-externalized')).toBeUndefined()
+        expect(repaired.prepare('SELECT value FROM kv WHERE key = ?')
+            .get('migration/disable-remote-saving')).toBeUndefined()
+        expect(repaired.prepare(
+            "SELECT key FROM kv WHERE key LIKE 'migration-backup/%'",
+        ).all()).toEqual([])
+        repaired.prepare(
+            'UPDATE kv SET value = ?, updated_at = ? WHERE key = ?',
+        ).run(
+            Buffer.from(encodeRisuSaveLegacy({ characters: [] })),
+            Date.now() + 1,
+            'database/database.bin',
+        )
+        repaired.close()
+
+        server = await startServer(cwd)
+        expect(server.logs()).not.toContain('starting in snapshot-recovery mode')
+        await stopServer(server)
+        const afterRepair = openFixtureDatabase(cwd)
+        expect(Buffer.from((afterRepair.prepare('SELECT value FROM kv WHERE key = ?')
+            .get('migration/chats-externalized') as { value: Buffer }).value).toString())
+            .toBe('done')
+        expect(Buffer.from((afterRepair.prepare('SELECT value FROM kv WHERE key = ?')
+            .get('migration/disable-remote-saving') as { value: Buffer }).value).toString())
+            .toBe('done')
+        afterRepair.close()
+    }, 30_000)
+
+    it.each([
+        {
+            label: 'a manifest-owned missing physical row before streaming overwrites the same key',
+            manifestKeys: (ownedKey: string, targetKey: string) => [ownedKey, targetKey],
+            extraEnv: { RISU_STREAM_INGEST_MIN_BYTES: '1' },
+        },
+        {
+            label: 'duplicate manifest entries',
+            manifestKeys: (ownedKey: string, _targetKey: string) => [ownedKey, ownedKey],
+            extraEnv: {},
+        },
+    ])('refuses marked recovery without partial publication for $label', async ({
+        manifestKeys,
+        extraEnv,
+    }) => {
+        const cwd = makeWorkDir()
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+        const ownedKey = valueRowKey('current-owned')
+        const targetKey = valueRowKey('selected-target')
+        seedRecoveryFixture(cwd, snapshotKey, encodeRisuSaveLegacy({
+            characters: [],
+            optimizePluginMemory: true,
+            pluginStorageFolded: true,
+            pluginStorageGeneration: 'selected-target-generation',
+            pluginCustomStorage: { 'selected-target': 'target-value' },
+        }), [
+            { key: ownedKey, value: Buffer.from(JSON.stringify('current-value')) },
+            {
+                key: PLUGIN_STORAGE_MANIFEST_KEY,
+                value: manifestBytes(
+                    'current-owned-generation',
+                    manifestKeys(ownedKey, targetKey),
+                ),
+            },
+        ])
+        const before = readExactKvState(cwd)
+        const server = await startServer(cwd, extraEnv)
+        const auth = await authenticate(server)
+
+        const response = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(response.status).toBe(500)
+        await expect(response.json()).resolves.toMatchObject({
+            code: 'SNAPSHOT_RESTORE_NOT_COMMITTED',
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        })
+
+        await stopServer(server)
+        expect(readExactKvState(cwd)).toEqual(before)
+        const after = openFixtureDatabase(cwd)
+        expect(after.prepare('SELECT value FROM kv WHERE key = ?').get(targetKey))
+            .toBeUndefined()
+        after.close()
+    }, 30_000)
+
+    it('starts with corrupt live bytes and atomically restores a marked exact value/owner set', async () => {
+        const cwd = makeWorkDir()
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+        const generation = 'marked-selected-generation'
+        const currentGeneration = 'newer-corrupt-generation'
+        const longRawKey = 'l'.repeat(752)
+        const selectedValueKeys = [valueRowKey('shared'), valueRowKey(longRawKey)]
+        const selectedMetaKeys = [metaRowKey('shared'), metaRowKey(longRawKey)]
+        const staleKey = valueRowKey('created-after-snapshot')
+        const malformedKey = valueRowKey('malformed-current-row')
+        const foreignKey = valueRowKey('foreign-unowned-row')
+        seedRecoveryFixture(cwd, snapshotKey, encodeRisuSaveLegacy({
+            characters: [],
+            optimizePluginMemory: true,
+            pluginStorageFolded: true,
+            pluginStorageGeneration: generation,
+            pluginCustomStorage: {
+                shared: { selected: 'old-exact-value' },
+                [longRawKey]: 'long-value',
+            },
+            pluginStorageMeta: {
+                shared: { plugin: 'Selected owner', updatedAt: 10 },
+                [longRawKey]: { plugin: 'Long-key owner', updatedAt: 11 },
+            },
+        }), [
+            { key: valueRowKey('shared'), value: Buffer.from(JSON.stringify('newer-duplicate')) },
+            { key: metaRowKey('shared'), value: Buffer.from(JSON.stringify({ plugin: 'Newer owner' })) },
+            { key: staleKey, value: Buffer.from(JSON.stringify('must-disappear')) },
+            { key: malformedKey, value: Buffer.from(JSON.stringify('owned-extra')) },
+            { key: foreignKey, value: Buffer.from(JSON.stringify('preserve-quarantined')) },
+            {
+                key: PLUGIN_STORAGE_MANIFEST_KEY,
+                value: manifestBytes(currentGeneration, [
+                    valueRowKey('shared'),
+                    staleKey,
+                    malformedKey,
+                ], [metaRowKey('shared')]),
+            },
+        ])
+
+        let server = await startServer(cwd)
+        let auth = await authenticate(server)
+        expect(server.logs()).toContain('starting in snapshot-recovery mode')
+        const rawRead = await fetch(`${server.origin}/api/db/read-raw-for-boot`, {
+            headers: auth,
+        })
+        expect(rawRead.status).toBe(200)
+        expect(Buffer.from(await rawRead.arrayBuffer()).toString('utf-8'))
+            .toBe('corrupt-live-database')
+
+        const restore = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(restore.status).toBe(200)
+        await expect(restore.json()).resolves.toEqual({
+            ok: true,
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+        })
+
+        const restoredDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        expect(restoredDb).toMatchObject({
+            optimizePluginMemory: true,
+            pluginStorageGeneration: generation,
+            pluginCustomStorage: {},
+        })
+        expect(restoredDb.pluginStorageFolded).toBeUndefined()
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            PLUGIN_STORAGE_MANIFEST_KEY,
+        )).toString('utf-8'))).toEqual({
+            version: 1,
+            generation,
+            valueKeys: selectedValueKeys,
+            metaKeys: selectedMetaKeys,
+        })
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('shared'),
+            generation,
+        )).toString('utf-8'))).toEqual({ selected: 'old-exact-value' })
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            metaRowKey('shared'),
+            generation,
+        )).toString('utf-8'))).toEqual({ plugin: 'Selected owner', updatedAt: 10 })
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey(longRawKey),
+            generation,
+        )).toString('utf-8'))).toBe('long-value')
+        expect((await readKey(server, auth, staleKey, generation)).length).toBe(0)
+        expect((await readKey(server, auth, malformedKey, generation)).length).toBe(0)
+
+        await stopServer(server)
+        server = await startServer(cwd)
+        auth = await authenticate(server)
+        const restartedDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        expect(restartedDb.pluginStorageGeneration).toBe(generation)
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('shared'),
+            generation,
+        )).toString('utf-8'))).toEqual({ selected: 'old-exact-value' })
+        expect((await readKey(server, auth, foreignKey, generation)).length).toBe(0)
+        await stopServer(server)
+        const afterRestart = openFixtureDatabase(cwd)
+        const preservedForeign = afterRestart.prepare('SELECT value FROM kv WHERE key = ?')
+            .get(foreignKey) as { value: Buffer }
+        afterRestart.close()
+        expect(JSON.parse(Buffer.from(preservedForeign.value).toString('utf-8')))
+            .toBe('preserve-quarantined')
+    }, 30_000)
+
+    it('preserves and quarantines physical rows when an unmarked snapshot cannot prove ownership', async () => {
+        const cwd = makeWorkDir()
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+        const physicalKey = valueRowKey('foreign-unmarked-row')
+        seedRecoveryFixture(cwd, snapshotKey, encodeRisuSaveLegacy({
+            characters: [],
+            optimizePluginMemory: true,
+            pluginCustomStorage: {},
+        }), [
+            { key: physicalKey, value: Buffer.from(JSON.stringify('preserve-physically')) },
+            {
+                key: PLUGIN_STORAGE_MANIFEST_KEY,
+                value: manifestBytes('unproven-current-generation', [physicalKey]),
+            },
+        ])
+
+        const server = await startServer(cwd)
+        const auth = await authenticate(server)
+        await restoreSnapshot(server, auth, snapshotKey)
+
+        const restoredDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        expect(restoredDb.pluginStorageGeneration).toBeUndefined()
+        expect((await readKeyResponse(server, auth, physicalKey)).status).toBe(409)
+
+        await stopServer(server)
+        const raw = openFixtureDatabase(cwd)
+        const physical = raw.prepare('SELECT value FROM kv WHERE key = ?').get(physicalKey) as {
+            value: Buffer
+        }
+        const manifest = raw.prepare('SELECT value FROM kv WHERE key = ?')
+            .get(PLUGIN_STORAGE_MANIFEST_KEY) as { value: Buffer }
+        raw.close()
+        expect(JSON.parse(Buffer.from(physical.value).toString('utf-8')))
+            .toBe('preserve-physically')
+        expect(JSON.parse(Buffer.from(manifest.value).toString('utf-8')).generation)
+            .toBe('unproven-current-generation')
+    }, 30_000)
+
+    it('restores a marked empty snapshot as an exact empty publication over corrupt live state', async () => {
+        const cwd = makeWorkDir()
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+        const staleValue = valueRowKey('newer-value')
+        const staleMeta = metaRowKey('newer-value')
+        seedRecoveryFixture(cwd, snapshotKey, encodeRisuSaveLegacy({
+            characters: [],
+            optimizePluginMemory: true,
+            pluginStorageFolded: true,
+            pluginStorageGeneration: 'selected-empty-generation',
+            pluginCustomStorage: {},
+            pluginStorageMeta: {},
+        }), [
+            { key: staleValue, value: Buffer.from(JSON.stringify('newer-value')) },
+            { key: staleMeta, value: Buffer.from(JSON.stringify({ plugin: 'Newer owner' })) },
+            {
+                key: PLUGIN_STORAGE_MANIFEST_KEY,
+                value: manifestBytes('newer-generation', [staleValue], [staleMeta]),
+            },
+        ])
+
+        const server = await startServer(cwd)
+        const auth = await authenticate(server)
+        await restoreSnapshot(server, auth, snapshotKey)
+
+        const restoredDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        expect(restoredDb.pluginStorageGeneration).toBe('selected-empty-generation')
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            PLUGIN_STORAGE_MANIFEST_KEY,
+        )).toString('utf-8'))).toEqual({
+            version: 1,
+            generation: 'selected-empty-generation',
+            valueKeys: [],
+            metaKeys: [],
+        })
+        expect((await readKey(
+            server,
+            auth,
+            staleValue,
+            'selected-empty-generation',
+        )).length).toBe(0)
+        expect((await readKey(
+            server,
+            auth,
+            staleMeta,
+            'selected-empty-generation',
+        )).length).toBe(0)
+    }, 30_000)
+
+    it('rolls back a validated marked recovery at the pre-commit failpoint', async () => {
+        const cwd = makeWorkDir()
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+        const currentGeneration = 'current-before-rollback'
+        const currentKey = valueRowKey('current')
+        const targetKey = valueRowKey('target')
+        const raw = openFixtureDatabase(cwd)
+        const insert = raw.prepare(
+            'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+        )
+        raw.transaction(() => {
+            const now = Date.now()
+            insert.run('database/database.bin', Buffer.from(encodeRisuSaveLegacy({
+                characters: [],
+                optimizePluginMemory: true,
+                pluginStorageGeneration: currentGeneration,
+                pluginCustomStorage: {},
+            })), now)
+            insert.run('migration/chats-externalized', Buffer.from('done'), now)
+            insert.run('migration/disable-remote-saving', Buffer.from('done'), now)
+            insert.run(currentKey, Buffer.from(JSON.stringify('current-value')), now)
+            insert.run(
+                PLUGIN_STORAGE_MANIFEST_KEY,
+                manifestBytes(currentGeneration, [currentKey]),
+                now,
+            )
+            insert.run(snapshotKey, Buffer.from(encodeRisuSaveLegacy({
+                characters: [],
+                optimizePluginMemory: true,
+                pluginStorageFolded: true,
+                pluginStorageGeneration: 'target-generation',
+                pluginCustomStorage: { target: 'target-value' },
+            })), now)
+        })()
+        raw.close()
+
+        const server = await startServer(cwd, {
+            POCKETRISU_TEST_SNAPSHOT_RESTORE_FAILPOINT: 'before-commit',
+        })
+        const auth = await authenticate(server)
+        const beforeDatabase = await readKey(server, auth, 'database/database.bin')
+        const beforeManifest = await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)
+        const response = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(response.status).toBe(500)
+        await expect(response.json()).resolves.toMatchObject({
+            code: 'SNAPSHOT_RESTORE_NOT_COMMITTED',
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        })
+        // The failed transaction must not leave this session pinned to the
+        // tentative target generation.
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            currentKey,
+            currentGeneration,
+        )).toString('utf-8'))).toBe('current-value')
+        expect((await readKey(server, auth, targetKey, currentGeneration)).length).toBe(0)
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(beforeDatabase)
+        expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(beforeManifest)
+    }, 30_000)
+
+    it('keeps a response-lost restore committed durably without exposing a false acknowledgement', async () => {
+        const cwd = makeWorkDir()
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+        const currentKey = valueRowKey('response-current')
+        const targetKey = valueRowKey('response-target')
+        const raw = openFixtureDatabase(cwd)
+        const insert = raw.prepare(
+            'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+        )
+        raw.transaction(() => {
+            const now = Date.now()
+            insert.run('database/database.bin', Buffer.from(encodeRisuSaveLegacy({
+                characters: [],
+                optimizePluginMemory: true,
+                pluginStorageGeneration: 'response-current-generation',
+                pluginCustomStorage: {},
+            })), now)
+            insert.run('migration/chats-externalized', Buffer.from('done'), now)
+            insert.run('migration/disable-remote-saving', Buffer.from('done'), now)
+            insert.run(currentKey, Buffer.from(JSON.stringify('current-value')), now)
+            insert.run(
+                PLUGIN_STORAGE_MANIFEST_KEY,
+                manifestBytes('response-current-generation', [currentKey]),
+                now,
+            )
+            insert.run(snapshotKey, Buffer.from(encodeRisuSaveLegacy({
+                characters: [],
+                optimizePluginMemory: true,
+                pluginStorageFolded: true,
+                pluginStorageGeneration: 'response-target-generation',
+                pluginCustomStorage: { 'response-target': 'target-value' },
+            })), now)
+        })()
+        raw.close()
+
+        let server = await startServer(cwd, {
+            POCKETRISU_TEST_SNAPSHOT_RESTORE_FAILPOINT: 'response',
+        })
+        let auth = await authenticate(server)
+        let acknowledgementLost = false
+        try {
+            const response = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+                method: 'POST',
+                headers: { ...auth, 'content-type': 'application/json' },
+                body: JSON.stringify({ key: snapshotKey }),
+            })
+            await response.arrayBuffer()
+        } catch {
+            acknowledgementLost = true
+        }
+        expect(acknowledgementLost).toBe(true)
+        await stopServer(server)
+
+        server = await startServer(cwd)
+        auth = await authenticate(server)
+        const restoredDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        expect(restoredDb.pluginStorageGeneration).toBe('response-target-generation')
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            targetKey,
+            'response-target-generation',
+        )).toString('utf-8'))).toBe('target-value')
+        expect((await readKey(
+            server,
+            auth,
+            currentKey,
+            'response-target-generation',
+        )).length).toBe(0)
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            PLUGIN_STORAGE_MANIFEST_KEY,
+        )).toString('utf-8'))).toEqual({
+            version: 1,
+            generation: 'response-target-generation',
+            valueKeys: [targetKey],
+            metaKeys: [],
+        })
+    }, 30_000)
+
+    it('waits behind an active import before reading and publishing the selected snapshot', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+            RISU_STREAM_INGEST_MIN_BYTES: '1',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { selected: 'snapshot-value' },
+            meta: { selected: { plugin: 'Snapshot owner' } },
+        }))
+        const [snapshotKey] = await listSnapshotKeys(server, auth)
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [
+                { storageKey: valueRowKey('selected'), value: 'newer-live' },
+                { storageKey: valueRowKey('extra'), value: 'newer-extra' },
+            ],
+        })).status).toBe(200)
+
+        const backup = encodeBackup([{
+            name: 'database.risudat',
+            data: lateFailingDatabase(),
+        }])
+        let releaseUpload!: () => void
+        const uploadGate = new Promise<void>((resolve) => { releaseUpload = resolve })
+        const body = new ReadableStream<Uint8Array>({
+            async pull(controller) {
+                controller.enqueue(new Uint8Array(backup))
+                await uploadGate
+                controller.close()
+            },
+        })
+        const importDone = fetch(`${server.origin}/api/backup/import`, {
+            method: 'POST',
+            headers: {
+                ...auth,
+                'content-type': 'application/x-risu-backup',
+            },
+            body,
+            // @ts-expect-error -- Node requires duplex for streaming request bodies.
+            duplex: 'half',
+        })
+        await delay(150)
+
+        let restoreSettled = false
+        const restoreDone = fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        }).finally(() => { restoreSettled = true })
+        let rawReadSettled = false
+        const rawReadDone = fetch(`${server.origin}/api/db/read-raw-for-boot`, {
+            headers: auth,
+        }).finally(() => { rawReadSettled = true })
+        await delay(150)
+        expect(restoreSettled).toBe(false)
+        expect(rawReadSettled).toBe(false)
+
+        releaseUpload()
+        const importResponse = await importDone
+        await importResponse.text()
+        expect(importResponse.ok).toBe(false)
+        const restoreResponse = await restoreDone
+        expect(restoreResponse.status).toBe(200)
+        const rawReadResponse = await rawReadDone
+        expect(rawReadResponse.status).toBe(200)
+
+        const restoredDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        const generation = restoredDb.pluginStorageGeneration as string
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('selected'),
+            generation,
+        )).toString('utf-8'))).toBe('snapshot-value')
+        expect((await readKey(server, auth, valueRowKey('extra'), generation)).length).toBe(0)
+    }, 30_000)
 })

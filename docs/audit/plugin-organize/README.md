@@ -42,7 +42,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [AA3](atomicity-acknowledgement.md#aa3) | High | Fixed | No batch/transaction/CAS primitive: the one-second unload deadline can terminate a multi-row commit, leaving a torn but durable generation |
 | [BR1](backup-recovery.md#br1) | Medium | Fixed | Optimized-only mutations never advance automatic recovery snapshots |
 | [BR2](backup-recovery.md#br2) | Medium | Fixed | Cross-mode snapshot ownership is ambiguous: unmarked just-disabled snapshots and no storage generation |
-| [BR3](backup-recovery.md#br3) | Medium | Open | Corrupt-database boot fallback ignores a marked snapshot's exact plugin-row set |
+| [BR3](backup-recovery.md#br3) | Medium | Fixed | Corrupt-database boot fallback ignores a marked snapshot's exact plugin-row set |
 | [BR4](backup-recovery.md#br4) | Medium | Fixed | Valid long keys produce Node backups the same server refuses to import |
 | [PM1](performance-memory.md#pm1) | Medium | Fixed | Large plugin values bypass chunking and incur multiple full-size client/server copies |
 | [PM2](performance-memory.md#pm2) | Medium | Fixed | Mode transitions are not memory-bounded in either direction; the UI guards on entry count only |
@@ -120,7 +120,6 @@ The suites still do not exercise:
 
 - the production save loop as the reconciliation durability callback
   (pre-initialization no-op, in-flight save join, 409/500/network failure);
-- marked-snapshot restore through the corrupt-database boot fallback;
 - key-length boundaries for backup export/import symmetry;
 - read failure followed by a fallback-derived overwrite;
 - corrupt-row boot recovery.
@@ -149,10 +148,10 @@ The suites still do not exercise:
    non-destructive invalidate/rewrite operation.
 
 The former compatibility, startup, mutation, primary recovery, and transition
-capacity blockers MT1–MT3, AC1–AC4, SA1–SA4, AA1–AA3, BR1–BR2, BR4, and PM2
-are fixed and covered.
-The beta still should not be treated as risk-free for every V3 workload: BR3,
-PM3–PM4, and IP1–IP5 remain open. The AA3 primitives make safe compound-write
-guidance possible, but do not automatically repair existing plugin protocols.
-Verify a backup before transitions and before using the remaining open recovery
-and tooling paths with very large repositories.
+capacity blockers MT1–MT3, AC1–AC4, SA1–SA4, AA1–AA3, BR1–BR4, and PM1–PM2
+are fixed and covered. The beta still should not be treated as risk-free for
+every V3 workload: PM3–PM4 and IP1–IP5 remain open. The AA3 primitives make
+safe compound-write guidance possible, but do not automatically repair existing
+plugin protocols.
+Verify a backup before transitions and before using the remaining open tooling
+and integration paths with very large repositories.
