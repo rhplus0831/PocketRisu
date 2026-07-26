@@ -52,7 +52,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [IP2](integration-patterns.md#ip2) | High | Fixed | Remove-then-rewrite maintenance flows durably delete rows mid-sequence and report success |
 | [IP3](integration-patterns.md#ip3) | Medium | Fixed | Swallowed mutation failures desynchronize plugin caches and success counters from durable server state |
 | [IP4](integration-patterns.md#ip4) | Medium | Fixed | Reused sub-row keys with manifest-last publishing let an old manifest resolve to newer bodies; loaders do not verify generations |
-| [IP5](integration-patterns.md#ip5) | Medium | Open | Uncancelled long-running plugin-side migrations without CAS overwrite newer rows after their watchdog reports a timeout |
+| [IP5](integration-patterns.md#ip5) | Medium | Fixed | Uncancelled long-running plugin-side migrations without CAS overwrite newer rows after their watchdog reports a timeout |
 
 The IP items describe plugin-side coding patterns that only become unsafe once
 the beta turns local map operations into independent, fallible, durable server
@@ -63,8 +63,10 @@ public migration guidance. IP2 adds the public one-SET `rewriteItem()`
 primitive and confirmed-outcome guidance needed to replace destructive
 REMOVE→SET maintenance. IP3 adds public structured mutation outcomes plus a
 confirmed-removal workflow. IP4 adds a public immutable-generation helper and
-verified load/publication/cleanup protocol. Existing third-party plugins must
-adopt those safe protocols. IP5 remains open in this audit state.
+verified load/publication/cleanup protocol. IP5 adds a cancellable,
+mutex-bound one-row update primitive, public types, migration guidance, and
+end-to-end race coverage. Existing third-party plugins must adopt those safe
+protocols.
 
 ## Intentional enabled-mode behavior (not defects)
 
@@ -134,6 +136,9 @@ status refresh cannot consume a matching but tentative import publication.
 Immutable-generation coverage also verifies exact repository lineage,
 complete-body fallback, corruption rejection, protected garbage collection,
 and every body/manifest/head publication boundary.
+Cancellable migration coverage additionally verifies deadlines and stale CAS,
+post-publication acknowledgement loss, teardown publication draining, and
+invocation-scoped unload capabilities.
 The original consolidated validation gaps are now covered, including the
 production save loop, exact marked-snapshot restore, backup key boundaries,
 large transition memory, corrupt-row recovery, and read-failure fallbacks.
@@ -162,9 +167,8 @@ large transition memory, corrupt-row recovery, and read-failure fallbacks.
 
 The former compatibility, startup, mutation, primary recovery, transition
 capacity, and tooling-memory blockers MT1–MT3, AC1–AC4, SA1–SA4, AA1–AA3,
-BR1–BR4, PM1–PM4, and IP1–IP4 are fixed and covered. The beta still should not be
-treated as risk-free for every V3 workload: IP5 remains open. The AA3 primitives
-and IP4 generation helper make safe compound-write protocols possible, but do
-not automatically rewrite existing plugin data layouts.
-Verify a backup before transitions and before using the remaining open
-integration paths with very large repositories.
+BR1–BR4, PM1–PM4, and IP1–IP5 are fixed and covered. The AA3 primitives, IP4
+generation helper, and IP5 revision-safe update path make safe compound-write
+protocols possible, but do not automatically rewrite existing third-party
+plugin data layouts. Verify a backup before transitions and migrate legacy
+integrations to the documented contracts.

@@ -1,5 +1,5 @@
 import { allowedDbKeys, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginV2, type EditFunction, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
-import { authorizeSandboxCallbackDuringTermination, SandboxHost } from "./factory";
+import { SandboxHost } from "./factory";
 import {
     getDatabase,
     normalizeChat,
@@ -49,6 +49,11 @@ import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
 import type { OpenAIChat } from "src/ts/process/index.svelte";
+import {
+    PluginStorageUpdateCoordinator,
+    type PluginStorageUpdateOptions,
+    type PluginStorageUpdateTransform,
+} from "./pluginStorageUpdate";
 import { getModuleLorebooks } from "src/ts/process/modules";
 import {
     registerTTSPreprocessor,
@@ -90,6 +95,7 @@ class V3PluginLifecycleScope {
     private state: 'initializing' | 'ready' | 'terminating' | 'terminated' = 'initializing';
     private cleanupCallbacks: V3LifecycleCallback[] = [];
     private unloadCallbacks: V3LifecycleCallback[] = [];
+    private postUnloadDrains: Array<() => void | Promise<void>> = [];
 
     constructor(private pluginName: string) {}
 
@@ -119,6 +125,11 @@ class V3PluginLifecycleScope {
         this.unloadCallbacks.push(callback);
     }
 
+    addPostUnloadDrain(callback: () => void | Promise<void>) {
+        this.assertCanRegister();
+        this.postUnloadDrains.push(callback);
+    }
+
     markReady() {
         if (this.state !== 'initializing') return false;
         this.state = 'ready';
@@ -140,7 +151,7 @@ class V3PluginLifecycleScope {
         const controller = new AbortController();
         host.beginUnloadStorageAdmission();
         const completion = Promise.allSettled(callbacks.map(callback =>
-            Promise.resolve().then(() => callback(controller.signal)),
+            Promise.resolve().then(() => host.invokeUnloadCallback(callback, controller.signal)),
         ));
         const timeout = 'timeout' as const;
         let result: PromiseSettledResult<void>[] | typeof timeout = await Promise.race([
@@ -193,6 +204,14 @@ class V3PluginLifecycleScope {
         }
         this.state = 'terminated';
         return errors;
+    }
+
+    async drainPostUnloadWork(): Promise<unknown[]> {
+        const drains = this.postUnloadDrains.splice(0);
+        const results = await Promise.allSettled(drains.map(drain => drain()));
+        return results
+            .filter((entry): entry is PromiseRejectedResult => entry.status === 'rejected')
+            .map(entry => entry.reason);
     }
 }
 
@@ -682,7 +701,14 @@ const unloadV3PluginInstance = async (instance: V3PluginInstance) => {
                 try {
                     errors.push(...await instance.scope.runUnloadCallbacks(instance.host));
                 } finally {
-                    instance.host.terminate();
+                    try {
+                        // onUnload may admit a storage CAS after ordinary
+                        // cleanup has run. Keep the sandbox alive until every
+                        // such non-cancellable publication has acknowledged.
+                        errors.push(...await instance.scope.drainPostUnloadWork());
+                    } finally {
+                        instance.host.terminate();
+                    }
                 }
             }
 
@@ -1037,6 +1063,18 @@ export const makeRisuaiAPIV3 = (
             setDatabaseState(db);
         },
     });
+    const pluginStorageUpdates = new PluginStorageUpdateCoordinator({
+        read: getPluginSaveStorageItemWithRevision,
+        atomicSet: (key, value, expectedRevision, signal) => (
+            atomicBatchOwnedPluginSaveStorage([{
+                type: "set",
+                key,
+                value,
+                expectedRevision,
+            }], plugin.name, signal)
+        ),
+    });
+    lifecycle.addPostUnloadDrain(() => pluginStorageUpdates.drainPendingPublications());
     return {
 
         //Old APIs from v2.1
@@ -1159,26 +1197,30 @@ export const makeRisuaiAPIV3 = (
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
         setDatabaseLite: async (database: unknown, signal?: AbortSignal) => {
-            const conf = await getPluginPermission(
-                plugin.name,
-                'db',
-                'periodically',
-                signal,
-            );
-            if (!conf) return;
-            throwIfAborted(signal);
-            await databaseBridge.setDatabaseLite(database, signal);
+            await pluginStorageUpdates.runWriter(async () => {
+                const conf = await getPluginPermission(
+                    plugin.name,
+                    'db',
+                    'periodically',
+                    signal,
+                );
+                if (!conf) return;
+                throwIfAborted(signal);
+                await databaseBridge.setDatabaseLite(database, signal);
+            }, signal);
         },
         setDatabase: async (database: unknown, signal?: AbortSignal) => {
-            const conf = await getPluginPermission(
-                plugin.name,
-                'db',
-                'periodically',
-                signal,
-            );
-            if (!conf) return;
-            throwIfAborted(signal);
-            await databaseBridge.setDatabase(database, signal);
+            await pluginStorageUpdates.runWriter(async () => {
+                const conf = await getPluginPermission(
+                    plugin.name,
+                    'db',
+                    'periodically',
+                    signal,
+                );
+                if (!conf) return;
+                throwIfAborted(signal);
+                await databaseBridge.setDatabase(database, signal);
+            }, signal);
         },
         loadPlugins: oldApis.loadPlugins,
         readImage: oldApis.readImage,
@@ -1605,7 +1647,7 @@ export const makeRisuaiAPIV3 = (
             return observer;
         },
         onUnload: (callback: (signal?: AbortSignal) => void | Promise<void>) => {
-            lifecycle.addUnload(authorizeSandboxCallbackDuringTermination(callback));
+            lifecycle.addUnload(callback);
         },
         getFetchLogs: async () => {
             const unsafeFetchLog = getFetchLogs()
@@ -1701,14 +1743,20 @@ export const makeRisuaiAPIV3 = (
             read: Parameters<typeof setOwnedPluginSaveStorageItemFromRead>[0],
             value: unknown,
             signal?: AbortSignal,
-        ) => setOwnedPluginSaveStorageItemFromRead(read, value, plugin.name, signal),
+        ) => pluginStorageUpdates.runWriter(
+            () => setOwnedPluginSaveStorageItemFromRead(read, value, plugin.name, signal),
+            signal,
+        ),
         _atomicBatchPluginStorage: (
             operations: Parameters<typeof atomicBatchOwnedPluginSaveStorage>[0],
             _unloadCapabilityOrRequestSignal?: AbortSignal,
             requestSignal?: AbortSignal,
-        ) => atomicBatchOwnedPluginSaveStorage(
-            operations,
-            plugin.name,
+        ) => pluginStorageUpdates.runWriter(
+            () => atomicBatchOwnedPluginSaveStorage(
+                operations,
+                plugin.name,
+                requestSignal ?? _unloadCapabilityOrRequestSignal,
+            ),
             requestSignal ?? _unloadCapabilityOrRequestSignal,
         ),
         _rewritePluginStorage: (
@@ -1717,30 +1765,63 @@ export const makeRisuaiAPIV3 = (
             expectedRevision?: string | null,
             _unloadCapabilityOrRequestSignal?: AbortSignal,
             requestSignal?: AbortSignal,
-        ) => rewriteOwnedPluginSaveStorageItem(
-            key,
-            value,
-            plugin.name,
-            expectedRevision,
+        ) => pluginStorageUpdates.runWriter(
+            () => rewriteOwnedPluginSaveStorageItem(
+                key,
+                value,
+                plugin.name,
+                expectedRevision,
+                requestSignal ?? _unloadCapabilityOrRequestSignal,
+            ),
             requestSignal ?? _unloadCapabilityOrRequestSignal,
         ),
+        _updatePluginStorage: (
+            key: string,
+            transform: PluginStorageUpdateTransform,
+            options?: PluginStorageUpdateOptions,
+            unloadSignal?: AbortSignal,
+            requestSignal?: AbortSignal,
+        ) => pluginStorageUpdates.updateItem(
+            key,
+            transform,
+            options,
+            [unloadSignal, requestSignal],
+        ),
         _setPluginStorage: async (key: string, value: any, signal?: AbortSignal) => {
-            await setOwnedPluginSaveStorageItem(key, value, plugin.name, signal)
+            await pluginStorageUpdates.runWriter(
+                () => setOwnedPluginSaveStorageItem(key, value, plugin.name, signal),
+                signal,
+            )
         },
         _setPluginStorageWithOutcome: (key: string, value: any, signal?: AbortSignal) => (
-            setOwnedPluginSaveStorageItemWithOutcome(key, value, plugin.name, signal)
+            pluginStorageUpdates.runWriter(
+                () => setOwnedPluginSaveStorageItemWithOutcome(key, value, plugin.name, signal),
+                signal,
+            )
         ),
         _removePluginStorage: async (key: string, signal?: AbortSignal) => {
-            await removeOwnedPluginSaveStorageItem(key, signal)
+            await pluginStorageUpdates.runWriter(
+                () => removeOwnedPluginSaveStorageItem(key, signal),
+                signal,
+            )
         },
         _removePluginStorageWithOutcome: (key: string, signal?: AbortSignal) => (
-            removeOwnedPluginSaveStorageItemWithOutcome(key, signal)
+            pluginStorageUpdates.runWriter(
+                () => removeOwnedPluginSaveStorageItemWithOutcome(key, signal),
+                signal,
+            )
         ),
         _removePluginStorageConfirmed: (key: string, signal?: AbortSignal) => (
-            removeOwnedPluginSaveStorageItemConfirmed(key, signal)
+            pluginStorageUpdates.runWriter(
+                () => removeOwnedPluginSaveStorageItemConfirmed(key, signal),
+                signal,
+            )
         ),
         _clearPluginStorage: async (signal?: AbortSignal) => {
-            await clearOwnedPluginSaveStorage(signal)
+            await pluginStorageUpdates.runWriter(
+                () => clearOwnedPluginSaveStorage(signal),
+                signal,
+            )
         },
         _keyPluginStorage: (index: number, signal?: AbortSignal) => (
             getPluginSaveStorageKey(index, signal)
@@ -1780,6 +1861,7 @@ export const makeRisuaiAPIV3 = (
                     'setFromRead': '_setPluginStorageFromRead',
                     'atomicBatch': '_atomicBatchPluginStorage',
                     'rewriteItem': '_rewritePluginStorage',
+                    'updateItem': '_updatePluginStorage',
                     'setItem': '_setPluginStorage',
                     'setItemWithOutcome': '_setPluginStorageWithOutcome',
                     'removeItem': '_removePluginStorage',

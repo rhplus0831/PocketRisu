@@ -1145,6 +1145,16 @@ interface PluginStorageGenerationHelpers {
     >;
 }
 
+type PluginStorageUpdateTransform = (
+    current: PluginStorageVersionedValue,
+    signal: AbortSignal,
+) => any | Promise<any>;
+
+interface PluginStorageUpdateOptions {
+    /** One total deadline for mutex admission, reads, transform, and CAS. */
+    timeoutMs?: number;
+}
+
 interface PluginStorage {
     /** Safe immutable-generation publication helpers for sharded records. */
     readonly generations: PluginStorageGenerationHelpers;
@@ -1176,17 +1186,6 @@ interface PluginStorage {
     ): Promise<PluginStorageGuardedSetResult>;
 
     /**
-     * Safe single-key read/modify/write. The callback runs only after a
-     * successful missing/value read, and publication uses revision CAS.
-     * Conflicts are not retried automatically because callbacks may have side
-     * effects; call updateItem() again explicitly with an idempotent callback.
-     */
-    updateItem<TCurrent = any, TNext = any>(
-        key: string,
-        update: (read: PluginStorageReadSnapshot<TCurrent>) => TNext | Promise<TNext>,
-    ): Promise<PluginStorageGuardedSetResult>;
-
-    /**
      * Atomically applies 1-128 distinct-key mutations. `expectedRevision`
      * omitted is unconditional; null requires absence; a token requires the
      * exact state returned by getWithRevision().
@@ -1208,6 +1207,21 @@ interface PluginStorage {
         key: string,
         value: any,
         expectedRevision?: string | null,
+        unloadSignal?: AbortSignal,
+    ): Promise<PluginStorageAtomicBatchResult>;
+
+    /**
+     * Cancellably transforms one value under this plugin instance's migration
+     * mutex. The host re-reads the revision before publishing with atomic CAS;
+     * a concurrent write returns `committed: false` and is never overwritten.
+     * The transform must be pure: do not call mutation methods from inside it.
+     * Cancellation before CAS is known not committed. Cancellation after CAS
+     * dispatch rejects with `commitOutcomeUnknown: true`; re-read before retry.
+     */
+    updateItem(
+        key: string,
+        transform: PluginStorageUpdateTransform,
+        options?: PluginStorageUpdateOptions,
         unloadSignal?: AbortSignal,
     ): Promise<PluginStorageAtomicBatchResult>;
 

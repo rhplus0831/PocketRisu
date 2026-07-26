@@ -250,13 +250,14 @@ encoded-size checks after the structured-clone boundary.
 
 Unload storage admission is capability-scoped to the captured unload callback
 and its signal. Once termination begins, forged, expired, or uncaptured
-signals cannot open storage access, and the only newly admitted storage method
-is the bounded atomic batch. Mutations accepted before the deadline—including
-pre-existing work when no unload callback exists—remain tracked through their
-authoritative acknowledgement before iframe removal. Expiry aborts further
-callback preparation without cancelling admitted storage; a callback that
-still cannot finish after the drain reports the typed
-`PLUGIN_UNLOAD_INCOMPLETE` outcome rather than silently tearing work.
+signals cannot open storage access; newly admitted storage is limited to the
+bounded atomic batch and the IP5 bounded `updateItem()` helper. Mutations
+accepted before the deadline—including pre-existing work when no unload
+callback exists—remain tracked through their authoritative acknowledgement
+before iframe removal. Expiry aborts further callback preparation without
+cancelling admitted storage; a callback that still cannot finish after the
+drain reports the typed `PLUGIN_UNLOAD_INCOMPLETE` outcome rather than silently
+tearing work.
 
 Regression coverage injects failure before the transaction; after every value,
 owner, remove, and logical operation; after manifest publication; before
@@ -271,7 +272,8 @@ the server against the same SQLite save directory and observes only the
 complete old generation after rollback or the complete new generation after
 commit.
 
-These primitives do not by themselves rewrite unsafe plugin protocols, but
-they provide the host foundation needed for later IP1/IP4/IP5 integration
-guidance: distinguish missing from failure, read a revision, atomically publish
-a complete generation, and reject stale writers with CAS.
+These primitives do not by themselves rewrite unsafe plugin protocols. They
+provide the host foundation still needed for IP1/IP4 guidance—distinguish
+missing from failure, atomically publish a complete generation, and reject
+stale writers with CAS—and are composed by the now-fixed IP5 cancellable
+one-row update helper.

@@ -526,6 +526,7 @@ async function batchActualPluginStorage(
     generation: string,
     expectedManifest: unknown,
     operations: unknown[],
+    signal?: AbortSignal,
 ): Promise<Response> {
     return await fetch(`${server.origin}/api/plugin-storage/batch`, {
         method: 'POST',
@@ -536,6 +537,22 @@ async function batchActualPluginStorage(
             expectedManifest,
             operations,
         })),
+        signal,
+    })
+}
+
+async function readActualPluginStorageState(
+    server: RunningServer,
+    auth: AuthHeaders,
+    rawKey: string,
+    generation: string,
+): Promise<Response> {
+    return await fetch(`${server.origin}/api/plugin-storage/state`, {
+        headers: {
+            ...auth,
+            'file-path': Buffer.from(valueRowKey(rawKey), 'utf-8').toString('hex'),
+            'x-plugin-storage-generation': generation,
+        },
     })
 }
 
@@ -1345,6 +1362,148 @@ describe('plugin publication recovery snapshot scheduling', () => {
             valueRowKey('removed'),
             generation,
         )).length).toBe(0)
+    }, 30_000)
+
+    it('rejects a stale migration CAS after a newer value lands during transform', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { settings: { schema: 1, source: 'old' } },
+            meta: { settings: { plugin: 'Migration Plugin' } },
+        }))
+        const db = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        const generation = db.pluginStorageGeneration as string
+        const expectedManifest = JSON.parse((await readKey(
+            server,
+            auth,
+            PLUGIN_STORAGE_MANIFEST_KEY,
+        )).toString('utf-8'))
+        const initialStateResponse = await readActualPluginStorageState(
+            server,
+            auth,
+            'settings',
+            generation,
+        )
+        expect(initialStateResponse.status).toBe(200)
+        const initialState = await initialStateResponse.json() as {
+            revision: string
+        }
+
+        const newer = await mutateActualPluginStorage(server, auth, {
+            rawKey: 'settings',
+            operation: 'set',
+            generation,
+            value: { schema: 3, source: 'newer-writer' },
+            owner: 'Normal Writer',
+        })
+        expect(newer.status).toBe(200)
+
+        const stalePublish = await batchActualPluginStorage(
+            server,
+            auth,
+            generation,
+            expectedManifest,
+            [{
+                operation: 'set',
+                key: 'settings',
+                value: Buffer.from(JSON.stringify({
+                    schema: 2,
+                    source: 'stale-transform',
+                })).toString('base64'),
+                owner: 'Migration Plugin',
+                expectedRevision: initialState.revision,
+            }],
+        )
+        expect(stalePublish.status).toBe(409)
+        await expect(stalePublish.json()).resolves.toMatchObject({
+            success: false,
+            outcome: 'not-committed',
+            operation: 'batch',
+            code: 'PLUGIN_STORAGE_REVISION_CONFLICT',
+            conflicts: [{
+                key: 'settings',
+                currentRevision: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+            }],
+        })
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('settings'),
+            generation,
+        )).toString('utf-8'))).toEqual({
+            schema: 3,
+            source: 'newer-writer',
+        })
+    }, 30_000)
+
+    it('may commit a migration CAS when teardown aborts during its delayed acknowledgement', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+            POCKETRISU_TEST_PLUGIN_BATCH_FAILPOINT: 'acknowledgement-delay',
+            POCKETRISU_TEST_PLUGIN_BATCH_ACK_DELAY_MS: '5000',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { settings: { schema: 1 } },
+            meta: { settings: { plugin: 'Migration Plugin' } },
+        }))
+        const db = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        const generation = db.pluginStorageGeneration as string
+        const expectedManifest = JSON.parse((await readKey(
+            server,
+            auth,
+            PLUGIN_STORAGE_MANIFEST_KEY,
+        )).toString('utf-8'))
+        const initialStateResponse = await readActualPluginStorageState(
+            server,
+            auth,
+            'settings',
+            generation,
+        )
+        const initialState = await initialStateResponse.json() as { revision: string }
+        const controller = new AbortController()
+
+        const publishing = batchActualPluginStorage(
+            server,
+            auth,
+            generation,
+            expectedManifest,
+            [{
+                operation: 'set',
+                key: 'settings',
+                value: Buffer.from(JSON.stringify({
+                    schema: 2,
+                    source: 'committed-before-teardown',
+                })).toString('base64'),
+                owner: 'Migration Plugin',
+                expectedRevision: initialState.revision,
+            }],
+            controller.signal,
+        )
+
+        await waitFor(async () => {
+            const bytes = await readKey(server, auth, valueRowKey('settings'), generation)
+            return bytes.length > 0
+                && JSON.parse(bytes.toString('utf-8')).schema === 2
+        })
+        controller.abort(new DOMException('Plugin teardown', 'AbortError'))
+        await expect(publishing).rejects.toMatchObject({ name: 'AbortError' })
+
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('settings'),
+            generation,
+        )).toString('utf-8'))).toEqual({
+            schema: 2,
+            source: 'committed-before-teardown',
+        })
     }, 30_000)
 
     it('does not snapshot a rolled-back actual V3 value/owner request', async () => {

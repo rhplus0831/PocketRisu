@@ -326,6 +326,12 @@ const PLUGIN_STORAGE_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab
 const pluginStorageBatchFailpoint = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_PLUGIN_BATCH_FAILPOINT ?? '').trim()
     : '';
+const pluginStorageBatchAcknowledgementDelayMs = process.env.NODE_ENV === 'test'
+    ? Math.max(0, Number.parseInt(
+        process.env.POCKETRISU_TEST_PLUGIN_BATCH_ACK_DELAY_MS ?? '0',
+        10,
+    ) || 0)
+    : 0;
 
 // Test-only authoritative read failure used by the IP1 integration contract.
 // It is intentionally scoped to the versioned state endpoint.
@@ -6094,7 +6100,7 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                 logger.warn('[PluginStorageBatch] Post-commit verification unavailable:', error);
             }
 
-            return res.json({
+            const acknowledgement = {
                 success: true,
                 outcome: 'committed',
                 operation: 'batch',
@@ -6102,7 +6108,15 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                 requestHash,
                 generation,
                 revisions: committedRevisions,
-            });
+            };
+            if (pluginStorageBatchFailpoint === 'acknowledgement-delay') {
+                const acknowledgementTimer = setTimeout(() => {
+                    if (!res.headersSent && !res.destroyed) res.json(acknowledgement);
+                }, pluginStorageBatchAcknowledgementDelayMs);
+                acknowledgementTimer.unref?.();
+                return;
+            }
+            return res.json(acknowledgement);
         });
     } catch (error) {
         if (isImportInProgressError(error)) {

@@ -7,7 +7,10 @@ const storageMocks = vi.hoisted(() => ({
     writeGate: null as null | ((key: string, signal?: AbortSignal | null) => Promise<void>),
     removeGate: null as null | ((key: string, signal?: AbortSignal | null) => Promise<void>),
     clearGate: null as null | ((prefix: string, signal?: AbortSignal | null) => Promise<void>),
-    batchGate: null as null | ((signal?: AbortSignal | null) => Promise<void>),
+    batchGate: null as null | ((signal?: AbortSignal | null, request?: any) => Promise<void>),
+    batchCalls: 0,
+    batchApplyBeforeGate: false,
+    revisionOverrides: new Map<string, string>(),
 }));
 const alertConfirmMock = vi.hoisted(() => vi.fn(async () => true));
 const notifyErrorMock = vi.hoisted(() => vi.fn());
@@ -65,53 +68,59 @@ vi.mock("../../storage/persistentKv", () => {
     };
     return {
     batchPersistentPluginStorage: async (request: any, signal?: AbortSignal | null) => {
-        await storageMocks.batchGate?.(signal);
-        throwIfAborted(signal);
+        storageMocks.batchCalls += 1;
         const generation = crypto.randomUUID();
-        for (const operation of request.operations) {
-            const valueKey = `pluginsave/${encodeKey(operation.key)}.json`;
-            const ownerKey = `pluginsave-meta/${encodeKey(operation.key)}.json`;
-            if (operation.operation === "set") {
-                storageMocks.persistent.set(
-                    valueKey,
-                    JSON.parse(new TextDecoder().decode(operation.valueBytes)),
-                );
-                storageMocks.persistent.set(ownerKey, {
-                    plugin: operation.owner,
-                    updatedAt: Date.now(),
-                    generation,
-                });
-            } else {
-                storageMocks.persistent.delete(valueKey);
-                storageMocks.persistent.delete(ownerKey);
+        const apply = () => {
+            for (const operation of request.operations) {
+                const valueKey = `pluginsave/${encodeKey(operation.key)}.json`;
+                const ownerKey = `pluginsave-meta/${encodeKey(operation.key)}.json`;
+                if (operation.operation === "set") {
+                    storageMocks.persistent.set(
+                        valueKey,
+                        JSON.parse(new TextDecoder().decode(operation.valueBytes)),
+                    );
+                    storageMocks.persistent.set(ownerKey, {
+                        plugin: operation.owner,
+                        updatedAt: Date.now(),
+                        generation,
+                    });
+                } else {
+                    storageMocks.persistent.delete(valueKey);
+                    storageMocks.persistent.delete(ownerKey);
+                }
             }
-        }
-        const currentManifest = storageMocks.persistent.get(manifestKey) as any;
-        const valueKeys = new Set<string>(currentManifest?.valueKeys ?? []);
-        const metaKeys = new Set<string>(currentManifest?.metaKeys ?? []);
-        for (const operation of request.operations) {
-            const valueKey = `pluginsave/${encodeKey(operation.key)}.json`;
-            const ownerKey = `pluginsave-meta/${encodeKey(operation.key)}.json`;
-            if (operation.operation === "set") {
-                valueKeys.add(valueKey);
-                metaKeys.add(ownerKey);
-            } else {
-                valueKeys.delete(valueKey);
-                metaKeys.delete(ownerKey);
+            const currentManifest = storageMocks.persistent.get(manifestKey) as any;
+            const valueKeys = new Set<string>(currentManifest?.valueKeys ?? []);
+            const metaKeys = new Set<string>(currentManifest?.metaKeys ?? []);
+            for (const operation of request.operations) {
+                const valueKey = `pluginsave/${encodeKey(operation.key)}.json`;
+                const ownerKey = `pluginsave-meta/${encodeKey(operation.key)}.json`;
+                if (operation.operation === "set") {
+                    valueKeys.add(valueKey);
+                    metaKeys.add(ownerKey);
+                } else {
+                    valueKeys.delete(valueKey);
+                    metaKeys.delete(ownerKey);
+                }
             }
-        }
-        storageMocks.persistent.set(manifestKey, {
-            version: 1,
-            generation: request.generation,
-            valueKeys: [...valueKeys].sort(),
-            metaKeys: [...metaKeys].sort(),
-        });
+            storageMocks.persistent.set(manifestKey, {
+                version: 1,
+                generation: request.generation,
+                valueKeys: [...valueKeys].sort(),
+                metaKeys: [...metaKeys].sort(),
+            });
+        };
+        if (storageMocks.batchApplyBeforeGate) apply();
+        await storageMocks.batchGate?.(signal, request);
+        throwIfAborted(signal);
+        if (!storageMocks.batchApplyBeforeGate) apply();
         return {
             outcome: "committed" as const,
             generation,
             revisions: request.operations.map((operation: any) => ({
                 key: operation.key,
                 revision: operation.operation === "set" ? `sha256:${"a".repeat(64)}` : null,
+                valueHash: operation.operation === "set" ? "b".repeat(64) : null,
             })),
         };
     },
@@ -207,7 +216,8 @@ vi.mock("../../storage/persistentKv", () => {
             : {
                 status: "value" as const,
                 value: cloneJson(value),
-                revision: `sha256:${"b".repeat(64)}`,
+                revision: storageMocks.revisionOverrides.get(valueKey)
+                    ?? `sha256:${"b".repeat(64)}`,
                 generation: null,
             };
     },
@@ -485,6 +495,9 @@ beforeEach(async () => {
     storageMocks.removeGate = null;
     storageMocks.clearGate = null;
     storageMocks.batchGate = null;
+    storageMocks.batchCalls = 0;
+    storageMocks.batchApplyBeforeGate = false;
+    storageMocks.revisionOverrides.clear();
     alertConfirmMock.mockClear();
     notifyErrorMock.mockClear();
     pluginV2.providers.clear();
@@ -1824,6 +1837,379 @@ describe("V3 guest startup handshake", () => {
         restoreRelay();
     });
 
+    test("updateItem preserves a newer value that lands during the guest transform", async () => {
+        storageMocks.persistent.set(storageKey("settings"), { schema: 1, source: "old" });
+        installManifestOwnedStartupKeys("settings");
+        const plugin = startupPlugin("Cancellable Storage Migration", `
+            globalThis.updatePending = risuai.pluginStorage.updateItem(
+                "settings",
+                async (current, signal) => {
+                    globalThis.updateInitial = current;
+                    globalThis.updateTransformStarted = true;
+                    await new Promise(resolve => { globalThis.releaseUpdateTransform = resolve; });
+                    signal.throwIfAborted();
+                    return { ...current.value, schema: 2, source: "stale-transform" };
+                },
+                { timeoutMs: 5_000 },
+            ).then(
+                result => { globalThis.updateResult = result; },
+                error => { globalThis.updateError = error; },
+            );
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+        await vi.waitFor(() => expect(guestWindow.updateTransformStarted).toBe(true));
+
+        // Represents a different plugin instance/session, outside this
+        // instance's migration mutex but still protected by the final CAS.
+        storageMocks.persistent.set(storageKey("settings"), {
+            schema: 3,
+            source: "newer-writer",
+        });
+        storageMocks.revisionOverrides.set(
+            storageKey("settings"),
+            `sha256:${"c".repeat(64)}`,
+        );
+        guestWindow.releaseUpdateTransform();
+
+        await vi.waitFor(() => expect(guestWindow.updateResult).toEqual({
+            committed: false,
+            conflicts: [{
+                key: "settings",
+                revision: `sha256:${"c".repeat(64)}`,
+                generation: null,
+            }],
+        }));
+        expect(storageMocks.batchCalls).toBe(0);
+        expect(storageMocks.persistent.get(storageKey("settings"))).toEqual({
+            schema: 3,
+            source: "newer-writer",
+        });
+
+        await teardownV3Plugins();
+        restoreRelay();
+    });
+
+    test("updateItem watchdog aborts the transform and never sends a late SET", async () => {
+        storageMocks.persistent.set(storageKey("settings"), { schema: 1 });
+        installManifestOwnedStartupKeys("settings");
+        const plugin = startupPlugin("Timed Storage Migration", `
+            globalThis.updatePending = risuai.pluginStorage.updateItem(
+                "settings",
+                async (_current, signal) => {
+                    globalThis.updateSignal = signal;
+                    globalThis.updateTransformStarted = true;
+                    await new Promise(resolve => { globalThis.releaseUpdateTransform = resolve; });
+                    globalThis.updateObservedAbort = signal.aborted;
+                    return { schema: 2 };
+                },
+                { timeoutMs: 25 },
+            ).then(
+                result => { globalThis.updateResult = result; },
+                error => { globalThis.updateError = error; },
+            );
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+        await vi.waitFor(() => expect(guestWindow.updateTransformStarted).toBe(true));
+        await vi.waitFor(() => expect(guestWindow.updateError).toMatchObject({
+            name: "StorageError",
+            code: "STORAGE_TIMEOUT",
+            operation: "update",
+            commitOutcomeUnknown: false,
+        }));
+
+        expect(guestWindow.updateSignal.aborted).toBe(true);
+        expect(storageMocks.batchCalls).toBe(0);
+        guestWindow.releaseUpdateTransform();
+        await vi.waitFor(() => expect(guestWindow.updateObservedAbort).toBe(true));
+        await new Promise(resolve => setTimeout(resolve, 25));
+        expect(storageMocks.batchCalls).toBe(0);
+        expect(storageMocks.persistent.get(storageKey("settings")))
+            .toEqual({ schema: 1 });
+
+        await teardownV3Plugins();
+        restoreRelay();
+    });
+
+    test("updateItem deadline cancels a production final read before CAS", async () => {
+        storageMocks.persistent.set(storageKey("settings"), { schema: 1 });
+        installManifestOwnedStartupKeys("settings");
+        const finalReadStarted = deferred();
+        const releaseFinalRead = deferred();
+        let settingsReads = 0;
+        storageMocks.readGate = async (key, signal) => {
+            if (key !== storageKey("settings")) return;
+            settingsReads += 1;
+            if (settingsReads !== 2) return;
+            finalReadStarted.resolve();
+            await awaitWithAbort(releaseFinalRead.promise, signal);
+        };
+        const plugin = startupPlugin("Final Read Deadline", `
+            globalThis.updatePending = risuai.pluginStorage.updateItem(
+                "settings",
+                current => ({ ...current.value, schema: 2 }),
+                { timeoutMs: 25 },
+            ).then(
+                result => { globalThis.updateResult = result; },
+                error => { globalThis.updateError = error; },
+            );
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+        await finalReadStarted.promise;
+
+        await vi.waitFor(() => expect(guestWindow.updateError).toMatchObject({
+            code: "STORAGE_TIMEOUT",
+            operation: "update",
+            commitOutcomeUnknown: false,
+        }));
+        expect(settingsReads).toBe(2);
+        expect(storageMocks.batchCalls).toBe(0);
+        expect(storageMocks.persistent.get(storageKey("settings")))
+            .toEqual({ schema: 1 });
+        releaseFinalRead.resolve();
+        storageMocks.readGate = null;
+        await teardownV3Plugins();
+        restoreRelay();
+    });
+
+    test("updateItem reports unknown when timeout loses a committed CAS acknowledgement", async () => {
+        storageMocks.persistent.set(storageKey("settings"), { schema: 1 });
+        installManifestOwnedStartupKeys("settings");
+        const casCommitted = deferred();
+        const releaseAcknowledgement = deferred();
+        storageMocks.batchApplyBeforeGate = true;
+        storageMocks.batchGate = async () => {
+            casCommitted.resolve();
+            await releaseAcknowledgement.promise;
+        };
+        const plugin = startupPlugin("Ambiguous Storage Migration", `
+            globalThis.updatePending = risuai.pluginStorage.updateItem(
+                "settings",
+                () => ({ schema: 2, source: "migration" }),
+                { timeoutMs: 25 },
+            ).then(
+                result => { globalThis.updateResult = result; },
+                error => { globalThis.updateError = error; },
+            );
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+        await casCommitted.promise;
+
+        await vi.waitFor(() => expect(guestWindow.updateError).toMatchObject({
+            name: "StorageError",
+            code: "COMMIT_OUTCOME_UNKNOWN",
+            operation: "update",
+            retryable: false,
+            commitOutcomeUnknown: true,
+        }));
+        expect(storageMocks.persistent.get(storageKey("settings"))).toEqual({
+            schema: 2,
+            source: "migration",
+        });
+        releaseAcknowledgement.resolve();
+        await new Promise(resolve => setTimeout(resolve, 0));
+        await teardownV3Plugins();
+        restoreRelay();
+    });
+
+    test("teardown drains a CAS that may have committed after update cancellation", async () => {
+        storageMocks.persistent.set(storageKey("settings"), { schema: 1 });
+        installManifestOwnedStartupKeys("settings");
+        const casCommitted = deferred();
+        const releaseAcknowledgement = deferred();
+        storageMocks.batchApplyBeforeGate = true;
+        storageMocks.batchGate = async () => {
+            casCommitted.resolve();
+            await releaseAcknowledgement.promise;
+        };
+        const plugin = startupPlugin("Teardown Ambiguous Migration", `
+            globalThis.updatePending = risuai.pluginStorage.updateItem(
+                "settings",
+                () => ({ schema: 2, source: "may-have-committed" }),
+                { timeoutMs: 5_000 },
+            ).catch(error => { globalThis.updateError = error; });
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+        await casCommitted.promise;
+        const responseSpy = vi.spyOn(guestWindow, "postMessage");
+
+        let teardownSettled = false;
+        const teardown = teardownV3Plugins().finally(() => { teardownSettled = true; });
+        await new Promise(resolve => setTimeout(resolve, 25));
+        expect(teardownSettled).toBe(false);
+        expect(iframe.isConnected).toBe(true);
+        expect(storageMocks.persistent.get(storageKey("settings"))).toEqual({
+            schema: 2,
+            source: "may-have-committed",
+        });
+
+        releaseAcknowledgement.resolve();
+        await teardown;
+        expect(responseSpy.mock.calls.some(([unknownMessage]) => {
+            const message = unknownMessage as any;
+            return message?.type === "RESPONSE"
+                && message?.error?.code === "COMMIT_OUTCOME_UNKNOWN"
+                && message?.error?.commitOutcomeUnknown === true;
+        })).toBe(true);
+        expect(iframe.isConnected).toBe(false);
+        restoreRelay();
+    });
+
+    test("update transform signals never inherit reusable unload capability", async () => {
+        storageMocks.persistent.set(storageKey("settings"), { schema: 1 });
+        installManifestOwnedStartupKeys("settings");
+        const plugin = startupPlugin("Scoped Update Authorization", `
+            await risuai.onUnload(async (unloadSignal) => {
+                globalThis.scopedUpdateResult = await risuai.pluginStorage.updateItem(
+                    "settings",
+                    async (current, updateSignal) => {
+                        try {
+                            await risuai.pluginStorage.atomicBatch([{
+                                type: "set",
+                                key: "leaked-capability",
+                                value: true,
+                            }], updateSignal);
+                        } catch (error) {
+                            globalThis.leakedCapabilityError = error;
+                        }
+                        return { ...current.value, schema: 2 };
+                    },
+                    { timeoutMs: 750 },
+                    unloadSignal,
+                );
+            });
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+
+        await teardownV3Plugins();
+
+        expect(guestWindow.leakedCapabilityError).toMatchObject({
+            message: "Plugin sandbox is terminating; RPC invocation was rejected.",
+        });
+        expect(guestWindow.scopedUpdateResult).toMatchObject({ committed: true });
+        expect(storageMocks.persistent.has(storageKey("leaked-capability"))).toBe(false);
+        expect(storageMocks.persistent.get(storageKey("settings")))
+            .toEqual({ schema: 2 });
+        expect(iframe.isConnected).toBe(false);
+        restoreRelay();
+    });
+
+    test("the same guest function cannot pass unload capability into its nested update transform", async () => {
+        storageMocks.persistent.set(storageKey("settings"), { schema: 1 });
+        installManifestOwnedStartupKeys("settings");
+        const plugin = startupPlugin("Invocation Scoped Update Authorization", `
+            const sharedCallback = async (...args) => {
+                if (args.length === 1) {
+                    const [unloadSignal] = args;
+                    globalThis.sameFunctionUpdateResult = await risuai.pluginStorage.updateItem(
+                        "settings",
+                        sharedCallback,
+                        { timeoutMs: 750 },
+                        unloadSignal,
+                    );
+                    return;
+                }
+
+                const [current, updateSignal] = args;
+                try {
+                    await risuai.pluginStorage.atomicBatch([{
+                        type: "set",
+                        key: "same-function-leaked-capability",
+                        value: true,
+                    }], updateSignal);
+                } catch (error) {
+                    globalThis.sameFunctionCapabilityError = error;
+                }
+                return { ...current.value, schema: 2 };
+            };
+            await risuai.onUnload(sharedCallback);
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+
+        await teardownV3Plugins();
+
+        expect(guestWindow.sameFunctionCapabilityError).toMatchObject({
+            message: "Plugin sandbox is terminating; RPC invocation was rejected.",
+        });
+        expect(guestWindow.sameFunctionUpdateResult).toMatchObject({ committed: true });
+        expect(storageMocks.persistent.has(storageKey("same-function-leaked-capability")))
+            .toBe(false);
+        expect(storageMocks.persistent.get(storageKey("settings")))
+            .toEqual({ schema: 2 });
+        expect(iframe.isConnected).toBe(false);
+        restoreRelay();
+    });
+
+    test("teardown cancels and drains an active update transform without publishing", async () => {
+        storageMocks.persistent.set(storageKey("settings"), { schema: 1 });
+        installManifestOwnedStartupKeys("settings");
+        const plugin = startupPlugin("Teardown Storage Migration", `
+            globalThis.updatePending = risuai.pluginStorage.updateItem(
+                "settings",
+                async (_current, signal) => {
+                    globalThis.updateTransformStarted = true;
+                    await new Promise((resolve, reject) => {
+                        signal.addEventListener("abort", () => {
+                            globalThis.updateTeardownAborted = true;
+                            reject(signal.reason);
+                        }, { once: true });
+                    });
+                    return { schema: 2 };
+                },
+                { timeoutMs: 5_000 },
+            ).catch(error => { globalThis.updateError = error; });
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+        await vi.waitFor(() => expect(guestWindow.updateTransformStarted).toBe(true));
+        const responseSpy = vi.spyOn(guestWindow, "postMessage");
+
+        await teardownV3Plugins();
+
+        expect(responseSpy.mock.calls.some(([unknownMessage]) => {
+            const message = unknownMessage as any;
+            return message?.type === "RESPONSE"
+            && message?.error?.name === "AbortError"
+            && message?.error?.message
+                === "Plugin storage update was cancelled during teardown."
+        })).toBe(true);
+        expect(storageMocks.batchCalls).toBe(0);
+        expect(storageMocks.persistent.get(storageKey("settings")))
+            .toEqual({ schema: 1 });
+        expect(iframe.isConnected).toBe(false);
+        restoreRelay();
+    });
+
     test("extends unload for an admitted atomic batch and rejects uncaptured late writes", async () => {
         const batchStarted = deferred();
         const releaseBatch = deferred();
@@ -1919,6 +2305,60 @@ describe("V3 guest startup handshake", () => {
             committed: true,
             removed: true,
         });
+        expect(iframe.isConnected).toBe(false);
+        restoreRelay();
+    });
+
+    test("teardown drains a CAS admitted by onUnload after its acknowledgement exceeds the grace period", async () => {
+        storageMocks.persistent.set(storageKey("settings"), { schema: 1 });
+        installManifestOwnedStartupKeys("settings");
+        const casCommitted = deferred();
+        const releaseAcknowledgement = deferred();
+        storageMocks.batchApplyBeforeGate = true;
+        storageMocks.batchGate = async () => {
+            casCommitted.resolve();
+            await releaseAcknowledgement.promise;
+        };
+        const plugin = startupPlugin("Unload Update Publication Drain", `
+            await risuai.onUnload(async (signal) => {
+                try {
+                    globalThis.unloadUpdateResult = await risuai.pluginStorage.updateItem(
+                        "settings",
+                        current => ({ ...current.value, schema: 2, source: "onUnload" }),
+                        { timeoutMs: 5_000 },
+                        signal,
+                    );
+                } catch (error) {
+                    globalThis.unloadUpdateError = error;
+                }
+            });
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+
+        let teardownSettled = false;
+        const teardown = teardownV3Plugins().finally(() => { teardownSettled = true; });
+        await casCommitted.promise;
+        await new Promise(resolve => setTimeout(resolve, 1_100));
+
+        expect(guestWindow.unloadUpdateError).toMatchObject({
+            code: "COMMIT_OUTCOME_UNKNOWN",
+            commitOutcomeUnknown: true,
+        });
+        expect(teardownSettled).toBe(false);
+        expect(iframe.isConnected).toBe(true);
+        expect(storageMocks.persistent.get(storageKey("settings"))).toEqual({
+            schema: 2,
+            source: "onUnload",
+        });
+
+        releaseAcknowledgement.resolve();
+        await teardown;
+
+        expect(teardownSettled).toBe(true);
         expect(iframe.isConnected).toBe(false);
         restoreRelay();
     });

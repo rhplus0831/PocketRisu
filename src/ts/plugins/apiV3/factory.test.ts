@@ -631,10 +631,14 @@ describe("V3 plugin storage safe update helpers", () => {
             let transformations = 0;
             const results = [];
             for (const key of keys) {
-                results.push(await risuai.pluginStorage.updateItem(key, () => {
-                    transformations += 1;
-                    return key === "credential" ? "" : {};
-                }));
+                const read = await risuai.pluginStorage.readItem(key);
+                if (read.status === "failed") {
+                    results.push({ status: "failed", stage: "read", error: read.error });
+                    continue;
+                }
+                transformations += 1;
+                const fallback = key === "credential" ? "" : {};
+                results.push(await risuai.pluginStorage.setFromRead(read, fallback));
             }
             await risuai.recordResults(results, transformations);
         `);

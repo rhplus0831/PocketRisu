@@ -8,11 +8,12 @@ and protocols. At the audit point the host offered no versioned read or atomic
 write primitive. AA3 is now fixed: bounded `getWithRevision()` and
 `atomicBatch()` provide per-key revisions/CAS and atomic generation publish.
 That enables safe guidance for the patterns below, but does not repair plugin
-fallbacks, loaders, or cancellation by itself. IP1–IP4 are now fixed on the
+fallbacks, loaders, or cancellation by itself. IP1–IP5 are now fixed on the
 host side with explicit read outcomes, guarded CAS writes, structured mutation
 outcomes, a non-destructive rewrite helper, an immutable-generation helper,
-and adoption guidance. Existing third-party plugins still have to adopt those
-protocols. See [README.md](README.md) for the full index.
+a mutex-bound `updateItem()` primitive, and adoption guidance. Existing
+third-party plugins still have to adopt those protocols. See
+[README.md](README.md) for the full index.
 
 <a id="ip1"></a>
 ## IP1 — A failed read treated as a missing key becomes a destructive overwrite
@@ -345,3 +346,61 @@ realistic, which is why this is listed as an enabled-mode issue.
   CAS/an atomic transform operation.
 - Test a newer write landing during the transform and after watchdog expiry;
   the newer value must survive and no late SET may occur.
+
+### Resolution
+
+**Fixed 2026-07-27.** V3 now exposes typed
+`pluginStorage.updateItem(key, transform, options?, unloadSignal?)` as the
+one-row migration/read-modify-write primitive. Its default timeout is 10
+seconds, callers may select an integer from 1 ms through 15 seconds, and one
+total `AbortSignal` covers fair mutex admission, the initial versioned read,
+the guest transform, the final versioned read, and the caller's wait for CAS.
+The transform receives that same signal. A timeout or cancellation before CAS
+submission is known not committed, and an expired transform cannot submit a
+late write after it eventually returns.
+
+Each plugin instance has a fair shared-writer/exclusive-migration barrier.
+`setItem()`, `removeItem()`, `clear()`, `atomicBatch()`, and the V3 database
+replacement APIs enter as writers; `updateItem()` excludes them for its full
+read-transform-CAS interval. A queued migration prevents later writers from
+overtaking it. If the caller's deadline expires after CAS admission, the
+barrier remains held until that non-cancellable publication settles. Writers
+in another plugin instance or session are outside the local barrier, so the
+coordinator re-reads the opaque revision immediately before publication and
+the AA3 atomic batch supplies the final server-side `expectedRevision` check.
+A changed revision returns `committed: false` without writing.
+
+The CAS admission boundary is intentionally explicit. Before dispatch,
+cancellation is `STORAGE_TIMEOUT`/abort with `commitOutcomeUnknown: false`.
+After dispatch, cancelling the transport cannot prove rollback because the
+server may already have committed; the caller instead receives the
+non-retryable `COMMIT_OUTCOME_UNKNOWN` storage error with
+`commitOutcomeUnknown: true`. The CAS itself continues without the caller's
+signal, remains tracked, and must be re-read before any deliberate retry.
+Official guidance in `src/ts/plugins/migrationGuide.md` documents this rule,
+requires pure transforms, and shows both startup and bounded unload updates.
+The public contract is mirrored in `src/ts/plugins/apiV3/risuai.d.ts`.
+
+Teardown now aborts active pre-publication updates, runs admitted unload
+callbacks, and then drains all outstanding CAS publications before terminating
+the iframe. Thus a CAS that committed but whose acknowledgement outlives the
+one-second unload grace period cannot escape the only drain. Unload authority
+is also invocation-scoped: the captured `onUnload` callback receives the
+capability, but the host-created transform signal never does—even when the
+same guest function is simultaneously the outer unload callback and the nested
+transform. The transform therefore cannot use its internal signal to open a
+new storage RPC during termination.
+
+Unit and iframe-bridge coverage in
+`src/ts/plugins/apiV3/pluginStorageUpdate.test.ts` and
+`src/ts/plugins/apiV3/pluginDatabaseBridge.svelte.test.ts` exercises total
+deadlines at the mutex, both reads, transform, and CAS; fair writer exclusion;
+a newer write during transform; final-read and final-CAS conflicts; no late
+SET; committed-but-lost acknowledgements; teardown cancellation;
+post-`onUnload` publication drain; and same-function capability overlap.
+Real-server coverage in `server/node/snapshotPluginStorage.e2e.test.ts`
+verifies stale CAS preservation and a commit followed by delayed
+acknowledgement and caller abort. Independent verification passed all 50
+focused coordinator/bridge tests, 1,314 frontend tests (3 skipped), 196 server
+tests, 145 compatibility tests (5 skipped), `pnpm check`, and a production
+build.

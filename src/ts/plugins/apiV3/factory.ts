@@ -26,6 +26,7 @@ const ABORTABLE_ROOT_METHODS = new Set([
     '_setPluginStorageFromRead',
     '_atomicBatchPluginStorage',
     '_rewritePluginStorage',
+    '_updatePluginStorage',
     '_setPluginStorage',
     '_setPluginStorageWithOutcome',
     '_removePluginStorage',
@@ -44,12 +45,14 @@ const UNLOAD_STORAGE_ROOT_METHODS = new Set([
     '_getVersionedPluginStorage',
     '_atomicBatchPluginStorage',
     '_rewritePluginStorage',
+    '_updatePluginStorage',
 ]);
 
 const UNLOAD_STORAGE_MUTATION_METHODS = new Set([
     '_atomicBatchPluginStorage',
     '_setPluginStorageFromRead',
     '_rewritePluginStorage',
+    '_updatePluginStorage',
     '_setPluginStorage',
     '_setPluginStorageWithOutcome',
     '_removePluginStorage',
@@ -171,13 +174,6 @@ type GuestControlMessage = {
     errorStack?: string;
 };
 
-const unloadAuthorizedCallbacks = new WeakSet<Function>();
-
-export function authorizeSandboxCallbackDuringTermination<T extends Function>(callback: T): T {
-    unloadAuthorizedCallbacks.add(callback);
-    return callback;
-}
-
 function validateAsyncFunctionBody(source: string): void {
     const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
     // Compile only. This enforces that plugin source remains an async function
@@ -205,6 +201,7 @@ export function createV3BridgeRequestRegistry(options: {
         _atomicBatchPluginStorage: 'batch',
         _setPluginStorageFromRead: 'batch',
         _rewritePluginStorage: 'batch',
+        _updatePluginStorage: 'write',
         _setPluginStorage: 'write',
         _setPluginStorageWithOutcome: 'write',
         _removePluginStorage: 'remove',
@@ -549,9 +546,10 @@ export function snapshotV3PluginStorageBatchForTransport(input: unknown): unknow
 }
 
 /**
- * Install the compound-update helpers inside the guest realm. Keeping the
- * transform callback in the iframe avoids callback-registry retention and
- * guarantees it is never invoked when the prerequisite read failed.
+ * Install the explicit IP1 read/guarded-set result adapters inside the guest
+ * realm. The public updateItem name is reserved for the host-coordinated IP5
+ * migration primitive, whose transform crosses the callback bridge and is
+ * protected by the fair writer/migration barrier.
  * Self-contained because its source is installed in the generated guest.
  */
 export function installV3PluginStorageHelpers(pluginStorage: Record<string, any>): void {
@@ -610,22 +608,6 @@ export function installV3PluginStorageHelpers(pluginStorage: Record<string, any>
                 error: describeFailure(error, "batch"),
             };
         }
-    };
-    pluginStorage.updateItem = async (
-        key: string,
-        update: (read: Record<string, unknown>) => unknown | Promise<unknown>,
-    ) => {
-        if (typeof update !== "function") {
-            throw new TypeError("pluginStorage.updateItem requires an update function.");
-        }
-        const read = await pluginStorage.readItem(key);
-        if (read.status === "failed") {
-            return { status: "failed", stage: "read", error: read.error };
-        }
-        // Deliberately do not catch plugin code errors. Only storage failures
-        // are result values; programming errors still reject normally.
-        const value = await update(read);
-        return await pluginStorage.setFromRead(read, value);
     };
 }
 
@@ -1052,12 +1034,17 @@ export class SandboxHost {
     private instanceRegistry = new Map<string, any>();
     private abortControllers = new Map<string, AbortController>();
     private activeRequestControllers = new Map<string, AbortController>();
+    private readonly activePluginStorageUpdateControllers = new Set<AbortController>();
     private cancelledRequestControllers = new WeakSet<AbortController>();
     private readonly unloadCapabilitySignals = new WeakSet<AbortSignal>();
     private unloadStorageAdmission = false;
     private unloadCapabilityToken: string | null = null;
     private readonly unloadStorageMutations = new Set<Promise<void>>();
     private callbackWrapperCache = new Map<string, Function>();
+    private readonly terminationCallbackInvocationStack: Array<{
+        callback: Function;
+        grantUnloadCapability: boolean;
+    }> = [];
 
     private pendingCallbacks = new Map<string, { resolve: Function, reject: Function }>();
     private pendingExecutions = new Map<string, { resolve: Function, reject: Function }>();
@@ -1178,8 +1165,12 @@ export class SandboxHost {
                 if (cached) return cached;
 
                 const wrapper = async (...innerArgs: any[]) => {
+                    const authorization = this.terminationCallbackInvocationStack[
+                        this.terminationCallbackInvocationStack.length - 1
+                    ];
+                    const invocationAuthorized = authorization?.callback === wrapper;
                     if (this.terminated
-                        || (this.terminating && !unloadAuthorizedCallbacks.has(wrapper))) {
+                        || (this.terminating && !invocationAuthorized)) {
                         throw new Error("Plugin sandbox is terminating; callback invocation was rejected.");
                     }
                     return new Promise((resolve, reject) => {
@@ -1196,7 +1187,7 @@ export class SandboxHost {
                                     __type: 'ABORT_SIGNAL_REF',
                                     abortId,
                                     aborted: arg.aborted,
-                                    unloadToken: unloadAuthorizedCallbacks.has(wrapper)
+                                    unloadToken: invocationAuthorized && authorization.grantUnloadCapability
                                         ? this.unloadCapabilityToken ?? undefined
                                         : undefined,
                                 };
@@ -1286,9 +1277,47 @@ export class SandboxHost {
         else reject?.(error);
     }
 
+    private invokeTerminationCallback<T>(
+        callback: (...args: any[]) => T,
+        args: any[],
+        grantUnloadCapability: boolean,
+    ): T {
+        const authorization = { callback, grantUnloadCapability };
+        this.terminationCallbackInvocationStack.push(authorization);
+        try {
+            // Callback wrappers read the top frame synchronously before they
+            // return their promise, so authority belongs only to this exact
+            // invocation and cannot leak to an overlapping use of the same
+            // guest function.
+            return callback(...args);
+        } finally {
+            const popped = this.terminationCallbackInvocationStack.pop();
+            if (popped !== authorization) {
+                throw new Error("Plugin callback authorization stack was corrupted.");
+            }
+        }
+    }
+
+    /** Invoke exactly one registered teardown callback with unload authority. */
+    public async invokeUnloadCallback(
+        callback: (signal: AbortSignal) => void | Promise<void>,
+        signal: AbortSignal,
+    ): Promise<void> {
+        await this.invokeTerminationCallback(callback, [signal], true);
+    }
+
     public beginTermination() {
         if (this.terminating || this.terminated) return;
         this.terminating = true;
+        // Cancel pre-publication work immediately. If an update already
+        // crossed into CAS publication, the coordinator reports an unknown
+        // outcome and its post-unload drain waits for the non-cancelled request.
+        for (const controller of this.activePluginStorageUpdateControllers) {
+            controller.abort(new DOMException(
+                "Plugin storage update was cancelled during teardown.",
+                "AbortError",
+            ));
+        }
         this.settleInitialization(
             new Error("Plugin initialization was cancelled during teardown."),
         );
@@ -1474,7 +1503,9 @@ export class SandboxHost {
                 if (data.reqId) {
                     this.activeRequestControllers.set(data.reqId, requestController);
                 }
-
+                if (data.type === 'CALL_ROOT' && data.method === '_updatePluginStorage') {
+                    this.activePluginStorageUpdateControllers.add(requestController);
+                }
                 try {
                     const args = this.deserializeArgs(data.args || [], usedAbortIds);
                     const hasUnloadCapability = args.some(arg =>
@@ -1485,6 +1516,20 @@ export class SandboxHost {
                         && this.unloadStorageAdmission
                         && hasUnloadCapability
                         && UNLOAD_STORAGE_ROOT_METHODS.has(data.method);
+                    if (unloadStorageCall
+                        && data.method === '_updatePluginStorage'
+                        && typeof args[1] === 'function') {
+                        // The transform may continue as part of this admitted
+                        // request, but its host-created total signal is not an
+                        // unload capability. Only the outer onUnload signal
+                        // may authorize new storage RPCs during termination.
+                        const transform = args[1];
+                        args[1] = (...transformArgs: any[]) => this.invokeTerminationCallback(
+                            transform,
+                            transformArgs,
+                            false,
+                        );
+                    }
                     if (this.terminated || (this.terminating && !unloadStorageCall)) {
                         throw new Error("Plugin sandbox is terminating; RPC invocation was rejected.");
                     }
@@ -1554,6 +1599,7 @@ export class SandboxHost {
                         && this.activeRequestControllers.get(data.reqId) === requestController) {
                         this.activeRequestControllers.delete(data.reqId);
                     }
+                    this.activePluginStorageUpdateControllers.delete(requestController);
                     for (const id of usedAbortIds) this.abortControllers.delete(id);
                 }
 

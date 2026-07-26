@@ -682,6 +682,7 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
                 revisions: [{
                     key: 'aa3-body',
                     revision: `sha256:${'d'.repeat(64)}`,
+                    valueHash,
                 }],
             })
         })
@@ -690,10 +691,17 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
             outcome: 'committed',
             revisions: [{ key: 'aa3-body' }],
         })
-        expect(cache.storeBytes).toHaveBeenCalledOnce()
-        expect((cache.storeBytes.mock.calls as unknown[][])[0][1]).toEqual(
-            rewriteRequest.operations[0].valueBytes,
-        )
+        expect(cache.storeBytes).not.toHaveBeenCalled()
+        expect(cache.applyOwnedResourceCacheMutations).toHaveBeenCalledOnce()
+        expect(cache.applyOwnedResourceCacheMutations).toHaveBeenCalledWith([{
+            type: 'set',
+            resourceKey: 'kv:pluginsave/YWEzLWJvZHk.json',
+            hash: valueHash,
+            ownedBytes: expect.any(Uint8Array),
+        }])
+        expect(
+            cache.applyOwnedResourceCacheMutations.mock.calls[0]![0][0]!.ownedBytes,
+        ).not.toBe(rewriteRequest.operations[0].valueBytes)
         expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
     })
 

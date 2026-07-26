@@ -705,6 +705,72 @@ conflict leaves both durable storage and cache state unchanged. An unknown
 acknowledgement also leaves the cache untouched, because the server result must
 be reconciled before cache publication or a maintenance success is reported.
 
+### Safe storage migrations and updates
+
+Do not implement a migration as `getItem()` followed later by `setItem()`, and
+do not use `Promise.race()` as a watchdog. A losing promise keeps running, so
+it can overwrite a newer value after the timeout was reported.
+
+Use `pluginStorage.updateItem()` for one-row transforms. Its timeout is one
+total deadline covering mutex admission, both reads, the transform, and the
+atomic CAS publish. The callback receives that same `AbortSignal`. PocketRisu
+re-reads the row revision immediately before publish; if another plugin
+instance or session changed it, the method returns a conflict without writing.
+If cancellation happens after the CAS request was dispatched, the method
+rejects with `commitOutcomeUnknown: true`: the server may have committed even
+though its acknowledgement was lost. Re-read the row before deciding whether
+to retry; never blindly replay that transform. PocketRisu stops lending the
+caller's cancellation signal to an admitted CAS and drains its authoritative
+outcome during plugin teardown. The deadline prevents any new CAS submission
+after expiry; it cannot retroactively cancel a request already admitted by the
+server.
+
+```javascript
+const result = await risuai.pluginStorage.updateItem(
+  'settings',
+  async (current, signal) => {
+    signal.throwIfAborted()
+    const oldSettings = current.status === 'value' ? current.value : {}
+    const compressed = await compressSettings(oldSettings, { signal })
+    signal.throwIfAborted()
+    return { schema: 2, compressed }
+  },
+  { timeoutMs: 10_000 },
+)
+
+if (!result.committed) {
+  // A newer value won. Re-read and retry the whole migration if appropriate.
+  console.log('Migration skipped because settings changed concurrently')
+}
+```
+
+The transform must be pure: do not call `setItem()`, `removeItem()`,
+`clear()`, `atomicBatch()`, `updateItem()`, or a database setter from inside
+it. Those writers are deliberately excluded by the migration mutex. Pass the
+unload signal when a small update is required during teardown:
+
+```javascript
+await risuai.onUnload(async (signal) => {
+  await risuai.pluginStorage.updateItem(
+    'session',
+    (current, updateSignal) => {
+      updateSignal.throwIfAborted()
+      return {
+        ...(current.status === 'value' ? current.value : {}),
+        closedCleanly: true,
+      }
+    },
+    { timeoutMs: 750 },
+    signal,
+  )
+})
+```
+
+For multi-row migrations, first prepare immutable generation rows and publish
+them with one `atomicBatch()` whose `expectedRevision` values came from
+`getWithRevision()`. Treat `committed: false` as a stale migration and restart
+from fresh reads; never fall back to unconditional writes.
+
 ### Example: Complete v3.0 Plugin
 
 ```javascript
