@@ -4,43 +4,43 @@ export type BootSnapshotDatabaseRead =
     | { kind: "bytes"; bytes: Uint8Array | null }
     | { kind: "decoded"; database: unknown }
 
+export interface BootInternalSnapshot {
+    key: string
+    size: number
+    timestamp: number
+}
+
 export interface BootSnapshotRecoveryStorage {
-    getItem(key: string): Promise<Uint8Array>
+    listInternalSnapshotsForBoot(): Promise<BootInternalSnapshot[]>
     restoreInternalSnapshotForBoot(key: string): Promise<"committed">
     readDatabaseForBoot(): Promise<BootSnapshotDatabaseRead>
 }
 
 export interface BootSnapshotRecoveryOptions<T> {
-    backups: readonly number[]
     storage: BootSnapshotRecoveryStorage
     decode: (bytes: Uint8Array) => Promise<T>
     onStatus?: (status: string) => void
 }
 
 /**
- * Select the first decodable internal snapshot and publish it through the
- * server's atomic restore boundary. Known pre-commit failures may try an older
- * candidate. A lost acknowledgement, or any failure after a confirmed commit,
- * must stop immediately so a possibly committed recovery point is never
- * overwritten by blind fallback.
+ * Ask the authoritative server to select and validate an internal snapshot.
+ * Discovery is metadata-only: folded candidate bodies never cross the browser
+ * boundary or get decoded into browser memory. Known pre-commit failures may
+ * try an older candidate. A lost acknowledgement, or any failure after a
+ * confirmed commit, must stop immediately so a possibly committed recovery
+ * point is never overwritten by blind fallback.
  */
 export async function recoverDatabaseFromInternalSnapshots<T>({
-    backups,
     storage,
     decode,
     onStatus = () => undefined,
 }: BootSnapshotRecoveryOptions<T>): Promise<T | null> {
-    for (const backup of backups) {
+    const snapshots = await storage.listInternalSnapshotsForBoot()
+    for (const snapshot of snapshots) {
         let candidateCommitted = false
         try {
-            const backupKey = `database/dbbackup-${backup}.bin`
-            onStatus(`Reading Backup File ${backup}...`)
-            const backupData = await storage.getItem(backupKey)
-            // Validate the candidate before it can replace live state. The
-            // server repeats strict plugin/chat checks inside the transaction.
-            await decode(backupData)
-            onStatus(`Restoring Backup File ${backup}...`)
-            await storage.restoreInternalSnapshotForBoot(backupKey)
+            onStatus(`Restoring Backup File ${snapshot.timestamp}...`)
+            await storage.restoreInternalSnapshotForBoot(snapshot.key)
             candidateCommitted = true
 
             // Install only the committed stripped publication read back from

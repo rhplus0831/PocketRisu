@@ -296,6 +296,16 @@ of beginning with `kvGet()` / `Buffer.concat()`. Disconnect cancellation rolls
 back streaming ingest, and cancellation, failure, success, and startup cleanup
 remove incomplete restore/export spools.
 
+Corrupt-database bootstrap uses the same bounded path. It obtains only a strict,
+newest-first metadata list from the import-safe `/api/db/snapshots` read, then
+submits each canonical key directly to the authoritative restore transaction.
+It never enumerates the generic KV namespace, trims recovery points, downloads a
+candidate through `/api/read`, or decodes a folded candidate in browser memory.
+Only after a definitive commit does it read and decode the small stripped live
+database once. List, restore, and delete share canonical no-leading-zero and
+safe-timestamp key validation, while the client also rejects any extended or
+non-200 restore acknowledgement as commit-unknown.
+
 Coverage uses deterministic bounds rather than raw-heap timing: a 10,000-key
 viewer asserts a 50-value page and one in-flight read; partial folding exercises
 1,000 rows plus a 4 MiB body with one parsed row in flight and archive/import
@@ -303,8 +313,12 @@ round trips; chunk restore asserts one chunk in flight, a 64 KiB maximum chunk,
 hundreds of chunks, exact bytes, folded-snapshot recovery, and cancellation/error
 cleanup. A combined real-server test pauses after the exact prior ownership set
 is tentatively deleted, disconnects the client, and verifies transaction
-rollback, spool cleanup, and old-state durability after restart. The full
-client, server, compatibility, check, and production-build validation sets pass.
+rollback, spool cleanup, and old-state durability after restart. A real
+NodeStorage recovery test supplies two 64 MiB chunked candidates (newer invalid,
+older valid), rejects any candidate `/api/read`, observes server-side fallback,
+hashes the exact recovered chat after restart, and requires empty restore spools.
+The full client, server, compatibility, check, and production-build validation
+sets pass.
 
 <a id="pm4"></a>
 ## PM4 — Write amplification and cache overhead

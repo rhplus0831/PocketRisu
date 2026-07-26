@@ -205,11 +205,22 @@ the boot-fallback/full-write path drops its semantics.
 **Fixed 2026-07-27.** Bootstrap no longer installs an internal snapshot in
 browser memory and later persists it through the generic full-write path. A
 decode-free authenticated boot read returns the authoritative monolith behind
-the import barrier. If the client cannot decode it, each internal candidate is
-validated and then submitted to the same server-side snapshot restore/ingest
-boundary used by an explicit Settings restore. The browser installs only the
-committed stripped database read back from the server, never the folded
-ingest-only snapshot object.
+the import barrier. If the client cannot decode it, an import-safe queued
+`/api/db/snapshots` read returns only strict newest-first key/size/timestamp
+metadata. Bootstrap submits those keys directly to the same server-side
+snapshot restore/ingest boundary used by an explicit Settings restore; it does
+not call the generic key list, trim snapshots, fetch a candidate through
+`/api/read`, or decode a folded candidate in browser memory. The server is the
+candidate validation boundary. The browser installs only one committed stripped
+database read back from the server, never the folded ingest-only snapshot object.
+
+Snapshot list, restore, and delete share one canonical key parser: only
+`database/dbbackup-<canonical-digits>.bin` with no leading zeros and safe parsed
+and millisecond timestamps is visible or actionable. The client repeats that
+validation, requires an exact list schema and newest-first order, and accepts a
+restore acknowledgement only for HTTP 200 with exactly the three expected
+fields and values. Extra fields, another 2xx status, truncation, or response loss
+remain `COMMIT_OUTCOME_UNKNOWN`.
 
 Corrupt boot is nonmutating until a recovery point is selected. Before the
 list epoch or any asset, inlay, chat, or REMOTE migration can publish a marker,
@@ -253,7 +264,11 @@ generation and manifest mismatches, missing and duplicate manifest ownership,
 legacy and streaming ingest, raw and structural corrupt boots, fresh install,
 active imports, PM2 private-stage preservation/source invalidation, PM1 quota
 rollback, pre-commit rollback, response loss after COMMIT, restart durability,
-and no-older-candidate replay.
+and no-older-candidate replay. A real NodeStorage/corrupt-server case uses a
+newer invalid and older valid 64 MiB chunked snapshot pair, records and rejects
+any candidate `/api/read`, then proves exact chat bytes, restart durability, and
+restore-spool cleanup. Import-barrier races prove metadata listing cannot expose
+a tentative replacement.
 
 <a id="br4"></a>
 ## BR4 — Valid long keys produce Node backups the same server refuses to import

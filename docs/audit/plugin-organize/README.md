@@ -125,7 +125,10 @@ production save loop and staged transition path with a 56 MiB Unicode store,
 forced-GC checkpoints, PM1 chunks, and the resource cache both off and on.
 PM3 covers one-page viewer loading, generation-owned partial folding, chunked
 file-cursor restore, and a real disconnect after tentative exact-set deletion
-with rollback, spool cleanup, and restart durability.
+with rollback, spool cleanup, and restart durability. Corrupt boot also uses an
+import-safe metadata-only snapshot list and direct server restore: a 64 MiB
+newer-invalid/older-valid pair proves that candidate bodies never cross the
+browser `/api/read` boundary and that the exact older chat survives restart.
 PM4 additionally covers compact manifest CAS, exact server value hashes,
 50-row snapshot reuse, canonical manifest-key validation and cancellation,
 donated 128-row and four-by-2-MiB batches, one IndexedDB mutation transaction,

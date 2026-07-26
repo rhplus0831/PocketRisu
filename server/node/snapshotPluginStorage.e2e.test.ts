@@ -2133,13 +2133,20 @@ describe('plugin publication recovery snapshot scheduling', () => {
         })
 
         // The scheduler becomes eligible while the importer holds its raw
-        // transaction, but must neither snapshot inside it nor retry-spin.
+        // transaction, but must neither snapshot inside it nor retry-spin. A
+        // snapshot metadata read now waits at the same import-safe boundary;
+        // it must not inspect the importer's tentative SQLite state.
         await delay(500)
-        expect(await listSnapshotKeys(server, auth)).toHaveLength(1)
+        let listSettled = false
+        const listDone = listSnapshotKeys(server, auth)
+            .finally(() => { listSettled = true })
+        await delay(150)
+        expect(listSettled).toBe(false)
         releaseUpload()
         const importResponse = await importDone
         await importResponse.text()
         expect(importResponse.ok).toBe(false)
+        expect((await listDone).length).toBeGreaterThanOrEqual(1)
 
         await waitFor(async () => {
             const snapshots = await readSnapshotDatabases(server, auth)
@@ -2969,6 +2976,75 @@ describe('corrupt database boot snapshot recovery', () => {
         raw.close()
     }
 
+    it('lists only exact snapshot metadata and rejects prefix siblings for restore/delete', async () => {
+        const cwd = makeWorkDir()
+        const exactKeys = [
+            'database/dbbackup-100.bin',
+            'database/dbbackup-300.bin',
+            'database/dbbackup-200.bin',
+        ]
+        const prefixSiblings = [
+            'database/dbbackup-400.bin/extra',
+            'database/dbbackup-abc.bin',
+            'database/dbbackup-500.bin.suffix',
+            'database/dbbackup-0600.bin',
+            'database/dbbackup-90071992547410.bin',
+        ]
+        const raw = openFixtureDatabase(cwd)
+        const insert = raw.prepare(
+            'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+        )
+        raw.transaction(() => {
+            const now = Date.now()
+            insert.run('database/database.bin', Buffer.from('corrupt-live'), now)
+            for (const key of [...exactKeys, ...prefixSiblings]) {
+                insert.run(key, Buffer.from(encodeRisuSaveLegacy({ characters: [] })), now)
+            }
+        })()
+        raw.close()
+
+        const server = await startServer(cwd)
+        const auth = await authenticate(server)
+        const listed = await fetch(`${server.origin}/api/db/snapshots`, { headers: auth })
+        expect(listed.status).toBe(200)
+        await expect(listed.json()).resolves.toEqual({
+            snapshots: [
+                { key: exactKeys[1], size: expect.any(Number), timestamp: 30_000 },
+                { key: exactKeys[2], size: expect.any(Number), timestamp: 20_000 },
+                { key: exactKeys[0], size: expect.any(Number), timestamp: 10_000 },
+            ],
+        })
+
+        for (const invalidKey of prefixSiblings) {
+            const invalidRestore = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+                method: 'POST',
+                headers: { ...auth, 'content-type': 'application/json' },
+                body: JSON.stringify({ key: invalidKey }),
+            })
+            expect(invalidRestore.status).toBe(400)
+            const invalidDelete = await fetch(
+                `${server.origin}/api/db/snapshots?key=${encodeURIComponent(invalidKey)}`,
+                { method: 'DELETE', headers: auth },
+            )
+            expect(invalidDelete.status).toBe(400)
+        }
+        const exactDelete = await fetch(
+            `${server.origin}/api/db/snapshots?key=${encodeURIComponent(exactKeys[2])}`,
+            { method: 'DELETE', headers: auth },
+        )
+        expect(exactDelete.status).toBe(200)
+
+        await stopServer(server)
+        const verified = openFixtureDatabase(cwd)
+        for (const invalidKey of prefixSiblings) {
+            expect(verified.prepare('SELECT 1 FROM kv WHERE key = ?').get(invalidKey))
+                .toBeDefined()
+        }
+        expect(verified.prepare('SELECT 1 FROM kv WHERE key = ?').get(exactKeys[2]))
+            .toBeUndefined()
+        verified.close()
+    }, 30_000)
+
     it('accepts the fresh-install empty database envelope and boots it after restart', async () => {
         const cwd = makeWorkDir()
         let server = await startServer(cwd)
@@ -3616,9 +3692,14 @@ describe('corrupt database boot snapshot recovery', () => {
         const rawReadDone = fetch(`${server.origin}/api/db/read-raw-for-boot`, {
             headers: auth,
         }).finally(() => { rawReadSettled = true })
+        let snapshotListSettled = false
+        const snapshotListDone = fetch(`${server.origin}/api/db/snapshots`, {
+            headers: auth,
+        }).finally(() => { snapshotListSettled = true })
         await delay(150)
         expect(restoreSettled).toBe(false)
         expect(rawReadSettled).toBe(false)
+        expect(snapshotListSettled).toBe(false)
 
         releaseUpload()
         const importResponse = await importDone
@@ -3628,6 +3709,12 @@ describe('corrupt database boot snapshot recovery', () => {
         expect(restoreResponse.status).toBe(200)
         const rawReadResponse = await rawReadDone
         expect(rawReadResponse.status).toBe(200)
+        const snapshotListResponse = await snapshotListDone
+        expect(snapshotListResponse.status).toBe(200)
+        const snapshotList = await snapshotListResponse.json() as {
+            snapshots: Array<{ key: string }>
+        }
+        expect(snapshotList.snapshots.map(snapshot => snapshot.key)).toContain(snapshotKey)
 
         const restoredDb = await decodeRisuSave(
             await readKey(server, auth, 'database/database.bin'),

@@ -9729,7 +9729,27 @@ app.post('/api/migrate/save-folder/cleanup/execute', async (req, res, next) => {
 
 const DB_BLOB_KEY = 'database/database.bin';
 const DB_BACKUP_PREFIX = 'database/dbbackup-';
+const INTERNAL_SNAPSHOT_KEY_PATTERN = /^database\/dbbackup-(0|[1-9]\d*)\.bin$/;
 const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/'];
+
+function parseInternalSnapshotKey(key) {
+    if (typeof key !== 'string') return null;
+    const match = INTERNAL_SNAPSHOT_KEY_PATTERN.exec(key);
+    if (!match) return null;
+    const snapshotTimestamp = Number(match[1]);
+    const timestamp = snapshotTimestamp * 100;
+    if (!Number.isSafeInteger(snapshotTimestamp) || snapshotTimestamp < 0
+        || !Number.isSafeInteger(timestamp) || timestamp < 0) return null;
+    return { key, timestamp };
+}
+
+function internalSnapshotMetadata(key) {
+    const parsed = parseInternalSnapshotKey(key);
+    if (!parsed) return null;
+    const size = kvSize(key);
+    if (!Number.isSafeInteger(size) || size < 0) return null;
+    return { ...parsed, size };
+}
 
 function statsBasename(s) {
     if (!s) return '';
@@ -10338,17 +10358,10 @@ app.put('/api/db/snapshots/limits', async (req, res, next) => {
 app.get('/api/db/snapshots', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
-        const out = kvList(DB_BACKUP_PREFIX).map((key) => {
-            const tsRaw = parseInt(key.slice(DB_BACKUP_PREFIX.length, -4), 10);
-            const ts = Number.isFinite(tsRaw) ? tsRaw * 100 : null;
-            // Logical size — the full data this snapshot represents (the whole DB),
-            // not its marginal on-disk cost. Users expect "this backup = my 53 MB
-            // DB"; the dedup win is shown once, as the section's savings figure.
-            // (kvSize reassembles via the manifest; the marker's 13 bytes are not
-            // what a user wants to see for a full backup.) Trimming still sizes by
-            // snapshotFootprint in db.cjs, so this display change can't over-trim.
-            return { key, size: kvSize(key) || 0, timestamp: ts };
-        }).sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+        const out = await queueStorageReadAfterImports(() => kvList(DB_BACKUP_PREFIX)
+            .map(internalSnapshotMetadata)
+            .filter(Boolean)
+            .sort((a, b) => b.timestamp - a.timestamp || b.key.localeCompare(a.key)));
         res.json({ snapshots: out });
     } catch (err) { next(err); }
 });
@@ -10358,8 +10371,9 @@ app.delete('/api/db/snapshots', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     try {
         const key = typeof req.query?.key === 'string' ? req.query.key : '';
-        // Restrict to snapshot prefix — never let this endpoint touch other kv keys.
-        if (!key.startsWith(DB_BACKUP_PREFIX)) {
+        // Require the complete canonical name — a prefix sibling must never be
+        // deletable through this endpoint.
+        if (!parseInternalSnapshotKey(key)) {
             return res.status(400).json({ error: 'Invalid snapshot key' });
         }
         await queueStorageMutation(() => kvDel(key));
@@ -10383,7 +10397,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
     res.once('close', () => { closed = true; });
     try {
         const key = typeof req.body?.key === 'string' ? req.body.key : '';
-        if (!key.startsWith(DB_BACKUP_PREFIX)) {
+        if (!parseInternalSnapshotKey(key)) {
             return res.status(400).json({ error: 'Invalid snapshot key' });
         }
         // Acquire before entering the storage queue: acquire() drains that same

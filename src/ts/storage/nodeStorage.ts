@@ -55,6 +55,7 @@ import {
     pluginStorageBatchTransportOutcomeUnknown,
 } from "./pluginStorageBatch"
 import { PLUGIN_VALUE_STREAM_THRESHOLD_BYTES } from "./pluginStorageLimits"
+import type { BootInternalSnapshot } from "./bootSnapshotRecovery"
 
 export const AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS = 15_000
 type BoundedStorageOperation = 'read' | 'list' | 'write' | 'remove' | 'transition' | 'batch'
@@ -386,12 +387,27 @@ interface StorageFailurePayload {
 }
 
 const PLUGIN_STORAGE_PREFIXES = ['pluginsave/', 'pluginsave-meta/'] as const
+const INTERNAL_SNAPSHOT_KEY_PATTERN = /^database\/dbbackup-(0|[1-9]\d*)\.bin$/
 const PLUGIN_STORAGE_MAX_RETRIES = 2
 const PLUGIN_STORAGE_DEFAULT_RETRY_SECONDS = 0.25
 const PLUGIN_STORAGE_MAX_RETRY_DELAY_SECONDS = 5
 
 function isPluginStorageTarget(target: string): boolean {
     return PLUGIN_STORAGE_PREFIXES.some(prefix => target.startsWith(prefix))
+}
+
+function parseInternalSnapshotKey(value: unknown): number | null {
+    if (typeof value !== 'string') return null
+    const match = INTERNAL_SNAPSHOT_KEY_PATTERN.exec(value)
+    if (!match) return null
+    const snapshotTimestamp = Number(match[1])
+    const timestamp = snapshotTimestamp * 100
+    return Number.isSafeInteger(snapshotTimestamp)
+        && snapshotTimestamp >= 0
+        && Number.isSafeInteger(timestamp)
+        && timestamp >= 0
+        ? timestamp
+        : null
 }
 
 function isCanonicalPluginStorageKey(value: unknown, prefix: string): value is string {
@@ -2197,6 +2213,79 @@ export class NodeStorage{
     }
 
     /**
+     * List exact internal recovery keys without enumerating the generic KV
+     * namespace. The response is deliberately metadata-only: bootstrap must
+     * submit candidates to the server validation boundary instead of reading
+     * and decoding folded snapshot bodies in browser memory.
+     */
+    async listInternalSnapshotsForBoot(
+        externalSignal?: AbortSignal | null,
+    ): Promise<BootInternalSnapshot[]> {
+        return runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const response = await this.requestStorage(
+                'database/dbbackup-',
+                'list',
+                false,
+                () => this.authFetch('/api/db/snapshots', {
+                    method: 'GET',
+                    signal,
+                }),
+                [],
+                signal,
+            )
+            const body = await awaitWithAbort(response.json(), signal) as unknown
+            if (!body || typeof body !== 'object' || Array.isArray(body)) {
+                throw new StorageError('Internal snapshot list response was malformed.', {
+                    code: 'STORAGE_RESPONSE_ERROR', operation: 'list', retryable: true,
+                })
+            }
+            const record = body as Record<string, unknown>
+            if (Object.keys(record).length !== 1 || !Array.isArray(record.snapshots)) {
+                throw new StorageError('Internal snapshot list response was malformed.', {
+                    code: 'STORAGE_RESPONSE_ERROR', operation: 'list', retryable: true,
+                })
+            }
+            const snapshots: BootInternalSnapshot[] = []
+            let previousTimestamp = Number.POSITIVE_INFINITY
+            const seen = new Set<string>()
+            for (const value of record.snapshots) {
+                if (!value || typeof value !== 'object' || Array.isArray(value)) {
+                    throw new StorageError('Internal snapshot list response was malformed.', {
+                        code: 'STORAGE_RESPONSE_ERROR', operation: 'list', retryable: true,
+                    })
+                }
+                const snapshot = value as Record<string, unknown>
+                const keyTimestamp = parseInternalSnapshotKey(snapshot.key)
+                if (Object.keys(snapshot).sort().join(',') !== 'key,size,timestamp'
+                    || keyTimestamp === null
+                    || !Number.isSafeInteger(snapshot.size)
+                    || (snapshot.size as number) < 0
+                    || !Number.isSafeInteger(snapshot.timestamp)
+                    || (snapshot.timestamp as number) < 0
+                    || (snapshot.timestamp as number) > previousTimestamp
+                    || seen.has(snapshot.key as string)) {
+                    throw new StorageError('Internal snapshot list response was malformed.', {
+                        code: 'STORAGE_RESPONSE_ERROR', operation: 'list', retryable: true,
+                    })
+                }
+                if (keyTimestamp !== snapshot.timestamp) {
+                    throw new StorageError('Internal snapshot list response was malformed.', {
+                        code: 'STORAGE_RESPONSE_ERROR', operation: 'list', retryable: true,
+                    })
+                }
+                seen.add(snapshot.key as string)
+                previousTimestamp = snapshot.timestamp as number
+                snapshots.push({
+                    key: snapshot.key as string,
+                    size: snapshot.size as number,
+                    timestamp: snapshot.timestamp as number,
+                })
+            }
+            return snapshots
+        }, 'list', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+    }
+
+    /**
      * Publish one internal snapshot through the same exclusive transaction as
      * the Settings restore flow. This is a mutation even though bootstrap uses
      * it while reading: an interrupted response must remain commit-unknown so
@@ -2207,7 +2296,7 @@ export class NodeStorage{
         key: string,
         externalSignal?: AbortSignal | null,
     ): Promise<'committed'> {
-        if (!/^database\/dbbackup-\d+\.bin$/.test(key)) {
+        if (parseInternalSnapshotKey(key) === null) {
             throw new TypeError('Invalid internal snapshot key')
         }
         return runBoundedAuthoritativeStorageOperation<'committed'>(async (signal, outcome) => {
@@ -2240,7 +2329,10 @@ export class NodeStorage{
                 // Invalid success acknowledgements remain commit-unknown.
             }
             if (
-                payload.ok !== true
+                response.status !== 200
+                || Object.keys(payload).sort().join(',')
+                    !== 'commitOutcome,commitOutcomeUnknown,ok'
+                || payload.ok !== true
                 || payload.commitOutcome !== 'committed'
                 || payload.commitOutcomeUnknown !== false
             ) {

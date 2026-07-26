@@ -23,7 +23,6 @@ import {
     forageStorage,
     saveDb,
     setPatchSyncBaseline,
-    getDbBackups,
     getUncleanables,
     getBasename,
     checkCharOrder
@@ -160,9 +159,7 @@ export async function loadData() {
                     setDatabase(decoded)
                 } catch (error) {
                     console.error(error)
-                    const backups = await getDbBackups()
                     const restoredDecoded = await recoverDatabaseFromInternalSnapshots({
-                        backups,
                         storage: forageStorage,
                         decode: decodeRisuSave,
                         onStatus: (status) => { LoadingStatusState.text = status },

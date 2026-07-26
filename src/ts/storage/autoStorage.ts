@@ -50,6 +50,12 @@ export class AutoStorage{
         await this.Init()
         return await this.realStorage.readDatabaseForBoot()
     }
+    async listInternalSnapshotsForBoot(signal?: AbortSignal | null) {
+        await this.Init()
+        return signal
+            ? await this.realStorage.listInternalSnapshotsForBoot(signal)
+            : await this.realStorage.listInternalSnapshotsForBoot()
+    }
     async restoreInternalSnapshotForBoot(
         key: string,
         signal?: AbortSignal | null,
