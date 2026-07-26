@@ -21,7 +21,17 @@ const {
     parseLegacyPluginStorageEnvelope,
     pluginStorageLegacyEscapeField,
 } = require('./utils.cjs');
-const { PLUGIN_STORAGE_FOLDED_MARKER } = require('./pluginSaveKeys.cjs');
+const {
+    PLUGIN_SAVE_PREFIX,
+    PLUGIN_SAVE_META_PREFIX,
+    PLUGIN_STORAGE_FOLDED_MARKER,
+} = require('./pluginSaveKeys.cjs');
+const {
+    PluginStorageValidationError,
+    encodeValidatedPluginStorageKey,
+    snapshotPluginStorageJson,
+    snapshotPluginStorageRecord,
+} = require('./pluginStorageJson.cjs');
 
 const DEFAULT_STREAM_INGEST_MIN_BYTES = 32 * 1024 * 1024;
 const CURSOR_CACHE_BYTES = 256 * 1024;
@@ -382,6 +392,56 @@ function defineOwn(target, key, value) {
     });
 }
 
+function pluginStoragePrefixForField(field) {
+    return field === 'pluginStorageMeta'
+        ? PLUGIN_SAVE_META_PREFIX
+        : PLUGIN_SAVE_PREFIX;
+}
+
+function snapshotStreamingPluginStorageValue(field, key, value) {
+    const prefix = pluginStoragePrefixForField(field);
+    const storageKey = encodeValidatedPluginStorageKey(key, prefix);
+    try {
+        return snapshotPluginStorageJson(value);
+    } catch {
+        throw new PluginStorageValidationError(storageKey);
+    }
+}
+
+async function inspectStreamingPluginStorageRecord(source, entry, field) {
+    if (!entry) {
+        return { present: false, count: 0, decodedRecord: null };
+    }
+    if (await descriptorCollectionKind(source, entry.descriptor) === 'map') {
+        const cursor = source.cursor(entry.descriptor.offset);
+        return {
+            present: true,
+            count: await readCollectionCount(cursor, 'map'),
+            decodedRecord: null,
+        };
+    }
+
+    const decoded = await decodeDescriptor(source, entry.descriptor);
+    if (field === 'pluginCustomStorage' && (decoded === null || decoded === undefined)) {
+        return { present: true, count: 0, decodedRecord: Object.create(null) };
+    }
+    const prefix = pluginStoragePrefixForField(field);
+    const record = snapshotPluginStorageRecord(decoded, field, prefix);
+    return {
+        present: true,
+        count: Object.keys(record).length,
+        decodedRecord: record,
+    };
+}
+
+async function emitStreamingPluginStorageEntry(onEntry, field, key, value) {
+    await onEntry({
+        field,
+        key,
+        value: snapshotStreamingPluginStorageValue(field, key, value),
+    });
+}
+
 async function processPluginMap(source, descriptor, field, onEntry, protoEscape = null) {
     const entries = await readMapDescriptors(source, descriptor);
     let count = 0;
@@ -391,18 +451,18 @@ async function processPluginMap(source, descriptor, field, onEntry, protoEscape 
         : Math.min(protoEscape.index, entries.length);
     for (let index = 0; index < entries.length + (protoEscape === null ? 0 : 1); index++) {
         if (index === insertAt) {
-            await onEntry({
+            await emitStreamingPluginStorageEntry(
+                onEntry,
                 field,
-                key: '__proto__',
-                value: normalizeJSON(protoEscape.value, true),
-            });
+                '__proto__',
+                protoEscape.value
+            );
             count++;
             continue;
         }
         const entry = entries[entryIndex++];
-        const normalized = normalizeJSON(await decodeDescriptor(source, entry.descriptor), true);
-        if (normalized === undefined) continue;
-        await onEntry({ field, key: entry.key, value: normalized });
+        const value = await decodeDescriptor(source, entry.descriptor);
+        await emitStreamingPluginStorageEntry(onEntry, field, entry.key, value);
         count++;
     }
     return count;
@@ -662,6 +722,9 @@ async function walkRisuSave(input, options = {}) {
             pluginStorageEscapeEnvelope?.escapes.map(escape => [escape.field, escape]) ?? []
         );
         let externalizePlugins = false;
+        let strictPluginStorageActive = false;
+        let valueRecordInspection = { present: false, count: 0, decodedRecord: null };
+        let metaRecordInspection = { present: false, count: 0, decodedRecord: null };
         if (options.externalizePluginStorage) {
             const optimizeEntry = byKey.get('optimizePluginMemory');
             const optimize = optimizeEntry
@@ -669,30 +732,29 @@ async function walkRisuSave(input, options = {}) {
                 : undefined;
             const valueEntry = byKey.get('pluginCustomStorage');
             const metaEntry = byKey.get('pluginStorageMeta');
-            let hasValues = false;
-            if (valueEntry) {
-                if (await descriptorCollectionKind(source, valueEntry.descriptor) === 'map') {
-                    const cursor = source.cursor(valueEntry.descriptor.offset);
-                    hasValues = (await readCollectionCount(cursor, 'map')) > 0;
-                } else {
-                    const value = normalizeJSON(
-                        await decodeDescriptor(source, valueEntry.descriptor),
-                        true
-                    );
-                    hasValues = value !== null && typeof value === 'object'
-                        && Object.keys(value).length > 0;
-                }
+            strictPluginStorageActive = pluginStorageFolded || optimize === true;
+            if (strictPluginStorageActive) {
+                // Match snapshotOptimizedPluginStorageFields exactly before
+                // deciding whether an optimized record is empty. In
+                // particular, null/missing values canonicalize to {}, while
+                // arrays/primitives and any present invalid metadata reject.
+                valueRecordInspection = await inspectStreamingPluginStorageRecord(
+                    source,
+                    valueEntry,
+                    'pluginCustomStorage'
+                );
+                metaRecordInspection = await inspectStreamingPluginStorageRecord(
+                    source,
+                    metaEntry,
+                    'pluginStorageMeta'
+                );
             }
-            hasValues ||= escapedPluginFields.has('pluginCustomStorage');
-            let hasMetaField = false;
-            if (metaEntry) {
-                const kind = await descriptorCollectionKind(source, metaEntry.descriptor);
-                hasMetaField = kind === 'map'
-                    || normalizeJSON(await decodeDescriptor(source, metaEntry.descriptor), true) !== undefined;
-            }
-            hasMetaField ||= escapedPluginFields.has('pluginStorageMeta');
+            const hasValues = valueRecordInspection.count > 0
+                || escapedPluginFields.has('pluginCustomStorage');
+            const hasMetaField = metaRecordInspection.present
+                || escapedPluginFields.has('pluginStorageMeta');
             externalizePlugins = pluginStorageFolded
-                || (optimize === true && (hasValues || hasMetaField));
+                || (strictPluginStorageActive && (hasValues || hasMetaField));
             if (pluginStorageFolded) {
                 if (typeof options.onPluginStorageFolded !== 'function') {
                     throw new TypeError(
@@ -734,9 +796,15 @@ async function walkRisuSave(input, options = {}) {
                         processedExternalEscapes.add(entry.key);
                     }
                 } else {
-                    const value = normalizeJSON(await decodeDescriptor(source, entry.descriptor), true);
-                    for (const [key, rowValue] of Object.entries(value ?? {})) {
-                        await options.onPluginStorageEntry({ field: entry.key, key, value: rowValue });
+                    for (const [key, rowValue] of Object.entries(
+                        valueRecordInspection.decodedRecord ?? {}
+                    )) {
+                        await emitStreamingPluginStorageEntry(
+                            options.onPluginStorageEntry,
+                            entry.key,
+                            key,
+                            rowValue
+                        );
                         pluginStats.values++;
                     }
                 }
@@ -754,12 +822,22 @@ async function walkRisuSave(input, options = {}) {
                         processedExternalEscapes.add(entry.key);
                     }
                 } else {
-                    const value = normalizeJSON(await decodeDescriptor(source, entry.descriptor), true);
-                    for (const [key, rowValue] of Object.entries(value ?? {})) {
-                        await options.onPluginStorageEntry({ field: entry.key, key, value: rowValue });
+                    for (const [key, rowValue] of Object.entries(
+                        metaRecordInspection.decodedRecord ?? {}
+                    )) {
+                        await emitStreamingPluginStorageEntry(
+                            options.onPluginStorageEntry,
+                            entry.key,
+                            key,
+                            rowValue
+                        );
                         pluginStats.meta++;
                     }
                 }
+            } else if (strictPluginStorageActive && entry.key === 'pluginCustomStorage') {
+                // An optimized empty/null value record is still canonicalized
+                // to the same empty object as the non-stream path.
+                remainder.pluginCustomStorage = {};
             } else {
                 const decoded = await decodeDescriptor(source, entry.descriptor);
                 if (entry.key === 'botPresets') {
@@ -776,14 +854,15 @@ async function walkRisuSave(input, options = {}) {
         }
         if (pluginStorageEscapeEnvelope !== null) {
             for (const escape of pluginStorageEscapeEnvelope.escapes) {
-                const value = normalizeJSON(escape.value, true);
+                const value = escape.value;
                 if (externalizePlugins) {
                     if (processedExternalEscapes.has(escape.field)) continue;
-                    await options.onPluginStorageEntry({
-                        field: escape.field,
-                        key: '__proto__',
-                        value,
-                    });
+                    await emitStreamingPluginStorageEntry(
+                        options.onPluginStorageEntry,
+                        escape.field,
+                        '__proto__',
+                        value
+                    );
                     if (escape.field === 'pluginCustomStorage') pluginStats.values++;
                     else pluginStats.meta++;
                 } else {
@@ -811,7 +890,7 @@ async function walkRisuSave(input, options = {}) {
                 );
             }
         }
-        if (externalizePlugins
+        if (strictPluginStorageActive
             && !Object.prototype.hasOwnProperty.call(remainder, 'pluginCustomStorage')) {
             remainder.pluginCustomStorage = {};
         }

@@ -133,7 +133,25 @@ vi.mock("../storage/persistentKv", () => {
                 verification: "verified" as const,
             };
         }),
+        restorePersistentPluginStoragePair: vi.fn(async (
+            valueKey: string,
+            value: unknown,
+            ownerRecord: unknown | undefined,
+        ) => {
+            const encodedKey = valueKey.slice("pluginsave/".length, -".json".length);
+            const metaKey = `pluginsave-meta/${encodedKey}.json`;
+            persistent.set(valueKey, value);
+            if (ownerRecord !== undefined) persistent.set(metaKey, ownerRecord);
+            return {
+                outcome: "committed" as const,
+                operation: "set" as const,
+                verification: "verified" as const,
+            };
+        }),
         readPersistentJson: vi.fn(async (key: string) => persistent.get(key) ?? null),
+        readPersistentJsonRow: vi.fn(async (key: string) => persistent.has(key)
+            ? { kind: "value", value: persistent.get(key) }
+            : { kind: "missing" }),
         removePersistentKey: vi.fn(async (key: string) => {
             persistent.delete(key);
         }),
@@ -159,6 +177,7 @@ const {
     PLUGIN_SAVE_PREFIX,
     readExternalizedPluginStorage,
     reconcilePluginStorageMode,
+    reconcilePluginStorageModeForBoot,
     removePluginSaveStorageItem,
     setOwnedPluginSaveStorageItem,
     setPluginSaveStorageItem,
@@ -272,6 +291,7 @@ beforeEach(async () => {
         makeEncodedStorageKey,
         mutatePersistentPluginStorage,
         readPersistentJson,
+        restorePersistentPluginStoragePair,
         removePersistentKey,
         writePersistentJson,
     } = vi.mocked(await import("../storage/persistentKv"));
@@ -303,6 +323,17 @@ beforeEach(async () => {
             persistent.delete(metaKey);
         }
         return { outcome: "committed", operation, verification: "verified" };
+    });
+    restorePersistentPluginStoragePair.mockImplementation(async (
+        valueKey: string,
+        value: unknown,
+        ownerRecord: unknown | undefined,
+    ) => {
+        const encodedKey = valueKey.slice(PLUGIN_SAVE_PREFIX.length, -".json".length);
+        const metaKey = `${PLUGIN_SAVE_META_PREFIX}${encodedKey}.json`;
+        persistent.set(valueKey, value);
+        if (ownerRecord !== undefined) persistent.set(metaKey, ownerRecord);
+        return { outcome: "committed", operation: "set", verification: "verified" };
     });
     readPersistentJson.mockImplementation(async (key: string) => persistent.get(key) ?? null);
     removePersistentKey.mockImplementation(async (key: string) => {
@@ -1354,6 +1385,480 @@ describe("reconcilePluginStorageMode", () => {
         });
         expect(dependencies.persistDatabase).toHaveBeenCalledTimes(1);
     });
+});
+
+describe("boot plugin storage reconciliation recovery", () => {
+    test("copies an inline value and owner through one acknowledged atomic mutation", async () => {
+        database = {
+            optimizePluginMemory: true,
+            pluginCustomStorage: { paired: { generation: 2 } },
+            pluginStorageMeta: { paired: { plugin: "Owner", updatedAt: 7 } },
+        };
+        const restorePersistentPluginStoragePair = vi.fn(async () => {
+            throw new Error("unknown acknowledgement");
+        });
+        const writePersistentJson = vi.fn();
+        const persistDatabase = vi.fn();
+
+        const result = await reconcilePluginStorageModeForBoot({
+            dependencies: {
+                restorePersistentPluginStoragePair,
+                writePersistentJson,
+                persistDatabase,
+            },
+        });
+
+        expect(restorePersistentPluginStoragePair).toHaveBeenCalledWith(
+            encoded(PLUGIN_SAVE_PREFIX, "paired"),
+            { generation: 2 },
+            { plugin: "Owner", updatedAt: 7 },
+            expect.any(AbortSignal),
+        );
+        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(database.pluginCustomStorage.paired).toEqual({ generation: 2 });
+        expect(database.pluginStorageMeta?.paired).toEqual({ plugin: "Owner", updatedAt: 7 });
+        expect(persistDatabase).not.toHaveBeenCalled();
+        expect(result.issues).toEqual([{
+            code: "write-failed",
+            encodedKey: encoded(PLUGIN_SAVE_PREFIX, "paired"),
+        }]);
+    });
+
+    test("aborts the whole recovery pass and releases its exclusive barrier", async () => {
+        const controller = new AbortController();
+        const listPersistentKeys = vi.fn((_prefix: string, signal?: AbortSignal | null) =>
+            new Promise<string[]>((_resolve, reject) => {
+                signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+            })
+        );
+        const recovery = reconcilePluginStorageModeForBoot({
+            signal: controller.signal,
+            timeoutMs: 60_000,
+            dependencies: { listPersistentKeys },
+        });
+        await vi.waitFor(() => expect(listPersistentKeys).toHaveBeenCalled());
+
+        controller.abort(new Error("cancel recovery"));
+        await expect(recovery).rejects.toThrow("cancel recovery");
+        await expect(withPluginSaveStorageKeyLock("later", async () => "released"))
+            .resolves.toBe("released");
+    });
+
+    test("waits for unrelated per-key work before taking the exclusive recovery barrier", async () => {
+        const externalKey = encoded(PLUGIN_SAVE_PREFIX, "after-held-work");
+        persistent.set(externalKey, { available: true });
+        let releaseHeld!: () => void;
+        let markHeld!: () => void;
+        const held = new Promise<void>(resolve => { releaseHeld = resolve; });
+        const heldStarted = new Promise<void>(resolve => { markHeld = resolve; });
+        const earlier = withPluginSaveStorageKeyLock("unrelated", async () => {
+            markHeld();
+            await held;
+        });
+        await heldStarted;
+        const listPersistentKeys = vi.fn(async (prefix: string) =>
+            [...persistent.keys()].filter(key => key.startsWith(prefix))
+        );
+
+        const reconciliation = reconcilePluginStorageModeForBoot({
+            dependencies: {
+                listPersistentKeys,
+                persistDatabase: vi.fn(async () => undefined),
+            },
+        });
+        await Promise.resolve();
+        expect(listPersistentKeys).not.toHaveBeenCalled();
+
+        releaseHeld();
+        await earlier;
+        await expect(reconciliation).resolves.toMatchObject({ issues: [] });
+        expect(database.pluginCustomStorage["after-held-work"]).toEqual({ available: true });
+    });
+
+    test("invalidates the SA2 enumeration snapshot when recovery changes the live key set", async () => {
+        database.pluginCustomStorage = { inline: true };
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["inline"]);
+        const externalKey = encoded(PLUGIN_SAVE_PREFIX, "external");
+        persistent.set(externalKey, { recovered: true });
+
+        await expect(reconcilePluginStorageModeForBoot({
+            dependencies: { persistDatabase: vi.fn(async () => undefined) },
+        })).resolves.toMatchObject({ issues: [] });
+
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["external", "inline"]);
+    });
+
+    test("quarantines an oversized inline key before violating the BR4 archive boundary", async () => {
+        const oversizedKey = "v".repeat(757);
+        const originalValues = { [oversizedKey]: { retained: true } };
+        database = {
+            optimizePluginMemory: true,
+            pluginCustomStorage: originalValues,
+            plugins: [],
+        };
+        const writePersistentJson = vi.fn();
+        const persistDatabase = vi.fn();
+
+        const result = await reconcilePluginStorageModeForBoot({
+            dependencies: { writePersistentJson, persistDatabase },
+        });
+
+        expect(result.issues).toEqual([{
+            code: "invalid-encoded-key",
+            encodedKey: PLUGIN_SAVE_PREFIX,
+        }]);
+        expect(database.pluginCustomStorage).toBe(originalValues);
+        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(persistDatabase).not.toHaveBeenCalled();
+    });
+
+    test("isolates zero-length and malformed JSON rows while good rows reach plugins and UI", async () => {
+        database = {
+            optimizePluginMemory: false,
+            pluginCustomStorage: {
+                zero: { inline: "zero-recovery-copy" },
+                malformed: { inline: "malformed-recovery-copy" },
+            },
+        };
+        const zeroKey = encoded(PLUGIN_SAVE_PREFIX, "zero");
+        const malformedKey = encoded(PLUGIN_SAVE_PREFIX, "malformed");
+        const goodKey = encoded(PLUGIN_SAVE_PREFIX, "good");
+        persistent.set(zeroKey, "zero-length-row-sentinel");
+        persistent.set(malformedKey, "malformed-row-sentinel");
+        persistent.set(goodKey, { available: true });
+        async function readPersistentJsonRow<T>(key: string): Promise<
+            { kind: "missing" } | { kind: "value"; value: T }
+        > {
+            if (key === zeroKey) throw new SyntaxError("Unexpected end of JSON input");
+            if (key === malformedKey) throw new SyntaxError("Unexpected token");
+            return persistent.has(key)
+                ? { kind: "value", value: persistent.get(key) as T }
+                : { kind: "missing" };
+        }
+        const persistDatabase = vi.fn(async () => undefined);
+        let pluginsLoaded = false;
+        let uiReached = false;
+
+        const result = await reconcilePluginStorageModeForBoot({
+            dependencies: { readPersistentJsonRow, persistDatabase },
+        });
+        // Model the two statements following the reconciliation boundary in
+        // bootstrap.ts. Recovery must resolve rather than strand this path.
+        pluginsLoaded = true;
+        uiReached = true;
+
+        expect(pluginsLoaded).toBe(true);
+        expect(uiReached).toBe(true);
+        expect(database.pluginCustomStorage.good).toEqual({ available: true });
+        expect(database.pluginCustomStorage.zero).toEqual({ inline: "zero-recovery-copy" });
+        expect(database.pluginCustomStorage.malformed)
+            .toEqual({ inline: "malformed-recovery-copy" });
+        // One suspect row makes the internalization copy-only. Good and bad
+        // external rows therefore remain available for explicit recovery.
+        expect(persistent.get(goodKey)).toEqual({ available: true });
+        expect(persistent.get(zeroKey)).toBe("zero-length-row-sentinel");
+        expect(persistent.get(malformedKey)).toBe("malformed-row-sentinel");
+        expect(result.issues).toEqual([
+            { code: "invalid-json", encodedKey: zeroKey },
+            { code: "invalid-json", encodedKey: malformedKey },
+        ]);
+        expect(JSON.stringify(result.issues)).not.toContain("recovery-copy");
+        expect(JSON.stringify(result.issues)).not.toContain("row-sentinel");
+    });
+
+    test("quarantines accessor and unsupported inline rows without invoking or overwriting them", async () => {
+        let getterCalls = 0;
+        const inline: Record<string, unknown> = {
+            good: { copied: true },
+            unsupported: new Map([["secret", "must-not-stringify"]]),
+        };
+        Object.defineProperty(inline, "accessor", {
+            configurable: true,
+            enumerable: true,
+            get: () => {
+                getterCalls += 1;
+                return { secret: "must-not-read" };
+            },
+        });
+        database = {
+            optimizePluginMemory: true,
+            pluginCustomStorage: inline,
+        };
+        const accessorKey = encoded(PLUGIN_SAVE_PREFIX, "accessor");
+        const unsupportedKey = encoded(PLUGIN_SAVE_PREFIX, "unsupported");
+        const goodKey = encoded(PLUGIN_SAVE_PREFIX, "good");
+        persistent.set(accessorKey, { external: "accessor-recovery-copy" });
+        persistent.set(unsupportedKey, { external: "unsupported-recovery-copy" });
+
+        const result = await reconcilePluginStorageModeForBoot({
+            dependencies: { persistDatabase: vi.fn(async () => undefined) },
+        });
+
+        expect(getterCalls).toBe(0);
+        expect(Reflect.getOwnPropertyDescriptor(database.pluginCustomStorage, "accessor")?.get)
+            .toBeTypeOf("function");
+        expect(database.pluginCustomStorage.unsupported).toBeInstanceOf(Map);
+        expect(database.pluginCustomStorage.good).toEqual({ copied: true });
+        expect(persistent.get(accessorKey)).toEqual({ external: "accessor-recovery-copy" });
+        expect(persistent.get(unsupportedKey)).toEqual({ external: "unsupported-recovery-copy" });
+        expect(persistent.get(goodKey)).toEqual({ copied: true });
+        expect(result.issues).toEqual([
+            { code: "unsupported-json", encodedKey: unsupportedKey },
+            { code: "unsupported-json", encodedKey: accessorKey },
+        ]);
+        const diagnostics = JSON.stringify(result.issues);
+        expect(diagnostics).not.toContain("must-not");
+        expect(diagnostics).not.toContain("recovery-copy");
+        expect(diagnostics).not.toContain("accessor\"");
+        expect(diagnostics).not.toContain("unsupported\"");
+    });
+
+    test("isolates transient read failure per encoded key and keeps good rows usable", async () => {
+        database = {
+            optimizePluginMemory: false,
+            pluginCustomStorage: { transient: { inline: "retained" } },
+        };
+        const transientKey = encoded(PLUGIN_SAVE_PREFIX, "transient");
+        const goodKey = encoded(PLUGIN_SAVE_PREFIX, "good");
+        persistent.set(transientKey, "unread-external-copy");
+        persistent.set(goodKey, { available: true });
+        async function readPersistentJsonRow<T>(key: string): Promise<
+            { kind: "missing" } | { kind: "value"; value: T }
+        > {
+            if (key === transientKey) throw new Error("temporary network failure");
+            return persistent.has(key)
+                ? { kind: "value", value: persistent.get(key) as T }
+                : { kind: "missing" };
+        }
+
+        const result = await reconcilePluginStorageModeForBoot({
+            dependencies: {
+                readPersistentJsonRow,
+                persistDatabase: vi.fn(async () => undefined),
+            },
+        });
+
+        expect(database.pluginCustomStorage.good).toEqual({ available: true });
+        expect(database.pluginCustomStorage.transient).toEqual({ inline: "retained" });
+        expect(persistent.get(goodKey)).toEqual({ available: true });
+        expect(persistent.get(transientKey)).toBe("unread-external-copy");
+        expect(result.issues).toEqual([
+            { code: "read-failed", encodedKey: transientKey },
+        ]);
+        expect(JSON.stringify(result.issues)).not.toContain("network failure");
+    });
+
+    test("a transient list failure preserves that prefix while the other prefix stays usable", async () => {
+        database = {
+            optimizePluginMemory: false,
+            pluginCustomStorage: { inline: "retained" },
+        };
+        const hiddenValueKey = encoded(PLUGIN_SAVE_PREFIX, "hidden");
+        const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "owner");
+        persistent.set(hiddenValueKey, { external: "retained" });
+        persistent.set(metaKey, { plugin: "Usable", updatedAt: 1 });
+        const listPersistentKeys = vi.fn(async (prefix: string) => {
+            if (prefix === PLUGIN_SAVE_PREFIX) throw new Error("temporary list failure");
+            return [...persistent.keys()].filter(key => key.startsWith(prefix));
+        });
+
+        const result = await reconcilePluginStorageModeForBoot({
+            dependencies: {
+                listPersistentKeys,
+                persistDatabase: vi.fn(async () => undefined),
+            },
+        });
+
+        expect(database.pluginCustomStorage.inline).toBe("retained");
+        expect(database.pluginStorageMeta.owner).toEqual({
+            plugin: "Usable",
+            updatedAt: 1,
+        });
+        expect(persistent.get(hiddenValueKey)).toEqual({ external: "retained" });
+        expect(persistent.get(metaKey)).toEqual({ plugin: "Usable", updatedAt: 1 });
+        expect(result.issues).toEqual([
+            { code: "list-failed", encodedKey: PLUGIN_SAVE_PREFIX },
+        ]);
+        expect(JSON.stringify(result.issues)).not.toContain("temporary list failure");
+    });
+
+    test("an unrelated suspect row makes externalization globally copy-only", async () => {
+        const duplicateKey = encoded(PLUGIN_SAVE_PREFIX, "duplicate");
+        const goodKey = encoded(PLUGIN_SAVE_PREFIX, "new-good");
+        const suspectKey = encoded(PLUGIN_SAVE_PREFIX, "unrelated-suspect");
+        const originalInline = {
+            duplicate: { copy: "inline-original" },
+            "new-good": { usable: true },
+        };
+        database = {
+            optimizePluginMemory: true,
+            pluginCustomStorage: originalInline,
+        };
+        persistent.set(duplicateKey, { copy: "external-original" });
+        persistent.set(suspectKey, "malformed-row-sentinel");
+        const persistDatabase = vi.fn(async () => undefined);
+        async function readPersistentJsonRow<T>(key: string): Promise<
+            { kind: "missing" } | { kind: "value"; value: T }
+        > {
+            if (key === suspectKey) throw new SyntaxError("secret malformed bytes");
+            return persistent.has(key)
+                ? { kind: "value", value: persistent.get(key) as T }
+                : { kind: "missing" };
+        }
+
+        const result = await reconcilePluginStorageModeForBoot({
+            dependencies: { readPersistentJsonRow, persistDatabase },
+        });
+
+        expect(database.pluginCustomStorage).toBe(originalInline);
+        expect(database.pluginCustomStorage.duplicate).toEqual({ copy: "inline-original" });
+        expect(persistent.get(duplicateKey)).toEqual({ copy: "external-original" });
+        expect(persistent.get(goodKey)).toEqual({ usable: true });
+        expect(persistent.get(suspectKey)).toBe("malformed-row-sentinel");
+        expect(persistDatabase).not.toHaveBeenCalled();
+        expect(result.issues).toEqual(expect.arrayContaining([
+            { code: "invalid-json", encodedKey: suspectKey },
+            { code: "conflicting-copies", encodedKey: duplicateKey },
+        ]));
+    });
+
+    test("an unrelated suspect row makes internalization globally copy-only", async () => {
+        const duplicateKey = encoded(PLUGIN_SAVE_PREFIX, "duplicate");
+        const goodKey = encoded(PLUGIN_SAVE_PREFIX, "new-good");
+        const suspectKey = encoded(PLUGIN_SAVE_PREFIX, "unrelated-suspect");
+        const originalInline = { duplicate: { copy: "inline-original" } };
+        database = {
+            optimizePluginMemory: false,
+            pluginCustomStorage: originalInline,
+        };
+        persistent.set(duplicateKey, { copy: "external-original" });
+        persistent.set(goodKey, { usable: true });
+        persistent.set(suspectKey, "malformed-row-sentinel");
+        const persistDatabase = vi.fn(async () => undefined);
+        async function readPersistentJsonRow<T>(key: string): Promise<
+            { kind: "missing" } | { kind: "value"; value: T }
+        > {
+            if (key === suspectKey) throw new SyntaxError("secret malformed bytes");
+            return { kind: "value", value: persistent.get(key) as T };
+        }
+
+        const result = await reconcilePluginStorageModeForBoot({
+            dependencies: { readPersistentJsonRow, persistDatabase },
+        });
+
+        expect(database.pluginCustomStorage.duplicate).toEqual({ copy: "inline-original" });
+        expect(database.pluginCustomStorage["new-good"]).toEqual({ usable: true });
+        expect(persistent.get(duplicateKey)).toEqual({ copy: "external-original" });
+        expect(persistent.get(goodKey)).toEqual({ usable: true });
+        expect(persistent.get(suspectKey)).toBe("malformed-row-sentinel");
+        expect(persistDatabase).not.toHaveBeenCalled();
+        expect(result.issues).toEqual(expect.arrayContaining([
+            { code: "invalid-json", encodedKey: suspectKey },
+            { code: "conflicting-copies", encodedKey: duplicateKey },
+        ]));
+    });
+
+    test("treats a listed but missing row as a read failure while accepting encoded JSON null", async () => {
+        const missingKey = encoded(PLUGIN_SAVE_PREFIX, "missing");
+        const nullKey = encoded(PLUGIN_SAVE_PREFIX, "null-row");
+        database = {
+            optimizePluginMemory: false,
+            pluginCustomStorage: { missing: { inline: "recovery-copy" } },
+        };
+        persistent.set(nullKey, null);
+        const listPersistentKeys = vi.fn(async (prefix: string) => prefix === PLUGIN_SAVE_PREFIX
+            ? [missingKey, nullKey]
+            : []);
+        const persistDatabase = vi.fn(async () => undefined);
+
+        const result = await reconcilePluginStorageModeForBoot({
+            dependencies: { listPersistentKeys, persistDatabase },
+        });
+
+        expect(result.issues).toContainEqual({ code: "read-failed", encodedKey: missingKey });
+        expect(Object.hasOwn(database.pluginCustomStorage, "null-row")).toBe(true);
+        expect(database.pluginCustomStorage["null-row"]).toBeNull();
+        expect(database.pluginCustomStorage.missing).toEqual({ inline: "recovery-copy" });
+        expect(persistent.has(nullKey)).toBe(true);
+        expect(persistDatabase).not.toHaveBeenCalled();
+    });
+
+    test("restores exact value and metadata maps after persist failure before retry", async () => {
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "external-value");
+        const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "external-value");
+        const originalValues = { inline: { exact: "value-copy" } };
+        const originalMeta = { inline: { plugin: "Inline", updatedAt: 1 } };
+        database = {
+            optimizePluginMemory: false,
+            pluginCustomStorage: originalValues,
+            pluginStorageMeta: originalMeta,
+        };
+        persistent.set(valueKey, { external: "value" });
+        persistent.set(metaKey, { plugin: "External", updatedAt: 2 });
+        const persistDatabase = vi.fn()
+            .mockRejectedValueOnce(new Error("secret persist failure"))
+            .mockResolvedValueOnce(undefined);
+
+        const first = await reconcilePluginStorageModeForBoot({
+            dependencies: { persistDatabase },
+        });
+
+        expect(first.issues).toEqual([
+            { code: "persist-failed", encodedKey: "database/database.bin" },
+        ]);
+        expect(database.pluginCustomStorage).toBe(originalValues);
+        expect(database.pluginStorageMeta).toBe(originalMeta);
+        expect(persistent.get(valueKey)).toEqual({ external: "value" });
+        expect(persistent.get(metaKey)).toEqual({ plugin: "External", updatedAt: 2 });
+        expect(JSON.stringify(first.issues)).not.toContain("secret");
+
+        const second = await reconcilePluginStorageModeForBoot({
+            dependencies: { persistDatabase },
+        });
+
+        expect(second.issues).toEqual([]);
+        expect(database.pluginCustomStorage).toEqual({
+            inline: { exact: "value-copy" },
+            "external-value": { external: "value" },
+        });
+        expect(database.pluginStorageMeta).toEqual({
+            inline: { plugin: "Inline", updatedAt: 1 },
+            "external-value": { plugin: "External", updatedAt: 2 },
+        });
+        expect(persistent.has(valueKey)).toBe(false);
+        expect(persistent.has(metaKey)).toBe(false);
+        expect(persistDatabase).toHaveBeenCalledTimes(2);
+    });
+
+    test.each(["getPrototypeOf", "ownKeys", "getOwnPropertyDescriptor"] as const)(
+        "contains hostile inline %s traps without leaking their messages",
+        async (trap) => {
+            const secret = "decoded-key=private-key value=private-value";
+            const handler: ProxyHandler<Record<string, unknown>> = {};
+            if (trap === "getPrototypeOf") handler.getPrototypeOf = () => { throw new Error(secret); };
+            if (trap === "ownKeys") handler.ownKeys = () => { throw new Error(secret); };
+            if (trap === "getOwnPropertyDescriptor") {
+                handler.getOwnPropertyDescriptor = () => { throw new Error(secret); };
+            }
+            const hostile = new Proxy({}, handler);
+            database = {
+                optimizePluginMemory: true,
+                pluginCustomStorage: hostile,
+            };
+
+            const result = await reconcilePluginStorageModeForBoot({
+                dependencies: { persistDatabase: vi.fn(async () => undefined) },
+            });
+
+            expect(database.pluginCustomStorage).toBe(hostile);
+            expect(result.issues).toContainEqual({
+                code: "unsupported-json",
+                encodedKey: PLUGIN_SAVE_PREFIX,
+            });
+            expect(JSON.stringify(result.issues)).not.toContain("private-key");
+            expect(JSON.stringify(result.issues)).not.toContain("private-value");
+        },
+    );
 });
 
 describe("transitionPluginStorageMode", () => {

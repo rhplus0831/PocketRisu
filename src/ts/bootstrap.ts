@@ -33,8 +33,9 @@ import { convertStubsToPlaceholders } from "./storage/chatStorage";
 import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelte";
 import { allowInsecureContext } from "./platform";
 import { isSecureContext, shouldBlockInsecureBoot } from "./secureContext";
-import { reconcilePluginStorageMode } from "./plugins/pluginSaveStorage";
+import { reconcilePluginStorageModeForBoot } from "./plugins/pluginSaveStorage";
 import { disableEnabledLegacyPluginsForOptimizedMemory } from "./plugins/pluginMemoryOptimization";
+import { setPluginStorageRecoveryState } from "./plugins/pluginStorageRecovery";
 import {
     isResourceCacheEnabled,
     isResourceCacheSupported,
@@ -187,14 +188,51 @@ export async function loadData() {
                         autoDisabledLegacyPlugins.join(", "),
                     ))
                 }
-                const pluginStorageReconcileResult = await reconcilePluginStorageMode({
-                    dependencies: {
-                        persistDatabase: persistBootPluginStorageReconcile,
-                    },
-                })
+                const pluginStorageDirection = getDatabase().optimizePluginMemory === true
+                    ? "externalize"
+                    : "internalize"
+                let pluginStorageReconcileResult
+                try {
+                    pluginStorageReconcileResult = await reconcilePluginStorageModeForBoot({
+                        dependencies: {
+                            persistDatabase: persistBootPluginStorageReconcile,
+                        },
+                    })
+                } catch {
+                    // This is the final boot availability boundary. Known
+                    // list/read/write/parse failures are isolated per row by
+                    // reconcilePluginStorageModeForBoot; an unexpected failure
+                    // must still not strand the whole app on the loading path.
+                    const issue = {
+                        code: "list-failed" as const,
+                        encodedKey: pluginStorageDirection === "externalize"
+                            ? "pluginsave/"
+                            : "pluginsave-meta/",
+                    }
+                    pluginStorageReconcileResult = {
+                        direction: pluginStorageDirection,
+                        values: 0,
+                        meta: 0,
+                        issues: [issue],
+                    }
+                    setPluginStorageRecoveryState({
+                        direction: pluginStorageDirection,
+                        issues: [issue],
+                    })
+                    console.error("[Plugin storage] Boot reconciliation entered recovery mode")
+                }
+                if (pluginStorageReconcileResult.issues.length > 0) {
+                    notifyWarning(
+                        language.pluginStorageRecoveryBootWarning(
+                            pluginStorageReconcileResult.issues.length,
+                        ),
+                        { source: "plugin-storage-recovery" },
+                    )
+                }
                 if (
                     autoDisabledLegacyPlugins.length > 0
                     && pluginStorageReconcileResult.direction === "none"
+                    && pluginStorageReconcileResult.issues.length === 0
                 ) {
                     await persistBootPluginStorageReconcile()
                 }

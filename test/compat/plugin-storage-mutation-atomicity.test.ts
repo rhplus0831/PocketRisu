@@ -15,6 +15,9 @@ const VALUE_KEY = `pluginsave/${Buffer.from(RAW_KEY, 'utf-8').toString('base64ur
 const OWNER_KEY = `pluginsave-meta/${Buffer.from(RAW_KEY, 'utf-8').toString('base64url')}.json`
 const OLD_VALUE = Buffer.from(JSON.stringify({ generation: 'old' }), 'utf-8')
 const OLD_OWNER = Buffer.from(JSON.stringify({ plugin: 'Old Plugin', updatedAt: 1 }), 'utf-8')
+const LONG_RAW_KEY = 'v'.repeat(756)
+const LONG_VALUE_KEY = `pluginsave/${Buffer.from(LONG_RAW_KEY, 'utf-8').toString('base64url')}.json`
+const LONG_OWNER_KEY = `pluginsave-meta/${Buffer.from(LONG_RAW_KEY, 'utf-8').toString('base64url')}.json`
 const servers: ServerHandle[] = []
 
 afterAll(async () => {
@@ -99,6 +102,44 @@ async function mutate(
   })
 }
 
+async function mutateRaw(
+  client: RisuClient,
+  body: Uint8Array,
+  owner = 'New Plugin',
+): Promise<Response> {
+  return client.fetch('/api/plugin-storage/mutate', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'file-path': Buffer.from(VALUE_KEY, 'utf-8').toString('hex'),
+      'x-plugin-storage-operation': 'set',
+      'x-plugin-storage-owner': Buffer.from(owner, 'utf-8').toString('base64url'),
+    },
+    body,
+  })
+}
+
+async function restorePair(
+  client: RisuClient,
+  value: Uint8Array,
+  ownerRecord?: Uint8Array,
+): Promise<Response> {
+  return client.fetch('/api/plugin-storage/mutate', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'file-path': Buffer.from(VALUE_KEY, 'utf-8').toString('hex'),
+      'x-plugin-storage-operation': 'set',
+      'x-plugin-storage-owner': '',
+      'x-plugin-storage-owner-policy': ownerRecord ? 'record' : 'preserve',
+      ...(ownerRecord
+        ? { 'x-plugin-storage-owner-record': Buffer.from(ownerRecord).toString('base64url') }
+        : {}),
+    },
+    body: value,
+  })
+}
+
 async function mutateWithClientOutcome(
   client: RisuClient,
   operation: 'set' | 'remove',
@@ -122,6 +163,84 @@ async function mutateWithClientOutcome(
 }
 
 describe('atomic optimized plugin value and owner acknowledgement', () => {
+  test('recovery atomically restores an exact sidecar or preserves the existing bytes', async () => {
+    const { server, client } = await boot()
+    const exactOwner = Buffer.from(JSON.stringify({ plugin: 'Snapshot', updatedAt: 7 }))
+    const firstValue = Buffer.from(JSON.stringify({ generation: 'recovered' }))
+
+    const restored = await restorePair(client, firstValue, exactOwner)
+    expect(restored.status).toBe(200)
+    expect(readRows(server.cwd)).toEqual({ value: firstValue, owner: exactOwner })
+
+    const secondValue = Buffer.from(JSON.stringify({ generation: 'preserved' }))
+    const preserved = await restorePair(client, secondValue)
+    expect(preserved.status).toBe(200)
+    expect(readRows(server.cwd)).toEqual({ value: secondValue, owner: exactOwner })
+  })
+
+  test('remove accepts a BR4-valid value-only key whose metadata name is oversized', async () => {
+    const { server, client } = await boot(undefined, undefined, (saveDir) => {
+      const database = new Database(path.join(saveDir, 'risuai.db'))
+      try {
+        database.exec(`
+          CREATE TABLE kv (
+            key TEXT PRIMARY KEY,
+            value BLOB NOT NULL,
+            updated_at INTEGER NOT NULL
+          )
+        `)
+        database.prepare(
+          'INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+        ).run(LONG_VALUE_KEY, OLD_VALUE, Date.now())
+      } finally {
+        database.close()
+      }
+    })
+
+    const response = await client.fetch('/api/plugin-storage/mutate', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': Buffer.from(LONG_VALUE_KEY, 'utf-8').toString('hex'),
+        'x-plugin-storage-operation': 'remove',
+      },
+      body: new Uint8Array(),
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      outcome: 'committed',
+      operation: 'remove',
+    })
+    const database = new Database(path.join(server.cwd, 'save', 'risuai.db'), {
+      readonly: true,
+    })
+    try {
+      const read = database.prepare('SELECT value FROM kv WHERE key = ?')
+      expect(read.get(LONG_VALUE_KEY)).toBeUndefined()
+      expect(read.get(LONG_OWNER_KEY)).toBeUndefined()
+    } finally {
+      database.close()
+    }
+  })
+
+  test('strict JSON rejection leaves the prior value and owner byte-exact', async () => {
+    const { server, client } = await boot()
+
+    const response = await mutateRaw(client, Buffer.from('1e400', 'utf-8'))
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({
+      success: false,
+      outcome: 'not-committed',
+      operation: 'set',
+      error: 'Invalid plugin storage JSON row',
+      code: 'INVALID_PLUGIN_STORAGE_MUTATION',
+      retryable: false,
+    })
+    expect(readRows(server.cwd)).toEqual({ value: OLD_VALUE, owner: OLD_OWNER })
+  })
+
   test('owner-write failure rolls the primary value back and reports not-committed', async () => {
     const { server, client } = await boot('owner-write')
 

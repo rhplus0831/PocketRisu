@@ -1809,6 +1809,18 @@ export const languageKorean = {
     `플러그인 저장소 이동 중… ${completed} / ${total}`,
   optimizePluginMemoryFailed: (message: string) =>
     `플러그인 저장 방식을 변경하지 못했습니다: ${message}`,
+  optimizePluginMemoryFailedSafe:
+    "플러그인 저장 방식을 변경하지 못했습니다. 행 세부 정보는 표시하지 않았습니다. 인코딩된 키 복구 진단을 확인하세요.",
+  pluginStorageRecoveryBootWarning: (count: number) =>
+    `플러그인 저장소 조정 문제 ${count}개를 격리했습니다. 앱과 영향을 받지 않은 플러그인은 계속 로드됩니다. 설정 → 플러그인의 복구 패널을 확인하세요.`,
+  pluginStorageRecoveryTitle: "플러그인 저장소 복구 필요",
+  pluginStorageRecoveryDesc:
+    "자동 조정 중 의심스러운 행을 발견했습니다. PocketRisu는 행을 덮어쓰거나 삭제하지 않고 인라인 및 외부 복사본을 보존했습니다. 일시적인 서버 접근 문제를 해결하거나 백업에서 데이터를 복구한 뒤 다시 시도하세요. 진단 정보에는 인코딩된 키만 포함됩니다.",
+  pluginStorageRecoveryRetry: "조정 다시 시도",
+  pluginStorageRecoveryCopy: "진단 정보 복사",
+  pluginStorageRecoveryRetrySuccess: "플러그인 저장소 조정을 완료했습니다. 격리가 해제되었습니다.",
+  pluginStorageRecoveryCopySuccess: "인코딩된 키 진단 정보를 복사했습니다.",
+  pluginStorageRecoveryCopyFailed: "플러그인 저장소 진단 정보를 복사하지 못했습니다.",
   partialBackupFirstConfirm:
     "⚠️ 경고: 부분 로컬 백업 ⚠️\n\n이 백업은 최소한의 필수 정보만 빠르게 저장하는 기능입니다.\n\n포함되는 것:\n- 데이터베이스 (채팅 기록, 캐릭터, 모듈, 플러그인, 프롬프트, 설정 등)\n- 캐릭터 프로필 아이콘 (메인 이미지)\n- 사용자 아이콘 및 커스텀 배경\n- 페르소나 아이콘\n- 폴더 이미지\n- 봇 프리셋 이미지\n\n⚠️ 포함되지 않는 것:\n- 감정 이미지\n- 추가 캐릭터 에셋\n- VITS 음성 파일\n- 기타 모든 추가 미디어 파일\n\n이 백업 파일에는 모든 캐릭터 에셋이 포함되지 않습니다!\n완전한 백업이 필요하다면 일반 로컬 백업을 사용하세요.\n\n그래도 계속하시겠습니까?",
   partialBackupSecondConfirm:

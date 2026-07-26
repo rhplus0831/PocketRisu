@@ -872,7 +872,13 @@ export class NodeStorage{
             return fallback('not-committed', 'A set mutation requires value bytes.', 'INVALID_REQUEST')
         }
         const stableRequest: PluginStorageMutationRequest = request.operation === 'set'
-            ? { ...request, valueBytes: new Uint8Array(request.valueBytes!) }
+            ? {
+                ...request,
+                valueBytes: new Uint8Array(request.valueBytes!),
+                ...(request.ownerRecordBytes
+                    ? { ownerRecordBytes: new Uint8Array(request.ownerRecordBytes) }
+                    : {}),
+            }
             : { ...request }
 
         try {
@@ -939,6 +945,14 @@ export class NodeStorage{
                     stableRequest.owner ?? '',
                     'utf-8',
                 ).toString('base64url')
+                if (stableRequest.preserveOwner) {
+                    headers['x-plugin-storage-owner-policy'] = 'preserve'
+                } else if (stableRequest.ownerRecordBytes) {
+                    headers['x-plugin-storage-owner-policy'] = 'record'
+                    headers['x-plugin-storage-owner-record'] = Buffer.from(
+                        stableRequest.ownerRecordBytes,
+                    ).toString('base64url')
+                }
             }
             const response = await this.authFetch('/api/plugin-storage/mutate', {
                 method: 'POST',

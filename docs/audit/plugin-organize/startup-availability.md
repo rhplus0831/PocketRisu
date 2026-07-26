@@ -183,6 +183,37 @@ already written a malformed row.
   path.
 - Record the offending encoded key without exposing its value.
 
+### Resolution
+
+**Fixed 2026-07-26.** Boot uses a recovery-safe per-row reconciler rather than
+the destructive manual-transition path. It strictly validates inline and
+external values, distinguishes a missing listed row from encoded JSON `null`,
+and records only canonical encoded keys or namespace prefixes. If any source,
+proxy trap, list/read/write, or persistence step is suspect, the whole boot
+pass becomes copy-only: existing inline and external duplicates remain exact,
+good rows stay usable, and cleanup is withheld. A failed persist restores the
+original inline value and owner map references before retry.
+
+Bootstrap contains reconciliation errors locally and continues to plugin/UI
+loading. Settings → Plugins exposes a persistent recovery panel with sanitized
+diagnostics, copy, and retry controls; arbitrary exception messages, decoded
+keys, and values never enter recovery state, logs, responses, or UI.
+
+The server validates plugin JSON at direct write, folded/streaming
+externalization, save-folder, and backup ingress. Streaming and non-streaming
+paths share strict optimized/folded map semantics, including empty/null
+canonicalization. Small backup and save-folder databases are decoded,
+validated, and prepared inside the replacement transaction before directory
+swap or commit, so invalid folded storage returns a sanitized error while the
+old database and external rows remain byte-exact.
+
+Regression coverage includes empty/malformed/unsupported rows, accessors and
+hostile proxies, mixed good/bad sets, duplicate retention in both directions,
+missing-vs-null reads, failed persist and retry, privacy, forced streaming, and
+transactional import rollback. Independent verification passed 103 focused
+client, 22 server, and 20 compatibility tests, all full suites, `pnpm check`,
+a production build, and the help audit.
+
 <a id="sa4"></a>
 ## SA4 — Import and retry failures abort startup or expose uncommitted state
 

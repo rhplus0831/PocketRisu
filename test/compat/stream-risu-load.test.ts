@@ -224,6 +224,78 @@ describe('disk-backed streaming Risu ingest', () => {
     expect(walked.remainder.pluginStorageMeta).toBeUndefined()
   })
 
+  test.each([
+    ['optimized', { optimizePluginMemory: true }],
+    ['folded', { optimizePluginMemory: false, pluginStorageFolded: true }],
+  ] as const)(
+    'strict-validates and canonicalizes every %s plugin record before the empty gate',
+    async (_mode, activeFields) => {
+      const walk = (fields: Record<string, unknown>) => walkRisuSave(
+        encodeRisuSaveLegacy({
+          characters: [],
+          ...activeFields,
+          ...fields,
+        }),
+        {
+          externalizePluginStorage: true,
+          onPluginStorageEntry: () => undefined,
+          onPluginStorageFolded: () => undefined,
+        },
+      )
+
+      for (const fields of [
+        {},
+        { pluginCustomStorage: null },
+        { pluginCustomStorage: {} },
+        { pluginCustomStorage: {}, pluginStorageMeta: {} },
+      ]) {
+        const walked = await walk(fields)
+        expect(walked.remainder.pluginCustomStorage).toEqual({})
+        expect(walked.remainder.pluginStorageMeta).toBeUndefined()
+      }
+
+      for (const pluginCustomStorage of [[], 0, false, 'primitive']) {
+        await expect(walk({ pluginCustomStorage })).rejects.toMatchObject({
+          code: 'INVALID_PLUGIN_STORAGE_ROW',
+          encodedKey: 'pluginsave/',
+          message: 'Invalid plugin storage JSON row',
+        })
+      }
+      for (const pluginStorageMeta of [null, [], 0, false, 'primitive']) {
+        await expect(walk({ pluginCustomStorage: {}, pluginStorageMeta }))
+          .rejects.toMatchObject({
+            code: 'INVALID_PLUGIN_STORAGE_ROW',
+            encodedKey: 'pluginsave-meta/',
+            message: 'Invalid plugin storage JSON row',
+          })
+      }
+    },
+  )
+
+  test.each([
+    ['optimized', { optimizePluginMemory: true }],
+    ['folded', { optimizePluginMemory: false, pluginStorageFolded: true }],
+  ] as const)('canonicalizes streamed %s row values before callbacks', async (_mode, activeFields) => {
+    const entries: Array<{ field: string; key: string; value: unknown }> = []
+    await walkRisuSave(encodeRisuSaveLegacy({
+      characters: [],
+      ...activeFields,
+      pluginCustomStorage: { row: [-0, { finite: 1 }] },
+    }), {
+      externalizePluginStorage: true,
+      onPluginStorageEntry: (entry: { field: string; key: string; value: unknown }) => {
+        entries.push(entry)
+      },
+      onPluginStorageFolded: () => undefined,
+    })
+
+    expect(entries).toEqual([{
+      field: 'pluginCustomStorage',
+      key: 'row',
+      value: [0, { finite: 1 }],
+    }])
+  })
+
   test('does not interpret a valid sidecar-shaped user field on an unmarked stream', async () => {
     const validCollision = [
       'PocketRisu.plugin-storage-escapes',

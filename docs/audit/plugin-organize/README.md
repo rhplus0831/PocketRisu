@@ -35,7 +35,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [AC4](api-compatibility.md#ac4) | Low–Medium | Fixed | Value and enumeration parity gaps: unrepresentable JSON is acknowledged, and key order is unstable |
 | [SA1](startup-availability.md#sa1) | High | Fixed | V3 startup is reported complete before async initialization settles; a slow or rejected optimized read silently prevents registration |
 | [SA2](startup-availability.md#sa2) | High | Fixed | One process-wide unbounded storage queue: a single stalled operation wedges every plugin and the mode transition |
-| [SA3](startup-availability.md#sa3) | Medium | Open | A reconciliation failure on boot prevents the whole application from loading |
+| [SA3](startup-availability.md#sa3) | Medium | Fixed | A reconciliation failure on boot prevents the whole application from loading |
 | [SA4](startup-availability.md#sa4) | High impact, window-dependent | Fixed | Import and retry failures abort startup or expose uncommitted state to optimized reads |
 | [AA1](atomicity-acknowledgement.md#aa1) | Medium | Fixed | Value and owner metadata are separate commits; a rejection can follow a durable primary mutation |
 | [AA2](atomicity-acknowledgement.md#aa2) | Medium | Fixed | Optimized `clear()` can partially apply |
@@ -120,8 +120,7 @@ do not exercise:
 - marked-snapshot restore through the corrupt-database boot fallback;
 - a very large individual value or aggregate store (including transition
   memory, with the resource cache on and off);
-- read failure followed by a fallback-derived overwrite;
-- corrupt-row boot recovery.
+- read failure followed by a fallback-derived overwrite.
 
 ## Original recommended fix order
 
@@ -146,8 +145,8 @@ do not exercise:
    missing/failed read outcomes, per-key revisions/CAS, atomic batch, and a
    non-destructive invalidate/rewrite operation.
 
-The former compatibility blockers MT1–MT2, AC1, SA1–SA2, SA4, and AC3 are
+The former compatibility blockers MT1–MT2, AC1, AC3, SA1–SA4, and AA1–AA2 are
 fixed and covered. The beta still should not be treated as risk-free for every
-V3 workload: SA3, AA3, BR1–BR3, PM1–PM4, and IP1–IP5 remain open. Verify a
+V3 workload: AA3, BR1–BR3, PM1–PM4, and IP1–IP5 remain open. Verify a
 backup before transitions, and avoid very large values or stores until the
 capacity work lands.

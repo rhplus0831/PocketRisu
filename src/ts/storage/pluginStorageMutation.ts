@@ -12,6 +12,10 @@ export interface PluginStorageMutationRequest {
     valueBytes?: Uint8Array;
     /** Empty means the value is deliberately unowned and removes stale metadata. */
     owner?: string;
+    /** Recovery-only exact sidecar bytes; mutually exclusive with ordinary owner. */
+    ownerRecordBytes?: Uint8Array;
+    /** Recovery-only: keep any historical sidecar unchanged. */
+    preserveOwner?: boolean;
 }
 
 export interface PluginStorageMutationResult {

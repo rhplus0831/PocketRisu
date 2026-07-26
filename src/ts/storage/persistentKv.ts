@@ -45,10 +45,14 @@ export interface PersistentJsonReadOptions {
     signal?: AbortSignal | null;
 }
 
-export async function readPersistentJson<T>(
+export type PersistentJsonRow<T> =
+    | { kind: "missing" }
+    | { kind: "value"; value: T };
+
+export async function readPersistentJsonRow<T>(
     storageKey: string,
     options: PersistentJsonReadOptions = {},
-): Promise<T | null> {
+): Promise<PersistentJsonRow<T>> {
     await ensureStorageReady(options.signal);
     const data = options.cached
         ? options.signal
@@ -57,10 +61,21 @@ export async function readPersistentJson<T>(
         : options.signal
             ? await forageStorage.getItem(storageKey, options.signal)
             : await forageStorage.getItem(storageKey);
-    if (!data) {
-        return null;
+    if (data === null || data === undefined) {
+        return { kind: "missing" };
     }
-    return JSON.parse(decoder.decode(data)) as T;
+    return {
+        kind: "value",
+        value: JSON.parse(decoder.decode(data)) as T,
+    };
+}
+
+export async function readPersistentJson<T>(
+    storageKey: string,
+    options: PersistentJsonReadOptions = {},
+): Promise<T | null> {
+    const row = await readPersistentJsonRow<T>(storageKey, options);
+    return row.kind === "missing" ? null : row.value;
 }
 
 export async function writePersistentJson<T>(
@@ -130,6 +145,37 @@ export async function mutatePersistentPluginStorage<T>(
     } as const;
     const result = activeSignal
         ? await forageStorage.mutatePluginStorage(request, activeSignal)
+        : await forageStorage.mutatePluginStorage(request);
+    return requireCommittedPluginStorageMutation(result);
+}
+
+/**
+ * Boot recovery copy with an exact ownership sidecar and the same strict
+ * acknowledgement/hash/retry contract as an ordinary AA1 mutation. Undefined
+ * metadata preserves any historical sidecar already present at the destination.
+ */
+export async function restorePersistentPluginStoragePair<T>(
+    valueStorageKey: string,
+    value: T,
+    ownerRecord: unknown | undefined,
+    signal?: AbortSignal | null,
+): Promise<PluginStorageMutationResult> {
+    throwIfAborted(signal);
+    const valueBytes = encoder.encode(stringifyJsonValue(value));
+    const ownerRecordBytes = ownerRecord === undefined
+        ? undefined
+        : encoder.encode(stringifyJsonValue(ownerRecord));
+    await ensureStorageReady(signal);
+    const request = {
+        operation: "set" as const,
+        valueKey: valueStorageKey,
+        valueBytes,
+        ...(ownerRecordBytes
+            ? { ownerRecordBytes }
+            : { preserveOwner: true }),
+    };
+    const result = signal
+        ? await forageStorage.mutatePluginStorage(request, signal)
         : await forageStorage.mutatePluginStorage(request);
     return requireCommittedPluginStorageMutation(result);
 }

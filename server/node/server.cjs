@@ -106,6 +106,15 @@ const {
     encodePluginSaveStorageKey,
 } = require('./pluginSaveKeys.cjs');
 const {
+    PluginStorageValidationError,
+    decodeValidatedPluginStorageKey,
+    encodeValidatedPluginStorageKey,
+    isPluginStorageValidationError,
+    serializePluginStorageRow,
+    snapshotPluginStorageRecord,
+    validatePluginStorageRow,
+} = require('./pluginStorageJson.cjs');
+const {
     CHAT_BACKUP_DIRNAME,
     createChatBackupStore,
     migrateLegacyChatBackups,
@@ -552,6 +561,11 @@ async function ingestDatabase(raw, { createBackup = false } = {}) {
         ? await decodeRisuSave(source)
         : source;
     const dbObj = normalizeJSON(decoded);
+    const strictPluginStorage = snapshotOptimizedPluginStorageFields(decoded);
+    if (strictPluginStorage) {
+        dbObj.pluginCustomStorage = strictPluginStorage.values;
+        if (strictPluginStorage.hasMeta) dbObj.pluginStorageMeta = strictPluginStorage.meta;
+    }
 
     // Plugin rows commit before chat ingestion rewrites database.bin. If the
     // process stops between those steps, the inline monolith remains the
@@ -602,10 +616,8 @@ async function ingestDatabaseStreaming(source, { inspection = null } = {}) {
             const prefix = field === 'pluginStorageMeta'
                 ? PLUGIN_SAVE_META_PREFIX
                 : PLUGIN_SAVE_PREFIX;
-            kvSet(
-                encodePluginSaveStorageKey(key, prefix),
-                Buffer.from(JSON.stringify(value), 'utf-8')
-            );
+            const storageKey = encodeValidatedPluginStorageKey(key, prefix);
+            kvSet(storageKey, serializePluginStorageRow(storageKey, value));
         },
         restoreColdStorageCharacters: (dbObj) => {
             const coldRestoreResult = restoreColdStorageCharactersInDb(dbObj);
@@ -624,7 +636,13 @@ async function loadStrippedDatabase(raw, source) {
         logger.warn(`[${source}] Large supported database.bin found; externalizing through the streaming ingest path`);
         return (await ingestDatabaseStreaming(raw, { inspection })).strippedDb;
     }
-    const decoded = normalizeJSON(await decodeRisuSave(raw));
+    const rawDecoded = await decodeRisuSave(raw);
+    const decoded = normalizeJSON(rawDecoded);
+    const strictPluginStorage = snapshotOptimizedPluginStorageFields(rawDecoded);
+    if (strictPluginStorage) {
+        decoded.pluginCustomStorage = strictPluginStorage.values;
+        if (strictPluginStorage.hasMeta) decoded.pluginStorageMeta = strictPluginStorage.meta;
+    }
     const hasChats = hasChatPayloads(decoded);
     const hasPluginStorage = hasExternalizablePluginStorage(decoded);
     if (!hasChats && !hasPluginStorage) return decoded;
@@ -2413,9 +2431,53 @@ function hasExternalizablePluginStorage(dbObj) {
     return hasValues || hasMetaField;
 }
 
+function snapshotOptimizedPluginStorageFields(dbObj) {
+    if (!dbObj || (
+        dbObj.optimizePluginMemory !== true
+        && dbObj[PLUGIN_STORAGE_FOLDED_MARKER] !== true
+    )) return null;
+    return {
+        values: snapshotPluginStorageRecord(
+            dbObj.pluginCustomStorage ?? {},
+            'pluginCustomStorage',
+            PLUGIN_SAVE_PREFIX
+        ),
+        meta: Object.prototype.hasOwnProperty.call(dbObj, 'pluginStorageMeta')
+            ? snapshotPluginStorageRecord(
+                dbObj.pluginStorageMeta,
+                'pluginStorageMeta',
+                PLUGIN_SAVE_META_PREFIX
+            )
+            : {},
+        hasMeta: Object.prototype.hasOwnProperty.call(dbObj, 'pluginStorageMeta'),
+    };
+}
+
+function pluginStorageValidationDiagnostic(error) {
+    if (!isPluginStorageValidationError(error)) return null;
+    const encodedKey = typeof error.encodedKey === 'string'
+        && (error.encodedKey.startsWith(PLUGIN_SAVE_PREFIX)
+            || error.encodedKey.startsWith(PLUGIN_SAVE_META_PREFIX))
+        ? error.encodedKey
+        : PLUGIN_SAVE_PREFIX;
+    return {
+        error: 'Invalid plugin storage JSON row',
+        code: 'INVALID_PLUGIN_STORAGE_ROW',
+        encodedKey,
+    };
+}
+
+function logPluginStorageValidationFailure(context, error) {
+    const diagnostic = pluginStorageValidationDiagnostic(error);
+    if (!diagnostic) return null;
+    logger.warn(`${context}: ${diagnostic.encodedKey}`);
+    return diagnostic;
+}
+
 function preparePluginStorageExternalization(dbObj) {
     const hasMarkerField = Boolean(dbObj)
         && Object.prototype.hasOwnProperty.call(dbObj, PLUGIN_STORAGE_FOLDED_MARKER);
+    const strictFields = snapshotOptimizedPluginStorageFields(dbObj);
     if (!hasExternalizablePluginStorage(dbObj)) {
         if (!hasMarkerField) {
             return {
@@ -2441,18 +2503,23 @@ function preparePluginStorageExternalization(dbObj) {
         };
     }
 
-    const valueEntries = Object.entries(dbObj.pluginCustomStorage ?? {});
-    const metaEntries = Object.entries(dbObj.pluginStorageMeta ?? {});
-    const rows = [
-        ...valueEntries.map(([rawKey, value]) => ({
-            storageKey: encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_PREFIX),
-            value: Buffer.from(JSON.stringify(value), 'utf-8'),
-        })),
-        ...metaEntries.map(([rawKey, value]) => ({
-            storageKey: encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX),
-            value: Buffer.from(JSON.stringify(value), 'utf-8'),
-        })),
-    ];
+    const valueEntries = Object.entries(strictFields.values);
+    const metaEntries = Object.entries(strictFields.meta);
+    const rows = [];
+    for (const [rawKey, value] of valueEntries) {
+        const storageKey = encodeValidatedPluginStorageKey(rawKey, PLUGIN_SAVE_PREFIX);
+        rows.push({
+            storageKey,
+            value: serializePluginStorageRow(storageKey, value),
+        });
+    }
+    for (const [rawKey, value] of metaEntries) {
+        const storageKey = encodeValidatedPluginStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX);
+        rows.push({
+            storageKey,
+            value: serializePluginStorageRow(storageKey, value),
+        });
+    }
     const strippedDb = { ...dbObj, pluginCustomStorage: {} };
     delete strippedDb.pluginStorageMeta;
     delete strippedDb[PLUGIN_STORAGE_FOLDED_MARKER];
@@ -2468,7 +2535,10 @@ function preparePluginStorageExternalization(dbObj) {
 }
 
 function writePluginStorageRows(rows) {
-    for (const row of rows) kvSet(row.storageKey, row.value);
+    for (const row of rows) {
+        validatePluginStorageRow(row.storageKey, row.value);
+        kvSet(row.storageKey, row.value);
+    }
 }
 
 /**
@@ -2505,13 +2575,9 @@ function externalizePluginStorageIfNeeded(dbObj) {
 function parsePluginSaveJson(storageKey, readValue = kvGet) {
     const value = readValue(storageKey);
     if (!value) {
-        throw new Error(`Missing external plugin storage value: ${storageKey}`);
+        throw new PluginStorageValidationError(storageKey);
     }
-    try {
-        return JSON.parse(value.toString('utf-8'));
-    } catch (error) {
-        throw new Error(`Invalid JSON in ${storageKey}: ${error.message}`);
-    }
+    return validatePluginStorageRow(storageKey, value);
 }
 
 /**
@@ -2536,11 +2602,11 @@ async function spoolSelfContainedBackupDatabase(
     const pluginStorage = foldPluginStorage
         ? {
             valueRows: reader.kvList(PLUGIN_SAVE_PREFIX).map((storageKey) => ({
-                key: decodePluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX),
+                key: decodeValidatedPluginStorageKey(storageKey, PLUGIN_SAVE_PREFIX),
                 source: storageKey,
             })),
             metaRows: reader.kvList(PLUGIN_SAVE_META_PREFIX).map((storageKey) => ({
-                key: decodePluginSaveStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX),
+                key: decodeValidatedPluginStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX),
                 source: storageKey,
             })),
             readRow: (storageKey) => parsePluginSaveJson(storageKey, reader.kvGet),
@@ -2671,7 +2737,7 @@ function resolveBackupStorageKey(name) {
         const prefix = name.startsWith(PLUGIN_SAVE_PREFIX)
             ? PLUGIN_SAVE_PREFIX
             : PLUGIN_SAVE_META_PREFIX;
-        decodePluginSaveStorageKey(name, prefix);
+        decodeValidatedPluginStorageKey(name, prefix);
         return name;
     }
 
@@ -2696,7 +2762,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
     let databaseSpool = null;
     let databaseWriteStream = null;
     let databaseWriteFinished = null;
-    let streamingDatabaseIngestion = null;
+    let databaseIngestion = null;
     let assetsRestored = 0;
     let bytesReceived = 0;
     const seenEntryNames = new Set();
@@ -2820,6 +2886,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                     parseColdStorageJsonBuffer(data, name, { allowPlainJson: true }).coldData
                 )
                 : data;
+            validatePluginStorageRow(storageKey, storageValue);
             if (storageKey.startsWith('assets/')) {
                 writeImportedAsset(assetStage, storageKey, storageValue, 'Backup import');
             } else {
@@ -2982,15 +3049,19 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         };
         const databaseInspection = await inspectRisuSaveSource(databaseSource);
         if (await shouldStreamRisuSave(databaseSource, { inspection: databaseInspection })) {
-            streamingDatabaseIngestion = await ingestDatabaseStreaming(databaseSource, {
+            databaseIngestion = await ingestDatabaseStreaming(databaseSource, {
                 inspection: databaseInspection,
             });
             // Supported legacy/gzip saves cannot contain REMOTE blocks.
             markRemoteMigrationDone();
         } else {
-            // Exotic/small formats retain the historical monolith + post-commit
-            // decoder path so their behavior remains unchanged.
-            kvSet(DB_BLOB_KEY, await fs.readFile(databaseSpool.filePath));
+            // Publish the raw candidate only inside the replacement
+            // transaction, then run the same strict folded-plugin preparation
+            // before any directory swap or COMMIT. A validation/ingest failure
+            // therefore rolls the old database and all old rows back together.
+            const databaseRaw = await fs.readFile(databaseSpool.filePath);
+            kvSet(DB_BLOB_KEY, databaseRaw);
+            databaseIngestion = await ingestDatabase(databaseRaw);
         }
         for (const [id, info] of legacyInlayInfoMap.entries()) {
             if (importedInlayIds.has(id) && !importedSidecarIds.has(id)) {
@@ -3111,14 +3182,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
 
     invalidateDbCache();
 
-    // Small/exotic formats still externalize after commit through the legacy
-    // decoder. Supported large formats were ingested inside the import transaction.
-    let coldStorageFailed = streamingDatabaseIngestion?.stats.failed || 0;
-    const dbRaw = streamingDatabaseIngestion ? null : kvGet(DB_BLOB_KEY);
-    if (dbRaw) {
-        const ingestion = await ingestDatabase(dbRaw);
-        coldStorageFailed = ingestion.stats.failed || 0;
-    }
+    const coldStorageFailed = databaseIngestion?.stats.failed || 0;
 
     try {
         checkpointWal('TRUNCATE');
@@ -4246,6 +4310,8 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
     const filePath = firstHeader(req.headers['file-path']);
     const operation = firstHeader(req.headers['x-plugin-storage-operation']);
     const ownerHeader = firstHeader(req.headers['x-plugin-storage-owner']) ?? '';
+    const ownerPolicyHeader = firstHeader(req.headers['x-plugin-storage-owner-policy']) ?? '';
+    const ownerRecordHeader = firstHeader(req.headers['x-plugin-storage-owner-record']);
     const reject = (error, code = 'INVALID_PLUGIN_STORAGE_MUTATION') => res.status(400).json({
         success: false,
         outcome: 'not-committed',
@@ -4265,19 +4331,49 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
     let valueKey;
     let ownerKey;
     let owner = '';
+    let ownerPolicy = 'replace';
+    let ownerRecordBytes = null;
     let valueBytes = null;
     try {
         valueKey = Buffer.from(filePath, 'hex').toString('utf-8');
         const rawKey = decodePluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX);
-        ownerKey = encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX);
+        const unrestrictedOwnerKey = `${PLUGIN_SAVE_META_PREFIX}${valueKey.slice(PLUGIN_SAVE_PREFIX.length)}`;
 
         if (operation === 'set') {
+            if (!['', 'preserve', 'record'].includes(ownerPolicyHeader)) {
+                throw new Error('Invalid plugin owner mutation policy.');
+            }
+            ownerPolicy = ownerPolicyHeader || 'replace';
             if (typeof ownerHeader !== 'string' || !/^[A-Za-z0-9_-]*$/.test(ownerHeader)) {
                 throw new Error('Plugin owner must use canonical base64url encoding.');
             }
             owner = Buffer.from(ownerHeader, 'base64url').toString('utf-8');
             if (Buffer.from(owner, 'utf-8').toString('base64url') !== ownerHeader) {
                 throw new Error('Plugin owner must use canonical UTF-8 base64url encoding.');
+            }
+            if (ownerPolicy === 'record') {
+                if (ownerHeader !== '' || typeof ownerRecordHeader !== 'string'
+                    || !/^[A-Za-z0-9_-]+$/.test(ownerRecordHeader)) {
+                    throw new Error('An exact owner record is required.');
+                }
+                ownerKey = encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX);
+                ownerRecordBytes = Buffer.from(ownerRecordHeader, 'base64url');
+                if (ownerRecordBytes.toString('base64url') !== ownerRecordHeader) {
+                    throw new Error('Plugin owner record must use canonical base64url encoding.');
+                }
+                validatePluginStorageRow(ownerKey, ownerRecordBytes);
+            } else if (ownerPolicy === 'preserve') {
+                if (ownerHeader !== '' || ownerRecordHeader !== undefined) {
+                    throw new Error('Preserved ownership cannot include replacement data.');
+                }
+                ownerKey = unrestrictedOwnerKey;
+            } else {
+                if (ownerRecordHeader !== undefined) {
+                    throw new Error('Unexpected plugin owner record.');
+                }
+                ownerKey = owner
+                    ? encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX)
+                    : unrestrictedOwnerKey;
             }
             if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
                 throw new Error('A set mutation requires JSON value bytes.');
@@ -4287,7 +4383,18 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
             if (!Buffer.from(valueText, 'utf-8').equals(valueBytes)) {
                 throw new Error('Plugin value must be valid UTF-8 JSON.');
             }
-            JSON.parse(valueText);
+            // Match every other optimized plugin row ingress boundary. JSON.parse
+            // alone accepts numeric overflow as Infinity, which cannot round-trip
+            // through the client's strict JSON value contract.
+            validatePluginStorageRow(valueKey, valueBytes);
+        } else {
+            if (ownerPolicyHeader !== '' || ownerRecordHeader !== undefined) {
+                throw new Error('Remove mutations do not accept owner replacement data.');
+            }
+            // BR4 permits a few value-only keys whose corresponding metadata
+            // name is too long for an archive. Removing such a value must still
+            // clean an impossible/historical sidecar without trying to create it.
+            ownerKey = unrestrictedOwnerKey;
         }
     } catch (error) {
         return reject(error instanceof Error ? error.message : String(error));
@@ -4295,12 +4402,18 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
 
     try {
         await queueStorageMutation(() => {
+            const preservedOwner = ownerPolicy === 'preserve' ? kvGet(ownerKey) : null;
             try {
                 sqliteDb.transaction(() => {
                     if (operation === 'set') {
                         kvSet(valueKey, valueBytes);
                         hitPluginStorageMutationFailpoint('owner-write');
-                        if (owner) {
+                        if (ownerPolicy === 'record') {
+                            kvSet(ownerKey, ownerRecordBytes);
+                        } else if (ownerPolicy === 'preserve') {
+                            // Boot recovery has no inline owner for this key;
+                            // retain any historical external sidecar byte-exact.
+                        } else if (owner) {
                             kvSet(ownerKey, Buffer.from(JSON.stringify({
                                 plugin: owner,
                                 updatedAt: Date.now(),
@@ -4342,10 +4455,15 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 const valueMatches = operation === 'set'
                     ? storedValue !== null && storedValue.equals(valueBytes)
                     : storedValue === null;
-                const ownerMatches = operation === 'set' && owner
-                    ? storedOwner !== null
-                        && JSON.parse(storedOwner.toString('utf-8'))?.plugin === owner
-                    : storedOwner === null;
+                const ownerMatches = operation === 'set' && ownerPolicy === 'record'
+                    ? storedOwner !== null && storedOwner.equals(ownerRecordBytes)
+                    : operation === 'set' && ownerPolicy === 'preserve'
+                        ? (storedOwner === null) === (preservedOwner === null)
+                            && (storedOwner === null || storedOwner.equals(preservedOwner))
+                        : operation === 'set' && owner
+                            ? storedOwner !== null
+                                && JSON.parse(storedOwner.toString('utf-8'))?.plugin === owner
+                            : storedOwner === null;
                 if (!valueMatches || !ownerMatches) {
                     throw new Error('Committed plugin storage rows failed verification.');
                 }
@@ -4498,6 +4616,25 @@ app.post('/api/write', async (req, res, next) => {
                 });
                 return;
             }
+            if (key.startsWith(PLUGIN_SAVE_PREFIX)
+                || key.startsWith(PLUGIN_SAVE_META_PREFIX)) {
+                try {
+                    validatePluginStorageRow(key, fileContent);
+                } catch (error) {
+                    const diagnostic = logPluginStorageValidationFailure(
+                        '[PluginStorage] Rejected invalid row write',
+                        error
+                    ) ?? {
+                        error: 'Invalid plugin storage JSON row',
+                        code: 'INVALID_PLUGIN_STORAGE_ROW',
+                        encodedKey: key.startsWith(PLUGIN_SAVE_META_PREFIX)
+                            ? PLUGIN_SAVE_META_PREFIX
+                            : PLUGIN_SAVE_PREFIX,
+                    };
+                    res.status(400).json(diagnostic);
+                    return;
+                }
+            }
 
             // ETag conflict detection for database.bin
             if (key === 'database/database.bin') {
@@ -4604,6 +4741,14 @@ app.post('/api/write', async (req, res, next) => {
                         }
                     })();
                 } catch (e) {
+                    const diagnostic = logPluginStorageValidationFailure(
+                        '[PluginStorage] Rejected invalid folded database row',
+                        e
+                    );
+                    if (diagnostic) {
+                        res.status(400).json(diagnostic);
+                        return;
+                    }
                     logger.error('[Write] Failed to externalize database payloads:', e.message);
                     res.status(500).json({ error: 'Database write failed' });
                     return;
@@ -4830,6 +4975,14 @@ app.post('/api/patch', async (req, res, next) => {
         });
     } catch (error) {
         if (isImportInProgressError(error)) return sendImportBusy(res);
+        const diagnostic = logPluginStorageValidationFailure(
+            '[PluginStorage] Rejected invalid patched database row',
+            error
+        );
+        if (diagnostic) {
+            res.status(400).json(diagnostic);
+            return;
+        }
         logger.error(`[Patch] Error applying patch to ${filePath}:`, error.name);
         res.status(500).send({
             error: 'Patch application failed: ' + (error && error.message ? error.message : error)
@@ -5222,11 +5375,19 @@ app.post('/api/backup/import', async (req, res, next) => {
             });
         }
     } catch (error) {
+        const diagnostic = logPluginStorageValidationFailure(
+            '[PluginStorage] Rejected invalid backup import row',
+            error
+        );
         if (wantsNdjson && res.headersSent) {
             try {
-                res.write(JSON.stringify({ type: 'error', message: error?.message || 'backup import failed' }) + '\n');
+                res.write(JSON.stringify(diagnostic
+                    ? { type: 'error', ...diagnostic }
+                    : { type: 'error', message: error?.message || 'backup import failed' }) + '\n');
                 res.end();
             } catch (_) {}
+        } else if (diagnostic) {
+            res.status(400).json(diagnostic);
         } else {
             next(error);
         }
@@ -5502,10 +5663,17 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
         }) + '\n');
         res.end();
     } catch (error) {
+        const diagnostic = logPluginStorageValidationFailure(
+            '[PluginStorage] Rejected invalid server-backup row',
+            error
+        );
         if (!res.headersSent) {
-            next(error);
+            if (diagnostic) res.status(400).json(diagnostic);
+            else next(error);
         } else {
-            res.write(JSON.stringify({ type: 'error', message: error.message }) + '\n');
+            res.write(JSON.stringify(diagnostic
+                ? { type: 'error', ...diagnostic }
+                : { type: 'error', message: error.message }) + '\n');
             res.end();
         }
     } finally {
@@ -5932,7 +6100,7 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
         .map((entry) => entry.key);
     const assetStage = await prepareAssetImportStage();
     let assetSwap = null;
-    let streamingIngestion = null;
+    let databaseIngestion = null;
     let journal = null;
     let transactionCommitted = false;
 
@@ -5964,14 +6132,22 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
                 kvSet(key, value);
                 continue;
             }
+            validatePluginStorageRow(key, value);
             kvSet(key, value);
         }
 
         if (streamDatabase) {
-            streamingIngestion = await ingestDatabaseStreaming(databaseSource, {
+            databaseIngestion = await ingestDatabaseStreaming(databaseSource, {
                 inspection: databaseInspection,
             });
             markRemoteMigrationDone();
+        } else {
+            // The raw database row was inserted by the source loop above.
+            // Decode, validate, externalize, and rewrite it while the broad
+            // replacement transaction still protects the prior save.
+            const databaseRaw = kvGet(DB_BLOB_KEY);
+            if (!databaseRaw) throw new Error('Imported database row is missing');
+            databaseIngestion = await ingestDatabase(databaseRaw);
         }
 
         fsyncDirectoryTree(assetImportStagingDir);
@@ -6039,10 +6215,6 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
         throw error;
     }
 
-    const importedDbRaw = streamingIngestion ? null : kvGet(DB_BLOB_KEY);
-    if (importedDbRaw) {
-        await ingestDatabase(importedDbRaw);
-    }
     writeFileSync(migrationMarkerPath, new Date().toISOString(), 'utf-8');
     return { imported: sources.length };
 }
@@ -6128,7 +6300,11 @@ app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
         const result = await importHexFilesFromDir(resolved);
         res.json({ ok: true, imported: result.imported });
     } catch (error) {
-        res.status(400).json({ error: error.message || 'Import failed' });
+        const diagnostic = logPluginStorageValidationFailure(
+            '[PluginStorage] Rejected invalid save-folder row',
+            error
+        );
+        res.status(400).json(diagnostic ?? { error: error.message || 'Import failed' });
     } finally {
         importInProgress = false;
         releaseImportBarrier();
@@ -6192,7 +6368,11 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
         const result = await importHexEntries(entries);
         res.json({ ok: true, imported: result.imported });
     } catch (error) {
-        res.status(400).json({ error: error.message || 'Import failed' });
+        const diagnostic = logPluginStorageValidationFailure(
+            '[PluginStorage] Rejected invalid uploaded save-folder row',
+            error
+        );
+        res.status(400).json(diagnostic ?? { error: error.message || 'Import failed' });
     } finally {
         importInProgress = false;
         releaseImportBarrier();
@@ -6914,31 +7094,51 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                 // after kvCopyValue and overwrite the restored snapshot.
                 await flushPendingDb();
                 const inspection = await inspectRisuSaveSource(blob);
-                let ingestion;
-                if (await shouldStreamRisuSave(blob, { inspection })) {
-                    // Avoid copying the snapshot monolith into the live key. The
-                    // streaming ingest atomically writes rows + stripped DB instead.
-                    kvDel(REMOTE_MIGRATION_MARKER_KEY);
+                const streamRestore = await shouldStreamRisuSave(blob, { inspection });
+                let restoreTransactionOpen = false;
+                try {
+                    // Keep the live monolith, external plugin rows, ownership
+                    // sidecars, chat rows, and migration markers in one rollback
+                    // boundary. Both ingest paths join an existing transaction.
+                    sqliteDb.exec('BEGIN');
+                    restoreTransactionOpen = true;
+                    let ingestion;
+                    if (streamRestore) {
+                        // Avoid copying the snapshot monolith into the live key.
+                        kvDel(REMOTE_MIGRATION_MARKER_KEY);
+                        invalidateDbCache();
+                        ingestion = await ingestDatabaseStreaming(blob, { inspection });
+                        markRemoteMigrationDone();
+                    } else {
+                        kvCopyValue(key, DB_BLOB_KEY);
+                        // Snapshot may pre-date the remote-block migration. Clear the marker
+                        // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
+                        // bytes instead of skipping based on the prior post-migration state.
+                        kvDel(REMOTE_MIGRATION_MARKER_KEY);
+                        invalidateDbCache();
+                        const raw = kvGet(DB_BLOB_KEY);
+                        if (raw) ingestion = await ingestDatabase(raw);
+                    }
+                    if (ingestion) {
+                        const strippedBytes = Buffer.from(encodeRisuSaveLegacy(ingestion.strippedDb));
+                        dbEtag = computeBufferEtag(strippedBytes);
+                    }
+                    // A restore can replace a broad logical database state. Force every
+                    // browser list cache to take one full snapshot after it completes.
+                    kvBumpListEpoch();
+                    sqliteDb.exec('COMMIT');
+                    restoreTransactionOpen = false;
+                } catch (error) {
+                    if (restoreTransactionOpen) {
+                        try { sqliteDb.exec('ROLLBACK'); } catch (rollbackError) {
+                            logger.error('[Snapshot Restore] Failed to roll back SQLite transaction:', rollbackError);
+                        }
+                    }
+                    // The cache and ETag may have been derived from tentative rows.
                     invalidateDbCache();
-                    ingestion = await ingestDatabaseStreaming(blob, { inspection });
-                    markRemoteMigrationDone();
-                } else {
-                    kvCopyValue(key, DB_BLOB_KEY);
-                    // Snapshot may pre-date the remote-block migration. Clear the marker
-                    // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
-                    // bytes instead of skipping based on the prior post-migration state.
-                    kvDel(REMOTE_MIGRATION_MARKER_KEY);
-                    invalidateDbCache();
-                    const raw = kvGet(DB_BLOB_KEY);
-                    if (raw) ingestion = await ingestDatabase(raw);
+                    dbEtag = null;
+                    throw error;
                 }
-                if (ingestion) {
-                    const strippedBytes = Buffer.from(encodeRisuSaveLegacy(ingestion.strippedDb));
-                    dbEtag = computeBufferEtag(strippedBytes);
-                }
-                // A restore can replace a broad logical database state. Force every
-                // browser list cache to take one full snapshot after it completes.
-                kvBumpListEpoch();
             });
         } catch (error) {
             try {
@@ -7541,6 +7741,14 @@ async function restoreBackup(backupDir, rootDir) {
 app.use(expressErrorMiddleware);
 app.use((err, req, res, next) => {
     if (res.headersSent) return next(err);
+    const diagnostic = logPluginStorageValidationFailure(
+        '[PluginStorage] Rejected invalid ingested row',
+        err
+    );
+    if (diagnostic) {
+        res.status(400).json(diagnostic);
+        return;
+    }
     res.status(500).json({ error: err?.message || 'internal server error' });
 });
 
@@ -7613,7 +7821,12 @@ async function startServer() {
             });
         }
     } catch (error) {
-        logger.error('[Server] Failed to start server :', error);
+        if (!logPluginStorageValidationFailure(
+            '[PluginStorage] Rejected invalid row during startup',
+            error
+        )) {
+            logger.error('[Server] Failed to start server :', error);
+        }
         process.exit(1);
     }
 }

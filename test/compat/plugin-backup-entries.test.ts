@@ -62,6 +62,20 @@ async function writeKvResponse(client: RisuClient, key: string, value: Buffer): 
   })
 }
 
+async function importBackupResponse(client: RisuClient, data: Buffer): Promise<Response> {
+  const prepared = await client.fetch('/api/backup/import/prepare', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ size: data.byteLength }),
+  })
+  expect(prepared.status).toBe(200)
+  return client.fetch('/api/backup/import', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-risu-backup' },
+    body: new Uint8Array(data),
+  })
+}
+
 function readKvValue(cwd: string, key: string): Buffer | null {
   const database = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
   try {
@@ -390,8 +404,69 @@ describe('external plugin rows in backup archives', () => {
 
     const result = await client.importBackup(invalidBackup)
     expect(result.ok).not.toBe(true)
-    expect(result.error).toContain('Invalid encoded plugin storage key')
+    expect(result.error).toBe('Invalid plugin storage JSON row')
+    expect(result.error).not.toContain('YQ==')
     expect(readKvValue(server.cwd, 'database/database.bin')).toBeNull()
+  })
+
+  test('invalid small folded databases roll back backup and save-folder replacements', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const oldDatabase = encodeRisuDat({
+      characters: [],
+      optimizePluginMemory: true,
+      pluginCustomStorage: {},
+      durableMarker: 'old-database',
+    })
+    const oldValueKey = pluginStorageKey('pluginsave/', 'old-value')
+    const oldMetaKey = pluginStorageKey('pluginsave-meta/', 'old-value')
+    const oldValue = Buffer.from('{"durable":"old-value"}')
+    const oldMeta = Buffer.from('{"plugin":"Old Plugin","updatedAt":1}')
+    await writeKv(client, 'database/database.bin', oldDatabase)
+    await writeKv(client, oldValueKey, oldValue)
+    await writeKv(client, oldMetaKey, oldMeta)
+
+    const persistedOldDatabase = readKvValue(server.cwd, 'database/database.bin')
+    const invalidDatabase = encodeRisuDat({
+      characters: [],
+      optimizePluginMemory: true,
+      pluginStorageFolded: true,
+      // Non-stream snapshotOptimizedPluginStorageFields rejects an array even
+      // when it is empty; the streaming path must have identical semantics.
+      pluginCustomStorage: [],
+    })
+    const diagnostic = {
+      error: 'Invalid plugin storage JSON row',
+      code: 'INVALID_PLUGIN_STORAGE_ROW',
+      encodedKey: 'pluginsave/',
+    }
+    const assertOldState = () => {
+      expect(readKvValue(server.cwd, 'database/database.bin')).toEqual(persistedOldDatabase)
+      expect(readKvValue(server.cwd, oldValueKey)).toEqual(oldValue)
+      expect(readKvValue(server.cwd, oldMetaKey)).toEqual(oldMeta)
+    }
+
+    const backupResponse = await importBackupResponse(client, encodeBackup([{
+      name: 'database.risudat',
+      data: invalidDatabase,
+    }]))
+    expect(backupResponse.status).toBe(400)
+    await expect(backupResponse.json()).resolves.toEqual(diagnostic)
+    assertOldState()
+
+    const sourceDir = path.join(server.cwd, 'invalid-small-folded-save')
+    const databaseHexName = Buffer.from('database/database.bin', 'utf-8').toString('hex')
+    await mkdir(sourceDir, { recursive: true })
+    await writeFile(path.join(sourceDir, databaseHexName), invalidDatabase)
+    const folderResponse = await client.fetch('/api/migrate/save-folder/execute', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: sourceDir }),
+    })
+    expect(folderResponse.status).toBe(400)
+    await expect(folderResponse.json()).resolves.toEqual(diagnostic)
+    assertOldState()
   })
 
   test('save-folder scan, directory import, and ZIP upload preserve external plugin rows', async () => {

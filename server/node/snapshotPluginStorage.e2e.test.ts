@@ -286,6 +286,241 @@ async function runRoundTrip(options: { streamIngestMinBytes?: number }): Promise
 }
 
 describe('automatic snapshots × optimized plugin storage', () => {
+    it('rolls back a rejected legacy snapshot before replacing live plugin state', async () => {
+        const server = await startServer(makeWorkDir())
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { durable: { generation: 'live' } },
+            meta: { durable: { plugin: 'Live Plugin', updatedAt: 1 } },
+        }))
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+        await writeKey(server, auth, snapshotKey, buildDatabase({
+            values: { invalid: Number.POSITIVE_INFINITY },
+        }))
+
+        const liveBefore = await readKey(server, auth, 'database/database.bin')
+        const valueBefore = await readKey(server, auth, valueRowKey('durable'))
+        const metaBefore = await readKey(server, auth, metaRowKey('durable'))
+        const migrationMarkerBefore = await readKey(
+            server,
+            auth,
+            'migration/disable-remote-saving',
+        )
+        const response = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+
+        expect(response.status).toBe(400)
+        await expect(response.json()).resolves.toEqual({
+            error: 'Invalid plugin storage JSON row',
+            code: 'INVALID_PLUGIN_STORAGE_ROW',
+            encodedKey: valueRowKey('invalid'),
+        })
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(liveBefore)
+        expect(await readKey(server, auth, valueRowKey('durable'))).toEqual(valueBefore)
+        expect(await readKey(server, auth, metaRowKey('durable'))).toEqual(metaBefore)
+        expect(await readKey(server, auth, 'migration/disable-remote-saving'))
+            .toEqual(migrationMarkerBefore)
+    })
+
+    it('rejects malformed direct plugin-row writes without replacing durable data', async () => {
+        const server = await startServer(makeWorkDir())
+        const auth = await authenticate(server)
+        const key = valueRowKey('write-boundary')
+        await writeKey(server, auth, key, Buffer.from('{"durable":true}'))
+
+        for (const invalid of [Buffer.from('{"unfinished":'), Buffer.from([0xff])]) {
+            const response = await fetch(`${server.origin}/api/write`, {
+                method: 'POST',
+                headers: {
+                    ...auth,
+                    'content-type': 'application/octet-stream',
+                    'file-path': Buffer.from(key).toString('hex'),
+                },
+                body: invalid,
+            })
+            expect(response.status).toBe(400)
+            await expect(response.json()).resolves.toEqual({
+                error: 'Invalid plugin storage JSON row',
+                code: 'INVALID_PLUGIN_STORAGE_ROW',
+                encodedKey: key,
+            })
+            expect(JSON.parse((await readKey(server, auth, key)).toString('utf-8')))
+                .toEqual({ durable: true })
+        }
+    })
+
+    it('keeps direct and folded validation diagnostics encoded-key-only', async () => {
+        const server = await startServer(makeWorkDir())
+        const auth = await authenticate(server)
+        const decodedKey = 'decoded/private-plugin-key'
+        const secretValue = 'SECRET_PLUGIN_VALUE'
+        const key = valueRowKey(decodedKey)
+
+        const directResponse = await fetch(`${server.origin}/api/write`, {
+            method: 'POST',
+            headers: {
+                ...auth,
+                'content-type': 'application/octet-stream',
+                'file-path': Buffer.from(key).toString('hex'),
+            },
+            body: Buffer.from(`{"${secretValue}":`),
+        })
+        expect(directResponse.status).toBe(400)
+        await expect(directResponse.json()).resolves.toEqual({
+            error: 'Invalid plugin storage JSON row',
+            code: 'INVALID_PLUGIN_STORAGE_ROW',
+            encodedKey: key,
+        })
+
+        const malformedKey = 'pluginsave/decoded-private-key'
+        const malformedResponse = await fetch(`${server.origin}/api/write`, {
+            method: 'POST',
+            headers: {
+                ...auth,
+                'content-type': 'application/octet-stream',
+                'file-path': Buffer.from(malformedKey).toString('hex'),
+            },
+            body: Buffer.from('1'),
+        })
+        expect(malformedResponse.status).toBe(400)
+        await expect(malformedResponse.json()).resolves.toEqual({
+            error: 'Invalid plugin storage JSON row',
+            code: 'INVALID_PLUGIN_STORAGE_ROW',
+            encodedKey: PLUGIN_SAVE_PREFIX,
+        })
+
+        const foldedResponse = await fetch(`${server.origin}/api/write`, {
+            method: 'POST',
+            headers: {
+                ...auth,
+                'content-type': 'application/octet-stream',
+                'file-path': Buffer.from('database/database.bin').toString('hex'),
+            },
+            body: buildDatabase({
+                values: {
+                    [decodedKey]: { [secretValue]: Number.POSITIVE_INFINITY },
+                },
+            }),
+        })
+        expect(foldedResponse.status).toBe(400)
+        await expect(foldedResponse.json()).resolves.toEqual({
+            error: 'Invalid plugin storage JSON row',
+            code: 'INVALID_PLUGIN_STORAGE_ROW',
+            encodedKey: key,
+        })
+
+        await delay(20)
+        expect(server.logs()).not.toContain(decodedKey)
+        expect(server.logs()).not.toContain(malformedKey)
+        expect(server.logs()).not.toContain(secretValue)
+    })
+
+    it('keeps streaming-ingest validation diagnostics encoded-key-only', async () => {
+        const cwd = makeWorkDir()
+        let server = await startServer(cwd, { RISU_STREAM_INGEST_MIN_BYTES: '1024' })
+        const decodedKey = 'decoded/private-stream-key'
+        const secretValue = 'SECRET_STREAM_VALUE'
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+
+        await stopServer(server)
+        const raw = new Database(path.join(cwd, 'save', 'risuai.db'))
+        raw.prepare('INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)').run(
+            snapshotKey,
+            Buffer.from(encodeRisuSaveLegacy({
+                characters: [],
+                optimizePluginMemory: true,
+                pluginStorageFolded: true,
+                pluginCustomStorage: {
+                    [decodedKey]: { [secretValue]: Number.POSITIVE_INFINITY },
+                },
+                formatPadding: 'x'.repeat(4096),
+            })),
+            Date.now(),
+        )
+        raw.close()
+
+        server = await startServer(cwd, { RISU_STREAM_INGEST_MIN_BYTES: '1024' })
+        const auth = await authenticate(server)
+        const response = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(response.status).toBe(400)
+        await expect(response.json()).resolves.toEqual({
+            error: 'Invalid plugin storage JSON row',
+            code: 'INVALID_PLUGIN_STORAGE_ROW',
+            encodedKey: valueRowKey(decodedKey),
+        })
+
+        await delay(20)
+        expect(server.logs()).not.toContain(decodedKey)
+        expect(server.logs()).not.toContain(secretValue)
+    })
+
+    it('forces streaming record-shape validation before the empty-row gate', async () => {
+        const cwd = makeWorkDir()
+        let server = await startServer(cwd, { RISU_STREAM_INGEST_MIN_BYTES: '1024' })
+        await stopServer(server)
+        const snapshots = [
+            {
+                key: `database/dbbackup-${((Date.now() + 120_000) / 100).toFixed()}.bin`,
+                database: {
+                    characters: [],
+                    optimizePluginMemory: true,
+                    pluginCustomStorage: [],
+                    formatPadding: 'x'.repeat(4096),
+                },
+                encodedKey: PLUGIN_SAVE_PREFIX,
+            },
+            {
+                key: `database/dbbackup-${((Date.now() + 180_000) / 100).toFixed()}.bin`,
+                database: {
+                    characters: [],
+                    optimizePluginMemory: false,
+                    pluginStorageFolded: true,
+                    pluginCustomStorage: {},
+                    pluginStorageMeta: null,
+                    formatPadding: 'x'.repeat(4096),
+                },
+                encodedKey: PLUGIN_SAVE_META_PREFIX,
+            },
+        ]
+        const raw = new Database(path.join(cwd, 'save', 'risuai.db'))
+        const insert = raw.prepare(
+            'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)'
+        )
+        for (const snapshot of snapshots) {
+            insert.run(
+                snapshot.key,
+                Buffer.from(encodeRisuSaveLegacy(snapshot.database)),
+                Date.now(),
+            )
+        }
+        raw.close()
+
+        server = await startServer(cwd, { RISU_STREAM_INGEST_MIN_BYTES: '1024' })
+        const auth = await authenticate(server)
+        for (const snapshot of snapshots) {
+            const blob = await readKey(server, auth, snapshot.key)
+            await expect(shouldStreamRisuSave(blob, { minBytes: 1024 })).resolves.toBe(true)
+            const response = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+                method: 'POST',
+                headers: { ...auth, 'content-type': 'application/json' },
+                body: JSON.stringify({ key: snapshot.key }),
+            })
+            expect(response.status).toBe(400)
+            await expect(response.json()).resolves.toEqual({
+                error: 'Invalid plugin storage JSON row',
+                code: 'INVALID_PLUGIN_STORAGE_ROW',
+                encodedKey: snapshot.encodedKey,
+            })
+        }
+    })
+
     it('restores snapshot-time plugin rows exactly (legacy ingest path)', async () => {
         await runRoundTrip({})
     })

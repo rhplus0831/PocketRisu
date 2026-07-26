@@ -178,7 +178,7 @@ async function seedKey(
     server: RunningServer,
     auth: AuthHeaders,
     key: string,
-    value = Buffer.from('durable seed'),
+    value = Buffer.from(JSON.stringify('durable seed')),
 ): Promise<void> {
     const response = await fetch(`${server.origin}/api/write`, {
         method: 'POST',
@@ -369,7 +369,7 @@ describe('list delta import isolation', () => {
         const cwd = makeWorkDir()
         const server = await startServer(cwd)
         const auth = await authenticate(server)
-        const seededKey = 'pluginsave/list-delta-regression'
+        const seededKey = `pluginsave/${Buffer.from('list-delta-regression').toString('base64url')}.json`
         await seedKey(server, auth, seededKey)
         const baseline = await listKeys(server, auth)
         expect(baseline.mode).toBe('full')
@@ -394,7 +394,7 @@ describe('list delta import isolation', () => {
         const cwd = makeWorkDir()
         const server = await startServer(cwd)
         const auth = await authenticate(server)
-        const seededKey = 'pluginsave/list-delta-crash-regression'
+        const seededKey = `pluginsave/${Buffer.from('list-delta-crash-regression').toString('base64url')}.json`
         await seedKey(server, auth, seededKey)
         const baseline = await listKeys(server, auth)
         expect(baseline.mode).toBe('full')

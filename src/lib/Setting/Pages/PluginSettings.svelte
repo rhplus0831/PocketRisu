@@ -2,6 +2,7 @@
     import { PlusIcon, TrashIcon, LinkIcon, CodeXmlIcon, PowerIcon, PowerOffIcon, ShieldIcon } from "@lucide/svelte";
     import { language } from "src/lang";
     import SettingPage from "src/lib/UI/GUI/SettingPage.svelte";
+    import ShButton from "src/lib/UI/GUI/ShButton.svelte";
     import {
         alertClear,
         alertConfirm,
@@ -37,11 +38,17 @@
         waitForPluginLifecycleIdle,
     } from "src/ts/plugins/pluginMemoryOptimization";
     import {
+        reconcilePluginStorageModeForBoot,
         transitionPluginStorageMode,
     } from "src/ts/plugins/pluginSaveStorage";
+    import {
+        createPluginStorageRecoveryDiagnostic,
+        pluginStorageRecoveryStore,
+    } from "src/ts/plugins/pluginStorageRecovery";
 
     let showParams = $state([])
     let reconcilingPluginStorage = $state(false)
+    let retryingPluginStorageRecovery = $state(false)
     const optimizePluginMemoryEligible = $derived(
         canOptimizePluginMemory(DBState.db.plugins),
     )
@@ -75,19 +82,75 @@
                     ? language.optimizePluginMemoryEnabled
                     : language.optimizePluginMemoryDisabled,
             )
-        } catch (error) {
-            notifyError(language.optimizePluginMemoryFailed(
-                error instanceof Error ? error.message : String(error),
-            ))
+        } catch {
+            notifyError(language.optimizePluginMemoryFailedSafe)
         } finally {
             if (blockingAlert) alertClear()
             reconcilingPluginStorage = false
+        }
+    }
+
+    async function retryPluginStorageRecovery() {
+        if (retryingPluginStorageRecovery) return
+        retryingPluginStorageRecovery = true
+        try {
+            const result = await reconcilePluginStorageModeForBoot()
+            if (result.issues.length === 0) {
+                notifySuccess(language.pluginStorageRecoveryRetrySuccess)
+            } else {
+                notifyWarning(language.pluginStorageRecoveryBootWarning(result.issues.length))
+            }
+        } catch {
+            // Recovery diagnostics must never echo arbitrary exception text:
+            // a hostile legacy row/proxy can put decoded keys or values there.
+            notifyWarning(language.pluginStorageRecoveryBootWarning(1))
+        } finally {
+            retryingPluginStorageRecovery = false
+        }
+    }
+
+    async function copyPluginStorageRecoveryDiagnostic() {
+        const recovery = $pluginStorageRecoveryStore
+        if (!recovery) return
+        try {
+            await navigator.clipboard.writeText(createPluginStorageRecoveryDiagnostic(recovery))
+            notifySuccess(language.pluginStorageRecoveryCopySuccess)
+        } catch {
+            notifyError(language.pluginStorageRecoveryCopyFailed)
         }
     }
 </script>
 
 <SettingPage title={language.plugin}>
 <span class="text-draculared text-xs mb-4">{language.pluginWarn}</span>
+
+{#if $pluginStorageRecoveryStore}
+    <div class="my-4 rounded border border-yellow-500/50 bg-yellow-500/10 p-3" role="alert">
+        <div class="flex items-center gap-2 text-yellow-300 font-medium">
+            <TriangleAlert size={18} />
+            <span>{language.pluginStorageRecoveryTitle}</span>
+        </div>
+        <p class="mt-2 text-xs text-textcolor2">{language.pluginStorageRecoveryDesc}</p>
+        <ul class="mt-2 max-h-32 overflow-auto space-y-1 text-xs font-mono text-textcolor2">
+            {#each $pluginStorageRecoveryStore.issues as issue, index (`${issue.code}:${issue.encodedKey}:${index}`)}
+                <li>{issue.code}: {issue.encodedKey}</li>
+            {/each}
+        </ul>
+        <div class="mt-3 flex flex-wrap gap-2">
+            <ShButton
+                size="sm"
+                variant="primary"
+                onclick={retryPluginStorageRecovery}
+                disabled={retryingPluginStorageRecovery}
+            >
+                {language.pluginStorageRecoveryRetry}
+            </ShButton>
+            <ShButton size="sm" variant="outline" onclick={copyPluginStorageRecoveryDiagnostic}>
+                {language.pluginStorageRecoveryCopy}
+            </ShButton>
+        </div>
+    </div>
+{/if}
 
 <div class="my-4 rounded border border-darkborderc bg-darkbg/40 p-3">
     <CheckInput

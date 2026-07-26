@@ -107,6 +107,33 @@ afterEach(() => {
 })
 
 describe('NodeStorage atomic plugin mutation cache publication', () => {
+    test.each([
+        ['record', { ownerRecordBytes: new TextEncoder().encode('{"plugin":"Exact","updatedAt":7}') }],
+        ['preserve', { preserveOwner: true }],
+    ] as const)('transports the recovery owner %s policy through the hashed mutation', async (
+        policy,
+        recovery,
+    ) => {
+        const storage = storageWithResponse(committedSet())
+
+        await expect(storage.mutatePluginStorage({
+            operation: 'set',
+            valueKey,
+            valueBytes,
+            ...recovery,
+        })).resolves.toMatchObject({ outcome: 'committed' })
+
+        const init = (storage as any).authFetch.mock.calls[0][1] as RequestInit
+        const headers = init.headers as Record<string, string>
+        expect(headers['x-plugin-storage-owner-policy']).toBe(policy)
+        if (policy === 'record') {
+            expect(Buffer.from(headers['x-plugin-storage-owner-record'], 'base64url').toString())
+                .toBe('{"plugin":"Exact","updatedAt":7}')
+        } else {
+            expect(headers['x-plugin-storage-owner-record']).toBeUndefined()
+        }
+    })
+
     test.each(['owner-write', 'primary-write'])(
         '%s rollback leaves the previous value cache untouched',
         async () => {

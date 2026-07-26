@@ -67,7 +67,9 @@ vi.mock("../storage/persistentKv", () => ({
     listPersistentKeys: vi.fn(async () => []),
     makeEncodedStorageKey: (prefix: string, key: string) => `${prefix}${key}.json`,
     readPersistentJson: vi.fn(),
+    readPersistentJsonRow: vi.fn(),
     removePersistentKey: vi.fn(),
+    restorePersistentPluginStoragePair: vi.fn(),
     writePersistentJson: vi.fn(),
 }));
 

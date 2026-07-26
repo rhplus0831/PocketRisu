@@ -6,11 +6,13 @@ import {
     listPersistentKeys,
     makeEncodedStorageKey,
     mutatePersistentPluginStorage,
+    restorePersistentPluginStoragePair,
     readPersistentJson,
+    readPersistentJsonRow,
     removePersistentKey,
     writePersistentJson,
 } from "../storage/persistentKv";
-import { snapshotJsonValue } from "../storage/jsonValue";
+import { snapshotJsonValue, stringifyJsonValue } from "../storage/jsonValue";
 import { assertWellFormedUnicode } from "../storage/unicodeWellFormed";
 import { requireCommittedDatabaseSave } from "../storage/databaseSave";
 import { StorageError } from "../storage/storageError";
@@ -39,10 +41,15 @@ import {
     getPluginStorageKeySetGeneration,
     markPluginStorageKeySetChanged,
 } from "./pluginStorageEnumeration";
+import {
+    setPluginStorageRecoveryState,
+    type PluginStorageRecoveryIssue,
+} from "./pluginStorageRecovery";
 
 export { PLUGIN_SAVE_META_PREFIX, PLUGIN_SAVE_PREFIX };
 
 export const PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS = 30_000;
+export const PLUGIN_STORAGE_BOOT_RECOVERY_TIMEOUT_MS = 30_000;
 
 type BarrierWaiter = {
     kind: "shared" | "exclusive";
@@ -866,10 +873,16 @@ export interface PluginStorageReconcileResult {
     meta: number;
 }
 
+export interface PluginStorageBootReconcileResult extends PluginStorageReconcileResult {
+    issues: PluginStorageRecoveryIssue[];
+}
+
 interface ReconcileDependencies {
     getDatabase: () => Database;
     listPersistentKeys: typeof listPersistentKeys;
     readPersistentJson: typeof readPersistentJson;
+    readPersistentJsonRow: typeof readPersistentJsonRow;
+    restorePersistentPluginStoragePair: typeof restorePersistentPluginStoragePair;
     writePersistentJson: typeof writePersistentJson;
     removePersistentKey: typeof removePersistentKey;
     persistDatabase: () => Promise<void>;
@@ -878,6 +891,9 @@ interface ReconcileDependencies {
 export interface PluginStorageReconcileOptions {
     onStart?: (progress: PluginStorageReconcileProgress) => void;
     onProgress?: (progress: PluginStorageReconcileProgress) => void;
+    signal?: AbortSignal | null;
+    /** Whole-pass boot recovery deadline; individual storage calls remain bounded too. */
+    timeoutMs?: number;
     /** Test/bootstrap injection. Normal UI calls use the immediate save path. */
     dependencies?: Partial<ReconcileDependencies>;
 }
@@ -895,6 +911,8 @@ function resolveReconcileDependencies(
         getDatabase,
         listPersistentKeys,
         readPersistentJson,
+        readPersistentJsonRow,
+        restorePersistentPluginStoragePair,
         writePersistentJson,
         removePersistentKey,
         persistDatabase: persistDatabaseImmediately,
@@ -1158,6 +1176,491 @@ export async function reconcilePluginStorageMode(
         const prepared = await preparePluginStorageReconciliation(deps, target, options);
         return applyPluginStorageReconciliation(prepared, deps, options);
     });
+}
+
+function bootRecoveryIssue(
+    error: unknown,
+    encodedKey: string,
+    fallback: "read-failed" | "write-failed" | "remove-failed" | "persist-failed",
+): PluginStorageRecoveryIssue {
+    return {
+        code: error instanceof SyntaxError
+            ? "invalid-json"
+            : error instanceof TypeError
+                ? "unsupported-json"
+                : fallback,
+        encodedKey,
+    };
+}
+
+interface BootInlineCollection {
+    entries: PreparedStorageEntry[];
+    storageKeys: Set<string>;
+    /** Descriptor-preserving copy, or null when a source trap prevented one. */
+    preserved: Record<string, unknown> | null;
+}
+
+function collectBootInlineEntries(
+    source: unknown,
+    prefix: PluginSaveStoragePrefix,
+    issues: PluginStorageRecoveryIssue[],
+): BootInlineCollection {
+    const failed = (): BootInlineCollection => ({
+        entries: [],
+        storageKeys: new Set(),
+        preserved: null,
+    });
+    if (source === null || typeof source !== "object" || Array.isArray(source)) {
+        issues.push({ code: "unsupported-json", encodedKey: prefix });
+        return failed();
+    }
+    let prototype: object | null;
+    try {
+        prototype = Reflect.getPrototypeOf(source);
+    } catch {
+        issues.push({ code: "unsupported-json", encodedKey: prefix });
+        return failed();
+    }
+    if (prototype !== Object.prototype && prototype !== null) {
+        issues.push({ code: "unsupported-json", encodedKey: prefix });
+        return failed();
+    }
+
+    let ownKeys: PropertyKey[];
+    try {
+        ownKeys = Reflect.ownKeys(source);
+    } catch {
+        issues.push({ code: "unsupported-json", encodedKey: prefix });
+        return failed();
+    }
+    const seen = new Set<PropertyKey>(ownKeys);
+    for (const key of Object.getOwnPropertyNames(Object.prototype)) {
+        if (seen.has(key)) continue;
+        try {
+            if (Reflect.getOwnPropertyDescriptor(source, key)?.enumerable) {
+                ownKeys.push(key);
+                seen.add(key);
+            }
+        } catch {
+            issues.push({ code: "unsupported-json", encodedKey: prefix });
+            return failed();
+        }
+    }
+
+    const entries: PreparedStorageEntry[] = [];
+    const storageKeys = new Set<string>();
+    const preserved = prototype === null
+        ? createPluginStorageRecord<unknown>()
+        : createDatabasePluginStorageRecord<unknown>();
+    for (const key of ownKeys) {
+        let descriptor: PropertyDescriptor | undefined;
+        try {
+            descriptor = Reflect.getOwnPropertyDescriptor(source, key);
+        } catch {
+            issues.push({ code: "unsupported-json", encodedKey: prefix });
+            return failed();
+        }
+        if (descriptor) {
+            try {
+                Object.defineProperty(preserved, key, descriptor);
+            } catch {
+                issues.push({ code: "unsupported-json", encodedKey: prefix });
+                return failed();
+            }
+        }
+        if (typeof key !== "string") {
+            issues.push({ code: "unsupported-json", encodedKey: prefix });
+            continue;
+        }
+        let storageKey: string;
+        try {
+            storageKey = makeArchiveSafePluginSaveStorageKey(prefix, key);
+        } catch {
+            issues.push({ code: "invalid-encoded-key", encodedKey: prefix });
+            continue;
+        }
+        storageKeys.add(storageKey);
+        if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
+            issues.push({ code: "unsupported-json", encodedKey: storageKey });
+            continue;
+        }
+        try {
+            entries.push({
+                key,
+                storageKey,
+                value: snapshotJsonValue(descriptor.value),
+            });
+        } catch (error) {
+            issues.push(bootRecoveryIssue(error, storageKey, "read-failed"));
+        }
+    }
+    return { entries, storageKeys, preserved };
+}
+
+async function listBootStorageKeys(
+    deps: ReconcileDependencies,
+    prefix: PluginSaveStoragePrefix,
+    issues: PluginStorageRecoveryIssue[],
+    signal?: AbortSignal | null,
+): Promise<string[] | null> {
+    try {
+        throwIfAborted(signal);
+        return await deps.listPersistentKeys(prefix, signal);
+    } catch {
+        throwIfAborted(signal);
+        issues.push({ code: "list-failed", encodedKey: prefix });
+        return null;
+    }
+}
+
+async function readBootStorageRows(
+    deps: ReconcileDependencies,
+    prefix: PluginSaveStoragePrefix,
+    listed: string[] | null,
+    cached: boolean,
+    issues: PluginStorageRecoveryIssue[],
+    signal?: AbortSignal | null,
+): Promise<PreparedStorageEntry[]> {
+    if (listed === null) return [];
+    const rows: PreparedStorageEntry[] = [];
+    for (const storageKey of listed) {
+        throwIfAborted(signal);
+        let key: string | null = null;
+        try {
+            key = decodeListedStorageKey(storageKey, prefix);
+            if (
+                key === null
+                || makeArchiveSafePluginSaveStorageKey(prefix, key) !== storageKey
+            ) {
+                throw new Error("non-canonical encoded key");
+            }
+        } catch {
+            issues.push({ code: "invalid-encoded-key", encodedKey: storageKey });
+            continue;
+        }
+        try {
+            const row = await deps.readPersistentJsonRow(
+                storageKey,
+                cached ? { cached: true, signal } : { signal },
+            );
+            if (row.kind === "missing") {
+                issues.push({ code: "read-failed", encodedKey: storageKey });
+                continue;
+            }
+            const value = snapshotJsonValue(row.value);
+            rows.push({ key, storageKey, value });
+        } catch (error) {
+            throwIfAborted(signal);
+            issues.push(bootRecoveryIssue(error, storageKey, "read-failed"));
+        }
+    }
+    return rows;
+}
+
+function bootJsonValuesEqual(left: unknown, right: unknown): boolean {
+    return stringifyJsonValue(left) === stringifyJsonValue(right);
+}
+
+function restoreBootInlineRecords(
+    db: Database,
+    values: Database["pluginCustomStorage"],
+    meta: Database["pluginStorageMeta"] | undefined,
+): void {
+    db.pluginCustomStorage = values;
+    if (meta === undefined) delete db.pluginStorageMeta;
+    else db.pluginStorageMeta = meta;
+}
+
+/**
+ * Boot-only recovery boundary for storage left half-migrated by an older build.
+ *
+ * Unlike the explicit settings transition, this path isolates malformed and
+ * transient rows by encoded KV key. Once any source is suspect, reconciliation
+ * becomes copy-only: good rows are usable for this session while neither the
+ * inline nor external set is destructively cleaned up. The user can repair the
+ * underlying row or connectivity and retry from Settings -> Plugins.
+ */
+export async function reconcilePluginStorageModeForBoot(
+    options: PluginStorageReconcileOptions = {},
+): Promise<PluginStorageBootReconcileResult> {
+    const deps = resolveReconcileDependencies(options.dependencies);
+    const controller = new AbortController();
+    const onAbort = () => controller.abort(abortReason(options.signal));
+    if (options.signal) {
+        if (options.signal.aborted) onAbort();
+        else options.signal.addEventListener("abort", onAbort, { once: true });
+    }
+    const timeout = setTimeout(
+        () => controller.abort(new Error("Plugin storage boot recovery timed out.")),
+        options.timeoutMs ?? PLUGIN_STORAGE_BOOT_RECOVERY_TIMEOUT_MS,
+    );
+    const signal = controller.signal;
+    try {
+        return await withPluginSaveStorageLock(async () => {
+        throwIfAborted(signal);
+        invalidateStorageEnumerationSnapshot();
+        const db = deps.getDatabase();
+        const target = db.optimizePluginMemory === true;
+        const direction = target ? "externalize" : "internalize";
+        const issues: PluginStorageRecoveryIssue[] = [];
+        const valueSource = db.pluginCustomStorage ?? createDatabasePluginStorageRecord();
+        const metaSource = db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
+            NonNullable<Database["pluginStorageMeta"]>[string]
+        >();
+        const inlineValueEntries = collectBootInlineEntries(
+            valueSource,
+            PLUGIN_SAVE_PREFIX,
+            issues,
+        );
+        const inlineMetaEntries = collectBootInlineEntries(
+            metaSource,
+            PLUGIN_SAVE_META_PREFIX,
+            issues,
+        );
+
+        const [listedValueKeys, listedMetaKeys] = await Promise.all([
+            listBootStorageKeys(deps, PLUGIN_SAVE_PREFIX, issues, signal),
+            listBootStorageKeys(deps, PLUGIN_SAVE_META_PREFIX, issues, signal),
+        ]);
+        const [externalValueEntries, externalMetaEntries] = await Promise.all([
+            readBootStorageRows(
+                deps,
+                PLUGIN_SAVE_PREFIX,
+                listedValueKeys,
+                true,
+                issues,
+                signal,
+            ),
+            readBootStorageRows(
+                deps,
+                PLUGIN_SAVE_META_PREFIX,
+                listedMetaKeys,
+                false,
+                issues,
+                signal,
+            ),
+        ]);
+
+        const externalValuesByKey = new Map(
+            externalValueEntries.map(entry => [entry.storageKey, entry]),
+        );
+        const externalMetaByKey = new Map(
+            externalMetaEntries.map(entry => [entry.storageKey, entry]),
+        );
+
+        const recordConflicts = (
+            inline: BootInlineCollection,
+            external: Map<string, PreparedStorageEntry>,
+        ) => {
+            for (const entry of inline.entries) {
+                const duplicate = external.get(entry.storageKey);
+                if (duplicate && !bootJsonValuesEqual(entry.value, duplicate.value)) {
+                    issues.push({
+                        code: "conflicting-copies",
+                        encodedKey: entry.storageKey,
+                    });
+                }
+            }
+        };
+        recordConflicts(inlineValueEntries, externalValuesByKey);
+        recordConflicts(inlineMetaEntries, externalMetaByKey);
+
+        if (target) {
+            const valueEntries = inlineValueEntries.entries;
+            const metaEntries = inlineMetaEntries.entries;
+            const total = valueEntries.length + metaEntries.length;
+            options.onStart?.({ direction, completed: 0, total });
+            let completed = 0;
+            let valueCopies = 0;
+            let metaCopies = 0;
+            const listedValueSet = listedValueKeys === null
+                ? null
+                : new Set(listedValueKeys);
+            const listedMetaSet = listedMetaKeys === null
+                ? null
+                : new Set(listedMetaKeys);
+            const inlineMetaByKey = new Map(metaEntries.map(entry => [entry.key, entry]));
+            const pairedMetaKeys = new Set<string>();
+
+            if (listedValueSet !== null) {
+                for (const entry of valueEntries) {
+                    throwIfAborted(signal);
+                    if (listedValueSet.has(entry.storageKey)) continue;
+                    const metaEntry = inlineMetaByKey.get(entry.key);
+                    if (metaEntry && listedMetaSet?.has(metaEntry.storageKey)) {
+                        const externalMeta = externalMetaByKey.get(metaEntry.storageKey);
+                        // A conflicting or unreadable destination is quarantined;
+                        // never let the atomic recovery copy overwrite it.
+                        if (!externalMeta
+                            || !bootJsonValuesEqual(metaEntry.value, externalMeta.value)) {
+                            continue;
+                        }
+                    }
+                    if (metaEntry) pairedMetaKeys.add(metaEntry.storageKey);
+                    try {
+                        await deps.restorePersistentPluginStoragePair(
+                            entry.storageKey,
+                            entry.value,
+                            metaEntry?.value,
+                            signal,
+                        );
+                        valueCopies += 1;
+                        completed += 1;
+                        if (metaEntry) {
+                            if (!listedMetaSet?.has(metaEntry.storageKey)) metaCopies += 1;
+                            completed += 1;
+                        }
+                        options.onProgress?.({ direction, completed, total });
+                    } catch (error) {
+                        throwIfAborted(signal);
+                        issues.push(bootRecoveryIssue(error, entry.storageKey, "write-failed"));
+                    }
+                }
+            }
+
+            // Historical owner orphans have no value to pair atomically. They
+            // remain recoverable as isolated strict JSON rows.
+            if (listedMetaSet !== null) {
+                for (const entry of metaEntries) {
+                    throwIfAborted(signal);
+                    if (pairedMetaKeys.has(entry.storageKey)
+                        || listedMetaSet.has(entry.storageKey)) continue;
+                    try {
+                        await deps.writePersistentJson(entry.storageKey, entry.value, signal);
+                        metaCopies += 1;
+                        options.onProgress?.({ direction, completed: ++completed, total });
+                    } catch (error) {
+                        throwIfAborted(signal);
+                        issues.push(bootRecoveryIssue(error, entry.storageKey, "write-failed"));
+                    }
+                }
+            }
+
+            if (issues.length === 0) {
+                const originalValues = db.pluginCustomStorage;
+                const originalMeta = db.pluginStorageMeta;
+                if (total > 0) {
+                    try {
+                        db.pluginCustomStorage = createDatabasePluginStorageRecord();
+                        delete db.pluginStorageMeta;
+                        throwIfAborted(signal);
+                        await deps.persistDatabase();
+                    } catch (error) {
+                        restoreBootInlineRecords(db, originalValues, originalMeta);
+                        throwIfAborted(signal);
+                        issues.push(bootRecoveryIssue(error, "database/database.bin", "persist-failed"));
+                    }
+                }
+            }
+
+            const result: PluginStorageBootReconcileResult = {
+                direction: total > 0 || issues.length > 0 ? direction : "none",
+                values: valueCopies,
+                meta: metaCopies,
+                issues,
+            };
+            setPluginStorageRecoveryState(issues.length > 0 ? { direction, issues } : null);
+            return result;
+        }
+
+        const valueRows = externalValueEntries;
+        const metaRows = externalMetaEntries;
+        const total = valueRows.length + metaRows.length;
+        options.onStart?.({ direction, completed: 0, total });
+        let completed = 0;
+
+        // Never overwrite a duplicate during boot. Equal duplicates need no
+        // assignment; conflicting or unreadable duplicates remain exact.
+        const appliedValueRows = inlineValueEntries.preserved === null
+            ? []
+            : valueRows.filter(entry => !inlineValueEntries.storageKeys.has(entry.storageKey));
+        const appliedMetaRows = inlineMetaEntries.preserved === null
+            ? []
+            : metaRows.filter(entry => !inlineMetaEntries.storageKeys.has(entry.storageKey));
+        const originalValues = db.pluginCustomStorage;
+        const originalMeta = db.pluginStorageMeta;
+        let publishedLiveCopy = false;
+        try {
+            if (appliedValueRows.length > 0) {
+                const nextValues = inlineValueEntries.preserved!;
+                for (const entry of appliedValueRows) {
+                    throwIfAborted(signal);
+                    definePluginStorageRecordValue(nextValues, entry.key, entry.value);
+                    options.onProgress?.({ direction, completed: ++completed, total });
+                }
+                db.pluginCustomStorage = nextValues;
+                publishedLiveCopy = true;
+            }
+            if (appliedMetaRows.length > 0) {
+                const nextMeta = inlineMetaEntries.preserved! as NonNullable<
+                    Database["pluginStorageMeta"]
+                >;
+                for (const entry of appliedMetaRows) {
+                    throwIfAborted(signal);
+                    definePluginStorageRecordValue(nextMeta, entry.key, entry.value as never);
+                    options.onProgress?.({ direction, completed: ++completed, total });
+                }
+                db.pluginStorageMeta = nextMeta;
+                publishedLiveCopy = true;
+            }
+        } catch {
+            restoreBootInlineRecords(db, originalValues, originalMeta);
+            throwIfAborted(signal);
+            issues.push({ code: "unsupported-json", encodedKey: PLUGIN_SAVE_PREFIX });
+            publishedLiveCopy = false;
+        }
+
+        const applied = appliedValueRows.length + appliedMetaRows.length;
+        let persisted = applied === 0 && issues.length === 0;
+        if (publishedLiveCopy && applied > 0 && issues.length === 0) {
+            try {
+                throwIfAborted(signal);
+                await deps.persistDatabase();
+                persisted = true;
+            } catch (error) {
+                restoreBootInlineRecords(db, originalValues, originalMeta);
+                throwIfAborted(signal);
+                issues.push(bootRecoveryIssue(error, "database/database.bin", "persist-failed"));
+                persisted = false;
+            }
+        }
+
+        // Any suspect source keeps the complete external set as a recovery
+        // copy. A clean run removes rows only after the inline DB committed.
+        if (persisted && issues.length === 0) {
+            for (const entry of valueRows) {
+                try {
+                    throwIfAborted(signal);
+                    await deps.removePersistentKey(entry.storageKey, signal);
+                } catch (error) {
+                    throwIfAborted(signal);
+                    issues.push(bootRecoveryIssue(error, entry.storageKey, "remove-failed"));
+                }
+            }
+            for (const entry of metaRows) {
+                try {
+                    throwIfAborted(signal);
+                    await deps.removePersistentKey(entry.storageKey, signal);
+                } catch (error) {
+                    throwIfAborted(signal);
+                    issues.push(bootRecoveryIssue(error, entry.storageKey, "remove-failed"));
+                }
+            }
+        }
+
+        const result: PluginStorageBootReconcileResult = {
+            direction: total > 0 || issues.length > 0 ? direction : "none",
+            values: appliedValueRows.length,
+            meta: appliedMetaRows.length,
+            issues,
+        };
+        setPluginStorageRecoveryState(issues.length > 0 ? { direction, issues } : null);
+        return result;
+        }, signal);
+    } finally {
+        clearTimeout(timeout);
+        options.signal?.removeEventListener("abort", onAbort);
+    }
 }
 
 /**

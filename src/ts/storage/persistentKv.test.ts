@@ -38,7 +38,9 @@ const {
     hasNativeStringWellFormed,
     makeEncodedStorageKey,
     mutatePersistentPluginStorage,
+    restorePersistentPluginStoragePair,
     readPersistentJson,
+    readPersistentJsonRow,
     writePersistentJson,
 } = await import('./persistentKv')
 const {
@@ -89,6 +91,20 @@ describe('persistent JSON read transport', () => {
 
         await expect(readPersistentJson('pluginsave/poisoned')).rejects.toThrow(SyntaxError)
     })
+
+    it('distinguishes an encoded JSON null row from a missing row', async () => {
+        storage.getItem
+            .mockResolvedValueOnce(new TextEncoder().encode('null'))
+            .mockResolvedValueOnce(null as any)
+
+        await expect(readPersistentJsonRow('pluginsave/null.json')).resolves.toEqual({
+            kind: 'value',
+            value: null,
+        })
+        await expect(readPersistentJsonRow('pluginsave/missing.json')).resolves.toEqual({
+            kind: 'missing',
+        })
+    })
 })
 
 describe('persistent JSON write transport', () => {
@@ -121,6 +137,35 @@ describe('externalized plugin clear transport', () => {
 })
 
 describe('atomic plugin storage mutation transport', () => {
+    it('serializes an exact recovery sidecar into the acknowledged mutation', async () => {
+        await restorePersistentPluginStoragePair(
+            'pluginsave/YWxwaGE.json',
+            { generation: 3 },
+            { plugin: 'Original', updatedAt: 7 },
+        )
+
+        const request = storage.mutatePluginStorage.mock.calls[0][0]
+        expect(JSON.parse(new TextDecoder().decode(request.valueBytes))).toEqual({ generation: 3 })
+        expect(JSON.parse(new TextDecoder().decode(request.ownerRecordBytes))).toEqual({
+            plugin: 'Original',
+            updatedAt: 7,
+        })
+        expect(request.preserveOwner).toBeUndefined()
+    })
+
+    it('requests byte-exact owner preservation when recovery has no inline sidecar', async () => {
+        await restorePersistentPluginStoragePair(
+            'pluginsave/YWxwaGE.json',
+            { generation: 3 },
+            undefined,
+        )
+
+        expect(storage.mutatePluginStorage.mock.calls[0][0]).toMatchObject({
+            operation: 'set',
+            preserveOwner: true,
+        })
+    })
+
     it('validates and detaches set bytes before invoking the atomic primitive', async () => {
         const callerOwned = { nested: ['captured'] }
         const writing = mutatePersistentPluginStorage(
