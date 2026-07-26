@@ -4,9 +4,12 @@ Plugin-side coding patterns, observed across the three audited workloads, that
 are harmless while plugin storage is a local in-memory map but become unsafe
 once the beta turns each operation into an independent, fallible, durable
 server commit. Responsibility is shared: the plugins own their error handling
-and protocols, but the host currently offers no primitive (typed read
-outcomes, per-key CAS/revisions, atomic batch, non-destructive invalidate)
-with which the patterns could be made safe. See [README.md](README.md) for
+and protocols. At the audit point the host offered no versioned read or atomic
+write primitive. AA3 is now fixed: bounded `getWithRevision()` and
+`atomicBatch()` provide per-key revisions/CAS and atomic generation publish.
+That enables safe guidance for the patterns below, but does not repair plugin
+fallbacks, loaders, or cancellation by itself; those integration findings stay
+open until guidance and plugin adoption land. See [README.md](README.md) for
 the full index.
 
 <a id="ip1"></a>
@@ -51,9 +54,9 @@ Confirmed destructive read/modify/write shapes:
 - Plugins must propagate an explicit `missing | value | failed` result; a
   failed prerequisite read must retry or abort the compound update, never
   return an empty repository.
-- The host should expose stable error classes distinguishing missing from
-  transient failure, plus per-key revisions/CAS or an atomic update primitive
-  so a fallback-derived value cannot unconditionally replace a newer row.
+- Plugins should use the host's versioned read plus atomic-batch CAS so a
+  fallback-derived value cannot unconditionally replace a newer row; stable
+  read-error guidance must still distinguish missing from transient failure.
 - Fault-inject one failed GET followed by a healthy SET for configuration,
   credentials, indexes, ledgers, and shard reads; assert the old value
   survives.
@@ -150,8 +153,9 @@ one debounced database save.
   parent manifest last, and garbage-collect old bodies only after publication.
 - Loaders must verify every manifest hash/count before hydrating; on mismatch,
   retry or fall back to a complete prior generation, never load a hybrid.
-- A host-side atomic multi-key batch/CAS API (AA3) would let plugins express
-  this protocol without exposing compound midpoints.
+- The host-side atomic multi-key batch/CAS API added by AA3 now lets plugins
+  express this protocol without exposing compound midpoints; affected plugins
+  still need to migrate to it and validate generations on load.
 
 <a id="ip5"></a>
 ## IP5 — Uncancelled long-running migrations overwrite newer rows after timeout
@@ -165,11 +169,9 @@ unguarded GET, transforms (compresses) the value outside its persistence
 mutex, and unconditionally SETs the result, wrapped in a 30-second
 `Promise.race()` watchdog. The timeout does not abort the migration: the
 losing promise continues iterating and mutating rows after the callback has
-logged the timeout and returned. PocketRisu provides no per-key ETag/CAS for
-ordinary `pluginsave/` writes — the server applies them with unconditional
-`kvSet()` (`server/node/server.cjs:4350-4356`) — so a concurrent normal write
-that commits between the migration's GET and SET is silently overwritten with
-the stale transformed copy.
+logged the timeout and returned. Ordinary `setItem()` remains unconditional,
+so a plugin that does not adopt AA3's versioned read and batch CAS can still
+overwrite a concurrent normal write with the stale transformed copy.
 
 The GET/SET race exists in inline mode too, but with local map mutations the
 migration completes almost instantly; optimized per-row network I/O plus owner

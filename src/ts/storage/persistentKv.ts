@@ -3,10 +3,17 @@ import { forageStorage } from "../globalApi.svelte";
 import { stringifyJsonValue } from "./jsonValue";
 import { assertWellFormedUnicode } from "./unicodeWellFormed";
 import { awaitWithAbort, throwIfAborted } from "./abort";
+import { StorageError } from "./storageError";
 import {
     requireCommittedPluginStorageMutation,
     type PluginStorageMutationResult,
 } from "./pluginStorageMutation";
+import type {
+    PluginStorageBatchRequest,
+    PluginStorageBatchResult,
+    PluginStorageVersionedState,
+} from "./pluginStorageBatch";
+import { PluginStorageBatchError } from "./pluginStorageBatch";
 import type {
     PluginStorageManifestTransport,
     PluginStorageTransitionTransport,
@@ -196,6 +203,68 @@ export async function restorePersistentPluginStoragePair<T>(
         ? await forageStorage.mutatePluginStorage(request, signal)
         : await forageStorage.mutatePluginStorage(request);
     return requireCommittedPluginStorageMutation(result);
+}
+
+export async function batchPersistentPluginStorage(
+    request: PluginStorageBatchRequest,
+    signal?: AbortSignal | null,
+): Promise<Extract<PluginStorageBatchResult, { outcome: "committed" }> | Extract<
+    PluginStorageBatchResult,
+    { outcome: "not-committed" }
+>> {
+    throwIfAborted(signal);
+    await ensureStorageReady(signal);
+    const result = signal
+        ? await forageStorage.batchPluginStorage(request, signal)
+        : await forageStorage.batchPluginStorage(request);
+    if (result.outcome === "committed"
+        || (result.outcome === "not-committed"
+            && (result.code === "PLUGIN_STORAGE_REVISION_CONFLICT"
+                || result.code === "PLUGIN_STORAGE_GENERATION_CONFLICT"))) {
+        return result as never;
+    }
+    throw new PluginStorageBatchError(result);
+}
+
+export async function readPersistentPluginStorageState<T>(
+    valueStorageKey: string,
+    signal?: AbortSignal | null,
+    pluginStorageGeneration?: string,
+): Promise<{
+    status: "missing";
+    value: null;
+    revision: null;
+    generation: string | null;
+} | {
+    status: "value";
+    value: T;
+    revision: string;
+    generation: string | null;
+}> {
+    await ensureStorageReady(signal);
+    const readOptions = {
+        ...(signal ? { signal } : {}),
+        ...(pluginStorageGeneration ? { pluginStorageGeneration } : {}),
+    };
+    const state: PluginStorageVersionedState = Object.keys(readOptions).length > 0
+        ? await forageStorage.getPluginStorageState(valueStorageKey, readOptions)
+        : await forageStorage.getPluginStorageState(valueStorageKey);
+    if (state.missing) {
+        return { status: "missing", value: null, revision: null, generation: state.generation };
+    }
+    if (!state.valueBytes || !state.revision) {
+        throw new StorageError("Plugin storage state omitted committed value bytes.", {
+            code: "STORAGE_RESPONSE_ERROR",
+            operation: "read",
+            retryable: true,
+        });
+    }
+    return {
+        status: "value",
+        value: JSON.parse(decoder.decode(state.valueBytes)) as T,
+        revision: state.revision,
+        generation: state.generation,
+    };
 }
 
 export async function listPersistentKeys(

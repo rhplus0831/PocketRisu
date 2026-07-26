@@ -9,6 +9,11 @@ import type {
     PluginStorageMutationRequest,
     PluginStorageMutationResult,
 } from "./pluginStorageMutation"
+import type {
+    PluginStorageBatchRequest,
+    PluginStorageBatchResult,
+    PluginStorageVersionedState,
+} from "./pluginStorageBatch"
 
 export class AutoStorage{
     isAccount:boolean = false
@@ -68,6 +73,24 @@ export class AutoStorage{
         return signal
             ? await this.realStorage.mutatePluginStorage(request, signal)
             : await this.realStorage.mutatePluginStorage(request)
+    }
+
+    async batchPluginStorage(
+        request: PluginStorageBatchRequest,
+        signal?: AbortSignal | null,
+    ): Promise<PluginStorageBatchResult> {
+        await this.Init()
+        return signal
+            ? await this.realStorage.batchPluginStorage(request, signal)
+            : await this.realStorage.batchPluginStorage(request)
+    }
+
+    async getPluginStorageState(
+        valueKey: string,
+        options: StorageReadOptions | AbortSignal | null = {},
+    ): Promise<PluginStorageVersionedState> {
+        await this.Init()
+        return await this.realStorage.getPluginStorageState(valueKey, options)
     }
 
     async checkAccountSync(){

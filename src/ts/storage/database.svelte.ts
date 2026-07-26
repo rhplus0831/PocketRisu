@@ -1443,7 +1443,12 @@ export interface Database{
     // existing plugins read their keys unchanged. Externalized to
     // pluginsave-meta/ alongside the values when optimizePluginMemory is on.
     // Populated for new V3 writes; legacy/V2 keys stay unrecorded.
-    pluginStorageMeta?:{[key:string]:{plugin:string,updatedAt:number}}
+    pluginStorageMeta?:{[key:string]:{
+        plugin:string,
+        updatedAt:number,
+        revision?:string,
+        generation?:string,
+    }}
     longPressToPopupEditor?: boolean
     showInputActionBar?: boolean
     moveInsteadOfCopyOnCMPConvert?:boolean

@@ -104,28 +104,34 @@ built-in storage viewer.
 
 ### Resolution
 
-**Fixed 2026-07-26.** Optimized full clear now uses a fixed authenticated
-`POST /api/plugin-storage/clear` operation. The caller cannot supply a prefix;
-the server deletes exactly `pluginsave/` and `pluginsave-meta/` inside one
-`queueStorageMutation()` entry and one SQLite transaction. Pre-transaction and
-mid-transaction failures preserve the complete old value+owner set, while a
-committed response represents an empty set.
+**Fixed 2026-07-26.** Optimized V3 clear and the storage viewer's unfiltered
+save clear now share `clearOwnedPluginSaveStorage()`. It resolves the BR2 exact
+ownership manifest and submits one manifest-CAS
+`commitOptimizedStorageMutation()` through `/api/plugin-storage/mutate`. The
+server deletes only the active manifest-owned `pluginsave/` and
+`pluginsave-meta/` rows, publishes an empty next manifest for the selected
+generation, and marks the BR1 recovery obligation inside the same SQLite
+transaction. Physical rows quarantined outside that manifest remain untouched.
+Pre-transaction, row, or manifest-publication failures preserve the complete
+old authoritative value+owner set; a committed response represents an empty
+authoritative set.
+
+The lower-level fixed-namespace `/api/plugin-storage/clear` endpoint remains
+available, but it is no longer the V3 or viewer primitive.
 
 The client uses the shared structured storage-error contract to distinguish a
 committed acknowledgement, explicitly not-committed failure, and an unknown
 outcome after response loss or a malformed acknowledgement. It never
 automatically replays an unknown mutation; a caller that still intends to
 clear the current namespace may retry it. Import-time 503 refusal is explicitly
-not committed and can be retried after the barrier opens. V3 `clear()` and the built-in viewer's
-unfiltered full clear use this same primitive; inline mode publishes one fresh
-empty value map. The former unbounded per-row `Promise.all` deletion path is no
-longer reachable for plugin-storage clear.
+not committed and can be retried after the barrier opens. Inline mode publishes
+one fresh empty value+owner map. The former unbounded per-row `Promise.all`
+deletion path is no longer reachable for V3 or unfiltered viewer save-storage
+clear.
 
-Regression coverage fault-injects pre-transaction failure, transaction
-rollback, response loss, retry, import refusal, concurrent writes, cache
-invalidation, and V3/viewer callers. Independent verification passed 116
-focused client/compatibility tests, all server and compatibility suites,
-`pnpm check`, and a production build.
+Regression coverage exercises exact manifest-owned deletion, quarantined-row
+preservation, stale manifest CAS, transaction rollback, response loss, import
+refusal, concurrent writes, cache invalidation, and V3/viewer callers.
 
 <a id="aa3"></a>
 ## AA3 — No batch/CAS primitive; unload can publish a torn but durable generation
@@ -174,3 +180,98 @@ generations, and reused sub-row keys — are IP4.
 - Test unload after each logical write position of a sharded commit and after
   primary-success/owner-failure; on restart, only a complete old or complete
   new generation may load.
+
+### Resolution
+
+**Fixed 2026-07-27.** V3 save storage now exposes bounded
+`pluginStorage.getWithRevision(key)` and
+`pluginStorage.atomicBatch(operations, unloadSignal?)` primitives in both
+storage modes. A batch accepts 1–128 distinct, well-formed keys and at most an
+exact 16 MiB encoded request. Each operation is a JSON `set` or `remove` and
+may carry an expected opaque revision (including `null` for a required-missing
+row). JSON values, keys, revisions, operation descriptors, and the complete
+request are validated and detached before queue admission.
+
+Optimized batches enter the import-aware mutation queue once. The request hash
+now covers the BR2-selected database generation and its exact expected
+ownership manifest as well as the ordered operations. The server rejects a
+stale generation/manifest before checking row CAS or writing anything, and
+versioned state reads are pinned to the same generation. Rows outside the
+selected manifest are quarantined as absent even if stale physical bytes still
+exist.
+
+Every row CAS check, value mutation, derived owner-sidecar mutation, next exact
+manifest publication, and BR1 recovery-dirty token update runs in one
+synchronous SQLite transaction. No write occurs before all expected revisions
+match. One canonical UUIDv4 generation identifies the AA3 transaction; every
+set receives a new UUIDv4 owner incarnation, and its opaque SHA-256 revision
+binds the exact value bytes to that incarnation. Rewriting identical bytes
+therefore produces a new revision. Historical or malformed owner rows use a
+deterministic raw-row fallback and are never trusted as modern incarnations.
+Results preserve input key order and distinguish stored JSON `null` from a
+missing row.
+
+The deferred recovery snapshot is scheduled immediately at the known-commit
+boundary, before verification or deliberate acknowledgement loss. Automatic
+snapshots and pinned exports therefore observe either the prior exact manifest
+or the complete committed batch, while restore continues to copy value rows
+with byte-exact owner sidecars instead of fabricating ownership.
+
+The wire contract has exact, request-bound schemas. A committed acknowledgement
+must bind the request hash, canonical generation, ordered operation-specific
+revisions (`set` has a revision; `remove` has `null`), and verification state.
+Conflict acknowledgements must be a nonempty ordered subset of only the
+request's CAS-bearing keys, cannot echo the supplied expected revision, and
+carry canonical current state. Extra, duplicate, reordered, malformed, or
+contradictory data makes the outcome unknown. Transport loss and malformed
+success never trigger replay or cache publication. Only an exact known
+`503 IMPORT_IN_PROGRESS` refusal is retried within the original timeout and
+abort signal; retry exhaustion remains known-not-committed. Disposable cache
+updates start only after an exact committed acknowledgement.
+
+Client scheduling acquires a sorted set of per-key queues under the fair
+shared/exclusive mode-transition barrier, preventing overlapping-batch
+deadlocks without blocking unrelated optimized keys. Inline V3 publishers use
+a whole-map publish mutex. Because V2/V2.1 writers must remain synchronous,
+every legacy root, nested, clear, remove, lite-replacement, and full-replacement
+path also advances a shared inline content version. A V3 batch that observes a
+version change while hashing discards its stale clone, re-snapshots, rechecks
+CAS, and only then publishes the detached value and owner maps in one
+no-`await` critical section. Thus neither async V3 writers nor synchronous
+legacy writers can be erased by stale whole-map publication.
+
+The iframe guest performs descriptor-only validation and deep detachment of
+atomic-batch arguments before `postMessage`. Accessors and `toJSON` are never
+invoked; symbol/non-enumerable properties, sparse or subclassed arrays, class
+instances, cycles, non-JSON values, duplicate/non-string keys, and malformed
+Unicode are rejected before a host request exists. Host validation repeats the
+key, JSON-value, revision, duplicate, archive-boundary, operation-count, and
+encoded-size checks after the structured-clone boundary.
+
+Unload storage admission is capability-scoped to the captured unload callback
+and its signal. Once termination begins, forged, expired, or uncaptured
+signals cannot open storage access, and the only newly admitted storage method
+is the bounded atomic batch. Mutations accepted before the deadline—including
+pre-existing work when no unload callback exists—remain tracked through their
+authoritative acknowledgement before iframe removal. Expiry aborts further
+callback preparation without cancelling admitted storage; a callback that
+still cannot finish after the drain reports the typed
+`PLUGIN_UNLOAD_INCOMPLETE` outcome rather than silently tearing work.
+
+Regression coverage injects failure before the transaction; after every value,
+owner, remove, and logical operation; after manifest publication; before
+commit; during verification; and after commit before acknowledgement. It
+covers exact BR2 manifest CAS and pinned ownership reads, BR1 dirty-token
+publication/scheduling, exact 0/1/128/129-operation and
+16 MiB boundaries, same-value rewrites, legacy/malformed rows, strict response
+schemas, import retry success/exhaustion/cancellation, overlapping and disjoint
+batch fairness, cancellation, transitions, every synchronous legacy race, and
+forged/expired unload capabilities. Compatibility coverage actually restarts
+the server against the same SQLite save directory and observes only the
+complete old generation after rollback or the complete new generation after
+commit.
+
+These primitives do not by themselves rewrite unsafe plugin protocols, but
+they provide the host foundation needed for later IP1/IP4/IP5 integration
+guidance: distinguish missing from failure, read a revision, atomically publish
+a complete generation, and reject stale writers with CAS.

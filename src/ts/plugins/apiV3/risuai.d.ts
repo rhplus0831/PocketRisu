@@ -974,6 +974,25 @@ interface SafeMutationObserver {
  * const keys = await risuai.pluginStorage.keys();
  * ```
  */
+type PluginStorageVersionedValue =
+    | { status: 'missing'; value: null; revision: null; generation: string | null }
+    | { status: 'value'; value: any; revision: string; generation: string | null };
+
+type PluginStorageAtomicMutation =
+    | { type: 'set'; key: string; value: any; expectedRevision?: string | null }
+    | { type: 'remove'; key: string; expectedRevision?: string | null };
+
+type PluginStorageAtomicBatchResult =
+    | {
+        committed: true;
+        generation: string;
+        revisions: { key: string; revision: string | null }[];
+    }
+    | {
+        committed: false;
+        conflicts: { key: string; revision: string | null; generation: string | null }[];
+    };
+
 interface PluginStorage {
     /**
      * Gets an item from storage
@@ -981,6 +1000,19 @@ interface PluginStorage {
      * @returns Promise resolving to stored value or null
      */
     getItem(key: string): Promise<any | null>;
+
+    /** Reads a value without conflating stored JSON null with a missing key. */
+    getWithRevision(key: string): Promise<PluginStorageVersionedValue>;
+
+    /**
+     * Atomically applies 1-128 distinct-key mutations. `expectedRevision`
+     * omitted is unconditional; null requires absence; a token requires the
+     * exact state returned by getWithRevision().
+     */
+    atomicBatch(
+        operations: readonly PluginStorageAtomicMutation[],
+        unloadSignal?: AbortSignal,
+    ): Promise<PluginStorageAtomicBatchResult>;
 
     /**
      * Sets an item in storage
@@ -1893,7 +1925,7 @@ interface RisuaiPluginAPI {
     /**
      * Registers an unload function called when plugin is unloaded
      */
-    onUnload(func: () => void | Promise<void>): Promise<void>;
+    onUnload(func: (signal: AbortSignal) => void | Promise<void>): Promise<void>;
 
     /**
      * Gets the fetch logs

@@ -1027,13 +1027,16 @@ export const getV2PluginAPIs = () => {
                 assertSynchronousPluginStorageAccess()
                 if (storageValue) {
                     if (Array.isArray(nestedTarget) && prop === 'length') {
-                        return Reflect.set(nestedTarget, prop, nestedValue, nestedTarget)
+                        const changed = Reflect.set(nestedTarget, prop, nestedValue, nestedTarget)
+                        if (changed) markPluginStorageKeySetChanged()
+                        return changed
                     }
                     defineLegacyStorageValue(
                         nestedTarget as Record<PropertyKey, unknown>,
                         prop,
                         nestedValue,
                     )
+                    markPluginStorageKeySetChanged()
                     return true
                 }
                 return Reflect.set(
@@ -1045,7 +1048,9 @@ export const getV2PluginAPIs = () => {
             },
             deleteProperty(nestedTarget, prop) {
                 assertSynchronousPluginStorageAccess()
-                return Reflect.deleteProperty(nestedTarget, prop)
+                const changed = Reflect.deleteProperty(nestedTarget, prop)
+                if (changed && storageValue) markPluginStorageKeySetChanged()
+                return changed
             },
             defineProperty(nestedTarget, prop, descriptor) {
                 assertSynchronousPluginStorageAccess()
@@ -1055,6 +1060,7 @@ export const getV2PluginAPIs = () => {
                         prop,
                         validateLegacyStorageDescriptor(descriptor),
                     )
+                    markPluginStorageKeySetChanged()
                     return true
                 }
                 const guardedDescriptor = "value" in descriptor

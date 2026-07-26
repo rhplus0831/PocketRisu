@@ -100,6 +100,32 @@ vi.mock("../storage/persistentKv", () => {
         "base64",
     ).toString("utf-8");
     return {
+        batchPersistentPluginStorage: vi.fn(async (request: any) => {
+            const generation = crypto.randomUUID();
+            for (const operation of request.operations) {
+                const valueKey = `pluginsave/${encode(operation.key)}.json`;
+                const metaKey = `pluginsave-meta/${encode(operation.key)}.json`;
+                if (operation.operation === "set") {
+                    persistent.set(valueKey, JSON.parse(new TextDecoder().decode(operation.valueBytes)));
+                    persistent.set(metaKey, {
+                        plugin: operation.owner,
+                        updatedAt: Date.now(),
+                        generation,
+                    });
+                } else {
+                    persistent.delete(valueKey);
+                    persistent.delete(metaKey);
+                }
+            }
+            return {
+                outcome: "committed" as const,
+                generation,
+                revisions: request.operations.map((operation: any) => ({
+                    key: operation.key,
+                    revision: operation.operation === "set" ? `sha256:${"a".repeat(64)}` : null,
+                })),
+            };
+        }),
         clearExternalizedPluginStorage: vi.fn(async () => {
             for (const key of persistent.keys()) {
                 if (key.startsWith("pluginsave/") || key.startsWith("pluginsave-meta/")) {
@@ -164,6 +190,17 @@ vi.mock("../storage/persistentKv", () => {
                 verification: "verified" as const,
             };
         }),
+        readPersistentPluginStorageState: vi.fn(async (valueKey: string) => {
+            if (!persistent.has(valueKey)) {
+                return { status: "missing" as const, value: null, revision: null, generation: null };
+            }
+            return {
+                status: "value" as const,
+                value: persistent.get(valueKey),
+                revision: `sha256:${"b".repeat(64)}`,
+                generation: null,
+            };
+        }),
         readPersistentJson: vi.fn(async (key: string) => persistent.get(key) ?? null),
         readPersistentJsonRow: vi.fn(async (key: string) => persistent.has(key)
             ? { kind: "value", value: persistent.get(key) }
@@ -182,9 +219,11 @@ vi.mock("../storage/persistentKv", () => {
 });
 
 const {
+    atomicBatchOwnedPluginSaveStorage,
     clearOwnedPluginSaveStorage,
     countExternalizedPluginStorageEntries,
     getPluginSaveStorageItem,
+    getPluginSaveStorageItemWithRevision,
     getPluginSaveStorageKey,
     getPluginSaveStorageKeys,
     getPluginSaveStorageLength,
@@ -387,6 +426,466 @@ beforeEach(async () => {
         persistent.set(key, value);
     });
     commitPersistentPluginStorageTransition.mockResolvedValue({ etag: "test-etag" });
+});
+
+describe("AA3 versioned atomic plugin storage", () => {
+    test("publishes an inline multi-key generation without an observable prefix", async () => {
+        database.pluginCustomStorage = { retained: { generation: "old" } };
+        const result = await atomicBatchOwnedPluginSaveStorage([
+            { type: "set", key: "body:0", value: { generation: "new", part: 0 } },
+            { type: "set", key: "body:1", value: { generation: "new", part: 1 } },
+            { type: "set", key: "manifest", value: { generation: "new", count: 2 } },
+            { type: "remove", key: "retained" },
+        ], "AA3 Plugin");
+
+        expect(result.committed).toBe(true);
+        expect(database.pluginCustomStorage).toEqual({
+            "body:0": { generation: "new", part: 0 },
+            "body:1": { generation: "new", part: 1 },
+            manifest: { generation: "new", count: 2 },
+        });
+        expect(new Set(Object.values(database.pluginStorageMeta)
+            .map((record: any) => record.generation))).toEqual(new Set([(result as any).generation]));
+    });
+
+    test("distinguishes stored null from missing and rejects a stale CAS before publish", async () => {
+        database.pluginCustomStorage = { nullable: null, record: { version: 1 } };
+        database.pluginStorageMeta = {
+            nullable: { plugin: "AA3", updatedAt: 1 },
+            record: { plugin: "AA3", updatedAt: 1 },
+        };
+        const nullable = await getPluginSaveStorageItemWithRevision("nullable");
+        const missing = await getPluginSaveStorageItemWithRevision("missing");
+        const original = await getPluginSaveStorageItemWithRevision("record");
+        expect(nullable).toMatchObject({ status: "value", value: null });
+        expect(missing).toEqual({ status: "missing", value: null, revision: null, generation: null });
+        expect(original.status).toBe("value");
+
+        await setOwnedPluginSaveStorageItem("record", { version: 2 }, "AA3");
+        const conflict = await atomicBatchOwnedPluginSaveStorage([
+            {
+                type: "set",
+                key: "record",
+                value: { version: 3 },
+                expectedRevision: original.revision,
+            },
+            { type: "set", key: "must-not-appear", value: true },
+        ], "AA3");
+        expect(conflict).toMatchObject({ committed: false });
+        expect(database.pluginCustomStorage.record).toEqual({ version: 2 });
+        expect(database.pluginCustomStorage).not.toHaveProperty("must-not-appear");
+    });
+
+    test("serializes whole-map inline publication against a disjoint single-key write", async () => {
+        database.pluginCustomStorage = { cas: { version: 1 } };
+        database.pluginStorageMeta = { cas: { plugin: "legacy", updatedAt: 1 } };
+        const original = await getPluginSaveStorageItemWithRevision("cas");
+        expect(original.status).toBe("value");
+
+        const actualDigest = crypto.subtle.digest.bind(crypto.subtle);
+        let releaseDigest!: () => void;
+        const digestGate = new Promise<void>(resolve => { releaseDigest = resolve; });
+        let firstDigestStarted!: () => void;
+        const firstDigest = new Promise<void>(resolve => { firstDigestStarted = resolve; });
+        let gated = false;
+        const digestSpy = vi.spyOn(crypto.subtle, "digest").mockImplementation(async (...args) => {
+            if (!gated) {
+                gated = true;
+                firstDigestStarted();
+                await digestGate;
+            }
+            return actualDigest(...args);
+        });
+        try {
+            const batch = atomicBatchOwnedPluginSaveStorage([{
+                type: "set",
+                key: "cas",
+                value: { version: 2 },
+                expectedRevision: original.revision,
+            }, {
+                type: "set",
+                key: "batch-only",
+                value: true,
+            }], "AA3");
+            await firstDigest;
+            const disjoint = setOwnedPluginSaveStorageItem("single-only", true, "AA3");
+            releaseDigest();
+            await expect(batch).resolves.toMatchObject({ committed: true });
+            await expect(disjoint).resolves.toBeUndefined();
+        } finally {
+            digestSpy.mockRestore();
+            releaseDigest?.();
+        }
+
+        expect(database.pluginCustomStorage).toMatchObject({
+            cas: { version: 2 },
+            "batch-only": true,
+            "single-only": true,
+        });
+        expect(database.pluginStorageMeta).toHaveProperty("batch-only");
+        expect(database.pluginStorageMeta).toHaveProperty("single-only");
+    });
+
+    test.each([
+        "set",
+        "remove",
+        "clear",
+        "setDatabaseLite",
+        "setDatabase",
+        "nested-set",
+    ] as const)("retries V3 publication after a synchronous V2 %s", async legacyMutation => {
+        database.pluginCustomStorage = {
+            retained: { nested: { version: 1 } },
+            "remove-me": true,
+            stale: true,
+        };
+        database.pluginStorageMeta = {};
+        const v2Apis = getV2PluginAPIs();
+        const retainedDatabase = v2Apis.getDatabase() as any;
+        const retainedNested = retainedDatabase.pluginCustomStorage.retained.nested;
+        const actualDigest = crypto.subtle.digest.bind(crypto.subtle);
+        let releaseDigest!: () => void;
+        const digestGate = new Promise<void>(resolve => { releaseDigest = resolve; });
+        let markDigestStarted!: () => void;
+        const digestStarted = new Promise<void>(resolve => { markDigestStarted = resolve; });
+        let gated = false;
+        const digestSpy = vi.spyOn(crypto.subtle, "digest").mockImplementation(async (...args) => {
+            if (!gated) {
+                gated = true;
+                markDigestStarted();
+                await digestGate;
+            }
+            return actualDigest(...args);
+        });
+        let legacyCompletion: Promise<unknown> = Promise.resolve();
+        try {
+            const batch = atomicBatchOwnedPluginSaveStorage([{
+                type: "set",
+                key: "batch-only",
+                value: { from: "v3" },
+            }], "AA3");
+            await digestStarted;
+            switch (legacyMutation) {
+                case "set":
+                    v2Apis.pluginStorage.setItem("legacy-set", "kept");
+                    break;
+                case "remove":
+                    v2Apis.pluginStorage.removeItem("remove-me");
+                    break;
+                case "clear":
+                    v2Apis.pluginStorage.clear();
+                    break;
+                case "setDatabaseLite":
+                    v2Apis.setDatabaseLite({ pluginCustomStorage: { "lite-replacement": true } });
+                    break;
+                case "setDatabase":
+                    legacyCompletion = v2Apis.setDatabase({
+                        pluginCustomStorage: { "full-replacement": true },
+                    });
+                    break;
+                case "nested-set":
+                    retainedNested.version = 2;
+                    break;
+            }
+            releaseDigest();
+            await legacyCompletion;
+            await expect(batch).resolves.toMatchObject({ committed: true });
+        } finally {
+            digestSpy.mockRestore();
+            releaseDigest?.();
+        }
+
+        expect(database.pluginCustomStorage["batch-only"]).toEqual({ from: "v3" });
+        if (legacyMutation === "set") {
+            expect(database.pluginCustomStorage["legacy-set"]).toBe("kept");
+        } else if (legacyMutation === "remove") {
+            expect(database.pluginCustomStorage).not.toHaveProperty("remove-me");
+        } else if (legacyMutation === "clear") {
+            expect(database.pluginCustomStorage).toEqual({
+                "batch-only": { from: "v3" },
+            });
+        } else if (legacyMutation === "setDatabaseLite") {
+            expect(database.pluginCustomStorage).toEqual({
+                "lite-replacement": true,
+                "batch-only": { from: "v3" },
+            });
+        } else if (legacyMutation === "setDatabase") {
+            expect(database.pluginCustomStorage).toEqual({
+                "full-replacement": true,
+                "batch-only": { from: "v3" },
+            });
+        } else {
+            expect(database.pluginCustomStorage.retained.nested.version).toBe(2);
+        }
+    });
+
+    test("re-evaluates CAS after a synchronous V2 write to the touched key", async () => {
+        database.pluginCustomStorage = { cas: { version: 1 } };
+        database.pluginStorageMeta = { cas: { plugin: "legacy", updatedAt: 1 } };
+        const original = await getPluginSaveStorageItemWithRevision("cas");
+        expect(original.status).toBe("value");
+        const v2Apis = getV2PluginAPIs();
+        const actualDigest = crypto.subtle.digest.bind(crypto.subtle);
+        let releaseDigest!: () => void;
+        const digestGate = new Promise<void>(resolve => { releaseDigest = resolve; });
+        let markDigestStarted!: () => void;
+        const digestStarted = new Promise<void>(resolve => { markDigestStarted = resolve; });
+        let gated = false;
+        const digestSpy = vi.spyOn(crypto.subtle, "digest").mockImplementation(async (...args) => {
+            if (!gated) {
+                gated = true;
+                markDigestStarted();
+                await digestGate;
+            }
+            return actualDigest(...args);
+        });
+        try {
+            const batch = atomicBatchOwnedPluginSaveStorage([{
+                type: "set",
+                key: "cas",
+                value: { version: 3 },
+                expectedRevision: original.revision,
+            }], "AA3");
+            await digestStarted;
+            (v2Apis.pluginStorage.setItem as any)("cas", { version: 2 });
+            releaseDigest();
+            await expect(batch).resolves.toMatchObject({
+                committed: false,
+                conflicts: [{ key: "cas" }],
+            });
+        } finally {
+            digestSpy.mockRestore();
+            releaseDigest?.();
+        }
+        expect(database.pluginCustomStorage.cas).toEqual({ version: 2 });
+    });
+
+    test("treats malformed UUID-looking owners as deterministic legacy rows", async () => {
+        database.pluginCustomStorage = {
+            alpha: { stable: true },
+            beta: { stable: true },
+            malformedNull: { stable: true },
+            unowned: { stable: true },
+        };
+        database.pluginStorageMeta = {
+            alpha: {
+                plugin: "legacy-a",
+                updatedAt: 1,
+                revision: "123e4567-e89b-42d3-a456-426614174000",
+            },
+            beta: {
+                plugin: "legacy-b",
+                updatedAt: 1,
+                revision: "123e4567-e89b-42d3-a456-426614174000",
+            },
+            malformedNull: null,
+        };
+        const alpha1 = await getPluginSaveStorageItemWithRevision("alpha");
+        const alpha2 = await getPluginSaveStorageItemWithRevision("alpha");
+        const beta = await getPluginSaveStorageItemWithRevision("beta");
+        const malformedNull = await getPluginSaveStorageItemWithRevision("malformedNull");
+        const unowned = await getPluginSaveStorageItemWithRevision("unowned");
+        expect(alpha1).toMatchObject({ status: "value", generation: null });
+        expect(alpha2).toEqual(alpha1);
+        expect(beta).toMatchObject({ status: "value", generation: null });
+        expect((alpha1 as any).revision).not.toBe((beta as any).revision);
+        expect((malformedNull as any).revision).not.toBe((unowned as any).revision);
+    });
+
+    test("rejects duplicate keys during bounded preflight", async () => {
+        await expect(atomicBatchOwnedPluginSaveStorage([
+            { type: "set", key: "same", value: 1 },
+            { type: "remove", key: "same" },
+        ], "AA3")).rejects.toThrow("Duplicate");
+        expect(database.pluginCustomStorage).toEqual({});
+    });
+
+    test("cancels bounded preparation before queue admission", async () => {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(), 0);
+        const mutations = Array.from({ length: 17 }, (_, index) => ({
+            type: "set" as const,
+            key: `prepared:${index}`,
+            value: { index },
+        }));
+        await expect(atomicBatchOwnedPluginSaveStorage(
+            mutations,
+            "AA3",
+            controller.signal,
+        )).rejects.toMatchObject({ name: "AbortError" });
+        expect(database.pluginCustomStorage).toEqual({});
+    });
+
+    test("optimized mode sends one detached authoritative batch", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("selected-generation", [], []);
+        const { batchPersistentPluginStorage } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        const result = await atomicBatchOwnedPluginSaveStorage([
+            { type: "set", key: "body", value: { detached: true } },
+            { type: "set", key: "manifest", value: ["body"] },
+        ], "AA3");
+        expect(result.committed).toBe(true);
+        expect(batchPersistentPluginStorage).toHaveBeenCalledOnce();
+        const request = batchPersistentPluginStorage.mock.calls[0][0];
+        expect(request).toMatchObject({
+            generation: "selected-generation",
+            expectedManifest: {
+                generation: "selected-generation",
+                valueKeys: [],
+                metaKeys: [],
+            },
+        });
+        expect(request.operations).toHaveLength(2);
+        expect(JSON.parse(new TextDecoder().decode(
+            (request.operations[0] as any).valueBytes,
+        ))).toEqual({ detached: true });
+    });
+
+    test("orders overlapping key sets without deadlock while disjoint batches proceed", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("selected-generation", [], []);
+        const { batchPersistentPluginStorage } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        const original = batchPersistentPluginStorage.getMockImplementation()!;
+        let releaseFirst!: () => void;
+        const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+        const entered: string[][] = [];
+        batchPersistentPluginStorage.mockImplementation(async (request: any) => {
+            const requestKeys = request.operations.map((operation: any) => operation.key);
+            entered.push(requestKeys);
+            if (requestKeys.includes("shared")) await firstGate;
+            return {
+                outcome: "committed",
+                generation: crypto.randomUUID(),
+                revisions: request.operations.map((operation: any) => ({
+                    key: operation.key,
+                    revision: operation.operation === "set" ? `sha256:${"a".repeat(64)}` : null,
+                })),
+            } as any;
+        });
+        try {
+            const first = atomicBatchOwnedPluginSaveStorage([
+                { type: "set", key: "shared", value: 1 },
+                { type: "set", key: "z", value: 1 },
+            ], "AA3");
+            await vi.waitFor(() => expect(entered).toHaveLength(1));
+            const overlapping = atomicBatchOwnedPluginSaveStorage([
+                { type: "set", key: "a", value: 2 },
+                { type: "set", key: "shared", value: 2 },
+            ], "AA3");
+            const disjoint = atomicBatchOwnedPluginSaveStorage([
+                { type: "set", key: "other", value: 3 },
+            ], "AA3");
+            await vi.waitFor(() => expect(entered).toContainEqual(["other"]));
+            expect(entered).not.toContainEqual(["a", "shared"]);
+            releaseFirst();
+            await expect(Promise.all([first, overlapping, disjoint])).resolves.toHaveLength(3);
+            expect(entered).toEqual([
+                ["shared", "z"],
+                ["other"],
+                ["a", "shared"],
+            ]);
+        } finally {
+            releaseFirst?.();
+            batchPersistentPluginStorage.mockImplementation(original);
+        }
+    });
+
+    test("keeps an aborted overlapping batch queued so its successor cannot overtake", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("selected-generation", [], []);
+        const { batchPersistentPluginStorage } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        const original = batchPersistentPluginStorage.getMockImplementation()!;
+        let releaseFirst!: () => void;
+        const gate = new Promise<void>(resolve => { releaseFirst = resolve; });
+        const entered: string[] = [];
+        batchPersistentPluginStorage.mockImplementation(async (request: any) => {
+            const key = request.operations[0].key;
+            entered.push(key);
+            if (key === "held") await gate;
+            return {
+                outcome: "committed",
+                generation: crypto.randomUUID(),
+                revisions: request.operations.map((operation: any) => ({
+                    key: operation.key,
+                    revision: `sha256:${"b".repeat(64)}`,
+                })),
+            } as any;
+        });
+        const controller = new AbortController();
+        try {
+            const held = atomicBatchOwnedPluginSaveStorage([
+                { type: "set", key: "held", value: 1 },
+                { type: "set", key: "shared", value: 1 },
+            ], "AA3");
+            await vi.waitFor(() => expect(entered).toEqual(["held"]));
+            const cancelled = atomicBatchOwnedPluginSaveStorage([
+                { type: "set", key: "shared", value: 2 },
+                { type: "set", key: "successor", value: 2 },
+            ], "AA3", controller.signal);
+            const successor = atomicBatchOwnedPluginSaveStorage([
+                { type: "set", key: "successor", value: 3 },
+            ], "AA3");
+            controller.abort();
+            await expect(cancelled).rejects.toMatchObject({ name: "AbortError" });
+            await new Promise(resolve => setTimeout(resolve, 0));
+            expect(entered).toEqual(["held"]);
+            releaseFirst();
+            await expect(held).resolves.toMatchObject({ committed: true });
+            await expect(successor).resolves.toMatchObject({ committed: true });
+            expect(entered).toEqual(["held", "successor"]);
+        } finally {
+            releaseFirst?.();
+            batchPersistentPluginStorage.mockImplementation(original);
+        }
+    });
+
+    test("holds a mode transition behind an active batch", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("selected-generation", [], []);
+        const { batchPersistentPluginStorage } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        const original = batchPersistentPluginStorage.getMockImplementation()!;
+        let releaseBatch!: () => void;
+        let markEntered!: () => void;
+        const gate = new Promise<void>(resolve => { releaseBatch = resolve; });
+        const entered = new Promise<void>(resolve => { markEntered = resolve; });
+        batchPersistentPluginStorage.mockImplementation(async (request: any) => {
+            markEntered();
+            await gate;
+            return {
+                outcome: "committed",
+                generation: crypto.randomUUID(),
+                revisions: request.operations.map((operation: any) => ({
+                    key: operation.key,
+                    revision: `sha256:${"c".repeat(64)}`,
+                })),
+            } as any;
+        });
+        try {
+            const batch = atomicBatchOwnedPluginSaveStorage([
+                { type: "set", key: "transition", value: true },
+            ], "AA3");
+            await entered;
+            let transitioned = false;
+            const transition = withPluginSaveStorageLock(async () => { transitioned = true; });
+            await new Promise(resolve => setTimeout(resolve, 0));
+            expect(transitioned).toBe(false);
+            releaseBatch();
+            await expect(batch).resolves.toMatchObject({ committed: true });
+            await expect(transition).resolves.toBeUndefined();
+            expect(transitioned).toBe(true);
+        } finally {
+            releaseBatch?.();
+            batchPersistentPluginStorage.mockImplementation(original);
+        }
+    });
 });
 
 describe("readExternalizedPluginStorage", () => {

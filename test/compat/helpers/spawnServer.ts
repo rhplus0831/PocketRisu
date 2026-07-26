@@ -19,6 +19,8 @@ export interface ServerHandle {
   port: number
   password: string
   cwd: string
+  /** Restart the same save directory on a fresh port. */
+  restart: (env?: Record<string, string>) => Promise<void>
   /** Kill the server and clean up the temp directory. */
   cleanup: () => Promise<void>
 }
@@ -63,59 +65,96 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Server
   await writeFile(path.join(tempDir, 'save', '__password'), TEST_PASSWORD, 'utf-8')
   if (opts.seedSave) await opts.seedSave(path.join(tempDir, 'save'))
 
-  const port = await getFreePort()
+  let child: ChildProcess | null = null
+  let exited = true
+  const handle = {
+    port: 0,
+    password: TEST_PASSWORD,
+    cwd: tempDir,
+  } as ServerHandle
 
-  const child: ChildProcess = spawn(
-    process.execPath,
-    [SERVER_SCRIPT],
-    {
-      cwd: tempDir,
-      env: { ...process.env, PORT: String(port), NODE_ENV: 'test', ...opts.env },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    },
-  )
+  const launch = async (extraEnv: Record<string, string> = {}) => {
+    handle.port = await getFreePort()
+    let stderrBuf = ''
+    const launched = spawn(
+      process.execPath,
+      [SERVER_SCRIPT],
+      {
+        cwd: tempDir,
+        env: {
+          ...process.env,
+          PORT: String(handle.port),
+          NODE_ENV: 'test',
+          ...opts.env,
+          ...extraEnv,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    )
+    child = launched
+    exited = launched.exitCode !== null
+    launched.stderr?.on('data', (chunk: Buffer) => { stderrBuf += chunk.toString() })
+    launched.on('exit', () => {
+      if (child === launched) exited = true
+    })
 
-  // Collect stderr for diagnostics on failure
-  let stderrBuf = ''
-  child.stderr?.on('data', (chunk: Buffer) => { stderrBuf += chunk.toString() })
-
-  // Wait for the server to print its "running" message
-  await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error(`Server did not start within 10 s.\nstderr: ${stderrBuf}`))
-    }, 10_000)
-
-    child.stdout?.on('data', (chunk: Buffer) => {
-      if (chunk.toString().includes('[Server]') && chunk.toString().includes('server is running')) {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      const timeout = setTimeout(() => {
+        settled = true
+        reject(new Error(`Server did not start within 10 s.\nstderr: ${stderrBuf}`))
+      }, 10_000)
+      launched.stdout?.on('data', (chunk: Buffer) => {
+        if (!settled
+          && chunk.toString().includes('[Server]')
+          && chunk.toString().includes('server is running')) {
+          settled = true
+          clearTimeout(timeout)
+          resolve()
+        }
+      })
+      launched.on('error', (err) => {
+        if (settled) return
+        settled = true
         clearTimeout(timeout)
-        resolve()
-      }
+        reject(err)
+      })
+      launched.on('exit', (code) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeout)
+        reject(new Error(`Server exited early with code ${code}.\nstderr: ${stderrBuf}`))
+      })
     })
+  }
 
-    child.on('error', (err) => { clearTimeout(timeout); reject(err) })
-    child.on('exit', (code) => {
-      clearTimeout(timeout)
-      reject(new Error(`Server exited early with code ${code}.\nstderr: ${stderrBuf}`))
-    })
-  })
-
-  // Track exit state via event listener (set up once, before any cleanup call)
-  let exited = child.exitCode !== null
-  child.on('exit', () => { exited = true })
-
-  const cleanup = async () => {
-    if (!exited) {
-      child.kill('SIGTERM')
+  const stop = async () => {
+    const active = child
+    if (active && !exited) {
+      active.kill('SIGTERM')
       await new Promise<void>(resolve => {
         const timeout = setTimeout(() => {
-          if (!exited) child.kill('SIGKILL')
+          if (active.exitCode === null) active.kill('SIGKILL')
           resolve()
         }, 3000)
-        child.on('exit', () => { clearTimeout(timeout); resolve() })
+        active.on('exit', () => { clearTimeout(timeout); resolve() })
       })
     }
+    if (child === active) {
+      child = null
+      exited = true
+    }
+  }
+
+  handle.restart = async (env = {}) => {
+    await stop()
+    await launch(env)
+  }
+  handle.cleanup = async () => {
+    await stop()
     await rm(tempDir, { recursive: true, force: true })
   }
 
-  return { port, password: TEST_PASSWORD, cwd: tempDir, cleanup }
+  await launch()
+  return handle
 }

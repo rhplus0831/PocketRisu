@@ -7,6 +7,7 @@ const storageMocks = vi.hoisted(() => ({
     writeGate: null as null | ((key: string, signal?: AbortSignal | null) => Promise<void>),
     removeGate: null as null | ((key: string, signal?: AbortSignal | null) => Promise<void>),
     clearGate: null as null | ((prefix: string, signal?: AbortSignal | null) => Promise<void>),
+    batchGate: null as null | ((signal?: AbortSignal | null) => Promise<void>),
 }));
 const alertConfirmMock = vi.hoisted(() => vi.fn(async () => true));
 const notifyErrorMock = vi.hoisted(() => vi.fn());
@@ -53,6 +54,37 @@ vi.mock("../../globalApi.svelte", () => ({
 vi.mock("../../storage/chatStorage", () => ({ chatToStub: (chat: unknown) => chat }));
 
 vi.mock("../../storage/persistentKv", () => ({
+    batchPersistentPluginStorage: async (request: any, signal?: AbortSignal | null) => {
+        await storageMocks.batchGate?.(signal);
+        throwIfAborted(signal);
+        const generation = crypto.randomUUID();
+        for (const operation of request.operations) {
+            const valueKey = `pluginsave/${encodeKey(operation.key)}.json`;
+            const ownerKey = `pluginsave-meta/${encodeKey(operation.key)}.json`;
+            if (operation.operation === "set") {
+                storageMocks.persistent.set(
+                    valueKey,
+                    JSON.parse(new TextDecoder().decode(operation.valueBytes)),
+                );
+                storageMocks.persistent.set(ownerKey, {
+                    plugin: operation.owner,
+                    updatedAt: Date.now(),
+                    generation,
+                });
+            } else {
+                storageMocks.persistent.delete(valueKey);
+                storageMocks.persistent.delete(ownerKey);
+            }
+        }
+        return {
+            outcome: "committed" as const,
+            generation,
+            revisions: request.operations.map((operation: any) => ({
+                key: operation.key,
+                revision: operation.operation === "set" ? `sha256:${"a".repeat(64)}` : null,
+            })),
+        };
+    },
     clearExternalizedPluginStorage: async (signal?: AbortSignal | null) => {
         await storageMocks.clearGate?.("pluginsave/", signal);
         throwIfAborted(signal);
@@ -129,6 +161,17 @@ vi.mock("../../storage/persistentKv", () => ({
             operation,
             verification: "verified" as const,
         };
+    },
+    readPersistentPluginStorageState: async (valueKey: string) => {
+        const value = storageMocks.persistent.get(valueKey);
+        return value === undefined
+            ? { status: "missing" as const, value: null, revision: null, generation: null }
+            : {
+                status: "value" as const,
+                value: cloneJson(value),
+                revision: `sha256:${"b".repeat(64)}`,
+                generation: null,
+            };
     },
     readPersistentJson: async <T>(
         key: string,
@@ -223,6 +266,7 @@ const {
     SandboxHost,
     createV3BridgeRequestRegistry,
     deserializeV3BridgeError,
+    snapshotV3PluginStorageBatchForTransport,
     validateV3DatabaseMutationForTransport,
 } = await import("./factory");
 const serverUtilsPath = "../../../../server/node/utils.cjs";
@@ -355,6 +399,7 @@ beforeEach(async () => {
     storageMocks.writeGate = null;
     storageMocks.removeGate = null;
     storageMocks.clearGate = null;
+    storageMocks.batchGate = null;
     alertConfirmMock.mockClear();
     notifyErrorMock.mockClear();
     pluginV2.providers.clear();
@@ -718,6 +763,62 @@ describe("V3 mode-aware database bridge", () => {
         expect(() => validateV3DatabaseMutationForTransport({
             pluginCustomStorage: malformedUnicode,
         })).toThrow("well-formed Unicode");
+    });
+
+    test("guest atomicBatch transport snapshots values without invoking user code", () => {
+        const getter = vi.fn(() => "evaluated");
+        const toJSON = vi.fn(() => ({ replaced: true }));
+        const value = { nested: { version: 1 } } as Record<string, unknown>;
+        const operations = [{ type: "set", key: "body", value }];
+        const detached = snapshotV3PluginStorageBatchForTransport(operations) as any[];
+        (value.nested as any).version = 2;
+        operations[0].key = "mutated";
+        expect(detached).toEqual([{
+            type: "set",
+            key: "body",
+            value: { nested: { version: 1 } },
+        }]);
+
+        const accessor = {};
+        Object.defineProperty(accessor, "secret", { enumerable: true, get: getter });
+        expect(() => snapshotV3PluginStorageBatchForTransport([
+            { type: "set", key: "body", value: accessor },
+        ])).toThrow("does not accept an accessor");
+        expect(getter).not.toHaveBeenCalled();
+
+        const customJson = { stable: true };
+        Object.defineProperty(customJson, "toJSON", {
+            enumerable: false,
+            value: toJSON,
+        });
+        expect(() => snapshotV3PluginStorageBatchForTransport([
+            { type: "set", key: "body", value: customJson },
+        ])).toThrow("invalid property");
+        expect(toJSON).not.toHaveBeenCalled();
+    });
+
+    test("guest atomicBatch transport rejects lossy descriptors and non-JSON values", () => {
+        const hidden = { visible: true } as Record<PropertyKey, unknown>;
+        Object.defineProperty(hidden, "hidden", { enumerable: false, value: true });
+        const symbol = { visible: true } as Record<PropertyKey, unknown>;
+        symbol[Symbol("hidden")] = true;
+        const sparse = new Array(2);
+        sparse[1] = true;
+        const cyclic: Record<string, unknown> = {};
+        cyclic.self = cyclic;
+        for (const value of [hidden, symbol, sparse, new Date(0), cyclic]) {
+            expect(() => snapshotV3PluginStorageBatchForTransport([
+                { type: "set", key: "body", value },
+            ])).toThrow();
+        }
+
+        const operation = { type: "remove", key: "old" } as Record<PropertyKey, unknown>;
+        operation[Symbol("hidden")] = true;
+        expect(() => snapshotV3PluginStorageBatchForTransport([operation])).toThrow("symbol key");
+        expect(() => snapshotV3PluginStorageBatchForTransport(new Array(1))).toThrow("dense");
+        expect(() => snapshotV3PluginStorageBatchForTransport([
+            { type: "set", key: "\uD800", value: true },
+        ])).toThrow("well-formed Unicode");
     });
 
     test("scrubs every Object.prototype-named value and owner hidden by live Svelte state", async () => {
@@ -1120,6 +1221,59 @@ describe("V3 mode-aware database bridge", () => {
         }
     });
 
+    test("rejects forged and expired unload storage capabilities", async () => {
+        const atomicBatch = vi.fn(async () => ({ committed: true }));
+        const iframe = document.createElement("iframe");
+        document.body.appendChild(iframe);
+        const host = new SandboxHost({
+            _atomicBatchPluginStorage: atomicBatch,
+        } as any);
+        const startup = host.run(iframe, "").catch(() => undefined);
+        const source = iframe.contentWindow!;
+        const responses: any[] = [];
+        vi.spyOn(source, "postMessage").mockImplementation((message: any) => {
+            if (message?.type === "RESPONSE") responses.push(message);
+        });
+        host.beginTermination();
+        expect(host.beginUnloadStorageAdmission()).toBe(true);
+        const validToken = (host as any).unloadCapabilityToken as string;
+        expect(validToken).toMatch(/^[0-9a-f-]{36}$/);
+        const dispatch = (reqId: string, unloadToken: string) => {
+            window.dispatchEvent(new MessageEvent("message", {
+                source,
+                origin: "null",
+                data: {
+                    type: "CALL_ROOT",
+                    reqId,
+                    method: "_atomicBatchPluginStorage",
+                    args: [[{ type: "remove", key: "old" }], {
+                        __type: "ABORT_SIGNAL_REF",
+                        abortId: `abort-${reqId}`,
+                        aborted: false,
+                        unloadToken,
+                    }],
+                },
+            }));
+        };
+        try {
+            dispatch("forged", crypto.randomUUID());
+            await vi.waitFor(() => expect(responses.some(response => (
+                response.reqId === "forged" && response.error
+            ))).toBe(true));
+            expect(atomicBatch).not.toHaveBeenCalled();
+
+            host.endUnloadStorageAdmission();
+            dispatch("expired", validToken);
+            await vi.waitFor(() => expect(responses.some(response => (
+                response.reqId === "expired" && response.error
+            ))).toBe(true));
+            expect(atomicBatch).not.toHaveBeenCalled();
+        } finally {
+            host.terminate();
+            await startup;
+        }
+    });
+
     test("database cancellation stops a pending permission wait before mutation", async () => {
         const plugin = {
             name: "Permission Cancellation Plugin",
@@ -1391,6 +1545,7 @@ describe("V3 guest startup handshake", () => {
         const capturedChannel = pluginChannel.get(channelKey)!;
 
         const teardown = teardownV3Plugins();
+        const teardownOutcome = teardown.then(() => null, error => error);
         await vi.waitFor(() => expect((iframe.contentWindow as any).unloadStarted).toBe(true));
         expect(getV3PluginInstance(plugin.name)).toBeUndefined();
         expect(pluginV2.providers.has("pre-unload-provider")).toBe(false);
@@ -1415,9 +1570,19 @@ describe("V3 guest startup handshake", () => {
         });
         expect(storageMocks.persistent.has(storageKey("late-write"))).toBe(false);
         expect(pluginV2.providers.has("too-late-provider")).toBe(false);
-        await teardown;
+        const teardownError = await teardownOutcome;
         const loadingError = await loadingOutcome;
 
+        expect(teardownError).toBeInstanceOf(AggregateError);
+        expect((teardownError as AggregateError).errors[0]).toBeInstanceOf(AggregateError);
+        expect(((teardownError as AggregateError).errors[0] as AggregateError).errors)
+            .toContainEqual(expect.objectContaining({
+                name: "PluginUnloadIncompleteError",
+                code: "PLUGIN_UNLOAD_INCOMPLETE",
+                retryable: false,
+                commitOutcomeUnknown: false,
+                operation: "unload",
+            }));
         expect(loadingError).toBeInstanceOf(AggregateError);
         expect(pluginV2.providers.has("too-late-provider")).toBe(false);
         expect(get(customProviderStore)).not.toContain("too-late-provider");
@@ -1428,6 +1593,87 @@ describe("V3 guest startup handshake", () => {
         restoreRelay();
         errorSpy.mockRestore();
         logSpy.mockRestore();
+    });
+
+    test("extends unload for an admitted atomic batch and rejects uncaptured late writes", async () => {
+        const batchStarted = deferred();
+        const releaseBatch = deferred();
+        storageMocks.batchGate = async () => {
+            batchStarted.resolve();
+            await releaseBatch.promise;
+        };
+        const plugin = startupPlugin("Atomic Unload Drain", `
+            await risuai.onUnload(async (signal) => {
+                globalThis.unloadBatchStarted = true;
+                globalThis.unloadBatchResult = await risuai.pluginStorage.atomicBatch([
+                    { type: "set", key: "body:0", value: { generation: "new", part: 0 } },
+                    { type: "set", key: "body:1", value: { generation: "new", part: 1 } },
+                    { type: "set", key: "manifest", value: { generation: "new", count: 2 } },
+                ], signal);
+                globalThis.unloadBatchFinished = true;
+            });
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+
+        let teardownSettled = false;
+        const teardown = teardownV3Plugins().finally(() => { teardownSettled = true; });
+        await batchStarted.promise;
+        await new Promise(resolve => setTimeout(resolve, 1_100));
+
+        expect(teardownSettled).toBe(false);
+        expect(iframe.isConnected).toBe(true);
+        expect(storageMocks.persistent.has(storageKey("body:0"))).toBe(false);
+        releaseBatch.resolve();
+        await teardown;
+
+        expect(guestWindow.unloadBatchFinished).toBe(true);
+        expect(storageMocks.persistent.get(storageKey("body:0"))).toEqual({
+            generation: "new",
+            part: 0,
+        });
+        expect(storageMocks.persistent.get(storageKey("manifest"))).toEqual({
+            generation: "new",
+            count: 2,
+        });
+        expect(iframe.isConnected).toBe(false);
+        restoreRelay();
+    });
+
+    test("drains a pre-existing storage mutation even without an unload callback", async () => {
+        const batchStarted = deferred();
+        const releaseBatch = deferred();
+        storageMocks.batchGate = async () => {
+            batchStarted.resolve();
+            await releaseBatch.promise;
+        };
+        const plugin = startupPlugin("Existing Batch Drain", `
+            globalThis.pendingBatch = risuai.pluginStorage.atomicBatch([
+                { type: "set", key: "already-started", value: { durable: true } },
+            ]);
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await batchStarted.promise;
+        await loading;
+
+        let settled = false;
+        const teardown = teardownV3Plugins().finally(() => { settled = true; });
+        await new Promise(resolve => setTimeout(resolve, 25));
+        expect(settled).toBe(false);
+        expect(iframe.isConnected).toBe(true);
+        releaseBatch.resolve();
+        await teardown;
+
+        expect(storageMocks.persistent.get(storageKey("already-started"))).toEqual({
+            durable: true,
+        });
+        expect(iframe.isConnected).toBe(false);
+        restoreRelay();
     });
 
     test("keeps a plugin generation pending until delayed storage finishes before registration", async () => {

@@ -43,6 +43,9 @@ export type PluginStorageBackend = "save" | "local" | "idb";
 export interface PluginOwnerRecord {
     plugin: string;
     updatedAt: number;
+    /** AA3 opaque incarnation and transaction generation for save storage. */
+    revision?: string;
+    generation?: string;
 }
 
 const LOCAL_META_KEY = "risu_plugin_storage_owners";

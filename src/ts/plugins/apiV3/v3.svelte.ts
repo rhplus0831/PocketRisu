@@ -10,7 +10,9 @@ import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
 import {
     clearOwnedPluginSaveStorage,
+    atomicBatchOwnedPluginSaveStorage,
     getPluginSaveStorageItem,
+    getPluginSaveStorageItemWithRevision,
     getPluginSaveStorageKey,
     getPluginSaveStorageKeys,
     getPluginSaveStorageLength,
@@ -75,7 +77,7 @@ import {
 
 export const pluginChannel = new Map<string, Function>();
 
-type V3LifecycleCallback = () => void | Promise<void>;
+type V3LifecycleCallback = (signal?: AbortSignal) => void | Promise<void>;
 type V3ScriptMode = 'input' | 'output' | 'process' | 'display';
 
 class V3PluginLifecycleScope {
@@ -123,18 +125,51 @@ class V3PluginLifecycleScope {
         return true;
     }
 
-    async runUnloadCallbacks(timeoutMs = 1000): Promise<unknown[]> {
+    async runUnloadCallbacks(host: SandboxHost, timeoutMs = 1000): Promise<unknown[]> {
         const callbacks = this.unloadCallbacks.splice(0);
-        if (callbacks.length === 0) return [];
+        if (callbacks.length === 0) {
+            await host.drainUnloadStorageMutations();
+            return [];
+        }
+        const controller = new AbortController();
+        host.beginUnloadStorageAdmission();
         const completion = Promise.allSettled(callbacks.map(callback =>
-            Promise.resolve().then(() => callback()),
+            Promise.resolve().then(() => callback(controller.signal)),
         ));
-        const timeout = Symbol('timeout');
-        const result = await Promise.race([
+        const timeout = 'timeout' as const;
+        let result: PromiseSettledResult<void>[] | typeof timeout = await Promise.race([
             completion,
             sleep(timeoutMs).then(() => timeout),
         ]);
-        if (!Array.isArray(result)) return [];
+        host.endUnloadStorageAdmission();
+
+        if (result === timeout) {
+            // Stop callback code from preparing later work. Storage mutations
+            // accepted before this boundary remain alive and are drained below.
+            controller.abort(new DOMException(
+                `Plugin ${this.pluginName} unload grace period expired.`,
+                'AbortError',
+            ));
+        }
+        await host.drainUnloadStorageMutations();
+
+        if (result === timeout) {
+            result = await Promise.race([
+                completion,
+                sleep(100).then(() => timeout),
+            ]);
+        }
+        if (result === timeout) {
+            const error = new Error(
+                `Plugin ${this.pluginName} unload did not finish after admitted storage drained.`,
+            ) as Error & Record<string, unknown>;
+            error.name = 'PluginUnloadIncompleteError';
+            error.code = 'PLUGIN_UNLOAD_INCOMPLETE';
+            error.retryable = false;
+            error.commitOutcomeUnknown = false;
+            error.operation = 'unload';
+            return [error];
+        }
         return result
             .filter((entry): entry is PromiseRejectedResult => entry.status === 'rejected')
             .map(entry => entry.reason);
@@ -639,7 +674,7 @@ const unloadV3PluginInstance = async (instance: V3PluginInstance) => {
                 errors.push(...await instance.scope.cleanup());
             } finally {
                 try {
-                    errors.push(...await instance.scope.runUnloadCallbacks());
+                    errors.push(...await instance.scope.runUnloadCallbacks(instance.host));
                 } finally {
                     instance.host.terminate();
                 }
@@ -1563,7 +1598,7 @@ export const makeRisuaiAPIV3 = (
             lifecycle.addCleanup(() => observer.disconnect());
             return observer;
         },
-        onUnload: (callback: () => void) => {
+        onUnload: (callback: (signal?: AbortSignal) => void | Promise<void>) => {
             lifecycle.addUnload(authorizeSandboxCallbackDuringTermination(callback));
         },
         getFetchLogs: async () => {
@@ -1629,6 +1664,18 @@ export const makeRisuaiAPIV3 = (
         _getPluginStorage: (key: string, signal?: AbortSignal) => {
             return getPluginSaveStorageItem(key, signal)
         },
+        _getVersionedPluginStorage: (key: string, signal?: AbortSignal) => {
+            return getPluginSaveStorageItemWithRevision(key, signal)
+        },
+        _atomicBatchPluginStorage: (
+            operations: Parameters<typeof atomicBatchOwnedPluginSaveStorage>[0],
+            _unloadCapabilityOrRequestSignal?: AbortSignal,
+            requestSignal?: AbortSignal,
+        ) => atomicBatchOwnedPluginSaveStorage(
+            operations,
+            plugin.name,
+            requestSignal ?? _unloadCapabilityOrRequestSignal,
+        ),
         _setPluginStorage: async (key: string, value: any, signal?: AbortSignal) => {
             await setOwnedPluginSaveStorageItem(key, value, plugin.name, signal)
         },
@@ -1671,6 +1718,8 @@ export const makeRisuaiAPIV3 = (
             return {
                 'pluginStorage':{
                     'getItem': '_getPluginStorage',
+                    'getWithRevision': '_getVersionedPluginStorage',
+                    'atomicBatch': '_atomicBatchPluginStorage',
                     'setItem': '_setPluginStorage',
                     'removeItem': '_removePluginStorage',
                     'clear': '_clearPluginStorage',

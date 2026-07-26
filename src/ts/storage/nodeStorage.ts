@@ -40,9 +40,20 @@ import {
     pluginStorageTransportOutcomeUnknown,
     publishPluginStorageMutationCache,
 } from "./pluginStorageMutation"
+import type {
+    PluginStorageBatchRequest,
+    PluginStorageBatchResult,
+    PluginStorageVersionedState,
+} from "./pluginStorageBatch"
+import {
+    classifyPluginStorageBatchAcknowledgement,
+    encodePluginStorageBatchRequest,
+    PLUGIN_STORAGE_UUID_PATTERN,
+    pluginStorageBatchTransportOutcomeUnknown,
+} from "./pluginStorageBatch"
 
 export const AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS = 15_000
-type BoundedStorageOperation = 'read' | 'list' | 'write' | 'remove' | 'transition'
+type BoundedStorageOperation = 'read' | 'list' | 'write' | 'remove' | 'transition' | 'batch'
 
 interface AuthoritativeStorageOutcomeTracker {
     markRequestDispatched: () => void
@@ -78,7 +89,8 @@ export async function runBoundedAuthoritativeStorageOperation<T>(
             controller.abort()
             const message = `Authoritative storage ${kind} timed out after ${timeoutMs}ms.`
             const ambiguousMutation = mutationRequestInFlight
-                && (kind === "write" || kind === "remove" || kind === "transition")
+                && (kind === "write" || kind === "remove"
+                    || kind === "transition" || kind === "batch")
             reject(new StorageError(message, {
                 code: ambiguousMutation
                     ? "COMMIT_OUTCOME_UNKNOWN"
@@ -100,7 +112,8 @@ export async function runBoundedAuthoritativeStorageOperation<T>(
             timeout,
         ])
     } catch (error) {
-        const mutation = kind === "write" || kind === "remove" || kind === "transition"
+        const mutation = kind === "write" || kind === "remove"
+            || kind === "transition" || kind === "batch"
         if (mutation && mutationRequestInFlight) {
             if (error instanceof StorageError && error.commitOutcomeUnknown) throw error
             throw new StorageError(
@@ -1137,6 +1150,217 @@ export class NodeStorage{
                 },
             })
             return result
+        }
+    }
+
+    async batchPluginStorage(
+        request: PluginStorageBatchRequest,
+        externalSignal?: AbortSignal | null,
+    ): Promise<PluginStorageBatchResult> {
+        const stableRequest: PluginStorageBatchRequest = {
+            generation: request.generation,
+            expectedManifest: {
+                ...request.expectedManifest,
+                valueKeys: [...request.expectedManifest.valueKeys],
+                metaKeys: [...request.expectedManifest.metaKeys],
+            },
+            operations: request.operations.map(operation => operation.operation === 'set'
+                ? { ...operation, valueBytes: new Uint8Array(operation.valueBytes) }
+                : { ...operation }),
+        }
+        try {
+            return await runBoundedAuthoritativeStorageOperation(
+                (signal, outcome) => this.batchPluginStorageAuthoritative(
+                    stableRequest,
+                    signal,
+                    outcome,
+                ),
+                'batch',
+                AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+                externalSignal,
+            )
+        } catch (error) {
+            if (error instanceof StorageError) {
+                return {
+                    outcome: error.commitOutcomeUnknown ? 'unknown' : 'not-committed',
+                    operation: 'batch',
+                    code: error.code ?? (error.commitOutcomeUnknown
+                        ? 'COMMIT_OUTCOME_UNKNOWN'
+                        : 'STORAGE_TRANSPORT_ERROR'),
+                    error: error.message,
+                    retryable: error.commitOutcomeUnknown ? false : error.retryable,
+                    status: error.status,
+                    ...(error.commitOutcomeUnknown
+                        ? { commitOutcomeUnknown: true as const }
+                        : {
+                            retryAfter: error.retryAfter,
+                            commitOutcomeUnknown: false as const,
+                        }),
+                } as PluginStorageBatchResult
+            }
+            return pluginStorageBatchTransportOutcomeUnknown(error)
+        }
+    }
+
+    private async batchPluginStorageAuthoritative(
+        request: PluginStorageBatchRequest,
+        signal: AbortSignal,
+        outcome: AuthoritativeStorageOutcomeTracker,
+    ): Promise<PluginStorageBatchResult> {
+        throwIfAborted(signal)
+        const requestBytes = encodePluginStorageBatchRequest(request)
+        const requestHash = await sha256Bytes(requestBytes)
+        throwIfAborted(signal)
+
+        for (let retryIndex = 0; ; retryIndex++) {
+            const response = await this.authFetch('/api/plugin-storage/batch', {
+                method: 'POST',
+                headers: { 'content-type': 'application/octet-stream' },
+                body: requestBytes as any,
+                signal,
+            }, true, outcome)
+
+            // Header receipt does not acknowledge the transaction; retain the
+            // ambiguous phase through complete, schema-bound body consumption.
+            outcome.markRequestDispatched()
+            let body: unknown = null
+            try {
+                body = await awaitWithAbort(response.json(), signal)
+            } catch (error) {
+                if (signal.aborted) throw error
+            }
+            const result = classifyPluginStorageBatchAcknowledgement(
+                response.status,
+                body,
+                requestHash,
+                request.operations,
+                parseRetryAfterSeconds(response.headers.get('retry-after')),
+            )
+            if (result.outcome === 'unknown') return result
+            outcome.markDefinitiveResponse()
+
+            if (result.outcome === 'not-committed'
+                && result.code === 'IMPORT_IN_PROGRESS'
+                && result.retryable
+                && retryIndex < PLUGIN_STORAGE_MAX_RETRIES) {
+                await this.waitForPluginStorageRetry(new StorageError(result.error, {
+                    status: result.status,
+                    code: result.code,
+                    retryAfter: result.retryAfter,
+                    retryable: true,
+                    commitOutcomeUnknown: false,
+                    operation: 'batch',
+                }), retryIndex, signal)
+                continue
+            }
+
+            if (result.outcome === 'committed' && isResourceCacheEnabled()) {
+                for (const operation of request.operations) {
+                    const valueKey = `${PLUGIN_STORAGE_PREFIXES[0]}${Buffer.from(
+                        operation.key,
+                        'utf-8',
+                    ).toString('base64url')}.json`
+                    if (operation.operation === 'set') {
+                        void settleBestEffortResourceCache(
+                            storeBytes(`kv:${valueKey}`, operation.valueBytes),
+                            null,
+                        )
+                    } else {
+                        void invalidateResourceCacheManifest(`kv:${valueKey}`)
+                    }
+                }
+            }
+            return result
+        }
+    }
+
+    async getPluginStorageState(
+        valueKey: string,
+        readOptions: StorageReadOptions | AbortSignal | null = {},
+    ): Promise<PluginStorageVersionedState> {
+        const options = normalizeStorageReadOptions(readOptions)
+        return runBoundedAuthoritativeStorageOperation(
+            signal => this.getPluginStorageStateAuthoritative(
+                valueKey,
+                signal,
+                options.pluginStorageGeneration,
+            ),
+            'read',
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            options.signal,
+        )
+    }
+
+    private async getPluginStorageStateAuthoritative(
+        valueKey: string,
+        signal: AbortSignal,
+        pluginStorageGeneration?: string,
+    ): Promise<PluginStorageVersionedState> {
+        const headers: Record<string, string> = {
+            'file-path': Buffer.from(valueKey, 'utf-8').toString('hex'),
+        }
+        if (pluginStorageGeneration) {
+            headers['x-plugin-storage-generation'] = pluginStorageGeneration
+        }
+        const response = await this.requestStorage(
+            valueKey,
+            'read',
+            false,
+            () => this.authFetch('/api/plugin-storage/state', {
+                method: 'GET',
+                headers,
+                signal,
+            }),
+            [],
+            signal,
+        )
+        const body = await awaitWithAbort(response.json(), signal) as unknown
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+            throw new StorageError('Plugin storage state response was malformed.', {
+                code: 'STORAGE_RESPONSE_ERROR', operation: 'read', retryable: true,
+            })
+        }
+        const record = body as Record<string, unknown>
+        const allowed = new Set(['success', 'missing', 'value', 'revision', 'generation'])
+        if (Object.keys(record).some(key => !allowed.has(key))
+            || record.success !== true
+            || typeof record.missing !== 'boolean'
+            || (record.revision !== null
+                && (typeof record.revision !== 'string'
+                    || !/^sha256:[0-9a-f]{64}$/.test(record.revision)))
+            || (record.generation !== null
+                && (typeof record.generation !== 'string'
+                    || !PLUGIN_STORAGE_UUID_PATTERN.test(record.generation)))) {
+            throw new StorageError('Plugin storage state response was malformed.', {
+                code: 'STORAGE_RESPONSE_ERROR', operation: 'read', retryable: true,
+            })
+        }
+        if (record.missing === true) {
+            if (record.value !== undefined
+                || record.revision !== null
+                || record.generation !== null) {
+                throw new StorageError('Missing plugin storage state included a value.', {
+                    code: 'STORAGE_RESPONSE_ERROR', operation: 'read', retryable: true,
+                })
+            }
+            return { missing: true, valueBytes: null, revision: null, generation: null }
+        }
+        if (typeof record.value !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(record.value)) {
+            throw new StorageError('Plugin storage state value was malformed.', {
+                code: 'STORAGE_RESPONSE_ERROR', operation: 'read', retryable: true,
+            })
+        }
+        const valueBytes = new Uint8Array(Buffer.from(record.value, 'base64'))
+        if (Buffer.from(valueBytes).toString('base64') !== record.value || record.revision === null) {
+            throw new StorageError('Plugin storage state value was malformed.', {
+                code: 'STORAGE_RESPONSE_ERROR', operation: 'read', retryable: true,
+            })
+        }
+        return {
+            missing: false,
+            valueBytes,
+            revision: record.revision as string,
+            generation: record.generation as string | null,
         }
     }
 

@@ -1,15 +1,19 @@
 import { getDatabase, type Database } from "../storage/database.svelte";
 import {
+    batchPersistentPluginStorage,
+    clearExternalizedPluginStorage,
+    clearPersistentPrefix,
     commitPersistentPluginStorageMutation,
     commitPersistentPluginStorageTransition,
     decodeStorageKeyComponent,
     listPersistentKeys,
     makeEncodedStorageKey,
     mutatePersistentPluginStorage,
-    restorePersistentPluginStoragePair,
+    readPersistentPluginStorageState,
     readPersistentJson,
     readPersistentJsonRow,
     removePersistentKey,
+    restorePersistentPluginStoragePair,
     writePersistentJson,
 } from "../storage/persistentKv";
 import { snapshotJsonValue, stringifyJsonValue } from "../storage/jsonValue";
@@ -46,6 +50,14 @@ import {
     setPluginStorageRecoveryState,
     type PluginStorageRecoveryIssue,
 } from "./pluginStorageRecovery";
+import {
+    PLUGIN_STORAGE_BATCH_MAX_BODY_BYTES,
+    PLUGIN_STORAGE_BATCH_MAX_OPERATIONS,
+    PLUGIN_STORAGE_REVISION_PATTERN,
+    PLUGIN_STORAGE_UUID_PATTERN,
+    encodePluginStorageBatchRequest,
+    type PluginStorageBatchOperation as PersistentPluginStorageBatchOperation,
+} from "../storage/pluginStorageBatch";
 
 export { PLUGIN_SAVE_META_PREFIX, PLUGIN_SAVE_PREFIX };
 export const PLUGIN_STORAGE_MANIFEST_KEY = "plugin-storage/manifest.json";
@@ -182,6 +194,7 @@ class PluginStorageBarrier {
 
 const storageBarrier = new PluginStorageBarrier();
 const storageScopeQueues = new Map<string, Promise<void>>();
+let inlinePluginStoragePublishQueue: Promise<void> = Promise.resolve();
 let storageEnumerationSnapshot: {
     database: Database;
     optimized: boolean;
@@ -194,16 +207,57 @@ function invalidateStorageEnumerationSnapshot(): void {
     markPluginStorageKeySetChanged();
 }
 
+/**
+ * Inline storage publishes by replacing the complete value/meta maps. Per-key
+ * queues alone therefore cannot protect a disjoint-key writer from a batch
+ * that cloned the maps before awaiting its revision hashes. Keep this mutex
+ * inside the already-admitted shared operation so mode transitions cannot
+ * deadlock behind a nested barrier acquisition.
+ */
+async function withInlinePluginStoragePublishLock<T>(
+    operation: () => Promise<T>,
+    signal?: AbortSignal | null,
+): Promise<T> {
+    const previous = inlinePluginStoragePublishQueue;
+    let resolveResult!: (value: T | PromiseLike<T>) => void;
+    let rejectResult!: (error: unknown) => void;
+    const result = new Promise<T>((resolve, reject) => {
+        resolveResult = resolve;
+        rejectResult = reject;
+    });
+    void result.catch(() => undefined);
+    const current = previous.catch(() => undefined).then(async () => {
+        try {
+            throwIfAborted(signal);
+            resolveResult(await operation());
+        } catch (error) {
+            rejectResult(error);
+        }
+    });
+    inlinePluginStoragePublishQueue = current;
+    return await awaitWithAbort(result, signal);
+}
+
 async function withPluginSaveStorageScope<T>(
     scope: string,
     operation: () => Promise<T>,
     signal?: AbortSignal | null,
 ): Promise<T> {
+    return withPluginSaveStorageScopes([scope], operation, signal);
+}
+
+async function withPluginSaveStorageScopes<T>(
+    requestedScopes: readonly string[],
+    operation: () => Promise<T>,
+    signal?: AbortSignal | null,
+): Promise<T> {
+    const scopes = [...new Set(requestedScopes)].sort();
+    if (scopes.length === 0) throw new TypeError("At least one plugin storage scope is required.");
     // Acquire shared admission immediately. This makes every ordinary call
     // submitted before a transition part of the old-mode drain, while calls
     // submitted after it wait for the new mode.
     const releaseBarrier = await storageBarrier.acquireShared(signal);
-    const previous = storageScopeQueues.get(scope) ?? Promise.resolve();
+    const previous = scopes.map(scope => storageScopeQueues.get(scope) ?? Promise.resolve());
     let resolveResult!: (value: T | PromiseLike<T>) => void;
     let rejectResult!: (error: unknown) => void;
     const result = new Promise<T>((resolve, reject) => {
@@ -218,8 +272,7 @@ async function withPluginSaveStorageScope<T>(
     // promise. A queued caller can reject immediately on abort, but its token
     // must remain behind the predecessor until that predecessor settles. This
     // prevents a later same-key operation from overtaking active work.
-    const current = previous
-        .catch(() => undefined)
+    const current = Promise.all(previous.map(token => token.catch(() => undefined)))
         .then(async () => {
             try {
                 throwIfAborted(signal);
@@ -228,9 +281,11 @@ async function withPluginSaveStorageScope<T>(
                 rejectResult(error);
             }
         });
-    storageScopeQueues.set(scope, current);
+    for (const scope of scopes) storageScopeQueues.set(scope, current);
     void current.then(() => {
-        if (storageScopeQueues.get(scope) === current) storageScopeQueues.delete(scope);
+        for (const scope of scopes) {
+            if (storageScopeQueues.get(scope) === current) storageScopeQueues.delete(scope);
+        }
         releaseBarrier();
     });
 
@@ -275,6 +330,19 @@ export function withPluginSaveStorageKeyLock<T>(
     signal?: AbortSignal | null,
 ): Promise<T> {
     return withPluginSaveStorageScope(`save:${key}`, operation, signal);
+}
+
+/** Atomically queue one operation behind every touched key without deadlock. */
+export function withPluginSaveStorageKeySetLock<T>(
+    keys: readonly string[],
+    operation: () => Promise<T>,
+    signal?: AbortSignal | null,
+): Promise<T> {
+    return withPluginSaveStorageScopes(
+        keys.map(key => `save:${normalizePluginStorageKey(key)}`),
+        operation,
+        signal,
+    );
 }
 
 function decodeListedStorageKey(fullKey: string, prefix: string): string | null {
@@ -858,11 +926,13 @@ export async function setPluginSaveStorageItem<T>(
             throwIfAborted(signal);
             const db = getDatabase();
             if (!db.optimizePluginMemory) {
-                const next = cloneJsonPluginStorageRecord(
-                    db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
-                );
-                definePluginStorageRecordValue(next, normalizedKey, snapshot);
-                db.pluginCustomStorage = next;
+                await withInlinePluginStoragePublishLock(async () => {
+                    const next = cloneJsonPluginStorageRecord(
+                        db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
+                    );
+                    definePluginStorageRecordValue(next, normalizedKey, snapshot);
+                    db.pluginCustomStorage = next;
+                }, signal);
                 return;
             }
             const storageKey = makeArchiveSafePluginSaveStorageKey(
@@ -898,7 +968,12 @@ export async function setOwnedPluginSaveStorageItem<T>(
         await withPluginSaveStorageKeyLock(normalizedKey, async () => {
             throwIfAborted(signal);
             const db = getDatabase();
-            const ownerRecord = { plugin: owner, updatedAt: Date.now() };
+            const ownerRecord: NonNullable<Database["pluginStorageMeta"]>[string] = {
+                plugin: owner,
+                updatedAt: Date.now(),
+                revision: crypto.randomUUID(),
+                generation: crypto.randomUUID(),
+            };
             if (db.optimizePluginMemory) {
                 const valueStorageKey = makeArchiveSafePluginSaveStorageKey(
                     PLUGIN_SAVE_PREFIX,
@@ -931,29 +1006,31 @@ export async function setOwnedPluginSaveStorageItem<T>(
                 return;
             }
 
-            const nextValues = cloneJsonPluginStorageRecord(
-                db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
-            );
-            const nextMeta = cloneJsonPluginStorageRecord(
-                db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
-                    NonNullable<Database["pluginStorageMeta"]>[string]
-                >(),
-                "pluginStorageMeta",
-            );
-            definePluginStorageRecordValue(nextValues, normalizedKey, snapshot);
-            if (owner) {
-                definePluginStorageRecordValue(nextMeta, normalizedKey, ownerRecord);
-            } else {
-                delete nextMeta[normalizedKey];
-            }
-            // Both detached records have passed preflight. Publish synchronously,
-            // with no await or observable plugin callback between the two fields.
-            db.pluginCustomStorage = nextValues;
-            if (getPluginStorageRecordKeys(nextMeta).length > 0) {
-                db.pluginStorageMeta = nextMeta;
-            } else {
-                delete db.pluginStorageMeta;
-            }
+            await withInlinePluginStoragePublishLock(async () => {
+                const nextValues = cloneJsonPluginStorageRecord(
+                    db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
+                );
+                const nextMeta = cloneJsonPluginStorageRecord(
+                    db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
+                        NonNullable<Database["pluginStorageMeta"]>[string]
+                    >(),
+                    "pluginStorageMeta",
+                );
+                definePluginStorageRecordValue(nextValues, normalizedKey, snapshot);
+                if (owner) {
+                    definePluginStorageRecordValue(nextMeta, normalizedKey, ownerRecord);
+                } else {
+                    delete nextMeta[normalizedKey];
+                }
+                // Both detached records have passed preflight. Publish synchronously,
+                // with no await or observable plugin callback between the two fields.
+                db.pluginCustomStorage = nextValues;
+                if (getPluginStorageRecordKeys(nextMeta).length > 0) {
+                    db.pluginStorageMeta = nextMeta;
+                } else {
+                    delete db.pluginStorageMeta;
+                }
+            }, signal);
         }, signal);
     } finally {
         invalidateStorageEnumerationSnapshot();
@@ -970,12 +1047,14 @@ export async function removePluginSaveStorageItem(
             throwIfAborted(signal);
             const db = getDatabase();
             if (!db.optimizePluginMemory) {
-                if (!hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) return;
-                const next = cloneJsonPluginStorageRecord(
-                    db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
-                );
-                delete next[normalizedKey];
-                db.pluginCustomStorage = next;
+                await withInlinePluginStoragePublishLock(async () => {
+                    if (!hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) return;
+                    const next = cloneJsonPluginStorageRecord(
+                        db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
+                    );
+                    delete next[normalizedKey];
+                    db.pluginCustomStorage = next;
+                }, signal);
                 return;
             }
             const storageKey = makeArchiveSafePluginSaveStorageKey(
@@ -1027,24 +1106,443 @@ export async function removeOwnedPluginSaveStorageItem(
                 return;
             }
 
-            const nextValues = cloneJsonPluginStorageRecord(
-                db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
-            );
-            const nextMeta = cloneJsonPluginStorageRecord(
-                db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
-                    NonNullable<Database["pluginStorageMeta"]>[string]
-                >(),
-                "pluginStorageMeta",
-            );
-            if (hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) {
-                delete nextValues[normalizedKey];
-                db.pluginCustomStorage = nextValues;
+            await withInlinePluginStoragePublishLock(async () => {
+                const nextValues = cloneJsonPluginStorageRecord(
+                    db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
+                );
+                const nextMeta = cloneJsonPluginStorageRecord(
+                    db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
+                        NonNullable<Database["pluginStorageMeta"]>[string]
+                    >(),
+                    "pluginStorageMeta",
+                );
+                if (hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) {
+                    delete nextValues[normalizedKey];
+                    db.pluginCustomStorage = nextValues;
+                }
+                if (hasPluginStorageRecordValue(db.pluginStorageMeta, normalizedKey)) {
+                    delete nextMeta[normalizedKey];
+                    if (getPluginStorageRecordKeys(nextMeta).length > 0) db.pluginStorageMeta = nextMeta;
+                    else delete db.pluginStorageMeta;
+                }
+            }, signal);
+        }, signal);
+    } finally {
+        invalidateStorageEnumerationSnapshot();
+    }
+}
+
+export type PluginSaveStorageAtomicMutation =
+    | {
+        type: "set";
+        key: string;
+        value: unknown;
+        expectedRevision?: string | null;
+    }
+    | {
+        type: "remove";
+        key: string;
+        expectedRevision?: string | null;
+    };
+
+export type PluginSaveStorageVersionedResult =
+    | { status: "missing"; value: null; revision: null; generation: string | null }
+    | { status: "value"; value: unknown; revision: string; generation: string | null };
+
+export type PluginSaveStorageAtomicBatchResult =
+    | {
+        committed: true;
+        generation: string;
+        revisions: { key: string; revision: string | null }[];
+    }
+    | {
+        committed: false;
+        conflicts: { key: string; revision: string | null; generation: string | null }[];
+    };
+
+const pluginStorageBatchEncoder = new TextEncoder();
+
+/** Snapshot bridge-realm JSON without trusting getters, toJSON, or prototypes. */
+function snapshotPluginBatchValue(
+    value: unknown,
+    path = "$",
+    seen = new Set<object>(),
+): unknown {
+    if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+    if (typeof value === "number") {
+        if (!Number.isFinite(value)) throw new TypeError(`Plugin batch value must be finite at ${path}.`);
+        return value;
+    }
+    if (typeof value !== "object") {
+        throw new TypeError(`Plugin batch value is not JSON-representable at ${path}.`);
+    }
+    if (seen.has(value)) throw new TypeError(`Plugin batch value is cyclic at ${path}.`);
+    seen.add(value);
+    try {
+        if (Array.isArray(value)) {
+            const keys = Reflect.ownKeys(value);
+            const out: unknown[] = [];
+            for (const key of keys) {
+                if (key === "length") continue;
+                if (typeof key !== "string" || !/^(0|[1-9][0-9]*)$/.test(key)) {
+                    throw new TypeError(`Plugin batch arrays must be dense at ${path}.`);
+                }
             }
-            if (hasPluginStorageRecordValue(db.pluginStorageMeta, normalizedKey)) {
-                delete nextMeta[normalizedKey];
-                if (getPluginStorageRecordKeys(nextMeta).length > 0) db.pluginStorageMeta = nextMeta;
-                else delete db.pluginStorageMeta;
+            for (let index = 0; index < value.length; index++) {
+                const descriptor = Reflect.getOwnPropertyDescriptor(value, String(index));
+                if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
+                    throw new TypeError(`Plugin batch arrays must be dense at ${path}[${index}].`);
+                }
+                out.push(snapshotPluginBatchValue(descriptor.value, `${path}[${index}]`, seen));
             }
+            return out;
+        }
+        const prototype = Reflect.getPrototypeOf(value);
+        const prototypeConstructor = prototype
+            ? Reflect.getOwnPropertyDescriptor(prototype, "constructor")?.value
+            : null;
+        if (prototype !== null
+            && (typeof prototypeConstructor !== "function"
+                || prototypeConstructor.name !== "Object")) {
+            throw new TypeError(`Plugin batch values require plain objects at ${path}.`);
+        }
+        const out = createDatabasePluginStorageRecord<unknown>();
+        for (const key of Reflect.ownKeys(value)) {
+            if (typeof key !== "string") throw new TypeError(`Plugin batch symbols are invalid at ${path}.`);
+            const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+            if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
+                throw new TypeError(`Plugin batch values require enumerable data properties at ${path}.${key}.`);
+            }
+            definePluginStorageRecordValue(
+                out,
+                key,
+                snapshotPluginBatchValue(descriptor.value, `${path}.${key}`, seen),
+            );
+        }
+        return out;
+    } finally {
+        seen.delete(value);
+    }
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource));
+    return [...digest].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function isCanonicalInlinePluginStorageOwner(
+    owner: unknown,
+): owner is Record<string, unknown> & {
+    plugin: string;
+    updatedAt: number;
+    revision: string;
+    generation: string;
+} {
+    if (owner === null || typeof owner !== "object" || Array.isArray(owner)) return false;
+    const keys = Reflect.ownKeys(owner);
+    if (keys.length !== 4
+        || keys[0] !== "plugin"
+        || keys[1] !== "updatedAt"
+        || keys[2] !== "revision"
+        || keys[3] !== "generation") return false;
+    const values = new Map<string, unknown>();
+    for (const key of keys) {
+        if (typeof key !== "string") return false;
+        const descriptor = Reflect.getOwnPropertyDescriptor(owner, key);
+        if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return false;
+        values.set(key, descriptor.value);
+    }
+    const plugin = values.get("plugin");
+    try {
+        if (typeof plugin !== "string" || plugin.length === 0) return false;
+        assertWellFormedUnicode(plugin);
+    } catch {
+        return false;
+    }
+    return Number.isSafeInteger(values.get("updatedAt"))
+        && (values.get("updatedAt") as number) >= 0
+        && typeof values.get("revision") === "string"
+        && PLUGIN_STORAGE_UUID_PATTERN.test(values.get("revision") as string)
+        && typeof values.get("generation") === "string"
+        && PLUGIN_STORAGE_UUID_PATTERN.test(values.get("generation") as string);
+}
+
+async function inlinePluginStorageRevision(
+    value: unknown,
+    owner: unknown,
+    ownerRowPresent: boolean,
+): Promise<string> {
+    const valueBytes = pluginStorageBatchEncoder.encode(stringifyJsonValue(value));
+    const incarnation = isCanonicalInlinePluginStorageOwner(owner)
+        ? owner.revision
+        : ownerRowPresent
+            ? `legacy:${await sha256Hex(pluginStorageBatchEncoder.encode(
+                JSON.stringify(snapshotPluginBatchValue(owner)),
+            ))}`
+            : "legacy:unowned";
+    const prefix = pluginStorageBatchEncoder.encode(
+        `pocketrisu-plugin-storage-v1\0${incarnation}\0`,
+    );
+    const input = new Uint8Array(prefix.byteLength + valueBytes.byteLength);
+    input.set(prefix, 0);
+    input.set(valueBytes, prefix.byteLength);
+    return `sha256:${await sha256Hex(input)}`;
+}
+
+/** Read JSON null and a missing key distinctly, with an opaque CAS revision. */
+export async function getPluginSaveStorageItemWithRevision(
+    key: unknown,
+    signal?: AbortSignal | null,
+): Promise<PluginSaveStorageVersionedResult> {
+    const normalizedKey = normalizePluginStorageKey(key);
+    return withPluginSaveStorageKeyLock(normalizedKey, async () => {
+        throwIfAborted(signal);
+        const db = getDatabase();
+        if (db.optimizePluginMemory) {
+            const storageKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_PREFIX,
+                normalizedKey,
+            );
+            makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_META_PREFIX, normalizedKey);
+            return readPersistentPluginStorageState(
+                storageKey,
+                signal,
+                db.pluginStorageGeneration,
+            );
+        }
+        if (!hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) {
+            return { status: "missing", value: null, revision: null, generation: null };
+        }
+        const value = snapshotJsonValue(db.pluginCustomStorage[normalizedKey]);
+        const ownerRowPresent = hasPluginStorageRecordValue(db.pluginStorageMeta, normalizedKey);
+        const owner = ownerRowPresent ? db.pluginStorageMeta?.[normalizedKey] : undefined;
+        return {
+            status: "value",
+            value,
+            revision: await inlinePluginStorageRevision(value, owner, ownerRowPresent),
+            generation: isCanonicalInlinePluginStorageOwner(owner)
+                ? owner.generation
+                : null,
+        };
+    }, signal);
+}
+
+/**
+ * Apply a bounded, distinct-key set/remove group atomically. All input is
+ * detached and validated before storage readiness or any durable mutation.
+ */
+export async function atomicBatchOwnedPluginSaveStorage(
+    mutations: readonly PluginSaveStorageAtomicMutation[],
+    owner: string,
+    signal?: AbortSignal | null,
+): Promise<PluginSaveStorageAtomicBatchResult> {
+    throwIfAborted(signal);
+    if (!Array.isArray(mutations)
+        || mutations.length < 1
+        || mutations.length > PLUGIN_STORAGE_BATCH_MAX_OPERATIONS) {
+        throw new RangeError(
+            `pluginStorage.atomicBatch requires 1-${PLUGIN_STORAGE_BATCH_MAX_OPERATIONS} operations.`,
+        );
+    }
+    const seen = new Set<string>();
+    const prepared: PersistentPluginStorageBatchOperation[] = [];
+    for (let index = 0; index < mutations.length; index++) {
+        if (index > 0 && index % 16 === 0) {
+            await new Promise<void>(resolve => setTimeout(resolve, 0));
+        }
+        throwIfAborted(signal);
+        const mutation = mutations[index];
+        if (!mutation || (mutation.type !== "set" && mutation.type !== "remove")) {
+            throw new TypeError(`Plugin storage batch operation ${index} is invalid.`);
+        }
+        const key = normalizePluginStorageKey(mutation.key);
+        if (seen.has(key)) throw new TypeError(`Duplicate plugin storage batch key: ${key}`);
+        seen.add(key);
+        makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_PREFIX, key);
+        makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_META_PREFIX, key);
+        if (Object.prototype.hasOwnProperty.call(mutation, "expectedRevision")
+            && mutation.expectedRevision !== null
+            && (typeof mutation.expectedRevision !== "string"
+                || !PLUGIN_STORAGE_REVISION_PATTERN.test(mutation.expectedRevision))) {
+            throw new TypeError(`Plugin storage batch operation ${index} has an invalid revision.`);
+        }
+        const expected = Object.prototype.hasOwnProperty.call(mutation, "expectedRevision")
+            ? { expectedRevision: mutation.expectedRevision }
+            : {};
+        if (mutation.type === "set") {
+            const snapshot = snapshotPluginBatchValue(mutation.value);
+            prepared.push({
+                operation: "set",
+                key,
+                valueBytes: pluginStorageBatchEncoder.encode(stringifyJsonValue(snapshot)),
+                owner,
+                ...expected,
+            });
+        } else {
+            prepared.push({ operation: "remove", key, ...expected });
+        }
+    }
+    // Preflight the detached operation payload before queueing. The exact wire
+    // bound is checked again once the locked BR2 manifest CAS is available.
+    encodePluginStorageBatchRequest({
+        generation: "preflight",
+        expectedManifest: {
+            version: 1,
+            generation: "preflight",
+            valueKeys: [],
+            metaKeys: [],
+        },
+        operations: prepared,
+    });
+
+    try {
+        return await withPluginSaveStorageKeySetLock([...seen], async () => {
+            throwIfAborted(signal);
+            const db = getDatabase();
+            if (db.optimizePluginMemory) {
+                for (let attempt = 0; ; attempt++) {
+                    const ownership = await readCurrentOwnership(db, signal);
+                    const generation = db.pluginStorageGeneration;
+                    if (!generation
+                        || !ownership.manifestValid
+                        || ownership.manifest?.generation !== generation) {
+                        throw new Error(
+                            "Optimized plugin storage is not reconciled; reload to complete its atomic adoption.",
+                        );
+                    }
+                    const result = await batchPersistentPluginStorage({
+                        generation,
+                        expectedManifest: ownership.manifest,
+                        operations: prepared,
+                    }, signal);
+                    if (result.outcome === "committed") {
+                        return {
+                            committed: true,
+                            generation: result.generation,
+                            revisions: result.revisions,
+                        };
+                    }
+                    if (result.code === "PLUGIN_STORAGE_GENERATION_CONFLICT" && attempt < 2) {
+                        continue;
+                    }
+                    if (result.code === "PLUGIN_STORAGE_GENERATION_CONFLICT") {
+                        throw new StorageError(result.error, {
+                            status: result.status,
+                            code: result.code,
+                            retryAfter: result.retryAfter,
+                            retryable: true,
+                            commitOutcomeUnknown: false,
+                            operation: "batch",
+                        });
+                    }
+                    return {
+                        committed: false,
+                        conflicts: (result.conflicts ?? []).map(conflict => ({
+                            key: conflict.key,
+                            revision: conflict.revision,
+                            generation: conflict.currentGeneration,
+                        })),
+                    };
+                }
+            }
+
+            return await withInlinePluginStoragePublishLock(async () => {
+                // V2/V2.1 storage writes are intentionally synchronous and
+                // cannot await this mutex. They advance the shared inline
+                // content generation. If one runs while revision hashing is
+                // suspended, discard this stale whole-map clone and retry.
+                while (true) {
+                    throwIfAborted(signal);
+                    const inlineVersion = getPluginStorageKeySetGeneration();
+                    const inlineDb = getDatabase();
+                    const nextValues = cloneJsonPluginStorageRecord(
+                        inlineDb.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
+                    );
+                    const nextMeta = cloneJsonPluginStorageRecord(
+                        inlineDb.pluginStorageMeta ?? createDatabasePluginStorageRecord(),
+                        "pluginStorageMeta",
+                    ) as NonNullable<Database["pluginStorageMeta"]>;
+                    const conflicts: {
+                        key: string;
+                        revision: string | null;
+                        generation: string | null;
+                    }[] = [];
+                    for (const mutation of prepared) {
+                        if (!Object.prototype.hasOwnProperty.call(mutation, "expectedRevision")) continue;
+                        const present = hasPluginStorageRecordValue(nextValues, mutation.key);
+                        const metaPresent = hasPluginStorageRecordValue(nextMeta, mutation.key);
+                        const meta = metaPresent ? nextMeta[mutation.key] : undefined;
+                        const revision = present
+                            ? await inlinePluginStorageRevision(
+                                nextValues[mutation.key],
+                                meta,
+                                metaPresent,
+                            )
+                            : null;
+                        if (revision !== mutation.expectedRevision) {
+                            conflicts.push({
+                                key: mutation.key,
+                                revision,
+                                generation: isCanonicalInlinePluginStorageOwner(meta)
+                                    ? meta.generation
+                                    : null,
+                            });
+                        }
+                    }
+                    if (conflicts.length > 0) {
+                        if (getPluginStorageKeySetGeneration() !== inlineVersion) continue;
+                        return { committed: false as const, conflicts };
+                    }
+
+                    const generation = crypto.randomUUID();
+                    const updatedAt = Date.now();
+                    for (const mutation of prepared) {
+                        if (mutation.operation === "set") {
+                            const value = JSON.parse(new TextDecoder().decode(mutation.valueBytes));
+                            definePluginStorageRecordValue(nextValues, mutation.key, value);
+                            if (owner) {
+                                definePluginStorageRecordValue(nextMeta, mutation.key, {
+                                    plugin: owner,
+                                    updatedAt,
+                                    revision: crypto.randomUUID(),
+                                    generation,
+                                });
+                            } else {
+                                delete nextMeta[mutation.key];
+                            }
+                        } else {
+                            delete nextValues[mutation.key];
+                            delete nextMeta[mutation.key];
+                        }
+                    }
+                    const revisions = [];
+                    for (const mutation of prepared) {
+                        revisions.push({
+                            key: mutation.key,
+                            revision: hasPluginStorageRecordValue(nextValues, mutation.key)
+                                ? await inlinePluginStorageRevision(
+                                    nextValues[mutation.key],
+                                    nextMeta[mutation.key],
+                                    hasPluginStorageRecordValue(nextMeta, mutation.key),
+                                )
+                                : null,
+                        });
+                    }
+                    throwIfAborted(signal);
+                    if (getPluginStorageKeySetGeneration() !== inlineVersion) continue;
+
+                    // The version check and both detached assignments are one
+                    // synchronous critical publication. Legacy code cannot
+                    // interleave between them on the browser event loop.
+                    inlineDb.pluginCustomStorage = nextValues;
+                    if (getPluginStorageRecordKeys(nextMeta).length > 0) {
+                        inlineDb.pluginStorageMeta = nextMeta;
+                    } else {
+                        delete inlineDb.pluginStorageMeta;
+                    }
+                    return { committed: true as const, generation, revisions };
+                }
+            }, signal);
         }, signal);
     } finally {
         invalidateStorageEnumerationSnapshot();

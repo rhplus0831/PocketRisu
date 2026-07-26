@@ -503,6 +503,25 @@ async function clearActualPluginStorage(
     })
 }
 
+async function batchActualPluginStorage(
+    server: RunningServer,
+    auth: AuthHeaders,
+    generation: string,
+    expectedManifest: unknown,
+    operations: unknown[],
+): Promise<Response> {
+    return await fetch(`${server.origin}/api/plugin-storage/batch`, {
+        method: 'POST',
+        headers: { ...auth, 'content-type': 'application/octet-stream' },
+        body: Buffer.from(JSON.stringify({
+            version: 1,
+            generation,
+            expectedManifest,
+            operations,
+        })),
+    })
+}
+
 async function mutateCurrentStorage(
     server: RunningServer,
     auth: AuthHeaders,
@@ -1249,6 +1268,66 @@ describe('plugin publication recovery snapshot scheduling', () => {
             valueRowKey('alpha'),
             db.pluginStorageGeneration,
         )).toString('utf-8'))).toBe('committed-without-ack')
+    }, 30_000)
+
+    it('snapshots an exact AA3 batch when its acknowledgement is lost', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '300',
+            POCKETRISU_TEST_PLUGIN_BATCH_FAILPOINT: 'acknowledgement-loss',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'before-batch', removed: 'delete-me' },
+            meta: {
+                alpha: { plugin: 'owner-before' },
+                removed: { plugin: 'owner-removed' },
+            },
+        }))
+        const db = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        const generation = db.pluginStorageGeneration as string
+        const expectedManifest = JSON.parse((await readKey(
+            server,
+            auth,
+            PLUGIN_STORAGE_MANIFEST_KEY,
+        )).toString('utf-8'))
+
+        await expect(batchActualPluginStorage(
+            server,
+            auth,
+            generation,
+            expectedManifest,
+            [{
+                operation: 'set',
+                key: 'alpha',
+                value: Buffer.from(JSON.stringify('committed-batch')).toString('base64'),
+                owner: 'Batch Plugin',
+            }, {
+                operation: 'remove',
+                key: 'removed',
+            }],
+        )).rejects.toThrow()
+
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
+        const [latest] = await readSnapshotDatabases(server, auth)
+        expect(latest.db.pluginCustomStorage).toEqual({ alpha: 'committed-batch' })
+        expect(latest.db.pluginStorageMeta).toEqual({
+            alpha: expect.objectContaining({ plugin: 'Batch Plugin' }),
+        })
+        await restoreSnapshot(server, auth, latest.key)
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('alpha'),
+            generation,
+        )).toString('utf-8'))).toBe('committed-batch')
+        expect((await readKey(
+            server,
+            auth,
+            valueRowKey('removed'),
+            generation,
+        )).length).toBe(0)
     }, 30_000)
 
     it('does not snapshot a rolled-back actual V3 value/owner request', async () => {

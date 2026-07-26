@@ -140,14 +140,13 @@ preserves plugin rows as independent archive entries
 
 ### Evidence
 
-One V3 save-backed `setItem()` is two separately awaited host mutations —
-value, then owner sidecar (`src/ts/plugins/apiV3/v3.svelte.ts:1328-1331`) —
-and in optimized mode each becomes its own `/api/write` and SQLite mutation
-(`src/ts/plugins/pluginSaveStorage.ts:87-96`,
-`src/ts/plugins/pluginStorageMeta.ts:60-75`,
-`server/node/server.cjs:4209-4370`). They remain separate mutations within the
-same key-scoped operation, while unrelated keys can now proceed independently.
-Measured against audited workloads:
+At the audit point, one V3 save-backed `setItem()` became two separately
+awaited host mutations (value then owner), and sharded records multiplied that
+cost across every logical row. AA1 now coalesces each value+owner pair into one
+server transaction, and AA3 offers a bounded multi-key batch. Existing plugins
+that continue issuing independent `setItem()` calls still multiply request,
+hashing, and cache work across every logical row. Measured against the audited
+workloads before plugin adoption:
 
 - one read-touch that also rewrites an index can become six serialized writes
   (value plus owner for three logical records);
@@ -165,6 +164,7 @@ CPU, allocation, IndexedDB write amplification, and repeated cache scans.
 
 ### Required correction
 
-- Coalesce value+owner writes and add batch APIs.
+- Migrate compound plugin writes to the AA3 batch API; value+owner coalescing
+  is complete.
 - Reuse one defensive byte copy/hash through acknowledgement and detached
   seeding, and amortize cache pruning across writes.

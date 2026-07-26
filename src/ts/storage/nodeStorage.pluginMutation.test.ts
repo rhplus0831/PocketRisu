@@ -34,6 +34,7 @@ vi.mock('./resourceCache', () => ({
         const { createHash } = await import('node:crypto')
         return createHash('sha256').update(bytes).digest('hex')
     }),
+    settleBestEffortResourceCache: vi.fn((promise: Promise<unknown>) => promise),
     storeBytes: cache.storeBytes,
     touchResourceCacheManifest: vi.fn(async () => undefined),
 }))
@@ -63,6 +64,17 @@ function importBusy(retryAfter = '0'): Response {
         success: false,
         outcome: 'not-committed',
         operation: 'set',
+        code: 'IMPORT_IN_PROGRESS',
+        error: 'endpoint rejected before commit',
+        retryable: true,
+    }, 503, { 'retry-after': retryAfter })
+}
+
+function batchImportBusy(retryAfter = '0'): Response {
+    return response({
+        success: false,
+        outcome: 'not-committed',
+        operation: 'batch',
         code: 'IMPORT_IN_PROGRESS',
         error: 'endpoint rejected before commit',
         retryable: true,
@@ -515,4 +527,362 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
             expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
         },
     )
+})
+
+describe('NodeStorage AA3 batch acknowledgement', () => {
+    const batchRequest = {
+        generation: 'selected-generation',
+        expectedManifest: {
+            version: 1 as const,
+            generation: 'selected-generation',
+            valueKeys: [],
+            metaKeys: [],
+        },
+        operations: [
+            {
+                operation: 'set' as const,
+                key: 'aa3-body',
+                valueBytes: new TextEncoder().encode('{"generation":"new"}'),
+                owner: 'AA3',
+                expectedRevision: null,
+            },
+            { operation: 'remove' as const, key: 'aa3-old' },
+        ],
+    }
+
+    function committedBatch(init: RequestInit): Response {
+        const bytes = init.body as Uint8Array
+        const requestHash = createHash('sha256').update(bytes).digest('hex')
+        return response({
+            success: true,
+            outcome: 'committed',
+            operation: 'batch',
+            verification: 'verified',
+            requestHash,
+            generation: '123e4567-e89b-42d3-a456-426614174000',
+            revisions: [
+                { key: 'aa3-body', revision: `sha256:${'a'.repeat(64)}` },
+                { key: 'aa3-old', revision: null },
+            ],
+        })
+    }
+
+    test('publishes cache only after an exact request-bound committed acknowledgement', async () => {
+        const storage = new NodeStorage()
+        ;(storage as any).authFetch = vi.fn(async (
+            _input: RequestInfo | URL,
+            init: RequestInit,
+        ) => committedBatch(init))
+
+        const result = await storage.batchPluginStorage(batchRequest)
+        expect(result.outcome, JSON.stringify(result)).toBe('committed')
+        expect(cache.storeBytes).toHaveBeenCalledOnce()
+        expect(cache.invalidateResourceCacheManifest).toHaveBeenCalledOnce()
+    })
+
+    test('malformed success and transport loss remain unknown without cache publication', async () => {
+        const malformed = new NodeStorage()
+        ;(malformed as any).authFetch = vi.fn(async () => response({
+            success: true,
+            outcome: 'committed',
+            operation: 'batch',
+            verification: 'verified',
+            requestHash: '0'.repeat(64),
+            generation: '123e4567-e89b-12d3-a456-426614174000',
+            revisions: [],
+        }))
+        await expect(malformed.batchPluginStorage(batchRequest)).resolves.toMatchObject({
+            outcome: 'unknown',
+            commitOutcomeUnknown: true,
+        })
+        expect(cache.storeBytes).not.toHaveBeenCalled()
+
+        const lost = new NodeStorage()
+        ;(lost as any).authFetch = vi.fn(async (
+            _input: RequestInfo | URL,
+            _init: RequestInit,
+            _retry: boolean,
+            outcome: { markRequestDispatched: () => void },
+        ) => {
+            outcome.markRequestDispatched()
+            throw new TypeError('connection lost')
+        })
+        await expect(lost.batchPluginStorage(batchRequest)).resolves.toMatchObject({
+            outcome: 'unknown',
+            commitOutcomeUnknown: true,
+        })
+        expect(cache.storeBytes).not.toHaveBeenCalled()
+    })
+
+    test('an exact CAS conflict is known not committed and never retried', async () => {
+        const storage = new NodeStorage()
+        const authFetch = vi.fn(async (
+            _input: RequestInfo | URL,
+            _init?: RequestInit,
+        ) => response({
+            success: false,
+            outcome: 'not-committed',
+            operation: 'batch',
+            error: 'stale',
+            code: 'PLUGIN_STORAGE_REVISION_CONFLICT',
+            retryable: false,
+            conflicts: [{
+                key: 'aa3-body',
+                currentRevision: `sha256:${'b'.repeat(64)}`,
+                currentGeneration: null,
+            }],
+        }, 409))
+        ;(storage as any).authFetch = authFetch
+        await expect(storage.batchPluginStorage(batchRequest)).resolves.toMatchObject({
+            outcome: 'not-committed',
+            code: 'PLUGIN_STORAGE_REVISION_CONFLICT',
+        })
+        expect(authFetch).toHaveBeenCalledOnce()
+        expect(cache.storeBytes).not.toHaveBeenCalled()
+    })
+
+    test('retries only an exact import refusal and accepts the later request-bound commit', async () => {
+        const storage = new NodeStorage()
+        const authFetch = vi.fn()
+            .mockResolvedValueOnce(batchImportBusy())
+            .mockImplementationOnce(async (
+                _input: RequestInfo | URL,
+                init: RequestInit,
+            ) => committedBatch(init))
+        ;(storage as any).authFetch = authFetch
+
+        await expect(storage.batchPluginStorage(batchRequest)).resolves.toMatchObject({
+            outcome: 'committed',
+            commitOutcomeUnknown: false,
+        })
+        expect(authFetch).toHaveBeenCalledTimes(2)
+    })
+
+    test('returns the third exact import refusal after exhausting the fixed retry bound', async () => {
+        const storage = new NodeStorage()
+        const authFetch = vi.fn()
+            .mockResolvedValueOnce(batchImportBusy())
+            .mockResolvedValueOnce(batchImportBusy())
+            .mockResolvedValueOnce(batchImportBusy())
+            .mockImplementationOnce(async (
+                _input: RequestInfo | URL,
+                init: RequestInit,
+            ) => committedBatch(init))
+        ;(storage as any).authFetch = authFetch
+
+        await expect(storage.batchPluginStorage(batchRequest)).resolves.toMatchObject({
+            outcome: 'not-committed',
+            status: 503,
+            code: 'IMPORT_IN_PROGRESS',
+            retryAfter: 0,
+            retryable: true,
+            commitOutcomeUnknown: false,
+        })
+        expect(authFetch).toHaveBeenCalledTimes(3)
+    })
+
+    test('cancels an exact import retry delay without dispatching another batch', async () => {
+        vi.useFakeTimers()
+        const storage = new NodeStorage()
+        const authFetch = vi.fn()
+            .mockResolvedValueOnce(batchImportBusy('5'))
+            .mockImplementationOnce(async (
+                _input: RequestInfo | URL,
+                init: RequestInit,
+            ) => committedBatch(init))
+        ;(storage as any).authFetch = authFetch
+        const controller = new AbortController()
+
+        const pending = storage.batchPluginStorage(batchRequest, controller.signal)
+        await vi.advanceTimersByTimeAsync(0)
+        expect(authFetch).toHaveBeenCalledOnce()
+
+        controller.abort()
+        await expect(pending).resolves.toMatchObject({
+            outcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        })
+        await vi.advanceTimersByTimeAsync(10_000)
+        expect(authFetch).toHaveBeenCalledOnce()
+    })
+
+    test.each([
+        ['malformed 503', 503, {
+            success: false,
+            outcome: 'not-committed',
+            operation: 'batch',
+            code: 'IMPORT_IN_PROGRESS',
+            error: 'endpoint rejected before commit',
+            retryable: true,
+            injected: true,
+        }],
+        ['unknown 200 acknowledgement', 200, {
+            success: true,
+            outcome: 'committed',
+            operation: 'batch',
+        }],
+    ] as const)('does not replay a %s', async (_name, status, body) => {
+        const storage = new NodeStorage()
+        const authFetch = vi.fn()
+            .mockResolvedValueOnce(response(body, status))
+            .mockImplementationOnce(async (
+                _input: RequestInfo | URL,
+                init: RequestInit,
+            ) => committedBatch(init))
+        ;(storage as any).authFetch = authFetch
+
+        await expect(storage.batchPluginStorage(batchRequest)).resolves.toMatchObject({
+            outcome: 'unknown',
+            code: 'ACKNOWLEDGEMENT_UNKNOWN',
+            commitOutcomeUnknown: true,
+        })
+        expect(authFetch).toHaveBeenCalledOnce()
+        expect(cache.storeBytes).not.toHaveBeenCalled()
+        expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
+    })
+
+    test('abort before dispatch is known not committed; abort after dispatch is unknown', async () => {
+        const before = new NodeStorage()
+        const beforeFetch = vi.fn()
+        ;(before as any).authFetch = beforeFetch
+        const alreadyAborted = new AbortController()
+        alreadyAborted.abort()
+        await expect(before.batchPluginStorage(batchRequest, alreadyAborted.signal))
+            .resolves.toMatchObject({
+                outcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            })
+        expect(beforeFetch).not.toHaveBeenCalled()
+
+        const after = new NodeStorage()
+        ;(after as any).authFetch = vi.fn(async (
+            _input: RequestInfo | URL,
+            init: RequestInit,
+            _retry: boolean,
+            outcome: { markRequestDispatched: () => void },
+        ) => {
+            outcome.markRequestDispatched()
+            await new Promise<never>((_resolve, reject) => {
+                init.signal!.addEventListener('abort', () => reject(
+                    new DOMException('aborted after dispatch', 'AbortError'),
+                ), { once: true })
+            })
+        })
+        const controller = new AbortController()
+        const pending = after.batchPluginStorage(batchRequest, controller.signal)
+        await vi.waitFor(() => expect((after as any).authFetch).toHaveBeenCalledOnce())
+        controller.abort()
+        await expect(pending).resolves.toMatchObject({
+            outcome: 'unknown',
+            commitOutcomeUnknown: true,
+        })
+    })
+})
+
+describe('NodeStorage AA3 versioned state response', () => {
+    test('accepts exact missing and present state envelopes', async () => {
+        const missing = new NodeStorage()
+        ;(missing as any).authFetch = vi.fn(async () => response({
+            success: true,
+            missing: true,
+            revision: null,
+            generation: null,
+        }))
+        await expect(missing.getPluginStorageState(valueKey)).resolves.toEqual({
+            missing: true,
+            valueBytes: null,
+            revision: null,
+            generation: null,
+        })
+
+        const present = new NodeStorage()
+        ;(present as any).authFetch = vi.fn(async () => response({
+            success: true,
+            missing: false,
+            value: Buffer.from(valueBytes).toString('base64'),
+            revision: `sha256:${'c'.repeat(64)}`,
+            generation: '123e4567-e89b-42d3-a456-426614174000',
+        }))
+        await expect(present.getPluginStorageState(valueKey)).resolves.toEqual({
+            missing: false,
+            valueBytes,
+            revision: `sha256:${'c'.repeat(64)}`,
+            generation: '123e4567-e89b-42d3-a456-426614174000',
+        })
+    })
+
+    test('pins state reads to the selected BR2 publication generation', async () => {
+        const storage = new NodeStorage()
+        let receivedInit: RequestInit | undefined
+        const authFetch = vi.fn(async (
+            _input: RequestInfo | URL,
+            init?: RequestInit,
+        ) => {
+            receivedInit = init
+            return response({
+                success: true,
+                missing: true,
+                revision: null,
+                generation: null,
+            })
+        })
+        ;(storage as any).authFetch = authFetch
+
+        await storage.getPluginStorageState(valueKey, {
+            pluginStorageGeneration: 'selected-generation',
+        })
+        expect(receivedInit?.headers).toMatchObject({
+            'x-plugin-storage-generation': 'selected-generation',
+        })
+    })
+
+    test.each([
+        ['extra field', {
+            success: true,
+            missing: true,
+            revision: null,
+            generation: null,
+            injected: true,
+        }],
+        ['missing value with non-null revision', {
+            success: true,
+            missing: true,
+            revision: `sha256:${'c'.repeat(64)}`,
+            generation: null,
+        }],
+        ['missing value with non-null generation', {
+            success: true,
+            missing: true,
+            revision: null,
+            generation: '123e4567-e89b-42d3-a456-426614174000',
+        }],
+        ['present value with null revision', {
+            success: true,
+            missing: false,
+            value: Buffer.from(valueBytes).toString('base64'),
+            revision: null,
+            generation: null,
+        }],
+        ['noncanonical generation UUID', {
+            success: true,
+            missing: false,
+            value: Buffer.from(valueBytes).toString('base64'),
+            revision: `sha256:${'c'.repeat(64)}`,
+            generation: '123e4567-e89b-12d3-a456-426614174000',
+        }],
+        ['noncanonical base64', {
+            success: true,
+            missing: false,
+            value: 'AA=',
+            revision: `sha256:${'c'.repeat(64)}`,
+            generation: null,
+        }],
+    ] as const)('rejects a %s response', async (_name, body) => {
+        const storage = new NodeStorage()
+        ;(storage as any).authFetch = vi.fn(async () => response(body))
+
+        await expect(storage.getPluginStorageState(valueKey)).rejects.toMatchObject({
+            code: 'STORAGE_RESPONSE_ERROR',
+        })
+    })
 })

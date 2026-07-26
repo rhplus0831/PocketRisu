@@ -19,6 +19,8 @@ const ABORTABLE_ROOT_METHODS = new Set([
     'setDatabase',
     'setDatabaseLite',
     '_getPluginStorage',
+    '_getVersionedPluginStorage',
+    '_atomicBatchPluginStorage',
     '_setPluginStorage',
     '_removePluginStorage',
     '_clearPluginStorage',
@@ -28,6 +30,17 @@ const ABORTABLE_ROOT_METHODS = new Set([
     '_setSafeLocalStorage',
     '_removeSafeLocalStorage',
     '_clearSafeLocalStorage',
+]);
+
+const UNLOAD_STORAGE_ROOT_METHODS = new Set([
+    '_atomicBatchPluginStorage',
+]);
+
+const UNLOAD_STORAGE_MUTATION_METHODS = new Set([
+    '_atomicBatchPluginStorage',
+    '_setPluginStorage',
+    '_removePluginStorage',
+    '_clearPluginStorage',
 ]);
 
 interface RpcMessage {
@@ -173,7 +186,8 @@ export function createV3BridgeRequestRegistry(options: {
         reject: (error: unknown) => void;
         timer: ReturnType<typeof setTimeout>;
     }>();
-    const rootMutations: Record<string, "write" | "remove"> = {
+    const rootMutations: Record<string, "write" | "remove" | "batch"> = {
+        _atomicBatchPluginStorage: 'batch',
         _setPluginStorage: 'write',
         _removePluginStorage: 'remove',
         _clearPluginStorage: 'remove',
@@ -281,6 +295,7 @@ interface AbortSignalRef {
     __type: 'ABORT_SIGNAL_REF';
     abortId: string;
     aborted: boolean;
+    unloadToken?: string;
 }
 
 /**
@@ -347,6 +362,172 @@ export function validateV3DatabaseMutationForTransport(input: unknown): void {
     }
 }
 
+/**
+ * Validate and synchronously detach atomic-batch arguments before postMessage.
+ * Descriptor-only traversal is deliberate: structured cloning would invoke
+ * getters and discard symbol/non-enumerable properties before the host could
+ * reject them. Kept self-contained because its source runs in the guest.
+ */
+export function snapshotV3PluginStorageBatchForTransport(input: unknown): unknown[] {
+    const revisionPattern = /^sha256:[0-9a-f]{64}$/;
+    const assertWellFormed = (value: string): void => {
+        for (let index = 0; index < value.length; index += 1) {
+            const codeUnit = value.charCodeAt(index);
+            if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
+                const trailing = value.charCodeAt(index + 1);
+                if (!(trailing >= 0xDC00 && trailing <= 0xDFFF)) {
+                    throw new TypeError("Plugin storage keys must be well-formed Unicode.");
+                }
+                index += 1;
+            } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
+                throw new TypeError("Plugin storage keys must be well-formed Unicode.");
+            }
+        }
+    };
+    const readDataDescriptor = (
+        object: object,
+        key: PropertyKey,
+        path: string,
+        enumerable = true,
+    ): PropertyDescriptor => {
+        const descriptor = Reflect.getOwnPropertyDescriptor(object, key);
+        if (!descriptor || !("value" in descriptor)) {
+            throw new TypeError(`Plugin storage atomicBatch does not accept an accessor at ${path}.`);
+        }
+        if (descriptor.enumerable !== enumerable) {
+            throw new TypeError(`Plugin storage atomicBatch has an invalid property at ${path}.`);
+        }
+        return descriptor;
+    };
+    const snapshotValue = (value: unknown, path: string, seen: Set<object>): unknown => {
+        if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+        if (typeof value === "number") {
+            if (!Number.isFinite(value)) {
+                throw new TypeError(`Plugin storage atomicBatch requires finite numbers at ${path}.`);
+            }
+            return value;
+        }
+        if (typeof value !== "object") {
+            throw new TypeError(`Plugin storage atomicBatch value is not JSON at ${path}.`);
+        }
+        if (seen.has(value)) {
+            throw new TypeError(`Plugin storage atomicBatch value is cyclic at ${path}.`);
+        }
+        seen.add(value);
+        try {
+            if (Array.isArray(value)) {
+                if (Reflect.getPrototypeOf(value) !== Array.prototype) {
+                    throw new TypeError(`Plugin storage atomicBatch requires plain arrays at ${path}.`);
+                }
+                const lengthDescriptor = readDataDescriptor(value, "length", `${path}.length`, false);
+                const length = lengthDescriptor.value;
+                if (!Number.isSafeInteger(length) || length < 0) {
+                    throw new TypeError(`Plugin storage atomicBatch array length is invalid at ${path}.`);
+                }
+                const ownKeys = Reflect.ownKeys(value);
+                if (ownKeys.length !== length + 1) {
+                    throw new TypeError(`Plugin storage atomicBatch arrays must be dense at ${path}.`);
+                }
+                const out: unknown[] = [];
+                for (let index = 0; index < length; index += 1) {
+                    const descriptor = readDataDescriptor(value, String(index), `${path}[${index}]`);
+                    out.push(snapshotValue(descriptor.value, `${path}[${index}]`, seen));
+                }
+                return out;
+            }
+            const prototype = Reflect.getPrototypeOf(value);
+            if (prototype !== Object.prototype && prototype !== null) {
+                throw new TypeError(`Plugin storage atomicBatch requires plain objects at ${path}.`);
+            }
+            const out = Object.create(null) as Record<string, unknown>;
+            for (const key of Reflect.ownKeys(value)) {
+                if (typeof key !== "string") {
+                    throw new TypeError(`Plugin storage atomicBatch does not accept symbols at ${path}.`);
+                }
+                const descriptor = readDataDescriptor(value, key, `${path}.${key}`);
+                Object.defineProperty(out, key, {
+                    value: snapshotValue(descriptor.value, `${path}.${key}`, seen),
+                    enumerable: true,
+                    configurable: true,
+                    writable: true,
+                });
+            }
+            return out;
+        } finally {
+            seen.delete(value);
+        }
+    };
+
+    if (!Array.isArray(input) || Reflect.getPrototypeOf(input) !== Array.prototype) {
+        throw new TypeError("Plugin storage atomicBatch requires an operations array.");
+    }
+    const lengthDescriptor = readDataDescriptor(input, "length", "operations.length", false);
+    const length = lengthDescriptor.value;
+    if (!Number.isInteger(length) || length < 1 || length > 128
+        || Reflect.ownKeys(input).length !== length + 1) {
+        throw new RangeError("Plugin storage atomicBatch requires 1-128 dense operations.");
+    }
+
+    const seenKeys = new Set<string>();
+    const output: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+        const operationDescriptor = readDataDescriptor(input, String(index), `operations[${index}]`);
+        const operation = operationDescriptor.value;
+        if (operation === null || typeof operation !== "object" || Array.isArray(operation)
+            || (Reflect.getPrototypeOf(operation) !== Object.prototype
+                && Reflect.getPrototypeOf(operation) !== null)) {
+            throw new TypeError(`Plugin storage atomicBatch operation ${index} must be a plain object.`);
+        }
+        const descriptors = new Map<PropertyKey, PropertyDescriptor>();
+        for (const key of Reflect.ownKeys(operation)) {
+            if (typeof key !== "string") {
+                throw new TypeError(`Plugin storage atomicBatch operation ${index} has a symbol key.`);
+            }
+            descriptors.set(key, readDataDescriptor(operation, key, `operations[${index}].${key}`));
+        }
+        const type = descriptors.get("type")?.value;
+        const allowed = type === "set"
+            ? new Set(["type", "key", "value", "expectedRevision"])
+            : type === "remove"
+                ? new Set(["type", "key", "expectedRevision"])
+                : null;
+        if (!allowed || [...descriptors.keys()].some(key => !allowed.has(key as string))) {
+            throw new TypeError(`Plugin storage atomicBatch operation ${index} has invalid fields.`);
+        }
+        const key = descriptors.get("key")?.value;
+        if (typeof key !== "string") {
+            throw new TypeError(`Plugin storage atomicBatch operation ${index} requires a string key.`);
+        }
+        assertWellFormed(key);
+        if (seenKeys.has(key)) {
+            throw new TypeError(`Plugin storage atomicBatch has duplicate key ${key}.`);
+        }
+        seenKeys.add(key);
+        const expectedRevision = descriptors.get("expectedRevision")?.value;
+        if (descriptors.has("expectedRevision")
+            && expectedRevision !== null
+            && (typeof expectedRevision !== "string" || !revisionPattern.test(expectedRevision))) {
+            throw new TypeError(`Plugin storage atomicBatch operation ${index} has an invalid revision.`);
+        }
+        if (type === "set" && !descriptors.has("value")) {
+            throw new TypeError(`Plugin storage atomicBatch operation ${index} requires a value.`);
+        }
+        output.push(type === "set"
+            ? {
+                type,
+                key,
+                value: snapshotValue(descriptors.get("value")!.value, `operations[${index}].value`, new Set()),
+                ...(descriptors.has("expectedRevision") ? { expectedRevision } : {}),
+            }
+            : {
+                type,
+                key,
+                ...(descriptors.has("expectedRevision") ? { expectedRevision } : {}),
+            });
+    }
+    return output;
+}
+
 
 const GUEST_BRIDGE_SCRIPT = `
 await (async function() {
@@ -355,10 +536,12 @@ await (async function() {
     const callbackIdByFunction = new WeakMap();
     const proxyRefRegistry = new Map();
     const abortControllers = new Map();
+    const unloadCapabilitySignals = new WeakMap();
     const bridgeGeneration = globalThis.crypto.randomUUID();
     let nextBridgeId = 0;
     const allocateBridgeId = (prefix) => prefix + bridgeGeneration + ':' + nextBridgeId++;
     const validateDatabaseMutationForTransport = ${validateV3DatabaseMutationForTransport.toString()};
+    const snapshotPluginStorageBatchForTransport = ${snapshotV3PluginStorageBatchForTransport.toString()};
     const serializeBridgeError = ${serializeV3BridgeError.toString()};
     const deserializeBridgeError = ${deserializeV3BridgeError.toString()};
     const createRequestRegistry = ${createV3BridgeRequestRegistry.toString()};
@@ -373,6 +556,20 @@ await (async function() {
             callbackRegistry.set(id, arg);
             callbackIdByFunction.set(arg, id);
             return { __type: 'CALLBACK_REF', id: id };
+        }
+        if (arg instanceof AbortSignal) {
+            const abortId = allocateBridgeId('abort_');
+            if (!arg.aborted) {
+                arg.addEventListener('abort', () => {
+                    send({ type: 'ABORT_SIGNAL', abortId });
+                }, { once: true });
+            }
+            return {
+                __type: 'ABORT_SIGNAL_REF',
+                abortId,
+                aborted: arg.aborted,
+                unloadToken: unloadCapabilitySignals.get(arg),
+            };
         }
         if (arg && typeof arg === 'object') {
             const refId = proxyRefRegistry.get(arg);
@@ -392,7 +589,12 @@ await (async function() {
                             }, { once: true });
                         }
 
-                        out[key] = { __type: 'ABORT_SIGNAL_REF', abortId, aborted: val.aborted };
+                        out[key] = {
+                            __type: 'ABORT_SIGNAL_REF',
+                            abortId,
+                            aborted: val.aborted,
+                            unloadToken: unloadCapabilitySignals.get(val),
+                        };
                     }
                 }
                 if (out) return out;
@@ -477,6 +679,14 @@ await (async function() {
                 return Promise.reject(error);
             }
         }
+        if (type === 'CALL_ROOT' && payload.method === '_atomicBatchPluginStorage') {
+            try {
+                const detached = snapshotPluginStorageBatchForTransport(payload.args?.[0]);
+                payload = { ...payload, args: [detached, ...(payload.args || []).slice(1)] };
+            } catch (error) {
+                return Promise.reject(error);
+            }
+        }
         return requestRegistry.sendRequest(type, payload);
     }
 
@@ -524,6 +734,9 @@ await (async function() {
                         abortControllers.set(a.abortId, controller);
                         usedAbortIds.push(a.abortId);
                         if (a.aborted) { controller.abort(); }
+                        if (typeof a.unloadToken === 'string') {
+                            unloadCapabilitySignals.set(controller.signal, a.unloadToken);
+                        }
                         return controller.signal;
                     }
                     return a;
@@ -693,6 +906,10 @@ export class SandboxHost {
     private abortControllers = new Map<string, AbortController>();
     private activeRequestControllers = new Map<string, AbortController>();
     private cancelledRequestControllers = new WeakSet<AbortController>();
+    private readonly unloadCapabilitySignals = new WeakSet<AbortSignal>();
+    private unloadStorageAdmission = false;
+    private unloadCapabilityToken: string | null = null;
+    private readonly unloadStorageMutations = new Set<Promise<void>>();
     private callbackWrapperCache = new Map<string, Function>();
 
     private pendingCallbacks = new Map<string, { resolve: Function, reject: Function }>();
@@ -831,7 +1048,10 @@ export class SandboxHost {
                                 const ref: AbortSignalRef = {
                                     __type: 'ABORT_SIGNAL_REF',
                                     abortId,
-                                    aborted: arg.aborted
+                                    aborted: arg.aborted,
+                                    unloadToken: unloadAuthorizedCallbacks.has(wrapper)
+                                        ? this.unloadCapabilityToken ?? undefined
+                                        : undefined,
                                 };
                                 if (!arg.aborted) {
                                     arg.addEventListener('abort', () => {
@@ -868,6 +1088,18 @@ export class SandboxHost {
                     return instance;
                 }
             }
+            if (arg && arg.__type === 'ABORT_SIGNAL_REF') {
+                const abortRef = arg as AbortSignalRef;
+                const controller = new AbortController();
+                if (abortRef.aborted) controller.abort();
+                else this.abortControllers.set(abortRef.abortId, controller);
+                usedAbortIds?.push(abortRef.abortId);
+                if (abortRef.unloadToken === this.unloadCapabilityToken
+                    && this.unloadCapabilityToken !== null) {
+                    this.unloadCapabilitySignals.add(controller.signal);
+                }
+                return controller.signal;
+            }
             if (arg && typeof arg === 'object' && arg.constructor === Object) {
                 let out: any = null;
                 for (const [key, val] of Object.entries<any>(arg)) {
@@ -877,6 +1109,10 @@ export class SandboxHost {
 
                         if (abortRef.aborted) controller.abort();
                         else this.abortControllers.set(abortRef.abortId, controller);
+                        if (abortRef.unloadToken === this.unloadCapabilityToken
+                            && this.unloadCapabilityToken !== null) {
+                            this.unloadCapabilitySignals.add(controller.signal);
+                        }
 
                         usedAbortIds?.push(abortRef.abortId);
                         out[key] = controller.signal;
@@ -913,6 +1149,27 @@ export class SandboxHost {
         // unload grace period. Its rejection/success lets guest code leave the
         // startup await and observe that all later registrations are closed.
         this.detachRemoteState(false);
+    }
+
+    /** Permit only plugin-storage calls made by the captured unload callback. */
+    public beginUnloadStorageAdmission() {
+        if (this.terminated) return false;
+        this.unloadStorageAdmission = true;
+        this.unloadCapabilityToken = crypto.randomUUID();
+        return true;
+    }
+
+    /** Close admission without cancelling a mutation already accepted. */
+    public endUnloadStorageAdmission() {
+        this.unloadStorageAdmission = false;
+        this.unloadCapabilityToken = null;
+    }
+
+    /** Drain through authoritative acknowledgement before iframe removal. */
+    public async drainUnloadStorageMutations(): Promise<void> {
+        while (this.unloadStorageMutations.size > 0) {
+            await Promise.allSettled([...this.unloadStorageMutations]);
+        }
     }
 
     public run(container: HTMLElement|HTMLIFrameElement, userCode: string): Promise<void> {
@@ -1072,11 +1329,18 @@ export class SandboxHost {
                 }
 
                 try {
-                    if (this.terminating || this.terminated) {
+                    const args = this.deserializeArgs(data.args || [], usedAbortIds);
+                    const hasUnloadCapability = args.some(arg =>
+                        arg instanceof AbortSignal && this.unloadCapabilitySignals.has(arg),
+                    );
+                    const unloadStorageCall = data.type === 'CALL_ROOT'
+                        && typeof data.method === 'string'
+                        && this.unloadStorageAdmission
+                        && hasUnloadCapability
+                        && UNLOAD_STORAGE_ROOT_METHODS.has(data.method);
+                    if (this.terminated || (this.terminating && !unloadStorageCall)) {
                         throw new Error("Plugin sandbox is terminating; RPC invocation was rejected.");
                     }
-
-                    const args = this.deserializeArgs(data.args || [], usedAbortIds);
                     let result: any;
 
 
@@ -1091,7 +1355,16 @@ export class SandboxHost {
                             }
                             args.push(requestController.signal);
                         }
-                        result = await fn(...args);
+                        const invocation = Promise.resolve().then(() => fn(...args));
+                        if (UNLOAD_STORAGE_MUTATION_METHODS.has(data.method!)) {
+                            let tracked!: Promise<void>;
+                            tracked = invocation.then(
+                                () => undefined,
+                                () => undefined,
+                            ).finally(() => this.unloadStorageMutations.delete(tracked));
+                            this.unloadStorageMutations.add(tracked);
+                        }
+                        result = await invocation;
                     } else {
                         const instance = this.instanceRegistry.get(data.id!);
                         if (!instance) throw new Error("Instance not found or released");

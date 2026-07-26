@@ -39,7 +39,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [SA4](startup-availability.md#sa4) | High impact, window-dependent | Fixed | Import and retry failures abort startup or expose uncommitted state to optimized reads |
 | [AA1](atomicity-acknowledgement.md#aa1) | Medium | Fixed | Value and owner metadata are separate commits; a rejection can follow a durable primary mutation |
 | [AA2](atomicity-acknowledgement.md#aa2) | Medium | Fixed | Optimized `clear()` can partially apply |
-| [AA3](atomicity-acknowledgement.md#aa3) | High | Open | No batch/transaction/CAS primitive: the one-second unload deadline can terminate a multi-row commit, leaving a torn but durable generation |
+| [AA3](atomicity-acknowledgement.md#aa3) | High | Fixed | No batch/transaction/CAS primitive: the one-second unload deadline can terminate a multi-row commit, leaving a torn but durable generation |
 | [BR1](backup-recovery.md#br1) | Medium | Fixed | Optimized-only mutations never advance automatic recovery snapshots |
 | [BR2](backup-recovery.md#br2) | Medium | Fixed | Cross-mode snapshot ownership is ambiguous: unmarked just-disabled snapshots and no storage generation |
 | [BR3](backup-recovery.md#br3) | Medium | Open | Corrupt-database boot fallback ignores a marked snapshot's exact plugin-row set |
@@ -47,7 +47,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [PM1](performance-memory.md#pm1) | Medium | Open | Large plugin values bypass chunking and incur multiple full-size client/server copies |
 | [PM2](performance-memory.md#pm2) | Medium | Open | Mode transitions are not memory-bounded in either direction; the UI guards on entry count only |
 | [PM3](performance-memory.md#pm3) | Medium | Open | Viewer, partial backup, and snapshot restore eagerly rematerialize the whole external store |
-| [PM4](performance-memory.md#pm4) | Medium | Open | Write amplification: value and owner use separate HTTP mutations, while cache seeding repeats full-value hashing/copies and prunes per write |
+| [PM4](performance-memory.md#pm4) | Medium | Open | Remaining write/cache amplification: independent logical writes still repeat full-value hashing/copies and cache pruning |
 | [IP1](integration-patterns.md#ip1) | High | Open | Treating a failed read as a missing key turns transient I/O errors into destructive whole-value overwrites |
 | [IP2](integration-patterns.md#ip2) | High | Open | Remove-then-rewrite maintenance flows durably delete rows mid-sequence and report success |
 | [IP3](integration-patterns.md#ip3) | Medium | Open | Swallowed mutation failures desynchronize plugin caches and success counters from durable server state |
@@ -56,9 +56,10 @@ listed with rationale in [Excluded findings](#excluded-findings).
 
 The IP items describe plugin-side coding patterns that only become unsafe once
 the beta turns local map operations into independent, fallible, durable server
-commits. They are integration findings: the host cannot fix them alone, but the
-listed host primitives (typed errors, CAS, batch, non-destructive invalidate)
-are what would make the patterns safe.
+commits. They are integration findings: the host cannot fix them alone. AA3
+now supplies bounded versioned reads and atomic batch/CAS, which enables later
+plugin guidance and migrations for IP1, IP4, and IP5; the IP findings remain
+open until that guidance exists and affected plugins adopt safe protocols.
 
 ## Intentional enabled-mode behavior (not defects)
 
@@ -110,13 +111,12 @@ point. They matter for triaging reports from older builds, not as open work.
 The current passing suites cover happy-path key transport, mode-aware V3
 database/storage mixing, startup readiness and timeout behavior, transition
 ordering, key validation and canonical enumeration, server ingest, import
-barriers, atomic clear outcomes, and steady-state backup folding. They still
-do not exercise:
+barriers, atomic value/owner mutation, atomic clear and batch/CAS outcomes,
+unload admission/draining, failpoint rollback, acknowledgement loss, and
+old-or-new state after a real server restart. They still do not exercise:
 
 - the production save loop as the reconciliation durability callback
   (pre-initialization no-op, in-flight save join, 409/500/network failure);
-- unload terminated at intermediate positions of a multi-row commit;
-- plugin-only automatic snapshot cadence;
 - marked-snapshot restore through the corrupt-database boot fallback;
 - a very large individual value or aggregate store (including transition
   memory, with the resource cache on and off);
@@ -145,8 +145,10 @@ do not exercise:
    missing/failed read outcomes, per-key revisions/CAS, atomic batch, and a
    non-destructive invalidate/rewrite operation.
 
-The former compatibility blockers MT1–MT2, AC1, AC3, SA1–SA4, and AA1–AA2 are
-fixed and covered. The beta still should not be treated as risk-free for every
-V3 workload: AA3, BR1–BR3, PM1–PM4, and IP1–IP5 remain open. Verify a
-backup before transitions, and avoid very large values or stores until the
-capacity work lands.
+The former compatibility, startup, mutation, and primary recovery blockers
+MT1–MT3, AC1–AC4, SA1–SA4, AA1–AA3, BR1–BR2, and BR4 are fixed and covered.
+The beta still should not be treated as risk-free for every V3 workload: BR3,
+PM1–PM4, and IP1–IP5 remain open. The AA3 primitives make safe compound-write
+guidance possible, but do not automatically repair existing plugin protocols.
+Verify a backup before transitions, and avoid very large values or stores until
+the capacity work lands.
