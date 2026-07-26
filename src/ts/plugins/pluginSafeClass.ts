@@ -1,5 +1,6 @@
 import { toGetter } from "../globalApi.svelte";
 import { clearPersistentPrefix, decodeStorageKeyComponent, listPersistentKeys, makeEncodedStorageKey, readPersistentJson, removePersistentKey, writePersistentJson } from "../storage/persistentKv";
+import { snapshotJsonValue } from "../storage/jsonValue";
 import { recordOwner, removeOwner, clearOwners } from "./pluginStorageMeta";
 
 const pluginStorage = new Map<string, unknown>();
@@ -70,8 +71,12 @@ export class SafeLocalPluginStorage {
     }
     async setItem<T>(key: string, value: T): Promise<void> {
         const cacheKey = `safe_plugin_${key}`;
-        pluginStorage.set(cacheKey, value);
-        await writePersistentJson(makeEncodedStorageKey(pluginStoragePrefix, key), value);
+        // Capture and validate synchronously, then publish the detached value
+        // only after persistence succeeds. Rejected writes leave any previous
+        // cache entry authoritative and cannot retain a caller-owned alias.
+        const snapshot = snapshotJsonValue(value);
+        await writePersistentJson(makeEncodedStorageKey(pluginStoragePrefix, key), snapshot);
+        pluginStorage.set(cacheKey, snapshot);
         if (this.owner) await recordOwner('idb', key, this.owner);
     }
     async removeItem(key: string): Promise<void> {

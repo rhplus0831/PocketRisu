@@ -4,6 +4,7 @@ const storage = vi.hoisted(() => ({
     Init: vi.fn(async () => undefined),
     getItem: vi.fn(async () => new TextEncoder().encode('{"source":"plain"}')),
     getItemCached: vi.fn(async () => new TextEncoder().encode('{"source":"cached"}')),
+    setItem: vi.fn(async (_key: string, _value: Uint8Array) => undefined),
 }))
 
 vi.mock('../globalApi.svelte', () => ({ forageStorage: storage }))
@@ -22,6 +23,7 @@ const {
     hasNativeStringWellFormed,
     makeEncodedStorageKey,
     readPersistentJson,
+    writePersistentJson,
 } = await import('./persistentKv')
 
 afterAll(() => {
@@ -33,10 +35,10 @@ afterAll(() => {
         )
     }
 })
-
 beforeEach(() => {
     storage.getItem.mockClear()
     storage.getItemCached.mockClear()
+    storage.setItem.mockClear()
 })
 
 describe('persistent JSON read transport', () => {
@@ -51,6 +53,33 @@ describe('persistent JSON read transport', () => {
             .resolves.toEqual({ source: 'cached' })
         expect(storage.getItemCached).toHaveBeenCalledWith('pluginsave/value')
         expect(storage.getItem).not.toHaveBeenCalled()
+    })
+
+    it('rejects a poisoned JSON row instead of treating it as a missing value', async () => {
+        storage.getItem.mockResolvedValueOnce(new TextEncoder().encode(''))
+
+        await expect(readPersistentJson('pluginsave/poisoned')).rejects.toThrow(SyntaxError)
+    })
+})
+
+describe('persistent JSON write transport', () => {
+    it('validates before touching storage', async () => {
+        await expect(writePersistentJson('pluginsave/invalid', { nested: undefined }))
+            .rejects.toThrow(TypeError)
+
+        expect(storage.setItem).not.toHaveBeenCalled()
+    })
+
+    it('writes the validated detached JSON bytes', async () => {
+        const value = { nested: ['safe', -0] }
+        const writing = writePersistentJson('pluginsave/valid', value)
+        value.nested[0] = 'mutated-after-call'
+        await writing
+
+        expect(storage.setItem).toHaveBeenCalledOnce()
+        const [key, bytes] = storage.setItem.mock.calls[0]
+        expect(key).toBe('pluginsave/valid')
+        expect(JSON.parse(new TextDecoder().decode(bytes))).toEqual({ nested: ['safe', 0] })
     })
 })
 

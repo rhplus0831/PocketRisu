@@ -86,6 +86,36 @@ export function getPluginStorageRecordKeys<T>(
     return keys;
 }
 
+const MAX_ARRAY_INDEX = 0xffff_ffff;
+
+function pluginStorageArrayIndex(key: string): number | null {
+    const index = Number(key);
+    return Number.isInteger(index)
+        && index >= 0
+        && index < MAX_ARRAY_INDEX
+        && String(index) === key
+        ? index
+        : null;
+}
+
+/**
+ * Canonical V3 enumeration order, independent of database/list insertion order.
+ * ECMAScript array-index property names come first numerically; all remaining
+ * keys use deterministic UTF-16 code-unit order.
+ */
+export function orderPluginStorageKeys(keys: Iterable<string>): string[] {
+    return [...new Set(keys)].sort((left, right) => {
+        const leftIndex = pluginStorageArrayIndex(left);
+        const rightIndex = pluginStorageArrayIndex(right);
+        if (leftIndex !== null || rightIndex !== null) {
+            if (leftIndex === null) return 1;
+            if (rightIndex === null) return -1;
+            return leftIndex - rightIndex;
+        }
+        return left < right ? -1 : left > right ? 1 : 0;
+    });
+}
+
 export function copyPluginStorageRecord<T>(
     source: PluginStorageRecord<T> | null | undefined,
 ): PluginStorageRecord<T> {

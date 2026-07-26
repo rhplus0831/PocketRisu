@@ -268,3 +268,30 @@ while the SQLite queries have no `ORDER BY` (`server/node/db.cjs:136-139`,
 - Validate JSON representability before acknowledging a write.
 - Define and implement a stable enumeration order shared by both modes, or
   document the instability and provide a snapshot/iterator API (see PM4).
+
+### Resolution
+
+**Fixed 2026-07-26.** Plugin storage now accepts a strict, detached JSON value
+tree in both modes. Descriptor-based validation rejects accessors, symbols,
+non-enumerable properties, sparse arrays, custom prototypes/`toJSON`, cycles,
+non-finite numbers, `BigInt`, and other lossy values before any asynchronous
+write or inline mutation. Caller-owned objects are snapshotted at ingress;
+the save-backed and safe-local facades publish caches only after persistence
+succeeds, so later caller mutation or a rejected write cannot poison reads.
+
+Mode reconciliation uses separate prepare/apply phases. It validates complete
+inline value and owner records plus every retained external orphan before the
+progress callback, mode flag change, database publication, write, delete, or
+durable save. Source inspection uses own descriptors without invoking getters,
+and validated inline destinations may skip only the exact external rows they
+will replace.
+
+Both backends now expose one documented deterministic enumeration: canonical
+array-index names first in numeric order, followed by other keys in UTF-16
+lexical order. Duplicate and reordered server/list-delta results cannot shift
+`key(index)`. Regression coverage includes hostile values and descriptors,
+Svelte special-key proxies, transition failure with zero mutation, poisoned
+external orphans, caller aliases, failed cache writes, and the
+`4294967294`/`4294967295` index boundary. Independent verification passed 107
+focused tests, the full client suite (1,052 passed, 3 skipped), `pnpm check`,
+and a production build.

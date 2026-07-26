@@ -123,6 +123,7 @@ const {
     readExternalizedPluginStorage,
     reconcilePluginStorageMode,
     removePluginSaveStorageItem,
+    setOwnedPluginSaveStorageItem,
     setPluginSaveStorageItem,
     transitionPluginStorageMode,
     withPluginSaveStorageLock,
@@ -154,9 +155,51 @@ const SPECIAL_PLUGIN_STORAGE_KEYS = [
     "hasOwnProperty",
     "",
 ] as const;
+const ORDERED_SPECIAL_PLUGIN_STORAGE_KEYS = [
+    "",
+    "__proto__",
+    "constructor",
+    "hasOwnProperty",
+    "prototype",
+    "toString",
+] as const;
 
 function encoded(prefix: string, key: string) {
     return `${prefix}${Buffer.from(key, "utf-8").toString("base64url")}.json`;
+}
+
+type InvalidRecordKind = "accessor" | "symbol" | "non-enumerable";
+
+function makeInvalidRecord(
+    kind: InvalidRecordKind,
+    onGetter = () => undefined,
+): Record<string, unknown> {
+    const record: Record<string, unknown> = {};
+    if (kind === "accessor") {
+        Object.defineProperty(record, "poisoned", {
+            configurable: true,
+            enumerable: true,
+            get: () => {
+                onGetter();
+                return { silently: "serialized" };
+            },
+        });
+    } else if (kind === "symbol") {
+        Object.defineProperty(record, Symbol("poisoned"), {
+            configurable: true,
+            enumerable: true,
+            value: { silently: "omitted" },
+            writable: true,
+        });
+    } else {
+        Object.defineProperty(record, "poisoned", {
+            configurable: true,
+            enumerable: false,
+            value: { silently: "omitted" },
+            writable: true,
+        });
+    }
+    return record;
 }
 
 beforeEach(async () => {
@@ -270,6 +313,20 @@ describe("readExternalizedPluginStorage", () => {
         expect(readPersistentJson).toHaveBeenCalledWith(validMetaKey);
     });
 
+    test("rejects poisoned rows instead of treating them as absent during enumeration", async () => {
+        const validKey = encoded(PLUGIN_SAVE_PREFIX, "valid");
+        const poisonedKey = encoded(PLUGIN_SAVE_PREFIX, "poisoned");
+        const { readPersistentJson } = await import("../storage/persistentKv");
+        persistent.set(validKey, { safe: true });
+        persistent.set(poisonedKey, "corrupt bytes sentinel");
+        vi.mocked(readPersistentJson).mockImplementation(async (key: string) => {
+            if (key === poisonedKey) throw new SyntaxError("Unexpected end of JSON input");
+            return persistent.get(key);
+        });
+
+        await expect(readExternalizedPluginStorage()).rejects.toThrow(SyntaxError);
+    });
+
     test("preserves special property names in value and metadata records", async () => {
         for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
             persistent.set(encoded(PLUGIN_SAVE_PREFIX, key), { index });
@@ -362,7 +419,9 @@ describe("plugin save storage transport", () => {
         }
 
         expect(Object.getPrototypeOf(database.pluginCustomStorage)).toBe(Object.prototype);
-        await expect(getPluginSaveStorageKeys()).resolves.toEqual(SPECIAL_PLUGIN_STORAGE_KEYS);
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(
+            ORDERED_SPECIAL_PLUGIN_STORAGE_KEYS,
+        );
         for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
             await expect(getPluginSaveStorageItem(key)).resolves.toEqual({ index });
             expect(Object.hasOwn(database.pluginCustomStorage, key)).toBe(true);
@@ -373,6 +432,105 @@ describe("plugin save storage transport", () => {
             await expect(getPluginSaveStorageItem(key)).resolves.toBeNull();
         }
         await expect(getPluginSaveStorageKeys()).resolves.toEqual([]);
+    });
+
+    test.each([false, true])(
+        "rejects unrepresentable JSON without mutating %s mode",
+        async (optimized) => {
+            database.optimizePluginMemory = optimized;
+            const invalidValues: unknown[] = [
+                undefined,
+                () => undefined,
+                new Map([["key", "value"]]),
+                new Set(["value"]),
+                { nested: undefined },
+                { nested: Number.NaN },
+                { nested: 1n },
+            ];
+            const cycle: Record<string, unknown> = {};
+            cycle.self = cycle;
+            invalidValues.push(cycle);
+
+            const { writePersistentJson } = await import("../storage/persistentKv");
+            for (const [index, value] of invalidValues.entries()) {
+                await expect(setPluginSaveStorageItem(`invalid-${index}`, value))
+                    .rejects.toThrow(TypeError);
+            }
+
+            expect(Object.keys(database.pluginCustomStorage)).toEqual([]);
+            expect(persistent.size).toBe(0);
+            expect(writePersistentJson).not.toHaveBeenCalled();
+        },
+    );
+
+    test("inline get rejects an accessor without invoking it", async () => {
+        let getterCalls = 0;
+        database.pluginCustomStorage = makeInvalidRecord("accessor", () => {
+            getterCalls += 1;
+        });
+
+        await expect(getPluginSaveStorageItem("poisoned"))
+            .rejects.toThrow("does not accept an accessor");
+        expect(getterCalls).toBe(0);
+    });
+
+    test.each(["accessor", "symbol", "non-enumerable"] as const)(
+        "inline set rejects an existing %s property without replacing the record",
+        async (kind) => {
+            let getterCalls = 0;
+            const original = makeInvalidRecord(kind, () => {
+                getterCalls += 1;
+            });
+            database.pluginCustomStorage = original;
+
+            await expect(setPluginSaveStorageItem("new-key", { safe: true }))
+                .rejects.toThrow(TypeError);
+
+            expect(database.pluginCustomStorage).toBe(original);
+            expect(Object.hasOwn(database.pluginCustomStorage, "new-key")).toBe(false);
+            expect(getterCalls).toBe(0);
+        },
+    );
+
+    test("owned inline set validates metadata before publishing the value", async () => {
+        let getterCalls = 0;
+        const invalidMeta = makeInvalidRecord("accessor", () => {
+            getterCalls += 1;
+        });
+        database.pluginCustomStorage = { existing: { safe: true } };
+        database.pluginStorageMeta = invalidMeta;
+        const originalValues = database.pluginCustomStorage;
+
+        await expect(setOwnedPluginSaveStorageItem("new-key", { safe: true }, "Plugin"))
+            .rejects.toThrow("does not accept an accessor");
+
+        expect(database.pluginCustomStorage).toBe(originalValues);
+        expect(database.pluginStorageMeta).toBe(invalidMeta);
+        expect(Object.hasOwn(database.pluginCustomStorage, "new-key")).toBe(false);
+        expect(getterCalls).toBe(0);
+    });
+
+    test("uses one stable ECMAScript-aware key order in both modes", async () => {
+        const insertionOrder = ["beta", "10", "2", "01", "alpha", "4294967295", "0", ""];
+        const expected = ["0", "2", "10", "", "01", "4294967295", "alpha", "beta"];
+        for (const key of insertionOrder) {
+            await setPluginSaveStorageItem(key, key);
+        }
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(expected);
+
+        database.optimizePluginMemory = true;
+        database.pluginCustomStorage = {};
+        for (const key of [...insertionOrder].reverse()) {
+            persistent.set(encoded(PLUGIN_SAVE_PREFIX, key), key);
+        }
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(expected);
+
+        // Model a list-delta merge that moves an updated row to the end.
+        const movedKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        const value = persistent.get(movedKey);
+        persistent.delete(movedKey);
+        persistent.set(movedKey, value);
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(expected);
     });
 });
 
@@ -443,6 +601,55 @@ describe("reconcilePluginStorageMode", () => {
         expect(persistent.get(encoded(PLUGIN_SAVE_PREFIX, "first"))).toBe(1);
         expect(database.pluginCustomStorage.first).toBeUndefined();
         expect(database.pluginCustomStorage.second).toBe(2);
+    });
+
+    test("validates every value before writing or deleting any inline source", async () => {
+        database = {
+            optimizePluginMemory: true,
+            pluginCustomStorage: {
+                valid: { value: 1 },
+                invalid: new Map([["lost", "if-written-as-empty-object"]]),
+            },
+        };
+        const writePersistentJson = vi.fn();
+        const persistDatabase = vi.fn();
+
+        await expect(reconcilePluginStorageMode({
+            dependencies: { writePersistentJson, persistDatabase },
+        })).rejects.toThrow("plain objects");
+
+        expect(database.pluginCustomStorage.valid).toEqual({ value: 1 });
+        expect(database.pluginCustomStorage.invalid).toBeInstanceOf(Map);
+        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(persistDatabase).not.toHaveBeenCalled();
+    });
+
+    test("rejects an enumerable source accessor without invoking it", async () => {
+        let getterCalls = 0;
+        const invalid = makeInvalidRecord("accessor", () => {
+            getterCalls += 1;
+        });
+        database = {
+            optimizePluginMemory: true,
+            pluginCustomStorage: invalid,
+        };
+        const writePersistentJson = vi.fn();
+        const removePersistentKey = vi.fn();
+        const persistDatabase = vi.fn();
+
+        await expect(reconcilePluginStorageMode({
+            dependencies: {
+                writePersistentJson,
+                removePersistentKey,
+                persistDatabase,
+            },
+        })).rejects.toThrow("does not accept an accessor");
+
+        expect(database.pluginCustomStorage).toBe(invalid);
+        expect(getterCalls).toBe(0);
+        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(removePersistentKey).not.toHaveBeenCalled();
+        expect(persistDatabase).not.toHaveBeenCalled();
     });
 
     test("rejects colliding lone-surrogate value keys before any mutation", async () => {
@@ -1142,7 +1349,9 @@ describe("transitionPluginStorageMode", () => {
         expect(database.optimizePluginMemory).toBe(true);
         expect(Object.keys(database.pluginCustomStorage)).toEqual([]);
         expect(database.pluginStorageMeta).toBeUndefined();
-        await expect(getPluginSaveStorageKeys()).resolves.toEqual(SPECIAL_PLUGIN_STORAGE_KEYS);
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(
+            ORDERED_SPECIAL_PLUGIN_STORAGE_KEYS,
+        );
         for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
             await expect(getPluginSaveStorageItem(key)).resolves.toEqual({ index });
             expect(persistent.get(encoded(PLUGIN_SAVE_META_PREFIX, key))).toEqual({
@@ -1175,6 +1384,246 @@ describe("transitionPluginStorageMode", () => {
         expect(persistent.size).toBe(0);
         expect(persistDatabase).toHaveBeenCalledTimes(2);
     });
+
+    test.each([
+        ["pluginCustomStorage", "accessor"],
+        ["pluginCustomStorage", "symbol"],
+        ["pluginCustomStorage", "non-enumerable"],
+        ["pluginStorageMeta", "accessor"],
+        ["pluginStorageMeta", "symbol"],
+        ["pluginStorageMeta", "non-enumerable"],
+    ] as const)(
+        "enable preflight rejects %s %s properties before every mutation",
+        async (field, kind) => {
+            let getterCalls = 0;
+            const invalid = makeInvalidRecord(kind, () => {
+                getterCalls += 1;
+            });
+            database.optimizePluginMemory = false;
+            database.pluginCustomStorage = field === "pluginCustomStorage" ? invalid : { safe: 1 };
+            database.pluginStorageMeta = field === "pluginStorageMeta" ? invalid : undefined;
+            const originalValues = database.pluginCustomStorage;
+            const originalMeta = database.pluginStorageMeta;
+            const listPersistentKeys = vi.fn();
+            const readPersistentJson = vi.fn();
+            const writePersistentJson = vi.fn();
+            const removePersistentKey = vi.fn();
+            const persistDatabase = vi.fn();
+
+            await expect(transitionPluginStorageMode(true, {
+                dependencies: {
+                    listPersistentKeys,
+                    readPersistentJson,
+                    writePersistentJson,
+                    removePersistentKey,
+                    persistDatabase,
+                },
+            })).rejects.toThrow(TypeError);
+
+            expect(database.optimizePluginMemory).toBe(false);
+            expect(database.pluginCustomStorage).toBe(originalValues);
+            expect(database.pluginStorageMeta).toBe(originalMeta);
+            expect(getterCalls).toBe(0);
+            expect(listPersistentKeys).not.toHaveBeenCalled();
+            expect(readPersistentJson).not.toHaveBeenCalled();
+            expect(writePersistentJson).not.toHaveBeenCalled();
+            expect(removePersistentKey).not.toHaveBeenCalled();
+            expect(persistDatabase).not.toHaveBeenCalled();
+            expect(persistent.size).toBe(0);
+        },
+    );
+
+    test("enable preflight rejects a poisoned retained orphan value before mutation", async () => {
+        let getterCalls = 0;
+        const invalid = makeInvalidRecord("accessor", () => {
+            getterCalls += 1;
+        });
+        const orphanKey = encoded(PLUGIN_SAVE_PREFIX, "orphan");
+        database.optimizePluginMemory = false;
+        database.pluginCustomStorage = { inline: { safe: true } };
+        const originalValues = database.pluginCustomStorage;
+        persistent.set(orphanKey, "durable-row-sentinel");
+        const readCalls: Array<[string, { cached?: boolean } | undefined]> = [];
+        async function readPersistentJson<T>(
+            key: string,
+            options?: { cached?: boolean },
+        ): Promise<T> {
+            readCalls.push([key, options]);
+            return (key === orphanKey ? invalid : persistent.get(key)) as T;
+        }
+        const writePersistentJson = vi.fn();
+        const removePersistentKey = vi.fn();
+        const persistDatabase = vi.fn();
+
+        await expect(transitionPluginStorageMode(true, {
+            dependencies: {
+                readPersistentJson,
+                writePersistentJson,
+                removePersistentKey,
+                persistDatabase,
+            },
+        })).rejects.toThrow("does not accept accessors");
+
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginCustomStorage).toBe(originalValues);
+        expect(getterCalls).toBe(0);
+        expect(readCalls).toContainEqual([orphanKey, { cached: true }]);
+        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(removePersistentKey).not.toHaveBeenCalled();
+        expect(persistDatabase).not.toHaveBeenCalled();
+        expect(persistent.get(orphanKey)).toBe("durable-row-sentinel");
+    });
+
+    test("enable preflight propagates a retained orphan metadata parse failure", async () => {
+        const orphanMetaKey = encoded(PLUGIN_SAVE_META_PREFIX, "orphan");
+        database.optimizePluginMemory = false;
+        database.pluginCustomStorage = { inline: { safe: true } };
+        database.pluginStorageMeta = { inline: { plugin: "Plugin", updatedAt: 1 } };
+        const originalValues = database.pluginCustomStorage;
+        const originalMeta = database.pluginStorageMeta;
+        persistent.set(orphanMetaKey, "corrupt-json-sentinel");
+        async function readPersistentJson<T>(key: string): Promise<T> {
+            if (key === orphanMetaKey) {
+                throw new SyntaxError("Unexpected end of JSON input");
+            }
+            return persistent.get(key) as T;
+        }
+        const writePersistentJson = vi.fn();
+        const removePersistentKey = vi.fn();
+        const persistDatabase = vi.fn();
+
+        await expect(transitionPluginStorageMode(true, {
+            dependencies: {
+                readPersistentJson,
+                writePersistentJson,
+                removePersistentKey,
+                persistDatabase,
+            },
+        })).rejects.toThrow(SyntaxError);
+
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginCustomStorage).toBe(originalValues);
+        expect(database.pluginStorageMeta).toBe(originalMeta);
+        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(removePersistentKey).not.toHaveBeenCalled();
+        expect(persistDatabase).not.toHaveBeenCalled();
+        expect(persistent.get(orphanMetaKey)).toBe("corrupt-json-sentinel");
+    });
+
+    test("enable preflight skips an external row definitely overwritten inline", async () => {
+        const overwrittenKey = encoded(PLUGIN_SAVE_PREFIX, "same");
+        database.optimizePluginMemory = false;
+        database.pluginCustomStorage = { same: { newest: true } };
+        persistent.set(overwrittenKey, "poisoned-old-row");
+        const readPersistentJson = vi.fn(async () => {
+            throw new SyntaxError("overwritten row must not be read");
+        });
+        const writePersistentJson = vi.fn(async (key: string, value: unknown) => {
+            persistent.set(key, value);
+        });
+        const persistDatabase = vi.fn();
+
+        await expect(transitionPluginStorageMode(true, {
+            dependencies: { readPersistentJson, writePersistentJson, persistDatabase },
+        })).resolves.toEqual({ direction: "externalize", values: 1, meta: 0 });
+
+        expect(readPersistentJson).not.toHaveBeenCalled();
+        expect(database.optimizePluginMemory).toBe(true);
+        expect(persistent.get(overwrittenKey)).toEqual({ newest: true });
+    });
+
+    test.each([
+        ["pluginCustomStorage", "accessor"],
+        ["pluginCustomStorage", "symbol"],
+        ["pluginCustomStorage", "non-enumerable"],
+        ["pluginStorageMeta", "accessor"],
+        ["pluginStorageMeta", "symbol"],
+        ["pluginStorageMeta", "non-enumerable"],
+    ] as const)(
+        "disable preflight rejects inline %s %s properties before reading external rows",
+        async (field, kind) => {
+            let getterCalls = 0;
+            const invalid = makeInvalidRecord(kind, () => {
+                getterCalls += 1;
+            });
+            database.optimizePluginMemory = true;
+            database.pluginCustomStorage = field === "pluginCustomStorage" ? invalid : {};
+            database.pluginStorageMeta = field === "pluginStorageMeta" ? invalid : undefined;
+            const originalValues = database.pluginCustomStorage;
+            const originalMeta = database.pluginStorageMeta;
+            persistent.set(encoded(PLUGIN_SAVE_PREFIX, "external"), { durable: true });
+            const listPersistentKeys = vi.fn();
+            const readPersistentJson = vi.fn();
+            const writePersistentJson = vi.fn();
+            const removePersistentKey = vi.fn();
+            const persistDatabase = vi.fn();
+
+            await expect(transitionPluginStorageMode(false, {
+                dependencies: {
+                    listPersistentKeys,
+                    readPersistentJson,
+                    writePersistentJson,
+                    removePersistentKey,
+                    persistDatabase,
+                },
+            })).rejects.toThrow(TypeError);
+
+            expect(database.optimizePluginMemory).toBe(true);
+            expect(database.pluginCustomStorage).toBe(originalValues);
+            expect(database.pluginStorageMeta).toBe(originalMeta);
+            expect(getterCalls).toBe(0);
+            expect(listPersistentKeys).not.toHaveBeenCalled();
+            expect(readPersistentJson).not.toHaveBeenCalled();
+            expect(writePersistentJson).not.toHaveBeenCalled();
+            expect(removePersistentKey).not.toHaveBeenCalled();
+            expect(persistDatabase).not.toHaveBeenCalled();
+            expect(persistent.get(encoded(PLUGIN_SAVE_PREFIX, "external")))
+                .toEqual({ durable: true });
+        },
+    );
+
+    test.each(["accessor", "symbol", "non-enumerable"] as const)(
+        "disable preflight rejects an external %s value before mode/database mutation",
+        async (kind) => {
+            let getterCalls = 0;
+            const invalid = makeInvalidRecord(kind, () => {
+                getterCalls += 1;
+            });
+            const valueKey = encoded(PLUGIN_SAVE_PREFIX, "external");
+            database.optimizePluginMemory = true;
+            database.pluginCustomStorage = {};
+            persistent.set(valueKey, "durable-row-sentinel");
+            const readCalls: Array<[string, { cached?: boolean } | undefined]> = [];
+            async function readPersistentJson<T>(
+                key: string,
+                options?: { cached?: boolean },
+            ): Promise<T> {
+                readCalls.push([key, options]);
+                return (key === valueKey ? invalid : null) as T;
+            }
+            const writePersistentJson = vi.fn();
+            const removePersistentKey = vi.fn();
+            const persistDatabase = vi.fn();
+
+            await expect(transitionPluginStorageMode(false, {
+                dependencies: {
+                    readPersistentJson,
+                    writePersistentJson,
+                    removePersistentKey,
+                    persistDatabase,
+                },
+            })).rejects.toThrow(TypeError);
+
+            expect(database.optimizePluginMemory).toBe(true);
+            expect(database.pluginCustomStorage).toEqual({});
+            expect(getterCalls).toBe(0);
+            expect(readCalls).toContainEqual([valueKey, { cached: true }]);
+            expect(writePersistentJson).not.toHaveBeenCalled();
+            expect(removePersistentKey).not.toHaveBeenCalled();
+            expect(persistDatabase).not.toHaveBeenCalled();
+            expect(persistent.get(valueKey)).toBe("durable-row-sentinel");
+        },
+    );
 
     test("drains SETs queued behind a held count before disabling", async () => {
         database.optimizePluginMemory = true;
@@ -1370,7 +1819,7 @@ describe("transitionPluginStorageMode", () => {
             database.pluginCustomStorage.alpha = "legacy-write";
         }
 
-        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.optimizePluginMemory).toBe(true);
         expect(isPluginStorageModeTransitioning()).toBe(true);
         expect(activated).toBe(false);
         expect(synchronousSetRan).toBe(false);
@@ -1418,7 +1867,7 @@ describe("transitionPluginStorageMode", () => {
             delete database.pluginCustomStorage.alpha;
         }
 
-        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.optimizePluginMemory).toBe(true);
         expect(isPluginStorageModeTransitioning()).toBe(true);
         expect(activated).toBe(false);
         expect(synchronousRemoveRan).toBe(false);
@@ -1468,6 +1917,8 @@ describe("transitionPluginStorageMode", () => {
             dependencies: { persistDatabase: vi.fn(async () => undefined) },
         });
         await readStarted;
+
+        expect(database.optimizePluginMemory).toBe(true);
 
         // Direct compatibility APIs are no-ops while guarded.
         v2Apis.pluginStorage.setItem("alpha", "pluginStorage-write");

@@ -985,7 +985,8 @@ interface PluginStorage {
     /**
      * Sets an item in storage
      * @param key - Storage key
-     * @param value - Value to store (any JSON-serializable value)
+     * @param value - Value to store (a JSON value: null, boolean, finite number,
+     * string, dense array, or plain object containing only JSON values)
      * @returns Promise that resolves when item is stored
      */
     setItem(key: string, value: any): Promise<void>;
@@ -1006,13 +1007,16 @@ interface PluginStorage {
     /**
      * Gets a key by index
      * @param index - Key index
-     * @returns Promise resolving to key name or null
+     * @returns Promise resolving to key name or null. Keys use the same stable
+     * order in every storage mode: array-index names numerically, then other
+     * names by UTF-16 code-unit order.
      */
-    key(index: number): Promise<any | null>;
+    key(index: number): Promise<string | null>;
 
     /**
      * Gets all storage keys
-     * @returns Promise resolving to array of key names
+     * @returns Promise resolving to key names in the stable order documented
+     * by key().
      */
     keys(): Promise<string[]>;
 

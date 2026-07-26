@@ -1,5 +1,6 @@
 import { hasher } from "../parser/parser.svelte";
 import { forageStorage } from "../globalApi.svelte";
+import { stringifyJsonValue } from "./jsonValue";
 import { assertWellFormedUnicode } from "./unicodeWellFormed";
 
 export { hasNativeStringWellFormed } from "./unicodeWellFormed";
@@ -52,8 +53,12 @@ export async function readPersistentJson<T>(
 }
 
 export async function writePersistentJson<T>(storageKey: string, value: T): Promise<void> {
+    // Snapshot and validate before the first await. Callers may mutate their
+    // object after invoking this async method, and storage initialization must
+    // not turn that into an unacknowledged change to the bytes being written.
+    const json = stringifyJsonValue(value);
     await ensureStorageReady();
-    await forageStorage.setItem(storageKey, encoder.encode(JSON.stringify(value)));
+    await forageStorage.setItem(storageKey, encoder.encode(json));
 }
 
 export async function removePersistentKey(storageKey: string): Promise<void> {
