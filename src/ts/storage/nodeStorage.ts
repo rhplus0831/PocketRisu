@@ -26,6 +26,7 @@ import {
     sha256Bytes,
     settleBestEffortResourceCache,
     storeBytes,
+    storeOwnedBytesWithKnownHash,
     touchResourceCacheManifest,
     invalidateResourceCacheManifest,
 } from "./resourceCache"
@@ -51,6 +52,7 @@ import {
     PLUGIN_STORAGE_UUID_PATTERN,
     pluginStorageBatchTransportOutcomeUnknown,
 } from "./pluginStorageBatch"
+import { PLUGIN_VALUE_STREAM_THRESHOLD_BYTES } from "./pluginStorageLimits"
 
 export const AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS = 15_000
 type BoundedStorageOperation = 'read' | 'list' | 'write' | 'remove' | 'transition' | 'batch'
@@ -175,7 +177,7 @@ export interface PluginStorageMutationTransport {
     generation: string
     expectedManifest: PluginStorageManifestTransport
     nextManifest: PluginStorageManifestTransport
-    writes: { storageKey: string, valueJson: string }[]
+    writes: { storageKey: string, valueBytes: Uint8Array }[]
     deletes: string[]
 }
 
@@ -844,12 +846,12 @@ export class NodeStorage{
             // Keep the result ambiguous until its acknowledgement body is
             // available; an HTTP status without the transaction payload is not
             // proof of commit or rollback.
-            if (kind === 'write') outcome.markRequestDispatched()
+            outcome.markRequestDispatched()
             let result: any = null
             try {
                 result = await awaitWithAbort(response.json(), signal)
             } catch (error) {
-                if (kind === 'write') throw error
+                throw error
             }
             if (response.status === 409) {
                 outcome.markDefinitiveResponse()
@@ -935,10 +937,6 @@ export class NodeStorage{
         outcome: AuthoritativeStorageOutcomeTracker,
     ) {
         const shouldSeedResourceCache = isResourceCacheEnabled() && key.startsWith('pluginsave/')
-        const requestBytes = shouldSeedResourceCache ? new Uint8Array(value) : value
-        const requestHash = shouldSeedResourceCache
-            ? settleBestEffortResourceCache(sha256Bytes(requestBytes), null)
-            : null
         const headers: Record<string, string> = {
             'content-type': 'application/octet-stream',
             'file-path': Buffer.from(key, 'utf-8').toString('hex')
@@ -946,9 +944,10 @@ export class NodeStorage{
         if (etag) {
             headers['x-if-match'] = etag
         }
-        const da = await this.requestStorage(key, 'write', true, () => this.authFetch('/api/write', {
+        const da = await this.requestStorage(key, 'write', true, () => this.authFetch(
+            '/api/write', {
             method: "POST",
-            body: requestBytes as any,
+            body: value as any,
             headers,
             signal,
         }, true, outcome), [409], signal, outcome)
@@ -967,18 +966,16 @@ export class NodeStorage{
         if (key === 'database/database.bin' && nextEtag) {
             this._lastDbEtag = nextEtag
         }
-        if (requestHash && isSha256Hex(data.hash)) {
-            // Cache hashing/persistence is disposable and must not extend the
-            // authoritative key lock after the server has acknowledged commit.
-            void requestHash.then((encodedHash) => {
-                if (encodedHash !== data.hash) return
-                return settleBestEffortResourceCache(
-                    storeBytes(`kv:${key}`, requestBytes),
-                    null,
+        if (shouldSeedResourceCache && isSha256Hex(data.hash)) {
+            // persistentKv donated a fresh immutable buffer. Reuse the server's
+            // exact request digest after acknowledgement, outside the key lock;
+            // large values are rejected by the cache helper before any copy.
+            setTimeout(() => {
+                void settleBestEffortResourceCache(
+                    storeOwnedBytesWithKnownHash(`kv:${key}`, data.hash, value),
+                    undefined,
                 )
-            }).catch(() => {
-                // The authoritative write succeeded; cache seeding is best-effort.
-            })
+            }, 0)
         }
     }
     async mutatePluginStorage(
@@ -1009,7 +1006,9 @@ export class NodeStorage{
         const stableRequest: PluginStorageMutationRequest = request.operation === 'set'
             ? {
                 ...request,
-                valueBytes: new Uint8Array(request.valueBytes!),
+                valueBytes: request.ownedValueBytes
+                    ? request.valueBytes!
+                    : new Uint8Array(request.valueBytes!),
                 ...(request.ownerRecordBytes
                     ? { ownerRecordBytes: new Uint8Array(request.ownerRecordBytes) }
                     : {}),
@@ -1079,6 +1078,9 @@ export class NodeStorage{
                 headers['x-plugin-storage-generation'] = stableRequest.generation
             }
             if (stableRequest.operation === 'set') {
+                if (stableRequest.valueBytes!.byteLength >= PLUGIN_VALUE_STREAM_THRESHOLD_BYTES) {
+                    headers['x-plugin-storage-stream'] = '1'
+                }
                 headers['x-plugin-storage-owner'] = Buffer.from(
                     stableRequest.owner ?? '',
                     'utf-8',
@@ -1143,7 +1145,9 @@ export class NodeStorage{
             void publishPluginStorageMutationCache(stableRequest, result, {
                 enabled: isResourceCacheEnabled(),
                 storeValue: async (valueKey, valueBytes) => {
-                    await storeBytes(`kv:${valueKey}`, valueBytes)
+                    if (result.outcome === 'committed' && isSha256Hex(result.hash)) {
+                        await storeOwnedBytesWithKnownHash(`kv:${valueKey}`, result.hash, valueBytes)
+                    }
                 },
                 invalidateValue: async (valueKey) => {
                     await invalidateResourceCacheManifest(`kv:${valueKey}`)

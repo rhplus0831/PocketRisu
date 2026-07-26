@@ -43,6 +43,59 @@ of value/aggregate limits are unchanged.
 - Test large vectors, media, many record bodies, and resource-cache
   enabled/disabled combinations.
 
+### Resolution
+
+**Fixed 2026-07-26.** Optimized plugin values now have an exact serialized
+UTF-8 capacity contract. The browser measures the JSON byte length before
+dispatch and rejects values above the 128 MiB default per-value cap with a
+structured, non-retryable storage error. The authoritative server enforces the
+same per-value default plus a 1 GiB aggregate default (both server defaults are
+configurable), reports the limit and actual byte count in structured 413
+responses, and permits an already-over-limit repository to shrink without
+allowing further growth. A persistent logical-byte counter is updated in the
+same SQLite transaction as every write, replacement, copy, deletion, and
+prefix clear, and is rebuilt from live rows on boot so rollback, older data,
+and interrupted maintenance cannot leave quota accounting stale.
+
+`pluginsave/` is now a chunk-capable namespace. Large live values use the same
+content-defined chunk store and deduplication as other large server rows, while
+reads, copies, prefix deletion, portable export, live enumeration, and pinned
+snapshot enumeration operate on logical values and byte sizes rather than the
+chunk marker. Import mutations participate in the enclosing SQLite transaction,
+so a failed import rolls back both rows and aggregate usage. Concurrent writes
+are admitted under the server mutation queue and re-evaluate the counter in
+their transaction, preventing two individually valid requests from jointly
+exceeding the aggregate cap.
+
+Single-row owned mutations of at least 1 MiB keep the canonical atomic
+`/api/plugin-storage/mutate` protocol but opt into parser-free streaming. The
+server requires an exact `Content-Length`, bounds and hashes bytes
+incrementally while spooling to a temporary file, and holds the authoritative
+mutation queue only for the file-to-chunk SQLite commit; every exit removes
+the spool file. Older clients remain supported through `/api/write`, but
+`pluginsave/` bodies on that route use the per-value parser cap instead of the
+generic 2 GiB octet-stream limit.
+
+The client snapshots, stringifies, measures, and encodes ordinary writes,
+owned writes, and exact V3 database replacements before entering SA2's
+shared/key or exclusive barrier. The fresh prepared buffer is reused for the
+request. The client still computes one request-bound SHA-256 digest so it can
+verify the acknowledgement; the server computes its streamed digest
+incrementally. After acknowledgement, the server-provided digest and the same
+immutable buffer are donated to detached best-effort cache seeding, so the
+cache performs no second full-value copy or hash; disabled and
+over-cache-limit values are skipped before either cost. Cache reads continue
+to verify stored bytes independently.
+
+Legacy save-folder migration also routes new chunk-capable rows through the
+chunk store, but first checks whether the key already exists in SQLite. Thus a
+stale hex file cannot overwrite the authoritative database when the migration
+marker is absent. Regression coverage exercises exact 8,192/8,193-byte Unicode
+boundaries, aggregate replacement and concurrent admission, large vector and
+media values, twenty record bodies, logical live/snapshot sizes, legacy
+writes, transaction rollback, manifest cleanup, migration-authority restart
+conflicts, and resource-cache enabled/disabled behavior.
+
 <a id="pm2"></a>
 ## PM2 — Mode transitions are not memory-bounded in either direction
 

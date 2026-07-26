@@ -9,6 +9,7 @@ import {
     listPersistentKeys,
     makeEncodedStorageKey,
     mutatePersistentPluginStorage,
+    preparePersistentJson,
     readPersistentPluginStorageState,
     readPersistentJson,
     readPersistentJsonRow,
@@ -512,7 +513,7 @@ function readGenerationBoundPluginStorageJson<T>(
 
 async function commitOptimizedStorageMutation(
     db: Database,
-    writes: { storageKey: string; value: unknown }[],
+    writes: { storageKey: string; valueBytes: Uint8Array }[],
     deletes: string[],
     mutate: (valueKeys: Set<string>, metaKeys: Set<string>) => void,
     signal?: AbortSignal | null,
@@ -723,6 +724,14 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
     const replacement = pluginCustomStorage === undefined
         ? undefined
         : cloneJsonPluginStorageRecord(pluginCustomStorage);
+    const preparedValues = new Map(
+        replacement === undefined
+            ? []
+            : getPluginStorageRecordKeys(replacement).map((key) => [
+                key,
+                preparePersistentJson(replacement[key], { pluginValue: true }),
+            ] as const),
+    );
 
     try {
         return await withPluginSaveStorageLock(async () => {
@@ -750,7 +759,7 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
                             PLUGIN_SAVE_PREFIX,
                             key,
                         ),
-                        value: replacement[key],
+                        valueBytes: preparedValues.get(key)!.bytes,
                     }));
                     if (new Set(prepared.map(entry => entry.storageKey)).size !== prepared.length) {
                         throw new Error(
@@ -813,7 +822,7 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
                         db,
                         prepared.map(entry => ({
                             storageKey: entry.storageKey,
-                            value: entry.value,
+                            valueBytes: entry.valueBytes,
                         })),
                         deletes,
                         (values, meta) => {
@@ -921,6 +930,9 @@ export async function setPluginSaveStorageItem<T>(
     throwIfAborted(signal);
     const normalizedKey = normalizePluginStorageKey(key);
     const snapshot = snapshotJsonValue(value);
+    // Snapshot, stringify, measure, and encode before entering SA2's shared
+    // barrier/key queue. The lock now covers only authoritative I/O.
+    const prepared = preparePersistentJson(snapshot, { pluginValue: true });
     try {
         await withPluginSaveStorageKeyLock(normalizedKey, async () => {
             throwIfAborted(signal);
@@ -941,7 +953,7 @@ export async function setPluginSaveStorageItem<T>(
             );
             await commitOptimizedStorageMutation(
                 db,
-                [{ storageKey, value: snapshot }],
+                [{ storageKey, valueBytes: prepared.bytes }],
                 [],
                 values => values.add(storageKey),
                 signal,
@@ -964,6 +976,7 @@ export async function setOwnedPluginSaveStorageItem<T>(
     throwIfAborted(signal);
     const normalizedKey = normalizePluginStorageKey(key);
     const snapshot = snapshotJsonValue(value);
+    const preparedValue = preparePersistentJson(snapshot, { pluginValue: true });
     try {
         await withPluginSaveStorageKeyLock(normalizedKey, async () => {
             throwIfAborted(signal);
@@ -993,6 +1006,7 @@ export async function setOwnedPluginSaveStorageItem<T>(
                         owner,
                         signal,
                         db.pluginStorageGeneration,
+                        preparedValue,
                     );
                 } else {
                     await mutatePersistentPluginStorage(
@@ -1001,6 +1015,8 @@ export async function setOwnedPluginSaveStorageItem<T>(
                         snapshot,
                         owner,
                         signal,
+                        undefined,
+                        preparedValue,
                     );
                 }
                 return;
@@ -1345,11 +1361,20 @@ export async function atomicBatchOwnedPluginSaveStorage(
         );
     }
     const seen = new Set<string>();
-    const prepared: PersistentPluginStorageBatchOperation[] = [];
-    for (let index = 0; index < mutations.length; index++) {
-        if (index > 0 && index % 16 === 0) {
-            await new Promise<void>(resolve => setTimeout(resolve, 0));
+    const detached: Array<
+        | {
+            type: "set";
+            key: string;
+            value: unknown;
+            expectedRevision?: string | null;
         }
+        | {
+            type: "remove";
+            key: string;
+            expectedRevision?: string | null;
+        }
+    > = [];
+    for (let index = 0; index < mutations.length; index++) {
         throwIfAborted(signal);
         const mutation = mutations[index];
         if (!mutation || (mutation.type !== "set" && mutation.type !== "remove")) {
@@ -1370,16 +1395,42 @@ export async function atomicBatchOwnedPluginSaveStorage(
             ? { expectedRevision: mutation.expectedRevision }
             : {};
         if (mutation.type === "set") {
-            const snapshot = snapshotPluginBatchValue(mutation.value);
-            prepared.push({
-                operation: "set",
+            detached.push({
+                type: "set",
                 key,
-                valueBytes: pluginStorageBatchEncoder.encode(stringifyJsonValue(snapshot)),
-                owner,
+                value: snapshotPluginBatchValue(mutation.value),
                 ...expected,
             });
         } else {
-            prepared.push({ operation: "remove", key, ...expected });
+            detached.push({ type: "remove", key, ...expected });
+        }
+    }
+
+    const prepared: PersistentPluginStorageBatchOperation[] = [];
+    for (let index = 0; index < detached.length; index++) {
+        if (index > 0 && index % 16 === 0) {
+            await new Promise<void>(resolve => setTimeout(resolve, 0));
+        }
+        throwIfAborted(signal);
+        const mutation = detached[index];
+        if (mutation.type === "set") {
+            prepared.push({
+                operation: "set",
+                key: mutation.key,
+                valueBytes: preparePersistentJson(mutation.value, { pluginValue: true }).bytes,
+                owner,
+                ...(Object.prototype.hasOwnProperty.call(mutation, "expectedRevision")
+                    ? { expectedRevision: mutation.expectedRevision }
+                    : {}),
+            });
+        } else {
+            prepared.push({
+                operation: "remove",
+                key: mutation.key,
+                ...(Object.prototype.hasOwnProperty.call(mutation, "expectedRevision")
+                    ? { expectedRevision: mutation.expectedRevision }
+                    : {}),
+            });
         }
     }
     // Preflight the detached operation payload before queueing. The exact wire
@@ -1658,6 +1709,7 @@ export async function setPluginSaveStorageOwner(
     if (!plugin) return;
     const normalizedKey = normalizePluginStorageKey(key);
     const record = { plugin, updatedAt: Date.now() };
+    const preparedRecord = preparePersistentJson(record);
     await withPluginSaveStorageKeyLock(normalizedKey, async () => {
         throwIfAborted(signal);
         const db = getDatabase();
@@ -1682,7 +1734,7 @@ export async function setPluginSaveStorageOwner(
         if (!ownership.valueKeys.includes(valueStorageKey)) return;
         await commitOptimizedStorageMutation(
             db,
-            [{ storageKey, value: record }],
+            [{ storageKey, valueBytes: preparedRecord.bytes }],
             [],
             (_values, meta) => meta.add(storageKey),
             signal,

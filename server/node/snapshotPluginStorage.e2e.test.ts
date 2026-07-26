@@ -556,7 +556,7 @@ async function mutateCurrentStorage(
         },
         writes: (changes.writes ?? []).map(({ storageKey, value }) => ({
             storageKey,
-            valueJson: JSON.stringify(value),
+            valueBytes: Buffer.from(JSON.stringify(value)),
         })),
         deletes: changes.deletes ?? [],
     }, failpoint)
@@ -654,7 +654,7 @@ describe('atomic plugin storage publication', () => {
             nextManifest: manifest,
             writes: [{
                 storageKey: valueRowKey('alpha'),
-                valueJson: JSON.stringify('new'),
+                valueBytes: Buffer.from(JSON.stringify('new')),
             }],
             deletes: [],
         })
@@ -1000,7 +1000,7 @@ describe('atomic plugin storage publication', () => {
                     ...originalManifest,
                     valueKeys: [...originalManifest.valueKeys, betaKey],
                 },
-                writes: [{ storageKey: betaKey, valueJson: JSON.stringify('new') }],
+                writes: [{ storageKey: betaKey, valueBytes: Buffer.from(JSON.stringify('new')) }],
                 deletes: [],
             }, failpoint)
             expect(response.status).toBe(500)
@@ -1068,7 +1068,7 @@ describe('atomic plugin storage publication', () => {
                 ...stalePlan(generation, originalManifest),
                 writes: [{
                     storageKey: valueRowKey('alpha'),
-                    valueJson: JSON.stringify('must-not-land'),
+                    valueBytes: Buffer.from(JSON.stringify('must-not-land')),
                 }],
                 deletes: [],
             })
@@ -1727,10 +1727,10 @@ describe('plugin publication recovery snapshot scheduling', () => {
             expectedManifest: manifest,
             nextManifest: manifest,
             writes: [
-                { storageKey: valueRowKey('alpha'), valueJson: JSON.stringify('T2') },
+                { storageKey: valueRowKey('alpha'), valueBytes: Buffer.from(JSON.stringify('T2')) },
                 {
                     storageKey: metaRowKey('alpha'),
-                    valueJson: JSON.stringify({ plugin: 'owner-T2' }),
+                    valueBytes: Buffer.from(JSON.stringify({ plugin: 'owner-T2' })),
                 },
             ],
             deletes: [],
@@ -2091,8 +2091,8 @@ async function runRoundTrip(options: { streamIngestMinBytes?: number }): Promise
             metaKeys: [],
         },
         writes: [
-            { storageKey: valueRowKey('keyA'), valueJson: JSON.stringify('V2') },
-            { storageKey: valueRowKey('keyC'), valueJson: JSON.stringify('added-later') },
+            { storageKey: valueRowKey('keyA'), valueBytes: Buffer.from(JSON.stringify('V2')) },
+            { storageKey: valueRowKey('keyC'), valueBytes: Buffer.from(JSON.stringify('added-later')) },
         ],
         deletes: [valueRowKey('keyB'), metaRowKey('keyA')],
     })
@@ -2559,7 +2559,7 @@ describe('automatic snapshots × optimized plugin storage', () => {
             nextManifest: manifest,
             writes: [{
                 storageKey: valueRowKey('keyP'),
-                valueJson: JSON.stringify('V2'),
+                valueBytes: Buffer.from(JSON.stringify('V2')),
             }],
             deletes: [],
         })

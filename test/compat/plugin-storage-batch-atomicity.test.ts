@@ -5,8 +5,9 @@ import { createClient, type RisuClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import utilsPkg from '../../server/node/utils.cjs'
 
-const { encodeRisuSaveLegacy } = utilsPkg as {
+const { encodeRisuSaveLegacy, decodeRisuSave } = utilsPkg as {
   encodeRisuSaveLegacy: (value: unknown) => Uint8Array
+  decodeRisuSave: (value: Uint8Array) => Promise<any>
 }
 
 const servers: ServerHandle[] = []
@@ -176,8 +177,22 @@ describe('AA3 atomic plugin storage batch', () => {
       (readRow.get(MANIFEST_KEY) as { value: Buffer }).value,
     ).toString('utf-8'))
     expect(manifest).toEqual(activeManifest)
-    expect(readRow.get(RECOVERY_DIRTY_KEY)).toBeTruthy()
+    const dirty = readRow.get(RECOVERY_DIRTY_KEY)
+    const completedSnapshot = dirty ? undefined : sqlite.prepare(
+      "SELECT value FROM kv WHERE key LIKE 'database/dbbackup-%' ORDER BY updated_at DESC LIMIT 1",
+    ).get() as { value: Buffer } | undefined
     sqlite.close()
+    if (dirty) {
+      expect(dirty).toBeTruthy()
+    } else {
+      expect(completedSnapshot).toBeTruthy()
+      const snapshot = await decodeRisuSave(new Uint8Array(completedSnapshot!.value))
+      expect(snapshot.pluginCustomStorage).toMatchObject({
+        [keys[0]]: { generation: 'new', key: keys[0] },
+        [keys[1]]: { generation: 'new', key: keys[1] },
+        [keys[2]]: { generation: 'new', key: keys[2] },
+      })
+    }
   })
 
   test.each([

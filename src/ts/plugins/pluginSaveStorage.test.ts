@@ -99,6 +99,9 @@ vi.mock("../storage/persistentKv", () => {
             .padEnd(Math.ceil(value.length / 4) * 4, "="),
         "base64",
     ).toString("utf-8");
+    const writePersistentJson = vi.fn(async (key: string, value: unknown) => {
+        persistent.set(key, value);
+    });
     return {
         batchPersistentPluginStorage: vi.fn(async (request: any) => {
             const generation = crypto.randomUUID();
@@ -140,7 +143,10 @@ vi.mock("../storage/persistentKv", () => {
         }),
         commitPersistentPluginStorageMutation: vi.fn(async (mutation: any) => {
             for (const write of mutation.writes) {
-                persistent.set(write.storageKey, write.value);
+                persistent.set(
+                    write.storageKey,
+                    JSON.parse(new TextDecoder().decode(write.valueBytes)),
+                );
             }
             for (const key of mutation.deletes) persistent.delete(key);
             persistent.set("plugin-storage/manifest.json", mutation.nextManifest);
@@ -208,13 +214,15 @@ vi.mock("../storage/persistentKv", () => {
         removePersistentKey: vi.fn(async (key: string) => {
             persistent.delete(key);
         }),
-        writePersistentJson: vi.fn(async (
-            key: string,
-            value: unknown,
-            _signal?: AbortSignal | null,
-        ) => {
-            persistent.set(key, value);
+        writePersistentJson,
+        preparePersistentJson: vi.fn((value: unknown) => {
+            const bytes = new TextEncoder().encode(JSON.stringify(value));
+            return { bytes, byteLength: bytes.byteLength, value };
         }),
+        writePreparedPersistentJson: vi.fn(
+            async (key: string, prepared: { value: unknown }) =>
+                writePersistentJson(key, prepared.value),
+        ),
     };
 });
 
@@ -716,6 +724,32 @@ describe("AA3 versioned atomic plugin storage", () => {
         expect(database.pluginCustomStorage).toEqual({});
     });
 
+    test("detaches every batch value synchronously before bounded preparation yields", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("selected-generation", [], []);
+        const { batchPersistentPluginStorage } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        const values = Array.from({ length: 17 }, (_, index) => ({ captured: index }));
+        const batch = atomicBatchOwnedPluginSaveStorage(values.map((value, index) => ({
+            type: "set" as const,
+            key: `detached:${index}`,
+            value,
+        })), "AA3");
+
+        values[0].captured = -1;
+        values[16].captured = -1;
+        await expect(batch).resolves.toMatchObject({ committed: true });
+
+        const request = batchPersistentPluginStorage.mock.calls[0][0];
+        expect(JSON.parse(new TextDecoder().decode(
+            (request.operations[0] as any).valueBytes,
+        ))).toEqual({ captured: 0 });
+        expect(JSON.parse(new TextDecoder().decode(
+            (request.operations[16] as any).valueBytes,
+        ))).toEqual({ captured: 16 });
+    });
+
     test("optimized mode sends one detached authoritative batch", async () => {
         database.optimizePluginMemory = true;
         installOwnershipManifest("selected-generation", [], []);
@@ -1101,6 +1135,11 @@ describe("plugin save storage transport", () => {
             { value: "maximum" },
             "Boundary Plugin",
             undefined,
+            undefined,
+            expect.objectContaining({
+                bytes: expect.any(Uint8Array),
+                byteLength: expect.any(Number),
+            }),
         );
         expect(writePersistentJson).not.toHaveBeenCalled();
     });
@@ -1397,7 +1436,10 @@ describe("plugin save storage transport", () => {
                 await stalledWrite;
             }
             for (const write of mutation.writes) {
-                persistent.set(write.storageKey, write.value);
+                persistent.set(
+                    write.storageKey,
+                    JSON.parse(new TextDecoder().decode(write.valueBytes)),
+                );
             }
             for (const key of mutation.deletes) persistent.delete(key);
             persistent.set(PLUGIN_STORAGE_MANIFEST_KEY, mutation.nextManifest);

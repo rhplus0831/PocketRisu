@@ -78,6 +78,11 @@ vi.mock("../storage/persistentKv", () => {
         readPersistentJson: mocks.readPersistentJson,
         removePersistentKey: vi.fn(),
         writePersistentJson: vi.fn(),
+        preparePersistentJson: (value: unknown) => {
+            const bytes = new TextEncoder().encode(JSON.stringify(value));
+            return { bytes, byteLength: bytes.byteLength, value };
+        },
+        writePreparedPersistentJson: vi.fn(),
     };
 });
 

@@ -12,6 +12,8 @@ export interface PluginStorageMutationRequest {
     /** Active optimized publication selected by the caller's database read. */
     generation?: string;
     valueBytes?: Uint8Array;
+    /** The caller donates a fresh immutable buffer; storage may retain it for cache seeding. */
+    ownedValueBytes?: true;
     /** Empty means the value is deliberately unowned and removes stale metadata. */
     owner?: string;
     /** Recovery-only exact sidecar bytes; mutually exclusive with ordinary owner. */
@@ -30,6 +32,8 @@ export interface PluginStorageMutationResult {
     retryable?: boolean;
     status?: number | null;
     retryAfter?: number | null;
+    limit?: number;
+    actual?: number;
     commitOutcomeUnknown?: boolean;
 }
 
@@ -134,6 +138,33 @@ export function classifyPluginStorageMutationAcknowledgement(
             };
         }
         return unknownAcknowledgement(operation, status);
+    }
+
+    if (status === 413
+        && hasOnlyKeys(body, [
+            "success", "outcome", "operation", "error", "code",
+            "limit", "actual", "retryable",
+        ])
+        && body.success === false
+        && body.outcome === "not-committed"
+        && (body.code === "PLUGIN_VALUE_TOO_LARGE"
+            || body.code === "PLUGIN_STORAGE_TOTAL_TOO_LARGE")
+        && body.retryable === false
+        && typeof body.error === "string"
+        && Number.isSafeInteger(body.limit)
+        && Number.isSafeInteger(body.actual)) {
+        return {
+            outcome: "not-committed",
+            operation,
+            code: body.code,
+            error: body.error,
+            limit: body.limit as number,
+            actual: body.actual as number,
+            retryable: false,
+            status,
+            retryAfter: retryAfter ?? null,
+            commitOutcomeUnknown: false,
+        };
     }
 
     const expected = NOT_COMMITTED_ACKNOWLEDGEMENTS.get(status);

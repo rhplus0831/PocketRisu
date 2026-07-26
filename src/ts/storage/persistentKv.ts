@@ -18,6 +18,10 @@ import type {
     PluginStorageManifestTransport,
     PluginStorageTransitionTransport,
 } from "./nodeStorage";
+import {
+    PLUGIN_VALUE_MAX_BYTES,
+    pluginStorageLimitMessage,
+} from "./pluginStorageLimits";
 
 export { hasNativeStringWellFormed } from "./unicodeWellFormed";
 
@@ -89,6 +93,30 @@ export async function readPersistentJsonRow<T>(
     };
 }
 
+export interface PreparedPersistentJson {
+    /** Fresh immutable bytes owned by the persistence operation. */
+    bytes: Uint8Array;
+    byteLength: number;
+}
+
+export function preparePersistentJson<T>(
+    value: T,
+    options: { pluginValue?: boolean } = {},
+): PreparedPersistentJson {
+    const serialized = stringifyJsonValue(value);
+    const bytes = encoder.encode(serialized);
+    const byteLength = bytes.byteLength;
+    if (options.pluginValue && byteLength > PLUGIN_VALUE_MAX_BYTES) {
+        throw new StorageError(pluginStorageLimitMessage(byteLength), {
+            status: 413,
+            code: "PLUGIN_VALUE_TOO_LARGE",
+            retryable: false,
+            operation: "write",
+        });
+    }
+    return { bytes, byteLength };
+}
+
 export async function readPersistentJson<T>(
     storageKey: string,
     options: PersistentJsonReadOptions = {},
@@ -106,11 +134,21 @@ export async function writePersistentJson<T>(
     // Snapshot and validate before the first await. Callers may mutate their
     // object after invoking this async method, and storage initialization must
     // not turn that into an unacknowledged change to the bytes being written.
-    const json = stringifyJsonValue(value);
+    const prepared = preparePersistentJson(value, {
+        pluginValue: storageKey.startsWith("pluginsave/"),
+    });
+    await writePreparedPersistentJson(storageKey, prepared, signal);
+}
+
+export async function writePreparedPersistentJson(
+    storageKey: string,
+    prepared: PreparedPersistentJson,
+    signal?: AbortSignal | null,
+): Promise<void> {
+    throwIfAborted(signal);
     await ensureStorageReady(signal);
-    const bytes = encoder.encode(json);
-    if (signal) await forageStorage.setItem(storageKey, bytes, undefined, signal);
-    else await forageStorage.setItem(storageKey, bytes);
+    if (signal) await forageStorage.setItem(storageKey, prepared.bytes, undefined, signal);
+    else await forageStorage.setItem(storageKey, prepared.bytes);
 }
 
 export async function removePersistentKey(
@@ -134,6 +172,7 @@ export async function mutatePersistentPluginStorage<T>(
     owner: string,
     signal?: AbortSignal | null,
     generation?: string,
+    preparedValue?: PreparedPersistentJson,
 ): Promise<PluginStorageMutationResult>;
 export async function mutatePersistentPluginStorage(
     valueStorageKey: string,
@@ -148,6 +187,7 @@ export async function mutatePersistentPluginStorage<T>(
     ownerOrGeneration = "",
     signal?: AbortSignal | null,
     generation?: string,
+    preparedValue?: PreparedPersistentJson,
 ): Promise<PluginStorageMutationResult> {
     const activeSignal = operation === "remove"
         ? valueOrSignal as AbortSignal | null | undefined
@@ -158,13 +198,15 @@ export async function mutatePersistentPluginStorage<T>(
     // Preserve the ordinary persistent JSON rule: validation and detachment
     // happen before storage initialization or any queued mutation can run.
     const valueBytes = operation === "set"
-        ? encoder.encode(stringifyJsonValue(valueOrSignal as T))
+        ? (preparedValue
+            ?? preparePersistentJson(valueOrSignal as T, { pluginValue: true })).bytes
         : undefined;
     await ensureStorageReady(activeSignal);
     const request = {
         operation,
         valueKey: valueStorageKey,
         valueBytes,
+        ...(operation === "set" ? { ownedValueBytes: true as const } : {}),
         owner,
         ...(activeGeneration ? { generation: activeGeneration } : {}),
     } as const;
@@ -186,7 +228,7 @@ export async function restorePersistentPluginStoragePair<T>(
     signal?: AbortSignal | null,
 ): Promise<PluginStorageMutationResult> {
     throwIfAborted(signal);
-    const valueBytes = encoder.encode(stringifyJsonValue(value));
+    const valueBytes = preparePersistentJson(value, { pluginValue: true }).bytes;
     const ownerRecordBytes = ownerRecord === undefined
         ? undefined
         : encoder.encode(stringifyJsonValue(ownerRecord));
@@ -308,7 +350,7 @@ export interface PersistentPluginStorageMutation {
     generation: string;
     expectedManifest: PluginStorageManifestTransport;
     nextManifest: PluginStorageManifestTransport;
-    writes: { storageKey: string; value: unknown }[];
+    writes: { storageKey: string; valueBytes: Uint8Array }[];
     deletes: string[];
 }
 
@@ -317,9 +359,9 @@ export async function commitPersistentPluginStorageMutation(
     signal?: AbortSignal | null,
 ): Promise<void> {
     throwIfAborted(signal);
-    const writes = mutation.writes.map(({ storageKey, value }) => ({
+    const writes = mutation.writes.map(({ storageKey, valueBytes }) => ({
         storageKey,
-        valueJson: stringifyJsonValue(value),
+        valueBytes,
     }));
     await ensureStorageReady(signal);
     const plan = {

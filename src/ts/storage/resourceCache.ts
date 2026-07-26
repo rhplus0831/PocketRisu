@@ -492,17 +492,17 @@ export async function storeBytes(
     resourceKey: string,
     bytes: Uint8Array,
 ): Promise<string | null> {
+    if (
+        !isResourceCacheEnabled()
+        || !nonEmptyString(resourceKey)
+        || bytes.byteLength > RESOURCE_CACHE_MAX_VALUE_BYTES
+    ) {
+        return null
+    }
     const copied = new Uint8Array(bytes.byteLength)
     copied.set(bytes)
     const hash = await settleBestEffortResourceCache(sha256Bytes(copied), null)
     if (!hash) return null
-    if (
-        !isResourceCacheEnabled()
-        || !nonEmptyString(resourceKey)
-        || copied.byteLength > RESOURCE_CACHE_MAX_VALUE_BYTES
-    ) {
-        return hash
-    }
 
     const epoch = resourceCacheEpoch
     const operation = enqueueResourceCacheWrite(async () => {
@@ -515,6 +515,38 @@ export async function storeBytes(
         })
     await operation
     return hash
+}
+
+/**
+ * Persist immutable, caller-owned authoritative bytes under a server-provided
+ * digest. Plugin JSON preparation creates a fresh buffer and donates it after
+ * commit, so this path needs neither another full-size copy nor another hash.
+ * Every cache read still re-hashes before use; a bad server digest only causes
+ * a disposable cache miss.
+ */
+export function storeOwnedBytesWithKnownHash(
+    resourceKey: string,
+    hash: string,
+    ownedBytes: Uint8Array,
+): Promise<void> {
+    if (
+        !isResourceCacheEnabled()
+        || !nonEmptyString(resourceKey)
+        || !isSha256Hex(hash)
+        || ownedBytes.byteLength > RESOURCE_CACHE_MAX_VALUE_BYTES
+    ) {
+        return Promise.resolve()
+    }
+
+    const epoch = resourceCacheEpoch
+    return enqueueResourceCacheWrite(async () => {
+        if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
+        const database = await openResourceCacheDatabase()
+        if (!database) return
+        await persistResourceCacheBytes(database, resourceKey, hash, ownedBytes)
+        if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
+        await pruneResourceCache(database)
+    })
 }
 
 /** Persist several authoritative segment misses and replace their manifests. */

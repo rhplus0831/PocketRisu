@@ -60,6 +60,8 @@ export type PluginStorageBatchResult =
         retryable: boolean;
         status: number;
         retryAfter: number | null;
+        limit?: number;
+        actual?: number;
         conflicts?: PluginStorageConflictResult[];
         commitOutcomeUnknown: false;
     }
@@ -202,6 +204,33 @@ export function classifyPluginStorageBatchAcknowledgement(
             };
         }
         return unknown(status, "Plugin storage batch committed acknowledgement was malformed.");
+    }
+
+    if (status === 413
+        && hasOnlyKeys(body, [
+            "success", "outcome", "operation", "error", "code",
+            "limit", "actual", "retryable",
+        ])
+        && body.success === false
+        && body.outcome === "not-committed"
+        && (body.code === "PLUGIN_VALUE_TOO_LARGE"
+            || body.code === "PLUGIN_STORAGE_TOTAL_TOO_LARGE")
+        && body.retryable === false
+        && typeof body.error === "string"
+        && Number.isSafeInteger(body.limit)
+        && Number.isSafeInteger(body.actual)) {
+        return {
+            outcome: "not-committed",
+            operation: "batch",
+            code: body.code,
+            error: body.error,
+            limit: body.limit as number,
+            actual: body.actual as number,
+            retryable: false,
+            status,
+            retryAfter,
+            commitOutcomeUnknown: false,
+        };
     }
 
     const expected = new Map<number, { code: string; retryable: boolean }>([

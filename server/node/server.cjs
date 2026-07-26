@@ -38,6 +38,7 @@ const { kvGet, kvSet, kvSetFromFile, kvDel, kvList,
         kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
         kvGetListEpoch, kvBumpListEpoch,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, createKvSnapshot,
+        withPluginStorageQuotaPlan,
         db: sqliteDb } = require('./db.cjs');
 const { buildListResponse } = require('./listDelta.cjs');
 const {
@@ -118,6 +119,11 @@ const {
     snapshotPluginStorageRecord,
     validatePluginStorageRow,
 } = require('./pluginStorageJson.cjs');
+const {
+    PLUGIN_VALUE_MAX_BYTES,
+    PLUGIN_STORAGE_MAX_BYTES,
+    PluginStorageLimitError,
+} = require('./pluginStorageLimits.cjs');
 const {
     CHAT_BACKUP_DIRNAME,
     createChatBackupStore,
@@ -1137,17 +1143,61 @@ app.use((req, res, next) => {
     return defaultJsonParser(req, res, next);
 });
 app.use((req, res, next) => {
-    // Skip express.raw() for backup import — it must stream, not buffer into memory
-    if (req.path === '/api/backup/import') return next();
+    // These endpoints consume the request stream directly and must never be
+    // pre-buffered by the generic octet-stream parser.
+    const isStreamingPluginMutation = req.path === '/api/plugin-storage/mutate'
+        && req.headers['x-plugin-storage-stream'] === '1';
+    if (req.path === '/api/backup/import' || isStreamingPluginMutation) return next();
     const isPluginStorageBatch = req.path === '/api/plugin-storage/batch';
+    const isBufferedPluginMutationSet = req.path === '/api/plugin-storage/mutate'
+        && req.headers['x-plugin-storage-operation'] === 'set';
+    const isPluginManifestMutation = req.path === '/api/plugin-storage/mutate'
+        && req.headers['x-plugin-storage-operation'] === undefined;
+    let pluginLegacyWrite = false;
+    if (req.path === '/api/write') {
+        const encodedPath = req.headers['file-path'];
+        if (typeof encodedPath === 'string' && /^[0-9a-fA-F]+$/.test(encodedPath)) {
+            pluginLegacyWrite = Buffer.from(encodedPath, 'hex')
+                .toString('utf-8')
+                .startsWith(PLUGIN_SAVE_PREFIX);
+        }
+    }
     const parser = express.raw({
         type: 'application/octet-stream',
-        limit: isPluginStorageBatch ? PLUGIN_STORAGE_BATCH_MAX_BODY_BYTES : '2gb',
+        limit: isPluginStorageBatch
+            ? PLUGIN_STORAGE_BATCH_MAX_BODY_BYTES
+            : (pluginLegacyWrite || isBufferedPluginMutationSet)
+                ? PLUGIN_VALUE_MAX_BYTES
+                : isPluginManifestMutation
+                    ? PLUGIN_STORAGE_MAX_BYTES
+                : '2gb',
     });
     return parser(req, res, (error) => {
         if (!error) return next();
-        if (!isPluginStorageBatch) return next(error);
         const tooLarge = error.type === 'entity.too.large';
+        if (pluginLegacyWrite && tooLarge) {
+            return res.status(413).json({
+                error: `Plugin value exceeds the ${PLUGIN_VALUE_MAX_BYTES}-byte per-value limit. Split the value into smaller records.`,
+                code: 'PLUGIN_VALUE_TOO_LARGE',
+                limit: PLUGIN_VALUE_MAX_BYTES,
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            });
+        }
+        if (isBufferedPluginMutationSet && tooLarge) {
+            return res.status(413).json({
+                success: false,
+                outcome: 'not-committed',
+                operation: 'set',
+                error: `Plugin value exceeds the ${PLUGIN_VALUE_MAX_BYTES}-byte per-value limit. Split the value into smaller records.`,
+                code: 'PLUGIN_VALUE_TOO_LARGE',
+                limit: PLUGIN_VALUE_MAX_BYTES,
+                actual: Number(req.headers['content-length']) || PLUGIN_VALUE_MAX_BYTES + 1,
+                retryable: false,
+            });
+        }
+        if (!isPluginStorageBatch) return next(error);
         return res.status(tooLarge ? 413 : 400).json({
             success: false,
             outcome: 'not-committed',
@@ -1174,6 +1224,7 @@ if(!existsSync(savePath)){
 }
 
 const DATABASE_SPOOL_FILE_PREFIX = '.database-risudat-';
+const PLUGIN_VALUE_SPOOL_FILE_PREFIX = '.plugin-value-';
 // POCKETRISU_SPOOL_DIR may relocate temporary database assembly. The default
 // remains on the writable save volume and is independent of server backups.
 const configuredDatabaseSpoolDir = String(process.env.POCKETRISU_SPOOL_DIR ?? '').trim();
@@ -1190,7 +1241,10 @@ try {
 if (databaseSpoolReady) {
     try {
         for (const entry of readdirSync(databaseSpoolDir, { withFileTypes: true })) {
-            if (!entry.isFile() || !entry.name.startsWith(DATABASE_SPOOL_FILE_PREFIX)) continue;
+            if (!entry.isFile() || !(
+                entry.name.startsWith(DATABASE_SPOOL_FILE_PREFIX)
+                || entry.name.startsWith(PLUGIN_VALUE_SPOOL_FILE_PREFIX)
+            )) continue;
             try {
                 unlinkSync(path.join(databaseSpoolDir, entry.name));
             } catch (error) {
@@ -5354,7 +5408,10 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                 };
                 const recoverySnapshotToken = newPluginRecoverySnapshotToken();
                 hitPluginStorageBatchFailpoint('before-transaction');
-                sqliteDb.transaction(() => {
+                withPluginStorageQuotaPlan(operations.map(operation => ({
+                    key: operation.valueKey,
+                    size: operation.operation === 'set' ? operation.valueBytes.length : null,
+                })), () => {
                     const conflicts = [];
                     for (const operation of operations) {
                         if (!operation.hasExpectedRevision) continue;
@@ -5406,7 +5463,7 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                             operation.ownerKey,
                         ).revision,
                     }));
-                })();
+                });
             } catch (error) {
                 if (error instanceof PluginStorageRevisionConflict) {
                     return res.status(409).json({
@@ -5418,6 +5475,9 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                         retryable: false,
                         conflicts: error.conflicts,
                     });
+                }
+                if (error instanceof PluginStorageLimitError) {
+                    return sendPluginStorageMutationLimitError(res, 'batch', error);
                 }
                 logger.warn('[PluginStorageBatch] Transaction rolled back:', error);
                 return res.status(500).json({
@@ -5489,6 +5549,19 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
  * unowned (delete stale metadata); remove always deletes a matching owner row,
  * including an owner orphan left by historical clients.
  */
+function sendPluginStorageMutationLimitError(res, operation, error) {
+    return res.status(error.status || 413).json({
+        success: false,
+        outcome: 'not-committed',
+        operation,
+        error: error.message,
+        code: error.code,
+        limit: error.limit,
+        actual: error.actual,
+        retryable: false,
+    });
+}
+
 app.post('/api/plugin-storage/mutate', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
@@ -5500,6 +5573,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
     const ownerHeader = firstHeader(req.headers['x-plugin-storage-owner']) ?? '';
     const ownerPolicyHeader = firstHeader(req.headers['x-plugin-storage-owner-policy']) ?? '';
     const ownerRecordHeader = firstHeader(req.headers['x-plugin-storage-owner-record']);
+    const streamHeader = firstHeader(req.headers['x-plugin-storage-stream']);
     const reject = (error, code = 'INVALID_PLUGIN_STORAGE_MUTATION') => res.status(400).json({
         success: false,
         outcome: 'not-committed',
@@ -5519,6 +5593,13 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
     if (operation !== 'set' && operation !== 'remove') {
         return reject('Plugin storage operation must be set or remove.');
     }
+    if (streamHeader !== undefined && streamHeader !== '1') {
+        return reject('x-plugin-storage-stream must be 1 when present.');
+    }
+    const streamingSet = operation === 'set' && streamHeader === '1';
+    if (operation === 'remove' && streamHeader !== undefined) {
+        return reject('Remove mutations cannot stream a value body.');
+    }
     if (requestedGeneration !== undefined
         && (typeof requestedGeneration !== 'string' || requestedGeneration.length === 0)) {
         return reject('Plugin storage generation must be a non-empty string.');
@@ -5533,6 +5614,9 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
     let ownerPolicy = 'replace';
     let ownerRecordBytes = null;
     let valueBytes = null;
+    let valueFilePath = null;
+    let valueHash = null;
+    let valueSize = 0;
     try {
         valueKey = Buffer.from(filePath, 'hex').toString('utf-8');
         const rawKey = decodePluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX);
@@ -5574,18 +5658,16 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                     ? encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX)
                     : unrestrictedOwnerKey;
             }
-            if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
-                throw new Error('A set mutation requires JSON value bytes.');
+            if (!streamingSet) {
+                if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+                    throw new Error('A set mutation requires JSON value bytes.');
+                }
+                valueBytes = Buffer.from(req.body);
+                valueSize = valueBytes.length;
+                valueHash = sha256Hex(valueBytes);
+                // Match every other optimized plugin row ingress boundary.
+                validatePluginStorageRow(valueKey, valueBytes);
             }
-            valueBytes = Buffer.from(req.body);
-            const valueText = valueBytes.toString('utf-8');
-            if (!Buffer.from(valueText, 'utf-8').equals(valueBytes)) {
-                throw new Error('Plugin value must be valid UTF-8 JSON.');
-            }
-            // Match every other optimized plugin row ingress boundary. JSON.parse
-            // alone accepts numeric overflow as Infinity, which cannot round-trip
-            // through the client's strict JSON value contract.
-            validatePluginStorageRow(valueKey, valueBytes);
         } else {
             if (ownerPolicyHeader !== '' || ownerRecordHeader !== undefined) {
                 throw new Error('Remove mutations do not accept owner replacement data.');
@@ -5597,6 +5679,83 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
         }
     } catch (error) {
         return reject(error instanceof Error ? error.message : String(error));
+    }
+
+    if (streamingSet) {
+        const rawLength = firstHeader(req.headers['content-length']);
+        const expectedLength = typeof rawLength === 'string' ? Number(rawLength) : NaN;
+        if (!Number.isSafeInteger(expectedLength) || expectedLength <= 0) {
+            return reject('Streaming plugin mutations require an exact positive Content-Length.');
+        }
+        if (expectedLength > PLUGIN_VALUE_MAX_BYTES) {
+            return sendPluginStorageMutationLimitError(res, operation, new PluginStorageLimitError(
+                `Plugin value is ${expectedLength} bytes; the per-value limit is ${PLUGIN_VALUE_MAX_BYTES} bytes. Split the value into smaller records.`,
+                { code: 'PLUGIN_VALUE_TOO_LARGE', limit: PLUGIN_VALUE_MAX_BYTES, actual: expectedLength },
+            ));
+        }
+        if (!databaseSpoolReady) {
+            return res.status(503).json({
+                success: false,
+                outcome: 'not-committed',
+                operation,
+                error: 'The server upload spool is unavailable; check the save volume permissions.',
+                code: 'PLUGIN_STORAGE_SPOOL_UNAVAILABLE',
+                retryable: true,
+            });
+        }
+        valueFilePath = path.join(
+            databaseSpoolDir,
+            `${PLUGIN_VALUE_SPOOL_FILE_PREFIX}${nodeCrypto.randomUUID()}.upload`,
+        );
+        let received = 0;
+        const digest = nodeCrypto.createHash('sha256');
+        const meter = new Transform({
+            transform(chunk, _encoding, callback) {
+                received += chunk.length;
+                if (received > PLUGIN_VALUE_MAX_BYTES) {
+                    return callback(new PluginStorageLimitError(
+                        `Plugin value exceeded the ${PLUGIN_VALUE_MAX_BYTES}-byte per-value limit while uploading. Split the value into smaller records.`,
+                        { code: 'PLUGIN_VALUE_TOO_LARGE', limit: PLUGIN_VALUE_MAX_BYTES, actual: received },
+                    ));
+                }
+                digest.update(chunk);
+                callback(null, chunk);
+            },
+        });
+        try {
+            await pipeline(req, meter, createWriteStream(valueFilePath, { flags: 'wx' }));
+            if (received !== expectedLength) {
+                try { unlinkSync(valueFilePath); } catch {}
+                valueFilePath = null;
+                return reject(
+                    `Plugin value length mismatch: expected ${expectedLength} bytes but received ${received}.`,
+                    'PLUGIN_VALUE_LENGTH_MISMATCH',
+                );
+            }
+            valueSize = received;
+            valueHash = digest.digest('hex');
+            // Strict validation stays outside the authoritative mutation queue.
+            // The subsequent SQLite commit reads chunks directly from the spool.
+            validatePluginStorageRow(valueKey, readFileSync(valueFilePath));
+        } catch (error) {
+            try { if (valueFilePath) unlinkSync(valueFilePath); } catch {}
+            valueFilePath = null;
+            if (error instanceof PluginStorageLimitError) {
+                return sendPluginStorageMutationLimitError(res, operation, error);
+            }
+            const diagnostic = logPluginStorageValidationFailure(
+                '[PluginStorage] Rejected invalid streamed row',
+                error,
+            );
+            if (diagnostic) return res.status(400).json({
+                success: false,
+                outcome: 'not-committed',
+                operation,
+                ...diagnostic,
+                retryable: false,
+            });
+            return next(error);
+        }
     }
 
     try {
@@ -5653,7 +5812,8 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
             try {
                 sqliteDb.transaction(() => {
                     if (operation === 'set') {
-                        kvSet(valueKey, valueBytes);
+                        if (valueFilePath) kvSetFromFile(valueKey, valueFilePath);
+                        else kvSet(valueKey, valueBytes);
                         hitPluginStorageMutationFailpoint('owner-write');
                         if (ownerPolicy === 'record') {
                             kvSet(ownerKey, ownerRecordBytes);
@@ -5683,6 +5843,9 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 })();
             } catch (error) {
                 logger.warn('[PluginStorageMutation] Transaction rolled back:', error);
+                if (error instanceof PluginStorageLimitError) {
+                    return sendPluginStorageMutationLimitError(res, operation, error);
+                }
                 return res.status(500).json({
                     success: false,
                     outcome: 'not-committed',
@@ -5707,11 +5870,13 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
             let verification = 'verified';
             try {
                 hitPluginStorageMutationFailpoint('verification-read');
-                const storedValue = kvGet(valueKey);
+                const storedValue = valueFilePath ? null : kvGet(valueKey);
                 const storedOwner = kvGet(ownerKey);
                 const storedManifest = readPluginStorageManifest();
                 const valueMatches = operation === 'set'
-                    ? storedValue !== null && storedValue.equals(valueBytes)
+                    ? valueFilePath
+                        ? kvSize(valueKey) === valueSize
+                        : storedValue !== null && storedValue.equals(valueBytes)
                     : storedValue === null;
                 const ownerMatches = operation === 'set' && ownerPolicy === 'record'
                     ? storedOwner !== null && storedOwner.equals(ownerRecordBytes)
@@ -5739,7 +5904,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 outcome: 'committed',
                 operation,
                 verification,
-                hash: operation === 'set' ? sha256Hex(valueBytes) : undefined,
+                hash: operation === 'set' ? valueHash : undefined,
             });
         });
     } catch (error) {
@@ -5755,6 +5920,8 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
             });
         }
         next(error);
+    } finally {
+        try { if (valueFilePath) unlinkSync(valueFilePath); } catch {}
     }
 });
 
@@ -5885,10 +6052,10 @@ async function handlePluginStorageManifestMutation(req, res, next) {
             };
             const preparedWrites = writes.map((write) => {
                 const keys = classify(write?.storageKey);
-                if (typeof write?.valueJson !== 'string') {
-                    throw new TypeError('Plugin storage writes require valueJson');
+                if (!(write?.valueBytes instanceof Uint8Array)) {
+                    throw new TypeError('Plugin storage writes require valueBytes');
                 }
-                const value = Buffer.from(write.valueJson, 'utf-8');
+                const value = Buffer.from(write.valueBytes);
                 validatePluginStorageRow(write.storageKey, value);
                 keys.add(write.storageKey);
                 return { storageKey: write.storageKey, value };
@@ -5910,7 +6077,14 @@ async function handlePluginStorageManifestMutation(req, res, next) {
             }
 
             const recoverySnapshotToken = newPluginRecoverySnapshotToken();
-            sqliteDb.transaction(() => {
+            withPluginStorageQuotaPlan([
+                ...preparedWrites
+                    .filter(write => write.storageKey.startsWith(PLUGIN_SAVE_PREFIX))
+                    .map(write => ({ key: write.storageKey, size: write.value.length })),
+                ...preparedDeletes
+                    .filter(storageKey => storageKey.startsWith(PLUGIN_SAVE_PREFIX))
+                    .map(key => ({ key, size: null })),
+            ], () => {
                 for (const write of preparedWrites) {
                     kvSet(write.storageKey, write.value);
                     maybeFailPluginStorageTransaction(req, 'after-row');
@@ -5922,7 +6096,7 @@ async function handlePluginStorageManifestMutation(req, res, next) {
                 writePluginStorageManifest(nextManifest);
                 maybeFailPluginStorageTransaction(req, 'after-manifest');
                 markPluginRecoverySnapshotDirty(recoverySnapshotToken);
-            })();
+            });
             schedulePluginRecoverySnapshot();
             res.json({ success: true });
         });
@@ -6030,9 +6204,20 @@ app.post('/api/plugin-storage/transition', async (req, res, next) => {
             const persistedDatabaseContent = Buffer.from(
                 encodeRisuSaveLegacy(pluginExternalization.strippedDb),
             );
+            const quotaChanges = new Map(
+                sourceKeys.valueKeys.map(key => [key, { key, size: null }]),
+            );
+            for (const row of pluginExternalization.rows) {
+                if (row.storageKey.startsWith(PLUGIN_SAVE_PREFIX)) {
+                    quotaChanges.set(row.storageKey, {
+                        key: row.storageKey,
+                        size: row.value.length,
+                    });
+                }
+            }
 
             const recoverySnapshotToken = newPluginRecoverySnapshotToken();
-            sqliteDb.transaction(() => {
+            withPluginStorageQuotaPlan([...quotaChanges.values()], () => {
                 for (const row of pluginExternalization.rows) {
                     kvSet(row.storageKey, row.value);
                     maybeFailPluginStorageTransaction(req, 'after-row');
@@ -6055,7 +6240,7 @@ app.post('/api/plugin-storage/transition', async (req, res, next) => {
                 chatRowStore.deleteRemovedChatRows(liveDb, pluginExternalization.strippedDb);
                 maybeFailPluginStorageTransaction(req, 'after-database');
                 markPluginRecoverySnapshotDirty(recoverySnapshotToken);
-            })();
+            });
 
             invalidateDbCache();
             dbEtag = computeBufferEtag(persistedDatabaseContent);
@@ -6287,6 +6472,7 @@ app.post('/api/write', async (req, res, next) => {
                         res.status(400).json(diagnostic);
                         return;
                     }
+                    if (e instanceof PluginStorageLimitError) throw e;
                     logger.error('[Write] Failed to externalize database payloads:', e.message);
                     if (e?.pluginStorageNamespaceConflict) {
                         res.status(409).json({ error: e.message });
@@ -9376,6 +9562,17 @@ app.use((err, req, res, next) => {
     if (diagnostic) {
         res.status(400).json(diagnostic);
         return;
+    }
+    if (err instanceof PluginStorageLimitError) {
+        return res.status(413).json({
+            error: err.message,
+            code: err.code,
+            limit: err.limit,
+            actual: err.actual,
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        });
     }
     res.status(500).json({ error: err?.message || 'internal server error' });
 });

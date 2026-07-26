@@ -5,6 +5,13 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const { createChunkStore, createSnapshotReader, isChunkableKey } = require('./chunkStore.cjs');
+const {
+    PLUGIN_VALUE_MAX_BYTES,
+    PLUGIN_STORAGE_MAX_BYTES,
+    isPluginValueKey,
+    assertPluginValueSize,
+    assertPluginStorageTotal,
+} = require('./pluginStorageLimits.cjs');
 
 const saveDir = path.join(process.cwd(), 'save');
 if (!fs.existsSync(saveDir)) {
@@ -44,9 +51,15 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS sync_meta (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
     list_epoch TEXT    NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS plugin_storage_usage (
+    id    INTEGER PRIMARY KEY CHECK (id = 1),
+    bytes INTEGER NOT NULL CHECK (bytes >= 0)
   )
 `);
 db.prepare(`INSERT OR IGNORE INTO sync_meta (id, list_epoch) VALUES (1, ?)`).run(crypto.randomUUID());
+db.prepare(`INSERT OR IGNORE INTO plugin_storage_usage (id, bytes) VALUES (1, 0)`).run();
 
 // Entity tables (characters, chats, settings, presets, modules) were used in
 // a previous version. The tables are no longer created or used, but existing
@@ -77,6 +90,7 @@ function migrateFromSaveDir() {
     const insert = db.prepare(
         `INSERT OR IGNORE INTO kv (key, value, updated_at) VALUES (?, ?, ?)`
     );
+    const exists = db.prepare(`SELECT 1 FROM kv WHERE key = ?`);
     const now = Date.now();
 
     const run = db.transaction(() => {
@@ -85,6 +99,10 @@ function migrateFromSaveDir() {
                 console.log(`[DB] Migrating... ${i + 1}/${hexFiles.length}`);
             }
             const key = Buffer.from(hexFiles[i], 'hex').toString('utf-8');
+            // SQLite is authoritative once a key has been imported.  In
+            // particular, chunkStore.putValue() uses INSERT OR REPLACE, so a
+            // stale legacy file must be skipped before entering that path.
+            if (exists.get(key)) continue;
             const value = fs.readFileSync(path.join(savePath, hexFiles[i]));
             // Route every chunk-capable namespace through the same size gate so
             // oversized legacy values cannot hit SQLite's BLOB bind limit.
@@ -136,8 +154,8 @@ const kvSetFailpoint = parseKvSetFailpoint(process.env.POCKETRISU_TEST_FAILPOINT
 const stmtKvSet    = db.prepare(`INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)`);
 const stmtKvList   = db.prepare(`SELECT key FROM kv`);
 const stmtKvPrefix = db.prepare(`SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\'`);
-const stmtKvPrefixSizes = db.prepare(`SELECT key, LENGTH(value) as size FROM kv WHERE key LIKE ? ESCAPE '\\'`);
 const stmtKvDelPrefix = db.prepare(`DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'`);
+const stmtManifestDelPrefix = db.prepare(`DELETE FROM manifest_chunks WHERE manifest_key LIKE ? ESCAPE '\\'`);
 const stmtKvUpdatedAt = db.prepare(`SELECT updated_at FROM kv WHERE key = ?`);
 const stmtRecordDeletion = db.prepare(`INSERT OR REPLACE INTO deleted_keys (key, deleted_at) VALUES (?, ?)`);
 const stmtRemoveDeletion = db.prepare(`DELETE FROM deleted_keys WHERE key = ?`);
@@ -151,17 +169,134 @@ const stmtRecordDeletionBulk = db.prepare(
 );
 const stmtGetListEpoch = db.prepare(`SELECT list_epoch FROM sync_meta WHERE id = 1`);
 const stmtSetListEpoch = db.prepare(`UPDATE sync_meta SET list_epoch = ? WHERE id = 1`);
+const stmtGetPluginStorageUsage = db.prepare(`SELECT bytes FROM plugin_storage_usage WHERE id = 1`);
+const stmtSetPluginStorageUsage = db.prepare(`UPDATE plugin_storage_usage SET bytes = ? WHERE id = 1`);
 
 const DELETION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
+function getPluginStorageUsage() {
+    return stmtGetPluginStorageUsage.get().bytes;
+}
+
+function assertPluginWriteWithinLimits(key, nextSize, previousSize) {
+    if (!isPluginValueKey(key)) return;
+    // A legacy repository may already exceed a newly configured limit. Permit
+    // strict size-decreasing repairs, but never allow it to grow further.
+    if (nextSize > PLUGIN_VALUE_MAX_BYTES && nextSize >= previousSize) {
+        assertPluginValueSize(nextSize);
+    }
+    const currentTotal = getPluginStorageUsage();
+    const nextTotal = currentTotal - previousSize + nextSize;
+    if (nextTotal > PLUGIN_STORAGE_MAX_BYTES && nextTotal >= currentTotal) {
+        assertPluginStorageTotal(nextTotal);
+    }
+    return nextTotal;
+}
+
+function updatePluginStorageUsageForWrite(key, nextSize, previousSize) {
+    if (!isPluginValueKey(key)) return;
+    stmtSetPluginStorageUsage.run(getPluginStorageUsage() - previousSize + nextSize);
+}
+
+let activePluginStorageQuotaPlan = null;
+
+/**
+ * Validate a logical multi-row plugin mutation against its final state, then
+ * suppress order-dependent intermediate quota checks while the enclosing
+ * SQLite transaction applies exactly those changes.
+ */
+function withPluginStorageQuotaPlan(changes, operation) {
+    if (activePluginStorageQuotaPlan) return operation();
+    const planned = new Map();
+    for (const change of changes) {
+        if (!isPluginValueKey(change.key)) continue;
+        if (planned.has(change.key)) throw new Error(`Duplicate plugin quota plan key: ${change.key}`);
+        const previousSize = chunkStore.sizeValue(change.key) ?? 0;
+        const nextSize = change.size === null ? 0 : change.size;
+        if (!Number.isSafeInteger(nextSize) || nextSize < 0) assertPluginValueSize(nextSize);
+        if (nextSize > PLUGIN_VALUE_MAX_BYTES && nextSize >= previousSize) {
+            assertPluginValueSize(nextSize);
+        }
+        planned.set(change.key, { previousSize, nextSize, consumed: false });
+    }
+    const currentTotal = getPluginStorageUsage();
+    const finalTotal = [...planned.values()].reduce(
+        (total, change) => total - change.previousSize + change.nextSize,
+        currentTotal,
+    );
+    if (finalTotal > PLUGIN_STORAGE_MAX_BYTES && finalTotal >= currentTotal) {
+        assertPluginStorageTotal(finalTotal);
+    }
+    const run = db.transaction(() => {
+        activePluginStorageQuotaPlan = { planned, finalTotal };
+        try {
+            const result = operation();
+            for (const [key, change] of planned) {
+                if (!change.consumed) throw new Error(`Plugin quota plan did not mutate ${key}`);
+            }
+            stmtSetPluginStorageUsage.run(finalTotal);
+            return result;
+        } finally {
+            activePluginStorageQuotaPlan = null;
+        }
+    });
+    return run();
+}
+
+function consumePluginStorageQuotaPlan(key, nextSize) {
+    if (!activePluginStorageQuotaPlan || !isPluginValueKey(key)) return false;
+    const change = activePluginStorageQuotaPlan.planned.get(key);
+    if (!change || change.consumed || change.nextSize !== nextSize) {
+        throw new Error(`Plugin storage mutation did not match its quota plan for ${key}`);
+    }
+    change.consumed = true;
+    return true;
+}
+
+const runKvSet = db.transaction((key, value) => {
+    const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
+    const quotaPlanned = consumePluginStorageQuotaPlan(key, value.length);
+    if (!quotaPlanned) assertPluginWriteWithinLimits(key, value.length, previousSize);
+    if (isChunkableKey(key)) chunkStore.putValue(key, value);
+    else stmtKvSet.run(key, value, Date.now());
+    if (!quotaPlanned) updatePluginStorageUsageForWrite(key, value.length, previousSize);
+    stmtRemoveDeletion.run(key);
+});
+
+const runKvSetFromFile = db.transaction((key, filePath, size) => {
+    const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
+    const quotaPlanned = consumePluginStorageQuotaPlan(key, size);
+    if (!quotaPlanned) assertPluginWriteWithinLimits(key, size, previousSize);
+    if (isChunkableKey(key)) chunkStore.putValueFromFile(key, filePath);
+    else stmtKvSet.run(key, fs.readFileSync(filePath), Date.now());
+    if (!quotaPlanned) updatePluginStorageUsageForWrite(key, size, previousSize);
+    stmtRemoveDeletion.run(key);
+});
+
 const runKvDel = db.transaction((key) => {
+    const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
+    const quotaPlanned = consumePluginStorageQuotaPlan(key, 0);
     chunkStore.dropValue(key);
+    if (!quotaPlanned && previousSize > 0) {
+        stmtSetPluginStorageUsage.run(Math.max(0, getPluginStorageUsage() - previousSize));
+    }
     stmtRecordDeletion.run(key, Date.now());
 });
 
-const runKvDelPrefix = db.transaction((pattern) => {
+const runKvDelPrefix = db.transaction((prefix, pattern) => {
+    const prefixCanMatchPluginValues = prefix.startsWith('pluginsave/')
+        || 'pluginsave/'.startsWith(prefix);
+    const removedPluginBytes = prefixCanMatchPluginValues
+        ? chunkStore.listValuesWithSizes(prefix.startsWith('pluginsave/') ? prefix : 'pluginsave/')
+            .filter((entry) => entry.key.startsWith(prefix))
+            .reduce((sum, entry) => sum + entry.size, 0)
+        : 0;
     stmtRecordDeletionBulk.run(Date.now(), pattern);
+    stmtManifestDelPrefix.run(pattern);
     stmtKvDelPrefix.run(pattern);
+    if (removedPluginBytes > 0) {
+        stmtSetPluginStorageUsage.run(Math.max(0, getPluginStorageUsage() - removedPluginBytes));
+    }
 });
 
 function kvGet(key) {
@@ -185,25 +320,13 @@ function checkKvSetFailpoint(key) {
 
 function kvSet(key, value) {
     checkKvSetFailpoint(key);
-    if (isChunkableKey(key)) {
-        chunkStore.putValue(key, value);
-    } else {
-        stmtKvSet.run(key, value, Date.now());
-    }
-    // Deliberately a separate tiny indexed statement. If a reader or crash lands
-    // between these statements, the key appears in both added and deleted; the
-    // client merge gives added precedence, so it remains live.
-    stmtRemoveDeletion.run(key);
+    runKvSet(key, value);
 }
 
 function kvSetFromFile(key, filePath) {
     checkKvSetFailpoint(key);
-    if (isChunkableKey(key)) {
-        chunkStore.putValueFromFile(key, filePath);
-    } else {
-        stmtKvSet.run(key, fs.readFileSync(filePath), Date.now());
-    }
-    stmtRemoveDeletion.run(key);
+    const size = fs.statSync(filePath).size;
+    runKvSetFromFile(key, filePath, size);
 }
 
 function kvDel(key) {
@@ -226,11 +349,20 @@ function kvGetUpdatedAt(key) {
     return row ? row.updated_at : null;
 }
 
-function kvCopyValue(srcKey, dstKey) {
+const runKvCopyValue = db.transaction((srcKey, dstKey) => {
+    const sourceSize = chunkStore.sizeValue(srcKey);
+    if (sourceSize === null) return;
+    const previousSize = isPluginValueKey(dstKey) ? (chunkStore.sizeValue(dstKey) ?? 0) : 0;
+    assertPluginWriteWithinLimits(dstKey, sourceSize, previousSize);
     // Chunked src copies only its manifest (chunks stay shared); raw src copies
     // the value. Used for snapshots — keeps them near-free and byte-identical.
     chunkStore.snapshotValue(srcKey, dstKey);
+    updatePluginStorageUsageForWrite(dstKey, sourceSize, previousSize);
     if (stmtKvUpdatedAt.get(dstKey)) stmtRemoveDeletion.run(dstKey);
+});
+
+function kvCopyValue(srcKey, dstKey) {
+    runKvCopyValue(srcKey, dstKey);
 }
 
 function kvDelPrefix(prefix) {
@@ -238,7 +370,7 @@ function kvDelPrefix(prefix) {
     const pattern = `${escaped}%`;
     // Capture the logical keys before deleting the source rows. Keeping both
     // operations in one transaction prevents a delta reader seeing half-state.
-    runKvDelPrefix(pattern);
+    runKvDelPrefix(prefix, pattern);
 }
 
 function kvList(prefix) {
@@ -250,8 +382,7 @@ function kvList(prefix) {
 }
 
 function kvListWithSizes(prefix) {
-    const escaped = prefix.replace(/[\\%_]/g, '\\$&');
-    return stmtKvPrefixSizes.all(`${escaped}%`).map(r => ({ key: r.key, size: r.size }));
+    return chunkStore.listValuesWithSizes(prefix);
 }
 
 function kvClearDeletion(key) {
@@ -323,7 +454,22 @@ function createKvSnapshot() {
     }
 }
 
+function reconcilePluginStorageUsage() {
+    const bytes = chunkStore.listValuesWithSizes('pluginsave/')
+        .reduce((sum, entry) => sum + entry.size, 0);
+    if (!Number.isSafeInteger(bytes)) {
+        throw new Error('Optimized plugin storage usage exceeds the safe integer range.');
+    }
+    stmtSetPluginStorageUsage.run(bytes);
+    return bytes;
+}
+
+// The counter is an optimization, not an authority. Rebuild it on every boot
+// so older servers, interrupted upgrades, and direct maintenance cannot leave
+// quota accounting stale.
+reconcilePluginStorageUsage();
 migrateFromSaveDir();
+reconcilePluginStorageUsage();
 
 function checkpointWal(mode = 'TRUNCATE') {
     return db.pragma(`wal_checkpoint(${mode})`);
@@ -376,4 +522,7 @@ module.exports = {
     reclaimableChunkBytes,
     isDbBlobChunked,
     snapshotFootprint,
+    getPluginStorageUsage,
+    reconcilePluginStorageUsage,
+    withPluginStorageQuotaPlan,
 };

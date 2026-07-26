@@ -6,6 +6,7 @@ const cache = vi.hoisted(() => ({
     getVerifiedCachedBytes: vi.fn(),
     sha256Bytes: vi.fn(),
     storeBytes: vi.fn(),
+    storeOwnedBytesWithKnownHash: vi.fn(),
 }))
 
 vi.mock('./resourceCache', () => ({
@@ -28,6 +29,7 @@ vi.mock('./resourceCache', () => ({
         }
     },
     storeBytes: cache.storeBytes,
+    storeOwnedBytesWithKnownHash: cache.storeOwnedBytesWithKnownHash,
     touchResourceCacheManifest: vi.fn(async () => undefined),
 }))
 
@@ -71,6 +73,7 @@ beforeEach(() => {
     cache.getVerifiedCachedBytes.mockResolvedValue(null)
     cache.sha256Bytes.mockResolvedValue('a'.repeat(64))
     cache.storeBytes.mockResolvedValue(undefined)
+    cache.storeOwnedBytesWithKnownHash.mockResolvedValue(undefined)
 })
 
 afterEach(() => {
@@ -79,6 +82,87 @@ afterEach(() => {
 })
 
 describe('NodeStorage availability bounds', () => {
+    it('routes large plugin values through the parser-free streaming endpoint', async () => {
+        cache.enabled = false
+        const requestBytes = new Uint8Array(1024 * 1024)
+        const fetchMock = vi.fn(async (_input: string, _init: RequestInit) => new Response(JSON.stringify({
+            success: true,
+            outcome: 'committed',
+            operation: 'set',
+            verification: 'verified',
+            hash: 'a'.repeat(64),
+        }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+        }))
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+
+        await expect(storage.mutatePluginStorage({
+            operation: 'set',
+            valueKey: 'pluginsave/bGFyZ2U.json',
+            valueBytes: requestBytes,
+            ownedValueBytes: true,
+            owner: 'Capacity Test',
+        })).resolves.toMatchObject({ outcome: 'committed' })
+        expect(fetchMock).toHaveBeenCalledOnce()
+        const [path, init] = fetchMock.mock.calls[0]
+        expect(path).toBe('/api/plugin-storage/mutate')
+        expect(init).toMatchObject({ body: requestBytes, method: 'POST' })
+        expect((init.headers as Headers).get('x-plugin-storage-stream')).toBe('1')
+        expect(cache.sha256Bytes).toHaveBeenCalledOnce()
+        expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
+    }, 15_000)
+
+    it('seeds a cache-enabled legacy value with the server hash and donated bytes', async () => {
+        vi.useFakeTimers()
+        cache.enabled = true
+        const requestBytes = new Uint8Array(1024 * 1024)
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+            hash: 'b'.repeat(64),
+            size: requestBytes.byteLength,
+        }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+        })))
+        const storage = readyStorage()
+
+        await storage.setItem('pluginsave/Y2FjaGVkLWxhcmdl.json', requestBytes)
+        await vi.advanceTimersByTimeAsync(0)
+
+        expect(cache.storeOwnedBytesWithKnownHash).toHaveBeenCalledWith(
+            'kv:pluginsave/Y2FjaGVkLWxhcmdl.json',
+            'b'.repeat(64),
+            requestBytes,
+        )
+        expect(cache.sha256Bytes).not.toHaveBeenCalled()
+    }, 15_000)
+
+    it('preserves actionable plugin capacity errors after a definitive response', async () => {
+        cache.enabled = false
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+            error: 'Optimized plugin storage would exceed its aggregate limit.',
+            code: 'PLUGIN_STORAGE_TOTAL_TOO_LARGE',
+            retryable: false,
+        }), {
+            status: 413,
+            headers: { 'content-type': 'application/json' },
+        })))
+        const storage = readyStorage()
+
+        await expect(storage.setItem(
+            'pluginsave/YQ.json',
+            new TextEncoder().encode('{"value":1}'),
+        )).rejects.toMatchObject({
+            name: 'StorageError',
+            status: 413,
+            code: 'PLUGIN_STORAGE_TOTAL_TOO_LARGE',
+            retryable: false,
+            commitOutcomeUnknown: false,
+            operation: 'write',
+        })
+    })
+
     it('falls through a stalled resource-cache read to the authoritative server', async () => {
         vi.useFakeTimers()
         cache.getVerifiedManifestSnapshot.mockImplementation(
@@ -103,7 +187,7 @@ describe('NodeStorage availability bounds', () => {
     })
 
     it('does not await best-effort cache seeding after an acknowledged write', async () => {
-        cache.storeBytes
+        cache.storeOwnedBytesWithKnownHash
             .mockImplementationOnce(() => new Promise<never>(() => undefined))
             .mockResolvedValueOnce(undefined)
         vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
@@ -118,22 +202,23 @@ describe('NodeStorage availability bounds', () => {
             'pluginsave/alpha.json',
             new TextEncoder().encode('{"value":1}'),
         )).resolves.toBeUndefined()
-        await Promise.resolve()
+        await new Promise(resolve => setTimeout(resolve, 0))
 
-        expect(cache.storeBytes).toHaveBeenCalledOnce()
+        expect(cache.storeOwnedBytesWithKnownHash).toHaveBeenCalledOnce()
+        expect(cache.sha256Bytes).not.toHaveBeenCalled()
 
         await expect(storage.setItem(
             'pluginsave/beta.json',
             new TextEncoder().encode('{"value":2}'),
         )).resolves.toBeUndefined()
-        await vi.waitFor(() => expect(cache.storeBytes).toHaveBeenCalledTimes(2))
+        await vi.waitFor(() => expect(cache.storeOwnedBytesWithKnownHash).toHaveBeenCalledTimes(2))
     })
 
-    it('recovers cache seeding after a hash operation never settles', async () => {
+    it('recovers cache seeding after a known-hash cache operation never settles', async () => {
         vi.useFakeTimers()
-        cache.sha256Bytes
+        cache.storeOwnedBytesWithKnownHash
             .mockImplementationOnce(() => new Promise<never>(() => undefined))
-            .mockResolvedValueOnce('a'.repeat(64))
+            .mockResolvedValueOnce(undefined)
         vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
             hash: 'a'.repeat(64),
         }), {
@@ -146,15 +231,16 @@ describe('NodeStorage availability bounds', () => {
             'pluginsave/alpha.json',
             new TextEncoder().encode('{"value":1}'),
         )
-        await vi.advanceTimersByTimeAsync(2_000)
-        expect(cache.storeBytes).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(cache.storeOwnedBytesWithKnownHash).toHaveBeenCalledOnce()
+        expect(cache.sha256Bytes).not.toHaveBeenCalled()
 
         await storage.setItem(
             'pluginsave/beta.json',
             new TextEncoder().encode('{"value":2}'),
         )
         await vi.advanceTimersByTimeAsync(0)
-        expect(cache.storeBytes).toHaveBeenCalledOnce()
+        expect(cache.storeOwnedBytesWithKnownHash).toHaveBeenCalledTimes(2)
     })
 
     it('aborts a stalled write and reports an unknown commit outcome', async () => {
@@ -342,6 +428,41 @@ describe('NodeStorage availability bounds', () => {
             operation: 'write',
         })
         expect(requestSignal?.aborted).toBe(true)
+    })
+
+    it('keeps a stalled transition acknowledgement body commit-ambiguous', async () => {
+        vi.useFakeTimers()
+        let requestSignal: AbortSignal | undefined
+        const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+            requestSignal = init?.signal ?? undefined
+            const response = new Response(null, { status: 200 })
+            vi.spyOn(response, 'json').mockImplementation(
+                () => new Promise<never>(() => undefined),
+            )
+            return Promise.resolve(response)
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+
+        const pending = storage.commitPluginStorageTransition({
+            version: 1,
+            source: { optimized: false, generation: null, manifest: null },
+            database: new Uint8Array(),
+        }).catch(error => error)
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        const error = await pending
+
+        expect(error).toBeInstanceOf(StorageError)
+        expect(error).toMatchObject({
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            commitOutcomeUnknown: true,
+            retryable: false,
+            operation: 'transition',
+        })
+        expect(fetchMock).toHaveBeenCalledOnce()
+        expect(requestSignal?.aborted).toBe(true)
+        expect(cache.storeBytes).not.toHaveBeenCalled()
+        expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
     })
 
     it('clears mutation ambiguity before a definitive conflict body stalls', async () => {

@@ -53,7 +53,17 @@ vi.mock("../../globalApi.svelte", () => ({
 
 vi.mock("../../storage/chatStorage", () => ({ chatToStub: (chat: unknown) => chat }));
 
-vi.mock("../../storage/persistentKv", () => ({
+vi.mock("../../storage/persistentKv", () => {
+    const writePersistentJson = async (
+        key: string,
+        value: unknown,
+        signal?: AbortSignal | null,
+    ) => {
+        await storageMocks.writeGate?.(key, signal);
+        throwIfAborted(signal);
+        storageMocks.persistent.set(key, cloneJson(value));
+    };
+    return {
     batchPersistentPluginStorage: async (request: any, signal?: AbortSignal | null) => {
         await storageMocks.batchGate?.(signal);
         throwIfAborted(signal);
@@ -110,7 +120,10 @@ vi.mock("../../storage/persistentKv", () => ({
         for (const write of mutation.writes) {
             await storageMocks.writeGate?.(write.storageKey, signal);
             throwIfAborted(signal);
-            storageMocks.persistent.set(write.storageKey, cloneJson(write.value));
+            storageMocks.persistent.set(
+                write.storageKey,
+                JSON.parse(new TextDecoder().decode(write.valueBytes)),
+            );
         }
         for (const key of mutation.deletes) {
             await storageMocks.removeGate?.(key, signal);
@@ -202,16 +215,18 @@ vi.mock("../../storage/persistentKv", () => ({
         throwIfAborted(signal);
         storageMocks.persistent.delete(key);
     },
-    writePersistentJson: async (
-        key: string,
-        value: unknown,
-        signal?: AbortSignal | null,
-    ) => {
-        await storageMocks.writeGate?.(key, signal);
-        throwIfAborted(signal);
-        storageMocks.persistent.set(key, cloneJson(value));
-    },
-}));
+        writePersistentJson,
+        preparePersistentJson: (value: unknown) => {
+            const bytes = new TextEncoder().encode(JSON.stringify(value));
+            return { bytes, byteLength: bytes.byteLength, value: cloneJson(value) };
+        },
+        writePreparedPersistentJson: async (
+            key: string,
+            prepared: { value: unknown },
+            signal?: AbortSignal | null,
+        ) => writePersistentJson(key, prepared.value, signal),
+    };
+});
 
 vi.mock("../../alert", () => ({
     alertConfirm: alertConfirmMock,

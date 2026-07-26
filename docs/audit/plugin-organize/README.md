@@ -44,7 +44,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [BR2](backup-recovery.md#br2) | Medium | Fixed | Cross-mode snapshot ownership is ambiguous: unmarked just-disabled snapshots and no storage generation |
 | [BR3](backup-recovery.md#br3) | Medium | Open | Corrupt-database boot fallback ignores a marked snapshot's exact plugin-row set |
 | [BR4](backup-recovery.md#br4) | Medium | Fixed | Valid long keys produce Node backups the same server refuses to import |
-| [PM1](performance-memory.md#pm1) | Medium | Open | Large plugin values bypass chunking and incur multiple full-size client/server copies |
+| [PM1](performance-memory.md#pm1) | Medium | Fixed | Large plugin values bypass chunking and incur multiple full-size client/server copies |
 | [PM2](performance-memory.md#pm2) | Medium | Open | Mode transitions are not memory-bounded in either direction; the UI guards on entry count only |
 | [PM3](performance-memory.md#pm3) | Medium | Open | Viewer, partial backup, and snapshot restore eagerly rematerialize the whole external store |
 | [PM4](performance-memory.md#pm4) | Medium | Open | Remaining write/cache amplification: independent logical writes still repeat full-value hashing/copies and cache pruning |
@@ -118,9 +118,11 @@ old-or-new state after a real server restart. They still do not exercise:
 - the production save loop as the reconciliation durability callback
   (pre-initialization no-op, in-flight save join, 409/500/network failure);
 - marked-snapshot restore through the corrupt-database boot fallback;
-- a very large individual value or aggregate store (including transition
-  memory, with the resource cache on and off);
-- read failure followed by a fallback-derived overwrite.
+- key-length boundaries for backup export/import symmetry;
+- transition peak memory for a 50–100 MiB aggregate store, including
+  non-ASCII values and the resource cache on and off;
+- read failure followed by a fallback-derived overwrite;
+- corrupt-row boot recovery.
 
 ## Original recommended fix order
 
@@ -137,10 +139,10 @@ old-or-new state after a real server restart. They still do not exercise:
 5. **Repair recovery semantics** (BR1–BR4): plugin-mutation snapshot triggers,
    generation/ownership markers, exact-set boot-fallback restore, and
    symmetric key limits.
-6. **Bind lifecycle, parity, and capacity** (AC2, AC4, MT3, SA3, PM1–PM4):
+6. **Bind lifecycle, parity, and capacity** (AC2, AC4, MT3, SA3, PM2–PM4):
    awaited unload before eligibility, JSON/enumeration/special-key parity,
-   isolated boot reconciliation failures, and bounded/streamed large-value
-   paths.
+   isolated boot reconciliation failures, memory-bounded transitions, and
+   remaining recovery/write amplification.
 7. **Publish integration guidance and primitives** (IP1–IP5): typed
    missing/failed read outcomes, per-key revisions/CAS, atomic batch, and a
    non-destructive invalidate/rewrite operation.
@@ -148,7 +150,7 @@ old-or-new state after a real server restart. They still do not exercise:
 The former compatibility, startup, mutation, and primary recovery blockers
 MT1–MT3, AC1–AC4, SA1–SA4, AA1–AA3, BR1–BR2, and BR4 are fixed and covered.
 The beta still should not be treated as risk-free for every V3 workload: BR3,
-PM1–PM4, and IP1–IP5 remain open. The AA3 primitives make safe compound-write
+PM2–PM4, and IP1–IP5 remain open. The AA3 primitives make safe compound-write
 guidance possible, but do not automatically repair existing plugin protocols.
-Verify a backup before transitions, and avoid very large values or stores until
-the capacity work lands.
+Verify a backup before transitions, and avoid very large mode transitions until
+the remaining transition-capacity work lands.

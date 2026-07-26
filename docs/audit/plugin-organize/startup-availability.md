@@ -149,6 +149,14 @@ key or poison later cache work. Enumeration caches one invalidated key
 snapshot, so a conventional `length()`/`key(i)` loop issues one list request
 instead of about `2N`.
 
+PM1's later capacity fix completes the large-value part of this remediation:
+plugin JSON is serialized and UTF-8 encoded before shared/key admission, and
+post-commit cache seeding donates those immutable bytes with the
+server-provided SHA-256 result. One request-bound client hash still verifies
+the acknowledgement, but cache publication performs neither another
+full-size copy nor another hash while the key remains locked; disabled and
+over-limit cache candidates are rejected before either operation.
+
 Regression coverage includes stalled unrelated keys, bounded transition
 failure, same-key cancellation ordering, auth/pending recovery, exact bridge
 cancellation, permission waits, cache hash/store stalls, late messages,

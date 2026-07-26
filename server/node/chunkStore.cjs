@@ -52,7 +52,8 @@ function isChunkableKey(key) {
     return typeof key === 'string'
         && (key === 'database/database.bin'
             || key.startsWith('database/dbbackup-')
-            || key.startsWith('chats/'));
+            || key.startsWith('chats/')
+            || key.startsWith('pluginsave/'));
 }
 
 function isChunked(value) {
@@ -74,7 +75,6 @@ function createSnapshotReader(db) {
     const selSize = db.prepare(
         'SELECT SUM(LENGTH(c.data)) AS n FROM manifest_chunks m JOIN chunks c ON c.hash = m.hash WHERE m.manifest_key = ?',
     );
-
     function kvGet(key) {
         const row = selKv.get(key);
         if (!row) return null;
@@ -136,6 +136,10 @@ function createChunkStore(db, opts = {}) {
     const selChunk = db.prepare('SELECT data FROM chunks WHERE hash = ?');
     const selSize = db.prepare(
         'SELECT SUM(LENGTH(c.data)) AS n FROM manifest_chunks m JOIN chunks c ON c.hash = m.hash WHERE m.manifest_key = ?',
+    );
+    const selKvPrefixSizes = db.prepare(
+        `SELECT key, LENGTH(value) AS size, value = @chunkMarker AS is_chunked
+         FROM kv WHERE key LIKE @pattern ESCAPE '\\'`,
     );
     // Physical bytes that deleting one manifest would make unreachable. Count
     // each chunk hash once even if repeated within the logical value.
@@ -253,8 +257,21 @@ function createChunkStore(db, opts = {}) {
     function sizeValue(key) {
         const row = kvGet.get(key);
         if (!row) return null;
-        if (isChunked(row.value)) return selSize.get(key).n;
+        if (isChunked(row.value)) return selSize.get(key).n ?? row.value.length;
         return row.value.length;
+    }
+
+    // Enumerate logical payload sizes without reassembling chunk bodies. This
+    // mirrors createSnapshotReader.kvListWithSizes for the live connection.
+    function listValuesWithSizes(prefix) {
+        const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+        return selKvPrefixSizes.all({
+            chunkMarker: CHUNK_MARKER,
+            pattern: `${escaped}%`,
+        }).map((row) => ({
+            key: row.key,
+            size: row.is_chunked ? (selSize.get(row.key).n ?? row.size) : row.size,
+        }));
     }
 
     // Bytes deleting this key would free after chunk GC. Raw values own their row;
@@ -312,6 +329,7 @@ function createChunkStore(db, opts = {}) {
         putValueFromFile,
         getValue,
         sizeValue,
+        listValuesWithSizes,
         snapshotCostExclusive,
         snapshotValue,
         dropValue,

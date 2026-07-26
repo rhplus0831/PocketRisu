@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto'
 const cache = vi.hoisted(() => ({
     invalidateResourceCacheManifest: vi.fn(async () => undefined),
     storeBytes: vi.fn(async () => 'hash'),
+    storeOwnedBytesWithKnownHash: vi.fn(async () => undefined),
 }))
 
 vi.mock('src/lang', () => ({ language: {} }))
@@ -36,6 +37,7 @@ vi.mock('./resourceCache', () => ({
     }),
     settleBestEffortResourceCache: vi.fn((promise: Promise<unknown>) => promise),
     storeBytes: cache.storeBytes,
+    storeOwnedBytesWithKnownHash: cache.storeOwnedBytesWithKnownHash,
     touchResourceCacheManifest: vi.fn(async () => undefined),
 }))
 
@@ -109,6 +111,7 @@ function storageWithResponse(next: Response | Error): InstanceType<typeof NodeSt
 
 beforeEach(() => {
     cache.storeBytes.mockClear()
+    cache.storeOwnedBytesWithKnownHash.mockClear()
     cache.invalidateResourceCacheManifest.mockClear()
 })
 
@@ -164,7 +167,7 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
                 valueBytes,
                 owner: 'Plugin',
             })).resolves.toMatchObject({ outcome: 'not-committed' })
-            expect(cache.storeBytes).not.toHaveBeenCalled()
+            expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
             expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
         },
     )
@@ -183,7 +186,7 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
             operation: 'remove',
             valueKey,
         })).resolves.toMatchObject({ outcome: 'not-committed' })
-        expect(cache.storeBytes).not.toHaveBeenCalled()
+        expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
         expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
     })
 
@@ -205,7 +208,11 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
             outcome: 'committed',
             verification: 'unavailable',
         })
-        expect(cache.storeBytes).toHaveBeenCalledWith(`kv:${valueKey}`, valueBytes)
+        expect(cache.storeOwnedBytesWithKnownHash).toHaveBeenCalledWith(
+            `kv:${valueKey}`,
+            valueHash,
+            expect.any(Uint8Array),
+        )
         expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
     })
 
@@ -227,7 +234,7 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
             outcome: 'unknown',
             code: 'ACKNOWLEDGEMENT_UNKNOWN',
         })
-        expect(cache.storeBytes).not.toHaveBeenCalled()
+        expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
         expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
     })
 
@@ -242,7 +249,7 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
         await storage.mutatePluginStorage({ operation: 'remove', valueKey })
 
         expect(cache.invalidateResourceCacheManifest).toHaveBeenCalledWith(`kv:${valueKey}`)
-        expect(cache.storeBytes).not.toHaveBeenCalled()
+        expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
     })
 
     test.each([
@@ -270,7 +277,7 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
                 code,
                 retryable,
             })
-            expect(cache.storeBytes).not.toHaveBeenCalled()
+            expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
             expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
         },
     )
@@ -444,7 +451,7 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
             code: 'COMMIT_OUTCOME_UNKNOWN',
             commitOutcomeUnknown: true,
         })
-        expect(cache.storeBytes).not.toHaveBeenCalled()
+        expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
         expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
     })
 
@@ -459,7 +466,7 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
             code: 'COMMIT_OUTCOME_UNKNOWN',
             commitOutcomeUnknown: true,
         })
-        expect(cache.storeBytes).not.toHaveBeenCalled()
+        expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
         expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
     })
 
@@ -523,7 +530,7 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
                 outcome: 'unknown',
                 code: 'ACKNOWLEDGEMENT_UNKNOWN',
             })
-            expect(cache.storeBytes).not.toHaveBeenCalled()
+            expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
             expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
         },
     )

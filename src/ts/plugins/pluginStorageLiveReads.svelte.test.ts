@@ -71,6 +71,11 @@ vi.mock("../storage/persistentKv", () => ({
     removePersistentKey: vi.fn(),
     restorePersistentPluginStoragePair: vi.fn(),
     writePersistentJson: vi.fn(),
+    preparePersistentJson: (value: unknown) => {
+        const bytes = new TextEncoder().encode(JSON.stringify(value));
+        return { bytes, byteLength: bytes.byteLength, value };
+    },
+    writePreparedPersistentJson: vi.fn(),
 }));
 
 const { getV2PluginAPIs } = await import("./plugins.svelte");

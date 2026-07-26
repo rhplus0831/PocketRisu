@@ -38,6 +38,7 @@ const {
     hasNativeStringWellFormed,
     makeEncodedStorageKey,
     mutatePersistentPluginStorage,
+    preparePersistentJson,
     restorePersistentPluginStoragePair,
     readPersistentJson,
     readPersistentJsonRow,
@@ -215,6 +216,31 @@ describe('atomic plugin storage mutation transport', () => {
             })
         },
     )
+})
+
+describe('persistent JSON preparation', () => {
+    it('measures exact UTF-8 bytes for non-ASCII plugin payloads', () => {
+        const value = { vector: [1, 2, 3], media: '😀한글'.repeat(500) }
+        const expected = Buffer.from(JSON.stringify(value), 'utf8')
+        const prepared = preparePersistentJson(value, { pluginValue: true })
+
+        expect(prepared.byteLength).toBe(expected.byteLength)
+        expect(Buffer.from(prepared.bytes)).toEqual(expected)
+    })
+
+    it('does not invoke toJSON and rejects values with no JSON representation', () => {
+        let calls = 0
+        expect(() => preparePersistentJson({
+            toJSON() {
+                calls += 1
+                return { stable: true }
+            },
+        }, { pluginValue: true })).toThrow(TypeError)
+
+        expect(calls).toBe(0)
+        expect(() => preparePersistentJson(undefined, { pluginValue: true }))
+            .toThrow(TypeError)
+    })
 })
 
 describe('encoded storage keys', () => {

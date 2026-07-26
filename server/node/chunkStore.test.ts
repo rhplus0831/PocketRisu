@@ -17,6 +17,7 @@ const { cdcSplit, createChunkStore, isChunkableKey } = pkg as {
         putValueFromFile: (key: string, filePath: string) => void
         getValue: (key: string) => Buffer | null
         sizeValue: (key: string) => number | null
+        listValuesWithSizes: (prefix: string) => Array<{ key: string; size: number }>
         snapshotCostExclusive: (key: string) => number
         snapshotValue: (srcKey: string, dstKey: string) => void
         dropValue: (key: string) => void
@@ -99,10 +100,12 @@ describe('cdcSplit — content-defined chunking (pure)', () => {
 describe('createChunkStore — chunk-aware kv (injected :memory: db)', () => {
     const T = { threshold: 1024 } // small threshold so test buffers exercise chunking
 
-    it('B0: chunk gate includes live DB, snapshots, and chat rows only', () => {
+    it('B0: chunk gate includes live DB, snapshots, chat rows, and plugin values only', () => {
         expect(isChunkableKey('database/database.bin')).toBe(true)
         expect(isChunkableKey('database/dbbackup-123.bin')).toBe(true)
         expect(isChunkableKey('chats/character/chat')).toBe(true)
+        expect(isChunkableKey('pluginsave/dmVjdG9y.json')).toBe(true)
+        expect(isChunkableKey('pluginsave-meta/dmVjdG9y.json')).toBe(false)
         expect(isChunkableKey('database/other.bin')).toBe(false)
         expect(isChunkableKey('assets/large.bin')).toBe(false)
         expect(isChunkableKey('chats')).toBe(false)
@@ -208,6 +211,20 @@ describe('createChunkStore — chunk-aware kv (injected :memory: db)', () => {
         // raw 값이 마커를 덮은 stale 상태 → 청킹 아님으로 정확히 판정
         db.prepare("UPDATE kv SET value = ? WHERE key = 'big'").run(Buffer.from('raw'))
         expect(store.isChunkedKey('big')).toBe(false)
+    })
+
+    it('B10: live size enumeration reports logical plugin bytes without reassembly', () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const large = randomBytes(200_000)
+        store.putValue('pluginsave/bGFyZ2U.json', large)
+        store.putValue('pluginsave/c21hbGw.json', Buffer.from('small'))
+
+        expect(store.listValuesWithSizes('pluginsave/').sort((a, b) => a.key.localeCompare(b.key)))
+            .toEqual([
+                { key: 'pluginsave/bGFyZ2U.json', size: large.length },
+                { key: 'pluginsave/c21hbGw.json', size: 5 },
+            ])
     })
 })
 

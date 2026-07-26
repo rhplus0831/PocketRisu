@@ -50,7 +50,7 @@ async function mutatePluginRow(
       generation,
       expectedManifest: manifest,
       nextManifest: manifest,
-      writes: [{ storageKey, valueJson: value.toString('utf-8') }],
+      writes: [{ storageKey, valueBytes: value }],
       deletes: [],
     })),
   })
