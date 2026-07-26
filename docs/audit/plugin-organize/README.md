@@ -50,7 +50,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [PM4](performance-memory.md#pm4) | Medium | Fixed | Batch writes now use compact CAS, donated bytes, server hashes, one cache transaction, and amortized pruning |
 | [IP1](integration-patterns.md#ip1) | High | Fixed | Treating a failed read as a missing key turns transient I/O errors into destructive whole-value overwrites |
 | [IP2](integration-patterns.md#ip2) | High | Fixed | Remove-then-rewrite maintenance flows durably delete rows mid-sequence and report success |
-| [IP3](integration-patterns.md#ip3) | Medium | Open | Swallowed mutation failures desynchronize plugin caches and success counters from durable server state |
+| [IP3](integration-patterns.md#ip3) | Medium | Fixed | Swallowed mutation failures desynchronize plugin caches and success counters from durable server state |
 | [IP4](integration-patterns.md#ip4) | Medium | Open | Reused sub-row keys with manifest-last publishing let an old manifest resolve to newer bodies; loaders do not verify generations |
 | [IP5](integration-patterns.md#ip5) | Medium | Open | Uncancelled long-running plugin-side migrations without CAS overwrite newer rows after their watchdog reports a timeout |
 
@@ -61,8 +61,9 @@ code on its behalf. AA3 supplies bounded versioned reads and atomic batch/CAS;
 IP1 now adds explicit failed-read results, guarded single-key CAS helpers, and
 public migration guidance. IP2 adds the public one-SET `rewriteItem()`
 primitive and confirmed-outcome guidance needed to replace destructive
-REMOVE→SET maintenance. Existing third-party plugins must adopt those safe
-protocols. IP3–IP5 remain open in this audit state.
+REMOVE→SET maintenance. IP3 adds public structured mutation outcomes plus a
+confirmed-removal workflow. Existing third-party plugins must adopt those safe
+protocols. IP4–IP5 remain open in this audit state.
 
 ## Intentional enabled-mode behavior (not defects)
 
@@ -157,8 +158,8 @@ large transition memory, corrupt-row recovery, and read-failure fallbacks.
 
 The former compatibility, startup, mutation, primary recovery, transition
 capacity, and tooling-memory blockers MT1–MT3, AC1–AC4, SA1–SA4, AA1–AA3,
-BR1–BR4, PM1–PM4, and IP1–IP2 are fixed and covered. The beta still should not be
-treated as risk-free for every V3 workload: IP3–IP5 remain open. The AA3
+BR1–BR4, PM1–PM4, and IP1–IP3 are fixed and covered. The beta still should not be
+treated as risk-free for every V3 workload: IP4–IP5 remain open. The AA3
 primitives make safe compound-write guidance possible, but do not automatically
 repair existing plugin protocols.
 Verify a backup before transitions and before using the remaining open

@@ -73,6 +73,12 @@ import {
     PLUGIN_STORAGE_UUID_PATTERN,
     type PluginStorageBatchOperation as PersistentPluginStorageBatchOperation,
 } from "../storage/pluginStorageBatch";
+import {
+    runConfirmedPluginStorageRemove,
+    runPublicPluginStorageMutation,
+    type PublicPluginStorageConfirmedRemoveOutcome,
+    type PublicPluginStorageMutationOutcome,
+} from "./pluginStorageMutationOutcome";
 
 export { PLUGIN_SAVE_META_PREFIX, PLUGIN_SAVE_PREFIX };
 export const PLUGIN_STORAGE_MANIFEST_KEY = "plugin-storage/manifest.json";
@@ -1244,6 +1250,62 @@ export async function removeOwnedPluginSaveStorageItem(
     } finally {
         invalidateStorageEnumerationSnapshot();
     }
+}
+
+/**
+ * Public V3 mutation workflow that preserves a definitive refusal versus an
+ * ambiguous commit without asking plugins to inspect an untyped rejection.
+ * It never retries: a caller may only retry a known-not-committed outcome.
+ */
+export function setOwnedPluginSaveStorageItemWithOutcome<T>(
+    key: string,
+    value: T,
+    owner: string,
+    signal?: AbortSignal | null,
+): Promise<PublicPluginStorageMutationOutcome> {
+    return runPublicPluginStorageMutation(
+        "set",
+        () => setOwnedPluginSaveStorageItem(key, value, owner, signal),
+    );
+}
+
+/** See setOwnedPluginSaveStorageItemWithOutcome(). */
+export function removeOwnedPluginSaveStorageItemWithOutcome(
+    key: string,
+    signal?: AbortSignal | null,
+): Promise<PublicPluginStorageMutationOutcome> {
+    return runPublicPluginStorageMutation(
+        "remove",
+        () => removeOwnedPluginSaveStorageItem(key, signal),
+    );
+}
+
+/**
+ * Remove once and perform a fresh versioned read before reporting success.
+ * This is the safe boundary for clearing a plugin-owned dirty flag or
+ * incrementing a reset/cleanup success counter.
+ */
+export function removeOwnedPluginSaveStorageItemConfirmed(
+    key: string,
+    signal?: AbortSignal | null,
+): Promise<PublicPluginStorageConfirmedRemoveOutcome> {
+    return runConfirmedPluginStorageRemove(
+        () => removeOwnedPluginSaveStorageItem(key, signal),
+        async () => {
+            const state = await getPluginSaveStorageItemWithRevision(key, signal);
+            return state.status === "missing"
+                ? {
+                    status: "missing" as const,
+                    revision: null,
+                    generation: state.generation,
+                }
+                : {
+                    status: "value" as const,
+                    revision: state.revision,
+                    generation: state.generation,
+                };
+        },
+    );
 }
 
 export type PluginSaveStorageAtomicMutation =

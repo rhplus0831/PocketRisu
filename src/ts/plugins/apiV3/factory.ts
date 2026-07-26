@@ -1,4 +1,5 @@
 import { safeStructuredClone } from "../../polyfill";
+import { publicPluginStorageMutationFailure } from "../pluginStorageMutationOutcome";
 
 type MsgType =
     | 'CALL_ROOT'
@@ -25,7 +26,10 @@ const ABORTABLE_ROOT_METHODS = new Set([
     '_atomicBatchPluginStorage',
     '_rewritePluginStorage',
     '_setPluginStorage',
+    '_setPluginStorageWithOutcome',
     '_removePluginStorage',
+    '_removePluginStorageWithOutcome',
+    '_removePluginStorageConfirmed',
     '_clearPluginStorage',
     '_keyPluginStorage',
     '_keysPluginStorage',
@@ -45,7 +49,10 @@ const UNLOAD_STORAGE_MUTATION_METHODS = new Set([
     '_setPluginStorageFromRead',
     '_rewritePluginStorage',
     '_setPluginStorage',
+    '_setPluginStorageWithOutcome',
     '_removePluginStorage',
+    '_removePluginStorageWithOutcome',
+    '_removePluginStorageConfirmed',
     '_clearPluginStorage',
 ]);
 
@@ -197,7 +204,10 @@ export function createV3BridgeRequestRegistry(options: {
         _setPluginStorageFromRead: 'batch',
         _rewritePluginStorage: 'batch',
         _setPluginStorage: 'write',
+        _setPluginStorageWithOutcome: 'write',
         _removePluginStorage: 'remove',
+        _removePluginStorageWithOutcome: 'remove',
+        _removePluginStorageConfirmed: 'remove',
         _clearPluginStorage: 'remove',
         setDatabase: 'write',
         setDatabaseLite: 'write',
@@ -634,7 +644,13 @@ await (async function() {
     const installPluginStorageHelpers = ${installV3PluginStorageHelpers.toString()};
     const serializeBridgeError = ${serializeV3BridgeError.toString()};
     const deserializeBridgeError = ${deserializeV3BridgeError.toString()};
+    const mutationFailureOutcome = ${publicPluginStorageMutationFailure.toString()};
     const createRequestRegistry = ${createV3BridgeRequestRegistry.toString()};
+    const structuredMutationMethods = {
+        _setPluginStorageWithOutcome: 'set',
+        _removePluginStorageWithOutcome: 'remove',
+        _removePluginStorageConfirmed: 'remove',
+    };
 
     function serializeArg(arg) {
         if (typeof arg === 'function') {
@@ -800,7 +816,13 @@ await (async function() {
                 return Promise.reject(error);
             }
         }
-        return requestRegistry.sendRequest(type, payload);
+        const request = requestRegistry.sendRequest(type, payload);
+        const structuredOperation = type === 'CALL_ROOT'
+            ? structuredMutationMethods[payload.method]
+            : undefined;
+        return structuredOperation
+            ? request.catch(error => mutationFailureOutcome(structuredOperation, error))
+            : request;
     }
 
     

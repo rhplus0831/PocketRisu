@@ -21,7 +21,10 @@ import {
     getPluginSaveStorageSnapshot,
     removeOwnedPluginSaveStorageItem,
     setOwnedPluginSaveStorageItemFromRead,
+    removeOwnedPluginSaveStorageItemConfirmed,
+    removeOwnedPluginSaveStorageItemWithOutcome,
     setOwnedPluginSaveStorageItem,
+    setOwnedPluginSaveStorageItemWithOutcome,
     updateDatabaseWithPluginStorageSnapshot,
 } from "../pluginSaveStorage";
 import { createPluginDatabaseBridge } from "./pluginDatabaseBridge";
@@ -1703,9 +1706,18 @@ export const makeRisuaiAPIV3 = (
         _setPluginStorage: async (key: string, value: any, signal?: AbortSignal) => {
             await setOwnedPluginSaveStorageItem(key, value, plugin.name, signal)
         },
+        _setPluginStorageWithOutcome: (key: string, value: any, signal?: AbortSignal) => (
+            setOwnedPluginSaveStorageItemWithOutcome(key, value, plugin.name, signal)
+        ),
         _removePluginStorage: async (key: string, signal?: AbortSignal) => {
             await removeOwnedPluginSaveStorageItem(key, signal)
         },
+        _removePluginStorageWithOutcome: (key: string, signal?: AbortSignal) => (
+            removeOwnedPluginSaveStorageItemWithOutcome(key, signal)
+        ),
+        _removePluginStorageConfirmed: (key: string, signal?: AbortSignal) => (
+            removeOwnedPluginSaveStorageItemConfirmed(key, signal)
+        ),
         _clearPluginStorage: async (signal?: AbortSignal) => {
             await clearOwnedPluginSaveStorage(signal)
         },
@@ -1748,7 +1760,10 @@ export const makeRisuaiAPIV3 = (
                     'atomicBatch': '_atomicBatchPluginStorage',
                     'rewriteItem': '_rewritePluginStorage',
                     'setItem': '_setPluginStorage',
+                    'setItemWithOutcome': '_setPluginStorageWithOutcome',
                     'removeItem': '_removePluginStorage',
+                    'removeItemWithOutcome': '_removePluginStorageWithOutcome',
+                    'removeItemConfirmed': '_removePluginStorageConfirmed',
                     'clear': '_clearPluginStorage',
                     'key': '_keyPluginStorage',
                     'keys': '_keysPluginStorage',

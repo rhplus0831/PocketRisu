@@ -185,6 +185,48 @@ which under the beta produces:
 - The host should return structured outcomes (see AA1) so "swallow
   everything" stops being the only ergonomic option.
 
+### Resolution
+
+**Fixed 2026-07-27.** V3 save storage now exposes
+`setItemWithOutcome()`, `removeItemWithOutcome()`, and
+`removeItemConfirmed()` alongside the original rejecting `setItem()` and
+`removeItem()` methods. The outcome APIs preserve `committed`,
+`not-committed`, and `unknown` across the iframe bridge, including local RPC
+timeouts. Definitive import/session refusals retain their structured status,
+code, retry delay, and retryability; network loss, acknowledgement loss,
+malformed or contradictory failures, and unclassified bridge errors remain
+conservatively unknown. The new workflows add no retry of their own, and an
+unknown mutation is never made retryable or replayed.
+
+`removeItemConfirmed()` sends exactly one REMOVE. A definitive refusal returns
+immediately. After a committed or unknown request outcome it performs a fresh,
+generation-bound versioned read against the authoritative state endpoint and
+reports success only when that read observes the key missing. A present row —
+including stale data that reattaches after deletion — or an unavailable read
+returns unknown, with present-row revision/generation metadata but not the
+value. The result also retains the original mutation outcome, so callers can
+distinguish an acknowledged delete from absence confirmed after a lost
+acknowledgement.
+
+The public types and [safe mutation workflow guide](../../plugin-storage-mutation-outcomes.md)
+show plugin authors how to publish cache entries only after confirmed SET,
+retain dirty edits after known refusal, evict and re-read after an unknown
+outcome, clear deletion dirtiness only after authoritative absence, and derive
+reset/cleanup counters from confirmed results rather than attempted promises.
+For multi-key logical records, the guide directs authors to AA3
+`getWithRevision()` plus `atomicBatch()` instead of treating an individually
+confirmed loop as atomic.
+
+Adversarial tests carry network, import, expired-session, and lost-
+acknowledgement SET/REMOVE failures through the generated V3 guest bridge and
+assert one mutation attempt. Cache tests cover retention after known refusal
+and eviction/reload after unknown outcomes. Workflow tests cover committed
+absence after acknowledgement loss, failed confirmation reads, authoritative
+reattachment, dirty-state retention, and reset counters advancing only for
+confirmed absence. Independent verification passed the focused and full
+client suites, server and compatibility suites, type checking, production
+build, help-key audit, and diff hygiene.
+
 <a id="ip4"></a>
 ## IP4 — Reused sub-row keys with manifest-last publishing; loaders accept mixed generations
 

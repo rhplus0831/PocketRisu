@@ -277,6 +277,14 @@ Server ingestion and backup assembly understand the same split. Node-only portab
 
 V2/V2.1 plugins cannot participate because their save-storage facade is synchronous. The UI refuses this optimization while any legacy plugin is enabled, disables an imported legacy plugin when the mode is active, and prevents later enablement. V3 storage remains asynchronous and uses the serialized `pluginSaveStorage` path.
 
+V3 mutation failures retain `committed`, `not-committed`, and `unknown`
+outcomes across the iframe bridge. `setItemWithOutcome()` and
+`removeItemWithOutcome()` expose those results directly, while
+`removeItemConfirmed()` performs a fresh versioned read and reports success
+only after it observes absence. Ambiguous mutations are never replayed. Plugin
+caches, dirty flags, cleanup counters, and reset UI should follow the confirmed
+outcome workflow in [Safe V3 plugin-storage mutations](../plugin-storage-mutation-outcomes.md).
+
 ### MCP-to-model flow
 
 1. Every `requestChatData()` call resolves tools from `arg.tools` or `getTools()` before retries begin (`src/ts/process/request/request.ts:120`, `src/ts/process/request/request.ts:123`).

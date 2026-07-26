@@ -122,6 +122,43 @@ describe("SafeLocalPluginStorage write acknowledgement", () => {
         expect(kv.readPersistentJson).not.toHaveBeenCalled();
     });
 
+    test.each([
+        ["import refusal", "IMPORT_IN_PROGRESS", 503],
+        ["session refusal", "AUTH_REQUIRED", 401],
+    ])("a known-not-committed %s keeps the prior cache", async (_label, code, status) => {
+        const storage = new SafeLocalPluginStorage();
+        const key = `known-write-${code}-${keySequence}`;
+        await storage.setItem(key, { state: "previous" });
+        kv.readPersistentJson.mockClear();
+        kv.writePersistentJson.mockRejectedValueOnce(Object.assign(
+            new Error("write refused"),
+            { code, status, commitOutcomeUnknown: false },
+        ));
+
+        await expect(storage.setItem(key, { state: "not-written" }))
+            .rejects.toThrow("write refused");
+        await expect(storage.getItem(key)).resolves.toEqual({ state: "previous" });
+        expect(kv.readPersistentJson).not.toHaveBeenCalled();
+    });
+
+    test.each([
+        ["import refusal", "IMPORT_IN_PROGRESS", 503],
+        ["session refusal", "AUTH_REQUIRED", 401],
+    ])("a known-not-committed %s keeps the row cached", async (_label, code, status) => {
+        const storage = new SafeLocalPluginStorage();
+        const key = `known-remove-${code}-${keySequence}`;
+        await storage.setItem(key, { state: "still-authoritative" });
+        kv.readPersistentJson.mockClear();
+        kv.removePersistentKey.mockRejectedValueOnce(Object.assign(
+            new Error("remove refused"),
+            { code, status, commitOutcomeUnknown: false },
+        ));
+
+        await expect(storage.removeItem(key)).rejects.toThrow("remove refused");
+        await expect(storage.getItem(key)).resolves.toEqual({ state: "still-authoritative" });
+        expect(kv.readPersistentJson).not.toHaveBeenCalled();
+    });
+
     test("returns detached snapshots on cache misses and hits", async () => {
         const storage = new SafeLocalPluginStorage();
         const key = `read-detached-${keySequence}`;

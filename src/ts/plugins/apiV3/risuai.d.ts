@@ -1035,6 +1035,41 @@ type PluginStorageAtomicBatchResult =
         conflicts: { key: string; revision: string | null; generation: string | null }[];
     };
 
+type PluginStorageMutationFailure = {
+    outcome: 'not-committed' | 'unknown';
+    operation: 'set' | 'remove';
+    message: string;
+    code: string | null;
+    status: number | null;
+    retryAfter: number | null;
+    retryable: boolean;
+    commitOutcomeUnknown: boolean;
+};
+
+type PluginStorageMutationCommitted = {
+    outcome: 'committed';
+    operation: 'set' | 'remove';
+    confirmation: 'acknowledgement' | 'authoritative-absence';
+    /** Outcome of the request before an optional confirmation read. */
+    mutationOutcome: 'committed' | 'unknown';
+};
+
+type PluginStorageMutationOutcome =
+    | PluginStorageMutationCommitted
+    | PluginStorageMutationFailure;
+
+type PluginStorageConfirmedRemoveOutcome =
+    | PluginStorageMutationCommitted
+    | (PluginStorageMutationFailure & {
+        mutationOutcome?: 'committed' | 'not-committed' | 'unknown';
+        /** A row reappeared or remained; re-read it before rebuilding a cache. */
+        authoritative?: {
+            status: 'value';
+            revision: string;
+            generation: string | null;
+        };
+    });
+
 interface PluginStorage {
     /**
      * Gets an item from storage
@@ -1108,11 +1143,30 @@ interface PluginStorage {
     setItem(key: string, value: any): Promise<void>;
 
     /**
+     * Sets once and returns a durable outcome instead of requiring an untyped
+     * error catch. Never retry `unknown`; invalidate/re-read local cache state.
+     */
+    setItemWithOutcome(key: string, value: any): Promise<PluginStorageMutationOutcome>;
+
+    /**
      * Removes an item from storage
      * @param key - Storage key
      * @returns Promise that resolves when item is removed
      */
     removeItem(key: string): Promise<void>;
+
+    /**
+     * Removes once and returns the acknowledgement outcome. A committed result
+     * does not include a later authoritative absence check.
+     */
+    removeItemWithOutcome(key: string): Promise<PluginStorageMutationOutcome>;
+
+    /**
+     * Removes once and verifies a fresh versioned read is missing before
+     * reporting committed. Use this before clearing dirty flags or counting a
+     * cleanup/reset as successful. It never replays an unknown request.
+     */
+    removeItemConfirmed(key: string): Promise<PluginStorageConfirmedRemoveOutcome>;
 
     /**
      * Clears all items from storage

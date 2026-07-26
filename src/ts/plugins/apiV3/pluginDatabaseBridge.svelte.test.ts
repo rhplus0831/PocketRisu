@@ -195,7 +195,12 @@ vi.mock("../../storage/persistentKv", () => {
             verification: "verified" as const,
         };
     },
-    readPersistentPluginStorageState: async (valueKey: string) => {
+    readPersistentPluginStorageState: async (
+        valueKey: string,
+        signal?: AbortSignal | null,
+    ) => {
+        await storageMocks.readGate?.(valueKey, signal);
+        throwIfAborted(signal);
         const value = storageMocks.persistent.get(valueKey);
         return value === undefined
             ? { status: "missing" as const, value: null, revision: null, generation: null }
@@ -574,6 +579,117 @@ describe("V3 mode-aware database bridge", () => {
             expect(await api._keysPluginStorage()).toEqual([]);
         },
     );
+
+    test("carries network, import, session, and ack-loss mutation outcomes through the guest bridge", async () => {
+        const calls = new Map<string, number>();
+        const count = (key: string) => calls.set(key, (calls.get(key) ?? 0) + 1);
+        storageMocks.writeGate = async (key) => {
+            count(key);
+            if (key === storageKey("network-set")) throw new TypeError("network unavailable");
+            if (key === storageKey("import-set")) {
+                throw Object.assign(new Error("import owns storage"), {
+                    outcome: "not-committed",
+                    code: "IMPORT_IN_PROGRESS",
+                    status: 503,
+                    retryAfter: 1,
+                    retryable: true,
+                    commitOutcomeUnknown: false,
+                });
+            }
+        };
+        storageMocks.removeGate = async (key) => {
+            count(key);
+            if (key === storageKey("session-remove")) {
+                throw Object.assign(new Error("session expired"), {
+                    outcome: "not-committed",
+                    code: "AUTH_REQUIRED",
+                    status: 401,
+                    retryable: false,
+                    commitOutcomeUnknown: false,
+                });
+            }
+            if (key === storageKey("ack-remove")) {
+                throw Object.assign(new Error("remove response lost"), {
+                    outcome: "unknown",
+                    code: "COMMIT_OUTCOME_UNKNOWN",
+                    commitOutcomeUnknown: true,
+                });
+            }
+        };
+        const plugin = startupPlugin("Mutation Outcome Bridge", `
+            globalThis.networkSet = await risuai.pluginStorage.setItemWithOutcome(
+                "network-set", "attempted"
+            );
+            globalThis.importSet = await risuai.pluginStorage.setItemWithOutcome(
+                "import-set", "attempted"
+            );
+            globalThis.sessionRemove = await risuai.pluginStorage.removeItemWithOutcome(
+                "session-remove"
+            );
+            globalThis.ackRemove = await risuai.pluginStorage.removeItemWithOutcome(
+                "ack-remove"
+            );
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        try {
+            await loading;
+            const guest = iframe.contentWindow as any;
+            expect(guest.networkSet).toMatchObject({
+                outcome: "unknown",
+                operation: "set",
+                commitOutcomeUnknown: true,
+            });
+            expect(guest.importSet).toMatchObject({
+                outcome: "not-committed",
+                operation: "set",
+                code: "IMPORT_IN_PROGRESS",
+                retryable: true,
+            });
+            expect(guest.sessionRemove).toMatchObject({
+                outcome: "not-committed",
+                operation: "remove",
+                code: "AUTH_REQUIRED",
+            });
+            expect(guest.ackRemove).toMatchObject({
+                outcome: "unknown",
+                operation: "remove",
+                code: "COMMIT_OUTCOME_UNKNOWN",
+            });
+            for (const key of ["network-set", "import-set", "session-remove", "ack-remove"]) {
+                expect(calls.get(storageKey(key))).toBe(1);
+            }
+        } finally {
+            restoreRelay();
+            await teardownV3Plugins();
+        }
+    });
+
+    test("confirmed remove reports a stale authoritative reattach instead of reset success", async () => {
+        const plugin = startupPlugin("Confirmed Remove", "");
+        const api = makeRisuaiAPIV3(document.createElement("iframe"), plugin as any) as any;
+        await api._setPluginStorage("dirty-row", { version: "old" });
+        let reattached = false;
+        storageMocks.readGate = async (key) => {
+            if (key !== storageKey("dirty-row") || reattached) return;
+            reattached = true;
+            storageMocks.persistent.set(key, { version: "authoritative-reattach" });
+        };
+
+        const result = await api._removePluginStorageConfirmed("dirty-row");
+
+        expect(result).toMatchObject({
+            outcome: "unknown",
+            operation: "remove",
+            code: "PLUGIN_STORAGE_VALUE_PRESENT",
+            mutationOutcome: "committed",
+            authoritative: { status: "value" },
+        });
+        expect(await api._getPluginStorage("dirty-row")).toEqual({
+            version: "authoritative-reattach",
+        });
+    });
 
     test("mixes authoritative get/set/pluginStorage with exact and omitted semantics", async () => {
         storageMocks.persistent.set(storageKey("cfg"), { value: "real" });
