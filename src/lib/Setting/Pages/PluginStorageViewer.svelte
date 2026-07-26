@@ -30,7 +30,7 @@
         clearOwnedPluginSaveStorage,
         getPluginSaveStorageItem,
         getPluginSaveStorageKeys,
-        removePluginSaveStorageItem,
+        removeOwnedPluginSaveStorageItem,
         setPluginSaveStorageItem,
     } from 'src/ts/plugins/pluginSaveStorage'
 
@@ -159,7 +159,8 @@
         // dangling entry. (The idb instance here has no owner, so its own
         // removeItem won't touch meta — we clean it explicitly.)
         if (backend === 'save') {
-            await removePluginSaveStorageItem(key)
+            await removeOwnedPluginSaveStorageItem(key)
+            return
         } else if (backend === 'local') {
             safeLocal.removeItem(key)
         } else {

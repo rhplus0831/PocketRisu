@@ -117,8 +117,7 @@ async function streamRisuSaveToFile({
     }
 
     const shouldMarkPluginStorageFolded = markPluginStorageFolded
-        && pluginStorage !== null
-        && dbObj.optimizePluginMemory === true;
+        && pluginStorage !== null;
     const valuePlan = valueRows.length > 0
         || Object.prototype.hasOwnProperty.call(dbObj.pluginCustomStorage ?? {}, '__proto__')
         ? buildPluginMapPlan(dbObj.pluginCustomStorage, valueRows, readPluginRow)

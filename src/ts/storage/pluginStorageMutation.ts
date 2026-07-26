@@ -9,6 +9,8 @@ export type PluginStorageMutationCommitState =
 export interface PluginStorageMutationRequest {
     operation: PluginStorageMutationOperation;
     valueKey: string;
+    /** Active optimized publication selected by the caller's database read. */
+    generation?: string;
     valueBytes?: Uint8Array;
     /** Empty means the value is deliberately unowned and removes stale metadata. */
     owner?: string;
@@ -37,6 +39,7 @@ const NOT_COMMITTED_ACKNOWLEDGEMENTS = new Map<number, {
     retryable: boolean;
 }>([
     [400, { code: "INVALID_PLUGIN_STORAGE_MUTATION", retryable: false }],
+    [409, { code: "PLUGIN_STORAGE_GENERATION_CONFLICT", retryable: true }],
     [500, { code: "PLUGIN_STORAGE_TRANSACTION_ROLLED_BACK", retryable: false }],
     [503, { code: "IMPORT_IN_PROGRESS", retryable: true }],
 ]);

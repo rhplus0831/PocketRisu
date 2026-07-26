@@ -78,7 +78,7 @@ export async function runBoundedAuthoritativeStorageOperation<T>(
             controller.abort()
             const message = `Authoritative storage ${kind} timed out after ${timeoutMs}ms.`
             const ambiguousMutation = mutationRequestInFlight
-                && (kind === "write" || kind === "remove")
+                && (kind === "write" || kind === "remove" || kind === "transition")
             reject(new StorageError(message, {
                 code: ambiguousMutation
                     ? "COMMIT_OUTCOME_UNKNOWN"
@@ -100,7 +100,7 @@ export async function runBoundedAuthoritativeStorageOperation<T>(
             timeout,
         ])
     } catch (error) {
-        const mutation = kind === "write" || kind === "remove"
+        const mutation = kind === "write" || kind === "remove" || kind === "transition"
         if (mutation && mutationRequestInFlight) {
             if (error instanceof StorageError && error.commitOutcomeUnknown) throw error
             throw new StorageError(
@@ -145,6 +145,48 @@ export type BootDatabaseReadResult =
     | { kind: 'bytes', bytes: Buffer | null }
     | { kind: 'decoded', database: Record<string, any> }
 
+export interface StorageReadOptions {
+    pluginStorageGeneration?: string
+    signal?: AbortSignal | null
+}
+
+export interface PluginStorageManifestTransport {
+    version: 1
+    generation: string
+    valueKeys: string[]
+    metaKeys: string[]
+}
+
+export interface PluginStorageMutationTransport {
+    version: 1
+    generation: string
+    expectedManifest: PluginStorageManifestTransport
+    nextManifest: PluginStorageManifestTransport
+    writes: { storageKey: string, valueJson: string }[]
+    deletes: string[]
+}
+
+export interface PluginStorageTransitionTransport {
+    version: 1
+    source: {
+        optimized: boolean
+        generation: string | null
+        manifest: PluginStorageManifestTransport | null
+    }
+    database: Uint8Array
+    expectedEtag?: string
+}
+
+function normalizeStorageReadOptions(
+    options: StorageReadOptions | AbortSignal | null | undefined,
+): StorageReadOptions {
+    if (!options) return {}
+    if ('aborted' in options && 'addEventListener' in options) {
+        return { signal: options as AbortSignal }
+    }
+    return options as StorageReadOptions
+}
+
 export interface ChatBackupSummary {
     chaId: string
     chatId: string
@@ -179,7 +221,7 @@ export class ConflictError extends StorageError {
     }
 }
 
-type StorageOperation = 'read' | 'list' | 'write' | 'remove'
+type StorageOperation = 'read' | 'list' | 'write' | 'remove' | 'transition'
 
 interface StorageFailurePayload {
     error?: unknown
@@ -772,6 +814,86 @@ export class NodeStorage{
         }
     }
 
+    private async sendPluginStorageTransaction(
+        path: string,
+        payload: PluginStorageMutationTransport | PluginStorageTransitionTransport,
+        kind: 'write' | 'transition',
+        externalSignal?: AbortSignal | null,
+    ): Promise<{ etag?: string }> {
+        return runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
+            const response = await this.authFetch(path, {
+                method: 'POST',
+                headers: { 'content-type': 'application/octet-stream' },
+                body: encodeRisuSaveLegacy(payload) as any,
+                signal,
+            }, true, outcome)
+            const failureResponse = response.clone()
+            // Keep the result ambiguous until its acknowledgement body is
+            // available; an HTTP status without the transaction payload is not
+            // proof of commit or rollback.
+            if (kind === 'write') outcome.markRequestDispatched()
+            let result: any = null
+            try {
+                result = await awaitWithAbort(response.json(), signal)
+            } catch (error) {
+                if (kind === 'write') throw error
+            }
+            if (response.status === 409) {
+                outcome.markDefinitiveResponse()
+                throw new ConflictError(
+                    result?.error ?? 'Plugin storage transaction conflict',
+                    result?.currentEtag ?? this._lastDbEtag ?? '',
+                )
+            }
+            if (!response.ok) {
+                const storageError = await this.parseStorageFailureResponse(
+                    failureResponse,
+                    kind,
+                    true,
+                    signal,
+                )
+                if (storageError.commitOutcomeUnknown) throw storageError
+                outcome.markDefinitiveResponse()
+                throw storageError
+            }
+            if (!result || result.success !== true) {
+                throw new StorageError('Invalid plugin storage transaction acknowledgement.', {
+                    code: 'COMMIT_OUTCOME_UNKNOWN',
+                    retryable: false,
+                    commitOutcomeUnknown: true,
+                    operation: kind,
+                })
+            }
+            outcome.markDefinitiveResponse()
+            if (typeof result.etag === 'string') this._lastDbEtag = result.etag
+            return result
+        }, kind, AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+    }
+
+    async commitPluginStorageMutation(
+        plan: PluginStorageMutationTransport,
+        signal?: AbortSignal | null,
+    ): Promise<void> {
+        await this.sendPluginStorageTransaction(
+            '/api/plugin-storage/mutate',
+            plan,
+            'write',
+            signal,
+        )
+    }
+
+    async commitPluginStorageTransition(
+        plan: PluginStorageTransitionTransport,
+        signal?: AbortSignal | null,
+    ): Promise<{ etag?: string }> {
+        return await this.sendPluginStorageTransaction(
+            '/api/plugin-storage/transition',
+            plan,
+            'transition',
+            signal,
+        )
+    }
+
     async setItem(
         key:string,
         value:Uint8Array,
@@ -940,6 +1062,9 @@ export class NodeStorage{
                 'file-path': Buffer.from(stableRequest.valueKey, 'utf-8').toString('hex'),
                 'x-plugin-storage-operation': stableRequest.operation,
             }
+            if (stableRequest.generation) {
+                headers['x-plugin-storage-generation'] = stableRequest.generation
+            }
             if (stableRequest.operation === 'set') {
                 headers['x-plugin-storage-owner'] = Buffer.from(
                     stableRequest.owner ?? '',
@@ -1015,18 +1140,33 @@ export class NodeStorage{
         }
     }
 
-    async getItem(key:string, externalSignal?: AbortSignal | null):Promise<Buffer> {
+    async getItem(
+        key:string,
+        readOptions: StorageReadOptions | AbortSignal | null = {},
+    ):Promise<Buffer> {
+        const options = normalizeStorageReadOptions(readOptions)
         return runBoundedAuthoritativeStorageOperation(
-            signal => this.getItemAuthoritative(key, signal),
+            signal => this.getItemAuthoritative(
+                key,
+                signal,
+                options.pluginStorageGeneration,
+            ),
             "read",
             AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
-            externalSignal,
+            options.signal,
         )
     }
 
-    private async getItemAuthoritative(key: string, signal: AbortSignal): Promise<Buffer> {
+    private async getItemAuthoritative(
+        key: string,
+        signal: AbortSignal,
+        pluginStorageGeneration?: string,
+    ): Promise<Buffer> {
         const headers: Record<string, string> = {
             'file-path': Buffer.from(key, 'utf-8').toString('hex')
+        }
+        if (pluginStorageGeneration) {
+            headers['x-plugin-storage-generation'] = pluginStorageGeneration
         }
 
         const da = await this.requestStorage(key, 'read', false, () => (
@@ -1049,22 +1189,28 @@ export class NodeStorage{
 
     async getItemCached(
         key: string,
-        externalSignal?: AbortSignal | null,
+        readOptions: StorageReadOptions | AbortSignal | null = {},
     ): Promise<Buffer | null> {
+        const options = normalizeStorageReadOptions(readOptions)
         return runBoundedAuthoritativeStorageOperation(
-            signal => this.getItemCachedAuthoritative(key, signal),
+            signal => this.getItemCachedAuthoritative(
+                key,
+                signal,
+                options.pluginStorageGeneration,
+            ),
             "read",
             AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
-            externalSignal,
+            options.signal,
         )
     }
 
     private async getItemCachedAuthoritative(
         key: string,
         signal: AbortSignal,
+        pluginStorageGeneration?: string,
     ): Promise<Buffer | null> {
         if (!isResourceCacheEnabled() || key === 'database/database.bin') {
-            return await this.getItemAuthoritative(key, signal)
+            return await this.getItemAuthoritative(key, signal, pluginStorageGeneration)
         }
 
         const resourceKey = `kv:${key}`
@@ -1080,6 +1226,9 @@ export class NodeStorage{
 
         const plainHeaders: Record<string, string> = {
             'file-path': Buffer.from(key, 'utf-8').toString('hex'),
+        }
+        if (pluginStorageGeneration) {
+            plainHeaders['x-plugin-storage-generation'] = pluginStorageGeneration
         }
         const headers: Record<string, string> = { ...plainHeaders }
         if (manifestHashes.length > 0) {

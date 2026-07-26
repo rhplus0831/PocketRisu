@@ -70,7 +70,7 @@ describe('cached database read route', () => {
   })
 
   test('negotiates generic KV reads while database.bin ignores the cache header', async () => {
-    const key = `pluginsave/${Buffer.from('cache-test').toString('base64url')}.json`
+    const key = 'cache-test/generic.json'
     const encodedKey = Buffer.from(key).toString('hex')
     const value = Buffer.from('{"unicode":"캐시","items":[1,2,3]}')
     const contentHash = sha256(value)
@@ -84,7 +84,7 @@ describe('cached database read route', () => {
       body: new Uint8Array(value),
     })
     expect(writeResponse.status).toBe(200)
-    await expect(writeResponse.json()).resolves.toMatchObject({ success: true, hash: contentHash })
+    await expect(writeResponse.json()).resolves.toMatchObject({ success: true })
 
     const ordinary = await client.fetch('/api/read', { headers: { 'file-path': encodedKey } })
     expect(ordinary.status).toBe(200)

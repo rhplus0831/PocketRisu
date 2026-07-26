@@ -1,6 +1,8 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
+import Database from 'better-sqlite3'
+import path from 'node:path'
 
 const servers: ServerHandle[] = []
 
@@ -63,7 +65,15 @@ async function startSeededServer(failpoint = ''): Promise<{
   })
   servers.push(server)
   const client = await createClient(server.port, server.password)
-  for (const [key, value] of OLD_ROWS) await writeKv(client, key, value)
+  const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'))
+  try {
+    const insert = sqlite.prepare(
+      'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+    )
+    for (const [key, value] of OLD_ROWS) insert.run(key, value, Date.now())
+  } finally {
+    sqlite.close()
+  }
   await writeKv(client, UNRELATED_KEY, UNRELATED_VALUE)
   return { client, server }
 }

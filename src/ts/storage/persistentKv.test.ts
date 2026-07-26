@@ -86,6 +86,16 @@ describe('persistent JSON read transport', () => {
         expect(storage.getItem).not.toHaveBeenCalled()
     })
 
+    it('binds plugin row reads to the selected database generation', async () => {
+        await expect(readPersistentJson<{ source: string }>('pluginsave/value', {
+            cached: true,
+            pluginStorageGeneration: 'selected-generation',
+        })).resolves.toEqual({ source: 'cached' })
+        expect(storage.getItemCached).toHaveBeenCalledWith('pluginsave/value', {
+            pluginStorageGeneration: 'selected-generation',
+        })
+    })
+
     it('rejects a poisoned JSON row instead of treating it as a missing value', async () => {
         storage.getItem.mockResolvedValueOnce(new TextEncoder().encode(''))
 

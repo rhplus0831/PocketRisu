@@ -37,7 +37,10 @@ function chatRowKey(chaId: string, chatId: string): string {
   return `chats/${encodeURIComponent(chaId)}/${encodeURIComponent(chatId)}`
 }
 
-function makeFullDatabase(version: 'old' | 'new'): Record<string, any> {
+function makeFullDatabase(
+  version: 'old' | 'new',
+  includePluginStorage = true,
+): Record<string, any> {
   const databaseEntry = decodeBackup(createSeedBackup({
     characterCount: 2,
     chatsPerCharacter: 2,
@@ -56,12 +59,16 @@ function makeFullDatabase(version: 'old' | 'new'): Record<string, any> {
     }
   }
   database.optimizePluginMemory = true
-  database.pluginCustomStorage = {
-    'shared/key': { version, nested: [version, 1] },
-    [`${version}/only`]: { version },
-  }
-  database.pluginStorageMeta = {
-    'shared/key': { plugin: `${version} plugin`, updatedAt: version === 'old' ? 1 : 2 },
+  database.pluginCustomStorage = includePluginStorage
+    ? {
+        'shared/key': { version, nested: [version, 1] },
+        [`${version}/only`]: { version },
+      }
+    : {}
+  if (includePluginStorage) {
+    database.pluginStorageMeta = {
+      'shared/key': { plugin: `${version} plugin`, updatedAt: version === 'old' ? 1 : 2 },
+    }
   }
   return database
 }
@@ -219,7 +226,7 @@ describe('atomic database writes with external rows', () => {
     const { client, server } = await bootSeeded('key:database/database.bin')
     const before = snapshotExternalRows(server.cwd)
 
-    const response = await writeFullDatabase(client, makeFullDatabase('new'))
+    const response = await writeFullDatabase(client, makeFullDatabase('new', false))
 
     expect(response.status).toBe(500)
     expect(snapshotExternalRows(server.cwd)).toEqual(before)
@@ -229,15 +236,15 @@ describe('atomic database writes with external rows', () => {
     const { client, server } = await bootSeeded('prefix:chats/:2')
     const before = snapshotExternalRows(server.cwd)
 
-    const response = await writeFullDatabase(client, makeFullDatabase('new'))
+    const response = await writeFullDatabase(client, makeFullDatabase('new', false))
 
     expect(response.status).toBe(500)
     expect(snapshotExternalRows(server.cwd)).toEqual(before)
   })
 
-  test('full write commits stripped database, chat rows, plugin rows, and ETag', async () => {
+  test('full write commits chat rows and ETag without changing legacy-owned plugin rows', async () => {
     const { client, server } = await bootSeeded()
-    const incoming = makeFullDatabase('new')
+    const incoming = makeFullDatabase('new', false)
 
     const response = await writeFullDatabase(client, incoming)
 
@@ -263,15 +270,15 @@ describe('atomic database writes with external rows', () => {
     expect(readKv(
       server.cwd,
       pluginStorageKey('pluginsave/', 'shared/key'),
-    )).toEqual(Buffer.from(JSON.stringify(incoming.pluginCustomStorage['shared/key'])))
+    )).toEqual(Buffer.from(JSON.stringify({ version: 'old', nested: ['old', 1] })))
     expect(readKv(
       server.cwd,
       pluginStorageKey('pluginsave/', 'new/only'),
-    )).toEqual(Buffer.from(JSON.stringify(incoming.pluginCustomStorage['new/only'])))
+    )).toBeNull()
     expect(readKv(
       server.cwd,
       pluginStorageKey('pluginsave-meta/', 'shared/key'),
-    )).toEqual(Buffer.from(JSON.stringify(incoming.pluginStorageMeta['shared/key'])))
+    )).toEqual(Buffer.from(JSON.stringify({ plugin: 'old plugin', updatedAt: 1 })))
   })
 
   test('patch removal keeps its row until database.bin and deletion commit together', async () => {

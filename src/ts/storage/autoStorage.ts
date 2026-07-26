@@ -1,4 +1,10 @@
-import { NodeStorage, type PatchItemResult } from "./nodeStorage"
+import {
+    NodeStorage,
+    type PatchItemResult,
+    type PluginStorageMutationTransport,
+    type PluginStorageTransitionTransport,
+    type StorageReadOptions,
+} from "./nodeStorage"
 import type {
     PluginStorageMutationRequest,
     PluginStorageMutationResult,
@@ -19,16 +25,18 @@ export class AutoStorage{
         else await this.realStorage.setItem(key, value, etag)
         return null
     }
-    async getItem(key:string, signal?: AbortSignal | null):Promise<Buffer> {
-        return signal
-            ? await this.realStorage.getItem(key, signal)
-            : await this.realStorage.getItem(key)
+    async getItem(
+        key:string,
+        options: StorageReadOptions | AbortSignal | null = {},
+    ):Promise<Buffer> {
+        return await this.realStorage.getItem(key, options)
     }
-    async getItemCached(key: string, signal?: AbortSignal | null): Promise<Buffer | null> {
+    async getItemCached(
+        key: string,
+        options: StorageReadOptions | AbortSignal | null = {},
+    ): Promise<Buffer | null> {
         await this.Init()
-        return signal
-            ? await this.realStorage.getItemCached(key, signal)
-            : await this.realStorage.getItemCached(key)
+        return await this.realStorage.getItemCached(key, options)
     }
     async readDatabaseForBoot() {
         await this.Init()
@@ -94,6 +102,22 @@ export class AutoStorage{
 
     async patchItem(key: string, patchData: { patch: any[], expectedHash: string }): Promise<PatchItemResult> {
         return await this.realStorage.patchItem(key, patchData)
+    }
+
+    async commitPluginStorageMutation(
+        plan: PluginStorageMutationTransport,
+        signal?: AbortSignal | null,
+    ): Promise<void> {
+        await this.Init()
+        return await this.realStorage.commitPluginStorageMutation(plan, signal)
+    }
+
+    async commitPluginStorageTransition(
+        plan: PluginStorageTransitionTransport,
+        signal?: AbortSignal | null,
+    ) {
+        await this.Init()
+        return await this.realStorage.commitPluginStorageTransition(plan, signal)
     }
 
     /** Get the last known ETag for database.bin */

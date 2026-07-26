@@ -1433,6 +1433,10 @@ export interface Database{
     // on-demand pluginsave/ server entries. V2/V2.1 plugins require the
     // synchronous inline representation and therefore cannot run in this mode.
     optimizePluginMemory?: boolean
+    // PocketRisu-only ownership epoch for external plugin rows. The matching
+    // Node manifest defines their exact active set; unknown fields remain safe
+    // in upstream RisuAI saves.
+    pluginStorageGeneration?: string
     pluginCustomStorage:{[key:string]:any}
     // Best-effort "which plugin last wrote this key" sidecar for the save-file
     // plugin storage. Additive metadata only — never wraps the value itself, so

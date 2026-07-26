@@ -22,6 +22,7 @@ const decodeKey = (value: string) => Buffer.from(
     "base64",
 ).toString("utf-8");
 const cloneJson = <T>(value: T): T => JSON.parse(JSON.stringify(value));
+const manifestKey = "plugin-storage/manifest.json";
 
 vi.mock("../../storage/database.svelte", () => ({
     changeToPreset: vi.fn(),
@@ -70,6 +71,23 @@ vi.mock("../../storage/persistentKv", () => ({
             if (key.startsWith(prefix)) storageMocks.persistent.delete(key);
         }
     },
+    commitPersistentPluginStorageMutation: async (
+        mutation: any,
+        signal?: AbortSignal | null,
+    ) => {
+        for (const write of mutation.writes) {
+            await storageMocks.writeGate?.(write.storageKey, signal);
+            throwIfAborted(signal);
+            storageMocks.persistent.set(write.storageKey, cloneJson(write.value));
+        }
+        for (const key of mutation.deletes) {
+            await storageMocks.removeGate?.(key, signal);
+            throwIfAborted(signal);
+            storageMocks.persistent.delete(key);
+        }
+        storageMocks.persistent.set(manifestKey, cloneJson(mutation.nextManifest));
+    },
+    commitPersistentPluginStorageTransition: vi.fn(),
     decodeStorageKeyComponent: decodeKey,
     listPersistentKeys: async (prefix = "", signal?: AbortSignal | null) => {
         throwIfAborted(signal);
@@ -114,10 +132,25 @@ vi.mock("../../storage/persistentKv", () => ({
     },
     readPersistentJson: async <T>(
         key: string,
-        options: { signal?: AbortSignal | null } = {},
+        options: {
+            signal?: AbortSignal | null;
+            pluginStorageGeneration?: string;
+        } = {},
     ) => {
         await storageMocks.readGate?.(key, options.signal);
         throwIfAborted(options.signal);
+        if (key === manifestKey) {
+            return {
+                version: 1,
+                generation: testState.database.pluginStorageGeneration,
+                valueKeys: [...storageMocks.persistent.keys()].filter(
+                    candidate => candidate.startsWith("pluginsave/"),
+                ),
+                metaKeys: [...storageMocks.persistent.keys()].filter(
+                    candidate => candidate.startsWith("pluginsave-meta/"),
+                ),
+            } as T;
+        }
         const value = storageMocks.persistent.get(key);
         return value === undefined ? null : cloneJson(value) as T;
     },
@@ -219,6 +252,21 @@ function createBridge(onFull = vi.fn()) {
 
 function storageKey(key: string) {
     return `pluginsave/${encodeKey(key)}.json`;
+}
+
+function installManifestOwnedStartupKeys(...keys: string[]) {
+    const storageKeys = keys.map(storageKey);
+    for (const key of storageKeys) {
+        if (!storageMocks.persistent.has(key)) {
+            storageMocks.persistent.set(key, { fixture: true });
+        }
+    }
+    storageMocks.persistent.set(manifestKey, {
+        version: 1,
+        generation: testState.database.pluginStorageGeneration,
+        valueKeys: storageKeys,
+        metaKeys: [],
+    });
 }
 
 function emptyToSave() {
@@ -326,10 +374,17 @@ beforeEach(async () => {
         botPresets: [],
         modules: [],
         optimizePluginMemory: true,
+        pluginStorageGeneration: "bridge-generation",
         pluginCustomStorage: { staleInline: { mustDisappear: true } },
         temperature: 10,
         theme: "default",
     };
+    storageMocks.persistent.set(manifestKey, {
+        version: 1,
+        generation: "bridge-generation",
+        valueKeys: [],
+        metaKeys: [],
+    });
     DBState.db = testState.database;
     await resetAllPluginPermissions();
 });
@@ -886,8 +941,8 @@ describe("V3 mode-aware database bridge", () => {
         let clearStarted!: () => void;
         const clearBlocked = new Promise<void>(resolve => { releaseClear = resolve; });
         const clearWriteStarted = new Promise<void>(resolve => { clearStarted = resolve; });
-        storageMocks.clearGate = async (prefix) => {
-            if (prefix === "pluginsave/") {
+        storageMocks.removeGate = async (key) => {
+            if (key === storageKey("clear-race")) {
                 clearStarted();
                 await clearBlocked;
             }
@@ -900,7 +955,7 @@ describe("V3 mode-aware database bridge", () => {
         await new Promise(resolve => setTimeout(resolve, 0));
         releaseClear();
         await Promise.all([clearing, replacingAfterClear]);
-        storageMocks.clearGate = null;
+        storageMocks.removeGate = null;
         expect(await getPluginSaveStorageSnapshot()).toEqual({ afterClear: true });
         expect(await getOwners("save")).toEqual({});
     });
@@ -1280,6 +1335,7 @@ describe("V3 guest startup handshake", () => {
         const startupReadStarted = deferred();
         const releaseStartupRead = deferred();
         const preprocessorCount = getTTSPreprocessors().length;
+        installManifestOwnedStartupKeys("startup-held");
         storageMocks.readGate = async (key) => {
             if (key === storageKey("startup-held")) {
                 startupReadStarted.resolve();
@@ -1380,6 +1436,7 @@ describe("V3 guest startup handshake", () => {
         const postRegistrationReadStarted = deferred();
         const releasePostRegistrationRead = deferred();
         storageMocks.persistent.set(storageKey("startup-config"), { enabled: true });
+        installManifestOwnedStartupKeys("startup-config", "post-registration");
         storageMocks.readGate = async (key) => {
             if (key === storageKey("startup-config")) {
                 readStarted.resolve();
@@ -1427,6 +1484,7 @@ describe("V3 guest startup handshake", () => {
     test("waits for every guest, reports rejection visibly, and never logs the failed guest as loaded", async () => {
         const slowReadStarted = deferred();
         const releaseSlowRead = deferred();
+        installManifestOwnedStartupKeys("rejected-config", "slow-config");
         storageMocks.readGate = async (key) => {
             if (key === storageKey("rejected-config")) {
                 throw new Error("optimized storage unavailable");
@@ -1490,6 +1548,7 @@ describe("V3 guest startup handshake", () => {
         const postprocessorCount = getTTSPostprocessors().length;
         const disconnectSpy = vi.spyOn(MutationObserver.prototype, "disconnect");
         const removeEventListenerSpy = vi.spyOn(document, "removeEventListener");
+        installManifestOwnedStartupKeys("fail-after-register");
         storageMocks.readGate = async (key) => {
             if (key === storageKey("fail-after-register")) {
                 throw new Error("late startup rejection");

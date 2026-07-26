@@ -7,6 +7,10 @@ import {
     requireCommittedPluginStorageMutation,
     type PluginStorageMutationResult,
 } from "./pluginStorageMutation";
+import type {
+    PluginStorageManifestTransport,
+    PluginStorageTransitionTransport,
+} from "./nodeStorage";
 
 export { hasNativeStringWellFormed } from "./unicodeWellFormed";
 
@@ -43,6 +47,7 @@ function decodeKeyComponent(value: string) {
 export interface PersistentJsonReadOptions {
     cached?: boolean;
     signal?: AbortSignal | null;
+    pluginStorageGeneration?: string;
 }
 
 export type PersistentJsonRow<T> =
@@ -54,12 +59,19 @@ export async function readPersistentJsonRow<T>(
     options: PersistentJsonReadOptions = {},
 ): Promise<PersistentJsonRow<T>> {
     await ensureStorageReady(options.signal);
+    const storageOptions = {
+        ...(options.signal ? { signal: options.signal } : {}),
+        ...(options.pluginStorageGeneration
+            ? { pluginStorageGeneration: options.pluginStorageGeneration }
+            : {}),
+    };
+    const hasStorageOptions = Object.keys(storageOptions).length > 0;
     const data = options.cached
-        ? options.signal
-            ? await forageStorage.getItemCached(storageKey, options.signal)
+        ? hasStorageOptions
+            ? await forageStorage.getItemCached(storageKey, storageOptions)
             : await forageStorage.getItemCached(storageKey)
-        : options.signal
-            ? await forageStorage.getItem(storageKey, options.signal)
+        : hasStorageOptions
+            ? await forageStorage.getItem(storageKey, storageOptions)
             : await forageStorage.getItem(storageKey);
     if (data === null || data === undefined) {
         return { kind: "missing" };
@@ -114,22 +126,27 @@ export async function mutatePersistentPluginStorage<T>(
     value: T,
     owner: string,
     signal?: AbortSignal | null,
+    generation?: string,
 ): Promise<PluginStorageMutationResult>;
 export async function mutatePersistentPluginStorage(
     valueStorageKey: string,
     operation: "remove",
     signal?: AbortSignal | null,
+    generation?: string,
 ): Promise<PluginStorageMutationResult>;
 export async function mutatePersistentPluginStorage<T>(
     valueStorageKey: string,
     operation: "set" | "remove",
     valueOrSignal?: T | AbortSignal | null,
-    owner = "",
+    ownerOrGeneration = "",
     signal?: AbortSignal | null,
+    generation?: string,
 ): Promise<PluginStorageMutationResult> {
     const activeSignal = operation === "remove"
         ? valueOrSignal as AbortSignal | null | undefined
         : signal;
+    const owner = operation === "set" ? ownerOrGeneration : "";
+    const activeGeneration = operation === "set" ? generation : ownerOrGeneration || undefined;
     throwIfAborted(activeSignal);
     // Preserve the ordinary persistent JSON rule: validation and detachment
     // happen before storage initialization or any queued mutation can run.
@@ -142,6 +159,7 @@ export async function mutatePersistentPluginStorage<T>(
         valueKey: valueStorageKey,
         valueBytes,
         owner,
+        ...(activeGeneration ? { generation: activeGeneration } : {}),
     } as const;
     const result = activeSignal
         ? await forageStorage.mutatePluginStorage(request, activeSignal)
@@ -215,6 +233,53 @@ export async function clearExternalizedPluginStorage(
     await ensureStorageReady(signal);
     if (signal) await forageStorage.clearPluginSaveStorage(signal);
     else await forageStorage.clearPluginSaveStorage();
+}
+
+export interface PersistentPluginStorageMutation {
+    generation: string;
+    expectedManifest: PluginStorageManifestTransport;
+    nextManifest: PluginStorageManifestTransport;
+    writes: { storageKey: string; value: unknown }[];
+    deletes: string[];
+}
+
+export async function commitPersistentPluginStorageMutation(
+    mutation: PersistentPluginStorageMutation,
+    signal?: AbortSignal | null,
+): Promise<void> {
+    throwIfAborted(signal);
+    const writes = mutation.writes.map(({ storageKey, value }) => ({
+        storageKey,
+        valueJson: stringifyJsonValue(value),
+    }));
+    await ensureStorageReady(signal);
+    const plan = {
+        version: 1,
+        generation: mutation.generation,
+        expectedManifest: mutation.expectedManifest,
+        nextManifest: mutation.nextManifest,
+        writes,
+        deletes: mutation.deletes,
+    } as const;
+    if (signal) await forageStorage.commitPluginStorageMutation(plan, signal);
+    else await forageStorage.commitPluginStorageMutation(plan);
+}
+
+export async function commitPersistentPluginStorageTransition(
+    transition: PluginStorageTransitionTransport,
+    signal?: AbortSignal | null,
+): Promise<{ etag?: string }> {
+    throwIfAborted(signal);
+    await ensureStorageReady(signal);
+    const plan = {
+        ...transition,
+        expectedEtag: transition.expectedEtag
+            ?? forageStorage.getDbEtag()
+            ?? undefined,
+    };
+    return signal
+        ? await forageStorage.commitPluginStorageTransition(plan, signal)
+        : await forageStorage.commitPluginStorageTransition(plan);
 }
 
 export async function makeHashedStorageKey(prefix: string, rawKey: string): Promise<string> {

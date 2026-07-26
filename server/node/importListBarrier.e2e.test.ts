@@ -180,12 +180,20 @@ async function seedKey(
     key: string,
     value = Buffer.from(JSON.stringify('durable seed')),
 ): Promise<void> {
-    const response = await fetch(`${server.origin}/api/write`, {
+    const pluginValue = key.startsWith('pluginsave/')
+        && !key.startsWith('pluginsave-meta/')
+    const response = await fetch(`${server.origin}${pluginValue
+        ? '/api/plugin-storage/mutate'
+        : '/api/write'}`, {
         method: 'POST',
         headers: {
             ...auth,
             'content-type': 'application/octet-stream',
             'file-path': Buffer.from(key).toString('hex'),
+            ...(pluginValue ? {
+                'x-plugin-storage-operation': 'set',
+                'x-plugin-storage-owner': '',
+            } : {}),
         },
         body: value,
     })
@@ -439,7 +447,11 @@ describe('storage reads and mutations during import', () => {
         const importResult = await withTimeout(pausedImport.finish(), 15_000, 'committed import')
         expect(importResult.status).toBe(200)
         expect(importResult.body).toContain('"type":"done"')
-        expect(await withTimeout(pendingRead, 15_000, 'post-commit read')).toEqual(committed)
+        await expect(withTimeout(pendingRead, 15_000, 'post-commit read'))
+            .rejects.toThrow('Read failed (409)')
+        // A read submitted before publication may not cross into the imported
+        // generation. Refresh database.bin to pin the new generation first.
+        expect(await readKey(server, auth, 'database/database.bin')).toBeTruthy()
         expect(await readKey(server, auth, key)).toEqual(committed)
     }, 60_000)
 

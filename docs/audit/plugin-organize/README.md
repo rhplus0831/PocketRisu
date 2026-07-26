@@ -41,7 +41,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [AA2](atomicity-acknowledgement.md#aa2) | Medium | Fixed | Optimized `clear()` can partially apply |
 | [AA3](atomicity-acknowledgement.md#aa3) | High | Open | No batch/transaction/CAS primitive: the one-second unload deadline can terminate a multi-row commit, leaving a torn but durable generation |
 | [BR1](backup-recovery.md#br1) | Medium | Open | Optimized-only mutations never advance automatic recovery snapshots |
-| [BR2](backup-recovery.md#br2) | Medium | Open | Cross-mode snapshot ownership is ambiguous: unmarked just-disabled snapshots and no storage generation |
+| [BR2](backup-recovery.md#br2) | Medium | Fixed | Cross-mode snapshot ownership is ambiguous: unmarked just-disabled snapshots and no storage generation |
 | [BR3](backup-recovery.md#br3) | Medium | Open | Corrupt-database boot fallback ignores a marked snapshot's exact plugin-row set |
 | [BR4](backup-recovery.md#br4) | Medium | Fixed | Valid long keys produce Node backups the same server refuses to import |
 | [PM1](performance-memory.md#pm1) | Medium | Open | Large plugin values bypass chunking and incur multiple full-size client/server copies |

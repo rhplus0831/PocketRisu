@@ -22,6 +22,7 @@ vi.mock("../globalApi.svelte", () => ({
     globalFetch: vi.fn(),
     readImage: vi.fn(),
     requestImmediateSave,
+    setPatchSyncBaseline: vi.fn(),
     saveAsset: vi.fn(),
     toGetter: (getter: () => unknown) => getter,
 }));
@@ -88,9 +89,16 @@ vi.mock("../storage/persistentKv", () => {
                 `Plugin storage keys must be well-formed Unicode (no unpaired surrogates): ${JSON.stringify(value)}`,
             );
         }
-        return Buffer.from(value, "utf-8").toString("base64url");
+        return Buffer.from(value, "utf-8").toString("base64")
+            .replace(/\+/g, "-")
+            .replace(/\//g, "_")
+            .replace(/=+$/g, "");
     };
-    const decode = (value: string) => Buffer.from(value, "base64url").toString("utf-8");
+    const decode = (value: string) => Buffer.from(
+        value.replace(/-/g, "+").replace(/_/g, "/")
+            .padEnd(Math.ceil(value.length / 4) * 4, "="),
+        "base64",
+    ).toString("utf-8");
     return {
         clearExternalizedPluginStorage: vi.fn(async () => {
             for (const key of persistent.keys()) {
@@ -104,6 +112,14 @@ vi.mock("../storage/persistentKv", () => {
                 if (key.startsWith(prefix)) persistent.delete(key);
             }
         }),
+        commitPersistentPluginStorageMutation: vi.fn(async (mutation: any) => {
+            for (const write of mutation.writes) {
+                persistent.set(write.storageKey, write.value);
+            }
+            for (const key of mutation.deletes) persistent.delete(key);
+            persistent.set("plugin-storage/manifest.json", mutation.nextManifest);
+        }),
+        commitPersistentPluginStorageTransition: vi.fn(),
         decodeStorageKeyComponent: decode,
         listPersistentKeys: vi.fn(async (prefix: string) =>
             [...persistent.keys()].filter((key) => key.startsWith(prefix))
@@ -175,6 +191,7 @@ const {
     PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_SAVE_PREFIX,
+    PLUGIN_STORAGE_MANIFEST_KEY,
     readExternalizedPluginStorage,
     reconcilePluginStorageMode,
     reconcilePluginStorageModeForBoot,
@@ -228,7 +245,26 @@ const ORDERED_SPECIAL_PLUGIN_STORAGE_KEYS = [
 ] as const;
 
 function encoded(prefix: string, key: string) {
-    return `${prefix}${Buffer.from(key, "utf-8").toString("base64url")}.json`;
+    const component = Buffer.from(key, "utf-8").toString("base64")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/g, "");
+    return `${prefix}${component}.json`;
+}
+
+function installOwnershipManifest(
+    generation: string,
+    valueKeys: string[],
+    metaKeys: string[],
+    destination = persistent,
+) {
+    database.pluginStorageGeneration = generation;
+    destination.set(PLUGIN_STORAGE_MANIFEST_KEY, {
+        version: 1,
+        generation,
+        valueKeys,
+        metaKeys,
+    });
 }
 
 type InvalidRecordKind = "accessor" | "symbol" | "non-enumerable";
@@ -272,6 +308,9 @@ beforeEach(async () => {
     teardownV3PluginsMock.mockResolvedValue(undefined);
     loadV3PluginGenerationMock.mockResolvedValue(undefined);
     database = {
+        characters: [],
+        botPresets: [],
+        modules: [],
         optimizePluginMemory: false,
         pluginCustomStorage: {},
         plugins: [],
@@ -294,6 +333,7 @@ beforeEach(async () => {
         restorePersistentPluginStoragePair,
         removePersistentKey,
         writePersistentJson,
+        commitPersistentPluginStorageTransition,
     } = vi.mocked(await import("../storage/persistentKv"));
     listPersistentKeys.mockImplementation(async (prefix: string) =>
         [...persistent.keys()].filter((key) => key.startsWith(prefix))
@@ -346,9 +386,15 @@ beforeEach(async () => {
     ) => {
         persistent.set(key, value);
     });
+    commitPersistentPluginStorageTransition.mockResolvedValue({ etag: "test-etag" });
 });
 
 describe("readExternalizedPluginStorage", () => {
+    beforeEach(() => {
+        // These transport tests model a pre-generation optimized database,
+        // the only legacy state allowed to adopt unmarked external rows.
+        database.optimizePluginMemory = true;
+    });
     test("reads and decodes values and metadata with their respective cache modes", async () => {
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "plain key");
         const unicodeValueKey = encoded(PLUGIN_SAVE_PREFIX, "키🔑");
@@ -398,15 +444,17 @@ describe("readExternalizedPluginStorage", () => {
                 validMetaKey.slice(0, -".json".length),
             ];
         });
-        vi.mocked(readPersistentJson).mockImplementation(async (key: string) =>
-            key === validValueKey ? 42 : { plugin: "Test", updatedAt: 9 }
-        );
+        vi.mocked(readPersistentJson).mockImplementation(async (key: string) => {
+            if (key === PLUGIN_STORAGE_MANIFEST_KEY) return null;
+            return key === validValueKey ? 42 : { plugin: "Test", updatedAt: 9 };
+        });
 
         await expect(readExternalizedPluginStorage()).resolves.toEqual({
             values: { valid: 42 },
             meta: { valid: { plugin: "Test", updatedAt: 9 } },
         });
-        expect(readPersistentJson).toHaveBeenCalledTimes(2);
+        expect(readPersistentJson).toHaveBeenCalledTimes(3);
+        expect(readPersistentJson).toHaveBeenCalledWith(PLUGIN_STORAGE_MANIFEST_KEY);
         expect(readPersistentJson).toHaveBeenCalledWith(validValueKey, { cached: true });
         expect(readPersistentJson).toHaveBeenCalledWith(validMetaKey);
     });
@@ -453,80 +501,6 @@ describe("readExternalizedPluginStorage", () => {
 });
 
 describe("plugin save storage transport", () => {
-    test("cancels optimized owner sidecar persistence with the caller signal", async () => {
-        database.optimizePluginMemory = true;
-        const controller = new AbortController();
-        const { writePersistentJson } = await import("../storage/persistentKv");
-        let markWriteStarted!: () => void;
-        const writeStarted = new Promise<void>((resolve) => {
-            markWriteStarted = resolve;
-        });
-        vi.mocked(writePersistentJson).mockImplementation(async (_key, _value, signal) => {
-            markWriteStarted();
-            await new Promise<void>((resolve, reject) => {
-                const onAbort = () => reject(signal?.reason);
-                signal?.addEventListener("abort", onAbort, { once: true });
-                if (signal?.aborted) onAbort();
-            });
-        });
-
-        const writing = Promise.resolve(recordOwner(
-            "save",
-            "sidecar-key",
-            "Sidecar Plugin",
-            controller.signal,
-        ));
-        await writeStarted;
-        controller.abort(new DOMException("sidecar cancelled", "AbortError"));
-
-        await expect(writing).rejects.toMatchObject({ name: "AbortError" });
-        expect(writePersistentJson).toHaveBeenCalledWith(
-            encoded(PLUGIN_SAVE_META_PREFIX, "sidecar-key"),
-            expect.objectContaining({ plugin: "Sidecar Plugin" }),
-            controller.signal,
-        );
-    });
-
-    test("forwards one signal through optimized owner remove and clear persistence", async () => {
-        database.optimizePluginMemory = true;
-        const controller = new AbortController();
-        const {
-            clearPersistentPrefix,
-            removePersistentKey,
-        } = await import("../storage/persistentKv");
-
-        await removeOwner("save", "sidecar-key", controller.signal);
-        await clearOwners("save", controller.signal);
-
-        expect(removePersistentKey).toHaveBeenCalledWith(
-            encoded(PLUGIN_SAVE_META_PREFIX, "sidecar-key"),
-            controller.signal,
-        );
-        expect(clearPersistentPrefix).toHaveBeenCalledWith(
-            PLUGIN_SAVE_META_PREFIX,
-            controller.signal,
-        );
-    });
-
-    test("optimized owned clear is one fixed-namespace server mutation", async () => {
-        database.optimizePluginMemory = true;
-        persistent.set(encoded(PLUGIN_SAVE_PREFIX, "alpha"), { value: 1 });
-        persistent.set(encoded(PLUGIN_SAVE_META_PREFIX, "alpha"), {
-            plugin: "Plugin",
-            updatedAt: 1,
-        });
-        const {
-            clearExternalizedPluginStorage,
-            clearPersistentPrefix,
-        } = await import("../storage/persistentKv");
-
-        await clearOwnedPluginSaveStorage();
-
-        expect(clearExternalizedPluginStorage).toHaveBeenCalledOnce();
-        expect(clearPersistentPrefix).not.toHaveBeenCalled();
-        expect(persistent.size).toBe(0);
-    });
-
     test("inline owned clear publishes one empty value map", async () => {
         const previousValues = { alpha: { value: 1 } };
         database.pluginCustomStorage = previousValues;
@@ -541,6 +515,33 @@ describe("plugin save storage transport", () => {
         expect(Object.keys(database.pluginCustomStorage)).toEqual([]);
         expect(database.pluginStorageMeta).toBeUndefined();
         expect(clearExternalizedPluginStorage).not.toHaveBeenCalled();
+    });
+
+    test("save-owner viewer APIs filter and mutate only manifest-owned metadata", async () => {
+        database.optimizePluginMemory = true;
+        const activeValue = encoded(PLUGIN_SAVE_PREFIX, "active");
+        const activeMeta = encoded(PLUGIN_SAVE_META_PREFIX, "active");
+        const foreignMeta = encoded(PLUGIN_SAVE_META_PREFIX, "foreign");
+        persistent.set(activeValue, { value: true });
+        persistent.set(activeMeta, { plugin: "Active", updatedAt: 1 });
+        persistent.set(foreignMeta, { plugin: "Foreign", updatedAt: 2 });
+        installOwnershipManifest("viewer-generation", [activeValue], [activeMeta]);
+        const { getOwners, removeOwner } = await import("./pluginStorageMeta");
+
+        await expect(getOwners("save")).resolves.toEqual({ active: "Active" });
+        await removeOwner("save", "active");
+
+        expect(persistent.has(activeMeta)).toBe(false);
+        expect(persistent.get(foreignMeta)).toEqual({
+            plugin: "Foreign",
+            updatedAt: 2,
+        });
+        expect(persistent.get(PLUGIN_STORAGE_MANIFEST_KEY)).toEqual({
+            version: 1,
+            generation: "viewer-generation",
+            valueKeys: [activeValue],
+            metaKeys: [],
+        });
     });
 
     test("opts only externalized plugin values into cached persistent reads", async () => {
@@ -642,6 +643,7 @@ describe("plugin save storage transport", () => {
         const rawKey = "v".repeat(756);
         const valueStorageKey = encoded(PLUGIN_SAVE_PREFIX, rawKey);
         persistent.set(valueStorageKey, { source: "existing-value-only" });
+        installOwnershipManifest("value-only-generation", [valueStorageKey], []);
 
         await expect(updateDatabaseWithPluginStorageSnapshot(
             { [rawKey]: { source: "exact-replacement" } },
@@ -710,6 +712,7 @@ describe("plugin save storage transport", () => {
 
     test("a literal replacement-character key round-trips through optimized storage", async () => {
         database.optimizePluginMemory = true;
+        installOwnershipManifest("transport-generation", [], []);
         const value = { exact: "replacement-character" };
 
         await setPluginSaveStorageItem("�", value);
@@ -811,8 +814,8 @@ describe("plugin save storage transport", () => {
             getterCalls += 1;
         });
         database.pluginCustomStorage = { existing: { safe: true } };
-        database.pluginStorageMeta = invalidMeta;
         const originalValues = database.pluginCustomStorage;
+        database.pluginStorageMeta = invalidMeta;
 
         await expect(setOwnedPluginSaveStorageItem("new-key", { safe: true }, "Plugin"))
             .rejects.toThrow("does not accept an accessor");
@@ -878,18 +881,27 @@ describe("plugin save storage transport", () => {
     test("a stalled write does not block another key and bounds a requested transition", async () => {
         vi.useFakeTimers();
         database.optimizePluginMemory = true;
-        persistent.set(encoded(PLUGIN_SAVE_PREFIX, "beta"), { available: true });
-        const { writePersistentJson } = await import("../storage/persistentKv");
+        const betaKey = encoded(PLUGIN_SAVE_PREFIX, "beta");
+        const alphaKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        persistent.set(betaKey, { available: true });
+        installOwnershipManifest("concurrent-generation", [betaKey], []);
+        const { commitPersistentPluginStorageMutation } = await import(
+            "../storage/persistentKv"
+        );
         let markWriteStarted!: () => void;
         let releaseWrite!: () => void;
         const writeStarted = new Promise<void>(resolve => { markWriteStarted = resolve; });
         const stalledWrite = new Promise<void>(resolve => { releaseWrite = resolve; });
-        vi.mocked(writePersistentJson).mockImplementation(async (storageKey, value) => {
-            if (storageKey === encoded(PLUGIN_SAVE_PREFIX, "alpha")) {
+        vi.mocked(commitPersistentPluginStorageMutation).mockImplementation(async (mutation) => {
+            if (mutation.writes.some(write => write.storageKey === alphaKey)) {
                 markWriteStarted();
                 await stalledWrite;
             }
-            persistent.set(storageKey, value);
+            for (const write of mutation.writes) {
+                persistent.set(write.storageKey, write.value);
+            }
+            for (const key of mutation.deletes) persistent.delete(key);
+            persistent.set(PLUGIN_STORAGE_MANIFEST_KEY, mutation.nextManifest);
         });
 
         try {
@@ -995,8 +1007,9 @@ describe("plugin save storage transport", () => {
         }
 
         expect(enumerated).toEqual(["alpha", "beta", "gamma"]);
-        expect(listPersistentKeys).toHaveBeenCalledTimes(1);
+        expect(listPersistentKeys).toHaveBeenCalledTimes(2);
         expect(listPersistentKeys).toHaveBeenCalledWith(PLUGIN_SAVE_PREFIX);
+        expect(listPersistentKeys).toHaveBeenCalledWith(PLUGIN_SAVE_META_PREFIX);
     });
 });
 
@@ -1019,11 +1032,20 @@ describe("reconcilePluginStorageMode", () => {
                 updatedAt: 1,
             });
         });
+        async function readPersistentJson<T>(key: string): Promise<T> {
+            return persistent.get(key) as T;
+        }
         const dependencies = {
+            listPersistentKeys: vi.fn(async (prefix: string) =>
+                [...persistent.keys()].filter(key => key.startsWith(prefix))
+            ),
+            readPersistentJson,
             writePersistentJson: vi.fn(async (key: string, value: unknown) => {
                 operations.push(`write:${key}`);
                 // The inline copy must still exist until its KV write succeeds.
-                expect(database.pluginCustomStorage.alpha ?? database.pluginStorageMeta?.alpha).toBeTruthy();
+                if (key !== PLUGIN_STORAGE_MANIFEST_KEY) {
+                    expect(database.pluginCustomStorage.alpha ?? database.pluginStorageMeta?.alpha).toBeTruthy();
+                }
                 persistent.set(key, value);
             }),
             persistDatabase,
@@ -1248,6 +1270,7 @@ describe("reconcilePluginStorageMode", () => {
             [valueKey, { value: 1 }],
             [metaKey, { plugin: "Test", updatedAt: 1 }],
         ]);
+        installOwnershipManifest("internalize-order", [valueKey], [metaKey], persistent);
         const operations: string[] = [];
         const readCalls: Array<[string, { cached?: boolean } | undefined]> = [];
         async function readPersistentJson<T>(
@@ -1282,8 +1305,13 @@ describe("reconcilePluginStorageMode", () => {
         });
         expect(operations[0]).toBe("persist");
         expect(persistent.size).toBe(0);
-        expect(readCalls).toContainEqual([valueKey, { cached: true }]);
-        expect(readCalls).toContainEqual([metaKey, undefined]);
+        expect(readCalls).toContainEqual([valueKey, {
+            cached: true,
+            pluginStorageGeneration: "internalize-order",
+        }]);
+        expect(readCalls).toContainEqual([metaKey, {
+            pluginStorageGeneration: "internalize-order",
+        }]);
 
         await expect(reconcilePluginStorageMode({ dependencies })).resolves.toEqual({
             direction: "none",
@@ -1295,6 +1323,7 @@ describe("reconcilePluginStorageMode", () => {
     test("a failed internalizing save leaves every external key intact", async () => {
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
         const persistent = new Map<string, unknown>([[valueKey, 42]]);
+        installOwnershipManifest("failed-internalize", [valueKey], [], persistent);
         const removePersistentKey = vi.fn();
 
         await expect(reconcilePluginStorageMode({
@@ -1317,30 +1346,35 @@ describe("reconcilePluginStorageMode", () => {
         expect(removePersistentKey).not.toHaveBeenCalled();
     });
 
-    test.each([
-        { status: "retry" } as const,
-        { status: "displaced" } as const,
-        { status: "failed", error: new Error("server rejected write") } as const,
-    ])("production $status outcome leaves every external key intact", async (outcome) => {
+    test("a rejected production atomic transition leaves every external key intact", async () => {
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
         const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "alpha");
         persistent.set(valueKey, 42);
         persistent.set(metaKey, { plugin: "Test", updatedAt: 1 });
-        requestImmediateSave.mockResolvedValueOnce(outcome);
-        const { removePersistentKey } = await import("../storage/persistentKv");
+        installOwnershipManifest("production-failure", [valueKey], [metaKey]);
+        const {
+            commitPersistentPluginStorageTransition,
+            removePersistentKey,
+        } = vi.mocked(await import("../storage/persistentKv"));
+        commitPersistentPluginStorageTransition.mockRejectedValueOnce(
+            new Error("atomic transition rejected"),
+        );
 
-        await expect(reconcilePluginStorageMode()).rejects.toThrow("not durably committed");
+        await expect(reconcilePluginStorageMode()).rejects.toThrow("atomic transition rejected");
 
-        expect(requestImmediateSave).toHaveBeenCalledWith({ forceFullWrite: true });
-        expect(database.pluginCustomStorage.alpha).toBe(42);
+        expect(commitPersistentPluginStorageTransition).toHaveBeenCalledOnce();
+        expect(requestImmediateSave).not.toHaveBeenCalled();
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginCustomStorage.alpha).toBeUndefined();
         expect(persistent.get(valueKey)).toBe(42);
         expect(persistent.get(metaKey)).toEqual({ plugin: "Test", updatedAt: 1 });
         expect(removePersistentKey).not.toHaveBeenCalled();
     });
 
-    test("production committed outcome permits external key deletion", async () => {
+    test("production committed outcome publishes the internalized live state", async () => {
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
         persistent.set(valueKey, 42);
+        installOwnershipManifest("production-commit", [valueKey], []);
 
         await expect(reconcilePluginStorageMode()).resolves.toEqual({
             direction: "internalize",
@@ -1348,9 +1382,14 @@ describe("reconcilePluginStorageMode", () => {
             meta: 0,
         });
 
-        expect(requestImmediateSave).toHaveBeenCalledWith({ forceFullWrite: true });
+        const { commitPersistentPluginStorageTransition } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        expect(commitPersistentPluginStorageTransition).toHaveBeenCalledOnce();
+        expect(requestImmediateSave).not.toHaveBeenCalled();
         expect(database.pluginCustomStorage.alpha).toBe(42);
-        expect(persistent.has(valueKey)).toBe(false);
+        // The mocked transport does not emulate the server's physical cleanup.
+        expect(persistent.has(valueKey)).toBe(true);
     });
 
     test("internalized data survives a simulated refresh after external rows are deleted", async () => {
@@ -1358,6 +1397,7 @@ describe("reconcilePluginStorageMode", () => {
         const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "alpha");
         persistent.set(valueKey, { value: 1 });
         persistent.set(metaKey, { plugin: "Test", updatedAt: 1 });
+        installOwnershipManifest("refresh", [valueKey], [metaKey]);
         let persistedDatabase: any = null;
         const dependencies = {
             persistDatabase: vi.fn(async () => {
@@ -1862,6 +1902,140 @@ describe("boot plugin storage reconciliation recovery", () => {
 });
 
 describe("transitionPluginStorageMode", () => {
+    test("production disable rotates generation and sends one snapshot-boundary envelope", async () => {
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "alpha");
+        database.optimizePluginMemory = true;
+        persistent.set(valueKey, { value: "owned" });
+        persistent.set(metaKey, { plugin: "Owner", updatedAt: 1 });
+        installOwnershipManifest("source-generation", [valueKey], [metaKey]);
+        const { commitPersistentPluginStorageTransition } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+
+        await expect(transitionPluginStorageMode(false)).resolves.toEqual({
+            direction: "internalize",
+            values: 1,
+            meta: 1,
+        });
+
+        expect(commitPersistentPluginStorageTransition).toHaveBeenCalledOnce();
+        const envelope = commitPersistentPluginStorageTransition.mock.calls[0][0];
+        expect(envelope.source).toEqual({
+            optimized: true,
+            generation: "source-generation",
+            manifest: {
+                version: 1,
+                generation: "source-generation",
+                valueKeys: [valueKey],
+                metaKeys: [metaKey],
+            },
+        });
+        expect(envelope.database).toBeInstanceOf(Uint8Array);
+        expect(envelope.database.byteLength).toBeGreaterThan(0);
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginStorageGeneration).not.toBe("source-generation");
+        expect(database.pluginCustomStorage).toEqual({ alpha: { value: "owned" } });
+        expect(database.pluginStorageMeta).toEqual({
+            alpha: { plugin: "Owner", updatedAt: 1 },
+        });
+    });
+
+    test("enabling an exact empty inline set quarantines stale unmarked rows", async () => {
+        const staleKey = encoded(PLUGIN_SAVE_PREFIX, "stale");
+        persistent.set(staleKey, { resurrected: false });
+        database.optimizePluginMemory = false;
+        database.pluginCustomStorage = {};
+
+        await expect(transitionPluginStorageMode(true, {
+            dependencies: { persistDatabase: vi.fn(async () => undefined) },
+        })).resolves.toEqual({ direction: "externalize", values: 0, meta: 0 });
+
+        expect(database.optimizePluginMemory).toBe(true);
+        expect(database.pluginStorageGeneration).toEqual(expect.any(String));
+        expect(persistent.get(staleKey)).toEqual({ resurrected: false });
+        expect(persistent.get(PLUGIN_STORAGE_MANIFEST_KEY)).toEqual({
+            version: 1,
+            generation: database.pluginStorageGeneration,
+            valueKeys: [],
+            metaKeys: [],
+        });
+        await expect(getPluginSaveStorageItem("stale")).resolves.toBeNull();
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual([]);
+    });
+
+    test("a foreign generation is never overlaid while disabling", async () => {
+        const foreignKey = encoded(PLUGIN_SAVE_PREFIX, "foreign");
+        database.optimizePluginMemory = true;
+        database.pluginStorageGeneration = "selected-generation";
+        database.pluginCustomStorage = { inlineRecovery: "selected" };
+        persistent.set(foreignKey, "foreign-value");
+        persistent.set(PLUGIN_STORAGE_MANIFEST_KEY, {
+            version: 1,
+            generation: "other-generation",
+            valueKeys: [foreignKey],
+            metaKeys: [],
+        });
+
+        await expect(transitionPluginStorageMode(false, {
+            dependencies: { persistDatabase: vi.fn(async () => undefined) },
+        })).resolves.toEqual({ direction: "internalize", values: 0, meta: 0 });
+
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginCustomStorage).toEqual({ inlineRecovery: "selected" });
+        expect(persistent.get(foreignKey)).toBe("foreign-value");
+        expect(persistent.has(PLUGIN_STORAGE_MANIFEST_KEY)).toBe(false);
+        await expect(readExternalizedPluginStorage()).resolves.toEqual({
+            values: {},
+            meta: {},
+        });
+    });
+
+    test("a matching manifest internalizes only its exact row set", async () => {
+        const activeKey = encoded(PLUGIN_SAVE_PREFIX, "active");
+        const foreignKey = encoded(PLUGIN_SAVE_PREFIX, "foreign");
+        database.optimizePluginMemory = true;
+        database.pluginStorageGeneration = "matching-generation";
+        persistent.set(activeKey, "owned");
+        persistent.set(foreignKey, "quarantined");
+        persistent.set(PLUGIN_STORAGE_MANIFEST_KEY, {
+            version: 1,
+            generation: "matching-generation",
+            valueKeys: [activeKey],
+            metaKeys: [],
+        });
+
+        await expect(transitionPluginStorageMode(false, {
+            dependencies: { persistDatabase: vi.fn(async () => undefined) },
+        })).resolves.toEqual({ direction: "internalize", values: 1, meta: 0 });
+
+        expect(database.pluginCustomStorage).toEqual({ active: "owned" });
+        expect(persistent.has(activeKey)).toBe(false);
+        expect(persistent.get(foreignKey)).toBe("quarantined");
+    });
+
+    test("legacy unmarked optimized rows are adopted into a new generation", async () => {
+        const legacyKey = encoded(PLUGIN_SAVE_PREFIX, "legacy");
+        database.optimizePluginMemory = true;
+        database.pluginCustomStorage = {};
+        persistent.set(legacyKey, { compatible: true });
+
+        await expect(reconcilePluginStorageMode({
+            dependencies: { persistDatabase: vi.fn(async () => undefined) },
+        })).resolves.toEqual({ direction: "externalize", values: 0, meta: 0 });
+
+        expect(database.pluginStorageGeneration).toEqual(expect.any(String));
+        expect(persistent.get(PLUGIN_STORAGE_MANIFEST_KEY)).toEqual({
+            version: 1,
+            generation: database.pluginStorageGeneration,
+            valueKeys: [legacyKey],
+            metaKeys: [],
+        });
+        await expect(getPluginSaveStorageItem("legacy")).resolves.toEqual({
+            compatible: true,
+        });
+    });
+
     test("durably saves a disabled plugin before surfacing a rejecting unload", async () => {
         database.plugins = [{
             name: "Disable despite unload error",
@@ -2287,6 +2461,8 @@ describe("transitionPluginStorageMode", () => {
         });
 
         expect(database.optimizePluginMemory).toBe(true);
+        const enabledGeneration = database.pluginStorageGeneration;
+        expect(enabledGeneration).toEqual(expect.any(String));
         expect(Object.keys(database.pluginCustomStorage)).toEqual([]);
         expect(database.pluginStorageMeta).toBeUndefined();
         await expect(getPluginSaveStorageKeys()).resolves.toEqual(
@@ -2309,6 +2485,8 @@ describe("transitionPluginStorageMode", () => {
         });
 
         expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginStorageGeneration).toEqual(expect.any(String));
+        expect(database.pluginStorageGeneration).not.toBe(enabledGeneration);
         expect(Object.getPrototypeOf(database.pluginCustomStorage)).toBe(Object.prototype);
         expect(Object.getPrototypeOf(database.pluginStorageMeta)).toBe(Object.prototype);
         expect(Object.keys(database.pluginCustomStorage)).toEqual(
@@ -2377,7 +2555,7 @@ describe("transitionPluginStorageMode", () => {
         },
     );
 
-    test("enable preflight rejects a poisoned retained orphan value before mutation", async () => {
+    test("enable quarantines a poisoned unmarked orphan instead of adopting it", async () => {
         let getterCalls = 0;
         const invalid = makeInvalidRecord("accessor", () => {
             getterCalls += 1;
@@ -2385,7 +2563,6 @@ describe("transitionPluginStorageMode", () => {
         const orphanKey = encoded(PLUGIN_SAVE_PREFIX, "orphan");
         database.optimizePluginMemory = false;
         database.pluginCustomStorage = { inline: { safe: true } };
-        const originalValues = database.pluginCustomStorage;
         persistent.set(orphanKey, "durable-row-sentinel");
         const readCalls: Array<[string, { cached?: boolean } | undefined]> = [];
         async function readPersistentJson<T>(
@@ -2406,25 +2583,23 @@ describe("transitionPluginStorageMode", () => {
                 removePersistentKey,
                 persistDatabase,
             },
-        })).rejects.toThrow("does not accept accessors");
+        })).resolves.toEqual({ direction: "externalize", values: 1, meta: 0 });
 
-        expect(database.optimizePluginMemory).toBe(false);
-        expect(database.pluginCustomStorage).toBe(originalValues);
+        expect(database.optimizePluginMemory).toBe(true);
+        expect(database.pluginCustomStorage).toEqual({});
         expect(getterCalls).toBe(0);
-        expect(readCalls).toContainEqual([orphanKey, { cached: true }]);
-        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(readCalls).not.toContainEqual([orphanKey, { cached: true }]);
+        expect(writePersistentJson).toHaveBeenCalled();
         expect(removePersistentKey).not.toHaveBeenCalled();
-        expect(persistDatabase).not.toHaveBeenCalled();
+        expect(persistDatabase).toHaveBeenCalledOnce();
         expect(persistent.get(orphanKey)).toBe("durable-row-sentinel");
     });
 
-    test("enable preflight propagates a retained orphan metadata parse failure", async () => {
+    test("enable quarantines an unmarked metadata row without parsing it", async () => {
         const orphanMetaKey = encoded(PLUGIN_SAVE_META_PREFIX, "orphan");
         database.optimizePluginMemory = false;
         database.pluginCustomStorage = { inline: { safe: true } };
         database.pluginStorageMeta = { inline: { plugin: "Plugin", updatedAt: 1 } };
-        const originalValues = database.pluginCustomStorage;
-        const originalMeta = database.pluginStorageMeta;
         persistent.set(orphanMetaKey, "corrupt-json-sentinel");
         async function readPersistentJson<T>(key: string): Promise<T> {
             if (key === orphanMetaKey) {
@@ -2443,14 +2618,14 @@ describe("transitionPluginStorageMode", () => {
                 removePersistentKey,
                 persistDatabase,
             },
-        })).rejects.toThrow(SyntaxError);
+        })).resolves.toEqual({ direction: "externalize", values: 1, meta: 1 });
 
-        expect(database.optimizePluginMemory).toBe(false);
-        expect(database.pluginCustomStorage).toBe(originalValues);
-        expect(database.pluginStorageMeta).toBe(originalMeta);
-        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(database.optimizePluginMemory).toBe(true);
+        expect(database.pluginCustomStorage).toEqual({});
+        expect(database.pluginStorageMeta).toBeUndefined();
+        expect(writePersistentJson).toHaveBeenCalled();
         expect(removePersistentKey).not.toHaveBeenCalled();
-        expect(persistDatabase).not.toHaveBeenCalled();
+        expect(persistDatabase).toHaveBeenCalledOnce();
         expect(persistent.get(orphanMetaKey)).toBe("corrupt-json-sentinel");
     });
 
@@ -2471,7 +2646,10 @@ describe("transitionPluginStorageMode", () => {
             dependencies: { readPersistentJson, writePersistentJson, persistDatabase },
         })).resolves.toEqual({ direction: "externalize", values: 1, meta: 0 });
 
-        expect(readPersistentJson).not.toHaveBeenCalled();
+        expect(readPersistentJson).not.toHaveBeenCalledWith(
+            overwrittenKey,
+            expect.anything(),
+        );
         expect(database.optimizePluginMemory).toBe(true);
         expect(persistent.get(overwrittenKey)).toEqual({ newest: true });
     });
@@ -2573,6 +2751,7 @@ describe("transitionPluginStorageMode", () => {
         database.optimizePluginMemory = true;
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
         persistent.set(valueKey, "old");
+        installOwnershipManifest("queued-set-generation", [valueKey], []);
         const { listPersistentKeys } = await import("../storage/persistentKv");
         let releaseCount!: () => void;
         let markCountStarted!: () => void;
@@ -2622,6 +2801,7 @@ describe("transitionPluginStorageMode", () => {
         database.optimizePluginMemory = true;
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
         persistent.set(valueKey, "old");
+        installOwnershipManifest("queued-remove-generation", [valueKey], []);
         const { listPersistentKeys } = await import("../storage/persistentKv");
         let releaseCount!: () => void;
         let markCountStarted!: () => void;
@@ -2710,6 +2890,7 @@ describe("transitionPluginStorageMode", () => {
         database.optimizePluginMemory = true;
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
         persistent.set(valueKey, "old");
+        installOwnershipManifest("rollback-generation", [valueKey], []);
         const persistDatabase = vi.fn()
             .mockRejectedValueOnce(new Error("transition save failed"))
             .mockResolvedValueOnce(undefined);
@@ -2725,6 +2906,27 @@ describe("transitionPluginStorageMode", () => {
         expect(database.optimizePluginMemory).toBe(true);
         expect(database.pluginCustomStorage).toEqual({});
         expect(persistent.get(valueKey)).toBe("after-failure");
+        expect(persistDatabase).toHaveBeenCalledTimes(2);
+    });
+
+    test("an interrupted enable restores inline ownership and quarantines no stale row", async () => {
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        database.optimizePluginMemory = false;
+        database.pluginCustomStorage = { alpha: "inline-before-enable" };
+        const persistDatabase = vi.fn()
+            .mockRejectedValueOnce(new Error("enable database save failed"))
+            .mockResolvedValueOnce(undefined);
+
+        await expect(transitionPluginStorageMode(true, {
+            dependencies: { persistDatabase },
+        })).rejects.toThrow("enable database save failed");
+
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginCustomStorage).toEqual({
+            alpha: "inline-before-enable",
+        });
+        expect(persistent.has(valueKey)).toBe(false);
+        expect(persistent.has(PLUGIN_STORAGE_MANIFEST_KEY)).toBe(false);
         expect(persistDatabase).toHaveBeenCalledTimes(2);
     });
 

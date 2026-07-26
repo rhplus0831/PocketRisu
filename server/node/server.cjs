@@ -102,6 +102,10 @@ const {
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_STORAGE_FOLDED_MARKER,
     assertArchiveSafePluginSaveStorageKey,
+    PLUGIN_STORAGE_GENERATION_FIELD,
+    PLUGIN_STORAGE_MANIFEST_KEY,
+    createPluginStorageManifest,
+    parsePluginStorageManifest,
     decodePluginSaveStorageKey,
     encodePluginSaveStorageKey,
 } = require('./pluginSaveKeys.cjs');
@@ -605,12 +609,17 @@ function logDuplicateCharacterIdReassignments(result) {
 }
 
 async function ingestDatabaseStreaming(source, { inspection = null } = {}) {
+    const streamedPluginValueKeys = new Set();
+    const streamedPluginMetaKeys = new Set();
+    let foldedPluginStorage = false;
     const result = await chatRowStore.ingestStreamingDatabase(source, {
         inspection: inspection ?? await inspectRisuSaveSource(source),
         tempDir: savePath,
         onPluginStorageFolded: () => {
+            foldedPluginStorage = true;
             kvDelPrefix(PLUGIN_SAVE_PREFIX);
             kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
+            kvDel(PLUGIN_STORAGE_MANIFEST_KEY);
         },
         onPluginStorageEntry: ({ field, key, value }) => {
             const prefix = field === 'pluginStorageMeta'
@@ -618,6 +627,23 @@ async function ingestDatabaseStreaming(source, { inspection = null } = {}) {
                 : PLUGIN_SAVE_PREFIX;
             const storageKey = encodeValidatedPluginStorageKey(key, prefix);
             kvSet(storageKey, serializePluginStorageRow(storageKey, value));
+            (prefix === PLUGIN_SAVE_META_PREFIX
+                ? streamedPluginMetaKeys
+                : streamedPluginValueKeys).add(storageKey);
+        },
+        onPluginStorageComplete: ({ dbObj, pluginStats }) => {
+            if (!foldedPluginStorage && !pluginStats?.changed) return;
+            const generation = foldedPluginStorage
+                && typeof dbObj[PLUGIN_STORAGE_GENERATION_FIELD] === 'string'
+                && dbObj[PLUGIN_STORAGE_GENERATION_FIELD].length > 0
+                ? dbObj[PLUGIN_STORAGE_GENERATION_FIELD]
+                : nodeCrypto.randomUUID();
+            dbObj[PLUGIN_STORAGE_GENERATION_FIELD] = generation;
+            writePluginStorageManifest(createPluginStorageManifest(
+                generation,
+                streamedPluginValueKeys,
+                streamedPluginMetaKeys,
+            ));
         },
         restoreColdStorageCharacters: (dbObj) => {
             const coldRestoreResult = restoreColdStorageCharactersInDb(dbObj);
@@ -835,6 +861,7 @@ async function persistDbCache(filePath, decodedKey) {
         // Must stay synchronous: better-sqlite3 commits when this callback returns.
         sqliteDb.transaction(() => {
             writePluginStorageRows(pluginExternalization.rows);
+            writePluginStorageManifest(pluginExternalization.manifest);
             kvSet(decodedKey, data);
             for (const key of chatRowsToDelete) kvDel(key);
         })();
@@ -1734,6 +1761,23 @@ async function checkDiskSpace(requiredBytes) {
 // same protection extends across devices. The last client to call /api/session
 // becomes the active writer; older sessions receive 423 on write attempts.
 let activeSessionId = null // string | null
+const pluginStorageReadStateBySession = new Map();
+
+function rememberSessionPluginStorageState(req, dbObj) {
+    const clientSessionId = req.headers['x-session-id'];
+    if (typeof clientSessionId !== 'string' || clientSessionId.length === 0) return;
+    pluginStorageReadStateBySession.set(clientSessionId, {
+        optimized: dbObj?.optimizePluginMemory === true,
+        generation: pluginStorageGeneration(dbObj),
+    });
+}
+
+function sessionPluginStorageReadState(req) {
+    const clientSessionId = req.headers['x-session-id'];
+    return typeof clientSessionId === 'string'
+        ? pluginStorageReadStateBySession.get(clientSessionId) ?? null
+        : null;
+}
 
 function checkActiveSession(req, res) {
     const clientSessionId = req.headers['x-session-id']
@@ -2488,6 +2532,7 @@ function preparePluginStorageExternalization(dbObj) {
                 clearExisting: false,
                 values: 0,
                 meta: 0,
+                manifest: null,
             };
         }
         const strippedDb = { ...dbObj };
@@ -2500,6 +2545,7 @@ function preparePluginStorageExternalization(dbObj) {
             clearExisting: false,
             values: 0,
             meta: 0,
+            manifest: null,
         };
     }
 
@@ -2520,9 +2566,31 @@ function preparePluginStorageExternalization(dbObj) {
             value: serializePluginStorageRow(storageKey, value),
         });
     }
-    const strippedDb = { ...dbObj, pluginCustomStorage: {} };
+    const exactFoldedSet = dbObj[PLUGIN_STORAGE_FOLDED_MARKER] === true;
+    const generation = exactFoldedSet
+        && typeof dbObj[PLUGIN_STORAGE_GENERATION_FIELD] === 'string'
+        && dbObj[PLUGIN_STORAGE_GENERATION_FIELD].length > 0
+        ? dbObj[PLUGIN_STORAGE_GENERATION_FIELD]
+        : nodeCrypto.randomUUID();
+    const strippedDb = {
+        ...dbObj,
+        [PLUGIN_STORAGE_GENERATION_FIELD]: generation,
+        pluginCustomStorage: {},
+    };
     delete strippedDb.pluginStorageMeta;
     delete strippedDb[PLUGIN_STORAGE_FOLDED_MARKER];
+    // A folded marker is already exact. Unmarked inline data is an import or
+    // defensive monolith and starts a fresh generation rather than unioning
+    // rows left by the previously selected database.
+    const activeValueKeys = new Set();
+    const activeMetaKeys = new Set();
+    for (const row of rows) {
+        if (row.storageKey.startsWith(PLUGIN_SAVE_META_PREFIX)) {
+            activeMetaKeys.add(row.storageKey);
+        } else {
+            activeValueKeys.add(row.storageKey);
+        }
+    }
     return {
         strippedDb,
         rows,
@@ -2531,6 +2599,11 @@ function preparePluginStorageExternalization(dbObj) {
         clearExisting: dbObj[PLUGIN_STORAGE_FOLDED_MARKER] === true,
         values: valueEntries.length,
         meta: metaEntries.length,
+        manifest: createPluginStorageManifest(
+            generation,
+            activeValueKeys,
+            activeMetaKeys,
+        ),
     };
 }
 
@@ -2538,6 +2611,317 @@ function writePluginStorageRows(rows) {
     for (const row of rows) {
         validatePluginStorageRow(row.storageKey, row.value);
         kvSet(row.storageKey, row.value);
+    }
+}
+
+function writePluginStorageManifest(manifest) {
+    if (!manifest) return;
+    kvSet(
+        PLUGIN_STORAGE_MANIFEST_KEY,
+        Buffer.from(JSON.stringify(manifest), 'utf-8'),
+    );
+}
+
+function pluginStorageManifestEquals(left, right) {
+    if (left === null || right === null) return left === right;
+    if (left.generation !== right.generation) return false;
+    const sameKeys = (a, b) => (
+        a.length === b.length
+        && new Set(a).size === a.length
+        && a.every((key) => b.includes(key))
+    );
+    return sameKeys(left.valueKeys, right.valueKeys)
+        && sameKeys(left.metaKeys, right.metaKeys);
+}
+
+function normalizePluginStorageManifestRequest(value, fieldName, { nullable = false } = {}) {
+    if (value === null && nullable) return null;
+    const manifest = parsePluginStorageManifest(value);
+    if (!manifest) throw new TypeError(`${fieldName} is not a valid plugin storage manifest`);
+    return manifest;
+}
+
+function readPluginStorageManifestState(readValue = kvGet) {
+    const raw = readValue(PLUGIN_STORAGE_MANIFEST_KEY);
+    if (!raw) return { manifest: null, present: false, valid: true };
+    try {
+        const manifest = parsePluginStorageManifest(JSON.parse(raw.toString('utf-8')));
+        return { manifest, present: true, valid: manifest !== null };
+    } catch {
+        return { manifest: null, present: true, valid: false };
+    }
+}
+
+function pluginStorageGeneration(dbObj) {
+    return typeof dbObj?.[PLUGIN_STORAGE_GENERATION_FIELD] === 'string'
+        && dbObj[PLUGIN_STORAGE_GENERATION_FIELD].length > 0
+        ? dbObj[PLUGIN_STORAGE_GENERATION_FIELD]
+        : null;
+}
+
+function canonicalPluginStorageRowPrefix(storageKey) {
+    const prefix = typeof storageKey === 'string' && storageKey.startsWith(PLUGIN_SAVE_META_PREFIX)
+        ? PLUGIN_SAVE_META_PREFIX
+        : typeof storageKey === 'string' && storageKey.startsWith(PLUGIN_SAVE_PREFIX)
+            ? PLUGIN_SAVE_PREFIX
+            : null;
+    if (!prefix) return null;
+    try {
+        decodePluginSaveStorageKey(storageKey, prefix);
+        return prefix;
+    } catch {
+        return null;
+    }
+}
+
+async function readLivePluginStoragePublication() {
+    await flushPendingDb();
+    const rawDatabase = kvGet('database/database.bin');
+    const dbObj = rawDatabase ? await decodeRisuSave(rawDatabase) : null;
+    return {
+        dbObj,
+        generation: pluginStorageGeneration(dbObj),
+        manifestState: readPluginStorageManifestState(),
+    };
+}
+
+function pluginStorageNamespaceConflict(message) {
+    const error = new Error(message);
+    error.pluginStorageNamespaceConflict = true;
+    return error;
+}
+
+function assertGenericPluginStorageMutationAllowed(storageKey, publication) {
+    if (storageKey === 'database/database.bin') {
+        const hasPublishedPluginStorage = publication.generation
+            || publication.manifestState.present
+            || (publication.dbObj?.optimizePluginMemory === true && (
+                kvList(PLUGIN_SAVE_PREFIX).length > 0
+                || kvList(PLUGIN_SAVE_META_PREFIX).length > 0
+            ));
+        if (hasPublishedPluginStorage) {
+            throw pluginStorageNamespaceConflict(
+                'database.bin cannot be removed while it selects a plugin storage publication',
+            );
+        }
+        return;
+    }
+    if (storageKey === PLUGIN_STORAGE_MANIFEST_KEY) {
+        throw pluginStorageNamespaceConflict(
+            'The plugin storage manifest can only be changed by an atomic plugin storage transaction',
+        );
+    }
+    const prefix = canonicalPluginStorageRowPrefix(storageKey);
+    if (!prefix) return;
+
+    const { dbObj, generation, manifestState } = publication;
+    // As soon as a generation or manifest exists, the whole canonical row
+    // namespace is reserved. Unlisted physical names are quarantined, not an
+    // alternate generic-write channel into a future publication.
+    if (generation || manifestState.present) {
+        throw pluginStorageNamespaceConflict(
+            'The generated plugin storage namespace can only be changed atomically',
+        );
+    }
+
+    // The sole generic compatibility path is an absent row staged after a
+    // pre-generation optimized database has selected legacy external storage.
+    // Existing legacy rows are implicitly owned; disabled/missing databases do
+    // not authorize a generic pluginsave namespace at all.
+    if (dbObj?.optimizePluginMemory === true && kvGet(storageKey) === null) return;
+    throw pluginStorageNamespaceConflict(
+        'Only an absent legacy plugin storage row may be staged generically',
+    );
+}
+
+function assertGenericDatabasePluginPublicationAllowed(
+    livePublication,
+    incomingDb,
+    pluginExternalization,
+) {
+    const liveDb = livePublication.dbObj;
+    const liveGeneration = livePublication.generation;
+    const incomingGeneration = pluginStorageGeneration(incomingDb);
+    const manifestState = livePublication.manifestState;
+    const touchesPublication = pluginExternalization.rows.length > 0
+        || pluginExternalization.manifest !== null
+        || pluginExternalization.clearExisting === true;
+    const hasPhysicalRows = kvList(PLUGIN_SAVE_PREFIX).length > 0
+        || kvList(PLUGIN_SAVE_META_PREFIX).length > 0;
+
+    if (!liveDb) {
+        if (manifestState.present || (hasPhysicalRows && (
+            incomingDb?.optimizePluginMemory !== true
+            || incomingGeneration !== null
+            || touchesPublication
+        ))) {
+            throw pluginStorageNamespaceConflict(
+                'Existing plugin storage rows must be adopted as an unchanged legacy publication',
+            );
+        }
+        return;
+    }
+
+    if (liveGeneration || manifestState.present) {
+        if (
+            incomingDb?.optimizePluginMemory !== (liveDb.optimizePluginMemory === true)
+            || incomingGeneration !== liveGeneration
+            || touchesPublication
+        ) {
+            throw pluginStorageNamespaceConflict(
+                'Plugin storage mode, generation, rows, and manifest must be changed atomically',
+            );
+        }
+        return;
+    }
+
+    if (liveDb.optimizePluginMemory === true && hasPhysicalRows && (
+        incomingDb?.optimizePluginMemory !== true
+        || incomingGeneration !== null
+        || touchesPublication
+    )) {
+        throw pluginStorageNamespaceConflict(
+            'Legacy plugin storage must be adopted by an atomic plugin storage transition',
+        );
+    }
+}
+
+async function readGenerationBoundPluginStorageRow(req, storageKey) {
+    const explicitGeneration = req.headers['x-plugin-storage-generation'];
+    if (explicitGeneration !== undefined
+        && (typeof explicitGeneration !== 'string' || explicitGeneration.length === 0)) {
+        throw new TypeError('x-plugin-storage-generation must be a non-empty string');
+    }
+    const pinnedState = sessionPluginStorageReadState(req);
+    if (typeof explicitGeneration === 'string' && pinnedState && (
+        pinnedState.optimized !== true
+        || pinnedState.generation !== explicitGeneration
+    )) {
+        throw pluginStorageNamespaceConflict(
+            'The requested plugin storage generation does not match this session database',
+        );
+    }
+    const expectedState = typeof explicitGeneration === 'string'
+        ? { optimized: true, generation: explicitGeneration }
+        : pinnedState;
+
+    return queueStorageOperation(async () => {
+        const publication = await readLivePluginStoragePublication();
+        const { dbObj, generation, manifestState } = publication;
+        const prefix = canonicalPluginStorageRowPrefix(storageKey);
+        if (!prefix) throw new TypeError('Invalid plugin storage row key');
+
+        const activeManifest = generation
+            && dbObj?.optimizePluginMemory === true
+            && manifestState.valid
+            && manifestState.manifest?.generation === generation
+            ? manifestState.manifest
+            : null;
+        const legacyPublication = !generation
+            && dbObj?.optimizePluginMemory === true
+            && !manifestState.present;
+
+        if (!expectedState) {
+            if (activeManifest || legacyPublication) {
+                throw pluginStorageNamespaceConflict(
+                    'Read database.bin before reading authoritative plugin storage rows',
+                );
+            }
+            return kvGet(storageKey);
+        }
+        if (
+            expectedState.optimized !== (dbObj?.optimizePluginMemory === true)
+            || expectedState.generation !== generation
+        ) {
+            throw pluginStorageNamespaceConflict(
+                'Plugin storage generation changed before the row could be read',
+            );
+        }
+
+        if (generation) {
+            if (!activeManifest) {
+                throw pluginStorageNamespaceConflict(
+                    'The selected plugin storage generation has no matching manifest',
+                );
+            }
+            const ownedKeys = prefix === PLUGIN_SAVE_META_PREFIX
+                ? activeManifest.metaKeys
+                : activeManifest.valueKeys;
+            // Exact ownership is also enforced at the read boundary. A foreign
+            // physical row must look absent even if a caller guesses its name.
+            return ownedKeys.includes(storageKey) ? kvGet(storageKey) : null;
+        }
+        if (!legacyPublication) {
+            throw pluginStorageNamespaceConflict(
+                'The legacy plugin storage publication changed before the row could be read',
+            );
+        }
+        return kvGet(storageKey);
+    });
+}
+
+function assertPluginStorageSource(source, liveDb, manifestState) {
+    if (!source || typeof source !== 'object' || Array.isArray(source)) {
+        throw new TypeError('source must be an object');
+    }
+    if (typeof source.optimized !== 'boolean') {
+        throw new TypeError('source.optimized must be a boolean');
+    }
+    const expectedGeneration = source.generation === null
+        ? null
+        : typeof source.generation === 'string' && source.generation.length > 0
+            ? source.generation
+            : undefined;
+    if (expectedGeneration === undefined) {
+        throw new TypeError('source.generation must be null or a non-empty string');
+    }
+    const expectedManifest = normalizePluginStorageManifestRequest(
+        source.manifest,
+        'source.manifest',
+        { nullable: true },
+    );
+    const liveOptimized = liveDb?.optimizePluginMemory === true;
+    const liveGeneration = pluginStorageGeneration(liveDb);
+    if (
+        liveOptimized !== source.optimized
+        || liveGeneration !== expectedGeneration
+        || !manifestState.valid
+        || !pluginStorageManifestEquals(manifestState.manifest, expectedManifest)
+    ) {
+        const error = new Error('Plugin storage state changed while the operation was being prepared');
+        error.pluginStorageConflict = true;
+        throw error;
+    }
+}
+
+function resolveOwnedPluginStorageKeys(dbObj, reader = { kvGet, kvList }) {
+    const manifestState = readPluginStorageManifestState(reader.kvGet);
+    const generation = pluginStorageGeneration(dbObj);
+    if (generation && manifestState.valid && manifestState.manifest?.generation === generation) {
+        const physicalValues = new Set(reader.kvList(PLUGIN_SAVE_PREFIX));
+        const physicalMeta = new Set(reader.kvList(PLUGIN_SAVE_META_PREFIX));
+        return {
+            valueKeys: manifestState.manifest.valueKeys.filter(key => physicalValues.has(key)),
+            metaKeys: manifestState.manifest.metaKeys.filter(key => physicalMeta.has(key)),
+        };
+    }
+    if (
+        !generation
+        && !manifestState.present
+        && dbObj?.optimizePluginMemory === true
+    ) {
+        return {
+            valueKeys: reader.kvList(PLUGIN_SAVE_PREFIX),
+            metaKeys: reader.kvList(PLUGIN_SAVE_META_PREFIX),
+        };
+    }
+    return { valueKeys: [], metaKeys: [] };
+}
+
+function maybeFailPluginStorageTransaction(req, boundary) {
+    if (process.env.POCKETRISU_PLUGIN_STORAGE_TEST_FAILPOINTS !== '1') return;
+    if (req.headers['x-plugin-storage-failpoint'] === boundary) {
+        throw new Error(`Injected plugin storage failure at ${boundary}`);
     }
 }
 
@@ -2557,12 +2941,15 @@ function externalizePluginStorageIfNeeded(dbObj) {
             kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
         }
         writePluginStorageRows(prepared.rows);
+        writePluginStorageManifest(prepared.manifest);
     });
     writeRows();
 
     if (prepared.externalized) {
         dbObj.pluginCustomStorage = {};
         delete dbObj.pluginStorageMeta;
+        dbObj[PLUGIN_STORAGE_GENERATION_FIELD]
+            = prepared.strippedDb[PLUGIN_STORAGE_GENERATION_FIELD];
     }
     delete dbObj[PLUGIN_STORAGE_FOLDED_MARKER];
     return {
@@ -2578,6 +2965,26 @@ function parsePluginSaveJson(storageKey, readValue = kvGet) {
         throw new PluginStorageValidationError(storageKey);
     }
     return validatePluginStorageRow(storageKey, value);
+}
+
+function readPluginStorageManifest(readValue = kvGet) {
+    return readPluginStorageManifestState(readValue).manifest;
+}
+
+function resolveOwnedPluginStorageRows(dbObj, reader) {
+    const { valueKeys, metaKeys } = resolveOwnedPluginStorageKeys(dbObj, reader);
+
+    return {
+        valueRows: valueKeys.map((storageKey) => ({
+            key: decodeValidatedPluginStorageKey(storageKey, PLUGIN_SAVE_PREFIX),
+            source: storageKey,
+        })),
+        metaRows: metaKeys.map((storageKey) => ({
+            key: decodeValidatedPluginStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX),
+            source: storageKey,
+        })),
+        readRow: (storageKey) => parsePluginSaveJson(storageKey, reader.kvGet),
+    };
 }
 
 /**
@@ -2600,17 +3007,7 @@ async function spoolSelfContainedBackupDatabase(
     );
     const filePath = finalPath + '.tmp';
     const pluginStorage = foldPluginStorage
-        ? {
-            valueRows: reader.kvList(PLUGIN_SAVE_PREFIX).map((storageKey) => ({
-                key: decodeValidatedPluginStorageKey(storageKey, PLUGIN_SAVE_PREFIX),
-                source: storageKey,
-            })),
-            metaRows: reader.kvList(PLUGIN_SAVE_META_PREFIX).map((storageKey) => ({
-                key: decodeValidatedPluginStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX),
-                source: storageKey,
-            })),
-            readRow: (storageKey) => parsePluginSaveJson(storageKey, reader.kvGet),
-        }
+        ? resolveOwnedPluginStorageRows(strippedDb, reader)
         : null;
 
     try {
@@ -2668,21 +3065,49 @@ async function buildSelfContainedBackupDatabase({
     }
 }
 
-function listPluginBackupEntries(reader = { kvListWithSizes }) {
-    return [PLUGIN_SAVE_PREFIX, PLUGIN_SAVE_META_PREFIX].flatMap((prefix) => (
-        reader.kvListWithSizes(prefix).map((entry) => {
-            // Export and import use the same validator. This catches legacy or
-            // manually inserted rows before an archive is published.
-            resolveBackupStorageKey(entry.key);
-            return {
-                kind: 'kv',
-                key: entry.key,
-                backupName: entry.key,
-                sortKey: entry.key,
-                size: entry.size,
-            };
-        })
-    ));
+async function listPluginBackupEntries(
+    reader = { kvGet, kvList, kvListWithSizes },
+) {
+    const rawDatabase = reader.kvGet('database/database.bin');
+    if (!rawDatabase) return [];
+    const dbObj = await decodeRisuSave(rawDatabase);
+    const owned = resolveOwnedPluginStorageKeys(dbObj, reader);
+    const sizes = new Map([
+        ...reader.kvListWithSizes(PLUGIN_SAVE_PREFIX),
+        ...reader.kvListWithSizes(PLUGIN_SAVE_META_PREFIX),
+    ].map(entry => [entry.key, entry.size]));
+    const rows = [...owned.valueKeys, ...owned.metaKeys].map((key) => {
+        // Export and import use the same validator. This catches legacy or
+        // manually inserted rows before an archive is published.
+        resolveBackupStorageKey(key);
+        return {
+            kind: 'kv',
+            key,
+            backupName: key,
+            sortKey: key,
+            size: sizes.get(key) ?? Buffer.byteLength(reader.kvGet(key) ?? Buffer.alloc(0)),
+        };
+    });
+    const manifestState = readPluginStorageManifestState(reader.kvGet);
+    const generation = pluginStorageGeneration(dbObj);
+    const manifestSize = reader.kvListWithSizes(PLUGIN_STORAGE_MANIFEST_KEY)
+        .find(entry => entry.key === PLUGIN_STORAGE_MANIFEST_KEY)?.size;
+    if (
+        dbObj.optimizePluginMemory === true
+        && generation
+        && manifestState.valid
+        && manifestState.manifest?.generation === generation
+        && manifestSize !== undefined
+    ) {
+        rows.push({
+            kind: 'kv',
+            key: PLUGIN_STORAGE_MANIFEST_KEY,
+            backupName: PLUGIN_STORAGE_MANIFEST_KEY,
+            sortKey: PLUGIN_STORAGE_MANIFEST_KEY,
+            size: manifestSize,
+        });
+    }
+    return rows;
 }
 
 function assertBackupEntryNameWithinLimit(name) {
@@ -2728,6 +3153,10 @@ function resolveBackupStorageKey(name) {
             throw new Error(`Invalid inlay sidecar backup entry name: ${name}`);
         }
         return name;
+    }
+
+    if (name === PLUGIN_STORAGE_MANIFEST_KEY) {
+        return PLUGIN_STORAGE_MANIFEST_KEY;
     }
 
     if (
@@ -2926,6 +3355,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         // values folded in database.risudat. Either way, stale rows must go.
         kvDelPrefix(PLUGIN_SAVE_PREFIX);
         kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
+        kvDel(PLUGIN_STORAGE_MANIFEST_KEY);
         // Composer drafts are session/device-local and not carried in the backup;
         // wipe stale ones so an old snapshot's chats don't resurrect later drafts.
         kvDelPrefix('drafts/');
@@ -4089,7 +4519,18 @@ app.get('/api/read', async (req, res, next) => {
             value = readAssetValue(key);
         }
         if (value === null && !key.startsWith('assets/')) {
-            value = kvGet(key);
+            if (canonicalPluginStorageRowPrefix(key)) {
+                try {
+                    value = await readGenerationBoundPluginStorageRow(req, key);
+                } catch (error) {
+                    if (error?.pluginStorageNamespaceConflict) {
+                        return res.status(409).json({ error: error.message });
+                    }
+                    throw error;
+                }
+            } else {
+                value = kvGet(key);
+            }
         }
         if(value === null){
             res.send();
@@ -4098,7 +4539,9 @@ app.get('/api/read', async (req, res, next) => {
             // ever leaks a payload into the live row.
             if (key === 'database/database.bin') {
                 try {
-                    value = (await prepareLiveDatabaseRead(value, 'Read')).fullBlob;
+                    const prepared = await prepareLiveDatabaseRead(value, 'Read');
+                    value = prepared.fullBlob;
+                    rememberSessionPluginStorageState(req, prepared.strippedDatabase);
                 } catch (e) {
                     // Log the Error itself (not just e.message) so logger.*
                     // tags it and the Express middleware won't re-log after next().
@@ -4165,6 +4608,7 @@ app.post('/api/db/read-cached', (req, res, next) => {
             return res.status(409).json({ error: error.message });
         }
         const envelope = buildCachedDbReadEnvelope(encodedSegments, inventory, prepared.etag);
+        rememberSessionPluginStorageState(req, prepared.strippedDatabase);
         res.setHeader('x-db-etag', prepared.etag);
         res.setHeader('Content-Type', 'application/octet-stream');
         res.send(encodeCachedDbReadEnvelope(envelope));
@@ -4239,6 +4683,21 @@ app.get('/api/remove', async (req, res, next) => {
     try {
         await queueStorageMutation(async () => {
             const key = Buffer.from(filePath, 'hex').toString('utf-8');
+            if (key === 'database/database.bin'
+                || key === PLUGIN_STORAGE_MANIFEST_KEY
+                || canonicalPluginStorageRowPrefix(key)) {
+                try {
+                    assertGenericPluginStorageMutationAllowed(
+                        key,
+                        await readLivePluginStoragePublication(),
+                    );
+                } catch (error) {
+                    if (error?.pluginStorageNamespaceConflict) {
+                        return res.status(409).json({ error: error.message });
+                    }
+                    throw error;
+                }
+            }
             if (key.startsWith('inlay/')) {
                 const id = key.slice('inlay/'.length)
                 await deleteInlayFile(id)
@@ -4309,6 +4768,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
     const firstHeader = (value) => Array.isArray(value) ? value[0] : value;
     const filePath = firstHeader(req.headers['file-path']);
     const operation = firstHeader(req.headers['x-plugin-storage-operation']);
+    const requestedGeneration = firstHeader(req.headers['x-plugin-storage-generation']);
     const ownerHeader = firstHeader(req.headers['x-plugin-storage-owner']) ?? '';
     const ownerPolicyHeader = firstHeader(req.headers['x-plugin-storage-owner-policy']) ?? '';
     const ownerRecordHeader = firstHeader(req.headers['x-plugin-storage-owner-record']);
@@ -4321,8 +4781,19 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
         retryable: false,
     });
 
+    // BR2 batch/CAS publications share this endpoint with AA1's exact
+    // value+owner acknowledgement protocol. Dispatch by the canonical AA1
+    // operation header so only one route owns the namespace and writer queue.
+    if (operation === undefined) {
+        return handlePluginStorageManifestMutation(req, res, next);
+    }
+
     if (operation !== 'set' && operation !== 'remove') {
         return reject('Plugin storage operation must be set or remove.');
+    }
+    if (requestedGeneration !== undefined
+        && (typeof requestedGeneration !== 'string' || requestedGeneration.length === 0)) {
+        return reject('Plugin storage generation must be a non-empty string.');
     }
     if (typeof filePath !== 'string' || !isHex(filePath)) {
         return reject('A valid value row path is required.');
@@ -4401,7 +4872,54 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
     }
 
     try {
-        await queueStorageMutation(() => {
+        await queueStorageMutation(async () => {
+            const publication = await readLivePluginStoragePublication();
+            const liveGeneration = publication.generation;
+            const activeManifest = liveGeneration
+                && publication.dbObj?.optimizePluginMemory === true
+                && publication.manifestState.valid
+                && publication.manifestState.manifest?.generation === liveGeneration
+                ? publication.manifestState.manifest
+                : null;
+            const pinnedState = sessionPluginStorageReadState(req);
+            if (
+                (requestedGeneration !== undefined && (
+                    requestedGeneration !== liveGeneration
+                    || !activeManifest
+                    || (pinnedState && (
+                        pinnedState.optimized !== true
+                        || pinnedState.generation !== requestedGeneration
+                    ))
+                ))
+                || (liveGeneration && requestedGeneration === undefined)
+            ) {
+                return res.status(409).json({
+                    success: false,
+                    outcome: 'not-committed',
+                    operation,
+                    error: 'Plugin storage generation changed before the mutation committed.',
+                    code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
+                    retryable: true,
+                });
+            }
+            const nextValueKeys = new Set(activeManifest?.valueKeys ?? []);
+            const nextMetaKeys = new Set(activeManifest?.metaKeys ?? []);
+            if (activeManifest) {
+                if (operation === 'set') nextValueKeys.add(valueKey);
+                else nextValueKeys.delete(valueKey);
+                if (operation === 'remove' || ownerPolicy === 'replace' && !owner) {
+                    nextMetaKeys.delete(ownerKey);
+                } else if (operation === 'set' && ownerPolicy !== 'preserve') {
+                    nextMetaKeys.add(ownerKey);
+                }
+            }
+            const nextManifest = activeManifest
+                ? createPluginStorageManifest(
+                    liveGeneration,
+                    nextValueKeys,
+                    nextMetaKeys,
+                )
+                : null;
             const preservedOwner = ownerPolicy === 'preserve' ? kvGet(ownerKey) : null;
             try {
                 sqliteDb.transaction(() => {
@@ -4426,6 +4944,9 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                         hitPluginStorageMutationFailpoint('owner-remove');
                         kvDel(ownerKey);
                     }
+                    maybeFailPluginStorageTransaction(req, 'after-row');
+                    writePluginStorageManifest(nextManifest);
+                    maybeFailPluginStorageTransaction(req, 'after-manifest');
                     hitPluginStorageMutationFailpoint('pre-commit');
                 })();
             } catch (error) {
@@ -4452,6 +4973,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 hitPluginStorageMutationFailpoint('verification-read');
                 const storedValue = kvGet(valueKey);
                 const storedOwner = kvGet(ownerKey);
+                const storedManifest = readPluginStorageManifest();
                 const valueMatches = operation === 'set'
                     ? storedValue !== null && storedValue.equals(valueBytes)
                     : storedValue === null;
@@ -4464,7 +4986,8 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                             ? storedOwner !== null
                                 && JSON.parse(storedOwner.toString('utf-8'))?.plugin === owner
                             : storedOwner === null;
-                if (!valueMatches || !ownerMatches) {
+                if (!valueMatches || !ownerMatches
+                    || !pluginStorageManifestEquals(storedManifest, nextManifest)) {
                     throw new Error('Committed plugin storage rows failed verification.');
                 }
             } catch (error) {
@@ -4568,6 +5091,257 @@ app.delete('/api/logs', async (req, res, next) => {
     }
 });
 
+async function handlePluginStorageManifestMutation(req, res, next) {
+    try {
+        const plan = await decodeRisuSave(req.body);
+        await queueStorageMutation(async () => {
+            await flushPendingDb();
+            const rawDatabase = kvGet('database/database.bin');
+            if (!rawDatabase) return res.status(409).json({ error: 'Database not found' });
+            const liveDb = await decodeRisuSave(rawDatabase);
+            const generation = typeof plan?.generation === 'string' && plan.generation.length > 0
+                ? plan.generation
+                : null;
+            const expectedManifest = normalizePluginStorageManifestRequest(
+                plan?.expectedManifest,
+                'expectedManifest',
+            );
+            const nextManifest = normalizePluginStorageManifestRequest(
+                plan?.nextManifest,
+                'nextManifest',
+            );
+            const manifestState = readPluginStorageManifestState();
+            if (
+                plan?.version !== 1
+                || !generation
+                || liveDb?.optimizePluginMemory !== true
+                || pluginStorageGeneration(liveDb) !== generation
+                || !manifestState.valid
+                || !pluginStorageManifestEquals(manifestState.manifest, expectedManifest)
+                || expectedManifest.generation !== generation
+                || nextManifest.generation !== generation
+            ) {
+                return res.status(409).json({
+                    error: 'Plugin storage state changed while the mutation was being prepared',
+                });
+            }
+
+            const writes = Array.isArray(plan.writes) ? plan.writes : null;
+            const deletes = Array.isArray(plan.deletes) ? plan.deletes : null;
+            if (!writes || !deletes) {
+                return res.status(400).json({ error: 'writes and deletes must be arrays' });
+            }
+            const nextValueKeys = new Set(expectedManifest.valueKeys);
+            const nextMetaKeys = new Set(expectedManifest.metaKeys);
+            const seen = new Set();
+            const classify = (storageKey) => {
+                if (typeof storageKey !== 'string') throw new TypeError('storage key must be a string');
+                const prefix = storageKey.startsWith(PLUGIN_SAVE_META_PREFIX)
+                    ? PLUGIN_SAVE_META_PREFIX
+                    : storageKey.startsWith(PLUGIN_SAVE_PREFIX)
+                        ? PLUGIN_SAVE_PREFIX
+                        : null;
+                if (!prefix) throw new TypeError(`Invalid plugin storage key: ${storageKey}`);
+                decodePluginSaveStorageKey(storageKey, prefix);
+                if (seen.has(storageKey)) throw new TypeError(`Duplicate plugin storage mutation: ${storageKey}`);
+                seen.add(storageKey);
+                return prefix === PLUGIN_SAVE_META_PREFIX ? nextMetaKeys : nextValueKeys;
+            };
+            const preparedWrites = writes.map((write) => {
+                const keys = classify(write?.storageKey);
+                if (typeof write?.valueJson !== 'string') {
+                    throw new TypeError('Plugin storage writes require valueJson');
+                }
+                const value = Buffer.from(write.valueJson, 'utf-8');
+                validatePluginStorageRow(write.storageKey, value);
+                keys.add(write.storageKey);
+                return { storageKey: write.storageKey, value };
+            });
+            const preparedDeletes = deletes.map((storageKey) => {
+                const keys = classify(storageKey);
+                keys.delete(storageKey);
+                return storageKey;
+            });
+            const derivedManifest = createPluginStorageManifest(
+                generation,
+                nextValueKeys,
+                nextMetaKeys,
+            );
+            if (!pluginStorageManifestEquals(derivedManifest, nextManifest)) {
+                return res.status(400).json({
+                    error: 'nextManifest does not exactly match the requested row mutations',
+                });
+            }
+
+            sqliteDb.transaction(() => {
+                for (const write of preparedWrites) {
+                    kvSet(write.storageKey, write.value);
+                    maybeFailPluginStorageTransaction(req, 'after-row');
+                }
+                for (const storageKey of preparedDeletes) {
+                    kvDel(storageKey);
+                    maybeFailPluginStorageTransaction(req, 'after-row');
+                }
+                writePluginStorageManifest(nextManifest);
+                maybeFailPluginStorageTransaction(req, 'after-manifest');
+            })();
+            res.json({ success: true });
+        });
+    } catch (error) {
+        if (isImportInProgressError(error)) {
+            res.setHeader('Retry-After', '5');
+            return res.status(503).json({
+                success: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+                error: 'An import is in progress; retry this mutation after it completes',
+                code: 'IMPORT_IN_PROGRESS',
+                retryable: true,
+            });
+        }
+        next(error);
+    }
+}
+
+app.post('/api/plugin-storage/transition', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const plan = await decodeRisuSave(req.body);
+        if (plan?.version !== 1 || !(plan.database instanceof Uint8Array)) {
+            return res.status(400).json({ error: 'Invalid plugin storage transition envelope' });
+        }
+        const targetDatabaseBytes = Buffer.from(plan.database);
+        const targetDb = await decodeRisuSave(targetDatabaseBytes);
+        await queueStorageMutation(async () => {
+            await flushPendingDb();
+            const rawDatabase = kvGet('database/database.bin');
+            if (!rawDatabase) return res.status(409).json({ error: 'Database not found' });
+            const liveDb = await decodeRisuSave(rawDatabase);
+            const manifestState = readPluginStorageManifestState();
+            try {
+                assertPluginStorageSource(plan.source, liveDb, manifestState);
+            } catch (error) {
+                if (error?.pluginStorageConflict) {
+                    return res.status(409).json({ error: error.message, currentEtag: dbEtag });
+                }
+                throw error;
+            }
+            if (plan.expectedEtag && dbEtag && plan.expectedEtag !== dbEtag) {
+                return res.status(409).json({
+                    error: 'ETag mismatch - concurrent modification detected',
+                    currentEtag: dbEtag,
+                });
+            }
+
+            const targetOptimized = targetDb?.optimizePluginMemory === true;
+            const targetGeneration = pluginStorageGeneration(targetDb);
+            if (!targetGeneration || targetGeneration === pluginStorageGeneration(liveDb)) {
+                return res.status(400).json({
+                    error: 'A plugin storage transition must publish a fresh generation',
+                });
+            }
+            if (
+                !targetDb.pluginCustomStorage
+                || typeof targetDb.pluginCustomStorage !== 'object'
+                || Array.isArray(targetDb.pluginCustomStorage)
+                || (Object.hasOwn(targetDb, 'pluginStorageMeta') && (
+                    !targetDb.pluginStorageMeta
+                    || typeof targetDb.pluginStorageMeta !== 'object'
+                    || Array.isArray(targetDb.pluginStorageMeta)
+                ))
+            ) {
+                return res.status(400).json({ error: 'Invalid inline plugin storage records' });
+            }
+            const losses = findStubFlagLossChats(targetDb);
+            if (losses.length > 0 || findDuplicateChaIds(targetDb).length > 0) {
+                return res.status(400).json({ error: 'Plugin storage transition failed database integrity checks' });
+            }
+
+            const sourceKeys = resolveOwnedPluginStorageKeys(liveDb);
+            if (targetOptimized) {
+                // The marker tells the shared ingest helper that the supplied
+                // inline maps are an exact generation, including an empty set.
+                targetDb[PLUGIN_STORAGE_FOLDED_MARKER] = true;
+            } else {
+                delete targetDb[PLUGIN_STORAGE_FOLDED_MARKER];
+            }
+            const splitDatabase = chatRowStore.splitFullDb(targetDb);
+            const chatRows = splitDatabase.chatEntries.map(entry => ({
+                ...entry,
+                value: Buffer.from(encodeRisuSaveLegacy(entry.chat)),
+            }));
+            const pluginExternalization = targetOptimized
+                ? preparePluginStorageExternalization(splitDatabase.strippedDb)
+                : {
+                    strippedDb: splitDatabase.strippedDb,
+                    rows: [],
+                    manifest: null,
+                };
+            if (
+                targetOptimized
+                && pluginExternalization.manifest?.generation !== targetGeneration
+            ) {
+                return res.status(400).json({ error: 'Target plugin generation was not preserved' });
+            }
+            const targetKeys = new Set([
+                ...(pluginExternalization.manifest?.valueKeys ?? []),
+                ...(pluginExternalization.manifest?.metaKeys ?? []),
+            ]);
+            const persistedDatabaseContent = Buffer.from(
+                encodeRisuSaveLegacy(pluginExternalization.strippedDb),
+            );
+
+            sqliteDb.transaction(() => {
+                for (const row of pluginExternalization.rows) {
+                    kvSet(row.storageKey, row.value);
+                    maybeFailPluginStorageTransaction(req, 'after-row');
+                }
+                for (const storageKey of [...sourceKeys.valueKeys, ...sourceKeys.metaKeys]) {
+                    if (targetKeys.has(storageKey)) continue;
+                    kvDel(storageKey);
+                    maybeFailPluginStorageTransaction(req, 'after-row');
+                }
+                if (pluginExternalization.manifest) {
+                    writePluginStorageManifest(pluginExternalization.manifest);
+                } else {
+                    kvDel(PLUGIN_STORAGE_MANIFEST_KEY);
+                }
+                maybeFailPluginStorageTransaction(req, 'after-manifest');
+                for (const row of chatRows) {
+                    chatRowStore.writeChatRowRaw(row.chaId, row.chatId, row.value);
+                }
+                kvSet('database/database.bin', persistedDatabaseContent);
+                chatRowStore.deleteRemovedChatRows(liveDb, pluginExternalization.strippedDb);
+                maybeFailPluginStorageTransaction(req, 'after-database');
+            })();
+
+            invalidateDbCache();
+            dbEtag = computeBufferEtag(persistedDatabaseContent);
+            rememberSessionPluginStorageState(req, pluginExternalization.strippedDb);
+            try {
+                await createBackupAndRotate();
+            } catch (error) {
+                logger.error('[Plugin storage] post-transition backup failed:', error);
+            }
+            res.json({ success: true, etag: dbEtag });
+        });
+    } catch (error) {
+        if (isImportInProgressError(error)) {
+            res.setHeader('Retry-After', '5');
+            return res.status(503).json({
+                success: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+                error: 'An import is in progress; retry this transition after it completes',
+                code: 'IMPORT_IN_PROGRESS',
+                retryable: true,
+            });
+        }
+        next(error);
+    }
+});
+
 app.post('/api/write', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
@@ -4586,6 +5360,12 @@ app.post('/api/write', async (req, res, next) => {
     try {
         await queueStorageMutation(async () => {
             const key = Buffer.from(filePath, 'hex').toString('utf-8');
+            const protectsPluginPublication = key === 'database/database.bin'
+                || key === PLUGIN_STORAGE_MANIFEST_KEY
+                || canonicalPluginStorageRowPrefix(key);
+            const livePluginPublication = protectsPluginPublication
+                ? await readLivePluginStoragePublication()
+                : null;
             let persistedDatabaseContent = fileContent;
             if (
                 key.startsWith(PLUGIN_SAVE_PREFIX)
@@ -4633,6 +5413,16 @@ app.post('/api/write', async (req, res, next) => {
                     };
                     res.status(400).json(diagnostic);
                     return;
+                }
+            }
+            if (key !== 'database/database.bin' && protectsPluginPublication) {
+                try {
+                    assertGenericPluginStorageMutationAllowed(key, livePluginPublication);
+                } catch (error) {
+                    if (error?.pluginStorageNamespaceConflict) {
+                        return res.status(409).json({ error: error.message });
+                    }
+                    throw error;
                 }
             }
 
@@ -4723,6 +5513,11 @@ app.post('/api/write', async (req, res, next) => {
                     const pluginExternalization = preparePluginStorageExternalization(
                         splitDatabase.strippedDb
                     );
+                    assertGenericDatabasePluginPublicationAllowed(
+                        livePluginPublication,
+                        splitDatabase.strippedDb,
+                        pluginExternalization,
+                    );
                     const strippedDb = pluginExternalization.strippedDb;
                     if (chatRows.length > 0 || pluginExternalization.changed) {
                         persistedDatabaseContent = Buffer.from(encodeRisuSaveLegacy(strippedDb));
@@ -4732,6 +5527,7 @@ app.post('/api/write', async (req, res, next) => {
                     // commit or roll back together with database.bin.
                     sqliteDb.transaction(() => {
                         writePluginStorageRows(pluginExternalization.rows);
+                        writePluginStorageManifest(pluginExternalization.manifest);
                         for (const row of chatRows) {
                             chatRowStore.writeChatRowRaw(row.chaId, row.chatId, row.value);
                         }
@@ -4750,6 +5546,10 @@ app.post('/api/write', async (req, res, next) => {
                         return;
                     }
                     logger.error('[Write] Failed to externalize database payloads:', e.message);
+                    if (e?.pluginStorageNamespaceConflict) {
+                        res.status(409).json({ error: e.message });
+                        return;
+                    }
                     res.status(500).json({ error: 'Database write failed' });
                     return;
                 }
@@ -4766,6 +5566,10 @@ app.post('/api/write', async (req, res, next) => {
                 invalidateDbCache();
                 // ETag based on stripped version (what client sees)
                 dbEtag = computeBufferEtag(persistedDatabaseContent);
+                rememberSessionPluginStorageState(
+                    req,
+                    await decodeRisuSave(persistedDatabaseContent),
+                );
                 await createBackupAndRotate();
             }
 
@@ -4798,6 +5602,30 @@ app.post('/api/db/flush', sessionAuthMiddleware, async (req, res, next) => {
 });
 
 // ─── Patch sync endpoint ──────────────────────────────────────────────────────
+function patchTouchesPluginStoragePublication(patch) {
+    if (!Array.isArray(patch)) return false;
+    const protectedRoots = [
+        'pluginCustomStorage',
+        'pluginStorageMeta',
+        'optimizePluginMemory',
+        PLUGIN_STORAGE_GENERATION_FIELD,
+        PLUGIN_STORAGE_FOLDED_MARKER,
+    ];
+    const touchesProtectedPointer = (pointer) => {
+        if (pointer === '' || pointer === '/') return true;
+        if (typeof pointer !== 'string') return false;
+        return protectedRoots.some((root) => (
+            pointer === `/${root}` || pointer.startsWith(`/${root}/`)
+        ));
+    };
+    return patch.some((operation) => (
+        operation && typeof operation === 'object' && (
+            touchesProtectedPointer(operation.path)
+            || touchesProtectedPointer(operation.from)
+        )
+    ));
+}
+
 app.post('/api/patch', async (req, res, next) => {
     if (!enablePatchSync) {
         res.status(404).send({ error: 'Patch sync is not enabled' });
@@ -4823,6 +5651,22 @@ app.post('/api/patch', async (req, res, next) => {
     try {
         await queueStorageMutation(async () => {
             const decodedKey = Buffer.from(filePath, 'hex').toString('utf-8');
+
+            // Publication-sensitive patches must never reach dbCache or the
+            // eager externalization helper below. Mode transitions, generation
+            // rotation, inline/external map changes, and direct row patches all
+            // publish through the CAS-backed plugin storage endpoints instead.
+            if (
+                decodedKey === PLUGIN_STORAGE_MANIFEST_KEY
+                || canonicalPluginStorageRowPrefix(decodedKey)
+                || (decodedKey === 'database/database.bin'
+                    && patchTouchesPluginStoragePublication(patch))
+            ) {
+                return res.status(409).json({
+                    error: 'Patch rejected: plugin storage publication must be changed atomically',
+                    code: 'PLUGIN_STORAGE_PUBLICATION_GUARD',
+                });
+            }
 
             // Load database into memory if not already cached
             // For database.bin, cache holds the STRIPPED version (stubs only)
@@ -5099,7 +5943,37 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
 
         // One mutation for every batch: a partially-applied bulk write must not
         // straddle the point where an import claims the barrier.
-        await queueStorageMutation(() => {
+        await queueStorageMutation(async () => {
+            const protectedEntries = decodedEntries.filter(({ key }) => (
+                key === 'database/database.bin'
+                || key === PLUGIN_STORAGE_MANIFEST_KEY
+                || canonicalPluginStorageRowPrefix(key)
+            ));
+            if (protectedEntries.length > 0) {
+                const publication = await readLivePluginStoragePublication();
+                const seenPluginKeys = new Set();
+                try {
+                    for (const { key } of protectedEntries) {
+                        if (key === 'database/database.bin') {
+                            throw pluginStorageNamespaceConflict(
+                                'database.bin cannot be changed through the bulk asset endpoint',
+                            );
+                        }
+                        if (seenPluginKeys.has(key)) {
+                            throw pluginStorageNamespaceConflict(
+                                'A bulk write cannot repeat a plugin storage row',
+                            );
+                        }
+                        seenPluginKeys.add(key);
+                        assertGenericPluginStorageMutationAllowed(key, publication);
+                    }
+                } catch (error) {
+                    if (error?.pluginStorageNamespaceConflict) {
+                        return res.status(409).json({ error: error.message });
+                    }
+                    throw error;
+                }
+            }
             for(let i = 0; i < decodedEntries.length; i += BULK_BATCH){
                 const batch = decodedEntries.slice(i, i + BULK_BATCH);
                 const writeBatch = sqliteDb.transaction(() => {
@@ -5116,6 +5990,7 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
                 writeBatch();
             }
         });
+        if (res.headersSent) return;
         res.json({ success: true, count: entries.length });
     } catch(error){
         if (isImportInProgressError(error)) return sendImportBusy(res);
@@ -5182,7 +6057,9 @@ app.get('/api/backup/export', async (req, res, next) => {
             sortKey: entry.key,
             size: entry.size,
         }));
-        const pluginEntries = target === 'upstream' ? [] : listPluginBackupEntries(backupSnapshot);
+        const pluginEntries = target === 'upstream'
+            ? []
+            : await listPluginBackupEntries(backupSnapshot);
         const namespacedEntries = [
             ...listAssetEntriesWithSizes(backupSnapshot).map((entry) => ({
                 kind: 'asset',
@@ -5464,7 +6341,7 @@ app.post('/api/backup/server/save', async (req, res, next) => {
                 reader: backupSnapshot,
                 migrateLegacy: false,
             }),
-            ...listPluginBackupEntries(backupSnapshot),
+            ...await listPluginBackupEntries(backupSnapshot),
             ...backupSnapshot.kvListWithSizes('inlay_meta/').map((e) => ({ kind: 'kv', key: e.key, backupName: e.key, size: e.size })),
             ...inlayEntries,
             ...sidecarEntries,
@@ -6061,6 +6938,7 @@ function clearExistingData() {
     kvDelPrefix('inlay_info/');
     kvDelPrefix(PLUGIN_SAVE_PREFIX);
     kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
+    kvDel(PLUGIN_STORAGE_MANIFEST_KEY);
     for (const key of chatRowStore.listAllChatRowKeys()) kvDel(key);
     // Composer drafts aren't part of a save folder; clear stale ones on import.
     kvDelPrefix('drafts/');
@@ -7122,6 +8000,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                     if (ingestion) {
                         const strippedBytes = Buffer.from(encodeRisuSaveLegacy(ingestion.strippedDb));
                         dbEtag = computeBufferEtag(strippedBytes);
+                        rememberSessionPluginStorageState(req, ingestion.strippedDb);
                     }
                     // A restore can replace a broad logical database state. Force every
                     // browser list cache to take one full snapshot after it completes.

@@ -12,6 +12,7 @@ import { encodeBackup } from './helpers/encode.js'
 import { decodeRisuDat } from './helpers/normalize.js'
 
 const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
+const PLUGIN_STORAGE_MANIFEST_KEY = 'plugin-storage/manifest.json'
 const packr = new Packr({ useRecords: false })
 const servers: ServerHandle[] = []
 
@@ -83,6 +84,17 @@ function readKvValue(cwd: string, key: string): Buffer | null {
       | { value: Buffer }
       | undefined
     return row ? Buffer.from(row.value) : null
+  } finally {
+    database.close()
+  }
+}
+
+function writeFixtureKvValue(cwd: string, key: string, value: Buffer): void {
+  const database = new Database(path.join(cwd, 'save', 'risuai.db'))
+  try {
+    database.prepare(`
+      INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)
+    `).run(key, value, Date.now())
   } finally {
     database.close()
   }
@@ -169,7 +181,7 @@ describe('external plugin rows in backup archives', () => {
     expect(readKvValue(destination.cwd, maxValueOnlyKey)).toEqual(Buffer.from('"value-only-maximum"'))
   })
 
-  test('exports reject a legacy oversized row before publishing an archive', async () => {
+  test('exports quarantine an unowned oversized physical row', async () => {
     const server = await spawnServer()
     servers.push(server)
     const client = await createClient(server.port, server.password)
@@ -186,16 +198,15 @@ describe('external plugin rows in backup archives', () => {
     }
 
     const exportResponse = await client.fetch('/api/backup/export')
-    expect(exportResponse.status).toBe(500)
-    expect(exportResponse.headers.get('content-disposition')).toBeNull()
-    expect(exportResponse.headers.get('content-type')).not.toContain('application/octet-stream')
+    expect(exportResponse.status).toBe(200)
+    const exported = entriesByName(Buffer.from(await exportResponse.arrayBuffer()))
+    expect(exported.has(oversizedKey)).toBe(false)
 
     const backupsPath = path.join(server.cwd, 'backups')
-    const beforeFiles = await readdir(backupsPath)
     const saveResponse = await client.fetch('/api/backup/server/save', { method: 'POST' })
-    expect(saveResponse.status).toBe(500)
-    expect(saveResponse.headers.get('content-type')).not.toContain('application/x-ndjson')
-    expect(await readdir(backupsPath)).toEqual(beforeFiles)
+    expect(saveResponse.status).toBe(200)
+    await saveResponse.text()
+    expect((await readdir(backupsPath)).length).toBeGreaterThan(0)
   })
 
   test('Node-only exports and server saves stream rows, upstream folds them, and import restores bytes', async () => {
@@ -209,7 +220,7 @@ describe('external plugin rows in backup archives', () => {
     expect((await sourceClient.importBackup(seed)).ok).toBe(true)
 
     const valueRows = new Map<string, Buffer>([
-      [pluginStorageKey('pluginsave/', 'plain/key'), Buffer.from('{\n  "value": 1\n}\n')],
+      [pluginStorageKey('pluginsave/', 'plain/key'), Buffer.from('{"value":1}')],
       [pluginStorageKey('pluginsave/', '유니코드 키'), Buffer.from('["alpha",2]')],
     ])
     const metaRows = new Map<string, Buffer>([
@@ -219,6 +230,50 @@ describe('external plugin rows in backup archives', () => {
     for (const [key, value] of [...valueRows, ...metaRows]) {
       await writeKv(sourceClient, key, value)
     }
+    const storageGeneration = 'node-backup-generation'
+    const storageManifest = Buffer.from(JSON.stringify({
+      version: 1,
+      generation: storageGeneration,
+      valueKeys: [...valueRows.keys()],
+      metaKeys: [...metaRows.keys()],
+    }))
+    const sourceDatabase = decodeRisuDat(readKvValue(source.cwd, 'database/database.bin')!)
+    const transitionResponse = await sourceClient.fetch('/api/plugin-storage/transition', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: new Uint8Array(encodeRisuDat({
+        version: 1,
+        source: { optimized: true, generation: null, manifest: null },
+        database: encodeRisuDat({
+          ...sourceDatabase,
+          optimizePluginMemory: true,
+          pluginStorageGeneration: storageGeneration,
+          pluginCustomStorage: Object.fromEntries(
+            [...valueRows].map(([key, value]) => [
+              Buffer.from(key.slice('pluginsave/'.length, -'.json'.length), 'base64url')
+                .toString('utf-8'),
+              JSON.parse(value.toString('utf-8')),
+            ]),
+          ),
+          pluginStorageMeta: Object.fromEntries(
+            [...metaRows].map(([key, value]) => [
+              Buffer.from(key.slice('pluginsave-meta/'.length, -'.json'.length), 'base64url')
+                .toString('utf-8'),
+              JSON.parse(value.toString('utf-8')),
+            ]),
+          ),
+        }),
+      })),
+    })
+    expect(transitionResponse.status).toBe(200)
+    expect(readKvValue(source.cwd, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(storageManifest)
+    const foreignValueKey = pluginStorageKey('pluginsave/', 'foreign-row')
+    const foreignMetaKey = pluginStorageKey('pluginsave-meta/', 'foreign-row')
+    // These simulate pre-fix/untrusted physical leftovers. Generated
+    // publications now reserve the entire generic pluginsave namespace, so a
+    // live client cannot create unlisted rows through /api/write anymore.
+    writeFixtureKvValue(source.cwd, foreignValueKey, Buffer.from('"quarantined"'))
+    writeFixtureKvValue(source.cwd, foreignMetaKey, Buffer.from('{"plugin":"Foreign"}'))
 
     const nodeResponse = await sourceClient.fetch('/api/backup/export')
     expect(nodeResponse.status).toBe(200)
@@ -230,9 +285,13 @@ describe('external plugin rows in backup archives', () => {
     for (const [key, value] of [...valueRows, ...metaRows]) {
       expect(nodeEntries.get(key)).toEqual(value)
     }
+    expect(nodeEntries.get(PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(storageManifest)
+    expect(nodeEntries.has(foreignValueKey)).toBe(false)
+    expect(nodeEntries.has(foreignMetaKey)).toBe(false)
     const nodeDatabase = decodeRisuDat(nodeEntries.get('database.risudat')!)
     expect(nodeDatabase.pluginCustomStorage).toEqual({})
     expect(nodeDatabase.pluginStorageMeta).toBeUndefined()
+    expect(nodeDatabase.pluginStorageGeneration).toBe(storageGeneration)
 
     const upstreamResponse = await sourceClient.fetch('/api/backup/export?target=upstream')
     expect(upstreamResponse.status).toBe(200)
@@ -241,6 +300,7 @@ describe('external plugin rows in backup archives', () => {
     const upstreamEntries = decodeBackup(upstreamBackup)
     expect(upstreamEntries.some(entry => entry.name.startsWith('pluginsave/'))).toBe(false)
     expect(upstreamEntries.some(entry => entry.name.startsWith('pluginsave-meta/'))).toBe(false)
+    expect(upstreamEntries.some(entry => entry.name === PLUGIN_STORAGE_MANIFEST_KEY)).toBe(false)
     const upstreamDatabase = decodeRisuDat(
       upstreamEntries.find(entry => entry.name === 'database.risudat')!.data,
     )
@@ -252,6 +312,8 @@ describe('external plugin rows in backup archives', () => {
       'plain/key': { plugin: 'Plugin A', updatedAt: 10 },
       '유니코드 키': { plugin: 'Plugin B', updatedAt: 20 },
     })
+    expect(upstreamDatabase.pluginCustomStorage['foreign-row']).toBeUndefined()
+    expect(upstreamDatabase.pluginStorageGeneration).toBe(storageGeneration)
 
     const upstreamDestination = await spawnServer()
     servers.push(upstreamDestination)
@@ -307,7 +369,12 @@ describe('external plugin rows in backup archives', () => {
     const destination = await spawnServer()
     servers.push(destination)
     const destinationClient = await createClient(destination.port, destination.password)
-    expect((await destinationClient.importBackup(createSeedBackup())).ok).toBe(true)
+    expect((await destinationClient.importBackup(createSeedBackup({
+      databaseFields: {
+        optimizePluginMemory: true,
+        pluginCustomStorage: {},
+      },
+    }))).ok).toBe(true)
     const staleKey = pluginStorageKey('pluginsave/', 'stale')
     await writeKv(destinationClient, staleKey, Buffer.from('"stale"'))
 
@@ -316,15 +383,24 @@ describe('external plugin rows in backup archives', () => {
     for (const [key, value] of [...valueRows, ...metaRows]) {
       expect(readKvValue(destination.cwd, key)).toEqual(value)
     }
+    expect(readKvValue(destination.cwd, PLUGIN_STORAGE_MANIFEST_KEY))
+      .toEqual(storageManifest)
     const storedDatabase = decodeRisuDat(readKvValue(destination.cwd, 'database/database.bin')!)
     expect(storedDatabase.pluginCustomStorage).toEqual({})
     expect(storedDatabase.pluginStorageMeta).toBeUndefined()
+    expect(storedDatabase.pluginStorageGeneration).toBe(storageGeneration)
   })
 
   test('legacy optimized backups externalize folded plugin storage and clear stale rows', async () => {
     const server = await spawnServer()
     servers.push(server)
     const client = await createClient(server.port, server.password)
+    expect((await client.importBackup(createSeedBackup({
+      databaseFields: {
+        optimizePluginMemory: true,
+        pluginCustomStorage: {},
+      },
+    }))).ok).toBe(true)
     const staleValueKey = pluginStorageKey('pluginsave/', 'stale')
     const staleMetaKey = pluginStorageKey('pluginsave-meta/', 'stale')
     await writeKv(client, staleValueKey, Buffer.from('1'))

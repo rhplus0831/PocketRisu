@@ -526,6 +526,12 @@ function createChatRowStore(options) {
                 },
             });
             const dbObj = walked.remainder;
+            if (typeof opts.onPluginStorageComplete === 'function') {
+                await opts.onPluginStorageComplete({
+                    dbObj,
+                    pluginStats: walked.pluginStats,
+                });
+            }
 
             // walkRisuSave normalizes its remainder into fresh objects. Bind
             // their streamed state before the shared post-walk sweep.

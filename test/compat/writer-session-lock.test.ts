@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from 'vitest'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { createClient, type RisuClient } from './helpers/client.js'
 
-const KEY = `pluginsave/${Buffer.from('writer-lock-victim', 'utf-8').toString('base64url')}.json`
+const KEY = 'writer-lock/victim.json'
 const KEY_HEX = Buffer.from(KEY, 'utf-8').toString('hex')
 const servers: ServerHandle[] = []
 

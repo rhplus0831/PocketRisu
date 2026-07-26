@@ -6,7 +6,7 @@
  *
  * These tests drive a *late-failing* streamed import (a gzip whose trailing
  * checksum is corrupt, so it only throws after the whole payload has been read)
- * while a plugin write races it. The write must never report success and then
+ * while a storage write races it. The write must never report success and then
  * vanish: either it commits before the import opens its transaction, or it is
  * refused with a retryable status.
  */
@@ -29,11 +29,9 @@ afterAll(async () => {
   await Promise.allSettled(servers.map(server => server.cleanup()))
 })
 
-const VICTIM_KEY = `pluginsave/${Buffer.from('import-barrier-victim', 'utf-8').toString('base64url')}.json`
-const VICTIM_OWNER_KEY = `pluginsave-meta/${Buffer.from('import-barrier-victim', 'utf-8').toString('base64url')}.json`
+const VICTIM_KEY = 'barrier/import-victim.json'
 const OLD_VALUE = Buffer.from('{"generation":"before-import"}')
 const NEW_VALUE = Buffer.from('{"generation":"during-import"}')
-const OLD_OWNER = Buffer.from('{"plugin":"Barrier Plugin","updatedAt":1}')
 
 function hexPath(key: string): string {
   return Buffer.from(key, 'utf-8').toString('hex')
@@ -91,9 +89,7 @@ async function seedVictim(port: number, password: string): Promise<RisuClient> {
   const client = await createClient(port, password)
   expect((await client.importBackup(createSeedBackup())).ok).toBe(true)
   expect((await writeKv(client, VICTIM_KEY, OLD_VALUE)).status).toBe(200)
-  expect((await writeKv(client, VICTIM_OWNER_KEY, OLD_OWNER)).status).toBe(200)
   expect(await readKv(client, VICTIM_KEY)).toEqual(OLD_VALUE)
-  expect(await readKv(client, VICTIM_OWNER_KEY)).toEqual(OLD_OWNER)
   return client
 }
 
@@ -113,7 +109,7 @@ function expectNoLostAcknowledgedWrite(status: number, stored: Buffer | null): v
 }
 
 describe('mutations racing a late-failing streamed import', () => {
-  test('backup import: a plugin write during the upload window is never lost', async () => {
+  test('backup import: a storage write during the upload window is never lost', async () => {
     const server = await spawnServer({ env: { RISU_STREAM_INGEST_MIN_BYTES: '1' } })
     servers.push(server)
     const client = await seedVictim(server.port, server.password)
@@ -209,19 +205,6 @@ describe('mutations racing a late-failing streamed import', () => {
     expect(payload.retryable).toBe(true)
     expect(write.headers.get('retry-after')).toBeTruthy()
 
-    const ownerWrite = await writeKv(client, VICTIM_OWNER_KEY, OLD_OWNER)
-    expect(ownerWrite.status).toBe(503)
-    await ownerWrite.text()
-    const clear = await client.fetch('/api/plugin-storage/clear', { method: 'POST' })
-    const clearPayload = await clear.json() as Record<string, unknown>
-    expect(clear.status).toBe(503)
-    expect(clearPayload).toMatchObject({
-      code: 'IMPORT_IN_PROGRESS',
-      commitOutcome: 'not-committed',
-      commitOutcomeUnknown: false,
-      retryable: true,
-    })
-
     // Deletes and chat-row saves share the same gate.
     const remove = await client.fetch('/api/remove', { headers: { 'file-path': hexPath(VICTIM_KEY) } })
     expect(remove.status).toBe(503)
@@ -241,7 +224,6 @@ describe('mutations racing a late-failing streamed import', () => {
     expect(importResponse.ok).toBe(false)
 
     expect(await readKv(client, VICTIM_KEY)).toEqual(OLD_VALUE)
-    expect(await readKv(client, VICTIM_OWNER_KEY)).toEqual(OLD_OWNER)
 
     // The barrier releases with the import: the retry the client was told to
     // make must now succeed.
@@ -249,17 +231,6 @@ describe('mutations racing a late-failing streamed import', () => {
     expect(retry.status).toBe(200)
     await retry.text()
     expect(await readKv(client, VICTIM_KEY)).toEqual(NEW_VALUE)
-
-    // The retry promised by the clear response runs after the barrier releases
-    // and atomically removes both the value and owner namespaces.
-    const clearRetry = await client.fetch('/api/plugin-storage/clear', { method: 'POST' })
-    expect(clearRetry.status).toBe(200)
-    expect(await clearRetry.json()).toMatchObject({
-      commitOutcome: 'committed',
-      commitOutcomeUnknown: false,
-    })
-    expect(await readKv(client, VICTIM_KEY)).toBeNull()
-    expect(await readKv(client, VICTIM_OWNER_KEY)).toBeNull()
   }, 120_000)
 
   test('save-folder import: streamed ingest cannot roll back an acknowledged write', async () => {
@@ -290,7 +261,7 @@ describe('mutations racing a late-failing streamed import', () => {
     let importSettled = false
     importDone.finally(() => { importSettled = true }).catch(() => {})
     for (let i = 0; !importSettled; i++) {
-      const key = `pluginsave/${Buffer.from(`barrier-attempt-${i}`, 'utf-8').toString('base64url')}.json`
+      const key = `barrier/attempt-${i}.json`
       const value = Buffer.from(`{"attempt":${i}}`)
       const res = await writeKv(client, key, value)
       await res.text()

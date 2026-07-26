@@ -37,6 +37,8 @@ export interface SeedOptions {
   includeAssets?: boolean
   /** Cold storage character stubs to include in the backup. */
   coldStorageCharacters?: ColdStorageCharacterSpec[]
+  /** Additional root database fields for compatibility scenarios. */
+  databaseFields?: Record<string, unknown>
 }
 
 export function createSeedBackup(opts: SeedOptions = {}): Buffer {
@@ -46,6 +48,7 @@ export function createSeedBackup(opts: SeedOptions = {}): Buffer {
     messagesPerChat = 2,
     includeAssets = false,
     coldStorageCharacters = [],
+    databaseFields = {},
   } = opts
 
   const characters = Array.from({ length: characterCount }, (_, ci) => {
@@ -93,6 +96,7 @@ export function createSeedBackup(opts: SeedOptions = {}): Buffer {
     moduleIntergration: [],
     selectedCharacter: 0,
   }
+  Object.assign(database, databaseFields)
 
   // Add cold storage character stubs to the database
   for (const cs of coldStorageCharacters) {

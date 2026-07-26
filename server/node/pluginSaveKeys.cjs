@@ -4,6 +4,9 @@ const BACKUP_ENTRY_NAME_MAX_BYTES = policy.backupEntryNameMaxBytes;
 const PLUGIN_SAVE_PREFIX = policy.valuePrefix;
 const PLUGIN_SAVE_META_PREFIX = policy.metaPrefix;
 const PLUGIN_STORAGE_FOLDED_MARKER = 'pluginStorageFolded';
+const PLUGIN_STORAGE_GENERATION_FIELD = 'pluginStorageGeneration';
+const PLUGIN_STORAGE_MANIFEST_KEY = 'plugin-storage/manifest.json';
+const PLUGIN_STORAGE_MANIFEST_VERSION = 1;
 
 function assertArchiveSafePluginSaveStorageKey(storageKey) {
     if (Buffer.byteLength(storageKey, 'utf-8') > BACKUP_ENTRY_NAME_MAX_BYTES) {
@@ -43,12 +46,65 @@ function encodePluginSaveStorageKey(rawKey, prefix) {
     return storageKey;
 }
 
+function normalizeManifestKeyList(value, prefix) {
+    if (!Array.isArray(value)) return null;
+    const keys = [];
+    const seen = new Set();
+    for (const key of value) {
+        if (typeof key !== 'string') return null;
+        try {
+            decodePluginSaveStorageKey(key, prefix);
+        } catch {
+            return null;
+        }
+        if (!seen.has(key)) {
+            seen.add(key);
+            keys.push(key);
+        }
+    }
+    return keys;
+}
+
+function parsePluginStorageManifest(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+        || value.version !== PLUGIN_STORAGE_MANIFEST_VERSION
+        || typeof value.generation !== 'string' || value.generation.length === 0) {
+        return null;
+    }
+    const valueKeys = normalizeManifestKeyList(value.valueKeys, PLUGIN_SAVE_PREFIX);
+    const metaKeys = normalizeManifestKeyList(value.metaKeys, PLUGIN_SAVE_META_PREFIX);
+    if (!valueKeys || !metaKeys) return null;
+    return {
+        version: PLUGIN_STORAGE_MANIFEST_VERSION,
+        generation: value.generation,
+        valueKeys,
+        metaKeys,
+    };
+}
+
+function createPluginStorageManifest(generation, valueKeys, metaKeys) {
+    if (typeof generation !== 'string' || generation.length === 0) {
+        throw new TypeError('Plugin storage generation must be a non-empty string');
+    }
+    return {
+        version: PLUGIN_STORAGE_MANIFEST_VERSION,
+        generation,
+        valueKeys: [...new Set(valueKeys)],
+        metaKeys: [...new Set(metaKeys)],
+    };
+}
+
 module.exports = {
     BACKUP_ENTRY_NAME_MAX_BYTES,
     PLUGIN_SAVE_PREFIX,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_STORAGE_FOLDED_MARKER,
     assertArchiveSafePluginSaveStorageKey,
+    PLUGIN_STORAGE_GENERATION_FIELD,
+    PLUGIN_STORAGE_MANIFEST_KEY,
+    PLUGIN_STORAGE_MANIFEST_VERSION,
+    createPluginStorageManifest,
+    parsePluginStorageManifest,
     decodePluginSaveStorageKey,
     encodePluginSaveStorageKey,
 };

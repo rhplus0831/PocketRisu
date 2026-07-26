@@ -17,7 +17,6 @@
 //   - idb   → persistentKv under a dedicated prefix (separate from the data
 //             prefix, so it never shows up in the viewer's idb listing)
 
-import { getDatabase } from "../storage/database.svelte";
 import {
     listPersistentKeys,
     makeEncodedStorageKey,
@@ -27,21 +26,17 @@ import {
     removePersistentKey,
     clearPersistentPrefix,
 } from "../storage/persistentKv";
-import { makeArchiveSafePluginSaveStorageKey } from "../storage/pluginSaveKeyPolicy";
 import { throwIfAborted } from "../storage/abort";
 import {
-    PLUGIN_SAVE_META_PREFIX,
-    withPluginSaveStorageLock,
-    withPluginSaveStorageKeyLock,
+    clearPluginSaveStorageOwners,
+    getPluginSaveStorageOwners,
+    removePluginSaveStorageOwner,
+    setPluginSaveStorageOwner,
 } from "./pluginSaveStorage";
 import {
-    copyDatabasePluginStorageRecord,
     copyPluginStorageRecord,
-    createDatabasePluginStorageRecord,
     createPluginStorageRecord,
     definePluginStorageRecordValue,
-    getPluginStorageRecordKeys,
-    hasPluginStorageRecordValue,
 } from "./pluginStorageRecord";
 
 export type PluginStorageBackend = "save" | "local" | "idb";
@@ -81,22 +76,7 @@ export function recordOwner(
     if (!plugin) return;
     const record: PluginOwnerRecord = { plugin, updatedAt: Date.now() };
     if (backend === "save") {
-        return withPluginSaveStorageKeyLock(key, async () => {
-            throwIfAborted(signal);
-            const db = getDatabase();
-            if (db.optimizePluginMemory) {
-                const storageKey = makeArchiveSafePluginSaveStorageKey(
-                    PLUGIN_SAVE_META_PREFIX,
-                    key,
-                );
-                if (signal) await writePersistentJson(storageKey, record, signal);
-                else await writePersistentJson(storageKey, record);
-                return;
-            }
-            const next = copyDatabasePluginStorageRecord(db.pluginStorageMeta);
-            definePluginStorageRecordValue(next, key, record);
-            db.pluginStorageMeta = next;
-        }, signal);
+        return setPluginSaveStorageOwner(key, plugin, signal);
     }
     if (backend === "local") {
         const map = readLocalMeta();
@@ -117,20 +97,7 @@ export function removeOwner(
 ): void | Promise<void> {
     throwIfAborted(signal);
     if (backend === "save") {
-        return withPluginSaveStorageKeyLock(key, async () => {
-            throwIfAborted(signal);
-            const db = getDatabase();
-            if (db.optimizePluginMemory) {
-                const storageKey = makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, key);
-                if (signal) await removePersistentKey(storageKey, signal);
-                else await removePersistentKey(storageKey);
-                return;
-            }
-            if (!hasPluginStorageRecordValue(db.pluginStorageMeta, key)) return;
-            const next = copyDatabasePluginStorageRecord(db.pluginStorageMeta);
-            delete next[key];
-            db.pluginStorageMeta = next;
-        }, signal);
+        return removePluginSaveStorageOwner(key, signal);
     }
     if (backend === "local") {
         const map = readLocalMeta();
@@ -150,16 +117,7 @@ export function clearOwners(
 ): void | Promise<void> {
     throwIfAborted(signal);
     if (backend === "save") {
-        return withPluginSaveStorageLock(async () => {
-            throwIfAborted(signal);
-            const db = getDatabase();
-            if (db.optimizePluginMemory) {
-                if (signal) await clearPersistentPrefix(PLUGIN_SAVE_META_PREFIX, signal);
-                else await clearPersistentPrefix(PLUGIN_SAVE_META_PREFIX);
-                return;
-            }
-            db.pluginStorageMeta = createDatabasePluginStorageRecord();
-        }, signal);
+        return clearPluginSaveStorageOwners(signal);
     }
     if (backend === "local") {
         writeLocalMeta(createPluginStorageRecord());
@@ -179,36 +137,7 @@ export async function getOwners(
     throwIfAborted(signal);
     const out = createPluginStorageRecord<string>();
     if (backend === "save") {
-        return withPluginSaveStorageLock(async () => {
-            throwIfAborted(signal);
-            const db = getDatabase();
-            if (!db.optimizePluginMemory) {
-                // `$state.snapshot` drops an own `__proto__`; values returned
-                // here are primitive plugin names, so an own-safe live read is
-                // both detached and complete.
-                const meta = db.pluginStorageMeta ?? {};
-                for (const key of getPluginStorageRecordKeys(meta)) {
-                    if (meta[key]?.plugin) {
-                        definePluginStorageRecordValue(out, key, meta[key].plugin);
-                    }
-                }
-                return out;
-            }
-            const storageKeys = signal
-                ? await listPersistentKeys(PLUGIN_SAVE_META_PREFIX, signal)
-                : await listPersistentKeys(PLUGIN_SAVE_META_PREFIX);
-            for (const fullKey of storageKeys) {
-                throwIfAborted(signal);
-                if (!fullKey.endsWith(".json")) continue;
-                const encoded = fullKey.slice(PLUGIN_SAVE_META_PREFIX.length, -".json".length);
-                const rawKey = decodeStorageKeyComponent(encoded);
-                const record = signal
-                    ? await readPersistentJson<PluginOwnerRecord>(fullKey, { signal })
-                    : await readPersistentJson<PluginOwnerRecord>(fullKey);
-                if (record?.plugin) definePluginStorageRecordValue(out, rawKey, record.plugin);
-            }
-            return out;
-        }, signal);
+        return getPluginSaveStorageOwners(signal);
     }
     if (backend === "local") {
         const map = readLocalMeta();

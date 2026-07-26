@@ -1,9 +1,15 @@
 import { afterAll, describe, expect, test } from 'vitest'
+import { Packr } from 'msgpackr'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { createSeedBackup } from './helpers/seed.js'
+import { decodeBackup } from './helpers/decode.js'
+import { encodeBackup } from './helpers/encode.js'
 
 const MIB = 1024 * 1024
+const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
+const PLUGIN_STORAGE_MANIFEST_KEY = 'plugin-storage/manifest.json'
+const packr = new Packr({ useRecords: false })
 const servers: ServerHandle[] = []
 
 afterAll(async () => {
@@ -22,6 +28,31 @@ async function writeKv(client: RisuClient, key: string, value: Buffer): Promise<
       'file-path': Buffer.from(key, 'utf-8').toString('hex'),
     },
     body: new Uint8Array(value),
+  })
+}
+
+function encodeRisuDat(value: unknown): Buffer {
+  return Buffer.concat([MAGIC_RAW, Buffer.from(packr.encode(value))])
+}
+
+async function mutatePluginRow(
+  client: RisuClient,
+  generation: string,
+  manifest: Record<string, unknown>,
+  storageKey: string,
+  value: Buffer,
+): Promise<Response> {
+  return client.fetch('/api/plugin-storage/mutate', {
+    method: 'POST',
+    headers: { 'content-type': 'application/octet-stream' },
+    body: new Uint8Array(encodeRisuDat({
+      version: 1,
+      generation,
+      expectedManifest: manifest,
+      nextManifest: manifest,
+      writes: [{ storageKey, valueJson: value.toString('utf-8') }],
+      deletes: [],
+    })),
   })
 }
 
@@ -71,15 +102,32 @@ async function expectPointInTimeExport(initial: Buffer, replacement: Buffer): Pr
   const source = await spawnServer()
   servers.push(source)
   const client = await createClient(source.port, source.password)
-  expect((await client.importBackup(createSeedBackup())).ok).toBe(true)
+  const victimKey = pluginStorageKey('concurrent-export-victim')
+  const generation = 'concurrent-export-generation'
+  const manifest = {
+    version: 1,
+    generation,
+    valueKeys: [victimKey],
+    metaKeys: [],
+  }
+  const seed = decodeBackup(createSeedBackup({
+    databaseFields: {
+      optimizePluginMemory: true,
+      pluginStorageGeneration: generation,
+      pluginCustomStorage: {},
+    },
+  }))
+  seed.push({ name: victimKey, data: initial })
+  seed.push({
+    name: PLUGIN_STORAGE_MANIFEST_KEY,
+    data: Buffer.from(JSON.stringify(manifest)),
+  })
+  expect((await client.importBackup(encodeBackup(seed))).ok).toBe(true)
 
   const stallAsset = Buffer.alloc(8 * MIB, 0xab)
   for (let i = 0; i < 6; i++) {
     expect((await writeKv(client, `assets/stall-${i}.png`, stallAsset)).status).toBe(200)
   }
-
-  const victimKey = pluginStorageKey('concurrent-export-victim')
-  expect((await writeKv(client, victimKey, initial)).status).toBe(200)
 
   // Fetch resolves once headers arrive. Leave the body unread so the six
   // preceding assets fill socket buffers and stall the server on backpressure.
@@ -91,7 +139,13 @@ async function expectPointInTimeExport(initial: Buffer, replacement: Buffer): Pr
   expect(advertisedLength).toBeGreaterThan(0)
 
   await new Promise(resolve => setTimeout(resolve, 750))
-  expect((await writeKv(client, victimKey, replacement)).status).toBe(200)
+  expect((await mutatePluginRow(
+    client,
+    generation,
+    manifest,
+    victimKey,
+    replacement,
+  )).status).toBe(200)
 
   const downloaded = Buffer.from(await exportResponse.arrayBuffer())
   expect(downloaded.length).toBe(advertisedLength)

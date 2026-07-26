@@ -193,11 +193,7 @@ export async function loadData() {
                     : "internalize"
                 let pluginStorageReconcileResult
                 try {
-                    pluginStorageReconcileResult = await reconcilePluginStorageModeForBoot({
-                        dependencies: {
-                            persistDatabase: persistBootPluginStorageReconcile,
-                        },
-                    })
+                    pluginStorageReconcileResult = await reconcilePluginStorageModeForBoot()
                 } catch {
                     // This is the final boot availability boundary. Known
                     // list/read/write/parse failures are isolated per row by

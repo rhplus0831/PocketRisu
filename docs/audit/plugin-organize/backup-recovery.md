@@ -84,6 +84,41 @@ cannot prove which copy belongs to the selected database generation.
   rows belonging to a different database generation.
 - Test the just-disabled restore window.
 
+### Resolution
+
+**Fixed 2026-07-27.** Optimized mutations and mode transitions now use queued
+SQLite mutation/transition endpoints with compare-and-swap source checks. A
+successful transaction publishes the database, exact plugin-row manifest,
+value rows, owner-metadata rows, and their new storage generation atomically;
+any validation, write, or injected failpoint failure rolls the whole
+publication back. The client updates its live mode and generation only after
+that durable acknowledgement and restores its prior state when publication
+fails.
+
+Optimized reads are bound to the generation pinned to the authenticated
+session. An explicit generation header cannot override that pin, and stale or
+unowned rows are excluded rather than being combined with the selected
+database. The generic write, remove, bulk-write, and patch routes reserve the
+database publication fields, manifest, and canonical value/metadata row
+namespace once storage ownership exists, including root patches plus `move`
+and `copy` operations whose `from` path is protected. This prevents a second
+write path from bypassing the atomic publication boundary.
+
+Bootstrap reconciliation and the just-disabled snapshot window now preserve
+exact ownership: folded snapshots and external-to-inline transitions retain
+the manifest/generation relationship even when the mode flag is false. Backup
+export and the plugin-storage viewer enumerate only the manifest-owned rows
+for the selected generation, so leftovers from another generation cannot be
+published or displayed as current state.
+
+Regression coverage exercises optimized mutation and both transition
+directions, source-CAS conflicts, rollback at database/manifest/row
+failpoints, session-pinned and generation-bound reads, bootstrap and
+just-disabled ownership, export/viewer filtering, generic route and JSON Patch
+attacks, exact bytes after flush, and process restart recovery. **BR3 remains
+separate and open:** corrupt-database boot fallback still needs to honor a
+marked snapshot's exact row set through its own restore path.
+
 <a id="br3"></a>
 ## BR3 — Corrupt-database boot fallback ignores a marked snapshot's exact row set
 
