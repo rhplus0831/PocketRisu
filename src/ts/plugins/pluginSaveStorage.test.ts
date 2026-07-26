@@ -2,9 +2,14 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 
 let database: any;
 const persistent = vi.hoisted(() => new Map<string, unknown>());
+const requestImmediateSave = vi.hoisted(() => vi.fn());
 
 vi.mock("../storage/database.svelte", () => ({
     getDatabase: () => database,
+}));
+
+vi.mock("../globalApi.svelte", () => ({
+    requestImmediateSave,
 }));
 
 vi.mock("../storage/persistentKv", () => {
@@ -58,6 +63,7 @@ function encoded(prefix: string, key: string) {
 beforeEach(async () => {
     vi.clearAllMocks();
     persistent.clear();
+    requestImmediateSave.mockResolvedValue({ status: "committed" });
     database = {
         optimizePluginMemory: false,
         pluginCustomStorage: {},
@@ -473,6 +479,42 @@ describe("reconcilePluginStorageMode", () => {
 
         expect(persistent.get(valueKey)).toBe(42);
         expect(removePersistentKey).not.toHaveBeenCalled();
+    });
+
+    test.each([
+        { status: "retry" } as const,
+        { status: "displaced" } as const,
+        { status: "failed", error: new Error("server rejected write") } as const,
+    ])("production $status outcome leaves every external key intact", async (outcome) => {
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "alpha");
+        persistent.set(valueKey, 42);
+        persistent.set(metaKey, { plugin: "Test", updatedAt: 1 });
+        requestImmediateSave.mockResolvedValueOnce(outcome);
+        const { removePersistentKey } = await import("../storage/persistentKv");
+
+        await expect(reconcilePluginStorageMode()).rejects.toThrow("not durably committed");
+
+        expect(requestImmediateSave).toHaveBeenCalledWith({ forceFullWrite: true });
+        expect(database.pluginCustomStorage.alpha).toBe(42);
+        expect(persistent.get(valueKey)).toBe(42);
+        expect(persistent.get(metaKey)).toEqual({ plugin: "Test", updatedAt: 1 });
+        expect(removePersistentKey).not.toHaveBeenCalled();
+    });
+
+    test("production committed outcome permits external key deletion", async () => {
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        persistent.set(valueKey, 42);
+
+        await expect(reconcilePluginStorageMode()).resolves.toEqual({
+            direction: "internalize",
+            values: 1,
+            meta: 0,
+        });
+
+        expect(requestImmediateSave).toHaveBeenCalledWith({ forceFullWrite: true });
+        expect(database.pluginCustomStorage.alpha).toBe(42);
+        expect(persistent.has(valueKey)).toBe(false);
     });
 
     test("internalized data survives a simulated refresh after external rows are deleted", async () => {

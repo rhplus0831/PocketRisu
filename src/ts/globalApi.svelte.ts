@@ -31,6 +31,10 @@ import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 import { capturePreTrackingPluginStorageChanges } from "./plugins/pluginStorageTracking";
 import { enterWriterTakeoverFlow } from "./storage/writerTakeover";
+import {
+    DatabaseSaveCoordinator,
+    type DatabaseSaveOutcome,
+} from "./storage/databaseSave"
 
 export const forageStorage = new AutoStorage()
 
@@ -244,9 +248,8 @@ export let saving = $state({
 })
 
 /**
- * Saves the current state of the database.
- * 
- * @returns {Promise<void>} - A promise that resolves when the database has been saved.
+ * Saves the current state of the database and reports whether that exact
+ * attempt was durably committed.
  */
 export let requiresFullEncoderReload = $state({
     state: false
@@ -254,7 +257,10 @@ export let requiresFullEncoderReload = $state({
 
 let requestImmediateSaveImpl: ((options?: {
     forceFullWrite?: boolean
-}) => Promise<void> | void) = () => {}
+}) => Promise<DatabaseSaveOutcome>) = async () => ({
+    status: 'failed',
+    error: new Error('Database save loop is not initialized'),
+})
 let markCharacterDirtyImpl: ((chaId: string) => void) = () => {}
 let patchSyncBaseline: Database | null = null
 
@@ -361,7 +367,7 @@ export function previewPersistFailureToast() {
 
 export function requestImmediateSave(options?: {
     forceFullWrite?: boolean
-}) {
+}): Promise<DatabaseSaveOutcome> {
     return requestImmediateSaveImpl(options)
 }
 
@@ -380,7 +386,7 @@ export async function saveDb() {
     let changed = false
     let gotChannel = false
     const sessionID = v4()
-    let saveInFlight: Promise<void> | null = null
+    const saveCoordinator = new DatabaseSaveCoordinator()
     let doingChatState = get(doingChat)
     const knownChatIdsByCharacter = new Map<string, Set<string>>(
         (getDatabase()?.characters ?? [])
@@ -784,11 +790,11 @@ export async function saveDb() {
             skipBroadcast?: boolean
             forceChatPersist?: boolean
         }
-    ): Promise<'saved' | 'retry' | 'noop'> {
+    ): Promise<'saved' | 'retry' | 'noop' | 'displaced'> {
         if (gotChannel) {
             // Another session owns the server. Keep this page's live state in
             // memory for the read-only recovery UI, but never retry stale data.
-            return 'noop'
+            return 'displaced'
         }
         if (channel && !options?.skipBroadcast) {
             channel.postMessage(sessionID)
@@ -1042,31 +1048,32 @@ export async function saveDb() {
         forceFullWrite?: boolean
         skipBroadcast?: boolean
         forceChatPersist?: boolean
-    }): Promise<void> {
-        if (saveInFlight) {
-            if (options?.forceChatPersist) {
-                await saveInFlight
-                return triggerSave(options)
+    }): Promise<DatabaseSaveOutcome> {
+        return saveCoordinator.run(async () => {
+            const toSave = takeTrackedChanges()
+            if (!hasTrackedChanges(toSave) && !options?.forceFullWrite) {
+                return { status: 'committed' }
             }
-            return saveInFlight
-        }
 
-        const toSave = takeTrackedChanges()
-        if (!hasTrackedChanges(toSave) && !options?.forceFullWrite) {
-            return
-        }
-
-        saveInFlight = (async () => {
             saving.state = true
             try {
                 const result = await persistTrackedChanges(toSave, options)
                 if (result === 'saved') {
                     savetrys = 0
+                    return { status: 'committed' }
+                } else if (result === 'retry') {
+                    return { status: 'retry' }
+                } else if (result === 'displaced') {
+                    return { status: 'displaced' }
                 } else if (result === 'noop' && hasTrackedChanges(toSave)) {
                     requeueTrackedChanges(toSave)
                     // Once displaced, pause instead of spinning forever. The
                     // frozen page can only leave through an explicit reload.
                     if (!gotChannel) changed = true
+                }
+                return {
+                    status: 'failed',
+                    error: new Error('Database save completed without a durable write'),
                 }
             } catch (error) {
                 requeueTrackedChanges(toSave)
@@ -1080,19 +1087,21 @@ export async function saveDb() {
                     await sleep(Math.min(500 * savetrys, 3000))
                     changed = true
                 }
+                return { status: 'failed', error }
             } finally {
                 saving.state = false
-                saveInFlight = null
             }
-        })()
-
-        return saveInFlight
+        }, {
+            // A force request is a durability barrier for its caller. It must
+            // run after an older save rather than inherit that save's promise.
+            queueAfterInFlight: options?.forceFullWrite || options?.forceChatPersist,
+        })
     }
 
     requestImmediateSaveImpl = async (options) => {
         changed = true
         await tick()
-        await triggerSave({
+        return triggerSave({
             forceFullWrite: options?.forceFullWrite,
         })
     }

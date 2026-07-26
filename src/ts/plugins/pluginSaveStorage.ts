@@ -8,6 +8,7 @@ import {
     removePersistentKey,
     writePersistentJson,
 } from "../storage/persistentKv";
+import { requireCommittedDatabaseSave } from "../storage/databaseSave";
 
 export const PLUGIN_SAVE_PREFIX = "pluginsave/";
 export const PLUGIN_SAVE_META_PREFIX = "pluginsave-meta/";
@@ -176,7 +177,8 @@ export interface PluginStorageReconcileOptions {
 
 async function persistDatabaseImmediately(): Promise<void> {
     const { requestImmediateSave } = await import("../globalApi.svelte");
-    await requestImmediateSave({ forceFullWrite: true });
+    const outcome = await requestImmediateSave({ forceFullWrite: true });
+    requireCommittedDatabaseSave(outcome, "Plugin storage mode transition");
 }
 
 /**

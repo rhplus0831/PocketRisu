@@ -34,6 +34,7 @@
         countExternalizedPluginStorageEntries,
         reconcilePluginStorageMode,
     } from "src/ts/plugins/pluginSaveStorage";
+    import { requireCommittedDatabaseSave } from "src/ts/storage/databaseSave";
 
     let showParams = $state([])
     let reconcilingPluginStorage = $state(false)
@@ -72,7 +73,8 @@
             // A flag-only toggle has no values for the reconciler to move, but
             // the new mode still needs to travel with the save.
             if (result.direction === "none") {
-                await requestImmediateSave({ forceFullWrite: true })
+                const outcome = await requestImmediateSave({ forceFullWrite: true })
+                requireCommittedDatabaseSave(outcome, "Plugin storage mode transition")
             }
             notifySuccess(
                 enabled
@@ -86,7 +88,8 @@
             try {
                 const rollback = await reconcilePluginStorageMode()
                 if (rollback.direction === "none") {
-                    await requestImmediateSave({ forceFullWrite: true })
+                    const outcome = await requestImmediateSave({ forceFullWrite: true })
+                    requireCommittedDatabaseSave(outcome, "Plugin storage mode rollback")
                 }
             } catch (rollbackError) {
                 console.error("[Plugin storage] mode rollback failed", rollbackError)
