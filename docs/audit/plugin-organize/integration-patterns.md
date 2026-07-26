@@ -8,9 +8,11 @@ and protocols. At the audit point the host offered no versioned read or atomic
 write primitive. AA3 is now fixed: bounded `getWithRevision()` and
 `atomicBatch()` provide per-key revisions/CAS and atomic generation publish.
 That enables safe guidance for the patterns below, but does not repair plugin
-fallbacks, loaders, or cancellation by itself. IP1's host primitives and
-guidance are now fixed; existing third-party plugins still have to adopt them.
-See [README.md](README.md) for the full index.
+fallbacks, loaders, or cancellation by itself. IP1 and IP2 are now fixed on
+the host side with explicit read outcomes, guarded CAS writes, a public
+non-destructive rewrite helper, and adoption guidance. Existing third-party
+plugins still have to adopt those protocols. See [README.md](README.md) for
+the full index.
 
 <a id="ip1"></a>
 ## IP1 — A failed read treated as a missing key becomes a destructive overwrite
@@ -123,6 +125,35 @@ and several cleanup/delete counters report success after a failed mutation.
 - Fault-inject termination and SET failure immediately after every successful
   REMOVE; the original row must survive or the action must report an exact,
   repairable failure.
+
+### Resolution (fixed)
+
+V3 now exposes `pluginStorage.rewriteItem(key, value, expectedRevision?,
+unloadSignal?)`. The public method snapshots and validates its arguments in the
+guest before dispatch, then routes through
+`rewriteOwnedPluginSaveStorageItem()` as exactly one AA3 `atomicBatch()` SET.
+It never publishes a REMOVE. Supplying the revision returned by
+`getWithRevision()` makes a stale maintenance copy return the structured
+`committed: false` conflict result instead of overwriting a newer row. Abort,
+unload, timeout, rollback, and acknowledgement-unknown paths retain the
+structured storage outcome rather than resolving as success.
+
+Cache publication follows the same exact commit boundary: a trusted committed
+SET refreshes the verified value cache directly, while a conflict, known
+rollback, malformed/lost acknowledgement, or pre-dispatch abort neither seeds
+nor invalidates it. There is therefore no disposable-cache gap that requires a
+durable delete. The V3 migration guide demonstrates the versioned rewrite
+protocol, propagates errors, and increments its maintenance counter only for
+`committed: true`.
+
+Focused unit and sandbox tests cover public API exposure, detached argument
+transport, stale CAS, cancellation, confirmed-only counting, and cache
+publication. The real-server failpoint matrix in
+`test/compat/plugin-storage-batch-atomicity.test.ts` stops the rewrite before
+the transaction and after value, owner, operation, manifest, and pre-commit
+boundaries. Every known failure retains the exact original value/owner pair;
+acknowledgement loss retains the same value and is exactly reconcilable by a
+new versioned read.
 
 <a id="ip3"></a>
 ## IP3 — Swallowed mutation failures desynchronize caches and status reporting

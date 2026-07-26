@@ -1675,6 +1675,39 @@ describe("V3 guest startup handshake", () => {
         logSpy.mockRestore();
     });
 
+    test("exposes a non-destructive rewrite helper with a confirmed result", async () => {
+        storageMocks.persistent.set(storageKey("maintenance-index"), {
+            entries: ["kept"],
+        });
+        installManifestOwnedStartupKeys("maintenance-index");
+        const plugin = startupPlugin("Atomic Rewrite", `
+            const current = await risuai.pluginStorage.getWithRevision("maintenance-index");
+            if (current.status !== "value") throw new Error("fixture missing");
+            globalThis.rewriteResult = await risuai.pluginStorage.rewriteItem(
+                "maintenance-index",
+                JSON.parse(JSON.stringify(current.value)),
+                current.revision,
+            );
+            globalThis.confirmedRewriteCount = globalThis.rewriteResult.committed ? 1 : 0;
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+
+        await loading;
+
+        expect(guestWindow.rewriteResult).toMatchObject({
+            committed: true,
+            revisions: [{ key: "maintenance-index" }],
+        });
+        expect(guestWindow.confirmedRewriteCount).toBe(1);
+        expect(storageMocks.persistent.get(storageKey("maintenance-index"))).toEqual({
+            entries: ["kept"],
+        });
+        restoreRelay();
+    });
+
     test("extends unload for an admitted atomic batch and rejects uncaptured late writes", async () => {
         const batchStarted = deferred();
         const releaseBatch = deferred();

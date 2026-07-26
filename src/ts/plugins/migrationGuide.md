@@ -665,6 +665,46 @@ API v3.0 implements multiple security layers:
 6. **Handle async errors**: Wrap async calls in try-catch blocks
 7. **Clean up resources**: Remove event listeners when no longer needed
 
+### Safe Plugin Storage Maintenance
+
+Every v3 storage mutation is an independent durable operation. Never force a
+replacement with `getItem()` → `removeItem()` → `setItem()`: termination or a
+failed second request can leave the only row deleted. Read a revision and use
+`rewriteItem()` instead. It publishes one atomic SET, and refreshes the
+disposable verified cache only after the host confirms the commit.
+
+```javascript
+let confirmedRewrites = 0
+const current = await risuai.pluginStorage.getWithRevision('index')
+
+if (current.status === 'value') {
+  try {
+    const result = await risuai.pluginStorage.rewriteItem(
+      'index',
+      current.value,
+      current.revision,
+    )
+
+    if (result.committed) {
+      confirmedRewrites += 1
+    } else {
+      // A concurrent writer won. Re-read before deciding whether to retry.
+      console.log('Rewrite skipped because the revision changed', result.conflicts)
+    }
+  } catch (error) {
+    // Do not swallow a mutation error or increment a success counter here.
+    // If commitOutcomeUnknown is true, reconcile with getWithRevision() before
+    // retrying; a blind retry could replace a newer value.
+    throw error
+  }
+}
+```
+
+The value is detached and validated before dispatch. A known rollback or CAS
+conflict leaves both durable storage and cache state unchanged. An unknown
+acknowledgement also leaves the cache untouched, because the server result must
+be reconciled before cache publication or a maintenance success is reported.
+
 ### Example: Complete v3.0 Plugin
 
 ```javascript
@@ -706,7 +746,7 @@ API v3.0 implements multiple security layers:
     }
 
     // Use plugin storage
-    risuai.pluginStorage.setItem('lastRun', Date.now())
+    await risuai.pluginStorage.setItem('lastRun', Date.now())
 
     console.log('Plugin setup complete')
   } catch (error) {

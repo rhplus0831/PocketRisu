@@ -11,6 +11,7 @@ import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
 import {
     clearOwnedPluginSaveStorage,
     atomicBatchOwnedPluginSaveStorage,
+    rewriteOwnedPluginSaveStorageItem,
     getPluginSaveStorageItem,
     getPluginSaveStorageItemWithRevision,
     readPluginSaveStorageItemResult,
@@ -1686,6 +1687,19 @@ export const makeRisuaiAPIV3 = (
             plugin.name,
             requestSignal ?? _unloadCapabilityOrRequestSignal,
         ),
+        _rewritePluginStorage: (
+            key: string,
+            value: unknown,
+            expectedRevision?: string | null,
+            _unloadCapabilityOrRequestSignal?: AbortSignal,
+            requestSignal?: AbortSignal,
+        ) => rewriteOwnedPluginSaveStorageItem(
+            key,
+            value,
+            plugin.name,
+            expectedRevision,
+            requestSignal ?? _unloadCapabilityOrRequestSignal,
+        ),
         _setPluginStorage: async (key: string, value: any, signal?: AbortSignal) => {
             await setOwnedPluginSaveStorageItem(key, value, plugin.name, signal)
         },
@@ -1732,6 +1746,7 @@ export const makeRisuaiAPIV3 = (
                     'readItem': '_readPluginStorageResult',
                     'setFromRead': '_setPluginStorageFromRead',
                     'atomicBatch': '_atomicBatchPluginStorage',
+                    'rewriteItem': '_rewritePluginStorage',
                     'setItem': '_setPluginStorage',
                     'removeItem': '_removePluginStorage',
                     'clear': '_clearPluginStorage',

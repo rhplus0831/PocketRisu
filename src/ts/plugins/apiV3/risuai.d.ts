@@ -1084,6 +1084,21 @@ interface PluginStorage {
     ): Promise<PluginStorageAtomicBatchResult>;
 
     /**
+     * Rewrites one value with a single atomic SET and refreshes the disposable
+     * verified cache only after a confirmed commit. Use the revision returned
+     * by getWithRevision() to prevent an older maintenance read from replacing
+     * a newer value. Unlike REMOVE -> SET, every known failure preserves the
+     * original row; unknown outcomes must be reconciled with another versioned
+     * read before retrying or incrementing a success counter.
+     */
+    rewriteItem(
+        key: string,
+        value: any,
+        expectedRevision?: string | null,
+        unloadSignal?: AbortSignal,
+    ): Promise<PluginStorageAtomicBatchResult>;
+
+    /**
      * Sets an item in storage
      * @param key - Storage key
      * @param value - Value to store (a JSON value: null, boolean, finite number,

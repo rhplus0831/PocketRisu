@@ -136,6 +136,25 @@ function mixedRollbackBody(): Uint8Array {
         }))
 }
 
+function rewriteBody(key: string, revision?: string): Uint8Array {
+  return envelope([{
+    operation: 'set',
+    key,
+    value: Buffer.from(JSON.stringify({ generation: 'old', key })).toString('base64'),
+    owner: 'AA3',
+    ...(revision === undefined ? {} : { expectedRevision: revision }),
+  }])
+}
+
+function readPhysicalPair(cwd: string, key: string): { value: Buffer; owner: Buffer } {
+  const db = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
+  const get = db.prepare('SELECT value FROM kv WHERE key = ?')
+  const value = Buffer.from((get.get(valueKey(key)) as { value: Buffer }).value)
+  const owner = Buffer.from((get.get(ownerKey(key)) as { value: Buffer }).value)
+  db.close()
+  return { value, owner }
+}
+
 function countedBatchBody(
   count: number,
   expectedManifest: typeof activeManifest = activeManifest,
@@ -458,6 +477,38 @@ describe('AA3 atomic plugin storage batch', () => {
     expect(readGeneration(server.cwd)).toBe('old')
   })
 
+  test.each([
+    'before-transaction',
+    'after-value:0',
+    'after-owner:0',
+    'after-operation:0',
+    'pre-commit',
+    'after-manifest',
+  ])('IP2 same-value rewrite at %s never exposes the old REMOVE midpoint', async failpoint => {
+    const { server, client } = await boot(failpoint)
+    const key = keys[0]
+    const before = readPhysicalPair(server.cwd, key)
+    const state = await readState(client, key)
+
+    const response = await mutate(client, rewriteBody(key, state.revision))
+
+    expect(response.status).toBe(500)
+    await expect(response.json()).resolves.toMatchObject({
+      outcome: 'not-committed',
+      operation: 'batch',
+      code: 'PLUGIN_STORAGE_BATCH_ROLLED_BACK',
+      retryable: false,
+    })
+    const after = readPhysicalPair(server.cwd, key)
+    expect(after.value).toEqual(before.value)
+    expect(after.owner).toEqual(before.owner)
+    await expect(readState(client, key)).resolves.toMatchObject({
+      missing: false,
+      value: before.value.toString('base64'),
+      revision: state.revision,
+    })
+  })
+
   test('a verification-read failure reports unavailable after the whole batch commits', async () => {
     const { server, client } = await boot('verification-read')
     const response = await mutate(client)
@@ -675,5 +726,26 @@ describe('AA3 atomic plugin storage batch', () => {
     const { server, client } = await boot('acknowledgement-loss')
     await expect(mutate(client)).rejects.toThrow()
     expect(readGeneration(server.cwd)).toBe('new')
+  })
+
+  test('IP2 acknowledgement loss keeps the same-value row present and exactly reconcilable', async () => {
+    const { server, client } = await boot('acknowledgement-loss')
+    const key = keys[0]
+    const before = readPhysicalPair(server.cwd, key)
+    const state = await readState(client, key)
+
+    await expect(mutate(client, rewriteBody(key, state.revision))).rejects.toThrow()
+
+    const after = readPhysicalPair(server.cwd, key)
+    expect(after.value).toEqual(before.value)
+    const reconciled = await readState(
+      await createClient(server.port, server.password),
+      key,
+    )
+    expect(reconciled).toMatchObject({
+      missing: false,
+      value: before.value.toString('base64'),
+    })
+    expect(reconciled.revision).not.toBe(state.revision)
   })
 })

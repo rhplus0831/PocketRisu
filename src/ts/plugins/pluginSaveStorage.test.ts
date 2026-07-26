@@ -394,6 +394,7 @@ const {
     reconcilePluginStorageMode,
     reconcilePluginStorageModeForBoot,
     removePluginSaveStorageItem,
+    rewriteOwnedPluginSaveStorageItem,
     setOwnedPluginSaveStorageItem,
     setOwnedPluginSaveStorageItemFromRead,
     setPluginSaveStorageItem,
@@ -736,6 +737,58 @@ describe("AA3 versioned atomic plugin storage", () => {
             record: { version: 2 },
             "new-record": { version: "current" },
         });
+    });
+
+    test("rewrites one value with a single atomic set and reports only its confirmed outcome", async () => {
+        database.pluginCustomStorage = { index: { entries: [1, 2, 3] } };
+        database.pluginStorageMeta = { index: { plugin: "legacy", updatedAt: 1 } };
+        const current = await getPluginSaveStorageItemWithRevision("index");
+        expect(current.status).toBe("value");
+
+        const result = await rewriteOwnedPluginSaveStorageItem(
+            "index",
+            current.value,
+            "Maintenance Plugin",
+            current.revision,
+        );
+
+        expect(result).toMatchObject({
+            committed: true,
+            revisions: [{ key: "index", revision: expect.stringMatching(/^sha256:/) }],
+        });
+        expect(database.pluginCustomStorage.index).toEqual({ entries: [1, 2, 3] });
+        expect(database.pluginStorageMeta.index.plugin).toBe("Maintenance Plugin");
+    });
+
+    test("a cancelled or stale rewrite preserves the original row and exposes no false success", async () => {
+        database.pluginCustomStorage = { index: { version: 1 } };
+        database.pluginStorageMeta = { index: { plugin: "legacy", updatedAt: 1 } };
+        const stale = await getPluginSaveStorageItemWithRevision("index");
+        expect(stale.status).toBe("value");
+
+        await setOwnedPluginSaveStorageItem("index", { version: 2 }, "Live Writer");
+        const conflict = await rewriteOwnedPluginSaveStorageItem(
+            "index",
+            stale.value,
+            "Maintenance Plugin",
+            stale.revision,
+        );
+        expect(conflict).toMatchObject({
+            committed: false,
+            conflicts: [{ key: "index" }],
+        });
+        expect(database.pluginCustomStorage.index).toEqual({ version: 2 });
+
+        const controller = new AbortController();
+        controller.abort(new DOMException("terminated before rewrite", "AbortError"));
+        await expect(rewriteOwnedPluginSaveStorageItem(
+            "index",
+            { version: 3 },
+            "Maintenance Plugin",
+            undefined,
+            controller.signal,
+        )).rejects.toMatchObject({ name: "AbortError" });
+        expect(database.pluginCustomStorage.index).toEqual({ version: 2 });
     });
 
     test("publishes an inline multi-key generation without an observable prefix", async () => {

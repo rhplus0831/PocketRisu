@@ -1323,6 +1323,27 @@ export type PluginSaveStorageAtomicBatchResult =
         conflicts: { key: string; revision: string | null; generation: string | null }[];
     };
 
+/**
+ * Rewrite one logical value as a single atomic set. This is the safe
+ * replacement for maintenance code that used to remove a row before writing
+ * the same value back: no durable deletion is ever published, and an optional
+ * revision binds the rewrite to the exact value that was read.
+ */
+export async function rewriteOwnedPluginSaveStorageItem(
+    key: unknown,
+    value: unknown,
+    owner: string,
+    expectedRevision?: string | null,
+    signal?: AbortSignal | null,
+): Promise<PluginSaveStorageAtomicBatchResult> {
+    return atomicBatchOwnedPluginSaveStorage([{
+        type: "set",
+        key: normalizePluginStorageKey(key),
+        value,
+        ...(expectedRevision === undefined ? {} : { expectedRevision }),
+    }], owner, signal);
+}
+
 const pluginStorageBatchEncoder = new TextEncoder();
 
 function describePluginStorageFailure(

@@ -23,6 +23,7 @@ const ABORTABLE_ROOT_METHODS = new Set([
     '_readPluginStorageResult',
     '_setPluginStorageFromRead',
     '_atomicBatchPluginStorage',
+    '_rewritePluginStorage',
     '_setPluginStorage',
     '_removePluginStorage',
     '_clearPluginStorage',
@@ -36,11 +37,13 @@ const ABORTABLE_ROOT_METHODS = new Set([
 
 const UNLOAD_STORAGE_ROOT_METHODS = new Set([
     '_atomicBatchPluginStorage',
+    '_rewritePluginStorage',
 ]);
 
 const UNLOAD_STORAGE_MUTATION_METHODS = new Set([
     '_atomicBatchPluginStorage',
     '_setPluginStorageFromRead',
+    '_rewritePluginStorage',
     '_setPluginStorage',
     '_removePluginStorage',
     '_clearPluginStorage',
@@ -192,6 +195,7 @@ export function createV3BridgeRequestRegistry(options: {
     const rootMutations: Record<string, "write" | "remove" | "batch"> = {
         _atomicBatchPluginStorage: 'batch',
         _setPluginStorageFromRead: 'batch',
+        _rewritePluginStorage: 'batch',
         _setPluginStorage: 'write',
         _removePluginStorage: 'remove',
         _clearPluginStorage: 'remove',
@@ -769,6 +773,29 @@ await (async function() {
             try {
                 const detached = snapshotPluginStorageBatchForTransport(payload.args?.[0]);
                 payload = { ...payload, args: [detached, ...(payload.args || []).slice(1)] };
+            } catch (error) {
+                return Promise.reject(error);
+            }
+        }
+        if (type === 'CALL_ROOT' && payload.method === '_rewritePluginStorage') {
+            try {
+                const args = payload.args || [];
+                const operation = {
+                    type: 'set',
+                    key: args[0],
+                    value: args[1],
+                    ...(args[2] === undefined ? {} : { expectedRevision: args[2] }),
+                };
+                const [detached] = snapshotPluginStorageBatchForTransport([operation]);
+                payload = {
+                    ...payload,
+                    args: [
+                        detached.key,
+                        detached.value,
+                        detached.expectedRevision,
+                        ...args.slice(3),
+                    ],
+                };
             } catch (error) {
                 return Promise.reject(error);
             }

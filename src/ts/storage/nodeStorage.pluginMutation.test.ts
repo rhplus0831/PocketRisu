@@ -659,6 +659,44 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
         }
     })
 
+    test('a one-SET rewrite refreshes cache after commit without an invalidation gap', async () => {
+        const rewriteRequest = {
+            ...batchRequest,
+            operations: [batchRequest.operations[0]],
+        }
+        const storage = new NodeStorage()
+        ;(storage as any).authFetch = vi.fn(async (
+            _input: RequestInfo | URL,
+            init: RequestInit,
+        ) => {
+            const requestHash = createHash('sha256')
+                .update(init.body as Uint8Array)
+                .digest('hex')
+            return response({
+                success: true,
+                outcome: 'committed',
+                operation: 'batch',
+                verification: 'verified',
+                requestHash,
+                generation: '123e4567-e89b-42d3-a456-426614174000',
+                revisions: [{
+                    key: 'aa3-body',
+                    revision: `sha256:${'d'.repeat(64)}`,
+                }],
+            })
+        })
+
+        await expect(storage.batchPluginStorage(rewriteRequest)).resolves.toMatchObject({
+            outcome: 'committed',
+            revisions: [{ key: 'aa3-body' }],
+        })
+        expect(cache.storeBytes).toHaveBeenCalledOnce()
+        expect((cache.storeBytes.mock.calls as unknown[][])[0][1]).toEqual(
+            rewriteRequest.operations[0].valueBytes,
+        )
+        expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
+    })
+
     test('malformed success and transport loss remain unknown without cache publication', async () => {
         const malformed = new NodeStorage()
         ;(malformed as any).authFetch = vi.fn(async () => response({
