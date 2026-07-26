@@ -14,7 +14,12 @@ const {
     magicHeader,
     magicCompressedHeader,
     magicStreamCompressedHeader,
+    magicPluginStorageHeader,
+    magicPluginStorageCompressedHeader,
+    magicPluginStorageStreamHeader,
     normalizeJSON,
+    parseLegacyPluginStorageEnvelope,
+    pluginStorageLegacyEscapeField,
 } = require('./utils.cjs');
 const { PLUGIN_STORAGE_FOLDED_MARKER } = require('./pluginSaveKeys.cjs');
 
@@ -84,6 +89,7 @@ async function inspectRisuSaveSource(input) {
     const { normalized, prefix } = await readInputPrefix(input, headerBytes + 2);
     let format = null;
     let compression = null;
+    let pluginStorageEscapes = false;
 
     if (startsWith(prefix, magicHeader)) {
         format = 'raw';
@@ -98,6 +104,22 @@ async function inspectRisuSaveSource(input) {
         if (prefix[headerBytes] === 0x1f && prefix[headerBytes + 1] === 0x8b) {
             compression = 'gzip';
         }
+    } else if (startsWith(prefix, magicPluginStorageHeader)) {
+        format = 'raw';
+        pluginStorageEscapes = true;
+    } else if (startsWith(prefix, magicPluginStorageCompressedHeader)) {
+        format = 'compressed';
+        pluginStorageEscapes = true;
+        const first = prefix[headerBytes];
+        const second = prefix[headerBytes + 1];
+        if (first === 0x1f && second === 0x8b) compression = 'gzip';
+        else if (isZlibHeader(first, second)) compression = 'zlib';
+    } else if (startsWith(prefix, magicPluginStorageStreamHeader)) {
+        format = 'stream';
+        pluginStorageEscapes = true;
+        if (prefix[headerBytes] === 0x1f && prefix[headerBytes + 1] === 0x8b) {
+            compression = 'gzip';
+        }
     }
 
     const supported = format === 'raw' || compression !== null;
@@ -105,6 +127,7 @@ async function inspectRisuSaveSource(input) {
         ...normalized,
         format,
         compression,
+        pluginStorageEscapes,
         payloadOffset: supported ? headerBytes : 0,
         supported,
         size: normalized.size,
@@ -336,15 +359,48 @@ async function readMapDescriptors(source, descriptor) {
 
 function assignNormalizedProperty(target, key, value) {
     if (value === undefined) return;
-    const normalized = normalizeJSON(value);
-    if (normalized !== undefined) target[key] = normalized;
+    const normalized = normalizeJSON(
+        value,
+        key === 'pluginCustomStorage' || key === 'pluginStorageMeta'
+    );
+    if (normalized !== undefined) {
+        Object.defineProperty(target, key, {
+            configurable: true,
+            enumerable: true,
+            value: normalized,
+            writable: true,
+        });
+    }
 }
 
-async function processPluginMap(source, descriptor, field, onEntry) {
+function defineOwn(target, key, value) {
+    Object.defineProperty(target, key, {
+        configurable: true,
+        enumerable: true,
+        value,
+        writable: true,
+    });
+}
+
+async function processPluginMap(source, descriptor, field, onEntry, protoEscape = null) {
     const entries = await readMapDescriptors(source, descriptor);
     let count = 0;
-    for (const entry of entries) {
-        const normalized = normalizeJSON(await decodeDescriptor(source, entry.descriptor));
+    let entryIndex = 0;
+    const insertAt = protoEscape === null
+        ? -1
+        : Math.min(protoEscape.index, entries.length);
+    for (let index = 0; index < entries.length + (protoEscape === null ? 0 : 1); index++) {
+        if (index === insertAt) {
+            await onEntry({
+                field,
+                key: '__proto__',
+                value: normalizeJSON(protoEscape.value, true),
+            });
+            count++;
+            continue;
+        }
+        const entry = entries[entryIndex++];
+        const normalized = normalizeJSON(await decodeDescriptor(source, entry.descriptor), true);
         if (normalized === undefined) continue;
         await onEntry({ field, key: entry.key, value: normalized });
         count++;
@@ -591,6 +647,20 @@ async function walkRisuSave(input, options = {}) {
         const pluginStorageFolded = foldedMarkerEntry
             ? normalizeJSON(await decodeDescriptor(source, foldedMarkerEntry.descriptor)) === true
             : false;
+        const pluginStorageEscapeEntry = inspection.pluginStorageEscapes
+            ? byKey.get(pluginStorageLegacyEscapeField)
+            : null;
+        const pluginStorageEscapeEnvelope = pluginStorageEscapeEntry
+            ? parseLegacyPluginStorageEnvelope(
+                await decodeDescriptor(source, pluginStorageEscapeEntry.descriptor)
+            )
+            : null;
+        const escapedPluginFields = new Set(
+            pluginStorageEscapeEnvelope?.escapes.map(escape => escape.field) ?? []
+        );
+        const pluginStorageEscapeByField = new Map(
+            pluginStorageEscapeEnvelope?.escapes.map(escape => [escape.field, escape]) ?? []
+        );
         let externalizePlugins = false;
         if (options.externalizePluginStorage) {
             const optimizeEntry = byKey.get('optimizePluginMemory');
@@ -605,17 +675,22 @@ async function walkRisuSave(input, options = {}) {
                     const cursor = source.cursor(valueEntry.descriptor.offset);
                     hasValues = (await readCollectionCount(cursor, 'map')) > 0;
                 } else {
-                    const value = normalizeJSON(await decodeDescriptor(source, valueEntry.descriptor));
+                    const value = normalizeJSON(
+                        await decodeDescriptor(source, valueEntry.descriptor),
+                        true
+                    );
                     hasValues = value !== null && typeof value === 'object'
                         && Object.keys(value).length > 0;
                 }
             }
+            hasValues ||= escapedPluginFields.has('pluginCustomStorage');
             let hasMetaField = false;
             if (metaEntry) {
                 const kind = await descriptorCollectionKind(source, metaEntry.descriptor);
                 hasMetaField = kind === 'map'
-                    || normalizeJSON(await decodeDescriptor(source, metaEntry.descriptor)) !== undefined;
+                    || normalizeJSON(await decodeDescriptor(source, metaEntry.descriptor), true) !== undefined;
             }
+            hasMetaField ||= escapedPluginFields.has('pluginStorageMeta');
             externalizePlugins = pluginStorageFolded
                 || (optimize === true && (hasValues || hasMetaField));
             if (pluginStorageFolded) {
@@ -630,8 +705,12 @@ async function walkRisuSave(input, options = {}) {
 
         const remainder = {};
         const pluginStats = { changed: externalizePlugins, values: 0, meta: 0 };
+        const processedExternalEscapes = new Set();
         for (const entry of rootEntries) {
             if (entry.key === PLUGIN_STORAGE_FOLDED_MARKER) {
+                continue;
+            } else if (entry.key === pluginStorageLegacyEscapeField
+                && pluginStorageEscapeEnvelope !== null) {
                 continue;
             } else if (entry.key === 'characters') {
                 assignNormalizedProperty(
@@ -648,10 +727,14 @@ async function walkRisuSave(input, options = {}) {
                         source,
                         entry.descriptor,
                         entry.key,
-                        options.onPluginStorageEntry
+                        options.onPluginStorageEntry,
+                        pluginStorageEscapeByField.get(entry.key) ?? null
                     );
+                    if (pluginStorageEscapeByField.has(entry.key)) {
+                        processedExternalEscapes.add(entry.key);
+                    }
                 } else {
-                    const value = normalizeJSON(await decodeDescriptor(source, entry.descriptor));
+                    const value = normalizeJSON(await decodeDescriptor(source, entry.descriptor), true);
                     for (const [key, rowValue] of Object.entries(value ?? {})) {
                         await options.onPluginStorageEntry({ field: entry.key, key, value: rowValue });
                         pluginStats.values++;
@@ -664,10 +747,14 @@ async function walkRisuSave(input, options = {}) {
                         source,
                         entry.descriptor,
                         entry.key,
-                        options.onPluginStorageEntry
+                        options.onPluginStorageEntry,
+                        pluginStorageEscapeByField.get(entry.key) ?? null
                     );
+                    if (pluginStorageEscapeByField.has(entry.key)) {
+                        processedExternalEscapes.add(entry.key);
+                    }
                 } else {
-                    const value = normalizeJSON(await decodeDescriptor(source, entry.descriptor));
+                    const value = normalizeJSON(await decodeDescriptor(source, entry.descriptor), true);
                     for (const [key, rowValue] of Object.entries(value ?? {})) {
                         await options.onPluginStorageEntry({ field: entry.key, key, value: rowValue });
                         pluginStats.meta++;
@@ -684,6 +771,43 @@ async function walkRisuSave(input, options = {}) {
                     remainder,
                     entry.key,
                     decoded
+                );
+            }
+        }
+        if (pluginStorageEscapeEnvelope !== null) {
+            for (const escape of pluginStorageEscapeEnvelope.escapes) {
+                const value = normalizeJSON(escape.value, true);
+                if (externalizePlugins) {
+                    if (processedExternalEscapes.has(escape.field)) continue;
+                    await options.onPluginStorageEntry({
+                        field: escape.field,
+                        key: '__proto__',
+                        value,
+                    });
+                    if (escape.field === 'pluginCustomStorage') pluginStats.values++;
+                    else pluginStats.meta++;
+                } else {
+                    const current = remainder[escape.field];
+                    const sourceRecord = current && typeof current === 'object' && !Array.isArray(current)
+                        ? current
+                        : {};
+                    const record = {};
+                    const keys = Object.keys(sourceRecord);
+                    const insertAt = Math.min(escape.index, keys.length);
+                    for (let index = 0; index <= keys.length; index++) {
+                        if (index === insertAt) defineOwn(record, '__proto__', value);
+                        if (index < keys.length) {
+                            defineOwn(record, keys[index], sourceRecord[keys[index]]);
+                        }
+                    }
+                    remainder[escape.field] = record;
+                }
+            }
+            if (pluginStorageEscapeEnvelope.originalField.present) {
+                assignNormalizedProperty(
+                    remainder,
+                    pluginStorageLegacyEscapeField,
+                    pluginStorageEscapeEnvelope.originalField.value
                 );
             }
         }

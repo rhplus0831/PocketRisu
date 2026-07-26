@@ -5,6 +5,7 @@ import { getDatabase, type Chat } from "../storage/database.svelte";
 import { fetchChatFromServer } from "../storage/chatStorage";
 import { language } from "src/lang";
 import { readExternalizedPluginStorage } from "../plugins/pluginSaveStorage";
+import { mergePluginStorageRecords } from "../plugins/pluginStorageRecord";
 
 function formatBytes(bytes: number): string {
     if (bytes < 1024) return `${bytes} B`
@@ -208,8 +209,14 @@ export async function SavePartialLocalBackup(){
         alertWait(`Saving partial local backup... (Assembling plugin storage)`)
         const external = await readExternalizedPluginStorage()
         // Fold external rows for the archive; optimized imports externalize them again.
-        dbCopy.pluginCustomStorage = { ...external.values, ...dbCopy.pluginCustomStorage }
-        const pluginStorageMeta = { ...external.meta, ...dbCopy.pluginStorageMeta }
+        dbCopy.pluginCustomStorage = mergePluginStorageRecords(
+            external.values,
+            dbCopy.pluginCustomStorage,
+        )
+        const pluginStorageMeta = mergePluginStorageRecords(
+            external.meta,
+            dbCopy.pluginStorageMeta,
+        )
         if (Object.keys(pluginStorageMeta).length > 0) {
             dbCopy.pluginStorageMeta = pluginStorageMeta
         } else {

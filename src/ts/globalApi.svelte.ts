@@ -30,6 +30,10 @@ import { doingChat } from "./process/index.svelte";
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 import { capturePreTrackingPluginStorageChanges } from "./plugins/pluginStorageTracking";
+import {
+    cloneDatabaseState,
+    mergeTrackedDatabaseOnConflict,
+} from "./storage/databaseClone";
 import { enterWriterTakeoverFlow } from "./storage/writerTakeover";
 import {
     DatabaseSaveCoordinator,
@@ -379,7 +383,7 @@ export function markCharacterDirty(chaId: string) {
 }
 
 export function setPatchSyncBaseline(data: Database | null) {
-    patchSyncBaseline = data ? safeStructuredClone(data) as Database : null
+    patchSyncBaseline = data ? cloneDatabaseState(data) : null
 }
 
 export async function saveDb() {
@@ -435,7 +439,7 @@ export async function saveDb() {
     // baseline so inline plugin writes made during plugin initialization are
     // not mistaken for the save tracker's initial clean state.
     const initialSaveBaseline = patchSyncBaseline
-        ?? safeStructuredClone(getDatabase()) as Database
+        ?? cloneDatabaseState(getDatabase())
 
     let encoder = new RisuSaveEncoder()
     await encoder.init(getDatabase(), {
@@ -553,6 +557,7 @@ export async function saveDb() {
                 if (
                     key !== 'characters' && key !== 'botPresets' && key !== 'modules' &&
                     key !== 'plugins' && key !== 'pluginCustomStorage'
+                    && key !== 'pluginStorageMeta'
                 ) {
                     deepTouch(DBState.db[key])
                 }
@@ -603,6 +608,7 @@ export async function saveDb() {
             // during a reconciler transition; tracking it is what persists the
             // final empty/restored pluginStorage save block.
             deepTouch(DBState.db.pluginCustomStorage)
+            deepTouch(DBState.db.pluginStorageMeta)
             if (!didInitPluginStorageEffect) {
                 didInitPluginStorageEffect = true
                 return
@@ -711,63 +717,8 @@ export async function saveDb() {
         const latestData = await forageStorage.getItem('database/database.bin') as unknown as Uint8Array
         if (latestData && latestData.length > 0) {
             const latestDb = await decodeRisuSave(latestData) as Database
-            const mergedDb = safeStructuredClone(latestDb) as Database
-            const localDb = safeStructuredClone(db) as Database
-
-            for (const key in localDb) {
-                if (
-                    key !== 'characters' && key !== 'botPresets' && key !== 'modules' &&
-                    key !== 'plugins' && key !== 'pluginCustomStorage'
-                ) {
-                    mergedDb[key] = safeStructuredClone(localDb[key])
-                }
-            }
-
-            if (toSave.botPreset) {
-                mergedDb.botPresets = safeStructuredClone(localDb.botPresets)
-                mergedDb.botPresetsId = localDb.botPresetsId
-            }
-            if (toSave.modules) {
-                mergedDb.modules = safeStructuredClone(localDb.modules)
-            }
-            if (toSave.plugins) {
-                mergedDb.plugins = safeStructuredClone(localDb.plugins)
-            }
-            if (toSave.pluginCustomStorage) {
-                // Optimized mode normally leaves this empty; the branch still
-                // matters while the reconciler internalizes/externalizes data.
-                // Without it a concurrent-write rebase could resurrect inline
-                // values or discard the newly internalized copy.
-                mergedDb.pluginCustomStorage = safeStructuredClone(localDb.pluginCustomStorage)
-            }
-
-            const trackedCharIds = new Set<string>(toSave.character.filter(Boolean))
-            for (const trackedChat of toSave.chat) {
-                if (trackedChat?.[0]) {
-                    trackedCharIds.add(trackedChat[0])
-                }
-            }
-            const mergedCharacters = Array.isArray(mergedDb.characters) ? mergedDb.characters : []
-            const localCharacters = Array.isArray(localDb.characters) ? localDb.characters : []
-
-            for (const charId of trackedCharIds) {
-                const localChar = localCharacters.find((char) => char?.chaId === charId)
-                const mergedIndex = mergedCharacters.findIndex((char) => char?.chaId === charId)
-                if (localChar) {
-                    const clonedLocalChar = safeStructuredClone(localChar)
-                    if (mergedIndex >= 0) {
-                        mergedCharacters[mergedIndex] = clonedLocalChar
-                    }
-                    else {
-                        mergedCharacters.push(clonedLocalChar)
-                    }
-                }
-                else if (mergedIndex >= 0) {
-                    mergedCharacters.splice(mergedIndex, 1)
-                }
-            }
-            mergedDb.characters = mergedCharacters
-            const mergedBaseline = safeStructuredClone(mergedDb) as Database
+            const mergedDb = mergeTrackedDatabaseOnConflict(latestDb, db, toSave)
+            const mergedBaseline = cloneDatabaseState(mergedDb)
             setDatabase(mergedDb)
 
             encoder = new RisuSaveEncoder()

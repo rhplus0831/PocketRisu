@@ -132,6 +132,19 @@ const {
     loadV2Plugin,
     pluginV2,
 } = await import("./plugins.svelte");
+const {
+    createPluginStorageRecord,
+    definePluginStorageRecordValue,
+} = await import("./pluginStorageRecord");
+
+const SPECIAL_PLUGIN_STORAGE_KEYS = [
+    "__proto__",
+    "constructor",
+    "prototype",
+    "toString",
+    "hasOwnProperty",
+    "",
+] as const;
 
 function encoded(prefix: string, key: string) {
     return `${prefix}${Buffer.from(key, "utf-8").toString("base64url")}.json`;
@@ -242,6 +255,32 @@ describe("readExternalizedPluginStorage", () => {
         expect(readPersistentJson).toHaveBeenCalledWith(validValueKey, { cached: true });
         expect(readPersistentJson).toHaveBeenCalledWith(validMetaKey);
     });
+
+    test("preserves special property names in value and metadata records", async () => {
+        for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
+            persistent.set(encoded(PLUGIN_SAVE_PREFIX, key), { index });
+            persistent.set(encoded(PLUGIN_SAVE_META_PREFIX, key), {
+                plugin: `Plugin ${index}`,
+                updatedAt: index,
+            });
+        }
+
+        const external = await readExternalizedPluginStorage();
+
+        expect(Object.getPrototypeOf(external.values)).toBeNull();
+        expect(Object.getPrototypeOf(external.meta)).toBeNull();
+        expect(Object.keys(external.values)).toEqual(SPECIAL_PLUGIN_STORAGE_KEYS);
+        expect(Object.keys(external.meta)).toEqual(SPECIAL_PLUGIN_STORAGE_KEYS);
+        for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
+            expect(Object.hasOwn(external.values, key)).toBe(true);
+            expect(external.values[key]).toEqual({ index });
+            expect(Object.hasOwn(external.meta, key)).toBe(true);
+            expect(external.meta[key]).toEqual({
+                plugin: `Plugin ${index}`,
+                updatedAt: index,
+            });
+        }
+    });
 });
 
 describe("plugin save storage transport", () => {
@@ -295,6 +334,31 @@ describe("plugin save storage transport", () => {
         await removePluginSaveStorageItem("�");
 
         expect(persistent.has(encoded(PLUGIN_SAVE_PREFIX, "�"))).toBe(false);
+    });
+
+    test("inline set/get/list/remove treats special names as exact own keys", async () => {
+        // Start from an ordinary legacy object to cover inherited-name misses.
+        database.pluginCustomStorage = {};
+        for (const key of SPECIAL_PLUGIN_STORAGE_KEYS) {
+            await expect(getPluginSaveStorageItem(key)).resolves.toBeNull();
+        }
+
+        for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
+            await setPluginSaveStorageItem(key, { index });
+        }
+
+        expect(Object.getPrototypeOf(database.pluginCustomStorage)).toBe(Object.prototype);
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(SPECIAL_PLUGIN_STORAGE_KEYS);
+        for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
+            await expect(getPluginSaveStorageItem(key)).resolves.toEqual({ index });
+            expect(Object.hasOwn(database.pluginCustomStorage, key)).toBe(true);
+        }
+
+        for (const key of SPECIAL_PLUGIN_STORAGE_KEYS) {
+            await removePluginSaveStorageItem(key);
+            await expect(getPluginSaveStorageItem(key)).resolves.toBeNull();
+        }
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual([]);
     });
 });
 
@@ -637,6 +701,65 @@ describe("reconcilePluginStorageMode", () => {
 });
 
 describe("transitionPluginStorageMode", () => {
+    test("round-trips special value and metadata keys through both mode transitions", async () => {
+        const values = createPluginStorageRecord<unknown>();
+        const meta = createPluginStorageRecord<any>();
+        for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
+            definePluginStorageRecordValue(values, key, { index });
+            definePluginStorageRecordValue(meta, key, {
+                plugin: `Plugin ${index}`,
+                updatedAt: index,
+            });
+        }
+        database.pluginCustomStorage = values;
+        database.pluginStorageMeta = meta;
+        const persistDatabase = vi.fn(async () => undefined);
+
+        await expect(transitionPluginStorageMode(true, {
+            dependencies: { persistDatabase },
+        })).resolves.toEqual({
+            direction: "externalize",
+            values: SPECIAL_PLUGIN_STORAGE_KEYS.length,
+            meta: SPECIAL_PLUGIN_STORAGE_KEYS.length,
+        });
+
+        expect(database.optimizePluginMemory).toBe(true);
+        expect(Object.keys(database.pluginCustomStorage)).toEqual([]);
+        expect(database.pluginStorageMeta).toBeUndefined();
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(SPECIAL_PLUGIN_STORAGE_KEYS);
+        for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
+            await expect(getPluginSaveStorageItem(key)).resolves.toEqual({ index });
+            expect(persistent.get(encoded(PLUGIN_SAVE_META_PREFIX, key))).toEqual({
+                plugin: `Plugin ${index}`,
+                updatedAt: index,
+            });
+        }
+
+        await expect(transitionPluginStorageMode(false, {
+            dependencies: { persistDatabase },
+        })).resolves.toEqual({
+            direction: "internalize",
+            values: SPECIAL_PLUGIN_STORAGE_KEYS.length,
+            meta: SPECIAL_PLUGIN_STORAGE_KEYS.length,
+        });
+
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(Object.getPrototypeOf(database.pluginCustomStorage)).toBe(Object.prototype);
+        expect(Object.getPrototypeOf(database.pluginStorageMeta)).toBe(Object.prototype);
+        expect(Object.keys(database.pluginCustomStorage)).toEqual(SPECIAL_PLUGIN_STORAGE_KEYS);
+        expect(Object.keys(database.pluginStorageMeta)).toEqual(SPECIAL_PLUGIN_STORAGE_KEYS);
+        for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
+            await expect(getPluginSaveStorageItem(key)).resolves.toEqual({ index });
+            expect(Object.hasOwn(database.pluginCustomStorage, key)).toBe(true);
+            expect(database.pluginStorageMeta[key]).toEqual({
+                plugin: `Plugin ${index}`,
+                updatedAt: index,
+            });
+        }
+        expect(persistent.size).toBe(0);
+        expect(persistDatabase).toHaveBeenCalledTimes(2);
+    });
+
     test("drains SETs queued behind a held count before disabling", async () => {
         database.optimizePluginMemory = true;
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
@@ -968,6 +1091,26 @@ describe("transitionPluginStorageMode", () => {
             removed: "external-value",
         });
         expect(persistent.size).toBe(0);
+    });
+
+    test("V2 pluginStorage round-trips special keys including an empty key at index zero", () => {
+        const v2Apis = getV2PluginAPIs();
+        for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
+            v2Apis.pluginStorage.setItem(key, `value-${index}`);
+        }
+
+        expect(v2Apis.pluginStorage.keys()).toEqual(SPECIAL_PLUGIN_STORAGE_KEYS);
+        expect(v2Apis.pluginStorage.length()).toBe(SPECIAL_PLUGIN_STORAGE_KEYS.length);
+        for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
+            expect(v2Apis.pluginStorage.key(index)).toBe(key);
+            expect(v2Apis.pluginStorage.getItem(key)).toBe(`value-${index}`);
+            expect(Object.hasOwn(database.pluginCustomStorage, key)).toBe(true);
+        }
+
+        v2Apis.pluginStorage.clear();
+        v2Apis.pluginStorage.setItem("", "empty-first");
+        expect(v2Apis.pluginStorage.key(0)).toBe("");
+        expect(v2Apis.pluginStorage.getItem("")).toBe("empty-first");
     });
 
     test("V2.0 rechecks the transition guard immediately before execution", async () => {

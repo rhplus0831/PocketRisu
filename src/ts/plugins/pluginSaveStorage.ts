@@ -10,6 +10,13 @@ import {
 } from "../storage/persistentKv";
 import { requireCommittedDatabaseSave } from "../storage/databaseSave";
 import { beginPluginStorageModeTransition } from "./pluginMemoryOptimization";
+import {
+    copyDatabasePluginStorageRecord,
+    createDatabasePluginStorageRecord,
+    createPluginStorageRecord,
+    definePluginStorageRecordValue,
+    hasPluginStorageRecordValue,
+} from "./pluginStorageRecord";
 
 export const PLUGIN_SAVE_PREFIX = "pluginsave/";
 export const PLUGIN_SAVE_META_PREFIX = "pluginsave-meta/";
@@ -52,18 +59,24 @@ export async function readExternalizedPluginStorage(): Promise<{
             listPersistentKeys(PLUGIN_SAVE_PREFIX),
             listPersistentKeys(PLUGIN_SAVE_META_PREFIX),
         ]);
-        const values: Record<string, unknown> = {};
-        const meta: NonNullable<Database["pluginStorageMeta"]> = {};
+        const values = createPluginStorageRecord<unknown>();
+        const meta = createPluginStorageRecord<
+            NonNullable<Database["pluginStorageMeta"]>[string]
+        >();
 
         for (const storageKey of listedValueKeys) {
             const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
             if (key === null) continue;
-            values[key] = await readPersistentJson(storageKey, { cached: true });
+            definePluginStorageRecordValue(
+                values,
+                key,
+                await readPersistentJson(storageKey, { cached: true }),
+            );
         }
         for (const storageKey of listedMetaKeys) {
             const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
             if (key === null) continue;
-            meta[key] = await readPersistentJson(storageKey);
+            definePluginStorageRecordValue(meta, key, await readPersistentJson(storageKey));
         }
 
         return { values, meta };
@@ -74,7 +87,8 @@ export async function getPluginSaveStorageItem<T>(key: string): Promise<T | null
     return withPluginSaveStorageLock(async () => {
         const db = getDatabase();
         if (!db.optimizePluginMemory) {
-            const value = db.pluginCustomStorage?.[key];
+            if (!hasPluginStorageRecordValue(db.pluginCustomStorage, key)) return null;
+            const value = db.pluginCustomStorage![key];
             if (value === undefined || value === null) return null;
             // db is reactive $state, so inline values are Svelte proxies.
             // postMessage/structuredClone reject proxies (DataCloneError), and
@@ -90,8 +104,9 @@ export async function setPluginSaveStorageItem<T>(key: string, value: T): Promis
     await withPluginSaveStorageLock(async () => {
         const db = getDatabase();
         if (!db.optimizePluginMemory) {
-            db.pluginCustomStorage ??= {};
-            db.pluginCustomStorage[key] = value;
+            const next = copyDatabasePluginStorageRecord(db.pluginCustomStorage);
+            definePluginStorageRecordValue(next, key, value);
+            db.pluginCustomStorage = next;
             return;
         }
         await writePersistentJson(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key), value);
@@ -102,7 +117,10 @@ export async function removePluginSaveStorageItem(key: string): Promise<void> {
     await withPluginSaveStorageLock(async () => {
         const db = getDatabase();
         if (!db.optimizePluginMemory) {
-            if (db.pluginCustomStorage) delete db.pluginCustomStorage[key];
+            if (!hasPluginStorageRecordValue(db.pluginCustomStorage, key)) return;
+            const next = copyDatabasePluginStorageRecord(db.pluginCustomStorage);
+            delete next[key];
+            db.pluginCustomStorage = next;
             return;
         }
         await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key));
@@ -113,7 +131,7 @@ export async function clearPluginSaveStorage(): Promise<void> {
     await withPluginSaveStorageLock(async () => {
         const db = getDatabase();
         if (!db.optimizePluginMemory) {
-            db.pluginCustomStorage = {};
+            db.pluginCustomStorage = createDatabasePluginStorageRecord();
             return;
         }
         await clearPersistentPrefix(PLUGIN_SAVE_PREFIX);
@@ -277,14 +295,18 @@ async function reconcilePluginStorageModeUnlocked(
         return { direction: "none", values: 0, meta: 0 };
     }
 
-    db.pluginCustomStorage ??= {};
-    if (metaStorageKeys.length > 0) db.pluginStorageMeta ??= {};
+    const nextValues = copyDatabasePluginStorageRecord(db.pluginCustomStorage);
+    const nextMeta = copyDatabasePluginStorageRecord(db.pluginStorageMeta);
 
     let completed = 0;
     for (const storageKey of valueStorageKeys) {
         const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
         if (key === null) continue;
-        db.pluginCustomStorage[key] = await deps.readPersistentJson(storageKey, { cached: true });
+        definePluginStorageRecordValue(
+            nextValues,
+            key,
+            await deps.readPersistentJson(storageKey, { cached: true }),
+        );
         options.onProgress?.({
             direction: "internalize",
             completed: ++completed,
@@ -294,12 +316,23 @@ async function reconcilePluginStorageModeUnlocked(
     for (const storageKey of metaStorageKeys) {
         const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
         if (key === null) continue;
-        db.pluginStorageMeta![key] = await deps.readPersistentJson(storageKey);
+        definePluginStorageRecordValue(
+            nextMeta,
+            key,
+            await deps.readPersistentJson(storageKey),
+        );
         options.onProgress?.({
             direction: "internalize",
             completed: ++completed,
             total,
         });
+    }
+
+    db.pluginCustomStorage = nextValues;
+    if (metaStorageKeys.length > 0 || Object.keys(nextMeta).length > 0) {
+        db.pluginStorageMeta = nextMeta;
+    } else {
+        delete db.pluginStorageMeta;
     }
 
     // The database becomes the durable copy before any external key goes.

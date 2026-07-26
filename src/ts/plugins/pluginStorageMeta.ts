@@ -31,6 +31,14 @@ import {
     PLUGIN_SAVE_META_PREFIX,
     withPluginSaveStorageLock,
 } from "./pluginSaveStorage";
+import {
+    copyDatabasePluginStorageRecord,
+    copyPluginStorageRecord,
+    createDatabasePluginStorageRecord,
+    createPluginStorageRecord,
+    definePluginStorageRecordValue,
+    hasPluginStorageRecordValue,
+} from "./pluginStorageRecord";
 
 export type PluginStorageBackend = "save" | "local" | "idb";
 export interface PluginOwnerRecord {
@@ -44,9 +52,11 @@ const IDB_META_PREFIX = "cache/plugin-storage-meta/";
 // ── local backend blob helpers ──────────────────────────────────────────────
 function readLocalMeta(): Record<string, PluginOwnerRecord> {
     try {
-        return JSON.parse(localStorage.getItem(LOCAL_META_KEY) || "{}");
+        return copyPluginStorageRecord(
+            JSON.parse(localStorage.getItem(LOCAL_META_KEY) || "{}"),
+        );
     } catch {
-        return {};
+        return createPluginStorageRecord();
     }
 }
 
@@ -70,13 +80,14 @@ export function recordOwner(backend: PluginStorageBackend, key: string, plugin: 
                 );
                 return;
             }
-            db.pluginStorageMeta ??= {};
-            db.pluginStorageMeta[key] = record;
+            const next = copyDatabasePluginStorageRecord(db.pluginStorageMeta);
+            definePluginStorageRecordValue(next, key, record);
+            db.pluginStorageMeta = next;
         });
     }
     if (backend === "local") {
         const map = readLocalMeta();
-        map[key] = record;
+        definePluginStorageRecordValue(map, key, record);
         writeLocalMeta(map);
         return;
     }
@@ -91,7 +102,10 @@ export function removeOwner(backend: PluginStorageBackend, key: string): void | 
                 await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, key));
                 return;
             }
-            if (db.pluginStorageMeta) delete db.pluginStorageMeta[key];
+            if (!hasPluginStorageRecordValue(db.pluginStorageMeta, key)) return;
+            const next = copyDatabasePluginStorageRecord(db.pluginStorageMeta);
+            delete next[key];
+            db.pluginStorageMeta = next;
         });
     }
     if (backend === "local") {
@@ -111,11 +125,11 @@ export function clearOwners(backend: PluginStorageBackend): void | Promise<void>
                 await clearPersistentPrefix(PLUGIN_SAVE_META_PREFIX);
                 return;
             }
-            db.pluginStorageMeta = {};
+            db.pluginStorageMeta = createDatabasePluginStorageRecord();
         });
     }
     if (backend === "local") {
-        writeLocalMeta({});
+        writeLocalMeta(createPluginStorageRecord());
         return;
     }
     return clearPersistentPrefix(IDB_META_PREFIX);
@@ -124,14 +138,19 @@ export function clearOwners(backend: PluginStorageBackend): void | Promise<void>
 // ── read side (called from the viewer) ──────────────────────────────────────
 // Returns a { storageKey → plugin name } map for the given backend.
 export async function getOwners(backend: PluginStorageBackend): Promise<Record<string, string>> {
-    const out: Record<string, string> = {};
+    const out = createPluginStorageRecord<string>();
     if (backend === "save") {
         return withPluginSaveStorageLock(async () => {
             const db = getDatabase();
             if (!db.optimizePluginMemory) {
-                const meta = getDatabase({ snapshot: true }).pluginStorageMeta ?? {};
+                // `$state.snapshot` drops an own `__proto__`; values returned
+                // here are primitive plugin names, so an own-safe live read is
+                // both detached and complete.
+                const meta = db.pluginStorageMeta ?? {};
                 for (const key of Object.keys(meta)) {
-                    if (meta[key]?.plugin) out[key] = meta[key].plugin;
+                    if (meta[key]?.plugin) {
+                        definePluginStorageRecordValue(out, key, meta[key].plugin);
+                    }
                 }
                 return out;
             }
@@ -141,7 +160,7 @@ export async function getOwners(backend: PluginStorageBackend): Promise<Record<s
                 const encoded = fullKey.slice(PLUGIN_SAVE_META_PREFIX.length, -".json".length);
                 const rawKey = decodeStorageKeyComponent(encoded);
                 const record = await readPersistentJson<PluginOwnerRecord>(fullKey);
-                if (record?.plugin) out[rawKey] = record.plugin;
+                if (record?.plugin) definePluginStorageRecordValue(out, rawKey, record.plugin);
             }
             return out;
         });
@@ -149,7 +168,7 @@ export async function getOwners(backend: PluginStorageBackend): Promise<Record<s
     if (backend === "local") {
         const map = readLocalMeta();
         for (const key of Object.keys(map)) {
-            if (map[key]?.plugin) out[key] = map[key].plugin;
+            if (map[key]?.plugin) definePluginStorageRecordValue(out, key, map[key].plugin);
         }
         return out;
     }
@@ -158,7 +177,7 @@ export async function getOwners(backend: PluginStorageBackend): Promise<Record<s
         const encoded = fullKey.slice(IDB_META_PREFIX.length, -".json".length);
         const rawKey = decodeStorageKeyComponent(encoded);
         const record = await readPersistentJson<PluginOwnerRecord>(fullKey);
-        if (record?.plugin) out[rawKey] = record.plugin;
+        if (record?.plugin) definePluginStorageRecordValue(out, rawKey, record.plugin);
     }
     return out;
 }

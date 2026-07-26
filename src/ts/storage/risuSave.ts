@@ -3,6 +3,12 @@ import * as fflate from "fflate";
 import { createBotPresetTemplate, getDatabase, type Database } from "./database.svelte";
 import { forageStorage } from "../globalApi.svelte";
 import { chatToStub } from "./chatStorage";
+import {
+    copyDatabasePluginStorageRecord,
+    createDatabasePluginStorageRecord,
+    definePluginStorageRecordValue,
+    hasPluginStorageRecordValue,
+} from "../plugins/pluginStorageRecord";
 
 const packr = new Packr({
     useRecords:false
@@ -20,7 +26,153 @@ const checkedRemoteExistence = new Set<string>();
 const magicHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7]); 
 const magicCompressedHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 8]);
 const magicStreamCompressedHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 9]);
+const magicPluginStorageHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 10]);
+const magicPluginStorageCompressedHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 11]);
+const magicPluginStorageStreamHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 12]);
 const magicRisuSaveHeader = new TextEncoder().encode("RISUSAVE\0");
+const pluginStorageLegacyEscapeField = "__pocketRisuPluginStorageEscapesV1";
+const pluginStorageLegacyEscapeMarker = "PocketRisu.plugin-storage-escapes";
+
+type PluginStorageLegacyEscape = {
+    field: "pluginCustomStorage" | "pluginStorageMeta";
+    index: number;
+    value: unknown;
+};
+
+type SerializedLegacyEscapeValue = [0] | [1, string];
+type PluginStorageLegacyEscapeEnvelope = [
+    typeof pluginStorageLegacyEscapeMarker,
+    1,
+    SerializedLegacyEscapeValue | null,
+    Array<[PluginStorageLegacyEscape["field"], number, SerializedLegacyEscapeValue]>,
+];
+
+function serializeLegacyEscapeValue(value: unknown): SerializedLegacyEscapeValue {
+    const json = JSON.stringify(value);
+    return json === undefined ? [0] : [1, json];
+}
+
+function deserializeLegacyEscapeValue(value: unknown): { valid: boolean; value?: unknown } {
+    if (!Array.isArray(value)) return { valid: false };
+    if (value.length === 1 && value[0] === 0) return { valid: true, value: undefined };
+    if (value.length !== 2 || value[0] !== 1 || typeof value[1] !== "string") {
+        return { valid: false };
+    }
+    try {
+        return { valid: true, value: JSON.parse(value[1]) };
+    } catch {
+        return { valid: false };
+    }
+}
+
+function parseLegacyPluginStorageEnvelope(value: unknown): {
+    originalField: { present: boolean; value?: unknown };
+    escapes: PluginStorageLegacyEscape[];
+} | null {
+    if (!Array.isArray(value)
+        || value.length !== 4
+        || value[0] !== pluginStorageLegacyEscapeMarker
+        || value[1] !== 1
+        || (value[2] !== null && !Array.isArray(value[2]))
+        || !Array.isArray(value[3])
+        || (value[2] === null && value[3].length === 0)) {
+        return null;
+    }
+    const original = value[2] === null
+        ? { valid: true, present: false, value: undefined }
+        : { ...deserializeLegacyEscapeValue(value[2]), present: true };
+    if (!original.valid) return null;
+
+    const seen = new Set<string>();
+    const escapes: PluginStorageLegacyEscape[] = [];
+    for (const entry of value[3]) {
+        if (!Array.isArray(entry)
+            || entry.length !== 3
+            || (entry[0] !== "pluginCustomStorage" && entry[0] !== "pluginStorageMeta")
+            || !Number.isInteger(entry[1])
+            || entry[1] < 0
+            || seen.has(entry[0])) {
+            return null;
+        }
+        const parsed = deserializeLegacyEscapeValue(entry[2]);
+        if (!parsed.valid) return null;
+        seen.add(entry[0]);
+        escapes.push({ field: entry[0], index: entry[1], value: parsed.value });
+    }
+    return {
+        originalField: { present: original.present, value: original.value },
+        escapes,
+    };
+}
+
+function prepareLegacyPluginStorageKeys(data: any): { data: any; escaped: boolean } {
+    const escapes: PluginStorageLegacyEscape[] = [];
+    let prepared = data;
+    for (const field of ["pluginCustomStorage", "pluginStorageMeta"] as const) {
+        const record = data?.[field] as Record<string, unknown> | undefined;
+        if (!hasPluginStorageRecordValue(record, "__proto__")) continue;
+        if (prepared === data) prepared = { ...data };
+        const recordCopy = copyDatabasePluginStorageRecord(record);
+        escapes.push({
+            field,
+            index: Object.keys(record).indexOf("__proto__"),
+            value: recordCopy["__proto__"],
+        });
+        delete recordCopy["__proto__"];
+        prepared[field] = recordCopy;
+    }
+    if (escapes.length === 0) return { data, escaped: false };
+
+    const hasReservedField = hasPluginStorageRecordValue(data, pluginStorageLegacyEscapeField);
+    const envelope: PluginStorageLegacyEscapeEnvelope = [
+        pluginStorageLegacyEscapeMarker,
+        1,
+        hasReservedField ? serializeLegacyEscapeValue(data[pluginStorageLegacyEscapeField]) : null,
+        escapes.map(escape => [
+            escape.field,
+            escape.index,
+            serializeLegacyEscapeValue(escape.value),
+        ]),
+    ];
+    Object.defineProperty(prepared, pluginStorageLegacyEscapeField, {
+        configurable: true,
+        enumerable: true,
+        value: envelope,
+        writable: true,
+    });
+    return { data: prepared, escaped: true };
+}
+
+function restoreLegacyPluginStorageKeys(data: any): any {
+    if (!hasPluginStorageRecordValue(data, pluginStorageLegacyEscapeField)) return data;
+    const envelope = parseLegacyPluginStorageEnvelope(data[pluginStorageLegacyEscapeField]);
+    if (!envelope) return data;
+    for (const escape of envelope.escapes) {
+        const source = data[escape.field] ?? createDatabasePluginStorageRecord();
+        const record = createDatabasePluginStorageRecord<unknown>();
+        const keys = Object.keys(source);
+        const insertAt = Math.min(escape.index, keys.length);
+        for (let index = 0; index <= keys.length; index++) {
+            if (index === insertAt) {
+                definePluginStorageRecordValue(record, "__proto__", escape.value);
+            }
+            if (index < keys.length) {
+                definePluginStorageRecordValue(record, keys[index], source[keys[index]]);
+            }
+        }
+        data[escape.field] = record;
+    }
+    if (envelope.originalField.present) {
+        definePluginStorageRecordValue(
+            data,
+            pluginStorageLegacyEscapeField,
+            envelope.originalField.value,
+        );
+    } else {
+        delete data[pluginStorageLegacyEscapeField];
+    }
+    return data;
+}
 
 
 async function checkCompressionStreams(){
@@ -37,33 +189,42 @@ async function checkCompressionStreams(){
 }
 
 export function encodeRisuSaveLegacy(data:any, compression:'noCompression'|'compression' = 'noCompression'){
-    let encoded:Uint8Array = packr.encode(data)
+    const prepared = prepareLegacyPluginStorageKeys(data)
+    let encoded:Uint8Array = packr.encode(prepared.data)
     if(compression === 'compression'){
         encoded = fflate.compressSync(encoded)
-        const result = new Uint8Array(encoded.length + magicCompressedHeader.length);
-        result.set(magicCompressedHeader, 0)
-        result.set(encoded, magicCompressedHeader.length)
+        const header = prepared.escaped
+            ? magicPluginStorageCompressedHeader
+            : magicCompressedHeader
+        const result = new Uint8Array(encoded.length + header.length);
+        result.set(header, 0)
+        result.set(encoded, header.length)
         return result
     }
     else{
-        const result = new Uint8Array(encoded.length + magicHeader.length);
-        result.set(magicHeader, 0)
-        result.set(encoded, magicHeader.length)
+        const header = prepared.escaped ? magicPluginStorageHeader : magicHeader
+        const result = new Uint8Array(encoded.length + header.length);
+        result.set(header, 0)
+        result.set(encoded, header.length)
         return result
     }
 }
 
 export async function encodeRisuSaveCompressionStream(data:any) {
     await checkCompressionStreams()
-    let encoded:Uint8Array = packr.encode(data)
+    const prepared = prepareLegacyPluginStorageKeys(data)
+    let encoded:Uint8Array = packr.encode(prepared.data)
     const cs = new CompressionStream('gzip');
     const writer = cs.writable.getWriter();
     writer.write(encoded as any);
     writer.close();
     const buf = await new Response(cs.readable).arrayBuffer()
-    const result = new Uint8Array(new Uint8Array(buf).length + magicStreamCompressedHeader.length);
-    result.set(magicStreamCompressedHeader, 0)
-    result.set(new Uint8Array(buf), magicStreamCompressedHeader.length)
+    const header = prepared.escaped
+        ? magicPluginStorageStreamHeader
+        : magicStreamCompressedHeader
+    const result = new Uint8Array(new Uint8Array(buf).length + header.length);
+    result.set(header, 0)
+    result.set(new Uint8Array(buf), header.length)
     return result
 }
 
@@ -604,12 +765,28 @@ export async function decodeRisuSave(data:Uint8Array){
     try {
         const header = checkHeader(data)
         switch(header){
+            case "plugin-compressed":
+                data = data.slice(magicPluginStorageCompressedHeader.length)
+                return restoreLegacyPluginStorageKeys(decode(fflate.decompressSync(data)))
             case "compressed":
                 data = data.slice(magicCompressedHeader.length)
                 return decode(fflate.decompressSync(data))
+            case "plugin-raw":
+                data = data.slice(magicPluginStorageHeader.length)
+                return restoreLegacyPluginStorageKeys(unpackr.decode(data))
             case "raw":
                 data = data.slice(magicHeader.length)
                 return unpackr.decode(data)
+            case "plugin-stream":{
+                await checkCompressionStreams()
+                data = data.slice(magicPluginStorageStreamHeader.length)
+                const cs = new DecompressionStream('gzip');
+                const writer = cs.writable.getWriter();
+                writer.write(data as any);
+                writer.close();
+                const buf = await new Response(cs.readable).arrayBuffer()
+                return restoreLegacyPluginStorageKeys(unpackr.decode(new Uint8Array(buf)))
+            }
             case "stream":{
                 await checkCompressionStreams()
                 data = data.slice(magicStreamCompressedHeader.length)
@@ -634,11 +811,11 @@ export async function decodeRisuSave(data:Uint8Array){
             const risuSaveHeader = new Uint8Array(Buffer.from("\u0000\u0000RISU",'utf-8'))
             const realData = data.subarray(risuSaveHeader.length)
             const dec = unpackr.decode(realData)
-            return dec   
+            return dec
         } catch (error) {
             const buf = Buffer.from(fflate.decompressSync(Buffer.from(data)))
             try {
-                return JSON.parse(buf.toString('utf-8'))                            
+                return JSON.parse(buf.toString('utf-8'))
             } catch (error) {
                 return unpackr.decode(buf)
             }
@@ -648,7 +825,7 @@ export async function decodeRisuSave(data:Uint8Array){
 
 function checkHeader(data: Uint8Array) {
 
-    let header:'none'|'compressed'|'raw'|'stream'|'risusave' = 'raw'
+    let header:'none'|'compressed'|'raw'|'stream'|'risusave'|'plugin-raw'|'plugin-compressed'|'plugin-stream' = 'raw'
 
     if (data.length < magicHeader.length) {
       return false;
@@ -675,6 +852,36 @@ function checkHeader(data: Uint8Array) {
         header = 'stream'
         for (let i = 0; i < magicStreamCompressedHeader.length; i++) {
             if (data[i] !== magicStreamCompressedHeader[i]) {
+                header = 'none'
+                break
+            }
+        }
+    }
+
+    if(header === 'none'){
+        header = 'plugin-raw'
+        for (let i = 0; i < magicPluginStorageHeader.length; i++) {
+            if (data[i] !== magicPluginStorageHeader[i]) {
+                header = 'none'
+                break
+            }
+        }
+    }
+
+    if(header === 'none'){
+        header = 'plugin-compressed'
+        for (let i = 0; i < magicPluginStorageCompressedHeader.length; i++) {
+            if (data[i] !== magicPluginStorageCompressedHeader[i]) {
+                header = 'none'
+                break
+            }
+        }
+    }
+
+    if(header === 'none'){
+        header = 'plugin-stream'
+        for (let i = 0; i < magicPluginStorageStreamHeader.length; i++) {
+            if (data[i] !== magicPluginStorageStreamHeader[i]) {
                 header = 'none'
                 break
             }
@@ -747,7 +954,11 @@ export function calculateHash(node: any): number {
     }
 }
 
-export function normalizeJSON(value: any, seen?: WeakSet<object>): any {
+export function normalizeJSON(
+    value: any,
+    seen?: WeakSet<object>,
+    preservePluginStorageKeys = false,
+): any {
     if (value === null || value === undefined) return null;
     if (typeof value !== 'object') {
         if (typeof value === 'number' && !isFinite(value)) return null;
@@ -771,7 +982,7 @@ export function normalizeJSON(value: any, seen?: WeakSet<object>): any {
             if (item === undefined) {
                 result.push(null);
             } else {
-                const normalized = normalizeJSON(item, seen);
+                const normalized = normalizeJSON(item, seen, preservePluginStorageKeys);
                 result.push(normalized === undefined ? null : normalized);
             }
         }
@@ -783,9 +994,20 @@ export function normalizeJSON(value: any, seen?: WeakSet<object>): any {
         if (Object.prototype.hasOwnProperty.call(value, key)) {
             const propValue = value[key];
             if (propValue !== undefined) {
-                const normalized = normalizeJSON(propValue, seen);
-                if (normalized !== undefined)
-                    result[key] = normalized;
+                const normalized = normalizeJSON(
+                    propValue,
+                    seen,
+                    preservePluginStorageKeys
+                        || key === "pluginCustomStorage"
+                        || key === "pluginStorageMeta",
+                );
+                if (normalized !== undefined) {
+                    if (preservePluginStorageKeys) {
+                        definePluginStorageRecordValue(result, key, normalized);
+                    } else {
+                        result[key] = normalized;
+                    }
+                }
             }
         }
     }
@@ -991,7 +1213,13 @@ export class RisuSavePatcher {
             // normalized-undefined value means the key is absent. (A raw
             // JSON.stringify of undefined does NOT imply that: e.g.
             // {x:1, toJSON:()=>undefined} normalizes to {x:1}.)
-            const normVal = normalizeJSON(curRoot[key])
+            const preservePluginStorageKeys = key === "pluginCustomStorage"
+                || key === "pluginStorageMeta"
+            const normVal = normalizeJSON(
+                curRoot[key],
+                undefined,
+                preservePluginStorageKeys,
+            )
             if (normVal === undefined) {
                 // Absent in the normalized form. If it was present (hadKey) the
                 // key stays in removedRootKeys → the removal loop emits a remove;
@@ -999,8 +1227,24 @@ export class RisuSavePatcher {
                 continue
             }
             removedRootKeys.delete(key)
-            const before = hadKey ? { [key]: lastRoot[key] } : {}
-            for (const p of compare(before, { [key]: normVal })) patch.push(p)
+            // JSON Patch rejects a path segment named `__proto__`, but a
+            // whole-map replacement can safely carry that own key inside the
+            // operation value. Use that form for additions, updates, and
+            // removals involving the special key.
+            const requiresWholePluginMapReplace = preservePluginStorageKeys && (
+                hasPluginStorageRecordValue(lastRoot[key], "__proto__")
+                || hasPluginStorageRecordValue(normVal, "__proto__")
+            )
+            if (requiresWholePluginMapReplace) {
+                patch.push({
+                    op: hadKey ? "replace" : "add",
+                    path: `/${key}`,
+                    value: normVal,
+                })
+            } else {
+                const before = hadKey ? { [key]: lastRoot[key] } : {}
+                for (const p of compare(before, { [key]: normVal })) patch.push(p)
+            }
             this.hashBlocks[key] = calculateHash(normVal)
             this.lastRootKeyJsons.set(key, JSON.stringify(normVal))
             nextRoot[key] = normVal

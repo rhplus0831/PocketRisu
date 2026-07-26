@@ -19,6 +19,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { applyModelPresetDefaults } from '../preset/dbDefaults';
 import type { ApiKeyPoolEntry, ModelBindingFields, ModelBindingSet, ModelPreset, ModelPresetMigrationSummary, RegistryCache } from '../preset/types';
 import { emptyModelBinding } from '../preset/types';
+import { copyDatabasePluginStorageRecord } from '../plugins/pluginStorageRecord';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
 export let appVer = "2026.2.291" //<APP_VERSION_POINT>
@@ -726,7 +727,10 @@ export function setDatabase(data:Database){
     if (typeof data.localNetworkTimeoutSec !== 'number' || Number.isNaN(data.localNetworkTimeoutSec)) data.localNetworkTimeoutSec = 600
     // Optimized mode deliberately retains only this empty compatibility map;
     // V3 values are read on demand from pluginsave/ by pluginSaveStorage.ts.
-    data.pluginCustomStorage ??= {}
+    data.pluginCustomStorage = copyDatabasePluginStorageRecord(data.pluginCustomStorage)
+    if (data.pluginStorageMeta) {
+        data.pluginStorageMeta = copyDatabasePluginStorageRecord(data.pluginStorageMeta)
+    }
     data.longPressToPopupEditor ??= false
     data.showInputActionBar ??= true
     data.moveInsteadOfCopyOnCMPConvert ??= false

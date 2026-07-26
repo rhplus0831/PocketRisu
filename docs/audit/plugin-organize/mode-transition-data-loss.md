@@ -183,3 +183,32 @@ remains a host defect.
 - Use an own-property presence test for reads.
 - Round-trip `__proto__`, `constructor`, `prototype`, `toString`, and an empty
   key through set/get/list, both mode transitions, and partial backup.
+
+### Resolution
+
+**Fixed 2026-07-26.** Plugin-storage boundary records now use null prototypes,
+while records stored in Svelte state use ordinary prototypes plus explicit own
+data-property creation so they remain deeply reactive. Reads test own presence;
+value and owner maps, mode transitions, viewer/backup assembly, database-load
+normalization, V2 compatibility APIs, and partial-backup merging all use the
+shared safe-record helpers. A retained V2 database-storage handle is a live
+facade over the current map, so first-time special keys remain enumerable,
+serializable, reactive, and valid after map replacement or a mode transition.
+
+Database-aware cloning preserves both plugin maps across initial save
+baselines and ETag-conflict rebases. Changes involving an own `__proto__` use a
+whole-map JSON Patch replacement rather than a forbidden nested path. Because
+`msgpackr` deliberately renames `__proto__` in ordinary maps, exact legacy
+backups use dedicated marked raw/compressed/stream headers (10/11/12) and a
+schema-validated, collision-preserving envelope. Standard saves retain the
+upstream headers byte-for-byte, and only marked formats authorize restoration;
+the protocol is mirrored by client, server, and streaming codecs.
+
+Regression coverage round-trips `__proto__`, `__proto_`, `constructor`,
+`prototype`, `toString`, `hasOwnProperty`, and the empty key through V2/V3
+reads, writes, enumeration, metadata, both transitions, real partial-backup
+encoding, client/server decoding, streaming import/export, Svelte snapshots,
+reactive nested updates, conflict rebasing, and JSON Patch add/update/removal.
+Independent verification passed 113 focused tests, 990 client tests (3
+skipped), 138 server tests, 95 compatibility tests (5 skipped), `pnpm check`,
+and a production build.

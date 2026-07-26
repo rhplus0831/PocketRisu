@@ -16,6 +16,14 @@ import {
     isPluginStorageModeTransitioning,
     shouldDisableImportedPlugin,
 } from "./pluginMemoryOptimization";
+import {
+    copyDatabasePluginStorageRecord,
+    createDatabasePluginStorageRecord,
+    createPluginStorageRecord,
+    definePluginStorageRecordValue,
+    hasPluginStorageRecordValue,
+    setDatabasePluginStorageRecordValue,
+} from "./pluginStorageRecord";
 
 export const customProviderStore = writable([] as string[])
 
@@ -629,7 +637,7 @@ export const getV2PluginAPIs = () => {
                 }
                 result = arraySnapshot
             } else {
-                const objectSnapshot: Record<string, unknown> = Object.create(null)
+                const objectSnapshot = createDatabasePluginStorageRecord<unknown>()
                 for (const key of Reflect.ownKeys(object)) {
                     if (typeof key !== 'string') {
                         throw new TypeError(`Legacy plugin storage does not accept symbol keys at ${path}.`)
@@ -690,12 +698,12 @@ export const getV2PluginAPIs = () => {
                     if (Array.isArray(nestedTarget) && prop === 'length') {
                         return Reflect.set(nestedTarget, prop, nestedValue, nestedTarget)
                     }
-                    return Reflect.defineProperty(nestedTarget, prop, {
-                        configurable: true,
-                        enumerable: true,
-                        value: cloneLegacyStorageJson(nestedValue),
-                        writable: true,
-                    })
+                    defineLegacyStorageValue(
+                        nestedTarget as Record<PropertyKey, unknown>,
+                        prop,
+                        nestedValue,
+                    )
+                    return true
                 }
                 return Reflect.set(
                     nestedTarget,
@@ -710,11 +718,17 @@ export const getV2PluginAPIs = () => {
             },
             defineProperty(nestedTarget, prop, descriptor) {
                 assertSynchronousPluginStorageAccess()
-                const guardedDescriptor = storageValue
-                    ? { ...descriptor, value: validateLegacyStorageDescriptor(descriptor) }
-                    : "value" in descriptor
-                        ? { ...descriptor, value: unwrapGuardedValue(descriptor.value) }
-                        : descriptor
+                if (storageValue) {
+                    setDatabasePluginStorageRecordValue(
+                        nestedTarget as Record<string, unknown>,
+                        prop,
+                        validateLegacyStorageDescriptor(descriptor),
+                    )
+                    return true
+                }
+                const guardedDescriptor = "value" in descriptor
+                    ? { ...descriptor, value: unwrapGuardedValue(descriptor.value) }
+                    : descriptor
                 return Reflect.defineProperty(nestedTarget, prop, guardedDescriptor)
             },
             has(nestedTarget, prop) {
@@ -781,12 +795,148 @@ export const getV2PluginAPIs = () => {
         key: PropertyKey,
         value: unknown,
     ): void => {
-        Reflect.defineProperty(storage, key, {
-            configurable: true,
-            enumerable: true,
-            value: cloneLegacyStorageJson(value),
-            writable: true,
+        setDatabasePluginStorageRecordValue(
+            storage as Record<string, unknown>,
+            key,
+            cloneLegacyStorageJson(value),
+        )
+    }
+    const replaceLegacyStorageValue = (
+        db: ReturnType<typeof getDatabase>,
+        key: PropertyKey,
+        value: unknown,
+    ): void => {
+        // Svelte's state proxy cannot enumerate a first virtual `__proto__`
+        // source because its ownKeys implementation treats the inherited
+        // Object.prototype member as already present. Seed every root write on
+        // a detached record and replace the map so all keys are real target
+        // properties. The live facade below keeps retained handles current.
+        const next = copyDatabasePluginStorageRecord(db.pluginCustomStorage)
+        definePluginStorageRecordValue(next, key, cloneLegacyStorageJson(value))
+        db.pluginCustomStorage = next
+    }
+    const removeLegacyStorageValue = (
+        db: ReturnType<typeof getDatabase>,
+        key: PropertyKey,
+    ): boolean => {
+        if (!hasPluginStorageRecordValue(db.pluginCustomStorage, key)) return true
+        const next = copyDatabasePluginStorageRecord(db.pluginCustomStorage)
+        Reflect.deleteProperty(next, key)
+        db.pluginCustomStorage = next
+        return true
+    }
+    const snapshotLegacyStorage = (): Record<string, unknown> => {
+        const source = getDatabase().pluginCustomStorage
+            ?? createDatabasePluginStorageRecord<unknown>()
+        const snapshot = createPluginStorageRecord<unknown>()
+        const seen = new WeakSet<object>()
+        const trackNestedState = (candidate: unknown): void => {
+            if (candidate === null || typeof candidate !== "object" || seen.has(candidate)) {
+                return
+            }
+            seen.add(candidate)
+            for (const key of Object.keys(candidate)) {
+                trackNestedState((candidate as Record<string, unknown>)[key])
+            }
+        }
+        for (const key of Object.keys(source)) {
+            const value = source[key]
+            // Descriptor-only cloning intentionally avoids arbitrary Proxy get
+            // traps. These values have already crossed that validated ingress,
+            // so explicitly read their nested state here to establish Svelte
+            // dependencies for JSON/snapshot effects on the facade.
+            trackNestedState(value)
+            definePluginStorageRecordValue(
+                snapshot,
+                key,
+                cloneLegacyStorageJson(value),
+            )
+        }
+        return snapshot
+    }
+    let legacyStorageFacade: Record<PropertyKey, unknown> | null = null
+    const getLegacyStorageFacade = (): Record<PropertyKey, unknown> => {
+        if (legacyStorageFacade) return legacyStorageFacade
+
+        const facadeToJSON = () => snapshotLegacyStorage()
+        legacyStorageFacade = new Proxy(Object.create(null), {
+            get(_target, prop) {
+                assertSynchronousPluginStorageAccess()
+                const storage = getDatabase().pluginCustomStorage
+                if (hasPluginStorageRecordValue(storage, prop)) {
+                    return guardNestedValue(storage![prop as keyof typeof storage], true)
+                }
+                // Svelte snapshot cannot structured-clone a user Proxy. A
+                // null-prototype detached value lets its standard toJSON path
+                // preserve an own `__proto__` without exposing the hook as an
+                // enumerable storage key.
+                if (prop === "toJSON") return facadeToJSON
+                return undefined
+            },
+            set(_target, prop, value) {
+                assertSynchronousPluginStorageAccess()
+                replaceLegacyStorageValue(getDatabase(), prop, value)
+                return true
+            },
+            deleteProperty(_target, prop) {
+                assertSynchronousPluginStorageAccess()
+                return removeLegacyStorageValue(getDatabase(), prop)
+            },
+            defineProperty(_target, prop, descriptor) {
+                assertSynchronousPluginStorageAccess()
+                replaceLegacyStorageValue(
+                    getDatabase(),
+                    prop,
+                    validateLegacyStorageDescriptor(descriptor),
+                )
+                return true
+            },
+            has(_target, prop) {
+                assertSynchronousPluginStorageAccess()
+                return hasPluginStorageRecordValue(getDatabase().pluginCustomStorage, prop)
+            },
+            ownKeys() {
+                assertSynchronousPluginStorageAccess()
+                return Reflect.ownKeys(
+                    getDatabase().pluginCustomStorage
+                        ?? createDatabasePluginStorageRecord<unknown>(),
+                )
+            },
+            getOwnPropertyDescriptor(_target, prop) {
+                assertSynchronousPluginStorageAccess()
+                const storage = getDatabase().pluginCustomStorage
+                const descriptor = storage
+                    ? Reflect.getOwnPropertyDescriptor(storage, prop)
+                    : undefined
+                if (!descriptor) return undefined
+                if (!("value" in descriptor)) {
+                    throw new TypeError("Legacy plugin storage does not accept accessor descriptors.")
+                }
+                return {
+                    configurable: true,
+                    enumerable: descriptor.enumerable,
+                    value: guardNestedValue(descriptor.value, true),
+                    writable: true,
+                }
+            },
+            getPrototypeOf() {
+                assertSynchronousPluginStorageAccess()
+                return null
+            },
+            setPrototypeOf() {
+                assertSynchronousPluginStorageAccess()
+                throw new TypeError("Legacy plugin storage prototypes cannot be changed.")
+            },
+            isExtensible() {
+                assertSynchronousPluginStorageAccess()
+                return true
+            },
+            preventExtensions() {
+                assertSynchronousPluginStorageAccess()
+                throw new TypeError("Legacy plugin storage objects must remain extensible.")
+            },
         })
+        return legacyStorageFacade
     }
 
     return {
@@ -959,13 +1109,20 @@ export const getV2PluginAPIs = () => {
                 get(target, prop) {
                     assertSynchronousPluginStorageAccess()
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
+                        if (prop === 'pluginCustomStorage') {
+                            return getLegacyStorageFacade()
+                        }
                         return guardNestedValue(
                             (target as any)[prop],
-                            prop === 'pluginCustomStorage',
+                            false,
                         );
                     }
                     else if(target.pluginCustomStorage){
                         console.log('Getting custom db property', prop.toString());
+                        if (!hasPluginStorageRecordValue(
+                            target.pluginCustomStorage,
+                            prop.toString(),
+                        )) return undefined;
                         return guardNestedValue(
                             target.pluginCustomStorage[prop.toString()],
                             true,
@@ -983,8 +1140,7 @@ export const getV2PluginAPIs = () => {
                     }
                     else{
                         console.log('Setting custom db property', prop.toString(), value);
-                        target.pluginCustomStorage ??= {}
-                        defineLegacyStorageValue(target.pluginCustomStorage, prop, value)
+                        replaceLegacyStorageValue(target, prop, value)
                         return true;
                     }
                 },
@@ -1035,11 +1191,12 @@ export const getV2PluginAPIs = () => {
                                 : unwrapGuardedValue(descriptor.value),
                         })
                     }
-                    target.pluginCustomStorage ??= {}
-                    return Reflect.defineProperty(target.pluginCustomStorage, prop, {
-                        ...descriptor,
-                        value: validateLegacyStorageDescriptor(descriptor),
-                    })
+                    replaceLegacyStorageValue(
+                        target,
+                        prop,
+                        validateLegacyStorageDescriptor(descriptor),
+                    )
+                    return true
                 },
                 getOwnPropertyDescriptor(target, prop) {
                     assertSynchronousPluginStorageAccess()
@@ -1056,7 +1213,9 @@ export const getV2PluginAPIs = () => {
                         || prop === 'pluginCustomStorage'
                     return {
                         ...descriptor,
-                        value: guardNestedValue(descriptor.value, storageValue),
+                        value: prop === 'pluginCustomStorage'
+                            ? getLegacyStorageFacade()
+                            : guardNestedValue(descriptor.value, storageValue),
                     }
                 },
             })
@@ -1064,44 +1223,48 @@ export const getV2PluginAPIs = () => {
         pluginStorage: {
             getItem: (key: string) => {
                 if (!canUseSynchronousPluginStorage()) return null
-                const db = getDatabase({ snapshot: true });
-                db.pluginCustomStorage ??= {}
-                return db.pluginCustomStorage[key] || null;
+                // Svelte's snapshot currently omits an own `__proto__` key.
+                // Read the live proxy with an own-presence check, then return
+                // the same detached JSON value used by legacy writes.
+                const db = getDatabase();
+                if (!hasPluginStorageRecordValue(db.pluginCustomStorage, key)) return null;
+                const value = db.pluginCustomStorage![key];
+                return value === undefined || value === null
+                    ? null
+                    : cloneLegacyStorageJson(value);
             },
             setItem: (key: string, value: string) => {
                 if (!canUseSynchronousPluginStorage()) return
                 const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                defineLegacyStorageValue(db.pluginCustomStorage, key, value)
+                replaceLegacyStorageValue(db, key, value)
             },
             removeItem: (key: string) => {
                 if (!canUseSynchronousPluginStorage()) return
                 const db = getDatabase();
-                db.pluginCustomStorage ??= {}
-                delete db.pluginCustomStorage[key];
+                removeLegacyStorageValue(db, key)
             },
             clear: () => {
                 if (!canUseSynchronousPluginStorage()) return
                 const db = getDatabase();
-                db.pluginCustomStorage = {};
+                db.pluginCustomStorage = createDatabasePluginStorageRecord();
             },
             key: (index: number) => {
                 if (!canUseSynchronousPluginStorage()) return null
                 const db = getDatabase();
-                db.pluginCustomStorage ??= {}
+                db.pluginCustomStorage ??= createDatabasePluginStorageRecord()
                 const keys = Object.keys(db.pluginCustomStorage);
-                return keys[index] || null;
+                return keys[index] ?? null;
             },
             keys: () => {
                 if (!canUseSynchronousPluginStorage()) return []
                 const db = getDatabase();
-                db.pluginCustomStorage ??= {}
+                db.pluginCustomStorage ??= createDatabasePluginStorageRecord()
                 return Object.keys(db.pluginCustomStorage);
             },
             length: () => {
                 if (!canUseSynchronousPluginStorage()) return 0
                 const db = getDatabase();
-                db.pluginCustomStorage ??= {}
+                db.pluginCustomStorage ??= createDatabasePluginStorageRecord()
                 return Object.keys(db.pluginCustomStorage).length;
             }
         },
@@ -1110,7 +1273,7 @@ export const getV2PluginAPIs = () => {
             // pending, so enforce the transition guard at the mutation itself.
             if (!canUseSynchronousPluginStorage()) return
             const db = getDatabase();
-            db.pluginCustomStorage ??= {}
+            db.pluginCustomStorage ??= createDatabasePluginStorageRecord()
             for (const key of Object.keys(newDb)) {
                 if (allowedDbKeys.includes(key)) {
                     (db as any)[key] = key === 'pluginCustomStorage'
@@ -1118,11 +1281,7 @@ export const getV2PluginAPIs = () => {
                         : newDb[key];
                 }
                 else{
-                    defineLegacyStorageValue(
-                        db.pluginCustomStorage,
-                        key,
-                        readLegacyStorageInput(newDb, key),
-                    )
+                    replaceLegacyStorageValue(db, key, readLegacyStorageInput(newDb, key))
                 }
             }
             DBState.db = db;
@@ -1132,7 +1291,7 @@ export const getV2PluginAPIs = () => {
             // installation delegated below accepts V3 plugins only.
             if (!canUseSynchronousPluginStorage()) return
             const db = getDatabase();
-            db.pluginCustomStorage ??= {}
+            db.pluginCustomStorage ??= createDatabasePluginStorageRecord()
             for (const key of Object.keys(newDb)) {
                 if (!canUseSynchronousPluginStorage()) return
                 if (key === 'plugins') {
@@ -1147,11 +1306,7 @@ export const getV2PluginAPIs = () => {
                         : newDb[key];
                 }
                 else{
-                    defineLegacyStorageValue(
-                        db.pluginCustomStorage,
-                        key,
-                        readLegacyStorageInput(newDb, key),
-                    )
+                    replaceLegacyStorageValue(db, key, readLegacyStorageInput(newDb, key))
                 }
             }
             setDatabase(db);

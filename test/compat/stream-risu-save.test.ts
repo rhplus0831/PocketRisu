@@ -31,6 +31,22 @@ const { decodeRisuSave, encodeRisuSaveLegacy } = utilsPkg as {
 }
 
 const tempDirs: string[] = []
+const SPECIAL_PLUGIN_STORAGE_KEYS = [
+  '__proto__', 'constructor', 'prototype', 'toString', 'hasOwnProperty', '',
+] as const
+
+function specialRecord(prefix: string) {
+  const record: Record<string, unknown> = {}
+  for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
+    Object.defineProperty(record, key, {
+      configurable: true,
+      enumerable: true,
+      value: { prefix, index },
+      writable: true,
+    })
+  }
+  return record
+}
 
 afterAll(async () => {
   await Promise.all(tempDirs.map(dir => rm(dir, { recursive: true, force: true })))
@@ -185,6 +201,42 @@ describe('disk-backed streaming Risu save encoding', () => {
         await decodeRisuSave(encodeRisuSaveLegacy(assembled)),
       )
       expect(strippedDb).toEqual(untouched)
+    }
+  })
+
+  test('preserves special plugin keys, their order, and a protocol-field collision', async () => {
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'risu-stream-save-special-'))
+    tempDirs.push(tempDir)
+    const filePath = path.join(tempDir, 'database-special.risudat.tmp')
+    const reservedCollision = [
+      'PocketRisu.plugin-storage-escapes',
+      1,
+      null,
+      [['pluginCustomStorage', 0, [1, '"user-collision"']]],
+    ]
+    const dbObj: Record<string, unknown> = {
+      botPresets: [{ id: 'stable-preset', name: 'Stable' }],
+      characters: [],
+      pluginCustomStorage: specialRecord('value'),
+      pluginStorageMeta: specialRecord('meta'),
+    }
+    Object.defineProperty(dbObj, '__pocketRisuPluginStorageEscapesV1', {
+      configurable: true,
+      enumerable: true,
+      value: reservedCollision,
+      writable: true,
+    })
+
+    await streamRisuSaveToFile({ dbObj, filePath, readChatRow: async () => null })
+    const bytes = await readFile(filePath)
+    expect(bytes[10]).toBe(10)
+    const decoded = await decodeRisuSave(bytes)
+    expect(Object.keys(decoded.pluginCustomStorage)).toEqual(SPECIAL_PLUGIN_STORAGE_KEYS)
+    expect(Object.keys(decoded.pluginStorageMeta)).toEqual(SPECIAL_PLUGIN_STORAGE_KEYS)
+    expect(decoded.__pocketRisuPluginStorageEscapesV1).toEqual(reservedCollision)
+    for (const key of SPECIAL_PLUGIN_STORAGE_KEYS) {
+      expect(Object.hasOwn(decoded.pluginCustomStorage, key)).toBe(true)
+      expect(Object.hasOwn(decoded.pluginStorageMeta, key)).toBe(true)
     }
   })
 })

@@ -5,7 +5,12 @@ const fs = require('fs/promises');
 const { once } = require('events');
 const { finished } = require('stream/promises');
 const { Packr } = require('msgpackr');
-const { magicHeader } = require('./utils.cjs');
+const {
+    createLegacyPluginStorageEnvelope,
+    magicHeader,
+    magicPluginStorageHeader,
+    pluginStorageLegacyEscapeField,
+} = require('./utils.cjs');
 const { mergeChatStubWithFullChat } = require('./chatRows.cjs');
 const { PLUGIN_STORAGE_FOLDED_MARKER } = require('./pluginSaveKeys.cjs');
 
@@ -114,7 +119,40 @@ async function streamRisuSaveToFile({
     const shouldMarkPluginStorageFolded = markPluginStorageFolded
         && pluginStorage !== null
         && dbObj.optimizePluginMemory === true;
-    const topKeys = Object.keys(dbObj).filter(key => key !== PLUGIN_STORAGE_FOLDED_MARKER);
+    const valuePlan = valueRows.length > 0
+        || Object.prototype.hasOwnProperty.call(dbObj.pluginCustomStorage ?? {}, '__proto__')
+        ? buildPluginMapPlan(dbObj.pluginCustomStorage, valueRows, readPluginRow)
+        : null;
+    const metaPlan = metaRows.length > 0
+        || Object.prototype.hasOwnProperty.call(dbObj.pluginStorageMeta ?? {}, '__proto__')
+        ? buildPluginMapPlan(dbObj.pluginStorageMeta, metaRows, readPluginRow)
+        : null;
+
+    async function extractProtoEscape(plan, field) {
+        if (!plan) return null;
+        const index = plan.keys.indexOf('__proto__');
+        if (index === -1) return null;
+        plan.keys.splice(index, 1);
+        const value = plan.rowByKey.has('__proto__')
+            ? await plan.readRow(plan.rowByKey.get('__proto__'))
+            : plan.base.__proto__;
+        return { field, index, value };
+    }
+
+    const pluginStorageEscapes = [];
+    const valueEscape = await extractProtoEscape(valuePlan, 'pluginCustomStorage');
+    const metaEscape = await extractProtoEscape(metaPlan, 'pluginStorageMeta');
+    if (valueEscape) pluginStorageEscapes.push(valueEscape);
+    if (metaEscape) pluginStorageEscapes.push(metaEscape);
+    const pluginStorageEscapeEnvelope = createLegacyPluginStorageEnvelope(
+        dbObj,
+        pluginStorageEscapes,
+    );
+
+    const topKeys = Object.keys(dbObj).filter(key =>
+        key !== PLUGIN_STORAGE_FOLDED_MARKER
+        && (pluginStorageEscapeEnvelope === null || key !== pluginStorageLegacyEscapeField)
+    );
     const characters = dbObj.characters;
     if (Array.isArray(characters) && !topKeys.includes('characters')) {
         topKeys.push('characters');
@@ -128,13 +166,9 @@ async function streamRisuSaveToFile({
     if (shouldMarkPluginStorageFolded) {
         topKeys.push(PLUGIN_STORAGE_FOLDED_MARKER);
     }
-
-    const valuePlan = valueRows.length > 0
-        ? buildPluginMapPlan(dbObj.pluginCustomStorage, valueRows, readPluginRow)
-        : null;
-    const metaPlan = metaRows.length > 0
-        ? buildPluginMapPlan(dbObj.pluginStorageMeta, metaRows, readPluginRow)
-        : null;
+    if (pluginStorageEscapeEnvelope !== null) {
+        topKeys.push(pluginStorageLegacyEscapeField);
+    }
 
     const output = createWriteStream(filePath, { flags: 'wx' });
     const outputFinished = finished(output);
@@ -203,7 +237,9 @@ async function streamRisuSaveToFile({
     }
 
     try {
-        await write(Buffer.from(magicHeader));
+        await write(Buffer.from(
+            pluginStorageEscapeEnvelope === null ? magicHeader : magicPluginStorageHeader
+        ));
         await write(mapHeader(topKeys.length));
         for (const key of topKeys) {
             await writeValue(key);
@@ -216,6 +252,9 @@ async function streamRisuSaveToFile({
                 await writePluginMap(metaPlan);
             } else if (key === PLUGIN_STORAGE_FOLDED_MARKER) {
                 await writeValue(true);
+            } else if (key === pluginStorageLegacyEscapeField
+                && pluginStorageEscapeEnvelope !== null) {
+                await writeValue(pluginStorageEscapeEnvelope);
             } else {
                 await writeValue(dbObj[key]);
             }

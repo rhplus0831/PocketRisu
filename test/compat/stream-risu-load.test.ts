@@ -18,10 +18,14 @@ const { streamRisuSaveToFile } = streamRisuSavePkg as any
 const {
   decodeRisuSave,
   encodeRisuSaveLegacy,
+  magicHeader,
   magicStreamCompressedHeader,
 } = utilsPkg as any
 
 const packr = new Packr({ useRecords: false })
+const SPECIAL_PLUGIN_STORAGE_KEYS = [
+  '__proto__', 'constructor', 'prototype', 'toString', 'hasOwnProperty', '',
+] as const
 const tempDirs: string[] = []
 const servers: ServerHandle[] = []
 
@@ -179,6 +183,73 @@ describe('disk-backed streaming Risu ingest', () => {
       expect(await decodedState(streaming.values), variant.name)
         .toEqual(await decodedState(legacy.values))
     }
+  })
+
+  test('externalizes escaped special plugin keys in their original order', async () => {
+    const pluginCustomStorage: Record<string, unknown> = {}
+    const pluginStorageMeta: Record<string, unknown> = {}
+    for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
+      Object.defineProperty(pluginCustomStorage, key, {
+        configurable: true,
+        enumerable: true,
+        value: { index },
+        writable: true,
+      })
+      Object.defineProperty(pluginStorageMeta, key, {
+        configurable: true,
+        enumerable: true,
+        value: { plugin: `Plugin ${index}`, updatedAt: index },
+        writable: true,
+      })
+    }
+    const entries: Array<{ field: string; key: string; value: unknown }> = []
+    const walked = await walkRisuSave(encodeRisuSaveLegacy({
+      botPresets: [{ id: 'stable-preset' }],
+      characters: [],
+      optimizePluginMemory: true,
+      pluginCustomStorage,
+      pluginStorageMeta,
+    }), {
+      externalizePluginStorage: true,
+      onPluginStorageEntry: (entry: { field: string; key: string; value: unknown }) => {
+        entries.push(entry)
+      },
+    })
+
+    expect(entries.filter(entry => entry.field === 'pluginCustomStorage').map(entry => entry.key))
+      .toEqual(SPECIAL_PLUGIN_STORAGE_KEYS)
+    expect(entries.filter(entry => entry.field === 'pluginStorageMeta').map(entry => entry.key))
+      .toEqual(SPECIAL_PLUGIN_STORAGE_KEYS)
+    expect(walked.remainder.pluginCustomStorage).toEqual({})
+    expect(walked.remainder.pluginStorageMeta).toBeUndefined()
+  })
+
+  test('does not interpret a valid sidecar-shaped user field on an unmarked stream', async () => {
+    const validCollision = [
+      'PocketRisu.plugin-storage-escapes',
+      1,
+      null,
+      [['pluginCustomStorage', 0, [1, '"forged"']]],
+    ]
+    const database: Record<string, unknown> = {
+      botPresets: [{ id: 'stable-preset' }],
+      characters: [],
+      optimizePluginMemory: false,
+      pluginCustomStorage: { safe: 'external' },
+    }
+    Object.defineProperty(database, '__pocketRisuPluginStorageEscapesV1', {
+      configurable: true,
+      enumerable: true,
+      value: validCollision,
+      writable: true,
+    })
+    const raw = Buffer.concat([Buffer.from(magicHeader), packr.encode(database)])
+
+    const walked = await walkRisuSave(raw)
+
+    expect(walked.remainder.__pocketRisuPluginStorageEscapesV1).toEqual(validCollision)
+    expect(walked.remainder.pluginCustomStorage.safe).toBe('external')
+    expect(Object.hasOwn(walked.remainder.pluginCustomStorage, '__proto__')).toBe(false)
   })
 
   test('rejects a truncated raw spool', async () => {

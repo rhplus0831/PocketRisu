@@ -907,6 +907,42 @@ describe('fast-path — per-root-key granularity', () => {
         expect((await p.set(clone(changed), emptyToSave())).patch).toEqual([])
     })
 
+    test('an own plugin storage __proto__ key uses a safe whole-map replacement', async () => {
+        const { applyPatch: apply } = await import('fast-json-patch')
+        const makeStorage = (version: number) => {
+            const storage: Record<string, unknown> = { ordinary: true }
+            Object.defineProperty(storage, '__proto__', {
+                configurable: true,
+                enumerable: true,
+                value: { version },
+                writable: true,
+            })
+            return storage
+        }
+        const baseline = dbWith([chr('a')], {
+            pluginCustomStorage: makeStorage(1),
+        })
+        const changed = clone(baseline)
+        changed.pluginCustomStorage.__proto__.version = 2
+        const p = new RisuSavePatcher()
+        await p.init(baseline)
+
+        const { patch } = await p.set(changed, {
+            ...emptyToSave(),
+            pluginCustomStorage: true,
+        })
+
+        expect(patch).toHaveLength(1)
+        expect(patch[0].op).toBe('replace')
+        expect(patch[0].path).toBe('/pluginCustomStorage')
+        expect(Object.hasOwn(patch[0].value, '__proto__')).toBe(true)
+        const serverState = JSON.parse(JSON.stringify(normalizeJSON(baseline)))
+        expect(() => apply(serverState, patch, true)).not.toThrow()
+        expect(Object.hasOwn(serverState.pluginCustomStorage, '__proto__')).toBe(true)
+        expect(serverState.pluginCustomStorage.__proto__).toEqual({ version: 2 })
+        expect((await p.set(changed, emptyToSave())).patch).toEqual([])
+    })
+
     test('a root value with toJSON()→undefined is kept, not removed', async () => {
         // normalizeJSON ignores toJSON and keeps {x:1}; the per-key path must
         // decide presence by the normalized result, not by JSON.stringify(raw)
