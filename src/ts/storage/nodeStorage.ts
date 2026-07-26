@@ -2360,10 +2360,12 @@ export class NodeStorage{
         }
     }
 
-    async exportBackup(opts?: { target?: 'upstream' }): Promise<Response> {
-        const url = opts?.target === 'upstream'
-            ? '/api/backup/export?target=upstream'
-            : '/api/backup/export'
+    async exportBackup(opts?: { target?: 'upstream'; scope?: 'partial' }): Promise<Response> {
+        const params = new URLSearchParams()
+        if (opts?.target === 'upstream') params.set('target', 'upstream')
+        if (opts?.scope === 'partial') params.set('scope', 'partial')
+        const query = params.toString()
+        const url = `/api/backup/export${query ? `?${query}` : ''}`
         const da = await this.authFetch(url)
         if (da.status < 200 || da.status >= 300) throw `backup export error: ${da.status}`
         return da

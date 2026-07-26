@@ -1,11 +1,6 @@
 import { alertError, alertStore, alertWait, alertMd, alertConfirm, waitAlert, notifySuccess, notifyInfo, notifyError } from "../alert";
-import { downloadFile, LocalWriter, forageStorage } from "../globalApi.svelte";
-import { encodeRisuSaveLegacy } from "../storage/risuSave";
-import { getDatabase, type Chat } from "../storage/database.svelte";
-import { fetchChatFromServer } from "../storage/chatStorage";
+import { downloadFile, forageStorage } from "../globalApi.svelte";
 import { language } from "src/lang";
-import { readExternalizedPluginStorage } from "../plugins/pluginSaveStorage";
-import { mergePluginStorageRecords } from "../plugins/pluginStorageRecord";
 
 function formatBytes(bytes: number): string {
     if (bytes < 1024) return `${bytes} B`
@@ -26,21 +21,27 @@ async function streamBackupToDisk(response: Response, fallbackName: string){
         const reader = response.body.getReader()
         let downloadedBytes = 0
 
-        while (true) {
-            const { done, value } = await reader.read()
-            if (done) {
-                break
+        try {
+            while (true) {
+                const { done, value } = await reader.read()
+                if (done) {
+                    break
+                }
+                downloadedBytes += value.length
+                if (totalBytes > 0) {
+                    const progress = ((downloadedBytes / totalBytes) * 100).toFixed(2)
+                    alertWait(`Saving local backup... (${progress}%)`)
+                } else {
+                    alertWait(`Saving local backup... (${(downloadedBytes / (1024 * 1024)).toFixed(1)} MB)`)
+                }
+                await writer.write(value)
             }
-            downloadedBytes += value.length
-            if (totalBytes > 0) {
-                const progress = ((downloadedBytes / totalBytes) * 100).toFixed(2)
-                alertWait(`Saving local backup... (${progress}%)`)
-            } else {
-                alertWait(`Saving local backup... (${(downloadedBytes / (1024 * 1024)).toFixed(1)} MB)`)
-            }
-            await writer.write(value)
+            await writer.close()
+        } catch (error) {
+            await reader.cancel(error).catch(() => {})
+            await writer.abort(error).catch(() => {})
+            throw error
         }
-        await writer.close()
     } else {
         await downloadFile(fileName, new Uint8Array(await response.arrayBuffer()))
     }
@@ -95,154 +96,23 @@ export async function SavePartialLocalBackup(){
         return
     }
     
-    alertWait("Saving partial local backup...")
-    const writer = new LocalWriter()
-    const r = await writer.init()
-    if(!r){
+    try {
+        alertWait("Saving partial local backup...")
+        // The server pins one SQLite snapshot, folds external plugin rows into
+        // database.risudat one entry at a time, and streams the finished archive.
+        // This retains the historical upstream-compatible partial-backup shape
+        // without materializing plugin storage in the browser.
+        const response = await forageStorage.exportBackup({ scope: 'partial' })
+        const missingAssets = Number(response.headers.get('x-risu-backup-missing-assets') ?? '0')
+        await streamBackupToDisk(response, `risu-backup-${Date.now()}-partial.bin`)
+        if (Number.isFinite(missingAssets) && missingAssets > 0) {
+            alertMd(`Partial backup successful, but ${missingAssets} referenced profile image(s) were missing and skipped.`)
+        } else {
+            notifySuccess('Success')
+        }
+    } catch (error) {
+        console.error(error)
         alertError('Failed')
-        return
-    }
-
-    const db = getDatabase()
-    const assetMap = new Map<string, { charName: string, assetName: string }>()
-    
-    // Only collect main profile images for both characters and groups
-    if (db.characters) {
-        for (const char of db.characters) {
-            if (!char) continue
-            const charName = char.name ?? 'Unknown Character'
-            
-            // Save the main profile image (supports both character and group types)
-            // Note: emotionImages are intentionally excluded from partial backup
-            if (char.image) {
-                assetMap.set(char.image, { charName: charName, assetName: 'Profile Image' })
-            }
-        }
-    }
-    
-    // User icon
-    if (db.userIcon) {
-        assetMap.set(db.userIcon, { charName: 'User Settings', assetName: 'User Icon' })
-    }
-    
-    // Persona icons
-    if (db.personas) {
-        for (const persona of db.personas) {
-            if (persona && persona.icon) {
-                assetMap.set(persona.icon, { charName: 'Persona', assetName: `${persona.name} Icon` })
-            }
-        }
-    }
-    
-    // Custom background
-    if (db.customBackground) {
-        assetMap.set(db.customBackground, { charName: 'User Settings', assetName: 'Custom Background' })
-    }
-    
-    // Folder images in characterOrder
-    if (db.characterOrder) {
-        for (const item of db.characterOrder) {
-            if (typeof item !== 'string' && item.img) {
-                assetMap.set(item.img, { charName: 'Folder', assetName: `${item.name} Folder Image` })
-            }
-            if (typeof item !== 'string' && item.imgFile) {
-                assetMap.set(item.imgFile, { charName: 'Folder', assetName: `${item.name} Folder Image File` })
-            }
-        }
-    }
-    
-    // Bot preset images
-    if (db.botPresets) {
-        for (const preset of db.botPresets) {
-            if (preset && preset.image) {
-                assetMap.set(preset.image, { charName: 'Preset', assetName: `${preset.name} Preset Image` })
-            }
-        }
-    }
-    
-    const missingAssets: string[] = []
-
-    const assetKeys = Array.from(assetMap.keys())
-
-    for(let i=0;i<assetKeys.length;i++){
-        const key = assetKeys[i]
-        let message = `Saving partial local backup... (${i + 1} / ${assetKeys.length})`
-        if (missingAssets.length > 0) {
-            const skippedItems = missingAssets.map(key => {
-                const assetInfo = assetMap.get(key);
-                return assetInfo ? `'${assetInfo.assetName}' from ${assetInfo.charName}` : `'${key}'`;
-            }).join(', ');
-            message += `\n(Skipping... ${skippedItems})`;
-        }
-        alertWait(message)
-
-        if(!key || !key.endsWith('.png')){
-            continue
-        }
-
-        const data = await forageStorage.getItem(key) as unknown as Uint8Array
-
-        if (data) {
-            await writer.writeBackup(key, data)
-        } else {
-            missingAssets.push(key)
-        }
-    }
-
-    // Reassemble full chats from server for placeholders (runtime lazy load)
-    alertWait(`Saving partial local backup... (Assembling chat data)`)
-    const dbCopy = structuredClone({ ...db, account: undefined })
-    for (const char of dbCopy.characters) {
-        for (let i = 0; i < char.chats.length; i++) {
-            const chat = char.chats[i]
-            if (chat._placeholder && chat.id) {
-                const full = await fetchChatFromServer(char.chaId, i, chat.id)
-                if (full) {
-                    char.chats[i] = full as Chat
-                } else {
-                    throw new Error(`Chat data missing for "${char.name}" / "${chat.name}" (${chat.id}). Backup aborted to prevent data loss.`)
-                }
-            }
-        }
-    }
-    if (db.optimizePluginMemory) {
-        alertWait(`Saving partial local backup... (Assembling plugin storage)`)
-        const external = await readExternalizedPluginStorage()
-        // Fold external rows for the archive; optimized imports externalize them again.
-        dbCopy.pluginCustomStorage = mergePluginStorageRecords(
-            external.values,
-            dbCopy.pluginCustomStorage,
-        )
-        const pluginStorageMeta = mergePluginStorageRecords(
-            external.meta,
-            dbCopy.pluginStorageMeta,
-        )
-        if (Object.keys(pluginStorageMeta).length > 0) {
-            dbCopy.pluginStorageMeta = pluginStorageMeta
-        } else {
-            delete dbCopy.pluginStorageMeta
-        }
-    }
-    const dbData = encodeRisuSaveLegacy(dbCopy, 'compression')
-
-    alertWait(`Saving partial local backup... (Saving database)`) 
-
-    await writer.writeBackup('database.risudat', dbData)
-    await writer.close()
-
-    if (missingAssets.length > 0) {
-        let message = 'Partial backup successful, but the following profile images were missing and skipped:\n\n'
-        for (const key of missingAssets) {
-            const assetInfo = assetMap.get(key)
-            if (assetInfo) {
-                message += `* **${assetInfo.assetName}** (from *${assetInfo.charName}*)  \n  *File: ${key}*\n`
-            } else {
-                message += `* **Unknown Asset**  \n  *File: ${key}*\n`
-            }
-        }
-        alertMd(message)
-    } else {
-        notifySuccess('Success')
     }
 }
 

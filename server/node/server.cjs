@@ -37,7 +37,7 @@ const getVips = () => {
     }
     return _vipsPromise
 }
-const { kvGet, kvSet, kvSetFromFile, kvDel, kvList,
+const { kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
         kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
         kvGetListEpoch, kvBumpListEpoch,
@@ -256,6 +256,25 @@ const pluginStorageMutationFailpoint = process.env.NODE_ENV === 'test'
 const snapshotRestoreFailpoint = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_SNAPSHOT_RESTORE_FAILPOINT ?? '').trim()
     : '';
+const SNAPSHOT_RESTORE_TEST_GATE_DIR = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_SNAPSHOT_RESTORE_TEST_GATE_DIR ?? '').trim() || null
+    : null;
+
+async function waitAtSnapshotRestoreTestGate() {
+    if (!SNAPSHOT_RESTORE_TEST_GATE_DIR) return;
+    const holdPath = path.join(SNAPSHOT_RESTORE_TEST_GATE_DIR, 'hold');
+    if (!existsSync(holdPath)) return;
+    await fs.mkdir(SNAPSHOT_RESTORE_TEST_GATE_DIR, { recursive: true });
+    await fs.writeFile(
+        path.join(SNAPSHOT_RESTORE_TEST_GATE_DIR, 'entered'),
+        'after-folded-delete',
+        'utf-8',
+    );
+    const releasePath = path.join(SNAPSHOT_RESTORE_TEST_GATE_DIR, 'release');
+    while (existsSync(holdPath) && !existsSync(releasePath)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+}
 
 function hitPluginStorageMutationFailpoint(boundary) {
     if (pluginStorageMutationFailpoint === boundary) {
@@ -857,7 +876,7 @@ function logDuplicateCharacterIdReassignments(result) {
     }
 }
 
-async function ingestDatabaseStreaming(source, { inspection = null } = {}) {
+async function ingestDatabaseStreaming(source, { inspection = null, shouldAbort } = {}) {
     const streamedPluginValueKeys = new Set();
     const streamedPluginMetaKeys = new Set();
     let foldedPluginStorage = false;
@@ -875,10 +894,12 @@ async function ingestDatabaseStreaming(source, { inspection = null } = {}) {
     const result = await chatRowStore.ingestStreamingDatabase(source, {
         inspection: inspection ?? await inspectRisuSaveSource(source),
         tempDir: savePath,
-        onPluginStorageFolded: () => {
+        shouldAbort,
+        onPluginStorageFolded: async () => {
             foldedPluginStorage = true;
             if (priorOwnershipError) throw priorOwnershipError;
             deleteOwnedPluginStorageRows(priorOwnership);
+            await waitAtSnapshotRestoreTestGate();
         },
         onPluginStorageEntry: ({ field, key, value }) => {
             const prefix = field === 'pluginStorageMeta'
@@ -3609,6 +3630,8 @@ async function buildSelfContainedBackupDatabase({
     shouldAbort = () => false,
     onMissingChatRow,
     snapshot: externalSnapshot = null,
+    onDatabaseLoaded,
+    omitAccount = false,
 } = {}) {
     let snapshot = externalSnapshot;
     let ownsSnapshot = false;
@@ -3624,7 +3647,11 @@ async function buildSelfContainedBackupDatabase({
         if (!raw) return null;
 
         const strippedDb = await loadStrippedDatabase(raw, 'Backup');
-        return await spoolSelfContainedBackupDatabase(strippedDb, {
+        const backupDatabase = omitAccount
+            ? { ...strippedDb, account: undefined }
+            : strippedDb;
+        onDatabaseLoaded?.(backupDatabase);
+        return await spoolSelfContainedBackupDatabase(backupDatabase, {
             foldPluginStorage,
             shouldAbort,
             reader: snapshot,
@@ -3678,6 +3705,50 @@ async function listPluginBackupEntries(
         });
     }
     return rows;
+}
+
+function partialBackupAssetKeys(database) {
+    const keys = new Set();
+    const addPng = (key) => {
+        if (typeof key === 'string' && key.endsWith('.png')) keys.add(key);
+    };
+    for (const character of database?.characters ?? []) addPng(character?.image);
+    addPng(database?.userIcon);
+    for (const persona of database?.personas ?? []) addPng(persona?.icon);
+    addPng(database?.customBackground);
+    for (const item of database?.characterOrder ?? []) {
+        if (item && typeof item === 'object') {
+            addPng(item.img);
+            addPng(item.imgFile);
+        }
+    }
+    for (const preset of database?.botPresets ?? []) addPng(preset?.image);
+    return keys;
+}
+
+function listPartialBackupAssetEntries(database, reader) {
+    const requested = partialBackupAssetKeys(database);
+    const available = new Map(
+        listAssetEntriesWithSizes(reader).map(entry => [entry.key, entry]),
+    );
+    const entries = [];
+    let missing = 0;
+    for (const key of requested) {
+        const entry = available.get(key);
+        if (!entry) {
+            missing++;
+            continue;
+        }
+        entries.push({
+            kind: 'asset',
+            key: entry.key,
+            backupName: path.basename(entry.key),
+            sortKey: entry.key,
+            size: entry.size,
+        });
+    }
+    entries.sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+    return { entries, missing };
 }
 
 function assertBackupEntryNameWithinLimit(name) {
@@ -8154,11 +8225,15 @@ app.get('/api/backup/export', async (req, res, next) => {
             return createKvSnapshot();
         });
 
+        const partial = req.query.scope === 'partial';
         // ?target=upstream excludes NodeOnly-only slashed namespaces: plugin
         // rows plus inlay/, inlay_sidecar/, and inlay_meta/. Upstream RisuAI's
         // import treats those names as paths under assets/ and fails with
         // ENOENT. Plugin rows are folded inline; inlay images remain lossy.
-        const target = req.query.target === 'upstream' ? 'upstream' : 'nodeonly';
+        // Partial archives retain their historical upstream-compatible shape:
+        // selected PNGs plus one folded database.risudat and no slashed rows.
+        const target = partial || req.query.target === 'upstream' ? 'upstream' : 'nodeonly';
+        let backupDatabase = null;
         backupDbSpool = await buildSelfContainedBackupDatabase({
             foldPluginStorage: target === 'upstream',
             shouldAbort: () => closed,
@@ -8166,6 +8241,8 @@ app.get('/api/backup/export', async (req, res, next) => {
                 warnAndPreserveMissingChatRow('Backup Export', chaId, chatId);
             },
             snapshot: backupSnapshot,
+            onDatabaseLoaded: (database) => { backupDatabase = database; },
+            omitAccount: partial,
         });
         if (closed) return;
         const inlayFiles = target === 'upstream' ? [] : await listInlayFiles();
@@ -8204,34 +8281,42 @@ app.get('/api/backup/export', async (req, res, next) => {
         const pluginEntries = target === 'upstream'
             ? []
             : await listPluginBackupEntries(backupSnapshot);
-        const namespacedEntries = [
-            ...listAssetEntriesWithSizes(backupSnapshot).map((entry) => ({
-                kind: 'asset',
-                key: entry.key,
-                backupName: path.basename(entry.key),
-                sortKey: entry.key,
-                size: entry.size,
-            })),
-            ...listColdStorageBackupEntries({
-                reader: backupSnapshot,
-                migrateLegacy: false,
-            }),
-            ...pluginEntries,
-            ...inlayMetaEntries,
-            ...inlayEntries,
-            ...sidecarEntries.filter(Boolean),
-        ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+        const partialAssets = partial
+            ? listPartialBackupAssetEntries(backupDatabase, backupSnapshot)
+            : null;
+        const namespacedEntries = partial
+            ? partialAssets.entries
+            : [
+                ...listAssetEntriesWithSizes(backupSnapshot).map((entry) => ({
+                    kind: 'asset',
+                    key: entry.key,
+                    backupName: path.basename(entry.key),
+                    sortKey: entry.key,
+                    size: entry.size,
+                })),
+                ...listColdStorageBackupEntries({
+                    reader: backupSnapshot,
+                    migrateLegacy: false,
+                }),
+                ...pluginEntries,
+                ...inlayMetaEntries,
+                ...inlayEntries,
+                ...sidecarEntries.filter(Boolean),
+            ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
         preflightBackupEntryNames(namespacedEntries);
         const dbSize = backupDbSpool?.size ?? 0;
         const totalBytes = namespacedEntries.reduce((sum, entry) => {
             return sum + backupEntrySize(entry.backupName, entry.size);
         }, 0) + (dbSize ? backupEntrySize('database.risudat', dbSize) : 0);
 
-        const filenameSuffix = target === 'upstream' ? '-upstream' : '';
+        const filenameSuffix = partial ? '-partial' : target === 'upstream' ? '-upstream' : '';
         res.setHeader('content-type', 'application/octet-stream');
         res.setHeader('content-disposition', `attachment; filename="risu-backup-${Date.now()}${filenameSuffix}.bin"`);
         res.setHeader('content-length', totalBytes);
         res.setHeader('x-risu-backup-assets', namespacedEntries.length);
+        if (partial) {
+            res.setHeader('x-risu-backup-missing-assets', partialAssets.missing);
+        }
 
         for (const entry of namespacedEntries) {
             if (closed) break;
@@ -10098,6 +10183,9 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
     let restoreCommitted = false;
+    let restoreSpool = null;
+    let closed = false;
+    res.once('close', () => { closed = true; });
     try {
         const key = typeof req.body?.key === 'string' ? req.body.key : '';
         if (!key.startsWith(DB_BACKUP_PREFIX)) {
@@ -10115,15 +10203,25 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                 // after kvCopyValue and overwrite the restored snapshot.
                 await flushPendingDb();
                 // Read only after the import barrier is held. The importer uses
-                // this same SQLite connection, so an earlier kvGet could observe
-                // its uncommitted snapshot rows and publish transient state.
-                const blob = kvGet(key);
-                if (!blob) {
+                // this same SQLite connection, so an earlier cursor could observe
+                // its uncommitted snapshot rows and publish transient state. Spool
+                // one persisted chunk at a time instead of assembling the value.
+                const restorePath = path.join(
+                    databaseSpoolDir,
+                    `${DATABASE_SPOOL_FILE_PREFIX}snapshot-restore-${process.pid}-${nodeCrypto.randomUUID()}.tmp`,
+                );
+                restoreSpool = kvWriteToFile(key, restorePath, {
+                    shouldAbort: () => closed,
+                });
+                if (!restoreSpool) {
                     snapshotFound = false;
                     return;
                 }
-                const inspection = await inspectRisuSaveSource(blob);
-                const streamRestore = await shouldStreamRisuSave(blob, { inspection });
+                const source = {
+                    filePath: restoreSpool.filePath,
+                    size: restoreSpool.size,
+                };
+                const inspection = await inspectRisuSaveSource(source);
                 let restoreTransactionOpen = false;
                 try {
                     // Keep the live monolith, external plugin rows, ownership
@@ -10132,20 +10230,27 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                     sqliteDb.exec('BEGIN');
                     restoreTransactionOpen = true;
                     let ingestion;
-                    if (streamRestore) {
-                        // Avoid copying the snapshot monolith into the live key.
+                    if (inspection.supported) {
+                        // Every supported snapshot ingests from the bounded file
+                        // cursor. This avoids kvGet()/Buffer.concat() even below
+                        // the general import streaming threshold.
                         kvDel(REMOTE_MIGRATION_MARKER_KEY);
                         invalidateDbCache();
-                        ingestion = await ingestDatabaseStreaming(blob, { inspection });
+                        ingestion = await ingestDatabaseStreaming(source, {
+                            inspection,
+                            shouldAbort: () => closed,
+                        });
                         markRemoteMigrationDone();
                     } else {
+                        // Preserve compatibility for uncommon legacy formats the
+                        // streaming walker cannot inspect yet.
                         kvCopyValue(key, DB_BLOB_KEY);
                         // Snapshot may pre-date the remote-block migration. Clear the marker
                         // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
                         // bytes instead of skipping based on the prior post-migration state.
                         kvDel(REMOTE_MIGRATION_MARKER_KEY);
                         invalidateDbCache();
-                        const raw = kvGet(DB_BLOB_KEY);
+                        const raw = await fs.readFile(restoreSpool.filePath);
                         if (raw) ingestion = await ingestDatabase(raw);
                     }
                     if (ingestion) {
@@ -10180,6 +10285,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             releaseImportBarrier();
         }
         if (!snapshotFound) {
+            if (closed) return;
             return res.status(404).json({ error: 'Snapshot not found' });
         }
         if (committedPublication) {
@@ -10193,6 +10299,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                 logger.error('[Snapshot Restore] Failed to refresh session read state:', error);
             }
         }
+        if (closed) return;
         if (snapshotRestoreFailpoint === 'response') {
             res.destroy();
             return;
@@ -10205,6 +10312,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
     } catch (err) {
         if (restoreCommitted) {
             logger.error('[Snapshot Restore] Commit succeeded but acknowledgement failed:', err);
+            if (closed) return;
             if (!res.headersSent) {
                 res.status(500).json({
                     error: 'Snapshot restore committed, but acknowledgement failed',
@@ -10216,6 +10324,10 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             } else {
                 res.destroy();
             }
+            return;
+        }
+        if (closed) {
+            logger.warn('[Snapshot Restore] Client disconnected before commit; transaction was rolled back');
             return;
         }
         const diagnostic = pluginStorageValidationDiagnostic(err);
@@ -10241,6 +10353,10 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             commitOutcome: 'not-committed',
             commitOutcomeUnknown: false,
         });
+    } finally {
+        if (restoreSpool?.filePath) {
+            await fs.unlink(restoreSpool.filePath).catch(() => {});
+        }
     }
 });
 

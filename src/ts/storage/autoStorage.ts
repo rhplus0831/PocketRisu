@@ -135,7 +135,7 @@ export class AutoStorage{
             : this.realStorage.createAuth()
     }
 
-    async exportBackup(opts?: { target?: 'upstream' }) {
+    async exportBackup(opts?: { target?: 'upstream'; scope?: 'partial' }) {
         await this.Init()
         return this.realStorage.exportBackup(opts)
     }

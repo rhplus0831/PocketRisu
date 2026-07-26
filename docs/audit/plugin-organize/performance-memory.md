@@ -265,6 +265,32 @@ preserves plugin rows as independent archive entries
 - Add high-cardinality and large-body tests with bounded peak-memory
   assertions.
 
+### Resolution
+
+Fixed. The Plugin Storage viewer now retains one 50-value page, reads values
+serially, and stores only their display serialization; changing pages,
+cancellation, or errors discard the prior page. Partial local export now pins a
+server-side SQLite snapshot and folds external values into the streamed
+`database.risudat` spool one row at a time. Its selected-asset archive remains
+upstream compatible, omits account data, and applies the same BR4 archive-key
+validation as other folded exports.
+
+Snapshot restore now spools a chunked value directly from its manifest to a
+temporary file one chunk at a time, then ingests through the file cursor instead
+of beginning with `kvGet()` / `Buffer.concat()`. Disconnect cancellation rolls
+back streaming ingest, and cancellation, failure, success, and startup cleanup
+remove incomplete restore/export spools.
+
+Coverage uses deterministic bounds rather than raw-heap timing: a 10,000-key
+viewer asserts a 50-value page and one in-flight read; partial folding exercises
+1,000 rows plus a 4 MiB body with one parsed row in flight and archive/import
+round trips; chunk restore asserts one chunk in flight, a 64 KiB maximum chunk,
+hundreds of chunks, exact bytes, folded-snapshot recovery, and cancellation/error
+cleanup. A combined real-server test pauses after the exact prior ownership set
+is tentatively deleted, disconnects the client, and verifies transaction
+rollback, spool cleanup, and old-state durability after restart. The full
+client, server, compatibility, check, and production-build validation sets pass.
+
 <a id="pm4"></a>
 ## PM4 — Write amplification and cache overhead
 

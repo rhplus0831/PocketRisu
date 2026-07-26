@@ -21,6 +21,8 @@
         PencilIcon,
         AlignLeftIcon,
         SaveIcon,
+        ChevronLeftIcon,
+        ChevronRightIcon,
     } from '@lucide/svelte'
     import { alertConfirm, notifyError, notifySuccess } from 'src/ts/alert'
     import { SafeLocalStorage, SafeLocalPluginStorage } from 'src/ts/plugins/pluginSafeClass'
@@ -33,20 +35,19 @@
         removeOwnedPluginSaveStorageItem,
         setPluginSaveStorageItem,
     } from 'src/ts/plugins/pluginSaveStorage'
+    import {
+        loadPluginStorageViewerPage,
+        PluginStorageViewerLoadCancelled,
+        type PluginStorageViewerEntry,
+        type PluginStorageViewerKey,
+    } from 'src/ts/plugins/pluginStorageViewerPage'
 
     type BackendId = 'save' | 'local' | 'idb'
 
     // Sentinel filter value for entries with no recorded origin plugin.
     const UNKNOWN = '__risu_unknown__'
 
-    interface Entry {
-        key: string
-        raw: unknown
-        str: string
-        size: number
-        type: string
-        owner?: string
-    }
+    type Entry = PluginStorageViewerEntry
 
     const BACKENDS: { id: BackendId; label: () => string; desc: () => string }[] = [
         { id: 'save', label: () => language.pluginStorageBackendSave, desc: () => language.pluginStorageBackendSaveDesc },
@@ -59,7 +60,10 @@
 
     let backendIndex = $state(0)
     const backend = $derived(BACKENDS[backendIndex].id)
+    let keyEntries = $state<PluginStorageViewerKey[]>([])
     let entries = $state<Entry[]>([])
+    let page = $state(0)
+    let pageCount = $state(1)
     let loading = $state(false)
     let loadError = $state<string | null>(null)
     let loadProgress = $state(0)
@@ -77,17 +81,24 @@
     let editText = $state('')
     let saving = $state(false)
 
-    const filtered = $derived.by(() => {
+    const filteredKeys = $derived.by(() => {
         const k = searchKey.trim().toLowerCase()
-        const v = searchVal.trim().toLowerCase()
         const f = ownerFilter
-        return entries.filter((e) => {
+        return keyEntries.filter((e) => {
             const keyMatch = !k || e.key.toLowerCase().includes(k)
-            const valMatch = !v || e.str.toLowerCase().includes(v)
             const ownerMatch =
                 !f || (f === UNKNOWN ? !e.owner : e.owner === f)
-            return keyMatch && valMatch && ownerMatch
+            return keyMatch && ownerMatch
         })
+    })
+    // Value search intentionally applies to the resident page only. Searching
+    // every value would defeat the page bound that keeps this viewer safe for
+    // large repositories.
+    const filtered = $derived.by(() => {
+        const value = searchVal.trim().toLowerCase()
+        return value
+            ? entries.filter((entry) => entry.text.toLowerCase().includes(value))
+            : entries
     })
 
     // True when any search/owner filter narrows the list — drives the bulk
@@ -99,34 +110,19 @@
     // Distinct origin plugins present in the current backend, for the filter.
     const ownerOptions = $derived.by(() => {
         const set = new Set<string>()
-        for (const e of entries) if (e.owner) set.add(e.owner)
+        for (const e of keyEntries) if (e.owner) set.add(e.owner)
         return [...set].sort((a, b) => a.localeCompare(b))
     })
-    const hasUnknown = $derived(entries.some((e) => !e.owner))
+    const hasUnknown = $derived(keyEntries.some((e) => !e.owner))
+    const bulkTargetCount = $derived(
+        !isFiltered
+            ? keyEntries.length
+            : searchVal.trim() !== ''
+                ? filtered.length
+                : filteredKeys.length,
+    )
 
     // ── helpers ────────────────────────────────────────────────────────────
-    function valueToString(val: unknown): string {
-        if (typeof val === 'string') return val
-        if (val === null || val === undefined) return ''
-        try {
-            return JSON.stringify(val)
-        } catch {
-            return String(val)
-        }
-    }
-
-    function detectType(raw: string): string {
-        if (!raw) return 'empty'
-        try {
-            const parsed = JSON.parse(raw)
-            if (Array.isArray(parsed)) return 'array'
-            if (typeof parsed === 'object' && parsed !== null) return 'object'
-            return typeof parsed
-        } catch {
-            return 'string'
-        }
-    }
-
     function prettyPrint(raw: string): string {
         try {
             return JSON.stringify(JSON.parse(raw), null, 2)
@@ -170,6 +166,45 @@
     }
 
     // ── actions ────────────────────────────────────────────────────────────
+    function readBackendValue(key: string): unknown | Promise<unknown> {
+        if (backend === 'save') return getPluginSaveStorageItem(key)
+        if (backend === 'local') return safeLocal.getItem(key)
+        return idb.getItem(key)
+    }
+
+    async function loadPage(nextPage = page, token = ++loadToken) {
+        loading = true
+        loadError = null
+        loadProgress = 0
+        loadTotal = 0
+        entries = []
+        selected = null
+        detailOpen = false
+        try {
+            const result = await loadPluginStorageViewerPage({
+                keys: filteredKeys,
+                page: nextPage,
+                read: readBackendValue,
+                cancelled: () => token !== loadToken,
+                onProgress: (completed, total) => {
+                    if (token !== loadToken) return
+                    loadProgress = completed
+                    loadTotal = total
+                },
+            })
+            if (token !== loadToken) return
+            entries = result.entries
+            page = result.page
+            pageCount = result.pageCount
+        } catch (e) {
+            if (token !== loadToken || e instanceof PluginStorageViewerLoadCancelled) return
+            loadError = e instanceof Error ? e.message : String(e)
+            entries = []
+        } finally {
+            if (token === loadToken) loading = false
+        }
+    }
+
     async function load() {
         const token = ++loadToken
         loading = true
@@ -177,54 +212,27 @@
         loadProgress = 0
         loadTotal = 0
         entries = []
+        keyEntries = []
+        page = 0
+        pageCount = 1
         try {
-            // Resolve the key list and a per-key value reader ONCE. Previously
-            // the save backend re-snapshotted the entire DB on every key, which
-            // froze the UI on large saves before anything could paint.
             let keys: string[]
-            let read: (key: string) => unknown | Promise<unknown>
-            if (backend === 'save') {
-                keys = await getPluginSaveStorageKeys()
-                read = (k) => getPluginSaveStorageItem(k)
-            } else if (backend === 'local') {
-                keys = safeLocal.keys()
-                read = (k) => safeLocal.getItem(k)
-            } else {
-                keys = await idb.keys()
-                read = (k) => idb.getItem(k)
-            }
+            if (backend === 'save') keys = await getPluginSaveStorageKeys()
+            else if (backend === 'local') keys = safeLocal.keys()
+            else keys = await idb.keys()
             if (token !== loadToken) return
-            loadTotal = keys.length
 
-            // Best-effort origin map (key → plugin name). Empty for legacy/V2
-            // keys written before tagging existed.
             const owners = await getOwners(backend)
             if (token !== loadToken) return
-
-            // Yield once so the page shell paints before the stringify loop.
-            await new Promise((r) => setTimeout(r))
-
-            const list: Entry[] = []
-            for (let i = 0; i < keys.length; i++) {
-                const key = keys[i]
-                const raw = await read(key)
-                const str = valueToString(raw)
-                list.push({ key, raw, str, size: str.length * 2, type: detectType(str), owner: owners[key] })
-                loadProgress = i + 1
-                // Periodically yield to keep the UI responsive and let the
-                // progress bar update.
-                if ((i & 63) === 63) {
-                    await new Promise((r) => setTimeout(r))
-                    if (token !== loadToken) return
-                }
-            }
-            if (token !== loadToken) return
-            list.sort((a, b) => a.key.localeCompare(b.key))
-            entries = list
+            keyEntries = keys
+                .map((key) => ({ key, owner: owners[key] }))
+                .sort((a, b) => a.key.localeCompare(b.key))
+            await loadPage(0, token)
         } catch (e) {
-            if (token !== loadToken) return
+            if (token !== loadToken || e instanceof PluginStorageViewerLoadCancelled) return
             loadError = e instanceof Error ? e.message : String(e)
             entries = []
+            keyEntries = []
         } finally {
             if (token === loadToken) loading = false
         }
@@ -233,13 +241,13 @@
     function openDetail(entry: Entry) {
         selected = entry
         editing = false
-        editText = prettyPrint(entry.str)
+        editText = prettyPrint(entry.text)
         detailOpen = true
     }
 
     function startEdit() {
         if (!selected) return
-        editText = prettyPrint(selected.str)
+        editText = prettyPrint(selected.text)
         editing = true
     }
 
@@ -272,7 +280,7 @@
             }
             await backendSet(selected.key, saveValue)
             const savedKey = selected.key
-            await load()
+            await loadPage(page)
             selected = entries.find((e) => e.key === savedKey) ?? null
             editing = false
             if (!selected) detailOpen = false
@@ -302,10 +310,14 @@
     // serves both partial and full clears. The label reflects which it is.
     async function removeFiltered() {
         // Snapshot before load() swaps `entries` out from under `filtered`.
-        const targets = filtered.slice()
+        const targets = !isFiltered
+            ? keyEntries.slice()
+            : searchVal.trim() !== ''
+                ? filtered.slice()
+                : filteredKeys.slice()
         if (targets.length === 0) return
 
-        const isAll = targets.length === entries.length
+        const isAll = !isFiltered
         const backendLabel = BACKENDS[backendIndex].label()
         const msg = isAll
             ? language.pluginStorageBulkDeleteAllConfirm(backendLabel, targets.length)
@@ -342,6 +354,14 @@
         searchVal = ''
         ownerFilter = ''
         load()
+    })
+
+    let filterSignature = ''
+    $effect(() => {
+        const signature = `${backendIndex}\u0000${searchKey.trim()}\u0000${ownerFilter}`
+        if (signature === filterSignature) return
+        filterSignature = signature
+        if (loadedIndex === backendIndex && keyEntries.length > 0) loadPage(0)
     })
 </script>
 
@@ -395,19 +415,20 @@
 <!-- Count + bulk delete + refresh -->
 <div class="flex items-center justify-between mb-2">
     <span class="text-textcolor2 text-xs">
-        <ShBadge variant="secondary">{filtered.length}</ShBadge> / {entries.length} keys
+        <ShBadge variant="secondary">{filtered.length}</ShBadge>
+        {language.pluginStoragePageCount(page + 1, pageCount, filteredKeys.length)}
     </span>
     <div class="flex items-center gap-1">
         <ShButton
             variant="destructive"
             size="sm"
             onclick={removeFiltered}
-            disabled={loading || filtered.length === 0}
+            disabled={loading || bulkTargetCount === 0}
         >
             <Trash2Icon size={14} />
             {isFiltered
-                ? language.pluginStorageBulkDeleteShown(filtered.length)
-                : language.pluginStorageBulkDeleteAll(filtered.length)}
+                ? language.pluginStorageBulkDeleteShown(bulkTargetCount)
+                : language.pluginStorageBulkDeleteAll(bulkTargetCount)}
         </ShButton>
         <ShButton variant="ghost" size="sm" onclick={load} disabled={loading}>
             <RefreshCwIcon size={14} class={loading ? 'animate-spin' : ''} />
@@ -462,6 +483,20 @@
     {/if}
 </div>
 
+{#if !loading && !loadError && pageCount > 1}
+    <div class="flex items-center justify-center gap-2 mt-2">
+        <ShButton variant="ghost" size="sm" onclick={() => loadPage(page - 1)} disabled={page === 0}>
+            <ChevronLeftIcon size={14} />
+            {language.pluginStoragePreviousPage}
+        </ShButton>
+        <span class="text-textcolor2 text-xs tabular-nums">{page + 1} / {pageCount}</span>
+        <ShButton variant="ghost" size="sm" onclick={() => loadPage(page + 1)} disabled={page + 1 >= pageCount}>
+            {language.pluginStorageNextPage}
+            <ChevronRightIcon size={14} />
+        </ShButton>
+    </div>
+{/if}
+
 <!-- Detail / edit dialog. tier="base" (z-40) so the delete confirm popup
      (alert tier, z-50) renders above this management dialog. -->
 <ShDialog bind:open={detailOpen} size="xl" tier="base">
@@ -472,7 +507,7 @@
         <div class="flex flex-wrap gap-x-6 gap-y-1 text-xs mb-3">
             <span class="text-textcolor2">{language.pluginStorageMetaType}: <span class="text-textcolor font-mono">{selected.type}</span></span>
             <span class="text-textcolor2">{language.pluginStorageMetaSize}: <span class="text-textcolor font-mono">{formatSize(selected.size)}</span></span>
-            <span class="text-textcolor2">{language.pluginStorageMetaChars}: <span class="text-textcolor font-mono">{selected.str.length.toLocaleString()}</span></span>
+            <span class="text-textcolor2">{language.pluginStorageMetaChars}: <span class="text-textcolor font-mono">{selected.text.length.toLocaleString()}</span></span>
             <span class="text-textcolor2">{language.pluginStorageOwner}: <span class="text-textcolor font-mono">{selected.owner ?? language.pluginStorageOwnerUnknown}</span></span>
         </div>
 
@@ -483,7 +518,7 @@
                 spellcheck="false"
             ></textarea>
         {:else}
-            <pre class="w-full h-[50vh] overflow-auto rounded-md border border-darkborderc bg-black/40 p-3 font-mono text-xs leading-relaxed text-textcolor2 whitespace-pre-wrap break-all">{prettyPrint(selected.str)}</pre>
+            <pre class="w-full h-[50vh] overflow-auto rounded-md border border-darkborderc bg-black/40 p-3 font-mono text-xs leading-relaxed text-textcolor2 whitespace-pre-wrap break-all">{prettyPrint(selected.text)}</pre>
         {/if}
     {/if}
     {#snippet footer()}

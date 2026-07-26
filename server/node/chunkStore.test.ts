@@ -15,6 +15,14 @@ const { cdcSplit, createChunkStore, isChunkableKey } = pkg as {
     ) => {
         putValue: (key: string, value: Buffer) => void
         putValueFromFile: (key: string, filePath: string) => void
+        writeValueToFile: (
+            key: string,
+            filePath: string,
+            options?: {
+                shouldAbort?: () => boolean
+                onChunk?: (chunk: { index: number; size: number }) => void
+            },
+        ) => { filePath: string; size: number; chunks: number; maxChunkBytes: number } | null
         getValue: (key: string) => Buffer | null
         sizeValue: (key: string) => number | null
         listValuesWithSizes: (prefix: string) => Array<{ key: string; size: number }>
@@ -506,5 +514,59 @@ describe('putValueFromFile — 파일 스트리밍 쓰기 (putValue와 저장 �
         store.putValueFromFile('k', writeTemp('replace', replacement))
         expect((store.getValue('k') as Buffer).equals(replacement)).toBe(true)
         expect(countManifest(db, 'k')).toBeGreaterThan(0)
+    })
+})
+
+describe('writeValueToFile — bounded snapshot restore source', () => {
+    const T = { threshold: 1024 }
+    const fileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'risu-chunk-read-file-'))
+    afterAll(() => fs.rmSync(fileDir, { recursive: true, force: true }))
+
+    it('F1: streams a high-chunk-count value with one bounded chunk at a time', () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const bytes = seededBytes(20 * 1024 * 1024, 87)
+        store.putValue('database/dbbackup-1.bin', bytes)
+        const filePath = path.join(fileDir, 'snapshot.risudat.tmp')
+        let callbacks = 0
+        let active = 0
+        let maxActive = 0
+        const result = store.writeValueToFile('database/dbbackup-1.bin', filePath, {
+            onChunk: ({ size }) => {
+                active++
+                maxActive = Math.max(maxActive, active)
+                expect(size).toBeLessThanOrEqual(65536)
+                callbacks++
+                active--
+            },
+        })!
+
+        expect(result.chunks).toBeGreaterThan(300)
+        expect(result.chunks).toBe(callbacks)
+        expect(result.maxChunkBytes).toBeLessThanOrEqual(65536)
+        expect(maxActive).toBe(1)
+        expect(result.size).toBe(bytes.length)
+        expect(fs.readFileSync(filePath).equals(bytes)).toBe(true)
+    })
+
+    it('F2: cancellation removes the partial spool immediately', () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        store.putValue('database/dbbackup-2.bin', seededBytes(2 * 1024 * 1024, 91))
+        const filePath = path.join(fileDir, 'cancelled.risudat.tmp')
+        let chunks = 0
+        expect(() => store.writeValueToFile('database/dbbackup-2.bin', filePath, {
+            shouldAbort: () => chunks >= 4,
+            onChunk: () => { chunks++ },
+        })).toThrow('KV value stream cancelled')
+        expect(chunks).toBe(4)
+        expect(fs.existsSync(filePath)).toBe(false)
+    })
+
+    it('F3: missing values do not create a spool file', () => {
+        const store = createChunkStore(freshDb(), T)
+        const filePath = path.join(fileDir, 'missing.risudat.tmp')
+        expect(store.writeValueToFile('missing', filePath)).toBeNull()
+        expect(fs.existsSync(filePath)).toBe(false)
     })
 })

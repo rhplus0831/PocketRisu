@@ -473,6 +473,64 @@ describe('external plugin rows in backup archives', () => {
     expect(storedDatabase.pluginStorageGeneration).toBe(storageGeneration)
   })
 
+  test('partial export streams a high-cardinality store into an upstream-compatible archive', async () => {
+    const source = await spawnServer()
+    servers.push(source)
+    const sourceClient = await createClient(source.port, source.password)
+    const seed = withDatabaseFields(createSeedBackup({ characterCount: 1 }), {
+      optimizePluginMemory: true,
+      pluginCustomStorage: {},
+      account: { token: 'must-not-enter-partial-backup' },
+    })
+    expect((await sourceClient.importBackup(seed)).ok).toBe(true)
+
+    const rowCount = 1_000
+    const values = Object.fromEntries(Array.from({ length: rowCount }, (_, index) => [
+      `partial/${index}`,
+      {
+        index,
+        body: 'x'.repeat(index === rowCount - 1 ? 4 * 1024 * 1024 : 1024),
+      },
+    ]))
+    const sourceDatabase = decodeRisuDat(readKvValue(source.cwd, 'database/database.bin')!)
+    const transition = await sourceClient.fetch('/api/plugin-storage/transition', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: new Uint8Array(encodeRisuDat({
+        version: 1,
+        source: { optimized: true, generation: null, manifest: null },
+        database: encodeRisuDat({
+          ...sourceDatabase,
+          optimizePluginMemory: true,
+          pluginStorageGeneration: 'partial-export-generation',
+          pluginCustomStorage: values,
+        }),
+      })),
+    })
+    expect(transition.status).toBe(200)
+
+    const response = await sourceClient.fetch('/api/backup/export?scope=partial')
+    expect(response.status).toBe(200)
+    expect(response.headers.get('content-disposition')).toContain('-partial.bin')
+    const backup = Buffer.from(await response.arrayBuffer())
+    expect(Number(response.headers.get('content-length'))).toBe(backup.length)
+    const entries = decodeBackup(backup)
+    expect(entries.map(entry => entry.name)).toEqual(['database.risudat'])
+    const folded = decodeRisuDat(entries[0].data)
+    expect(folded.account).toBeUndefined()
+    expect(Object.keys(folded.pluginCustomStorage)).toHaveLength(rowCount)
+    expect(folded.pluginCustomStorage['partial/999'].body).toHaveLength(4 * 1024 * 1024)
+
+    const destination = await spawnServer()
+    servers.push(destination)
+    const destinationClient = await createClient(destination.port, destination.password)
+    expect((await destinationClient.importBackup(backup)).ok).toBe(true)
+    expect(JSON.parse(readKvValue(
+      destination.cwd,
+      pluginStorageKey('pluginsave/', 'partial/999'),
+    )!.toString('utf-8')).body).toHaveLength(4 * 1024 * 1024)
+  })
+
   test('legacy optimized backups externalize folded plugin storage and clear stale rows', async () => {
     const server = await spawnServer()
     servers.push(server)

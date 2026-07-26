@@ -8,6 +8,7 @@ import utilsPkg from '../../server/node/utils.cjs'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { decodeRisuDat } from './helpers/normalize.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
+import { decodeBackup } from './helpers/decode.js'
 
 const { encodeRisuSaveLegacy } = utilsPkg as {
   encodeRisuSaveLegacy: (value: unknown) => Uint8Array
@@ -389,6 +390,47 @@ describe('staged plugin transition verifier boundaries (real server)', () => {
       valueKeys: [valueKey],
       metaKeys: [metaKey],
     })
+  }, 30_000)
+
+  test('partial export pins the live source and ignores private staged rows', async () => {
+    const rawKey = 'private-stage/source'
+    const valueKey = encodeStorageKey(VALUE_PREFIX, rawKey)
+    const value = Buffer.from(JSON.stringify({ source: 'live-inline' }))
+    const database = {
+      characters: [],
+      optimizePluginMemory: false,
+      pluginCustomStorage: { [rawKey]: JSON.parse(value.toString('utf8')) },
+      account: { token: 'must-not-enter-partial-backup' },
+    }
+    const server = await trackedServer({
+      seedSave: async saveDir => seedPublication(saveDir, { database }),
+    })
+    const client = await createClient(server.port, server.password)
+    const live = await readPublication(client)
+    const begun = await beginTransition(client, {
+      source: sourceOf(live.database, null),
+      targetOptimized: true,
+      rows: [{ storageKey: valueKey, size: value.length }],
+      expectedEtag: live.etag,
+    })
+    expect(begun.response.status).toBe(200)
+    expect((await uploadRow(client, begun.transitionId, valueKey, value)).status).toBe(200)
+    expect(readSqliteValue(server, valueKey)).toBeNull()
+    expect((await readdir(stageDir(server))).some(name => name.endsWith('.row'))).toBe(true)
+
+    const response = await client.fetch('/api/backup/export?scope=partial')
+    expect(response.status).toBe(200)
+    const entries = decodeBackup(Buffer.from(await response.arrayBuffer()))
+    expect(entries.map(entry => entry.name)).toEqual(['database.risudat'])
+    const exported = decodeRisuDat(entries[0].data)
+    expect(exported.account).toBeUndefined()
+    expect(exported.optimizePluginMemory).toBe(false)
+    expect(exported.pluginCustomStorage).toEqual({
+      [rawKey]: { source: 'live-inline' },
+    })
+    expect(readSqliteValue(server, valueKey)).toBeNull()
+    expect((await readdir(stageDir(server))).some(name => name.endsWith('.row'))).toBe(true)
+    expect((await abort(client, begun.transitionId)).status).toBe(200)
   }, 30_000)
 
   test('rejects malicious begin envelopes and row descriptors before staging', async () => {

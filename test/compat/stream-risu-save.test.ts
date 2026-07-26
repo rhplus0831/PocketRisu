@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from 'vitest'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import chatRowsPkg from '../../server/node/chatRows.cjs'
@@ -21,8 +21,9 @@ const { streamRisuSaveToFile } = streamRisuSavePkg as {
     pluginStorage?: {
       valueRows: Array<{ key: string; source: string }>
       metaRows: Array<{ key: string; source: string }>
-      readRow: (source: string) => unknown
+      readRow: (source: string) => unknown | Promise<unknown>
     } | null
+    shouldAbort?: () => boolean
   }) => Promise<{ filePath: string; size: number }>
 }
 const { decodeRisuSave, encodeRisuSaveLegacy } = utilsPkg as {
@@ -238,5 +239,73 @@ describe('disk-backed streaming Risu save encoding', () => {
       expect(Object.hasOwn(decoded.pluginCustomStorage, key)).toBe(true)
       expect(Object.hasOwn(decoded.pluginStorageMeta, key)).toBe(true)
     }
+  })
+
+  test('folds high-cardinality and large plugin bodies with one row in flight', async () => {
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'risu-stream-save-bounded-'))
+    tempDirs.push(tempDir)
+    const filePath = path.join(tempDir, 'database-bounded.risudat.tmp')
+    const rowCount = 2_500
+    const valueRows = Array.from({ length: rowCount }, (_, index) => ({
+      key: `record/${index.toString().padStart(5, '0')}`,
+      source: `row-${index}`,
+    }))
+    let activeReads = 0
+    let maxActiveReads = 0
+    let completedReads = 0
+
+    await streamRisuSaveToFile({
+      dbObj: { optimizePluginMemory: true, characters: [], pluginCustomStorage: {} },
+      filePath,
+      readChatRow: async () => null,
+      pluginStorage: {
+        valueRows,
+        metaRows: [],
+        readRow: async (source: string) => {
+          activeReads++
+          maxActiveReads = Math.max(maxActiveReads, activeReads)
+          await Promise.resolve()
+          const index = Number(source.slice('row-'.length))
+          const result = {
+            index,
+            body: 'x'.repeat(index === rowCount - 1 ? 4 * 1024 * 1024 : 1024),
+          }
+          completedReads++
+          activeReads--
+          return result
+        },
+      },
+    })
+
+    expect(completedReads).toBe(rowCount)
+    expect(maxActiveReads).toBe(1)
+    expect((await stat(filePath)).size).toBeGreaterThan(6 * 1024 * 1024)
+    const decoded = await decodeRisuSave(await readFile(filePath))
+    expect(Object.keys(decoded.pluginCustomStorage)).toHaveLength(rowCount)
+    const lastKey = `record/${(rowCount - 1).toString().padStart(5, '0')}`
+    expect(decoded.pluginCustomStorage[lastKey].body).toHaveLength(4 * 1024 * 1024)
+  })
+
+  test('cancellation removes an incomplete folded database spool', async () => {
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'risu-stream-save-cancel-'))
+    tempDirs.push(tempDir)
+    const filePath = path.join(tempDir, 'database-cancelled.risudat.tmp')
+    let reads = 0
+    await expect(streamRisuSaveToFile({
+      dbObj: { optimizePluginMemory: true, characters: [], pluginCustomStorage: {} },
+      filePath,
+      readChatRow: async () => null,
+      pluginStorage: {
+        valueRows: Array.from({ length: 100 }, (_, index) => ({
+          key: `row-${index}`,
+          source: `row-${index}`,
+        })),
+        metaRows: [],
+        readRow: () => ({ body: 'x'.repeat(256 * 1024), index: reads++ }),
+      },
+      shouldAbort: () => reads >= 4,
+    } as any)).rejects.toMatchObject({ code: 'BACKUP_STREAM_ABORTED' })
+    await expect(stat(filePath)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(reads).toBeLessThan(100)
   })
 })

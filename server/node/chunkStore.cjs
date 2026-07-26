@@ -134,6 +134,13 @@ function createChunkStore(db, opts = {}) {
     const selManifest = db.prepare('SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq');
     const selManifestExists = db.prepare('SELECT 1 FROM manifest_chunks WHERE manifest_key = ? LIMIT 1');
     const selChunk = db.prepare('SELECT data FROM chunks WHERE hash = ?');
+    const streamChunks = db.prepare(
+        `SELECT c.data AS data
+         FROM manifest_chunks m
+         JOIN chunks c ON c.hash = m.hash
+         WHERE m.manifest_key = ?
+         ORDER BY m.seq`,
+    );
     const selSize = db.prepare(
         'SELECT SUM(LENGTH(c.data)) AS n FROM manifest_chunks m JOIN chunks c ON c.hash = m.hash WHERE m.manifest_key = ?',
     );
@@ -254,6 +261,55 @@ function createChunkStore(db, opts = {}) {
         return row.value;
     }
 
+    function writeAll(fd, data) {
+        let offset = 0;
+        while (offset < data.length) {
+            const written = fs.writeSync(fd, data, offset, data.length - offset);
+            if (written <= 0) throw new Error('Snapshot spool write made no progress');
+            offset += written;
+        }
+    }
+
+    /**
+     * Spool one logical value without reassembling its chunk manifest. At most
+     * one stored chunk is handed to JavaScript at a time; incomplete files are
+     * removed on cancellation, read errors, and write errors.
+     */
+    function writeValueToFile(key, filePath, options = {}) {
+        const row = kvGet.get(key);
+        if (!row) return null;
+        const shouldAbort = options.shouldAbort ?? (() => false);
+        const fd = fs.openSync(filePath, 'wx');
+        let size = 0;
+        let chunks = 0;
+        let maxChunkBytes = 0;
+        const writePart = (data) => {
+            if (shouldAbort()) {
+                const error = new Error('KV value stream cancelled');
+                error.code = 'KV_STREAM_ABORTED';
+                throw error;
+            }
+            writeAll(fd, data);
+            size += data.length;
+            chunks++;
+            maxChunkBytes = Math.max(maxChunkBytes, data.length);
+            options.onChunk?.({ index: chunks - 1, size: data.length });
+        };
+        try {
+            if (isChunked(row.value) && selManifestExists.get(key)) {
+                for (const chunk of streamChunks.iterate(key)) writePart(chunk.data);
+            } else {
+                writePart(row.value);
+            }
+            fs.closeSync(fd);
+            return { filePath, size, chunks, maxChunkBytes };
+        } catch (error) {
+            try { fs.closeSync(fd); } catch {}
+            try { fs.unlinkSync(filePath); } catch {}
+            throw error;
+        }
+    }
+
     function sizeValue(key) {
         const row = kvGet.get(key);
         if (!row) return null;
@@ -328,6 +384,7 @@ function createChunkStore(db, opts = {}) {
         putValue,
         putValueFromFile,
         getValue,
+        writeValueToFile,
         sizeValue,
         listValuesWithSizes,
         snapshotCostExclusive,

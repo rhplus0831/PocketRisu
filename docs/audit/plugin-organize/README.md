@@ -46,7 +46,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [BR4](backup-recovery.md#br4) | Medium | Fixed | Valid long keys produce Node backups the same server refuses to import |
 | [PM1](performance-memory.md#pm1) | Medium | Fixed | Large plugin values bypass chunking and incur multiple full-size client/server copies |
 | [PM2](performance-memory.md#pm2) | Medium | Fixed | Mode transitions are not memory-bounded in either direction; the UI guards on entry count only |
-| [PM3](performance-memory.md#pm3) | Medium | Open | Viewer, partial backup, and snapshot restore eagerly rematerialize the whole external store |
+| [PM3](performance-memory.md#pm3) | Medium | Fixed | Viewer, partial backup, and snapshot restore eagerly rematerialize the whole external store |
 | [PM4](performance-memory.md#pm4) | Medium | Open | Remaining write/cache amplification: independent logical writes still repeat full-value hashing/copies and cache pruning |
 | [IP1](integration-patterns.md#ip1) | High | Open | Treating a failed read as a missing key turns transient I/O errors into destructive whole-value overwrites |
 | [IP2](integration-patterns.md#ip2) | High | Open | Remove-then-rewrite maintenance flows durably delete rows mid-sequence and report success |
@@ -116,13 +116,14 @@ unload admission/draining, failpoint rollback, acknowledgement loss, and
 old-or-new state after a real server restart. PM2 additionally covers the
 production save loop and staged transition path with a 56 MiB Unicode store,
 forced-GC checkpoints, PM1 chunks, and the resource cache both off and on.
+PM3 covers one-page viewer loading, generation-owned partial folding, chunked
+file-cursor restore, and a real disconnect after tentative exact-set deletion
+with rollback, spool cleanup, and restart durability.
 The suites still do not exercise:
 
 - the production save loop as the reconciliation durability callback
   (pre-initialization no-op, in-flight save join, 409/500/network failure);
-- key-length boundaries for backup export/import symmetry;
-- read failure followed by a fallback-derived overwrite;
-- corrupt-row boot recovery.
+- read failure followed by a fallback-derived overwrite.
 
 ## Original recommended fix order
 
@@ -139,19 +140,19 @@ The suites still do not exercise:
 5. **Repair recovery semantics** (BR1–BR4): plugin-mutation snapshot triggers,
    generation/ownership markers, exact-set boot-fallback restore, and
    symmetric key limits.
-6. **Bind lifecycle, parity, and capacity** (AC2, AC4, MT3, SA3, PM2–PM4):
+6. **Bind lifecycle, parity, and capacity** (AC2, AC4, MT3, SA3, PM4):
    awaited unload before eligibility, JSON/enumeration/special-key parity,
-   isolated boot reconciliation failures, memory-bounded transitions, and
-   remaining recovery/write amplification.
+   isolated boot reconciliation failures, and remaining write amplification.
 7. **Publish integration guidance and primitives** (IP1–IP5): typed
    missing/failed read outcomes, per-key revisions/CAS, atomic batch, and a
    non-destructive invalidate/rewrite operation.
 
-The former compatibility, startup, mutation, primary recovery, and transition
-capacity blockers MT1–MT3, AC1–AC4, SA1–SA4, AA1–AA3, BR1–BR4, and PM1–PM2
-are fixed and covered. The beta still should not be treated as risk-free for
-every V3 workload: PM3–PM4 and IP1–IP5 remain open. The AA3 primitives make
+The former compatibility, startup, mutation, primary recovery, transition
+capacity, and tooling-memory blockers MT1–MT3, AC1–AC4, SA1–SA4, AA1–AA3,
+BR1–BR4, and PM1–PM3 are fixed and covered. The beta still should not be
+treated as risk-free for every V3 workload: PM4 and IP1–IP5 remain open. The
+AA3 primitives make
 safe compound-write guidance possible, but do not automatically repair existing
 plugin protocols.
-Verify a backup before transitions and before using the remaining open tooling
-and integration paths with very large repositories.
+Verify a backup before transitions and before using the remaining open
+integration paths with very large repositories.

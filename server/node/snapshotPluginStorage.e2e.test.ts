@@ -2656,6 +2656,136 @@ describe('automatic snapshots × optimized plugin storage', () => {
         afterRestore.close()
         expect(JSON.parse(Buffer.from(physical.value).toString('utf-8'))).toBe('V2')
     })
+
+    it('restores a chunked high-cardinality folded snapshot and removes its file cursor', async () => {
+        const cwd = makeWorkDir()
+        const server = await startServer(cwd, {
+            POCKETRISU_CHUNK_THRESHOLD: '4096',
+        })
+        const auth = await authenticate(server)
+        const rowCount = 1_000
+        const values = Object.fromEntries(Array.from({ length: rowCount }, (_, index) => [
+            `record/${index}`,
+            {
+                index,
+                body: 'x'.repeat(index === rowCount - 1 ? 4 * 1024 * 1024 : 1024),
+            },
+        ]))
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({ values }))
+        const [snapshotKey] = await listSnapshotKeys(server, auth)
+        expect(snapshotKey).toBeTruthy()
+
+        const sqlite = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
+        try {
+            const row = sqlite.prepare('SELECT value FROM kv WHERE key = ?').get(snapshotKey) as
+                | { value: Buffer }
+                | undefined
+            expect(Buffer.from(row!.value)).toEqual(Buffer.from('\x00RISUCHUNKED\x00', 'binary'))
+            const chunks = sqlite.prepare(
+                'SELECT COUNT(*) AS count FROM manifest_chunks WHERE manifest_key = ?',
+            ).get(snapshotKey) as { count: number }
+            expect(chunks.count).toBeGreaterThan(50)
+        } finally {
+            sqlite.close()
+        }
+
+        const mutation = await mutateCurrentStorage(server, auth, {
+            writes: [{
+                storageKey: valueRowKey(`record/${rowCount - 1}`),
+                value: 'changed',
+            }],
+        })
+        expect(mutation.status).toBe(200)
+        await restoreSnapshot(server, auth, snapshotKey)
+        const restored = JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey(`record/${rowCount - 1}`),
+        )).toString('utf-8'))
+        expect(restored.body).toHaveLength(4 * 1024 * 1024)
+        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+            name => name.includes('snapshot-restore'),
+        )).toEqual([])
+    })
+
+    it('rolls back a chunked exact restore when the client disconnects mid-publication', async () => {
+        const cwd = makeWorkDir()
+        const gateDir = path.join(cwd, 'snapshot-restore-gate')
+        const server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+            POCKETRISU_CHUNK_THRESHOLD: '4096',
+            POCKETRISU_SNAPSHOT_RESTORE_TEST_GATE_DIR: gateDir,
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: {
+                target: { body: 'x'.repeat(1024 * 1024) },
+                retained: 'snapshot-value',
+            },
+        }))
+        const [snapshotKey] = await listSnapshotKeys(server, auth)
+        expect(snapshotKey).toBeTruthy()
+
+        const mutation = await mutateCurrentStorage(server, auth, {
+            writes: [
+                { storageKey: valueRowKey('target'), value: 'current-value' },
+                { storageKey: valueRowKey('current-only'), value: 'must-survive' },
+            ],
+        })
+        expect(mutation.status).toBe(200)
+        const currentDb = await readKey(server, auth, 'database/database.bin')
+        const currentManifest = await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)
+        const generation = (await decodeRisuSave(currentDb)).pluginStorageGeneration as string
+
+        await armSnapshotPublicationGate(gateDir)
+        const controller = new AbortController()
+        const restore = fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+            signal: controller.signal,
+        })
+        await waitForSnapshotPublicationGate(gateDir)
+        controller.abort()
+        await expect(restore).rejects.toThrow()
+        await delay(50)
+        await releaseSnapshotPublicationGate(gateDir)
+        await waitFor(async () => server.logs().includes(
+            'Client disconnected before commit; transaction was rolled back',
+        ))
+        await disarmSnapshotPublicationGate(gateDir)
+
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(currentDb)
+        expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(currentManifest)
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('target'),
+            generation,
+        )).toString('utf-8'))).toBe('current-value')
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('current-only'),
+            generation,
+        )).toString('utf-8'))).toBe('must-survive')
+        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+            name => name.includes('snapshot-restore'),
+        )).toEqual([])
+
+        await stopServer(server)
+        const restarted = await startServer(cwd, { POCKETRISU_BACKUP_INTERVAL_MS: '10000' })
+        const restartedAuth = await authenticate(restarted)
+        expect(await readKey(restarted, restartedAuth, 'database/database.bin')).toEqual(currentDb)
+        expect(await readKey(restarted, restartedAuth, PLUGIN_STORAGE_MANIFEST_KEY))
+            .toEqual(currentManifest)
+        expect(JSON.parse((await readKey(
+            restarted,
+            restartedAuth,
+            valueRowKey('current-only'),
+            generation,
+        )).toString('utf-8'))).toBe('must-survive')
+    }, 30_000)
 })
 
 describe('corrupt database boot snapshot recovery', () => {

@@ -151,14 +151,23 @@ async function shouldStreamRisuSave(input, options = {}) {
 }
 
 class RandomAccessSource {
-    constructor({ buffer = null, handle = null, size, filePath = null }) {
+    constructor({ buffer = null, handle = null, size, filePath = null, shouldAbort = () => false }) {
         this.buffer = buffer;
         this.handle = handle;
         this.size = size;
         this.filePath = filePath;
+        this.shouldAbort = shouldAbort;
+    }
+
+    throwIfAborted() {
+        if (!this.shouldAbort()) return;
+        const error = new Error('Streaming Risu load cancelled');
+        error.code = 'RISU_STREAM_ABORTED';
+        throw error;
     }
 
     async readRange(offset, length) {
+        this.throwIfAborted();
         if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length)
             || offset < 0 || length < 0 || offset + length > this.size) {
             throw new Error(`Truncated MessagePack payload at byte ${offset}`);
@@ -209,6 +218,7 @@ class SourceCursor {
     }
 
     async readBytes(length) {
+        this.source.throwIfAborted();
         if (!Number.isSafeInteger(length) || length < 0 || this.position + length > this.source.size) {
             throw new Error(`Truncated MessagePack payload at byte ${this.position}`);
         }
@@ -595,21 +605,31 @@ async function processCharacters(source, descriptor, options) {
     return characters;
 }
 
-async function openBaseSource(inspection) {
+async function openBaseSource(inspection, shouldAbort) {
     if (inspection.buffer) {
-        return new RandomAccessSource({ buffer: inspection.buffer, size: inspection.buffer.length });
+        return new RandomAccessSource({
+            buffer: inspection.buffer,
+            size: inspection.buffer.length,
+            shouldAbort,
+        });
     }
     const handle = await fs.open(inspection.filePath, 'r');
     return new RandomAccessSource({
         handle,
         size: inspection.size,
         filePath: inspection.filePath,
+        shouldAbort,
     });
 }
 
-async function prepareMessagePackSource(input, inspection, tempDir = null) {
+async function prepareMessagePackSource(
+    input,
+    inspection,
+    tempDir = null,
+    shouldAbort = () => false,
+) {
     if (inspection.format === 'raw') {
-        const source = await openBaseSource(inspection);
+        const source = await openBaseSource(inspection, shouldAbort);
         return {
             source,
             payloadOffset: inspection.payloadOffset,
@@ -645,7 +665,12 @@ async function prepareMessagePackSource(input, inspection, tempDir = null) {
         await fs.unlink(tempPath).catch(() => {});
         throw error;
     }
-    const source = new RandomAccessSource({ handle, size: stat.size, filePath: tempPath });
+    const source = new RandomAccessSource({
+        handle,
+        size: stat.size,
+        filePath: tempPath,
+        shouldAbort,
+    });
     return {
         source,
         payloadOffset: 0,
@@ -670,7 +695,12 @@ async function walkRisuSave(input, options = {}) {
         throw new Error('Risu save format is not supported by the streaming loader');
     }
 
-    const prepared = await prepareMessagePackSource(input, inspection, options.tempDir);
+    const prepared = await prepareMessagePackSource(
+        input,
+        inspection,
+        options.tempDir,
+        options.shouldAbort,
+    );
     try {
         const source = prepared.source;
         const rootCursor = source.cursor(prepared.payloadOffset);

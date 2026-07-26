@@ -529,6 +529,7 @@ function createChatRowStore(options) {
             const walked = await walkRisuSave(source, {
                 inspection: opts.inspection,
                 tempDir: opts.tempDir,
+                shouldAbort: opts.shouldAbort,
                 externalizePluginStorage: typeof opts.onPluginStorageEntry === 'function',
                 onPluginStorageEntry: opts.onPluginStorageEntry,
                 onPluginStorageFolded: opts.onPluginStorageFolded,

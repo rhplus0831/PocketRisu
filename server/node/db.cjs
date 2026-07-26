@@ -304,6 +304,10 @@ function kvGet(key) {
     return chunkStore.getValue(key);
 }
 
+function kvWriteToFile(key, filePath, options) {
+    return chunkStore.writeValueToFile(key, filePath, options);
+}
+
 function checkKvSetFailpoint(key) {
     if (kvSetFailpoint) {
         if (kvSetFailpoint.type === 'key' && key === kvSetFailpoint.key) {
@@ -512,7 +516,7 @@ function clearEntities() {
 module.exports = {
     db,
     // KV
-    kvGet, kvSet, kvSetFromFile, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue,
+    kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue,
     kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
     kvGetListEpoch, kvBumpListEpoch,
     createKvSnapshot,
