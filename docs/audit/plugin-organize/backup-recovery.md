@@ -271,11 +271,35 @@ the exact database, manifest, and owned rows durable after restart. Corrupt
 chunks fail with a definitive non-committed envelope, while repeated
 keep-alive restores release all disconnect listeners.
 
+The same atomic boundary owns compressed and legacy preparation. Snapshot
+bytes are file-cursor inspected before publication; gzip/zlib output is
+backpressured, AbortSignal-aware, disk-spooled, and capped by decoded bytes and
+disk headroom, while cursor-unsupported compatibility formats have a separate
+finite memory cap. Structural corruption is a known-not-committed 400 and
+capacity exhaustion is a known-not-committed 413. The block compatibility path
+publishes the decoded selected snapshot directly and explicitly suppresses the
+ordinary live-monolith REMOTE migration, preventing the current database from
+being substituted for the requested recovery point.
+
+Referenced REMOTE content is also part of the selected snapshot's validity.
+Restore checks logical row size before materialization, meters and caches the
+entire recursive graph, and rejects cycles, excessive depth, missing rows, and
+rows that disappear between size and read. Resolver size/body exceptions are
+never merely logged and omitted: they escape to the restore transaction, which
+returns the stable retryable `SNAPSHOT_RESTORE_NOT_COMMITTED` envelope after
+rollback.
+Save-folder adoption follows the same resolver-present rule; a missing payload
+rejects the import and preserves the prior database bytes, REMOTE rows, marker,
+and normalized export across restart.
+
 ETag and authenticated-session generation state are published only after
 COMMIT. The success envelope is strict and explicit; a lost response after
 COMMIT remains `COMMIT_OUTCOME_UNKNOWN`. Bootstrap stops immediately on that
 outcome, or on any post-commit read failure, instead of replaying an older
-candidate over a possibly committed restore. Regression coverage includes
+candidate over a possibly committed restore. It tries an older candidate only
+after a `StorageError` that explicitly carries `commitOutcome: not-committed`;
+plain errors and storage failures without that proof stop conservatively.
+Regression coverage includes
 marked non-empty and empty exact sets, long keys, extra/foreign/malformed rows,
 generation and manifest mismatches, missing and duplicate manifest ownership,
 legacy and streaming ingest, raw and structural corrupt boots, fresh install,
@@ -293,7 +317,11 @@ cancellation stops before deletion, PM2 private stages remain invisible and
 source-invalidated, and PM4 rejects the pre-restore manifest token before a
 fresh-token mutation commits. Further recovery coverage includes full
 chunk-publication deletion, legacy manifest-protection migration, raw-marker
-compatibility, a real mid-spool disconnect, and listener cleanup.
+compatibility, a real mid-spool disconnect, listener cleanup, newer
+compressed-limit fallback to an older valid block snapshot, exact
+requested-target publication over a distinct live REMOTE
+database, recursive REMOTE failures, and restore-spool cleanup. Independent
+verification passed in each source branch before composition.
 
 <a id="br4"></a>
 ## BR4 — Valid long keys produce Node backups the same server refuses to import

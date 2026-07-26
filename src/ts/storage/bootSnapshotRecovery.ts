@@ -23,12 +23,15 @@ export interface BootSnapshotRecoveryOptions<T> {
 }
 
 /**
- * Ask the authoritative server to select and validate an internal snapshot.
- * Discovery is metadata-only: folded candidate bodies never cross the browser
- * boundary or get decoded into browser memory. Known pre-commit failures may
- * try an older candidate. A lost acknowledgement, or any failure after a
- * confirmed commit, must stop immediately so a possibly committed recovery
- * point is never overwritten by blind fallback.
+ * Ask the authoritative server to validate and publish each internal snapshot
+ * through its
+ * bounded atomic restore boundary. The browser must not fetch/decompress a
+ * folded candidate first: doing so would duplicate the repository in memory
+ * and bypass the server's decoded-size and disk-headroom limits. Discovery is
+ * metadata-only, and folded candidate bodies never cross the browser boundary.
+ * Known pre-commit failures may try an older candidate. A lost acknowledgement,
+ * or any failure after a confirmed commit, must stop immediately so a possibly
+ * committed recovery point is never overwritten by blind fallback.
  */
 export async function recoverDatabaseFromInternalSnapshots<T>({
     storage,
@@ -52,10 +55,10 @@ export async function recoverDatabaseFromInternalSnapshots<T>({
             }
             return restoredRead.database as T
         } catch (error) {
-            if (
-                candidateCommitted
-                || (error instanceof StorageError && error.commitOutcomeUnknown)
-            ) {
+            if (candidateCommitted
+                || !(error instanceof StorageError)
+                || error.commitOutcomeUnknown
+                || error.commitOutcome !== "not-committed") {
                 throw error
             }
         }

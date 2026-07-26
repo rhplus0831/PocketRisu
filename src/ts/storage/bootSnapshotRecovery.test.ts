@@ -28,9 +28,10 @@ describe("boot internal snapshot selection", () => {
             readDatabaseForBoot: vi.fn(),
         }
 
+        const decode = vi.fn(async (value: Uint8Array) => ({ candidate: value[0] }))
         await expect(recoverDatabaseFromInternalSnapshots({
             storage,
-            decode: vi.fn(async (value) => ({ candidate: value[0] })),
+            decode,
         })).rejects.toMatchObject({
             code: "COMMIT_OUTCOME_UNKNOWN",
             commitOutcomeUnknown: true,
@@ -38,6 +39,7 @@ describe("boot internal snapshot selection", () => {
         expect(storage.listInternalSnapshotsForBoot).toHaveBeenCalledTimes(1)
         expect(storage.restoreInternalSnapshotForBoot).toHaveBeenCalledTimes(1)
         expect(storage.readDatabaseForBoot).not.toHaveBeenCalled()
+        expect(decode).not.toHaveBeenCalled()
     })
 
     it("does not replay an older snapshot after a committed candidate cannot be read back", async () => {
@@ -49,21 +51,28 @@ describe("boot internal snapshot selection", () => {
             }),
         }
 
+        const decode = vi.fn(async (value: Uint8Array) => ({ candidate: value[0] }))
         await expect(recoverDatabaseFromInternalSnapshots({
             storage,
-            decode: vi.fn(async (value) => ({ candidate: value[0] })),
+            decode,
         })).rejects.toThrow("read-back failed")
         expect(storage.listInternalSnapshotsForBoot).toHaveBeenCalledTimes(1)
         expect(storage.restoreInternalSnapshotForBoot).toHaveBeenCalledTimes(1)
         expect(storage.readDatabaseForBoot).toHaveBeenCalledTimes(1)
+        expect(decode).not.toHaveBeenCalled()
     })
 
-    it("may continue after a known not-committed failure", async () => {
+    it.each([
+        ["decoded-size limit", "RISU_SAVE_DECODED_TOO_LARGE", 413],
+        ["definitive corruption", "RISU_SAVE_INVALID", 400],
+    ])("may continue after a known not-committed %s", async (_label, code, status) => {
         const storage = {
             listInternalSnapshotsForBoot: vi.fn(async () => [snapshot(20_000), snapshot(10_000)]),
             restoreInternalSnapshotForBoot: vi.fn()
                 .mockRejectedValueOnce(new StorageError("rolled back", {
-                    code: "SNAPSHOT_RESTORE_NOT_COMMITTED",
+                    code,
+                    status,
+                    commitOutcome: "not-committed",
                     commitOutcomeUnknown: false,
                     operation: "transition",
                 }))
@@ -74,11 +83,45 @@ describe("boot internal snapshot selection", () => {
             })),
         }
 
+        const decode = vi.fn(async (value: Uint8Array) => ({ candidate: value[0] }))
         await expect(recoverDatabaseFromInternalSnapshots({
             storage,
-            decode: vi.fn(async (value) => ({ candidate: value[0] })),
+            decode,
         })).resolves.toEqual({ candidate: "older-committed" })
+        expect(storage.restoreInternalSnapshotForBoot).toHaveBeenNthCalledWith(
+            1,
+            "database/dbbackup-200.bin",
+        )
+        expect(storage.restoreInternalSnapshotForBoot).toHaveBeenNthCalledWith(
+            2,
+            "database/dbbackup-100.bin",
+        )
         expect(storage.restoreInternalSnapshotForBoot).toHaveBeenCalledTimes(2)
+        expect(decode).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        ["a non-storage failure", new Error("unclassified restore failure")],
+        ["an unclassified storage failure", new StorageError("unclassified restore failure", {
+            code: "HTTP_400",
+            commitOutcomeUnknown: false,
+            operation: "transition",
+        })],
+    ])("stops after %s instead of trying an older candidate", async (_label, failure) => {
+        const storage = {
+            listInternalSnapshotsForBoot: vi.fn(async () => [snapshot(20_000), snapshot(10_000)]),
+            restoreInternalSnapshotForBoot: vi.fn()
+                .mockRejectedValueOnce(failure)
+                .mockResolvedValueOnce("committed" as const),
+            readDatabaseForBoot: vi.fn(),
+        }
+
+        await expect(recoverDatabaseFromInternalSnapshots({
+            storage,
+            decode: vi.fn(),
+        })).rejects.toThrow("unclassified restore failure")
+        expect(storage.restoreInternalSnapshotForBoot).toHaveBeenCalledTimes(1)
+        expect(storage.readDatabaseForBoot).not.toHaveBeenCalled()
     })
 
     it("never reads or decodes a candidate body before server validation", async () => {
@@ -86,7 +129,8 @@ describe("boot internal snapshot selection", () => {
             listInternalSnapshotsForBoot: vi.fn(async () => [snapshot(20_000), snapshot(10_000)]),
             restoreInternalSnapshotForBoot: vi.fn()
                 .mockRejectedValueOnce(new StorageError("invalid candidate", {
-                    code: "INVALID_DATABASE",
+                    code: "RISU_SAVE_INVALID",
+                    commitOutcome: "not-committed",
                     commitOutcomeUnknown: false,
                     operation: "transition",
                 }))

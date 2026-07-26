@@ -864,6 +864,9 @@ export class NodeStorage{
             retryAfter,
             retryable: payload?.retryable === true,
             commitOutcomeUnknown,
+            commitOutcome: explicitlyNotCommitted
+                ? 'not-committed'
+                : (commitOutcomeUnknown ? 'unknown' : null),
             operation,
         })
     }
@@ -966,7 +969,9 @@ export class NodeStorage{
         mutation: boolean,
         status: number,
     ): StorageError {
-        const commitOutcomeUnknown = mutation && payload.commitOutcomeUnknown !== false
+        const explicitlyNotCommitted = payload.commitOutcome === 'not-committed'
+            && payload.commitOutcomeUnknown === false
+        const commitOutcomeUnknown = mutation && !explicitlyNotCommitted
         return new StorageError(payloadMessage(payload) ?? `${operation} failed`, {
             status,
             code: typeof payload.code === 'string'
@@ -975,6 +980,9 @@ export class NodeStorage{
             retryAfter: parseRetryAfterSeconds(payload.retryAfter),
             retryable: payload.retryable === true,
             commitOutcomeUnknown,
+            commitOutcome: explicitlyNotCommitted
+                ? 'not-committed'
+                : (commitOutcomeUnknown ? 'unknown' : null),
             operation,
         })
     }
@@ -1127,6 +1135,10 @@ export class NodeStorage{
                             : 'PLUGIN_STORAGE_TRANSITION_FAILED'),
                         retryable: definitiveFailure && response.status >= 500,
                         commitOutcomeUnknown: mutation && !definitiveFailure,
+                        commitOutcome: result?.commitOutcome === 'not-committed'
+                            && result?.commitOutcomeUnknown === false
+                            ? 'not-committed'
+                            : (mutation && !definitiveFailure ? 'unknown' : null),
                         operation: 'transition',
                     })
                 }

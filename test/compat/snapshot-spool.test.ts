@@ -47,6 +47,8 @@ async function listSnapshots(client: RisuClient): Promise<Array<{ key: string }>
 describe('database snapshot spool isolation', () => {
   test('hub writes snapshot through save/.spool without a backups directory', async () => {
     const orphanName = '.database-risudat-crash-orphan.tmp'
+    const decodedOrphanName = `${orphanName}.decoded-crash.tmp`
+    const blockOrphanName = `${orphanName}.block-decoded-crash.tmp`
     const server = await spawnServer({
       createBackupsDir: false,
       env: {
@@ -57,6 +59,8 @@ describe('database snapshot spool isolation', () => {
         const spoolDir = path.join(saveDir, '.spool')
         await mkdir(spoolDir, { recursive: true })
         await writeFile(path.join(spoolDir, orphanName), 'orphan')
+        await writeFile(path.join(spoolDir, decodedOrphanName), 'decoded orphan')
+        await writeFile(path.join(spoolDir, blockOrphanName), 'block orphan')
       },
     })
     servers.push(server)
@@ -65,6 +69,8 @@ describe('database snapshot spool isolation', () => {
     expect(existsSync(path.join(server.cwd, 'backups'))).toBe(false)
     expect(existsSync(path.join(server.cwd, 'save', '.spool'))).toBe(true)
     expect(existsSync(path.join(server.cwd, 'save', '.spool', orphanName))).toBe(false)
+    expect(existsSync(path.join(server.cwd, 'save', '.spool', decodedOrphanName))).toBe(false)
+    expect(existsSync(path.join(server.cwd, 'save', '.spool', blockOrphanName))).toBe(false)
 
     expect((await writeDatabase(client, 'hub-write')).status).toBe(200)
     expect(await listSnapshots(client)).toHaveLength(1)

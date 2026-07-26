@@ -412,18 +412,24 @@ class RisuSaveDecoder {
         // skipped (the historical behavior) — which loses any characters that
         // were saved as remote blocks by upstream RisuAI or by an earlier
         // NodeOnly version.
-        const { resolveRemote = null } = options;
+        const { resolveRemote = null, maxRemoteDepth = 32 } = options;
         let offset = magicRisuSaveHeader.length;
         let db = {};
 
         while (offset < data.length) {
             try {
+                if (offset + 7 > data.length) {
+                    throw structuralRisuSaveError(`Truncated RisuSave block header at byte ${offset}`);
+                }
                 const type = data[offset];
                 const compression = data[offset + 1] === 1;
                 offset += 2;
 
                 const nameLength = data[offset];
                 offset += 1;
+                if (offset + nameLength + 4 > data.length) {
+                    throw structuralRisuSaveError(`Truncated RisuSave block name at byte ${offset}`);
+                }
                 const name = new TextDecoder().decode(data.subarray(offset, offset + nameLength));
                 offset += nameLength;
 
@@ -432,6 +438,10 @@ class RisuSaveDecoder {
                 new Uint8Array(newArrayBuf).set(lengthSubUint8Buf);
                 const length = new Uint32Array(newArrayBuf)[0];
                 offset += 4;
+
+                if (offset + length > data.length) {
+                    throw structuralRisuSaveError(`Truncated RisuSave block body at byte ${offset}`);
+                }
 
                 let blockData = data.subarray(offset, offset + length);
                 offset += length;
@@ -450,10 +460,15 @@ class RisuSaveDecoder {
                     name,
                     type,
                     compression,
-                    content: new TextDecoder().decode(blockData)
+                    content: new TextDecoder().decode(blockData),
+                    remoteChain: [],
                 });
             } catch (error) {
-                continue;
+                if (error?.risuSaveStructuralInvalid) throw error;
+                throw structuralRisuSaveError(
+                    `Failed to read RisuSave block at byte ${offset}: ${error?.message ?? error}`,
+                    error,
+                );
             }
         }
 
@@ -516,10 +531,43 @@ class RisuSaveDecoder {
                         // that drops characters saved by upstream RisuAI.
                         if (!resolveRemote) break;
                         const remoteInfo = JSON.parse(this.blocks[key].content);
-                        const resolved = await resolveRemote(remoteInfo.name);
+                        if (!remoteInfo || typeof remoteInfo.name !== 'string'
+                            || remoteInfo.name.length === 0
+                            || !Number.isInteger(remoteInfo.type)) {
+                            throw structuralRisuSaveError('Invalid REMOTE block metadata');
+                        }
+                        const remoteChain = Array.isArray(this.blocks[key].remoteChain)
+                            ? this.blocks[key].remoteChain
+                            : [];
+                        if (remoteChain.includes(remoteInfo.name)) {
+                            throw structuralRisuSaveError(
+                                `REMOTE block cycle detected: ${[...remoteChain, remoteInfo.name].join(' -> ')}`,
+                            );
+                        }
+                        if (remoteChain.length >= maxRemoteDepth) {
+                            throw structuralRisuSaveError(
+                                `REMOTE block nesting exceeds ${maxRemoteDepth} levels`,
+                            );
+                        }
+                        const nextChain = [...remoteChain, remoteInfo.name];
+                        let resolved;
+                        try {
+                            resolved = await resolveRemote(remoteInfo.name, {
+                                type: remoteInfo.type,
+                                chain: remoteChain,
+                                depth: nextChain.length,
+                            });
+                        } catch (error) {
+                            if (error?.risuSavePreparationLimit
+                                || error?.risuSavePreparationInvalid
+                                || error?.risuSaveRemoteResolutionFailure
+                                || error?.code === 'RISU_STREAM_ABORTED') throw error;
+                            throw remoteResolutionError(remoteInfo.name, 'read', error);
+                        }
                         if (!resolved) {
-                            logger.warn(`[RisuSaveDecoder] Remote block ${remoteInfo.name} could not be resolved`);
-                            break;
+                            throw structuralRisuSaveError(
+                                `Referenced REMOTE block ${remoteInfo.name} is missing`,
+                            );
                         }
                         // Push the resolved block back into the queue so it
                         // gets processed by a later iteration of this loop.
@@ -528,6 +576,7 @@ class RisuSaveDecoder {
                             type: remoteInfo.type,
                             compression: false,
                             content: new TextDecoder().decode(resolved),
+                            remoteChain: nextChain,
                         });
                         break;
                     }
@@ -537,6 +586,19 @@ class RisuSaveDecoder {
                 }
             } catch (error) {
                 logger.error(`[RisuSaveDecoder] Error processing block ${this.blocks[key].name}:`, error);
+                if (error?.risuSavePreparationLimit
+                    || error?.risuSavePreparationInvalid
+                    || error?.risuSaveRemoteResolutionFailure
+                    || error?.risuSaveStructuralInvalid
+                    || error?.code === 'RISU_STREAM_ABORTED') {
+                    throw error;
+                }
+                if (this.blocks[key].type === RisuSaveType.REMOTE) {
+                    throw structuralRisuSaveError(
+                        `Invalid REMOTE block ${this.blocks[key].name}: ${error?.message ?? error}`,
+                        error,
+                    );
+                }
                 if (this.blocks[key].type === RisuSaveType.ROOT) {
                     throw new Error('Failed to decode root block, cannot proceed with decoding RisuSave data');
                 }
@@ -557,6 +619,23 @@ class RisuSaveDecoder {
 
         return db;
     }
+}
+
+function structuralRisuSaveError(message, cause) {
+    const error = new Error(message, cause === undefined ? undefined : { cause });
+    error.code = 'RISU_SAVE_INVALID';
+    error.risuSaveStructuralInvalid = true;
+    return error;
+}
+
+function remoteResolutionError(name, phase, cause) {
+    const error = new Error(
+        `Failed to ${phase} referenced REMOTE block ${name}`,
+        { cause },
+    );
+    error.code = 'RISU_SAVE_REMOTE_READ_FAILED';
+    error.risuSaveRemoteResolutionFailure = true;
+    return error;
 }
 
 /**
@@ -619,6 +698,13 @@ async function _decodeRisuSaveInternal(data, options = {}) {
         }
         return unpackr.decode(data);
     } catch (error) {
+        if (error?.risuSavePreparationLimit
+            || error?.risuSavePreparationInvalid
+            || error?.risuSaveRemoteResolutionFailure
+            || error?.risuSaveStructuralInvalid
+            || error?.code === 'RISU_STREAM_ABORTED') {
+            throw error;
+        }
         logger.error('Error decoding RisuSave data:', error);
         try {
             const risuSaveHeader = new Uint8Array(Buffer.from("\u0000\u0000RISU", 'utf-8'));

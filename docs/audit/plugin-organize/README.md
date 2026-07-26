@@ -137,7 +137,14 @@ never cross the browser `/api/read` boundary and that the exact older chat
 survives restart. Versioned publication-integrity guards cover every
 read/size/copy path, thresholds are clamped, and a 52 MiB mid-spool socket abort
 proves keep-alive listener cleanup and exact restart durability after
-cancellation or corrupt-chunk rejection.
+cancellation or corrupt-chunk rejection. Its restore coverage also includes
+bounded/cancellable gzip and zlib output, legacy memory and disk
+headroom caps, stable pre-commit 400/413 classification, and recursive REMOTE
+size-before-read metering with duplicate caching, cycle/depth rejection, strict
+missing/read failures, exact requested-target publication, and save-folder
+rollback. BR3 boot fallback tries an older candidate only after explicit
+known-not-committed proof; unclassified, transport-ambiguous, and post-commit
+failures stop conservatively.
 PM4 additionally covers compact manifest CAS, exact server value hashes,
 50-row snapshot reuse, canonical manifest-key validation and cancellation,
 donated 128-row and four-by-2-MiB batches, one IndexedDB mutation transaction,

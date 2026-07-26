@@ -193,18 +193,19 @@ describe('decodeRisuSave with resolveRemote', () => {
         expect(db.characters[0].chats[0].message.length).toBe(2)
     })
 
-    test('continues past a missing remote block instead of failing the whole decode', async () => {
+    test('rejects a missing remote block when a resolver was explicitly supplied', async () => {
         const goodChar = buildCharacter('good', 'Good', 'present')
         const dbBuf = encodeRisuSaveWithRemoteBlocks({
             rootData: { apiType: 'openai' },
             remoteCharacterIds: ['good', 'missing'],
         })
         const goodBytes = new TextEncoder().encode(JSON.stringify(goodChar))
-        const db = await utils.decodeRisuSave(dbBuf, {
+        await expect(utils.decodeRisuSave(dbBuf, {
             resolveRemote: async (name: string) => name === 'good' ? goodBytes : null,
-        }) as { characters: Array<{ chaId: string }> }
-        // We get the good one; the missing one is dropped with a warning.
-        expect(db.characters.map(c => c.chaId)).toEqual(['good'])
+        })).rejects.toMatchObject({
+            code: 'RISU_SAVE_INVALID',
+            message: 'Referenced REMOTE block missing is missing',
+        })
     })
 })
 
@@ -358,10 +359,36 @@ describe('boot-time remote-block migration', () => {
         expect(n2.characters.map(c => c.chaId)).toEqual(n1.characters.map(c => c.chaId))
     })
 
-    test('non-existent remote file is reported and skipped (rest survive)', async () => {
+    test('missing remote payload rejects migration and preserves the prior publication', async () => {
         const srv = await spawnServer()
         servers.push(srv)
         const client = await createClient(srv.port, srv.password)
+
+        const baseline = buildCharacter('baseline', 'Baseline', 'durable baseline')
+        const baselineZip = buildSaveFolderZip({
+            'database/database.bin': encodeRisuSaveWithRemoteBlocks({
+                rootData: { apiType: 'openai', selectedCharacter: 0 },
+                remoteCharacterIds: ['baseline'],
+            }),
+            'remotes/baseline.local.bin': Buffer.from(JSON.stringify(baseline), 'utf-8'),
+        })
+        const baselineUpload = await client.fetch('/api/migrate/save-folder/upload', {
+            method: 'POST',
+            headers: { 'content-type': 'application/zip' },
+            body: new Uint8Array(baselineZip),
+        })
+        expect(baselineUpload.ok).toBe(true)
+        const readKey = async (key: string): Promise<Buffer> => {
+            const response = await client.fetch('/api/read', {
+                headers: { 'file-path': Buffer.from(key, 'utf-8').toString('hex') },
+            })
+            expect(response.ok).toBe(true)
+            return Buffer.from(await response.arrayBuffer())
+        }
+        const databaseBefore = await readKey('database/database.bin')
+        const baselineRemoteBefore = await readKey('remotes/baseline.local.bin')
+        const markerBefore = await readKey('migration/disable-remote-saving')
+        const normalizedBefore = normalizeBackup(await client.exportBackup()).normalized
 
         const ok = buildCharacter('cha-ok', 'OK', 'fine')
         const zip = buildSaveFolderZip({
@@ -372,24 +399,38 @@ describe('boot-time remote-block migration', () => {
             'remotes/cha-ok.local.bin': Buffer.from(JSON.stringify(ok), 'utf-8'),
             // Intentionally omit remotes/cha-broken.local.bin
         })
-        await client.fetch('/api/migrate/save-folder/upload', {
+        const rejected = await client.fetch('/api/migrate/save-folder/upload', {
             method: 'POST',
             // 'application/zip' (not octet-stream) so the global express.raw()
             // middleware leaves the body unbuffered for the streaming handler.
             headers: { 'content-type': 'application/zip' },
             body: new Uint8Array(zip),
         })
-        await client.fetch('/api/read', {
-            headers: { 'file-path': Buffer.from('database/database.bin', 'utf-8').toString('hex') },
+        expect(rejected.status).toBe(400)
+        await expect(rejected.json()).resolves.toEqual({
+            error: 'Referenced REMOTE block cha-broken is missing',
         })
 
-        const exported = await client.exportBackup()
-        const { normalized } = normalizeBackup(exported)
-        const ids = normalized.characters.map(c => c.chaId)
-        expect(ids).toContain('cha-ok')
-        // cha-broken's payload was missing — character is dropped (warning logged
-        // server-side), but the migration as a whole still completes.
-        expect(ids).not.toContain('cha-broken')
+        expect(await readKey('database/database.bin')).toEqual(databaseBefore)
+        expect(await readKey('remotes/baseline.local.bin')).toEqual(baselineRemoteBefore)
+        expect(await readKey('remotes/cha-ok.local.bin')).toHaveLength(0)
+        expect(await readKey('migration/disable-remote-saving')).toEqual(markerBefore)
+        expect(normalizeBackup(await client.exportBackup()).normalized).toEqual(normalizedBefore)
+
+        await srv.restart()
+        const restarted = await createClient(srv.port, srv.password)
+        const restartedRead = async (key: string): Promise<Buffer> => {
+            const response = await restarted.fetch('/api/read', {
+                headers: { 'file-path': Buffer.from(key, 'utf-8').toString('hex') },
+            })
+            expect(response.ok).toBe(true)
+            return Buffer.from(await response.arrayBuffer())
+        }
+        expect(await restartedRead('database/database.bin')).toEqual(databaseBefore)
+        expect(await restartedRead('remotes/baseline.local.bin')).toEqual(baselineRemoteBefore)
+        expect(await restartedRead('remotes/cha-ok.local.bin')).toHaveLength(0)
+        expect(await restartedRead('migration/disable-remote-saving')).toEqual(markerBefore)
+        expect(normalizeBackup(await restarted.exportBackup()).normalized).toEqual(normalizedBefore)
     })
 })
 

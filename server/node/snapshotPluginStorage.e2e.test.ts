@@ -27,7 +27,8 @@ const {
     normalizeJSON: (value: unknown) => any
     magicCompressedHeader: Uint8Array
 }
-const { shouldStreamRisuSave } = streamLoadPkg as {
+const { inspectRisuSaveSource, shouldStreamRisuSave } = streamLoadPkg as {
+    inspectRisuSaveSource: (input: Buffer) => Promise<{ format: string; supported: boolean }>
     shouldStreamRisuSave: (input: Buffer, options?: { minBytes?: number }) => Promise<boolean>
 }
 const {
@@ -415,6 +416,36 @@ function buildDatabase(pluginStorage: {
         dbObj.pluginStorageMeta = pluginStorage.meta
     }
     return encodeRisuSaveLegacy(dbObj)
+}
+
+function encodeRisuSaveBlock(
+    type: number,
+    name: string,
+    value: unknown,
+    compressed = false,
+): Buffer {
+    const nameBytes = Buffer.from(name, 'utf-8')
+    const json = Buffer.from(JSON.stringify(value), 'utf-8')
+    const body = compressed ? gzipSync(json) : json
+    const header = Buffer.alloc(3 + nameBytes.length + 4)
+    header[0] = type
+    header[1] = compressed ? 1 : 0
+    header[2] = nameBytes.length
+    nameBytes.copy(header, 3)
+    header.writeUInt32LE(body.length, 3 + nameBytes.length)
+    return Buffer.concat([header, body])
+}
+
+function encodeBlockRisuSave(database: Record<string, unknown>): Buffer {
+    const { characters = [], pluginCustomStorage = {}, ...root } = database
+    return Buffer.concat([
+        Buffer.from('RISUSAVE\0', 'binary'),
+        encodeRisuSaveBlock(1, 'root', root, true),
+        ...((characters as unknown[]) ?? []).map((character, index) => (
+            encodeRisuSaveBlock(2, `character-${index}`, character, index % 2 === 0)
+        )),
+        encodeRisuSaveBlock(11, 'plugin-storage', pluginCustomStorage, true),
+    ])
 }
 
 const valueRowKey = (rawKey: string) => encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_PREFIX)
@@ -2228,15 +2259,12 @@ describe('plugin publication recovery snapshot scheduling', () => {
 // The audit regression (docs/audit/snapshots-omit-optimized-plugin-storage.md):
 // snapshot V1 → change to V2, delete an old key, add a new key → restore →
 // the exact snapshot-time key set and values must come back.
-async function runRoundTrip(options: { streamIngestMinBytes?: number }): Promise<void> {
+async function runRoundTrip(format: 'canonical' | 'gzip' | 'block'): Promise<void> {
     // This case explicitly restores the pre-mutation point. Keep the new BR1
     // deferred snapshot outside the test window so it cannot replace the same
     // 100 ms timestamp bucket before restore.
     const extraEnv = {
         POCKETRISU_BACKUP_INTERVAL_MS: '10000',
-        ...(options.streamIngestMinBytes !== undefined
-            ? { RISU_STREAM_INGEST_MIN_BYTES: String(options.streamIngestMinBytes) }
-            : {}),
     }
     const server = await startServer(makeWorkDir(), extraEnv)
     const auth = await authenticate(server)
@@ -2251,17 +2279,25 @@ async function runRoundTrip(options: { streamIngestMinBytes?: number }): Promise
 
     // Creation-side canary: the snapshot itself carries the folded values and
     // the marker, not the optimized stub's empty maps.
-    const snapshotBlob = await readKey(server, auth, snapshots[0])
-    // Prove which restore branch the server under test will take — both paths
-    // produce identical observable results, so a silent fall-through here
-    // would leave one of them untested.
-    await expect(shouldStreamRisuSave(snapshotBlob, {
-        minBytes: options.streamIngestMinBytes,
-    })).resolves.toBe(options.streamIngestMinBytes !== undefined)
+    let snapshotBlob = await readKey(server, auth, snapshots[0])
     const snapshotDb = await decodeRisuSave(snapshotBlob)
     expect(snapshotDb.pluginStorageFolded).toBe(true)
     expect(snapshotDb.pluginCustomStorage).toEqual({ keyA: 'V1', keyB: { keep: true } })
     expect(snapshotDb.pluginStorageMeta).toEqual({ keyA: { quota: 1 } })
+    if (format === 'gzip') {
+        snapshotBlob = Buffer.concat([
+            Buffer.from(magicCompressedHeader),
+            gzipSync(packr.encode(snapshotDb)),
+        ])
+        await writeKey(server, auth, snapshots[0], snapshotBlob)
+    } else if (format === 'block') {
+        snapshotBlob = encodeBlockRisuSave(snapshotDb)
+        await expect(inspectRisuSaveSource(snapshotBlob)).resolves.toMatchObject({
+            format: 'risusave',
+            supported: false,
+        })
+        await writeKey(server, auth, snapshots[0], snapshotBlob)
+    }
 
     const liveBeforeMutation = await decodeRisuSave(
         await readKey(server, auth, 'database/database.bin'),
@@ -2304,7 +2340,7 @@ async function runRoundTrip(options: { streamIngestMinBytes?: number }): Promise
 }
 
 describe('automatic snapshots × optimized plugin storage', () => {
-    it('rolls back a rejected legacy snapshot before replacing live plugin state', async () => {
+    it('rolls back a rejected canonical cursor snapshot before replacing live plugin state', async () => {
         const server = await startServer(makeWorkDir())
         const auth = await authenticate(server)
         await writeKey(server, auth, 'database/database.bin', buildDatabase({
@@ -2615,13 +2651,196 @@ describe('automatic snapshots × optimized plugin storage', () => {
         after.close()
     })
 
-    it('restores snapshot-time plugin rows exactly (legacy ingest path)', async () => {
-        await runRoundTrip({})
+    it('restores snapshot-time plugin rows exactly (canonical raw cursor)', async () => {
+        await runRoundTrip('canonical')
     })
 
-    it('restores snapshot-time plugin rows exactly (streaming ingest path)', async () => {
-        await runRoundTrip({ streamIngestMinBytes: 1024 })
+    it('restores snapshot-time plugin rows exactly (bounded gzip cursor)', async () => {
+        await runRoundTrip('gzip')
     })
+
+    it('restores snapshot-time plugin rows exactly (actual block-format compatibility path)', async () => {
+        await runRoundTrip('block')
+    })
+
+    it('publishes the requested block snapshot instead of substituting the current REMOTE live database', async () => {
+        const cwd = makeWorkDir()
+        const server = await startServer(cwd, { POCKETRISU_BACKUP_INTERVAL_MS: '0' })
+        const auth = await authenticate(server)
+        const snapshotKey = `database/dbbackup-${((Date.now() + 120_000) / 100).toFixed()}.bin`
+        const currentLive = Buffer.concat([
+            Buffer.from('RISUSAVE\0', 'binary'),
+            encodeRisuSaveBlock(1, 'root', {
+                currentLiveOnly: 'must-not-be-published',
+            }),
+            encodeRisuSaveBlock(6, 'current-remote', {
+                v: 1,
+                type: 2,
+                name: 'current-remote',
+            }),
+        ])
+        const requestedSnapshot = encodeBlockRisuSave({
+            characters: [],
+            requestedSnapshot: 'exact-target',
+            optimizePluginMemory: false,
+        })
+        const raw = openFixtureDatabase(cwd)
+        const set = raw.prepare(
+            'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+        )
+        raw.transaction(() => {
+            set.run('database/database.bin', currentLive, Date.now())
+            set.run('remotes/current-remote.local.bin', Buffer.from(JSON.stringify({
+                chaId: 'current-remote',
+                name: 'Current Remote Character',
+                chats: [],
+            })), Date.now())
+            set.run(snapshotKey, requestedSnapshot, Date.now())
+            raw.prepare('DELETE FROM kv WHERE key = ?')
+                .run('migration/disable-remote-saving')
+        })()
+        raw.close()
+
+        await restoreSnapshot(server, auth, snapshotKey)
+        const restored = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        expect(restored.requestedSnapshot).toBe('exact-target')
+        expect(restored.currentLiveOnly).toBeUndefined()
+        expect(restored.characters).toEqual([])
+    })
+
+    it('returns a definitive 400 for a structurally truncated cursor snapshot', async () => {
+        const server = await startServer(makeWorkDir(), { POCKETRISU_BACKUP_INTERVAL_MS: '0' })
+        const auth = await authenticate(server)
+        const snapshotKey = `database/dbbackup-${((Date.now() + 180_000) / 100).toFixed()}.bin`
+        const valid = Buffer.from(encodeRisuSaveLegacy({
+            characters: [],
+            target: 'truncated',
+        }))
+        await writeKey(server, auth, snapshotKey, valid.subarray(0, -1))
+
+        const response = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(response.status).toBe(400)
+        await expect(response.json()).resolves.toMatchObject({
+            code: 'RISU_SAVE_INVALID',
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        })
+    })
+
+    it.each([
+        {
+            phase: 'size resolver throws',
+            failpoint: 'size',
+            seedRemote: true,
+            status: 500,
+            expected: {
+                error: 'Snapshot restore was not committed',
+                code: 'SNAPSHOT_RESTORE_NOT_COMMITTED',
+                retryAfter: 0,
+                retryable: true,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            },
+        },
+        {
+            phase: 'body resolver throws',
+            failpoint: 'body',
+            seedRemote: true,
+            status: 500,
+            expected: {
+                error: 'Snapshot restore was not committed',
+                code: 'SNAPSHOT_RESTORE_NOT_COMMITTED',
+                retryAfter: 0,
+                retryable: true,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            },
+        },
+        {
+            phase: 'referenced row is missing',
+            failpoint: '',
+            seedRemote: false,
+            status: 400,
+            expected: {
+                error: 'Referenced REMOTE block selected-remote is missing',
+                code: 'RISU_SAVE_INVALID',
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            },
+        },
+    ])('rolls a REMOTE snapshot back exactly when $phase', async ({
+        failpoint,
+        seedRemote,
+        status,
+        expected,
+    }) => {
+        const cwd = makeWorkDir()
+        let server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '0',
+            POCKETRISU_TEST_SNAPSHOT_REMOTE_FAILPOINT: failpoint,
+        })
+        let auth = await authenticate(server)
+        const liveDatabase = Buffer.from(encodeRisuSaveLegacy({
+            characters: [],
+            durableLiveState: 'must-survive',
+        }))
+        await writeKey(server, auth, 'database/database.bin', liveDatabase)
+        const snapshotKey = `database/dbbackup-${((Date.now() + 240_000) / 100).toFixed()}.bin`
+        const selectedSnapshot = Buffer.concat([
+            Buffer.from('RISUSAVE\0', 'binary'),
+            encodeRisuSaveBlock(1, 'root', {
+                selectedTarget: 'must-not-partially-publish',
+            }),
+            encodeRisuSaveBlock(6, 'selected-pointer', {
+                v: 1,
+                type: 2,
+                name: 'selected-remote',
+            }),
+        ])
+        await writeKey(server, auth, snapshotKey, selectedSnapshot)
+        if (seedRemote) {
+            await writeKey(
+                server,
+                auth,
+                'remotes/selected-remote.local.bin',
+                Buffer.from(JSON.stringify({
+                    chaId: 'selected-remote',
+                    name: 'Selected Remote Character',
+                    chats: [],
+                })),
+            )
+        }
+        const before = readExactKvState(cwd)
+
+        const response = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(response.status).toBe(status)
+        await expect(response.json()).resolves.toEqual(expected)
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(liveDatabase)
+        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+            name => name.includes('snapshot-restore'),
+        )).toEqual([])
+
+        await stopServer(server)
+        expect(readExactKvState(cwd)).toEqual(before)
+        server = await startServer(cwd, { POCKETRISU_BACKUP_INTERVAL_MS: '0' })
+        auth = await authenticate(server)
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(liveDatabase)
+        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+            name => name.includes('snapshot-restore'),
+        )).toEqual([])
+    }, 30_000)
 
     it('restoring a folded-empty snapshot clears plugin rows added afterwards', async () => {
         const server = await startServer(makeWorkDir(), {
@@ -3210,6 +3429,135 @@ describe('automatic snapshots × optimized plugin storage', () => {
         expect(closeListenerCounts.at(-1)).toBeLessThanOrEqual(closeListenerCounts[0] + 1)
         expect(server.logs()).not.toMatch(/MaxListenersExceededWarning|Possible EventEmitter memory leak/)
     }, 30_000)
+
+    it('rejects a gzip expansion bomb with a definitive 413 and cleans both restore spools', async () => {
+        const cwd = makeWorkDir()
+        let server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+            RISU_RESTORE_MAX_DECODED_BYTES: String(128 * 1024),
+            RISU_RESTORE_DISK_HEADROOM_BYTES: '0',
+        })
+        let auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { durable: 'current-value' },
+        }))
+        const [snapshotKey] = await listSnapshotKeys(server, auth)
+        const targetPayload = packr.encode({
+            characters: [],
+            optimizePluginMemory: false,
+            padding: 'A'.repeat(8 * 1024 * 1024),
+        })
+        const bomb = Buffer.concat([
+            Buffer.from(magicCompressedHeader),
+            gzipSync(targetPayload),
+        ])
+        await writeKey(server, auth, snapshotKey, bomb)
+        const currentDb = await readKey(server, auth, 'database/database.bin')
+        const currentManifest = await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)
+
+        const response = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(response.status).toBe(413)
+        const failure = await response.json() as Record<string, unknown>
+        expect(failure).toMatchObject({
+            code: 'RISU_SAVE_DECODED_TOO_LARGE',
+            limit: 128 * 1024,
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        })
+        expect(Number(failure.actual)).toBeLessThanOrEqual(192 * 1024)
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(currentDb)
+        expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(currentManifest)
+
+        const corrupt = Buffer.concat([
+            Buffer.from(magicCompressedHeader),
+            gzipSync(packr.encode({ characters: [], corrupt: true })),
+        ])
+        corrupt[corrupt.length - 1] ^= 0xff
+        await writeKey(server, auth, snapshotKey, corrupt)
+        const corruptResponse = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(corruptResponse.status).toBe(400)
+        await expect(corruptResponse.json()).resolves.toMatchObject({
+            code: 'RISU_SAVE_INVALID',
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        })
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(currentDb)
+        expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(currentManifest)
+        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+            name => name.includes('snapshot-restore'),
+        )).toEqual([])
+
+        await stopServer(server)
+        server = await startServer(cwd, { POCKETRISU_BACKUP_INTERVAL_MS: '10000' })
+        auth = await authenticate(server)
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(currentDb)
+        expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(currentManifest)
+    }, 30_000)
+
+    it('cancels a real gzip pipeline on disconnect before any publication and restarts cleanly', async () => {
+        const cwd = makeWorkDir()
+        const gateDir = path.join(cwd, 'snapshot-decode-gate')
+        let server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+            RISU_RESTORE_MAX_DECODED_BYTES: String(16 * 1024 * 1024),
+            RISU_RESTORE_DISK_HEADROOM_BYTES: '0',
+            POCKETRISU_SNAPSHOT_RESTORE_DECODE_TEST_GATE_DIR: gateDir,
+        })
+        let auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { durable: 'current-value' },
+        }))
+        const [snapshotKey] = await listSnapshotKeys(server, auth)
+        const compressed = Buffer.concat([
+            Buffer.from(magicCompressedHeader),
+            gzipSync(packr.encode({
+                characters: [],
+                optimizePluginMemory: false,
+                padding: 'disconnect-'.repeat(700_000),
+            })),
+        ])
+        await writeKey(server, auth, snapshotKey, compressed)
+        const currentDb = await readKey(server, auth, 'database/database.bin')
+        const currentManifest = await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)
+
+        await armSnapshotPublicationGate(gateDir)
+        const controller = new AbortController()
+        const restore = fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+            signal: controller.signal,
+        })
+        await waitForSnapshotPublicationGate(gateDir)
+        controller.abort()
+        await expect(restore).rejects.toThrow()
+        await waitFor(async () => server.logs().includes(
+            'Client disconnected before commit; transaction was rolled back',
+        ))
+        await disarmSnapshotPublicationGate(gateDir)
+
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(currentDb)
+        expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(currentManifest)
+        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+            name => name.includes('snapshot-restore'),
+        )).toEqual([])
+
+        await stopServer(server)
+        server = await startServer(cwd, { POCKETRISU_BACKUP_INTERVAL_MS: '10000' })
+        auth = await authenticate(server)
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(currentDb)
+        expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(currentManifest)
+    }, 30_000)
 })
 
 describe('corrupt database boot snapshot recovery', () => {
@@ -3301,6 +3649,82 @@ describe('corrupt database boot snapshot recovery', () => {
         expect(verified.prepare('SELECT 1 FROM kv WHERE key = ?').get(exactKeys[2]))
             .toBeUndefined()
         verified.close()
+    }, 30_000)
+
+    it('skips a definitive compressed-limit candidate and can publish an older block-format snapshot', async () => {
+        const cwd = makeWorkDir()
+        const newestKey = `database/dbbackup-${Math.floor((Date.now() + 120_000) / 100)}.bin`
+        const olderKey = `database/dbbackup-${Math.floor((Date.now() + 60_000) / 100)}.bin`
+        const newest = Buffer.concat([
+            Buffer.from(magicCompressedHeader),
+            gzipSync(packr.encode({
+                characters: [],
+                padding: 'B'.repeat(8 * 1024 * 1024),
+            })),
+        ])
+        const older = encodeBlockRisuSave({
+            characters: [],
+            recoveredFrom: 'older-block-snapshot',
+            optimizePluginMemory: false,
+            pluginCustomStorage: {},
+        })
+        const raw = openFixtureDatabase(cwd)
+        const insert = raw.prepare(
+            'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+        )
+        raw.transaction(() => {
+            const now = Date.now()
+            insert.run('database/database.bin', Buffer.from('corrupt-live-database'), now)
+            insert.run(newestKey, newest, now + 2)
+            insert.run(olderKey, older, now + 1)
+        })()
+        raw.close()
+
+        let server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+            RISU_RESTORE_MAX_DECODED_BYTES: String(128 * 1024),
+            RISU_RESTORE_DISK_HEADROOM_BYTES: '0',
+        })
+        let auth = await authenticate(server)
+        expect(server.logs()).toContain('starting in snapshot-recovery mode')
+        const beforeRejectedCandidate = readExactKvState(cwd)
+
+        const rejected = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: newestKey }),
+        })
+        expect(rejected.status).toBe(413)
+        await expect(rejected.json()).resolves.toMatchObject({
+            code: 'RISU_SAVE_DECODED_TOO_LARGE',
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        })
+        expect(readExactKvState(cwd)).toEqual(beforeRejectedCandidate)
+
+        const restored = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: olderKey }),
+        })
+        expect(restored.status).toBe(200)
+        await expect(restored.json()).resolves.toMatchObject({
+            ok: true,
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+        })
+        expect(await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )).toMatchObject({ recoveredFrom: 'older-block-snapshot' })
+
+        await stopServer(server)
+        server = await startServer(cwd, { POCKETRISU_BACKUP_INTERVAL_MS: '10000' })
+        auth = await authenticate(server)
+        expect(server.logs()).not.toContain('starting in snapshot-recovery mode')
+        expect(await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )).toMatchObject({ recoveredFrom: 'older-block-snapshot' })
     }, 30_000)
 
     it('accepts the fresh-install empty database envelope and boots it after restart', async () => {

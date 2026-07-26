@@ -5,6 +5,7 @@ export interface StorageErrorOptions {
     retryAfter?: number | null;
     retryable?: boolean;
     commitOutcomeUnknown?: boolean;
+    commitOutcome?: "not-committed" | "committed" | "unknown" | null;
     operation?: string | null;
     cause?: unknown;
 }
@@ -19,6 +20,7 @@ export class StorageError extends Error {
     readonly retryAfter: number | null;
     readonly retryable: boolean;
     readonly commitOutcomeUnknown: boolean;
+    readonly commitOutcome: "not-committed" | "committed" | "unknown" | null;
     readonly operation: string | null;
 
     constructor(message: string, options: StorageErrorOptions = {}) {
@@ -29,6 +31,7 @@ export class StorageError extends Error {
         this.retryAfter = options.retryAfter ?? null;
         this.retryable = options.retryable === true;
         this.commitOutcomeUnknown = options.commitOutcomeUnknown === true;
+        this.commitOutcome = options.commitOutcome ?? null;
         this.operation = options.operation ?? null;
     }
 }

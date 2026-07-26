@@ -335,6 +335,31 @@ owned set. Consequently a same-key target cannot manufacture proof for a
 missing or malformed old row, and unmarked imports do not read any live
 ownership body.
 
+Compressed and compatibility snapshots are bounded at the decode boundary as
+well. Canonical gzip/zlib/stream inputs expand through a backpressured Node
+pipeline with an output-meter transform whose chunks are at most 64 KiB. The
+meter polls both `AbortSignal` and the request disconnect state, enforces a
+finite decoded-byte ceiling plus reserved disk headroom, and removes every
+decoded or compressed-block spool on success, failure, cancellation, and
+restart cleanup. The defaults are a 4 GiB decoded ceiling, 256 MiB disk reserve,
+and a separate 64 MiB in-memory ceiling for formats that the cursor cannot
+safely walk; each remains configurable. Known decoded-size, legacy-memory, and
+disk-headroom failures return a definitive pre-commit 413. Corrupt compressed
+data and structural cursor failures return a definitive pre-commit
+`RISU_SAVE_INVALID` 400 instead of a retryable 500.
+
+Block-format REMOTE resolution is finite and fail-closed. The restore adapter
+queries each row's logical `kvSize()` before `kvGet()` may concatenate it,
+meters the complete recursive graph cumulatively, caches duplicate references
+so they are neither read nor counted twice, and rejects cycles or nesting past
+32 levels. A referenced missing/disappearing row is invalid input; size/read
+exceptions propagate to the transaction boundary. Resolver-present decode can
+therefore never commit a database with a silently omitted character. Direct
+legacy decode without a resolver retains its historical skip behavior. The
+legacy restore path also bypasses live-database REMOTE migration after decoding,
+so it publishes the requested snapshot object rather than substituting the
+current live monolith.
+
 Coverage uses deterministic bounds rather than raw-heap timing: a 10,000-key
 viewer asserts a 50-value page and one in-flight read; partial folding exercises
 1,000 rows plus a 4 MiB body with one parsed row in flight and archive/import
@@ -361,10 +386,15 @@ the client socket before `BEGIN`, and verifies less-than-total copying, cleanup,
 exact old-state preservation, and restart durability. Corrupt-middle and
 full-publication-deletion cases return definitive non-committed failures; a
 30-restore single-socket keep-alive run has stable listener counts and no
-`MaxListenersExceededWarning`. Independent verification passed the final
-implementation. The complete server suite passed 230 tests, compatibility
-passed 172 with five expected skips, `svelte-check` reported zero errors, and
-the help audit and production build passed.
+`MaxListenersExceededWarning`. Additional fixtures cover actual gzip, zlib,
+raw-deflate, old-prefix,
+headerless MessagePack, compressed block, and REMOTE files; expansion bombs and
+exact size/headroom boundaries; real decompression cancellation; recursive
+REMOTE success, oversize-before-read, duplicate caching, cycle/depth rejection,
+resolver size/read failures, and missing rows. Full-route cases prove exact
+rollback, stable 400/413/500 not-committed classification, spool cleanup, and
+restart preservation. Independent verification passed in each source branch;
+the composed stack is verified separately below.
 
 <a id="pm4"></a>
 ## PM4 — Write amplification and cache overhead

@@ -6,10 +6,11 @@ const os = require('os');
 const path = require('path');
 const nodeCrypto = require('crypto');
 const zlib = require('zlib');
-const { Readable } = require('stream');
+const { Readable, Transform } = require('stream');
 const { pipeline } = require('stream/promises');
 const { Unpackr } = require('msgpackr');
 const {
+    decodeRisuSave,
     ensureBotPresetIds,
     magicHeader,
     magicCompressedHeader,
@@ -20,6 +21,7 @@ const {
     normalizeJSON,
     parseLegacyPluginStorageEnvelope,
     pluginStorageLegacyEscapeField,
+    restoreLegacyPluginStorageKeys,
 } = require('./utils.cjs');
 const {
     PLUGIN_SAVE_PREFIX,
@@ -35,7 +37,106 @@ const {
 
 const DEFAULT_STREAM_INGEST_MIN_BYTES = 32 * 1024 * 1024;
 const CURSOR_CACHE_BYTES = 256 * 1024;
+const DECODE_OUTPUT_CHUNK_BYTES = 64 * 1024;
+const DEFAULT_MAX_DECODED_BYTES = 4 * 1024 * 1024 * 1024;
+const DEFAULT_DECODE_DISK_HEADROOM_BYTES = 256 * 1024 * 1024;
+const DEFAULT_MAX_LEGACY_RESTORE_BYTES = 64 * 1024 * 1024;
 const unpackr = new Unpackr({ int64AsType: 'number', useRecords: false });
+const streamingCallbackErrors = new WeakSet();
+
+function guardStreamingCallback(callback, synchronous = false) {
+    if (typeof callback !== 'function') return callback;
+    const markAndRethrow = (error) => {
+        if (error && (typeof error === 'object' || typeof error === 'function')) {
+            streamingCallbackErrors.add(error);
+            throw error;
+        }
+        const wrapped = new Error(`Streaming callback failed: ${String(error)}`);
+        wrapped.streamingCallbackCause = error;
+        streamingCallbackErrors.add(wrapped);
+        throw wrapped;
+    };
+    if (synchronous) {
+        return (...args) => {
+            try {
+                return callback(...args);
+            } catch (error) {
+                return markAndRethrow(error);
+            }
+        };
+    }
+    return async (...args) => {
+        try {
+            return await callback(...args);
+        } catch (error) {
+            return markAndRethrow(error);
+        }
+    };
+}
+
+class RisuSavePreparationLimitError extends Error {
+    constructor(message, { code, limit, actual }) {
+        super(message);
+        this.name = 'RisuSavePreparationLimitError';
+        this.code = code;
+        this.status = 413;
+        this.limit = limit;
+        this.actual = actual;
+        this.retryable = false;
+        this.commitOutcome = 'not-committed';
+        this.commitOutcomeUnknown = false;
+        this.risuSavePreparationLimit = true;
+    }
+}
+
+class RisuSavePreparationError extends Error {
+    constructor(message, options = {}) {
+        super(message, options);
+        this.name = 'RisuSavePreparationError';
+        this.code = 'RISU_SAVE_INVALID';
+        this.status = 400;
+        this.retryable = false;
+        this.commitOutcome = 'not-committed';
+        this.commitOutcomeUnknown = false;
+        this.risuSavePreparationInvalid = true;
+    }
+}
+
+function streamAbortError(signal) {
+    const reason = signal?.reason;
+    const error = reason instanceof Error
+        ? new Error(reason.message, { cause: reason })
+        : new Error('Streaming Risu load cancelled');
+    error.name = 'AbortError';
+    error.code = 'RISU_STREAM_ABORTED';
+    return error;
+}
+
+function positiveSafeInteger(value, fallback) {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function configuredMaxDecodedBytes() {
+    return positiveSafeInteger(
+        process.env.RISU_RESTORE_MAX_DECODED_BYTES,
+        DEFAULT_MAX_DECODED_BYTES,
+    );
+}
+
+function configuredDecodeDiskHeadroomBytes() {
+    const parsed = Number(process.env.RISU_RESTORE_DISK_HEADROOM_BYTES);
+    return Number.isSafeInteger(parsed) && parsed >= 0
+        ? parsed
+        : DEFAULT_DECODE_DISK_HEADROOM_BYTES;
+}
+
+function configuredMaxLegacyRestoreBytes() {
+    return positiveSafeInteger(
+        process.env.RISU_RESTORE_MAX_LEGACY_BYTES,
+        DEFAULT_MAX_LEGACY_RESTORE_BYTES,
+    );
+}
 
 function configuredStreamIngestMinBytes() {
     const raw = process.env.RISU_STREAM_INGEST_MIN_BYTES;
@@ -96,10 +197,16 @@ async function readInputPrefix(input, length) {
 
 async function inspectRisuSaveSource(input) {
     const headerBytes = magicHeader.length;
-    const { normalized, prefix } = await readInputPrefix(input, headerBytes + 2);
+    const legacyPrefix = Buffer.from('\x00\x00RISU', 'binary');
+    const risuSavePrefix = Buffer.from('RISUSAVE\x00', 'binary');
+    const { normalized, prefix } = await readInputPrefix(
+        input,
+        Math.max(headerBytes + 2, risuSavePrefix.length),
+    );
     let format = null;
     let compression = null;
     let pluginStorageEscapes = false;
+    let boundedFallback = false;
 
     if (startsWith(prefix, magicHeader)) {
         format = 'raw';
@@ -109,6 +216,7 @@ async function inspectRisuSaveSource(input) {
         const second = prefix[headerBytes + 1];
         if (first === 0x1f && second === 0x8b) compression = 'gzip';
         else if (isZlibHeader(first, second)) compression = 'zlib';
+        else compression = 'deflate-raw';
     } else if (startsWith(prefix, magicStreamCompressedHeader)) {
         format = 'stream';
         if (prefix[headerBytes] === 0x1f && prefix[headerBytes + 1] === 0x8b) {
@@ -124,22 +232,65 @@ async function inspectRisuSaveSource(input) {
         const second = prefix[headerBytes + 1];
         if (first === 0x1f && second === 0x8b) compression = 'gzip';
         else if (isZlibHeader(first, second)) compression = 'zlib';
+        else compression = 'deflate-raw';
     } else if (startsWith(prefix, magicPluginStorageStreamHeader)) {
         format = 'stream';
         pluginStorageEscapes = true;
         if (prefix[headerBytes] === 0x1f && prefix[headerBytes + 1] === 0x8b) {
             compression = 'gzip';
         }
+    } else if (startsWith(prefix, legacyPrefix)) {
+        // Very old PocketRisu/RisuAI saves prefixed a plain MessagePack map
+        // with NUL NUL RISU. The cursor walker can safely skip that prefix.
+        format = 'raw';
+    } else if (startsWith(prefix, risuSavePrefix)) {
+        // Block-oriented RisuSave can contain gzip members and REMOTE blocks.
+        // It is validated under the explicit legacy preparation cap before the
+        // compatibility decoder is allowed to materialize it.
+        format = 'risusave';
+        boundedFallback = true;
+    } else if (
+        (prefix[0] >= 0x80 && prefix[0] <= 0x8f)
+        || prefix[0] === 0xde
+        || prefix[0] === 0xdf
+    ) {
+        // Headerless legacy MessagePack root. This is as cursor-safe as a
+        // canonical raw payload and avoids a whole-file read.
+        format = 'raw';
+    } else if (prefix[0] === 0x1f && prefix[1] === 0x8b) {
+        format = 'legacy-compressed';
+        compression = 'gzip';
+        boundedFallback = true;
+    } else if (isZlibHeader(prefix[0], prefix[1])) {
+        // The historical catch-fallback accepts headerless zlib containing
+        // either MessagePack or JSON. Prepare it to disk under a hard decoded
+        // limit, then retain that decoder compatibility under a memory cap.
+        format = 'legacy-compressed';
+        compression = 'zlib';
+        boundedFallback = true;
+    } else {
+        format = 'legacy-unknown';
+        boundedFallback = true;
     }
 
-    const supported = format === 'raw' || compression !== null;
+    const supported = format === 'raw'
+        || ((format === 'compressed' || format === 'stream') && compression !== null);
+    const payloadOffset = startsWith(prefix, legacyPrefix)
+        ? legacyPrefix.length
+        : supported && format !== 'raw'
+            ? headerBytes
+            : startsWith(prefix, magicHeader)
+                || startsWith(prefix, magicPluginStorageHeader)
+                ? headerBytes
+                : 0;
     return {
         ...normalized,
         format,
         compression,
         pluginStorageEscapes,
-        payloadOffset: supported ? headerBytes : 0,
+        payloadOffset,
         supported,
+        boundedFallback,
         size: normalized.size,
     };
 }
@@ -151,19 +302,25 @@ async function shouldStreamRisuSave(input, options = {}) {
 }
 
 class RandomAccessSource {
-    constructor({ buffer = null, handle = null, size, filePath = null, shouldAbort = () => false }) {
+    constructor({
+        buffer = null,
+        handle = null,
+        size,
+        filePath = null,
+        shouldAbort = () => false,
+        signal = null,
+    }) {
         this.buffer = buffer;
         this.handle = handle;
         this.size = size;
         this.filePath = filePath;
         this.shouldAbort = shouldAbort;
+        this.signal = signal;
     }
 
     throwIfAborted() {
-        if (!this.shouldAbort()) return;
-        const error = new Error('Streaming Risu load cancelled');
-        error.code = 'RISU_STREAM_ABORTED';
-        throw error;
+        if (!this.signal?.aborted && !this.shouldAbort()) return;
+        throw streamAbortError(this.signal);
     }
 
     async readRange(offset, length) {
@@ -254,6 +411,10 @@ class SourceCursor {
 
     async readUInt32BE() {
         return (await this.readBytes(4)).readUInt32BE(0);
+    }
+
+    async readUInt32LE() {
+        return (await this.readBytes(4)).readUInt32LE(0);
     }
 }
 
@@ -605,12 +766,153 @@ async function processCharacters(source, descriptor, options) {
     return characters;
 }
 
-async function openBaseSource(inspection, shouldAbort) {
+function throwIfPreparationAborted(shouldAbort, signal) {
+    if (!signal?.aborted && !shouldAbort()) return;
+    throw streamAbortError(signal);
+}
+
+async function availableBytesForPath(targetPath, override) {
+    if (override !== undefined) {
+        const parsed = Number(override);
+        return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+    }
+    try {
+        const stat = await fs.statfs(path.dirname(targetPath));
+        const available = Number(stat.bavail) * Number(stat.bsize);
+        return Number.isSafeInteger(available) && available >= 0 ? available : null;
+    } catch {
+        return null;
+    }
+}
+
+async function decodedOutputLimit(tempPath, options) {
+    const maxDecodedBytes = positiveSafeInteger(
+        options.maxDecodedBytes,
+        configuredMaxDecodedBytes(),
+    );
+    const diskHeadroomBytes = options.diskHeadroomBytes === undefined
+        ? configuredDecodeDiskHeadroomBytes()
+        : Math.max(0, Number(options.diskHeadroomBytes) || 0);
+    const availableBytes = await availableBytesForPath(
+        tempPath,
+        options.availableDiskBytes,
+    );
+    const diskLimit = availableBytes === null
+        ? maxDecodedBytes
+        : Math.max(0, Math.floor(availableBytes - diskHeadroomBytes));
+    const limit = Math.min(maxDecodedBytes, diskLimit);
+    const code = diskLimit < maxDecodedBytes
+        ? 'RISU_SAVE_DECODE_DISK_HEADROOM'
+        : 'RISU_SAVE_DECODED_TOO_LARGE';
+    if (limit <= 0) {
+        throw new RisuSavePreparationLimitError(
+            'Insufficient disk headroom to prepare this snapshot safely',
+            { code, limit: 0, actual: 1 },
+        );
+    }
+    return { limit, code };
+}
+
+function createDecodedOutputMeter({
+    limit,
+    limitCode,
+    shouldAbort,
+    signal,
+    onDecodedChunk,
+}) {
+    let total = 0;
+    return new Transform({
+        readableHighWaterMark: DECODE_OUTPUT_CHUNK_BYTES,
+        writableHighWaterMark: DECODE_OUTPUT_CHUNK_BYTES,
+        async transform(chunk, _encoding, callback) {
+            try {
+                throwIfPreparationAborted(shouldAbort, signal);
+                const bytes = Buffer.from(chunk);
+                for (let offset = 0; offset < bytes.length; offset += DECODE_OUTPUT_CHUNK_BYTES) {
+                    throwIfPreparationAborted(shouldAbort, signal);
+                    const piece = bytes.subarray(
+                        offset,
+                        Math.min(bytes.length, offset + DECODE_OUTPUT_CHUNK_BYTES),
+                    );
+                    const next = total + piece.length;
+                    if (!Number.isSafeInteger(next) || next > limit) {
+                        throw new RisuSavePreparationLimitError(
+                            `Decoded Risu save exceeds the safe preparation limit (${limit} bytes)`,
+                            { code: limitCode, limit, actual: next },
+                        );
+                    }
+                    total = next;
+                    if (onDecodedChunk) await onDecodedChunk({ bytes: piece.length, total });
+                    this.push(piece);
+                }
+                callback();
+            } catch (error) {
+                callback(error);
+            }
+        },
+    });
+}
+
+async function decompressToBoundedFile({
+    inspection,
+    tempPath,
+    shouldAbort = () => false,
+    signal = null,
+    maxDecodedBytes,
+    diskHeadroomBytes,
+    availableDiskBytes,
+    onDecodedChunk,
+}) {
+    throwIfPreparationAborted(shouldAbort, signal);
+    const { limit, code } = await decodedOutputLimit(tempPath, {
+        maxDecodedBytes,
+        diskHeadroomBytes,
+        availableDiskBytes,
+    });
+    const inputStream = inspection.buffer
+        ? Readable.from([inspection.buffer.subarray(inspection.payloadOffset)])
+        : createReadStream(inspection.filePath, {
+            start: inspection.payloadOffset,
+            highWaterMark: DECODE_OUTPUT_CHUNK_BYTES,
+        });
+    const decompressor = inspection.compression === 'gzip'
+        ? zlib.createGunzip({ chunkSize: DECODE_OUTPUT_CHUNK_BYTES })
+        : inspection.compression === 'deflate-raw'
+            ? zlib.createInflateRaw({ chunkSize: DECODE_OUTPUT_CHUNK_BYTES })
+            : zlib.createInflate({ chunkSize: DECODE_OUTPUT_CHUNK_BYTES });
+    const meter = createDecodedOutputMeter({
+        limit,
+        limitCode: code,
+        shouldAbort,
+        signal,
+        onDecodedChunk,
+    });
+    const output = createWriteStream(tempPath, {
+        flags: 'wx',
+        highWaterMark: DECODE_OUTPUT_CHUNK_BYTES,
+    });
+    try {
+        await pipeline(inputStream, decompressor, meter, output, signal ? { signal } : {});
+    } catch (error) {
+        await fs.unlink(tempPath).catch(() => {});
+        if (error?.risuSavePreparationLimit) throw error;
+        if (error?.code === 'RISU_STREAM_ABORTED' || signal?.aborted || shouldAbort()) {
+            throw streamAbortError(signal);
+        }
+        throw new RisuSavePreparationError(`Failed to decompress streaming Risu save: ${error.message}`, {
+            cause: error,
+        });
+    }
+    return { filePath: tempPath, size: meter.readableLength, limit };
+}
+
+async function openBaseSource(inspection, shouldAbort, signal = null) {
     if (inspection.buffer) {
         return new RandomAccessSource({
             buffer: inspection.buffer,
             size: inspection.buffer.length,
             shouldAbort,
+            signal,
         });
     }
     const handle = await fs.open(inspection.filePath, 'r');
@@ -619,6 +921,7 @@ async function openBaseSource(inspection, shouldAbort) {
         size: inspection.size,
         filePath: inspection.filePath,
         shouldAbort,
+        signal,
     });
 }
 
@@ -627,9 +930,10 @@ async function prepareMessagePackSource(
     inspection,
     tempDir = null,
     shouldAbort = () => false,
+    options = {},
 ) {
     if (inspection.format === 'raw') {
-        const source = await openBaseSource(inspection, shouldAbort);
+        const source = await openBaseSource(inspection, shouldAbort, options.signal);
         return {
             source,
             payloadOffset: inspection.payloadOffset,
@@ -641,18 +945,20 @@ async function prepareMessagePackSource(
         ? inspection.filePath
         : path.join(tempDir ?? os.tmpdir(), `.risu-stream-load-${process.pid}`);
     const tempPath = `${tempBase}.decoded-${nodeCrypto.randomUUID()}.tmp`;
-    const inputStream = inspection.buffer
-        ? Readable.from([inspection.buffer.subarray(inspection.payloadOffset)])
-        : createReadStream(inspection.filePath, { start: inspection.payloadOffset });
-    const decompressor = inspection.compression === 'gzip'
-        ? zlib.createGunzip()
-        : zlib.createInflate();
-
     try {
-        await pipeline(inputStream, decompressor, createWriteStream(tempPath, { flags: 'wx' }));
+        await decompressToBoundedFile({
+            inspection,
+            tempPath,
+            shouldAbort,
+            signal: options.signal,
+            maxDecodedBytes: options.maxDecodedBytes,
+            diskHeadroomBytes: options.diskHeadroomBytes,
+            availableDiskBytes: options.availableDiskBytes,
+            onDecodedChunk: options.onDecodedChunk,
+        });
     } catch (error) {
         await fs.unlink(tempPath).catch(() => {});
-        throw new Error(`Failed to decompress streaming Risu save: ${error.message}`, { cause: error });
+        throw error;
     }
 
     let handle;
@@ -670,6 +976,7 @@ async function prepareMessagePackSource(
         size: stat.size,
         filePath: tempPath,
         shouldAbort,
+        signal: options.signal,
     });
     return {
         source,
@@ -679,6 +986,343 @@ async function prepareMessagePackSource(
             await fs.unlink(tempPath).catch(() => {});
         },
     };
+}
+
+function legacySourceLimitError(limit, actual) {
+    return new RisuSavePreparationLimitError(
+        `Legacy Risu save exceeds the finite restore limit (${limit} bytes)`,
+        {
+            code: 'RISU_SAVE_LEGACY_TOO_LARGE',
+            limit,
+            actual,
+        },
+    );
+}
+
+async function readBoundedInput(input, inspection, limit) {
+    if (inspection.size > limit) throw legacySourceLimitError(limit, inspection.size);
+    if (inspection.buffer) return Buffer.from(inspection.buffer);
+    const value = await fs.readFile(inspection.filePath);
+    if (value.length > limit) throw legacySourceLimitError(limit, value.length);
+    return value;
+}
+
+function decodePreparedLegacyPayload(bytes, pluginStorageEscapes = false) {
+    let decoded;
+    try {
+        decoded = unpackr.decode(bytes);
+    } catch (messagePackError) {
+        try {
+            decoded = JSON.parse(Buffer.from(bytes).toString('utf-8'));
+        } catch (jsonError) {
+            throw new RisuSavePreparationError(
+                `Failed to decode bounded legacy Risu save: msgpack=${messagePackError.message}; json=${jsonError.message}`,
+                { cause: jsonError },
+            );
+        }
+    }
+    return pluginStorageEscapes ? restoreLegacyPluginStorageKeys(decoded) : decoded;
+}
+
+async function verifyRisuSaveBlocksBounded(input, inspection, options) {
+    const maxDecodedBytes = positiveSafeInteger(
+        options.maxDecodedBytes,
+        configuredMaxDecodedBytes(),
+    );
+    const source = await openBaseSource(inspection, options.shouldAbort, options.signal);
+    let decodedBytes = 0;
+    try {
+        const cursor = source.cursor(Buffer.byteLength('RISUSAVE\x00', 'binary'));
+        while (cursor.position < source.size) {
+            throwIfPreparationAborted(options.shouldAbort, options.signal);
+            const type = await cursor.readUInt8();
+            const compressed = await cursor.readUInt8() === 1;
+            const nameLength = await cursor.readUInt8();
+            await cursor.readBytes(nameLength);
+            const length = await cursor.readUInt32LE();
+            const bodyOffset = cursor.position;
+            cursor.skip(length);
+
+            let body;
+            if (compressed) {
+                const compressedBody = await source.readRange(bodyOffset, length);
+                const tempBase = inspection.filePath
+                    ? inspection.filePath
+                    : path.join(options.tempDir ?? os.tmpdir(), `.risu-legacy-block-${process.pid}`);
+                const tempPath = `${tempBase}.block-decoded-${nodeCrypto.randomUUID()}.tmp`;
+                const remaining = maxDecodedBytes - decodedBytes;
+                if (remaining <= 0) throw legacySourceLimitError(maxDecodedBytes, decodedBytes + 1);
+                try {
+                    await decompressToBoundedFile({
+                        inspection: {
+                            buffer: compressedBody,
+                            payloadOffset: 0,
+                            compression: 'gzip',
+                        },
+                        tempPath,
+                        shouldAbort: options.shouldAbort,
+                        signal: options.signal,
+                        maxDecodedBytes: remaining,
+                        diskHeadroomBytes: options.diskHeadroomBytes,
+                        availableDiskBytes: options.availableDiskBytes,
+                        onDecodedChunk: options.onDecodedChunk,
+                    });
+                    body = await fs.readFile(tempPath);
+                } finally {
+                    await fs.unlink(tempPath).catch(() => {});
+                }
+            } else {
+                body = await source.readRange(bodyOffset, length);
+            }
+
+            decodedBytes += body.length;
+            if (!Number.isSafeInteger(decodedBytes) || decodedBytes > maxDecodedBytes) {
+                throw legacySourceLimitError(maxDecodedBytes, decodedBytes);
+            }
+
+            if (type === 6) {
+                let remoteInfo;
+                try {
+                    remoteInfo = JSON.parse(body.toString('utf-8'));
+                } catch (error) {
+                    throw new RisuSavePreparationError(
+                        `Invalid REMOTE block metadata: ${error.message}`,
+                        { cause: error },
+                    );
+                }
+                if (!remoteInfo || typeof remoteInfo.name !== 'string'
+                    || remoteInfo.name.length === 0
+                    || !Number.isInteger(remoteInfo.type)) {
+                    throw new RisuSavePreparationError('Invalid REMOTE block metadata');
+                }
+            }
+        }
+        if (cursor.position !== source.size) {
+            throw new Error(`Trailing bytes after RisuSave blocks at byte ${cursor.position}`);
+        }
+        return { decodedBytes };
+    } catch (error) {
+        if (error?.risuSavePreparationLimit
+            || error?.risuSavePreparationInvalid
+            || error?.code === 'RISU_STREAM_ABORTED') throw error;
+        throw new RisuSavePreparationError(
+            `Invalid block-oriented Risu save: ${error?.message ?? error}`,
+            { cause: error },
+        );
+    } finally {
+        await source.close();
+    }
+}
+
+function createBoundedCachedRemoteResolver({
+    resolveRemote,
+    resolveRemoteSize,
+    initialDecodedBytes,
+    maxDecodedBytes,
+    shouldAbort,
+    signal,
+}) {
+    if (typeof resolveRemote !== 'function') return null;
+    if (typeof resolveRemoteSize !== 'function') {
+        throw new RisuSavePreparationError(
+            'REMOTE restore requires a logical-size resolver before materialization',
+        );
+    }
+    const cache = new Map();
+    let decodedBytes = initialDecodedBytes;
+
+    return async (name) => {
+        throwIfPreparationAborted(shouldAbort, signal);
+        if (cache.has(name)) return cache.get(name);
+
+        const pending = (async () => {
+            let logicalSize;
+            try {
+                logicalSize = await resolveRemoteSize(name);
+            } catch (cause) {
+                const error = new Error(
+                    `Failed to size referenced REMOTE block ${name}`,
+                    { cause },
+                );
+                error.code = 'RISU_SAVE_REMOTE_READ_FAILED';
+                error.risuSaveRemoteResolutionFailure = true;
+                throw error;
+            }
+            throwIfPreparationAborted(shouldAbort, signal);
+            if (logicalSize === null || logicalSize === undefined) {
+                throw new RisuSavePreparationError(
+                    `Referenced REMOTE block ${name} is missing`,
+                );
+            }
+            if (!Number.isSafeInteger(logicalSize) || logicalSize < 0) {
+                throw new RisuSavePreparationError(
+                    `REMOTE block ${name} has an invalid logical size`,
+                );
+            }
+            const reservedTotal = decodedBytes + logicalSize;
+            if (!Number.isSafeInteger(reservedTotal) || reservedTotal > maxDecodedBytes) {
+                throw legacySourceLimitError(maxDecodedBytes, reservedTotal);
+            }
+
+            // Reserve against the cumulative decoded budget before kvGet can
+            // reassemble a chunked value. Duplicate references use this same
+            // promise and therefore neither allocate nor count twice.
+            decodedBytes = reservedTotal;
+            let resolved;
+            try {
+                resolved = await resolveRemote(name);
+            } catch (cause) {
+                const error = new Error(
+                    `Failed to read referenced REMOTE block ${name}`,
+                    { cause },
+                );
+                error.code = 'RISU_SAVE_REMOTE_READ_FAILED';
+                error.risuSaveRemoteResolutionFailure = true;
+                throw error;
+            }
+            throwIfPreparationAborted(shouldAbort, signal);
+            if (resolved === null || resolved === undefined) {
+                throw new RisuSavePreparationError(
+                    `Referenced REMOTE block ${name} disappeared during restore`,
+                );
+            }
+            if (!Buffer.isBuffer(resolved) && !(resolved instanceof Uint8Array)) {
+                throw new RisuSavePreparationError(
+                    `REMOTE block ${name} did not resolve to bytes`,
+                );
+            }
+            const actualSize = resolved.byteLength;
+            const actualTotal = decodedBytes - logicalSize + actualSize;
+            if (!Number.isSafeInteger(actualTotal) || actualTotal > maxDecodedBytes) {
+                throw legacySourceLimitError(maxDecodedBytes, actualTotal);
+            }
+            decodedBytes = actualTotal;
+            return resolved;
+        })();
+        cache.set(name, pending);
+        return pending;
+    };
+}
+
+/**
+ * Decode inspector-unsupported compatibility formats under an explicit finite
+ * memory contract. Headerless compressed saves are expanded through the same
+ * disk-backed meter as canonical gzip/zlib. Block/REMOTE and unknown formats
+ * remain in-memory only below the legacy cap, with compressed block output
+ * pre-validated before the historical decoder runs.
+ */
+async function decodeBoundedLegacyRisuSave(input, options = {}) {
+    const inspection = options.inspection ?? await inspectRisuSaveSource(input);
+    const shouldAbort = options.shouldAbort ?? (() => false);
+    const maxLegacyBytes = positiveSafeInteger(
+        options.maxLegacyBytes,
+        configuredMaxLegacyRestoreBytes(),
+    );
+    throwIfPreparationAborted(shouldAbort, options.signal);
+
+    if (inspection.format === 'legacy-compressed'
+        || ((inspection.format === 'compressed' || inspection.format === 'stream')
+            && !inspection.supported)) {
+        const tempBase = inspection.filePath
+            ? inspection.filePath
+            : path.join(options.tempDir ?? os.tmpdir(), `.risu-legacy-load-${process.pid}`);
+        const tempPath = `${tempBase}.decoded-${nodeCrypto.randomUUID()}.tmp`;
+        try {
+            await decompressToBoundedFile({
+                inspection: inspection.compression
+                    ? inspection
+                    : { ...inspection, compression: 'deflate-raw' },
+                tempPath,
+                shouldAbort,
+                signal: options.signal,
+                maxDecodedBytes: Math.min(
+                    maxLegacyBytes,
+                    positiveSafeInteger(options.maxDecodedBytes, configuredMaxDecodedBytes()),
+                ),
+                diskHeadroomBytes: options.diskHeadroomBytes,
+                availableDiskBytes: options.availableDiskBytes,
+                onDecodedChunk: options.onDecodedChunk,
+            });
+            const stat = await fs.stat(tempPath);
+            if (stat.size > maxLegacyBytes) throw legacySourceLimitError(maxLegacyBytes, stat.size);
+            return decodePreparedLegacyPayload(
+                await fs.readFile(tempPath),
+                inspection.pluginStorageEscapes,
+            );
+        } finally {
+            await fs.unlink(tempPath).catch(() => {});
+        }
+    }
+
+    if (inspection.format === 'legacy-unknown') {
+        // The old catch-fallback also accepted raw-deflate JSON/MessagePack.
+        // Probe it through the bounded meter; a normal unknown/corrupt source
+        // falls back to the explicitly capped compatibility decoder.
+        const tempBase = inspection.filePath
+            ? inspection.filePath
+            : path.join(options.tempDir ?? os.tmpdir(), `.risu-legacy-load-${process.pid}`);
+        const tempPath = `${tempBase}.decoded-${nodeCrypto.randomUUID()}.tmp`;
+        try {
+            try {
+                await decompressToBoundedFile({
+                    inspection: { ...inspection, compression: 'deflate-raw', payloadOffset: 0 },
+                    tempPath,
+                    shouldAbort,
+                    signal: options.signal,
+                    maxDecodedBytes: Math.min(
+                        maxLegacyBytes,
+                        positiveSafeInteger(options.maxDecodedBytes, configuredMaxDecodedBytes()),
+                    ),
+                    diskHeadroomBytes: options.diskHeadroomBytes,
+                    availableDiskBytes: options.availableDiskBytes,
+                    onDecodedChunk: options.onDecodedChunk,
+                });
+                return decodePreparedLegacyPayload(await fs.readFile(tempPath));
+            } catch (error) {
+                if (error?.risuSavePreparationLimit
+                    || error?.code === 'RISU_STREAM_ABORTED') throw error;
+            }
+        } finally {
+            await fs.unlink(tempPath).catch(() => {});
+        }
+    }
+
+    const raw = await readBoundedInput(input, inspection, maxLegacyBytes);
+    let boundedRemoteResolver = null;
+    if (inspection.format === 'risusave') {
+        const maxDecodedBytes = Math.min(
+            maxLegacyBytes,
+            positiveSafeInteger(options.maxDecodedBytes, configuredMaxDecodedBytes()),
+        );
+        const verified = await verifyRisuSaveBlocksBounded(input, inspection, {
+            ...options,
+            shouldAbort,
+            maxDecodedBytes,
+        });
+        boundedRemoteResolver = createBoundedCachedRemoteResolver({
+            resolveRemote: options.resolveRemote,
+            resolveRemoteSize: options.resolveRemoteSize,
+            initialDecodedBytes: verified.decodedBytes,
+            maxDecodedBytes,
+            shouldAbort,
+            signal: options.signal,
+        });
+    }
+    throwIfPreparationAborted(shouldAbort, options.signal);
+    try {
+        return await decodeRisuSave(raw, {
+            resolveRemote: boundedRemoteResolver,
+        });
+    } catch (error) {
+        if (error?.risuSavePreparationLimit
+            || error?.risuSavePreparationInvalid
+            || error?.risuSaveRemoteResolutionFailure
+            || error?.code === 'RISU_STREAM_ABORTED') throw error;
+        throw new RisuSavePreparationError(
+            `Invalid bounded legacy Risu save: ${error?.message ?? error}`,
+            { cause: error },
+        );
+    }
 }
 
 /**
@@ -694,12 +1338,27 @@ async function walkRisuSave(input, options = {}) {
     if (!inspection.supported) {
         throw new Error('Risu save format is not supported by the streaming loader');
     }
+    options = {
+        ...options,
+        onMissingChatId: guardStreamingCallback(options.onMissingChatId),
+        onChat: guardStreamingCallback(options.onChat),
+        onPluginStorageEntry: guardStreamingCallback(options.onPluginStorageEntry),
+        onPluginStorageFolded: guardStreamingCallback(options.onPluginStorageFolded),
+        retainCharacterChats: guardStreamingCallback(options.retainCharacterChats, true),
+    };
 
     const prepared = await prepareMessagePackSource(
         input,
         inspection,
         options.tempDir,
         options.shouldAbort,
+        {
+            signal: options.signal,
+            maxDecodedBytes: options.maxDecodedBytes,
+            diskHeadroomBytes: options.diskHeadroomBytes,
+            availableDiskBytes: options.availableDiskBytes,
+            onDecodedChunk: options.onDecodedChunk,
+        },
     );
     try {
         const source = prepared.source;
@@ -931,6 +1590,16 @@ async function walkRisuSave(input, options = {}) {
             format: inspection.format,
             messagePackBytes: source.size - rootStart,
         };
+    } catch (error) {
+        if (streamingCallbackErrors.has(error)
+            || error?.risuSavePreparationLimit
+            || error?.risuSavePreparationInvalid
+            || error?.code === 'INVALID_PLUGIN_STORAGE_ROW'
+            || error?.code === 'RISU_STREAM_ABORTED') throw error;
+        throw new RisuSavePreparationError(
+            `Invalid streaming Risu save: ${error?.message ?? error}`,
+            { cause: error },
+        );
     } finally {
         await prepared.cleanup();
     }
@@ -954,9 +1623,17 @@ async function scanMessagePackValue(input) {
 }
 
 module.exports = {
+    DECODE_OUTPUT_CHUNK_BYTES,
+    DEFAULT_MAX_DECODED_BYTES,
+    DEFAULT_DECODE_DISK_HEADROOM_BYTES,
+    DEFAULT_MAX_LEGACY_RESTORE_BYTES,
     DEFAULT_STREAM_INGEST_MIN_BYTES,
+    RisuSavePreparationError,
+    RisuSavePreparationLimitError,
     configuredStreamIngestMinBytes,
+    decodeBoundedLegacyRisuSave,
     inspectRisuSaveSource,
+    prepareMessagePackSource,
     shouldStreamRisuSave,
     scanMessagePackValue,
     skipMessagePackValue,

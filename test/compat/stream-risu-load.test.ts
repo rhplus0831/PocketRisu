@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from 'vitest'
-import { deflateSync, gzipSync } from 'node:zlib'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { deflateRawSync, deflateSync, gzipSync } from 'node:zlib'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Packr } from 'msgpackr'
@@ -13,7 +13,12 @@ import { createClient } from './helpers/client.js'
 import { encodeBackup } from './helpers/encode.js'
 
 const { createChatRowStore } = chatRowsPkg as any
-const { scanMessagePackValue, walkRisuSave } = streamRisuLoadPkg as any
+const {
+  decodeBoundedLegacyRisuSave,
+  inspectRisuSaveSource,
+  scanMessagePackValue,
+  walkRisuSave,
+} = streamRisuLoadPkg as any
 const { streamRisuSaveToFile } = streamRisuSavePkg as any
 const {
   decodeRisuSave,
@@ -101,6 +106,36 @@ function fixtureDatabase() {
   }
 }
 
+function encodeRisuSaveBlock(
+  type: number,
+  name: string,
+  value: unknown,
+  compressed = false,
+): Buffer {
+  const nameBytes = Buffer.from(name, 'utf-8')
+  const json = Buffer.from(JSON.stringify(value), 'utf-8')
+  const body = compressed ? gzipSync(json) : json
+  const header = Buffer.alloc(3 + nameBytes.length + 4)
+  header[0] = type
+  header[1] = compressed ? 1 : 0
+  header[2] = nameBytes.length
+  nameBytes.copy(header, 3)
+  header.writeUInt32LE(body.length, 3 + nameBytes.length)
+  return Buffer.concat([header, body])
+}
+
+function encodeBlockRisuSave(database: Record<string, unknown>): Buffer {
+  const { characters = [], pluginCustomStorage = {}, ...root } = database
+  return Buffer.concat([
+    Buffer.from('RISUSAVE\0', 'binary'),
+    encodeRisuSaveBlock(1, 'root', root, true),
+    ...((characters as unknown[]) ?? []).map((character, index) => (
+      encodeRisuSaveBlock(2, `character-${index}`, character, index % 2 === 0)
+    )),
+    encodeRisuSaveBlock(11, 'plugin-storage', pluginCustomStorage, true),
+  ])
+}
+
 async function decodedState(values: Map<string, Buffer>) {
   const keys = [...values.keys()]
     .filter(key => key === 'database/database.bin' || key.startsWith('chats/'))
@@ -150,6 +185,10 @@ describe('disk-backed streaming Risu ingest', () => {
       Buffer.from((utilsPkg as any).magicCompressedHeader),
       deflateSync(packr.encode(database)),
     ])
+    const rawDeflateCompressed = Buffer.concat([
+      Buffer.from((utilsPkg as any).magicCompressedHeader),
+      deflateRawSync(packr.encode(database)),
+    ])
     const streamCompressed = Buffer.concat([
       Buffer.from(magicStreamCompressedHeader),
       gzipSync(packr.encode(database)),
@@ -168,6 +207,7 @@ describe('disk-backed streaming Risu ingest', () => {
       { name: 'raw', oldBytes: raw, streamingSource: raw },
       { name: 'compressed', oldBytes: compressed, streamingSource: compressed },
       { name: 'zlib-compressed', oldBytes: zlibCompressed, streamingSource: zlibCompressed },
+      { name: 'raw-deflate-compressed', oldBytes: rawDeflateCompressed, streamingSource: rawDeflateCompressed },
       { name: 'stream-compressed', oldBytes: streamCompressed, streamingSource: streamCompressed },
       { name: 'file-spooled', oldBytes: await readFile(streamedPath), streamingSource: { filePath: streamedPath } },
     ]
@@ -333,6 +373,373 @@ describe('disk-backed streaming Risu ingest', () => {
     await expect(walkRisuSave({ filePath })).rejects.toThrow(/Truncated MessagePack payload/)
   })
 
+  test('cursor-walks actual headerless and old-prefix MessagePack fixtures', async () => {
+    const database = fixtureDatabase()
+    const payload = Buffer.from(packr.encode(database))
+    const fixtures = [
+      { name: 'headerless', bytes: payload },
+      { name: 'old-six-byte-prefix', bytes: Buffer.concat([Buffer.from('\0\0RISU', 'binary'), payload]) },
+    ]
+
+    for (const fixture of fixtures) {
+      const inspection = await inspectRisuSaveSource(fixture.bytes)
+      expect(inspection, fixture.name).toMatchObject({ format: 'raw', supported: true })
+      const walked = await walkRisuSave(fixture.bytes, { inspection })
+      expect(walked.remainder, fixture.name).toEqual(
+        (await walkRisuSave(encodeRisuSaveLegacy(database))).remainder,
+      )
+    }
+  })
+
+  test.each([
+    ['gzip-v8', (payload: Buffer) => Buffer.concat([
+      Buffer.from((utilsPkg as any).magicCompressedHeader),
+      gzipSync(payload),
+    ])],
+    ['zlib-v8', (payload: Buffer) => Buffer.concat([
+      Buffer.from((utilsPkg as any).magicCompressedHeader),
+      deflateSync(payload),
+    ])],
+    ['stream-gzip-v9', (payload: Buffer) => Buffer.concat([
+      Buffer.from(magicStreamCompressedHeader),
+      gzipSync(payload),
+    ])],
+  ] as const)('meters %s decoded output at the exact byte boundary', async (_name, wrap) => {
+    const payload = Buffer.from(packr.encode({ characters: [], exact: 'boundary' }))
+    const bytes = wrap(payload)
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'risu-stream-boundary-'))
+    tempDirs.push(tempDir)
+    const filePath = path.join(tempDir, 'source.risudat.tmp')
+    await writeFile(filePath, bytes)
+    const observed: number[] = []
+
+    await expect(walkRisuSave({ filePath }, {
+      maxDecodedBytes: payload.length,
+      diskHeadroomBytes: 0,
+      availableDiskBytes: payload.length,
+      onDecodedChunk: ({ bytes: chunkBytes }: { bytes: number }) => observed.push(chunkBytes),
+    })).resolves.toMatchObject({ remainder: { characters: [], exact: 'boundary' } })
+    expect(Math.max(...observed)).toBeLessThanOrEqual(64 * 1024)
+    expect(await readdir(tempDir)).toEqual(['source.risudat.tmp'])
+
+    await expect(walkRisuSave({ filePath }, {
+      maxDecodedBytes: payload.length - 1,
+      diskHeadroomBytes: 0,
+      availableDiskBytes: payload.length * 2,
+    })).rejects.toMatchObject({
+      code: 'RISU_SAVE_DECODED_TOO_LARGE',
+      limit: payload.length - 1,
+      retryable: false,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+    expect(await readdir(tempDir)).toEqual(['source.risudat.tmp'])
+  })
+
+  test('stops a compressed expansion bomb within one 64 KiB output chunk', async () => {
+    const payload = Buffer.from(packr.encode({
+      characters: [],
+      padding: 'A'.repeat(8 * 1024 * 1024),
+    }))
+    const bytes = Buffer.concat([
+      Buffer.from((utilsPkg as any).magicCompressedHeader),
+      gzipSync(payload),
+    ])
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'risu-stream-bomb-'))
+    tempDirs.push(tempDir)
+    const filePath = path.join(tempDir, 'bomb.risudat.tmp')
+    await writeFile(filePath, bytes)
+    let observed = 0
+
+    let failure: any
+    try {
+      await walkRisuSave({ filePath }, {
+        maxDecodedBytes: 128 * 1024,
+        diskHeadroomBytes: 0,
+        availableDiskBytes: 16 * 1024 * 1024,
+        onDecodedChunk: ({ total }: { total: number }) => { observed = total },
+      })
+    } catch (error) {
+      failure = error
+    }
+    expect(failure).toMatchObject({
+      code: 'RISU_SAVE_DECODED_TOO_LARGE',
+      limit: 128 * 1024,
+      retryable: false,
+    })
+    expect(failure.actual).toBeLessThanOrEqual(192 * 1024)
+    expect(observed).toBeLessThanOrEqual(128 * 1024)
+    expect(await readdir(tempDir)).toEqual(['bomb.risudat.tmp'])
+  })
+
+  test('accepts exact decode disk headroom and rejects one byte less', async () => {
+    const payload = Buffer.from(packr.encode({ characters: [], disk: 'boundary' }))
+    const bytes = Buffer.concat([
+      Buffer.from((utilsPkg as any).magicCompressedHeader),
+      gzipSync(payload),
+    ])
+    const headroom = 4096
+
+    await expect(walkRisuSave(bytes, {
+      maxDecodedBytes: payload.length * 2,
+      diskHeadroomBytes: headroom,
+      availableDiskBytes: payload.length + headroom,
+    })).resolves.toMatchObject({ remainder: { characters: [], disk: 'boundary' } })
+
+    await expect(walkRisuSave(bytes, {
+      maxDecodedBytes: payload.length * 2,
+      diskHeadroomBytes: headroom,
+      availableDiskBytes: payload.length + headroom - 1,
+    })).rejects.toMatchObject({
+      code: 'RISU_SAVE_DECODE_DISK_HEADROOM',
+      limit: payload.length - 1,
+      retryable: false,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+  })
+
+  test('AbortSignal cancels during real gzip decompression and removes decoded spools', async () => {
+    const payload = Buffer.from(packr.encode({
+      characters: [],
+      padding: 'abort-me-'.repeat(512 * 1024),
+    }))
+    const bytes = Buffer.concat([
+      Buffer.from((utilsPkg as any).magicCompressedHeader),
+      gzipSync(payload),
+    ])
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'risu-stream-abort-'))
+    tempDirs.push(tempDir)
+    const filePath = path.join(tempDir, 'abort.risudat.tmp')
+    await writeFile(filePath, bytes)
+    const controller = new AbortController()
+
+    await expect(walkRisuSave({ filePath }, {
+      signal: controller.signal,
+      diskHeadroomBytes: 0,
+      onDecodedChunk: () => controller.abort(new Error('disconnect mid-decompress')),
+    })).rejects.toMatchObject({
+      name: 'AbortError',
+      code: 'RISU_STREAM_ABORTED',
+    })
+    expect(await readdir(tempDir)).toEqual(['abort.risudat.tmp'])
+  })
+
+  test('bounds real block, REMOTE, compressed JSON, and raw-deflate compatibility fixtures', async () => {
+    const database = {
+      characters: [{ chaId: 'block-char', chats: [], name: 'Block Character' }],
+      optimizePluginMemory: false,
+      pluginCustomStorage: { block: { works: true } },
+    }
+    const blockBytes = encodeBlockRisuSave(database)
+    const blockInspection = await inspectRisuSaveSource(blockBytes)
+    expect(blockInspection).toMatchObject({ format: 'risusave', supported: false })
+    await expect(decodeBoundedLegacyRisuSave(blockBytes, {
+      inspection: blockInspection,
+      maxLegacyBytes: blockBytes.length,
+      maxDecodedBytes: 1024 * 1024,
+      diskHeadroomBytes: 0,
+      availableDiskBytes: 1024 * 1024,
+    })).resolves.toMatchObject(database)
+    await expect(decodeBoundedLegacyRisuSave(blockBytes, {
+      inspection: blockInspection,
+      maxLegacyBytes: blockBytes.length - 1,
+      maxDecodedBytes: 1024 * 1024,
+      diskHeadroomBytes: 0,
+      availableDiskBytes: 1024 * 1024,
+    })).rejects.toMatchObject({
+      code: 'RISU_SAVE_LEGACY_TOO_LARGE',
+      limit: blockBytes.length - 1,
+      actual: blockBytes.length,
+      retryable: false,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+
+    const remoteBytes = Buffer.concat([
+      Buffer.from('RISUSAVE\0', 'binary'),
+      encodeRisuSaveBlock(1, 'root', { optimizePluginMemory: false }, true),
+      encodeRisuSaveBlock(6, 'remote-char', {
+        v: 1,
+        type: 2,
+        name: 'remote-char',
+      }),
+    ])
+    await expect(decodeBoundedLegacyRisuSave(remoteBytes, {
+      inspection: await inspectRisuSaveSource(remoteBytes),
+      maxLegacyBytes: 1024 * 1024,
+      maxDecodedBytes: 1024 * 1024,
+      diskHeadroomBytes: 0,
+      availableDiskBytes: 1024 * 1024,
+      resolveRemoteSize: async (name: string) => name === 'remote-char'
+        ? Buffer.byteLength(JSON.stringify({
+          chaId: 'remote-char',
+          name: 'Resolved Remote',
+          chats: [],
+        }))
+        : null,
+      resolveRemote: async (name: string) => name === 'remote-char'
+        ? Buffer.from(JSON.stringify({
+          chaId: 'remote-char',
+          name: 'Resolved Remote',
+          chats: [],
+        }))
+        : null,
+    })).resolves.toMatchObject({
+      characters: [{ chaId: 'remote-char', name: 'Resolved Remote', chats: [] }],
+    })
+
+    const json = Buffer.from(JSON.stringify(database), 'utf-8')
+    for (const [name, bytes] of [
+      ['zlib-json', deflateSync(json)],
+      ['raw-deflate-json', deflateRawSync(json)],
+    ] as const) {
+      const inspection = await inspectRisuSaveSource(bytes)
+      await expect(decodeBoundedLegacyRisuSave(bytes, {
+        inspection,
+        maxLegacyBytes: json.length,
+        maxDecodedBytes: json.length,
+        diskHeadroomBytes: 0,
+        availableDiskBytes: json.length,
+      }), name).resolves.toEqual(database)
+    }
+  })
+
+  test('bounds nested REMOTEs before materialization, detects cycles, and caches duplicates', async () => {
+    const remotePointer = (name: string, type: number) => Buffer.from(JSON.stringify({
+      v: 1,
+      type,
+      name,
+    }))
+    const character = Buffer.from(JSON.stringify({
+      chaId: 'nested-char',
+      name: 'Nested Remote',
+      chats: [],
+    }))
+    const sourceWithPointers = (...names: string[]) => Buffer.concat([
+      Buffer.from('RISUSAVE\0', 'binary'),
+      encodeRisuSaveBlock(1, 'root', { optimizePluginMemory: false }),
+      ...names.map((name, index) => encodeRisuSaveBlock(6, `pointer-${index}`, {
+        v: 1,
+        type: 6,
+        name,
+      })),
+    ])
+
+    const nestedSource = sourceWithPointers('remote-a')
+    const nestedValues = new Map<string, Buffer>([
+      ['remote-a', remotePointer('remote-b', 2)],
+      ['remote-b', character],
+    ])
+    const sizeCalls: string[] = []
+    const readCalls: string[] = []
+    await expect(decodeBoundedLegacyRisuSave(nestedSource, {
+      maxLegacyBytes: 1024 * 1024,
+      maxDecodedBytes: 1024 * 1024,
+      resolveRemoteSize: async (name: string) => {
+        sizeCalls.push(name)
+        return nestedValues.get(name)?.length ?? null
+      },
+      resolveRemote: async (name: string) => {
+        readCalls.push(name)
+        return nestedValues.get(name) ?? null
+      },
+    })).resolves.toMatchObject({
+      characters: [{ chaId: 'nested-char', name: 'Nested Remote' }],
+    })
+    expect(sizeCalls).toEqual(['remote-a', 'remote-b'])
+    expect(readCalls).toEqual(['remote-a', 'remote-b'])
+
+    const duplicateSource = Buffer.concat([
+      Buffer.from('RISUSAVE\0', 'binary'),
+      encodeRisuSaveBlock(1, 'root', { optimizePluginMemory: false }),
+      encodeRisuSaveBlock(6, 'pointer-0', { v: 1, type: 2, name: 'remote-b' }),
+      encodeRisuSaveBlock(6, 'pointer-1', { v: 1, type: 2, name: 'remote-b' }),
+    ])
+    let duplicateSizeCalls = 0
+    let duplicateReadCalls = 0
+    const duplicateResult = await decodeBoundedLegacyRisuSave(duplicateSource, {
+      maxLegacyBytes: 1024 * 1024,
+      maxDecodedBytes: 1024 * 1024,
+      resolveRemoteSize: async () => {
+        duplicateSizeCalls++
+        return character.length
+      },
+      resolveRemote: async () => {
+        duplicateReadCalls++
+        return character
+      },
+    })
+    expect(duplicateResult.characters).toHaveLength(2)
+    expect(duplicateSizeCalls).toBe(1)
+    expect(duplicateReadCalls).toBe(1)
+
+    const cycleValues = new Map<string, Buffer>([
+      ['remote-a', remotePointer('remote-b', 6)],
+      ['remote-b', remotePointer('remote-a', 6)],
+    ])
+    await expect(decodeBoundedLegacyRisuSave(nestedSource, {
+      maxLegacyBytes: 1024 * 1024,
+      maxDecodedBytes: 1024 * 1024,
+      resolveRemoteSize: async (name: string) => cycleValues.get(name)?.length ?? null,
+      resolveRemote: async (name: string) => cycleValues.get(name) ?? null,
+    })).rejects.toMatchObject({
+      code: 'RISU_SAVE_INVALID',
+      status: 400,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+
+    const depthValues = new Map<string, Buffer>()
+    for (let index = 0; index < 34; index++) {
+      depthValues.set(
+        `remote-${index}`,
+        remotePointer(`remote-${index + 1}`, index === 33 ? 2 : 6),
+      )
+    }
+    const depthSource = sourceWithPointers('remote-0')
+    await expect(decodeBoundedLegacyRisuSave(depthSource, {
+      maxLegacyBytes: 1024 * 1024,
+      maxDecodedBytes: 1024 * 1024,
+      resolveRemoteSize: async (name: string) => depthValues.get(name)?.length ?? null,
+      resolveRemote: async (name: string) => depthValues.get(name) ?? null,
+    })).rejects.toMatchObject({
+      code: 'RISU_SAVE_INVALID',
+      status: 400,
+      message: expect.stringMatching(/nesting exceeds 32 levels/),
+    })
+
+    const nestedOversizeReads: string[] = []
+    await expect(decodeBoundedLegacyRisuSave(nestedSource, {
+      maxLegacyBytes: 1024 * 1024,
+      maxDecodedBytes: 256,
+      resolveRemoteSize: async (name: string) => name === 'remote-a'
+        ? remotePointer('remote-b', 2).length
+        : 1024,
+      resolveRemote: async (name: string) => {
+        nestedOversizeReads.push(name)
+        return name === 'remote-a' ? remotePointer('remote-b', 2) : Buffer.alloc(1024)
+      },
+    })).rejects.toMatchObject({
+      code: 'RISU_SAVE_LEGACY_TOO_LARGE',
+      status: 413,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+    expect(nestedOversizeReads).toEqual(['remote-a'])
+  })
+
+  test('classifies supported cursor truncation as definitive invalid input', async () => {
+    const valid = Buffer.from(encodeRisuSaveLegacy({ characters: [], marker: 'valid' }))
+    await expect(walkRisuSave(valid.subarray(0, -1))).rejects.toMatchObject({
+      code: 'RISU_SAVE_INVALID',
+      status: 400,
+      retryable: false,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+  })
+
   test('rejects corrupt gzip without leaving a decoded temp file', async () => {
     const tempDir = await mkdtemp(path.join(tmpdir(), 'risu-stream-corrupt-'))
     tempDirs.push(tempDir)
@@ -341,8 +748,14 @@ describe('disk-backed streaming Risu ingest', () => {
       Buffer.from((utilsPkg as any).magicCompressedHeader),
       Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef]),
     ]))
-    await expect(walkRisuSave({ filePath })).rejects.toThrow(/Failed to decompress streaming Risu save/)
-    expect((await import('node:fs/promises')).readdir(tempDir).then(files => files.sort()))
+    await expect(walkRisuSave({ filePath })).rejects.toMatchObject({
+      message: expect.stringMatching(/Failed to decompress streaming Risu save/),
+      code: 'RISU_SAVE_INVALID',
+      retryable: false,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+    await expect((await import('node:fs/promises')).readdir(tempDir).then(files => files.sort()))
       .resolves.toEqual(['corrupt.risudat.tmp'])
   })
 

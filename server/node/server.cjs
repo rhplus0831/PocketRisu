@@ -101,7 +101,11 @@ const {
     validateDatabaseShape,
 } = require('./chatRows.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
-const { inspectRisuSaveSource, shouldStreamRisuSave } = require('./streamRisuLoad.cjs');
+const {
+    decodeBoundedLegacyRisuSave,
+    inspectRisuSaveSource,
+    shouldStreamRisuSave,
+} = require('./streamRisuLoad.cjs');
 const {
     BACKUP_ENTRY_NAME_MAX_BYTES,
     PLUGIN_SAVE_PREFIX,
@@ -278,8 +282,16 @@ const pluginStorageOwnershipReadFailpoint = process.env.NODE_ENV === 'test'
 const pluginStorageOwnershipStatsPath = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_PLUGIN_OWNERSHIP_STATS_PATH ?? '').trim()
     : '';
+// Test-only REMOTE resolver boundaries. These live at the restore-route adapter
+// so production KV primitives never gain failure behavior.
+const snapshotRestoreRemoteFailpoint = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_SNAPSHOT_REMOTE_FAILPOINT ?? '').trim()
+    : '';
 const SNAPSHOT_RESTORE_TEST_GATE_DIR = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_SNAPSHOT_RESTORE_TEST_GATE_DIR ?? '').trim() || null
+    : null;
+const SNAPSHOT_RESTORE_DECODE_TEST_GATE_DIR = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_SNAPSHOT_RESTORE_DECODE_TEST_GATE_DIR ?? '').trim() || null
     : null;
 const BACKUP_IMPORT_TEST_GATE_DIR = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_BACKUP_IMPORT_TEST_GATE_DIR ?? '').trim() || null
@@ -311,6 +323,24 @@ async function waitAtSnapshotRestoreTestGate(shouldAbort) {
         await new Promise((resolve) => setTimeout(resolve, 10));
     }
     throwIfStreamingRestoreAborted(shouldAbort);
+}
+
+let snapshotRestoreDecodeGateEntered = false;
+async function waitAtSnapshotRestoreDecodeTestGate(signal) {
+    if (!SNAPSHOT_RESTORE_DECODE_TEST_GATE_DIR || snapshotRestoreDecodeGateEntered) return;
+    const holdPath = path.join(SNAPSHOT_RESTORE_DECODE_TEST_GATE_DIR, 'hold');
+    if (!existsSync(holdPath)) return;
+    snapshotRestoreDecodeGateEntered = true;
+    await fs.mkdir(SNAPSHOT_RESTORE_DECODE_TEST_GATE_DIR, { recursive: true });
+    await fs.writeFile(
+        path.join(SNAPSHOT_RESTORE_DECODE_TEST_GATE_DIR, 'entered'),
+        'during-decompression',
+        'utf-8',
+    );
+    const releasePath = path.join(SNAPSHOT_RESTORE_DECODE_TEST_GATE_DIR, 'release');
+    while (!signal?.aborted && existsSync(holdPath) && !existsSync(releasePath)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
 }
 
 async function waitAtBackupImportTestGate() {
@@ -882,8 +912,13 @@ async function preflightBootDatabase(raw) {
     snapshotOptimizedPluginStorageFields(decoded);
 }
 
-async function ingestDatabase(raw, { createBackup = false } = {}) {
-    const migration = await migrateRemoteBlocksIfNeeded();
+async function ingestDatabase(raw, {
+    createBackup = false,
+    skipLiveRemoteMigration = false,
+} = {}) {
+    const migration = skipLiveRemoteMigration
+        ? { ran: false }
+        : await migrateRemoteBlocksIfNeeded();
     const source = migration.ran ? kvGet('database/database.bin') : raw;
     if (Buffer.isBuffer(source) || source instanceof Uint8Array) {
         const inspection = await inspectRisuSaveSource(source);
@@ -941,7 +976,15 @@ function logDuplicateCharacterIdReassignments(result) {
     }
 }
 
-async function ingestDatabaseStreaming(source, { inspection = null, shouldAbort } = {}) {
+async function ingestDatabaseStreaming(source, {
+    inspection = null,
+    shouldAbort,
+    signal,
+    maxDecodedBytes,
+    diskHeadroomBytes,
+    availableDiskBytes,
+    onDecodedChunk,
+} = {}) {
     const streamedPluginValueKeys = new Set();
     const streamedPluginMetaKeys = new Set();
     let foldedPluginStorage = false;
@@ -949,6 +992,11 @@ async function ingestDatabaseStreaming(source, { inspection = null, shouldAbort 
         inspection: inspection ?? await inspectRisuSaveSource(source),
         tempDir: savePath,
         shouldAbort,
+        signal,
+        maxDecodedBytes,
+        diskHeadroomBytes,
+        availableDiskBytes,
+        onDecodedChunk,
         onPluginStorageFolded: async () => {
             foldedPluginStorage = true;
             // The marker is decoded before the walker emits any target rows.
@@ -10499,7 +10547,9 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
         // response represents the peer disappearing while spooling/publishing.
         if (res.writableEnded) return;
         closed = true;
-        restoreAbortController.abort();
+        if (!restoreCommitted && !restoreAbortController.signal.aborted) {
+            restoreAbortController.abort(new Error('Snapshot restore client disconnected'));
+        }
     };
     const throwIfRestoreAborted = () => {
         if (!restoreAbortController.signal.aborted) return;
@@ -10571,19 +10621,51 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                         ingestion = await ingestDatabaseStreaming(source, {
                             inspection,
                             shouldAbort: () => restoreAbortController.signal.aborted,
+                            signal: restoreAbortController.signal,
+                            onDecodedChunk: () => waitAtSnapshotRestoreDecodeTestGate(
+                                restoreAbortController.signal,
+                            ),
                         });
                         markRemoteMigrationDone();
                     } else {
-                        // Preserve compatibility for uncommon legacy formats the
-                        // streaming walker cannot inspect yet.
-                        kvCopyValue(key, DB_BLOB_KEY);
-                        // Snapshot may pre-date the remote-block migration. Clear the marker
-                        // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
-                        // bytes instead of skipping based on the prior post-migration state.
+                        // Compatibility formats that cannot be cursor-walked
+                        // safely are decoded only below an explicit finite cap.
+                        // Compressed legacy inputs still expand through the same
+                        // disk-backed output meter and AbortSignal as canonical
+                        // gzip/zlib, so no fallback performs an unbounded read or
+                        // synchronous expansion bomb.
                         kvDel(REMOTE_MIGRATION_MARKER_KEY);
                         invalidateDbCache();
-                        const raw = await fs.readFile(restoreSpool.filePath);
-                        if (raw) ingestion = await ingestDatabase(raw);
+                        const decoded = await decodeBoundedLegacyRisuSave(source, {
+                            inspection,
+                            tempDir: savePath,
+                            shouldAbort: () => restoreAbortController.signal.aborted,
+                            signal: restoreAbortController.signal,
+                            onDecodedChunk: () => waitAtSnapshotRestoreDecodeTestGate(
+                                restoreAbortController.signal,
+                            ),
+                            // Check the logical value length from chunk metadata
+                            // before kvGet is allowed to concatenate its chunks.
+                            resolveRemoteSize: async (name) => {
+                                if (snapshotRestoreRemoteFailpoint === 'size') {
+                                    throw new Error('Injected REMOTE size read failure');
+                                }
+                                return kvSize(`remotes/${name}.local.bin`);
+                            },
+                            resolveRemote: async (name) => {
+                                if (snapshotRestoreRemoteFailpoint === 'body') {
+                                    throw new Error('Injected REMOTE body read failure');
+                                }
+                                return kvGet(`remotes/${name}.local.bin`);
+                            },
+                        });
+                        // `decoded` is the requested snapshot. Running the live
+                        // REMOTE migration here would replace it with the current
+                        // database.bin after the marker was cleared.
+                        ingestion = await ingestDatabase(decoded, {
+                            skipLiveRemoteMigration: true,
+                        });
+                        markRemoteMigrationDone();
                     }
                     if (ingestion) {
                         const strippedBytes = Buffer.from(encodeRisuSaveLegacy(ingestion.strippedDb));
@@ -10668,6 +10750,26 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
         const diagnostic = pluginStorageValidationDiagnostic(err);
         if (diagnostic) return res.status(400).json(diagnostic);
         if (isImportInProgressError(err)) return sendImportBusy(res);
+        if (err?.risuSavePreparationInvalid === true) {
+            return res.status(400).json({
+                error: err.message,
+                code: err.code,
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            });
+        }
+        if (err?.risuSavePreparationLimit === true) {
+            return res.status(413).json({
+                error: err.message,
+                code: err.code,
+                limit: err.limit,
+                actual: err.actual,
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            });
+        }
         if (err instanceof PluginStorageLimitError) {
             return res.status(413).json({
                 error: err.message,
