@@ -156,6 +156,8 @@ const stmtKvList   = db.prepare(`SELECT key FROM kv`);
 const stmtKvPrefix = db.prepare(`SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\'`);
 const stmtKvDelPrefix = db.prepare(`DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'`);
 const stmtManifestDelPrefix = db.prepare(`DELETE FROM manifest_chunks WHERE manifest_key LIKE ? ESCAPE '\\'`);
+const stmtManifestMetaDelPrefix = db.prepare(`DELETE FROM chunk_manifest_meta WHERE manifest_key LIKE ? ESCAPE '\\'`);
+const stmtManifestPublicationDelPrefix = db.prepare(`DELETE FROM chunk_manifest_publications WHERE manifest_key LIKE ? ESCAPE '\\'`);
 const stmtKvUpdatedAt = db.prepare(`SELECT updated_at FROM kv WHERE key = ?`);
 const stmtRecordDeletion = db.prepare(`INSERT OR REPLACE INTO deleted_keys (key, deleted_at) VALUES (?, ?)`);
 const stmtRemoveDeletion = db.prepare(`DELETE FROM deleted_keys WHERE key = ?`);
@@ -293,6 +295,8 @@ const runKvDelPrefix = db.transaction((prefix, pattern) => {
         : 0;
     stmtRecordDeletionBulk.run(Date.now(), pattern);
     stmtManifestDelPrefix.run(pattern);
+    stmtManifestMetaDelPrefix.run(pattern);
+    stmtManifestPublicationDelPrefix.run(pattern);
     stmtKvDelPrefix.run(pattern);
     if (removedPluginBytes > 0) {
         stmtSetPluginStorageUsage.run(Math.max(0, getPluginStorageUsage() - removedPluginBytes));

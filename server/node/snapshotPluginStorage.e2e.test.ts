@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
+import http from 'node:http'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -2960,6 +2961,254 @@ describe('automatic snapshots × optimized plugin storage', () => {
             valueRowKey('current-only'),
             generation,
         )).toString('utf-8'))).toBe('must-survive')
+    }, 30_000)
+
+    it('observes a real socket abort during a 52 MiB spool and never begins publication', async () => {
+        const cwd = makeWorkDir()
+        let server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+            POCKETRISU_CHUNK_THRESHOLD: '4096',
+        })
+        let auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: {
+                retained: 'current-value',
+                currentOnly: { exact: true },
+            },
+        }))
+        const currentDb = await readKey(server, auth, 'database/database.bin')
+        const currentManifest = await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)
+        const currentGeneration = (await decodeRisuSave(currentDb)).pluginStorageGeneration as string
+        const currentRetained = await readKey(
+            server,
+            auth,
+            valueRowKey('retained'),
+            currentGeneration,
+        )
+        const currentOnly = await readKey(
+            server,
+            auth,
+            valueRowKey('currentOnly'),
+            currentGeneration,
+        )
+
+        const snapshotKey = `database/dbbackup-${((Date.now() + 120_000) / 100).toFixed()}.bin`
+        let snapshotBytes: Uint8Array | null = encodeRisuSaveLegacy({
+            characters: [],
+            optimizePluginMemory: false,
+            pluginCustomStorage: { retained: 'snapshot-value' },
+            formatPadding: 's'.repeat(52 * 1024 * 1024),
+        })
+        const snapshotSize = snapshotBytes.length
+        expect(snapshotSize).toBeGreaterThanOrEqual(50 * 1024 * 1024)
+        await writeKey(server, auth, snapshotKey, snapshotBytes)
+        snapshotBytes = null
+
+        const controller = new AbortController()
+        const restore = fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+            signal: controller.signal,
+        })
+        const spoolDir = path.join(cwd, 'save', '.spool')
+        let observedPartialBytes = 0
+        await waitFor(async () => {
+            const name = fs.readdirSync(spoolDir).find((entry) => entry.includes('snapshot-restore'))
+            if (!name) return false
+            observedPartialBytes = fs.statSync(path.join(spoolDir, name)).size
+            return observedPartialBytes >= 512 * 1024 && observedPartialBytes < snapshotSize
+        }, 15_000)
+        controller.abort()
+        await expect(restore).rejects.toThrow()
+        expect(observedPartialBytes).toBeGreaterThanOrEqual(512 * 1024)
+        expect(observedPartialBytes).toBeLessThan(snapshotSize)
+        await waitFor(async () => fs.readdirSync(spoolDir).every(
+            (entry) => !entry.includes('snapshot-restore'),
+        ))
+
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(currentDb)
+        expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(currentManifest)
+        expect(await readKey(
+            server,
+            auth,
+            valueRowKey('retained'),
+            currentGeneration,
+        )).toEqual(currentRetained)
+        expect(await readKey(
+            server,
+            auth,
+            valueRowKey('currentOnly'),
+            currentGeneration,
+        )).toEqual(currentOnly)
+        expect(server.logs()).not.toContain('Client disconnected before commit; transaction was rolled back')
+
+        await stopServer(server)
+        server = await startServer(cwd, { POCKETRISU_BACKUP_INTERVAL_MS: '10000' })
+        auth = await authenticate(server)
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(currentDb)
+        expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(currentManifest)
+        expect(await readKey(
+            server,
+            auth,
+            valueRowKey('retained'),
+            currentGeneration,
+        )).toEqual(currentRetained)
+        expect(await readKey(
+            server,
+            auth,
+            valueRowKey('currentOnly'),
+            currentGeneration,
+        )).toEqual(currentOnly)
+    }, 45_000)
+
+    it('rejects an altered middle snapshot chunk as definitively not committed', async () => {
+        const cwd = makeWorkDir()
+        let server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+            POCKETRISU_CHUNK_THRESHOLD: '4096',
+        })
+        let auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { retained: 'current-value' },
+        }))
+        const currentDb = await readKey(server, auth, 'database/database.bin')
+        const currentManifest = await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)
+        const currentGeneration = (await decodeRisuSave(currentDb)).pluginStorageGeneration as string
+        const currentValue = await readKey(
+            server,
+            auth,
+            valueRowKey('retained'),
+            currentGeneration,
+        )
+        const snapshotKey = `database/dbbackup-${((Date.now() + 120_000) / 100).toFixed()}.bin`
+        await writeKey(server, auth, snapshotKey, encodeRisuSaveLegacy({
+            characters: [],
+            optimizePluginMemory: false,
+            pluginCustomStorage: { retained: 'snapshot-value' },
+            formatPadding: 'c'.repeat(4 * 1024 * 1024),
+        }))
+        await stopServer(server)
+
+        const raw = openFixtureDatabase(cwd)
+        const middle = raw.prepare(
+            `SELECT m.hash AS hash
+             FROM manifest_chunks m
+             WHERE m.manifest_key = ?
+             ORDER BY m.seq
+             LIMIT 1 OFFSET (
+                 SELECT CAST(COUNT(*) / 2 AS INTEGER)
+                 FROM manifest_chunks WHERE manifest_key = ?
+             )`,
+        ).get(snapshotKey, snapshotKey) as { hash: string }
+        expect(middle?.hash).toMatch(/^[0-9a-f]{64}$/)
+        raw.prepare('UPDATE chunks SET data = ? WHERE hash = ?').run(
+            Buffer.from('tampered-middle-chunk'),
+            middle.hash,
+        )
+        raw.close()
+
+        server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+            POCKETRISU_CHUNK_THRESHOLD: '4096',
+        })
+        auth = await authenticate(server)
+        const response = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(response.status).toBe(500)
+        await expect(response.json()).resolves.toEqual({
+            error: 'Snapshot restore was not committed',
+            code: 'SNAPSHOT_RESTORE_NOT_COMMITTED',
+            retryAfter: 0,
+            retryable: true,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        })
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(currentDb)
+        expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(currentManifest)
+        expect(await readKey(
+            server,
+            auth,
+            valueRowKey('retained'),
+            currentGeneration,
+        )).toEqual(currentValue)
+        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+            (name) => name.includes('snapshot-restore'),
+        )).toEqual([])
+
+        await stopServer(server)
+        server = await startServer(cwd, { POCKETRISU_BACKUP_INTERVAL_MS: '10000' })
+        auth = await authenticate(server)
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(currentDb)
+        expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(currentManifest)
+        expect(await readKey(
+            server,
+            auth,
+            valueRowKey('retained'),
+            currentGeneration,
+        )).toEqual(currentValue)
+    }, 30_000)
+
+    it('releases every request, response, and keep-alive socket abort listener', async () => {
+        const cwd = makeWorkDir()
+        const server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+            NODE_OPTIONS: '--trace-warnings',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { repeated: 'stable' },
+        }))
+        const [snapshotKey] = await listSnapshotKeys(server, auth)
+        expect(snapshotKey).toBeTruthy()
+
+        const agent = new http.Agent({ keepAlive: true, maxSockets: 1 })
+        const closeListenerCounts: number[] = []
+        try {
+            for (let index = 0; index < 30; index++) {
+                const result = await new Promise<{ status: number; body: string; listeners: number }>(
+                    (resolve, reject) => {
+                        let requestSocket: import('node:net').Socket | null = null
+                        const url = new URL('/api/db/snapshots/restore', server.origin)
+                        const body = JSON.stringify({ key: snapshotKey })
+                        const request = http.request(url, {
+                            method: 'POST',
+                            agent,
+                            headers: {
+                                ...auth,
+                                'content-type': 'application/json',
+                                'content-length': Buffer.byteLength(body),
+                            },
+                        }, (response) => {
+                            const chunks: Buffer[] = []
+                            response.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+                            response.once('error', reject)
+                            response.once('end', () => setImmediate(() => resolve({
+                                status: response.statusCode ?? 0,
+                                body: Buffer.concat(chunks).toString('utf-8'),
+                                listeners: requestSocket?.listenerCount('close') ?? -1,
+                            })))
+                        })
+                        request.once('socket', (socket) => { requestSocket = socket })
+                        request.once('error', reject)
+                        request.end(body)
+                    },
+                )
+                expect(result.status, result.body).toBe(200)
+                closeListenerCounts.push(result.listeners)
+            }
+        } finally {
+            agent.destroy()
+        }
+
+        expect(closeListenerCounts.every((count) => count >= 0)).toBe(true)
+        const steadyCounts = closeListenerCounts.slice(5)
+        expect(Math.max(...steadyCounts)).toBeLessThanOrEqual(Math.min(...steadyCounts) + 1)
+        expect(closeListenerCounts.at(-1)).toBeLessThanOrEqual(closeListenerCounts[0] + 1)
+        expect(server.logs()).not.toMatch(/MaxListenersExceededWarning|Possible EventEmitter memory leak/)
     }, 30_000)
 })
 

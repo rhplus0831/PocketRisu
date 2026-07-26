@@ -1,12 +1,19 @@
 import { describe, it, expect, afterAll } from 'vitest'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import pkg from './chunkStore.cjs'
 
-const { cdcSplit, createChunkStore, isChunkableKey } = pkg as {
+const {
+    cdcSplit,
+    createChunkStore,
+    createSnapshotReader,
+    isChunkableKey,
+    normalizeThreshold,
+    CHUNK_MARKER,
+} = pkg as {
     cdcSplit: (buf: Buffer) => { hash: string; data: Buffer }[]
     isChunkableKey: (key: string) => boolean
     createChunkStore: (
@@ -20,9 +27,10 @@ const { cdcSplit, createChunkStore, isChunkableKey } = pkg as {
             filePath: string,
             options?: {
                 shouldAbort?: () => boolean
+                signal?: AbortSignal
                 onChunk?: (chunk: { index: number; size: number }) => void
             },
-        ) => { filePath: string; size: number; chunks: number; maxChunkBytes: number } | null
+        ) => Promise<{ filePath: string; size: number; chunks: number; maxChunkBytes: number } | null>
         getValue: (key: string) => Buffer | null
         sizeValue: (key: string) => number | null
         listValuesWithSizes: (prefix: string) => Array<{ key: string; size: number }>
@@ -33,6 +41,12 @@ const { cdcSplit, createChunkStore, isChunkableKey } = pkg as {
         isChunkedKey: (key: string) => boolean
         reclaimableBytes: () => number
     }
+    createSnapshotReader: (db: any) => {
+        kvGet: (key: string) => Buffer | null
+        kvListWithSizes: (prefix: string) => Array<{ key: string; size: number }>
+    }
+    normalizeThreshold: (value: unknown) => number
+    CHUNK_MARKER: Buffer
 }
 
 // Fresh in-memory DB with the same kv schema db.cjs creates (kv is db.cjs's
@@ -522,7 +536,7 @@ describe('writeValueToFile — bounded snapshot restore source', () => {
     const fileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'risu-chunk-read-file-'))
     afterAll(() => fs.rmSync(fileDir, { recursive: true, force: true }))
 
-    it('F1: streams a high-chunk-count value with one bounded chunk at a time', () => {
+    it('F1: streams a high-chunk-count value with one bounded chunk at a time', async () => {
         const db = freshDb()
         const store = createChunkStore(db, T)
         const bytes = seededBytes(20 * 1024 * 1024, 87)
@@ -531,7 +545,7 @@ describe('writeValueToFile — bounded snapshot restore source', () => {
         let callbacks = 0
         let active = 0
         let maxActive = 0
-        const result = store.writeValueToFile('database/dbbackup-1.bin', filePath, {
+        const result = (await store.writeValueToFile('database/dbbackup-1.bin', filePath, {
             onChunk: ({ size }) => {
                 active++
                 maxActive = Math.max(maxActive, active)
@@ -539,7 +553,7 @@ describe('writeValueToFile — bounded snapshot restore source', () => {
                 callbacks++
                 active--
             },
-        })!
+        }))!
 
         expect(result.chunks).toBeGreaterThan(300)
         expect(result.chunks).toBe(callbacks)
@@ -549,24 +563,283 @@ describe('writeValueToFile — bounded snapshot restore source', () => {
         expect(fs.readFileSync(filePath).equals(bytes)).toBe(true)
     })
 
-    it('F2: cancellation removes the partial spool immediately', () => {
+    it('F2: cancellation removes the partial spool immediately', async () => {
         const db = freshDb()
         const store = createChunkStore(db, T)
         store.putValue('database/dbbackup-2.bin', seededBytes(2 * 1024 * 1024, 91))
         const filePath = path.join(fileDir, 'cancelled.risudat.tmp')
         let chunks = 0
-        expect(() => store.writeValueToFile('database/dbbackup-2.bin', filePath, {
+        await expect(store.writeValueToFile('database/dbbackup-2.bin', filePath, {
             shouldAbort: () => chunks >= 4,
             onChunk: () => { chunks++ },
-        })).toThrow('KV value stream cancelled')
+        })).rejects.toThrow('KV value stream cancelled')
         expect(chunks).toBe(4)
         expect(fs.existsSync(filePath)).toBe(false)
     })
 
-    it('F3: missing values do not create a spool file', () => {
+    it('F3: missing values do not create a spool file', async () => {
         const store = createChunkStore(freshDb(), T)
         const filePath = path.join(fileDir, 'missing.risudat.tmp')
-        expect(store.writeValueToFile('missing', filePath)).toBeNull()
+        expect(await store.writeValueToFile('missing', filePath)).toBeNull()
         expect(fs.existsSync(filePath)).toBe(false)
+    })
+
+    it('F4: pages legacy oversized raw rows through <=64 KiB substr reads', async () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const bytes = seededBytes(20 * 1024 * 1024, 131)
+        db.prepare('INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)').run(
+            'database/dbbackup-legacy.bin', bytes, Date.now(),
+        )
+        const filePath = path.join(fileDir, 'legacy-raw.risudat.tmp')
+        const partSizes: number[] = []
+        const result = (await store.writeValueToFile(
+            'database/dbbackup-legacy.bin',
+            filePath,
+            { onChunk: ({ size }) => partSizes.push(size) },
+        ))!
+
+        expect(result.size).toBe(bytes.length)
+        expect(result.chunks).toBe(320)
+        expect(Math.max(...partSizes)).toBeLessThanOrEqual(65536)
+        expect(fs.readFileSync(filePath).equals(bytes)).toBe(true)
+    })
+
+    it('F5: rejects missing, altered, reordered, and substituted chunk publications', async () => {
+        const corruptions: Array<{
+            name: string
+            mutate: (db: Database.Database, key: string) => void
+        }> = [
+            {
+                name: 'missing',
+                mutate: (db, key) => {
+                    const row = db.prepare(
+                        'SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq LIMIT 1 OFFSET 2',
+                    ).get(key) as { hash: string }
+                    db.prepare('DELETE FROM chunks WHERE hash = ?').run(row.hash)
+                },
+            },
+            {
+                name: 'altered',
+                mutate: (db, key) => {
+                    const row = db.prepare(
+                        'SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq LIMIT 1 OFFSET 2',
+                    ).get(key) as { hash: string }
+                    db.prepare('UPDATE chunks SET data = ? WHERE hash = ?').run(Buffer.from('altered'), row.hash)
+                },
+            },
+            {
+                name: 'reordered',
+                mutate: (db, key) => {
+                    db.prepare('UPDATE manifest_chunks SET seq = -1 WHERE manifest_key = ? AND seq = 1').run(key)
+                    db.prepare('UPDATE manifest_chunks SET seq = 1 WHERE manifest_key = ? AND seq = 2').run(key)
+                    db.prepare('UPDATE manifest_chunks SET seq = 2 WHERE manifest_key = ? AND seq = -1').run(key)
+                },
+            },
+            {
+                name: 'substituted',
+                mutate: (db, key) => {
+                    const rows = db.prepare(
+                        'SELECT seq, hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq LIMIT 2',
+                    ).all(key) as Array<{ seq: number; hash: string }>
+                    db.prepare(
+                        'UPDATE manifest_chunks SET hash = ? WHERE manifest_key = ? AND seq = ?',
+                    ).run(rows[0].hash, key, rows[1].seq)
+                },
+            },
+            {
+                name: 'metadata-deleted-missing-tail',
+                mutate: (db, key) => {
+                    db.prepare('DELETE FROM chunk_manifest_meta WHERE manifest_key = ?').run(key)
+                    db.prepare(
+                        `DELETE FROM manifest_chunks WHERE manifest_key = ? AND seq = (
+                            SELECT MAX(seq) FROM manifest_chunks WHERE manifest_key = ?
+                        )`,
+                    ).run(key, key)
+                },
+            },
+            {
+                name: 'metadata-deleted-reordered',
+                mutate: (db, key) => {
+                    db.prepare('DELETE FROM chunk_manifest_meta WHERE manifest_key = ?').run(key)
+                    db.prepare('UPDATE manifest_chunks SET seq = -1 WHERE manifest_key = ? AND seq = 1').run(key)
+                    db.prepare('UPDATE manifest_chunks SET seq = 1 WHERE manifest_key = ? AND seq = 2').run(key)
+                    db.prepare('UPDATE manifest_chunks SET seq = 2 WHERE manifest_key = ? AND seq = -1').run(key)
+                },
+            },
+            {
+                name: 'metadata-and-manifest-deleted',
+                mutate: (db, key) => {
+                    db.prepare('DELETE FROM chunk_manifest_meta WHERE manifest_key = ?').run(key)
+                    db.prepare('DELETE FROM manifest_chunks WHERE manifest_key = ?').run(key)
+                },
+            },
+        ]
+
+        for (const corruption of corruptions) {
+            const db = freshDb()
+            const store = createChunkStore(db, T)
+            const key = `database/dbbackup-corrupt-${corruption.name}.bin`
+            store.putValue(key, seededBytes(400_000, 149))
+            corruption.mutate(db, key)
+            const filePath = path.join(fileDir, `${corruption.name}.risudat.tmp`)
+            await expect(store.writeValueToFile(key, filePath)).rejects.toMatchObject({
+                code: 'KV_CHUNK_CORRUPT',
+            })
+            expect(fs.existsSync(filePath)).toBe(false)
+        }
+    })
+
+    it('F6: publishes count, length, and logical SHA metadata for new chunk manifests', async () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const key = 'database/dbbackup-meta.bin'
+        const bytes = seededBytes(300_000, 157)
+        store.putValue(key, bytes)
+        const metadata = db.prepare(
+            'SELECT chunk_count, logical_size, logical_sha256 FROM chunk_manifest_meta WHERE manifest_key = ?',
+        ).get(key) as { chunk_count: number; logical_size: number; logical_sha256: string }
+        expect(metadata.chunk_count).toBe(countManifest(db, key))
+        expect(metadata.logical_size).toBe(bytes.length)
+        expect(metadata.logical_sha256).toBe(createHash('sha256').update(bytes).digest('hex'))
+    })
+
+    it('F7: migrates legacy manifests once and never reinterprets missing protected metadata', async () => {
+        const db = freshDb()
+        const key = 'database/dbbackup-legacy-metadata.bin'
+        const bytes = seededBytes(300_000, 163)
+        createChunkStore(db, T).putValue(key, bytes)
+
+        // Recreate the pre-protection layout, then open the upgraded store. The
+        // migration verifies the legacy chunks and publishes metadata + marker
+        // in one transaction.
+        db.prepare('DELETE FROM chunk_manifest_meta WHERE manifest_key = ?').run(key)
+        db.prepare('DELETE FROM chunk_manifest_publications WHERE manifest_key = ?').run(key)
+        db.prepare('DELETE FROM chunk_manifest_protection').run()
+        const migrated = createChunkStore(db, T)
+        const protection = db.prepare(
+            'SELECT version FROM chunk_manifest_protection WHERE id = 1',
+        ).get() as { version: number }
+        const metadata = db.prepare(
+            'SELECT chunk_count, logical_size, logical_sha256 FROM chunk_manifest_meta WHERE manifest_key = ?',
+        ).get(key) as { chunk_count: number; logical_size: number; logical_sha256: string }
+        expect(protection.version).toBe(2)
+        expect(metadata.chunk_count).toBe(countManifest(db, key))
+        expect(metadata.logical_size).toBe(bytes.length)
+        expect(metadata.logical_sha256).toBe(createHash('sha256').update(bytes).digest('hex'))
+
+        // A later metadata deletion remains corruption across another open;
+        // the durable protection marker prevents a second legacy migration.
+        db.prepare('DELETE FROM chunk_manifest_meta WHERE manifest_key = ?').run(key)
+        const reopened = createChunkStore(db, T)
+        expect(db.prepare(
+            'SELECT 1 FROM chunk_manifest_meta WHERE manifest_key = ?',
+        ).get(key)).toBeUndefined()
+        const filePath = path.join(fileDir, 'legacy-metadata-downgrade.risudat.tmp')
+        await expect(reopened.writeValueToFile(key, filePath)).rejects.toMatchObject({
+            code: 'KV_CHUNK_CORRUPT',
+        })
+        expect(fs.existsSync(filePath)).toBe(false)
+
+        // The already-open upgraded store observes the same durable damage;
+        // no hidden per-instance downgrade state can return the marker raw.
+        expect(() => migrated.getValue(key)).toThrow(expect.objectContaining({
+            code: 'KV_CHUNK_CORRUPT',
+        }))
+    })
+
+    it('F8: rolls back the protection marker when legacy migration finds corruption', () => {
+        const db = freshDb()
+        const key = 'database/dbbackup-corrupt-legacy.bin'
+        createChunkStore(db, T).putValue(key, seededBytes(300_000, 167))
+        const middle = db.prepare(
+            'SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq LIMIT 1 OFFSET 2',
+        ).get(key) as { hash: string }
+        db.prepare('DELETE FROM chunk_manifest_meta WHERE manifest_key = ?').run(key)
+        db.prepare('DELETE FROM chunk_manifest_publications WHERE manifest_key = ?').run(key)
+        db.prepare('DELETE FROM chunk_manifest_protection').run()
+        db.prepare('UPDATE chunks SET data = ? WHERE hash = ?').run(Buffer.from('corrupt'), middle.hash)
+
+        expect(() => createChunkStore(db, T)).toThrow(/failed chunk verification/)
+        expect(db.prepare('SELECT 1 FROM chunk_manifest_protection').get()).toBeUndefined()
+        expect(db.prepare(
+            'SELECT 1 FROM chunk_manifest_meta WHERE manifest_key = ?',
+        ).get(key)).toBeUndefined()
+    })
+
+    it('F9: preserves a legitimate raw value equal to the chunk marker', async () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const source = 'database/dbbackup-raw-marker.bin'
+        const copy = 'database/dbbackup-raw-marker-copy.bin'
+        store.putValue(source, CHUNK_MARKER)
+
+        expect(db.prepare(
+            'SELECT 1 FROM chunk_manifest_publications WHERE manifest_key = ?',
+        ).get(source)).toBeUndefined()
+        expect(store.getValue(source)).toEqual(CHUNK_MARKER)
+        expect(store.sizeValue(source)).toBe(CHUNK_MARKER.length)
+        expect(store.isChunkedKey(source)).toBe(false)
+
+        const sourcePath = path.join(fileDir, 'raw-marker.risudat.tmp')
+        const sourceResult = await store.writeValueToFile(source, sourcePath)
+        expect(sourceResult?.size).toBe(CHUNK_MARKER.length)
+        expect(fs.readFileSync(sourcePath)).toEqual(CHUNK_MARKER)
+
+        store.snapshotValue(source, copy)
+        expect(store.getValue(copy)).toEqual(CHUNK_MARKER)
+        expect(store.isChunkedKey(copy)).toBe(false)
+        expect(db.prepare(
+            'SELECT 1 FROM chunk_manifest_publications WHERE manifest_key = ?',
+        ).get(copy)).toBeUndefined()
+    })
+
+    it('F10: rejects a fully deleted protected publication through every logical API', async () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const source = 'database/dbbackup-fully-deleted.bin'
+        const destination = 'database/dbbackup-copy-target.bin'
+        const destinationBytes = Buffer.from('destination-before')
+        store.putValue(source, seededBytes(400_000, 173))
+        store.putValue(destination, destinationBytes)
+        db.prepare('DELETE FROM chunk_manifest_meta WHERE manifest_key = ?').run(source)
+        db.prepare('DELETE FROM manifest_chunks WHERE manifest_key = ?').run(source)
+
+        for (const operation of [
+            () => store.getValue(source),
+            () => store.sizeValue(source),
+            () => store.listValuesWithSizes('database/'),
+            () => store.snapshotCostExclusive(source),
+            () => store.isChunkedKey(source),
+            () => store.snapshotValue(source, destination),
+        ]) {
+            expect(operation).toThrow(expect.objectContaining({ code: 'KV_CHUNK_CORRUPT' }))
+        }
+        expect(store.getValue(destination)).toEqual(destinationBytes)
+
+        const reader = createSnapshotReader(db)
+        expect(() => reader.kvGet(source)).toThrow(expect.objectContaining({
+            code: 'KV_CHUNK_CORRUPT',
+        }))
+        expect(() => reader.kvListWithSizes('database/')).toThrow(expect.objectContaining({
+            code: 'KV_CHUNK_CORRUPT',
+        }))
+
+        const filePath = path.join(fileDir, 'fully-deleted.risudat.tmp')
+        await expect(store.writeValueToFile(source, filePath)).rejects.toMatchObject({
+            code: 'KV_CHUNK_CORRUPT',
+        })
+        expect(fs.existsSync(filePath)).toBe(false)
+    })
+})
+
+describe('normalizeThreshold — lower-only bounded raw storage', () => {
+    it('accepts lower finite positive values and clamps every unsafe value', () => {
+        expect(normalizeThreshold(4096)).toBe(4096)
+        expect(normalizeThreshold('1024')).toBe(1024)
+        expect(normalizeThreshold(99_999_999_999)).toBe(16 * 1024 * 1024)
+        for (const value of [undefined, null, 0, -1, Number.NaN, Number.POSITIVE_INFINITY, 'wat']) {
+            expect(normalizeThreshold(value)).toBe(16 * 1024 * 1024)
+        }
     })
 })

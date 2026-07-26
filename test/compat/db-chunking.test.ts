@@ -63,6 +63,20 @@ function bigDbBlob(salt = ''): Buffer {
   const database = { characters, apiType: 'openai', personas: [{ name: 'D', icon: '', personaPrompt: '' }], botPresets: [], botPresetsId: 0, selectedCharacter: 0 }
   return Buffer.concat([MAGIC_RAW, packr.encode(database)])
 }
+function hugeChatDbBlob(): Buffer {
+  const database = {
+    characters: [{
+      name: 'Threshold', chaId: 'threshold-char', type: 'character', chatPage: 0,
+      image: '', desc: '', firstMessage: 'hi',
+      chats: [{
+        id: 'threshold-chat', name: 'large', lastDate: 0, localLore: [], scriptstate: {}, note: '',
+        message: [{ role: 'char', data: 'h'.repeat(17 * 1024 * 1024) }],
+      }],
+    }],
+    apiType: 'openai', personas: [], botPresets: [], botPresetsId: 0, selectedCharacter: 0,
+  }
+  return Buffer.concat([MAGIC_RAW, packr.encode(database)])
+}
 const DB_BLOB_HEX = Buffer.from('database/database.bin', 'utf-8').toString('hex')
 function saveFolderZip(blob: Buffer): Buffer {
   return Buffer.from(zipSync({ [DB_BLOB_HEX]: new Uint8Array(blob) }))
@@ -341,12 +355,24 @@ describe('chunking lifecycle (real server, low threshold)', () => {
     expect(blob.length).toBeGreaterThan(4096)
     expect(blob.includes(Buffer.from('XYZ'))).toBe(true)
 
-    // Simulate an "old" server (chunking effectively off via a huge threshold):
-    // it must import and store the blob raw.
+    // The bounded server still accepts the portable blob through the ordinary
+    // import path; chunking remains an internal layout detail.
     const exported = await client.exportBackup()
     const { client: oldish } = await boot({ POCKETRISU_CHUNK_THRESHOLD: '9999999999' })
     expect((await oldish.importBackup(exported)).ok).toBe(true)
     const s2 = await getStats(oldish)
-    expect(s2.chunks.liveChunked).toBe(false) // stored raw, like a pre-chunking server
+    expect(s2.chunks.liveChunked).toBe(false)
   })
+
+  test.each(['9999999999', 'Infinity', 'NaN', '0', '-1'])(
+    'unsafe chunk threshold %s cannot create an oversized raw chat row',
+    async (threshold) => {
+      const { client, srv } = await boot({ POCKETRISU_CHUNK_THRESHOLD: threshold })
+      expect((await uploadZip(client, hugeChatDbBlob())).status).toBe(200)
+      const layout = getStorageLayout(srv)
+      expect(layout.chatRows).toBe(1)
+      expect(layout.chunkedChatRows).toBe(1)
+    },
+    30_000,
+  )
 })

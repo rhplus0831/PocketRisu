@@ -282,19 +282,37 @@ preserves plugin rows as independent archive entries
 
 ### Resolution
 
-Fixed. The Plugin Storage viewer now retains one 50-value page, reads values
-serially, and stores only their display serialization; changing pages,
-cancellation, or errors discard the prior page. Partial local export now pins a
-server-side SQLite snapshot and folds external values into the streamed
+**Fixed 2026-07-27.** The Plugin Storage viewer now retains one 50-value page,
+reads values serially, and stores only their display serialization; changing
+pages, cancellation, or errors discard the prior page. Partial local export now
+pins a server-side SQLite snapshot and folds external values into the streamed
 `database.risudat` spool one row at a time. Its selected-asset archive remains
 upstream compatible, omits account data, and applies the same BR4 archive-key
 validation as other folded exports.
 
-Snapshot restore now spools a chunked value directly from its manifest to a
-temporary file one chunk at a time, then ingests through the file cursor instead
-of beginning with `kvGet()` / `Buffer.concat()`. Disconnect cancellation rolls
-back streaming ingest, and cancellation, failure, success, and startup cleanup
-remove incomplete restore/export spools.
+Snapshot restore now queries only publication metadata up front, then spools a
+raw row through SQLite `substr()` pages or a chunked row through completed
+point queries of at most 64 KiB. It never keeps a `better-sqlite3` iterator open
+across an `await`, yields and checks the socket-derived `AbortSignal` before and
+after every part, and ingests through the resulting file cursor instead of
+beginning with `kvGet()` / `Buffer.concat()`. Cancellation before publication,
+streaming-ingest rollback, failure, success, and startup cleanup all remove an
+incomplete restore/export spool. Request, response, and keep-alive socket abort
+listeners are detached in the route `finally` block.
+
+Chunk publications now carry expected count, logical length, and logical
+SHA-256 metadata plus a durable per-key publication guard. A transactional,
+versioned one-time migration verifies legacy dense sequences, row presence,
+sizes, and canonical chunk hashes before enabling protection. Afterwards,
+missing metadata, a missing tail, reordered/substituted/altered chunks, or even
+deletion of both manifest tables is corruption rather than a downgrade to the
+13-byte raw marker. The guard is enforced consistently by live and pinned
+reads, size/list queries, snapshot cost/copy, chunk-status checks, and restore
+spooling; a failed copy leaves its destination unchanged. A legitimate
+unguarded raw value equal to the marker remains byte-compatible. The chunk
+threshold environment override is finite, positive, and lower-only, capped at
+the 16 MiB safe default; invalid/high overrides cannot create new oversized raw
+rows, while legacy raw rows are still read in bounded pages.
 
 Corrupt-database bootstrap uses the same bounded path. It obtains only a strict,
 newest-first metadata list from the import-safe `/api/db/snapshots` read, then
@@ -337,7 +355,16 @@ fresh revision. A real NodeStorage recovery test supplies two 64 MiB chunked
 candidates (newer invalid, older valid), rejects any candidate `/api/read`,
 observes server-side fallback, hashes the exact recovered chat after restart,
 and requires empty restore spools. The full client, server, compatibility,
-performance, check, and production-build validation sets pass.
+performance, check, and production-build validation sets pass. A separate
+52 MiB real-server test observes a genuinely partial spool, closes
+the client socket before `BEGIN`, and verifies less-than-total copying, cleanup,
+exact old-state preservation, and restart durability. Corrupt-middle and
+full-publication-deletion cases return definitive non-committed failures; a
+30-restore single-socket keep-alive run has stable listener counts and no
+`MaxListenersExceededWarning`. Independent verification passed the final
+implementation. The complete server suite passed 230 tests, compatibility
+passed 172 with five expected skips, `svelte-check` reported zero errors, and
+the help audit and production build passed.
 
 <a id="pm4"></a>
 ## PM4 — Write amplification and cache overhead

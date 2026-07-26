@@ -258,6 +258,19 @@ PM1 per-row and aggregate limits remain authoritative inside the restore
 transaction: an over-limit selected set rolls back and returns the definitive
 non-committed 413 envelope rather than a generic retryable restore failure.
 
+The selected snapshot bytes are also protected before that transaction begins.
+Restore pages raw rows and chunk bodies asynchronously in at most 64 KiB parts,
+with no SQLite iterator held across an event-loop yield. Versioned manifest
+metadata and a durable per-key publication guard verify dense order, row and
+chunk presence, canonical hashes, count, length, and logical SHA-256 across
+live reads, pinned reads, sizing, copying, and restore spooling. Deleting both
+manifest tables therefore remains a known corrupt publication rather than
+silently restoring the 13-byte chunk marker. A real 52 MiB socket abort is
+observed during the spool, before `BEGIN`, cleans the partial file, and leaves
+the exact database, manifest, and owned rows durable after restart. Corrupt
+chunks fail with a definitive non-committed envelope, while repeated
+keep-alive restores release all disconnect listeners.
+
 ETag and authenticated-session generation state are published only after
 COMMIT. The success envelope is strict and explicit; a lost response after
 COMMIT remains `COMMIT_OUTCOME_UNKNOWN`. Bootstrap stops immediately on that
@@ -278,7 +291,9 @@ active body with forced-GC retained heap below two rows. Further composition
 coverage proves a same-key target cannot mask a malformed final current row,
 cancellation stops before deletion, PM2 private stages remain invisible and
 source-invalidated, and PM4 rejects the pre-restore manifest token before a
-fresh-token mutation commits.
+fresh-token mutation commits. Further recovery coverage includes full
+chunk-publication deletion, legacy manifest-protection migration, raw-marker
+compatibility, a real mid-spool disconnect, and listener cleanup.
 
 <a id="br4"></a>
 ## BR4 — Valid long keys produce Node backups the same server refuses to import

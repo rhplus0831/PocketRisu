@@ -10490,8 +10490,26 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     let restoreCommitted = false;
     let restoreSpool = null;
+    let restorePublicationStarted = false;
     let closed = false;
-    res.once('close', () => { closed = true; });
+    const restoreAbortController = new AbortController();
+    const restoreSocket = req.socket;
+    const abortRestoreOnDisconnect = () => {
+        // `close` also follows a normal completed response.  Only an unfinished
+        // response represents the peer disappearing while spooling/publishing.
+        if (res.writableEnded) return;
+        closed = true;
+        restoreAbortController.abort();
+    };
+    const throwIfRestoreAborted = () => {
+        if (!restoreAbortController.signal.aborted) return;
+        const error = new Error('Snapshot restore client disconnected');
+        error.code = 'KV_STREAM_ABORTED';
+        throw error;
+    };
+    req.once('aborted', abortRestoreOnDisconnect);
+    req.socket?.once('close', abortRestoreOnDisconnect);
+    res.once('close', abortRestoreOnDisconnect);
     try {
         const key = typeof req.body?.key === 'string' ? req.body.key : '';
         if (!parseInternalSnapshotKey(key)) {
@@ -10504,10 +10522,12 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
         let committedPublication = null;
         try {
             await queueStorageOperation(async () => {
+                throwIfRestoreAborted();
                 // Drain any pending debounced persist first — same pattern as
                 // /api/db/optimize. Without this, an in-flight save could land
                 // after kvCopyValue and overwrite the restored snapshot.
                 await flushPendingDb();
+                throwIfRestoreAborted();
                 // Read only after the import barrier is held. The importer uses
                 // this same SQLite connection, so an earlier cursor could observe
                 // its uncommitted snapshot rows and publish transient state. Spool
@@ -10516,8 +10536,8 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                     databaseSpoolDir,
                     `${DATABASE_SPOOL_FILE_PREFIX}snapshot-restore-${process.pid}-${nodeCrypto.randomUUID()}.tmp`,
                 );
-                restoreSpool = kvWriteToFile(key, restorePath, {
-                    shouldAbort: () => closed,
+                restoreSpool = await kvWriteToFile(key, restorePath, {
+                    signal: restoreAbortController.signal,
                 });
                 if (!restoreSpool) {
                     snapshotFound = false;
@@ -10528,12 +10548,18 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                     size: restoreSpool.size,
                 };
                 const inspection = await inspectRisuSaveSource(source);
+                throwIfRestoreAborted();
                 let restoreTransactionOpen = false;
                 try {
                     // Keep the live monolith, external plugin rows, ownership
                     // sidecars, chat rows, and migration markers in one rollback
                     // boundary. Both ingest paths join an existing transaction.
+                    // The spool and inspection both yield.  Re-check the real
+                    // socket-derived AbortSignal immediately before opening the
+                    // publication transaction, and again before COMMIT.
+                    throwIfRestoreAborted();
                     sqliteDb.exec('BEGIN');
+                    restorePublicationStarted = true;
                     restoreTransactionOpen = true;
                     let ingestion;
                     if (inspection.supported) {
@@ -10544,7 +10570,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                         invalidateDbCache();
                         ingestion = await ingestDatabaseStreaming(source, {
                             inspection,
-                            shouldAbort: () => closed,
+                            shouldAbort: () => restoreAbortController.signal.aborted,
                         });
                         markRemoteMigrationDone();
                     } else {
@@ -10572,6 +10598,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                     if (snapshotRestoreFailpoint === 'before-commit') {
                         throw new Error('Injected snapshot restore failure before commit');
                     }
+                    throwIfRestoreAborted();
                     sqliteDb.exec('COMMIT');
                     restoreTransactionOpen = false;
                     restoreCommitted = true;
@@ -10633,7 +10660,9 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             return;
         }
         if (closed) {
-            logger.warn('[Snapshot Restore] Client disconnected before commit; transaction was rolled back');
+            logger.warn(restorePublicationStarted
+                ? '[Snapshot Restore] Client disconnected before commit; transaction was rolled back'
+                : '[Snapshot Restore] Client disconnected before publication; partial spool was discarded');
             return;
         }
         const diagnostic = pluginStorageValidationDiagnostic(err);
@@ -10660,6 +10689,9 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             commitOutcomeUnknown: false,
         });
     } finally {
+        req.off('aborted', abortRestoreOnDisconnect);
+        restoreSocket?.off('close', abortRestoreOnDisconnect);
+        res.off('close', abortRestoreOnDisconnect);
         if (restoreSpool?.filePath) {
             await fs.unlink(restoreSpool.filePath).catch(() => {});
         }
