@@ -27,7 +27,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | ID | Severity | Status | Finding |
 |---|---|---|---|
 | [MT1](mode-transition-data-loss.md#mt1) | High | Fixed | Disabling the beta can delete external rows after a save that never durably committed |
-| [MT2](mode-transition-data-loss.md#mt2) | High | Open | The mode flag changes outside the storage queue, so queued operations run against the wrong backend and reconciliation overwrites or resurrects values |
+| [MT2](mode-transition-data-loss.md#mt2) | High | Fixed | The mode flag changes outside the storage queue, so queued operations run against the wrong backend and reconciliation overwrites or resurrects values |
 | [MT3](mode-transition-data-loss.md#mt3) | Medium | Open | Special property names survive optimized storage but are lost or misread when internalized into the inline object backend |
 | [AC1](api-compatibility.md#ac1) | High | Open | V3 database access and mode-aware plugin storage form a split-brain store; the eligibility gate checks only API version |
 | [AC2](api-compatibility.md#ac2) | Medium | Open | V2 lifecycle gaps: eligibility races unload completion, and invalid persisted states look enabled but never run |

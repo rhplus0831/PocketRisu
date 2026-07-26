@@ -31,10 +31,8 @@
         canOptimizePluginMemory,
     } from "src/ts/plugins/pluginMemoryOptimization";
     import {
-        countExternalizedPluginStorageEntries,
-        reconcilePluginStorageMode,
+        transitionPluginStorageMode,
     } from "src/ts/plugins/pluginSaveStorage";
-    import { requireCommittedDatabaseSave } from "src/ts/storage/databaseSave";
 
     let showParams = $state([])
     let reconcilingPluginStorage = $state(false)
@@ -45,55 +43,31 @@
     async function togglePluginMemoryOptimization(enabled: boolean) {
         if (reconcilingPluginStorage || !optimizePluginMemoryEligible) return
 
-        const db = DBState.db
-        const previous = db.optimizePluginMemory === true
         reconcilingPluginStorage = true
         let blockingAlert = false
 
         try {
-            const total = enabled
-                ? Object.keys(db.pluginCustomStorage ?? {}).length
-                    + Object.keys(db.pluginStorageMeta ?? {}).length
-                : await countExternalizedPluginStorageEntries()
-            // Key values can be arbitrarily large, so count alone is not a
-            // reliable size threshold. Block whenever data actually moves.
-            blockingAlert = total > 0
-            db.optimizePluginMemory = enabled
-
-            if (blockingAlert) {
-                alertWait(language.optimizePluginMemoryProgress(0, total))
-            }
-            const result = await reconcilePluginStorageMode({
+            await transitionPluginStorageMode(enabled, {
+                onStart: ({ total }) => {
+                    // Key values can be arbitrarily large, so count alone is
+                    // not a reliable size threshold. Block whenever data moves.
+                    blockingAlert = total > 0
+                    if (blockingAlert) {
+                        alertWait(language.optimizePluginMemoryProgress(0, total))
+                    }
+                },
                 onProgress: ({ completed, total: progressTotal }) => {
                     if (blockingAlert) {
                         alertWait(language.optimizePluginMemoryProgress(completed, progressTotal))
                     }
                 },
             })
-            // A flag-only toggle has no values for the reconciler to move, but
-            // the new mode still needs to travel with the save.
-            if (result.direction === "none") {
-                const outcome = await requestImmediateSave({ forceFullWrite: true })
-                requireCommittedDatabaseSave(outcome, "Plugin storage mode transition")
-            }
             notifySuccess(
                 enabled
                     ? language.optimizePluginMemoryEnabled
                     : language.optimizePluginMemoryDisabled,
             )
         } catch (error) {
-            // Return to the prior mode through the same crash-safe reconciler.
-            // This recovers keys already moved by a partial failed attempt.
-            db.optimizePluginMemory = previous
-            try {
-                const rollback = await reconcilePluginStorageMode()
-                if (rollback.direction === "none") {
-                    const outcome = await requestImmediateSave({ forceFullWrite: true })
-                    requireCommittedDatabaseSave(outcome, "Plugin storage mode rollback")
-                }
-            } catch (rollbackError) {
-                console.error("[Plugin storage] mode rollback failed", rollbackError)
-            }
             notifyError(language.optimizePluginMemoryFailed(
                 error instanceof Error ? error.message : String(error),
             ))

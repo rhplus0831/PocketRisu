@@ -13,6 +13,7 @@ import { loadV3Plugins } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 import {
     canEnablePlugin,
+    isPluginStorageModeTransitioning,
     shouldDisableImportedPlugin,
 } from "./pluginMemoryOptimization";
 
@@ -379,7 +380,7 @@ export async function importPlugin(code:string|null = null, argu:{
             return
         }
         
-        const disabledForMemoryOptimization = shouldDisableImportedPlugin(
+        let disabledForMemoryOptimization = shouldDisableImportedPlugin(
             apiInternalVersion,
             db.optimizePluginMemory,
         );
@@ -414,6 +415,15 @@ export async function importPlugin(code:string|null = null, argu:{
                 return
             }
         }
+
+        // The duplicate-confirmation await may overlap a storage mode
+        // transition. Re-evaluate at the commit point so a legacy import can
+        // never become enabled from a stale pre-transition decision.
+        disabledForMemoryOptimization = shouldDisableImportedPlugin(
+            apiInternalVersion,
+            db.optimizePluginMemory,
+        )
+        pluginData.enabled = !disabledForMemoryOptimization
 
         if(oldPluginIndex !== -1){
             db.plugins[oldPluginIndex] = pluginData;
@@ -527,6 +537,258 @@ export const allowedDbKeys = [
 ]
 
 export const getV2PluginAPIs = () => {
+    const canUseSynchronousPluginStorage = () => {
+        const db = getDatabase()
+        return db.optimizePluginMemory !== true && !isPluginStorageModeTransitioning()
+    }
+    const assertSynchronousPluginStorageAccess = () => {
+        if (!canUseSynchronousPluginStorage()) {
+            throw new Error("Legacy plugin database access is unavailable during a storage mode transition.")
+        }
+    }
+    const guardedProxyByTarget = new WeakMap<object, object>()
+    const targetByGuardedProxy = new WeakMap<object, object>()
+    const unwrapGuardedValue = <T>(value: T): T => {
+        if ((typeof value === 'object' && value !== null) || typeof value === 'function') {
+            return (targetByGuardedProxy.get(value as object) ?? value) as T
+        }
+        return value
+    }
+    const cloneLegacyStorageJson = <T>(input: T): T => {
+        const value = unwrapGuardedValue(input)
+        const visiting = new Set<object>()
+        const snapshot = (candidate: unknown, path: string): unknown => {
+            if (candidate === null || typeof candidate === 'string' || typeof candidate === 'boolean') {
+                return candidate
+            }
+            if (typeof candidate === 'number') {
+                if (!Number.isFinite(candidate)) {
+                    throw new TypeError(`Legacy plugin storage requires finite JSON numbers at ${path}.`)
+                }
+                return Object.is(candidate, -0) ? 0 : candidate
+            }
+            if (typeof candidate !== 'object') {
+                throw new TypeError(`Legacy plugin storage requires JSON data at ${path}.`)
+            }
+
+            const object = candidate as object
+            if (visiting.has(object)) {
+                throw new TypeError(`Legacy plugin storage does not accept circular data at ${path}.`)
+            }
+            const prototype = Reflect.getPrototypeOf(object)
+            if (prototype !== Object.prototype && prototype !== null && !Array.isArray(object)) {
+                throw new TypeError(`Legacy plugin storage requires plain JSON objects at ${path}.`)
+            }
+
+            visiting.add(object)
+            let result: unknown
+            if (Array.isArray(object)) {
+                const lengthDescriptor = Reflect.getOwnPropertyDescriptor(object, 'length')
+                const length = lengthDescriptor && "value" in lengthDescriptor
+                    ? lengthDescriptor.value
+                    : undefined
+                if (!Number.isSafeInteger(length) || length < 0) {
+                    throw new TypeError(`Legacy plugin storage received an invalid array at ${path}.`)
+                }
+                const arraySnapshot: unknown[] = []
+                // Shadow any subsequently poisoned Array.prototype.toJSON.
+                Object.defineProperty(arraySnapshot, 'toJSON', {
+                    configurable: false,
+                    enumerable: false,
+                    value: undefined,
+                    writable: false,
+                })
+                for (let index = 0; index < length; index += 1) {
+                    const descriptor = Reflect.getOwnPropertyDescriptor(object, String(index))
+                    if (!descriptor) {
+                        // JSON serialization turns array holes into null.
+                        Object.defineProperty(arraySnapshot, index, {
+                            configurable: true,
+                            enumerable: true,
+                            value: null,
+                            writable: true,
+                        })
+                        continue
+                    }
+                    if (!("value" in descriptor)) {
+                        throw new TypeError(
+                            `Legacy plugin storage does not accept accessors at ${path}[${index}].`,
+                        )
+                    }
+                    if (!descriptor.configurable || !descriptor.enumerable) {
+                        throw new TypeError(
+                            `Legacy plugin storage requires configurable enumerable data at ${path}[${index}].`,
+                        )
+                    }
+                    Object.defineProperty(arraySnapshot, index, {
+                        configurable: true,
+                        enumerable: true,
+                        value: snapshot(descriptor.value, `${path}[${index}]`),
+                        writable: true,
+                    })
+                }
+                result = arraySnapshot
+            } else {
+                const objectSnapshot: Record<string, unknown> = Object.create(null)
+                for (const key of Reflect.ownKeys(object)) {
+                    if (typeof key !== 'string') {
+                        throw new TypeError(`Legacy plugin storage does not accept symbol keys at ${path}.`)
+                    }
+                    const descriptor = Reflect.getOwnPropertyDescriptor(object, key)
+                    if (!descriptor || !("value" in descriptor)) {
+                        throw new TypeError(`Legacy plugin storage does not accept accessors at ${path}.${key}.`)
+                    }
+                    if (!descriptor.configurable || !descriptor.enumerable) {
+                        throw new TypeError(
+                            `Legacy plugin storage requires configurable enumerable data at ${path}.${key}.`,
+                        )
+                    }
+                    Object.defineProperty(objectSnapshot, key, {
+                        configurable: true,
+                        enumerable: true,
+                        value: snapshot(descriptor.value, `${path}.${key}`),
+                        writable: true,
+                    })
+                }
+                result = objectSnapshot
+            }
+            visiting.delete(object)
+            return result
+        }
+
+        return snapshot(value, "$") as T
+    }
+    const validateLegacyStorageDescriptor = (descriptor: PropertyDescriptor): unknown => {
+        if (!("value" in descriptor) || descriptor.get || descriptor.set) {
+            throw new TypeError("Legacy plugin storage does not accept accessor descriptors.")
+        }
+        if (descriptor.configurable !== true
+            || descriptor.enumerable !== true
+            || descriptor.writable !== true) {
+            throw new TypeError(
+                "Legacy plugin storage descriptors must be configurable, enumerable, and writable.",
+            )
+        }
+        return cloneLegacyStorageJson(descriptor.value)
+    }
+    const guardedStorageProxyByTarget = new WeakMap<object, object>()
+    const guardNestedValue = <T>(value: T, storageValue = false): T => {
+        if (typeof value !== 'object' || value === null) return value
+        const target = value as object
+        const proxyCache = storageValue ? guardedStorageProxyByTarget : guardedProxyByTarget
+        const cached = proxyCache.get(target)
+        if (cached) return cached as T
+
+        const guarded = new Proxy(target, {
+            get(nestedTarget, prop, receiver) {
+                assertSynchronousPluginStorageAccess()
+                return guardNestedValue(Reflect.get(nestedTarget, prop, receiver), storageValue)
+            },
+            set(nestedTarget, prop, nestedValue) {
+                assertSynchronousPluginStorageAccess()
+                if (storageValue) {
+                    if (Array.isArray(nestedTarget) && prop === 'length') {
+                        return Reflect.set(nestedTarget, prop, nestedValue, nestedTarget)
+                    }
+                    return Reflect.defineProperty(nestedTarget, prop, {
+                        configurable: true,
+                        enumerable: true,
+                        value: cloneLegacyStorageJson(nestedValue),
+                        writable: true,
+                    })
+                }
+                return Reflect.set(
+                    nestedTarget,
+                    prop,
+                    unwrapGuardedValue(nestedValue),
+                    nestedTarget,
+                )
+            },
+            deleteProperty(nestedTarget, prop) {
+                assertSynchronousPluginStorageAccess()
+                return Reflect.deleteProperty(nestedTarget, prop)
+            },
+            defineProperty(nestedTarget, prop, descriptor) {
+                assertSynchronousPluginStorageAccess()
+                const guardedDescriptor = storageValue
+                    ? { ...descriptor, value: validateLegacyStorageDescriptor(descriptor) }
+                    : "value" in descriptor
+                        ? { ...descriptor, value: unwrapGuardedValue(descriptor.value) }
+                        : descriptor
+                return Reflect.defineProperty(nestedTarget, prop, guardedDescriptor)
+            },
+            has(nestedTarget, prop) {
+                assertSynchronousPluginStorageAccess()
+                return Reflect.has(nestedTarget, prop)
+            },
+            ownKeys(nestedTarget) {
+                assertSynchronousPluginStorageAccess()
+                return Reflect.ownKeys(nestedTarget)
+            },
+            getOwnPropertyDescriptor(nestedTarget, prop) {
+                assertSynchronousPluginStorageAccess()
+                const descriptor = Reflect.getOwnPropertyDescriptor(nestedTarget, prop)
+                if (!descriptor || !("value" in descriptor) || !descriptor.configurable) {
+                    return descriptor
+                }
+                return {
+                    ...descriptor,
+                    value: guardNestedValue(descriptor.value, storageValue),
+                }
+            },
+            getPrototypeOf(nestedTarget) {
+                assertSynchronousPluginStorageAccess()
+                if (storageValue) return null
+                return Reflect.getPrototypeOf(nestedTarget)
+            },
+            setPrototypeOf(nestedTarget, prototype) {
+                assertSynchronousPluginStorageAccess()
+                if (storageValue) {
+                    throw new TypeError("Legacy plugin storage prototypes cannot be changed.")
+                }
+                return Reflect.setPrototypeOf(nestedTarget, prototype)
+            },
+            isExtensible(nestedTarget) {
+                assertSynchronousPluginStorageAccess()
+                return Reflect.isExtensible(nestedTarget)
+            },
+            preventExtensions(nestedTarget) {
+                assertSynchronousPluginStorageAccess()
+                if (storageValue) {
+                    throw new TypeError("Legacy plugin storage objects must remain extensible.")
+                }
+                return Reflect.preventExtensions(nestedTarget)
+            },
+        })
+        proxyCache.set(target, guarded)
+        targetByGuardedProxy.set(guarded, target)
+        return guarded as T
+    }
+    const readLegacyStorageInput = (source: object, key: string): unknown => {
+        const descriptor = Reflect.getOwnPropertyDescriptor(source, key)
+        if (!descriptor || !("value" in descriptor)) {
+            throw new TypeError(`Legacy plugin storage does not accept an accessor for ${key}.`)
+        }
+        if (!descriptor.configurable || !descriptor.enumerable) {
+            throw new TypeError(
+                `Legacy plugin storage requires configurable enumerable data for ${key}.`,
+            )
+        }
+        return cloneLegacyStorageJson(descriptor.value)
+    }
+    const defineLegacyStorageValue = (
+        storage: Record<PropertyKey, unknown>,
+        key: PropertyKey,
+        value: unknown,
+    ): void => {
+        Reflect.defineProperty(storage, key, {
+            configurable: true,
+            enumerable: true,
+            value: cloneLegacyStorageJson(value),
+            writable: true,
+        })
+    }
+
     return {
         risuFetch: globalFetch,
         nativeFetch: fetchNative,
@@ -695,92 +957,172 @@ export const getV2PluginAPIs = () => {
             }
             return new Proxy(db, {
                 get(target, prop) {
+                    assertSynchronousPluginStorageAccess()
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
-                        return (target as any)[prop];
+                        return guardNestedValue(
+                            (target as any)[prop],
+                            prop === 'pluginCustomStorage',
+                        );
                     }
                     else if(target.pluginCustomStorage){
                         console.log('Getting custom db property', prop.toString());
-                        return target.pluginCustomStorage[prop.toString()];
+                        return guardNestedValue(
+                            target.pluginCustomStorage[prop.toString()],
+                            true,
+                        );
                     }
                     return undefined;
                 },
                 set(target, prop, value) {
+                    assertSynchronousPluginStorageAccess()
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
-                        (target as any)[prop] = value;
+                        (target as any)[prop] = prop === 'pluginCustomStorage'
+                            ? cloneLegacyStorageJson(value)
+                            : unwrapGuardedValue(value);
                         return true;
                     }
                     else{
                         console.log('Setting custom db property', prop.toString(), value);
                         target.pluginCustomStorage ??= {}
-                        target.pluginCustomStorage[prop.toString()] = value;
+                        defineLegacyStorageValue(target.pluginCustomStorage, prop, value)
                         return true;
                     }
                 },
                 ownKeys(target) {
-                    const keys = Reflect.ownKeys(target).filter(key => typeof key === 'string' && allowedDbKeys.includes(key));
+                    assertSynchronousPluginStorageAccess()
+                    const keys = new Set(Reflect.ownKeys(target).filter(
+                        key => typeof key === 'string' && allowedDbKeys.includes(key),
+                    ));
                     if(target.pluginCustomStorage){
-                        keys.push(...Object.keys(target.pluginCustomStorage));
+                        for (const key of Object.keys(target.pluginCustomStorage)) keys.add(key)
                     }
-                    return keys;
+                    return [...keys];
                 },
                 deleteProperty(target, prop) {
+                    assertSynchronousPluginStorageAccess()
                     console.log('Attempt to delete db.' + String(prop) + ' denied in safe database proxy.');
                     return false;
                 },
                 getPrototypeOf(target) {
+                    assertSynchronousPluginStorageAccess()
                     return Reflect.getPrototypeOf(target);
+                },
+                setPrototypeOf() {
+                    assertSynchronousPluginStorageAccess()
+                    throw new TypeError("Legacy plugin database prototypes cannot be changed.")
+                },
+                isExtensible(target) {
+                    assertSynchronousPluginStorageAccess()
+                    return Reflect.isExtensible(target)
+                },
+                preventExtensions() {
+                    assertSynchronousPluginStorageAccess()
+                    throw new TypeError("Legacy plugin database proxies must remain extensible.")
+                },
+                has(target, prop) {
+                    assertSynchronousPluginStorageAccess()
+                    return (typeof prop === 'string' && allowedDbKeys.includes(prop))
+                        || Object.hasOwn(target.pluginCustomStorage ?? {}, prop)
+                },
+                defineProperty(target, prop, descriptor) {
+                    assertSynchronousPluginStorageAccess()
+                    if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
+                        if (!("value" in descriptor)) return false
+                        return Reflect.defineProperty(target, prop, {
+                            ...descriptor,
+                            value: prop === 'pluginCustomStorage'
+                                ? validateLegacyStorageDescriptor(descriptor)
+                                : unwrapGuardedValue(descriptor.value),
+                        })
+                    }
+                    target.pluginCustomStorage ??= {}
+                    return Reflect.defineProperty(target.pluginCustomStorage, prop, {
+                        ...descriptor,
+                        value: validateLegacyStorageDescriptor(descriptor),
+                    })
+                },
+                getOwnPropertyDescriptor(target, prop) {
+                    assertSynchronousPluginStorageAccess()
+                    const source = typeof prop === 'string' && allowedDbKeys.includes(prop)
+                        ? target
+                        : target.pluginCustomStorage
+                    const descriptor = source
+                        ? Reflect.getOwnPropertyDescriptor(source, prop)
+                        : undefined
+                    if (!descriptor || !("value" in descriptor) || !descriptor.configurable) {
+                        return descriptor
+                    }
+                    const storageValue = !(typeof prop === 'string' && allowedDbKeys.includes(prop))
+                        || prop === 'pluginCustomStorage'
+                    return {
+                        ...descriptor,
+                        value: guardNestedValue(descriptor.value, storageValue),
+                    }
                 },
             })
         },
         pluginStorage: {
             getItem: (key: string) => {
+                if (!canUseSynchronousPluginStorage()) return null
                 const db = getDatabase({ snapshot: true });
                 db.pluginCustomStorage ??= {}
                 return db.pluginCustomStorage[key] || null;
             },
             setItem: (key: string, value: string) => {
+                if (!canUseSynchronousPluginStorage()) return
                 const db = getDatabase();
                 db.pluginCustomStorage ??= {}
-                db.pluginCustomStorage[key] = value;
+                defineLegacyStorageValue(db.pluginCustomStorage, key, value)
             },
             removeItem: (key: string) => {
+                if (!canUseSynchronousPluginStorage()) return
                 const db = getDatabase();
                 db.pluginCustomStorage ??= {}
                 delete db.pluginCustomStorage[key];
             },
             clear: () => {
+                if (!canUseSynchronousPluginStorage()) return
                 const db = getDatabase();
                 db.pluginCustomStorage = {};
             },
             key: (index: number) => {
+                if (!canUseSynchronousPluginStorage()) return null
                 const db = getDatabase();
                 db.pluginCustomStorage ??= {}
                 const keys = Object.keys(db.pluginCustomStorage);
                 return keys[index] || null;
             },
             keys: () => {
+                if (!canUseSynchronousPluginStorage()) return []
                 const db = getDatabase();
                 db.pluginCustomStorage ??= {}
                 return Object.keys(db.pluginCustomStorage);
             },
             length: () => {
+                if (!canUseSynchronousPluginStorage()) return 0
                 const db = getDatabase();
                 db.pluginCustomStorage ??= {}
                 return Object.keys(db.pluginCustomStorage).length;
             }
         },
         setDatabaseLite: (newDb: any) => {
-            // This API is exposed only to V2/V2.1 plugins. Those plugins are
-            // never loaded while optimizePluginMemory is enabled, so its
-            // synchronous pluginCustomStorage redirect is unreachable then.
+            // A stale legacy task can retain this API while a transition is
+            // pending, so enforce the transition guard at the mutation itself.
+            if (!canUseSynchronousPluginStorage()) return
             const db = getDatabase();
             db.pluginCustomStorage ??= {}
             for (const key of Object.keys(newDb)) {
                 if (allowedDbKeys.includes(key)) {
-                    (db as any)[key] = newDb[key];
+                    (db as any)[key] = key === 'pluginCustomStorage'
+                        ? readLegacyStorageInput(newDb, key)
+                        : newDb[key];
                 }
                 else{
-                    db.pluginCustomStorage[key] = newDb[key];
+                    defineLegacyStorageValue(
+                        db.pluginCustomStorage,
+                        key,
+                        readLegacyStorageInput(newDb, key),
+                    )
                 }
             }
             DBState.db = db;
@@ -788,19 +1130,28 @@ export const getV2PluginAPIs = () => {
         setDatabase: async (newDb: any) => {
             // V2-only compatibility path; see setDatabaseLite above. Plugin
             // installation delegated below accepts V3 plugins only.
+            if (!canUseSynchronousPluginStorage()) return
             const db = getDatabase();
             db.pluginCustomStorage ??= {}
             for (const key of Object.keys(newDb)) {
+                if (!canUseSynchronousPluginStorage()) return
                 if (key === 'plugins') {
                     console.warn('[WARN] Plugin attempted to access plugin directly. this would be blocked in future versions. Instead, use the provided APIs to manage plugins. Attempting to handle plugin installation via plugin for new plugins in the provided database object.')
                     newDb[key] = await handlePluginInstallViaPlugin(newDb.plugins)
                 }
+                if (!canUseSynchronousPluginStorage()) return
                 
                 if (allowedDbKeys.includes(key)) {
-                    (db as any)[key] = newDb[key];
+                    (db as any)[key] = key === 'pluginCustomStorage'
+                        ? readLegacyStorageInput(newDb, key)
+                        : newDb[key];
                 }
                 else{
-                    db.pluginCustomStorage[key] = newDb[key];
+                    defineLegacyStorageValue(
+                        db.pluginCustomStorage,
+                        key,
+                        readLegacyStorageInput(newDb, key),
+                    )
                 }
             }
             setDatabase(db);
@@ -841,6 +1192,13 @@ export const getV2PluginAPIs = () => {
 
 export async function loadV2Plugin(plugins: RisuPlugin[]) {
 
+    const canLoadLegacyPlugin = (plugin: RisuPlugin) =>
+        canEnablePlugin(plugin, getDatabase().optimizePluginMemory)
+
+    // This exported compatibility loader is also called defensively rather
+    // than relying only on loadPlugins() to have filtered its input.
+    plugins = plugins.filter(canLoadLegacyPlugin)
+
     if (pluginV2.loaded) {
         for (const unload of pluginV2.unload) {
             await unload()
@@ -852,6 +1210,10 @@ export async function loadV2Plugin(plugins: RisuPlugin[]) {
         pluginV2.editprocess.clear()
         pluginV2.editinput.clear()
     }
+
+    // Unload callbacks are asynchronous and a transition can begin while they
+    // run. Do not execute a legacy plugin based on the earlier filter.
+    plugins = plugins.filter(canLoadLegacyPlugin)
 
     pluginV2.loaded = true
 
@@ -917,6 +1279,10 @@ export async function loadV2Plugin(plugins: RisuPlugin[]) {
             console.log('Safety check result:', safety)
             console.log('Loading V2.1 Plugin', plugin.name, data)
 
+            if (!canLoadLegacyPlugin(plugin)) {
+                console.warn(`[Plugins] ${plugin.name} was not loaded because plugin storage is transitioning.`)
+                continue
+            }
             try {
                 new Function(createRealScript(data))()
             } catch (error) {
@@ -930,6 +1296,10 @@ export async function loadV2Plugin(plugins: RisuPlugin[]) {
             console.log('Loading V2.0 Plugin', plugin.name)
 
             if(DBState.db.allowV2Plugin){
+                if (!canLoadLegacyPlugin(plugin)) {
+                    console.warn(`[Plugins] ${plugin.name} was not loaded because plugin storage is transitioning.`)
+                    continue
+                }
                 try {
                     new Function(createRealScript(data))()
                 } catch (error) {

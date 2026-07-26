@@ -6,10 +6,75 @@ const requestImmediateSave = vi.hoisted(() => vi.fn());
 
 vi.mock("../storage/database.svelte", () => ({
     getDatabase: () => database,
+    getCurrentCharacter: () => null,
+    setDatabase: (value: unknown) => {
+        database = value;
+    },
+    setDatabaseLite: (value: unknown) => {
+        database = value;
+    },
 }));
 
 vi.mock("../globalApi.svelte", () => ({
+    fetchNative: vi.fn(),
+    globalFetch: vi.fn(),
+    readImage: vi.fn(),
     requestImmediateSave,
+    saveAsset: vi.fn(),
+    toGetter: (getter: () => unknown) => getter,
+}));
+
+vi.mock("../stores.svelte", () => {
+    const DBState = {} as { db: unknown };
+    Object.defineProperty(DBState, "db", {
+        get: () => database,
+        set: (value) => {
+            database = value;
+        },
+    });
+    return {
+        DBState,
+        hotReloading: [],
+        pluginAlertModalStore: { errors: [], open: false },
+        selectedCharID: { subscribe: (run: (value: number) => void) => {
+            run(0);
+            return () => undefined;
+        } },
+    };
+});
+
+vi.mock("../alert", () => ({
+    alertConfirm: vi.fn(async () => false),
+    alertError: vi.fn(),
+    alertPluginConfirm: vi.fn(async () => false),
+    notifyWarning: vi.fn(),
+}));
+
+vi.mock("../util", () => ({
+    selectSingleFile: vi.fn(),
+    sleep: vi.fn(async () => undefined),
+}));
+
+vi.mock("./pluginSafety", () => ({
+    checkCodeSafety: vi.fn(async (code: string) => ({
+        errors: [],
+        isSafe: true,
+        modifiedCode: code,
+    })),
+}));
+
+vi.mock("./pluginSafeClass", () => ({
+    SafeDocument: {},
+    SafeIdbFactory: class {},
+    SafeLocalStorage: class {},
+}));
+
+vi.mock("./apiV3/v3.svelte", () => ({
+    loadV3Plugins: vi.fn(async () => undefined),
+}));
+
+vi.mock("./apiV3/transpiler", () => ({
+    pluginCodeTranspiler: vi.fn(async (code: string) => code),
 }));
 
 vi.mock("../storage/persistentKv", () => {
@@ -46,6 +111,7 @@ vi.mock("../storage/persistentKv", () => {
 });
 
 const {
+    countExternalizedPluginStorageEntries,
     getPluginSaveStorageItem,
     getPluginSaveStorageKeys,
     PLUGIN_SAVE_META_PREFIX,
@@ -54,7 +120,18 @@ const {
     reconcilePluginStorageMode,
     removePluginSaveStorageItem,
     setPluginSaveStorageItem,
+    transitionPluginStorageMode,
 } = await import("./pluginSaveStorage");
+const {
+    beginPluginStorageModeTransition,
+    canEnablePlugin,
+    isPluginStorageModeTransitioning,
+} = await import("./pluginMemoryOptimization");
+const {
+    getV2PluginAPIs,
+    loadV2Plugin,
+    pluginV2,
+} = await import("./plugins.svelte");
 
 function encoded(prefix: string, key: string) {
     return `${prefix}${Buffer.from(key, "utf-8").toString("base64url")}.json`;
@@ -67,7 +144,15 @@ beforeEach(async () => {
     database = {
         optimizePluginMemory: false,
         pluginCustomStorage: {},
+        plugins: [],
     };
+    pluginV2.loaded = false;
+    pluginV2.providers.clear();
+    pluginV2.editdisplay.clear();
+    pluginV2.editoutput.clear();
+    pluginV2.editprocess.clear();
+    pluginV2.editinput.clear();
+    pluginV2.unload.clear();
     const {
         listPersistentKeys,
         makeEncodedStorageKey,
@@ -548,5 +633,546 @@ describe("reconcilePluginStorageMode", () => {
             updatedAt: 1,
         });
         expect(dependencies.persistDatabase).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe("transitionPluginStorageMode", () => {
+    test("drains SETs queued behind a held count before disabling", async () => {
+        database.optimizePluginMemory = true;
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        persistent.set(valueKey, "old");
+        const { listPersistentKeys } = await import("../storage/persistentKv");
+        let releaseCount!: () => void;
+        let markCountStarted!: () => void;
+        const countBlocked = new Promise<void>((resolve) => {
+            releaseCount = resolve;
+        });
+        const countStarted = new Promise<void>((resolve) => {
+            markCountStarted = resolve;
+        });
+        vi.mocked(listPersistentKeys)
+            .mockImplementationOnce(async (prefix: string) => {
+                markCountStarted();
+                await countBlocked;
+                return [...persistent.keys()].filter((key) => key.startsWith(prefix));
+            })
+            .mockImplementationOnce(async (prefix: string) => {
+                await countBlocked;
+                return [...persistent.keys()].filter((key) => key.startsWith(prefix));
+            });
+
+        const count = countExternalizedPluginStorageEntries();
+        await countStarted;
+        const firstSet = setPluginSaveStorageItem("alpha", "newer");
+        const secondSet = setPluginSaveStorageItem("alpha", "newest");
+        const persistDatabase = vi.fn(async () => {
+            expect(database.optimizePluginMemory).toBe(false);
+            expect(database.pluginCustomStorage.alpha).toBe("newest");
+        });
+        const transition = transitionPluginStorageMode(false, {
+            dependencies: { persistDatabase },
+        });
+
+        // Calling the transition must not flip the live mode while older work
+        // is still waiting behind the current queue owner.
+        expect(database.optimizePluginMemory).toBe(true);
+        releaseCount();
+        await expect(count).resolves.toBe(1);
+        await Promise.all([firstSet, secondSet, transition]);
+
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginCustomStorage.alpha).toBe("newest");
+        expect(persistent.has(valueKey)).toBe(false);
+        expect(persistDatabase).toHaveBeenCalledTimes(1);
+    });
+
+    test("drains removes queued behind a held count before disabling", async () => {
+        database.optimizePluginMemory = true;
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        persistent.set(valueKey, "old");
+        const { listPersistentKeys } = await import("../storage/persistentKv");
+        let releaseCount!: () => void;
+        let markCountStarted!: () => void;
+        const countBlocked = new Promise<void>((resolve) => {
+            releaseCount = resolve;
+        });
+        const countStarted = new Promise<void>((resolve) => {
+            markCountStarted = resolve;
+        });
+        vi.mocked(listPersistentKeys)
+            .mockImplementationOnce(async (prefix: string) => {
+                markCountStarted();
+                await countBlocked;
+                return [...persistent.keys()].filter((key) => key.startsWith(prefix));
+            })
+            .mockImplementationOnce(async (prefix: string) => {
+                await countBlocked;
+                return [...persistent.keys()].filter((key) => key.startsWith(prefix));
+            });
+
+        const count = countExternalizedPluginStorageEntries();
+        await countStarted;
+        const firstRemove = removePluginSaveStorageItem("alpha");
+        const secondRemove = removePluginSaveStorageItem("alpha");
+        const persistDatabase = vi.fn(async () => {
+            expect(database.optimizePluginMemory).toBe(false);
+            expect(database.pluginCustomStorage.alpha).toBeUndefined();
+        });
+        const transition = transitionPluginStorageMode(false, {
+            dependencies: { persistDatabase },
+        });
+
+        expect(database.optimizePluginMemory).toBe(true);
+        releaseCount();
+        await expect(count).resolves.toBe(1);
+        await Promise.all([firstRemove, secondRemove, transition]);
+
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginCustomStorage.alpha).toBeUndefined();
+        expect(persistent.has(valueKey)).toBe(false);
+        expect(persistDatabase).toHaveBeenCalledTimes(1);
+    });
+
+    test("holds new-mode operations until migration is durably persisted", async () => {
+        database.optimizePluginMemory = true;
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        persistent.set(valueKey, "old");
+        let releasePersist!: () => void;
+        let markPersistStarted!: () => void;
+        const persistBlocked = new Promise<void>((resolve) => {
+            releasePersist = resolve;
+        });
+        const persistStarted = new Promise<void>((resolve) => {
+            markPersistStarted = resolve;
+        });
+        const persistDatabase = vi.fn(async () => {
+            markPersistStarted();
+            await persistBlocked;
+        });
+
+        const transition = transitionPluginStorageMode(false, {
+            dependencies: { persistDatabase },
+        });
+        await persistStarted;
+        let setCompleted = false;
+        const queuedSet = setPluginSaveStorageItem("alpha", "after-transition")
+            .then(() => {
+                setCompleted = true;
+            });
+        await Promise.resolve();
+
+        expect(database.pluginCustomStorage.alpha).toBe("old");
+        expect(setCompleted).toBe(false);
+        expect(persistent.has(valueKey)).toBe(true);
+
+        releasePersist();
+        await transition;
+        await queuedSet;
+
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginCustomStorage.alpha).toBe("after-transition");
+        expect(persistent.has(valueKey)).toBe(false);
+    });
+
+    test("rolls a failed transition back before releasing queued operations", async () => {
+        database.optimizePluginMemory = true;
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        persistent.set(valueKey, "old");
+        const persistDatabase = vi.fn()
+            .mockRejectedValueOnce(new Error("transition save failed"))
+            .mockResolvedValueOnce(undefined);
+
+        const transition = transitionPluginStorageMode(false, {
+            dependencies: { persistDatabase },
+        });
+        const queuedSet = setPluginSaveStorageItem("alpha", "after-failure");
+
+        await expect(transition).rejects.toThrow("transition save failed");
+        await queuedSet;
+
+        expect(database.optimizePluginMemory).toBe(true);
+        expect(database.pluginCustomStorage).toEqual({});
+        expect(persistent.get(valueKey)).toBe("after-failure");
+        expect(persistDatabase).toHaveBeenCalledTimes(2);
+    });
+
+    test("blocks legacy activation and synchronous SET during a held disable read", async () => {
+        database.optimizePluginMemory = true;
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        persistent.set(valueKey, "newest-external-value");
+        const { readPersistentJson } = await import("../storage/persistentKv");
+        let releaseRead!: () => void;
+        let markReadStarted!: () => void;
+        const readBlocked = new Promise<void>((resolve) => {
+            releaseRead = resolve;
+        });
+        const readStarted = new Promise<void>((resolve) => {
+            markReadStarted = resolve;
+        });
+        vi.mocked(readPersistentJson).mockImplementation(async (key: string) => {
+            const value = persistent.get(key);
+            if (key === valueKey) {
+                markReadStarted();
+                await readBlocked;
+            }
+            return value;
+        });
+
+        const transition = transitionPluginStorageMode(false, {
+            dependencies: { persistDatabase: vi.fn(async () => undefined) },
+        });
+        await readStarted;
+
+        let synchronousSetRan = false;
+        const legacyPlugin = { version: "2.1" as const };
+        const activated = canEnablePlugin(legacyPlugin, database.optimizePluginMemory);
+        if (activated) {
+            synchronousSetRan = true;
+            database.pluginCustomStorage.alpha = "legacy-write";
+        }
+
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(isPluginStorageModeTransitioning()).toBe(true);
+        expect(activated).toBe(false);
+        expect(synchronousSetRan).toBe(false);
+
+        releaseRead();
+        await transition;
+
+        expect(isPluginStorageModeTransitioning()).toBe(false);
+        expect(database.pluginCustomStorage.alpha).toBe("newest-external-value");
+        expect(persistent.has(valueKey)).toBe(false);
+    });
+
+    test("blocks legacy activation and synchronous remove during a held disable read", async () => {
+        database.optimizePluginMemory = true;
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        persistent.set(valueKey, "value-that-must-not-be-resurrected");
+        const { readPersistentJson } = await import("../storage/persistentKv");
+        let releaseRead!: () => void;
+        let markReadStarted!: () => void;
+        const readBlocked = new Promise<void>((resolve) => {
+            releaseRead = resolve;
+        });
+        const readStarted = new Promise<void>((resolve) => {
+            markReadStarted = resolve;
+        });
+        vi.mocked(readPersistentJson).mockImplementation(async (key: string) => {
+            const value = persistent.get(key);
+            if (key === valueKey) {
+                markReadStarted();
+                await readBlocked;
+            }
+            return value;
+        });
+
+        const transition = transitionPluginStorageMode(false, {
+            dependencies: { persistDatabase: vi.fn(async () => undefined) },
+        });
+        await readStarted;
+
+        let synchronousRemoveRan = false;
+        const legacyPlugin = { version: 2 as const };
+        const activated = canEnablePlugin(legacyPlugin, database.optimizePluginMemory);
+        if (activated) {
+            synchronousRemoveRan = true;
+            delete database.pluginCustomStorage.alpha;
+        }
+
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(isPluginStorageModeTransitioning()).toBe(true);
+        expect(activated).toBe(false);
+        expect(synchronousRemoveRan).toBe(false);
+
+        releaseRead();
+        await transition;
+
+        expect(isPluginStorageModeTransitioning()).toBe(false);
+        expect(database.pluginCustomStorage.alpha).toBe("value-that-must-not-be-resurrected");
+        expect(persistent.has(valueKey)).toBe(false);
+    });
+
+    test("actual retained V2 APIs cannot mutate inline storage during a held disable read", async () => {
+        database.pluginCustomStorage = {
+            alpha: { nested: "inline-stale" },
+            removed: "inline-stale",
+        };
+        const v2Apis = getV2PluginAPIs();
+        const retainedDatabase = v2Apis.getDatabase() as any;
+        const retainedStorage = retainedDatabase.pluginCustomStorage as any;
+        const retainedNested = retainedStorage.alpha as any;
+
+        database.optimizePluginMemory = true;
+        const alphaKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        const removedKey = encoded(PLUGIN_SAVE_PREFIX, "removed");
+        persistent.set(alphaKey, { nested: "newest-external-value" });
+        persistent.set(removedKey, "external-value");
+        const { readPersistentJson } = await import("../storage/persistentKv");
+        let releaseRead!: () => void;
+        let markReadStarted!: () => void;
+        const readBlocked = new Promise<void>((resolve) => {
+            releaseRead = resolve;
+        });
+        const readStarted = new Promise<void>((resolve) => {
+            markReadStarted = resolve;
+        });
+        vi.mocked(readPersistentJson).mockImplementation(async (key: string) => {
+            const value = persistent.get(key);
+            if (key === alphaKey) {
+                markReadStarted();
+                await readBlocked;
+            }
+            return value;
+        });
+
+        const transition = transitionPluginStorageMode(false, {
+            dependencies: { persistDatabase: vi.fn(async () => undefined) },
+        });
+        await readStarted;
+
+        // Direct compatibility APIs are no-ops while guarded.
+        v2Apis.pluginStorage.setItem("alpha", "pluginStorage-write");
+        v2Apis.pluginStorage.removeItem("removed");
+        v2Apis.setDatabaseLite({ alpha: "setDatabaseLite-write" });
+        await v2Apis.setDatabase({ removed: "setDatabase-write" });
+
+        // Proxies and nested handles captured before the transition remain
+        // membranes. Every access/mutation route is checked dynamically.
+        expect(() => {
+            retainedDatabase.alpha = "top-level-proxy-write";
+        }).toThrow("unavailable during a storage mode transition");
+        expect(() => {
+            retainedStorage.alpha = "retained-storage-write";
+        }).toThrow("unavailable during a storage mode transition");
+        expect(() => {
+            retainedNested.nested = "retained-nested-write";
+        }).toThrow("unavailable during a storage mode transition");
+        expect(() => {
+            delete retainedStorage.removed;
+        }).toThrow("unavailable during a storage mode transition");
+        expect(() => Object.getOwnPropertyDescriptor(retainedStorage, "alpha"))
+            .toThrow("unavailable during a storage mode transition");
+        expect(() => (v2Apis.getDatabase() as any).pluginCustomStorage)
+            .toThrow("unavailable during a storage mode transition");
+
+        expect(database.pluginCustomStorage).toEqual({
+            alpha: { nested: "inline-stale" },
+            removed: "inline-stale",
+        });
+
+        releaseRead();
+        await transition;
+
+        expect(database.pluginCustomStorage).toEqual({
+            alpha: { nested: "newest-external-value" },
+            removed: "external-value",
+        });
+        expect(persistent.size).toBe(0);
+    });
+
+    test("V2.0 rechecks the transition guard immediately before execution", async () => {
+        let finishTransition: (() => void) | undefined;
+        database.optimizePluginMemory = false;
+        Object.defineProperty(database, "allowV2Plugin", {
+            configurable: true,
+            get: () => {
+                finishTransition ??= beginPluginStorageModeTransition();
+                return true;
+            },
+        });
+        const executionMarker = "__pocketRisuMt2V2Executed";
+        delete (globalThis as any)[executionMarker];
+
+        try {
+            await loadV2Plugin([{
+                name: "MT2 V2.0 regression",
+                script: `globalThis.${executionMarker} = true`,
+                arguments: {},
+                realArg: {},
+                version: 2,
+                customLink: [],
+                argMeta: {},
+                enabled: true,
+            }]);
+
+            expect(finishTransition).toBeTypeOf("function");
+            expect(isPluginStorageModeTransitioning()).toBe(true);
+            expect((globalThis as any)[executionMarker]).toBeUndefined();
+        } finally {
+            finishTransition?.();
+            delete (globalThis as any)[executionMarker];
+        }
+        expect(isPluginStorageModeTransitioning()).toBe(false);
+    });
+
+    test("legacy storage ingress snapshots caller objects before a held enable write", async () => {
+        const v2Apis = getV2PluginAPIs();
+        const databaseProxy = v2Apis.getDatabase() as any;
+        const storageProxy = databaseProxy.pluginCustomStorage as any;
+        const callerOwned = { nested: { value: "captured-at-assignment" } };
+        const proxyCallerOwned = { nested: { value: "proxy-snapshot" } };
+        const liteCallerOwned = { nested: { value: "lite-snapshot" } };
+        const asyncCallerOwned = { nested: { value: "async-snapshot" } };
+
+        (v2Apis.pluginStorage.setItem as any)("alpha", callerOwned);
+        databaseProxy.beta = proxyCallerOwned;
+        v2Apis.setDatabaseLite({ gamma: liteCallerOwned });
+        await v2Apis.setDatabase({ delta: asyncCallerOwned });
+
+        expect(database.pluginCustomStorage.alpha).toEqual(callerOwned);
+        expect(database.pluginCustomStorage.alpha).not.toBe(callerOwned);
+        expect(database.pluginCustomStorage.alpha.nested).not.toBe(callerOwned.nested);
+        expect(database.pluginCustomStorage.beta).not.toBe(proxyCallerOwned);
+        expect(database.pluginCustomStorage.gamma).not.toBe(liteCallerOwned);
+        expect(database.pluginCustomStorage.delta).not.toBe(asyncCallerOwned);
+
+        expect(() => Object.defineProperty(storageProxy, "accessorEscape", {
+            configurable: true,
+            enumerable: true,
+            get: () => callerOwned,
+        })).toThrow("does not accept accessor descriptors");
+        expect(() => Object.defineProperty(storageProxy, "nonConfigurableEscape", {
+            configurable: false,
+            enumerable: true,
+            value: callerOwned,
+            writable: true,
+        })).toThrow("must be configurable, enumerable, and writable");
+        let accessorInvoked = false;
+        const accessorInput = {};
+        Object.defineProperty(accessorInput, "nested", {
+            configurable: true,
+            enumerable: true,
+            get: () => {
+                accessorInvoked = true;
+                return callerOwned;
+            },
+        });
+        expect(() => (v2Apis.pluginStorage.setItem as any)("accessorInput", accessorInput))
+            .toThrow("does not accept accessors");
+        expect(accessorInvoked).toBe(false);
+        expect(() => {
+            databaseProxy.frozenInput = Object.freeze({ value: "unsafe-alias" });
+        }).toThrow("requires configurable enumerable data");
+
+        let inheritedToJsonInvoked = false;
+        const previousToJson = Object.getOwnPropertyDescriptor(Object.prototype, "toJSON");
+        Object.defineProperty(Object.prototype, "toJSON", {
+            configurable: true,
+            value: () => {
+                inheritedToJsonInvoked = true;
+                return { replaced: true };
+            },
+        });
+        try {
+            (v2Apis.pluginStorage.setItem as any)("toJSONInput", { safe: "snapshot" });
+        } finally {
+            if (previousToJson) {
+                Object.defineProperty(Object.prototype, "toJSON", previousToJson);
+            } else {
+                delete (Object.prototype as any).toJSON;
+            }
+        }
+        expect(inheritedToJsonInvoked).toBe(false);
+        expect(database.pluginCustomStorage.toJSONInput).toEqual({ safe: "snapshot" });
+
+        let proxyGetInvoked = false;
+        const proxyInput = new Proxy({ safe: { nested: "descriptor-only" } }, {
+            get: () => {
+                proxyGetInvoked = true;
+                throw new Error("Proxy get must not be invoked while snapshotting");
+            },
+        });
+        (v2Apis.pluginStorage.setItem as any)("proxyInput", proxyInput);
+        expect(proxyGetInvoked).toBe(false);
+        expect(database.pluginCustomStorage.proxyInput).toEqual({
+            safe: { nested: "descriptor-only" },
+        });
+
+        let inheritedSetterTarget: unknown;
+        Object.defineProperty(Object.prototype, "capturedBySetter", {
+            configurable: true,
+            set(this: unknown) {
+                inheritedSetterTarget = this;
+            },
+        });
+        try {
+            storageProxy.capturedBySetter = { safe: "own-data-property" };
+        } finally {
+            delete (Object.prototype as any).capturedBySetter;
+        }
+        expect(inheritedSetterTarget).toBeUndefined();
+        expect(Object.hasOwn(database.pluginCustomStorage, "capturedBySetter")).toBe(true);
+        expect(database.pluginCustomStorage.capturedBySetter).toEqual({
+            safe: "own-data-property",
+        });
+
+        expect(() => Object.setPrototypeOf(storageProxy, {
+            toJSON: () => ({ escaped: true }),
+        })).toThrow("prototypes cannot be changed");
+        expect(Object.getPrototypeOf(storageProxy)).toBeNull();
+        expect(() => Object.preventExtensions(storageProxy))
+            .toThrow("must remain extensible");
+        expect(Object.isExtensible(storageProxy)).toBe(true);
+        expect(() => Object.setPrototypeOf(databaseProxy, {}))
+            .toThrow("database prototypes cannot be changed");
+        expect(() => Object.preventExtensions(databaseProxy))
+            .toThrow("database proxies must remain extensible");
+
+        const durable = new Map<string, unknown>();
+        let releaseWrite!: () => void;
+        let markWriteStarted!: () => void;
+        const writeBlocked = new Promise<void>((resolve) => {
+            releaseWrite = resolve;
+        });
+        const writeStarted = new Promise<void>((resolve) => {
+            markWriteStarted = resolve;
+        });
+        const writePersistentJson = vi.fn(async (key: string, value: unknown) => {
+            // Model the production boundary: JSON bytes are captured before
+            // the network/durable write completes.
+            const serialized = JSON.parse(JSON.stringify(value));
+            if (key === encoded(PLUGIN_SAVE_PREFIX, "alpha")) {
+                markWriteStarted();
+                await writeBlocked;
+            }
+            durable.set(key, serialized);
+        });
+
+        const transition = transitionPluginStorageMode(true, {
+            dependencies: {
+                persistDatabase: vi.fn(async () => undefined),
+                writePersistentJson,
+            },
+        });
+        await writeStarted;
+        expect(isPluginStorageModeTransitioning()).toBe(true);
+
+        // Legacy assignment has localStorage-like snapshot semantics. The
+        // caller may mutate its own object, but it is no longer a live storage
+        // alias and therefore cannot create an unacknowledged late write.
+        callerOwned.nested.value = "mutated-after-serialization";
+        proxyCallerOwned.nested.value = "mutated-after-serialization";
+        liteCallerOwned.nested.value = "mutated-after-serialization";
+        asyncCallerOwned.nested.value = "mutated-after-serialization";
+
+        expect(database.pluginCustomStorage.alpha.nested.value)
+            .toBe("captured-at-assignment");
+        releaseWrite();
+        await transition;
+
+        expect(isPluginStorageModeTransitioning()).toBe(false);
+        expect(database.pluginCustomStorage).toEqual({});
+        expect(durable.get(encoded(PLUGIN_SAVE_PREFIX, "alpha"))).toEqual({
+            nested: { value: "captured-at-assignment" },
+        });
+        expect(durable.get(encoded(PLUGIN_SAVE_PREFIX, "beta"))).toEqual({
+            nested: { value: "proxy-snapshot" },
+        });
+        expect(durable.get(encoded(PLUGIN_SAVE_PREFIX, "gamma"))).toEqual({
+            nested: { value: "lite-snapshot" },
+        });
+        expect(durable.get(encoded(PLUGIN_SAVE_PREFIX, "delta"))).toEqual({
+            nested: { value: "async-snapshot" },
+        });
     });
 });

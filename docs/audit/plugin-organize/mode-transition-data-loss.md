@@ -119,6 +119,30 @@ read-only preflight that cannot alter ordering. Add a deterministic test that
 holds the count's list I/O, queues two SETs (and separately two removes),
 releases the count, and asserts the newest operation survives the toggle.
 
+### Resolution
+
+**Fixed 2026-07-26.** `transitionPluginStorageMode(target)` now acquires the
+shared storage queue before changing the live mode, performs progress counting,
+migration, and the exact-snapshot durable save while holding that barrier, and
+keeps later V3/viewer work blocked until either the transition or its rollback
+finishes. The settings UI no longer changes the flag or reconciles storage as
+separate operations.
+
+Because V2/V2.1 storage is synchronous and cannot join the async queue, the
+transition also acquires a shared legacy guard before it starts draining queued
+work. Legacy enable, import, load, retained storage/database APIs, and both V2
+execution paths enforce that guard. Values entering the legacy storage surface
+are validated as JSON and snapshotted from own data descriptors, so neither
+caller-retained aliases, getters, inherited `toJSON`, Proxy `get` traps,
+inherited setters, nor prototype mutation can bypass the transition barrier.
+
+Regression coverage in `src/ts/plugins/pluginSaveStorage.test.ts` holds list,
+read, persistence, and serialized-write boundaries while exercising queued
+SET/remove operations, rollback, actual retained V2 APIs, caller-owned aliases,
+unsafe descriptors/prototypes, and the V2.0 execution boundary. The independent
+verification pass completed with 35 focused tests, the full client suite (975
+passed, 3 skipped), `pnpm check` with no errors, and a production build.
+
 <a id="mt3"></a>
 ## MT3 — Special property names are lost or misread by the inline object backend
 

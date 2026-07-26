@@ -9,6 +9,7 @@ import {
     writePersistentJson,
 } from "../storage/persistentKv";
 import { requireCommittedDatabaseSave } from "../storage/databaseSave";
+import { beginPluginStorageModeTransition } from "./pluginMemoryOptimization";
 
 export const PLUGIN_SAVE_PREFIX = "pluginsave/";
 export const PLUGIN_SAVE_META_PREFIX = "pluginsave-meta/";
@@ -170,6 +171,7 @@ interface ReconcileDependencies {
 }
 
 export interface PluginStorageReconcileOptions {
+    onStart?: (progress: PluginStorageReconcileProgress) => void;
     onProgress?: (progress: PluginStorageReconcileProgress) => void;
     /** Test/bootstrap injection. Normal UI calls use the immediate save path. */
     dependencies?: Partial<ReconcileDependencies>;
@@ -179,6 +181,140 @@ async function persistDatabaseImmediately(): Promise<void> {
     const { requestImmediateSave } = await import("../globalApi.svelte");
     const outcome = await requestImmediateSave({ forceFullWrite: true });
     requireCommittedDatabaseSave(outcome, "Plugin storage mode transition");
+}
+
+function resolveReconcileDependencies(
+    overrides: Partial<ReconcileDependencies> = {},
+): ReconcileDependencies {
+    return {
+        getDatabase,
+        listPersistentKeys,
+        readPersistentJson,
+        writePersistentJson,
+        removePersistentKey,
+        persistDatabase: persistDatabaseImmediately,
+        ...overrides,
+    };
+}
+
+async function reconcilePluginStorageModeUnlocked(
+    deps: ReconcileDependencies,
+    options: Omit<PluginStorageReconcileOptions, "dependencies">,
+): Promise<PluginStorageReconcileResult> {
+    const db = deps.getDatabase();
+
+    if (db.optimizePluginMemory) {
+        const valueEntries = Object.entries(db.pluginCustomStorage ?? {});
+        const metaEntries = Object.entries(db.pluginStorageMeta ?? {});
+        const total = valueEntries.length + metaEntries.length;
+        options.onStart?.({ direction: "externalize", completed: 0, total });
+        if (total === 0) {
+            return { direction: "none", values: 0, meta: 0 };
+        }
+
+        const destinationStorageKeys = new Set<string>();
+        const prepareEntries = <T>(entries: Array<[string, T]>, prefix: string) => (
+            entries.map(([key, value]) => {
+                const storageKey = makeEncodedStorageKey(prefix, key);
+                if (destinationStorageKeys.has(storageKey)) {
+                    throw new Error(
+                        `Plugin storage key collision while externalizing: ${JSON.stringify(key)}`,
+                    );
+                }
+                destinationStorageKeys.add(storageKey);
+                return { key, storageKey, value };
+            })
+        );
+        // Validate every destination before writing or deleting anything.
+        const preparedValueEntries = prepareEntries(valueEntries, PLUGIN_SAVE_PREFIX);
+        const preparedMetaEntries = prepareEntries(metaEntries, PLUGIN_SAVE_META_PREFIX);
+
+        let completed = 0;
+        for (const { key, storageKey, value } of preparedValueEntries) {
+            // Inline wins if a previous partial run left a duplicate.
+            await deps.writePersistentJson(storageKey, value);
+            delete db.pluginCustomStorage[key];
+            options.onProgress?.({
+                direction: "externalize",
+                completed: ++completed,
+                total,
+            });
+        }
+        for (const { key, storageKey, value: record } of preparedMetaEntries) {
+            await deps.writePersistentJson(storageKey, record);
+            if (db.pluginStorageMeta) delete db.pluginStorageMeta[key];
+            options.onProgress?.({
+                direction: "externalize",
+                completed: ++completed,
+                total,
+            });
+        }
+        if (db.pluginStorageMeta && Object.keys(db.pluginStorageMeta).length === 0) {
+            delete db.pluginStorageMeta;
+        }
+
+        await deps.persistDatabase();
+        return {
+            direction: "externalize",
+            values: valueEntries.length,
+            meta: metaEntries.length,
+        };
+    }
+
+    const [listedValueKeys, listedMetaKeys] = await Promise.all([
+        deps.listPersistentKeys(PLUGIN_SAVE_PREFIX),
+        deps.listPersistentKeys(PLUGIN_SAVE_META_PREFIX),
+    ]);
+    const valueStorageKeys = listedValueKeys.filter(
+        (key) => decodeListedStorageKey(key, PLUGIN_SAVE_PREFIX) !== null,
+    );
+    const metaStorageKeys = listedMetaKeys.filter(
+        (key) => decodeListedStorageKey(key, PLUGIN_SAVE_META_PREFIX) !== null,
+    );
+    const total = valueStorageKeys.length + metaStorageKeys.length;
+    options.onStart?.({ direction: "internalize", completed: 0, total });
+    if (total === 0) {
+        return { direction: "none", values: 0, meta: 0 };
+    }
+
+    db.pluginCustomStorage ??= {};
+    if (metaStorageKeys.length > 0) db.pluginStorageMeta ??= {};
+
+    let completed = 0;
+    for (const storageKey of valueStorageKeys) {
+        const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
+        if (key === null) continue;
+        db.pluginCustomStorage[key] = await deps.readPersistentJson(storageKey, { cached: true });
+        options.onProgress?.({
+            direction: "internalize",
+            completed: ++completed,
+            total,
+        });
+    }
+    for (const storageKey of metaStorageKeys) {
+        const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
+        if (key === null) continue;
+        db.pluginStorageMeta![key] = await deps.readPersistentJson(storageKey);
+        options.onProgress?.({
+            direction: "internalize",
+            completed: ++completed,
+            total,
+        });
+    }
+
+    // The database becomes the durable copy before any external key goes.
+    await deps.persistDatabase();
+    for (const storageKey of valueStorageKeys) {
+        await deps.removePersistentKey(storageKey);
+    }
+    for (const storageKey of metaStorageKeys) {
+        await deps.removePersistentKey(storageKey);
+    }
+    return {
+        direction: "internalize",
+        values: valueStorageKeys.length,
+        meta: metaStorageKeys.length,
+    };
 }
 
 /**
@@ -192,128 +328,53 @@ async function persistDatabaseImmediately(): Promise<void> {
 export async function reconcilePluginStorageMode(
     options: PluginStorageReconcileOptions = {},
 ): Promise<PluginStorageReconcileResult> {
-    const deps: ReconcileDependencies = {
-        getDatabase,
-        listPersistentKeys,
-        readPersistentJson,
-        writePersistentJson,
-        removePersistentKey,
-        persistDatabase: persistDatabaseImmediately,
-        ...options.dependencies,
-    };
+    const deps = resolveReconcileDependencies(options.dependencies);
+    return withPluginSaveStorageLock(() => reconcilePluginStorageModeUnlocked(deps, options));
+}
 
-    return withPluginSaveStorageLock(async () => {
-        const db = deps.getDatabase();
+/**
+ * Atomically switch plugin storage routing with respect to queued plugin calls.
+ * Operations already queued run in the old mode; later operations cannot observe
+ * the new flag until migration and its durable database save have completed.
+ */
+export async function transitionPluginStorageMode(
+    target: boolean,
+    options: PluginStorageReconcileOptions = {},
+): Promise<PluginStorageReconcileResult> {
+    const deps = resolveReconcileDependencies(options.dependencies);
+    // Acquire synchronously, before waiting behind the storage queue. This
+    // prevents legacy activation while a requested transition is draining old
+    // operations as well as while its new mode is being reconciled.
+    const finishTransition = beginPluginStorageModeTransition();
 
-        if (db.optimizePluginMemory) {
-            const valueEntries = Object.entries(db.pluginCustomStorage ?? {});
-            const metaEntries = Object.entries(db.pluginStorageMeta ?? {});
-            const total = valueEntries.length + metaEntries.length;
-            if (total === 0) {
-                return { direction: "none", values: 0, meta: 0 };
-            }
+    try {
+        return await withPluginSaveStorageLock(async () => {
+            const db = deps.getDatabase();
+            const previous = db.optimizePluginMemory === true;
+            db.optimizePluginMemory = target;
 
-            const destinationStorageKeys = new Set<string>();
-            const prepareEntries = <T>(entries: Array<[string, T]>, prefix: string) => (
-                entries.map(([key, value]) => {
-                    const storageKey = makeEncodedStorageKey(prefix, key);
-                    if (destinationStorageKeys.has(storageKey)) {
-                        throw new Error(
-                            `Plugin storage key collision while externalizing: ${JSON.stringify(key)}`,
-                        );
+            try {
+                const result = await reconcilePluginStorageModeUnlocked(deps, options);
+                // With no rows to move, reconciliation has no reason to save. An
+                // actual flag transition still needs its own durable acknowledgement.
+                if (result.direction === "none" && previous !== target) {
+                    await deps.persistDatabase();
+                }
+                return result;
+            } catch (transitionError) {
+                db.optimizePluginMemory = previous;
+                try {
+                    const rollback = await reconcilePluginStorageModeUnlocked(deps, {});
+                    if (rollback.direction === "none") {
+                        await deps.persistDatabase();
                     }
-                    destinationStorageKeys.add(storageKey);
-                    return { key, storageKey, value };
-                })
-            );
-            // Validate every destination before writing or deleting anything.
-            const preparedValueEntries = prepareEntries(valueEntries, PLUGIN_SAVE_PREFIX);
-            const preparedMetaEntries = prepareEntries(metaEntries, PLUGIN_SAVE_META_PREFIX);
-
-            let completed = 0;
-            for (const { key, storageKey, value } of preparedValueEntries) {
-                // Inline wins if a previous partial run left a duplicate.
-                await deps.writePersistentJson(storageKey, value);
-                delete db.pluginCustomStorage[key];
-                options.onProgress?.({
-                    direction: "externalize",
-                    completed: ++completed,
-                    total,
-                });
+                } catch (rollbackError) {
+                    console.error("[Plugin storage] mode rollback failed", rollbackError);
+                }
+                throw transitionError;
             }
-            for (const { key, storageKey, value: record } of preparedMetaEntries) {
-                await deps.writePersistentJson(storageKey, record);
-                if (db.pluginStorageMeta) delete db.pluginStorageMeta[key];
-                options.onProgress?.({
-                    direction: "externalize",
-                    completed: ++completed,
-                    total,
-                });
-            }
-            if (db.pluginStorageMeta && Object.keys(db.pluginStorageMeta).length === 0) {
-                delete db.pluginStorageMeta;
-            }
-
-            await deps.persistDatabase();
-            return {
-                direction: "externalize",
-                values: valueEntries.length,
-                meta: metaEntries.length,
-            };
-        }
-
-        const [listedValueKeys, listedMetaKeys] = await Promise.all([
-            deps.listPersistentKeys(PLUGIN_SAVE_PREFIX),
-            deps.listPersistentKeys(PLUGIN_SAVE_META_PREFIX),
-        ]);
-        const valueStorageKeys = listedValueKeys.filter(
-            (key) => decodeListedStorageKey(key, PLUGIN_SAVE_PREFIX) !== null,
-        );
-        const metaStorageKeys = listedMetaKeys.filter(
-            (key) => decodeListedStorageKey(key, PLUGIN_SAVE_META_PREFIX) !== null,
-        );
-        const total = valueStorageKeys.length + metaStorageKeys.length;
-        if (total === 0) {
-            return { direction: "none", values: 0, meta: 0 };
-        }
-
-        db.pluginCustomStorage ??= {};
-        if (metaStorageKeys.length > 0) db.pluginStorageMeta ??= {};
-
-        let completed = 0;
-        for (const storageKey of valueStorageKeys) {
-            const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
-            if (key === null) continue;
-            db.pluginCustomStorage[key] = await deps.readPersistentJson(storageKey, { cached: true });
-            options.onProgress?.({
-                direction: "internalize",
-                completed: ++completed,
-                total,
-            });
-        }
-        for (const storageKey of metaStorageKeys) {
-            const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
-            if (key === null) continue;
-            db.pluginStorageMeta![key] = await deps.readPersistentJson(storageKey);
-            options.onProgress?.({
-                direction: "internalize",
-                completed: ++completed,
-                total,
-            });
-        }
-
-        // The database becomes the durable copy before any external key goes.
-        await deps.persistDatabase();
-        for (const storageKey of valueStorageKeys) {
-            await deps.removePersistentKey(storageKey);
-        }
-        for (const storageKey of metaStorageKeys) {
-            await deps.removePersistentKey(storageKey);
-        }
-        return {
-            direction: "internalize",
-            values: valueStorageKeys.length,
-            meta: metaStorageKeys.length,
-        };
-    });
+        });
+    } finally {
+        finishTransition();
+    }
 }
