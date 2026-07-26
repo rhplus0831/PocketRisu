@@ -2,7 +2,7 @@
 
 - Audit point: `bbe0e024` (branch `serve`, clean tree)
 - Prior audit: [v1](../../../.archived-docs/v1/serve-branch-data-loss-audit.md) — 16 findings, all fixed at `2e3d4f05`
-- Current status: **35 open findings** — 12 fatal, 23 warning; 1 fixed
+- Current status: **34 open findings** — 11 fatal, 23 warning; 1 partially fixed, 1 fixed
 
 ## Scope and method
 
@@ -36,7 +36,7 @@ fixing.
 | recovery | [Every recovery copy omits MCP tool-call payloads](fatal/recovery-copies-omit-mcp-tool-call-payloads.md) | Broken recovery copy |
 | sync | [A patch conflict promotes the ETag and authorizes a stale full write](fatal/patch-conflict-etag-promotion-enables-stale-full-write.md) | Direct loss |
 | server core | [Acknowledged patches are not durable for up to five seconds](fatal/acknowledged-patches-are-not-durable.md) | Direct loss |
-| sync | [A new tab silently steals the writer lease; the displaced tab discards dirty state](fatal/writer-lease-displacement-discards-dirty-state.md) | Direct loss |
+| sync | [A new tab silently steals the writer lease; the displaced tab discards dirty state](../../../.archived-docs/v2/fatal/writer-lease-displacement-discards-dirty-state.md) | Direct loss (partially fixed) |
 | file mgmt | [The inlay orphan scan classifies referenced inlays as deletable](fatal/inlay-orphan-scan-classifies-referenced-inlays-as-deletable.md) | Direct loss |
 | file mgmt | [Automatic boot GC deletes plugin-owned assets](fatal/boot-asset-gc-deletes-plugin-owned-assets.md) | Direct loss |
 | file stores | [Inlay replacement unlinks the only copy before publishing](fatal/inlay-replacement-unlinks-before-publish.md) | Direct loss |

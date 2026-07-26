@@ -255,7 +255,7 @@ Drafts deliberately do not modify `Chat`, so typing does not re-upload a chat bo
 
 - Draft operations intentionally swallow failures so draft persistence cannot block chat interaction (`src/ts/storage/chatDraft.ts:54-60`). Do not reuse that error policy for database or chat-body writes.
 
-- The save coordinator uses both `BroadcastChannel('risu-db')` for same-browser tabs and the server’s `x-session-id` lock for other devices (`src/ts/globalApi.svelte.ts:380-406`; `src/ts/storage/nodeStorage.ts:43-45`, `:162-175`). A 423 response deactivates the page and prompts reload.
+- The save coordinator uses both `BroadcastChannel('risu-db')` for same-browser tabs and the server’s `x-session-id` lock for other devices (`src/ts/globalApi.svelte.ts:380-416`; `src/ts/storage/nodeStorage.ts:154-198`). A 423 response permanently fences the stale page, aborts its active chat request, and offers an explicit choice between a frozen read-only recovery view and discarding local state to reload/take write access. The server lock remains last-caller-wins; this UI does not flush or durably journal the displaced page's dirty state (`src/ts/storage/writerTakeover.ts`).
 
 - Patch conflict rebasing treats `plugins` and `pluginCustomStorage` as tracked branches instead of generic root fields; when their flags are dirty it explicitly overlays the local copies alongside bot presets, modules, and tracked characters (`src/ts/globalApi.svelte.ts:692-765`). Preserve those explicit branches when changing the merge.
 

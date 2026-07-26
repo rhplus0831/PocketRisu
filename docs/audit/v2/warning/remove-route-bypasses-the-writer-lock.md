@@ -11,7 +11,7 @@ Writes from a displaced tab are fenced with 423, but deletions are not:
 `/api/remove` (inlays, assets, arbitrary KV keys including `pluginsave/` and
 `drafts/`) never calls `checkActiveSession`. A stale tab therefore keeps
 deleting successfully after losing the writer lease — it also never receives
-the 423 that would tell it to reload — so it can remove values a newer
+the 423 that would tell it it has been displaced — so it can remove values a newer
 session wrote (plugin storage updated on another device, drafts, gallery
 deletions based on a stale view). The single-writer model's protection is
 one-sided.

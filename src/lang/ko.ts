@@ -1106,7 +1106,13 @@ export const languageKorean = {
   noWaitForTranslate: "번역 기다리지 않기",
   antiClaudeOverload: "Claude 오버로드 방지",
   activeTabChange:
-    "현재 탭이 비활성화되었습니다. OK를 누르면 탭이 다시 활성화됩니다.",
+    "다른 탭이 활성화되어 현재 탭이 비활성화되었습니다.",
+  writerTakeoverBody:
+    "다른 브라우저 세션이 쓰기 권한을 가져갔습니다. 이 페이지에서는 더 이상 변경 사항을 저장할 수 없습니다. 작성 중인 내용을 복사할 수 있도록 읽기 전용 상태로 머무르거나, 이 페이지의 저장되지 않은 변경 사항을 버리고 새로고침하여 다른 세션에서 쓰기 권한을 가져오세요.",
+  writerTakeoverStayOffline: "이 페이지에 머무르기 (읽기 전용)",
+  writerTakeoverReload: "변경 사항을 버리고 새로고침하여 쓰기 권한 가져오기",
+  writerOfflineBanner:
+    "읽기 전용: 다른 세션에 쓰기 권한이 있습니다. 새로고침하기 전에 저장되지 않은 내용을 복사하세요.",
   addCharacter: "캐릭터 추가",
   importFromRealm: "RisuRealm에서 고르기",
   importFromRealmDesc:

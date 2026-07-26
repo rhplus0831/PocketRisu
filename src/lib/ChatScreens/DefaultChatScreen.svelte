@@ -64,6 +64,7 @@ import { isMobile } from 'src/ts/platform'
 
     let messageInput:string = $state('')
     let messageInputTranslate:string = $state('')
+    let abortController:null|AbortController = null
     let openMenu = $state(false)
     let loadPages = $state(getInitialChatLoadPages(DBState.db))
     let doingChatInputTranslate = false
@@ -146,11 +147,14 @@ import { isMobile } from 'src/ts/platform'
     $effect(() => {
         const onHide = () => { if (document.visibilityState === 'hidden') persistDraftNow() }
         const onPageHide = () => persistDraftNow()
+        const onWriterAccessLost = () => abortController?.abort()
         document.addEventListener('visibilitychange', onHide)
         window.addEventListener('pagehide', onPageHide)
+        window.addEventListener('risu-writer-access-lost', onWriterAccessLost)
         return () => {
             document.removeEventListener('visibilitychange', onHide)
             window.removeEventListener('pagehide', onPageHide)
+            window.removeEventListener('risu-writer-access-lost', onWriterAccessLost)
         }
     })
 
@@ -545,8 +549,6 @@ import { isMobile } from 'src/ts/platform'
         }
         DBState.db.characters[$selectedCharID].reloadKeys += 1
     }
-
-    let abortController:null|AbortController = null
 
     async function sendChatMain(continued:boolean = false) {
 

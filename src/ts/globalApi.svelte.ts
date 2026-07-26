@@ -7,7 +7,7 @@ import { setDatabase, type Database, defaultSdDataFunc, getDatabase, appVer, nod
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore, loadingOverlayStore, chatDeselected } from "./stores.svelte";
 import { loadPlugins } from "./plugins/plugins.svelte";
-import { alertConfirm, alertError, alertMd, alertNormalWait, alertSelect, alertTOS, waitAlert, notifySuccess, notifyError } from "./alert";
+import { alertConfirm, alertError, alertMd, alertSelect, alertTOS, waitAlert, notifySuccess, notifyError } from "./alert";
 import { hasher } from "./parser/parser.svelte";
 import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
@@ -30,6 +30,7 @@ import { doingChat } from "./process/index.svelte";
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 import { capturePreTrackingPluginStorageChanges } from "./plugins/pluginStorageTracking";
+import { enterWriterTakeoverFlow } from "./storage/writerTakeover";
 
 export const forageStorage = new AutoStorage()
 
@@ -401,9 +402,7 @@ export async function saveDb() {
             }
             if (!gotChannel) {
                 gotChannel = true
-                alertNormalWait(language.activeTabChange).then(() => {
-                    location.reload()
-                })
+                enterWriterTakeoverFlow()
             }
         }
     }
@@ -412,9 +411,7 @@ export async function saveDb() {
     window.addEventListener('risu-session-deactivated', () => {
         if (!gotChannel) {
             gotChannel = true
-            alertNormalWait(language.activeTabChange).then(() => {
-                location.reload()
-            })
+            enterWriterTakeoverFlow()
         }
     })
 
@@ -789,8 +786,8 @@ export async function saveDb() {
         }
     ): Promise<'saved' | 'retry' | 'noop'> {
         if (gotChannel) {
-            // Data is saved in another tab.
-            await sleep(1000)
+            // Another session owns the server. Keep this page's live state in
+            // memory for the read-only recovery UI, but never retry stale data.
             return 'noop'
         }
         if (channel && !options?.skipBroadcast) {
@@ -1067,7 +1064,9 @@ export async function saveDb() {
                     savetrys = 0
                 } else if (result === 'noop' && hasTrackedChanges(toSave)) {
                     requeueTrackedChanges(toSave)
-                    changed = true
+                    // Once displaced, pause instead of spinning forever. The
+                    // frozen page can only leave through an explicit reload.
+                    if (!gotChannel) changed = true
                 }
             } catch (error) {
                 requeueTrackedChanges(toSave)

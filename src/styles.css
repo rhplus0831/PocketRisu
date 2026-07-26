@@ -380,6 +380,74 @@ html {
   height: 100%;
 }
 
+#app.risu-writer-offline-frozen :not(.risu-writer-offline-banner, .risu-writer-offline-banner *) {
+  user-select: text !important;
+}
+
+#app.risu-writer-offline-frozen
+  :is(
+    button,
+    a[href],
+    select,
+    summary,
+    [role='button'],
+    [role='checkbox'],
+    [role='link'],
+    [role='menuitem'],
+    [role='menuitemcheckbox'],
+    [role='menuitemradio'],
+    [role='option'],
+    [role='radio'],
+    [role='slider'],
+    [role='switch'],
+    audio[controls],
+    video[controls],
+    input[type='button'],
+    input[type='checkbox'],
+    input[type='color'],
+    input[type='file'],
+    input[type='image'],
+    input[type='radio'],
+    input[type='range'],
+    input[type='reset'],
+    input[type='submit']
+  ) {
+  pointer-events: none;
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.risu-writer-offline-banner {
+  position: fixed;
+  z-index: 2147483647;
+  top: 0;
+  left: 50%;
+  display: flex;
+  width: min(100%, 48rem);
+  box-sizing: border-box;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--risu-theme-borderc);
+  border-top: 0;
+  border-radius: 0 0 0.5rem 0.5rem;
+  background: var(--risu-theme-darkbg);
+  color: var(--risu-theme-textcolor);
+  box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 0.35);
+  transform: translateX(-50%);
+  user-select: text;
+}
+
+.risu-writer-offline-banner button {
+  flex: none;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--risu-theme-borderc);
+  border-radius: 0.375rem;
+  background: var(--risu-theme-darkbutton);
+  color: var(--risu-theme-textcolor);
+}
+
 .bgc {
   border-top: 1px solid rgba(98, 114, 164, 0.7);
 }
