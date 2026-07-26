@@ -76,10 +76,12 @@ absence is `missing`.
 `setFromRead()` accepts that read result and publishes through AA3 CAS. A
 failed prerequisite read is a guaranteed no-op, a missing read uses
 `expectedRevision: null`, and a stale value/mistaken-missing snapshot returns
-an explicit conflict without changing the row. Guest-local `updateItem()`
-performs the read/transform/guarded-set pattern and never invokes its transform
-after a failed read. Guarded writes retain the existing abort, lifecycle-drain,
-structured failure, atomic owner, and mode-transition behavior.
+an explicit conflict without changing the row. The final host-coordinated
+`updateItem()` contract from IP5 also never invokes its transform after a
+failed initial read; it adds a fair migration barrier, a final revision
+recheck, one atomic CAS, and a total cancellation deadline. Guarded writes
+retain the existing abort, lifecycle-drain, structured failure, atomic owner,
+and mode-transition behavior.
 
 [Public integration guidance](../../en/plugin-storage.md) documents safe
 configuration, credential, index, ledger, and shard migration patterns,
@@ -360,15 +362,18 @@ submission is known not committed, and an expired transform cannot submit a
 late write after it eventually returns.
 
 Each plugin instance has a fair shared-writer/exclusive-migration barrier.
-`setItem()`, `removeItem()`, `clear()`, `atomicBatch()`, and the V3 database
-replacement APIs enter as writers; `updateItem()` excludes them for its full
-read-transform-CAS interval. A queued migration prevents later writers from
-overtaking it. If the caller's deadline expires after CAS admission, the
-barrier remains held until that non-cancellable publication settles. Writers
-in another plugin instance or session are outside the local barrier, so the
-coordinator re-reads the opaque revision immediately before publication and
-the AA3 atomic batch supplies the final server-side `expectedRevision` check.
-A changed revision returns `committed: false` without writing.
+`setFromRead()`, `rewriteItem()`, `setItem()`/`setItemWithOutcome()`,
+`removeItem()`/`removeItemWithOutcome()`/`removeItemConfirmed()`, `clear()`,
+`atomicBatch()` (including immutable-generation publication/collection), and
+the V3 database replacement APIs enter as writers; `updateItem()` excludes
+them for its full read-transform-CAS interval. A queued migration prevents
+later writers from overtaking it. If the caller's deadline expires after CAS
+admission, the barrier remains held until that non-cancellable publication
+settles. Writers in another plugin instance or session are outside the local
+barrier, so the coordinator re-reads the opaque revision immediately before
+publication and the AA3 atomic batch supplies the final server-side
+`expectedRevision` check. A changed revision returns `committed: false`
+without writing.
 
 The CAS admission boundary is intentionally explicit. Before dispatch,
 cancellation is `STORAGE_TIMEOUT`/abort with `commitOutcomeUnknown: false`.

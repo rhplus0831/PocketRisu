@@ -70,21 +70,33 @@ A `missing` read uses an absence CAS (`expectedRevision: null`). If another
 row already exists—or appears before the write—the server returns a conflict
 instead of overwriting it. Passing a `failed` read is a no-op.
 
-For a single-key update, `updateItem()` performs the same pattern and does not
-run its callback after a failed read:
+For a single-key update, `updateItem()` uses the host's fair migration barrier,
+performs an initial versioned read plus a final pre-publication re-read, and
+does not run its callback when the initial read rejects. The callback receives
+the current `missing | value` snapshot and the operation's `AbortSignal`:
 
 ```ts
-const result = await risuai.pluginStorage.updateItem<Ledger, Ledger>(
+const result = await risuai.pluginStorage.updateItem(
   'ledger',
-  read => read.status === 'missing'
-    ? { entries: [] }
-    : appendEntry(read.value),
+  (current, signal) => {
+    signal.throwIfAborted();
+    return current.status === 'missing'
+      ? { entries: [] }
+      : appendEntry(current.value);
+  },
+  { timeoutMs: 10_000 },
 );
 
-if (result.status === 'conflict') {
-  // Retry the whole update only if this callback is safe to run again.
+if (!result.committed) {
+  // A concurrent writer won. Re-read before retrying a pure transform.
 }
 ```
+
+Unlike `readItem()`, a failed `updateItem()` read rejects because no explicit
+`failed` union is returned from this migration API. Cancellation after its CAS
+has been submitted rejects with `commitOutcomeUnknown: true`; re-read before
+retrying. Use `readItem()` plus `setFromRead()` when the caller needs failures
+as values or must decide whether to construct a fallback before transforming.
 
 For multi-key publication, call `getWithRevision()`/`readItem()` for every
 prerequisite and pass every successful revision to `atomicBatch()`. Abort the
