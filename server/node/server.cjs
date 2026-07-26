@@ -117,6 +117,7 @@ const {
 } = require('./pluginSaveKeys.cjs');
 const {
     PluginStorageValidationError,
+    assertPluginStorageRow,
     decodeValidatedPluginStorageKey,
     encodeValidatedPluginStorageKey,
     isPluginStorageValidationError,
@@ -271,6 +272,12 @@ const pluginStorageMutationFailpoint = process.env.NODE_ENV === 'test'
 const snapshotRestoreFailpoint = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_SNAPSHOT_RESTORE_FAILPOINT ?? '').trim()
     : '';
+const pluginStorageOwnershipReadFailpoint = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_PLUGIN_OWNERSHIP_READ_FAILPOINT ?? '').trim()
+    : '';
+const pluginStorageOwnershipStatsPath = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_PLUGIN_OWNERSHIP_STATS_PATH ?? '').trim()
+    : '';
 const SNAPSHOT_RESTORE_TEST_GATE_DIR = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_SNAPSHOT_RESTORE_TEST_GATE_DIR ?? '').trim() || null
     : null;
@@ -281,20 +288,29 @@ const backupImportFailpoint = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_BACKUP_IMPORT_FAILPOINT ?? '').trim()
     : '';
 
-async function waitAtSnapshotRestoreTestGate() {
+function throwIfStreamingRestoreAborted(shouldAbort) {
+    if (typeof shouldAbort !== 'function' || !shouldAbort()) return;
+    const error = new Error('Streaming Risu load cancelled');
+    error.code = 'RISU_STREAM_ABORTED';
+    throw error;
+}
+
+async function waitAtSnapshotRestoreTestGate(shouldAbort) {
     if (!SNAPSHOT_RESTORE_TEST_GATE_DIR) return;
     const holdPath = path.join(SNAPSHOT_RESTORE_TEST_GATE_DIR, 'hold');
     if (!existsSync(holdPath)) return;
     await fs.mkdir(SNAPSHOT_RESTORE_TEST_GATE_DIR, { recursive: true });
     await fs.writeFile(
         path.join(SNAPSHOT_RESTORE_TEST_GATE_DIR, 'entered'),
-        'after-folded-delete',
+        'before-folded-delete',
         'utf-8',
     );
     const releasePath = path.join(SNAPSHOT_RESTORE_TEST_GATE_DIR, 'release');
     while (existsSync(holdPath) && !existsSync(releasePath)) {
+        throwIfStreamingRestoreAborted(shouldAbort);
         await new Promise((resolve) => setTimeout(resolve, 10));
     }
+    throwIfStreamingRestoreAborted(shouldAbort);
 }
 
 async function waitAtBackupImportTestGate() {
@@ -929,26 +945,24 @@ async function ingestDatabaseStreaming(source, { inspection = null, shouldAbort 
     const streamedPluginValueKeys = new Set();
     const streamedPluginMetaKeys = new Set();
     let foldedPluginStorage = false;
-    // Capture the live ownership proof before the streaming parser can write a
-    // target row whose key overlaps the current manifest. Defer a validation
-    // error until the folded marker is actually observed so unmarked imports
-    // retain their non-destructive legacy behavior.
-    let priorOwnership = null;
-    let priorOwnershipError = null;
-    try {
-        priorOwnership = readStrictPluginStorageOwnershipBoundary();
-    } catch (error) {
-        priorOwnershipError = error;
-    }
     const result = await chatRowStore.ingestStreamingDatabase(source, {
         inspection: inspection ?? await inspectRisuSaveSource(source),
         tempDir: savePath,
         shouldAbort,
         onPluginStorageFolded: async () => {
             foldedPluginStorage = true;
-            if (priorOwnershipError) throw priorOwnershipError;
+            // The marker is decoded before the walker emits any target rows.
+            // Prove the current publication only at that point: an unmarked
+            // import must not read large live ownership bodies at all. The
+            // async proof releases each decoded row before yielding, remains
+            // cancellable, and completes before a same-key target can replace
+            // the old bytes that established deletion authority.
+            const priorOwnership = await proveStrictPluginStorageOwnershipBoundary({
+                shouldAbort,
+            });
+            await waitAtSnapshotRestoreTestGate(shouldAbort);
+            throwIfStreamingRestoreAborted(shouldAbort);
             deleteOwnedPluginStorageRows(priorOwnership);
-            await waitAtSnapshotRestoreTestGate();
         },
         onPluginStorageEntry: ({ field, key, value }) => {
             const prefix = field === 'pluginStorageMeta'
@@ -3254,13 +3268,18 @@ function readPluginStorageManifestState(readValue = kvGet) {
     }
 }
 
-function readStrictPluginStorageOwnershipBoundary(readValue = kvGet) {
+function readStrictPluginStorageOwnershipManifest(readValue = kvGet) {
     const raw = readValue(PLUGIN_STORAGE_MANIFEST_KEY);
     if (!raw) return { manifest: null, valueKeys: [], metaKeys: [] };
 
     let parsed;
     try {
-        parsed = JSON.parse(Buffer.from(raw).toString('utf-8'));
+        const bytes = Buffer.isBuffer(raw)
+            ? raw
+            : ArrayBuffer.isView(raw)
+                ? Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength)
+                : Buffer.from(raw);
+        parsed = JSON.parse(bytes.toString('utf-8'));
     } catch {
         throw new TypeError('The live plugin storage manifest is malformed');
     }
@@ -3271,24 +3290,102 @@ function readStrictPluginStorageOwnershipBoundary(readValue = kvGet) {
     // parsePluginStorageManifest canonicalizes duplicate entries for ordinary
     // reads. Destructive replacement needs a stronger ownership proof: a
     // duplicate declaration is ambiguous input, not permission to delete.
-    if (
-        new Set(parsed.valueKeys).size !== parsed.valueKeys.length
-        || new Set(parsed.metaKeys).size !== parsed.metaKeys.length
-    ) {
+    if (manifest.valueKeys.length !== parsed.valueKeys.length
+        || manifest.metaKeys.length !== parsed.metaKeys.length) {
         throw new TypeError('The live plugin storage manifest contains duplicate entries');
     }
-    for (const storageKey of [...manifest.valueKeys, ...manifest.metaKeys]) {
-        const value = readValue(storageKey);
-        if (!value) {
-            throw new TypeError('The live plugin storage manifest references a missing row');
-        }
-        validatePluginStorageRow(storageKey, value);
-    }
+
     return {
         manifest,
         valueKeys: manifest.valueKeys,
         metaKeys: manifest.metaKeys,
     };
+}
+
+function validateStrictPluginStorageOwnershipRow(storageKey, readValue) {
+    // Keep the byte body and its parsed JSON inside this narrow call. The
+    // assertion validates row JSON without constructing another deep snapshot,
+    // and neither representation is retained by the manifest proof.
+    if (pluginStorageOwnershipReadFailpoint === 'any'
+        || pluginStorageOwnershipReadFailpoint === storageKey) {
+        throw new Error('Injected live plugin ownership body read failure');
+    }
+    const value = readValue(storageKey);
+    if (!value) {
+        throw new TypeError('The live plugin storage manifest references a missing row');
+    }
+    assertPluginStorageRow(storageKey, value);
+    return value.byteLength ?? value.length ?? 0;
+}
+
+function readStrictPluginStorageOwnershipBoundary(readValue = kvGet) {
+    const ownership = readStrictPluginStorageOwnershipManifest(readValue);
+    for (const keys of [ownership.valueKeys, ownership.metaKeys]) {
+        for (const storageKey of keys) {
+            validateStrictPluginStorageOwnershipRow(storageKey, readValue);
+        }
+    }
+    return ownership;
+}
+
+async function proveStrictPluginStorageOwnershipBoundary({
+    readValue = kvGet,
+    shouldAbort,
+} = {}) {
+    const stats = pluginStorageOwnershipStatsPath
+        ? {
+            activeRows: 0,
+            completed: false,
+            largestRowBytes: 0,
+            maxActiveRows: 0,
+            maxPostGcHeapGrowth: 0,
+            rowsRead: 0,
+        }
+        : null;
+    if (stats && typeof global.gc === 'function') global.gc();
+    const baselineHeapUsed = stats ? process.memoryUsage().heapUsed : 0;
+    throwIfStreamingRestoreAborted(shouldAbort);
+    const ownership = readStrictPluginStorageOwnershipManifest(readValue);
+    try {
+        for (const keys of [ownership.valueKeys, ownership.metaKeys]) {
+            for (const storageKey of keys) {
+                throwIfStreamingRestoreAborted(shouldAbort);
+                if (stats) {
+                    stats.activeRows += 1;
+                    stats.maxActiveRows = Math.max(stats.maxActiveRows, stats.activeRows);
+                }
+                let rowBytes = 0;
+                try {
+                    rowBytes = validateStrictPluginStorageOwnershipRow(storageKey, readValue);
+                } finally {
+                    if (stats) stats.activeRows -= 1;
+                }
+                if (stats) {
+                    stats.rowsRead += 1;
+                    stats.largestRowBytes = Math.max(stats.largestRowBytes, rowBytes);
+                }
+                // Give disconnect/AbortSignal state and GC a chance to settle
+                // after every row. At this point the row-local Buffer, decoded
+                // string, and parsed value are out of scope and no aggregate
+                // body exists.
+                await new Promise((resolve) => setImmediate(resolve));
+                if (stats && typeof global.gc === 'function') {
+                    global.gc();
+                    stats.maxPostGcHeapGrowth = Math.max(
+                        stats.maxPostGcHeapGrowth,
+                        Math.max(0, process.memoryUsage().heapUsed - baselineHeapUsed),
+                    );
+                }
+            }
+        }
+        throwIfStreamingRestoreAborted(shouldAbort);
+        if (stats) stats.completed = true;
+        return ownership;
+    } finally {
+        if (stats) {
+            writeFileSync(pluginStorageOwnershipStatsPath, JSON.stringify(stats), 'utf-8');
+        }
+    }
 }
 
 function deleteOwnedPluginStorageRows(ownership) {

@@ -138,7 +138,12 @@ async function startServer(cwd: string, extraEnv: Record<string, string> = {}): 
     for (let attempt = 0; attempt < 3; attempt++) {
         const port = await getFreePort()
         let output = ''
-        const child = spawn(process.execPath, [serverEntry], {
+        const child = spawn(process.execPath, [
+            ...(extraEnv.POCKETRISU_TEST_PLUGIN_OWNERSHIP_STATS_PATH
+                ? ['--expose-gc']
+                : []),
+            serverEntry,
+        ], {
             cwd,
             env: {
                 ...process.env,
@@ -2912,6 +2917,10 @@ describe('automatic snapshots × optimized plugin storage', () => {
             signal: controller.signal,
         })
         await waitForSnapshotPublicationGate(gateDir)
+        expect(await fs.promises.readFile(
+            path.join(gateDir, 'entered'),
+            'utf-8',
+        )).toBe('before-folded-delete')
         controller.abort()
         await expect(restore).rejects.toThrow()
         await delay(50)
@@ -3272,6 +3281,111 @@ describe('corrupt database boot snapshot recovery', () => {
         after.close()
     }, 30_000)
 
+    it('validates the final live ownership row before a same-key target can replace it', async () => {
+        const cwd = makeWorkDir()
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+        const firstKey = valueRowKey('ownership-first-valid')
+        const malformedLastKey = valueRowKey('ownership-last-malformed')
+        seedRecoveryFixture(cwd, snapshotKey, encodeRisuSaveLegacy({
+            characters: [],
+            optimizePluginMemory: true,
+            pluginStorageFolded: true,
+            pluginStorageGeneration: 'malformed-target-generation',
+            pluginCustomStorage: {
+                'ownership-last-malformed': 'target-must-not-mask-preimage',
+            },
+        }), [
+            { key: firstKey, value: Buffer.from(JSON.stringify({ valid: true })) },
+            { key: malformedLastKey, value: Buffer.from('{"unfinished":', 'utf-8') },
+            {
+                key: PLUGIN_STORAGE_MANIFEST_KEY,
+                value: manifestBytes(
+                    'malformed-current-generation',
+                    [firstKey, malformedLastKey],
+                ),
+            },
+        ])
+        const before = readExactKvState(cwd)
+        const server = await startServer(cwd, { RISU_STREAM_INGEST_MIN_BYTES: '1' })
+        const auth = await authenticate(server)
+
+        const response = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(response.status).toBe(400)
+        await expect(response.json()).resolves.toMatchObject({
+            code: 'INVALID_PLUGIN_STORAGE_ROW',
+            encodedKey: malformedLastKey,
+        })
+        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+            name => name.includes('snapshot-restore'),
+        )).toEqual([])
+
+        await stopServer(server)
+        expect(readExactKvState(cwd)).toEqual(before)
+        const after = openFixtureDatabase(cwd)
+        const malformed = after.prepare('SELECT value FROM kv WHERE key = ?')
+            .get(malformedLastKey) as { value: Buffer }
+        after.close()
+        expect(Buffer.from(malformed.value).toString('utf-8')).toBe('{"unfinished":')
+    }, 30_000)
+
+    it('proves 56 MiB of live ownership with one collectible row scope', async () => {
+        const cwd = makeWorkDir()
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+        const statsPath = path.join(cwd, 'ownership-proof-stats.json')
+        const rowBodyBytes = 7 * 1024 * 1024
+        const liveKeys = Array.from({ length: 8 }, (_, index) => (
+            valueRowKey(`large-current-${index}`)
+        ))
+        seedRecoveryFixture(cwd, snapshotKey, encodeRisuSaveLegacy({
+            characters: [],
+            optimizePluginMemory: true,
+            pluginStorageFolded: true,
+            pluginStorageGeneration: 'bounded-empty-target',
+            pluginCustomStorage: {},
+        }), [
+            ...liveKeys.map((key, index) => ({
+                key,
+                value: Buffer.from(JSON.stringify({
+                    index,
+                    body: 'x'.repeat(rowBodyBytes),
+                })),
+            })),
+            {
+                key: PLUGIN_STORAGE_MANIFEST_KEY,
+                value: manifestBytes('large-current-generation', liveKeys),
+            },
+        ])
+
+        const server = await startServer(cwd, {
+            RISU_STREAM_INGEST_MIN_BYTES: '1',
+            POCKETRISU_TEST_PLUGIN_OWNERSHIP_STATS_PATH: statsPath,
+        })
+        const auth = await authenticate(server)
+        await restoreSnapshot(server, auth, snapshotKey)
+        const stats = JSON.parse(await fs.promises.readFile(statsPath, 'utf-8')) as {
+            completed: boolean
+            largestRowBytes: number
+            maxActiveRows: number
+            maxPostGcHeapGrowth: number
+            rowsRead: number
+        }
+        expect(stats).toMatchObject({
+            completed: true,
+            maxActiveRows: 1,
+            rowsRead: liveKeys.length,
+        })
+        expect(stats.largestRowBytes).toBeGreaterThan(rowBodyBytes)
+        // Forced GC runs only after the row-local Buffer, decoded text and
+        // parsed object leave scope. Retained heap therefore stays bounded by
+        // row-local work rather than the 56 MiB aggregate live publication.
+        expect(stats.maxPostGcHeapGrowth).toBeLessThan(rowBodyBytes * 2)
+        await stopServer(server)
+    }, 60_000)
+
     it('starts with corrupt live bytes and atomically restores a marked exact value/owner set', async () => {
         const cwd = makeWorkDir()
         const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
@@ -3283,6 +3397,14 @@ describe('corrupt database boot snapshot recovery', () => {
         const staleKey = valueRowKey('created-after-snapshot')
         const malformedKey = valueRowKey('malformed-current-row')
         const foreignKey = valueRowKey('foreign-unowned-row')
+        const currentManifestBytes = manifestBytes(currentGeneration, [
+            valueRowKey('shared'),
+            staleKey,
+            malformedKey,
+        ], [metaRowKey('shared')])
+        const staleManifestRevision = `sha256:${crypto.createHash('sha256')
+            .update(currentManifestBytes)
+            .digest('hex')}`
         seedRecoveryFixture(cwd, snapshotKey, encodeRisuSaveLegacy({
             characters: [],
             optimizePluginMemory: true,
@@ -3304,11 +3426,7 @@ describe('corrupt database boot snapshot recovery', () => {
             { key: foreignKey, value: Buffer.from(JSON.stringify('preserve-quarantined')) },
             {
                 key: PLUGIN_STORAGE_MANIFEST_KEY,
-                value: manifestBytes(currentGeneration, [
-                    valueRowKey('shared'),
-                    staleKey,
-                    malformedKey,
-                ], [metaRowKey('shared')]),
+                value: currentManifestBytes,
             },
         ])
 
@@ -3387,6 +3505,57 @@ describe('corrupt database boot snapshot recovery', () => {
             valueRowKey('shared'),
             generation,
         )).toString('utf-8'))).toEqual({ selected: 'old-exact-value' })
+        const freshManifestResponse = await fetch(
+            `${server.origin}/api/plugin-storage/manifest`,
+            {
+                headers: {
+                    ...auth,
+                    'x-plugin-storage-generation': generation,
+                    'x-plugin-storage-manifest-mode': 'state',
+                },
+            },
+        )
+        expect(freshManifestResponse.status).toBe(200)
+        const freshManifest = await freshManifestResponse.json() as {
+            manifestRevision: string
+        }
+        expect(freshManifest.manifestRevision).not.toBe(staleManifestRevision)
+        const postRestoreOperation = {
+            operation: 'set',
+            key: 'post-restore-cas',
+            value: Buffer.from(JSON.stringify({ committed: 'fresh' })).toString('base64'),
+            owner: 'Fresh post-restore writer',
+        }
+        const postRestoreBatch = (expectedManifestRevision: string) => fetch(
+            `${server.origin}/api/plugin-storage/batch`,
+            {
+                method: 'POST',
+                headers: { ...auth, 'content-type': 'application/octet-stream' },
+                body: JSON.stringify({
+                    version: 2,
+                    generation,
+                    expectedManifestRevision,
+                    operations: [postRestoreOperation],
+                }),
+            },
+        )
+        const staleBatch = await postRestoreBatch(staleManifestRevision)
+        expect(staleBatch.status).toBe(409)
+        await expect(staleBatch.json()).resolves.toMatchObject({
+            outcome: 'not-committed',
+            code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
+        })
+        const freshBatch = await postRestoreBatch(freshManifest.manifestRevision)
+        expect(freshBatch.status).toBe(200)
+        await expect(freshBatch.json()).resolves.toMatchObject({
+            outcome: 'committed',
+        })
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('post-restore-cas'),
+            generation,
+        )).toString('utf-8'))).toEqual({ committed: 'fresh' })
         expect((await readKey(server, auth, foreignKey, generation)).length).toBe(0)
         await stopServer(server)
         const afterRestart = openFixtureDatabase(cwd)
@@ -3413,7 +3582,13 @@ describe('corrupt database boot snapshot recovery', () => {
             },
         ])
 
-        const server = await startServer(cwd)
+        const server = await startServer(cwd, {
+            RISU_STREAM_INGEST_MIN_BYTES: '1',
+            // Any pre-marker live-body scan makes this restore fail. A passing
+            // restore therefore proves the unmarked production path reads zero
+            // ownership bodies rather than merely ignoring a captured error.
+            POCKETRISU_TEST_PLUGIN_OWNERSHIP_READ_FAILPOINT: 'any',
+        })
         const auth = await authenticate(server)
         await restoreSnapshot(server, auth, snapshotKey)
 

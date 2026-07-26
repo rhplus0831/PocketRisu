@@ -191,24 +191,73 @@ function snapshotPluginStorageRecord(value, _fieldName, prefix) {
     }
 }
 
-function parsePluginStorageJsonBuffer(value, storageKey = 'plugin storage row') {
-    const buffer = Buffer.from(value);
-    if (buffer.length === 0) {
+function decodePluginStorageJsonBuffer(value) {
+    // TextDecoder accepts Uint8Array directly. Keep SQLite/Buffer-backed rows
+    // as views instead of cloning a second full byte body before JSON.parse.
+    const bytes = value instanceof Uint8Array ? value : Buffer.from(value);
+    if (bytes.byteLength === 0) {
         throw new SyntaxError('Invalid plugin storage JSON row');
     }
     let text;
     try {
-        text = utf8Decoder.decode(buffer);
+        text = utf8Decoder.decode(bytes);
     } catch {
         throw new SyntaxError('Invalid plugin storage JSON row');
     }
-    let parsed;
     try {
-        parsed = JSON.parse(text);
+        return JSON.parse(text);
     } catch {
         throw new SyntaxError('Invalid plugin storage JSON row');
     }
-    return snapshotPluginStorageJson(parsed);
+}
+
+function assertPluginStorageJson(value, visiting = new Set()) {
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) throw new TypeError('Invalid plugin storage JSON value');
+        return;
+    }
+    if (typeof value !== 'object' || visiting.has(value)) {
+        throw new TypeError('Invalid plugin storage JSON value');
+    }
+    const isArray = Array.isArray(value);
+    const prototype = Reflect.getPrototypeOf(value);
+    if (!isArray && prototype !== Object.prototype && prototype !== null) {
+        throw new TypeError('Invalid plugin storage JSON value');
+    }
+    visiting.add(value);
+    try {
+        for (const key of Reflect.ownKeys(value)) {
+            if (isArray && key === 'length') continue;
+            if (typeof key !== 'string') {
+                throw new TypeError('Invalid plugin storage JSON value');
+            }
+            if (isArray) {
+                const index = Number(key);
+                if (!Number.isInteger(index)
+                    || index < 0
+                    || index >= value.length
+                    || String(index) !== key) {
+                    throw new TypeError('Invalid plugin storage JSON value');
+                }
+            }
+            const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+            if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) {
+                throw new TypeError('Invalid plugin storage JSON value');
+            }
+            assertPluginStorageJson(descriptor.value, visiting);
+        }
+    } finally {
+        visiting.delete(value);
+    }
+}
+
+function assertPluginStorageJsonBuffer(value) {
+    assertPluginStorageJson(decodePluginStorageJsonBuffer(value));
+}
+
+function parsePluginStorageJsonBuffer(value, storageKey = 'plugin storage row') {
+    return snapshotPluginStorageJson(decodePluginStorageJsonBuffer(value));
 }
 
 function pluginStoragePrefixForKey(storageKey) {
@@ -228,6 +277,18 @@ function validatePluginStorageRow(storageKey, value) {
     }
 }
 
+function assertPluginStorageRow(storageKey, value) {
+    const prefix = pluginStoragePrefixForKey(storageKey);
+    if (prefix === null) return false;
+    decodeValidatedPluginStorageKey(storageKey, prefix);
+    try {
+        assertPluginStorageJsonBuffer(value);
+    } catch {
+        throw new PluginStorageValidationError(storageKey);
+    }
+    return true;
+}
+
 function serializePluginStorageRow(storageKey, value) {
     try {
         return Buffer.from(stringifyPluginStorageJson(value), 'utf-8');
@@ -238,6 +299,8 @@ function serializePluginStorageRow(storageKey, value) {
 
 module.exports = {
     PluginStorageValidationError,
+    assertPluginStorageJsonBuffer,
+    assertPluginStorageRow,
     decodeValidatedPluginStorageKey,
     encodeValidatedPluginStorageKey,
     isPluginStorageValidationError,

@@ -306,19 +306,38 @@ database once. List, restore, and delete share canonical no-leading-zero and
 safe-timestamp key validation, while the client also rejects any extended or
 non-200 restore acknowledgement as commit-unknown.
 
+The BR3 live-ownership boundary is also bounded. The streaming loader first
+decodes the folded marker, then invokes a deferred proof before emitting any
+target plugin row. That proof parses and canonicalizes the manifest separately,
+rejects duplicate declarations, and validates each declared current row in a
+narrow scope without cloning its Buffer or retaining a second parsed snapshot.
+It yields and checks cancellation between rows; only after every row validates
+does the existing import-barrier-protected SQLite transaction delete the prior
+owned set. Consequently a same-key target cannot manufacture proof for a
+missing or malformed old row, and unmarked imports do not read any live
+ownership body.
+
 Coverage uses deterministic bounds rather than raw-heap timing: a 10,000-key
 viewer asserts a 50-value page and one in-flight read; partial folding exercises
 1,000 rows plus a 4 MiB body with one parsed row in flight and archive/import
 round trips; chunk restore asserts one chunk in flight, a 64 KiB maximum chunk,
 hundreds of chunks, exact bytes, folded-snapshot recovery, and cancellation/error
 cleanup. A combined real-server test pauses after the exact prior ownership set
-is tentatively deleted, disconnects the client, and verifies transaction
-rollback, spool cleanup, and old-state durability after restart. A real
-NodeStorage recovery test supplies two 64 MiB chunked candidates (newer invalid,
-older valid), rejects any candidate `/api/read`, observes server-side fallback,
-hashes the exact recovered chat after restart, and requires empty restore spools.
-The full client, server, compatibility, check, and production-build validation
-sets pass.
+has been fully proven but before deletion, disconnects the client, and verifies
+transaction rollback, spool cleanup, and old-state durability after restart.
+Another production-path case restores over eight 7 MiB current rows (56 MiB):
+instrumentation records one active row, and forced-GC retained heap remains
+below two row bodies rather than scaling with the aggregate. A fail-on-first-
+ownership-read guard proves unmarked streamed restore reads zero bodies, while
+a malformed final row—including when the target supplies the same key—preserves
+the old publication byte-exactly. Composition coverage confirms that PM2 private
+stage files are ignored and their old source cannot finalize after restore, and
+that PM4 rejects a stale pre-restore manifest revision but commits with the
+fresh revision. A real NodeStorage recovery test supplies two 64 MiB chunked
+candidates (newer invalid, older valid), rejects any candidate `/api/read`,
+observes server-side fallback, hashes the exact recovered chat after restart,
+and requires empty restore spools. The full client, server, compatibility,
+performance, check, and production-build validation sets pass.
 
 <a id="pm4"></a>
 ## PM4 — Write amplification and cache overhead

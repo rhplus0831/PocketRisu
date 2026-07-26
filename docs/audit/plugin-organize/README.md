@@ -124,11 +124,16 @@ old-or-new state after a real server restart. PM2 additionally covers the
 production save loop and staged transition path with a 56 MiB Unicode store,
 forced-GC checkpoints, PM1 chunks, and the resource cache both off and on.
 PM3 covers one-page viewer loading, generation-owned partial folding, chunked
-file-cursor restore, and a real disconnect after tentative exact-set deletion
-with rollback, spool cleanup, and restart durability. Corrupt boot also uses an
-import-safe metadata-only snapshot list and direct server restore: a 64 MiB
-newer-invalid/older-valid pair proves that candidate bodies never cross the
-browser `/api/read` boundary and that the exact older chat survives restart.
+file-cursor restore, and a folded-marker-only live ownership proof that validates
+one current row at a time before any exact-set deletion. Its 56 MiB production
+restore case proves a one-row scope with forced GC, while unmarked streams read
+zero ownership bodies and disconnect cancellation rolls back before deletion.
+PM2 private stages remain invisible and source-invalidated by restore, and PM4
+rejects the pre-restore manifest token while accepting the fresh token. Corrupt
+boot also uses an import-safe metadata-only snapshot list and direct server
+restore: a 64 MiB newer-invalid/older-valid pair proves that candidate bodies
+never cross the browser `/api/read` boundary and that the exact older chat
+survives restart.
 PM4 additionally covers compact manifest CAS, exact server value hashes,
 50-row snapshot reuse, canonical manifest-key validation and cancellation,
 donated 128-row and four-by-2-MiB batches, one IndexedDB mutation transaction,

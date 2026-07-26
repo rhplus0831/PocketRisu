@@ -242,8 +242,12 @@ then performs the deferred cleanup once that source is repaired.
 Marked restore is one exclusive SQLite transaction covering the live
 database, chats, migration markers, exact plugin value/owner publication,
 manifest, and list epoch. Before destructive replacement, the current
-manifest must be canonical, duplicate-free, and complete, and every row it
-owns must exist and contain valid JSON. A missing row, duplicate entry,
+manifest must be canonical, duplicate-free, and complete. The streaming loader
+defers that proof until it observes the folded marker, before it emits a target
+row: each manifest-owned current body is loaded and validated in a narrow scope,
+then released before an abort check and event-loop yield. No current bodies are
+read for an unmarked stream, and deletion begins only after all declared rows
+prove valid. A missing row, duplicate entry,
 malformed owned row, invalid selected snapshot, or injected pre-commit failure
 rolls the whole transaction back without publishing even a new epoch. A valid
 marked non-empty or marked-empty snapshot removes only the prior
@@ -269,6 +273,12 @@ newer invalid and older valid 64 MiB chunked snapshot pair, records and rejects
 any candidate `/api/read`, then proves exact chat bytes, restart durability, and
 restore-spool cleanup. Import-barrier races prove metadata listing cannot expose
 a tentative replacement.
+The bounded proof regression uses eight 7 MiB current rows and records one
+active body with forced-GC retained heap below two rows. Further composition
+coverage proves a same-key target cannot mask a malformed final current row,
+cancellation stops before deletion, PM2 private stages remain invisible and
+source-invalidated, and PM4 rejects the pre-restore manifest token before a
+fresh-token mutation commits.
 
 <a id="br4"></a>
 ## BR4 — Valid long keys produce Node backups the same server refuses to import
