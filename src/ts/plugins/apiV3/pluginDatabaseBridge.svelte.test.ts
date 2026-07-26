@@ -1837,6 +1837,171 @@ describe("V3 guest startup handshake", () => {
         restoreRelay();
     });
 
+    test("exposes the composed IP1-IP5 API while updateItem remains host-coordinated", async () => {
+        const plugin = startupPlugin("Composed Storage Surface", `
+            const methodNames = [
+                "readItem",
+                "setFromRead",
+                "rewriteItem",
+                "updateItem",
+                "setItemWithOutcome",
+                "removeItemWithOutcome",
+                "removeItemConfirmed",
+                "atomicBatch",
+            ];
+            globalThis.composedStorageSurface = Object.fromEntries(
+                methodNames.map(name => [name, typeof risuai.pluginStorage[name]]),
+            );
+            globalThis.composedStorageSurface.generations =
+                typeof risuai.pluginStorage.generations;
+            globalThis.composedUpdateResult = await risuai.pluginStorage.updateItem(
+                "composed-signature",
+                (current, signal) => {
+                    globalThis.composedUpdateCallback = {
+                        status: current.status,
+                        signal: signal instanceof AbortSignal,
+                    };
+                    return { version: 1 };
+                },
+                { timeoutMs: 5_000 },
+            );
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+
+        await loading;
+
+        expect(guestWindow.composedStorageSurface).toEqual({
+            readItem: "function",
+            setFromRead: "function",
+            rewriteItem: "function",
+            updateItem: "function",
+            setItemWithOutcome: "function",
+            removeItemWithOutcome: "function",
+            removeItemConfirmed: "function",
+            atomicBatch: "function",
+            generations: "object",
+        });
+        expect(guestWindow.composedUpdateCallback).toEqual({
+            status: "missing",
+            signal: true,
+        });
+        expect(guestWindow.composedUpdateResult).toMatchObject({ committed: true });
+        expect(storageMocks.persistent.get(storageKey("composed-signature")))
+            .toEqual({ version: 1 });
+
+        await teardownV3Plugins();
+        restoreRelay();
+    });
+
+    test("queues every IP1-IP4 mutation root behind an active IP5 migration", async () => {
+        for (const key of [
+            "barrier-migration",
+            "barrier-guarded",
+            "barrier-rewrite",
+            "barrier-remove-outcome",
+            "barrier-remove-confirmed",
+        ]) {
+            storageMocks.persistent.set(storageKey(key), { key, version: 1 });
+        }
+        installManifestOwnedStartupKeys(
+            "barrier-migration",
+            "barrier-guarded",
+            "barrier-rewrite",
+            "barrier-remove-outcome",
+            "barrier-remove-confirmed",
+        );
+        const plugin = startupPlugin("Composed Storage Barrier", `
+            const guarded = await risuai.pluginStorage.readItem("barrier-guarded");
+            const rewrite = await risuai.pluginStorage.getWithRevision("barrier-rewrite");
+            globalThis.composedMigration = risuai.pluginStorage.updateItem(
+                "barrier-migration",
+                async current => {
+                    globalThis.composedMigrationStarted = true;
+                    await new Promise(resolve => {
+                        globalThis.releaseComposedMigration = resolve;
+                    });
+                    return { ...current.value, version: 2 };
+                },
+                { timeoutMs: 5_000 },
+            );
+            globalThis.composedWriters = Promise.all([
+                risuai.pluginStorage.setFromRead(guarded, { guarded: true }),
+                risuai.pluginStorage.rewriteItem(
+                    "barrier-rewrite",
+                    { rewritten: true },
+                    rewrite.revision,
+                ),
+                risuai.pluginStorage.setItemWithOutcome(
+                    "barrier-set-outcome",
+                    "committed-set",
+                ),
+                risuai.pluginStorage.removeItemWithOutcome("barrier-remove-outcome"),
+                risuai.pluginStorage.removeItemConfirmed("barrier-remove-confirmed"),
+                risuai.pluginStorage.atomicBatch([{
+                    type: "set",
+                    key: "barrier-batch",
+                    value: { batch: true },
+                }]),
+                risuai.pluginStorage.generations.publish({
+                    manifestKey: "barrier/head",
+                    bodyKeyPrefix: "barrier/body",
+                    bodies: [{ id: "one", count: 1, value: { generation: true } }],
+                }),
+            ]).then(results => { globalThis.composedWriterResults = results; });
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+        await vi.waitFor(() => expect(guestWindow.composedMigrationStarted).toBe(true));
+        await new Promise(resolve => setTimeout(resolve, 25));
+
+        expect(storageMocks.batchCalls).toBe(0);
+        expect(storageMocks.persistent.has(storageKey("barrier-set-outcome"))).toBe(false);
+        expect(storageMocks.persistent.get(storageKey("barrier-guarded")))
+            .toEqual({ key: "barrier-guarded", version: 1 });
+        expect(storageMocks.persistent.get(storageKey("barrier-remove-outcome")))
+            .toEqual({ key: "barrier-remove-outcome", version: 1 });
+        expect(storageMocks.persistent.get(storageKey("barrier-remove-confirmed")))
+            .toEqual({ key: "barrier-remove-confirmed", version: 1 });
+
+        guestWindow.releaseComposedMigration();
+        await vi.waitFor(() => expect(guestWindow.composedWriterResults).toHaveLength(7));
+
+        expect(storageMocks.persistent.get(storageKey("barrier-migration")))
+            .toEqual({ key: "barrier-migration", version: 2 });
+        expect(storageMocks.persistent.get(storageKey("barrier-guarded")))
+            .toEqual({ guarded: true });
+        expect(storageMocks.persistent.get(storageKey("barrier-rewrite")))
+            .toEqual({ rewritten: true });
+        expect(storageMocks.persistent.get(storageKey("barrier-set-outcome")))
+            .toBe("committed-set");
+        expect(storageMocks.persistent.has(storageKey("barrier-remove-outcome"))).toBe(false);
+        expect(storageMocks.persistent.has(storageKey("barrier-remove-confirmed"))).toBe(false);
+        expect(storageMocks.persistent.get(storageKey("barrier-batch")))
+            .toEqual({ batch: true });
+        expect(guestWindow.composedWriterResults[2]).toMatchObject({
+            outcome: "committed",
+            operation: "set",
+        });
+        expect(guestWindow.composedWriterResults[3]).toMatchObject({
+            outcome: "committed",
+            operation: "remove",
+        });
+        expect(guestWindow.composedWriterResults[4]).toMatchObject({
+            outcome: "committed",
+            confirmation: "authoritative-absence",
+        });
+        expect(guestWindow.composedWriterResults[6]).toMatchObject({ committed: true });
+
+        await teardownV3Plugins();
+        restoreRelay();
+    });
+
     test("updateItem preserves a newer value that lands during the guest transform", async () => {
         storageMocks.persistent.set(storageKey("settings"), { schema: 1, source: "old" });
         installManifestOwnedStartupKeys("settings");

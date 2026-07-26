@@ -689,7 +689,7 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
 
         await expect(storage.batchPluginStorage(rewriteRequest)).resolves.toMatchObject({
             outcome: 'committed',
-            revisions: [{ key: 'aa3-body' }],
+            revisions: [{ key: 'aa3-body', valueHash }],
         })
         expect(cache.storeBytes).not.toHaveBeenCalled()
         expect(cache.applyOwnedResourceCacheMutations).toHaveBeenCalledOnce()
@@ -699,13 +699,15 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
             hash: valueHash,
             ownedBytes: expect.any(Uint8Array),
         }])
-        expect(
-            cache.applyOwnedResourceCacheMutations.mock.calls[0]![0][0]!.ownedBytes,
-        ).not.toBe(rewriteRequest.operations[0].valueBytes)
+        const cachedSet = cache.applyOwnedResourceCacheMutations.mock.calls[0]![0][0]!
+        expect(cachedSet.type).toBe('set')
+        if (cachedSet.type === 'set') {
+            expect(cachedSet.ownedBytes).not.toBe(rewriteRequest.operations[0].valueBytes)
+        }
         expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
     })
 
-    test('malformed success and transport loss remain unknown without cache publication', async () => {
+    test('malformed or lost acknowledgements stay unknown without value hashes or cache publication', async () => {
         const malformed = new NodeStorage()
         ;(malformed as any).authFetch = vi.fn(async () => response({
             success: true,
@@ -716,10 +718,12 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
             generation: '123e4567-e89b-12d3-a456-426614174000',
             revisions: [],
         }))
-        await expect(malformed.batchPluginStorage(batchRequest)).resolves.toMatchObject({
+        const malformedResult = await malformed.batchPluginStorage(batchRequest)
+        expect(malformedResult).toMatchObject({
             outcome: 'unknown',
             commitOutcomeUnknown: true,
         })
+        expect(malformedResult).not.toHaveProperty('revisions')
         expect(cache.storeBytes).not.toHaveBeenCalled()
         expect(cache.applyOwnedResourceCacheMutations).not.toHaveBeenCalled()
 
@@ -733,10 +737,12 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
             outcome.markRequestDispatched()
             throw new TypeError('connection lost')
         })
-        await expect(lost.batchPluginStorage(batchRequest)).resolves.toMatchObject({
+        const lostResult = await lost.batchPluginStorage(batchRequest)
+        expect(lostResult).toMatchObject({
             outcome: 'unknown',
             commitOutcomeUnknown: true,
         })
+        expect(lostResult).not.toHaveProperty('revisions')
         expect(cache.storeBytes).not.toHaveBeenCalled()
         expect(cache.applyOwnedResourceCacheMutations).not.toHaveBeenCalled()
     })
