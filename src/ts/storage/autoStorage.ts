@@ -27,6 +27,10 @@ export class AutoStorage{
     async removeItem(key:string){
         return await this.realStorage.removeItem(key)
     }
+    async clearPluginSaveStorage() {
+        await this.Init()
+        return await this.realStorage.clearPluginSaveStorage()
+    }
 
     async checkAccountSync(){
         return false

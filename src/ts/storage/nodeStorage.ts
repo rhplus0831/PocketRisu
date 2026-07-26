@@ -19,6 +19,7 @@ import {
     getManifestHashes,
     getVerifiedManifestSnapshot,
     getVerifiedCachedBytes,
+    invalidateResourceCachePrefix,
     isResourceCacheEnabled,
     isSha256Hex,
     persistResourceCacheManifests,
@@ -187,6 +188,25 @@ async function listCacheSet(prefix: string, entry: ListCacheEntry): Promise<void
         })
     } catch {
         // The server remains authoritative; cache failures never break keys().
+    } finally {
+        db?.close()
+    }
+}
+
+async function listCacheDelete(prefixes: readonly string[]): Promise<void> {
+    let db: IDBDatabase | null = null
+    try {
+        db = await openListCacheDb()
+        const transaction = db.transaction(LIST_CACHE_STORE, 'readwrite')
+        const store = transaction.objectStore(LIST_CACHE_STORE)
+        for (const prefix of prefixes) store.delete(listCacheKey(prefix))
+        await new Promise<void>((resolve, reject) => {
+            transaction.oncomplete = () => resolve()
+            transaction.onerror = () => reject(transaction.error)
+            transaction.onabort = () => reject(transaction.error)
+        })
+    } catch {
+        // This cache is disposable; the server list/delta remains authoritative.
     } finally {
         db?.close()
     }
@@ -363,9 +383,11 @@ export class NodeStorage{
 
         const status = response.status
         const serverCode = typeof payload?.code === 'string' ? payload.code : null
+        // Retry eligibility is a schema pair, not two independent hints. A
+        // stray `commitOutcomeUnknown: false` (including on a malformed 503)
+        // cannot prove rollback and must remain commit-outcome unknown.
         const explicitlyNotCommitted = payload?.commitOutcome === 'not-committed'
-            || payload?.commitOutcomeUnknown === false
-            || serverCode === 'IMPORT_IN_PROGRESS'
+            && payload?.commitOutcomeUnknown === false
         const commitOutcomeUnknown = mutation
             && (payload?.commitOutcomeUnknown === true
                 || payload?.commitOutcome === 'unknown'
@@ -723,6 +745,48 @@ export class NodeStorage{
         if(data.error){
             throw this.storagePayloadError(data, 'remove', true, da.status)
         }
+    }
+
+    /** Atomically clear the complete optimized save value + owner namespace. */
+    async clearPluginSaveStorage(): Promise<'committed'> {
+        const response = await this.requestStorage(
+            PLUGIN_STORAGE_PREFIXES[0],
+            'remove',
+            true,
+            () => this.authFetch('/api/plugin-storage/clear', { method: 'POST' }),
+        )
+
+        let payload: StorageFailurePayload & { success?: unknown } = {}
+        try {
+            const parsed = await response.clone().json() as unknown
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                payload = parsed as StorageFailurePayload & { success?: unknown }
+            }
+        } catch {
+            // A successful HTTP status without the commit envelope is not an
+            // acknowledgement: the proxy may have replaced the response after
+            // the transaction ran.
+        }
+
+        if (payload.success !== true
+            || payload.commitOutcome !== 'committed'
+            || payload.commitOutcomeUnknown !== false) {
+            throw new StorageError('Plugin storage clear returned an invalid commit acknowledgement', {
+                status: response.status,
+                code: 'COMMIT_OUTCOME_UNKNOWN',
+                retryable: false,
+                commitOutcomeUnknown: true,
+                operation: 'remove',
+            })
+        }
+
+        // A committed whole-namespace clear invalidates both cached key lists
+        // and any hash-addressed plugin manifests. Cache cleanup is
+        // best-effort and never changes the authoritative acknowledgement.
+        void listCacheDelete(['', ...PLUGIN_STORAGE_PREFIXES])
+        void invalidateResourceCachePrefix(`kv:${PLUGIN_STORAGE_PREFIXES[0]}`)
+        void invalidateResourceCachePrefix(`kv:${PLUGIN_STORAGE_PREFIXES[1]}`)
+        return 'committed'
     }
 
     private async checkAuth(){

@@ -73,7 +73,18 @@ export async function listPersistentKeys(prefix = ""): Promise<string[]> {
 
 export async function clearPersistentPrefix(prefix: string): Promise<void> {
     const keys = await listPersistentKeys(prefix);
-    await Promise.all(keys.map((key) => removePersistentKey(key)));
+    // Generic/device-local prefixes do not have a server transaction, but they
+    // must still avoid launching an unbounded number of mutations at once.
+    for (const key of keys) await removePersistentKey(key);
+}
+
+/**
+ * Clear the server-owned optimized plugin value and owner namespaces in one
+ * transaction. This deliberately accepts no caller-selected prefix.
+ */
+export async function clearExternalizedPluginStorage(): Promise<void> {
+    await ensureStorageReady();
+    await forageStorage.clearPluginSaveStorage();
 }
 
 export async function makeHashedStorageKey(prefix: string, rawKey: string): Promise<string> {

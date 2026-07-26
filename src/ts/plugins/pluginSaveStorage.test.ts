@@ -92,6 +92,13 @@ vi.mock("../storage/persistentKv", () => {
     };
     const decode = (value: string) => Buffer.from(value, "base64url").toString("utf-8");
     return {
+        clearExternalizedPluginStorage: vi.fn(async () => {
+            for (const key of persistent.keys()) {
+                if (key.startsWith("pluginsave/") || key.startsWith("pluginsave-meta/")) {
+                    persistent.delete(key);
+                }
+            }
+        }),
         clearPersistentPrefix: vi.fn(async (prefix: string) => {
             for (const key of persistent.keys()) {
                 if (key.startsWith(prefix)) persistent.delete(key);
@@ -115,6 +122,7 @@ vi.mock("../storage/persistentKv", () => {
 });
 
 const {
+    clearOwnedPluginSaveStorage,
     countExternalizedPluginStorageEntries,
     getPluginSaveStorageItem,
     getPluginSaveStorageKeys,
@@ -356,6 +364,41 @@ describe("readExternalizedPluginStorage", () => {
 });
 
 describe("plugin save storage transport", () => {
+    test("optimized owned clear is one fixed-namespace server mutation", async () => {
+        database.optimizePluginMemory = true;
+        persistent.set(encoded(PLUGIN_SAVE_PREFIX, "alpha"), { value: 1 });
+        persistent.set(encoded(PLUGIN_SAVE_META_PREFIX, "alpha"), {
+            plugin: "Plugin",
+            updatedAt: 1,
+        });
+        const {
+            clearExternalizedPluginStorage,
+            clearPersistentPrefix,
+        } = await import("../storage/persistentKv");
+
+        await clearOwnedPluginSaveStorage();
+
+        expect(clearExternalizedPluginStorage).toHaveBeenCalledOnce();
+        expect(clearPersistentPrefix).not.toHaveBeenCalled();
+        expect(persistent.size).toBe(0);
+    });
+
+    test("inline owned clear publishes one empty value map", async () => {
+        const previousValues = { alpha: { value: 1 } };
+        database.pluginCustomStorage = previousValues;
+        database.pluginStorageMeta = {
+            alpha: { plugin: "Plugin", updatedAt: 1 },
+        };
+        const { clearExternalizedPluginStorage } = await import("../storage/persistentKv");
+
+        await clearOwnedPluginSaveStorage();
+
+        expect(database.pluginCustomStorage).not.toBe(previousValues);
+        expect(Object.keys(database.pluginCustomStorage)).toEqual([]);
+        expect(database.pluginStorageMeta).toBeUndefined();
+        expect(clearExternalizedPluginStorage).not.toHaveBeenCalled();
+    });
+
     test("opts only externalized plugin values into cached persistent reads", async () => {
         database.optimizePluginMemory = true;
         const { readPersistentJson } = await import("../storage/persistentKv");

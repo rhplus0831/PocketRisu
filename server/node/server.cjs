@@ -211,6 +211,12 @@ function sendImportBusy(res) {
     });
 }
 
+// Test-only boundaries for the optimized plugin clear. Kept at route level so
+// production deletion primitives cannot accidentally acquire a failpoint.
+const pluginStorageClearFailpoint = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_PLUGIN_CLEAR_FAILPOINT ?? '')
+    : '';
+
 // Captures run inside the endpoint's storage operation. Reconcile enters the
 // same queue through runStorageOperation, so neither can observe half-written
 // backup state or race a chat-row overwrite.
@@ -4087,6 +4093,55 @@ app.post('/api/db/read-cached', (req, res, next) => {
     } catch (error) {
         next(error);
     }
+});
+
+/**
+ * Clear optimized plugin save values and their owner sidecars as one logical
+ * mutation. The namespace is intentionally fixed server-side: this is the
+ * narrow clear primitive, not a caller-controlled batch or prefix API.
+ */
+app.post('/api/plugin-storage/clear', async (req, res) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+
+    try {
+        await queueStorageMutation(() => {
+            if (pluginStorageClearFailpoint === 'pre-transaction') {
+                throw new Error('Injected plugin storage clear failure before transaction');
+            }
+            sqliteDb.transaction(() => {
+                kvDelPrefix(PLUGIN_SAVE_PREFIX);
+                if (pluginStorageClearFailpoint === 'transaction') {
+                    throw new Error('Injected plugin storage clear transaction failure');
+                }
+                kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
+            })();
+        });
+    } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
+        logger.error('[PluginStorage] Atomic clear rolled back:', error);
+        return res.status(500).json({
+            error: 'Plugin storage clear was not committed',
+            code: 'PLUGIN_STORAGE_CLEAR_NOT_COMMITTED',
+            retryAfter: 0,
+            retryable: true,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        });
+    }
+
+    // A response lost after this point cannot prove whether the transaction
+    // committed. The client labels that outcome unknown and may safely retry
+    // because clearing this fixed namespace is idempotent.
+    if (pluginStorageClearFailpoint === 'response') {
+        res.destroy();
+        return;
+    }
+    res.json({
+        success: true,
+        commitOutcome: 'committed',
+        commitOutcomeUnknown: false,
+    });
 });
 
 app.get('/api/remove', async (req, res, next) => {

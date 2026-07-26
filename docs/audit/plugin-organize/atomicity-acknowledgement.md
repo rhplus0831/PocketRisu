@@ -70,6 +70,31 @@ built-in storage viewer.
 - Test failure at each mutation boundary and assert an unambiguous reported
   outcome.
 
+### Resolution
+
+**Fixed 2026-07-26.** Optimized full clear now uses a fixed authenticated
+`POST /api/plugin-storage/clear` operation. The caller cannot supply a prefix;
+the server deletes exactly `pluginsave/` and `pluginsave-meta/` inside one
+`queueStorageMutation()` entry and one SQLite transaction. Pre-transaction and
+mid-transaction failures preserve the complete old value+owner set, while a
+committed response represents an empty set.
+
+The client uses the shared structured storage-error contract to distinguish a
+committed acknowledgement, explicitly not-committed failure, and an unknown
+outcome after response loss or a malformed acknowledgement. It never
+automatically replays an unknown mutation; a caller that still intends to
+clear the current namespace may retry it. Import-time 503 refusal is explicitly
+not committed and can be retried after the barrier opens. V3 `clear()` and the built-in viewer's
+unfiltered full clear use this same primitive; inline mode publishes one fresh
+empty value map. The former unbounded per-row `Promise.all` deletion path is no
+longer reachable for plugin-storage clear.
+
+Regression coverage fault-injects pre-transaction failure, transaction
+rollback, response loss, retry, import refusal, concurrent writes, cache
+invalidation, and V3/viewer callers. Independent verification passed 116
+focused client/compatibility tests, all server and compatibility suites,
+`pnpm check`, and a production build.
+
 <a id="aa3"></a>
 ## AA3 — No batch/CAS primitive; unload can publish a torn but durable generation
 

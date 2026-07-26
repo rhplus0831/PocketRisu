@@ -49,6 +49,14 @@ vi.mock("../../globalApi.svelte", () => ({
 vi.mock("../../storage/chatStorage", () => ({ chatToStub: (chat: unknown) => chat }));
 
 vi.mock("../../storage/persistentKv", () => ({
+    clearExternalizedPluginStorage: async () => {
+        await storageMocks.clearGate?.("pluginsave/");
+        for (const key of [...storageMocks.persistent.keys()]) {
+            if (key.startsWith("pluginsave/") || key.startsWith("pluginsave-meta/")) {
+                storageMocks.persistent.delete(key);
+            }
+        }
+    },
     clearPersistentPrefix: async (prefix: string) => {
         await storageMocks.clearGate?.(prefix);
         for (const key of [...storageMocks.persistent.keys()]) {

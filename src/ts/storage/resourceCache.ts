@@ -508,6 +508,34 @@ export function touchResourceCacheManifest(resourceKey: string): Promise<void> {
     return operation
 }
 
+/** Remove cached manifests in one logical key namespace without loading them. */
+export function invalidateResourceCachePrefix(resourceKeyPrefix: string): Promise<void> {
+    if (!isResourceCacheEnabled() || !nonEmptyString(resourceKeyPrefix)) return Promise.resolve()
+    const epoch = resourceCacheEpoch
+    const operation = resourceCacheWriteChain
+        .catch(() => undefined)
+        .then(async () => {
+            if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
+            const database = await openResourceCacheDatabase()
+            if (!database) return
+            const transaction = database.transaction(RESOURCE_CACHE_MANIFEST_STORE, 'readwrite')
+            const done = transactionComplete(transaction)
+            const manifests = transaction.objectStore(RESOURCE_CACHE_MANIFEST_STORE)
+            const range = IDBKeyRange.bound(resourceKeyPrefix, `${resourceKeyPrefix}\uffff`)
+            const cursorRequest = manifests.openKeyCursor(range)
+            cursorRequest.onsuccess = () => {
+                const cursor = cursorRequest.result
+                if (!cursor) return
+                cursor.delete()
+                cursor.continue()
+            }
+            await done
+        })
+        .catch(() => undefined)
+    resourceCacheWriteChain = operation
+    return operation
+}
+
 /** Clear the disposable cache, including pending connections and writes. */
 export async function clearResourceCache(): Promise<void> {
     resourceCacheEpoch += 1

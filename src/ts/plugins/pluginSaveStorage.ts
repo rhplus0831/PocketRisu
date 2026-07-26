@@ -1,5 +1,6 @@
 import { getDatabase, type Database } from "../storage/database.svelte";
 import {
+    clearExternalizedPluginStorage,
     clearPersistentPrefix,
     decodeStorageKeyComponent,
     listPersistentKeys,
@@ -471,8 +472,7 @@ export async function clearOwnedPluginSaveStorage(): Promise<void> {
     await withPluginSaveStorageLock(async () => {
         const db = getDatabase();
         if (db.optimizePluginMemory) {
-            await clearPersistentPrefix(PLUGIN_SAVE_PREFIX);
-            await clearPersistentPrefix(PLUGIN_SAVE_META_PREFIX);
+            await clearExternalizedPluginStorage();
             return;
         }
         db.pluginCustomStorage = createDatabasePluginStorageRecord();

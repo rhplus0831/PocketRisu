@@ -27,6 +27,7 @@
     import { getOwners, removeOwner } from 'src/ts/plugins/pluginStorageMeta'
     import { language } from 'src/lang'
     import {
+        clearOwnedPluginSaveStorage,
         getPluginSaveStorageItem,
         getPluginSaveStorageKeys,
         removePluginSaveStorageItem,
@@ -312,7 +313,14 @@
         if (!ok) return
 
         try {
-            for (const e of targets) await backendRemove(e.key)
+            if (backend === 'save' && !isFiltered) {
+                // The optimized backend clears value + owner prefixes in one
+                // server transaction; inline mode publishes one empty value
+                // map through the same primitive.
+                await clearOwnedPluginSaveStorage()
+            } else {
+                for (const e of targets) await backendRemove(e.key)
+            }
             detailOpen = false
             await load()
             notifySuccess(language.pluginStorageBulkDeleted(targets.length))

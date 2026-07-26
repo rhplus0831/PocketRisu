@@ -38,7 +38,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [SA3](startup-availability.md#sa3) | Medium | Open | A reconciliation failure on boot prevents the whole application from loading |
 | [SA4](startup-availability.md#sa4) | High impact, window-dependent | Fixed | Import and retry failures abort startup or expose uncommitted state to optimized reads |
 | [AA1](atomicity-acknowledgement.md#aa1) | Medium | Open | Value and owner metadata are separate commits; a rejection can follow a durable primary mutation |
-| [AA2](atomicity-acknowledgement.md#aa2) | Medium | Open | Optimized `clear()` can partially apply |
+| [AA2](atomicity-acknowledgement.md#aa2) | Medium | Fixed | Optimized `clear()` can partially apply |
 | [AA3](atomicity-acknowledgement.md#aa3) | High | Open | No batch/transaction/CAS primitive: the one-second unload deadline can terminate a multi-row commit, leaving a torn but durable generation |
 | [BR1](backup-recovery.md#br1) | Medium | Open | Optimized-only mutations never advance automatic recovery snapshots |
 | [BR2](backup-recovery.md#br2) | Medium | Open | Cross-mode snapshot ownership is ambiguous: unmarked just-disabled snapshots and no storage generation |

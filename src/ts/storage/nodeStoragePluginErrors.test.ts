@@ -15,6 +15,7 @@ vi.mock('./resourceCache', () => ({
     getManifestHashes: vi.fn(),
     getVerifiedManifestSnapshot: vi.fn(),
     getVerifiedCachedBytes: vi.fn(),
+    invalidateResourceCachePrefix: vi.fn(),
     isResourceCacheEnabled: () => false,
     isSha256Hex: () => false,
     persistResourceCacheManifests: vi.fn(),
@@ -172,6 +173,33 @@ describe('NodeStorage plugin error contract', () => {
             commitOutcomeUnknown: true,
         })
     })
+
+    test.each([500, 503])(
+        'does not replay malformed HTTP %s JSON that omits the not-committed outcome',
+        async (status) => {
+            fetchMock.mockResolvedValue(jsonResponse({
+                error: 'incomplete commit envelope',
+                code: status === 503 ? 'IMPORT_IN_PROGRESS' : 'TEMPORARY_STORAGE_FAILURE',
+                retryAfter: 0,
+                retryable: true,
+                commitOutcomeUnknown: false,
+            }, status))
+
+            const failure = await readyStorage().removeItem('pluginsave/bWFsZm9ybWVkLW91dGNvbWU.json')
+                .then(() => null, error => error)
+
+            expect(fetchMock).toHaveBeenCalledOnce()
+            expect(failure).toBeInstanceOf(StorageError)
+            expect(failure).toMatchObject({
+                message: 'incomplete commit envelope',
+                status,
+                code: status === 503 ? 'IMPORT_IN_PROGRESS' : 'TEMPORARY_STORAGE_FAILURE',
+                retryable: true,
+                commitOutcomeUnknown: true,
+                operation: 'remove',
+            })
+        },
+    )
 
     test('turns a validation 400 into a structured non-ambiguous write error', async () => {
         fetchMock.mockResolvedValueOnce(jsonResponse({ error: 'invalid plugin value' }, 400))

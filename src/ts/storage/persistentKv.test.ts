@@ -5,6 +5,7 @@ const storage = vi.hoisted(() => ({
     getItem: vi.fn(async () => new TextEncoder().encode('{"source":"plain"}')),
     getItemCached: vi.fn(async () => new TextEncoder().encode('{"source":"cached"}')),
     setItem: vi.fn(async (_key: string, _value: Uint8Array) => undefined),
+    clearPluginSaveStorage: vi.fn(async () => 'committed' as const),
 }))
 
 vi.mock('../globalApi.svelte', () => ({ forageStorage: storage }))
@@ -20,6 +21,7 @@ Reflect.deleteProperty(String.prototype, 'isWellFormed')
 
 const {
     decodeStorageKeyComponent,
+    clearExternalizedPluginStorage,
     hasNativeStringWellFormed,
     makeEncodedStorageKey,
     readPersistentJson,
@@ -45,6 +47,7 @@ beforeEach(() => {
     storage.getItem.mockClear()
     storage.getItemCached.mockClear()
     storage.setItem.mockClear()
+    storage.clearPluginSaveStorage.mockClear()
 })
 
 describe('persistent JSON read transport', () => {
@@ -86,6 +89,14 @@ describe('persistent JSON write transport', () => {
         const [key, bytes] = storage.setItem.mock.calls[0]
         expect(key).toBe('pluginsave/valid')
         expect(JSON.parse(new TextDecoder().decode(bytes))).toEqual({ nested: ['safe', 0] })
+    })
+})
+
+describe('externalized plugin clear transport', () => {
+    it('uses one fixed-namespace server mutation without listing or deleting rows', async () => {
+        await expect(clearExternalizedPluginStorage()).resolves.toBeUndefined()
+
+        expect(storage.clearPluginSaveStorage).toHaveBeenCalledOnce()
     })
 })
 
