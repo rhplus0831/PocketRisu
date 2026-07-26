@@ -323,6 +323,25 @@ requested-target publication over a distinct live REMOTE
 database, recursive REMOTE failures, and restore-spool cleanup. Independent
 verification passed in each source branch before composition.
 
+The explicit Settings action and boot fallback now enter that boundary through
+one shared `AutoStorage`/`NodeStorage` restore API. Both sides require the exact
+internal-snapshot key grammar; the client sends exactly one session-fenced POST
+under a finite ten-minute `AbortSignal` bound and accepts only an exact
+committed response whose key echoes the requested snapshot. Auth retry is
+disabled for this destructive request. A schema-invalid `2xx`, truncated body,
+transport loss, or timeout after dispatch is therefore commit-unknown and is
+never automatically retried. Settings warns and hard-reloads to reconcile;
+boot stops its candidate loop.
+
+The active-writer middleware's `423` is different: it rejects before the
+restore route can execute, so `NodeStorage` classifies it as definitively
+not-committed from the headers and disposes of the optional body best-effort.
+Even a never-ending body followed by external abort or the full restore timeout
+does not change that result or trigger a UI reload. Production-path tests pair
+this client/UI policy with real-server displaced sessions, exact response echo,
+post-COMMIT response loss, and PM2 staged-transition source invalidation, plus
+committed-path PM4 database-cache invalidation assertions.
+
 <a id="br4"></a>
 ## BR4 — Valid long keys produce Node backups the same server refuses to import
 

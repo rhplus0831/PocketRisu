@@ -360,6 +360,28 @@ legacy restore path also bypasses live-database REMOTE migration after decoding,
 so it publishes the requested snapshot object rather than substituting the
 current live monolith.
 
+Settings restore no longer bypasses the storage adapter with an unbounded raw
+`fetch()`. Settings and corrupt-boot fallback share
+`AutoStorage.restoreInternalSnapshot()` and the same authoritative
+`NodeStorage` implementation. It accepts only the exact
+`database/dbbackup-<digits>.bin` key form, sends one non-retried POST with the
+active writer-session header, and allows a finite, abortable ten-minute window
+for large file-cursor ingestion rather than the ordinary 15-second storage I/O
+bound. The server applies the same exact-key check and the client accepts only
+the exact echoed `{ ok, key, commitOutcome, commitOutcomeUnknown }` committed
+schema.
+
+A committed acknowledgement reloads into the new authoritative publication. A
+definitive rollback or active-session `423` leaves the current page in place;
+`423` is classified from response headers before reading its optional body, so
+a stalled, truncated, aborted, or timed-out diagnostic body cannot become an
+ambiguous mutation. The body is cancelled best-effort without changing that
+outcome. Transport loss, timeout after dispatch, malformed/truncated or
+proxy-generated `2xx`, and a mismatched echo remain commit-outcome unknown.
+They are never replayed automatically: Settings presents a distinct warning
+and hard-reloads only to reconcile server state, while boot recovery stops
+without selecting an older snapshot.
+
 Coverage uses deterministic bounds rather than raw-heap timing: a 10,000-key
 viewer asserts a 50-value page and one in-flight read; partial folding exercises
 1,000 rows plus a 4 MiB body with one parsed row in flight and archive/import
@@ -379,9 +401,8 @@ that PM4 rejects a stale pre-restore manifest revision but commits with the
 fresh revision. A real NodeStorage recovery test supplies two 64 MiB chunked
 candidates (newer invalid, older valid), rejects any candidate `/api/read`,
 observes server-side fallback, hashes the exact recovered chat after restart,
-and requires empty restore spools. The full client, server, compatibility,
-performance, check, and production-build validation sets pass. A separate
-52 MiB real-server test observes a genuinely partial spool, closes
+and requires empty restore spools. A separate 52 MiB real-server test observes
+a genuinely partial spool, closes
 the client socket before `BEGIN`, and verifies less-than-total copying, cleanup,
 exact old-state preservation, and restart durability. Corrupt-middle and
 full-publication-deletion cases return definitive non-committed failures; a
@@ -393,8 +414,15 @@ exact size/headroom boundaries; real decompression cancellation; recursive
 REMOTE success, oversize-before-read, duplicate caching, cycle/depth rejection,
 resolver size/read failures, and missing rows. Full-route cases prove exact
 rollback, stable 400/413/500 not-committed classification, spool cleanup, and
-restart preservation. Independent verification passed in each source branch;
-the composed stack is verified separately below.
+restart preservation. Restore-specific client/UI tests cover a valid response
+after 15 seconds,
+finite timeout abort, one-request transport loss, definitive rollback, exact
+schema and key echo, malformed/truncated proxy responses, and no unsafe retry.
+Real-server coverage proves displaced-session `423`, exact-key rejection,
+response loss after commit, and PM2 staged-source invalidation; the committed
+`NodeStorage` path separately asserts PM4 database-cache invalidation.
+Stalled-body regressions advance both an external abort and the full restore
+timeout while requiring `423` to remain non-committed with no UI reload.
 
 <a id="pm4"></a>
 ## PM4 — Write amplification and cache overhead

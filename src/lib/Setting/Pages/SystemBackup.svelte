@@ -21,12 +21,13 @@
         RefreshCwIcon,
         TrashIcon,
     } from '@lucide/svelte'
-    import { alertConfirm, alertError, alertWait, notifyError, notifySuccess } from 'src/ts/alert'
+    import { alertConfirm, alertError, alertWait, notifyError, notifySuccess, waitAlert } from 'src/ts/alert'
     import { forageStorage } from 'src/ts/globalApi.svelte'
     import { setDatabase } from 'src/ts/storage/database.svelte'
     import { decodeRisuSave } from 'src/ts/storage/risuSave'
     import { language } from 'src/lang'
     import { LoadLocalBackup, SaveLocalBackup, SaveServerBackup } from 'src/ts/drive/backuplocal'
+    import { runInternalSnapshotRestoreUi } from 'src/ts/storage/snapshotRestoreUi'
 
     // ── Types ────────────────────────────────────────────────────────────────
     interface Snapshot { key: string; size: number; timestamp: number | null }
@@ -138,25 +139,24 @@
         if (!(await alertConfirm(language.backupLoadConfirm))) return
         if (!(await alertConfirm(language.backupLoadConfirm2))) return
         alertWait(language.serverBackupRestoring)
-        try {
-            // Server-side atomic restore: copies snapshot blob → live blob,
-            // invalidates caches, rebuilds chat store. Avoids the race where
-            // a client-side setDatabase + reload could lose data because the
-            // debounced save hadn't flushed yet.
-            const auth = await forageStorage.createAuth()
-            const res = await fetch('/api/db/snapshots/restore', {
-                method: 'POST',
-                headers: { 'risu-auth': auth, 'content-type': 'application/json' },
-                body: JSON.stringify({ key: snap.key }),
-            })
-            const json = await res.json().catch(() => ({}))
-            if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-            notifySuccess('Loaded backup')
-            location.search = ''
-            location.reload()
-        } catch (err) {
-            alertError(err instanceof Error ? err.message : String(err))
-        }
+        await runInternalSnapshotRestoreUi(snap.key, {
+            // NodeStorage owns authentication, the active-writer session fence,
+            // the long restore timeout, strict acknowledgement parsing, and the
+            // no-retry mutation rule. Boot recovery uses the same method.
+            restore: (key, signal) => forageStorage.restoreInternalSnapshot(key, signal),
+            onCommitted: () => notifySuccess('Loaded backup'),
+            onDefinitiveFailure: (error) => {
+                alertError(error instanceof Error ? error.message : String(error))
+            },
+            onCommitUnknown: async (error) => {
+                alertError(`${language.backupSnapshotRestoreUnknown}\n\n${error.message}`)
+                await waitAlert()
+            },
+            hardReload: () => {
+                location.search = ''
+                location.reload()
+            },
+        })
     }
 
     // ── Snapshot limits ──────────────────────────────────────────────────────

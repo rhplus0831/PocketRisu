@@ -44,9 +44,10 @@ vi.mock('./risuSave', () => ({
     encodeRisuSaveLegacy: vi.fn(),
 }))
 
-const { NodeStorage } = await import('./nodeStorage')
+const { INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS, NodeStorage } = await import('./nodeStorage')
 const { StorageError } = await import('./storageError')
 const { recoverDatabaseFromInternalSnapshots } = await import('./bootSnapshotRecovery')
+const { runInternalSnapshotRestoreUi } = await import('./snapshotRestoreUi')
 const resourceCache = await import('./resourceCache')
 
 const {
@@ -309,6 +310,7 @@ describe('NodeStorage boot snapshot recovery', () => {
             })
             return new Response(JSON.stringify({
                 ok: true,
+                key: 'database/dbbackup-123.bin',
                 commitOutcome: 'committed',
                 commitOutcomeUnknown: false,
             }), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -317,7 +319,7 @@ describe('NodeStorage boot snapshot recovery', () => {
         const storage = readyStorage()
         storage._lastDbEtag = 'stale-etag'
 
-        await expect(storage.restoreInternalSnapshotForBoot(
+        await expect(storage.restoreInternalSnapshot(
             'database/dbbackup-123.bin',
         )).resolves.toBe('committed')
 
@@ -326,12 +328,12 @@ describe('NodeStorage boot snapshot recovery', () => {
     })
 
     it('keeps a truncated success acknowledgement commit-unknown', async () => {
-        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
-            ok: true,
-            commitOutcome: 'committed',
-        }), { status: 200, headers: { 'content-type': 'application/json' } })))
+        vi.stubGlobal('fetch', vi.fn(async () => new Response('{"ok":true,"key":', {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+        })))
 
-        await expect(readyStorage().restoreInternalSnapshotForBoot(
+        await expect(readyStorage().restoreInternalSnapshot(
             'database/dbbackup-456.bin',
         )).rejects.toMatchObject({
             code: 'COMMIT_OUTCOME_UNKNOWN',
@@ -366,7 +368,7 @@ describe('NodeStorage boot snapshot recovery', () => {
             headers: { 'content-type': 'application/json' },
         })))
 
-        await expect(readyStorage().restoreInternalSnapshotForBoot(
+        await expect(readyStorage().restoreInternalSnapshot(
             'database/dbbackup-456.bin',
         )).rejects.toMatchObject({
             code: 'COMMIT_OUTCOME_UNKNOWN',
@@ -381,13 +383,35 @@ describe('NodeStorage boot snapshot recovery', () => {
         })
         vi.stubGlobal('fetch', fetchMock)
 
-        await expect(readyStorage().restoreInternalSnapshotForBoot(
+        await expect(readyStorage().restoreInternalSnapshot(
             'database/dbbackup-789.bin',
         )).rejects.toMatchObject({
             code: 'COMMIT_OUTCOME_UNKNOWN',
             commitOutcomeUnknown: true,
             retryable: false,
             operation: 'transition',
+        } satisfies Partial<InstanceType<typeof StorageError>>)
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    it('accepts the exact rollback envelope as definitive and never retries it', async () => {
+        const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+            error: 'Snapshot restore was not committed',
+            code: 'SNAPSHOT_RESTORE_NOT_COMMITTED',
+            retryAfter: 0,
+            retryable: true,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        }), { status: 500, headers: { 'content-type': 'application/json' } }))
+        vi.stubGlobal('fetch', fetchMock)
+
+        await expect(readyStorage().restoreInternalSnapshot(
+            'database/dbbackup-444.bin',
+        )).rejects.toMatchObject({
+            status: 500,
+            code: 'SNAPSHOT_RESTORE_NOT_COMMITTED',
+            commitOutcomeUnknown: false,
+            retryable: true,
         } satisfies Partial<InstanceType<typeof StorageError>>)
         expect(fetchMock).toHaveBeenCalledOnce()
     })
@@ -400,7 +424,7 @@ describe('NodeStorage boot snapshot recovery', () => {
         const fetchMock = vi.fn()
         vi.stubGlobal('fetch', fetchMock)
 
-        await expect(readyStorage().restoreInternalSnapshotForBoot(
+        await expect(readyStorage().restoreInternalSnapshot(
             key,
         )).rejects.toThrow('Invalid internal snapshot key')
         expect(fetchMock).not.toHaveBeenCalled()
@@ -523,4 +547,192 @@ describe('NodeStorage boot snapshot recovery', () => {
             fs.rmSync(cwd, { recursive: true, force: true })
         }
     }, 120_000)
+
+    it('allows a valid large restore to outlive the ordinary 15 second I/O bound', async () => {
+        vi.useFakeTimers()
+        try {
+            const fetchMock = vi.fn(async () => {
+                await new Promise(resolve => setTimeout(resolve, 15_001))
+                return new Response(JSON.stringify({
+                    ok: true,
+                    key: 'database/dbbackup-321.bin',
+                    commitOutcome: 'committed',
+                    commitOutcomeUnknown: false,
+                }), { status: 200, headers: { 'content-type': 'application/json' } })
+            })
+            vi.stubGlobal('fetch', fetchMock)
+
+            const restore = readyStorage().restoreInternalSnapshot('database/dbbackup-321.bin')
+            await vi.advanceTimersByTimeAsync(15_001)
+
+            await expect(restore).resolves.toBe('committed')
+            expect(INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS).toBeGreaterThan(15_001)
+            expect(fetchMock).toHaveBeenCalledOnce()
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('aborts a stalled restore at the finite restore-specific bound without replaying it', async () => {
+        vi.useFakeTimers()
+        try {
+            let dispatchedSignal: AbortSignal | undefined
+            const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+                dispatchedSignal = init?.signal ?? undefined
+                return await new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener('abort', () => {
+                        reject(new DOMException('aborted', 'AbortError'))
+                    }, { once: true })
+                })
+            })
+            vi.stubGlobal('fetch', fetchMock)
+
+            const restore = readyStorage().restoreInternalSnapshot('database/dbbackup-333.bin')
+            const assertion = expect(restore).rejects.toMatchObject({
+                code: 'COMMIT_OUTCOME_UNKNOWN',
+                commitOutcomeUnknown: true,
+                retryable: false,
+            } satisfies Partial<InstanceType<typeof StorageError>>)
+            await vi.advanceTimersByTimeAsync(INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS)
+
+            await assertion
+            expect(dispatchedSignal?.aborted).toBe(true)
+            expect(fetchMock).toHaveBeenCalledOnce()
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('rejects a proxy-generated malformed 2xx and does not retry the restore POST', async () => {
+        const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+            ok: true,
+            key: 'database/dbbackup-654.bin',
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+            proxy: true,
+        }), { status: 200, headers: { 'content-type': 'application/json' } }))
+        vi.stubGlobal('fetch', fetchMock)
+
+        await expect(readyStorage().restoreInternalSnapshot(
+            'database/dbbackup-654.bin',
+        )).rejects.toMatchObject({
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            commitOutcomeUnknown: true,
+            retryable: false,
+        } satisfies Partial<InstanceType<typeof StorageError>>)
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    it('treats a displaced writer session as definitively not committed', async () => {
+        const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+            expect(new Headers(init?.headers).get('x-session-id')).toBeTruthy()
+            return new Response(JSON.stringify({ error: 'Session deactivated' }), {
+                status: 423,
+                headers: { 'content-type': 'application/json' },
+            })
+        })
+        vi.stubGlobal('fetch', fetchMock)
+
+        await expect(readyStorage().restoreInternalSnapshot(
+            'database/dbbackup-987.bin',
+        )).rejects.toMatchObject({
+            status: 423,
+            commitOutcomeUnknown: false,
+            retryable: false,
+        } satisfies Partial<InstanceType<typeof StorageError>>)
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    it('keeps a stalled 423 body definitive through external abort and never reloads the UI', async () => {
+        let resolveHeaders!: () => void
+        const headersReturned = new Promise<void>(resolve => { resolveHeaders = resolve })
+        let bodyCancelled = false
+        const fetchMock = vi.fn(async () => {
+            const body = new ReadableStream<Uint8Array>({
+                cancel() { bodyCancelled = true },
+            })
+            resolveHeaders()
+            return new Response(body, {
+                status: 423,
+                headers: { 'content-type': 'application/json' },
+            })
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+        const external = new AbortController()
+        const onDefinitiveFailure = vi.fn()
+        const onCommitUnknown = vi.fn()
+        const hardReload = vi.fn()
+
+        const result = runInternalSnapshotRestoreUi('database/dbbackup-555.bin', {
+            restore: (key, signal) => storage.restoreInternalSnapshot(key, signal),
+            onCommitted: vi.fn(),
+            onDefinitiveFailure,
+            onCommitUnknown,
+            hardReload,
+        }, external.signal)
+        await headersReturned
+        external.abort()
+
+        await expect(result).resolves.toBe('not-committed')
+        expect(onDefinitiveFailure).toHaveBeenCalledWith(expect.objectContaining({
+            status: 423,
+            commitOutcomeUnknown: false,
+        }))
+        expect(onCommitUnknown).not.toHaveBeenCalled()
+        expect(hardReload).not.toHaveBeenCalled()
+        expect(bodyCancelled).toBe(true)
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    it('keeps a stalled 423 body definitive when the restore timeout advances', async () => {
+        vi.useFakeTimers()
+        try {
+            let resolveHeaders!: () => void
+            const headersReturned = new Promise<void>(resolve => { resolveHeaders = resolve })
+            let bodyCancelled = false
+            const fetchMock = vi.fn(async () => {
+                const body = new ReadableStream<Uint8Array>({
+                    cancel() { bodyCancelled = true },
+                })
+                resolveHeaders()
+                return new Response(body, { status: 423 })
+            })
+            vi.stubGlobal('fetch', fetchMock)
+
+            const restore = readyStorage().restoreInternalSnapshot('database/dbbackup-556.bin')
+            const assertion = expect(restore).rejects.toMatchObject({
+                status: 423,
+                code: 'HTTP_423',
+                commitOutcomeUnknown: false,
+                retryable: false,
+            } satisfies Partial<InstanceType<typeof StorageError>>)
+            await headersReturned
+            await vi.advanceTimersByTimeAsync(INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS)
+
+            await assertion
+            expect(bodyCancelled).toBe(true)
+            expect(fetchMock).toHaveBeenCalledOnce()
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('requires the server to echo the exact requested snapshot key', async () => {
+        const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+            ok: true,
+            key: 'database/dbbackup-111.bin',
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+        }), { status: 200, headers: { 'content-type': 'application/json' } }))
+        vi.stubGlobal('fetch', fetchMock)
+
+        await expect(readyStorage().restoreInternalSnapshot(
+            'database/dbbackup-222.bin',
+        )).rejects.toMatchObject({
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            commitOutcomeUnknown: true,
+        } satisfies Partial<InstanceType<typeof StorageError>>)
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
 })

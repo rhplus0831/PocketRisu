@@ -3727,6 +3727,57 @@ describe('corrupt database boot snapshot recovery', () => {
         )).toMatchObject({ recoveredFrom: 'older-block-snapshot' })
     }, 30_000)
 
+    it('session-fences restore, rejects prefix-only keys, and echoes the exact committed key', async () => {
+        const cwd = makeWorkDir()
+        const snapshotKey = `database/dbbackup-${((Date.now() + 60_000) / 100).toFixed()}.bin`
+        seedRecoveryFixture(cwd, snapshotKey, encodeRisuSaveLegacy({
+            characters: [],
+            optimizePluginMemory: true,
+            pluginStorageFolded: true,
+            pluginStorageGeneration: 'session-fenced-restore-generation',
+            pluginCustomStorage: { selected: 'restored' },
+        }), [])
+
+        const server = await startServer(cwd)
+        const displaced = await authenticate(server)
+        const active = await authenticate(server)
+
+        const locked = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...displaced, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(locked.status).toBe(423)
+        await expect(locked.json()).resolves.toEqual({ error: 'Session deactivated' })
+        const unchanged = await fetch(`${server.origin}/api/db/read-raw-for-boot`, {
+            headers: active,
+        })
+        expect(unchanged.status).toBe(200)
+        expect(Buffer.from(await unchanged.arrayBuffer()).toString('utf-8'))
+            .toBe('corrupt-live-database')
+
+        const prefixOnly = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...active, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: `${snapshotKey}/suffix` }),
+        })
+        expect(prefixOnly.status).toBe(400)
+        await expect(prefixOnly.json()).resolves.toEqual({ error: 'Invalid snapshot key' })
+
+        const restored = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...active, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(restored.status).toBe(200)
+        await expect(restored.json()).resolves.toEqual({
+            ok: true,
+            key: snapshotKey,
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+        })
+    }, 30_000)
+
     it('accepts the fresh-install empty database envelope and boots it after restart', async () => {
         const cwd = makeWorkDir()
         let server = await startServer(cwd)
@@ -4121,6 +4172,7 @@ describe('corrupt database boot snapshot recovery', () => {
         expect(restore.status).toBe(200)
         await expect(restore.json()).resolves.toEqual({
             ok: true,
+            key: snapshotKey,
             commitOutcome: 'committed',
             commitOutcomeUnknown: false,
         })

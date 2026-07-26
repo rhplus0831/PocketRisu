@@ -934,6 +934,7 @@ describe('staged plugin transition verifier boundaries (real server)', () => {
     expect(restore.status).toBe(200)
     await expect(restore.json()).resolves.toMatchObject({
       ok: true,
+      key: snapshotKey,
       commitOutcome: 'committed',
       commitOutcomeUnknown: false,
     })

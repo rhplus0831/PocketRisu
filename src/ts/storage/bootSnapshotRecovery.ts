@@ -12,7 +12,7 @@ export interface BootInternalSnapshot {
 
 export interface BootSnapshotRecoveryStorage {
     listInternalSnapshotsForBoot(): Promise<BootInternalSnapshot[]>
-    restoreInternalSnapshotForBoot(key: string): Promise<"committed">
+    restoreInternalSnapshot(key: string): Promise<"committed">
     readDatabaseForBoot(): Promise<BootSnapshotDatabaseRead>
 }
 
@@ -43,7 +43,7 @@ export async function recoverDatabaseFromInternalSnapshots<T>({
         let candidateCommitted = false
         try {
             onStatus(`Restoring Backup File ${snapshot.timestamp}...`)
-            await storage.restoreInternalSnapshotForBoot(snapshot.key)
+            await storage.restoreInternalSnapshot(snapshot.key)
             candidateCommitted = true
 
             // Install only the committed stripped publication read back from

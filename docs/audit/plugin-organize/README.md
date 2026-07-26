@@ -144,7 +144,11 @@ size-before-read metering with duplicate caching, cycle/depth rejection, strict
 missing/read failures, exact requested-target publication, and save-folder
 rollback. BR3 boot fallback tries an older candidate only after explicit
 known-not-committed proof; unclassified, transport-ambiguous, and post-commit
-failures stop conservatively.
+failures stop conservatively. Settings and corrupt boot share one strict
+session-fenced restore call: exact key and echoed commit
+schema, a finite large-restore timeout, no mutation retry, definitive `423`
+classification before body I/O, and warning-plus-hard-reload reconciliation
+only for genuinely unknown outcomes.
 PM4 additionally covers compact manifest CAS, exact server value hashes,
 50-row snapshot reuse, canonical manifest-key validation and cancellation,
 donated 128-row and four-by-2-MiB batches, one IndexedDB mutation transaction,

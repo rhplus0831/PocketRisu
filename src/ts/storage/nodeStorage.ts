@@ -58,6 +58,9 @@ import { PLUGIN_VALUE_STREAM_THRESHOLD_BYTES } from "./pluginStorageLimits"
 import type { BootInternalSnapshot } from "./bootSnapshotRecovery"
 
 export const AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS = 15_000
+/** Snapshot ingestion can legitimately stream hundreds of MiB from chunk storage. */
+export const INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS = 10 * 60_000
+export const INTERNAL_SNAPSHOT_KEY_PATTERN = /^database\/dbbackup-(0|[1-9]\d*)\.bin$/
 type BoundedStorageOperation = 'read' | 'list' | 'write' | 'remove' | 'transition' | 'batch'
 
 interface AuthoritativeStorageOutcomeTracker {
@@ -386,8 +389,27 @@ interface StorageFailurePayload {
     commitOutcomeUnknown?: unknown
 }
 
+interface InternalSnapshotRestoreAcknowledgement {
+    ok: true
+    key: string
+    commitOutcome: 'committed'
+    commitOutcomeUnknown: false
+}
+
+function isExactInternalSnapshotRestoreAcknowledgement(
+    value: unknown,
+    key: string,
+): value is InternalSnapshotRestoreAcknowledgement {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const result = value as Record<string, unknown>
+    return Object.keys(result).sort().join(',') === 'commitOutcome,commitOutcomeUnknown,key,ok'
+        && result.ok === true
+        && result.key === key
+        && result.commitOutcome === 'committed'
+        && result.commitOutcomeUnknown === false
+}
+
 const PLUGIN_STORAGE_PREFIXES = ['pluginsave/', 'pluginsave-meta/'] as const
-const INTERNAL_SNAPSHOT_KEY_PATTERN = /^database\/dbbackup-(0|[1-9]\d*)\.bin$/
 const PLUGIN_STORAGE_MAX_RETRIES = 2
 const PLUGIN_STORAGE_DEFAULT_RETRY_SECONDS = 0.25
 const PLUGIN_STORAGE_MAX_RETRY_DELAY_SECONDS = 5
@@ -2298,13 +2320,13 @@ export class NodeStorage{
     }
 
     /**
-     * Publish one internal snapshot through the same exclusive transaction as
-     * the Settings restore flow. This is a mutation even though bootstrap uses
-     * it while reading: an interrupted response must remain commit-unknown so
-     * callers never blindly replay an older snapshot over a possibly committed
-     * recovery point.
+     * Publish one internal snapshot through the server's exclusive restore
+     * transaction. Boot recovery and Settings deliberately share this exact
+     * session-fenced boundary. The request is never replayed: once dispatched,
+     * a missing or malformed acknowledgement is commit-outcome unknown and the
+     * caller must reload/reconcile authoritative state.
      */
-    async restoreInternalSnapshotForBoot(
+    async restoreInternalSnapshot(
         key: string,
         externalSignal?: AbortSignal | null,
     ): Promise<'committed'> {
@@ -2312,43 +2334,89 @@ export class NodeStorage{
             throw new TypeError('Invalid internal snapshot key')
         }
         return runBoundedAuthoritativeStorageOperation<'committed'>(async (signal, outcome) => {
-            const response = await this.requestStorage(
-                key,
-                'transition',
-                true,
-                () => this.authFetch('/api/db/snapshots/restore', {
-                    method: 'POST',
-                    headers: { 'content-type': 'application/json' },
-                    body: JSON.stringify({ key }),
-                    signal,
-                }, true, outcome),
-                [],
+            // Retrying an expired-auth response would replay the restore POST.
+            // Authentication is completed before dispatch, so one attempt is
+            // the only safe mutation policy.
+            const response = await this.authFetch('/api/db/snapshots/restore', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ key }),
                 signal,
-                outcome,
-            )
+            }, false, outcome)
 
-            // Consume and validate the commit envelope before making the
-            // acknowledgement definitive. A proxy-generated 2xx or a truncated
-            // body after COMMIT cannot be mistaken for a known outcome.
-            outcome.markRequestDispatched()
-            let payload: StorageFailurePayload & { ok?: unknown } = {}
-            try {
-                const parsed = await awaitWithAbort(response.clone().json(), signal) as unknown
-                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-                    payload = parsed as StorageFailurePayload & { ok?: unknown }
+            // The active-session middleware rejects 423 before the restore
+            // route can run. Classify it from headers immediately: its optional
+            // diagnostic body may be delayed or truncated by a proxy, but that
+            // cannot make a mutation which never entered the route ambiguous.
+            if (response.status === 423) {
+                outcome.markDefinitiveResponse()
+                try {
+                    void response.body?.cancel().catch(() => undefined)
+                } catch {
+                    // Body disposal is best-effort and never changes the known
+                    // not-committed outcome.
                 }
-            } catch {
-                // Invalid success acknowledgements remain commit-unknown.
+                throw new StorageError('Session deactivated', {
+                    status: 423,
+                    code: 'HTTP_423',
+                    retryable: false,
+                    commitOutcomeUnknown: false,
+                    operation: 'transition',
+                })
             }
-            if (
-                response.status !== 200
-                || Object.keys(payload).sort().join(',')
-                    !== 'commitOutcome,commitOutcomeUnknown,ok'
-                || payload.ok !== true
-                || payload.commitOutcome !== 'committed'
-                || payload.commitOutcomeUnknown !== false
-            ) {
-                throw new StorageError('Snapshot recovery returned an invalid commit acknowledgement', {
+            // authFetch knows only that an HTTP response started. Keep the
+            // restore ambiguous until its complete, strict JSON envelope has
+            // been consumed. A proxy-generated 2xx, a mismatched echo, or a
+            // truncated body after COMMIT cannot become an acknowledgement.
+            outcome.markRequestDispatched()
+            let payload: unknown
+            try {
+                const body = await awaitWithAbort(response.text(), signal)
+                payload = JSON.parse(body)
+            } catch (error) {
+                throw new StorageError('Snapshot restore acknowledgement was truncated or malformed', {
+                    status: response.status,
+                    code: 'COMMIT_OUTCOME_UNKNOWN',
+                    retryable: false,
+                    commitOutcomeUnknown: true,
+                    operation: 'transition',
+                    cause: error,
+                })
+            }
+
+            if (!response.ok) {
+                const failure = payload && typeof payload === 'object' && !Array.isArray(payload)
+                    ? payload as StorageFailurePayload
+                    : null
+                const explicitlyNotCommitted = failure?.commitOutcome === 'not-committed'
+                    && failure?.commitOutcomeUnknown === false
+                // Authentication/session/key rejection happens before the
+                // mutation transaction. Server 5xx is definitive only when its
+                // rollback envelope says so exactly.
+                const rejectedBeforeMutation = response.status === 400
+                    || response.status === 401
+                    || response.status === 403
+                    || response.status === 404
+                    || response.status === 423
+                const definitive = explicitlyNotCommitted || rejectedBeforeMutation
+                if (definitive) outcome.markDefinitiveResponse()
+                throw new StorageError(
+                    payloadMessage(failure) ?? `Snapshot restore failed with HTTP ${response.status}`,
+                    {
+                        status: response.status,
+                        code: typeof failure?.code === 'string'
+                            ? failure.code
+                            : (definitive ? `HTTP_${response.status}` : 'COMMIT_OUTCOME_UNKNOWN'),
+                        retryAfter: parseRetryAfterSeconds(failure?.retryAfter),
+                        retryable: definitive && failure?.retryable === true,
+                        commitOutcomeUnknown: !definitive,
+                        operation: 'transition',
+                    },
+                )
+            }
+
+            if (!isExactInternalSnapshotRestoreAcknowledgement(payload, key)) {
+                throw new StorageError('Snapshot restore returned an invalid commit acknowledgement', {
                     status: response.status,
                     code: 'COMMIT_OUTCOME_UNKNOWN',
                     retryable: false,
@@ -2363,7 +2431,7 @@ export class NodeStorage{
                 void invalidateResourceCacheManifest(`db:${group}`)
             }
             return 'committed'
-        }, 'transition', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+        }, 'transition', INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS, externalSignal)
     }
     async keys(prefix: string = '', externalSignal?: AbortSignal | null):Promise<string[]>{
         return runBoundedAuthoritativeStorageOperation(

@@ -10721,6 +10721,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
         }
         res.json({
             ok: true,
+            key,
             commitOutcome: 'committed',
             commitOutcomeUnknown: false,
         });

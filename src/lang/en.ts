@@ -2049,6 +2049,7 @@ export const languageEnglish = {
     backupSnapshot: "Snapshot (DB only)",
     backupSnapshotEmpty: "No snapshots.",
     backupSnapshotRestore: "Restore from this snapshot",
+    backupSnapshotRestoreUnknown: "The server may have committed this snapshot restore, but its acknowledgement was lost or invalid. PocketRisu will not retry it. Dismiss this warning to reload and reconcile the authoritative server state.",
     backupSnapshotDelete: "Delete snapshot",
     backupSnapshotDeleteConfirm: (when: string) => `Delete the ${when} snapshot? This cannot be undone.`,
     backupSnapshotDeleted: "Snapshot deleted.",

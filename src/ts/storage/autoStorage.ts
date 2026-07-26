@@ -56,14 +56,14 @@ export class AutoStorage{
             ? await this.realStorage.listInternalSnapshotsForBoot(signal)
             : await this.realStorage.listInternalSnapshotsForBoot()
     }
-    async restoreInternalSnapshotForBoot(
+    async restoreInternalSnapshot(
         key: string,
         signal?: AbortSignal | null,
     ) {
         await this.Init()
         return signal
-            ? await this.realStorage.restoreInternalSnapshotForBoot(key, signal)
-            : await this.realStorage.restoreInternalSnapshotForBoot(key)
+            ? await this.realStorage.restoreInternalSnapshot(key, signal)
+            : await this.realStorage.restoreInternalSnapshot(key)
     }
     async keys(prefix: string = '', signal?: AbortSignal | null):Promise<string[]>{
         await this.Init()
