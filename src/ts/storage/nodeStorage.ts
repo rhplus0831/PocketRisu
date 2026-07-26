@@ -26,6 +26,7 @@ import {
     storeBytes,
     touchResourceCacheManifest,
 } from "./resourceCache"
+import { getThrownMessage, StorageError } from "./storageError"
 
 export type BootDatabaseReadResult =
     | { kind: 'bytes', bytes: Buffer | null }
@@ -50,13 +51,56 @@ export interface ChatBackupVersion {
 }
 
 // Custom error class for database conflict detection
-export class ConflictError extends Error {
+export class ConflictError extends StorageError {
     currentEtag: string
     constructor(message: string, currentEtag: string) {
-        super(message)
+        super(message, {
+            status: 409,
+            code: 'STORAGE_CONFLICT',
+            retryable: false,
+            commitOutcomeUnknown: false,
+            operation: 'write',
+        })
         this.name = 'ConflictError'
         this.currentEtag = currentEtag
     }
+}
+
+type StorageOperation = 'read' | 'list' | 'write' | 'remove'
+
+interface StorageFailurePayload {
+    error?: unknown
+    message?: unknown
+    code?: unknown
+    retryAfter?: unknown
+    retryable?: unknown
+    commitOutcome?: unknown
+    commitOutcomeUnknown?: unknown
+}
+
+const PLUGIN_STORAGE_PREFIXES = ['pluginsave/', 'pluginsave-meta/'] as const
+const PLUGIN_STORAGE_MAX_RETRIES = 2
+const PLUGIN_STORAGE_DEFAULT_RETRY_SECONDS = 0.25
+const PLUGIN_STORAGE_MAX_RETRY_DELAY_SECONDS = 5
+
+function isPluginStorageTarget(target: string): boolean {
+    return PLUGIN_STORAGE_PREFIXES.some(prefix => target.startsWith(prefix))
+}
+
+function parseRetryAfterSeconds(value: unknown): number | null {
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value
+    if (typeof value !== 'string' || value.trim() === '') return null
+    const numeric = Number(value)
+    if (Number.isFinite(numeric) && numeric >= 0) return numeric
+    const timestamp = Date.parse(value)
+    if (!Number.isFinite(timestamp)) return null
+    return Math.max(0, (timestamp - Date.now()) / 1000)
+}
+
+function payloadMessage(payload: StorageFailurePayload | null): string | null {
+    if (typeof payload?.error === 'string' && payload.error.length > 0) return payload.error
+    if (typeof payload?.message === 'string' && payload.message.length > 0) return payload.message
+    return null
 }
 
 // Warning the server attaches to /api/patch responses when the most recent
@@ -295,6 +339,166 @@ export class NodeStorage{
         return response
     }
 
+    private async parseStorageFailureResponse(
+        response: Response,
+        operation: StorageOperation,
+        mutation: boolean,
+    ): Promise<StorageError> {
+        let payload: StorageFailurePayload | null = null
+        let responseText = ''
+        try {
+            const parsed = await response.clone().json() as unknown
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                payload = parsed as StorageFailurePayload
+            } else if (typeof parsed === 'string') {
+                responseText = parsed
+            }
+        } catch {
+            try {
+                responseText = await response.clone().text()
+            } catch {
+                // A status and operation still provide a useful structured error.
+            }
+        }
+
+        const status = response.status
+        const serverCode = typeof payload?.code === 'string' ? payload.code : null
+        const explicitlyNotCommitted = payload?.commitOutcome === 'not-committed'
+            || payload?.commitOutcomeUnknown === false
+            || serverCode === 'IMPORT_IN_PROGRESS'
+        const commitOutcomeUnknown = mutation
+            && (payload?.commitOutcomeUnknown === true
+                || payload?.commitOutcome === 'unknown'
+                || ((status === 409 || status >= 500) && !explicitlyNotCommitted))
+        const retryAfter = parseRetryAfterSeconds(response.headers.get('retry-after'))
+            ?? parseRetryAfterSeconds(payload?.retryAfter)
+        const message = payloadMessage(payload)
+            ?? (responseText.trim() || `${operation} failed with HTTP ${status}`)
+
+        return new StorageError(message, {
+            status,
+            code: serverCode ?? (commitOutcomeUnknown ? 'COMMIT_OUTCOME_UNKNOWN' : `HTTP_${status}`),
+            retryAfter,
+            retryable: payload?.retryable === true,
+            commitOutcomeUnknown,
+            operation,
+        })
+    }
+
+    private makeStorageTransportError(
+        error: unknown,
+        operation: StorageOperation,
+        mutation: boolean,
+    ): StorageError {
+        return new StorageError(
+            getThrownMessage(error, `${operation} failed before a response was received`),
+            {
+                code: mutation ? 'COMMIT_OUTCOME_UNKNOWN' : 'STORAGE_TRANSPORT_ERROR',
+                retryable: !mutation,
+                commitOutcomeUnknown: mutation,
+                operation,
+                cause: error,
+            },
+        )
+    }
+
+    private async waitForPluginStorageRetry(error: StorageError, retryIndex: number): Promise<void> {
+        const delaySeconds = Math.min(
+            error.retryAfter
+                ?? PLUGIN_STORAGE_DEFAULT_RETRY_SECONDS * (2 ** retryIndex),
+            PLUGIN_STORAGE_MAX_RETRY_DELAY_SECONDS,
+        )
+        if (delaySeconds <= 0) return
+        await new Promise<void>(resolve => setTimeout(resolve, delaySeconds * 1000))
+    }
+
+    /**
+     * Plugin storage operations are idempotent at the HTTP boundary: writes
+     * replace one key and removes delete one key. Retry only failures that are
+     * explicitly safe, and never replay a mutation whose commit is ambiguous.
+     */
+    private async requestStorage(
+        target: string,
+        operation: StorageOperation,
+        mutation: boolean,
+        request: () => Promise<Response>,
+        allowedStatuses: readonly number[] = [],
+    ): Promise<Response> {
+        const retryPluginOperation = isPluginStorageTarget(target)
+        for (let retryIndex = 0; ; retryIndex++) {
+            let response: Response
+            try {
+                response = await request()
+            } catch (error) {
+                const storageError = this.makeStorageTransportError(error, operation, mutation)
+                if (retryPluginOperation
+                    && storageError.retryable
+                    && !storageError.commitOutcomeUnknown
+                    && retryIndex < PLUGIN_STORAGE_MAX_RETRIES) {
+                    await this.waitForPluginStorageRetry(storageError, retryIndex)
+                    continue
+                }
+                throw storageError
+            }
+
+            if (response.ok || allowedStatuses.includes(response.status)) return response
+            const storageError = await this.parseStorageFailureResponse(response, operation, mutation)
+            if (retryPluginOperation
+                && storageError.retryable
+                && !storageError.commitOutcomeUnknown
+                && retryIndex < PLUGIN_STORAGE_MAX_RETRIES) {
+                await this.waitForPluginStorageRetry(storageError, retryIndex)
+                continue
+            }
+            throw storageError
+        }
+    }
+
+    private storagePayloadError(
+        payload: StorageFailurePayload,
+        operation: StorageOperation,
+        mutation: boolean,
+        status: number,
+    ): StorageError {
+        const commitOutcomeUnknown = mutation && payload.commitOutcomeUnknown !== false
+        return new StorageError(payloadMessage(payload) ?? `${operation} failed`, {
+            status,
+            code: typeof payload.code === 'string'
+                ? payload.code
+                : (commitOutcomeUnknown ? 'COMMIT_OUTCOME_UNKNOWN' : 'STORAGE_RESPONSE_ERROR'),
+            retryAfter: parseRetryAfterSeconds(payload.retryAfter),
+            retryable: payload.retryable === true,
+            commitOutcomeUnknown,
+            operation,
+        })
+    }
+
+    private async parseDatabaseConflict(
+        response: Response,
+        key: string,
+        requestedEtag: string | undefined,
+    ): Promise<{ message: string; currentEtag: string } | null> {
+        if (response.status !== 409
+            || key !== 'database/database.bin'
+            || typeof requestedEtag !== 'string'
+            || requestedEtag.length === 0) {
+            return null
+        }
+        try {
+            const payload = await response.clone().json() as unknown
+            if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null
+            const record = payload as Record<string, unknown>
+            if (typeof record.error !== 'string' || record.error.length === 0) return null
+            if (typeof record.currentEtag !== 'string'
+                || !/^[0-9a-f]{32}$/.test(record.currentEtag)) {
+                return null
+            }
+            return { message: record.error, currentEtag: record.currentEtag }
+        } catch {
+            return null
+        }
+    }
+
     async setItem(key:string, value:Uint8Array, etag?:string) {
         const shouldSeedResourceCache = isResourceCacheEnabled() && key.startsWith('pluginsave/')
         const requestBytes = shouldSeedResourceCache ? new Uint8Array(value) : value
@@ -308,27 +512,21 @@ export class NodeStorage{
         if (etag) {
             headers['x-if-match'] = etag
         }
-        const da = await this.authFetch('/api/write', {
+        const da = await this.requestStorage(key, 'write', true, () => this.authFetch('/api/write', {
             method: "POST",
             body: requestBytes as any,
             headers
-        })
+        }), [409])
         if(da.status === 409){
-            const data = await da.json()
-            throw new ConflictError(data.error, data.currentEtag)
-        }
-        // The server refuses writes while an import holds the database, so this
-        // key was NOT written. Surface it as retryable instead of a generic
-        // failure — the save loop reissues on the next cycle.
-        if(da.status === 503){
-            throw "setItem skipped: an import is in progress on the server"
-        }
-        if(da.status < 200 || da.status >= 300){
-            throw "setItem Error"
+            const conflict = await this.parseDatabaseConflict(da, key, etag)
+            if (conflict) {
+                throw new ConflictError(conflict.message, conflict.currentEtag)
+            }
+            throw await this.parseStorageFailureResponse(da, 'write', true)
         }
         const data = await da.json()
         if(data.error){
-            throw data.error
+            throw this.storagePayloadError(data, 'write', true, da.status)
         }
         const nextEtag = data.etag as string | undefined
         if (key === 'database/database.bin' && nextEtag) {
@@ -350,10 +548,9 @@ export class NodeStorage{
             'file-path': Buffer.from(key, 'utf-8').toString('hex')
         }
 
-        const da = await this.authFetch('/api/read', { method: "GET", headers })
-        if(da.status < 200 || da.status >= 300){
-            throw "getItem Error"
-        }
+        const da = await this.requestStorage(key, 'read', false, () => (
+            this.authFetch('/api/read', { method: "GET", headers })
+        ))
 
         // Capture ETag for database.bin
         const etag = da.headers.get('x-db-etag')
@@ -390,7 +587,9 @@ export class NodeStorage{
             headers['x-cached-hashes'] = manifestHashes.join(',')
         }
 
-        let response = await this.authFetch('/api/read', { method: 'GET', headers })
+        let response = await this.requestStorage(key, 'read', false, () => (
+            this.authFetch('/api/read', { method: 'GET', headers })
+        ))
         if (response.status === 204) {
             try {
                 const contentHash = response.headers.get('x-content-hash')
@@ -402,10 +601,11 @@ export class NodeStorage{
                 void touchResourceCacheManifest(resourceKey)
                 return cachedBytes.byteLength === 0 ? null : Buffer.from(cachedBytes)
             } catch {
-                response = await this.authFetch('/api/read', { method: 'GET', headers: plainHeaders })
+                response = await this.requestStorage(key, 'read', false, () => (
+                    this.authFetch('/api/read', { method: 'GET', headers: plainHeaders })
+                ))
             }
         }
-        if (response.status < 200 || response.status >= 300) throw new Error(`getItemCached error: ${response.status}`)
 
         const bytes = Buffer.from(await response.arrayBuffer())
         if (bytes.length === 0) return null
@@ -477,16 +677,13 @@ export class NodeStorage{
             headers['x-last-sync'] = String(cached.timestamp)
             headers['x-list-epoch'] = cached.epoch
         }
-        const da = await this.authFetch('/api/list', {
+        const da = await this.requestStorage(prefix, 'list', false, () => this.authFetch('/api/list', {
             method: "GET",
             headers
-        })
-        if(da.status < 200 || da.status >= 300){
-            throw "listItem Error"
-        }
+        }))
         const data = await da.json()
         if(data.error){
-            throw data.error
+            throw this.storagePayloadError(data, 'list', false, da.status)
         }
 
         const serverTimestamp = data.timestamp
@@ -516,18 +713,15 @@ export class NodeStorage{
         return content
     }
     async removeItem(key:string){
-        const da = await this.authFetch('/api/remove', {
+        const da = await this.requestStorage(key, 'remove', true, () => this.authFetch('/api/remove', {
             method: "GET",
             headers: {
                 'file-path': Buffer.from(key, 'utf-8').toString('hex')
             }
-        })
-        if(da.status < 200 || da.status >= 300){
-            throw "removeItem Error"
-        }
+        }))
         const data = await da.json()
         if(data.error){
-            throw data.error
+            throw this.storagePayloadError(data, 'remove', true, da.status)
         }
     }
 

@@ -145,3 +145,28 @@ back.
   reads from an isolated committed-snapshot connection.
 - Test read, write, remove, and plugin startup while an import is held and
   while that import rolls back.
+
+### Resolution
+
+**Fixed 2026-07-26.** Plugin KV failures now use a structured `StorageError`
+contract from `NodeStorage` through both iframe RPC directions. HTTP status,
+stable code, bounded `Retry-After`, retryability, operation, and
+commit-outcome ambiguity survive the bridge; thrown strings retain their
+literal message. Malformed JSON/plain error bodies and ordinary 4xx/5xx
+responses cannot leak a parser exception. `ConflictError` is limited to a
+schema-valid database ETag conflict with a supplied prior ETag.
+
+Explicitly retryable idempotent plugin reads, lists, writes, and removes use a
+bounded policy. Ambiguous network/server mutation failures return
+`COMMIT_OUTCOME_UNKNOWN` and are never replayed; explicitly not-committed
+import responses remain safely retryable. Numeric and HTTP-date retry delays
+are honored with a five-second cap.
+
+The server now places `/api/read` immediately behind the same committed-state
+import barrier as `/api/list`. A held replacement import can no longer expose
+its cleared or partially repopulated transaction; after release, reads observe
+only the committed replacement or the rolled-back original. Import-time
+writes/removes keep a structured 503 contract. Independent verification
+passed 24 adversarial client/bridge tests, 4 real held-import commit/rollback
+tests, `pnpm check`, and a production build; the fixer also passed the full
+client, server, and compatibility suites.

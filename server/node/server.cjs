@@ -202,7 +202,10 @@ function sendImportBusy(res) {
     res.status(503).json({
         error: 'An import is in progress; retry this write after it completes',
         code: 'IMPORT_IN_PROGRESS',
+        retryAfter: 5,
         retryable: true,
+        commitOutcome: 'not-committed',
+        commitOutcomeUnknown: false,
     });
 }
 
@@ -3970,6 +3973,12 @@ app.get('/api/read', async (req, res, next) => {
         if (key === 'database/database.bin') {
             await flushPendingDb();
         }
+        // Imports hold an open transaction on the server's only SQLite
+        // connection while clearing and repopulating plugin rows. Waiting at
+        // the last async boundary before kvGet ensures reads observe either the
+        // pre-import commit or the post-import commit/rollback, never the
+        // transaction's transient contents.
+        await importBarrier.waitUntilIdle();
         let value = null;
         if (key.startsWith('inlay/')) {
             value = await readInlayAssetPayload(key.slice('inlay/'.length));

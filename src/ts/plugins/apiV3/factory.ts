@@ -16,8 +16,96 @@ interface RpcMessage {
     method?: string;
     args?: any[];
     result?: any;
-    error?: string;
+    error?: V3BridgeErrorPayload | string;
     abortId?: string;
+}
+
+export interface V3BridgeErrorPayload {
+    __type: 'ERROR';
+    name: string;
+    message: string;
+    status?: number | null;
+    code?: string | null;
+    retryAfter?: number | null;
+    retryable?: boolean;
+    commitOutcomeUnknown?: boolean;
+    operation?: string | null;
+}
+
+/** Self-contained because its source is also installed in the iframe guest. */
+export function serializeV3BridgeError(error: unknown): V3BridgeErrorPayload {
+    const source = error && typeof error === 'object'
+        ? error as Record<string, unknown>
+        : null;
+    let message: string;
+    if (typeof error === 'string') message = error;
+    else if (typeof source?.message === 'string' && source.message.length > 0) message = source.message;
+    else if (error !== undefined && error !== null && String(error) !== '[object Object]') message = String(error);
+    else message = 'Execution error';
+
+    const payload: V3BridgeErrorPayload = {
+        __type: 'ERROR',
+        name: typeof source?.name === 'string' && source.name.length > 0 ? source.name : 'Error',
+        message,
+    };
+    const status = source?.status;
+    const code = source?.code;
+    const retryAfter = source?.retryAfter;
+    const retryable = source?.retryable;
+    const commitOutcomeUnknown = source?.commitOutcomeUnknown;
+    const operation = source?.operation;
+    if (typeof status === 'number') payload.status = status;
+    else if (status === null) payload.status = null;
+    if (typeof code === 'string') payload.code = code;
+    else if (code === null) payload.code = null;
+    if (typeof retryAfter === 'number') payload.retryAfter = retryAfter;
+    else if (retryAfter === null) payload.retryAfter = null;
+    if (typeof retryable === 'boolean') payload.retryable = retryable;
+    if (typeof commitOutcomeUnknown === 'boolean') {
+        payload.commitOutcomeUnknown = commitOutcomeUnknown;
+    }
+    if (typeof operation === 'string') payload.operation = operation;
+    else if (operation === null) payload.operation = null;
+    return payload;
+}
+
+/** Self-contained because its source is also installed in the iframe guest. */
+export function deserializeV3BridgeError(input: unknown): Error {
+    if (typeof input === 'string') return new Error(input);
+    const source = input && typeof input === 'object'
+        ? input as Record<string, unknown>
+        : null;
+    const message = typeof source?.message === 'string' && source.message.length > 0
+        ? source.message
+        : 'Execution error';
+    const error = new Error(message) as Error & {
+        status?: number | null;
+        code?: string | null;
+        retryAfter?: number | null;
+        retryable?: boolean;
+        commitOutcomeUnknown?: boolean;
+        operation?: string | null;
+    };
+    if (typeof source?.name === 'string' && source.name.length > 0) error.name = source.name;
+    const status = source?.status;
+    const code = source?.code;
+    const retryAfter = source?.retryAfter;
+    const retryable = source?.retryable;
+    const commitOutcomeUnknown = source?.commitOutcomeUnknown;
+    const operation = source?.operation;
+    if (typeof status === 'number') error.status = status;
+    else if (status === null) error.status = null;
+    if (typeof code === 'string') error.code = code;
+    else if (code === null) error.code = null;
+    if (typeof retryAfter === 'number') error.retryAfter = retryAfter;
+    else if (retryAfter === null) error.retryAfter = null;
+    if (typeof retryable === 'boolean') error.retryable = retryable;
+    if (typeof commitOutcomeUnknown === 'boolean') {
+        error.commitOutcomeUnknown = commitOutcomeUnknown;
+    }
+    if (typeof operation === 'string') error.operation = operation;
+    else if (operation === null) error.operation = null;
+    return error;
 }
 
 interface RemoteRef {
@@ -94,6 +182,8 @@ await (async function() {
     const proxyRefRegistry = new Map();
     const abortControllers = new Map();
     const validateDatabaseMutationForTransport = ${validateV3DatabaseMutationForTransport.toString()};
+    const serializeBridgeError = ${serializeV3BridgeError.toString()};
+    const deserializeBridgeError = ${deserializeV3BridgeError.toString()};
 
     function serializeArg(arg) {
         if (typeof arg === 'function') {
@@ -226,7 +316,7 @@ await (async function() {
         if (data.type === 'RESPONSE' && data.reqId) {
             const req = pendingRequests.get(data.reqId);
             if (req) {
-                if (data.error) req.reject(new Error(data.error));
+                if (data.error) req.reject(deserializeBridgeError(data.error));
                 else req.resolve(deserializeResult(data.result));
                 pendingRequests.delete(data.reqId);
             }
@@ -238,7 +328,7 @@ await (async function() {
                 const result = await eval('(async () => {' + data.code + '})()');
                 response.result = result;
             } catch (e) {
-                response.error = e.message || String(e);
+                response.error = serializeBridgeError(e);
             }
             send(response);
         }
@@ -271,7 +361,7 @@ await (async function() {
                 const result = await fn(...deserializedArgs);
                 response.result = result;
             } catch (e) {
-                response.error = e.message || "Guest callback error";
+                response.error = serializeBridgeError(e);
             }
             // Clean up abort controllers after callback completes
             for (const id of usedAbortIds) {
@@ -375,7 +465,7 @@ export class SandboxHost {
                 if (data.type === 'EXEC_RESULT' && data.reqId === reqId) {
                     window.removeEventListener('message', handler);
                     if (data.error) {
-                        reject(new Error(data.error));
+                        reject(deserializeV3BridgeError(data.error));
                     } else {
                         resolve(data.result);
                     }
@@ -569,7 +659,7 @@ export class SandboxHost {
             if (data.type === 'CALLBACK_RETURN') {
                 const req = this.pendingCallbacks.get(data.reqId!);
                 if (req) {
-                    if (data.error) req.reject(new Error(data.error));
+                    if (data.error) req.reject(deserializeV3BridgeError(data.error));
                     else req.resolve(data.result);
                     this.pendingCallbacks.delete(data.reqId!);
                 }
@@ -639,7 +729,7 @@ export class SandboxHost {
                     }
 
                 } catch (err: any) {
-                    response.error = err.message || "Host execution error";
+                    response.error = serializeV3BridgeError(err);
                 } finally {
                     for (const id of usedAbortIds) this.abortControllers.delete(id);
                 }

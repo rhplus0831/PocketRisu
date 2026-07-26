@@ -6,6 +6,7 @@ import http, { type ClientRequest, type IncomingMessage } from 'node:http'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { Packr } from 'msgpackr'
 
 const serverEntry = path.resolve(process.cwd(), 'server/node/server.cjs')
 const testPasswordDigest = crypto.createHash('sha256').update('list-delta-test').digest('hex')
@@ -34,10 +35,13 @@ interface PausedImport {
     request: ClientRequest
     response: IncomingMessage
     abort: () => void
+    finish: () => Promise<{ status: number; body: string }>
 }
 
 const runningServers = new Set<RunningServer>()
 const tempDirs: string[] = []
+const rawSaveHeader = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
+const packr = new Packr({ useRecords: false })
 
 function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
@@ -170,7 +174,12 @@ async function authenticate(server: RunningServer): Promise<AuthHeaders> {
     return headers
 }
 
-async function seedKey(server: RunningServer, auth: AuthHeaders, key: string): Promise<void> {
+async function seedKey(
+    server: RunningServer,
+    auth: AuthHeaders,
+    key: string,
+    value = Buffer.from('durable seed'),
+): Promise<void> {
     const response = await fetch(`${server.origin}/api/write`, {
         method: 'POST',
         headers: {
@@ -178,9 +187,52 @@ async function seedKey(server: RunningServer, auth: AuthHeaders, key: string): P
             'content-type': 'application/octet-stream',
             'file-path': Buffer.from(key).toString('hex'),
         },
-        body: Buffer.from('durable seed'),
+        body: value,
     })
     if (!response.ok) throw new Error(`Seed write failed (${response.status}): ${await response.text()}`)
+}
+
+async function readKey(server: RunningServer, auth: AuthHeaders, key: string): Promise<Buffer | null> {
+    const response = await fetch(`${server.origin}/api/read`, {
+        headers: {
+            ...auth,
+            'file-path': Buffer.from(key).toString('hex'),
+        },
+    })
+    if (!response.ok) throw new Error(`Read failed (${response.status}): ${await response.text()}`)
+    const value = Buffer.from(await response.arrayBuffer())
+    return value.length === 0 ? null : value
+}
+
+async function mutateKeyDuringImport(
+    server: RunningServer,
+    auth: AuthHeaders,
+    method: 'write' | 'remove',
+    key: string,
+    value = Buffer.from('racing mutation'),
+): Promise<Response> {
+    return await fetch(`${server.origin}/api/${method}`, {
+        method: method === 'write' ? 'POST' : 'GET',
+        headers: {
+            ...auth,
+            'file-path': Buffer.from(key).toString('hex'),
+            ...(method === 'write' ? { 'content-type': 'application/octet-stream' } : {}),
+        },
+        ...(method === 'write' ? { body: value } : {}),
+    })
+}
+
+async function expectImportBusy(response: Response): Promise<void> {
+    const body = await response.json() as Record<string, unknown>
+    expect(response.status).toBe(503)
+    expect(response.headers.get('retry-after')).toBe('5')
+    expect(body).toMatchObject({
+        code: 'IMPORT_IN_PROGRESS',
+        retryAfter: 5,
+        retryable: true,
+        commitOutcome: 'not-committed',
+        commitOutcomeUnknown: false,
+    })
 }
 
 async function listKeys(
@@ -210,7 +262,35 @@ function partialDatabaseEntry(): Buffer {
     return Buffer.concat([header, Buffer.from([0])])
 }
 
-async function startPausedImport(server: RunningServer, auth: AuthHeaders): Promise<PausedImport> {
+function backupEntry(name: string, data: Buffer): Buffer {
+    const nameBytes = Buffer.from(name)
+    const header = Buffer.alloc(4 + nameBytes.length + 4)
+    header.writeUInt32LE(nameBytes.length, 0)
+    nameBytes.copy(header, 4)
+    header.writeUInt32LE(data.length, 4 + nameBytes.length)
+    return Buffer.concat([header, data])
+}
+
+function validPluginStorageBackup(key: string, value: Buffer): Buffer {
+    const database = {
+        characters: [],
+        personas: [],
+        botPresets: [],
+        modules: [],
+        pluginCustomStorage: {},
+        optimizePluginMemory: true,
+    }
+    return Buffer.concat([
+        backupEntry('database.risudat', Buffer.concat([rawSaveHeader, packr.encode(database)])),
+        backupEntry(key, value),
+    ])
+}
+
+async function startPausedImport(
+    server: RunningServer,
+    auth: AuthHeaders,
+    initialBytes = partialDatabaseEntry(),
+): Promise<PausedImport> {
     let response: IncomingMessage | undefined
     let progressSeen = false
     const request = http.request(`${server.origin}/api/backup/import`, {
@@ -223,11 +303,25 @@ async function startPausedImport(server: RunningServer, auth: AuthHeaders): Prom
     })
     request.on('error', () => {})
 
+    let finishImport: (() => Promise<{ status: number; body: string }>) | undefined
     const progress = new Promise<void>((resolve, reject) => {
         request.once('response', (incoming) => {
             response = incoming
             incoming.setEncoding('utf8')
             let body = ''
+            let resolveCompleted: (result: { status: number; body: string }) => void
+            let rejectCompleted: (error: unknown) => void
+            const completed = new Promise<{ status: number; body: string }>((resolveDone, rejectDone) => {
+                resolveCompleted = resolveDone
+                rejectCompleted = rejectDone
+            })
+            // Rollback/crash tests intentionally destroy this response instead
+            // of awaiting finish(); keep that expected rejection handled.
+            void completed.catch(() => {})
+            finishImport = async () => {
+                request.end()
+                return await completed
+            }
             incoming.on('data', (chunk) => {
                 body += chunk
                 if (!progressSeen && body.includes('"type":"progress"')) {
@@ -237,16 +331,18 @@ async function startPausedImport(server: RunningServer, auth: AuthHeaders): Prom
             })
             incoming.on('error', (error) => {
                 if (!progressSeen) reject(error)
+                rejectCompleted(error)
             })
             incoming.on('end', () => {
                 if (!progressSeen) reject(new Error(`Import ended before pausing: ${body}`))
+                resolveCompleted({ status: incoming.statusCode ?? 0, body })
             })
         })
     })
 
-    request.write(partialDatabaseEntry())
+    request.write(initialBytes)
     await withTimeout(progress, 15_000, 'paused import progress')
-    if (!response) throw new Error('Import response was not created')
+    if (!response || !finishImport) throw new Error('Import response was not created')
     return {
         request,
         response,
@@ -254,6 +350,7 @@ async function startPausedImport(server: RunningServer, auth: AuthHeaders): Prom
             response?.destroy()
             request.destroy()
         },
+        finish: finishImport,
     }
 }
 
@@ -312,5 +409,60 @@ describe('list delta import isolation', () => {
         expect(recovered.epoch).not.toBe(baseline.epoch)
         expect(recovered.mode).toBe('full')
         expect(recovered.content).toContain(seededKey)
+    }, 60_000)
+})
+
+describe('storage reads and mutations during import', () => {
+    it('hides transient rows until a held import commits and refuses racing mutations', async () => {
+        const cwd = makeWorkDir()
+        const server = await startServer(cwd)
+        const auth = await authenticate(server)
+        const key = 'pluginsave/aGVsZC1jb21taXQ.json'
+        const before = Buffer.from('{"generation":"before"}')
+        const committed = Buffer.from('{"generation":"committed"}')
+        await seedKey(server, auth, key, before)
+
+        const pausedImport = await startPausedImport(
+            server,
+            auth,
+            validPluginStorageBackup(key, committed),
+        )
+        const pendingRead = readKey(server, auth, key)
+        expect(await Promise.race([
+            pendingRead.then(() => 'resolved'),
+            delay(250).then(() => 'pending'),
+        ])).toBe('pending')
+
+        await expectImportBusy(await mutateKeyDuringImport(server, auth, 'write', key))
+        await expectImportBusy(await mutateKeyDuringImport(server, auth, 'remove', key))
+
+        const importResult = await withTimeout(pausedImport.finish(), 15_000, 'committed import')
+        expect(importResult.status).toBe(200)
+        expect(importResult.body).toContain('"type":"done"')
+        expect(await withTimeout(pendingRead, 15_000, 'post-commit read')).toEqual(committed)
+        expect(await readKey(server, auth, key)).toEqual(committed)
+    }, 60_000)
+
+    it('hides transient rows until a held import rolls back and preserves the old commit', async () => {
+        const cwd = makeWorkDir()
+        const server = await startServer(cwd)
+        const auth = await authenticate(server)
+        const key = 'pluginsave/aGVsZC1yb2xsYmFjaw.json'
+        const before = Buffer.from('{"generation":"before-rollback"}')
+        await seedKey(server, auth, key, before)
+
+        const pausedImport = await startPausedImport(server, auth)
+        const pendingRead = readKey(server, auth, key)
+        expect(await Promise.race([
+            pendingRead.then(() => 'resolved'),
+            delay(250).then(() => 'pending'),
+        ])).toBe('pending')
+
+        await expectImportBusy(await mutateKeyDuringImport(server, auth, 'write', key))
+        await expectImportBusy(await mutateKeyDuringImport(server, auth, 'remove', key))
+
+        pausedImport.abort()
+        expect(await withTimeout(pendingRead, 15_000, 'post-rollback read')).toEqual(before)
+        expect(await readKey(server, auth, key)).toEqual(before)
     }, 60_000)
 })

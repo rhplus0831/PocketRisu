@@ -36,7 +36,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [SA1](startup-availability.md#sa1) | High | Open | V3 startup is reported complete before async initialization settles; a slow or rejected optimized read silently prevents registration |
 | [SA2](startup-availability.md#sa2) | High | Open | One process-wide unbounded storage queue: a single stalled operation wedges every plugin and the mode transition |
 | [SA3](startup-availability.md#sa3) | Medium | Open | A reconciliation failure on boot prevents the whole application from loading |
-| [SA4](startup-availability.md#sa4) | High impact, window-dependent | Open | Import and retry failures abort startup or expose uncommitted state to optimized reads |
+| [SA4](startup-availability.md#sa4) | High impact, window-dependent | Fixed | Import and retry failures abort startup or expose uncommitted state to optimized reads |
 | [AA1](atomicity-acknowledgement.md#aa1) | Medium | Open | Value and owner metadata are separate commits; a rejection can follow a durable primary mutation |
 | [AA2](atomicity-acknowledgement.md#aa2) | Medium | Open | Optimized `clear()` can partially apply |
 | [AA3](atomicity-acknowledgement.md#aa3) | High | Open | No batch/transaction/CAS primitive: the one-second unload deadline can terminate a multi-row commit, leaving a torn but durable generation |
