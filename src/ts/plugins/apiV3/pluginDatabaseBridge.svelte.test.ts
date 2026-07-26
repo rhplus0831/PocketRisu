@@ -1872,6 +1872,57 @@ describe("V3 guest startup handshake", () => {
         restoreRelay();
     });
 
+    test("admits generation helper reads, publication, load, and GC from the captured unload signal", async () => {
+        const plugin = startupPlugin("Generation Helper Unload", `
+            globalThis.firstGeneration = await risuai.pluginStorage.generations.publish({
+                manifestKey: 'unload/head',
+                bodyKeyPrefix: 'unload/immutable',
+                bodies: [{ id: 'one', count: 1, value: 'one' }],
+            });
+            await risuai.pluginStorage.generations.publish({
+                manifestKey: 'unload/head',
+                bodyKeyPrefix: 'unload/immutable',
+                bodies: [{ id: 'two', count: 1, value: 'two' }],
+            });
+            await risuai.onUnload(async (signal) => {
+                globalThis.unloadGenerationPublish = await risuai.pluginStorage.generations.publish({
+                    manifestKey: 'unload/head',
+                    bodyKeyPrefix: 'unload/immutable',
+                    bodies: [{ id: 'three', count: 1, value: 'three' }],
+                    unloadSignal: signal,
+                });
+                globalThis.unloadGenerationLoad = await risuai.pluginStorage.generations.load(
+                    'unload/head',
+                    signal,
+                );
+                globalThis.unloadGenerationGc = await risuai.pluginStorage.generations.garbageCollect({
+                    manifestKey: 'unload/head',
+                    generation: globalThis.firstGeneration.current,
+                    unloadSignal: signal,
+                });
+            });
+        `);
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+
+        await teardownV3Plugins();
+
+        expect(guestWindow.unloadGenerationPublish).toMatchObject({ committed: true });
+        expect(guestWindow.unloadGenerationLoad).toMatchObject({
+            status: "value",
+            value: { bodies: [{ id: "three", count: 1, value: "three" }] },
+        });
+        expect(guestWindow.unloadGenerationGc).toMatchObject({
+            committed: true,
+            removed: true,
+        });
+        expect(iframe.isConnected).toBe(false);
+        restoreRelay();
+    });
+
     test("drains a pre-existing storage mutation even without an unload callback", async () => {
         const batchStarted = deferred();
         const releaseBatch = deferred();

@@ -61,11 +61,349 @@ function startupApi(overrides: Record<string, unknown> = {}) {
     };
 }
 
+function generationStorageApi() {
+    const rows = new Map<string, { value: any; revision: string }>();
+    let sequence = 1;
+    let failMode: "before" | "after" | null = null;
+    let readGate: Promise<void> | null = null;
+    const signals: AbortSignal[] = [];
+    let suppliedSignalCalls = 0;
+    const nextRevision = () => `sha256:${(sequence++).toString(16).padStart(64, "0")}`;
+    const api = startupApi({
+        _getAliases: () => ({
+            pluginStorage: {
+                getItem: "_getPluginStorage",
+                getWithRevision: "_getVersionedPluginStorage",
+                atomicBatch: "_atomicBatchPluginStorage",
+            },
+        }),
+        _getVersionedPluginStorage: async (
+            key: string,
+            suppliedOrRequestSignal?: AbortSignal,
+            requestSignal?: AbortSignal,
+        ) => {
+            if (requestSignal) suppliedSignalCalls += 1;
+            if (suppliedOrRequestSignal) signals.push(suppliedOrRequestSignal);
+            if (requestSignal) signals.push(requestSignal);
+            await readGate;
+            const row = rows.get(key);
+            return row
+                ? { status: "value", value: structuredClone(row.value), revision: row.revision, generation: null }
+                : { status: "missing", value: null, revision: null, generation: null };
+        },
+        _atomicBatchPluginStorage: async (
+            operations: readonly any[],
+            suppliedOrRequestSignal?: AbortSignal,
+            requestSignal?: AbortSignal,
+        ) => {
+            if (requestSignal) suppliedSignalCalls += 1;
+            if (suppliedOrRequestSignal) signals.push(suppliedOrRequestSignal);
+            if (requestSignal) signals.push(requestSignal);
+            for (const operation of operations) {
+                if (!Object.prototype.hasOwnProperty.call(operation, "expectedRevision")) continue;
+                const current = rows.get(operation.key)?.revision ?? null;
+                if (current !== operation.expectedRevision) {
+                    return {
+                        committed: false,
+                        conflicts: [{ key: operation.key, revision: current, generation: null }],
+                    };
+                }
+            }
+            if (failMode === "before") throw new Error("initial publication before commit");
+            const staged = new Map(rows);
+            const revisions = operations.map(operation => {
+                if (operation.type === "set") {
+                    const revision = nextRevision();
+                    staged.set(operation.key, { value: structuredClone(operation.value), revision });
+                    return { key: operation.key, revision };
+                }
+                staged.delete(operation.key);
+                return { key: operation.key, revision: null };
+            });
+            rows.clear();
+            for (const [key, row] of staged) rows.set(key, row);
+            if (failMode === "after") throw new Error("initial publication after commit");
+            return { committed: true, generation: crypto.randomUUID(), revisions };
+        },
+    });
+    return {
+        api,
+        rows,
+        signals,
+        get suppliedSignalCalls() { return suppliedSignalCalls; },
+        setFailMode(value: typeof failMode) { failMode = value; },
+        setReadGate(value: Promise<void> | null) { readGate = value; },
+    };
+}
+
+function stableJson(value: any): string {
+    if (value === null || typeof value !== "object") return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+    return `{${Object.keys(value).sort().map(key => (
+        `${JSON.stringify(key)}:${stableJson(value[key])}`
+    )).join(",")}}`;
+}
+
+async function generationHash(value: any): Promise<string> {
+    const digest = new Uint8Array(await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(stableJson(value)),
+    ));
+    return `sha256:${Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
 beforeEach(() => {
     document.body.replaceChildren();
 });
 
 describe("SandboxHost V3 startup lifecycle", () => {
+    test("installs immutable-generation helpers on the public plugin storage API", async () => {
+        const iframe = document.createElement("iframe");
+        document.body.appendChild(iframe);
+        const host = new SandboxHost(startupApi());
+        const startup = host.run(iframe, `
+            globalThis.generationHelpers = [
+                typeof risuai.pluginStorage.generations.publish,
+                typeof risuai.pluginStorage.generations.load,
+                typeof risuai.pluginStorage.generations.garbageCollect,
+            ];
+        `);
+        const restoreRelay = executeGeneratedGuest(iframe);
+
+        await expect(startup).resolves.toBeUndefined();
+        expect((iframe.contentWindow as any).generationHelpers).toEqual([
+            "function", "function", "function",
+        ]);
+        host.terminate();
+        restoreRelay();
+    });
+
+    test("runs generation publish/load/GC with signals through the real guest bridge", async () => {
+        const backend = generationStorageApi();
+        const iframe = document.createElement("iframe");
+        document.body.appendChild(iframe);
+        const host = new SandboxHost(backend.api);
+        const startup = host.run(iframe, `
+            const signal = new AbortController().signal;
+            const first = await risuai.pluginStorage.generations.publish({
+                manifestKey: 'records/head', bodyKeyPrefix: 'records/immutable',
+                bodies: [{ id: 'one', count: 1, value: { version: 1 } }],
+                unloadSignal: signal,
+            });
+            await risuai.pluginStorage.generations.publish({
+                manifestKey: 'records/head', bodyKeyPrefix: 'records/immutable',
+                bodies: [{ id: 'two', count: 2, value: ['v2a', 'v2b'] }],
+                unloadSignal: signal,
+            });
+            const third = await risuai.pluginStorage.generations.publish({
+                manifestKey: 'records/head', bodyKeyPrefix: 'records/immutable',
+                bodies: [{ id: 'three', count: 1, value: 'v3' }],
+                unloadSignal: signal,
+            });
+            globalThis.realGenerationResult = {
+                first,
+                third,
+                loaded: await risuai.pluginStorage.generations.load('records/head', signal),
+                collected: await risuai.pluginStorage.generations.garbageCollect({
+                    manifestKey: 'records/head', generation: first.current, unloadSignal: signal,
+                }),
+            };
+        `);
+        const restoreRelay = executeGeneratedGuest(iframe);
+        try {
+            await startup;
+            const result = (iframe.contentWindow as any).realGenerationResult;
+            expect(result.loaded).toMatchObject({
+                status: "value",
+                recoveredFromPrevious: false,
+                value: { bodies: [{ id: "three", count: 1, value: "v3" }] },
+            });
+            expect(result.collected).toMatchObject({ committed: true, removed: true });
+            expect(backend.rows.has(result.first.current.manifestKey)).toBe(false);
+            expect(backend.rows.has(result.third.current.manifestKey)).toBe(true);
+            expect(backend.suppliedSignalCalls).toBeGreaterThan(10);
+            expect(backend.signals.every(signal => signal instanceof AbortSignal)).toBe(true);
+        } finally {
+            host.terminate();
+            restoreRelay();
+        }
+    });
+
+    test("real guest rejects repository transplants, lineage splices, unsafe GC input, and empty prefixes", async () => {
+        const backend = generationStorageApi();
+        const iframe = document.createElement("iframe");
+        document.body.appendChild(iframe);
+        const host = new SandboxHost(backend.api);
+        const startup = host.run(iframe, `
+            globalThis.alphaFirst = await risuai.pluginStorage.generations.publish({
+                manifestKey: 'alpha/head', bodyKeyPrefix: 'alpha/immutable',
+                bodies: [{ id: 'a1', count: 1, value: 'a1' }],
+            });
+            await risuai.pluginStorage.generations.publish({
+                manifestKey: 'alpha/head', bodyKeyPrefix: 'alpha/immutable',
+                bodies: [{ id: 'a2', count: 1, value: 'a2' }],
+            });
+            globalThis.alphaThird = await risuai.pluginStorage.generations.publish({
+                manifestKey: 'alpha/head', bodyKeyPrefix: 'alpha/immutable',
+                bodies: [{ id: 'a3', count: 1, value: 'a3' }],
+            });
+            globalThis.betaFirst = await risuai.pluginStorage.generations.publish({
+                manifestKey: 'beta/head', bodyKeyPrefix: 'beta/immutable',
+                bodies: [{ id: 'b1', count: 1, value: 'b1' }],
+            });
+        `);
+        const restoreRelay = executeGeneratedGuest(iframe);
+        try {
+            await startup;
+            const alphaFirst = (iframe.contentWindow as any).alphaFirst;
+            const alphaThird = (iframe.contentWindow as any).alphaThird;
+            const crossRepository = await host.executeInIframe(`
+                try {
+                    await risuai.pluginStorage.generations.garbageCollect({
+                        manifestKey: 'beta/head', generation: globalThis.alphaFirst.current,
+                    });
+                    return 'accepted';
+                } catch (error) { return error.code || error.message; }
+            `);
+            expect(crossRepository).toBe("PLUGIN_GENERATION_LINEAGE_INVALID");
+
+            const alphaHead = backend.rows.get("alpha/head")!.value;
+            backend.rows.set("beta/head", {
+                value: structuredClone(alphaHead),
+                revision: backend.rows.get("beta/head")!.revision,
+            });
+            expect(await host.executeInIframe(`
+                try { await risuai.pluginStorage.generations.load('beta/head'); return 'accepted'; }
+                catch (error) { return error.code || error.message; }
+            `)).toBe("PLUGIN_GENERATION_LINEAGE_INVALID");
+
+            const betaFirst = (iframe.contentWindow as any).betaFirst;
+            backend.rows.set("beta/head", {
+                value: structuredClone(alphaHead),
+                revision: backend.rows.get("beta/head")!.revision,
+            });
+            const spliced = backend.rows.get("alpha/head")!.value;
+            spliced.previous = structuredClone(alphaFirst.current);
+            spliced.headHash = await generationHash({
+                protocol: spliced.protocol,
+                repository: spliced.repository,
+                current: spliced.current,
+                previous: spliced.previous,
+            });
+            expect(await host.executeInIframe(`
+                try { await risuai.pluginStorage.generations.load('alpha/head'); return 'accepted'; }
+                catch (error) { return error.code || error.message; }
+            `)).toBe("PLUGIN_GENERATION_LINEAGE_INVALID");
+
+            // Restore a valid alpha head for detachment checks.
+            spliced.previous = structuredClone(alphaThird.previous);
+            spliced.headHash = await generationHash({
+                protocol: spliced.protocol,
+                repository: spliced.repository,
+                current: spliced.current,
+                previous: spliced.previous,
+            });
+            const detached = await host.executeInIframe(`
+                const ref = { ...globalThis.alphaFirst.current };
+                const originalSignal = new AbortController().signal;
+                const options = {
+                    manifestKey: 'alpha/head', generation: ref, unloadSignal: originalSignal,
+                };
+                const pending = risuai.pluginStorage.generations.garbageCollect(options);
+                Object.assign(ref, globalThis.alphaThird.current);
+                options.manifestKey = 'mutated/head';
+                options.unloadSignal = new AbortController().signal;
+                return await pending;
+            `);
+            expect(detached).toMatchObject({ committed: true, removed: true });
+            expect(backend.rows.has(alphaFirst.current.manifestKey)).toBe(false);
+            expect(backend.rows.has(alphaThird.current.manifestKey)).toBe(true);
+
+            expect(await host.executeInIframe(`
+                let calls = 0;
+                const ref = { ...globalThis.alphaThird.current };
+                Object.defineProperty(ref, 'manifestHash', {
+                    enumerable: true,
+                    get() { calls += 1; return 'unsafe'; },
+                });
+                try {
+                    await risuai.pluginStorage.generations.garbageCollect({
+                        manifestKey: 'alpha/head', generation: ref,
+                    });
+                    return { accepted: true, calls };
+                } catch (error) { return { accepted: false, calls }; }
+            `)).toEqual({ accepted: false, calls: 0 });
+            expect(await host.executeInIframe(`
+                let calls = 0;
+                const options = {
+                    manifestKey: 'alpha/head',
+                    generation: globalThis.alphaThird.current,
+                };
+                Object.defineProperty(options, 'unloadSignal', {
+                    enumerable: true,
+                    get() { calls += 1; return new AbortController().signal; },
+                });
+                try {
+                    await risuai.pluginStorage.generations.garbageCollect(options);
+                    return { accepted: true, calls };
+                } catch (error) { return { accepted: false, calls }; }
+            `)).toEqual({ accepted: false, calls: 0 });
+            expect(await host.executeInIframe(`
+                try {
+                    await risuai.pluginStorage.generations.publish({
+                        manifestKey: 'empty/head', bodyKeyPrefix: '/',
+                        bodies: [{ id: 'x', count: 1, value: 'x' }],
+                    });
+                    return 'accepted';
+                } catch (error) { return error.message; }
+            `)).toContain("empty prefix");
+            expect(betaFirst.current.repositoryHash).not.toBe(alphaFirst.current.repositoryHash);
+        } finally {
+            host.terminate();
+            restoreRelay();
+        }
+    });
+
+    test("real guest initial publication failure exposes only missing or complete state", async () => {
+        const backend = generationStorageApi();
+        const iframe = document.createElement("iframe");
+        document.body.appendChild(iframe);
+        const host = new SandboxHost(backend.api);
+        const startup = host.run(iframe, "");
+        const restoreRelay = executeGeneratedGuest(iframe);
+        try {
+            await startup;
+            backend.setFailMode("before");
+            await expect(host.executeInIframe(`
+                return await risuai.pluginStorage.generations.publish({
+                    manifestKey: 'initial/head', bodyKeyPrefix: 'initial/immutable',
+                    bodies: [{ id: 'first', count: 1, value: 'complete' }],
+                });
+            `)).rejects.toThrow("before commit");
+            expect(await host.executeInIframe(`
+                return await risuai.pluginStorage.generations.load('initial/head');
+            `)).toEqual({ status: "missing", value: null, revision: null });
+
+            backend.setFailMode("after");
+            await expect(host.executeInIframe(`
+                return await risuai.pluginStorage.generations.publish({
+                    manifestKey: 'initial/head', bodyKeyPrefix: 'initial/immutable',
+                    bodies: [{ id: 'first', count: 1, value: 'complete' }],
+                });
+            `)).rejects.toThrow("after commit");
+            expect(await host.executeInIframe(`
+                return await risuai.pluginStorage.generations.load('initial/head');
+            `)).toMatchObject({
+                status: "value",
+                value: { bodies: [{ id: "first", count: 1, value: "complete" }] },
+            });
+        } finally {
+            backend.setFailMode(null);
+            host.terminate();
+            restoreRelay();
+        }
+    });
+
     test("teardown rejects a pending initialization and ignores its late continuation", async () => {
         const readStarted = deferred();
         const releaseRead = deferred();

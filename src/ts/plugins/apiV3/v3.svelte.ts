@@ -1670,8 +1670,29 @@ export const makeRisuaiAPIV3 = (
         _getPluginStorage: (key: string, signal?: AbortSignal) => {
             return getPluginSaveStorageItem(key, signal)
         },
-        _getVersionedPluginStorage: (key: string, signal?: AbortSignal) => {
-            return getPluginSaveStorageItemWithRevision(key, signal)
+        _getVersionedPluginStorage: async (
+            key: string,
+            _unloadCapabilityOrRequestSignal?: AbortSignal,
+            requestSignal?: AbortSignal,
+        ) => {
+            if (!requestSignal) {
+                return getPluginSaveStorageItemWithRevision(
+                    key,
+                    _unloadCapabilityOrRequestSignal,
+                )
+            }
+            const controller = new AbortController()
+            const stopCapability = forwardAbortSignal(
+                _unloadCapabilityOrRequestSignal,
+                controller,
+            )
+            const stopRequest = forwardAbortSignal(requestSignal, controller)
+            try {
+                return await getPluginSaveStorageItemWithRevision(key, controller.signal)
+            } finally {
+                stopCapability()
+                stopRequest()
+            }
         },
         _readPluginStorageResult: (key: string, signal?: AbortSignal) => {
             return readPluginSaveStorageItemResult(key, signal)

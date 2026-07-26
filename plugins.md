@@ -665,6 +665,49 @@ await Risuai.pluginStorage.clear(); // Remove all items
 - Data is specific to a save file
 - Storing user preferences or plugin state
 
+#### Immutable multi-row generations
+
+Do not update stable shard keys one at a time and then write a manifest. An
+interruption can leave the old manifest pointing at a mixture of old and new
+bodies. V3 plugins can publish a complete immutable generation atomically:
+
+```javascript
+const publication = await Risuai.pluginStorage.generations.publish({
+  manifestKey: 'history/head',
+  bodyKeyPrefix: 'history/generations',
+  bodies: [
+    { id: 'messages-0', count: 100, value: firstShard },
+    { id: 'messages-1', count: 42, value: secondShard },
+  ],
+});
+
+if (!publication.committed) {
+  // Another writer changed the head. Re-read application state before retrying.
+  throw new Error('Generation publication conflicted');
+}
+
+const loaded = await Risuai.pluginStorage.generations.load('history/head');
+if (loaded.status === 'value') {
+  useShards(loaded.value.bodies, loaded.value.totalCount);
+}
+```
+
+`publish()` snapshots and content-hashes the bodies, verifies the complete
+generation that will be retained as fallback, and atomically publishes the
+immutable bodies, manifest, and CAS-protected head. `load()` verifies every
+manifest/body hash, identity, generation, and count before returning data; it
+falls back only to the exact complete previous generation when the current
+one is structurally corrupt. Temporary I/O and invalid-lineage failures still
+reject.
+
+Keep the `current` references returned by successful publications if you want
+to reclaim older data later. Pass a retired reference to
+`generations.garbageCollect({ manifestKey, generation })` only after a newer
+current and fallback are established. The current and immediate previous
+generations are protected, and foreign, orphaned, or unverified references
+are rejected. A head key is permanently paired with its first normalized
+`bodyKeyPrefix`; use a different head for another repository.
+
 ### Safe Local Storage
 
 `safeLocalStorage` is **device-specific** and **shared between plugins**:

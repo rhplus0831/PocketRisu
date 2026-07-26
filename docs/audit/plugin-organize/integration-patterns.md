@@ -8,11 +8,11 @@ and protocols. At the audit point the host offered no versioned read or atomic
 write primitive. AA3 is now fixed: bounded `getWithRevision()` and
 `atomicBatch()` provide per-key revisions/CAS and atomic generation publish.
 That enables safe guidance for the patterns below, but does not repair plugin
-fallbacks, loaders, or cancellation by itself. IP1 and IP2 are now fixed on
-the host side with explicit read outcomes, guarded CAS writes, a public
-non-destructive rewrite helper, and adoption guidance. Existing third-party
-plugins still have to adopt those protocols. See [README.md](README.md) for
-the full index.
+fallbacks, loaders, or cancellation by itself. IP1–IP4 are now fixed on the
+host side with explicit read outcomes, guarded CAS writes, structured mutation
+outcomes, a non-destructive rewrite helper, an immutable-generation helper,
+and adoption guidance. Existing third-party plugins still have to adopt those
+protocols. See [README.md](README.md) for the full index.
 
 <a id="ip1"></a>
 ## IP1 — A failed read treated as a missing key becomes a destructive overwrite
@@ -261,6 +261,59 @@ one debounced database save.
 - The host-side atomic multi-key batch/CAS API added by AA3 now lets plugins
   express this protocol without exposing compound midpoints; affected plugins
   still need to migrate to it and validate generations on load.
+
+### Resolution
+
+**Fixed 2026-07-27.** V3 now exposes
+`risuai.pluginStorage.generations.publish()`, `load()`, and
+`garbageCollect()` as a complete immutable-generation protocol over AA3. A
+repository identity cryptographically binds the exact mutable head key and
+normalized, nonempty body-key prefix. Publication snapshots descriptor-only
+arguments before its first read, creates a UUIDv4 generation, writes bodies
+under immutable generation/content-hash keys, writes a hash-bound immutable
+manifest, and CAS-publishes a hash-bound head in one atomic batch. Accessors,
+sparse or subclassed arrays, class instances, unsupported JSON values, and
+caller mutation after invocation cannot change the publication plan.
+
+Publication never promotes an unverified fallback. Before replacing an
+existing head it verifies the current manifest and every current body. If
+that generation is structurally corrupt, it may retain the head's exact prior
+reference only after fully verifying that manifest and all of its bodies. A
+transient read failure or invalid lineage rejects publication without changing
+the head. Thus, if generation two is corrupt and generation three is later
+published, the last complete generation remains generation three's protected
+fallback rather than the corrupt generation two.
+
+`load()` validates exact head, repository, reference, manifest, and body
+schemas; repository and head hashes; manifest hash and generation; the head's
+exact current/previous linkage; entry identities, keys, hashes, and counts;
+and the aggregate count before exposing any body. Structural corruption may
+fall back once to the exact, fully verified previous generation. Transport,
+authentication, import-barrier, cancellation, and lineage failures reject
+instead of selecting stale data. A transplanted head, cross-repository
+reference, or recomputed head that splices unrelated history is therefore not
+eligible for fallback.
+
+Garbage collection walks only verified manifest lineage and atomically
+CAS-rewrites the head while removing the selected immutable manifest and
+bodies. It refuses the current and immediate previous generations, rejects
+foreign or orphan references, and snapshots its options/reference/signal
+before I/O. The supplied unload signal is forwarded through every preliminary
+versioned read and the final batch; the bridge combines it with request
+cancellation, while normal unload admission and draining keep accepted work
+tracked through its authoritative outcome.
+
+Deterministic regression coverage interrupts initial and subsequent
+publication before and after every body, owner, manifest, and head write, at
+commit, and after commit before acknowledgement. Live and restarted snapshots
+load only missing, the complete old generation, or the complete new
+generation. Additional tests corrupt body generation/hash/count/identity and
+manifest hash/count/generation/shape, distinguish transient failures, reject
+repository transplants and lineage splices, and exercise real generated-guest
+and teardown/unload paths. The fallback-retention regression publishes
+generation one, corrupts generation two, publishes generation three, attempts
+garbage collection, corrupts generation three, and still recovers the exact
+complete generation one.
 
 <a id="ip5"></a>
 ## IP5 — Uncancelled long-running migrations overwrite newer rows after timeout

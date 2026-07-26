@@ -1,5 +1,6 @@
 import { safeStructuredClone } from "../../polyfill";
 import { publicPluginStorageMutationFailure } from "../pluginStorageMutationOutcome";
+import { createPluginStorageGenerationHelpers } from "./pluginStorageGeneration";
 
 type MsgType =
     | 'CALL_ROOT'
@@ -40,6 +41,7 @@ const ABORTABLE_ROOT_METHODS = new Set([
 ]);
 
 const UNLOAD_STORAGE_ROOT_METHODS = new Set([
+    '_getVersionedPluginStorage',
     '_atomicBatchPluginStorage',
     '_rewritePluginStorage',
 ]);
@@ -642,6 +644,7 @@ await (async function() {
     const validateDatabaseMutationForTransport = ${validateV3DatabaseMutationForTransport.toString()};
     const snapshotPluginStorageBatchForTransport = ${snapshotV3PluginStorageBatchForTransport.toString()};
     const installPluginStorageHelpers = ${installV3PluginStorageHelpers.toString()};
+    const createGenerationStorageHelpers = ${createPluginStorageGenerationHelpers.toString()};
     const serializeBridgeError = ${serializeV3BridgeError.toString()};
     const deserializeBridgeError = ${deserializeV3BridgeError.toString()};
     const mutationFailureOutcome = ${publicPluginStorageMutationFailure.toString()};
@@ -926,6 +929,13 @@ await (async function() {
             for (let j = 0; j < childrens.length; j++) {
                 const childKey = childrens[j];
                 aliasObj[childKey] = risuai[aliases[aliasKey][childKey]];
+            }
+            if (aliasKey === 'pluginStorage') {
+                aliasObj.generations = createGenerationStorageHelpers(
+                    aliasObj,
+                    snapshotPluginStorageBatchForTransport,
+                    globalThis.crypto,
+                );
             }
             propertyCache.set(aliasKey, aliasObj);
         }

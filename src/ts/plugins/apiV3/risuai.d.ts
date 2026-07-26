@@ -1070,7 +1070,85 @@ type PluginStorageConfirmedRemoveOutcome =
         };
     });
 
+type PluginStorageGenerationReference = {
+    generation: string;
+    manifestKey: string;
+    manifestHash: string;
+    repositoryHash: string;
+};
+
+type PluginStorageGenerationBody = {
+    id: string;
+    /** Logical unit count represented by this body (records, messages, etc.). */
+    count: number;
+    value: any;
+};
+
+type PluginStorageGenerationPublishResult =
+    | {
+        committed: true;
+        generation: string;
+        revisions: { key: string; revision: string | null }[];
+        current: PluginStorageGenerationReference;
+        previous: PluginStorageGenerationReference | null;
+    }
+    | {
+        committed: false;
+        conflicts: { key: string; revision: string | null; generation: string | null }[];
+    };
+
+interface PluginStorageGenerationHelpers {
+    /**
+     * Content-hashes and snapshots every body, then atomically publishes the
+     * immutable bodies, immutable generation manifest, and CAS-protected head.
+     * At most 126 bodies fit because the host batch also publishes two rows.
+     */
+    publish(options: {
+        manifestKey: string;
+        bodyKeyPrefix: string;
+        bodies: readonly PluginStorageGenerationBody[];
+        /** Optional caller CAS. Omit to publish against the head read by the helper. */
+        expectedRevision?: string | null;
+        unloadSignal?: AbortSignal;
+    }): Promise<PluginStorageGenerationPublishResult>;
+
+    /**
+     * Verifies manifest hash, generation, body hashes, IDs, and counts before
+     * returning any body. A corrupt current generation falls back to the
+     * immediately previous complete generation; I/O failures still reject.
+     */
+    load(manifestKey: string, unloadSignal?: AbortSignal): Promise<
+        | { status: 'missing'; value: null; revision: null }
+        | {
+            status: 'value';
+            value: {
+                generation: string;
+                bodies: PluginStorageGenerationBody[];
+                totalCount: number;
+            };
+            revision: string;
+            recoveredFromPrevious: boolean;
+        }
+    >;
+
+    /**
+     * Atomically removes one retired generation while CAS-checking the head.
+     * The current and immediately previous generations cannot be removed.
+     */
+    garbageCollect(options: {
+        manifestKey: string;
+        generation: PluginStorageGenerationReference;
+        unloadSignal?: AbortSignal;
+    }): Promise<
+        | { committed: true; removed: boolean; generation?: string; revisions?: { key: string; revision: string | null }[] }
+        | { committed: false; conflicts: { key: string; revision: string | null; generation: string | null }[] }
+    >;
+}
+
 interface PluginStorage {
+    /** Safe immutable-generation publication helpers for sharded records. */
+    readonly generations: PluginStorageGenerationHelpers;
+
     /**
      * Gets an item from storage
      * @param key - Storage key
@@ -1079,7 +1157,7 @@ interface PluginStorage {
     getItem(key: string): Promise<any | null>;
 
     /** Reads a value without conflating stored JSON null with a missing key. */
-    getWithRevision<T = any>(key: string): Promise<PluginStorageVersionedValue<T>>;
+    getWithRevision<T = any>(key: string, unloadSignal?: AbortSignal): Promise<PluginStorageVersionedValue<T>>;
 
     /**
      * Reads a value as an explicit `missing | value | failed` result. A stored
