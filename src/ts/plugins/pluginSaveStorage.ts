@@ -15,6 +15,7 @@ import {
     createDatabasePluginStorageRecord,
     createPluginStorageRecord,
     definePluginStorageRecordValue,
+    getPluginStorageRecordKeys,
     hasPluginStorageRecordValue,
 } from "./pluginStorageRecord";
 
@@ -40,6 +41,85 @@ function decodeListedStorageKey(fullKey: string, prefix: string): string | null 
     return decodeStorageKeyComponent(encoded);
 }
 
+function cloneJsonPluginStorageRecord(
+    source: Record<string, unknown>,
+): Record<string, unknown> {
+    if (source === null || typeof source !== "object" || Array.isArray(source)) {
+        throw new TypeError("pluginCustomStorage must be a JSON object.");
+    }
+    const prototype = Reflect.getPrototypeOf(source);
+    if (prototype !== Object.prototype && prototype !== null) {
+        throw new TypeError("pluginCustomStorage must be a plain JSON object.");
+    }
+
+    const keys: string[] = [];
+    const seen = new Set<PropertyKey>();
+    const validateKey = (key: PropertyKey) => {
+        if (seen.has(key)) return;
+        seen.add(key);
+        if (typeof key !== "string") {
+            throw new TypeError("pluginCustomStorage does not accept symbol keys.");
+        }
+        const descriptor = Reflect.getOwnPropertyDescriptor(source, key);
+        if (!descriptor || !("value" in descriptor)) {
+            throw new TypeError(`pluginCustomStorage does not accept an accessor for ${key}.`);
+        }
+        if (!descriptor.enumerable) {
+            throw new TypeError(
+                `pluginCustomStorage requires an enumerable data property for ${key}.`,
+            );
+        }
+        keys.push(key);
+    };
+    for (const key of Reflect.ownKeys(source)) validateKey(key);
+    // A Svelte proxy may omit a configurable own inherited-name key from
+    // ownKeys. The dynamic fallback discovers both built-in and late-added
+    // Object.prototype names and subjects them to the same validation.
+    for (const key of getPluginStorageRecordKeys(source)) validateKey(key);
+
+    const snapshot = createDatabasePluginStorageRecord<unknown>();
+    for (const key of keys) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(source, key)!;
+        const json = JSON.stringify(descriptor.value);
+        if (json === undefined) {
+            throw new TypeError(`pluginCustomStorage value for ${JSON.stringify(key)} is not JSON.`);
+        }
+        definePluginStorageRecordValue(snapshot, key, JSON.parse(json));
+    }
+    return snapshot;
+}
+
+async function readExternalizedPluginStorageUnlocked(): Promise<{
+    values: Record<string, unknown>;
+    meta: NonNullable<Database["pluginStorageMeta"]>;
+}> {
+    const [listedValueKeys, listedMetaKeys] = await Promise.all([
+        listPersistentKeys(PLUGIN_SAVE_PREFIX),
+        listPersistentKeys(PLUGIN_SAVE_META_PREFIX),
+    ]);
+    const values = createPluginStorageRecord<unknown>();
+    const meta = createPluginStorageRecord<
+        NonNullable<Database["pluginStorageMeta"]>[string]
+    >();
+
+    for (const storageKey of listedValueKeys) {
+        const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
+        if (key === null) continue;
+        definePluginStorageRecordValue(
+            values,
+            key,
+            await readPersistentJson(storageKey, { cached: true }),
+        );
+    }
+    for (const storageKey of listedMetaKeys) {
+        const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
+        if (key === null) continue;
+        definePluginStorageRecordValue(meta, key, await readPersistentJson(storageKey));
+    }
+
+    return { values, meta };
+}
+
 async function listDecodedStorageKeys(prefix: string): Promise<string[]> {
     const storageKeys = await listPersistentKeys(prefix);
     const keys: string[] = [];
@@ -54,32 +134,104 @@ export async function readExternalizedPluginStorage(): Promise<{
     values: Record<string, unknown>;
     meta: NonNullable<Database["pluginStorageMeta"]>;
 }> {
+    return withPluginSaveStorageLock(readExternalizedPluginStorageUnlocked);
+}
+
+/** Detached authoritative snapshot used by the V3 database bridge. */
+export async function getPluginSaveStorageSnapshot(): Promise<Record<string, unknown>> {
     return withPluginSaveStorageLock(async () => {
-        const [listedValueKeys, listedMetaKeys] = await Promise.all([
-            listPersistentKeys(PLUGIN_SAVE_PREFIX),
-            listPersistentKeys(PLUGIN_SAVE_META_PREFIX),
-        ]);
-        const values = createPluginStorageRecord<unknown>();
-        const meta = createPluginStorageRecord<
-            NonNullable<Database["pluginStorageMeta"]>[string]
-        >();
+        const db = getDatabase();
+        const source = db.optimizePluginMemory
+            ? (await readExternalizedPluginStorageUnlocked()).values
+            : db.pluginCustomStorage;
+        return cloneJsonPluginStorageRecord(source ?? createDatabasePluginStorageRecord());
+    });
+}
 
-        for (const storageKey of listedValueKeys) {
-            const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
-            if (key === null) continue;
-            definePluginStorageRecordValue(
-                values,
-                key,
-                await readPersistentJson(storageKey, { cached: true }),
-            );
-        }
-        for (const storageKey of listedMetaKeys) {
-            const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
-            if (key === null) continue;
-            definePluginStorageRecordValue(meta, key, await readPersistentJson(storageKey));
+/**
+ * Apply a V3 database mutation while holding the same queue as pluginStorage.
+ * A provided plugin map is an exact replacement; `undefined` leaves the
+ * authoritative key set unchanged. Optimized mode never retains inline rows.
+ */
+export async function updateDatabaseWithPluginStorageSnapshot<T>(
+    pluginCustomStorage: Record<string, unknown> | undefined,
+    mutateDatabase: () => T | Promise<T>,
+): Promise<T> {
+    // Snapshot and validate before waiting so caller-owned objects cannot
+    // change underneath the queued operation.
+    const replacement = pluginCustomStorage === undefined
+        ? undefined
+        : cloneJsonPluginStorageRecord(pluginCustomStorage);
+    const prepared = replacement === undefined
+        ? []
+        : getPluginStorageRecordKeys(replacement).map((key) => ({
+            key,
+            storageKey: makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key),
+            value: replacement[key],
+        }));
+    if (new Set(prepared.map(entry => entry.storageKey)).size !== prepared.length) {
+        throw new Error("Plugin storage key collision while replacing V3 database storage.");
+    }
+
+    return withPluginSaveStorageLock(async () => {
+        const db = getDatabase();
+        if (db.optimizePluginMemory) {
+            if (replacement !== undefined) {
+                const [existingKeys, existingMetaKeys] = await Promise.all([
+                    listPersistentKeys(PLUGIN_SAVE_PREFIX),
+                    listPersistentKeys(PLUGIN_SAVE_META_PREFIX),
+                ]);
+                const destinationKeys = new Set(prepared.map(entry => entry.storageKey));
+                const existingKeySet = new Set(existingKeys);
+                const retainedMetaKeys = new Set(prepared
+                    .filter(entry => existingKeySet.has(entry.storageKey))
+                    .map(entry => makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, entry.key)));
+                // Upsert the complete replacement before deleting omitted rows.
+                for (const entry of prepared) {
+                    await writePersistentJson(entry.storageKey, entry.value);
+                }
+                for (const storageKey of existingKeys) {
+                    if (!destinationKeys.has(storageKey)) {
+                        await removePersistentKey(storageKey);
+                    }
+                }
+                // A direct database replacement has no plugin-owner context.
+                // Preserve metadata for retained keys, discard it for deleted
+                // keys, and leave new keys unowned.
+                for (const storageKey of existingMetaKeys) {
+                    if (!retainedMetaKeys.has(storageKey)) {
+                        await removePersistentKey(storageKey);
+                    }
+                }
+            }
+            if (getPluginStorageRecordKeys(db.pluginCustomStorage).length > 0) {
+                db.pluginCustomStorage = createDatabasePluginStorageRecord();
+            }
+            if (getPluginStorageRecordKeys(db.pluginStorageMeta).length > 0) {
+                delete db.pluginStorageMeta;
+            }
+        } else if (replacement !== undefined) {
+            const previousValues = db.pluginCustomStorage;
+            db.pluginCustomStorage = copyDatabasePluginStorageRecord(replacement);
+            const nextMeta = createDatabasePluginStorageRecord<
+                NonNullable<Database["pluginStorageMeta"]>[string]
+            >();
+            for (const key of getPluginStorageRecordKeys(replacement)) {
+                if (
+                    hasPluginStorageRecordValue(previousValues, key)
+                    && hasPluginStorageRecordValue(db.pluginStorageMeta, key)
+                ) {
+                    definePluginStorageRecordValue(nextMeta, key, db.pluginStorageMeta![key]);
+                }
+            }
+            if (Object.keys(nextMeta).length > 0) {
+                db.pluginStorageMeta = nextMeta;
+            } else {
+                delete db.pluginStorageMeta;
+            }
         }
 
-        return { values, meta };
+        return await mutateDatabase();
     });
 }
 
@@ -113,6 +265,37 @@ export async function setPluginSaveStorageItem<T>(key: string, value: T): Promis
     });
 }
 
+/** Set a V3 save value and its owner as one ordered storage operation. */
+export async function setOwnedPluginSaveStorageItem<T>(
+    key: string,
+    value: T,
+    owner: string,
+): Promise<void> {
+    await withPluginSaveStorageLock(async () => {
+        const db = getDatabase();
+        const ownerRecord = { plugin: owner, updatedAt: Date.now() };
+        if (db.optimizePluginMemory) {
+            await writePersistentJson(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key), value);
+            if (owner) {
+                await writePersistentJson(
+                    makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, key),
+                    ownerRecord,
+                );
+            }
+            return;
+        }
+
+        const nextValues = copyDatabasePluginStorageRecord(db.pluginCustomStorage);
+        definePluginStorageRecordValue(nextValues, key, value);
+        db.pluginCustomStorage = nextValues;
+        if (owner) {
+            const nextMeta = copyDatabasePluginStorageRecord(db.pluginStorageMeta);
+            definePluginStorageRecordValue(nextMeta, key, ownerRecord);
+            db.pluginStorageMeta = nextMeta;
+        }
+    });
+}
+
 export async function removePluginSaveStorageItem(key: string): Promise<void> {
     await withPluginSaveStorageLock(async () => {
         const db = getDatabase();
@@ -127,6 +310,30 @@ export async function removePluginSaveStorageItem(key: string): Promise<void> {
     });
 }
 
+/** Remove a V3 save value and its owner as one ordered storage operation. */
+export async function removeOwnedPluginSaveStorageItem(key: string): Promise<void> {
+    await withPluginSaveStorageLock(async () => {
+        const db = getDatabase();
+        if (db.optimizePluginMemory) {
+            await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key));
+            await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, key));
+            return;
+        }
+
+        if (hasPluginStorageRecordValue(db.pluginCustomStorage, key)) {
+            const nextValues = copyDatabasePluginStorageRecord(db.pluginCustomStorage);
+            delete nextValues[key];
+            db.pluginCustomStorage = nextValues;
+        }
+        if (hasPluginStorageRecordValue(db.pluginStorageMeta, key)) {
+            const nextMeta = copyDatabasePluginStorageRecord(db.pluginStorageMeta);
+            delete nextMeta[key];
+            if (getPluginStorageRecordKeys(nextMeta).length > 0) db.pluginStorageMeta = nextMeta;
+            else delete db.pluginStorageMeta;
+        }
+    });
+}
+
 export async function clearPluginSaveStorage(): Promise<void> {
     await withPluginSaveStorageLock(async () => {
         const db = getDatabase();
@@ -138,11 +345,25 @@ export async function clearPluginSaveStorage(): Promise<void> {
     });
 }
 
+/** Clear all V3 save values and owners as one ordered storage operation. */
+export async function clearOwnedPluginSaveStorage(): Promise<void> {
+    await withPluginSaveStorageLock(async () => {
+        const db = getDatabase();
+        if (db.optimizePluginMemory) {
+            await clearPersistentPrefix(PLUGIN_SAVE_PREFIX);
+            await clearPersistentPrefix(PLUGIN_SAVE_META_PREFIX);
+            return;
+        }
+        db.pluginCustomStorage = createDatabasePluginStorageRecord();
+        delete db.pluginStorageMeta;
+    });
+}
+
 export async function getPluginSaveStorageKeys(): Promise<string[]> {
     return withPluginSaveStorageLock(async () => {
         const db = getDatabase();
         if (!db.optimizePluginMemory) {
-            return Object.keys(db.pluginCustomStorage ?? {});
+            return getPluginStorageRecordKeys(db.pluginCustomStorage);
         }
         return await listDecodedStorageKeys(PLUGIN_SAVE_PREFIX);
     });
@@ -222,8 +443,10 @@ async function reconcilePluginStorageModeUnlocked(
     const db = deps.getDatabase();
 
     if (db.optimizePluginMemory) {
-        const valueEntries = Object.entries(db.pluginCustomStorage ?? {});
-        const metaEntries = Object.entries(db.pluginStorageMeta ?? {});
+        const valueEntries = getPluginStorageRecordKeys(db.pluginCustomStorage)
+            .map(key => [key, db.pluginCustomStorage[key]] as const);
+        const metaEntries = getPluginStorageRecordKeys(db.pluginStorageMeta)
+            .map(key => [key, db.pluginStorageMeta![key]] as const);
         const total = valueEntries.length + metaEntries.length;
         options.onStart?.({ direction: "externalize", completed: 0, total });
         if (total === 0) {
@@ -231,7 +454,10 @@ async function reconcilePluginStorageModeUnlocked(
         }
 
         const destinationStorageKeys = new Set<string>();
-        const prepareEntries = <T>(entries: Array<[string, T]>, prefix: string) => (
+        const prepareEntries = <T>(
+            entries: ReadonlyArray<readonly [string, T]>,
+            prefix: string,
+        ) => (
             entries.map(([key, value]) => {
                 const storageKey = makeEncodedStorageKey(prefix, key);
                 if (destinationStorageKeys.has(storageKey)) {
@@ -267,7 +493,7 @@ async function reconcilePluginStorageModeUnlocked(
                 total,
             });
         }
-        if (db.pluginStorageMeta && Object.keys(db.pluginStorageMeta).length === 0) {
+        if (db.pluginStorageMeta && getPluginStorageRecordKeys(db.pluginStorageMeta).length === 0) {
             delete db.pluginStorageMeta;
         }
 

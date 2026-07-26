@@ -37,6 +37,7 @@ import {
     createDatabasePluginStorageRecord,
     createPluginStorageRecord,
     definePluginStorageRecordValue,
+    getPluginStorageRecordKeys,
     hasPluginStorageRecordValue,
 } from "./pluginStorageRecord";
 
@@ -147,7 +148,7 @@ export async function getOwners(backend: PluginStorageBackend): Promise<Record<s
                 // here are primitive plugin names, so an own-safe live read is
                 // both detached and complete.
                 const meta = db.pluginStorageMeta ?? {};
-                for (const key of Object.keys(meta)) {
+                for (const key of getPluginStorageRecordKeys(meta)) {
                     if (meta[key]?.plugin) {
                         definePluginStorageRecordValue(out, key, meta[key].plugin);
                     }

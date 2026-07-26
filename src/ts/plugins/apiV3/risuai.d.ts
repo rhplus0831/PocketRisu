@@ -350,8 +350,9 @@ interface DatabaseSubset {
     /** Plugin instances */
     plugins?: RisuPlugin[];
     /**
-     * Legacy inline plugin storage object. This is empty while optimized
-     * plugin memory is enabled; use the pluginStorage API for mode-aware access.
+     * Detached snapshot of the authoritative plugin storage values. In
+     * optimized mode, getDatabase() materializes these values from external
+     * storage. Prefer pluginStorage for individual reads and writes.
      */
     pluginCustomStorage?: {[key: string]: any};
     /** AI temperature setting (0-100) */
@@ -1397,6 +1398,8 @@ interface RisuaiPluginAPI {
      * customCSS, guiHTML, colorSchemeName, characterOrder, selectedPersona
      *
      * Use includeOnly to limit which keys to retrieve for better performance.
+     * Requesting pluginCustomStorage materializes a detached snapshot of all
+     * authoritative plugin storage values and can be comparatively expensive.
      * 
      * @example
      * ```typescript
@@ -1410,12 +1413,38 @@ interface RisuaiPluginAPI {
 
     /**
      * Sets the database (lightweight save)
+     *
+     * Provided fields are merged into the live database; omitted fields stay
+     * unchanged. If pluginCustomStorage is provided, it exactly replaces the
+     * authoritative storage key set (`{}` clears it). Omitting
+     * pluginCustomStorage leaves plugin storage unchanged. Ownership metadata
+     * is retained for retained keys and removed for deleted keys; new keys are
+     * unowned until written through pluginStorage.
+     * DatabaseSubset fields and top-level pluginCustomStorage entries must be
+     * enumerable string data properties; symbols, accessors, non-enumerable
+     * properties, and unsupported database fields are rejected.
+     * The supported iframe API validates descriptors before postMessage can
+     * strip or evaluate them; the host validates the structured-cloned result
+     * again. This guarantee applies to calls made through risuai/Risuai.
      * @param db - DatabaseSubset object to save
      */
     setDatabaseLite(db: DatabaseSubset): Promise<void>;
 
     /**
      * Sets the database (full save with sync)
+     *
+     * Provided fields are merged into the live database; omitted fields stay
+     * unchanged. If pluginCustomStorage is provided, it exactly replaces the
+     * authoritative storage key set (`{}` clears it). Omitting
+     * pluginCustomStorage leaves plugin storage unchanged. Ownership metadata
+     * is retained for retained keys and removed for deleted keys; new keys are
+     * unowned until written through pluginStorage.
+     * DatabaseSubset fields and top-level pluginCustomStorage entries must be
+     * enumerable string data properties; symbols, accessors, non-enumerable
+     * properties, and unsupported database fields are rejected.
+     * The supported iframe API validates descriptors before postMessage can
+     * strip or evaluate them; the host validates the structured-cloned result
+     * again. This guarantee applies to calls made through risuai/Risuai.
      * @param db - DatabaseSubset object to save
      */
     setDatabase(db: DatabaseSubset): Promise<void>;

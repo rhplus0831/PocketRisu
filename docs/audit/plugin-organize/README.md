@@ -29,7 +29,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [MT1](mode-transition-data-loss.md#mt1) | High | Fixed | Disabling the beta can delete external rows after a save that never durably committed |
 | [MT2](mode-transition-data-loss.md#mt2) | High | Fixed | The mode flag changes outside the storage queue, so queued operations run against the wrong backend and reconciliation overwrites or resurrects values |
 | [MT3](mode-transition-data-loss.md#mt3) | Medium | Fixed | Special property names survive optimized storage but are lost or misread when internalized into the inline object backend |
-| [AC1](api-compatibility.md#ac1) | High | Open | V3 database access and mode-aware plugin storage form a split-brain store; the eligibility gate checks only API version |
+| [AC1](api-compatibility.md#ac1) | High | Fixed | V3 database access and mode-aware plugin storage form a split-brain store; the eligibility gate checks only API version |
 | [AC2](api-compatibility.md#ac2) | Medium | Open | V2 lifecycle gaps: eligibility races unload completion, and invalid persisted states look enabled but never run |
 | [AC3](api-compatibility.md#ac3) | High on affected runtimes | Open | Unguarded ES2024 key validation disables optimized storage on older WebViews; key coercion differs between modes |
 | [AC4](api-compatibility.md#ac4) | Low–Medium | Open | Value and enumeration parity gaps: unrepresentable JSON is acknowledged, and key order is unstable |

@@ -88,6 +88,26 @@ await risuai.setDatabaseLite(db);
 - Add a V3 bridge test that mixes `getDatabase`, `setDatabaseLite`, and
   `pluginStorage` across save cycles.
 
+### Resolution
+
+Fixed. V3 database access now materializes `pluginCustomStorage` from the
+authoritative backend under the shared storage queue and returns a detached
+snapshot in either mode. `setDatabase()` and `setDatabaseLite()` merge only
+the ordinary database roots that are present, while an explicitly supplied
+`pluginCustomStorage` is an exact replacement (`{}` clears it and omission
+preserves it). Optimized replacements update external rows, remove omitted
+values and orphan owner metadata, and scrub the inline value and metadata
+maps so stale state cannot be re-externalized.
+
+The real V3 bridge now applies each `pluginStorage` value and ownership change
+in one ordered operation. Both the guest bridge and host validate database
+setter inputs before reading values, including special property names and
+late prototype additions, so accessors and unsupported descriptors cannot
+cross the iframe boundary unnoticed. Regression coverage exercises the real
+V3 factory, exact replacements racing `setItem`/`removeItem`/`clear`, inline
+and optimized modes, save patch cycles, production server hash convergence,
+full-set plugin installation filtering, and special-key cleanup.
+
 <a id="ac2"></a>
 ## AC2 — V2 lifecycle and invalid-state handling are incomplete
 

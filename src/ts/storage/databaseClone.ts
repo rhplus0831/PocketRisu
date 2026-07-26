@@ -4,6 +4,7 @@ import type { Database } from "./database.svelte";
 import {
     createDatabasePluginStorageRecord,
     definePluginStorageRecordValue,
+    getPluginStorageRecordKeys,
     hasPluginStorageRecordValue,
 } from "../plugins/pluginStorageRecord";
 
@@ -38,7 +39,7 @@ function clonePluginStorageValue<T>(value: T, seen = new WeakMap<object, unknown
 
     const clone = createDatabasePluginStorageRecord<unknown>();
     seen.set(object, clone);
-    for (const key of Object.keys(value)) {
+    for (const key of getPluginStorageRecordKeys(value as Record<string, unknown>)) {
         definePluginStorageRecordValue(
             clone,
             key,

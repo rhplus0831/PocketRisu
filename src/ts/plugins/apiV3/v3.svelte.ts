@@ -1,17 +1,25 @@
 import { allowedDbKeys, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
 import { SandboxHost } from "./factory";
-import { getDatabase, normalizeChat } from "src/ts/storage/database.svelte";
+import {
+    getDatabase,
+    normalizeChat,
+    setDatabase as setDatabaseState,
+} from "src/ts/storage/database.svelte";
+import { cloneDatabaseField } from "src/ts/storage/databaseClone";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
 import {
-    clearPluginSaveStorage,
+    clearOwnedPluginSaveStorage,
     getPluginSaveStorageItem,
     getPluginSaveStorageKey,
     getPluginSaveStorageKeys,
     getPluginSaveStorageLength,
-    removePluginSaveStorageItem,
-    setPluginSaveStorageItem,
+    getPluginSaveStorageSnapshot,
+    removeOwnedPluginSaveStorageItem,
+    setOwnedPluginSaveStorageItem,
+    updateDatabaseWithPluginStorageSnapshot,
 } from "../pluginSaveStorage";
+import { createPluginDatabaseBridge } from "./pluginDatabaseBridge";
 import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
@@ -759,9 +767,32 @@ const authorizationHeaders = [
     'proxy-authorization',
 ]
 
-const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
+export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
 
     const oldApis = getV2PluginAPIs();
+    const databaseBridge = createPluginDatabaseBridge({
+        allowedDbKeys,
+        getLiveDatabase: () => getDatabase() as unknown as Record<string, unknown>,
+        snapshotField: (key, value) => cloneDatabaseField(key, value),
+        getPluginStorageSnapshot: getPluginSaveStorageSnapshot,
+        updateWithPluginStorageSnapshot: updateDatabaseWithPluginStorageSnapshot,
+        applyLite: (mutation) => {
+            const db = getDatabase();
+            for (const key of Object.keys(mutation)) {
+                (db as any)[key] = mutation[key];
+            }
+            DBState.db = db;
+        },
+        applyFull: async (mutation) => {
+            const db = getDatabase();
+            for (const key of Object.keys(mutation)) {
+                (db as any)[key] = key === "plugins"
+                    ? await handlePluginInstallViaPlugin(mutation[key] as RisuPlugin[])
+                    : mutation[key];
+            }
+            setDatabaseState(db);
+        },
+    });
     return {
 
         //Old APIs from v2.1
@@ -851,8 +882,16 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             oldApis.addRisuReplacer(name, func as any);
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
-        setDatabaseLite: oldApis.setDatabaseLite,
-        setDatabase: oldApis.setDatabase,
+        setDatabaseLite: async (database: unknown) => {
+            const conf = await getPluginPermission(plugin.name, 'db', 'periodically');
+            if (!conf) return;
+            await databaseBridge.setDatabaseLite(database);
+        },
+        setDatabase: async (database: unknown) => {
+            const conf = await getPluginPermission(plugin.name, 'db', 'periodically');
+            if (!conf) return;
+            await databaseBridge.setDatabase(database);
+        },
         loadPlugins: oldApis.loadPlugins,
         readImage: oldApis.readImage,
         saveAsset: oldApis.saveAsset,
@@ -862,15 +901,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             if(!conf){
                 return null;
             }
-            const db = DBState.db
-            let liteDB = {}
-            for(const key of allowedDbKeys){
-                if(includeOnly !== 'all' && !includeOnly.includes(key)){
-                    continue;
-                }
-                (liteDB as any)[key] = $state.snapshot((db as any)[key]);
-            }
-            return liteDB;
+            return await databaseBridge.getDatabase(includeOnly);
         },
 
         installPlugin: handlePluginInstallViaPlugin,
@@ -1326,16 +1357,13 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return getPluginSaveStorageItem(key)
         },
         _setPluginStorage: async (key: string, value: any) => {
-            await setPluginSaveStorageItem(key, value)
-            await recordOwner('save', key, plugin.name)
+            await setOwnedPluginSaveStorageItem(key, value, plugin.name)
         },
         _removePluginStorage: async (key: string) => {
-            await removePluginSaveStorageItem(key)
-            await removeOwner('save', key)
+            await removeOwnedPluginSaveStorageItem(key)
         },
         _clearPluginStorage: async () => {
-            await clearPluginSaveStorage()
-            await clearOwners('save')
+            await clearOwnedPluginSaveStorage()
         },
         _keyPluginStorage: (index: number) => getPluginSaveStorageKey(index),
         _keysPluginStorage: () => getPluginSaveStorageKeys(),

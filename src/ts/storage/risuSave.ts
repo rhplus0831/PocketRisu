@@ -7,6 +7,7 @@ import {
     copyDatabasePluginStorageRecord,
     createDatabasePluginStorageRecord,
     definePluginStorageRecordValue,
+    getPluginStorageRecordKeys,
     hasPluginStorageRecordValue,
 } from "../plugins/pluginStorageRecord";
 
@@ -115,7 +116,7 @@ function prepareLegacyPluginStorageKeys(data: any): { data: any; escaped: boolea
         const recordCopy = copyDatabasePluginStorageRecord(record);
         escapes.push({
             field,
-            index: Object.keys(record).indexOf("__proto__"),
+            index: getPluginStorageRecordKeys(record).indexOf("__proto__"),
             value: recordCopy["__proto__"],
         });
         delete recordCopy["__proto__"];
@@ -150,7 +151,7 @@ function restoreLegacyPluginStorageKeys(data: any): any {
     for (const escape of envelope.escapes) {
         const source = data[escape.field] ?? createDatabasePluginStorageRecord();
         const record = createDatabasePluginStorageRecord<unknown>();
-        const keys = Object.keys(source);
+        const keys = getPluginStorageRecordKeys(source);
         const insertAt = Math.min(escape.index, keys.length);
         for (let index = 0; index <= keys.length; index++) {
             if (index === insertAt) {
@@ -990,7 +991,10 @@ export function normalizeJSON(
         return result;
     }
     const result: Record<string, any> = {};
-    for (const key in value) {
+    const keys = preservePluginStorageKeys
+        ? getPluginStorageRecordKeys(value)
+        : Object.keys(value);
+    for (const key of keys) {
         if (Object.prototype.hasOwnProperty.call(value, key)) {
             const propValue = value[key];
             if (propValue !== undefined) {

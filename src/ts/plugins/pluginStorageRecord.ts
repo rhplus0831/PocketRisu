@@ -65,11 +65,32 @@ export function hasPluginStorageRecordValue<T>(
     return record !== null && record !== undefined && Object.hasOwn(record, key);
 }
 
+/**
+ * Enumerate storage keys even when Svelte hides a first own property whose
+ * name is inherited from Object.prototype (for example `constructor`).
+ */
+export function getPluginStorageRecordKeys<T>(
+    record: PluginStorageRecord<T> | null | undefined,
+): string[] {
+    if (record === null || record === undefined) return [];
+    const keys = Object.keys(record);
+    const seen = new Set(keys);
+    // Resolve this dynamically: plugin code can add a name to Object.prototype
+    // after this module loads, and Svelte can then hide that first own name.
+    for (const key of Object.getOwnPropertyNames(Object.prototype)) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(record, key);
+        if (!seen.has(key) && descriptor?.enumerable) {
+            keys.push(key);
+        }
+    }
+    return keys;
+}
+
 export function copyPluginStorageRecord<T>(
     source: PluginStorageRecord<T> | null | undefined,
 ): PluginStorageRecord<T> {
     const copy = createPluginStorageRecord<T>();
-    for (const key of Object.keys(source ?? {})) {
+    for (const key of getPluginStorageRecordKeys(source)) {
         definePluginStorageRecordValue(copy, key, source![key]);
     }
     return copy;
@@ -79,7 +100,7 @@ export function copyDatabasePluginStorageRecord<T>(
     source: PluginStorageRecord<T> | null | undefined,
 ): PluginStorageRecord<T> {
     const copy = createDatabasePluginStorageRecord<T>();
-    for (const key of Object.keys(source ?? {})) {
+    for (const key of getPluginStorageRecordKeys(source)) {
         definePluginStorageRecordValue(copy, key, source![key]);
     }
     return copy;
@@ -91,7 +112,7 @@ export function mergePluginStorageRecords<T>(
 ): PluginStorageRecord<T> {
     const merged = createPluginStorageRecord<T>();
     for (const source of sources) {
-        for (const key of Object.keys(source ?? {})) {
+        for (const key of getPluginStorageRecordKeys(source)) {
             definePluginStorageRecordValue(merged, key, source![key]);
         }
     }

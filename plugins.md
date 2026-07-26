@@ -731,6 +731,28 @@ await Risuai.setDatabaseLite(db);
 
 `getDatabase()` returns `null` if the user has not granted database access consent.
 
+Database updates merge only the fields you provide; omitted fields remain
+unchanged. `pluginCustomStorage` is the exception at the key level: when the
+field is provided, its object exactly replaces the authoritative plugin storage
+key set, so omitted keys are deleted and `{}` clears it. Omitting the field
+leaves plugin storage unchanged. Owner metadata is preserved for retained keys,
+removed for deleted keys, and absent for newly introduced keys until a
+`pluginStorage` write records an owner.
+
+The setter's `DatabaseSubset` fields and top-level `pluginCustomStorage`
+entries must use enumerable string data properties. Symbol keys, accessors,
+non-enumerable properties, and unsupported database fields are rejected
+instead of being ignored. Calls through the supported `risuai` /
+`Risuai` iframe API are validated before `postMessage` structured cloning can
+strip symbols/non-enumerables or evaluate accessors, then validated again by
+the host after cloning. This descriptor guarantee applies to calls through
+that supported API boundary.
+
+`getDatabase()` returns `pluginCustomStorage` as a detached snapshot of the
+authoritative values, including when optimized plugin memory stores them
+externally. Materializing the full map can be expensive, so prefer the
+`pluginStorage` API for individual plugin-data reads and writes.
+
 **Allowed database keys:**
 - `characters`
 - `modules`

@@ -21,6 +21,7 @@ import {
     createDatabasePluginStorageRecord,
     createPluginStorageRecord,
     definePluginStorageRecordValue,
+    getPluginStorageRecordKeys,
     hasPluginStorageRecordValue,
     setDatabasePluginStorageRecordValue,
 } from "./pluginStorageRecord";
@@ -835,11 +836,13 @@ export const getV2PluginAPIs = () => {
                 return
             }
             seen.add(candidate)
-            for (const key of Object.keys(candidate)) {
+            for (const key of getPluginStorageRecordKeys(
+                candidate as Record<string, unknown>,
+            )) {
                 trackNestedState((candidate as Record<string, unknown>)[key])
             }
         }
-        for (const key of Object.keys(source)) {
+        for (const key of getPluginStorageRecordKeys(source)) {
             const value = source[key]
             // Descriptor-only cloning intentionally avoids arbitrary Proxy get
             // traps. These values have already crossed that validated ingress,
@@ -1150,7 +1153,9 @@ export const getV2PluginAPIs = () => {
                         key => typeof key === 'string' && allowedDbKeys.includes(key),
                     ));
                     if(target.pluginCustomStorage){
-                        for (const key of Object.keys(target.pluginCustomStorage)) keys.add(key)
+                        for (const key of getPluginStorageRecordKeys(target.pluginCustomStorage)) {
+                            keys.add(key)
+                        }
                     }
                     return [...keys];
                 },
@@ -1252,20 +1257,20 @@ export const getV2PluginAPIs = () => {
                 if (!canUseSynchronousPluginStorage()) return null
                 const db = getDatabase();
                 db.pluginCustomStorage ??= createDatabasePluginStorageRecord()
-                const keys = Object.keys(db.pluginCustomStorage);
+                const keys = getPluginStorageRecordKeys(db.pluginCustomStorage);
                 return keys[index] ?? null;
             },
             keys: () => {
                 if (!canUseSynchronousPluginStorage()) return []
                 const db = getDatabase();
                 db.pluginCustomStorage ??= createDatabasePluginStorageRecord()
-                return Object.keys(db.pluginCustomStorage);
+                return getPluginStorageRecordKeys(db.pluginCustomStorage);
             },
             length: () => {
                 if (!canUseSynchronousPluginStorage()) return 0
                 const db = getDatabase();
                 db.pluginCustomStorage ??= createDatabasePluginStorageRecord()
-                return Object.keys(db.pluginCustomStorage).length;
+                return getPluginStorageRecordKeys(db.pluginCustomStorage).length;
             }
         },
         setDatabaseLite: (newDb: any) => {

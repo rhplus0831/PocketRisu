@@ -36,6 +36,55 @@ interface AbortSignalRef {
     aborted: boolean;
 }
 
+/**
+ * Validate database-setter descriptors before postMessage structured cloning
+ * can discard symbols/non-enumerables or evaluate accessors. Kept
+ * self-contained because its compiled source is installed in the guest.
+ */
+export function validateV3DatabaseMutationForTransport(input: unknown): void {
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+        throw new TypeError("V3 database updates require a DatabaseSubset object.");
+    }
+    for (const key of Reflect.ownKeys(input)) {
+        if (typeof key !== "string") {
+            throw new TypeError("V3 database updates do not accept symbol keys.");
+        }
+        const descriptor = Reflect.getOwnPropertyDescriptor(input, key);
+        if (!descriptor || !("value" in descriptor)) {
+            throw new TypeError(`V3 database updates do not accept an accessor for ${key}.`);
+        }
+        if (!descriptor.enumerable) {
+            throw new TypeError(`V3 database updates require an enumerable data property for ${key}.`);
+        }
+        if (key !== "pluginCustomStorage") continue;
+
+        const storage = descriptor.value;
+        if (storage === null || typeof storage !== "object" || Array.isArray(storage)) {
+            throw new TypeError("pluginCustomStorage must be a JSON object when provided.");
+        }
+        const prototype = Reflect.getPrototypeOf(storage);
+        if (prototype !== Object.prototype && prototype !== null) {
+            throw new TypeError("pluginCustomStorage must be a plain JSON object.");
+        }
+        for (const storageKey of Reflect.ownKeys(storage)) {
+            if (typeof storageKey !== "string") {
+                throw new TypeError("pluginCustomStorage does not accept symbol keys.");
+            }
+            const storageDescriptor = Reflect.getOwnPropertyDescriptor(storage, storageKey);
+            if (!storageDescriptor || !("value" in storageDescriptor)) {
+                throw new TypeError(
+                    `pluginCustomStorage does not accept an accessor for ${storageKey}.`,
+                );
+            }
+            if (!storageDescriptor.enumerable) {
+                throw new TypeError(
+                    `pluginCustomStorage requires an enumerable data property for ${storageKey}.`,
+                );
+            }
+        }
+    }
+}
+
 
 const GUEST_BRIDGE_SCRIPT = `
 await (async function() {
@@ -44,6 +93,7 @@ await (async function() {
     const callbackIdByFunction = new WeakMap();
     const proxyRefRegistry = new Map();
     const abortControllers = new Map();
+    const validateDatabaseMutationForTransport = ${validateV3DatabaseMutationForTransport.toString()};
 
     function serializeArg(arg) {
         if (typeof arg === 'function') {
@@ -142,6 +192,14 @@ await (async function() {
     }
 
     function sendRequest(type, payload) {
+        if (type === 'CALL_ROOT'
+            && (payload.method === 'setDatabase' || payload.method === 'setDatabaseLite')) {
+            try {
+                validateDatabaseMutationForTransport(payload.args?.[0]);
+            } catch (error) {
+                return Promise.reject(error);
+            }
+        }
         return new Promise((resolve, reject) => {
             const reqId = Math.random().toString(36).substring(7);
             pendingRequests.set(reqId, { resolve, reject });
