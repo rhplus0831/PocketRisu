@@ -18,7 +18,7 @@ export interface PluginStorageMutationRequest {
     owner?: string;
     /** Recovery-only exact sidecar bytes; mutually exclusive with ordinary owner. */
     ownerRecordBytes?: Uint8Array;
-    /** Recovery-only: keep any historical sidecar unchanged. */
+    /** Keep any historical sidecar unchanged (set or value-only remove). */
     preserveOwner?: boolean;
 }
 

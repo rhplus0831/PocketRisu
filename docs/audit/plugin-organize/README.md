@@ -47,7 +47,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [PM1](performance-memory.md#pm1) | Medium | Fixed | Large plugin values bypass chunking and incur multiple full-size client/server copies |
 | [PM2](performance-memory.md#pm2) | Medium | Fixed | Mode transitions are not memory-bounded in either direction; the UI guards on entry count only |
 | [PM3](performance-memory.md#pm3) | Medium | Fixed | Viewer, partial backup, and snapshot restore eagerly rematerialize the whole external store |
-| [PM4](performance-memory.md#pm4) | Medium | Open | Remaining write/cache amplification: independent logical writes still repeat full-value hashing/copies and cache pruning |
+| [PM4](performance-memory.md#pm4) | Medium | Fixed | Batch writes now use compact CAS, donated bytes, server hashes, one cache transaction, and amortized pruning |
 | [IP1](integration-patterns.md#ip1) | High | Open | Treating a failed read as a missing key turns transient I/O errors into destructive whole-value overwrites |
 | [IP2](integration-patterns.md#ip2) | High | Open | Remove-then-rewrite maintenance flows durably delete rows mid-sequence and report success |
 | [IP3](integration-patterns.md#ip3) | Medium | Open | Swallowed mutation failures desynchronize plugin caches and success counters from durable server state |
@@ -119,6 +119,13 @@ forced-GC checkpoints, PM1 chunks, and the resource cache both off and on.
 PM3 covers one-page viewer loading, generation-owned partial folding, chunked
 file-cursor restore, and a real disconnect after tentative exact-set deletion
 with rollback, spool cleanup, and restart durability.
+PM4 additionally covers compact manifest CAS, exact server value hashes,
+50-row snapshot reuse, canonical manifest-key validation and cancellation,
+donated 128-row and four-by-2-MiB batches, one IndexedDB mutation transaction,
+bounded real inventory scans, and versioned reads held across a late-failing
+streamed import. PM2 staged receipts are exact and plan-bound, and downloaded
+private rows are checked against their advertised SHA-256 before publication;
+status refresh cannot consume a matching but tentative import publication.
 The suites still do not exercise:
 
 - the production save loop as the reconciliation durability callback
@@ -149,10 +156,9 @@ The suites still do not exercise:
 
 The former compatibility, startup, mutation, primary recovery, transition
 capacity, and tooling-memory blockers MT1–MT3, AC1–AC4, SA1–SA4, AA1–AA3,
-BR1–BR4, and PM1–PM3 are fixed and covered. The beta still should not be
-treated as risk-free for every V3 workload: PM4 and IP1–IP5 remain open. The
-AA3 primitives make
-safe compound-write guidance possible, but do not automatically repair existing
-plugin protocols.
+BR1–BR4, and PM1–PM4 are fixed and covered. The beta still should not be
+treated as risk-free for every V3 workload: IP1–IP5 remain open. The AA3
+primitives make safe compound-write guidance possible, but do not automatically
+repair existing plugin protocols.
 Verify a backup before transitions and before using the remaining open
 integration paths with very large repositories.

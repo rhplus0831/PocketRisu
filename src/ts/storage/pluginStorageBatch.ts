@@ -10,6 +10,8 @@ export type PluginStorageBatchOperation =
         operation: "set";
         key: string;
         valueBytes: Uint8Array;
+        /** The caller donates a fresh immutable buffer for post-commit cache seeding. */
+        ownedValueBytes?: true;
         owner: string;
         expectedRevision?: string | null;
     }
@@ -28,16 +30,22 @@ export interface PluginStorageBatchManifest {
 
 export interface PluginStorageBatchRequest {
     generation: string;
-    expectedManifest: PluginStorageBatchManifest;
+    /** Legacy full-manifest CAS, retained for older callers/tests. */
+    expectedManifest?: PluginStorageBatchManifest;
+    /** Compact exact publication CAS used by ordinary clients. */
+    expectedManifestRevision?: string;
     operations: PluginStorageBatchOperation[];
 }
 
 export interface PluginStorageRevisionResult {
     key: string;
     revision: string | null;
+    /** SHA-256 of the authoritative value bytes; null for a remove. */
+    valueHash: string | null;
 }
 
-export interface PluginStorageConflictResult extends PluginStorageRevisionResult {
+export interface PluginStorageConflictResult
+    extends Omit<PluginStorageRevisionResult, "valueHash"> {
     currentGeneration: string | null;
 }
 
@@ -89,10 +97,22 @@ export function encodePluginStorageBatchRequest(request: PluginStorageBatchReque
             `Plugin storage atomicBatch requires 1-${PLUGIN_STORAGE_BATCH_MAX_OPERATIONS} operations.`,
         );
     }
+    const hasManifest = request.expectedManifest !== undefined;
+    const hasManifestRevision = request.expectedManifestRevision !== undefined;
+    if (hasManifest === hasManifestRevision) {
+        throw new TypeError("Plugin storage batch requires exactly one manifest CAS.");
+    }
+    const compact = hasManifestRevision;
+    if (compact && (typeof request.expectedManifestRevision !== "string"
+        || !PLUGIN_STORAGE_REVISION_PATTERN.test(request.expectedManifestRevision))) {
+        throw new TypeError("Plugin storage batch manifest revision is invalid.");
+    }
     const envelope = {
-        version: 1,
+        version: compact ? 2 : 1,
         generation: request.generation,
-        expectedManifest: request.expectedManifest,
+        ...(compact
+            ? { expectedManifestRevision: request.expectedManifestRevision }
+            : { expectedManifest: request.expectedManifest }),
         operations: request.operations.map(operation => ({
             operation: operation.operation,
             key: operation.key,
@@ -127,6 +147,10 @@ function validRevision(value: unknown): value is string {
     return typeof value === "string" && PLUGIN_STORAGE_REVISION_PATTERN.test(value);
 }
 
+function validValueHash(value: unknown): value is string {
+    return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
 function validUuid(value: unknown): value is string {
     return typeof value === "string" && PLUGIN_STORAGE_UUID_PATTERN.test(value);
 }
@@ -141,12 +165,16 @@ function parseRevisionList(
         const row = value[index];
         const expected = expectedOperations[index];
         if (!isRecord(row)
-            || !hasOnlyKeys(row, ["key", "revision"])
+            || !hasOnlyKeys(row, ["key", "revision", "valueHash"])
             || row.key !== expected.key
             || (expected.operation === "set"
-                ? !validRevision(row.revision)
-                : row.revision !== null)) return null;
-        out.push({ key: row.key as string, revision: row.revision as string | null });
+                ? !validRevision(row.revision) || !validValueHash(row.valueHash)
+                : row.revision !== null || row.valueHash !== null)) return null;
+        out.push({
+            key: row.key as string,
+            revision: row.revision as string | null,
+            valueHash: row.valueHash as string | null,
+        });
     }
     return out;
 }

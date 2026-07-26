@@ -1,9 +1,21 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+    IDBDatabase as FakeIDBDatabase,
+    IDBKeyRange as FakeIDBKeyRange,
+    IDBObjectStore as FakeIDBObjectStore,
+    indexedDB as fakeIndexedDB,
+} from 'fake-indexeddb'
+import {
     RESOURCE_CACHE_LOCAL_STORAGE_KEY,
     RESOURCE_CACHE_IO_TIMEOUT_MS,
+    RESOURCE_CACHE_PRUNE_MAX_ADDED_BYTES,
+    RESOURCE_CACHE_PRUNE_MAX_MUTATIONS,
+    RESOURCE_CACHE_PRUNE_MAX_DELAY_MS,
     RESOURCE_CACHE_MAX_DB_HASHES_PER_MANIFEST,
     chainBestEffortResourceCacheOperation,
+    applyOwnedResourceCacheMutations,
+    advanceResourceCachePruneDebt,
+    clearResourceCache,
     formatHashBytes,
     getResourceCacheStats,
     isResourceCacheEnabled,
@@ -82,6 +94,88 @@ describe('byte resource cache helpers', () => {
             hash(3),
             hash(1),
         ])
+    })
+
+    it('bounds prune debt by mutation count and donated bytes', () => {
+        let debt = { mutations: 0, addedBytes: 0 }
+        for (let index = 0; index < RESOURCE_CACHE_PRUNE_MAX_MUTATIONS - 1; index++) {
+            const next = advanceResourceCachePruneDebt(debt, 1, 1)
+            expect(next.prune).toBe(false)
+            debt = next.debt
+        }
+        const countBound = advanceResourceCachePruneDebt(debt, 1, 1)
+        expect(countBound).toEqual({
+            debt: { mutations: 0, addedBytes: 0 },
+            prune: true,
+        })
+
+        const byteBound = advanceResourceCachePruneDebt(
+            { mutations: 0, addedBytes: 0 },
+            4,
+            RESOURCE_CACHE_PRUNE_MAX_ADDED_BYTES,
+        )
+        expect(byteBound).toEqual({
+            debt: { mutations: 0, addedBytes: 0 },
+            prune: true,
+        })
+    })
+
+    it('uses one cache transaction per mutation group and bounds real inventory scans', async () => {
+        vi.stubGlobal('indexedDB', fakeIndexedDB)
+        vi.stubGlobal('IDBKeyRange', FakeIDBKeyRange)
+        localStorage.setItem(RESOURCE_CACHE_LOCAL_STORAGE_KEY, 'true')
+        const transactionSpy = vi.spyOn(FakeIDBDatabase.prototype, 'transaction')
+        const getAllKeysSpy = vi.spyOn(FakeIDBObjectStore.prototype, 'getAllKeys')
+        try {
+            await applyOwnedResourceCacheMutations([0, 1, 2].map(index => ({
+                type: 'set' as const,
+                resourceKey: `group:${index}`,
+                hash: hash(index + 1),
+                ownedBytes: new Uint8Array([index]),
+            })))
+            const groupedWrites = transactionSpy.mock.calls.filter(([stores, mode]) => (
+                Array.isArray(stores)
+                && stores.includes('entries')
+                && stores.includes('manifests')
+                && mode === 'readwrite'
+            ))
+            expect(groupedWrites).toHaveLength(1)
+
+            await clearResourceCache()
+            localStorage.setItem(RESOURCE_CACHE_LOCAL_STORAGE_KEY, 'true')
+            getAllKeysSpy.mockClear()
+            await Promise.all(Array.from({ length: 8 }, (_, index) => (
+                applyOwnedResourceCacheMutations([{
+                    type: 'set',
+                    resourceKey: `delayed:${index}`,
+                    hash: hash(index + 10),
+                    ownedBytes: new Uint8Array([index]),
+                }])
+            )))
+            await new Promise(resolve => setTimeout(
+                resolve,
+                RESOURCE_CACHE_PRUNE_MAX_DELAY_MS + 50,
+            ))
+            expect(getAllKeysSpy).toHaveBeenCalledTimes(2)
+
+            await clearResourceCache()
+            localStorage.setItem(RESOURCE_CACHE_LOCAL_STORAGE_KEY, 'true')
+            getAllKeysSpy.mockClear()
+            await Promise.all(Array.from({ length: 128 }, (_, index) => (
+                applyOwnedResourceCacheMutations([{
+                    type: 'set',
+                    resourceKey: `threshold:${index}`,
+                    hash: hash(index + 100),
+                    ownedBytes: new Uint8Array([index]),
+                }])
+            )))
+            expect(getAllKeysSpy).toHaveBeenCalledTimes(8)
+        } finally {
+            await clearResourceCache()
+            vi.unstubAllGlobals()
+            transactionSpy.mockRestore()
+            getAllKeysSpy.mockRestore()
+        }
     })
 
     it('advertises only de-duplicated resident manifest entries', () => {

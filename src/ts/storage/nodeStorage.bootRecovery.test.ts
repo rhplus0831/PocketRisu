@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const cache = vi.hoisted(() => ({ enabled: false }))
 
 vi.mock('./resourceCache', () => ({
+    applyOwnedResourceCacheMutations: vi.fn(async () => undefined),
     getManifestHashes: vi.fn(async () => []),
     getVerifiedManifestSnapshot: vi.fn(async () => null),
     getVerifiedCachedBytes: vi.fn(async () => null),
@@ -12,10 +13,12 @@ vi.mock('./resourceCache', () => ({
     isSha256Hex: (value: unknown) => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value),
     persistResourceCacheManifests: vi.fn(async () => undefined),
     sha256Bytes: vi.fn(async () => 'a'.repeat(64)),
+    sha256OwnedBytes: vi.fn(async () => 'a'.repeat(64)),
     settleBestEffortResourceCache: async <T>(operation: Promise<T>, fallback: T) => {
         try { return await operation } catch { return fallback }
     },
     storeBytes: vi.fn(async () => undefined),
+    storeOwnedBytesWithKnownHash: vi.fn(async () => undefined),
     touchResourceCacheManifest: vi.fn(async () => undefined),
 }))
 

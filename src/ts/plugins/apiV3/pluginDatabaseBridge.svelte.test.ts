@@ -86,6 +86,26 @@ vi.mock("../../storage/persistentKv", () => {
                 storageMocks.persistent.delete(ownerKey);
             }
         }
+        const currentManifest = storageMocks.persistent.get(manifestKey) as any;
+        const valueKeys = new Set<string>(currentManifest?.valueKeys ?? []);
+        const metaKeys = new Set<string>(currentManifest?.metaKeys ?? []);
+        for (const operation of request.operations) {
+            const valueKey = `pluginsave/${encodeKey(operation.key)}.json`;
+            const ownerKey = `pluginsave-meta/${encodeKey(operation.key)}.json`;
+            if (operation.operation === "set") {
+                valueKeys.add(valueKey);
+                metaKeys.add(ownerKey);
+            } else {
+                valueKeys.delete(valueKey);
+                metaKeys.delete(ownerKey);
+            }
+        }
+        storageMocks.persistent.set(manifestKey, {
+            version: 1,
+            generation: request.generation,
+            valueKeys: [...valueKeys].sort(),
+            metaKeys: [...metaKeys].sort(),
+        });
         return {
             outcome: "committed" as const,
             generation,
@@ -186,6 +206,37 @@ vi.mock("../../storage/persistentKv", () => {
                 generation: null,
             };
     },
+    readPersistentPluginStorageManifestSnapshot: async (generation: string) => {
+        const manifest = {
+            version: 1,
+            generation,
+            valueKeys: [...storageMocks.persistent.keys()].filter(
+                candidate => candidate.startsWith("pluginsave/"),
+            ),
+            metaKeys: [...storageMocks.persistent.keys()].filter(
+                candidate => candidate.startsWith("pluginsave-meta/"),
+            ),
+        };
+        return {
+            generation,
+            manifestRevision: `sha256:${"c".repeat(64)}`,
+            manifest,
+            valueKeys: manifest.valueKeys.filter((key: string) => storageMocks.persistent.has(key)),
+            metaKeys: manifest.metaKeys.filter((key: string) => storageMocks.persistent.has(key)),
+        };
+    },
+    readPersistentPluginStorageManifestState: async (generation: string) => ({
+        generation,
+        manifestRevision: `sha256:${"c".repeat(64)}`,
+    }),
+    removePersistentPluginStoragePreservingOwner: async (key: string) => {
+        storageMocks.persistent.delete(key);
+        return {
+            outcome: "committed" as const,
+            operation: "remove" as const,
+            verification: "verified" as const,
+        };
+    },
     readPersistentJson: async <T>(
         key: string,
         options: {
@@ -215,6 +266,20 @@ vi.mock("../../storage/persistentKv", () => {
         throwIfAborted(signal);
         storageMocks.persistent.delete(key);
     },
+        setPreparedPersistentPluginStoragePreservingOwner: async (
+            key: string,
+            prepared: { value: unknown },
+            signal?: AbortSignal | null,
+        ) => {
+            await storageMocks.writeGate?.(key, signal);
+            throwIfAborted(signal);
+            storageMocks.persistent.set(key, cloneJson(prepared.value));
+            return {
+                outcome: "committed" as const,
+                operation: "set" as const,
+                verification: "verified" as const,
+            };
+        },
         writePersistentJson,
         preparePersistentJson: (value: unknown) => {
             const bytes = new TextEncoder().encode(JSON.stringify(value));

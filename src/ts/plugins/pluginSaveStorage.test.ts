@@ -104,7 +104,7 @@ vi.mock("../storage/persistentKv", () => {
     });
     let stagedPlan: any = null;
     const stagedRows = new Map<string, Uint8Array>();
-    const stagedStatus = () => {
+    const stagedStatus = async () => {
         const storageKeys = stagedPlan.targetOptimized
             ? stagedPlan.rows.map((row: any) => row.storageKey)
             : [
@@ -117,17 +117,24 @@ vi.mock("../storage/persistentKv", () => {
             state: "ready" as const,
             direction: stagedPlan.targetOptimized ? "externalize" as const : "internalize" as const,
             targetGeneration: stagedPlan.targetGeneration,
-            rows: storageKeys.map((storageKey: string) => {
+            rows: await Promise.all(storageKeys.map(async (storageKey: string) => {
                 const bytes = stagedRows.get(storageKey)
                     ?? new TextEncoder().encode(JSON.stringify(persistent.get(storageKey)));
                 return {
                     storageKey,
                     size: bytes.byteLength,
-                    sha256: "a".repeat(64),
+                    sha256: [...new Uint8Array(await crypto.subtle.digest(
+                        "SHA-256",
+                        bytes as unknown as BufferSource,
+                    ))]
+                        .map(byte => byte.toString(16).padStart(2, "0"))
+                        .join(""),
                     uploaded: !stagedPlan.targetOptimized || stagedRows.has(storageKey),
                 };
-            }),
-            uploaded: storageKeys.length,
+            })),
+            uploaded: storageKeys.filter((storageKey: string) => (
+                !stagedPlan.targetOptimized || stagedRows.has(storageKey)
+            )).length,
             total: storageKeys.length,
             totalBytes: storageKeys.reduce((total: number, storageKey: string) => total + (
                 stagedRows.get(storageKey)
@@ -137,7 +144,7 @@ vi.mock("../storage/persistentKv", () => {
     };
     return {
         abortPersistentPluginStorageTransition: vi.fn(async () => ({
-            ...stagedStatus(),
+            ...await stagedStatus(),
             state: "aborted" as const,
         })),
         batchPersistentPluginStorage: vi.fn(async (request: any) => {
@@ -163,6 +170,7 @@ vi.mock("../storage/persistentKv", () => {
                 revisions: request.operations.map((operation: any) => ({
                     key: operation.key,
                     revision: operation.operation === "set" ? `sha256:${"a".repeat(64)}` : null,
+                    valueHash: operation.operation === "set" ? "c".repeat(64) : null,
                 })),
             };
         }),
@@ -192,7 +200,7 @@ vi.mock("../storage/persistentKv", () => {
         beginPersistentPluginStorageTransition: vi.fn(async (plan: any) => {
             stagedPlan = plan;
             stagedRows.clear();
-            return stagedStatus();
+            return await stagedStatus();
         }),
         decodeStorageKeyComponent: decode,
         getPersistentStorageFreeBytes: vi.fn(async () => null),
@@ -247,6 +255,56 @@ vi.mock("../storage/persistentKv", () => {
                 verification: "verified" as const,
             };
         }),
+        setPreparedPersistentPluginStoragePreservingOwner: vi.fn(async (
+            valueKey: string,
+            prepared: { value?: unknown; bytes: Uint8Array },
+        ) => {
+            persistent.set(
+                valueKey,
+                prepared.value ?? JSON.parse(new TextDecoder().decode(prepared.bytes)),
+            );
+            return {
+                outcome: "committed" as const,
+                operation: "set" as const,
+                verification: "verified" as const,
+            };
+        }),
+        removePersistentPluginStoragePreservingOwner: vi.fn(async (
+            valueKey: string,
+        ) => {
+            persistent.delete(valueKey);
+            const manifest = persistent.get("plugin-storage/manifest.json") as any;
+            if (manifest) {
+                persistent.set("plugin-storage/manifest.json", {
+                    ...manifest,
+                    valueKeys: manifest.valueKeys.filter((key: string) => key !== valueKey),
+                });
+            }
+            return {
+                outcome: "committed" as const,
+                operation: "remove" as const,
+                verification: "verified" as const,
+            };
+        }),
+        readPersistentPluginStorageManifestSnapshot: vi.fn(async (generation: string) => {
+            const manifest = persistent.get("plugin-storage/manifest.json") as any ?? {
+                version: 1,
+                generation,
+                valueKeys: [...persistent.keys()].filter(key => key.startsWith("pluginsave/")),
+                metaKeys: [...persistent.keys()].filter(key => key.startsWith("pluginsave-meta/")),
+            };
+            return {
+                generation,
+                manifestRevision: `sha256:${"d".repeat(64)}`,
+                manifest,
+                valueKeys: manifest.valueKeys.filter((key: string) => persistent.has(key)),
+                metaKeys: manifest.metaKeys.filter((key: string) => persistent.has(key)),
+            };
+        }),
+        readPersistentPluginStorageManifestState: vi.fn(async (generation: string) => ({
+            generation,
+            manifestRevision: `sha256:${"d".repeat(64)}`,
+        })),
         readPersistentPluginStorageState: vi.fn(async (valueKey: string) => {
             if (!persistent.has(valueKey)) {
                 return { status: "missing" as const, value: null, revision: null, generation: null };
@@ -276,7 +334,7 @@ vi.mock("../storage/persistentKv", () => {
             bytes: Uint8Array,
         ) => {
             stagedRows.set(storageKey, new Uint8Array(bytes));
-            return stagedStatus();
+            return await stagedStatus();
         }),
         finalizePersistentPluginStorageTransition: vi.fn(async () => {
             if (stagedPlan.targetOptimized) {
@@ -303,7 +361,7 @@ vi.mock("../storage/persistentKv", () => {
                 ]) persistent.delete(storageKey);
                 persistent.delete("plugin-storage/manifest.json");
             }
-            return { ...stagedStatus(), state: "committed" as const };
+            return { ...await stagedStatus(), state: "committed" as const };
         }),
         writePersistentJson,
         preparePersistentJson: vi.fn((value: unknown) => {
@@ -326,6 +384,7 @@ const {
     getPluginSaveStorageKey,
     getPluginSaveStorageKeys,
     getPluginSaveStorageLength,
+    getPluginSaveStorageOwners,
     PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_SAVE_PREFIX,
@@ -469,7 +528,10 @@ beforeEach(async () => {
         mutatePersistentPluginStorage,
         readPersistentJson,
         restorePersistentPluginStoragePair,
+        readPersistentPluginStorageManifestSnapshot,
+        readPersistentPluginStorageManifestState,
         removePersistentKey,
+        setPreparedPersistentPluginStoragePreservingOwner,
         writePersistentJson,
         commitPersistentPluginStorageTransition,
     } = vi.mocked(await import("../storage/persistentKv"));
@@ -500,6 +562,21 @@ beforeEach(async () => {
             persistent.delete(valueKey);
             persistent.delete(metaKey);
         }
+        const manifest = persistent.get(PLUGIN_STORAGE_MANIFEST_KEY) as any;
+        if (manifest) {
+            const valueKeys = new Set<string>(manifest.valueKeys);
+            const metaKeys = new Set<string>(manifest.metaKeys);
+            if (operation === "set") valueKeys.add(valueKey);
+            else {
+                valueKeys.delete(valueKey);
+                metaKeys.delete(metaKey);
+            }
+            persistent.set(PLUGIN_STORAGE_MANIFEST_KEY, {
+                ...manifest,
+                valueKeys: [...valueKeys],
+                metaKeys: [...metaKeys],
+            });
+        }
         return { outcome: "committed", operation, verification: "verified" };
     });
     restorePersistentPluginStoragePair.mockImplementation(async (
@@ -513,6 +590,39 @@ beforeEach(async () => {
         if (ownerRecord !== undefined) persistent.set(metaKey, ownerRecord);
         return { outcome: "committed", operation: "set", verification: "verified" };
     });
+    setPreparedPersistentPluginStoragePreservingOwner.mockImplementation(async (
+        valueKey: string,
+        prepared: { value?: unknown; bytes: Uint8Array },
+    ) => {
+        persistent.set(
+            valueKey,
+            prepared.value ?? JSON.parse(new TextDecoder().decode(prepared.bytes)),
+        );
+        const manifest = persistent.get(PLUGIN_STORAGE_MANIFEST_KEY) as any;
+        if (manifest) {
+            persistent.set(PLUGIN_STORAGE_MANIFEST_KEY, {
+                ...manifest,
+                valueKeys: [...new Set<string>([...manifest.valueKeys, valueKey])],
+            });
+        }
+        return { outcome: "committed", operation: "set", verification: "verified" };
+    });
+    readPersistentPluginStorageManifestSnapshot.mockImplementation(async (generation: string) => {
+        const manifest = persistent.get(PLUGIN_STORAGE_MANIFEST_KEY) as any ?? {
+            version: 1, generation, valueKeys: [], metaKeys: [],
+        };
+        return {
+            generation,
+            manifestRevision: `sha256:${"d".repeat(64)}`,
+            manifest,
+            valueKeys: manifest.valueKeys.filter((key: string) => persistent.has(key)),
+            metaKeys: manifest.metaKeys.filter((key: string) => persistent.has(key)),
+        };
+    });
+    readPersistentPluginStorageManifestState.mockImplementation(async (generation: string) => ({
+        generation,
+        manifestRevision: `sha256:${"d".repeat(64)}`,
+    }));
     readPersistentJson.mockImplementation(async (key: string) => persistent.get(key) ?? null);
     removePersistentKey.mockImplementation(async (key: string) => {
         persistent.delete(key);
@@ -818,7 +928,13 @@ describe("AA3 versioned atomic plugin storage", () => {
     test("detaches every batch value synchronously before bounded preparation yields", async () => {
         database.optimizePluginMemory = true;
         installOwnershipManifest("selected-generation", [], []);
-        const { batchPersistentPluginStorage } = vi.mocked(
+        const {
+            batchPersistentPluginStorage,
+            listPersistentKeys,
+            readPersistentJson,
+            readPersistentPluginStorageManifestSnapshot,
+            readPersistentPluginStorageManifestState,
+        } = vi.mocked(
             await import("../storage/persistentKv"),
         );
         const values = Array.from({ length: 17 }, (_, index) => ({ captured: index }));
@@ -844,7 +960,13 @@ describe("AA3 versioned atomic plugin storage", () => {
     test("optimized mode sends one detached authoritative batch", async () => {
         database.optimizePluginMemory = true;
         installOwnershipManifest("selected-generation", [], []);
-        const { batchPersistentPluginStorage } = vi.mocked(
+        const {
+            batchPersistentPluginStorage,
+            listPersistentKeys,
+            readPersistentJson,
+            readPersistentPluginStorageManifestSnapshot,
+            readPersistentPluginStorageManifestState,
+        } = vi.mocked(
             await import("../storage/persistentKv"),
         );
         const result = await atomicBatchOwnedPluginSaveStorage([
@@ -853,15 +975,20 @@ describe("AA3 versioned atomic plugin storage", () => {
         ], "AA3");
         expect(result.committed).toBe(true);
         expect(batchPersistentPluginStorage).toHaveBeenCalledOnce();
+        expect(readPersistentPluginStorageManifestState).toHaveBeenCalledOnce();
+        expect(readPersistentPluginStorageManifestState).toHaveBeenCalledWith(
+            "selected-generation",
+            undefined,
+        );
+        expect(readPersistentPluginStorageManifestSnapshot).not.toHaveBeenCalled();
+        expect(listPersistentKeys).not.toHaveBeenCalled();
+        expect(readPersistentJson).not.toHaveBeenCalled();
         const request = batchPersistentPluginStorage.mock.calls[0][0];
         expect(request).toMatchObject({
             generation: "selected-generation",
-            expectedManifest: {
-                generation: "selected-generation",
-                valueKeys: [],
-                metaKeys: [],
-            },
+            expectedManifestRevision: `sha256:${"d".repeat(64)}`,
         });
+        expect(request).not.toHaveProperty("expectedManifest");
         expect(request.operations).toHaveLength(2);
         expect(JSON.parse(new TextDecoder().decode(
             (request.operations[0] as any).valueBytes,
@@ -1352,6 +1479,161 @@ describe("plugin save storage transport", () => {
         expect(persistent.has(encoded(PLUGIN_SAVE_PREFIX, "�"))).toBe(false);
     });
 
+    test("generation-bound enumeration aborts its pending manifest snapshot", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("abort-generation", [], []);
+        const { readPersistentPluginStorageManifestSnapshot } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        const controller = new AbortController();
+        let observedAbort = false;
+        readPersistentPluginStorageManifestSnapshot.mockImplementationOnce(
+            async (_generation, signal) => await new Promise((_resolve, reject) => {
+                signal?.addEventListener("abort", () => {
+                    observedAbort = true;
+                    reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+                }, { once: true });
+            }),
+        );
+
+        const listing = getPluginSaveStorageKeys(controller.signal);
+        await vi.waitFor(() => {
+            expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledWith(
+                "abort-generation",
+                controller.signal,
+            );
+        });
+        controller.abort(new DOMException("cancel snapshot", "AbortError"));
+
+        await expect(listing).rejects.toMatchObject({ name: "AbortError" });
+        expect(observedAbort).toBe(true);
+    });
+
+    test("one generation snapshot feeds enumeration and a page of value reads", async () => {
+        database.optimizePluginMemory = true;
+        const pageKeys = Array.from({ length: 50 }, (_, index) => (
+            `page-${index.toString().padStart(2, "0")}`
+        ));
+        const storageKeys = pageKeys.map(key => encoded(PLUGIN_SAVE_PREFIX, key));
+        const metaKeys = pageKeys.map(key => encoded(PLUGIN_SAVE_META_PREFIX, key));
+        storageKeys.forEach((storageKey, index) => {
+            persistent.set(storageKey, { page: index });
+            persistent.set(metaKeys[index], { plugin: `Owner ${index}`, updatedAt: index });
+        });
+        installOwnershipManifest("viewer-generation", storageKeys, metaKeys);
+        const {
+            listPersistentKeys,
+            readPersistentPluginStorageManifestSnapshot,
+        } = vi.mocked(await import("../storage/persistentKv"));
+
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(pageKeys);
+        const owners = await getPluginSaveStorageOwners();
+        expect(Object.keys(owners)).toEqual(pageKeys);
+        expect(owners[pageKeys[49]]).toBe("Owner 49");
+        for (const [index, key] of pageKeys.entries()) {
+            await expect(getPluginSaveStorageItem(key)).resolves.toEqual({ page: index });
+        }
+        expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledOnce();
+        expect(listPersistentKeys).not.toHaveBeenCalled();
+
+        await setPluginSaveStorageItem(pageKeys[0], { page: 100 });
+        await expect(getPluginSaveStorageItem(pageKeys[49])).resolves.toEqual({ page: 49 });
+        expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledTimes(2);
+    });
+
+    test("ordinary optimized set uses one value mutation and no ownership read", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("set-generation", [], []);
+        const {
+            listPersistentKeys,
+            readPersistentPluginStorageManifestSnapshot,
+            readPersistentPluginStorageManifestState,
+            setPreparedPersistentPluginStoragePreservingOwner,
+        } = vi.mocked(await import("../storage/persistentKv"));
+
+        await setPluginSaveStorageItem("alpha", { once: true });
+
+        expect(setPreparedPersistentPluginStoragePreservingOwner).toHaveBeenCalledOnce();
+        expect(setPreparedPersistentPluginStoragePreservingOwner).toHaveBeenCalledWith(
+            encoded(PLUGIN_SAVE_PREFIX, "alpha"),
+            expect.objectContaining({ bytes: expect.any(Uint8Array) }),
+            undefined,
+            "set-generation",
+        );
+        expect(readPersistentPluginStorageManifestSnapshot).not.toHaveBeenCalled();
+        expect(readPersistentPluginStorageManifestState).not.toHaveBeenCalled();
+        expect(listPersistentKeys).not.toHaveBeenCalled();
+    });
+
+    test("a stalled viewer owner row does not block an unrelated batch", async () => {
+        database.optimizePluginMemory = true;
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "alpha");
+        persistent.set(valueKey, { retained: true });
+        persistent.set(metaKey, { plugin: "Owner", updatedAt: 1 });
+        installOwnershipManifest("viewer-batch-generation", [valueKey], [metaKey]);
+        const { readPersistentJson } = vi.mocked(await import("../storage/persistentKv"));
+        const originalRead = readPersistentJson.getMockImplementation()!;
+        let releaseOwner!: () => void;
+        let markOwnerStarted!: () => void;
+        const ownerBlocked = new Promise<void>(resolve => { releaseOwner = resolve; });
+        const ownerStarted = new Promise<void>(resolve => { markOwnerStarted = resolve; });
+        readPersistentJson.mockImplementation(async (storageKey, options) => {
+            if (storageKey === metaKey) {
+                markOwnerStarted();
+                await ownerBlocked;
+            }
+            return originalRead(storageKey, options);
+        });
+
+        const owners = getPluginSaveStorageOwners();
+        await ownerStarted;
+        await expect(atomicBatchOwnedPluginSaveStorage([{
+            type: "set",
+            key: "beta",
+            value: { concurrent: true },
+        }], "Viewer Batch")).resolves.toMatchObject({ committed: true });
+
+        releaseOwner();
+        await expect(owners).resolves.toEqual({ alpha: "Owner" });
+    });
+
+    test("value-only remove preserves ownership identically in inline and optimized modes", async () => {
+        const owner = { plugin: "Retained Owner", updatedAt: 7 };
+        database.pluginCustomStorage = { shared: { mode: "inline" } };
+        database.pluginStorageMeta = { shared: owner };
+
+        await removePluginSaveStorageItem("shared");
+        expect(database.pluginCustomStorage).toEqual({});
+        expect(database.pluginStorageMeta).toEqual({ shared: owner });
+
+        database.optimizePluginMemory = true;
+        database.pluginCustomStorage = {};
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "shared");
+        const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "shared");
+        persistent.set(valueKey, { mode: "optimized" });
+        persistent.set(metaKey, owner);
+        installOwnershipManifest("remove-parity-generation", [valueKey], [metaKey]);
+        const { removePersistentPluginStoragePreservingOwner } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+
+        await removePluginSaveStorageItem("shared");
+
+        expect(removePersistentPluginStoragePreservingOwner).toHaveBeenCalledOnce();
+        expect(removePersistentPluginStoragePreservingOwner).toHaveBeenCalledWith(
+            valueKey,
+            undefined,
+            "remove-parity-generation",
+        );
+        expect(persistent.has(valueKey)).toBe(false);
+        expect(persistent.get(metaKey)).toEqual(owner);
+        expect(persistent.get(PLUGIN_STORAGE_MANIFEST_KEY)).toMatchObject({
+            valueKeys: [],
+            metaKeys: [metaKey],
+        });
+    });
+
     test("inline set/get/list/remove treats special names as exact own keys", async () => {
         // Start from an ordinary legacy object to cover inherited-name misses.
         database.pluginCustomStorage = {};
@@ -1514,26 +1796,21 @@ describe("plugin save storage transport", () => {
         const alphaKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
         persistent.set(betaKey, { available: true });
         installOwnershipManifest("concurrent-generation", [betaKey], []);
-        const { commitPersistentPluginStorageMutation } = await import(
+        const { setPreparedPersistentPluginStoragePreservingOwner } = await import(
             "../storage/persistentKv"
         );
+        const setPrepared = vi.mocked(setPreparedPersistentPluginStoragePreservingOwner);
+        const originalSetPrepared = setPrepared.getMockImplementation()!;
         let markWriteStarted!: () => void;
         let releaseWrite!: () => void;
         const writeStarted = new Promise<void>(resolve => { markWriteStarted = resolve; });
         const stalledWrite = new Promise<void>(resolve => { releaseWrite = resolve; });
-        vi.mocked(commitPersistentPluginStorageMutation).mockImplementation(async (mutation) => {
-            if (mutation.writes.some(write => write.storageKey === alphaKey)) {
+        setPrepared.mockImplementation(async (valueKey, prepared, signal, generation) => {
+            if (valueKey === alphaKey) {
                 markWriteStarted();
                 await stalledWrite;
             }
-            for (const write of mutation.writes) {
-                persistent.set(
-                    write.storageKey,
-                    JSON.parse(new TextDecoder().decode(write.valueBytes)),
-                );
-            }
-            for (const key of mutation.deletes) persistent.delete(key);
-            persistent.set(PLUGIN_STORAGE_MANIFEST_KEY, mutation.nextManifest);
+            return originalSetPrepared(valueKey, prepared, signal, generation);
         });
 
         try {
@@ -2540,6 +2817,8 @@ describe("transitionPluginStorageMode", () => {
             beginPersistentPluginStorageTransition,
             commitPersistentPluginStorageTransition,
             finalizePersistentPluginStorageTransition,
+            listPersistentKeys,
+            readPersistentPluginStorageManifestSnapshot,
         } = vi.mocked(
             await import("../storage/persistentKv"),
         );
@@ -2565,6 +2844,12 @@ describe("transitionPluginStorageMode", () => {
         });
         expect(begin.rows).toEqual([]);
         expect(begin).not.toHaveProperty("database");
+        expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledOnce();
+        expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledWith(
+            "source-generation",
+            undefined,
+        );
+        expect(listPersistentKeys).not.toHaveBeenCalled();
         expect(finalizePersistentPluginStorageTransition).toHaveBeenCalledOnce();
         expect(database.optimizePluginMemory).toBe(false);
         expect(database.pluginStorageGeneration).not.toBe("source-generation");
@@ -2572,6 +2857,70 @@ describe("transitionPluginStorageMode", () => {
         expect(database.pluginStorageMeta).toEqual({
             alpha: { plugin: "Owner", updatedAt: 1 },
         });
+
+        const snapshotCalls = readPersistentPluginStorageManifestSnapshot.mock.calls.length;
+        listPersistentKeys.mockClear();
+        await expect(transitionPluginStorageMode(true)).resolves.toEqual({
+            direction: "externalize",
+            values: 1,
+            meta: 1,
+        });
+        expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledTimes(snapshotCalls);
+        expect(listPersistentKeys).toHaveBeenCalledTimes(2);
+        expect(listPersistentKeys).toHaveBeenCalledWith(PLUGIN_SAVE_PREFIX);
+        expect(listPersistentKeys).toHaveBeenCalledWith(PLUGIN_SAVE_META_PREFIX);
+        expect(database.optimizePluginMemory).toBe(true);
+    });
+
+    test("production disable rejects a same-size altered private-stage row", async () => {
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        database.optimizePluginMemory = true;
+        persistent.set(valueKey, { value: "aa" });
+        installOwnershipManifest("source-generation", [valueKey], []);
+        const {
+            finalizePersistentPluginStorageTransition,
+            readPersistentPluginStorageTransitionRow,
+        } = vi.mocked(await import("../storage/persistentKv"));
+        const substituted = new TextEncoder().encode(JSON.stringify({ value: "bb" }));
+        expect(substituted.byteLength).toBe(
+            new TextEncoder().encode(JSON.stringify({ value: "aa" })).byteLength,
+        );
+        readPersistentPluginStorageTransitionRow.mockResolvedValueOnce(substituted);
+
+        await expect(transitionPluginStorageMode(false)).rejects.toMatchObject({
+            code: "PLUGIN_STORAGE_CHANGED",
+        });
+
+        expect(finalizePersistentPluginStorageTransition).not.toHaveBeenCalled();
+        expect(database.optimizePluginMemory).toBe(true);
+        expect(database.pluginCustomStorage).toEqual({});
+        expect(persistent.get(valueKey)).toEqual({ value: "aa" });
+    });
+
+    test("production enable binds the begin acknowledgement to its exact plan", async () => {
+        database.optimizePluginMemory = false;
+        database.pluginCustomStorage = { alpha: { retained: true } };
+        const {
+            abortPersistentPluginStorageTransition,
+            beginPersistentPluginStorageTransition,
+            finalizePersistentPluginStorageTransition,
+            uploadPersistentPluginStorageTransitionRow,
+        } = vi.mocked(await import("../storage/persistentKv"));
+        const originalBegin = beginPersistentPluginStorageTransition.getMockImplementation()!;
+        beginPersistentPluginStorageTransition.mockImplementationOnce(async (plan, signal) => ({
+            ...await originalBegin(plan, signal),
+            targetGeneration: crypto.randomUUID(),
+        }));
+
+        await expect(transitionPluginStorageMode(true)).rejects.toMatchObject({
+            code: "STORAGE_RESPONSE_ERROR",
+        });
+
+        expect(abortPersistentPluginStorageTransition).toHaveBeenCalledOnce();
+        expect(uploadPersistentPluginStorageTransitionRow).not.toHaveBeenCalled();
+        expect(finalizePersistentPluginStorageTransition).not.toHaveBeenCalled();
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginCustomStorage).toEqual({ alpha: { retained: true } });
     });
 
     test("production enable releases acknowledged rows and switches routing only after commit", async () => {
@@ -3474,7 +3823,11 @@ describe("transitionPluginStorageMode", () => {
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
         persistent.set(valueKey, "old");
         installOwnershipManifest("queued-set-generation", [valueKey], []);
-        const { listPersistentKeys } = await import("../storage/persistentKv");
+        const { readPersistentPluginStorageManifestSnapshot } = await import(
+            "../storage/persistentKv"
+        );
+        const manifestSnapshot = vi.mocked(readPersistentPluginStorageManifestSnapshot);
+        const originalManifestSnapshot = manifestSnapshot.getMockImplementation()!;
         let releaseCount!: () => void;
         let markCountStarted!: () => void;
         const countBlocked = new Promise<void>((resolve) => {
@@ -3483,16 +3836,11 @@ describe("transitionPluginStorageMode", () => {
         const countStarted = new Promise<void>((resolve) => {
             markCountStarted = resolve;
         });
-        vi.mocked(listPersistentKeys)
-            .mockImplementationOnce(async (prefix: string) => {
-                markCountStarted();
-                await countBlocked;
-                return [...persistent.keys()].filter((key) => key.startsWith(prefix));
-            })
-            .mockImplementationOnce(async (prefix: string) => {
-                await countBlocked;
-                return [...persistent.keys()].filter((key) => key.startsWith(prefix));
-            });
+        manifestSnapshot.mockImplementationOnce(async (generation, signal) => {
+            markCountStarted();
+            await countBlocked;
+            return originalManifestSnapshot(generation, signal);
+        });
 
         const count = countExternalizedPluginStorageEntries();
         await countStarted;
@@ -3524,7 +3872,11 @@ describe("transitionPluginStorageMode", () => {
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
         persistent.set(valueKey, "old");
         installOwnershipManifest("queued-remove-generation", [valueKey], []);
-        const { listPersistentKeys } = await import("../storage/persistentKv");
+        const { readPersistentPluginStorageManifestSnapshot } = await import(
+            "../storage/persistentKv"
+        );
+        const manifestSnapshot = vi.mocked(readPersistentPluginStorageManifestSnapshot);
+        const originalManifestSnapshot = manifestSnapshot.getMockImplementation()!;
         let releaseCount!: () => void;
         let markCountStarted!: () => void;
         const countBlocked = new Promise<void>((resolve) => {
@@ -3533,16 +3885,11 @@ describe("transitionPluginStorageMode", () => {
         const countStarted = new Promise<void>((resolve) => {
             markCountStarted = resolve;
         });
-        vi.mocked(listPersistentKeys)
-            .mockImplementationOnce(async (prefix: string) => {
-                markCountStarted();
-                await countBlocked;
-                return [...persistent.keys()].filter((key) => key.startsWith(prefix));
-            })
-            .mockImplementationOnce(async (prefix: string) => {
-                await countBlocked;
-                return [...persistent.keys()].filter((key) => key.startsWith(prefix));
-            });
+        manifestSnapshot.mockImplementationOnce(async (generation, signal) => {
+            markCountStarted();
+            await countBlocked;
+            return originalManifestSnapshot(generation, signal);
+        });
 
         const count = countExternalizedPluginStorageEntries();
         await countStarted;

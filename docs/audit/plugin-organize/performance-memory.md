@@ -205,6 +205,21 @@ holds the V3/storage barrier, and rejects every later database save until the
 page reloads. It does not restore inline rows when the server may already have
 committed.
 
+Every staged acknowledgement is schema-exact and bound back to the requested
+transition id, direction, target generation, row key, size, upload state, and
+SHA-256. An inline source row is released only after that exact upload receipt.
+The response state is also constrained to combinations the server can emit:
+only an incomplete externalization may be `uploading`, `ready` and `committed`
+have every row uploaded, every row carries its authoritative SHA-256, and only
+a committed response carries an exact result ETag. Staged status refresh uses
+the same import wait-and-recheck gate as generation-bound reads, so a private
+receipt cannot be resolved or deleted from a tentative imported publication.
+Internalization hashes each downloaded private-stage row before parsing or
+finalizing, so a same-size substituted body cannot make browser memory diverge
+from the server's committed target. Abort is idempotent: the exact minimal
+missing-stage tombstone is definitive, and a lost abort acknowledgement retries
+that safe control before falling back to status resolution.
+
 The reproducible `pnpm test:performance` gate runs cache-off and cache-on in
 fresh processes with exposed GC, the real production save loop and public mode
 transition, a real Node server/SQLite database, PM1 multi-chunk rows, and no
@@ -326,3 +341,87 @@ CPU, allocation, IndexedDB write amplification, and repeated cache scans.
   is complete.
 - Reuse one defensive byte copy/hash through acknowledgement and detached
   seeding, and amortize cache pruning across writes.
+
+### Resolution
+
+**Fixed 2026-07-27.** Compound V3 writes use AA3's bounded `atomicBatch()`
+path. A generation-bound batch now reads one compact manifest-revision token
+and sends one batch request; it no longer lists both storage prefixes, reads
+the full manifest separately, or echoes every repository key in the request.
+The version-2 envelope is therefore O(batch rows), not O(repository rows),
+while the server compares the token inside the same serialized writer queue
+as the commit. Full-manifest version-1 requests remain accepted for older
+callers.
+
+Prepared set buffers are explicitly donated through the batch transport. The
+client makes no per-row stability copy, hashes only the one freshly encoded
+request envelope, and validates the request-bound acknowledgement. During the
+transaction, the server computes each raw value hash once and returns it with
+the committed revision. The client uses those hashes and the same donated
+buffers to publish all committed sets/removes in one best-effort cache call,
+one write queue slot, and one IndexedDB transaction. It neither copies nor
+rehashes each value for seeding; cache reads still independently verify bytes
+before use, so a bad cache entry remains only a disposable miss. Conflict,
+malformed, unknown-outcome, and cache-disabled paths publish nothing.
+
+Measured explicit client/cache work now has the following bounds. “Copies”
+counts the former full-value cache defensive copies and excludes unavoidable
+wire encoding and IndexedDB's internal structured clone; “prunes” counts full
+manifest/entry inventory scans.
+
+| Workload | Before: requests / client SHA-256 / copies / prunes | After |
+|---|---:|---:|
+| 3-row atomic batch, cache enabled | 4 / 4 / 6 / 3 | 2 / 1 / 0 / 1 |
+| 128-row atomic batch, cache enabled | 4 / 129 / 256 / 128 | 2 / 1 / 0 / 1 |
+| 4 × 2 MiB atomic batch, cache enabled | 4 / 5 / 8 / 4 | 2 / 1 / 0 / 1 |
+| Any atomic batch, cache disabled | 4 / 1 / 0 / 0 | 2 / 1 / 0 / 0 |
+
+Ordinary generation-bound unowned sets and value-only removes also fall from
+three ownership reads plus one mutation to one atomic mutation request. The
+set path preserves the existing sidecar. The value-only remove path likewise
+preserves the owner bytes and metadata-manifest membership, matching inline
+mode; the distinct owned remove still deletes both rows. Both remove forms
+invalidate the value cache only after a schema-valid committed
+acknowledgement.
+
+Independent plugin calls remain independent authoritative requests and retain
+their one request-bound digest, but they no longer force a global cache prune
+per row. Cache work accumulates bounded debt and prunes after 32 mutations,
+8 MiB of added bytes, or one 50 ms burst window. Thus eight same-tick writes
+cause one deferred scan, 128 independent writes cause four threshold scans,
+and a single 128-row or 8 MiB batch causes at most one scan.
+
+Generation-bound enumeration now receives the exact manifest plus its
+physically present owned value/meta rows in one server snapshot. A `keys()`
+refresh uses one request instead of two prefix lists plus a manifest read;
+repeated `key()` and `length` calls reuse that local snapshot with zero
+requests until a mutation or mode transition invalidates it. Foreign physical
+rows remain quarantined, and manifest-owned missing rows remain absent.
+
+The same generation snapshot feeds a viewer's 50-key page, owner lookup, and
+serial value reads, avoiding one repository-sized manifest request per value.
+Owner rows are fetched concurrently under shared transition admission, so a
+stalled viewer row does not block an unrelated atomic batch. Snapshot transport
+validation rejects padded base64 aliases, malformed suffixes, and invalid UTF-8,
+and cancellation propagates to the manifest request.
+
+Versioned manifest/state/value reads now cross the streamed-import boundary
+through a wait-and-recheck queue gate. They either complete ahead of the
+import's raw transaction or wait for its commit/rollback; they cannot observe
+tentative imported rows on the shared SQLite connection. This includes the
+ordinary `/api/read` transport when it is bound to a plugin-storage generation.
+
+Server-side supporting work avoids rebuilding full-value revision buffers,
+uses linear set comparisons for manifests and membership, computes committed
+revisions from already-held value/owner bytes, and reuses the flushed database
+publication cache instead of decoding `database.bin` for every operation.
+
+Regression coverage includes strict compact-envelope and acknowledgement
+schemas, identity checks for every one of 128 donated rows, a four-by-2-MiB
+donation workload, cache enabled/disabled publication, and real fake-IndexedDB
+proof of one mutation-group transaction plus the 8-to-1 and 128-to-4 inventory
+scan bounds. It also covers one-request 50-row viewer reuse, cancellation,
+ordinary one-request set/remove paths, stale compact CAS rejection,
+foreign/missing-row quarantine, exact returned value hashes, transaction and
+failpoint behavior, streamed-import read isolation, and real-server
+value-only-remove owner/manifest parity.

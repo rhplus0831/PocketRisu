@@ -38,8 +38,12 @@ function ack(overrides: Record<string, unknown> = {}) {
             requestHash,
             generation: "123e4567-e89b-42d3-a456-426614174000",
             revisions: [
-                { key: "body", revision: `sha256:${"a".repeat(64)}` },
-                { key: "old", revision: null },
+                {
+                    key: "body",
+                    revision: `sha256:${"a".repeat(64)}`,
+                    valueHash: "b".repeat(64),
+                },
+                { key: "old", revision: null, valueHash: null },
             ],
             ...overrides,
         },
@@ -47,6 +51,39 @@ function ack(overrides: Record<string, unknown> = {}) {
 }
 
 describe("plugin storage batch acknowledgement", () => {
+    test("encodes a compact manifest CAS without repository-cardinality payload", () => {
+        const operations = Array.from({ length: 128 }, (_, index) => ({
+            operation: "set" as const,
+            key: `row-${index}`,
+            owner: "PM4",
+            valueBytes: new TextEncoder().encode(JSON.stringify({ index })),
+        }));
+        const encoded = encodePluginStorageBatchRequest({
+            generation: "selected-generation",
+            expectedManifestRevision: `sha256:${"c".repeat(64)}`,
+            operations,
+        });
+        const envelope = JSON.parse(new TextDecoder().decode(encoded));
+        expect(envelope).toMatchObject({
+            version: 2,
+            generation: "selected-generation",
+            expectedManifestRevision: `sha256:${"c".repeat(64)}`,
+        });
+        expect(envelope).not.toHaveProperty("expectedManifest");
+        expect(encoded.byteLength).toBeLessThan(64 * 1024);
+    });
+
+    test("rejects missing or ambiguous manifest CAS inputs", () => {
+        expect(() => encodePluginStorageBatchRequest({
+            generation: request.generation,
+            operations: request.operations,
+        })).toThrow(/exactly one manifest CAS/);
+        expect(() => encodePluginStorageBatchRequest({
+            ...request,
+            expectedManifestRevision: `sha256:${"c".repeat(64)}`,
+        })).toThrow(/exactly one manifest CAS/);
+    });
+
     test("binds a committed acknowledgement to exact request bytes and key order", () => {
         const { body, requestHash } = ack();
         expect(classifyPluginStorageBatchAcknowledgement(
@@ -56,12 +93,36 @@ describe("plugin storage batch acknowledgement", () => {
 
     test.each([
         { requestHash: "0".repeat(64) },
-        { revisions: [{ key: "old", revision: null }, { key: "body", revision: null }] },
-        { revisions: [{ key: "body", revision: null }, { key: "old", revision: null }] },
         {
             revisions: [
-                { key: "body", revision: `sha256:${"a".repeat(64)}` },
-                { key: "old", revision: `sha256:${"b".repeat(64)}` },
+                { key: "old", revision: null, valueHash: null },
+                { key: "body", revision: null, valueHash: null },
+            ],
+        },
+        {
+            revisions: [
+                { key: "body", revision: null, valueHash: "b".repeat(64) },
+                { key: "old", revision: null, valueHash: null },
+            ],
+        },
+        {
+            revisions: [
+                {
+                    key: "body",
+                    revision: `sha256:${"a".repeat(64)}`,
+                    valueHash: "b".repeat(64),
+                },
+                { key: "old", revision: `sha256:${"b".repeat(64)}`, valueHash: null },
+            ],
+        },
+        {
+            revisions: [
+                {
+                    key: "body",
+                    revision: `sha256:${"a".repeat(64)}`,
+                    valueHash: "B".repeat(64),
+                },
+                { key: "old", revision: null, valueHash: null },
             ],
         },
         { generation: "123E4567-E89B-42D3-A456-426614174000" },

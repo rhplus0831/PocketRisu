@@ -16,6 +16,7 @@ vi.mock('./risuSave', () => ({
 }))
 vi.mock('./database.svelte', () => ({ normalizeChat: (value: unknown) => value }))
 vi.mock('./resourceCache', () => ({
+    applyOwnedResourceCacheMutations: vi.fn(async () => undefined),
     getManifestHashes: vi.fn(),
     getVerifiedManifestSnapshot: vi.fn(),
     getVerifiedCachedBytes: vi.fn(),
@@ -24,6 +25,7 @@ vi.mock('./resourceCache', () => ({
     isSha256Hex: () => false,
     persistResourceCacheManifests: vi.fn(),
     sha256Bytes: vi.fn(),
+    sha256OwnedBytes: vi.fn(),
     settleBestEffortResourceCache: async <T>(operation: Promise<T>, fallback: T) => {
         try {
             return await operation

@@ -6,11 +6,13 @@ const cache = vi.hoisted(() => ({
     getVerifiedManifestSnapshot: vi.fn(),
     getVerifiedCachedBytes: vi.fn(),
     sha256Bytes: vi.fn(),
+    sha256OwnedBytes: vi.fn(),
     storeBytes: vi.fn(),
     storeOwnedBytesWithKnownHash: vi.fn(),
 }))
 
 vi.mock('./resourceCache', () => ({
+    applyOwnedResourceCacheMutations: vi.fn(async () => undefined),
     getManifestHashes: cache.getManifestHashes,
     getVerifiedManifestSnapshot: cache.getVerifiedManifestSnapshot,
     getVerifiedCachedBytes: cache.getVerifiedCachedBytes,
@@ -20,6 +22,7 @@ vi.mock('./resourceCache', () => ({
     isSha256Hex: (value: unknown) => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value),
     persistResourceCacheManifests: vi.fn(async () => undefined),
     sha256Bytes: cache.sha256Bytes,
+    sha256OwnedBytes: cache.sha256OwnedBytes,
     settleBestEffortResourceCache: async <T>(operation: Promise<T>, fallback: T) => {
         try {
             return await Promise.race([
@@ -75,6 +78,7 @@ beforeEach(() => {
     cache.getVerifiedManifestSnapshot.mockResolvedValue(null)
     cache.getVerifiedCachedBytes.mockResolvedValue(null)
     cache.sha256Bytes.mockResolvedValue('a'.repeat(64))
+    cache.sha256OwnedBytes.mockResolvedValue('a'.repeat(64))
     cache.storeBytes.mockResolvedValue(undefined)
     cache.storeOwnedBytesWithKnownHash.mockResolvedValue(undefined)
 })
@@ -178,7 +182,8 @@ describe('NodeStorage availability bounds', () => {
         expect(path).toBe('/api/plugin-storage/mutate')
         expect(init).toMatchObject({ body: requestBytes, method: 'POST' })
         expect((init.headers as Headers).get('x-plugin-storage-stream')).toBe('1')
-        expect(cache.sha256Bytes).toHaveBeenCalledOnce()
+        expect(cache.sha256OwnedBytes).toHaveBeenCalledOnce()
+        expect(cache.sha256Bytes).not.toHaveBeenCalled()
         expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
     }, 15_000)
 

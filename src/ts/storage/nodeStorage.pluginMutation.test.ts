@@ -2,9 +2,20 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createHash } from 'node:crypto'
 
 const cache = vi.hoisted(() => ({
+    enabled: true,
+    applyOwnedResourceCacheMutations: vi.fn(async (
+        _mutations: Array<
+            | { type: 'set'; resourceKey: string; hash: string; ownedBytes: Uint8Array }
+            | { type: 'remove'; resourceKey: string }
+        >,
+    ) => undefined),
     invalidateResourceCacheManifest: vi.fn(async () => undefined),
     storeBytes: vi.fn(async () => 'hash'),
     storeOwnedBytesWithKnownHash: vi.fn(async () => undefined),
+    sha256OwnedBytes: vi.fn(async (bytes: Uint8Array) => {
+        const { createHash } = await import('node:crypto')
+        return createHash('sha256').update(bytes).digest('hex')
+    }),
 }))
 
 vi.mock('src/lang', () => ({ language: {} }))
@@ -24,17 +35,19 @@ vi.mock('./dbCachedRead', () => ({
     decodeAndAssembleCachedDbRead: vi.fn(),
 }))
 vi.mock('./resourceCache', () => ({
+    applyOwnedResourceCacheMutations: cache.applyOwnedResourceCacheMutations,
     getManifestHashes: vi.fn(async () => []),
     getVerifiedManifestSnapshot: vi.fn(async () => null),
     getVerifiedCachedBytes: vi.fn(async () => null),
     invalidateResourceCacheManifest: cache.invalidateResourceCacheManifest,
-    isResourceCacheEnabled: vi.fn(() => true),
+    isResourceCacheEnabled: vi.fn(() => cache.enabled),
     isSha256Hex: vi.fn((value: unknown) => typeof value === 'string'),
     persistResourceCacheManifests: vi.fn(async () => undefined),
     sha256Bytes: vi.fn(async (bytes: Uint8Array) => {
         const { createHash } = await import('node:crypto')
         return createHash('sha256').update(bytes).digest('hex')
     }),
+    sha256OwnedBytes: cache.sha256OwnedBytes,
     settleBestEffortResourceCache: vi.fn((promise: Promise<unknown>) => promise),
     storeBytes: cache.storeBytes,
     storeOwnedBytesWithKnownHash: cache.storeOwnedBytesWithKnownHash,
@@ -110,6 +123,9 @@ function storageWithResponse(next: Response | Error): InstanceType<typeof NodeSt
 }
 
 beforeEach(() => {
+    cache.enabled = true
+    cache.sha256OwnedBytes.mockClear()
+    cache.applyOwnedResourceCacheMutations.mockClear()
     cache.storeBytes.mockClear()
     cache.storeOwnedBytesWithKnownHash.mockClear()
     cache.invalidateResourceCacheManifest.mockClear()
@@ -248,6 +264,36 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
 
         await storage.mutatePluginStorage({ operation: 'remove', valueKey })
 
+        const init = (storage as any).authFetch.mock.calls[0][1] as RequestInit
+        expect((init.headers as Record<string, string>)['x-plugin-storage-owner-policy'])
+            .toBeUndefined()
+        expect(cache.invalidateResourceCacheManifest).toHaveBeenCalledWith(`kv:${valueKey}`)
+        expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
+    })
+
+    test('value-only remove sends one preserve-owner request and invalidates cache once', async () => {
+        const storage = storageWithResponse(response({
+            success: true,
+            outcome: 'committed',
+            operation: 'remove',
+            verification: 'verified',
+        }))
+
+        await storage.mutatePluginStorage({
+            operation: 'remove',
+            valueKey,
+            generation: 'selected-generation',
+            preserveOwner: true,
+        })
+
+        expect((storage as any).authFetch).toHaveBeenCalledOnce()
+        const init = (storage as any).authFetch.mock.calls[0][1] as RequestInit
+        expect(init.body).toEqual(new Uint8Array())
+        expect(init.headers).toMatchObject({
+            'x-plugin-storage-generation': 'selected-generation',
+            'x-plugin-storage-owner-policy': 'preserve',
+        })
+        expect(cache.invalidateResourceCacheManifest).toHaveBeenCalledOnce()
         expect(cache.invalidateResourceCacheManifest).toHaveBeenCalledWith(`kv:${valueKey}`)
         expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
     })
@@ -560,6 +606,9 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
     function committedBatch(init: RequestInit): Response {
         const bytes = init.body as Uint8Array
         const requestHash = createHash('sha256').update(bytes).digest('hex')
+        const envelope = JSON.parse(new TextDecoder().decode(bytes)) as {
+            operations: Array<{ operation: 'set' | 'remove'; key: string; value?: string }>
+        }
         return response({
             success: true,
             outcome: 'committed',
@@ -567,10 +616,15 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
             verification: 'verified',
             requestHash,
             generation: '123e4567-e89b-42d3-a456-426614174000',
-            revisions: [
-                { key: 'aa3-body', revision: `sha256:${'a'.repeat(64)}` },
-                { key: 'aa3-old', revision: null },
-            ],
+            revisions: envelope.operations.map(operation => operation.operation === 'set'
+                ? {
+                    key: operation.key,
+                    revision: `sha256:${'a'.repeat(64)}`,
+                    valueHash: createHash('sha256')
+                        .update(Buffer.from(operation.value!, 'base64'))
+                        .digest('hex'),
+                }
+                : { key: operation.key, revision: null, valueHash: null }),
         })
     }
 
@@ -583,8 +637,26 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
 
         const result = await storage.batchPluginStorage(batchRequest)
         expect(result.outcome, JSON.stringify(result)).toBe('committed')
-        expect(cache.storeBytes).toHaveBeenCalledOnce()
-        expect(cache.invalidateResourceCacheManifest).toHaveBeenCalledOnce()
+        expect(cache.storeBytes).not.toHaveBeenCalled()
+        expect(cache.invalidateResourceCacheManifest).not.toHaveBeenCalled()
+        expect(cache.applyOwnedResourceCacheMutations).toHaveBeenCalledOnce()
+        expect(cache.applyOwnedResourceCacheMutations).toHaveBeenCalledWith([
+            {
+                type: 'set',
+                resourceKey: 'kv:pluginsave/YWEzLWJvZHk.json',
+                hash: valueHash,
+                ownedBytes: expect.any(Uint8Array),
+            },
+            {
+                type: 'remove',
+                resourceKey: 'kv:pluginsave/YWEzLW9sZA.json',
+            },
+        ])
+        const cachedSet = cache.applyOwnedResourceCacheMutations.mock.calls[0]![0][0]!
+        expect(cachedSet.type).toBe('set')
+        if (cachedSet.type === 'set') {
+            expect(cachedSet.ownedBytes).not.toBe(batchRequest.operations[0].valueBytes)
+        }
     })
 
     test('malformed success and transport loss remain unknown without cache publication', async () => {
@@ -603,6 +675,7 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
             commitOutcomeUnknown: true,
         })
         expect(cache.storeBytes).not.toHaveBeenCalled()
+        expect(cache.applyOwnedResourceCacheMutations).not.toHaveBeenCalled()
 
         const lost = new NodeStorage()
         ;(lost as any).authFetch = vi.fn(async (
@@ -618,6 +691,89 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
             outcome: 'unknown',
             commitOutcomeUnknown: true,
         })
+        expect(cache.storeBytes).not.toHaveBeenCalled()
+        expect(cache.applyOwnedResourceCacheMutations).not.toHaveBeenCalled()
+    })
+
+    test('donates a 128-row owned batch with one envelope hash and one cache publication', async () => {
+        const operations = Array.from({ length: 128 }, (_, index) => ({
+            operation: 'set' as const,
+            key: `shard-${index}`,
+            valueBytes: new TextEncoder().encode(JSON.stringify({ index })),
+            ownedValueBytes: true as const,
+            owner: 'PM4',
+        }))
+        const storage = new NodeStorage()
+        ;(storage as any).authFetch = vi.fn(async (
+            _input: RequestInfo | URL,
+            init: RequestInit,
+        ) => committedBatch(init))
+
+        await expect(storage.batchPluginStorage({
+            generation: 'selected-generation',
+            expectedManifestRevision: `sha256:${'e'.repeat(64)}`,
+            operations,
+        })).resolves.toMatchObject({ outcome: 'committed' })
+
+        expect(cache.sha256OwnedBytes).toHaveBeenCalledOnce()
+        expect(cache.applyOwnedResourceCacheMutations).toHaveBeenCalledOnce()
+        const published = cache.applyOwnedResourceCacheMutations.mock.calls[0]![0]
+        expect(published).toHaveLength(128)
+        published.forEach((mutation, index) => {
+            expect(mutation.type).toBe('set')
+            if (mutation.type === 'set') {
+                expect(mutation.ownedBytes).toBe(operations[index]!.valueBytes)
+            }
+        })
+        expect(cache.storeBytes).not.toHaveBeenCalled()
+    })
+
+    test('donates four 2 MiB values with one envelope hash and one cache publication', async () => {
+        const operations = Array.from({ length: 4 }, (_, index) => ({
+            operation: 'set' as const,
+            key: `large-shard-${index}`,
+            valueBytes: new Uint8Array(2 * 1024 * 1024).fill(index + 1),
+            ownedValueBytes: true as const,
+            owner: 'PM4',
+        }))
+        const storage = new NodeStorage()
+        ;(storage as any).authFetch = vi.fn(async (
+            _input: RequestInfo | URL,
+            init: RequestInit,
+        ) => committedBatch(init))
+
+        await expect(storage.batchPluginStorage({
+            generation: 'selected-generation',
+            expectedManifestRevision: `sha256:${'e'.repeat(64)}`,
+            operations,
+        })).resolves.toMatchObject({ outcome: 'committed' })
+
+        expect(cache.sha256OwnedBytes).toHaveBeenCalledOnce()
+        expect(cache.applyOwnedResourceCacheMutations).toHaveBeenCalledOnce()
+        const published = cache.applyOwnedResourceCacheMutations.mock.calls[0]![0]
+        expect(published).toHaveLength(4)
+        published.forEach((mutation, index) => {
+            expect(mutation.type).toBe('set')
+            if (mutation.type === 'set') {
+                expect(mutation.ownedBytes).toBe(operations[index]!.valueBytes)
+                expect(mutation.ownedBytes.byteLength).toBe(2 * 1024 * 1024)
+            }
+        })
+        expect(cache.storeBytes).not.toHaveBeenCalled()
+    })
+
+    test('does no batch cache work when the disposable cache is disabled', async () => {
+        cache.enabled = false
+        const storage = new NodeStorage()
+        ;(storage as any).authFetch = vi.fn(async (
+            _input: RequestInfo | URL,
+            init: RequestInit,
+        ) => committedBatch(init))
+
+        await expect(storage.batchPluginStorage(batchRequest)).resolves.toMatchObject({
+            outcome: 'committed',
+        })
+        expect(cache.applyOwnedResourceCacheMutations).not.toHaveBeenCalled()
         expect(cache.storeBytes).not.toHaveBeenCalled()
     })
 
@@ -889,6 +1045,101 @@ describe('NodeStorage AA3 versioned state response', () => {
         ;(storage as any).authFetch = vi.fn(async () => response(body))
 
         await expect(storage.getPluginStorageState(valueKey)).rejects.toMatchObject({
+            code: 'STORAGE_RESPONSE_ERROR',
+        })
+    })
+})
+
+describe('NodeStorage plugin manifest snapshots', () => {
+    const generation = 'selected-generation'
+    const manifestRevision = `sha256:${'d'.repeat(64)}`
+    const manifest = {
+        version: 1,
+        generation,
+        valueKeys: ['pluginsave/YQ.json', 'pluginsave/Yg.json'],
+        metaKeys: ['pluginsave-meta/YQ.json'],
+    }
+
+    test('reads a compact manifest CAS state in one request', async () => {
+        const storage = storageWithResponse(response({
+            success: true,
+            generation,
+            manifestRevision,
+        }))
+
+        await expect(storage.getPluginStorageManifestState(generation)).resolves.toEqual({
+            generation,
+            manifestRevision,
+        })
+        expect((storage as any).authFetch).toHaveBeenCalledOnce()
+        expect((storage as any).authFetch.mock.calls[0][0]).toBe('/api/plugin-storage/manifest')
+        expect((storage as any).authFetch.mock.calls[0][1].headers).toMatchObject({
+            'x-plugin-storage-generation': generation,
+            'x-plugin-storage-manifest-mode': 'state',
+        })
+    })
+
+    test('accepts only physically present manifest-owned snapshot rows', async () => {
+        const storage = storageWithResponse(response({
+            success: true,
+            generation,
+            manifestRevision,
+            manifest,
+            valueKeys: ['pluginsave/YQ.json'],
+            metaKeys: ['pluginsave-meta/YQ.json'],
+        }))
+
+        await expect(storage.getPluginStorageManifestSnapshot(generation)).resolves.toEqual({
+            generation,
+            manifestRevision,
+            manifest,
+            valueKeys: ['pluginsave/YQ.json'],
+            metaKeys: ['pluginsave-meta/YQ.json'],
+        })
+    })
+
+    test('rejects foreign rows and malformed compact revisions', async () => {
+        const foreign = storageWithResponse(response({
+            success: true,
+            generation,
+            manifestRevision,
+            manifest,
+            valueKeys: ['pluginsave/Zm9yZWlnbg.json'],
+            metaKeys: [],
+        }))
+        await expect(foreign.getPluginStorageManifestSnapshot(generation)).rejects.toMatchObject({
+            code: 'STORAGE_RESPONSE_ERROR',
+        })
+
+        const malformed = storageWithResponse(response({
+            success: true,
+            generation,
+            manifestRevision: 'D'.repeat(64),
+        }))
+        await expect(malformed.getPluginStorageManifestState(generation)).rejects.toMatchObject({
+            code: 'STORAGE_RESPONSE_ERROR',
+        })
+    })
+
+    test.each([
+        ['padded alias', 'pluginsave/YQ==.json'],
+        ['invalid UTF-8', 'pluginsave/_w.json'],
+        ['wrong suffix', 'pluginsave/YQ.json.extra'],
+    ])('rejects a %s in manifest snapshots', async (_label, invalidKey) => {
+        const invalidManifest = {
+            ...manifest,
+            valueKeys: [invalidKey],
+        }
+        const storage = storageWithResponse(response({
+            success: true,
+            generation,
+            manifestRevision,
+            manifest: invalidManifest,
+            valueKeys: [invalidKey],
+            metaKeys: [],
+        }))
+
+        await expect(storage.getPluginStorageManifestSnapshot(generation)).rejects.toMatchObject({
             code: 'STORAGE_RESPONSE_ERROR',
         })
     })

@@ -581,6 +581,20 @@ describe('PM2 production plugin-storage transition memory (real client and serve
         assertPerRowMemoryShape('internalize', internalStageBaseline!, internalProgress)
 
         const internalRequests = requestLog.slice(internalStartLog)
+        const manifestSnapshots = internalRequests.filter(entry => (
+          entry.path === '/api/plugin-storage/manifest'
+        ))
+        expect(manifestSnapshots).toHaveLength(1)
+        expect(manifestSnapshots[0].headers.get('x-plugin-storage-generation'))
+          .toBeTruthy()
+        expect(manifestSnapshots[0].headers.get('x-plugin-storage-manifest-mode'))
+          .toBeNull()
+        expect(internalRequests.filter(entry => (
+          entry.path === '/api/list'
+          && ['pluginsave/', 'pluginsave-meta/'].includes(
+            entry.headers.get('key-prefix') ?? '',
+          )
+        ))).toEqual([])
         expect(internalRequests.filter(entry => (
           entry.path === '/api/plugin-storage/transition/stage/row'
         ))).toHaveLength(ROW_COUNT)
@@ -596,6 +610,33 @@ describe('PM2 production plugin-storage transition memory (real client and serve
         expect(pluginReads).toEqual([])
         inspectInternalLayout(server)
 
+        // PM2 keeps a fresh generation on the inline publication while the
+        // external manifest is intentionally absent. Re-enabling must use the
+        // inline source/list fallback rather than treating that generation as
+        // permission to request a nonexistent PM4 manifest snapshot.
+        const reexternalizeStart = requestLog.length
+        await expect(transitionPluginStorageMode(true)).resolves.toEqual({
+          direction: 'externalize',
+          values: ROW_COUNT,
+          meta: 0,
+        })
+        const reexternalizeRequests = requestLog.slice(reexternalizeStart)
+        expect(reexternalizeRequests.filter(entry => (
+          entry.path === '/api/plugin-storage/manifest'
+        ))).toEqual([])
+        const reexternalizeLists = reexternalizeRequests.filter(entry => (
+          entry.path === '/api/list'
+          && ['pluginsave/', 'pluginsave-meta/'].includes(
+            entry.headers.get('key-prefix') ?? '',
+          )
+        ))
+        expect(reexternalizeLists).toHaveLength(2)
+        expect(new Set(reexternalizeLists.map(entry => (
+          entry.headers.get('key-prefix')
+        )))).toEqual(new Set(['pluginsave/', 'pluginsave-meta/']))
+        expect(getDatabase().optimizePluginMemory).toBe(true)
+        inspectExternalChunkLayout(server, storageKeys)
+
         memoryEvidence[cycleLabel] = {
           externalize: {
             wholeBaseline: externalWholeBaseline,
@@ -610,6 +651,11 @@ describe('PM2 production plugin-storage transition memory (real client and serve
             peak: internalSampler.peak,
             final: internalFinal,
             checkpoints: internalProgress.map(({ completed, memory }) => ({ completed, ...memory })),
+            ownershipSnapshotRequests: manifestSnapshots.length,
+          },
+          reexternalize: {
+            manifestSnapshotRequests: 0,
+            prefixListRequests: reexternalizeLists.length,
           },
         }
       expect(saveLoopFailure).toBeNull()

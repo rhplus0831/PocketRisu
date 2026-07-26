@@ -1,14 +1,22 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import Database from 'better-sqlite3'
 import path from 'node:path'
+import { existsSync } from 'node:fs'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { gzipSync } from 'node:zlib'
+import { createHash } from 'node:crypto'
+import { Packr } from 'msgpackr'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
+import { encodeBackup } from './helpers/encode.js'
 import utilsPkg from '../../server/node/utils.cjs'
 
-const { encodeRisuSaveLegacy, decodeRisuSave } = utilsPkg as {
+const { encodeRisuSaveLegacy, decodeRisuSave, magicCompressedHeader } = utilsPkg as {
   encodeRisuSaveLegacy: (value: unknown) => Uint8Array
   decodeRisuSave: (value: Uint8Array) => Promise<any>
+  magicCompressedHeader: Uint8Array
 }
+const packr = new Packr({ useRecords: false })
 
 const servers: ServerHandle[] = []
 afterAll(async () => Promise.allSettled(servers.map(server => server.cleanup())))
@@ -30,20 +38,22 @@ const activeManifest = {
   metaKeys: keys.map(ownerKey),
 }
 
-function seed(saveDir: string): void {
+function seed(saveDir: string, omittedStorageKey?: string): void {
   const db = new Database(path.join(saveDir, 'risuai.db'))
   db.exec(`CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL, updated_at INTEGER NOT NULL)`)
   const insert = db.prepare('INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)')
   for (const [index, key] of keys.entries()) {
-    insert.run(valueKey(key), Buffer.from(JSON.stringify({ generation: 'old', key })), 1)
-    insert.run(ownerKey(key), Buffer.from(JSON.stringify(index === 1
+    if (valueKey(key) !== omittedStorageKey) {
+      insert.run(valueKey(key), Buffer.from(JSON.stringify({ generation: 'old', key })), 1)
+    }
+    if (ownerKey(key) !== omittedStorageKey) insert.run(ownerKey(key), Buffer.from(JSON.stringify(index === 1
       ? {
           plugin: 'AA3',
           updatedAt: 1,
           revision: 'not-a-storage-incarnation',
           generation: 'not-a-batch-generation',
         }
-      : { plugin: 'AA3', updatedAt: 1 })), 1)
+        : { plugin: 'AA3', updatedAt: 1 })), 1)
   }
   insert.run(valueKey('aa3/foreign'), Buffer.from('"quarantined-value"'), 1)
   insert.run(ownerKey('aa3/foreign'), Buffer.from(JSON.stringify({
@@ -60,13 +70,25 @@ function seed(saveDir: string): void {
   db.close()
 }
 
-async function boot(failpoint = ''): Promise<{ server: ServerHandle; client: RisuClient }> {
+async function boot(
+  failpoint = '',
+  omittedStorageKey?: string,
+): Promise<{ server: ServerHandle; client: RisuClient }> {
   const server = await spawnServer({
-    seedSave: async saveDir => seed(saveDir),
+    seedSave: async saveDir => seed(saveDir, omittedStorageKey),
     env: failpoint ? { POCKETRISU_TEST_PLUGIN_BATCH_FAILPOINT: failpoint } : undefined,
   })
   servers.push(server)
   return { server, client: await createClient(server.port, server.password) }
+}
+
+function lateFailingDatabase(payloadBytes: number): Buffer {
+  const gzipped = gzipSync(packr.encode({
+    characters: [],
+    importPadding: 'x'.repeat(payloadBytes),
+  }), { level: 1 })
+  gzipped[gzipped.length - 1] ^= 0xff
+  return Buffer.concat([Buffer.from(magicCompressedHeader), gzipped])
 }
 
 function envelope(
@@ -77,6 +99,18 @@ function envelope(
     version: 1,
     generation: STORAGE_GENERATION,
     expectedManifest,
+    operations,
+  }))
+}
+
+function compactEnvelope(
+  operations: unknown[],
+  expectedManifestRevision: string,
+): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify({
+    version: 2,
+    generation: STORAGE_GENERATION,
+    expectedManifestRevision,
     operations,
   }))
 }
@@ -133,6 +167,20 @@ async function readState(client: RisuClient, key: string): Promise<any> {
   return response.json()
 }
 
+async function readManifest(
+  client: RisuClient,
+  mode: 'snapshot' | 'state' = 'snapshot',
+): Promise<any> {
+  const response = await client.fetch('/api/plugin-storage/manifest', {
+    headers: {
+      'x-plugin-storage-generation': STORAGE_GENERATION,
+      'x-plugin-storage-manifest-mode': mode,
+    },
+  })
+  expect(response.status).toBe(200)
+  return response.json()
+}
+
 function readGeneration(cwd: string): 'old' | 'new' | 'torn' {
   const db = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
   const get = db.prepare('SELECT value FROM kv WHERE key = ?')
@@ -149,6 +197,196 @@ function readGeneration(cwd: string): 'old' | 'new' | 'torn' {
 }
 
 describe('AA3 atomic plugin storage batch', () => {
+  test('staged status cannot consume a tentative matching import publication', async () => {
+    const server = await spawnServer({
+      seedSave: async saveDir => {
+        seed(saveDir)
+        const gateDir = path.join(path.dirname(saveDir), 'import-gate')
+        await mkdir(gateDir, { recursive: true })
+        await writeFile(path.join(gateDir, 'hold'), '')
+      },
+      env: {
+        RISU_STREAM_INGEST_MIN_BYTES: '1',
+        POCKETRISU_BACKUP_IMPORT_TEST_GATE_DIR: 'import-gate',
+        POCKETRISU_TEST_BACKUP_IMPORT_FAILPOINT: 'after-database-ingestion',
+      },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const transitionId = '123e4567-e89b-42d3-a456-426614174210'
+    const targetGeneration = '123e4567-e89b-42d3-a456-426614174211'
+    const beginResponse = await client.fetch('/api/plugin-storage/transition/stage/begin', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-plugin-storage-transition': transitionId,
+      },
+      body: JSON.stringify({
+        version: 2,
+        transitionId,
+        source: {
+          optimized: true,
+          generation: STORAGE_GENERATION,
+          manifest: activeManifest,
+        },
+        targetOptimized: false,
+        targetGeneration,
+        rows: [],
+      }),
+    })
+    expect(beginResponse.status).toBe(200)
+    const begin = await beginResponse.json() as any
+    expect(begin.state).toBe('ready')
+    expect(begin.rows.length).toBe(activeManifest.valueKeys.length + activeManifest.metaKeys.length)
+
+    const backup = encodeBackup([{
+      name: 'database.risudat',
+      data: Buffer.from(encodeRisuSaveLegacy({
+        characters: [],
+        optimizePluginMemory: false,
+        pluginStorageGeneration: targetGeneration,
+        pluginCustomStorage: {},
+      })),
+    }])
+    expect((await client.fetch('/api/backup/import/prepare', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ size: backup.byteLength }),
+    })).status).toBe(200)
+    const importing = client.fetch('/api/backup/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-risu-backup' },
+      body: backup,
+    })
+    const enteredPath = path.join(server.cwd, 'import-gate', 'entered')
+    const enteredDeadline = Date.now() + 10_000
+    while (!existsSync(enteredPath) && Date.now() < enteredDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    expect(existsSync(enteredPath)).toBe(true)
+
+    const statusRead = client.fetch('/api/plugin-storage/transition/stage/status', {
+      headers: { 'x-plugin-storage-transition': transitionId },
+    })
+    await expect(Promise.race([
+      statusRead.then(() => 'settled'),
+      new Promise(resolve => setTimeout(() => resolve('pending'), 150)),
+    ])).resolves.toBe('pending')
+
+    await writeFile(path.join(server.cwd, 'import-gate', 'release'), '')
+    const importResponse = await importing
+    await importResponse.text()
+    expect(importResponse.ok).toBe(false)
+    const statusResponse = await statusRead
+    expect(statusResponse.status).toBe(200)
+    const status = await statusResponse.json() as any
+    expect(status.state).toBe('ready')
+    expect(status.targetGeneration).toBe(targetGeneration)
+    const rowResponse = await client.fetch('/api/plugin-storage/transition/stage/row', {
+      headers: {
+        'x-plugin-storage-transition': transitionId,
+        'x-plugin-storage-key': begin.rows[0].storageKey,
+      },
+    })
+    expect(rowResponse.status).toBe(200)
+    await rowResponse.arrayBuffer()
+  }, 120_000)
+
+  test('versioned state and manifest reads wait for a streamed import rollback', async () => {
+    const server = await spawnServer({
+      seedSave: async saveDir => seed(saveDir),
+      env: { RISU_STREAM_INGEST_MIN_BYTES: '1' },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const backup = encodeBackup([
+      { name: 'database.risudat', data: lateFailingDatabase(64 * 1024) },
+    ])
+    let releaseUpload!: () => void
+    const uploadGate = new Promise<void>(resolve => { releaseUpload = resolve })
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        controller.enqueue(new Uint8Array(backup))
+        await uploadGate
+        controller.close()
+      },
+    })
+
+    expect((await client.fetch('/api/backup/import/prepare', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ size: backup.byteLength }),
+    })).status).toBe(200)
+    const importing = client.fetch('/api/backup/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-risu-backup' },
+      body,
+      // @ts-expect-error Node requires duplex for streaming request bodies.
+      duplex: 'half',
+    })
+    await new Promise(resolve => setTimeout(resolve, 500))
+
+    const reads = [
+      client.fetch('/api/plugin-storage/manifest', {
+        headers: {
+          'x-plugin-storage-generation': STORAGE_GENERATION,
+          'x-plugin-storage-manifest-mode': 'snapshot',
+        },
+      }),
+      client.fetch('/api/plugin-storage/manifest', {
+        headers: {
+          'x-plugin-storage-generation': STORAGE_GENERATION,
+          'x-plugin-storage-manifest-mode': 'state',
+        },
+      }),
+      client.fetch('/api/plugin-storage/state', {
+        headers: {
+          'file-path': Buffer.from(valueKey(keys[0]), 'utf-8').toString('hex'),
+          'x-plugin-storage-generation': STORAGE_GENERATION,
+        },
+      }),
+      client.fetch('/api/read', {
+        headers: {
+          'file-path': Buffer.from(valueKey(keys[0]), 'utf-8').toString('hex'),
+          'x-plugin-storage-generation': STORAGE_GENERATION,
+        },
+      }),
+    ]
+    await expect(Promise.race([
+      Promise.all(reads).then(() => 'settled'),
+      new Promise(resolve => setTimeout(() => resolve('pending'), 150)),
+    ])).resolves.toBe('pending')
+
+    releaseUpload()
+    const importResponse = await importing
+    await importResponse.text()
+    expect(importResponse.ok).toBe(false)
+
+    const [
+      snapshotResponse,
+      manifestStateResponse,
+      valueStateResponse,
+      ordinaryValueResponse,
+    ] = await Promise.all(reads)
+    expect(snapshotResponse.status).toBe(200)
+    expect(manifestStateResponse.status).toBe(200)
+    expect(valueStateResponse.status).toBe(200)
+    expect(ordinaryValueResponse.status).toBe(200)
+    const snapshot = await snapshotResponse.json() as any
+    expect(snapshot.manifest).toEqual(activeManifest)
+    expect(snapshot.valueKeys).toEqual(activeManifest.valueKeys)
+    expect((await manifestStateResponse.json() as any).manifestRevision).toMatch(REVISION_PATTERN)
+    const valueState = await valueStateResponse.json() as any
+    expect(JSON.parse(Buffer.from(valueState.value, 'base64').toString())).toEqual({
+      generation: 'old',
+      key: keys[0],
+    })
+    expect(await ordinaryValueResponse.json()).toEqual({
+      generation: 'old',
+      key: keys[0],
+    })
+  }, 120_000)
+
   test('commits bodies, manifest, owners and one generation together', async () => {
     const { server, client } = await boot()
     const response = await mutate(client)
@@ -160,6 +398,11 @@ describe('AA3 atomic plugin storage batch', () => {
     expect(body.revisions).toHaveLength(keys.length)
     expect(body.revisions.map((row: any) => row.key)).toEqual(keys)
     expect(body.revisions.every((row: any) => REVISION_PATTERN.test(row.revision))).toBe(true)
+    expect(body.revisions.map((row: any) => row.valueHash)).toEqual(keys.map(key => (
+      createHash('sha256')
+        .update(Buffer.from(JSON.stringify({ generation: 'new', key })))
+        .digest('hex')
+    )))
     expect(new Set(body.revisions.map((row: any) => row.revision)).size).toBe(keys.length)
     expect(readGeneration(server.cwd)).toBe('new')
 
@@ -292,6 +535,62 @@ describe('AA3 atomic plugin storage batch', () => {
       revision: null,
       generation: null,
     })
+  })
+
+  test('one manifest snapshot reports only physically present manifest-owned rows', async () => {
+    const missingValue = activeManifest.valueKeys[1]
+    const { client } = await boot('', missingValue)
+    const snapshot = await readManifest(client)
+    expect(snapshot).toEqual({
+      success: true,
+      generation: STORAGE_GENERATION,
+      manifestRevision: expect.stringMatching(REVISION_PATTERN),
+      manifest: activeManifest,
+      valueKeys: activeManifest.valueKeys.filter(key => key !== missingValue),
+      metaKeys: activeManifest.metaKeys,
+    })
+    expect(snapshot.valueKeys).not.toContain(valueKey('aa3/foreign'))
+    expect(snapshot.valueKeys).not.toContain(missingValue)
+    expect(snapshot.metaKeys).not.toContain(ownerKey('aa3/foreign'))
+
+    await expect(readManifest(client, 'state')).resolves.toEqual({
+      success: true,
+      generation: STORAGE_GENERATION,
+      manifestRevision: snapshot.manifestRevision,
+    })
+  })
+
+  test('compact manifest CAS commits with the current token and rejects a stale token', async () => {
+    const { client } = await boot()
+    const state = await readManifest(client, 'state')
+    const operation = {
+      operation: 'set',
+      key: 'aa3/new-compact',
+      value: Buffer.from(JSON.stringify({ generation: 'new', key: 'aa3/new-compact' })).toString('base64'),
+      owner: 'AA3',
+    }
+    const committed = await mutate(client, compactEnvelope(
+      [operation],
+      state.manifestRevision,
+    ))
+    expect(committed.status).toBe(200)
+    const committedBody = await committed.json() as any
+    expect(committedBody.revisions).toEqual([{
+      key: 'aa3/new-compact',
+      revision: expect.stringMatching(REVISION_PATTERN),
+      valueHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }])
+
+    const stale = await mutate(client, compactEnvelope(
+      [operation],
+      state.manifestRevision,
+    ))
+    expect(stale.status).toBe(409)
+    await expect(stale.json()).resolves.toMatchObject({
+      outcome: 'not-committed',
+      code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
+    })
+    await expect(readState(client, 'aa3/new-compact')).resolves.toMatchObject({ missing: false })
   })
 
   test('a missing-key CAS has one winner under concurrent batches', async () => {

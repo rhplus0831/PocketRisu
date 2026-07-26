@@ -42,6 +42,7 @@ const {
     listPersistentEntriesWithSizes,
     makeEncodedStorageKey,
     mutatePersistentPluginStorage,
+    removePersistentPluginStoragePreservingOwner,
     preparePersistentJson,
     restorePersistentPluginStoragePair,
     readPersistentJson,
@@ -168,6 +169,22 @@ describe('externalized plugin clear transport', () => {
 })
 
 describe('atomic plugin storage mutation transport', () => {
+    it('sends one generation-bound value-only remove that preserves ownership', async () => {
+        await removePersistentPluginStoragePreservingOwner(
+            'pluginsave/YWxwaGE.json',
+            undefined,
+            'selected-generation',
+        )
+
+        expect(storage.mutatePluginStorage).toHaveBeenCalledOnce()
+        expect(storage.mutatePluginStorage).toHaveBeenCalledWith({
+            operation: 'remove',
+            valueKey: 'pluginsave/YWxwaGE.json',
+            preserveOwner: true,
+            generation: 'selected-generation',
+        })
+    })
+
     it('serializes an exact recovery sidecar into the acknowledged mutation', async () => {
         await restorePersistentPluginStoragePair(
             'pluginsave/YWxwaGE.json',

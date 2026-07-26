@@ -14,13 +14,17 @@ import {
     makeEncodedStorageKey,
     mutatePersistentPluginStorage,
     preparePersistentJson,
+    readPersistentPluginStorageManifestSnapshot,
+    readPersistentPluginStorageManifestState,
     readPersistentPluginStorageState,
     readPersistentPluginStorageTransitionRow,
     readPersistentJson,
     readPersistentJsonRow,
+    removePersistentPluginStoragePreservingOwner,
     removePersistentKey,
     restorePersistentPluginStoragePair,
     uploadPersistentPluginStorageTransitionRow,
+    setPreparedPersistentPluginStoragePreservingOwner,
     writePersistentJson,
 } from "../storage/persistentKv";
 import { snapshotJsonValue, stringifyJsonValue } from "../storage/jsonValue";
@@ -32,6 +36,7 @@ import {
 } from "../storage/databaseSave";
 import { StorageError } from "../storage/storageError";
 import { abortReason, awaitWithAbort, throwIfAborted } from "../storage/abort";
+import { sha256OwnedBytes } from "../storage/resourceCache";
 import {
     makeArchiveSafePluginSaveStorageKey,
     PLUGIN_SAVE_META_PREFIX,
@@ -63,11 +68,9 @@ import {
     type PluginStorageRecoveryIssue,
 } from "./pluginStorageRecovery";
 import {
-    PLUGIN_STORAGE_BATCH_MAX_BODY_BYTES,
     PLUGIN_STORAGE_BATCH_MAX_OPERATIONS,
     PLUGIN_STORAGE_REVISION_PATTERN,
     PLUGIN_STORAGE_UUID_PATTERN,
-    encodePluginStorageBatchRequest,
     type PluginStorageBatchOperation as PersistentPluginStorageBatchOperation,
 } from "../storage/pluginStorageBatch";
 
@@ -218,9 +221,16 @@ let storageEnumerationSnapshot: {
     generation: number;
     keys: string[];
 } | null = null;
+let storageOwnershipSnapshot: {
+    database: Database;
+    generation: string;
+    keySetGeneration: number;
+    ownership: PluginStorageOwnership;
+} | null = null;
 
 function invalidateStorageEnumerationSnapshot(): void {
     storageEnumerationSnapshot = null;
+    storageOwnershipSnapshot = null;
     markPluginStorageKeySetChanged();
 }
 
@@ -499,6 +509,19 @@ async function readCurrentOwnership(
     db: Database,
     signal?: AbortSignal | null,
 ): Promise<PluginStorageOwnership> {
+    if (db.optimizePluginMemory === true && db.pluginStorageGeneration) {
+        const snapshot = await readPersistentPluginStorageManifestSnapshot(
+            db.pluginStorageGeneration,
+            signal,
+        );
+        return {
+            manifest: snapshot.manifest,
+            manifestPresent: true,
+            manifestValid: true,
+            valueKeys: snapshot.valueKeys,
+            metaKeys: snapshot.metaKeys,
+        };
+    }
     const [valueKeys, metaKeys] = await Promise.all([
         signal
             ? listPersistentKeys(PLUGIN_SAVE_PREFIX, signal)
@@ -508,6 +531,48 @@ async function readCurrentOwnership(
             : listPersistentKeys(PLUGIN_SAVE_META_PREFIX),
     ]);
     return resolvePluginStorageOwnership(db, valueKeys, metaKeys, readPersistentJson, signal);
+}
+
+function clonePluginStorageOwnership(ownership: PluginStorageOwnership): PluginStorageOwnership {
+    return {
+        ...ownership,
+        manifest: ownership.manifest ? {
+            ...ownership.manifest,
+            valueKeys: [...ownership.manifest.valueKeys],
+            metaKeys: [...ownership.manifest.metaKeys],
+        } : null,
+        valueKeys: [...ownership.valueKeys],
+        metaKeys: [...ownership.metaKeys],
+    };
+}
+
+async function readCachedCurrentOwnership(
+    db: Database,
+    signal?: AbortSignal | null,
+    refresh = false,
+): Promise<PluginStorageOwnership> {
+    const generation = db.optimizePluginMemory === true
+        ? db.pluginStorageGeneration
+        : undefined;
+    const keySetGeneration = getPluginStorageKeySetGeneration();
+    if (!refresh
+        && generation
+        && storageOwnershipSnapshot?.database === db
+        && storageOwnershipSnapshot.generation === generation
+        && storageOwnershipSnapshot.keySetGeneration === keySetGeneration) {
+        throwIfAborted(signal);
+        return clonePluginStorageOwnership(storageOwnershipSnapshot.ownership);
+    }
+    const ownership = await readCurrentOwnership(db, signal);
+    if (generation && keySetGeneration === getPluginStorageKeySetGeneration()) {
+        storageOwnershipSnapshot = {
+            database: db,
+            generation,
+            keySetGeneration,
+            ownership: clonePluginStorageOwnership(ownership),
+        };
+    }
+    return ownership;
 }
 
 function readGenerationBoundPluginStorageJson<T>(
@@ -687,7 +752,7 @@ async function listDecodedStorageKeys(
     prefix: string,
     signal?: AbortSignal | null,
 ): Promise<string[]> {
-    const ownership = await readCurrentOwnership(getDatabase());
+    const ownership = await readCachedCurrentOwnership(getDatabase(), signal, true);
     const storageKeys = prefix === PLUGIN_SAVE_META_PREFIX
         ? ownership.metaKeys
         : ownership.valueKeys;
@@ -925,7 +990,7 @@ export async function getPluginSaveStorageItem<T>(
             normalizedKey,
         );
         if (db.pluginStorageGeneration) {
-            const ownership = await readCurrentOwnership(db, signal);
+            const ownership = await readCachedCurrentOwnership(db, signal);
             if (!ownership.valueKeys.includes(storageKey)) return null;
         }
         return await readGenerationBoundPluginStorageJson<T>(
@@ -967,6 +1032,15 @@ export async function setPluginSaveStorageItem<T>(
                 PLUGIN_SAVE_PREFIX,
                 normalizedKey,
             );
+            if (db.pluginStorageGeneration) {
+                await setPreparedPersistentPluginStoragePreservingOwner(
+                    storageKey,
+                    prepared,
+                    signal,
+                    db.pluginStorageGeneration,
+                );
+                return;
+            }
             await commitOptimizedStorageMutation(
                 db,
                 [{ storageKey, valueBytes: prepared.bytes }],
@@ -1093,6 +1167,14 @@ export async function removePluginSaveStorageItem(
                 PLUGIN_SAVE_PREFIX,
                 normalizedKey,
             );
+            if (db.pluginStorageGeneration) {
+                await removePersistentPluginStoragePreservingOwner(
+                    storageKey,
+                    signal,
+                    db.pluginStorageGeneration,
+                );
+                return;
+            }
             await commitOptimizedStorageMutation(
                 db,
                 [],
@@ -1434,6 +1516,7 @@ export async function atomicBatchOwnedPluginSaveStorage(
                 operation: "set",
                 key: mutation.key,
                 valueBytes: preparePersistentJson(mutation.value, { pluginValue: true }).bytes,
+                ownedValueBytes: true,
                 owner,
                 ...(Object.prototype.hasOwnProperty.call(mutation, "expectedRevision")
                     ? { expectedRevision: mutation.expectedRevision }
@@ -1449,44 +1532,35 @@ export async function atomicBatchOwnedPluginSaveStorage(
             });
         }
     }
-    // Preflight the detached operation payload before queueing. The exact wire
-    // bound is checked again once the locked BR2 manifest CAS is available.
-    encodePluginStorageBatchRequest({
-        generation: "preflight",
-        expectedManifest: {
-            version: 1,
-            generation: "preflight",
-            valueKeys: [],
-            metaKeys: [],
-        },
-        operations: prepared,
-    });
-
     try {
         return await withPluginSaveStorageKeySetLock([...seen], async () => {
             throwIfAborted(signal);
             const db = getDatabase();
             if (db.optimizePluginMemory) {
                 for (let attempt = 0; ; attempt++) {
-                    const ownership = await readCurrentOwnership(db, signal);
                     const generation = db.pluginStorageGeneration;
-                    if (!generation
-                        || !ownership.manifestValid
-                        || ownership.manifest?.generation !== generation) {
+                    if (!generation) {
                         throw new Error(
                             "Optimized plugin storage is not reconciled; reload to complete its atomic adoption.",
                         );
                     }
+                    const manifestState = await readPersistentPluginStorageManifestState(
+                        generation,
+                        signal,
+                    );
                     const result = await batchPersistentPluginStorage({
                         generation,
-                        expectedManifest: ownership.manifest,
+                        expectedManifestRevision: manifestState.manifestRevision,
                         operations: prepared,
                     }, signal);
                     if (result.outcome === "committed") {
                         return {
                             committed: true,
                             generation: result.generation,
-                            revisions: result.revisions,
+                            revisions: result.revisions.map(({ key, revision }) => ({
+                                key,
+                                revision,
+                            })),
                         };
                     }
                     if (result.code === "PLUGIN_STORAGE_GENERATION_CONFLICT" && attempt < 2) {
@@ -1815,7 +1889,7 @@ export async function clearPluginSaveStorageOwners(
 export async function getPluginSaveStorageOwners(
     signal?: AbortSignal | null,
 ): Promise<Record<string, string>> {
-    return withPluginSaveStorageLock(async () => {
+    return withPluginSaveStorageScope("owners", async () => {
         throwIfAborted(signal);
         const out = createPluginStorageRecord<string>();
         const db = getDatabase();
@@ -1828,12 +1902,12 @@ export async function getPluginSaveStorageOwners(
             }
             return out;
         }
-        const ownership = await readCurrentOwnership(db, signal);
+        const ownership = await readCachedCurrentOwnership(db, signal);
         const activeValues = new Set(ownership.valueKeys);
-        for (const fullKey of ownership.metaKeys) {
+        const entries = await Promise.all(ownership.metaKeys.map(async fullKey => {
             const key = decodeListedStorageKey(fullKey, PLUGIN_SAVE_META_PREFIX);
-            if (key === null) continue;
-            if (!activeValues.has(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key))) continue;
+            if (key === null) return null;
+            if (!activeValues.has(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key))) return null;
             const record = await readGenerationBoundPluginStorageJson<{ plugin?: string }>(
                 readPersistentJson,
                 fullKey,
@@ -1841,7 +1915,10 @@ export async function getPluginSaveStorageOwners(
                 false,
                 signal,
             );
-            if (record?.plugin) definePluginStorageRecordValue(out, key, record.plugin);
+            return record?.plugin ? { key, plugin: record.plugin } : null;
+        }));
+        for (const entry of entries) {
+            if (entry) definePluginStorageRecordValue(out, entry.key, entry.plugin);
         }
         return out;
     }, signal);
@@ -2671,6 +2748,22 @@ async function applyStagedPluginStorageTransition(
             }))
             : [],
     }, options.signal);
+    const expectedDirection = target ? "externalize" : "internalize";
+    if (stage.direction !== expectedDirection
+        || stage.targetGeneration !== targetGeneration
+        || (stage.state !== "uploading" && stage.state !== "ready")) {
+        try {
+            await abortPersistentPluginStorageTransition(transitionId);
+        } catch {
+            // The unpublished stage is already unusable to this client; keep
+            // the exact response error as the primary failure.
+        }
+        throw new StorageError("The staged transition acknowledgement did not match its plan.", {
+            code: "STORAGE_RESPONSE_ERROR",
+            operation: "transition",
+            retryable: false,
+        });
+    }
     const total = target ? preflight.entries.length : stage.rows.length;
     const totalBytes = target
         ? preflight.entries.reduce((sum, entry) => addTransitionBytes(sum, entry.size), 0)
@@ -2720,12 +2813,20 @@ async function applyStagedPluginStorageTransition(
                         retryable: true,
                     });
                 }
-                await uploadPersistentPluginStorageTransitionRow(
+                const upload = await uploadPersistentPluginStorageTransitionRow(
                     transitionId,
                     entry.storageKey,
                     prepared.bytes,
                     options.signal,
                 );
+                if (upload.direction !== expectedDirection
+                    || upload.targetGeneration !== targetGeneration) {
+                    throw new StorageError("The staged row acknowledgement changed transition identity.", {
+                        code: "COMMIT_OUTCOME_UNKNOWN",
+                        operation: "transition",
+                        commitOutcomeUnknown: true,
+                    });
+                }
                 if (entry.prefix === PLUGIN_SAVE_PREFIX) {
                     delete db.pluginCustomStorage[entry.rawKey];
                 } else if (db.pluginStorageMeta) {
@@ -2775,6 +2876,12 @@ async function applyStagedPluginStorageTransition(
                         operation: "transition",
                     });
                 }
+                if (!row.sha256 || await sha256OwnedBytes(bytes) !== row.sha256) {
+                    throw new StorageError("The staged transition row failed its source hash.", {
+                        code: "PLUGIN_STORAGE_CHANGED",
+                        operation: "transition",
+                    });
+                }
                 const value = JSON.parse(new TextDecoder().decode(bytes));
                 if (prefix === PLUGIN_SAVE_PREFIX) {
                     definePluginStorageRecordValue(nextValues, rawKey, value);
@@ -2800,7 +2907,9 @@ async function applyStagedPluginStorageTransition(
         throwIfAborted(options.signal);
         finalizeDispatched = true;
         const committed = await finalizePersistentPluginStorageTransition(transitionId);
-        if (committed.state !== "committed") {
+        if (committed.state !== "committed"
+            || committed.direction !== expectedDirection
+            || committed.targetGeneration !== targetGeneration) {
             throw new StorageError("Plugin storage finalize was not acknowledged.", {
                 code: "COMMIT_OUTCOME_UNKNOWN",
                 operation: "transition",

@@ -15,8 +15,10 @@ import type {
 } from "./pluginStorageBatch";
 import { PluginStorageBatchError } from "./pluginStorageBatch";
 import type {
+    PluginStorageManifestSnapshotTransport,
     PluginStorageManifestTransport,
     PluginStorageStagedTransitionBegin,
+    PluginStorageStagedTransitionAbortTombstone,
     PluginStorageStagedTransitionStatus,
     PluginStorageTransitionTransport,
 } from "./nodeStorage";
@@ -249,6 +251,49 @@ export async function restorePersistentPluginStoragePair<T>(
     return requireCommittedPluginStorageMutation(result);
 }
 
+/** Set one logical value while retaining its existing ownership sidecar. */
+export async function setPreparedPersistentPluginStoragePreservingOwner(
+    valueStorageKey: string,
+    preparedValue: PreparedPersistentJson,
+    signal?: AbortSignal | null,
+    generation?: string,
+): Promise<PluginStorageMutationResult> {
+    throwIfAborted(signal);
+    await ensureStorageReady(signal);
+    const request = {
+        operation: "set" as const,
+        valueKey: valueStorageKey,
+        valueBytes: preparedValue.bytes,
+        ownedValueBytes: true as const,
+        preserveOwner: true,
+        ...(generation ? { generation } : {}),
+    };
+    const result = signal
+        ? await forageStorage.mutatePluginStorage(request, signal)
+        : await forageStorage.mutatePluginStorage(request);
+    return requireCommittedPluginStorageMutation(result);
+}
+
+/** Remove one logical value while retaining its historical owner sidecar. */
+export async function removePersistentPluginStoragePreservingOwner(
+    valueStorageKey: string,
+    signal?: AbortSignal | null,
+    generation?: string,
+): Promise<PluginStorageMutationResult> {
+    throwIfAborted(signal);
+    await ensureStorageReady(signal);
+    const request = {
+        operation: "remove" as const,
+        valueKey: valueStorageKey,
+        preserveOwner: true,
+        ...(generation ? { generation } : {}),
+    };
+    const result = signal
+        ? await forageStorage.mutatePluginStorage(request, signal)
+        : await forageStorage.mutatePluginStorage(request);
+    return requireCommittedPluginStorageMutation(result);
+}
+
 export async function batchPersistentPluginStorage(
     request: PluginStorageBatchRequest,
     signal?: AbortSignal | null,
@@ -309,6 +354,24 @@ export async function readPersistentPluginStorageState<T>(
         revision: state.revision,
         generation: state.generation,
     };
+}
+
+export async function readPersistentPluginStorageManifestSnapshot(
+    generation: string,
+    signal?: AbortSignal | null,
+): Promise<PluginStorageManifestSnapshotTransport> {
+    throwIfAborted(signal);
+    await ensureStorageReady(signal);
+    return await forageStorage.getPluginStorageManifestSnapshot(generation, signal);
+}
+
+export async function readPersistentPluginStorageManifestState(
+    generation: string,
+    signal?: AbortSignal | null,
+): Promise<{ generation: string; manifestRevision: string }> {
+    throwIfAborted(signal);
+    await ensureStorageReady(signal);
+    return await forageStorage.getPluginStorageManifestState(generation, signal);
 }
 
 export async function listPersistentKeys(
@@ -484,7 +547,7 @@ export async function finalizePersistentPluginStorageTransition(
 
 export async function abortPersistentPluginStorageTransition(
     transitionId: string,
-): Promise<PluginStorageStagedTransitionStatus> {
+): Promise<PluginStorageStagedTransitionStatus | PluginStorageStagedTransitionAbortTombstone> {
     await ensureStorageReady();
     return await forageStorage.abortPluginStorageTransition(transitionId);
 }

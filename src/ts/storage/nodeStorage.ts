@@ -16,6 +16,7 @@ import {
     type DbCacheInventory,
 } from "./dbCachedRead"
 import {
+    applyOwnedResourceCacheMutations,
     getManifestHashes,
     getVerifiedManifestSnapshot,
     getVerifiedCachedBytes,
@@ -24,6 +25,7 @@ import {
     isSha256Hex,
     persistResourceCacheManifests,
     sha256Bytes,
+    sha256OwnedBytes,
     settleBestEffortResourceCache,
     storeBytes,
     storeOwnedBytesWithKnownHash,
@@ -172,6 +174,20 @@ export interface PluginStorageManifestTransport {
     metaKeys: string[]
 }
 
+export interface PluginStorageManifestSnapshotTransport {
+    generation: string
+    manifestRevision: string
+    manifest: PluginStorageManifestTransport
+    /** Manifest-owned rows that physically exist in the same server snapshot. */
+    valueKeys: string[]
+    metaKeys: string[]
+}
+
+export interface PluginStorageManifestStateTransport {
+    generation: string
+    manifestRevision: string
+}
+
 export interface PluginStorageMutationTransport {
     version: 1
     generation: string
@@ -211,13 +227,19 @@ export interface PluginStorageStagedTransitionStatus {
     rows: {
         storageKey: string
         size: number
-        sha256: string | null
+        sha256: string
         uploaded: boolean
     }[]
     uploaded: number
     total: number
     totalBytes: number
     etag?: string
+}
+
+export interface PluginStorageStagedTransitionAbortTombstone {
+    success: true
+    transitionId: string
+    state: 'aborted'
 }
 
 const PLUGIN_TRANSITION_STATES = new Set(['uploading', 'ready', 'committed', 'aborted'])
@@ -228,7 +250,12 @@ function isPluginStorageStagedTransitionStatus(
 ): value is PluginStorageStagedTransitionStatus {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return false
     const result = value as Record<string, unknown>
-    if (result.success !== true
+    const allowedKeys = new Set([
+        'success', 'transitionId', 'state', 'direction', 'targetGeneration',
+        'rows', 'uploaded', 'total', 'totalBytes', 'etag',
+    ])
+    if (Object.keys(result).some(key => !allowedKeys.has(key))
+        || result.success !== true
         || result.transitionId !== transitionId
         || typeof result.state !== 'string'
         || !PLUGIN_TRANSITION_STATES.has(result.state)
@@ -240,6 +267,9 @@ function isPluginStorageStagedTransitionStatus(
         || !Number.isSafeInteger(result.uploaded)
         || !Number.isSafeInteger(result.total)
         || !Number.isSafeInteger(result.totalBytes)
+        || (result.uploaded as number) < 0
+        || (result.total as number) < 0
+        || (result.totalBytes as number) < 0
         || result.total !== result.rows.length) return false
     let uploaded = 0
     let totalBytes = 0
@@ -247,24 +277,47 @@ function isPluginStorageStagedTransitionStatus(
     for (const rowValue of result.rows) {
         if (!rowValue || typeof rowValue !== 'object' || Array.isArray(rowValue)) return false
         const row = rowValue as Record<string, unknown>
-        if (typeof row.storageKey !== 'string'
+        if (Object.keys(row).sort().join(',') !== 'sha256,size,storageKey,uploaded'
+            || !PLUGIN_STORAGE_PREFIXES.some(prefix => (
+                isCanonicalPluginStorageKey(row.storageKey, prefix)
+            ))
             || !Number.isSafeInteger(row.size)
             || (row.size as number) <= 0
             || (row.size as number) > 32 * 1024 * 1024
             || typeof row.uploaded !== 'boolean'
-            || !(row.sha256 === null || isSha256Hex(row.sha256))) return false
-        if (storageKeys.has(row.storageKey as string)
-            || (row.uploaded && !isSha256Hex(row.sha256))) return false
+            || !isSha256Hex(row.sha256)) return false
+        if (storageKeys.has(row.storageKey as string)) return false
         storageKeys.add(row.storageKey as string)
         if (row.uploaded) uploaded += 1
         totalBytes += row.size as number
         if (!Number.isSafeInteger(totalBytes)) return false
     }
-    return result.uploaded === uploaded
-        && result.totalBytes === totalBytes
-        && (result.etag === undefined || typeof result.etag === 'string')
-        && (result.state !== 'committed'
-            || (typeof result.etag === 'string' && /^[0-9a-f]{32}$/.test(result.etag)))
+    if (result.uploaded !== uploaded || result.totalBytes !== totalBytes) return false
+    const allUploaded = uploaded === result.rows.length
+    if (result.state === 'committed') {
+        return allUploaded
+            && typeof result.etag === 'string'
+            && /^[0-9a-f]{32}$/.test(result.etag)
+    }
+    if (result.etag !== undefined) return false
+    if (result.direction === 'internalize' && !allUploaded) return false
+    if (result.state === 'uploading') {
+        return result.direction === 'externalize' && !allUploaded
+    }
+    if (result.state === 'ready') return allUploaded
+    return result.state === 'aborted'
+}
+
+function isPluginStorageStagedTransitionAbortTombstone(
+    value: unknown,
+    transitionId: string,
+): value is PluginStorageStagedTransitionAbortTombstone {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const result = value as Record<string, unknown>
+    return Object.keys(result).sort().join(',') === 'state,success,transitionId'
+        && result.success === true
+        && result.transitionId === transitionId
+        && result.state === 'aborted'
 }
 
 function normalizeStorageReadOptions(
@@ -339,6 +392,30 @@ const PLUGIN_STORAGE_MAX_RETRY_DELAY_SECONDS = 5
 
 function isPluginStorageTarget(target: string): boolean {
     return PLUGIN_STORAGE_PREFIXES.some(prefix => target.startsWith(prefix))
+}
+
+function isCanonicalPluginStorageKey(value: unknown, prefix: string): value is string {
+    if (typeof value !== 'string'
+        || !value.startsWith(prefix)
+        || !value.endsWith('.json')) return false
+    const encoded = value.slice(prefix.length, -'.json'.length)
+    if (!/^[A-Za-z0-9_-]*$/.test(encoded)) return false
+    try {
+        const padded = encoded
+            .replace(/-/g, '+')
+            .replace(/_/g, '/')
+            .padEnd(Math.ceil(encoded.length / 4) * 4, '=')
+        const bytes = Buffer.from(padded, 'base64')
+        const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+        const canonical = Buffer.from(decoded, 'utf-8')
+            .toString('base64')
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_')
+            .replace(/=+$/g, '')
+        return canonical === encoded
+    } catch {
+        return false
+    }
 }
 
 function parseRetryAfterSeconds(value: unknown): number | null {
@@ -1000,7 +1077,8 @@ export class NodeStorage{
         body?: PluginStorageStagedTransitionBegin,
         externalSignal?: AbortSignal | null,
         mutation = false,
-    ): Promise<PluginStorageStagedTransitionStatus> {
+        allowAbortTombstone = false,
+    ): Promise<PluginStorageStagedTransitionStatus | PluginStorageStagedTransitionAbortTombstone> {
         const execute = () => runBoundedAuthoritativeStorageOperation(
             async (signal, outcome) => {
                 const response = await this.authFetch(path, {
@@ -1036,7 +1114,9 @@ export class NodeStorage{
                         operation: 'transition',
                     })
                 }
-                if (!isPluginStorageStagedTransitionStatus(result, transitionId)) {
+                if (!isPluginStorageStagedTransitionStatus(result, transitionId)
+                    && !(allowAbortTombstone
+                        && isPluginStorageStagedTransitionAbortTombstone(result, transitionId))) {
                     throw new StorageError('Invalid staged transition acknowledgement', {
                         status: response.status,
                         code: mutation
@@ -1048,8 +1128,10 @@ export class NodeStorage{
                     })
                 }
                 if (mutation) outcome.markDefinitiveResponse()
-                if (typeof result.etag === 'string') this._lastDbEtag = result.etag
-                return result as PluginStorageStagedTransitionStatus
+                if ('etag' in result && typeof result.etag === 'string') {
+                    this._lastDbEtag = result.etag
+                }
+                return result
             },
             mutation ? 'transition' : 'read',
             AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
@@ -1061,6 +1143,17 @@ export class NodeStorage{
             if (!mutation
                 || !(error instanceof StorageError)
                 || !error.commitOutcomeUnknown) throw error
+            // Abort is idempotent and a missing stage has one exact definitive
+            // tombstone. Retry the same control once before consulting status;
+            // status legitimately 404s after an already-missing abort.
+            if (path.endsWith('/abort')) {
+                try {
+                    return await execute()
+                } catch (retryError) {
+                    if (!(retryError instanceof StorageError)
+                        || !retryError.commitOutcomeUnknown) throw retryError
+                }
+            }
             let status: PluginStorageStagedTransitionStatus
             try {
                 status = await this.getPluginStorageTransitionStatus(transitionId)
@@ -1112,7 +1205,7 @@ export class NodeStorage{
             plan,
             signal,
             true,
-        )
+        ) as PluginStorageStagedTransitionStatus
     }
 
     async uploadPluginStorageTransitionRow(
@@ -1121,6 +1214,7 @@ export class NodeStorage{
         bytes: Uint8Array,
         externalSignal?: AbortSignal | null,
     ): Promise<PluginStorageStagedTransitionStatus> {
+        const expectedHash = await sha256OwnedBytes(bytes)
         try {
             return await runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
                 const response = await this.authFetch(
@@ -1150,8 +1244,29 @@ export class NodeStorage{
                         operation: 'transition',
                     })
                 }
+                if (!isPluginStorageStagedTransitionStatus(result, transitionId)) {
+                    throw new StorageError('Invalid staged transition upload acknowledgement', {
+                        status: response.status,
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcomeUnknown: true,
+                        operation: 'transition',
+                    })
+                }
+                const row = result.rows.find(entry => entry.storageKey === storageKey)
+                if (!row?.uploaded
+                    || row.size !== bytes.byteLength
+                    || row.sha256 !== expectedHash) {
+                    throw new StorageError('Staged transition upload acknowledgement did not match the row', {
+                        status: response.status,
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcomeUnknown: true,
+                        operation: 'transition',
+                    })
+                }
                 outcome.markDefinitiveResponse()
-                return result as PluginStorageStagedTransitionStatus
+                return result
             }, 'transition', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
         } catch (error) {
             if (!(error instanceof StorageError) || !error.commitOutcomeUnknown) throw error
@@ -1174,7 +1289,9 @@ export class NodeStorage{
                 )
             }
             const row = status.rows.find(entry => entry.storageKey === storageKey)
-            if (row?.uploaded) return status
+            if (row?.uploaded
+                && row.size === bytes.byteLength
+                && row.sha256 === expectedHash) return status
             throw error
         }
     }
@@ -1211,7 +1328,7 @@ export class NodeStorage{
             'GET',
             undefined,
             signal,
-        )
+        ) as PluginStorageStagedTransitionStatus
     }
 
     async finalizePluginStorageTransition(
@@ -1225,19 +1342,20 @@ export class NodeStorage{
             undefined,
             signal,
             true,
-        )
+        ) as PluginStorageStagedTransitionStatus
     }
 
     async abortPluginStorageTransition(
         transitionId: string,
         signal?: AbortSignal | null,
-    ): Promise<PluginStorageStagedTransitionStatus> {
+    ): Promise<PluginStorageStagedTransitionStatus | PluginStorageStagedTransitionAbortTombstone> {
         return await this.stagedPluginStorageControl(
             '/api/plugin-storage/transition/stage/abort',
             transitionId,
             'POST',
             undefined,
             signal,
+            true,
             true,
         )
     }
@@ -1386,7 +1504,7 @@ export class NodeStorage{
         let expectedValueHash: string | undefined
         if (stableRequest.operation === 'set') {
             try {
-                expectedValueHash = await sha256Bytes(stableRequest.valueBytes!)
+                expectedValueHash = await sha256OwnedBytes(stableRequest.valueBytes!)
             } catch (error) {
                 return {
                     outcome: 'not-committed',
@@ -1426,6 +1544,8 @@ export class NodeStorage{
                         stableRequest.ownerRecordBytes,
                     ).toString('base64url')
                 }
+            } else if (stableRequest.preserveOwner) {
+                headers['x-plugin-storage-owner-policy'] = 'preserve'
             }
             const response = await this.authFetch('/api/plugin-storage/mutate', {
                 method: 'POST',
@@ -1496,13 +1616,25 @@ export class NodeStorage{
     ): Promise<PluginStorageBatchResult> {
         const stableRequest: PluginStorageBatchRequest = {
             generation: request.generation,
-            expectedManifest: {
-                ...request.expectedManifest,
-                valueKeys: [...request.expectedManifest.valueKeys],
-                metaKeys: [...request.expectedManifest.metaKeys],
-            },
+            ...(request.expectedManifest
+                ? {
+                    expectedManifest: {
+                        ...request.expectedManifest,
+                        valueKeys: [...request.expectedManifest.valueKeys],
+                        metaKeys: [...request.expectedManifest.metaKeys],
+                    },
+                }
+                : {}),
+            ...(request.expectedManifestRevision
+                ? { expectedManifestRevision: request.expectedManifestRevision }
+                : {}),
             operations: request.operations.map(operation => operation.operation === 'set'
-                ? { ...operation, valueBytes: new Uint8Array(operation.valueBytes) }
+                ? {
+                    ...operation,
+                    valueBytes: operation.ownedValueBytes
+                        ? operation.valueBytes
+                        : new Uint8Array(operation.valueBytes),
+                }
                 : { ...operation }),
         }
         try {
@@ -1546,7 +1678,7 @@ export class NodeStorage{
     ): Promise<PluginStorageBatchResult> {
         throwIfAborted(signal)
         const requestBytes = encodePluginStorageBatchRequest(request)
-        const requestHash = await sha256Bytes(requestBytes)
+        const requestHash = await sha256OwnedBytes(requestBytes)
         throwIfAborted(signal)
 
         for (let retryIndex = 0; ; retryIndex++) {
@@ -1592,20 +1724,24 @@ export class NodeStorage{
             }
 
             if (result.outcome === 'committed' && isResourceCacheEnabled()) {
-                for (const operation of request.operations) {
+                void settleBestEffortResourceCache(
+                    applyOwnedResourceCacheMutations(request.operations.map((operation, index) => {
                     const valueKey = `${PLUGIN_STORAGE_PREFIXES[0]}${Buffer.from(
                         operation.key,
                         'utf-8',
                     ).toString('base64url')}.json`
                     if (operation.operation === 'set') {
-                        void settleBestEffortResourceCache(
-                            storeBytes(`kv:${valueKey}`, operation.valueBytes),
-                            null,
-                        )
-                    } else {
-                        void invalidateResourceCacheManifest(`kv:${valueKey}`)
+                        return {
+                            type: 'set' as const,
+                            resourceKey: `kv:${valueKey}`,
+                            hash: result.revisions[index].valueHash!,
+                            ownedBytes: operation.valueBytes,
+                        }
                     }
-                }
+                    return { type: 'remove' as const, resourceKey: `kv:${valueKey}` }
+                })),
+                    undefined,
+                )
             }
             return result
         }
@@ -1680,7 +1816,12 @@ export class NodeStorage{
                     code: 'STORAGE_RESPONSE_ERROR', operation: 'read', retryable: true,
                 })
             }
-            return { missing: true, valueBytes: null, revision: null, generation: null }
+            return {
+                missing: true,
+                valueBytes: null,
+                revision: null,
+                generation: null,
+            }
         }
         if (typeof record.value !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(record.value)) {
             throw new StorageError('Plugin storage state value was malformed.', {
@@ -1698,6 +1839,146 @@ export class NodeStorage{
             valueBytes,
             revision: record.revision as string,
             generation: record.generation as string | null,
+        }
+    }
+
+    async getPluginStorageManifestSnapshot(
+        generation: string,
+        externalSignal?: AbortSignal | null,
+    ): Promise<PluginStorageManifestSnapshotTransport> {
+        return runBoundedAuthoritativeStorageOperation(
+            signal => this.getPluginStorageManifestSnapshotAuthoritative(generation, signal),
+            'list',
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+    }
+
+    async getPluginStorageManifestState(
+        generation: string,
+        externalSignal?: AbortSignal | null,
+    ): Promise<PluginStorageManifestStateTransport> {
+        return runBoundedAuthoritativeStorageOperation(
+            signal => this.getPluginStorageManifestStateAuthoritative(generation, signal),
+            'list',
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+    }
+
+    private async getPluginStorageManifestStateAuthoritative(
+        generation: string,
+        signal: AbortSignal,
+    ): Promise<PluginStorageManifestStateTransport> {
+        if (typeof generation !== 'string' || generation.length === 0) {
+            throw new TypeError('Plugin storage generation must be a non-empty string')
+        }
+        const response = await this.requestStorage(
+            'plugin-storage/manifest',
+            'list',
+            false,
+            () => this.authFetch('/api/plugin-storage/manifest', {
+                method: 'GET',
+                headers: {
+                    'x-plugin-storage-generation': generation,
+                    'x-plugin-storage-manifest-mode': 'state',
+                },
+                signal,
+            }),
+            [],
+            signal,
+        )
+        const body = await awaitWithAbort(response.json(), signal) as unknown
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+            throw new StorageError('Plugin storage manifest state was malformed.', {
+                code: 'STORAGE_RESPONSE_ERROR', operation: 'list', retryable: true,
+            })
+        }
+        const record = body as Record<string, unknown>
+        if (Object.keys(record).length !== 3
+            || record.success !== true
+            || record.generation !== generation
+            || typeof record.manifestRevision !== 'string'
+            || !/^sha256:[0-9a-f]{64}$/.test(record.manifestRevision)) {
+            throw new StorageError('Plugin storage manifest state was malformed.', {
+                code: 'STORAGE_RESPONSE_ERROR', operation: 'list', retryable: true,
+            })
+        }
+        return { generation, manifestRevision: record.manifestRevision }
+    }
+
+    private async getPluginStorageManifestSnapshotAuthoritative(
+        generation: string,
+        signal: AbortSignal,
+    ): Promise<PluginStorageManifestSnapshotTransport> {
+        if (typeof generation !== 'string' || generation.length === 0) {
+            throw new TypeError('Plugin storage generation must be a non-empty string')
+        }
+        const response = await this.requestStorage(
+            'plugin-storage/manifest',
+            'list',
+            false,
+            () => this.authFetch('/api/plugin-storage/manifest', {
+                method: 'GET',
+                headers: { 'x-plugin-storage-generation': generation },
+                signal,
+            }),
+            [],
+            signal,
+        )
+        const body = await awaitWithAbort(response.json(), signal) as unknown
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+            throw new StorageError('Plugin storage manifest response was malformed.', {
+                code: 'STORAGE_RESPONSE_ERROR', operation: 'list', retryable: true,
+            })
+        }
+        const record = body as Record<string, unknown>
+        const manifest = record.manifest as Record<string, unknown> | undefined
+        const allowed = new Set([
+            'success', 'generation', 'manifestRevision', 'manifest', 'valueKeys', 'metaKeys',
+        ])
+        const validKeys = (value: unknown, prefix: string): value is string[] => (
+            Array.isArray(value)
+            && value.every(key => isCanonicalPluginStorageKey(key, prefix))
+            && new Set(value).size === value.length
+        )
+        const manifestValueKeys = Array.isArray(manifest?.valueKeys)
+            ? new Set(manifest.valueKeys as string[])
+            : null
+        const manifestMetaKeys = Array.isArray(manifest?.metaKeys)
+            ? new Set(manifest.metaKeys as string[])
+            : null
+        if (Object.keys(record).some(key => !allowed.has(key))
+            || record.success !== true
+            || record.generation !== generation
+            || typeof record.manifestRevision !== 'string'
+            || !/^sha256:[0-9a-f]{64}$/.test(record.manifestRevision)
+            || !manifest
+            || Array.isArray(manifest)
+            || Object.keys(manifest).length !== 4
+            || manifest.version !== 1
+            || manifest.generation !== generation
+            || !validKeys(manifest.valueKeys, PLUGIN_STORAGE_PREFIXES[0])
+            || !validKeys(manifest.metaKeys, PLUGIN_STORAGE_PREFIXES[1])
+            || !validKeys(record.valueKeys, PLUGIN_STORAGE_PREFIXES[0])
+            || !validKeys(record.metaKeys, PLUGIN_STORAGE_PREFIXES[1])
+            || !(record.valueKeys as string[]).every(key => manifestValueKeys?.has(key))
+            || !(record.metaKeys as string[]).every(key => manifestMetaKeys?.has(key))) {
+            throw new StorageError('Plugin storage manifest response was malformed.', {
+                code: 'STORAGE_RESPONSE_ERROR', operation: 'list', retryable: true,
+            })
+        }
+        return {
+            generation,
+            manifestRevision: record.manifestRevision,
+            manifest: {
+                version: 1,
+                generation,
+                valueKeys: [...manifest.valueKeys as string[]],
+                metaKeys: [...manifest.metaKeys as string[]],
+            },
+            valueKeys: [...record.valueKeys as string[]],
+            metaKeys: [...record.metaKeys as string[]],
         }
     }
 

@@ -3,6 +3,8 @@ import {
     type PatchItemResult,
     type PluginStorageMutationTransport,
     type PluginStorageStagedTransitionBegin,
+    type PluginStorageManifestSnapshotTransport,
+    type PluginStorageManifestStateTransport,
     type PluginStorageTransitionTransport,
     type StorageReadOptions,
 } from "./nodeStorage"
@@ -113,6 +115,22 @@ export class AutoStorage{
     ): Promise<PluginStorageVersionedState> {
         await this.Init()
         return await this.realStorage.getPluginStorageState(valueKey, options)
+    }
+
+    async getPluginStorageManifestSnapshot(
+        generation: string,
+        signal?: AbortSignal | null,
+    ): Promise<PluginStorageManifestSnapshotTransport> {
+        await this.Init()
+        return await this.realStorage.getPluginStorageManifestSnapshot(generation, signal)
+    }
+
+    async getPluginStorageManifestState(
+        generation: string,
+        signal?: AbortSignal | null,
+    ): Promise<PluginStorageManifestStateTransport> {
+        await this.Init()
+        return await this.realStorage.getPluginStorageManifestState(generation, signal)
     }
 
     async checkAccountSync(){

@@ -7,6 +7,9 @@ export const RESOURCE_CACHE_MAX_ENTRIES = 32_768
 export const RESOURCE_CACHE_MAX_STORED_BYTES = 64 * 1024 * 1024
 export const RESOURCE_CACHE_MAX_VALUE_BYTES = 32 * 1024 * 1024
 export const RESOURCE_CACHE_IO_TIMEOUT_MS = 2_000
+export const RESOURCE_CACHE_PRUNE_MAX_MUTATIONS = 32
+export const RESOURCE_CACHE_PRUNE_MAX_ADDED_BYTES = 8 * 1024 * 1024
+export const RESOURCE_CACHE_PRUNE_MAX_DELAY_MS = 50
 
 const RESOURCE_CACHE_DATABASE_VERSION = 1
 const RESOURCE_CACHE_ENTRY_STORE = 'entries'
@@ -41,6 +44,15 @@ export interface ResourceCacheManifestUpdate {
 export interface VerifiedResourceCacheManifest {
     hashes: string[]
     bytesByHash: Map<string, Uint8Array>
+}
+
+export type OwnedResourceCacheMutation =
+    | { type: 'set'; resourceKey: string; hash: string; ownedBytes: Uint8Array }
+    | { type: 'remove'; resourceKey: string }
+
+export interface ResourceCachePruneDebt {
+    mutations: number
+    addedBytes: number
 }
 
 interface StoredResourceCacheManifest {
@@ -83,6 +95,23 @@ const DEFAULT_LIMITS: ResourceCacheLimits = {
 let resourceCacheDatabasePromise: Promise<IDBDatabase | null> | null = null
 let resourceCacheWriteChain: Promise<void> = Promise.resolve()
 let resourceCacheEpoch = 0
+let resourceCachePruneDebt: ResourceCachePruneDebt = { mutations: 0, addedBytes: 0 }
+let resourceCachePruneTimer: ReturnType<typeof setTimeout> | undefined
+let resourceCachePrunePending = false
+
+export function advanceResourceCachePruneDebt(
+    current: ResourceCachePruneDebt,
+    mutations: number,
+    addedBytes: number,
+): { debt: ResourceCachePruneDebt; prune: boolean } {
+    const debt = {
+        mutations: current.mutations + Math.max(0, mutations),
+        addedBytes: current.addedBytes + Math.max(0, addedBytes),
+    }
+    const prune = debt.mutations >= RESOURCE_CACHE_PRUNE_MAX_MUTATIONS
+        || debt.addedBytes >= RESOURCE_CACHE_PRUNE_MAX_ADDED_BYTES
+    return { debt: prune ? { mutations: 0, addedBytes: 0 } : debt, prune }
+}
 
 /** Bound disposable cache work so it can only delay an authoritative read briefly. */
 export async function settleBestEffortResourceCache<T>(
@@ -133,6 +162,58 @@ function enqueueResourceCacheWrite(operation: () => Promise<unknown>): Promise<v
     return next
 }
 
+function resetResourceCachePruneDebt(): void {
+    resourceCachePruneDebt = { mutations: 0, addedBytes: 0 }
+    if (resourceCachePruneTimer) clearTimeout(resourceCachePruneTimer)
+    resourceCachePruneTimer = undefined
+    resourceCachePrunePending = false
+}
+
+function scheduleDeferredResourceCachePrune(epoch: number): void {
+    if (resourceCachePruneTimer || resourceCachePrunePending) return
+    resourceCachePruneTimer = setTimeout(() => {
+        resourceCachePruneTimer = undefined
+        resourceCachePrunePending = true
+        void enqueueResourceCacheWrite(async () => {
+            try {
+                if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
+                const database = await openResourceCacheDatabase()
+                if (!database) return
+                await pruneResourceCache(database)
+            } finally {
+                if (epoch === resourceCacheEpoch) {
+                    resourceCachePruneDebt = { mutations: 0, addedBytes: 0 }
+                    resourceCachePrunePending = false
+                }
+            }
+        })
+    }, RESOURCE_CACHE_PRUNE_MAX_DELAY_MS)
+}
+
+async function accountResourceCachePruneDebt(
+    database: IDBDatabase,
+    epoch: number,
+    mutations: number,
+    addedBytes: number,
+): Promise<void> {
+    const next = advanceResourceCachePruneDebt(
+        resourceCachePruneDebt,
+        mutations,
+        addedBytes,
+    )
+    resourceCachePruneDebt = next.debt
+    if (next.prune) {
+        // A timer-fired prune already sits behind every earlier queued write,
+        // including this one. Let that single scan cover the accumulated debt.
+        if (resourceCachePrunePending) return
+        if (resourceCachePruneTimer) clearTimeout(resourceCachePruneTimer)
+        resourceCachePruneTimer = undefined
+        await pruneResourceCache(database)
+        return
+    }
+    scheduleDeferredResourceCachePrune(epoch)
+}
+
 export function isSha256Hex(value: unknown): value is string {
     return typeof value === 'string' && RESOURCE_CACHE_HASH_PATTERN.test(value)
 }
@@ -152,11 +233,16 @@ export function formatHashBytes(bytes: Uint8Array): string {
 }
 
 export async function sha256Bytes(bytes: Uint8Array): Promise<string> {
-    const subtle = globalThis.crypto?.subtle
-    if (!subtle) throw new Error('Web Crypto SHA-256 is unavailable')
     const copied = new Uint8Array(bytes.byteLength)
     copied.set(bytes)
-    const digest = await subtle.digest('SHA-256', copied)
+    return sha256OwnedBytes(copied)
+}
+
+/** Hash a fresh immutable caller-owned buffer without another full-size copy. */
+export async function sha256OwnedBytes(bytes: Uint8Array): Promise<string> {
+    const subtle = globalThis.crypto?.subtle
+    if (!subtle) throw new Error('Web Crypto SHA-256 is unavailable')
+    const digest = await subtle.digest('SHA-256', bytes as BufferSource)
     return formatHashBytes(new Uint8Array(digest))
 }
 
@@ -501,19 +587,15 @@ export async function storeBytes(
     }
     const copied = new Uint8Array(bytes.byteLength)
     copied.set(bytes)
-    const hash = await settleBestEffortResourceCache(sha256Bytes(copied), null)
+    const hash = await settleBestEffortResourceCache(sha256OwnedBytes(copied), null)
     if (!hash) return null
 
-    const epoch = resourceCacheEpoch
-    const operation = enqueueResourceCacheWrite(async () => {
-            if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
-            const database = await openResourceCacheDatabase()
-            if (!database) return
-            await persistResourceCacheBytes(database, resourceKey, hash, copied)
-            if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
-            await pruneResourceCache(database)
-        })
-    await operation
+    await applyOwnedResourceCacheMutations([{
+        type: 'set',
+        resourceKey,
+        hash,
+        ownedBytes: copied,
+    }])
     return hash
 }
 
@@ -538,14 +620,47 @@ export function storeOwnedBytesWithKnownHash(
         return Promise.resolve()
     }
 
+    return applyOwnedResourceCacheMutations([{
+        type: 'set', resourceKey, hash, ownedBytes,
+    }])
+}
+
+/**
+ * Publish a trusted mutation group with one queue slot and one IndexedDB
+ * transaction. The donated set buffers are never copied or re-hashed here;
+ * reads remain independently hash-verified before use.
+ */
+export function applyOwnedResourceCacheMutations(
+    mutations: readonly OwnedResourceCacheMutation[],
+): Promise<void> {
+    if (!isResourceCacheEnabled()) return Promise.resolve()
+    const filtered = mutations.flatMap((mutation): OwnedResourceCacheMutation[] => {
+        if (!nonEmptyString(mutation.resourceKey)) return []
+        if (mutation.type === 'remove') return [{ ...mutation }]
+        if (!isSha256Hex(mutation.hash)
+            || mutation.ownedBytes.byteLength > RESOURCE_CACHE_MAX_VALUE_BYTES) return []
+        return [{ ...mutation }]
+    })
+    const latestByResourceKey = new Map<string, OwnedResourceCacheMutation>()
+    for (const mutation of filtered) latestByResourceKey.set(mutation.resourceKey, mutation)
+    const prepared = [...latestByResourceKey.values()]
+    if (prepared.length === 0) return Promise.resolve()
+
     const epoch = resourceCacheEpoch
     return enqueueResourceCacheWrite(async () => {
         if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
         const database = await openResourceCacheDatabase()
         if (!database) return
-        await persistResourceCacheBytes(database, resourceKey, hash, ownedBytes)
+        await persistOwnedResourceCacheMutations(database, prepared)
         if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
-        await pruneResourceCache(database)
+        await accountResourceCachePruneDebt(
+            database,
+            epoch,
+            prepared.length,
+            prepared.reduce((total, mutation) => total + (
+                mutation.type === 'set' ? mutation.ownedBytes.byteLength : 0
+            ), 0),
+        )
     })
 }
 
@@ -564,7 +679,7 @@ export function persistResourceCacheManifests(
             if (!database) return
             await persistResourceCacheManifestUpdates(database, prepared)
             if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
-            await pruneResourceCache(database)
+            await accountResourceCachePruneDebt(database, epoch, prepared.length, 0)
         })
     return operation
 }
@@ -612,29 +727,13 @@ export function invalidateResourceCachePrefix(resourceKeyPrefix: string): Promis
 
 /** Drop one disposable manifest after an authoritative key deletion. */
 export function invalidateResourceCacheManifest(resourceKey: string): Promise<void> {
-    if (!isResourceCacheEnabled() || !nonEmptyString(resourceKey)) return Promise.resolve()
-    const epoch = resourceCacheEpoch
-    const operation = resourceCacheWriteChain
-        .catch(() => undefined)
-        .then(async () => {
-            if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
-            const database = await openResourceCacheDatabase()
-            if (!database) return
-            const transaction = database.transaction(RESOURCE_CACHE_MANIFEST_STORE, 'readwrite')
-            const done = transactionComplete(transaction)
-            transaction.objectStore(RESOURCE_CACHE_MANIFEST_STORE).delete(resourceKey)
-            await done
-            if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
-            await pruneResourceCache(database)
-        })
-        .catch(() => undefined)
-    resourceCacheWriteChain = operation
-    return operation
+    return applyOwnedResourceCacheMutations([{ type: 'remove', resourceKey }])
 }
 
 /** Clear the disposable cache, including pending connections and writes. */
 export async function clearResourceCache(): Promise<void> {
     resourceCacheEpoch += 1
+    resetResourceCachePruneDebt()
     await resourceCacheWriteChain.catch(() => undefined)
 
     const database = await resourceCacheDatabasePromise?.catch(() => null)
@@ -706,11 +805,9 @@ async function openResourceCacheDatabase(): Promise<IDBDatabase | null> {
     return database
 }
 
-async function persistResourceCacheBytes(
+async function persistOwnedResourceCacheMutations(
     database: IDBDatabase,
-    resourceKey: string,
-    hash: string,
-    bytes: Uint8Array,
+    mutations: readonly OwnedResourceCacheMutation[],
 ): Promise<void> {
     const transaction = database.transaction(
         [RESOURCE_CACHE_ENTRY_STORE, RESOURCE_CACHE_MANIFEST_STORE],
@@ -719,27 +816,36 @@ async function persistResourceCacheBytes(
     const done = transactionComplete(transaction)
     const entries = transaction.objectStore(RESOURCE_CACHE_ENTRY_STORE)
     const manifests = transaction.objectStore(RESOURCE_CACHE_MANIFEST_STORE)
-    const request = manifests.get(resourceKey)
-
-    request.onsuccess = () => {
-        const current = readStoredManifest(
-            request.result,
-            resourceCacheManifestHashLimit(resourceCacheManifestKind(resourceKey)),
-        )
-        const hashes = mergeResourceManifestHashes(current?.hashes ?? [], hash)
-        const currentSizes = new Map(
-            (current?.hashes ?? []).map((currentHash, index) => [currentHash, current?.sizes[index] ?? 0]),
-        )
-        const manifest: StoredResourceCacheManifest = {
-            version: RESOURCE_CACHE_MANIFEST_VERSION,
-            hashes,
-            sizes: hashes.map((currentHash) => currentHash === hash
-                ? bytes.byteLength
-                : currentSizes.get(currentHash) ?? 0),
-            updatedAt: Date.now(),
+    const writtenHashes = new Set<string>()
+    const updatedAt = Date.now()
+    for (const mutation of mutations) {
+        if (mutation.type === 'remove') {
+            manifests.delete(mutation.resourceKey)
+            continue
         }
-        entries.put(bytes, hash)
-        manifests.put(manifest, resourceKey)
+        const request = manifests.get(mutation.resourceKey)
+        request.onsuccess = () => {
+            const current = readStoredManifest(
+                request.result,
+                resourceCacheManifestHashLimit(resourceCacheManifestKind(mutation.resourceKey)),
+            )
+            const hashes = mergeResourceManifestHashes(current?.hashes ?? [], mutation.hash)
+            const currentSizes = new Map(
+                (current?.hashes ?? []).map((hash, index) => [hash, current?.sizes[index] ?? 0]),
+            )
+            manifests.put({
+                version: RESOURCE_CACHE_MANIFEST_VERSION,
+                hashes,
+                sizes: hashes.map(hash => hash === mutation.hash
+                    ? mutation.ownedBytes.byteLength
+                    : currentSizes.get(hash) ?? 0),
+                updatedAt,
+            } satisfies StoredResourceCacheManifest, mutation.resourceKey)
+            if (!writtenHashes.has(mutation.hash)) {
+                entries.put(mutation.ownedBytes, mutation.hash)
+                writtenHashes.add(mutation.hash)
+            }
+        }
     }
     await done
 }

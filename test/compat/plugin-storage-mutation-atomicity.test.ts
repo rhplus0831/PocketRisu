@@ -9,12 +9,20 @@ import {
   publishPluginStorageMutationCache,
   type PluginStorageMutationResult,
 } from '../../src/ts/storage/pluginStorageMutation.js'
+import utilsPkg from '../../server/node/utils.cjs'
+
+const { encodeRisuSaveLegacy } = utilsPkg as {
+  encodeRisuSaveLegacy: (value: unknown) => Uint8Array
+}
 
 const RAW_KEY = 'aa1/atomic-key'
 const VALUE_KEY = `pluginsave/${Buffer.from(RAW_KEY, 'utf-8').toString('base64url')}.json`
 const OWNER_KEY = `pluginsave-meta/${Buffer.from(RAW_KEY, 'utf-8').toString('base64url')}.json`
 const OLD_VALUE = Buffer.from(JSON.stringify({ generation: 'old' }), 'utf-8')
 const OLD_OWNER = Buffer.from(JSON.stringify({ plugin: 'Old Plugin', updatedAt: 1 }), 'utf-8')
+const STORAGE_GENERATION = 'pm4-remove-parity-generation'
+const MANIFEST_KEY = 'plugin-storage/manifest.json'
+const DATABASE_KEY = 'database/database.bin'
 const LONG_RAW_KEY = 'v'.repeat(756)
 const LONG_VALUE_KEY = `pluginsave/${Buffer.from(LONG_RAW_KEY, 'utf-8').toString('base64url')}.json`
 const LONG_OWNER_KEY = `pluginsave-meta/${Buffer.from(LONG_RAW_KEY, 'utf-8').toString('base64url')}.json`
@@ -39,6 +47,32 @@ function seedRows(saveDir: string, includeValue = true, includeOwner = true): vo
     )
     if (includeValue) insert.run(VALUE_KEY, OLD_VALUE, Date.now())
     if (includeOwner) insert.run(OWNER_KEY, OLD_OWNER, Date.now())
+  } finally {
+    database.close()
+  }
+}
+
+function seedActivePublication(saveDir: string): void {
+  const database = new Database(path.join(saveDir, 'risuai.db'))
+  try {
+    database.exec(`CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL, updated_at INTEGER NOT NULL)`)
+    const insert = database.prepare(
+      'INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+    )
+    insert.run(VALUE_KEY, OLD_VALUE, 1)
+    insert.run(OWNER_KEY, OLD_OWNER, 1)
+    insert.run(MANIFEST_KEY, Buffer.from(JSON.stringify({
+      version: 1,
+      generation: STORAGE_GENERATION,
+      valueKeys: [VALUE_KEY],
+      metaKeys: [OWNER_KEY],
+    })), 1)
+    insert.run(DATABASE_KEY, Buffer.from(encodeRisuSaveLegacy({
+      characters: [],
+      optimizePluginMemory: true,
+      pluginStorageGeneration: STORAGE_GENERATION,
+      pluginCustomStorage: {},
+    })), 1)
   } finally {
     database.close()
   }
@@ -163,6 +197,43 @@ async function mutateWithClientOutcome(
 }
 
 describe('atomic optimized plugin value and owner acknowledgement', () => {
+  test('generation-bound value-only remove preserves owner bytes and meta manifest membership', async () => {
+    const { server, client } = await boot(undefined, undefined, seedActivePublication)
+    const response = await client.fetch('/api/plugin-storage/mutate', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': Buffer.from(VALUE_KEY, 'utf-8').toString('hex'),
+        'x-plugin-storage-operation': 'remove',
+        'x-plugin-storage-generation': STORAGE_GENERATION,
+        'x-plugin-storage-owner-policy': 'preserve',
+      },
+      body: new Uint8Array(),
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      outcome: 'committed',
+      operation: 'remove',
+      verification: 'verified',
+    })
+    expect(readRows(server.cwd)).toEqual({ value: null, owner: OLD_OWNER })
+    const database = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
+    try {
+      const row = database.prepare('SELECT value FROM kv WHERE key = ?').get(MANIFEST_KEY) as {
+        value: Buffer
+      }
+      expect(JSON.parse(Buffer.from(row.value).toString('utf-8'))).toEqual({
+        version: 1,
+        generation: STORAGE_GENERATION,
+        valueKeys: [],
+        metaKeys: [OWNER_KEY],
+      })
+    } finally {
+      database.close()
+    }
+  })
+
   test('recovery atomically restores an exact sidecar or preserves the existing bytes', async () => {
     const { server, client } = await boot()
     const exactOwner = Buffer.from(JSON.stringify({ plugin: 'Snapshot', updatedAt: 7 }))

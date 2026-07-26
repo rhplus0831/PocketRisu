@@ -216,6 +216,21 @@ function queueStorageMutation(operation) {
     });
 }
 
+// Imports hold a raw transaction outside the storage queue. Wait before
+// entering the queue, then re-check from inside it: if an import won the race,
+// retry after that holder releases. If the read wins, the import's queue drain
+// stays behind it and cannot open its transaction until the read completes.
+async function queueStorageReadAfterImports(operation) {
+    while (true) {
+        await importBarrier.waitUntilIdle();
+        const attempt = await queueStorageOperation(async () => {
+            if (importBarrier.isHeld()) return { retry: true };
+            return { retry: false, value: await operation() };
+        });
+        if (!attempt.retry) return attempt.value;
+    }
+}
+
 function isImportInProgressError(error) {
     return Boolean(error && error.importInProgress === true);
 }
@@ -259,6 +274,12 @@ const snapshotRestoreFailpoint = process.env.NODE_ENV === 'test'
 const SNAPSHOT_RESTORE_TEST_GATE_DIR = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_SNAPSHOT_RESTORE_TEST_GATE_DIR ?? '').trim() || null
     : null;
+const BACKUP_IMPORT_TEST_GATE_DIR = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_BACKUP_IMPORT_TEST_GATE_DIR ?? '').trim() || null
+    : null;
+const backupImportFailpoint = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_BACKUP_IMPORT_FAILPOINT ?? '').trim()
+    : '';
 
 async function waitAtSnapshotRestoreTestGate() {
     if (!SNAPSHOT_RESTORE_TEST_GATE_DIR) return;
@@ -271,6 +292,22 @@ async function waitAtSnapshotRestoreTestGate() {
         'utf-8',
     );
     const releasePath = path.join(SNAPSHOT_RESTORE_TEST_GATE_DIR, 'release');
+    while (existsSync(holdPath) && !existsSync(releasePath)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+}
+
+async function waitAtBackupImportTestGate() {
+    if (!BACKUP_IMPORT_TEST_GATE_DIR) return;
+    const holdPath = path.join(BACKUP_IMPORT_TEST_GATE_DIR, 'hold');
+    if (!existsSync(holdPath)) return;
+    await fs.mkdir(BACKUP_IMPORT_TEST_GATE_DIR, { recursive: true });
+    await fs.writeFile(
+        path.join(BACKUP_IMPORT_TEST_GATE_DIR, 'entered'),
+        'after-database-ingestion',
+        'utf-8',
+    );
+    const releasePath = path.join(BACKUP_IMPORT_TEST_GATE_DIR, 'release');
     while (existsSync(holdPath) && !existsSync(releasePath)) {
         await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -339,12 +376,12 @@ function pluginStorageRevision(valueBytes, ownerBytes) {
     const incarnation = isCanonicalPluginStorageOwnerRecord(owner, ownerBytes)
         ? owner.revision
         : `legacy:${ownerBytes ? sha256Hex(ownerBytes) : 'unowned'}`;
-    return `sha256:${sha256Hex(Buffer.concat([
-        Buffer.from('pocketrisu-plugin-storage-v1\0', 'utf-8'),
-        Buffer.from(incarnation, 'utf-8'),
-        Buffer.from('\0', 'utf-8'),
-        valueBytes,
-    ]))}`;
+    const digest = nodeCrypto.createHash('sha256');
+    digest.update('pocketrisu-plugin-storage-v1\0', 'utf-8');
+    digest.update(incarnation, 'utf-8');
+    digest.update('\0', 'utf-8');
+    digest.update(valueBytes);
+    return `sha256:${digest.digest('hex')}`;
 }
 
 function readPluginStorageState(valueKey, ownerKey) {
@@ -3171,11 +3208,13 @@ function writePluginStorageManifest(manifest) {
 function pluginStorageManifestEquals(left, right) {
     if (left === null || right === null) return left === right;
     if (left.generation !== right.generation) return false;
-    const sameKeys = (a, b) => (
-        a.length === b.length
-        && new Set(a).size === a.length
-        && a.every((key) => b.includes(key))
-    );
+    const sameKeys = (a, b) => {
+        if (a.length !== b.length) return false;
+        const rightKeys = new Set(b);
+        return rightKeys.size === b.length
+            && new Set(a).size === a.length
+            && a.every(key => rightKeys.has(key));
+    };
     return sameKeys(left.valueKeys, right.valueKeys)
         && sameKeys(left.metaKeys, right.metaKeys);
 }
@@ -3189,12 +3228,17 @@ function normalizePluginStorageManifestRequest(value, fieldName, { nullable = fa
 
 function readPluginStorageManifestState(readValue = kvGet) {
     const raw = readValue(PLUGIN_STORAGE_MANIFEST_KEY);
-    if (!raw) return { manifest: null, present: false, valid: true };
+    if (!raw) return { manifest: null, present: false, valid: true, revision: null };
     try {
         const manifest = parsePluginStorageManifest(JSON.parse(raw.toString('utf-8')));
-        return { manifest, present: true, valid: manifest !== null };
+        return {
+            manifest,
+            present: true,
+            valid: manifest !== null,
+            revision: manifest ? `sha256:${sha256Hex(raw)}` : null,
+        };
     } catch {
-        return { manifest: null, present: true, valid: false };
+        return { manifest: null, present: true, valid: false, revision: null };
     }
 }
 
@@ -3264,8 +3308,11 @@ function canonicalPluginStorageRowPrefix(storageKey) {
 
 async function readLivePluginStoragePublication() {
     await flushPendingDb();
-    const rawDatabase = kvGet('database/database.bin');
-    const dbObj = rawDatabase ? await decodeRisuSave(rawDatabase) : null;
+    let dbObj = dbCache[DB_HEX_KEY] || null;
+    if (!dbObj) {
+        const rawDatabase = kvGet('database/database.bin');
+        dbObj = rawDatabase ? await decodeRisuSave(rawDatabase) : null;
+    }
     return {
         dbObj,
         generation: pluginStorageGeneration(dbObj),
@@ -3390,7 +3437,7 @@ async function readGenerationBoundPluginStorageRow(req, storageKey) {
         ? { optimized: true, generation: explicitGeneration }
         : pinnedState;
 
-    return queueStorageOperation(async () => {
+    return queueStorageReadAfterImports(async () => {
         const publication = await readLivePluginStoragePublication();
         const { dbObj, generation, manifestState } = publication;
         const prefix = canonicalPluginStorageRowPrefix(storageKey);
@@ -4133,6 +4180,13 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
             const databaseRaw = await fs.readFile(databaseSpool.filePath);
             kvSet(DB_BLOB_KEY, databaseRaw);
             databaseIngestion = await ingestDatabase(databaseRaw);
+        }
+        // Deterministically hold the hardest reader race in compatibility
+        // tests: the candidate database is visible inside SQLite's uncommitted
+        // replacement transaction, but the import has not published it.
+        await waitAtBackupImportTestGate();
+        if (backupImportFailpoint === 'after-database-ingestion') {
+            throw new Error('Injected backup import failure after database ingestion');
         }
         for (const [id, info] of legacyInlayInfoMap.entries()) {
             if (importedInlayIds.has(id) && !importedSidecarIds.has(id)) {
@@ -5482,7 +5536,7 @@ app.get('/api/plugin-storage/state', async (req, res, next) => {
         const valueKey = Buffer.from(filePath, 'hex').toString('utf-8');
         const rawKey = decodePluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX);
         const ownerKey = encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX);
-        const state = await queueStorageOperation(async () => {
+        const state = await queueStorageReadAfterImports(async () => {
             const publication = await readLivePluginStoragePublication();
             const { dbObj, generation, manifestState } = publication;
             const pinnedState = sessionPluginStorageReadState(req);
@@ -5596,6 +5650,86 @@ app.get('/api/storage/capacity', async (req, res, next) => {
 });
 
 /**
+ * Read the active publication manifest and its physically present row set in
+ * one generation-bound snapshot. Clients use this instead of issuing two list
+ * requests plus a separate manifest read for every batch or enumeration.
+ */
+app.get('/api/plugin-storage/manifest', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    const firstHeader = (value) => Array.isArray(value) ? value[0] : value;
+    const requestedGeneration = firstHeader(req.headers['x-plugin-storage-generation']);
+    const requestedMode = firstHeader(req.headers['x-plugin-storage-manifest-mode']) ?? 'snapshot';
+    if (requestedGeneration !== undefined
+        && (typeof requestedGeneration !== 'string' || requestedGeneration.length === 0)) {
+        return res.status(400).json({
+            success: false,
+            error: 'Plugin storage generation must be a non-empty string.',
+            code: 'INVALID_PLUGIN_STORAGE_MANIFEST_READ',
+        });
+    }
+    if (requestedMode !== 'snapshot' && requestedMode !== 'state') {
+        return res.status(400).json({
+            success: false,
+            error: 'Plugin storage manifest mode must be snapshot or state.',
+            code: 'INVALID_PLUGIN_STORAGE_MANIFEST_READ',
+        });
+    }
+
+    try {
+        const snapshot = await queueStorageReadAfterImports(async () => {
+            const publication = await readLivePluginStoragePublication();
+            const { dbObj, generation, manifestState } = publication;
+            const pinnedState = sessionPluginStorageReadState(req);
+            const expectedState = requestedGeneration !== undefined
+                ? { optimized: true, generation: requestedGeneration }
+                : pinnedState;
+            const activeManifest = generation
+                && dbObj?.optimizePluginMemory === true
+                && manifestState.valid
+                && manifestState.manifest?.generation === generation
+                ? manifestState.manifest
+                : null;
+            if (!expectedState
+                || expectedState.optimized !== true
+                || expectedState.generation !== generation
+                || !activeManifest
+                || (requestedGeneration !== undefined && pinnedState && (
+                    pinnedState.optimized !== true
+                    || pinnedState.generation !== requestedGeneration
+                ))) {
+                throw pluginStorageNamespaceConflict(
+                    'Plugin storage generation changed before the manifest could be read',
+                );
+            }
+
+            const manifestRevision = manifestState.revision;
+            if (requestedMode === 'state') {
+                return { generation, manifestRevision };
+            }
+            const physicalValues = new Set(kvList(PLUGIN_SAVE_PREFIX));
+            const physicalMeta = new Set(kvList(PLUGIN_SAVE_META_PREFIX));
+            return {
+                generation,
+                manifestRevision,
+                manifest: activeManifest,
+                valueKeys: activeManifest.valueKeys.filter(key => physicalValues.has(key)),
+                metaKeys: activeManifest.metaKeys.filter(key => physicalMeta.has(key)),
+            };
+        });
+        return res.json({ success: true, ...snapshot });
+    } catch (error) {
+        if (error?.pluginStorageNamespaceConflict) {
+            return res.status(409).json({
+                success: false,
+                error: error.message,
+                code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
+            });
+        }
+        next(error);
+    }
+});
+
+/**
  * Atomically mutate a bounded set of optimized plugin values. Every CAS is
  * checked before the first write, and every value plus owner sidecar is
  * applied inside the same SQLite writer transaction.
@@ -5618,6 +5752,7 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
     let requestHash;
     let requestedGeneration;
     let expectedManifest;
+    let expectedManifestRevision;
     try {
         if (!Buffer.isBuffer(req.body)) throw new Error('A JSON batch body is required.');
         if (req.body.length > PLUGIN_STORAGE_BATCH_MAX_BODY_BYTES) {
@@ -5632,9 +5767,10 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
         if (!body || typeof body !== 'object' || Array.isArray(body)
             || Object.keys(body).length !== 4
             || Object.keys(body).some(key => ![
-                'version', 'generation', 'expectedManifest', 'operations',
+                'version', 'generation', 'expectedManifest',
+                'expectedManifestRevision', 'operations',
             ].includes(key))
-            || body.version !== 1
+            || (body.version !== 1 && body.version !== 2)
             || typeof body.generation !== 'string'
             || body.generation.length === 0
             || !Array.isArray(body.operations)
@@ -5643,22 +5779,32 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
             throw new Error(`Plugin storage batch requires 1-${PLUGIN_STORAGE_BATCH_MAX_OPERATIONS} operations.`);
         }
         requestedGeneration = body.generation;
-        if (!body.expectedManifest || typeof body.expectedManifest !== 'object'
-            || Array.isArray(body.expectedManifest)
-            || Object.keys(body.expectedManifest).length !== 4
-            || Object.keys(body.expectedManifest).some(key => ![
-                'version', 'generation', 'valueKeys', 'metaKeys',
-            ].includes(key))) {
-            throw new Error('Plugin storage batch requires an exact expectedManifest.');
-        }
-        expectedManifest = normalizePluginStorageManifestRequest(
-            body.expectedManifest,
-            'expectedManifest',
-        );
-        if (expectedManifest.generation !== requestedGeneration
-            || expectedManifest.valueKeys.length !== body.expectedManifest.valueKeys.length
-            || expectedManifest.metaKeys.length !== body.expectedManifest.metaKeys.length) {
-            throw new Error('Plugin storage batch expectedManifest is not canonical.');
+        if (body.version === 1) {
+            if (!body.expectedManifest || body.expectedManifestRevision !== undefined
+                || typeof body.expectedManifest !== 'object'
+                || Array.isArray(body.expectedManifest)
+                || Object.keys(body.expectedManifest).length !== 4
+                || Object.keys(body.expectedManifest).some(key => ![
+                    'version', 'generation', 'valueKeys', 'metaKeys',
+                ].includes(key))) {
+                throw new Error('Plugin storage batch requires an exact expectedManifest.');
+            }
+            expectedManifest = normalizePluginStorageManifestRequest(
+                body.expectedManifest,
+                'expectedManifest',
+            );
+            if (expectedManifest.generation !== requestedGeneration
+                || expectedManifest.valueKeys.length !== body.expectedManifest.valueKeys.length
+                || expectedManifest.metaKeys.length !== body.expectedManifest.metaKeys.length) {
+                throw new Error('Plugin storage batch expectedManifest is not canonical.');
+            }
+        } else {
+            if (body.expectedManifest !== undefined
+                || typeof body.expectedManifestRevision !== 'string'
+                || !PLUGIN_STORAGE_REVISION_PATTERN.test(body.expectedManifestRevision)) {
+                throw new Error('Plugin storage batch requires an exact manifest revision.');
+            }
+            expectedManifestRevision = body.expectedManifestRevision;
         }
 
         const seen = new Set();
@@ -5725,6 +5871,7 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                 valueKey,
                 ownerKey,
                 valueBytes,
+                valueHash: sha256Hex(valueBytes),
                 owner: input.owner,
                 hasExpectedRevision,
                 expectedRevision: input.expectedRevision,
@@ -5758,7 +5905,9 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                     : null;
                 if (!activeManifest
                     || requestedGeneration !== liveGeneration
-                    || !pluginStorageManifestEquals(activeManifest, expectedManifest)
+                    || (expectedManifest
+                        ? !pluginStorageManifestEquals(activeManifest, expectedManifest)
+                        : manifestState.revision !== expectedManifestRevision)
                     || (pinnedState && (
                         pinnedState.optimized !== true
                         || pinnedState.generation !== requestedGeneration
@@ -5775,6 +5924,8 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
 
                 const nextValueKeys = new Set(activeManifest.valueKeys);
                 const nextMetaKeys = new Set(activeManifest.metaKeys);
+                const activeValueKeys = new Set(activeManifest.valueKeys);
+                const activeMetaKeys = new Set(activeManifest.metaKeys);
                 for (const operation of operations) {
                     if (operation.operation === 'set') {
                         nextValueKeys.add(operation.valueKey);
@@ -5791,10 +5942,10 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                     nextMetaKeys,
                 );
                 const readActiveState = (operation) => {
-                    const valueBytes = activeManifest.valueKeys.includes(operation.valueKey)
+                    const valueBytes = activeValueKeys.has(operation.valueKey)
                         ? kvGet(operation.valueKey)
                         : null;
-                    const ownerBytes = activeManifest.metaKeys.includes(operation.ownerKey)
+                    const ownerBytes = activeMetaKeys.has(operation.ownerKey)
                         ? kvGet(operation.ownerKey)
                         : null;
                     const owner = parsePluginStorageOwnerRecord(ownerBytes);
@@ -5836,13 +5987,15 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                             kvSet(operation.valueKey, operation.valueBytes);
                             hitPluginStorageBatchFailpoint(`after-value:${index}`);
                             if (operation.owner) {
-                                kvSet(operation.ownerKey, Buffer.from(JSON.stringify({
+                                operation.committedOwnerBytes = Buffer.from(JSON.stringify({
                                     plugin: operation.owner,
                                     updatedAt,
                                     revision: nodeCrypto.randomUUID(),
                                     generation,
-                                }), 'utf-8'));
+                                }), 'utf-8');
+                                kvSet(operation.ownerKey, operation.committedOwnerBytes);
                             } else {
+                                operation.committedOwnerBytes = null;
                                 kvDel(operation.ownerKey);
                             }
                             hitPluginStorageBatchFailpoint(`after-owner:${index}`);
@@ -5860,10 +6013,15 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                     markPluginRecoverySnapshotDirty(recoverySnapshotToken);
                     committedRevisions = operations.map(operation => ({
                         key: operation.rawKey,
-                        revision: readPluginStorageState(
-                            operation.valueKey,
-                            operation.ownerKey,
-                        ).revision,
+                        revision: operation.operation === 'set'
+                            ? pluginStorageRevision(
+                                operation.valueBytes,
+                                operation.committedOwnerBytes,
+                            )
+                            : null,
+                        valueHash: operation.operation === 'set'
+                            ? operation.valueHash
+                            : null,
                     }));
                 });
             } catch (error) {
@@ -5983,8 +6141,8 @@ app.get('/api/storage/list-sizes', async (req, res, next) => {
 /**
  * One logical V3 save mutation. The value row and its ownership sidecar share
  * one synchronous SQLite writer transaction. Empty owner means deliberately
- * unowned (delete stale metadata); remove always deletes a matching owner row,
- * including an owner orphan left by historical clients.
+ * unowned (delete stale metadata). Owned removes delete the matching sidecar;
+ * value-only removes preserve it byte-exact for inline/optimized parity.
  */
 function sendPluginStorageMutationLimitError(res, operation, error) {
     return res.status(error.status || 413).json({
@@ -6099,19 +6257,24 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
                     throw new Error('A set mutation requires JSON value bytes.');
                 }
-                valueBytes = Buffer.from(req.body);
+                // express.raw already owns an exact Buffer for this request.
+                // Retain it through validation, hashing, and the transaction
+                // instead of allocating another full-value defensive copy.
+                valueBytes = req.body;
                 valueSize = valueBytes.length;
                 valueHash = sha256Hex(valueBytes);
                 // Match every other optimized plugin row ingress boundary.
                 validatePluginStorageRow(valueKey, valueBytes);
             }
         } else {
-            if (ownerPolicyHeader !== '' || ownerRecordHeader !== undefined) {
-                throw new Error('Remove mutations do not accept owner replacement data.');
+            if (!['', 'preserve'].includes(ownerPolicyHeader)
+                || ownerRecordHeader !== undefined) {
+                throw new Error('Remove mutations accept only the preserve owner policy.');
             }
+            ownerPolicy = ownerPolicyHeader || 'replace';
             // BR4 permits a few value-only keys whose corresponding metadata
-            // name is too long for an archive. Removing such a value must still
-            // clean an impossible/historical sidecar without trying to create it.
+            // name is too long for an archive. Derive the unrestricted name so
+            // owned removal can clean it and value-only removal can preserve it.
             ownerKey = unrestrictedOwnerKey;
         }
     } catch (error) {
@@ -6231,7 +6394,8 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
             if (activeManifest) {
                 if (operation === 'set') nextValueKeys.add(valueKey);
                 else nextValueKeys.delete(valueKey);
-                if (operation === 'remove' || ownerPolicy === 'replace' && !owner) {
+                if ((operation === 'remove' && ownerPolicy !== 'preserve')
+                    || (ownerPolicy === 'replace' && !owner)) {
                     nextMetaKeys.delete(ownerKey);
                 } else if (operation === 'set' && ownerPolicy !== 'preserve') {
                     nextMetaKeys.add(ownerKey);
@@ -6270,7 +6434,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                     } else {
                         kvDel(valueKey);
                         hitPluginStorageMutationFailpoint('owner-remove');
-                        kvDel(ownerKey);
+                        if (ownerPolicy !== 'preserve') kvDel(ownerKey);
                     }
                     maybeFailPluginStorageTransaction(req, 'after-row');
                     writePluginStorageManifest(nextManifest);
@@ -6317,7 +6481,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                     : storedValue === null;
                 const ownerMatches = operation === 'set' && ownerPolicy === 'record'
                     ? storedOwner !== null && storedOwner.equals(ownerRecordBytes)
-                    : operation === 'set' && ownerPolicy === 'preserve'
+                    : ownerPolicy === 'preserve'
                         ? (storedOwner === null) === (preservedOwner === null)
                             && (storedOwner === null || storedOwner.equals(preservedOwner))
                         : operation === 'set' && owner
@@ -7182,7 +7346,7 @@ app.get('/api/plugin-storage/transition/stage/status', async (req, res, next) =>
     try {
         const transitionId = req.headers['x-plugin-storage-transition'];
         if (typeof transitionId !== 'string') return res.status(400).json({ error: 'Transition id required' });
-        await queueStorageOperation(async () => {
+        await queueStorageReadAfterImports(async () => {
             const stage = await refreshPluginTransitionStageState(
                 readPluginTransitionStage(transitionId),
             );

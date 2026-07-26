@@ -5,11 +5,13 @@ const cache = vi.hoisted(() => ({
     getVerifiedManifestSnapshot: vi.fn(),
     getVerifiedCachedBytes: vi.fn(),
     sha256Bytes: vi.fn(),
+    sha256OwnedBytes: vi.fn(),
     storeBytes: vi.fn(),
     storeOwnedBytesWithKnownHash: vi.fn(),
 }))
 
 vi.mock('./resourceCache', () => ({
+    applyOwnedResourceCacheMutations: vi.fn(async () => undefined),
     getManifestHashes: cache.getManifestHashes,
     getVerifiedManifestSnapshot: cache.getVerifiedManifestSnapshot,
     getVerifiedCachedBytes: cache.getVerifiedCachedBytes,
@@ -20,6 +22,7 @@ vi.mock('./resourceCache', () => ({
         typeof value === 'string' && /^[0-9a-f]{64}$/.test(value),
     persistResourceCacheManifests: vi.fn(async () => undefined),
     sha256Bytes: cache.sha256Bytes,
+    sha256OwnedBytes: cache.sha256OwnedBytes,
     settleBestEffortResourceCache: async <T>(operation: Promise<T>, fallback: T) => {
         try {
             return await operation
@@ -91,6 +94,13 @@ function transitionStatus(
     }
 }
 
+const unuploadedRow = {
+    storageKey: 'pluginsave/YQ.json',
+    size: 3,
+    sha256: 'a'.repeat(64),
+    uploaded: false,
+}
+
 function stalledAcknowledgement(): Response {
     const response = new Response(null, { status: 200 })
     vi.spyOn(response, 'json').mockImplementation(
@@ -118,6 +128,7 @@ beforeEach(() => {
     cache.getVerifiedManifestSnapshot.mockResolvedValue(null)
     cache.getVerifiedCachedBytes.mockResolvedValue(null)
     cache.sha256Bytes.mockResolvedValue('a'.repeat(64))
+    cache.sha256OwnedBytes.mockResolvedValue('a'.repeat(64))
     cache.storeBytes.mockResolvedValue(undefined)
     cache.storeOwnedBytesWithKnownHash.mockResolvedValue(undefined)
 })
@@ -128,6 +139,105 @@ afterEach(() => {
 })
 
 describe('NodeStorage staged finalize ambiguity', () => {
+    it('accepts only the exact missing-stage abort tombstone as definitive', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({
+            success: true,
+            transitionId: TRANSITION_ID,
+            state: 'aborted',
+        })))
+        const storage = readyStorage()
+
+        await expect(storage.abortPluginStorageTransition(TRANSITION_ID)).resolves.toEqual({
+            success: true,
+            transitionId: TRANSITION_ID,
+            state: 'aborted',
+        })
+    })
+
+    it('resolves a lost abort acknowledgement through one idempotent tombstone retry', async () => {
+        const fetchMock = vi.fn()
+            .mockRejectedValueOnce(new TypeError('abort acknowledgement lost'))
+            .mockResolvedValueOnce(jsonResponse({
+                success: true,
+                transitionId: TRANSITION_ID,
+                state: 'aborted',
+            }))
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+
+        await expect(storage.abortPluginStorageTransition(TRANSITION_ID)).resolves.toMatchObject({
+            state: 'aborted',
+        })
+        expect(fetchMock).toHaveBeenCalledTimes(2)
+        expect(fetchMock.mock.calls.every(([url]) => String(url).endsWith('/abort'))).toBe(true)
+    })
+
+    it.each([
+        ['extra status field', { ...transitionStatus('ready'), unexpected: true }],
+        ['ready with an etag', { ...transitionStatus('ready'), etag: 'a'.repeat(32) }],
+        ['aborted with an etag', { ...transitionStatus('aborted'), etag: 'a'.repeat(32) }],
+        ['uploading with no outstanding row', transitionStatus('uploading')],
+        ['uploading while internalizing', {
+            ...transitionStatus('uploading'),
+            direction: 'internalize',
+            rows: [unuploadedRow],
+            total: 1,
+            totalBytes: 3,
+        }],
+        ['unuploaded row without an authoritative hash', {
+            ...transitionStatus('uploading'),
+            rows: [{ ...unuploadedRow, sha256: null }],
+            total: 1,
+            totalBytes: 3,
+        }],
+        ['committed with an unuploaded row', {
+            ...transitionStatus('committed'),
+            rows: [unuploadedRow],
+            total: 1,
+            totalBytes: 3,
+        }],
+    ])('rejects %s', async (_name, invalidStatus) => {
+        vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(invalidStatus)))
+        const storage = readyStorage()
+
+        await expect(storage.getPluginStorageTransitionStatus(TRANSITION_ID))
+            .rejects.toMatchObject({ code: 'STORAGE_RESPONSE_ERROR' })
+    })
+
+    it.each([
+        ['wrong key', {
+            storageKey: 'pluginsave/Yg.json', size: 3, sha256: 'a'.repeat(64), uploaded: true,
+        }],
+        ['wrong size', {
+            storageKey: 'pluginsave/YQ.json', size: 4, sha256: 'a'.repeat(64), uploaded: true,
+        }],
+        ['wrong hash', {
+            storageKey: 'pluginsave/YQ.json', size: 3, sha256: 'b'.repeat(64), uploaded: true,
+        }],
+        ['not uploaded', {
+            storageKey: 'pluginsave/YQ.json', size: 3, sha256: 'a'.repeat(64), uploaded: false,
+        }],
+    ])('does not trust a staged upload acknowledgement with %s', async (_name, row) => {
+        const status = {
+            ...transitionStatus('ready'),
+            rows: [row],
+            uploaded: row.uploaded ? 1 : 0,
+            total: 1,
+            totalBytes: row.size,
+        }
+        vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(status)))
+        const storage = readyStorage()
+
+        await expect(storage.uploadPluginStorageTransitionRow(
+            TRANSITION_ID,
+            'pluginsave/YQ.json',
+            new Uint8Array([34, 97, 34]),
+        )).rejects.toMatchObject({
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            commitOutcomeUnknown: true,
+        })
+    })
+
     it('preserves ambiguity when both finalize and its status lookup time out', async () => {
         vi.useFakeTimers()
         const fetchMock = vi.fn((input: RequestInfo | URL) => {

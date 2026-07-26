@@ -123,6 +123,24 @@ describe('staged plugin storage transitions (real server)', () => {
     const internalState = await internalBegin.json() as any
     expect(internalState.state).toBe('ready')
     expect(internalState.rows).toHaveLength(1)
+    const ownershipSnapshot = await client.fetch('/api/plugin-storage/manifest', {
+      headers: { 'x-plugin-storage-generation': externalGeneration },
+    })
+    expect(ownershipSnapshot.status).toBe(200)
+    const ownership = await ownershipSnapshot.json() as any
+    expect(ownership).toMatchObject({
+      success: true,
+      generation: externalGeneration,
+      manifestRevision: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+      manifest: {
+        version: 1,
+        generation: externalGeneration,
+        valueKeys: [valueKey],
+        metaKeys: [],
+      },
+      valueKeys: [valueKey],
+      metaKeys: [],
+    })
     const stagedRead = await client.fetch('/api/plugin-storage/transition/stage/row', {
       headers: {
         'x-plugin-storage-transition': internalId,
@@ -137,6 +155,27 @@ describe('staged plugin storage transitions (real server)', () => {
     })
     expect(internalFinalize.status).toBe(200)
     expect((await internalFinalize.json() as any).state).toBe('committed')
+
+    const staleBatch = await client.fetch('/api/plugin-storage/batch', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: new TextEncoder().encode(JSON.stringify({
+        version: 2,
+        generation: externalGeneration,
+        expectedManifestRevision: ownership.manifestRevision,
+        operations: [{
+          operation: 'set',
+          key: rawKey,
+          value: value.toString('base64'),
+          owner: 'Stale PM4 Writer',
+        }],
+      })),
+    })
+    expect(staleBatch.status).toBe(409)
+    await expect(staleBatch.json()).resolves.toMatchObject({
+      outcome: 'not-committed',
+      code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
+    })
 
     const databaseResponse = await client.fetch('/api/read', {
       headers: { 'file-path': filePathHeader(DATABASE_KEY) },
