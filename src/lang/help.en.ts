@@ -639,7 +639,7 @@ export const helpEn = {
         embeddingCustomModel:
             "Model name to send to the custom endpoint, exactly as the server expects (e.g. `nomic-embed-text-v1.5`).",
         embeddingVoyageKey:
-            "Voyage AI API key (`https://www.voyageai.com/`). Required when the embedding model is set to voyageContext3 etc.",
+            "Voyage AI API key (`https://www.voyageai.com/`). Required when the embedding model is set to Voyage Context 3 or Voyage Context 4.",
 
         ttsAutoSpeech:
             "Automatically play the character's response as speech when it arrives. Mobile browsers may block this in the background — after enabling, tap the screen once to grant permission.",

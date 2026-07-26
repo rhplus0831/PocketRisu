@@ -22,7 +22,7 @@ The memory-lorebook subsystem builds context that is not simply the recent chat 
 ### Long-term memory and embeddings
 
 - `src/ts/process/memory/hypamemory.ts` — approximately 291 lines. First-generation embedding client, vector store, and shared persistent embedding cache.
-  - `HypaModel` lists custom, OpenAI, local Transformers, and Voyage Context 3 backends (`src/ts/process/memory/hypamemory.ts:9`).
+  - `HypaModel` lists custom, OpenAI, local Transformers, and Voyage Context 3/4 backends (`src/ts/process/memory/hypamemory.ts:9`).
   - `localModels` maps UI model identifiers to Hugging Face model IDs and identifies WebGPU variants (`src/ts/process/memory/hypamemory.ts:14`).
   - `hypaVectorCache`, `getPersistedHypaVector()`, and `setPersistedHypaVector()` provide process-local and persistent vector caching (`src/ts/process/memory/hypamemory.ts:40`, `src/ts/process/memory/hypamemory.ts:43`, `src/ts/process/memory/hypamemory.ts:56`).
   - `HypaProcesser` embeds documents, loads cached vectors, and performs similarity search (`src/ts/process/memory/hypamemory.ts:69`).
@@ -39,8 +39,8 @@ The memory-lorebook subsystem builds context that is not simply the recent chat 
 
 - `src/ts/process/memory/contextualEmbedding.ts` — approximately 133 lines. Adapter layer for context-dependent embedding APIs.
   - `ContextualEmbeddingProvider` requires grouped document embedding, query embedding, and a context-aware cache suffix (`src/ts/process/memory/contextualEmbedding.ts:5`).
-  - `isContextModel()` and `getContextProvider()` currently recognize only `voyageContext3` (`src/ts/process/memory/contextualEmbedding.ts:12`, `src/ts/process/memory/contextualEmbedding.ts:16`).
-  - `VoyageContext3Provider` calls Voyage’s `voyage-context-3` contextualized-embeddings endpoint using `db.voyageApiKey` (`src/ts/process/memory/contextualEmbedding.ts:25`, `src/ts/process/memory/contextualEmbedding.ts:30`).
+  - `isContextModel()` and `getContextProvider()` recognize `voyageContext3` and `voyageContext4` (`src/ts/process/memory/contextualEmbedding.ts:12`, `src/ts/process/memory/contextualEmbedding.ts:16`).
+  - `VoyageContextProvider` calls Voyage’s contextualized-embeddings endpoint with `voyage-context-3` or `voyage-context-4` using `db.voyageApiKey` (`src/ts/process/memory/contextualEmbedding.ts:25`, `src/ts/process/memory/contextualEmbedding.ts:39`).
   - Document groups are batched at no more than 1,000 groups or 16,000 total chunks per request (`src/ts/process/memory/contextualEmbedding.ts:27`, `src/ts/process/memory/contextualEmbedding.ts:108`).
   - Context hashes are included only when a group contains more than one text (`src/ts/process/memory/contextualEmbedding.ts:101`).
 
@@ -237,7 +237,7 @@ The two implementations differ in execution details:
 
 - `ada`, `openai3small`, and `openai3large` call the OpenAI embeddings API using `supaMemoryKey` unless an instance-specific key is set (`src/ts/process/memory/hypamemory.ts:142`).
 
-- `voyageContext3` uses grouped contextual document embeddings and separate query embeddings (`src/ts/process/memory/hypamemory.ts:104`, `src/ts/process/memory/contextualEmbedding.ts:42`).
+- `voyageContext3` and `voyageContext4` use grouped contextual document embeddings and separate query embeddings (`src/ts/process/memory/hypamemory.ts:104`, `src/ts/process/memory/contextualEmbedding.ts:51`).
 
 - Vector cache entries live both in the module-level `hypaVectorCache` map and `forageStorage` under hashed `cache/hypa-vector/` keys (`src/ts/process/memory/hypamemory.ts:39`). Hypa V3 summary text itself is not stored there; it is persisted per chat in `Chat.hypaV3Data` (`src/ts/storage/database.svelte.ts:2053`).
 

@@ -364,7 +364,7 @@ export const helpKo = {
         "embeddingCustomURL": "Custom 임베딩 모델의 OpenAI 호환 엔드포인트 URL. 자체 호스트 또는 오픈소스 임베딩 서버를 사용할 때.",
         "embeddingCustomKey": "Custom 임베딩 서버 인증 키. 서버가 인증을 요구하지 않으면 비워두세요.",
         "embeddingCustomModel": "Custom 엔드포인트에 보낼 모델 이름 (서버가 요구하는 형식 그대로 입력). 예: `nomic-embed-text-v1.5`.",
-        "embeddingVoyageKey": "Voyage AI API 키 (`https://www.voyageai.com/`). 임베딩 모델을 voyageContext3 등으로 선택했을 때 필요.",
+        "embeddingVoyageKey": "Voyage AI API 키 (`https://www.voyageai.com/`). 임베딩 모델을 Voyage Context 3 또는 Voyage Context 4로 선택했을 때 필요.",
 
         "ttsAutoSpeech": "캐릭터 응답이 도착하면 자동으로 음성으로 재생합니다. 모바일 백그라운드 사용 시 브라우저가 차단할 수 있으니, 활성화 후 직접 한 번 화면을 터치해 권한을 부여하세요.",
         "ttsElevenLabsKey": "ElevenLabs(`https://elevenlabs.io`) API 키. 가장 자연스러운 음성을 제공하지만 사용량 한도가 작은 무료 플랜·과금 플랜이 있습니다.",

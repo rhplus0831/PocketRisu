@@ -1226,6 +1226,7 @@
             <OptionInput value="openai3large">OpenAI text-embedding-3-large</OptionInput>
             <OptionInput value="ada">OpenAI Ada</OptionInput>
             <OptionInput value="custom">Custom (OpenAI-compatible)</OptionInput>
+            <OptionInput value="voyageContext4">Voyage Context 4</OptionInput>
             <OptionInput value="voyageContext3">Voyage Context 3</OptionInput>
         </SelectInput>
 
@@ -1243,7 +1244,7 @@
             <TextInput className="mt-2" marginBottom bind:value={DBState.db.hypaCustomSettings.model}/>
         {/if}
 
-        {#if DBState.db.hypaModel === 'voyageContext3'}
+        {#if DBState.db.hypaModel === 'voyageContext3' || DBState.db.hypaModel === 'voyageContext4'}
             <span class="text-textcolor">Voyage API Key <Help key="embeddingVoyageKey"/></span>
             <TextInput className="mt-2" marginBottom hideText={DBState.db.hideApiKey} bind:value={DBState.db.voyageApiKey}/>
         {/if}
