@@ -63,6 +63,49 @@ async function writeKvResponse(client: RisuClient, key: string, value: Buffer): 
   })
 }
 
+async function mutatePluginValueResponse(
+  client: RisuClient,
+  generation: string,
+  valueKey: string,
+  value: Buffer,
+  ownerRecord?: Buffer,
+): Promise<Response> {
+  const headers: Record<string, string> = {
+    'content-type': 'application/octet-stream',
+    'file-path': Buffer.from(valueKey, 'utf-8').toString('hex'),
+    'x-plugin-storage-operation': 'set',
+    'x-plugin-storage-generation': generation,
+    'x-plugin-storage-owner': '',
+  }
+  if (ownerRecord) {
+    headers['x-plugin-storage-owner-policy'] = 'record'
+    headers['x-plugin-storage-owner-record'] = ownerRecord.toString('base64url')
+  }
+  return client.fetch('/api/plugin-storage/mutate', {
+    method: 'POST',
+    headers,
+    body: new Uint8Array(value),
+  })
+}
+
+async function mutatePluginValue(
+  client: RisuClient,
+  generation: string,
+  valueKey: string,
+  value: Buffer,
+  ownerRecord?: Buffer,
+): Promise<void> {
+  const response = await mutatePluginValueResponse(
+    client,
+    generation,
+    valueKey,
+    value,
+    ownerRecord,
+  )
+  expect(response.status).toBe(200)
+  await response.text()
+}
+
 async function importBackupResponse(client: RisuClient, data: Buffer): Promise<Response> {
   const prepared = await client.fetch('/api/backup/import/prepare', {
     method: 'POST',
@@ -131,34 +174,71 @@ describe('external plugin rows in backup archives', () => {
     const source = await spawnServer()
     servers.push(source)
     const sourceClient = await createClient(source.port, source.password)
-    const seed = withDatabaseFields(createSeedBackup({ characterCount: 1 }), {
+    const seedGeneration = 'backup-boundary-generation'
+    const seedEntries = decodeBackup(withDatabaseFields(createSeedBackup({ characterCount: 1 }), {
       optimizePluginMemory: true,
+      pluginStorageGeneration: seedGeneration,
       pluginCustomStorage: {},
+    }))
+    seedEntries.push({
+      name: PLUGIN_STORAGE_MANIFEST_KEY,
+      data: Buffer.from(JSON.stringify({
+        version: 1,
+        generation: seedGeneration,
+        valueKeys: [],
+        metaKeys: [],
+      })),
     })
-    expect((await sourceClient.importBackup(seed)).ok).toBe(true)
+    expect((await sourceClient.importBackup(encodeBackup(seedEntries))).ok).toBe(true)
+    const activeDatabase = decodeRisuDat(readKvValue(source.cwd, 'database/database.bin')!)
+    expect(activeDatabase.pluginStorageGeneration).toBe(seedGeneration)
+    const activeGeneration = activeDatabase.pluginStorageGeneration as string
 
     const maxOwnedRawKey = 'o'.repeat(752)
     const maxValueOnlyRawKey = 'v'.repeat(756)
     const maxOwnedValueKey = pluginStorageKey('pluginsave/', maxOwnedRawKey)
     const maxOwnedMetaKey = pluginStorageKey('pluginsave-meta/', maxOwnedRawKey)
     const maxValueOnlyKey = pluginStorageKey('pluginsave/', maxValueOnlyRawKey)
+    const maxOwnedValue = Buffer.from('{"long":"identifier"}')
+    const maxOwnedMeta = Buffer.from('{"plugin":"Boundary","updatedAt":1}')
+    const maxValueOnly = Buffer.from('"value-only-maximum"')
     expect(Buffer.byteLength(maxOwnedMetaKey, 'utf-8')).toBe(1024)
     expect(Buffer.byteLength(maxValueOnlyKey, 'utf-8')).toBe(1024)
 
-    await writeKv(sourceClient, maxOwnedValueKey, Buffer.from('{"long":"identifier"}'))
-    await writeKv(sourceClient, maxOwnedMetaKey, Buffer.from('{"plugin":"Boundary","updatedAt":1}'))
-    await writeKv(sourceClient, maxValueOnlyKey, Buffer.from('"value-only-maximum"'))
+    const genericWriteResponse = await writeKvResponse(
+      sourceClient,
+      maxOwnedValueKey,
+      maxOwnedValue,
+    )
+    expect(genericWriteResponse.status).toBe(409)
+    await genericWriteResponse.text()
+    await mutatePluginValue(
+      sourceClient,
+      activeGeneration,
+      maxOwnedValueKey,
+      maxOwnedValue,
+      maxOwnedMeta,
+    )
+    await mutatePluginValue(
+      sourceClient,
+      activeGeneration,
+      maxValueOnlyKey,
+      maxValueOnly,
+    )
 
     const oversizedValueKey = pluginStorageKey('pluginsave/', 'x'.repeat(757))
     const oversizedMetaKey = pluginStorageKey('pluginsave-meta/', 'x'.repeat(753))
-    const oversizedValueResponse = await writeKvResponse(
+    const oversizedValueResponse = await mutatePluginValueResponse(
       sourceClient,
+      activeGeneration,
       oversizedValueKey,
       Buffer.from('1'),
     )
-    const oversizedMetaResponse = await writeKvResponse(
+    const oversizedMetaResponse = await mutatePluginValueResponse(
       sourceClient,
-      oversizedMetaKey,
+      activeGeneration,
+      pluginStorageKey('pluginsave/', 'x'.repeat(753)),
+      Buffer.from('1'),
       Buffer.from('{}'),
     )
     expect(oversizedValueResponse.status).toBe(400)
@@ -168,9 +248,9 @@ describe('external plugin rows in backup archives', () => {
 
     const nodeBackup = await sourceClient.exportBackup()
     const nodeEntries = entriesByName(nodeBackup)
-    expect(nodeEntries.get(maxOwnedValueKey)).toEqual(Buffer.from('{"long":"identifier"}'))
-    expect(nodeEntries.get(maxOwnedMetaKey)).toEqual(Buffer.from('{"plugin":"Boundary","updatedAt":1}'))
-    expect(nodeEntries.get(maxValueOnlyKey)).toEqual(Buffer.from('"value-only-maximum"'))
+    expect(nodeEntries.get(maxOwnedValueKey)).toEqual(maxOwnedValue)
+    expect(nodeEntries.get(maxOwnedMetaKey)).toEqual(maxOwnedMeta)
+    expect(nodeEntries.get(maxValueOnlyKey)).toEqual(maxValueOnly)
 
     const destination = await spawnServer()
     servers.push(destination)
@@ -502,8 +582,10 @@ describe('external plugin rows in backup archives', () => {
     const oldValue = Buffer.from('{"durable":"old-value"}')
     const oldMeta = Buffer.from('{"plugin":"Old Plugin","updatedAt":1}')
     await writeKv(client, 'database/database.bin', oldDatabase)
-    await writeKv(client, oldValueKey, oldValue)
-    await writeKv(client, oldMetaKey, oldMeta)
+    // Preserve a historical pre-BR2 physical publication for the rollback
+    // assertion. Generic plugin-row staging is intentionally rejected now.
+    writeFixtureKvValue(server.cwd, oldValueKey, oldValue)
+    writeFixtureKvValue(server.cwd, oldMetaKey, oldMeta)
 
     const persistedOldDatabase = readKvValue(server.cwd, 'database/database.bin')
     const invalidDatabase = encodeRisuDat({

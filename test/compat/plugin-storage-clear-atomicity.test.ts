@@ -3,6 +3,11 @@ import { createClient, type RisuClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import Database from 'better-sqlite3'
 import path from 'node:path'
+import utilsPkg from '../../server/node/utils.cjs'
+
+const { encodeRisuSaveLegacy } = utilsPkg as {
+  encodeRisuSaveLegacy: (value: unknown) => Uint8Array
+}
 
 const servers: ServerHandle[] = []
 
@@ -19,6 +24,9 @@ const OWNER_KEYS = [
   'pluginsave-meta/YmV0YQ.json',
 ]
 const UNRELATED_KEY = 'drafts/clear-must-not-touch'
+const DATABASE_KEY = 'database/database.bin'
+const MANIFEST_KEY = 'plugin-storage/manifest.json'
+const STORAGE_GENERATION = 'clear-storage-generation'
 const OLD_ROWS = new Map<string, Buffer>([
   [VALUE_KEYS[0], Buffer.from('{"value":"alpha"}')],
   [VALUE_KEYS[1], Buffer.from('{"value":"beta"}')],
@@ -26,6 +34,12 @@ const OLD_ROWS = new Map<string, Buffer>([
   [OWNER_KEYS[1], Buffer.from('{"plugin":"B","updatedAt":2}')],
 ])
 const UNRELATED_VALUE = Buffer.from('{"retained":true}')
+const ACTIVE_MANIFEST = {
+  version: 1,
+  generation: STORAGE_GENERATION,
+  valueKeys: VALUE_KEYS,
+  metaKeys: OWNER_KEYS,
+}
 
 function hexPath(key: string): string {
   return Buffer.from(key, 'utf-8').toString('hex')
@@ -45,11 +59,17 @@ async function writeKv(client: RisuClient, key: string, value: Buffer): Promise<
 }
 
 async function readKv(client: RisuClient, key: string): Promise<Buffer | null> {
+  const headers: Record<string, string> = { 'file-path': hexPath(key) }
+  if (key.startsWith('pluginsave/') || key.startsWith('pluginsave-meta/')) {
+    headers['x-plugin-storage-generation'] = STORAGE_GENERATION
+  }
   const response = await client.fetch('/api/read', {
-    headers: { 'file-path': hexPath(key) },
+    headers,
   })
   if (response.status === 404) return null
-  expect(response.status).toBe(200)
+  if (response.status !== 200) {
+    throw new Error(`read ${key} failed (${response.status}): ${await response.text()}`)
+  }
   const value = Buffer.from(await response.arrayBuffer())
   return value.byteLength === 0 ? null : value
 }
@@ -71,10 +91,18 @@ async function startSeededServer(failpoint = ''): Promise<{
       'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
     )
     for (const [key, value] of OLD_ROWS) insert.run(key, value, Date.now())
+    insert.run(MANIFEST_KEY, Buffer.from(JSON.stringify(ACTIVE_MANIFEST)), Date.now())
+    insert.run(DATABASE_KEY, Buffer.from(encodeRisuSaveLegacy({
+      characters: [],
+      optimizePluginMemory: true,
+      pluginStorageGeneration: STORAGE_GENERATION,
+      pluginCustomStorage: {},
+    })), Date.now())
   } finally {
     sqlite.close()
   }
   await writeKv(client, UNRELATED_KEY, UNRELATED_VALUE)
+  expect(await readKv(client, DATABASE_KEY)).not.toBeNull()
   return { client, server }
 }
 
@@ -83,6 +111,8 @@ async function expectOldSet(client: RisuClient): Promise<void> {
     expect(await readKv(client, key), key).toEqual(value)
   }
   expect(await readKv(client, UNRELATED_KEY)).toEqual(UNRELATED_VALUE)
+  expect(JSON.parse((await readKv(client, MANIFEST_KEY))!.toString('utf-8')))
+    .toEqual(ACTIVE_MANIFEST)
 }
 
 async function expectEmptyPluginSet(client: RisuClient): Promise<void> {
@@ -90,6 +120,13 @@ async function expectEmptyPluginSet(client: RisuClient): Promise<void> {
     expect(await readKv(client, key), key).toBeNull()
   }
   expect(await readKv(client, UNRELATED_KEY)).toEqual(UNRELATED_VALUE)
+  expect(JSON.parse((await readKv(client, MANIFEST_KEY))!.toString('utf-8')))
+    .toEqual({
+      version: 1,
+      generation: STORAGE_GENERATION,
+      valueKeys: [],
+      metaKeys: [],
+    })
 }
 
 describe('atomic optimized plugin storage clear', () => {

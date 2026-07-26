@@ -460,6 +460,49 @@ async function mutateStorage(
     })
 }
 
+async function mutateActualPluginStorage(
+    server: RunningServer,
+    auth: AuthHeaders,
+    {
+        rawKey,
+        operation,
+        generation,
+        value,
+        owner = '',
+    }: {
+        rawKey: string
+        operation: 'set' | 'remove'
+        generation: string
+        value?: unknown
+        owner?: string
+    },
+): Promise<Response> {
+    return await fetch(`${server.origin}/api/plugin-storage/mutate`, {
+        method: 'POST',
+        headers: {
+            ...auth,
+            'content-type': 'application/octet-stream',
+            'file-path': Buffer.from(valueRowKey(rawKey), 'utf-8').toString('hex'),
+            'x-plugin-storage-operation': operation,
+            'x-plugin-storage-generation': generation,
+            'x-plugin-storage-owner': Buffer.from(owner, 'utf-8').toString('base64url'),
+        },
+        body: operation === 'set'
+            ? Buffer.from(JSON.stringify(value), 'utf-8')
+            : new Uint8Array(),
+    })
+}
+
+async function clearActualPluginStorage(
+    server: RunningServer,
+    auth: AuthHeaders,
+): Promise<Response> {
+    return await fetch(`${server.origin}/api/plugin-storage/clear`, {
+        method: 'POST',
+        headers: auth,
+    })
+}
+
 async function mutateCurrentStorage(
     server: RunningServer,
     auth: AuthHeaders,
@@ -1094,6 +1137,258 @@ describe('atomic plugin storage publication', () => {
 })
 
 describe('plugin publication recovery snapshot scheduling', () => {
+    it('snapshots and restores actual V3 set/remove requests with an exact manifest', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '300',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'old', removed: 'delete-me' },
+            meta: {
+                alpha: { plugin: 'owner-old' },
+                removed: { plugin: 'owner-removed' },
+            },
+        }))
+        const db = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        const generation = db.pluginStorageGeneration as string
+
+        const setResponse = await mutateActualPluginStorage(server, auth, {
+            rawKey: 'alpha',
+            operation: 'set',
+            generation,
+            value: { actual: 'set' },
+            owner: 'Actual Plugin',
+        })
+        expect(setResponse.status).toBe(200)
+        await expect(setResponse.json()).resolves.toMatchObject({
+            outcome: 'committed',
+            operation: 'set',
+        })
+        const removeResponse = await mutateActualPluginStorage(server, auth, {
+            rawKey: 'removed',
+            operation: 'remove',
+            generation,
+        })
+        expect(removeResponse.status).toBe(200)
+        await expect(removeResponse.json()).resolves.toMatchObject({
+            outcome: 'committed',
+            operation: 'remove',
+        })
+
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
+        const expectedManifest = {
+            version: 1,
+            generation,
+            valueKeys: [valueRowKey('alpha')],
+            metaKeys: [metaRowKey('alpha')],
+        }
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            PLUGIN_STORAGE_MANIFEST_KEY,
+        )).toString('utf-8'))).toEqual(expectedManifest)
+        const [latest] = await readSnapshotDatabases(server, auth)
+        expect(latest.db.pluginCustomStorage).toEqual({ alpha: { actual: 'set' } })
+        expect(latest.db.pluginStorageMeta?.alpha).toMatchObject({
+            plugin: 'Actual Plugin',
+        })
+
+        await restoreSnapshot(server, auth, latest.key)
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('alpha'),
+            generation,
+        )).toString('utf-8'))).toEqual({ actual: 'set' })
+        expect((await readKey(
+            server,
+            auth,
+            valueRowKey('removed'),
+            generation,
+        )).length).toBe(0)
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            PLUGIN_STORAGE_MANIFEST_KEY,
+        )).toString('utf-8'))).toEqual(expectedManifest)
+    }, 30_000)
+
+    it('snapshots an actual V3 commit even when its acknowledgement is lost', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '300',
+            POCKETRISU_TEST_PLUGIN_MUTATION_FAILPOINT: 'acknowledgement-loss',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'before-ack-loss' },
+            meta: { alpha: { plugin: 'owner-before' } },
+        }))
+        const db = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        await expect(mutateActualPluginStorage(server, auth, {
+            rawKey: 'alpha',
+            operation: 'set',
+            generation: db.pluginStorageGeneration,
+            value: 'committed-without-ack',
+            owner: 'Ack Loss Plugin',
+        })).rejects.toThrow()
+
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
+        const [latest] = await readSnapshotDatabases(server, auth)
+        expect(latest.db.pluginCustomStorage?.alpha).toBe('committed-without-ack')
+        expect(latest.db.pluginStorageMeta?.alpha).toMatchObject({
+            plugin: 'Ack Loss Plugin',
+        })
+        await restoreSnapshot(server, auth, latest.key)
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('alpha'),
+            db.pluginStorageGeneration,
+        )).toString('utf-8'))).toBe('committed-without-ack')
+    }, 30_000)
+
+    it('does not snapshot a rolled-back actual V3 value/owner request', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '300',
+            POCKETRISU_TEST_PLUGIN_MUTATION_FAILPOINT: 'owner-write',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'old' },
+            meta: { alpha: { plugin: 'owner-old' } },
+        }))
+        const db = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        const manifestBefore = await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)
+        const response = await mutateActualPluginStorage(server, auth, {
+            rawKey: 'alpha',
+            operation: 'set',
+            generation: db.pluginStorageGeneration,
+            value: 'must-roll-back',
+            owner: 'Must Roll Back',
+        })
+        expect(response.status).toBe(500)
+        await delay(450)
+        expect(await listSnapshotKeys(server, auth)).toHaveLength(1)
+        expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY))
+            .toEqual(manifestBefore)
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('alpha'),
+            db.pluginStorageGeneration,
+        )).toString('utf-8'))).toBe('old')
+        expect((await readKey(server, auth, pluginRecoveryDirtyKey)).length).toBe(0)
+    }, 30_000)
+
+    it('publishes an actual clear as an empty manifest and restorable snapshot', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '300',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'a', beta: 'b' },
+            meta: {
+                alpha: { plugin: 'owner-a' },
+                beta: { plugin: 'owner-b' },
+            },
+        }))
+        const db = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        const response = await clearActualPluginStorage(server, auth)
+        expect(response.status).toBe(200)
+        await expect(response.json()).resolves.toMatchObject({
+            success: true,
+            commitOutcome: 'committed',
+        })
+
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
+        const emptyManifest = {
+            version: 1,
+            generation: db.pluginStorageGeneration,
+            valueKeys: [],
+            metaKeys: [],
+        }
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            PLUGIN_STORAGE_MANIFEST_KEY,
+        )).toString('utf-8'))).toEqual(emptyManifest)
+        const [latest] = await readSnapshotDatabases(server, auth)
+        expect(latest.db.pluginCustomStorage).toEqual({})
+        expect(latest.db.pluginStorageMeta).toBeUndefined()
+
+        await restoreSnapshot(server, auth, latest.key)
+        expect((await readKey(
+            server,
+            auth,
+            valueRowKey('alpha'),
+            db.pluginStorageGeneration,
+        )).length).toBe(0)
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            PLUGIN_STORAGE_MANIFEST_KEY,
+        )).toString('utf-8'))).toEqual(emptyManifest)
+    }, 30_000)
+
+    it('schedules clear before acknowledgement loss and never schedules a failed clear', async () => {
+        const lostAckServer = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '300',
+            POCKETRISU_TEST_PLUGIN_CLEAR_FAILPOINT: 'response',
+        })
+        const lostAckAuth = await authenticate(lostAckServer)
+        await writeKey(lostAckServer, lostAckAuth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'clear-without-ack' },
+            meta: { alpha: { plugin: 'owner' } },
+        }))
+        await readKey(lostAckServer, lostAckAuth, 'database/database.bin')
+        await expect(clearActualPluginStorage(lostAckServer, lostAckAuth)).rejects.toThrow()
+        await waitFor(async () => (
+            await listSnapshotKeys(lostAckServer, lostAckAuth)
+        ).length === 2)
+        const [lostAckSnapshot] = await readSnapshotDatabases(lostAckServer, lostAckAuth)
+        expect(lostAckSnapshot.db.pluginCustomStorage).toEqual({})
+
+        const failedServer = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '300',
+            POCKETRISU_TEST_PLUGIN_CLEAR_FAILPOINT: 'transaction',
+        })
+        const failedAuth = await authenticate(failedServer)
+        await writeKey(failedServer, failedAuth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'must-remain' },
+            meta: { alpha: { plugin: 'owner' } },
+        }))
+        const failedDb = await decodeRisuSave(
+            await readKey(failedServer, failedAuth, 'database/database.bin'),
+        )
+        const manifestBefore = await readKey(
+            failedServer,
+            failedAuth,
+            PLUGIN_STORAGE_MANIFEST_KEY,
+        )
+        const failedResponse = await clearActualPluginStorage(failedServer, failedAuth)
+        expect(failedResponse.status).toBe(500)
+        await delay(450)
+        expect(await listSnapshotKeys(failedServer, failedAuth)).toHaveLength(1)
+        expect(await readKey(failedServer, failedAuth, PLUGIN_STORAGE_MANIFEST_KEY))
+            .toEqual(manifestBefore)
+        expect(JSON.parse((await readKey(
+            failedServer,
+            failedAuth,
+            valueRowKey('alpha'),
+            failedDb.pluginStorageGeneration,
+        )).toString('utf-8'))).toBe('must-remain')
+        expect((await readKey(failedServer, failedAuth, pluginRecoveryDirtyKey)).length)
+            .toBe(0)
+    }, 60_000)
+
     it('coalesces plugin-only sets and removes into one exact restorable point', async () => {
         const cwd = makeWorkDir()
         let server = await startServer(cwd, {
@@ -1780,34 +2075,43 @@ describe('automatic snapshots × optimized plugin storage', () => {
             .toEqual(migrationMarkerBefore)
     })
 
-    it('rejects malformed direct plugin-row writes without replacing durable data', async () => {
+    it('rejects malformed atomic plugin-row writes without replacing durable data', async () => {
         const server = await startServer(makeWorkDir())
         const auth = await authenticate(server)
         const key = valueRowKey('write-boundary')
-        await writeKey(server, auth, 'database/database.bin', encodeRisuSaveLegacy({
-            characters: [],
-            optimizePluginMemory: true,
-            pluginCustomStorage: {},
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { 'write-boundary': { durable: true } },
         }))
-        await writeKey(server, auth, key, Buffer.from('{"durable":true}'))
+        const db = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
 
         for (const invalid of [Buffer.from('{"unfinished":'), Buffer.from([0xff])]) {
-            const response = await fetch(`${server.origin}/api/write`, {
+            const response = await fetch(`${server.origin}/api/plugin-storage/mutate`, {
                 method: 'POST',
                 headers: {
                     ...auth,
                     'content-type': 'application/octet-stream',
                     'file-path': Buffer.from(key).toString('hex'),
+                    'x-plugin-storage-operation': 'set',
+                    'x-plugin-storage-generation': db.pluginStorageGeneration,
+                    'x-plugin-storage-owner': '',
                 },
                 body: invalid,
             })
             expect(response.status).toBe(400)
-            await expect(response.json()).resolves.toEqual({
-                error: 'Invalid plugin storage JSON row',
-                code: 'INVALID_PLUGIN_STORAGE_ROW',
-                encodedKey: key,
+            await expect(response.json()).resolves.toMatchObject({
+                success: false,
+                outcome: 'not-committed',
+                error: expect.stringMatching(/valid UTF-8 JSON|Invalid plugin storage JSON row/),
+                code: 'INVALID_PLUGIN_STORAGE_MUTATION',
             })
-            expect(JSON.parse((await readKey(server, auth, key)).toString('utf-8')))
+            expect(JSON.parse((await readKey(
+                server,
+                auth,
+                key,
+                db.pluginStorageGeneration,
+            )).toString('utf-8')))
                 .toEqual({ durable: true })
         }
     })

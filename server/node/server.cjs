@@ -4753,20 +4753,57 @@ app.post('/api/plugin-storage/clear', async (req, res) => {
     if (!checkActiveSession(req, res)) return;
 
     try {
-        await queueStorageMutation(() => {
+        await queueStorageMutation(async () => {
             if (pluginStorageClearFailpoint === 'pre-transaction') {
                 throw new Error('Injected plugin storage clear failure before transaction');
             }
+            const publication = await readLivePluginStoragePublication();
+            const { dbObj, generation, manifestState } = publication;
+            const pinnedState = sessionPluginStorageReadState(req);
+            const activeManifest = generation
+                && dbObj?.optimizePluginMemory === true
+                && manifestState.valid
+                && manifestState.manifest?.generation === generation
+                ? manifestState.manifest
+                : null;
+            const legacyPublication = !generation
+                && dbObj?.optimizePluginMemory === true
+                && !manifestState.present;
+            if (
+                (!activeManifest && !legacyPublication)
+                || (pinnedState && (
+                    pinnedState.optimized !== true
+                    || pinnedState.generation !== generation
+                ))
+            ) {
+                throw pluginStorageNamespaceConflict(
+                    'Plugin storage generation changed before clear committed',
+                );
+            }
+            const nextManifest = activeManifest
+                ? createPluginStorageManifest(generation, [], [])
+                : null;
+            const recoverySnapshotToken = newPluginRecoverySnapshotToken();
             sqliteDb.transaction(() => {
                 kvDelPrefix(PLUGIN_SAVE_PREFIX);
                 if (pluginStorageClearFailpoint === 'transaction') {
                     throw new Error('Injected plugin storage clear transaction failure');
                 }
                 kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
+                writePluginStorageManifest(nextManifest);
+                markPluginRecoverySnapshotDirty(recoverySnapshotToken);
             })();
         });
     } catch (error) {
         if (isImportInProgressError(error)) return sendImportBusy(res);
+        if (error?.pluginStorageNamespaceConflict) {
+            return res.status(409).json({
+                error: error.message,
+                code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            });
+        }
         logger.error('[PluginStorage] Atomic clear rolled back:', error);
         return res.status(500).json({
             error: 'Plugin storage clear was not committed',
@@ -4777,6 +4814,9 @@ app.post('/api/plugin-storage/clear', async (req, res) => {
             commitOutcomeUnknown: false,
         });
     }
+
+    // This is a known commit even if the response is lost below.
+    schedulePluginRecoverySnapshot();
 
     // A response lost after this point cannot prove whether the transaction
     // committed. The client labels that outcome unknown and may safely retry
@@ -5047,6 +5087,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 )
                 : null;
             const preservedOwner = ownerPolicy === 'preserve' ? kvGet(ownerKey) : null;
+            const recoverySnapshotToken = newPluginRecoverySnapshotToken();
             try {
                 sqliteDb.transaction(() => {
                     if (operation === 'set') {
@@ -5074,6 +5115,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                     writePluginStorageManifest(nextManifest);
                     maybeFailPluginStorageTransaction(req, 'after-manifest');
                     hitPluginStorageMutationFailpoint('pre-commit');
+                    markPluginRecoverySnapshotDirty(recoverySnapshotToken);
                 })();
             } catch (error) {
                 logger.warn('[PluginStorageMutation] Transaction rolled back:', error);
@@ -5086,6 +5128,10 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                     retryable: false,
                 });
             }
+
+            // Schedule from the known-commit boundary, before any diagnostic
+            // read or deliberately lost acknowledgement can return control.
+            schedulePluginRecoverySnapshot();
 
             if (pluginStorageMutationFailpoint === 'acknowledgement-loss') {
                 // The transaction is durably committed, but the client receives
