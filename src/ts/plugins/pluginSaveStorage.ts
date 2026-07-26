@@ -9,7 +9,11 @@ import {
     writePersistentJson,
 } from "../storage/persistentKv";
 import { requireCommittedDatabaseSave } from "../storage/databaseSave";
-import { beginPluginStorageModeTransition } from "./pluginMemoryOptimization";
+import {
+    beginPluginStorageModeTransition,
+    hasEnabledLegacyPlugins,
+    withPluginLifecycleLock,
+} from "./pluginMemoryOptimization";
 import {
     copyDatabasePluginStorageRecord,
     createDatabasePluginStorageRecord,
@@ -601,39 +605,54 @@ export async function transitionPluginStorageMode(
     options: PluginStorageReconcileOptions = {},
 ): Promise<PluginStorageReconcileResult> {
     const deps = resolveReconcileDependencies(options.dependencies);
-    // Acquire synchronously, before waiting behind the storage queue. This
-    // prevents legacy activation while a requested transition is draining old
-    // operations as well as while its new mode is being reconciled.
-    const finishTransition = beginPluginStorageModeTransition();
+    return withPluginLifecycleLock(async () => {
+        const eligibilityDatabase = deps.getDatabase();
+        if (target && hasEnabledLegacyPlugins(eligibilityDatabase.plugins)) {
+            throw new Error(
+                "Disable every enabled V2/V2.1 plugin before optimizing plugin memory.",
+            );
+        }
 
-    try {
-        return await withPluginSaveStorageLock(async () => {
-            const db = deps.getDatabase();
-            const previous = db.optimizePluginMemory === true;
-            db.optimizePluginMemory = target;
-
-            try {
-                const result = await reconcilePluginStorageModeUnlocked(deps, options);
-                // With no rows to move, reconciliation has no reason to save. An
-                // actual flag transition still needs its own durable acknowledgement.
-                if (result.direction === "none" && previous !== target) {
-                    await deps.persistDatabase();
+        // Earlier plugin reloads, including every awaited V2 unload callback,
+        // have now drained. Keep the synchronous legacy guard active from this
+        // point until reconciliation and its durable save have completed.
+        const finishTransition = beginPluginStorageModeTransition();
+        try {
+            return await withPluginSaveStorageLock(async () => {
+                const db = deps.getDatabase();
+                // A V3 database mutation may have been queued ahead of this
+                // transition after the first eligibility read.
+                if (target && hasEnabledLegacyPlugins(db.plugins)) {
+                    throw new Error(
+                        "Disable every enabled V2/V2.1 plugin before optimizing plugin memory.",
+                    );
                 }
-                return result;
-            } catch (transitionError) {
-                db.optimizePluginMemory = previous;
+                const previous = db.optimizePluginMemory === true;
+                db.optimizePluginMemory = target;
+
                 try {
-                    const rollback = await reconcilePluginStorageModeUnlocked(deps, {});
-                    if (rollback.direction === "none") {
+                    const result = await reconcilePluginStorageModeUnlocked(deps, options);
+                    // With no rows to move, reconciliation has no reason to save. An
+                    // actual flag transition still needs its own durable acknowledgement.
+                    if (result.direction === "none" && previous !== target) {
                         await deps.persistDatabase();
                     }
-                } catch (rollbackError) {
-                    console.error("[Plugin storage] mode rollback failed", rollbackError);
+                    return result;
+                } catch (transitionError) {
+                    db.optimizePluginMemory = previous;
+                    try {
+                        const rollback = await reconcilePluginStorageModeUnlocked(deps, {});
+                        if (rollback.direction === "none") {
+                            await deps.persistDatabase();
+                        }
+                    } catch (rollbackError) {
+                        console.error("[Plugin storage] mode rollback failed", rollbackError);
+                    }
+                    throw transitionError;
                 }
-                throw transitionError;
-            }
-        });
-    } finally {
-        finishTransition();
-    }
+            });
+        } finally {
+            finishTransition();
+        }
+    });
 }

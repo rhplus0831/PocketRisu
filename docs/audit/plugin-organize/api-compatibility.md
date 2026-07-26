@@ -155,6 +155,34 @@ disabling optimization, and powering it on again.
   safe, explicit policy; do not silently retain `enabled: true` for code that
   was skipped.
 
+### Resolution
+
+**Fixed 2026-07-26.** Plugin load, unload, import, enable, removal, and storage
+mode transitions now share one lifecycle queue. A transition drains every
+earlier V2 unload callback before its final eligibility check and keeps later
+plugin generations behind the mode reconciliation. V2 registries are detached
+before callbacks run and cleared again afterward, including when a callback
+rejects. Plugin-requested reloads are deferred and coalesced so an unload
+callback can request one without re-entering or deadlocking its own teardown.
+
+An optimized database that contains enabled V2/V2.1 records now applies an
+explicit fail-closed policy: those records are visibly powered off, the user
+is warned, and boot/manual/V3 database-list paths require a durable database
+save. Plugin import, power, and removal mutations likewise require an exact
+forced save. Failed or displaced commits roll back against the current live
+plugin list by stable name and original position, so a V3 teardown callback
+that replaces the list cannot leave enabled records, duplicates, provider
+state, or hot-reload markers behind. Safe disable/removal mutations are still
+committed before unload errors are surfaced.
+
+Regression coverage holds delayed and rejecting unload callbacks, requests
+reloads from plugin callbacks, queues mode transitions and V3 list
+replacements, injects every non-committed save outcome, and verifies live
+runtime plus durable rollback snapshots. Independent verification passed 73
+focused tests, the full client suite (1,022 passed, 3 skipped), `pnpm check`,
+and a production build; the fixer also passed all server and compatibility
+suites.
+
 <a id="ac3"></a>
 ## AC3 — Unguarded ES2024 key validation breaks older browser runtimes
 

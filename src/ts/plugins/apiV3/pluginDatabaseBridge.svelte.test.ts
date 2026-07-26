@@ -161,6 +161,35 @@ beforeEach(async () => {
 });
 
 describe("V3 mode-aware database bridge", () => {
+    test("normalizes a plugin-list mutation before the setter resolves", async () => {
+        const normalizePluginMutation = vi.fn(() => {
+            for (const plugin of testState.database.plugins) {
+                if (plugin.version === "2.1") plugin.enabled = false;
+            }
+        });
+        const bridge = createPluginDatabaseBridge({
+            allowedDbKeys: ["plugins"],
+            getLiveDatabase: () => testState.database,
+            snapshotField: (key, value) => cloneDatabaseField(key, value),
+            getPluginStorageSnapshot: getPluginSaveStorageSnapshot,
+            updateWithPluginStorageSnapshot: updateDatabaseWithPluginStorageSnapshot,
+            normalizePluginMutation,
+            applyLite: (mutation) => {
+                testState.database.plugins = mutation.plugins;
+            },
+            applyFull: (mutation) => {
+                testState.database.plugins = mutation.plugins;
+            },
+        });
+
+        await bridge.setDatabaseLite({
+            plugins: [{ name: "Legacy", version: "2.1", enabled: true }],
+        });
+
+        expect(normalizePluginMutation).toHaveBeenCalledOnce();
+        expect(testState.database.plugins[0].enabled).toBe(false);
+    });
+
     test("mixes authoritative get/set/pluginStorage with exact and omitted semantics", async () => {
         storageMocks.persistent.set(storageKey("cfg"), { value: "real" });
         storageMocks.persistent.set(storageKey("old"), { remove: true });

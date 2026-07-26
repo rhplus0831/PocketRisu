@@ -55,7 +55,11 @@ vi.mock("./pluginSafeClass", () => ({
     SafeIdbFactory: class {},
     SafeLocalStorage: class {},
 }));
-vi.mock("./apiV3/v3.svelte", () => ({ loadV3Plugins: vi.fn() }));
+vi.mock("./apiV3/v3.svelte", () => ({
+    loadV3Plugins: vi.fn(),
+    teardownV3Plugins: vi.fn(),
+    loadV3PluginGeneration: vi.fn(),
+}));
 vi.mock("./apiV3/transpiler", () => ({ pluginCodeTranspiler: vi.fn() }));
 vi.mock("../storage/persistentKv", () => ({
     clearPersistentPrefix: vi.fn(),

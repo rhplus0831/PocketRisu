@@ -3,6 +3,53 @@ import type { RisuPlugin } from "./plugins.svelte";
 type PluginVersion = RisuPlugin["version"];
 
 let pluginStorageModeTransitionDepth = 0;
+let pluginLifecycleQueue: Promise<unknown> = Promise.resolve();
+let activePluginLifecycleLease: PluginLifecycleLease | undefined;
+
+export interface PluginLifecycleLease {
+    readonly id: symbol;
+}
+
+function invokePluginLifecycleOperation<T>(
+    operation: (lease: PluginLifecycleLease) => Promise<T>,
+    lease: PluginLifecycleLease,
+): Promise<T> {
+    return Promise.resolve(operation(lease));
+}
+
+/**
+ * Serialize plugin load/unload work with storage-mode transitions. A transition
+ * must not snapshot inline V2 storage until every earlier unload callback has
+ * completed, while later reloads must not start until reconciliation finishes.
+ */
+export function withPluginLifecycleLock<T>(
+    operation: (lease: PluginLifecycleLease) => Promise<T>,
+    lease?: PluginLifecycleLease,
+): Promise<T> {
+    if (lease && activePluginLifecycleLease === lease) {
+        return invokePluginLifecycleOperation(operation, lease);
+    }
+
+    const queuedLease: PluginLifecycleLease = {
+        id: Symbol("plugin-lifecycle"),
+    };
+    const execute = async () => {
+        activePluginLifecycleLease = queuedLease;
+        try {
+            return await invokePluginLifecycleOperation(operation, queuedLease);
+        } finally {
+            activePluginLifecycleLease = undefined;
+        }
+    };
+    const run = pluginLifecycleQueue.then(execute, execute);
+    pluginLifecycleQueue = run.then(() => undefined, () => undefined);
+    return run;
+}
+
+/** Wait for all lifecycle work that was queued before this call. */
+export async function waitForPluginLifecycleIdle(): Promise<void> {
+    await pluginLifecycleQueue;
+}
 
 export function beginPluginStorageModeTransition(): () => void {
     pluginStorageModeTransitionDepth += 1;
@@ -26,6 +73,30 @@ export function hasEnabledLegacyPlugins(plugins: RisuPlugin[] | undefined): bool
     return (plugins ?? []).some((plugin) =>
         plugin.enabled && isLegacyPluginVersion(plugin.version)
     );
+}
+
+/**
+ * Optimized storage is the authoritative policy for an invalid persisted
+ * combination. Legacy plugins are powered off visibly instead of remaining
+ * marked enabled while their code is silently skipped.
+ */
+export function disableEnabledLegacyPluginsForOptimizedMemory(
+    plugins: RisuPlugin[] | undefined,
+    optimizePluginMemory: boolean | undefined,
+): string[] {
+    if (optimizePluginMemory !== true) return [];
+
+    const disabled: string[] = [];
+    for (const plugin of plugins ?? []) {
+        if (!plugin.enabled || !isLegacyPluginVersion(plugin.version)) continue;
+        plugin.enabled = false;
+        disabled.push(
+            plugin.displayName?.trim()
+            || plugin.name?.trim()
+            || "Unnamed plugin",
+        );
+    }
+    return disabled;
 }
 
 export function canOptimizePluginMemory(plugins: RisuPlugin[] | undefined): boolean {

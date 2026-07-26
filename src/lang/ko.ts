@@ -1795,6 +1795,12 @@ export const languageKorean = {
     "플러그인 메모리 최적화 중에는 활성화된 모든 플러그인이 V3여야 하므로 V2/V2.1 플러그인을 비활성 상태로 가져왔습니다.",
   optimizePluginMemoryEnableBlocked:
     "V2/V2.1 플러그인을 활성화하려면 먼저 ‘플러그인 메모리 사용량 최적화’를 끄세요.",
+  optimizePluginMemoryLegacyOff:
+    "메모리 최적화가 켜져 있는 동안 V2/V2.1 플러그인은 비활성 상태로 유지됩니다. 사용하려면 최적화를 끄세요.",
+  optimizePluginMemoryLegacyAutoDisabled: (plugins: string) =>
+    `플러그인 메모리 최적화가 이미 켜져 있어 다음 V2/V2.1 플러그인을 비활성화했습니다: ${plugins}`,
+  pluginReloadDeferredPending:
+    "여러 번 다시 불러오기를 시도한 후에도 플러그인 다시 불러오기가 대기 중입니다. 플러그인을 다시 불러오거나 앱을 재시작해 주세요.",
   optimizePluginMemoryEnabled: "플러그인 메모리 최적화를 켰습니다.",
   optimizePluginMemoryDisabled: "플러그인 메모리 최적화를 껐습니다.",
   optimizePluginMemoryProgress: (completed: number, total: number) =>

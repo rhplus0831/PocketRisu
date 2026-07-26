@@ -7,6 +7,7 @@ export interface PluginDatabaseBridgeDependencies {
         pluginCustomStorage: Record<string, unknown> | undefined,
         mutateDatabase: () => T | Promise<T>,
     ) => Promise<T>;
+    normalizePluginMutation?: () => void | Promise<void>;
     applyLite: (database: Record<string, unknown>) => void | Promise<void>;
     applyFull: (database: Record<string, unknown>) => void | Promise<void>;
 }
@@ -96,7 +97,12 @@ export function createPluginDatabaseBridge(dependencies: PluginDatabaseBridgeDep
         const prepared = prepareMutation(input, dependencies);
         await dependencies.updateWithPluginStorageSnapshot(
             prepared.pluginCustomStorage,
-            () => dependencies.applyLite(prepared.database),
+            async () => {
+                await dependencies.applyLite(prepared.database);
+                if (Object.hasOwn(prepared.database, "plugins")) {
+                    await dependencies.normalizePluginMutation?.();
+                }
+            },
         );
     };
 
@@ -104,7 +110,12 @@ export function createPluginDatabaseBridge(dependencies: PluginDatabaseBridgeDep
         const prepared = prepareMutation(input, dependencies);
         await dependencies.updateWithPluginStorageSnapshot(
             prepared.pluginCustomStorage,
-            () => dependencies.applyFull(prepared.database),
+            async () => {
+                await dependencies.applyFull(prepared.database);
+                if (Object.hasOwn(prepared.database, "plugins")) {
+                    await dependencies.normalizePluginMutation?.();
+                }
+            },
         );
     };
 

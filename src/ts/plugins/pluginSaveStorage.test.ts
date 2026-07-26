@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 let database: any;
 const persistent = vi.hoisted(() => new Map<string, unknown>());
 const requestImmediateSave = vi.hoisted(() => vi.fn());
+const teardownV3PluginsMock = vi.hoisted(() => vi.fn(async () => undefined));
+const loadV3PluginGenerationMock = vi.hoisted(() => vi.fn(async (..._plugins: any[]) => undefined));
 
 vi.mock("../storage/database.svelte", () => ({
     getDatabase: () => database,
@@ -71,6 +73,8 @@ vi.mock("./pluginSafeClass", () => ({
 
 vi.mock("./apiV3/v3.svelte", () => ({
     loadV3Plugins: vi.fn(async () => undefined),
+    teardownV3Plugins: teardownV3PluginsMock,
+    loadV3PluginGeneration: loadV3PluginGenerationMock,
 }));
 
 vi.mock("./apiV3/transpiler", () => ({
@@ -121,6 +125,7 @@ const {
     removePluginSaveStorageItem,
     setPluginSaveStorageItem,
     transitionPluginStorageMode,
+    withPluginSaveStorageLock,
 } = await import("./pluginSaveStorage");
 const {
     beginPluginStorageModeTransition,
@@ -129,8 +134,12 @@ const {
 } = await import("./pluginMemoryOptimization");
 const {
     getV2PluginAPIs,
+    importPlugin,
+    loadPlugins,
     loadV2Plugin,
     pluginV2,
+    removePluginAndReload,
+    setPluginEnabledAndReload,
 } = await import("./plugins.svelte");
 const {
     createPluginStorageRecord,
@@ -154,6 +163,8 @@ beforeEach(async () => {
     vi.clearAllMocks();
     persistent.clear();
     requestImmediateSave.mockResolvedValue({ status: "committed" });
+    teardownV3PluginsMock.mockResolvedValue(undefined);
+    loadV3PluginGenerationMock.mockResolvedValue(undefined);
     database = {
         optimizePluginMemory: false,
         pluginCustomStorage: {},
@@ -161,10 +172,13 @@ beforeEach(async () => {
     };
     pluginV2.loaded = false;
     pluginV2.providers.clear();
+    pluginV2.providerOptions.clear();
     pluginV2.editdisplay.clear();
     pluginV2.editoutput.clear();
     pluginV2.editprocess.clear();
     pluginV2.editinput.clear();
+    pluginV2.replacerbeforeRequest.clear();
+    pluginV2.replacerafterRequest.clear();
     pluginV2.unload.clear();
     const {
         listPersistentKeys,
@@ -701,6 +715,408 @@ describe("reconcilePluginStorageMode", () => {
 });
 
 describe("transitionPluginStorageMode", () => {
+    test("durably saves a disabled plugin before surfacing a rejecting unload", async () => {
+        database.plugins = [{
+            name: "Disable despite unload error",
+            script: "",
+            arguments: {},
+            realArg: {},
+            version: "2.1",
+            customLink: [],
+            argMeta: {},
+            enabled: true,
+        }];
+        pluginV2.loaded = true;
+        pluginV2.unload.add(async () => { throw new Error("unload failed"); });
+        let persistedEnabled: boolean | undefined;
+        requestImmediateSave.mockImplementationOnce(async () => {
+            persistedEnabled = database.plugins[0].enabled;
+            return { status: "committed" };
+        });
+
+        await expect(setPluginEnabledAndReload(
+            "Disable despite unload error",
+            false,
+        )).rejects.toThrow("durably committed, but plugin teardown or reload failed");
+
+        expect(database.plugins[0].enabled).toBe(false);
+        expect(persistedEnabled).toBe(false);
+        expect(requestImmediateSave).toHaveBeenCalledOnce();
+        expect(requestImmediateSave).toHaveBeenCalledWith({ forceFullWrite: true });
+    });
+
+    test("durably saves removal before surfacing a rejecting unload", async () => {
+        database.plugins = [{
+            name: "Remove despite unload error",
+            script: "",
+            arguments: {},
+            realArg: {},
+            version: "2.1",
+            customLink: [],
+            argMeta: {},
+            enabled: true,
+        }];
+        pluginV2.loaded = true;
+        pluginV2.unload.add(async () => { throw new Error("unload failed"); });
+        let persistedPluginNames: string[] | undefined;
+        requestImmediateSave.mockImplementationOnce(async () => {
+            persistedPluginNames = database.plugins.map((plugin: any) => plugin.name);
+            return { status: "committed" };
+        });
+
+        await expect(removePluginAndReload("Remove despite unload error"))
+            .rejects.toThrow("durably committed, but plugin teardown or reload failed");
+
+        expect(database.plugins).toEqual([]);
+        expect(persistedPluginNames).toEqual([]);
+        expect(requestImmediateSave).toHaveBeenCalledOnce();
+        expect(requestImmediateSave).toHaveBeenCalledWith({ forceFullWrite: true });
+    });
+
+    test.each([
+        { status: "retry" } as const,
+        { status: "displaced" } as const,
+        { status: "failed", error: new Error("write failed") } as const,
+    ])("rolls a list mutation back after a non-committed $status exact save", async (outcome) => {
+        database.plugins = [{
+            name: "Rollback list mutation",
+            script: "",
+            arguments: {},
+            realArg: {},
+            version: "3.0",
+            customLink: [],
+            argMeta: {},
+            enabled: true,
+        }];
+        requestImmediateSave
+            .mockResolvedValueOnce(outcome)
+            .mockResolvedValueOnce({ status: "committed" });
+
+        await expect(setPluginEnabledAndReload("Rollback list mutation", false))
+            .rejects.toThrow("failed and was rolled back");
+
+        expect(database.plugins[0].enabled).toBe(true);
+        expect(requestImmediateSave).toHaveBeenCalledTimes(2);
+        expect(requestImmediateSave).toHaveBeenNthCalledWith(1, { forceFullWrite: true });
+        expect(requestImmediateSave).toHaveBeenNthCalledWith(2, { forceFullWrite: true });
+    });
+
+    test("restores a disabled plugin through the live list after teardown replaces it", async () => {
+        const originalPlugin = {
+            name: "Live-list power rollback",
+            script: "original script",
+            arguments: { original: "string" },
+            realArg: { original: "value" },
+            version: "3.0" as const,
+            customLink: [],
+            argMeta: {},
+            enabled: true,
+        };
+        database.plugins = [structuredClone(originalPlugin)];
+        teardownV3PluginsMock.mockImplementationOnce(async () => {
+            const replacement = structuredClone(database.plugins);
+            replacement[0].script = "callback replacement";
+            replacement[0].arguments = { callback: "string" };
+            database.plugins = replacement;
+        });
+        let persistedRollback: any[] | undefined;
+        requestImmediateSave
+            .mockRejectedValueOnce(new Error("exact save rejected"))
+            .mockImplementationOnce(async () => {
+                persistedRollback = structuredClone(database.plugins);
+                return { status: "committed" };
+            });
+
+        await expect(setPluginEnabledAndReload(originalPlugin.name, false))
+            .rejects.toThrow("failed and was rolled back");
+
+        expect(database.plugins).toEqual([originalPlugin]);
+        expect(persistedRollback).toEqual([originalPlugin]);
+        expect(requestImmediateSave).toHaveBeenCalledTimes(2);
+        expect(requestImmediateSave).toHaveBeenNthCalledWith(1, { forceFullWrite: true });
+        expect(requestImmediateSave).toHaveBeenNthCalledWith(2, { forceFullWrite: true });
+        expect(loadV3PluginGenerationMock.mock.calls[0]?.[0]).toEqual([]);
+        expect(loadV3PluginGenerationMock.mock.calls.at(-1)?.[0]).toEqual([originalPlugin]);
+    });
+
+    test("restores removal order and provider without duplicating a callback replacement", async () => {
+        const removedPlugin = {
+            name: "Live-list removal rollback",
+            script: "original removed script",
+            arguments: {},
+            realArg: {},
+            version: "3.0" as const,
+            customLink: [],
+            argMeta: {},
+            enabled: true,
+        };
+        const retainedPlugin = {
+            ...removedPlugin,
+            name: "Retained plugin",
+            script: "retained script",
+        };
+        database.plugins = [
+            structuredClone(removedPlugin),
+            structuredClone(retainedPlugin),
+        ];
+        database.currentPluginProvider = removedPlugin.name;
+        teardownV3PluginsMock.mockImplementationOnce(async () => {
+            database.plugins = [
+                structuredClone(database.plugins[0]),
+                { ...structuredClone(removedPlugin), script: "callback update" },
+                { ...structuredClone(removedPlugin), script: "callback duplicate" },
+            ];
+            database.currentPluginProvider = "callback provider";
+        });
+        let persistedRollback: any;
+        requestImmediateSave
+            .mockResolvedValueOnce({ status: "displaced" })
+            .mockImplementationOnce(async () => {
+                persistedRollback = {
+                    plugins: structuredClone(database.plugins),
+                    provider: database.currentPluginProvider,
+                };
+                return { status: "committed" };
+            });
+
+        await expect(removePluginAndReload(removedPlugin.name))
+            .rejects.toThrow("failed and was rolled back");
+
+        expect(database.plugins).toEqual([removedPlugin, retainedPlugin]);
+        expect(database.currentPluginProvider).toBe(removedPlugin.name);
+        expect(database.plugins.filter((plugin: any) => plugin.name === removedPlugin.name))
+            .toHaveLength(1);
+        expect(persistedRollback).toEqual({
+            plugins: [removedPlugin, retainedPlugin],
+            provider: removedPlugin.name,
+        });
+        expect(loadV3PluginGenerationMock.mock.calls.at(-1)?.[0])
+            .toEqual([removedPlugin, retainedPlugin]);
+        expect(requestImmediateSave).toHaveBeenNthCalledWith(1, { forceFullWrite: true });
+        expect(requestImmediateSave).toHaveBeenNthCalledWith(2, { forceFullWrite: true });
+    });
+
+    test.each([
+        { status: "retry" } as const,
+        { status: "displaced" } as const,
+        { status: "failed", error: new Error("write failed") } as const,
+    ])("rolls an import back after a non-committed $status exact save", async (outcome) => {
+        requestImmediateSave
+            .mockResolvedValueOnce(outcome)
+            .mockResolvedValueOnce({ status: "committed" });
+
+        await importPlugin(`//@name Durable import ${outcome.status}\n//@api 3.0\n`);
+
+        expect(database.plugins).toEqual([]);
+        expect(requestImmediateSave).toHaveBeenCalledTimes(2);
+        expect(requestImmediateSave).toHaveBeenNthCalledWith(1, { forceFullWrite: true });
+        expect(requestImmediateSave).toHaveBeenNthCalledWith(2, { forceFullWrite: true });
+        const { alertError } = vi.mocked(await import("../alert"));
+        expect(alertError).toHaveBeenCalledWith(
+            expect.stringContaining("Plugin import failed and was rolled back"),
+        );
+    });
+
+    test("does not let an inherited older save outcome acknowledge an import", async () => {
+        let forcedCalls = 0;
+        requestImmediateSave.mockImplementation(async (options) => {
+            if (options?.forceFullWrite !== true) {
+                return { status: "committed" };
+            }
+            forcedCalls += 1;
+            return forcedCalls === 1
+                ? { status: "retry" }
+                : { status: "committed" };
+        });
+
+        await importPlugin("//@name Exact import acknowledgement\n//@api 3.0\n");
+
+        expect(database.plugins).toEqual([]);
+        expect(forcedCalls).toBe(2);
+        expect(requestImmediateSave).toHaveBeenCalledTimes(2);
+        expect(requestImmediateSave).toHaveBeenNthCalledWith(1, { forceFullWrite: true });
+        expect(requestImmediateSave).toHaveBeenNthCalledWith(2, { forceFullWrite: true });
+    });
+
+    test("waits for delayed V2 unload writes before externalizing storage", async () => {
+        database.plugins = [{
+            name: "Legacy lifecycle plugin",
+            script: "",
+            arguments: {},
+            realArg: {},
+            version: "2.1",
+            customLink: [],
+            argMeta: {},
+            enabled: false,
+        }];
+        pluginV2.loaded = true;
+        const v2Apis = getV2PluginAPIs();
+        let releaseUnload!: () => void;
+        let markUnloadStarted!: () => void;
+        const unloadBlocked = new Promise<void>(resolve => { releaseUnload = resolve; });
+        const unloadStarted = new Promise<void>(resolve => { markUnloadStarted = resolve; });
+        pluginV2.unload.add(async () => {
+            markUnloadStarted();
+            await unloadBlocked;
+            v2Apis.pluginStorage.setItem("unload-final", "included");
+        });
+
+        const reload = loadPlugins();
+        await unloadStarted;
+        const transition = transitionPluginStorageMode(true, {
+            dependencies: { persistDatabase: vi.fn(async () => undefined) },
+        });
+        await Promise.resolve();
+
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(isPluginStorageModeTransitioning()).toBe(false);
+
+        releaseUnload();
+        await reload;
+        await transition;
+
+        expect(persistent.get(encoded(PLUGIN_SAVE_PREFIX, "unload-final")))
+            .toBe("included");
+        expect(database.pluginCustomStorage).toEqual({});
+    });
+
+    test("drains every V2 unload callback and releases a queued transition after errors", async () => {
+        database.plugins = [{
+            name: "Rejecting legacy plugin",
+            script: "",
+            arguments: {},
+            realArg: {},
+            version: "2.1",
+            customLink: [],
+            argMeta: {},
+            enabled: false,
+        }];
+        pluginV2.loaded = true;
+        const v2Apis = getV2PluginAPIs();
+        const calls: string[] = [];
+        pluginV2.unload.add(async () => {
+            calls.push("first");
+            throw new Error("first unload failed");
+        });
+        pluginV2.unload.add(async () => {
+            calls.push("final-write");
+            v2Apis.pluginStorage.setItem("late", "kept");
+        });
+        pluginV2.unload.add(async () => {
+            calls.push("last");
+            throw new Error("last unload failed");
+        });
+
+        const reload = loadPlugins().then(() => null, error => error);
+        const transition = transitionPluginStorageMode(true, {
+            dependencies: { persistDatabase: vi.fn(async () => undefined) },
+        });
+
+        const reloadError = await reload;
+        await transition;
+
+        expect(reloadError).toBeInstanceOf(AggregateError);
+        expect(calls).toEqual(["first", "final-write", "last"]);
+        expect(pluginV2.unload.size).toBe(0);
+        expect(persistent.get(encoded(PLUGIN_SAVE_PREFIX, "late"))).toBe("kept");
+    });
+
+    test("lets a V2 unload callback await its reload request without deadlocking", async () => {
+        pluginV2.loaded = true;
+        const v2Apis = getV2PluginAPIs();
+        let acknowledged = false;
+        pluginV2.unload.add(async () => {
+            await v2Apis.loadPlugins();
+            acknowledged = true;
+        });
+
+        await loadPlugins();
+
+        expect(acknowledged).toBe(true);
+        expect(pluginV2.unload.size).toBe(0);
+    });
+
+    test("durably powers off an invalid enabled V2 record instead of silently skipping it", async () => {
+        database.optimizePluginMemory = true;
+        database.plugins = [{
+            name: "Persisted legacy plugin",
+            script: "",
+            arguments: {},
+            realArg: {},
+            version: "2.1",
+            customLink: [],
+            argMeta: {},
+            enabled: true,
+        }];
+
+        await loadPlugins();
+
+        expect(database.plugins[0].enabled).toBe(false);
+        expect(requestImmediateSave).toHaveBeenCalledOnce();
+        expect(requestImmediateSave).toHaveBeenCalledWith({ forceFullWrite: true });
+        expect(pluginV2.loaded).toBe(false);
+    });
+
+    test("rechecks eligibility inside the lifecycle barrier", async () => {
+        database.plugins = [{
+            name: "Enabled legacy plugin",
+            script: "",
+            arguments: {},
+            realArg: {},
+            version: 2,
+            customLink: [],
+            argMeta: {},
+            enabled: true,
+        }];
+
+        await expect(transitionPluginStorageMode(true, {
+            dependencies: { persistDatabase: vi.fn(async () => undefined) },
+        })).rejects.toThrow("Disable every enabled V2/V2.1 plugin");
+        database.plugins[0].enabled = false;
+        database.optimizePluginMemory = true;
+        await expect(setPluginEnabledAndReload("Enabled legacy plugin", true))
+            .resolves.toBe("blocked");
+
+        expect(database.plugins[0].enabled).toBe(false);
+        expect(isPluginStorageModeTransitioning()).toBe(false);
+    });
+
+    test("rechecks eligibility after storage operations queued ahead of the transition", async () => {
+        const legacyPlugin = {
+            name: "Queued legacy plugin",
+            script: "",
+            arguments: {},
+            realArg: {},
+            version: "2.1",
+            customLink: [],
+            argMeta: {},
+            enabled: false,
+        };
+        database.plugins = [legacyPlugin];
+        let releaseMutation!: () => void;
+        let markStorageLockHeld!: () => void;
+        const mutationAllowed = new Promise<void>(resolve => { releaseMutation = resolve; });
+        const storageLockHeld = new Promise<void>(resolve => { markStorageLockHeld = resolve; });
+        const earlierMutation = withPluginSaveStorageLock(async () => {
+            markStorageLockHeld();
+            await mutationAllowed;
+            legacyPlugin.enabled = true;
+        });
+        await storageLockHeld;
+
+        const transition = transitionPluginStorageMode(true, {
+            dependencies: { persistDatabase: vi.fn(async () => undefined) },
+        });
+        const transitionAssertion = expect(transition)
+            .rejects.toThrow("Disable every enabled V2/V2.1 plugin");
+        await Promise.resolve();
+        releaseMutation();
+        await earlierMutation;
+
+        await transitionAssertion;
+        expect(database.optimizePluginMemory).toBe(false);
+    });
+
     test("round-trips special value and metadata keys through both mode transitions", async () => {
         const values = createPluginStorageRecord<unknown>();
         const meta = createPluginStorageRecord<any>();

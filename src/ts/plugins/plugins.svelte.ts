@@ -9,13 +9,20 @@ import { DBState, hotReloading, pluginAlertModalStore, selectedCharID } from "..
 import type { ScriptMode } from "../process/scripts";
 import { checkCodeSafety } from "./pluginSafety";
 import { SafeDocument, SafeIdbFactory, SafeLocalStorage } from "./pluginSafeClass";
-import { loadV3Plugins } from "./apiV3/v3.svelte";
+import {
+    loadV3PluginGeneration,
+    teardownV3Plugins,
+} from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 import {
     canEnablePlugin,
+    disableEnabledLegacyPluginsForOptimizedMemory,
     isPluginStorageModeTransitioning,
     shouldDisableImportedPlugin,
+    type PluginLifecycleLease,
+    withPluginLifecycleLock,
 } from "./pluginMemoryOptimization";
+import { requireCommittedDatabaseSave } from "../storage/databaseSave";
 import {
     copyDatabasePluginStorageRecord,
     createDatabasePluginStorageRecord,
@@ -425,64 +432,372 @@ export async function importPlugin(code:string|null = null, argu:{
             }
         }
 
-        // The duplicate-confirmation await may overlap a storage mode
-        // transition. Re-evaluate at the commit point so a legacy import can
-        // never become enabled from a stale pre-transition decision.
-        disabledForMemoryOptimization = shouldDisableImportedPlugin(
-            apiInternalVersion,
-            db.optimizePluginMemory,
-        )
-        pluginData.enabled = !disabledForMemoryOptimization
+        await withPluginLifecycleLock(async (lifecycleLease) => {
+            // The confirmation await may have overlapped a mode transition.
+            // Re-read the live database only after earlier lifecycle work has
+            // drained, then commit and reload as one serialized operation.
+            const commitDatabase = getDatabase()
+            commitDatabase.plugins ??= []
+            const commitPluginIndex = commitDatabase.plugins.findIndex(
+                (plugin: RisuPlugin) => plugin.name === pluginData.name,
+            )
+            disabledForMemoryOptimization = shouldDisableImportedPlugin(
+                apiInternalVersion,
+                commitDatabase.optimizePluginMemory,
+            )
+            pluginData.enabled = !disabledForMemoryOptimization
+            const previousPlugin = commitPluginIndex === -1
+                ? undefined
+                : safeStructuredClone(commitDatabase.plugins[commitPluginIndex])
+            let mutationApplied = false
 
-        if(oldPluginIndex !== -1){
-            db.plugins[oldPluginIndex] = pluginData;
-        }
-        else if(!isUpdate || argu.isHotReload){
-            db.plugins.push(pluginData)
-        }
+            if(commitPluginIndex !== -1){
+                commitDatabase.plugins[commitPluginIndex] = pluginData;
+                mutationApplied = true
+            }
+            else if(!isUpdate || argu.isHotReload){
+                commitDatabase.plugins.push(pluginData)
+                mutationApplied = true
+            }
 
-        if(argu.isHotReload && !hotReloading.includes(pluginData.name)){
-            hotReloading.push(pluginData.name)
-        }
+            const wasHotReloading = hotReloading.includes(pluginData.name)
+            if(argu.isHotReload && !hotReloading.includes(pluginData.name)){
+                hotReloading.push(pluginData.name)
+            }
 
-        console.log(`Imported plugin: ${pluginData.name} (API v${apiVersion})`)
-        if (disabledForMemoryOptimization) {
-            notifyWarning(language.optimizePluginMemoryImportDisabled)
-        }
-        setDatabaseLite(db)
-        void requestImmediateSave()
+            setDatabaseLite(commitDatabase)
+            await commitPluginListMutation(
+                lifecycleLease,
+                "Plugin import",
+                () => {
+                    if (mutationApplied) {
+                        if (previousPlugin === undefined) {
+                            removePluginFromLiveList(pluginData.name)
+                        } else {
+                            restorePluginInLiveList(
+                                pluginData.name,
+                                commitPluginIndex,
+                                previousPlugin,
+                            )
+                        }
+                    }
+                    if (!wasHotReloading) {
+                        const hotReloadIndex = hotReloading.indexOf(pluginData.name)
+                        if (hotReloadIndex !== -1) hotReloading.splice(hotReloadIndex, 1)
+                    }
+                },
+                true,
+            )
+            console.log(`Imported plugin: ${pluginData.name} (API v${apiVersion})`)
+            if (disabledForMemoryOptimization) {
+                notifyWarning(language.optimizePluginMemoryImportDisabled)
+            }
+        })
 
-        loadPlugins()
-        
     } catch (error) {
         console.error(error)
-        alertError(language.errors.noData)
+        alertError(error instanceof Error ? error.message : String(error))
     }
 }
 
 let pluginTranslator = false
 
-export async function loadPlugins() {
-    console.log('Loading plugins...')
-    let db = getDatabase()
+type PluginReloadPhase = "teardown" | "loading"
+let activePluginReloadPhase: PluginReloadPhase | undefined
+let pluginApiReloadPending = false
+let pluginApiReloadScheduled = false
+let pluginApiReloadDrainPromise: Promise<void> | undefined
+const MAX_DEFERRED_PLUGIN_RELOAD_ATTEMPTS = 2
 
+function retainDeferredPluginReloadDemand() {
+    pluginApiReloadPending = true
+    if (pluginApiReloadScheduled) return
+    pluginApiReloadScheduled = true
+    queueMicrotask(() => {
+        const drainPromise = drainDeferredPluginApiReload()
+        pluginApiReloadDrainPromise = drainPromise
+        void drainPromise.finally(() => {
+            if (pluginApiReloadDrainPromise === drainPromise) {
+                pluginApiReloadDrainPromise = undefined
+            }
+        })
+    })
+}
 
-    const enabledPlugins = safeStructuredClone(db.plugins).filter((p: RisuPlugin) => {
-        if (!p.enabled) return false
-        if (!canEnablePlugin(p, db.optimizePluginMemory)) {
-            // Defensive runtime gate for databases modified outside the normal
-            // import/toggle UI. The plugin remains visibly enabled so the user
-            // can turn it off, but its synchronous V2 code is never executed.
-            console.warn(`[Plugins] ${p.name} was not loaded because optimized plugin memory requires V3.`)
-            return false
+/**
+ * Plugin callbacks receive acknowledgement that a reload was requested. The
+ * generation itself is deferred so an unload callback can await this API
+ * without re-entering and deadlocking the lifecycle operation that invoked it.
+ */
+export function requestDeferredPluginApiReload(): Promise<void> {
+    // Teardown-time demand is covered by the live plugin-list read immediately
+    // after every unload callback settles.
+    if (activePluginReloadPhase !== "teardown") {
+        retainDeferredPluginReloadDemand()
+    }
+    return Promise.resolve()
+}
+
+export async function waitForDeferredPluginApiReloadIdle(): Promise<void> {
+    while (true) {
+        await Promise.resolve()
+        const drainPromise = pluginApiReloadDrainPromise
+        if (!drainPromise) return
+        await drainPromise
+        if (pluginApiReloadDrainPromise === drainPromise) return
+    }
+}
+
+async function drainDeferredPluginApiReload(): Promise<void> {
+    let attempts = 0
+    let lastError: unknown
+    try {
+        while (pluginApiReloadPending && attempts < MAX_DEFERRED_PLUGIN_RELOAD_ATTEMPTS) {
+            pluginApiReloadPending = false
+            attempts += 1
+            try {
+                await withPluginLifecycleLock(loadPluginsUnlocked)
+                lastError = undefined
+            } catch (error) {
+                lastError = error
+                pluginApiReloadPending = true
+            }
         }
+    } finally {
+        pluginApiReloadScheduled = false
+        if (pluginApiReloadPending) {
+            console.error(
+                "[Plugins] Deferred plugin reload remains pending after bounded attempts",
+                lastError,
+            )
+            notifyWarning(language.pluginReloadDeferredPending)
+        }
+    }
+}
+
+async function loadPluginsUnlocked(_lifecycleLease: PluginLifecycleLease) {
+    console.log('Loading plugins...')
+    const db = getDatabase()
+    const autoDisabledPlugins = disableEnabledLegacyPluginsForOptimizedMemory(
+        db.plugins,
+        db.optimizePluginMemory,
+    )
+    let compatibilityRepairError: unknown
+    if (autoDisabledPlugins.length > 0) {
+        setDatabaseLite(db)
+        notifyWarning(language.optimizePluginMemoryLegacyAutoDisabled(
+            autoDisabledPlugins.join(", "),
+        ))
+        try {
+            requireCommittedDatabaseSave(
+                await requestImmediateSave({ forceFullWrite: true }),
+                "Optimized plugin-memory invalid-state repair",
+            )
+        } catch (error) {
+            compatibilityRepairError = error
+        }
+    }
+
+    const previousPhase = activePluginReloadPhase
+    activePluginReloadPhase = "teardown"
+    let v2TeardownError: unknown
+    let v3TeardownError: unknown
+    try {
+        await teardownV2Plugins()
+    } catch (error) {
+        v2TeardownError = error
+    }
+    try {
+        await teardownV3Plugins()
+    } catch (error) {
+        v3TeardownError = error
+    }
+
+    activePluginReloadPhase = "loading"
+    let v2LoadError: unknown
+    let v3LoadError: unknown
+    try {
+        const currentDatabase = getDatabase()
+        const enabledPlugins = safeStructuredClone(currentDatabase.plugins ?? [])
+            .filter((plugin: RisuPlugin) => (
+                plugin.enabled
+                && canEnablePlugin(plugin, currentDatabase.optimizePluginMemory)
+            ))
+        try {
+            await loadV2PluginGeneration(enabledPlugins.filter(
+                (plugin: RisuPlugin) => plugin.version === 2 || plugin.version === "2.1",
+            ))
+        } catch (error) {
+            v2LoadError = error
+        }
+        try {
+            await loadV3PluginGeneration(enabledPlugins.filter(
+                (plugin: RisuPlugin) => plugin.version === "3.0",
+            ))
+        } catch (error) {
+            v3LoadError = error
+        }
+    } finally {
+        activePluginReloadPhase = previousPhase
+    }
+
+    const errors = [
+        compatibilityRepairError,
+        v2TeardownError,
+        v3TeardownError,
+        v2LoadError,
+        v3LoadError,
+    ]
+        .filter((error): error is unknown => error !== undefined)
+    if (errors.length > 0) {
+        throw new AggregateError(errors, "One or more plugin lifecycle phases failed.")
+    }
+}
+
+export function loadPlugins(): Promise<void> {
+    return withPluginLifecycleLock(loadPluginsUnlocked)
+}
+
+function removePluginFromLiveList(pluginName: string): void {
+    const liveDatabase = getDatabase()
+    liveDatabase.plugins = (liveDatabase.plugins ?? [])
+        .filter(plugin => plugin.name !== pluginName)
+}
+
+function restorePluginInLiveList(
+    pluginName: string,
+    originalIndex: number,
+    originalPlugin: RisuPlugin,
+): void {
+    const liveDatabase = getDatabase()
+    // Teardown callbacks may replace the array with cloned records, reinsert
+    // this plugin, or create duplicates. Reconcile against the current list by
+    // stable name and deliberately restore the original record and ordering.
+    const nextPlugins = (liveDatabase.plugins ?? [])
+        .filter(plugin => plugin.name !== pluginName)
+    const insertionIndex = Math.min(
+        Math.max(originalIndex, 0),
+        nextPlugins.length,
+    )
+    nextPlugins.splice(insertionIndex, 0, safeStructuredClone(originalPlugin))
+    liveDatabase.plugins = nextPlugins
+}
+
+async function commitPluginListMutation(
+    lifecycleLease: PluginLifecycleLease,
+    operation: string,
+    rollback: () => void,
+    rollbackOnReloadFailure: boolean,
+): Promise<void> {
+    let lifecycleError: unknown
+    try {
+        await loadPluginsUnlocked(lifecycleLease)
+    } catch (error) {
+        lifecycleError = error
+    }
+
+    const rollbackMutation = async (causes: unknown[]): Promise<never> => {
+        const errors = [...causes]
+        let rollbackSaveCommitted = false
+        try {
+            rollback()
+            setDatabaseLite(getDatabase())
+        } catch (error) {
+            errors.push(error)
+        }
+        try {
+            await loadPluginsUnlocked(lifecycleLease)
+        } catch (error) {
+            errors.push(error)
+        }
+        try {
+            requireCommittedDatabaseSave(
+                await requestImmediateSave({ forceFullWrite: true }),
+                `${operation} rollback`,
+            )
+            rollbackSaveCommitted = true
+        } catch (error) {
+            errors.push(error)
+        }
+        throw new AggregateError(
+            errors,
+            rollbackSaveCommitted
+                ? `${operation} failed and was rolled back.`
+                : `${operation} failed and its rollback was not durably committed.`,
+        )
+    }
+
+    if (lifecycleError && rollbackOnReloadFailure) {
+        return rollbackMutation([lifecycleError])
+    }
+
+    try {
+        requireCommittedDatabaseSave(
+            await requestImmediateSave({ forceFullWrite: true }),
+            operation,
+        )
+    } catch (saveError) {
+        return rollbackMutation(
+            lifecycleError ? [lifecycleError, saveError] : [saveError],
+        )
+    }
+
+    if (lifecycleError) {
+        throw new AggregateError(
+            [lifecycleError],
+            `${operation} was durably committed, but plugin teardown or reload failed.`,
+        )
+    }
+}
+
+export type PluginEnabledUpdateResult = "updated" | "blocked" | "missing"
+
+export function setPluginEnabledAndReload(
+    pluginName: string,
+    enabled: boolean,
+): Promise<PluginEnabledUpdateResult> {
+    return withPluginLifecycleLock(async (lifecycleLease) => {
+        const db = getDatabase()
+        const plugin = db.plugins?.find(candidate => candidate.name === pluginName)
+        if (!plugin) return "missing"
+        if (enabled && !canEnablePlugin(plugin, db.optimizePluginMemory)) return "blocked"
+
+        const originalIndex = db.plugins.indexOf(plugin)
+        const originalPlugin = safeStructuredClone(plugin)
+        plugin.enabled = enabled
+        setDatabaseLite(db)
+        await commitPluginListMutation(
+            lifecycleLease,
+            `Plugin ${enabled ? "enable" : "disable"}`,
+            () => restorePluginInLiveList(pluginName, originalIndex, originalPlugin),
+            enabled,
+        )
+        return "updated"
+    })
+}
+
+export function removePluginAndReload(pluginName: string): Promise<boolean> {
+    return withPluginLifecycleLock(async (lifecycleLease) => {
+        const db = getDatabase()
+        const index = db.plugins?.findIndex(plugin => plugin.name === pluginName) ?? -1
+        if (index === -1) return false
+
+        const removedPlugin = safeStructuredClone(db.plugins[index])
+        const previousProvider = db.currentPluginProvider
+        if (db.currentPluginProvider === pluginName) db.currentPluginProvider = ""
+        db.plugins.splice(index, 1)
+        setDatabaseLite(db)
+        await commitPluginListMutation(
+            lifecycleLease,
+            "Plugin removal",
+            () => {
+                restorePluginInLiveList(pluginName, index, removedPlugin)
+                getDatabase().currentPluginProvider = previousProvider
+            },
+            false,
+        )
         return true
     })
-    const pluginV2 = enabledPlugins.filter((a: RisuPlugin) => a.version === 2 || a.version === '2.1')
-    const pluginV3 = enabledPlugins.filter((a: RisuPlugin) => a.version === '3.0')
-
-    await loadV2Plugin(pluginV2)
-    await loadV3Plugins(pluginV3)
 }
 
 export type PluginV2ProviderArgument = {
@@ -517,6 +832,20 @@ export const pluginV2 = {
     replacerafterRequest: new Set<(content: string, type: string) => string | Promise<string>>(),
     unload: new Set<() => void | Promise<void>>(),
     loaded: false
+}
+
+export function clearPluginV2RuntimeRegistries() {
+    pluginV2.unload.clear()
+    pluginV2.loaded = false
+    pluginV2.providers.clear()
+    pluginV2.providerOptions.clear()
+    pluginV2.editdisplay.clear()
+    pluginV2.editoutput.clear()
+    pluginV2.editprocess.clear()
+    pluginV2.editinput.clear()
+    pluginV2.replacerbeforeRequest.clear()
+    pluginV2.replacerafterRequest.clear()
+    customProviderStore.set([])
 }
 
 export const allowedDbKeys = [
@@ -1331,7 +1660,7 @@ export const getV2PluginAPIs = () => {
             }
 
         }),
-        loadPlugins: loadPlugins,
+        loadPlugins: requestDeferredPluginApiReload,
         readImage: (path:string) => {
             if(path.startsWith('assets/')){
                 //trim assets/ prefix temporarily
@@ -1350,32 +1679,38 @@ export const getV2PluginAPIs = () => {
     }
 }
 
-export async function loadV2Plugin(plugins: RisuPlugin[]) {
+export async function teardownV2Plugins(): Promise<void> {
+    const callbacks = [...pluginV2.unload]
+    const errors: unknown[] = []
 
+    // Detach the dying generation from host event registries before invoking
+    // third-party cleanup, while retaining its captured storage facade so its
+    // awaited final inline writes can still complete.
+    clearPluginV2RuntimeRegistries()
+    try {
+        for (const unload of callbacks) {
+            try {
+                await unload()
+            } catch (error) {
+                errors.push(error)
+            }
+        }
+    } finally {
+        // Cleanup callbacks may register residue through captured APIs.
+        clearPluginV2RuntimeRegistries()
+    }
+
+    if (errors.length > 0) {
+        throw new AggregateError(errors, "One or more V2 unload callbacks failed.")
+    }
+}
+
+export async function loadV2PluginGeneration(plugins: RisuPlugin[]) {
     const canLoadLegacyPlugin = (plugin: RisuPlugin) =>
         canEnablePlugin(plugin, getDatabase().optimizePluginMemory)
 
-    // This exported compatibility loader is also called defensively rather
-    // than relying only on loadPlugins() to have filtered its input.
     plugins = plugins.filter(canLoadLegacyPlugin)
-
-    if (pluginV2.loaded) {
-        for (const unload of pluginV2.unload) {
-            await unload()
-        }
-
-        pluginV2.providers.clear()
-        pluginV2.editdisplay.clear()
-        pluginV2.editoutput.clear()
-        pluginV2.editprocess.clear()
-        pluginV2.editinput.clear()
-    }
-
-    // Unload callbacks are asynchronous and a transition can begin while they
-    // run. Do not execute a legacy plugin based on the earlier filter.
-    plugins = plugins.filter(canLoadLegacyPlugin)
-
-    pluginV2.loaded = true
+    pluginV2.loaded = plugins.length > 0
 
     globalThis.__pluginApis__ = getV2PluginAPIs()
 
@@ -1473,6 +1808,19 @@ export async function loadV2Plugin(plugins: RisuPlugin[]) {
             }
         }
     }
+}
+
+export function loadV2Plugin(plugins: RisuPlugin[]): Promise<void> {
+    return withPluginLifecycleLock(async () => {
+        let teardownError: unknown
+        try {
+            await teardownV2Plugins()
+        } catch (error) {
+            teardownError = error
+        }
+        await loadV2PluginGeneration(plugins)
+        if (teardownError) throw teardownError
+    })
 }
 
 export async function translatorPlugin(text: string, from: string, to: string) {

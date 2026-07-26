@@ -20,11 +20,12 @@ import {
     updateDatabaseWithPluginStorageSnapshot,
 } from "../pluginSaveStorage";
 import { createPluginDatabaseBridge } from "./pluginDatabaseBridge";
+import { disableEnabledLegacyPluginsForOptimizedMemory } from "../pluginMemoryOptimization";
 import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
-import { alertConfirm, alertError, alertNormal } from "src/ts/alert";
+import { alertConfirm, alertError, alertNormal, notifyWarning } from "src/ts/alert";
 import { language } from "src/lang";
 import { checkCharOrder, forageStorage, getFetchLogs } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
@@ -776,6 +777,18 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         snapshotField: (key, value) => cloneDatabaseField(key, value),
         getPluginStorageSnapshot: getPluginSaveStorageSnapshot,
         updateWithPluginStorageSnapshot: updateDatabaseWithPluginStorageSnapshot,
+        normalizePluginMutation: () => {
+            const liveDatabase = getDatabase();
+            const disabledPlugins = disableEnabledLegacyPluginsForOptimizedMemory(
+                liveDatabase.plugins,
+                liveDatabase.optimizePluginMemory,
+            );
+            if (disabledPlugins.length > 0) {
+                notifyWarning(language.optimizePluginMemoryLegacyAutoDisabled(
+                    disabledPlugins.join(", "),
+                ));
+            }
+        },
         applyLite: (mutation) => {
             const db = getDatabase();
             for (const key of Object.keys(mutation)) {
@@ -1526,12 +1539,22 @@ type V3PluginInstance = {
 
 const v3PluginInstances: V3PluginInstance[] = [];
 
-export async function loadV3Plugins(plugins:RisuPlugin[]){
-    await Promise.all(v3PluginInstances.map(async (instance) => {
+export async function teardownV3Plugins(){
+    // unloadV3Plugin removes from the live array synchronously, so iterate a
+    // snapshot or every shifted second instance would be skipped.
+    await Promise.all([...v3PluginInstances].map(async (instance) => {
         await unloadV3Plugin(instance.name);
     }));
+}
+
+export async function loadV3PluginGeneration(plugins:RisuPlugin[]){
     const loadPromises = plugins.map(plugin => executePluginV3(plugin));
     await Promise.all(loadPromises);
+}
+
+export async function loadV3Plugins(plugins:RisuPlugin[]){
+    await teardownV3Plugins();
+    await loadV3PluginGeneration(plugins);
 }
 
 export async function executePluginV3(plugin:RisuPlugin){

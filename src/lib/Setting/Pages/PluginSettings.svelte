@@ -15,8 +15,14 @@
     import { TriangleAlert } from '@lucide/svelte';
 
     import { DBState, hotReloading } from "src/ts/stores.svelte";
-    import { checkPluginUpdate, createBlankPlugin, importPlugin, loadPlugins, updatePlugin } from "src/ts/plugins/plugins.svelte";
-    import { requestImmediateSave } from "src/ts/globalApi.svelte";
+    import {
+        checkPluginUpdate,
+        createBlankPlugin,
+        importPlugin,
+        removePluginAndReload,
+        setPluginEnabledAndReload,
+        updatePlugin,
+    } from "src/ts/plugins/plugins.svelte";
     import { resetPluginPermission } from "src/ts/plugins/apiV3/v3.svelte";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";
@@ -27,8 +33,8 @@
     import { hotReloadPluginFiles } from "src/ts/plugins/apiV3/developMode";
     import ShBadge from "src/lib/UI/GUI/ShBadge.svelte";
     import {
-        canEnablePlugin,
         canOptimizePluginMemory,
+        waitForPluginLifecycleIdle,
     } from "src/ts/plugins/pluginMemoryOptimization";
     import {
         transitionPluginStorageMode,
@@ -41,12 +47,14 @@
     )
 
     async function togglePluginMemoryOptimization(enabled: boolean) {
-        if (reconcilingPluginStorage || !optimizePluginMemoryEligible) return
+        if (reconcilingPluginStorage) return
 
         reconcilingPluginStorage = true
         let blockingAlert = false
 
         try {
+            await waitForPluginLifecycleIdle()
+            if (enabled && !canOptimizePluginMemory(DBState.db.plugins)) return
             await transitionPluginStorageMode(enabled, {
                 onStart: ({ total }) => {
                     // Key values can be arbitrarily large, so count alone is
@@ -85,7 +93,9 @@
     <CheckInput
         check={DBState.db.optimizePluginMemory === true}
         onChange={togglePluginMemoryOptimization}
-        disabled={!optimizePluginMemoryEligible || reconcilingPluginStorage}
+        disabled={reconcilingPluginStorage || (
+            DBState.db.optimizePluginMemory !== true && !optimizePluginMemoryEligible
+        )}
         margin={false}
         name={language.optimizePluginMemory}
     >
@@ -94,6 +104,9 @@
     <p class="mt-1 text-xs text-textcolor2">{language.optimizePluginMemoryDesc}</p>
     {#if !optimizePluginMemoryEligible}
         <p class="mt-1 text-xs text-yellow-400">{language.optimizePluginMemoryV3Only}</p>
+    {/if}
+    {#if DBState.db.optimizePluginMemory === true}
+        <p class="mt-1 text-xs text-yellow-400">{language.optimizePluginMemoryLegacyOff}</p>
     {/if}
 </div>
 
@@ -208,17 +221,16 @@
             <button
                 class="textcolor2 hover:gray-200 cursor-pointer"
                 onclick={async (e) => {
-                    const nextEnabled = !plugin.enabled
-                    if (nextEnabled && !canEnablePlugin(plugin, DBState.db.optimizePluginMemory)) {
-                        notifyWarning(language.optimizePluginMemoryEnableBlocked)
-                        e.preventDefault()
-                        return
-                    }
-                    plugin.enabled = nextEnabled
-                    DBState.db.plugins[i] = plugin
-                    loadPlugins()
-                    void requestImmediateSave()
                     e.preventDefault()
+                    const nextEnabled = !plugin.enabled
+                    try {
+                        const result = await setPluginEnabledAndReload(plugin.name, nextEnabled)
+                        if (result === "blocked") {
+                            notifyWarning(language.optimizePluginMemoryEnableBlocked)
+                        }
+                    } catch (error) {
+                        notifyError(error instanceof Error ? error.message : String(error))
+                    }
                 }}
             >
                 {#if plugin.enabled}
@@ -254,14 +266,11 @@
                             (plugin.displayName ?? plugin.name),
                     );
                     if (v) {
-                        if (DBState.db.currentPluginProvider === plugin.name) {
-                            DBState.db.currentPluginProvider = "";
+                        try {
+                            await removePluginAndReload(plugin.name)
+                        } catch (error) {
+                            notifyError(error instanceof Error ? error.message : String(error))
                         }
-                        let plugins = DBState.db.plugins ?? [];
-                        plugins.splice(i, 1);
-                        DBState.db.plugins = plugins;
-                        loadPlugins()
-                        void requestImmediateSave()
                     }
                 }}
             >

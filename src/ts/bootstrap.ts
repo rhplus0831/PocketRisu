@@ -7,7 +7,7 @@ import { checkRisuUpdate } from "./update";
 import { fetchPublicStats } from "./publicStats";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, bootBackupPromptStore } from "./stores.svelte";
 import { loadPlugins } from "./plugins/plugins.svelte";
-import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertConfirmMulti, alertInput } from "./alert";
+import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertConfirmMulti, alertInput, notifyWarning } from "./alert";
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy, RisuSaveEncoder } from "./storage/risuSave";
@@ -34,6 +34,7 @@ import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelt
 import { allowInsecureContext } from "./platform";
 import { isSecureContext, shouldBlockInsecureBoot } from "./secureContext";
 import { reconcilePluginStorageMode } from "./plugins/pluginSaveStorage";
+import { disableEnabledLegacyPluginsForOptimizedMemory } from "./plugins/pluginMemoryOptimization";
 import {
     isResourceCacheEnabled,
     isResourceCacheSupported,
@@ -43,9 +44,9 @@ import {
 const RESOURCE_CACHE_ANNOUNCED_KEY = 'pocketrisu-resource-cache-announced'
 
 async function persistBootPluginStorageReconcile(): Promise<void> {
-    // saveDb() is intentionally started near the end of boot, so its immediate
-    // save hook does not exist yet. Encode the same stub-only block format here
-    // and refresh the future patch baseline after the migration write.
+    // saveDb() is installed near the end of boot. Encode the same stub-only
+    // block format directly here and refresh the future patch baseline after
+    // the compatibility repair/migration has durably committed.
     const encoder = new RisuSaveEncoder();
     await encoder.init(getDatabase(), {
         compression: false,
@@ -176,11 +177,27 @@ export async function loadData() {
                 }
 
                 LoadingStatusState.text = "Reconciling Plugin Storage..."
-                await reconcilePluginStorageMode({
+                const databaseForPluginCompatibility = getDatabase()
+                const autoDisabledLegacyPlugins = disableEnabledLegacyPluginsForOptimizedMemory(
+                    databaseForPluginCompatibility.plugins,
+                    databaseForPluginCompatibility.optimizePluginMemory,
+                )
+                if (autoDisabledLegacyPlugins.length > 0) {
+                    notifyWarning(language.optimizePluginMemoryLegacyAutoDisabled(
+                        autoDisabledLegacyPlugins.join(", "),
+                    ))
+                }
+                const pluginStorageReconcileResult = await reconcilePluginStorageMode({
                     dependencies: {
                         persistDatabase: persistBootPluginStorageReconcile,
                     },
                 })
+                if (
+                    autoDisabledLegacyPlugins.length > 0
+                    && pluginStorageReconcileResult.direction === "none"
+                ) {
+                    await persistBootPluginStorageReconcile()
+                }
 
                 if (getDatabase().didFirstSetup) {
                     characterURLImport()
