@@ -27,9 +27,19 @@ import {
     settleBestEffortResourceCache,
     storeBytes,
     touchResourceCacheManifest,
+    invalidateResourceCacheManifest,
 } from "./resourceCache"
 import { getThrownMessage, StorageError } from "./storageError"
 import { awaitWithAbort, forwardAbortSignal, throwIfAborted } from "./abort"
+import type {
+    PluginStorageMutationRequest,
+    PluginStorageMutationResult,
+} from "./pluginStorageMutation"
+import {
+    classifyPluginStorageMutationAcknowledgement,
+    pluginStorageTransportOutcomeUnknown,
+    publishPluginStorageMutationCache,
+} from "./pluginStorageMutation"
 
 export const AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS = 15_000
 type BoundedStorageOperation = 'read' | 'list' | 'write' | 'remove' | 'transition'
@@ -836,6 +846,161 @@ export class NodeStorage{
             })
         }
     }
+    async mutatePluginStorage(
+        request: PluginStorageMutationRequest,
+        externalSignal?: AbortSignal | null,
+    ): Promise<PluginStorageMutationResult> {
+        const fallback = (
+            outcome: PluginStorageMutationResult['outcome'],
+            error: string,
+            code: string,
+            retryable?: boolean,
+            status: number | null = null,
+            retryAfter: number | null = null,
+            commitOutcomeUnknown = outcome === 'unknown',
+        ): PluginStorageMutationResult => ({
+            outcome,
+            operation: request.operation,
+            error,
+            code,
+            status,
+            retryAfter,
+            commitOutcomeUnknown,
+            ...(retryable === undefined ? {} : { retryable }),
+        })
+        if (request.operation === 'set' && !request.valueBytes) {
+            return fallback('not-committed', 'A set mutation requires value bytes.', 'INVALID_REQUEST')
+        }
+        const stableRequest: PluginStorageMutationRequest = request.operation === 'set'
+            ? { ...request, valueBytes: new Uint8Array(request.valueBytes!) }
+            : { ...request }
+
+        try {
+            return await runBoundedAuthoritativeStorageOperation(
+                (signal, outcome) => this.mutatePluginStorageAuthoritative(
+                    stableRequest,
+                    signal,
+                    outcome,
+                ),
+                stableRequest.operation === 'set' ? 'write' : 'remove',
+                AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+                externalSignal,
+            )
+        } catch (error) {
+            if (error instanceof StorageError) {
+                return fallback(
+                    error.commitOutcomeUnknown ? 'unknown' : 'not-committed',
+                    error.message,
+                    error.code ?? (error.commitOutcomeUnknown
+                        ? 'COMMIT_OUTCOME_UNKNOWN'
+                        : 'STORAGE_TRANSPORT_ERROR'),
+                    error.retryable,
+                    error.status,
+                    error.retryAfter,
+                    error.commitOutcomeUnknown,
+                )
+            }
+            return pluginStorageTransportOutcomeUnknown(stableRequest.operation, error)
+        }
+    }
+
+    private async mutatePluginStorageAuthoritative(
+        stableRequest: PluginStorageMutationRequest,
+        signal: AbortSignal,
+        outcome: AuthoritativeStorageOutcomeTracker,
+    ): Promise<PluginStorageMutationResult> {
+        throwIfAborted(signal)
+        let expectedValueHash: string | undefined
+        if (stableRequest.operation === 'set') {
+            try {
+                expectedValueHash = await sha256Bytes(stableRequest.valueBytes!)
+            } catch (error) {
+                return {
+                    outcome: 'not-committed',
+                    operation: stableRequest.operation,
+                    error: error instanceof Error ? error.message : String(error),
+                    code: 'REQUEST_HASH_UNAVAILABLE',
+                    status: null,
+                    retryable: false,
+                    commitOutcomeUnknown: false,
+                }
+            }
+        }
+        throwIfAborted(signal)
+
+        for (let retryIndex = 0; ; retryIndex++) {
+            const headers: Record<string, string> = {
+                'content-type': 'application/octet-stream',
+                'file-path': Buffer.from(stableRequest.valueKey, 'utf-8').toString('hex'),
+                'x-plugin-storage-operation': stableRequest.operation,
+            }
+            if (stableRequest.operation === 'set') {
+                headers['x-plugin-storage-owner'] = Buffer.from(
+                    stableRequest.owner ?? '',
+                    'utf-8',
+                ).toString('base64url')
+            }
+            const response = await this.authFetch('/api/plugin-storage/mutate', {
+                method: 'POST',
+                headers,
+                body: (stableRequest.valueBytes ?? new Uint8Array()) as any,
+                signal,
+            }, true, outcome)
+
+            // Receiving an HTTP response is not enough: keep the mutation
+            // outcome ambiguous until the exact acknowledgement is consumed.
+            outcome.markRequestDispatched()
+            let body: unknown = null
+            try {
+                body = await awaitWithAbort(response.json(), signal)
+            } catch (error) {
+                if (signal.aborted) throw error
+                // A proxy or connection failure may replace/truncate any status
+                // body. Classification below treats it as outcome unknown.
+            }
+            const result = classifyPluginStorageMutationAcknowledgement(
+                response.status,
+                body,
+                stableRequest.operation,
+                expectedValueHash,
+                parseRetryAfterSeconds(response.headers.get('retry-after')),
+            )
+            if (result.outcome === 'unknown') return result
+            outcome.markDefinitiveResponse()
+
+            if (result.outcome === 'not-committed'
+                && result.code === 'IMPORT_IN_PROGRESS'
+                && result.retryable === true
+                && retryIndex < PLUGIN_STORAGE_MAX_RETRIES) {
+                await this.waitForPluginStorageRetry(new StorageError(
+                    result.error ?? 'Plugin storage import is in progress.',
+                    {
+                        status: result.status,
+                        code: result.code,
+                        retryAfter: result.retryAfter,
+                        retryable: true,
+                        commitOutcomeUnknown: false,
+                        operation: stableRequest.operation,
+                    },
+                ), retryIndex, signal)
+                continue
+            }
+
+            // Disposable cache publication must not extend the authoritative
+            // key lock once the transaction has a trusted acknowledgement.
+            void publishPluginStorageMutationCache(stableRequest, result, {
+                enabled: isResourceCacheEnabled(),
+                storeValue: async (valueKey, valueBytes) => {
+                    await storeBytes(`kv:${valueKey}`, valueBytes)
+                },
+                invalidateValue: async (valueKey) => {
+                    await invalidateResourceCacheManifest(`kv:${valueKey}`)
+                },
+            })
+            return result
+        }
+    }
+
     async getItem(key:string, externalSignal?: AbortSignal | null):Promise<Buffer> {
         return runBoundedAuthoritativeStorageOperation(
             signal => this.getItemAuthoritative(key, signal),

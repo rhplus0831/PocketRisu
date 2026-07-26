@@ -48,6 +48,38 @@ Observed downstream consequences in the audited workloads:
 - Fault-inject owner-write, owner-remove, and verification-read failures after
   a successful primary mutation.
 
+### Resolution
+
+**Fixed 2026-07-26.** Save-backed V3 set/remove now use one authenticated
+`POST /api/plugin-storage/mutate` operation. The server accepts one canonical
+value key, derives the owner key itself, and runs the primary plus owner
+mutation in one synchronous SQLite transaction inside
+`queueStorageMutation()`. Empty owners remove stale metadata; remove always
+cleans the matching owner orphan. Callers cannot target an unrelated row.
+
+The response contract distinguishes a schema-valid known commit, an explicit
+known rollback/refusal, and an unknown outcome after transport or malformed
+acknowledgement. A committed set must return the exact SHA-256 of the detached
+request bytes; wrong, missing, extra, or contradictory acknowledgements are
+unknown and cannot publish resource-cache state. A post-commit verification
+failure remains a known commit. Response loss after set or remove returns
+unknown while the durable database contains the complete new state; cache
+publication/invalidation waits for a verified commit.
+
+An exact `503 IMPORT_IN_PROGRESS` refusal is the sole retryable mutation
+acknowledgement. It is retried within the same total-operation timeout and
+abort signal; malformed or unknown outcomes are never replayed. Exhaustion
+preserves status, code, retry delay, retryability, operation, and commit state
+on `PluginStorageMutationError`, including across the V3 iframe bridge.
+
+Inline mode snapshots and validates value+owner maps before synchronously
+publishing both, so it also cannot expose a partially updated pair. Regression
+coverage fault-injects primary, owner, pre-commit, verification, and
+post-commit/pre-response boundaries for set and remove, plus import refusal,
+owner cleanup, malformed responses, and cache coherence. Independent
+verification passed 128 focused tests, 9 atomicity compatibility tests, all
+server and compatibility suites, `pnpm check`, and a production build.
+
 <a id="aa2"></a>
 ## AA2 — Optimized `clear()` can partially apply
 

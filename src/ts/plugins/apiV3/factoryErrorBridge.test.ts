@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { StorageError } from '../../storage/storageError'
+import { PluginStorageMutationError } from '../../storage/pluginStorageMutation'
 import {
     deserializeV3BridgeError,
     SandboxHost,
@@ -147,6 +148,31 @@ describe('V3 iframe error transport', () => {
     test('does not replace a thrown string with a generic host error', () => {
         const restored = deserializeV3BridgeError(serializeV3BridgeError('startup storage exploded'))
         expect(restored.message).toBe('startup storage exploded')
+    })
+
+    test('round-trips the real atomic mutation error metadata', () => {
+        const source = new PluginStorageMutationError({
+            outcome: 'not-committed',
+            operation: 'set',
+            status: 503,
+            code: 'IMPORT_IN_PROGRESS',
+            retryAfter: 5,
+            retryable: true,
+            commitOutcomeUnknown: false,
+            error: 'Import owns plugin storage',
+        })
+
+        expect(deserializeV3BridgeError(serializeV3BridgeError(source))).toMatchObject({
+            name: 'PluginStorageMutationError',
+            message: 'Import owns plugin storage',
+            status: 503,
+            code: 'IMPORT_IN_PROGRESS',
+            retryAfter: 5,
+            retryable: true,
+            commitOutcomeUnknown: false,
+            operation: 'set',
+            outcome: 'not-committed',
+        })
     })
 
     test('carries structured failures through the actual host RPC used at startup', async () => {

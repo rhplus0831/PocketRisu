@@ -3,6 +3,10 @@ import { forageStorage } from "../globalApi.svelte";
 import { stringifyJsonValue } from "./jsonValue";
 import { assertWellFormedUnicode } from "./unicodeWellFormed";
 import { awaitWithAbort, throwIfAborted } from "./abort";
+import {
+    requireCommittedPluginStorageMutation,
+    type PluginStorageMutationResult,
+} from "./pluginStorageMutation";
 
 export { hasNativeStringWellFormed } from "./unicodeWellFormed";
 
@@ -82,6 +86,52 @@ export async function removePersistentKey(
     await ensureStorageReady(signal);
     if (signal) await forageStorage.removeItem(storageKey, signal);
     else await forageStorage.removeItem(storageKey);
+}
+
+/**
+ * Mutate one optimized save value and its matching ownership row as one
+ * acknowledged server transaction. An empty owner deliberately removes stale
+ * ownership; remove also cleans an owner orphan when the value is absent.
+ */
+export async function mutatePersistentPluginStorage<T>(
+    valueStorageKey: string,
+    operation: "set",
+    value: T,
+    owner: string,
+    signal?: AbortSignal | null,
+): Promise<PluginStorageMutationResult>;
+export async function mutatePersistentPluginStorage(
+    valueStorageKey: string,
+    operation: "remove",
+    signal?: AbortSignal | null,
+): Promise<PluginStorageMutationResult>;
+export async function mutatePersistentPluginStorage<T>(
+    valueStorageKey: string,
+    operation: "set" | "remove",
+    valueOrSignal?: T | AbortSignal | null,
+    owner = "",
+    signal?: AbortSignal | null,
+): Promise<PluginStorageMutationResult> {
+    const activeSignal = operation === "remove"
+        ? valueOrSignal as AbortSignal | null | undefined
+        : signal;
+    throwIfAborted(activeSignal);
+    // Preserve the ordinary persistent JSON rule: validation and detachment
+    // happen before storage initialization or any queued mutation can run.
+    const valueBytes = operation === "set"
+        ? encoder.encode(stringifyJsonValue(valueOrSignal as T))
+        : undefined;
+    await ensureStorageReady(activeSignal);
+    const request = {
+        operation,
+        valueKey: valueStorageKey,
+        valueBytes,
+        owner,
+    } as const;
+    const result = activeSignal
+        ? await forageStorage.mutatePluginStorage(request, activeSignal)
+        : await forageStorage.mutatePluginStorage(request);
+    return requireCommittedPluginStorageMutation(result);
 }
 
 export async function listPersistentKeys(

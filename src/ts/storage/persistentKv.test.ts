@@ -1,9 +1,22 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import type {
+    PluginStorageMutationRequest,
+    PluginStorageMutationResult,
+} from './pluginStorageMutation'
+
+const mutatePluginStorage = vi.hoisted(() => vi.fn<
+    (request: PluginStorageMutationRequest) => Promise<PluginStorageMutationResult>
+>(async (request) => ({
+    outcome: 'committed',
+    operation: request.operation,
+    verification: 'verified',
+})))
 
 const storage = vi.hoisted(() => ({
     Init: vi.fn(async () => undefined),
     getItem: vi.fn(async () => new TextEncoder().encode('{"source":"plain"}')),
     getItemCached: vi.fn(async () => new TextEncoder().encode('{"source":"cached"}')),
+    mutatePluginStorage,
     setItem: vi.fn(async (_key: string, _value: Uint8Array) => undefined),
     clearPluginSaveStorage: vi.fn(async () => 'committed' as const),
 }))
@@ -24,6 +37,7 @@ const {
     clearExternalizedPluginStorage,
     hasNativeStringWellFormed,
     makeEncodedStorageKey,
+    mutatePersistentPluginStorage,
     readPersistentJson,
     writePersistentJson,
 } = await import('./persistentKv')
@@ -48,6 +62,12 @@ beforeEach(() => {
     storage.getItemCached.mockClear()
     storage.setItem.mockClear()
     storage.clearPluginSaveStorage.mockClear()
+    storage.mutatePluginStorage.mockClear()
+    storage.mutatePluginStorage.mockImplementation(async (request) => ({
+        outcome: 'committed',
+        operation: request.operation,
+        verification: 'verified',
+    }))
 })
 
 describe('persistent JSON read transport', () => {
@@ -98,6 +118,48 @@ describe('externalized plugin clear transport', () => {
 
         expect(storage.clearPluginSaveStorage).toHaveBeenCalledOnce()
     })
+})
+
+describe('atomic plugin storage mutation transport', () => {
+    it('validates and detaches set bytes before invoking the atomic primitive', async () => {
+        const callerOwned = { nested: ['captured'] }
+        const writing = mutatePersistentPluginStorage(
+            'pluginsave/YWxwaGE.json',
+            'set',
+            callerOwned,
+            'Plugin',
+        )
+        callerOwned.nested[0] = 'mutated-after-call'
+        await expect(writing).resolves.toMatchObject({ outcome: 'committed' })
+
+        expect(storage.mutatePluginStorage).toHaveBeenCalledOnce()
+        const request = storage.mutatePluginStorage.mock.calls[0][0]
+        expect(request.valueKey).toBe('pluginsave/YWxwaGE.json')
+        expect(request.owner).toBe('Plugin')
+        expect(JSON.parse(new TextDecoder().decode(request.valueBytes))).toEqual({
+            nested: ['captured'],
+        })
+    })
+
+    it.each(['not-committed', 'unknown'] as const)(
+        'rejects with the structured %s result',
+        async (outcome) => {
+            storage.mutatePluginStorage.mockResolvedValueOnce({
+                outcome,
+                operation: 'remove',
+                code: 'INJECTED',
+                error: 'injected outcome',
+            })
+
+            await expect(mutatePersistentPluginStorage(
+                'pluginsave/YWxwaGE.json',
+                'remove',
+            )).rejects.toMatchObject({
+                name: 'PluginStorageMutationError',
+                result: { outcome, code: 'INJECTED' },
+            })
+        },
+    )
 })
 
 describe('encoded storage keys', () => {

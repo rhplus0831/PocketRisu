@@ -76,6 +76,42 @@ vi.mock("../../storage/persistentKv", () => ({
         return [...storageMocks.persistent.keys()].filter(key => key.startsWith(prefix));
     },
     makeEncodedStorageKey: (prefix: string, key: string) => `${prefix}${encodeKey(key)}.json`,
+    mutatePersistentPluginStorage: async (
+        valueKey: string,
+        operation: "set" | "remove",
+        valueOrSignal?: unknown,
+        owner = "",
+        signal?: AbortSignal | null,
+    ) => {
+        const activeSignal = operation === "remove"
+            ? valueOrSignal as AbortSignal | null | undefined
+            : signal;
+        const encoded = valueKey.slice("pluginsave/".length, -".json".length);
+        const ownerKey = `pluginsave-meta/${encoded}.json`;
+        if (operation === "set") {
+            await storageMocks.writeGate?.(valueKey, activeSignal);
+            throwIfAborted(activeSignal);
+            storageMocks.persistent.set(valueKey, cloneJson(valueOrSignal));
+            if (owner) {
+                storageMocks.persistent.set(ownerKey, {
+                    plugin: owner,
+                    updatedAt: Date.now(),
+                });
+            } else {
+                storageMocks.persistent.delete(ownerKey);
+            }
+        } else {
+            await storageMocks.removeGate?.(valueKey, activeSignal);
+            throwIfAborted(activeSignal);
+            storageMocks.persistent.delete(valueKey);
+            storageMocks.persistent.delete(ownerKey);
+        }
+        return {
+            outcome: "committed" as const,
+            operation,
+            verification: "verified" as const,
+        };
+    },
     readPersistentJson: async <T>(
         key: string,
         options: { signal?: AbortSignal | null } = {},

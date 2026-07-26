@@ -1,4 +1,8 @@
 import { NodeStorage, type PatchItemResult } from "./nodeStorage"
+import type {
+    PluginStorageMutationRequest,
+    PluginStorageMutationResult,
+} from "./pluginStorageMutation"
 
 export class AutoStorage{
     isAccount:boolean = false
@@ -46,6 +50,16 @@ export class AutoStorage{
         return signal
             ? await this.realStorage.clearPluginSaveStorage(signal)
             : await this.realStorage.clearPluginSaveStorage()
+    }
+
+    async mutatePluginStorage(
+        request: PluginStorageMutationRequest,
+        signal?: AbortSignal | null,
+    ): Promise<PluginStorageMutationResult> {
+        await this.Init()
+        return signal
+            ? await this.realStorage.mutatePluginStorage(request, signal)
+            : await this.realStorage.mutatePluginStorage(request)
     }
 
     async checkAccountSync(){

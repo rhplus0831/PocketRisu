@@ -37,7 +37,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [SA2](startup-availability.md#sa2) | High | Fixed | One process-wide unbounded storage queue: a single stalled operation wedges every plugin and the mode transition |
 | [SA3](startup-availability.md#sa3) | Medium | Open | A reconciliation failure on boot prevents the whole application from loading |
 | [SA4](startup-availability.md#sa4) | High impact, window-dependent | Fixed | Import and retry failures abort startup or expose uncommitted state to optimized reads |
-| [AA1](atomicity-acknowledgement.md#aa1) | Medium | Open | Value and owner metadata are separate commits; a rejection can follow a durable primary mutation |
+| [AA1](atomicity-acknowledgement.md#aa1) | Medium | Fixed | Value and owner metadata are separate commits; a rejection can follow a durable primary mutation |
 | [AA2](atomicity-acknowledgement.md#aa2) | Medium | Fixed | Optimized `clear()` can partially apply |
 | [AA3](atomicity-acknowledgement.md#aa3) | High | Open | No batch/transaction/CAS primitive: the one-second unload deadline can terminate a multi-row commit, leaving a torn but durable generation |
 | [BR1](backup-recovery.md#br1) | Medium | Open | Optimized-only mutations never advance automatic recovery snapshots |
@@ -115,7 +115,6 @@ do not exercise:
 
 - the production save loop as the reconciliation durability callback
   (pre-initialization no-op, in-flight save join, 409/500/network failure);
-- value-success/owner-failure acknowledgement;
 - unload terminated at intermediate positions of a multi-row commit;
 - plugin-only automatic snapshot cadence;
 - marked-snapshot restore through the corrupt-database boot fallback;
@@ -149,6 +148,6 @@ do not exercise:
 
 The former compatibility blockers MT1–MT2, AC1, SA1–SA2, SA4, and AC3 are
 fixed and covered. The beta still should not be treated as risk-free for every
-V3 workload: SA3, AA1/AA3, BR1–BR3, PM1–PM4, and IP1–IP5 remain open. Verify a
+V3 workload: SA3, AA3, BR1–BR3, PM1–PM4, and IP1–IP5 remain open. Verify a
 backup before transitions, and avoid very large values or stores until the
 capacity work lands.

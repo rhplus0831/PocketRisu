@@ -5,6 +5,7 @@ import {
     decodeStorageKeyComponent,
     listPersistentKeys,
     makeEncodedStorageKey,
+    mutatePersistentPluginStorage,
     readPersistentJson,
     removePersistentKey,
     writePersistentJson,
@@ -640,46 +641,49 @@ export async function setOwnedPluginSaveStorageItem<T>(
             const db = getDatabase();
             const ownerRecord = { plugin: owner, updatedAt: Date.now() };
             if (db.optimizePluginMemory) {
-                // Metadata has the longer prefix. Prepare every destination
-                // before the primary value write so a rejected owner row
-                // cannot leave a durable, unowned value behind.
                 const valueStorageKey = makeArchiveSafePluginSaveStorageKey(
                     PLUGIN_SAVE_PREFIX,
                     normalizedKey,
                 );
-                const ownerStorageKey = owner
-                    ? makeArchiveSafePluginSaveStorageKey(
-                        PLUGIN_SAVE_META_PREFIX,
-                        normalizedKey,
-                    )
-                    : null;
-                if (signal) await writePersistentJson(valueStorageKey, snapshot, signal);
-                else await writePersistentJson(valueStorageKey, snapshot);
-                if (owner) {
-                    if (signal) await writePersistentJson(ownerStorageKey!, ownerRecord, signal);
-                    else await writePersistentJson(ownerStorageKey!, ownerRecord);
-                }
+                // The server derives this row, but preflight its stricter archive
+                // boundary before dispatching either side of the transaction.
+                makeArchiveSafePluginSaveStorageKey(
+                    PLUGIN_SAVE_META_PREFIX,
+                    normalizedKey,
+                );
+                await mutatePersistentPluginStorage(
+                    valueStorageKey,
+                    "set",
+                    snapshot,
+                    owner,
+                    signal,
+                );
                 return;
             }
 
             const nextValues = cloneJsonPluginStorageRecord(
                 db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
             );
-            const nextMeta = owner
-                ? cloneJsonPluginStorageRecord(
-                    db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
-                        NonNullable<Database["pluginStorageMeta"]>[string]
-                    >(),
-                    "pluginStorageMeta",
-                )
-                : undefined;
+            const nextMeta = cloneJsonPluginStorageRecord(
+                db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
+                    NonNullable<Database["pluginStorageMeta"]>[string]
+                >(),
+                "pluginStorageMeta",
+            );
             definePluginStorageRecordValue(nextValues, normalizedKey, snapshot);
-            if (nextMeta) {
+            if (owner) {
                 definePluginStorageRecordValue(nextMeta, normalizedKey, ownerRecord);
+            } else {
+                delete nextMeta[normalizedKey];
             }
-            // Both live records have passed preflight; only now publish either.
+            // Both detached records have passed preflight. Publish synchronously,
+            // with no await or observable plugin callback between the two fields.
             db.pluginCustomStorage = nextValues;
-            if (nextMeta) db.pluginStorageMeta = nextMeta;
+            if (getPluginStorageRecordKeys(nextMeta).length > 0) {
+                db.pluginStorageMeta = nextMeta;
+            } else {
+                delete db.pluginStorageMeta;
+            }
         }, signal);
     } finally {
         invalidateStorageEnumerationSnapshot();
@@ -728,17 +732,7 @@ export async function removeOwnedPluginSaveStorageItem(
                     PLUGIN_SAVE_PREFIX,
                     normalizedKey,
                 );
-                const metaStorageKey = makeEncodedStorageKey(
-                    PLUGIN_SAVE_META_PREFIX,
-                    normalizedKey,
-                );
-                if (signal) {
-                    await removePersistentKey(valueStorageKey, signal);
-                    await removePersistentKey(metaStorageKey, signal);
-                } else {
-                    await removePersistentKey(valueStorageKey);
-                    await removePersistentKey(metaStorageKey);
-                }
+                await mutatePersistentPluginStorage(valueStorageKey, "remove", signal);
                 return;
             }
 

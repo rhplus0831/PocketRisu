@@ -217,6 +217,20 @@ const pluginStorageClearFailpoint = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_PLUGIN_CLEAR_FAILPOINT ?? '')
     : '';
 
+// Test-only boundaries for the AA1 transaction contract. These are scoped to
+// the narrow plugin mutation endpoint so ordinary KV fault-injection remains
+// unchanged: owner-write | owner-remove | pre-commit | verification-read |
+// acknowledgement-loss.
+const pluginStorageMutationFailpoint = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_PLUGIN_MUTATION_FAILPOINT ?? '').trim()
+    : '';
+
+function hitPluginStorageMutationFailpoint(boundary) {
+    if (pluginStorageMutationFailpoint === boundary) {
+        throw new Error(`Injected plugin storage mutation failure at ${boundary}`);
+    }
+}
+
 // Captures run inside the endpoint's storage operation. Reconcile enters the
 // same queue through runStorageOperation, so neither can observe half-written
 // backup state or race a chat-row overwrite.
@@ -4214,6 +4228,155 @@ app.get('/api/list', async (req, res, next) => {
         });
         res.send({ success: true, ...response });
     } catch (error) {
+        next(error);
+    }
+});
+
+/**
+ * One logical V3 save mutation. The value row and its ownership sidecar share
+ * one synchronous SQLite writer transaction. Empty owner means deliberately
+ * unowned (delete stale metadata); remove always deletes a matching owner row,
+ * including an owner orphan left by historical clients.
+ */
+app.post('/api/plugin-storage/mutate', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+
+    const firstHeader = (value) => Array.isArray(value) ? value[0] : value;
+    const filePath = firstHeader(req.headers['file-path']);
+    const operation = firstHeader(req.headers['x-plugin-storage-operation']);
+    const ownerHeader = firstHeader(req.headers['x-plugin-storage-owner']) ?? '';
+    const reject = (error, code = 'INVALID_PLUGIN_STORAGE_MUTATION') => res.status(400).json({
+        success: false,
+        outcome: 'not-committed',
+        operation: operation === 'remove' ? 'remove' : 'set',
+        error,
+        code,
+        retryable: false,
+    });
+
+    if (operation !== 'set' && operation !== 'remove') {
+        return reject('Plugin storage operation must be set or remove.');
+    }
+    if (typeof filePath !== 'string' || !isHex(filePath)) {
+        return reject('A valid value row path is required.');
+    }
+
+    let valueKey;
+    let ownerKey;
+    let owner = '';
+    let valueBytes = null;
+    try {
+        valueKey = Buffer.from(filePath, 'hex').toString('utf-8');
+        const rawKey = decodePluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX);
+        ownerKey = encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX);
+
+        if (operation === 'set') {
+            if (typeof ownerHeader !== 'string' || !/^[A-Za-z0-9_-]*$/.test(ownerHeader)) {
+                throw new Error('Plugin owner must use canonical base64url encoding.');
+            }
+            owner = Buffer.from(ownerHeader, 'base64url').toString('utf-8');
+            if (Buffer.from(owner, 'utf-8').toString('base64url') !== ownerHeader) {
+                throw new Error('Plugin owner must use canonical UTF-8 base64url encoding.');
+            }
+            if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+                throw new Error('A set mutation requires JSON value bytes.');
+            }
+            valueBytes = Buffer.from(req.body);
+            const valueText = valueBytes.toString('utf-8');
+            if (!Buffer.from(valueText, 'utf-8').equals(valueBytes)) {
+                throw new Error('Plugin value must be valid UTF-8 JSON.');
+            }
+            JSON.parse(valueText);
+        }
+    } catch (error) {
+        return reject(error instanceof Error ? error.message : String(error));
+    }
+
+    try {
+        await queueStorageMutation(() => {
+            try {
+                sqliteDb.transaction(() => {
+                    if (operation === 'set') {
+                        kvSet(valueKey, valueBytes);
+                        hitPluginStorageMutationFailpoint('owner-write');
+                        if (owner) {
+                            kvSet(ownerKey, Buffer.from(JSON.stringify({
+                                plugin: owner,
+                                updatedAt: Date.now(),
+                            }), 'utf-8'));
+                        } else {
+                            kvDel(ownerKey);
+                        }
+                    } else {
+                        kvDel(valueKey);
+                        hitPluginStorageMutationFailpoint('owner-remove');
+                        kvDel(ownerKey);
+                    }
+                    hitPluginStorageMutationFailpoint('pre-commit');
+                })();
+            } catch (error) {
+                logger.warn('[PluginStorageMutation] Transaction rolled back:', error);
+                return res.status(500).json({
+                    success: false,
+                    outcome: 'not-committed',
+                    operation,
+                    error: 'Plugin storage transaction rolled back.',
+                    code: 'PLUGIN_STORAGE_TRANSACTION_ROLLED_BACK',
+                    retryable: false,
+                });
+            }
+
+            if (pluginStorageMutationFailpoint === 'acknowledgement-loss') {
+                // The transaction is durably committed, but the client receives
+                // no schema-valid response and must report outcome unknown.
+                res.socket?.destroy();
+                return;
+            }
+
+            let verification = 'verified';
+            try {
+                hitPluginStorageMutationFailpoint('verification-read');
+                const storedValue = kvGet(valueKey);
+                const storedOwner = kvGet(ownerKey);
+                const valueMatches = operation === 'set'
+                    ? storedValue !== null && storedValue.equals(valueBytes)
+                    : storedValue === null;
+                const ownerMatches = operation === 'set' && owner
+                    ? storedOwner !== null
+                        && JSON.parse(storedOwner.toString('utf-8'))?.plugin === owner
+                    : storedOwner === null;
+                if (!valueMatches || !ownerMatches) {
+                    throw new Error('Committed plugin storage rows failed verification.');
+                }
+            } catch (error) {
+                // The writer transaction has already returned successfully.
+                // Never reject a known committed primary mutation because a
+                // later diagnostic read failed.
+                verification = 'unavailable';
+                logger.warn('[PluginStorageMutation] Post-commit verification unavailable:', error);
+            }
+
+            return res.json({
+                success: true,
+                outcome: 'committed',
+                operation,
+                verification,
+                hash: operation === 'set' ? sha256Hex(valueBytes) : undefined,
+            });
+        });
+    } catch (error) {
+        if (isImportInProgressError(error)) {
+            res.setHeader('Retry-After', '5');
+            return res.status(503).json({
+                success: false,
+                outcome: 'not-committed',
+                operation,
+                error: 'An import is in progress; retry this write after it completes',
+                code: 'IMPORT_IN_PROGRESS',
+                retryable: true,
+            });
+        }
         next(error);
     }
 });

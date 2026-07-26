@@ -111,6 +111,28 @@ vi.mock("../storage/persistentKv", () => {
         makeEncodedStorageKey: vi.fn(
             (prefix: string, key: string) => `${prefix}${encode(key)}.json`,
         ),
+        mutatePersistentPluginStorage: vi.fn(async (
+            valueKey: string,
+            operation: "set" | "remove",
+            value?: unknown,
+            owner = "",
+        ) => {
+            const encodedKey = valueKey.slice("pluginsave/".length, -".json".length);
+            const metaKey = `pluginsave-meta/${encodedKey}.json`;
+            if (operation === "set") {
+                persistent.set(valueKey, value);
+                if (owner) persistent.set(metaKey, { plugin: owner, updatedAt: Date.now() });
+                else persistent.delete(metaKey);
+            } else {
+                persistent.delete(valueKey);
+                persistent.delete(metaKey);
+            }
+            return {
+                outcome: "committed" as const,
+                operation,
+                verification: "verified" as const,
+            };
+        }),
         readPersistentJson: vi.fn(async (key: string) => persistent.get(key) ?? null),
         removePersistentKey: vi.fn(async (key: string) => {
             persistent.delete(key);
@@ -248,6 +270,7 @@ beforeEach(async () => {
     const {
         listPersistentKeys,
         makeEncodedStorageKey,
+        mutatePersistentPluginStorage,
         readPersistentJson,
         removePersistentKey,
         writePersistentJson,
@@ -262,6 +285,24 @@ beforeEach(async () => {
             );
         }
         return encoded(prefix, key);
+    });
+    mutatePersistentPluginStorage.mockImplementation(async (
+        valueKey: string,
+        operation: "set" | "remove",
+        value?: unknown,
+        owner = "",
+    ) => {
+        const encodedKey = valueKey.slice(PLUGIN_SAVE_PREFIX.length, -".json".length);
+        const metaKey = `${PLUGIN_SAVE_META_PREFIX}${encodedKey}.json`;
+        if (operation === "set") {
+            persistent.set(valueKey, value);
+            if (owner) persistent.set(metaKey, { plugin: owner, updatedAt: Date.now() });
+            else persistent.delete(metaKey);
+        } else {
+            persistent.delete(valueKey);
+            persistent.delete(metaKey);
+        }
+        return { outcome: "committed", operation, verification: "verified" };
     });
     readPersistentJson.mockImplementation(async (key: string) => persistent.get(key) ?? null);
     removePersistentKey.mockImplementation(async (key: string) => {
@@ -514,7 +555,7 @@ describe("plugin save storage transport", () => {
     test("owned writes accept the maximum metadata-safe raw ASCII identifier", async () => {
         database.optimizePluginMemory = true;
         const rawKey = "k".repeat(752);
-        const { writePersistentJson } = await import("../storage/persistentKv");
+        const { mutatePersistentPluginStorage, writePersistentJson } = await import("../storage/persistentKv");
 
         await expect(setOwnedPluginSaveStorageItem(
             rawKey,
@@ -522,16 +563,15 @@ describe("plugin save storage transport", () => {
             "Boundary Plugin",
         )).resolves.toBeUndefined();
 
-        expect(writePersistentJson).toHaveBeenNthCalledWith(
-            1,
+        expect(mutatePersistentPluginStorage).toHaveBeenCalledOnce();
+        expect(mutatePersistentPluginStorage).toHaveBeenCalledWith(
             encoded(PLUGIN_SAVE_PREFIX, rawKey),
+            "set",
             { value: "maximum" },
+            "Boundary Plugin",
+            undefined,
         );
-        expect(writePersistentJson).toHaveBeenNthCalledWith(
-            2,
-            encoded(PLUGIN_SAVE_META_PREFIX, rawKey),
-            expect.objectContaining({ plugin: "Boundary Plugin" }),
-        );
+        expect(writePersistentJson).not.toHaveBeenCalled();
     });
 
     test("snapshots an inline oversized-key replacement before waiting without archive limits", async () => {
@@ -751,6 +791,35 @@ describe("plugin save storage transport", () => {
         expect(Object.hasOwn(database.pluginCustomStorage, "new-key")).toBe(false);
         expect(getterCalls).toBe(0);
     });
+
+    test.each([false, true])(
+        "owned set replaces stale ownership and empty owner removes it in %s mode",
+        async (optimized) => {
+            database.optimizePluginMemory = optimized;
+            const valueKey = encoded(PLUGIN_SAVE_PREFIX, "owned");
+            const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "owned");
+            if (optimized) {
+                persistent.set(valueKey, { state: "old" });
+                persistent.set(metaKey, { plugin: "Old", updatedAt: 1 });
+            } else {
+                database.pluginCustomStorage.owned = { state: "old" };
+                database.pluginStorageMeta = {
+                    owned: { plugin: "Old", updatedAt: 1 },
+                };
+            }
+
+            await setOwnedPluginSaveStorageItem("owned", { state: "new" }, "New");
+            await setOwnedPluginSaveStorageItem("owned", { state: "unowned" }, "");
+
+            if (optimized) {
+                expect(persistent.get(valueKey)).toEqual({ state: "unowned" });
+                expect(persistent.has(metaKey)).toBe(false);
+            } else {
+                expect(database.pluginCustomStorage.owned).toEqual({ state: "unowned" });
+                expect(database.pluginStorageMeta).toBeUndefined();
+            }
+        },
+    );
 
     test("uses one stable ECMAScript-aware key order in both modes", async () => {
         const insertionOrder = ["beta", "10", "2", "01", "alpha", "4294967295", "0", ""];

@@ -578,6 +578,28 @@ export function invalidateResourceCachePrefix(resourceKeyPrefix: string): Promis
     return operation
 }
 
+/** Drop one disposable manifest after an authoritative key deletion. */
+export function invalidateResourceCacheManifest(resourceKey: string): Promise<void> {
+    if (!isResourceCacheEnabled() || !nonEmptyString(resourceKey)) return Promise.resolve()
+    const epoch = resourceCacheEpoch
+    const operation = resourceCacheWriteChain
+        .catch(() => undefined)
+        .then(async () => {
+            if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
+            const database = await openResourceCacheDatabase()
+            if (!database) return
+            const transaction = database.transaction(RESOURCE_CACHE_MANIFEST_STORE, 'readwrite')
+            const done = transactionComplete(transaction)
+            transaction.objectStore(RESOURCE_CACHE_MANIFEST_STORE).delete(resourceKey)
+            await done
+            if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
+            await pruneResourceCache(database)
+        })
+        .catch(() => undefined)
+    resourceCacheWriteChain = operation
+    return operation
+}
+
 /** Clear the disposable cache, including pending connections and writes. */
 export async function clearResourceCache(): Promise<void> {
     resourceCacheEpoch += 1

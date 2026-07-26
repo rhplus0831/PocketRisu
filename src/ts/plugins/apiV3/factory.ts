@@ -52,6 +52,7 @@ export interface V3BridgeErrorPayload {
     retryable?: boolean;
     commitOutcomeUnknown?: boolean;
     operation?: string | null;
+    outcome?: string;
 }
 
 /** Self-contained because its source is also installed in the iframe guest. */
@@ -76,6 +77,7 @@ export function serializeV3BridgeError(error: unknown): V3BridgeErrorPayload {
     const retryable = source?.retryable;
     const commitOutcomeUnknown = source?.commitOutcomeUnknown;
     const operation = source?.operation;
+    const outcome = source?.outcome;
     if (typeof status === 'number') payload.status = status;
     else if (status === null) payload.status = null;
     if (typeof code === 'string') payload.code = code;
@@ -88,6 +90,7 @@ export function serializeV3BridgeError(error: unknown): V3BridgeErrorPayload {
     }
     if (typeof operation === 'string') payload.operation = operation;
     else if (operation === null) payload.operation = null;
+    if (typeof outcome === 'string') payload.outcome = outcome;
     return payload;
 }
 
@@ -107,6 +110,7 @@ export function deserializeV3BridgeError(input: unknown): Error {
         retryable?: boolean;
         commitOutcomeUnknown?: boolean;
         operation?: string | null;
+        outcome?: string;
     };
     const name = source?.name;
     const status = source?.status;
@@ -115,6 +119,7 @@ export function deserializeV3BridgeError(input: unknown): Error {
     const retryable = source?.retryable;
     const commitOutcomeUnknown = source?.commitOutcomeUnknown;
     const operation = source?.operation;
+    const outcome = source?.outcome;
     if (typeof name === 'string' && name.length > 0) error.name = name;
     if (typeof status === 'number') error.status = status;
     else if (status === null) error.status = null;
@@ -128,6 +133,7 @@ export function deserializeV3BridgeError(input: unknown): Error {
     }
     if (typeof operation === 'string') error.operation = operation;
     else if (operation === null) error.operation = null;
+    if (typeof outcome === 'string') error.outcome = outcome;
     return error;
 }
 
