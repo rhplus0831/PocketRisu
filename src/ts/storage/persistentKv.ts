@@ -1,5 +1,8 @@
 import { hasher } from "../parser/parser.svelte";
 import { forageStorage } from "../globalApi.svelte";
+import { assertWellFormedUnicode } from "./unicodeWellFormed";
+
+export { hasNativeStringWellFormed } from "./unicodeWellFormed";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -14,11 +17,7 @@ async function ensureStorageReady() {
 }
 
 function encodeKeyComponent(value: string) {
-    if (!value.isWellFormed()) {
-        throw new Error(
-            `Plugin storage keys must be well-formed Unicode (no unpaired surrogates): ${JSON.stringify(value)}`,
-        );
-    }
+    assertWellFormedUnicode(value);
     return Buffer.from(value, "utf-8")
         .toString("base64")
         .replace(/\+/g, "-")

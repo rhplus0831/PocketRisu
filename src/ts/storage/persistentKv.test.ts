@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const storage = vi.hoisted(() => ({
     Init: vi.fn(async () => undefined),
@@ -9,7 +9,30 @@ const storage = vi.hoisted(() => ({
 vi.mock('../globalApi.svelte', () => ({ forageStorage: storage }))
 vi.mock('../parser/parser.svelte', () => ({ hasher: vi.fn() }))
 
-const { makeEncodedStorageKey, readPersistentJson } = await import('./persistentKv')
+// Simulate an older Chromium/WebKit WebView before persistent storage is
+// initialized, so the module-level capability test selects the portable path.
+const nativeIsWellFormedDescriptor = Object.getOwnPropertyDescriptor(
+    String.prototype,
+    'isWellFormed',
+)
+Reflect.deleteProperty(String.prototype, 'isWellFormed')
+
+const {
+    decodeStorageKeyComponent,
+    hasNativeStringWellFormed,
+    makeEncodedStorageKey,
+    readPersistentJson,
+} = await import('./persistentKv')
+
+afterAll(() => {
+    if (nativeIsWellFormedDescriptor) {
+        Object.defineProperty(
+            String.prototype,
+            'isWellFormed',
+            nativeIsWellFormedDescriptor,
+        )
+    }
+})
 
 beforeEach(() => {
     storage.getItem.mockClear()
@@ -32,8 +55,18 @@ describe('persistent JSON read transport', () => {
 })
 
 describe('encoded storage keys', () => {
+    it('uses the portable validator when the WebView lacks the ES2024 method', () => {
+        expect(hasNativeStringWellFormed).toBe(false)
+        const rawKey = 'legacy WebView 🔑 key'
+        const encoded = makeEncodedStorageKey('pluginsave/', rawKey)
+        const component = encoded.slice('pluginsave/'.length, -'.json'.length)
+        expect(decodeStorageKeyComponent(component)).toBe(rawKey)
+    })
+
     it('rejects lone surrogates before UTF-8 encoding', () => {
         expect(() => makeEncodedStorageKey('pluginsave/', '\uD800'))
+            .toThrow('well-formed Unicode')
+        expect(() => makeEncodedStorageKey('pluginsave/', '\uDC00'))
             .toThrow('well-formed Unicode')
     })
 

@@ -8,6 +8,7 @@ import {
     removePersistentKey,
     writePersistentJson,
 } from "../storage/persistentKv";
+import { assertWellFormedUnicode } from "../storage/unicodeWellFormed";
 import { requireCommittedDatabaseSave } from "../storage/databaseSave";
 import {
     beginPluginStorageModeTransition,
@@ -27,6 +28,14 @@ export const PLUGIN_SAVE_PREFIX = "pluginsave/";
 export const PLUGIN_SAVE_META_PREFIX = "pluginsave-meta/";
 
 let storageOperationQueue: Promise<unknown> = Promise.resolve();
+
+function normalizePluginStorageKey(key: unknown): string {
+    // The inline object backend historically applies ordinary property-key
+    // coercion. Do it before routing so optimized mode has identical behavior.
+    const normalized = String(key);
+    assertWellFormedUnicode(normalized);
+    return normalized;
+}
 
 /**
  * Serialize mode transitions with V3/viewer storage operations. V2 calls are
@@ -240,11 +249,12 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
 }
 
 export async function getPluginSaveStorageItem<T>(key: string): Promise<T | null> {
+    const normalizedKey = normalizePluginStorageKey(key);
     return withPluginSaveStorageLock(async () => {
         const db = getDatabase();
         if (!db.optimizePluginMemory) {
-            if (!hasPluginStorageRecordValue(db.pluginCustomStorage, key)) return null;
-            const value = db.pluginCustomStorage![key];
+            if (!hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) return null;
+            const value = db.pluginCustomStorage![normalizedKey];
             if (value === undefined || value === null) return null;
             // db is reactive $state, so inline values are Svelte proxies.
             // postMessage/structuredClone reject proxies (DataCloneError), and
@@ -252,20 +262,21 @@ export async function getPluginSaveStorageItem<T>(key: string): Promise<T | null
             // JSON round-trip the optimized branch produces.
             return JSON.parse(JSON.stringify(value)) as T;
         }
-        return await readPersistentJson<T>(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key), { cached: true });
+        return await readPersistentJson<T>(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey), { cached: true });
     });
 }
 
 export async function setPluginSaveStorageItem<T>(key: string, value: T): Promise<void> {
+    const normalizedKey = normalizePluginStorageKey(key);
     await withPluginSaveStorageLock(async () => {
         const db = getDatabase();
         if (!db.optimizePluginMemory) {
             const next = copyDatabasePluginStorageRecord(db.pluginCustomStorage);
-            definePluginStorageRecordValue(next, key, value);
+            definePluginStorageRecordValue(next, normalizedKey, value);
             db.pluginCustomStorage = next;
             return;
         }
-        await writePersistentJson(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key), value);
+        await writePersistentJson(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey), value);
     });
 }
 
@@ -275,14 +286,15 @@ export async function setOwnedPluginSaveStorageItem<T>(
     value: T,
     owner: string,
 ): Promise<void> {
+    const normalizedKey = normalizePluginStorageKey(key);
     await withPluginSaveStorageLock(async () => {
         const db = getDatabase();
         const ownerRecord = { plugin: owner, updatedAt: Date.now() };
         if (db.optimizePluginMemory) {
-            await writePersistentJson(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key), value);
+            await writePersistentJson(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey), value);
             if (owner) {
                 await writePersistentJson(
-                    makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, key),
+                    makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, normalizedKey),
                     ownerRecord,
                 );
             }
@@ -290,48 +302,50 @@ export async function setOwnedPluginSaveStorageItem<T>(
         }
 
         const nextValues = copyDatabasePluginStorageRecord(db.pluginCustomStorage);
-        definePluginStorageRecordValue(nextValues, key, value);
+        definePluginStorageRecordValue(nextValues, normalizedKey, value);
         db.pluginCustomStorage = nextValues;
         if (owner) {
             const nextMeta = copyDatabasePluginStorageRecord(db.pluginStorageMeta);
-            definePluginStorageRecordValue(nextMeta, key, ownerRecord);
+            definePluginStorageRecordValue(nextMeta, normalizedKey, ownerRecord);
             db.pluginStorageMeta = nextMeta;
         }
     });
 }
 
 export async function removePluginSaveStorageItem(key: string): Promise<void> {
+    const normalizedKey = normalizePluginStorageKey(key);
     await withPluginSaveStorageLock(async () => {
         const db = getDatabase();
         if (!db.optimizePluginMemory) {
-            if (!hasPluginStorageRecordValue(db.pluginCustomStorage, key)) return;
+            if (!hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) return;
             const next = copyDatabasePluginStorageRecord(db.pluginCustomStorage);
-            delete next[key];
+            delete next[normalizedKey];
             db.pluginCustomStorage = next;
             return;
         }
-        await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key));
+        await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey));
     });
 }
 
 /** Remove a V3 save value and its owner as one ordered storage operation. */
 export async function removeOwnedPluginSaveStorageItem(key: string): Promise<void> {
+    const normalizedKey = normalizePluginStorageKey(key);
     await withPluginSaveStorageLock(async () => {
         const db = getDatabase();
         if (db.optimizePluginMemory) {
-            await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key));
-            await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, key));
+            await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey));
+            await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, normalizedKey));
             return;
         }
 
-        if (hasPluginStorageRecordValue(db.pluginCustomStorage, key)) {
+        if (hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) {
             const nextValues = copyDatabasePluginStorageRecord(db.pluginCustomStorage);
-            delete nextValues[key];
+            delete nextValues[normalizedKey];
             db.pluginCustomStorage = nextValues;
         }
-        if (hasPluginStorageRecordValue(db.pluginStorageMeta, key)) {
+        if (hasPluginStorageRecordValue(db.pluginStorageMeta, normalizedKey)) {
             const nextMeta = copyDatabasePluginStorageRecord(db.pluginStorageMeta);
-            delete nextMeta[key];
+            delete nextMeta[normalizedKey];
             if (getPluginStorageRecordKeys(nextMeta).length > 0) db.pluginStorageMeta = nextMeta;
             else delete db.pluginStorageMeta;
         }

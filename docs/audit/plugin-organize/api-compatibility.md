@@ -216,6 +216,26 @@ declared API, but the setting should not silently change coercion behavior.
 - Either coerce keys to strings consistently at the public boundary or reject
   non-strings with the same explicit error in both modes.
 
+### Resolution
+
+**Fixed 2026-07-26.** Client storage now feature-tests
+`String.prototype.isWellFormed` when the validation module initializes and
+uses a portable UTF-16 scanner when that ES2024 method is unavailable. Both
+paths reject lone surrogates before UTF-8/base64url encoding while preserving
+valid astral pairs and literal replacement characters.
+
+The mode-independent plugin-storage boundary now coerces runtime keys to
+strings and validates them before either the inline or optimized backend is
+selected. Untyped V3 callers therefore receive the same set/get/remove and
+enumeration behavior in both modes instead of succeeding inline and throwing
+only after optimization is enabled.
+
+Regression coverage simulates a legacy WebView by removing the native method
+before module initialization, exercises malformed and valid UTF-16 input, and
+uses the real V3 bridge to verify numeric-key parity in both modes.
+Independent verification passed 51 focused tests, the full client suite
+(1,005 passed, 3 skipped), `pnpm check`, and a production build.
+
 <a id="ac4"></a>
 ## AC4 — Value and enumeration parity gaps
 

@@ -190,6 +190,37 @@ describe("V3 mode-aware database bridge", () => {
         expect(testState.database.plugins[0].enabled).toBe(false);
     });
 
+    test.each([false, true])(
+        "coerces runtime keys identically with optimized mode %s",
+        async (optimized) => {
+            const plugin = {
+                name: "Key Coercion Plugin",
+                script: "// key coercion test",
+                arguments: {},
+                realArg: {},
+                customLink: [],
+                argMeta: {},
+                version: "3.0",
+                enabled: true,
+            } as const;
+            testState.database.optimizePluginMemory = optimized;
+            testState.database.pluginCustomStorage = {};
+            testState.database.plugins = [plugin];
+            DBState.db = testState.database;
+            const api = makeRisuaiAPIV3(document.createElement("iframe"), plugin as any) as any;
+
+            await api._setPluginStorage(42, { coerced: true });
+
+            expect(await api._getPluginStorage("42")).toEqual({ coerced: true });
+            expect(await api._getPluginStorage(42)).toEqual({ coerced: true });
+            expect(await api._keysPluginStorage()).toEqual(["42"]);
+
+            await api._removePluginStorage(42);
+            expect(await api._getPluginStorage("42")).toBeNull();
+            expect(await api._keysPluginStorage()).toEqual([]);
+        },
+    );
+
     test("mixes authoritative get/set/pluginStorage with exact and omitted semantics", async () => {
         storageMocks.persistent.set(storageKey("cfg"), { value: "real" });
         storageMocks.persistent.set(storageKey("old"), { remove: true });
