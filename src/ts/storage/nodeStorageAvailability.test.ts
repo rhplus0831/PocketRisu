@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const cache = vi.hoisted(() => ({
     enabled: true,
+    getManifestHashes: vi.fn(),
     getVerifiedManifestSnapshot: vi.fn(),
     getVerifiedCachedBytes: vi.fn(),
     sha256Bytes: vi.fn(),
@@ -10,9 +11,10 @@ const cache = vi.hoisted(() => ({
 }))
 
 vi.mock('./resourceCache', () => ({
-    getManifestHashes: vi.fn(async () => []),
+    getManifestHashes: cache.getManifestHashes,
     getVerifiedManifestSnapshot: cache.getVerifiedManifestSnapshot,
     getVerifiedCachedBytes: cache.getVerifiedCachedBytes,
+    invalidateResourceCacheManifest: vi.fn(async () => undefined),
     invalidateResourceCachePrefix: vi.fn(async () => undefined),
     isResourceCacheEnabled: () => cache.enabled,
     isSha256Hex: (value: unknown) => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value),
@@ -69,6 +71,7 @@ beforeEach(() => {
     ;(NodeStorage as any).sessionInitialized = false
     ;(NodeStorage as any).sessionPending = null
     cache.enabled = true
+    cache.getManifestHashes.mockResolvedValue([])
     cache.getVerifiedManifestSnapshot.mockResolvedValue(null)
     cache.getVerifiedCachedBytes.mockResolvedValue(null)
     cache.sha256Bytes.mockResolvedValue('a'.repeat(64))
@@ -82,6 +85,71 @@ afterEach(() => {
 })
 
 describe('NodeStorage availability bounds', () => {
+    it('routes staged transition controls without an aggregate database envelope', async () => {
+        const transitionId = '123e4567-e89b-42d3-a456-426614174000'
+        const targetGeneration = '123e4567-e89b-42d3-a456-426614174001'
+        const response = {
+            success: true,
+            transitionId,
+            state: 'ready',
+            direction: 'externalize',
+            targetGeneration,
+            rows: [{
+                storageKey: 'pluginsave/YQ.json',
+                size: 3,
+                sha256: 'a'.repeat(64),
+                uploaded: true,
+            }],
+            uploaded: 1,
+            total: 1,
+            totalBytes: 3,
+        }
+        const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => (
+            String(input).endsWith('/row')
+                ? new Response(new Uint8Array([34, 97, 34]), { status: 200 })
+                : new Response(JSON.stringify(response), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                })
+        ))
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+        const plan = {
+            version: 2 as const,
+            transitionId,
+            source: { optimized: false, generation: null, manifest: null },
+            targetOptimized: true,
+            targetGeneration,
+            rows: [{ storageKey: 'pluginsave/YQ.json', size: 3 }],
+        }
+
+        await storage.beginPluginStorageTransition(plan)
+        await storage.uploadPluginStorageTransitionRow(
+            transitionId,
+            'pluginsave/YQ.json',
+            new Uint8Array([34, 97, 34]),
+        )
+        await expect(storage.readPluginStorageTransitionRow(
+            transitionId,
+            'pluginsave/YQ.json',
+        )).resolves.toEqual(Buffer.from('"a"'))
+        await storage.getPluginStorageTransitionStatus(transitionId)
+        await storage.finalizePluginStorageTransition(transitionId)
+        await storage.abortPluginStorageTransition(transitionId)
+
+        expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+            '/api/plugin-storage/transition/stage/begin',
+            '/api/plugin-storage/transition/stage/upload',
+            '/api/plugin-storage/transition/stage/row',
+            '/api/plugin-storage/transition/stage/status',
+            '/api/plugin-storage/transition/stage/finalize',
+            '/api/plugin-storage/transition/stage/abort',
+        ])
+        const beginBody = JSON.parse(String(fetchMock.mock.calls[0][1]?.body))
+        expect(beginBody).not.toHaveProperty('database')
+        expect(fetchMock.mock.calls[1][1]?.body).toBeInstanceOf(Uint8Array)
+    })
+
     it('routes large plugin values through the parser-free streaming endpoint', async () => {
         cache.enabled = false
         const requestBytes = new Uint8Array(1024 * 1024)
@@ -165,7 +233,7 @@ describe('NodeStorage availability bounds', () => {
 
     it('falls through a stalled resource-cache read to the authoritative server', async () => {
         vi.useFakeTimers()
-        cache.getVerifiedManifestSnapshot.mockImplementation(
+        cache.getManifestHashes.mockImplementation(
             () => new Promise<never>(() => undefined),
         )
         const fetchMock = vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), {
@@ -430,39 +498,88 @@ describe('NodeStorage availability bounds', () => {
         expect(requestSignal?.aborted).toBe(true)
     })
 
-    it('keeps a stalled transition acknowledgement body commit-ambiguous', async () => {
+    it('resolves a stalled staged-finalize acknowledgement through status', async () => {
         vi.useFakeTimers()
         let requestSignal: AbortSignal | undefined
-        const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
-            requestSignal = init?.signal ?? undefined
-            const response = new Response(null, { status: 200 })
-            vi.spyOn(response, 'json').mockImplementation(
-                () => new Promise<never>(() => undefined),
-            )
-            return Promise.resolve(response)
+        const transitionId = '123e4567-e89b-42d3-a456-426614174010'
+        const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+            if (String(input).endsWith('/finalize')) {
+                requestSignal = init?.signal ?? undefined
+                const response = new Response(null, { status: 200 })
+                vi.spyOn(response, 'json').mockImplementation(
+                    () => new Promise<never>(() => undefined),
+                )
+                return Promise.resolve(response)
+            }
+            if (String(input).endsWith('/status')) {
+                return Promise.resolve(new Response(JSON.stringify({
+                    success: true,
+                    transitionId,
+                    state: 'committed',
+                    direction: 'externalize',
+                    targetGeneration: '123e4567-e89b-42d3-a456-426614174011',
+                    rows: [],
+                    uploaded: 0,
+                    total: 0,
+                    totalBytes: 0,
+                    etag: 'a'.repeat(32),
+                }), { status: 200 }))
+            }
+            throw new Error(`Unexpected request: ${String(input)}`)
         })
         vi.stubGlobal('fetch', fetchMock)
         const storage = readyStorage()
 
-        const pending = storage.commitPluginStorageTransition({
-            version: 1,
-            source: { optimized: false, generation: null, manifest: null },
-            database: new Uint8Array(),
-        }).catch(error => error)
+        const pending = storage.finalizePluginStorageTransition(transitionId)
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        const result = await pending
+
+        expect(result.state).toBe('committed')
+        expect(fetchMock).toHaveBeenCalledTimes(2)
+        expect(requestSignal?.aborted).toBe(true)
+        expect(cache.storeBytes).not.toHaveBeenCalled()
+        expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
+    })
+
+    it('classifies a serialized ready status as definitively not committed', async () => {
+        vi.useFakeTimers()
+        const transitionId = '123e4567-e89b-42d3-a456-426614174012'
+        vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+            if (String(input).endsWith('/finalize')) {
+                const response = new Response(null, { status: 200 })
+                vi.spyOn(response, 'json').mockImplementation(
+                    () => new Promise<never>(() => undefined),
+                )
+                return Promise.resolve(response)
+            }
+            if (String(input).endsWith('/status')) {
+                return Promise.resolve(new Response(JSON.stringify({
+                    success: true,
+                    transitionId,
+                    state: 'ready',
+                    direction: 'externalize',
+                    targetGeneration: '123e4567-e89b-42d3-a456-426614174013',
+                    rows: [],
+                    uploaded: 0,
+                    total: 0,
+                    totalBytes: 0,
+                }), { status: 200 }))
+            }
+            throw new Error(`Unexpected request: ${String(input)}`)
+        }))
+        const storage = readyStorage()
+
+        const pending = storage.finalizePluginStorageTransition(transitionId)
+            .catch(error => error)
         await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
         const error = await pending
 
         expect(error).toBeInstanceOf(StorageError)
         expect(error).toMatchObject({
-            code: 'COMMIT_OUTCOME_UNKNOWN',
-            commitOutcomeUnknown: true,
-            retryable: false,
-            operation: 'transition',
+            code: 'PLUGIN_STORAGE_TRANSITION_NOT_COMMITTED',
+            commitOutcomeUnknown: false,
+            retryable: true,
         })
-        expect(fetchMock).toHaveBeenCalledOnce()
-        expect(requestSignal?.aborted).toBe(true)
-        expect(cache.storeBytes).not.toHaveBeenCalled()
-        expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
     })
 
     it('clears mutation ambiguity before a definitive conflict body stalls', async () => {

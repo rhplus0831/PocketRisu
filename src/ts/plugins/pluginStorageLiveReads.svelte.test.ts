@@ -64,6 +64,8 @@ vi.mock("./apiV3/transpiler", () => ({ pluginCodeTranspiler: vi.fn() }));
 vi.mock("../storage/persistentKv", () => ({
     clearPersistentPrefix: vi.fn(),
     decodeStorageKeyComponent: (value: string) => value,
+    getPersistentStorageFreeBytes: vi.fn(async () => null),
+    listPersistentEntriesWithSizes: vi.fn(async () => []),
     listPersistentKeys: vi.fn(async () => []),
     makeEncodedStorageKey: (prefix: string, key: string) => `${prefix}${key}.json`,
     readPersistentJson: vi.fn(),
@@ -184,6 +186,13 @@ describe("live plugin storage reads", () => {
         const persistedInlineKeys: string[][] = [];
         const dependencies = {
             getDatabase: () => testState.database,
+            listPersistentEntriesWithSizes: async (prefix: string) =>
+                [...persistent.entries()]
+                    .filter(([key]) => key.startsWith(prefix))
+                    .map(([key, value]) => ({
+                        key,
+                        size: new TextEncoder().encode(JSON.stringify(value)).byteLength,
+                    })),
             listPersistentKeys: async (prefix: string) => [...persistent.keys()]
                 .filter(key => key.startsWith(prefix)),
             readPersistentJson: async <T>(key: string) => persistent.get(key) as T,

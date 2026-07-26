@@ -11,9 +11,13 @@ const {
     existsSync,
     mkdirSync,
     readFileSync,
+    renameSync,
     writeFileSync,
     readdirSync,
     unlinkSync,
+    openSync,
+    closeSync,
+    fsyncSync,
     createReadStream,
     createWriteStream,
 } = fsSync;
@@ -1147,7 +1151,13 @@ app.use((req, res, next) => {
     // pre-buffered by the generic octet-stream parser.
     const isStreamingPluginMutation = req.path === '/api/plugin-storage/mutate'
         && req.headers['x-plugin-storage-stream'] === '1';
-    if (req.path === '/api/backup/import' || isStreamingPluginMutation) return next();
+    const isStreamingPluginTransitionUpload
+        = req.path === '/api/plugin-storage/transition/stage/upload';
+    if (
+        req.path === '/api/backup/import'
+        || isStreamingPluginMutation
+        || isStreamingPluginTransitionUpload
+    ) return next();
     const isPluginStorageBatch = req.path === '/api/plugin-storage/batch';
     const isBufferedPluginMutationSet = req.path === '/api/plugin-storage/mutate'
         && req.headers['x-plugin-storage-operation'] === 'set';
@@ -1225,6 +1235,9 @@ if(!existsSync(savePath)){
 
 const DATABASE_SPOOL_FILE_PREFIX = '.database-risudat-';
 const PLUGIN_VALUE_SPOOL_FILE_PREFIX = '.plugin-value-';
+const PLUGIN_TRANSITION_STAGE_PREFIX = '.plugin-transition-stage-';
+const PLUGIN_TRANSITION_STAGE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const PLUGIN_TRANSITION_MAX_ROW_BYTES = 32 * 1024 * 1024;
 // POCKETRISU_SPOOL_DIR may relocate temporary database assembly. The default
 // remains on the writable save volume and is independent of server backups.
 const configuredDatabaseSpoolDir = String(process.env.POCKETRISU_SPOOL_DIR ?? '').trim();
@@ -1232,8 +1245,10 @@ const databaseSpoolDir = configuredDatabaseSpoolDir
     ? path.resolve(configuredDatabaseSpoolDir)
     : path.join(savePath, '.spool');
 let databaseSpoolReady = true;
+const pluginTransitionStageDir = path.join(savePath, '.plugin-transition-staging');
 try {
     mkdirSync(databaseSpoolDir, { recursive: true });
+    mkdirSync(pluginTransitionStageDir, { recursive: true, mode: 0o700 });
 } catch (error) {
     databaseSpoolReady = false;
     logger.error(`[Backup] Could not create database spool directory ${databaseSpoolDir}:`, error);
@@ -1253,6 +1268,183 @@ if (databaseSpoolReady) {
         }
     } catch (error) {
         logger.warn(`[Backup] Could not sweep database spool directory ${databaseSpoolDir}:`, error);
+    }
+}
+
+function pluginTransitionStageMetaPath(transitionId) {
+    if (!PLUGIN_STORAGE_UUID_PATTERN.test(transitionId)) {
+        throw new TypeError('Plugin transition id must be a canonical UUID');
+    }
+    return path.join(
+        pluginTransitionStageDir,
+        `${PLUGIN_TRANSITION_STAGE_PREFIX}${transitionId}.json`,
+    );
+}
+
+function pluginTransitionStageRowPath(transitionId, index) {
+    if (!Number.isSafeInteger(index) || index < 0 || index > 100_000) {
+        throw new TypeError('Invalid plugin transition row index');
+    }
+    return path.join(
+        pluginTransitionStageDir,
+        `${PLUGIN_TRANSITION_STAGE_PREFIX}${transitionId}-${index}.row`,
+    );
+}
+
+function readPluginTransitionStage(transitionId) {
+    try {
+        const value = JSON.parse(readFileSync(
+            pluginTransitionStageMetaPath(transitionId),
+            'utf-8',
+        ));
+        if (value?.version !== 1 || value.transitionId !== transitionId) return null;
+        return value;
+    } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        throw error;
+    }
+}
+
+function writePluginTransitionStage(stage) {
+    const metaPath = pluginTransitionStageMetaPath(stage.transitionId);
+    const temporaryPath = `${metaPath}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`;
+    try {
+        writeFileSync(temporaryPath, JSON.stringify(stage), { encoding: 'utf-8', flag: 'wx' });
+        const fileDescriptor = openSync(temporaryPath, 'r');
+        try {
+            fsyncSync(fileDescriptor);
+        } finally {
+            closeSync(fileDescriptor);
+        }
+        renameSync(temporaryPath, metaPath);
+        fsyncPluginTransitionStageDirectory();
+    } catch (error) {
+        try { unlinkSync(temporaryPath); } catch {}
+        throw error;
+    }
+}
+
+function writePluginTransitionStageRow(filePath, value) {
+    try {
+        writeFileSync(filePath, value, { flag: 'wx', mode: 0o600 });
+        const fileDescriptor = openSync(filePath, 'r');
+        try {
+            fsyncSync(fileDescriptor);
+        } finally {
+            closeSync(fileDescriptor);
+        }
+        fsyncPluginTransitionStageDirectory();
+    } catch (error) {
+        try { unlinkSync(filePath); } catch {}
+        fsyncPluginTransitionStageDirectory();
+        throw error;
+    }
+}
+
+function fsyncPluginTransitionStageDirectory() {
+    // POSIX requires the containing directory to be synced for a newly
+    // created or renamed entry to survive power loss. Some platforms reject
+    // opening directories; the row/receipt file itself is still synced there.
+    let directoryDescriptor = null;
+    try {
+        directoryDescriptor = openSync(pluginTransitionStageDir, 'r');
+        fsyncSync(directoryDescriptor);
+    } catch {}
+    finally {
+        if (directoryDescriptor !== null) closeSync(directoryDescriptor);
+    }
+}
+
+function pluginTransitionStageBelongsToRequest(stage, req) {
+    if (!stage) return false;
+    const requestSessionId = typeof req.headers['x-session-id'] === 'string'
+        ? req.headers['x-session-id']
+        : null;
+    return stage.sessionId === requestSessionId;
+}
+
+function removePluginTransitionStage(stage) {
+    if (!stage) return;
+    const prefix = `${PLUGIN_TRANSITION_STAGE_PREFIX}${stage.transitionId}`;
+    for (const entry of readdirSync(pluginTransitionStageDir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.startsWith(prefix)) continue;
+        const suffix = entry.name.slice(prefix.length);
+        if (suffix !== '.json' && !suffix.startsWith('-') && !suffix.startsWith('.json.')) continue;
+        try { unlinkSync(path.join(pluginTransitionStageDir, entry.name)); } catch {}
+    }
+    fsyncPluginTransitionStageDirectory();
+}
+
+function removePluginTransitionStageRows(stage) {
+    if (!stage) return;
+    const prefix = `${PLUGIN_TRANSITION_STAGE_PREFIX}${stage.transitionId}-`;
+    for (const entry of readdirSync(pluginTransitionStageDir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.startsWith(prefix)) continue;
+        try { unlinkSync(path.join(pluginTransitionStageDir, entry.name)); } catch {}
+    }
+    fsyncPluginTransitionStageDirectory();
+}
+
+async function findActivePluginTransition(req, excludeTransitionId = null) {
+    const requestSessionId = typeof req.headers['x-session-id'] === 'string'
+        ? req.headers['x-session-id']
+        : null;
+    for (const entry of readdirSync(pluginTransitionStageDir, { withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        const match = entry.name.match(
+            /^\.plugin-transition-stage-([0-9a-f-]{36})\.json$/,
+        );
+        if (!match || match[1] === excludeTransitionId) continue;
+        const stage = await refreshPluginTransitionStageState(
+            readPluginTransitionStage(match[1]),
+        );
+        if (!stage || (stage.state !== 'uploading' && stage.state !== 'ready')) continue;
+        // A page reload creates a new writer session. Once that session owns
+        // the server lock, an unpublished stage from the displaced page can
+        // no longer be finalized and must not block recovery forever.
+        if (stage.sessionId !== requestSessionId) {
+            removePluginTransitionStage(stage);
+            continue;
+        }
+        return stage;
+    }
+    return null;
+}
+
+if (databaseSpoolReady) {
+    try {
+        const now = Date.now();
+        for (const entry of readdirSync(pluginTransitionStageDir, { withFileTypes: true })) {
+            if (!entry.isFile()
+                || !entry.name.startsWith(PLUGIN_TRANSITION_STAGE_PREFIX)
+                || !entry.name.endsWith('.json')) continue;
+            const match = entry.name.match(
+                /^\.plugin-transition-stage-([0-9a-f-]{36})\.json$/,
+            );
+            if (!match || !PLUGIN_STORAGE_UUID_PATTERN.test(match[1])) continue;
+            const stage = readPluginTransitionStage(match[1]);
+            if (!stage
+                || stage.state === 'aborted'
+                || now - Number(stage.updatedAt ?? stage.createdAt ?? 0)
+                    > PLUGIN_TRANSITION_STAGE_MAX_AGE_MS) {
+                removePluginTransitionStage(stage ?? { transitionId: match[1], rows: [] });
+            }
+        }
+        for (const entry of readdirSync(pluginTransitionStageDir, { withFileTypes: true })) {
+            if (!entry.isFile() || !entry.name.startsWith(PLUGIN_TRANSITION_STAGE_PREFIX)) continue;
+            if (entry.name.endsWith('.json')) continue;
+            const match = entry.name.match(
+                /^\.plugin-transition-stage-([0-9a-f-]{36})-/,
+            );
+            const stage = match && PLUGIN_STORAGE_UUID_PATTERN.test(match[1])
+                ? readPluginTransitionStage(match[1])
+                : null;
+            if (!stage || stage.state === 'committed' || stage.state === 'aborted') {
+                try { unlinkSync(path.join(pluginTransitionStageDir, entry.name)); } catch {}
+            }
+        }
+    } catch (error) {
+        logger.warn('[PluginStorageTransition] Could not sweep stale stages:', error);
     }
 }
 
@@ -2027,6 +2219,15 @@ const ASSET_EXT_MIME = {
 }
 
 async function checkDiskSpace(requiredBytes) {
+    if (process.env.POCKETRISU_PLUGIN_STORAGE_TEST_FAILPOINTS === '1'
+        && process.env.POCKETRISU_PLUGIN_TRANSITION_TEST_AVAILABLE_BYTES !== undefined) {
+        const available = Number(
+            process.env.POCKETRISU_PLUGIN_TRANSITION_TEST_AVAILABLE_BYTES,
+        );
+        if (Number.isSafeInteger(available) && available >= 0) {
+            return { ok: available >= requiredBytes, available };
+        }
+    }
     try {
         const saveDir = path.join(process.cwd(), 'save');
         const stats = await fs.statfs(saveDir);
@@ -5193,6 +5394,26 @@ app.get('/api/plugin-storage/state', async (req, res, next) => {
     }
 });
 
+// Lightweight capacity preflight for operations that temporarily need both
+// the external plugin rows and a newly-expanded database blob on the save
+// volume. Unlike /api/db/stats this does not scan repository contents.
+app.get('/api/storage/capacity', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        await importBarrier.waitUntilIdle();
+        if (HUB_HOSTING_MODE) return res.send({ success: true, freeBytes: null });
+        const capacity = await checkDiskSpace(0);
+        res.send({
+            success: true,
+            freeBytes: Number.isSafeInteger(capacity.available) && capacity.available >= 0
+                ? capacity.available
+                : null,
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
 /**
  * Atomically mutate a bounded set of optimized plugin values. Every CAS is
  * checked before the first write, and every value plus owner sidecar is
@@ -5539,6 +5760,41 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                 retryable: true,
             });
         }
+        next(error);
+    }
+});
+
+const PLUGIN_STORAGE_SIZE_PREFIXES = new Set([
+    PLUGIN_SAVE_PREFIX,
+    PLUGIN_SAVE_META_PREFIX,
+]);
+
+// Logical sizes let clients reject an unsafe transition before a large or
+// malformed row is downloaded. Restrict this inventory to plugin storage so
+// the endpoint cannot become an arbitrary repository-inspection primitive.
+app.get('/api/storage/list-sizes', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const rawPrefix = Array.isArray(req.headers['key-prefix'])
+            ? req.headers['key-prefix'][0]
+            : req.headers['key-prefix'];
+        if (!PLUGIN_STORAGE_SIZE_PREFIXES.has(rawPrefix)) {
+            return res.status(400).send({ error: 'Unsupported storage size prefix' });
+        }
+        await importBarrier.waitUntilIdle();
+        // The chunk-aware inventory reports authoritative logical sizes without
+        // loading or reassembling plugin value bodies.
+        const content = kvListWithSizes(rawPrefix);
+        if (content.some((entry) => (
+            typeof entry.key !== 'string'
+            || !entry.key.startsWith(rawPrefix)
+            || !Number.isSafeInteger(entry.size)
+            || entry.size < 0
+        ))) {
+            throw new Error('Invalid logical plugin storage size');
+        }
+        res.send({ success: true, content });
+    } catch (error) {
         next(error);
     }
 });
@@ -6115,6 +6371,844 @@ async function handlePluginStorageManifestMutation(req, res, next) {
         next(error);
     }
 }
+
+function pluginTransitionStageResponse(stage) {
+    return {
+        success: true,
+        transitionId: stage.transitionId,
+        state: stage.state,
+        direction: stage.targetOptimized ? 'externalize' : 'internalize',
+        targetGeneration: stage.targetGeneration,
+        rows: stage.rows.map(row => ({
+            storageKey: row.storageKey,
+            size: row.size,
+            sha256: row.sha256 ?? null,
+            uploaded: row.uploaded === true,
+        })),
+        uploaded: stage.rows.filter(row => row.uploaded === true).length,
+        total: stage.rows.length,
+        totalBytes: stage.rows.reduce((sum, row) => sum + row.size, 0),
+        etag: stage.resultEtag ?? undefined,
+    };
+}
+
+function pluginTransitionDesiredManifest(stage) {
+    if (!stage.targetOptimized) return null;
+    return createPluginStorageManifest(
+        stage.targetGeneration,
+        stage.rows
+            .filter(row => row.storageKey.startsWith(PLUGIN_SAVE_PREFIX))
+            .map(row => row.storageKey),
+        stage.rows
+            .filter(row => row.storageKey.startsWith(PLUGIN_SAVE_META_PREFIX))
+            .map(row => row.storageKey),
+    );
+}
+
+async function refreshPluginTransitionStageState(stage) {
+    if (!stage || stage.state === 'committed' || stage.state === 'aborted') return stage;
+    const rawDatabase = kvGet('database/database.bin');
+    if (!rawDatabase) return stage;
+    const dbObj = await decodeRisuSave(rawDatabase);
+    const manifest = readPluginStorageManifestState().manifest;
+    if (
+        (dbObj?.optimizePluginMemory === true) === stage.targetOptimized
+        && pluginStorageGeneration(dbObj) === stage.targetGeneration
+        && pluginStorageManifestEquals(manifest, pluginTransitionDesiredManifest(stage))
+    ) {
+        stage.state = 'committed';
+        stage.resultEtag = computeBufferEtag(rawDatabase);
+        stage.updatedAt = Date.now();
+        writePluginTransitionStage(stage);
+        removePluginTransitionStageRows(stage);
+    }
+    return stage;
+}
+
+/**
+ * A process can exit after the SQLite publication commits but before its
+ * private receipt is rewritten. Keep fresh ready/uploading receipts during
+ * the early filesystem sweep, then resolve them against authoritative state
+ * once the database is available. Unpublished stages are removed before the
+ * server begins accepting clients.
+ */
+async function reconcilePluginTransitionStagesAtStartup() {
+    if (!databaseSpoolReady) return;
+    for (const entry of readdirSync(pluginTransitionStageDir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+        const match = entry.name.match(
+            /^\.plugin-transition-stage-([0-9a-f-]{36})\.json$/,
+        );
+        if (!match || !PLUGIN_STORAGE_UUID_PATTERN.test(match[1])) continue;
+        let stage = readPluginTransitionStage(match[1]);
+        if (!stage || stage.state === 'aborted') {
+            removePluginTransitionStage(stage ?? { transitionId: match[1], rows: [] });
+            continue;
+        }
+        if (stage.state !== 'committed') {
+            stage = await refreshPluginTransitionStageState(stage);
+        }
+        if (stage?.state !== 'committed') removePluginTransitionStage(stage);
+    }
+}
+
+function normalizedPluginTransitionRows(rows) {
+    if (!Array.isArray(rows) || rows.length > 100_000) {
+        throw new TypeError('Plugin transition rows must be a bounded array');
+    }
+    const seen = new Set();
+    let total = 0;
+    return rows.map((row, index) => {
+        if (!row || typeof row !== 'object' || Array.isArray(row)) {
+            throw new TypeError('Invalid plugin transition row descriptor');
+        }
+        const rowKeys = Object.keys(row).sort();
+        if (rowKeys.length !== 2
+            || rowKeys[0] !== 'size'
+            || rowKeys[1] !== 'storageKey') {
+            throw new TypeError('Transition row descriptors accept only storageKey and size');
+        }
+        const storageKey = row.storageKey;
+        const prefix = canonicalPluginStorageRowPrefix(storageKey);
+        if (!prefix || seen.has(storageKey)) {
+            throw new TypeError('Plugin transition row keys must be unique and canonical');
+        }
+        seen.add(storageKey);
+        const size = row.size;
+        if (!Number.isSafeInteger(size) || size <= 0 || size > PLUGIN_TRANSITION_MAX_ROW_BYTES) {
+            throw new PluginStorageLimitError(
+                `Plugin transition row exceeds the ${PLUGIN_TRANSITION_MAX_ROW_BYTES}-byte transition limit.`,
+                {
+                    code: 'PLUGIN_STORAGE_SIZE_LIMIT',
+                    limit: PLUGIN_TRANSITION_MAX_ROW_BYTES,
+                    actual: size,
+                },
+            );
+        }
+        total += size;
+        if (!Number.isSafeInteger(total)) {
+            throw new TypeError('Plugin transition size exceeds the safe integer range');
+        }
+        return { index, storageKey, size, sha256: null, uploaded: false };
+    });
+}
+
+function authoritativeInlinePluginTransitionRows(liveDb) {
+    const rows = [];
+    const seen = new Set();
+    const appendRecord = (record, prefix) => {
+        if (record === undefined) return;
+        if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+            throw new PluginStorageValidationError(prefix);
+        }
+        const prototype = Reflect.getPrototypeOf(record);
+        if (prototype !== Object.prototype && prototype !== null) {
+            throw new PluginStorageValidationError(prefix);
+        }
+        for (const rawKey of Reflect.ownKeys(record)) {
+            if (typeof rawKey !== 'string') throw new PluginStorageValidationError(prefix);
+            const storageKey = encodeValidatedPluginStorageKey(rawKey, prefix);
+            if (seen.has(storageKey)) throw new PluginStorageValidationError(storageKey);
+            const descriptor = Reflect.getOwnPropertyDescriptor(record, rawKey);
+            if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) {
+                throw new PluginStorageValidationError(storageKey);
+            }
+            const value = serializePluginStorageRow(storageKey, descriptor.value);
+            if (value.length > PLUGIN_TRANSITION_MAX_ROW_BYTES) {
+                throw new PluginStorageLimitError(
+                    `Plugin transition row exceeds the ${PLUGIN_TRANSITION_MAX_ROW_BYTES}-byte transition limit.`,
+                    {
+                        code: 'PLUGIN_STORAGE_SIZE_LIMIT',
+                        limit: PLUGIN_TRANSITION_MAX_ROW_BYTES,
+                        actual: value.length,
+                    },
+                );
+            }
+            seen.add(storageKey);
+            rows.push({
+                storageKey,
+                size: value.length,
+                sha256: sha256Hex(value),
+                uploaded: false,
+            });
+            if (rows.length > 100_000) {
+                throw new PluginStorageLimitError(
+                    'Plugin storage exceeds the 100000-entry transition limit.',
+                    { code: 'PLUGIN_STORAGE_SIZE_LIMIT', limit: 100_000, actual: rows.length },
+                );
+            }
+        }
+    };
+    appendRecord(liveDb?.pluginCustomStorage, PLUGIN_SAVE_PREFIX);
+    appendRecord(liveDb?.pluginStorageMeta, PLUGIN_SAVE_META_PREFIX);
+    rows.sort((left, right) => left.storageKey.localeCompare(right.storageKey));
+    return rows.map((row, index) => ({ ...row, index }));
+}
+
+function assertDeclaredTransitionRowsMatch(declaredRows, authoritativeRows) {
+    const mismatch = () => {
+        const error = new Error('Transition rows must exactly match authoritative inline storage');
+        error.pluginTransitionPlanMismatch = true;
+        return error;
+    };
+    if (!Array.isArray(declaredRows) || declaredRows.length !== authoritativeRows.length) {
+        throw mismatch();
+    }
+    let declared;
+    try {
+        declared = normalizedPluginTransitionRows(declaredRows);
+    } catch {
+        throw mismatch();
+    }
+    const declaredByKey = new Map(declared.map(row => [row.storageKey, row]));
+    for (const row of authoritativeRows) {
+        const candidate = declaredByKey.get(row.storageKey);
+        if (!candidate || candidate.size !== row.size) {
+            throw mismatch();
+        }
+    }
+}
+
+function assertInlineTransitionSourceHashes(liveDb, sourceRowHashes) {
+    const currentRows = authoritativeInlinePluginTransitionRows(liveDb);
+    const expected = new Map(
+        sourceRowHashes
+            .filter(row => row.backend === 'inline')
+            .map(row => [row.storageKey, row]),
+    );
+    if (currentRows.length !== expected.size) {
+        throw new Error('Inline plugin storage changed during transition');
+    }
+    for (const row of currentRows) {
+        const source = expected.get(row.storageKey);
+        if (!source || source.size !== row.size || source.sha256 !== row.sha256) {
+            throw new Error('Inline plugin storage changed during transition');
+        }
+    }
+}
+
+async function computeFileEtag(filePath) {
+    const hash = nodeCrypto.createHash('md5');
+    for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+    return hash.digest('hex');
+}
+
+async function computeFileSha256(filePath) {
+    const hash = nodeCrypto.createHash('sha256');
+    for await (const chunk of createReadStream(filePath)) hash.update(chunk);
+    return hash.digest('hex');
+}
+
+async function assertInternalTransitionBounds(liveDb, sourceKeys) {
+    const ownedValueRaw = new Set(sourceKeys.valueKeys.map(
+        key => decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_PREFIX),
+    ));
+    const ownedMetaRaw = new Set(sourceKeys.metaKeys.map(
+        key => decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_META_PREFIX),
+    ));
+    let entries = sourceKeys.valueKeys.length + sourceKeys.metaKeys.length;
+    let bytes = 0;
+    const addSize = size => {
+        if (!Number.isSafeInteger(size) || size < 0 || size > PLUGIN_TRANSITION_MAX_ROW_BYTES) {
+            throw new PluginStorageLimitError(
+                'Plugin storage contains a row outside the transition limit.',
+                {
+                    code: 'PLUGIN_STORAGE_SIZE_LIMIT',
+                    limit: PLUGIN_TRANSITION_MAX_ROW_BYTES,
+                    actual: size,
+                },
+            );
+        }
+        bytes += size;
+        if (!Number.isSafeInteger(bytes) || bytes > 64 * 1024 * 1024) {
+            throw new PluginStorageLimitError(
+                'Plugin storage exceeds the 64 MiB internalization limit.',
+                {
+                    code: 'PLUGIN_STORAGE_MEMORY_LIMIT',
+                    limit: 64 * 1024 * 1024,
+                    actual: bytes,
+                },
+            );
+        }
+    };
+    for (const key of sourceKeys.valueKeys) addSize(kvSize(key));
+    for (const key of sourceKeys.metaKeys) addSize(kvSize(key));
+    const accountInline = (record, prefix, externalKeys) => {
+        for (const [rawKey, value] of Object.entries(record ?? {})) {
+            const storageKey = encodeValidatedPluginStorageKey(rawKey, prefix);
+            if (externalKeys.has(rawKey)) continue;
+            const rowBytes = serializePluginStorageRow(storageKey, value);
+            entries++;
+            addSize(rowBytes.length);
+        }
+    };
+    accountInline(liveDb.pluginCustomStorage, PLUGIN_SAVE_PREFIX, ownedValueRaw);
+    accountInline(liveDb.pluginStorageMeta, PLUGIN_SAVE_META_PREFIX, ownedMetaRaw);
+    if (entries > 100_000) {
+        throw new PluginStorageLimitError(
+            'Plugin storage exceeds the 100000-entry internalization limit.',
+            { code: 'PLUGIN_STORAGE_SIZE_LIMIT', limit: 100_000, actual: entries },
+        );
+    }
+    const currentDbBytes = kvSize('database/database.bin') ?? 0;
+    const required = bytes * 3 + currentDbBytes * 2;
+    if (!Number.isSafeInteger(required)) {
+        throw new PluginStorageLimitError(
+            'Plugin storage transition disk requirement is too large.',
+            { code: 'PLUGIN_STORAGE_DISK_LIMIT', limit: Number.MAX_SAFE_INTEGER, actual: required },
+        );
+    }
+    const disk = await checkDiskSpace(required);
+    if (!disk.ok) {
+        throw new PluginStorageLimitError(
+            `Plugin storage transition requires ${required} free bytes.`,
+            { code: 'PLUGIN_STORAGE_DISK_LIMIT', limit: disk.available, actual: required },
+        );
+    }
+    return { entries, bytes };
+}
+
+app.post('/api/plugin-storage/transition/stage/begin', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const plan = req.body;
+        const planKeys = plan && typeof plan === 'object' && !Array.isArray(plan)
+            ? Object.keys(plan)
+            : [];
+        const allowedPlanKeys = new Set([
+            'version',
+            'transitionId',
+            'source',
+            'targetOptimized',
+            'targetGeneration',
+            'rows',
+            'expectedEtag',
+        ]);
+        const requiredPlanKeys = [
+            'version',
+            'transitionId',
+            'source',
+            'targetOptimized',
+            'targetGeneration',
+            'rows',
+        ];
+        const sourceKeys = plan?.source && typeof plan.source === 'object'
+            && !Array.isArray(plan.source)
+            ? Object.keys(plan.source).sort()
+            : [];
+        const sourceShapeValid = sourceKeys.length === 3
+            && sourceKeys[0] === 'generation'
+            && sourceKeys[1] === 'manifest'
+            && sourceKeys[2] === 'optimized';
+        const manifest = plan?.source?.manifest;
+        const manifestShapeValid = manifest === null || (
+            manifest
+            && typeof manifest === 'object'
+            && !Array.isArray(manifest)
+            && Object.keys(manifest).sort().join(',') === 'generation,metaKeys,valueKeys,version'
+        );
+        if (plan?.version !== 2
+            || !PLUGIN_STORAGE_UUID_PATTERN.test(plan.transitionId)
+            || !PLUGIN_STORAGE_UUID_PATTERN.test(plan.targetGeneration)
+            || typeof plan.targetOptimized !== 'boolean'
+            || planKeys.some(key => !allowedPlanKeys.has(key))
+            || requiredPlanKeys.some(key => !planKeys.includes(key))
+            || !sourceShapeValid
+            || typeof plan.source.optimized !== 'boolean'
+            || !(plan.source.generation === null || typeof plan.source.generation === 'string')
+            || !manifestShapeValid
+            || !Array.isArray(plan.rows)
+            || (plan.expectedEtag !== undefined && typeof plan.expectedEtag !== 'string')) {
+            return res.status(400).json({ error: 'Invalid staged plugin transition plan' });
+        }
+        await queueStorageMutation(async () => {
+            await flushPendingDb();
+            const rawDatabase = kvGet('database/database.bin');
+            if (!rawDatabase) return res.status(409).json({ error: 'Database not found' });
+            const currentEtag = dbEtag ?? computeBufferEtag(rawDatabase);
+            dbEtag = currentEtag;
+            const requestHash = sha256Hex(Buffer.from(JSON.stringify(plan), 'utf-8'));
+            let existing = readPluginTransitionStage(plan.transitionId);
+            if (existing) {
+                if (!pluginTransitionStageBelongsToRequest(existing, req)) {
+                    return res.status(404).json({ error: 'Transition not found' });
+                }
+                existing = await refreshPluginTransitionStageState(existing);
+                if (existing.requestHash !== requestHash) {
+                    return res.status(409).json({ error: 'Transition id is already bound to another plan' });
+                }
+                return res.json(pluginTransitionStageResponse(existing));
+            }
+            const activeStage = await findActivePluginTransition(req, plan.transitionId);
+            if (activeStage) {
+                return res.status(409).json({
+                    error: 'Another plugin storage transition is already active',
+                });
+            }
+            const liveDb = await decodeRisuSave(rawDatabase);
+            const manifestState = readPluginStorageManifestState();
+            try {
+                assertPluginStorageSource(plan.source, liveDb, manifestState);
+            } catch (error) {
+                if (error?.pluginStorageConflict) {
+                    return res.status(409).json({ error: error.message, currentEtag });
+                }
+                throw error;
+            }
+            if (plan.expectedEtag && plan.expectedEtag !== currentEtag) {
+                return res.status(409).json({ error: 'ETag mismatch', currentEtag });
+            }
+            if (
+                plan.targetOptimized === (liveDb?.optimizePluginMemory === true)
+                || plan.targetGeneration === pluginStorageGeneration(liveDb)
+            ) {
+                return res.status(400).json({ error: 'Transition target must use a fresh mode generation' });
+            }
+            const sourceKeys = resolveOwnedPluginStorageKeys(liveDb);
+            let rows;
+            if (plan.targetOptimized) {
+                rows = authoritativeInlinePluginTransitionRows(liveDb);
+                try {
+                    assertDeclaredTransitionRowsMatch(plan.rows, rows);
+                } catch (error) {
+                    if (error?.pluginTransitionPlanMismatch) {
+                        return res.status(409).json({
+                            error: error.message,
+                            code: 'PLUGIN_STORAGE_CHANGED',
+                        });
+                    }
+                    throw error;
+                }
+                const stagedBytes = rows.reduce((sum, row) => sum + row.size, 0);
+                const required = stagedBytes * 3 + (kvSize('database/database.bin') ?? 0) * 2;
+                if (!Number.isSafeInteger(required)) {
+                    throw new PluginStorageLimitError(
+                        'Plugin transition disk requirement is too large.',
+                        {
+                            code: 'PLUGIN_STORAGE_DISK_LIMIT',
+                            limit: Number.MAX_SAFE_INTEGER,
+                            actual: required,
+                        },
+                    );
+                }
+                const disk = await checkDiskSpace(required);
+                if (!disk.ok) {
+                    throw new PluginStorageLimitError(
+                        `Plugin transition requires ${required} free bytes.`,
+                        {
+                            code: 'PLUGIN_STORAGE_DISK_LIMIT',
+                            limit: disk.available,
+                            actual: required,
+                        },
+                    );
+                }
+            } else {
+                if (Array.isArray(plan.rows) && plan.rows.length > 0) {
+                    return res.status(400).json({ error: 'Internalization rows are server-derived' });
+                }
+                await assertInternalTransitionBounds(liveDb, sourceKeys);
+                rows = [];
+                try {
+                    for (const storageKey of [...sourceKeys.valueKeys, ...sourceKeys.metaKeys]) {
+                        if (req.aborted || res.destroyed) {
+                            throw new Error('Plugin transition begin disconnected');
+                        }
+                        const index = rows.length;
+                        const value = kvGet(storageKey);
+                        if (!value) throw new PluginStorageValidationError(storageKey);
+                        if (value.length > PLUGIN_TRANSITION_MAX_ROW_BYTES) {
+                            throw new PluginStorageLimitError(
+                                'Plugin storage row exceeds the transition limit.',
+                                {
+                                    code: 'PLUGIN_STORAGE_SIZE_LIMIT',
+                                    limit: PLUGIN_TRANSITION_MAX_ROW_BYTES,
+                                    actual: value.length,
+                                },
+                            );
+                        }
+                        validatePluginStorageRow(storageKey, value);
+                        const filePath = pluginTransitionStageRowPath(plan.transitionId, index);
+                        writePluginTransitionStageRow(filePath, value);
+                        rows.push({
+                            index,
+                            storageKey,
+                            size: value.length,
+                            sha256: sha256Hex(value),
+                            uploaded: true,
+                        });
+                    }
+                } catch (error) {
+                    for (const row of rows) {
+                        try {
+                            unlinkSync(pluginTransitionStageRowPath(plan.transitionId, row.index));
+                        } catch {}
+                    }
+                    fsyncPluginTransitionStageDirectory();
+                    throw error;
+                }
+            }
+            const stage = {
+                version: 1,
+                transitionId: plan.transitionId,
+                sessionId: typeof req.headers['x-session-id'] === 'string'
+                    ? req.headers['x-session-id']
+                    : null,
+                requestHash,
+                source: plan.source,
+                sourceEtag: currentEtag,
+                sourceRowHashes: rows.map(row => ({
+                    storageKey: row.storageKey,
+                    size: row.size,
+                    sha256: row.sha256,
+                    backend: plan.targetOptimized ? 'inline' : 'kv',
+                })),
+                targetOptimized: plan.targetOptimized,
+                targetGeneration: plan.targetGeneration,
+                rows,
+                state: rows.every(row => row.uploaded) ? 'ready' : 'uploading',
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+            };
+            try {
+                writePluginTransitionStage(stage);
+            } catch (error) {
+                removePluginTransitionStage(stage);
+                throw error;
+            }
+            res.json(pluginTransitionStageResponse(stage));
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.post('/api/plugin-storage/transition/stage/upload', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    let temporaryPath = null;
+    try {
+        const transitionId = req.headers['x-plugin-storage-transition'];
+        const storageKey = req.headers['x-plugin-storage-key'];
+        if (typeof transitionId !== 'string' || typeof storageKey !== 'string') {
+            return res.status(400).json({ error: 'Transition id and storage key are required' });
+        }
+        const stage = readPluginTransitionStage(transitionId);
+        if (!pluginTransitionStageBelongsToRequest(stage, req) || stage.state === 'aborted') {
+            return res.status(404).json({ error: 'Transition not found' });
+        }
+        if (stage.state === 'committed') return res.json(pluginTransitionStageResponse(stage));
+        if (!stage.targetOptimized) return res.status(409).json({ error: 'Internalization does not accept uploads' });
+        const row = stage.rows.find(entry => entry.storageKey === storageKey);
+        if (!row) return res.status(400).json({ error: 'Unexpected transition row' });
+        const declaredLength = Number(req.headers['content-length']);
+        if (!Number.isSafeInteger(declaredLength) || declaredLength !== row.size) {
+            return res.status(400).json({ error: 'Transition row length mismatch' });
+        }
+        temporaryPath = `${pluginTransitionStageRowPath(transitionId, row.index)}.${nodeCrypto.randomUUID()}.tmp`;
+        let received = 0;
+        const digest = nodeCrypto.createHash('sha256');
+        const meter = new Transform({
+            transform(chunk, _encoding, callback) {
+                received += chunk.length;
+                if (received > row.size || received > PLUGIN_TRANSITION_MAX_ROW_BYTES) {
+                    return callback(new Error('Transition row exceeded its declared size'));
+                }
+                digest.update(chunk);
+                callback(null, chunk);
+            },
+        });
+        await pipeline(req, meter, createWriteStream(temporaryPath, { flags: 'wx', mode: 0o600 }));
+        if (received !== row.size) throw new Error('Transition row length mismatch');
+        const fileDescriptor = openSync(temporaryPath, 'r');
+        try {
+            fsyncSync(fileDescriptor);
+        } finally {
+            closeSync(fileDescriptor);
+        }
+        const hash = digest.digest('hex');
+        validatePluginStorageRow(storageKey, readFileSync(temporaryPath));
+        await queueStorageMutation(async () => {
+            const current = readPluginTransitionStage(transitionId);
+            if (!pluginTransitionStageBelongsToRequest(current, req) || current.state === 'aborted') {
+                return res.status(404).json({ error: 'Transition not found' });
+            }
+            const currentRow = current.rows.find(entry => entry.storageKey === storageKey);
+            if (hash !== currentRow.sha256) {
+                return res.status(409).json({
+                    error: 'Transition row does not match the authoritative source',
+                    code: 'PLUGIN_STORAGE_CHANGED',
+                });
+            }
+            if (currentRow.uploaded) {
+                if (currentRow.sha256 !== hash || currentRow.size !== received) {
+                    return res.status(409).json({ error: 'Conflicting transition row retry' });
+                }
+                try { unlinkSync(temporaryPath); } catch {}
+                temporaryPath = null;
+                return res.json(pluginTransitionStageResponse(current));
+            }
+            renameSync(temporaryPath, pluginTransitionStageRowPath(transitionId, currentRow.index));
+            fsyncPluginTransitionStageDirectory();
+            temporaryPath = null;
+            currentRow.uploaded = true;
+            current.state = current.rows.every(entry => entry.uploaded) ? 'ready' : 'uploading';
+            current.updatedAt = Date.now();
+            writePluginTransitionStage(current);
+            res.json(pluginTransitionStageResponse(current));
+        });
+    } catch (error) {
+        next(error);
+    } finally {
+        try { if (temporaryPath) unlinkSync(temporaryPath); } catch {}
+    }
+});
+
+app.get('/api/plugin-storage/transition/stage/row', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const transitionId = req.headers['x-plugin-storage-transition'];
+        const storageKey = req.headers['x-plugin-storage-key'];
+        if (typeof transitionId !== 'string' || typeof storageKey !== 'string') {
+            return res.status(400).json({ error: 'Transition id and storage key are required' });
+        }
+        const stage = readPluginTransitionStage(transitionId);
+        const row = stage?.rows?.find(entry => entry.storageKey === storageKey);
+        if (!pluginTransitionStageBelongsToRequest(stage, req)
+            || !row?.uploaded
+            || stage.state === 'aborted') return res.status(404).end();
+        const value = readFileSync(pluginTransitionStageRowPath(transitionId, row.index));
+        if (value.length !== row.size || sha256Hex(value) !== row.sha256) {
+            return res.status(409).json({ error: 'Staged transition row failed verification' });
+        }
+        res.setHeader('content-type', 'application/octet-stream');
+        res.setHeader('content-length', value.length);
+        res.send(value);
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.get('/api/plugin-storage/transition/stage/status', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const transitionId = req.headers['x-plugin-storage-transition'];
+        if (typeof transitionId !== 'string') return res.status(400).json({ error: 'Transition id required' });
+        await queueStorageOperation(async () => {
+            const stage = await refreshPluginTransitionStageState(
+                readPluginTransitionStage(transitionId),
+            );
+            if (!pluginTransitionStageBelongsToRequest(stage, req)) {
+                return res.status(404).json({ error: 'Transition not found' });
+            }
+            res.json(pluginTransitionStageResponse(stage));
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.post('/api/plugin-storage/transition/stage/abort', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        const transitionId = req.headers['x-plugin-storage-transition'];
+        if (typeof transitionId !== 'string') return res.status(400).json({ error: 'Transition id required' });
+        await queueStorageMutation(async () => {
+            const stage = await refreshPluginTransitionStageState(
+                readPluginTransitionStage(transitionId),
+            );
+            if (!stage) return res.json({ success: true, state: 'aborted', transitionId });
+            if (!pluginTransitionStageBelongsToRequest(stage, req)) {
+                return res.status(404).json({ error: 'Transition not found' });
+            }
+            if (stage.state === 'committed') return res.json(pluginTransitionStageResponse(stage));
+            stage.state = 'aborted';
+            stage.updatedAt = Date.now();
+            writePluginTransitionStage(stage);
+            removePluginTransitionStageRows(stage);
+            res.json(pluginTransitionStageResponse(stage));
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.post('/api/plugin-storage/transition/stage/finalize', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    let databaseSpool = null;
+    try {
+        const transitionId = req.headers['x-plugin-storage-transition'];
+        if (typeof transitionId !== 'string') return res.status(400).json({ error: 'Transition id required' });
+        await queueStorageMutation(async () => {
+            let stage = await refreshPluginTransitionStageState(
+                readPluginTransitionStage(transitionId),
+            );
+            if (!pluginTransitionStageBelongsToRequest(stage, req)) {
+                return res.status(404).json({ error: 'Transition not found' });
+            }
+            if (stage.state === 'committed') return res.json(pluginTransitionStageResponse(stage));
+            if (stage.state !== 'ready' || stage.rows.some(row => !row.uploaded)) {
+                return res.status(409).json({ error: 'Transition rows are incomplete' });
+            }
+            await flushPendingDb();
+            const rawDatabase = kvGet('database/database.bin');
+            if (!rawDatabase) return res.status(409).json({ error: 'Database not found' });
+            const liveDb = await decodeRisuSave(rawDatabase);
+            const manifestState = readPluginStorageManifestState();
+            try {
+                assertPluginStorageSource(stage.source, liveDb, manifestState);
+            } catch (error) {
+                if (error?.pluginStorageConflict) {
+                    return res.status(409).json({ error: error.message, currentEtag: dbEtag });
+                }
+                throw error;
+            }
+            const currentEtag = dbEtag ?? computeBufferEtag(rawDatabase);
+            if (currentEtag !== stage.sourceEtag) {
+                return res.status(409).json({ error: 'Database changed during transition', currentEtag });
+            }
+            if (stage.targetOptimized) {
+                try {
+                    assertInlineTransitionSourceHashes(liveDb, stage.sourceRowHashes);
+                } catch {
+                    return res.status(409).json({ error: 'Inline plugin storage changed during transition' });
+                }
+            } else {
+                for (const sourceRow of stage.sourceRowHashes) {
+                    const current = kvGet(sourceRow.storageKey);
+                    if (!current
+                        || current.length !== sourceRow.size
+                        || sha256Hex(current) !== sourceRow.sha256) {
+                        return res.status(409).json({ error: 'Plugin row changed during transition' });
+                    }
+                }
+            }
+            const sourceKeys = resolveOwnedPluginStorageKeys(liveDb);
+            if (!stage.targetOptimized) await assertInternalTransitionBounds(liveDb, sourceKeys);
+            const targetDb = {
+                ...liveDb,
+                optimizePluginMemory: stage.targetOptimized,
+                [PLUGIN_STORAGE_GENERATION_FIELD]: stage.targetGeneration,
+            };
+            delete targetDb[PLUGIN_STORAGE_FOLDED_MARKER];
+            let pluginStorage = null;
+            if (stage.targetOptimized) {
+                targetDb.pluginCustomStorage = {};
+                delete targetDb.pluginStorageMeta;
+            } else {
+                pluginStorage = {
+                    valueRows: stage.rows
+                        .filter(row => row.storageKey.startsWith(PLUGIN_SAVE_PREFIX))
+                        .map(row => ({
+                            key: decodeValidatedPluginStorageKey(row.storageKey, PLUGIN_SAVE_PREFIX),
+                            source: row.index,
+                        })),
+                    metaRows: stage.rows
+                        .filter(row => row.storageKey.startsWith(PLUGIN_SAVE_META_PREFIX))
+                        .map(row => ({
+                            key: decodeValidatedPluginStorageKey(row.storageKey, PLUGIN_SAVE_META_PREFIX),
+                            source: row.index,
+                        })),
+                    readRow: index => {
+                        const row = stage.rows[index];
+                        const value = readFileSync(pluginTransitionStageRowPath(transitionId, index));
+                        if (value.length !== row.size || sha256Hex(value) !== row.sha256) {
+                            throw new Error(`Staged row changed: ${row.storageKey}`);
+                        }
+                        return validatePluginStorageRow(row.storageKey, value);
+                    },
+                };
+            }
+            const spoolPath = path.join(
+                databaseSpoolDir,
+                `${DATABASE_SPOOL_FILE_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}.transition`,
+            );
+            databaseSpool = await streamRisuSaveToFile({
+                dbObj: targetDb,
+                filePath: spoolPath,
+                readChatRow: async () => null,
+                foldChatRows: false,
+                pluginStorage,
+            });
+            const resultEtag = await computeFileEtag(databaseSpool.filePath);
+            const targetManifest = pluginTransitionDesiredManifest(stage);
+            const targetKeys = new Set([
+                ...(targetManifest?.valueKeys ?? []),
+                ...(targetManifest?.metaKeys ?? []),
+            ]);
+            const quotaChanges = new Map(
+                sourceKeys.valueKeys.map(key => [key, { key, size: null }]),
+            );
+            if (stage.targetOptimized) {
+                for (const row of stage.rows) {
+                    if (row.storageKey.startsWith(PLUGIN_SAVE_PREFIX)) {
+                        quotaChanges.set(row.storageKey, { key: row.storageKey, size: row.size });
+                    }
+                }
+            }
+            const recoverySnapshotToken = newPluginRecoverySnapshotToken();
+            if (stage.targetOptimized) {
+                for (const row of stage.rows) {
+                    const filePath = pluginTransitionStageRowPath(transitionId, row.index);
+                    const stat = await fs.stat(filePath);
+                    if (stat.size !== row.size
+                        || await computeFileSha256(filePath) !== row.sha256) {
+                        return res.status(409).json({ error: 'Staged transition row changed' });
+                    }
+                }
+            }
+            withPluginStorageQuotaPlan([...quotaChanges.values()], () => {
+                if (stage.targetOptimized) {
+                    for (const row of stage.rows) {
+                        kvSetFromFile(
+                            row.storageKey,
+                            pluginTransitionStageRowPath(transitionId, row.index),
+                        );
+                        maybeFailPluginStorageTransaction(req, 'after-row');
+                    }
+                }
+                for (const storageKey of [...sourceKeys.valueKeys, ...sourceKeys.metaKeys]) {
+                    if (targetKeys.has(storageKey)) continue;
+                    kvDel(storageKey);
+                    maybeFailPluginStorageTransaction(req, 'after-row');
+                }
+                if (targetManifest) writePluginStorageManifest(targetManifest);
+                else kvDel(PLUGIN_STORAGE_MANIFEST_KEY);
+                maybeFailPluginStorageTransaction(req, 'after-manifest');
+                kvSetFromFile('database/database.bin', databaseSpool.filePath);
+                maybeFailPluginStorageTransaction(req, 'after-database');
+                markPluginRecoverySnapshotDirty(recoverySnapshotToken);
+            });
+            invalidateDbCache();
+            dbEtag = resultEtag;
+            rememberSessionPluginStorageState(req, targetDb);
+            schedulePluginRecoverySnapshot();
+            // Exercise the hardest acknowledgement window: publication is
+            // durable but the private receipt still says ready. Status (or
+            // startup reconciliation after a crash) must infer the commit
+            // from the authoritative mode/generation/manifest tuple.
+            if (req.headers['x-plugin-storage-failpoint'] === 'acknowledgement-loss') {
+                res.socket?.destroy();
+                return;
+            }
+            stage.state = 'committed';
+            stage.resultEtag = resultEtag;
+            stage.updatedAt = Date.now();
+            writePluginTransitionStage(stage);
+            removePluginTransitionStageRows(stage);
+            res.json(pluginTransitionStageResponse(stage));
+        });
+    } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
+        next(error);
+    } finally {
+        if (databaseSpool) await fs.unlink(databaseSpool.filePath).catch(() => {});
+    }
+});
 
 app.post('/api/plugin-storage/transition', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
@@ -9621,6 +10715,7 @@ async function startServer() {
         const bootDatabase = kvGet('database/database.bin');
         if (bootDatabase) await loadStrippedDatabase(bootDatabase, 'Migration');
         await migrateRemoteBlocksIfNeeded();
+        await reconcilePluginTransitionStagesAtStartup();
         // A prior process may have exited while the snapshot cooldown was
         // deferring an already-committed plugin publication.
         schedulePluginRecoverySnapshot();

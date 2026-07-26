@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 import {
+    beginDatabaseSavePause,
     DatabaseSaveCoordinator,
     requireCommittedDatabaseSave,
     type DatabaseSaveOutcome,
@@ -16,6 +17,20 @@ function deferred<T>() {
 }
 
 describe("DatabaseSaveCoordinator", () => {
+    test("holds ordinary saves until a staged publication resumes them", async () => {
+        const coordinator = new DatabaseSaveCoordinator();
+        const resume = beginDatabaseSavePause();
+        const writer = vi.fn(async () => ({ status: "committed" }) as const);
+        const result = coordinator.run(writer);
+
+        await Promise.resolve();
+        expect(writer).not.toHaveBeenCalled();
+        resume();
+
+        await expect(result).resolves.toEqual({ status: "committed" });
+        expect(writer).toHaveBeenCalledOnce();
+    });
+
     test("queues a durability-sensitive save behind an ordinary in-flight save", async () => {
         const coordinator = new DatabaseSaveCoordinator();
         const first = deferred<DatabaseSaveOutcome>();

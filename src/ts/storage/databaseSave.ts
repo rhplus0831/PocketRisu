@@ -4,6 +4,42 @@ export type DatabaseSaveOutcome =
     | { status: "failed"; error: unknown }
     | { status: "displaced" };
 
+let databaseSavesBlockedUntilReload: unknown = null;
+let databaseSavePauseDepth = 0;
+let databaseSaveResumePromise: Promise<void> = Promise.resolve();
+let resumePausedDatabaseSaves: (() => void) | null = null;
+
+/** Temporarily defer ordinary saves while a server-side transition is staged. */
+export function beginDatabaseSavePause(): () => void {
+    if (databaseSavePauseDepth === 0) {
+        databaseSaveResumePromise = new Promise<void>(resolve => {
+            resumePausedDatabaseSaves = resolve;
+        });
+    }
+    databaseSavePauseDepth += 1;
+    let resumed = false;
+    return () => {
+        if (resumed) return;
+        resumed = true;
+        databaseSavePauseDepth -= 1;
+        if (databaseSavePauseDepth === 0) {
+            resumePausedDatabaseSaves?.();
+            resumePausedDatabaseSaves = null;
+        }
+    };
+}
+
+/**
+ * Stop all later database publications after an atomic server mutation whose
+ * outcome cannot be resolved. A reload is the only safe way to recover the
+ * authoritative mode/generation before another save is attempted.
+ */
+export function blockDatabaseSavesUntilReload(error: unknown): void {
+    databaseSavesBlockedUntilReload = error || new Error(
+        "Database saves are blocked until reload because a commit outcome is unknown.",
+    );
+}
+
 export function requireCommittedDatabaseSave(
     outcome: DatabaseSaveOutcome,
     operation: string,
@@ -32,6 +68,13 @@ export class DatabaseSaveCoordinator {
         save: () => Promise<DatabaseSaveOutcome>,
         options: { queueAfterInFlight?: boolean } = {},
     ): Promise<DatabaseSaveOutcome> {
+        if (databaseSavesBlockedUntilReload) {
+            return { status: "failed", error: databaseSavesBlockedUntilReload };
+        }
+        if (databaseSavePauseDepth > 0) {
+            await databaseSaveResumePromise;
+            return this.run(save, options);
+        }
         const activeSave = this.inFlight;
         if (activeSave) {
             if (!options.queueAfterInFlight) return activeSave;

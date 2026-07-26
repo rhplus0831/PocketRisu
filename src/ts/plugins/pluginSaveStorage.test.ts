@@ -102,7 +102,44 @@ vi.mock("../storage/persistentKv", () => {
     const writePersistentJson = vi.fn(async (key: string, value: unknown) => {
         persistent.set(key, value);
     });
+    let stagedPlan: any = null;
+    const stagedRows = new Map<string, Uint8Array>();
+    const stagedStatus = () => {
+        const storageKeys = stagedPlan.targetOptimized
+            ? stagedPlan.rows.map((row: any) => row.storageKey)
+            : [
+                ...(stagedPlan.source.manifest?.valueKeys ?? []),
+                ...(stagedPlan.source.manifest?.metaKeys ?? []),
+            ];
+        return {
+            success: true as const,
+            transitionId: stagedPlan.transitionId,
+            state: "ready" as const,
+            direction: stagedPlan.targetOptimized ? "externalize" as const : "internalize" as const,
+            targetGeneration: stagedPlan.targetGeneration,
+            rows: storageKeys.map((storageKey: string) => {
+                const bytes = stagedRows.get(storageKey)
+                    ?? new TextEncoder().encode(JSON.stringify(persistent.get(storageKey)));
+                return {
+                    storageKey,
+                    size: bytes.byteLength,
+                    sha256: "a".repeat(64),
+                    uploaded: !stagedPlan.targetOptimized || stagedRows.has(storageKey),
+                };
+            }),
+            uploaded: storageKeys.length,
+            total: storageKeys.length,
+            totalBytes: storageKeys.reduce((total: number, storageKey: string) => total + (
+                stagedRows.get(storageKey)
+                    ?? new TextEncoder().encode(JSON.stringify(persistent.get(storageKey)))
+            ).byteLength, 0),
+        };
+    };
     return {
+        abortPersistentPluginStorageTransition: vi.fn(async () => ({
+            ...stagedStatus(),
+            state: "aborted" as const,
+        })),
         batchPersistentPluginStorage: vi.fn(async (request: any) => {
             const generation = crypto.randomUUID();
             for (const operation of request.operations) {
@@ -152,7 +189,21 @@ vi.mock("../storage/persistentKv", () => {
             persistent.set("plugin-storage/manifest.json", mutation.nextManifest);
         }),
         commitPersistentPluginStorageTransition: vi.fn(),
+        beginPersistentPluginStorageTransition: vi.fn(async (plan: any) => {
+            stagedPlan = plan;
+            stagedRows.clear();
+            return stagedStatus();
+        }),
         decodeStorageKeyComponent: decode,
+        getPersistentStorageFreeBytes: vi.fn(async () => null),
+        listPersistentEntriesWithSizes: vi.fn(async (prefix: string) =>
+            [...persistent.entries()]
+                .filter(([key]) => key.startsWith(prefix))
+                .map(([key, value]) => ({
+                    key,
+                    size: new TextEncoder().encode(JSON.stringify(value)).byteLength,
+                })),
+        ),
         listPersistentKeys: vi.fn(async (prefix: string) =>
             [...persistent.keys()].filter((key) => key.startsWith(prefix))
         ),
@@ -207,12 +258,52 @@ vi.mock("../storage/persistentKv", () => {
                 generation: null,
             };
         }),
+        readPersistentPluginStorageTransitionRow: vi.fn(async (
+            _transitionId: string,
+            storageKey: string,
+        ) => stagedRows.get(storageKey)
+            ?? new TextEncoder().encode(JSON.stringify(persistent.get(storageKey)))),
         readPersistentJson: vi.fn(async (key: string) => persistent.get(key) ?? null),
         readPersistentJsonRow: vi.fn(async (key: string) => persistent.has(key)
             ? { kind: "value", value: persistent.get(key) }
             : { kind: "missing" }),
         removePersistentKey: vi.fn(async (key: string) => {
             persistent.delete(key);
+        }),
+        uploadPersistentPluginStorageTransitionRow: vi.fn(async (
+            _transitionId: string,
+            storageKey: string,
+            bytes: Uint8Array,
+        ) => {
+            stagedRows.set(storageKey, new Uint8Array(bytes));
+            return stagedStatus();
+        }),
+        finalizePersistentPluginStorageTransition: vi.fn(async () => {
+            if (stagedPlan.targetOptimized) {
+                for (const [storageKey, bytes] of stagedRows) {
+                    persistent.set(
+                        storageKey,
+                        JSON.parse(new TextDecoder().decode(bytes)),
+                    );
+                }
+                persistent.set("plugin-storage/manifest.json", {
+                    version: 1,
+                    generation: stagedPlan.targetGeneration,
+                    valueKeys: stagedPlan.rows
+                        .map((row: any) => row.storageKey)
+                        .filter((key: string) => key.startsWith("pluginsave/")),
+                    metaKeys: stagedPlan.rows
+                        .map((row: any) => row.storageKey)
+                        .filter((key: string) => key.startsWith("pluginsave-meta/")),
+                });
+            } else {
+                for (const storageKey of [
+                    ...(stagedPlan.source.manifest?.valueKeys ?? []),
+                    ...(stagedPlan.source.manifest?.metaKeys ?? []),
+                ]) persistent.delete(storageKey);
+                persistent.delete("plugin-storage/manifest.json");
+            }
+            return { ...stagedStatus(), state: "committed" as const };
         }),
         writePersistentJson,
         preparePersistentJson: vi.fn((value: unknown) => {
@@ -1887,7 +1978,7 @@ describe("reconcilePluginStorageMode", () => {
         expect(removePersistentKey).not.toHaveBeenCalled();
     });
 
-    test("a rejected production atomic transition leaves every external key intact", async () => {
+    test("direct production reconciliation is refused in favor of staged transition or boot recovery", async () => {
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
         const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "alpha");
         persistent.set(valueKey, 42);
@@ -1897,13 +1988,11 @@ describe("reconcilePluginStorageMode", () => {
             commitPersistentPluginStorageTransition,
             removePersistentKey,
         } = vi.mocked(await import("../storage/persistentKv"));
-        commitPersistentPluginStorageTransition.mockRejectedValueOnce(
-            new Error("atomic transition rejected"),
+        await expect(reconcilePluginStorageMode()).rejects.toThrow(
+            "must use transitionPluginStorageMode or boot recovery",
         );
 
-        await expect(reconcilePluginStorageMode()).rejects.toThrow("atomic transition rejected");
-
-        expect(commitPersistentPluginStorageTransition).toHaveBeenCalledOnce();
+        expect(commitPersistentPluginStorageTransition).not.toHaveBeenCalled();
         expect(requestImmediateSave).not.toHaveBeenCalled();
         expect(database.optimizePluginMemory).toBe(false);
         expect(database.pluginCustomStorage.alpha).toBeUndefined();
@@ -1912,24 +2001,21 @@ describe("reconcilePluginStorageMode", () => {
         expect(removePersistentKey).not.toHaveBeenCalled();
     });
 
-    test("production committed outcome publishes the internalized live state", async () => {
+    test("direct production reconciliation never falls back to the aggregate v1 envelope", async () => {
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
         persistent.set(valueKey, 42);
         installOwnershipManifest("production-commit", [valueKey], []);
 
-        await expect(reconcilePluginStorageMode()).resolves.toEqual({
-            direction: "internalize",
-            values: 1,
-            meta: 0,
-        });
+        await expect(reconcilePluginStorageMode()).rejects.toThrow(
+            "must use transitionPluginStorageMode or boot recovery",
+        );
 
         const { commitPersistentPluginStorageTransition } = vi.mocked(
             await import("../storage/persistentKv"),
         );
-        expect(commitPersistentPluginStorageTransition).toHaveBeenCalledOnce();
+        expect(commitPersistentPluginStorageTransition).not.toHaveBeenCalled();
         expect(requestImmediateSave).not.toHaveBeenCalled();
-        expect(database.pluginCustomStorage.alpha).toBe(42);
-        // The mocked transport does not emulate the server's physical cleanup.
+        expect(database.pluginCustomStorage.alpha).toBeUndefined();
         expect(persistent.has(valueKey)).toBe(true);
     });
 
@@ -2443,14 +2529,18 @@ describe("boot plugin storage reconciliation recovery", () => {
 });
 
 describe("transitionPluginStorageMode", () => {
-    test("production disable rotates generation and sends one snapshot-boundary envelope", async () => {
+    test("production disable stages rows and publishes without a database envelope", async () => {
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
         const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "alpha");
         database.optimizePluginMemory = true;
         persistent.set(valueKey, { value: "owned" });
         persistent.set(metaKey, { plugin: "Owner", updatedAt: 1 });
         installOwnershipManifest("source-generation", [valueKey], [metaKey]);
-        const { commitPersistentPluginStorageTransition } = vi.mocked(
+        const {
+            beginPersistentPluginStorageTransition,
+            commitPersistentPluginStorageTransition,
+            finalizePersistentPluginStorageTransition,
+        } = vi.mocked(
             await import("../storage/persistentKv"),
         );
 
@@ -2460,9 +2550,10 @@ describe("transitionPluginStorageMode", () => {
             meta: 1,
         });
 
-        expect(commitPersistentPluginStorageTransition).toHaveBeenCalledOnce();
-        const envelope = commitPersistentPluginStorageTransition.mock.calls[0][0];
-        expect(envelope.source).toEqual({
+        expect(commitPersistentPluginStorageTransition).not.toHaveBeenCalled();
+        expect(beginPersistentPluginStorageTransition).toHaveBeenCalledOnce();
+        const begin = beginPersistentPluginStorageTransition.mock.calls[0][0];
+        expect(begin.source).toEqual({
             optimized: true,
             generation: "source-generation",
             manifest: {
@@ -2472,13 +2563,103 @@ describe("transitionPluginStorageMode", () => {
                 metaKeys: [metaKey],
             },
         });
-        expect(envelope.database).toBeInstanceOf(Uint8Array);
-        expect(envelope.database.byteLength).toBeGreaterThan(0);
+        expect(begin.rows).toEqual([]);
+        expect(begin).not.toHaveProperty("database");
+        expect(finalizePersistentPluginStorageTransition).toHaveBeenCalledOnce();
         expect(database.optimizePluginMemory).toBe(false);
         expect(database.pluginStorageGeneration).not.toBe("source-generation");
         expect(database.pluginCustomStorage).toEqual({ alpha: { value: "owned" } });
         expect(database.pluginStorageMeta).toEqual({
             alpha: { plugin: "Owner", updatedAt: 1 },
+        });
+    });
+
+    test("production enable releases acknowledged rows and switches routing only after commit", async () => {
+        database.optimizePluginMemory = false;
+        database.pluginCustomStorage = {
+            first: { payload: "한😀" },
+            second: { payload: "two" },
+        };
+        database.pluginStorageMeta = {
+            first: { plugin: "Owner", updatedAt: 1 },
+        };
+        const releaseSnapshots: Array<{ values: string[]; meta: string[] }> = [];
+        const onProgress = vi.fn((_progress: unknown) => {
+            releaseSnapshots.push({
+                values: Object.keys(database.pluginCustomStorage),
+                meta: Object.keys(database.pluginStorageMeta ?? {}),
+            });
+        });
+        const {
+            beginPersistentPluginStorageTransition,
+            commitPersistentPluginStorageTransition,
+            finalizePersistentPluginStorageTransition,
+            uploadPersistentPluginStorageTransitionRow,
+        } = vi.mocked(await import("../storage/persistentKv"));
+
+        let releaseFinalize!: () => void;
+        const finalizeBlocked = new Promise<void>(resolve => {
+            releaseFinalize = resolve;
+        });
+        const commitFinalize = finalizePersistentPluginStorageTransition.getMockImplementation()!;
+        finalizePersistentPluginStorageTransition.mockImplementationOnce(async (...args) => {
+            await finalizeBlocked;
+            return await commitFinalize(...args);
+        });
+
+        const transition = transitionPluginStorageMode(true, { onProgress });
+        await vi.waitFor(() => {
+            expect(uploadPersistentPluginStorageTransitionRow).toHaveBeenCalledTimes(3);
+            expect(finalizePersistentPluginStorageTransition).toHaveBeenCalledOnce();
+        });
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginCustomStorage).toEqual({});
+        expect(database.pluginStorageMeta).toEqual({});
+        expect(releaseSnapshots).toEqual([
+            { values: ["second"], meta: ["first"] },
+            { values: [], meta: ["first"] },
+            { values: [], meta: [] },
+        ]);
+
+        // Progressive deletion is an intentional memory optimization, not a
+        // partial publication: routing remains in the source mode and even a
+        // fresh save coordinator must wait until finalize settles and the
+        // transition resumes database saves.
+        const { DatabaseSaveCoordinator } = await import("../storage/databaseSave");
+        const databaseWriter = vi.fn(async () => ({ status: "committed" as const }));
+        const saveDuringTransition = new DatabaseSaveCoordinator().run(databaseWriter);
+        await Promise.resolve();
+        expect(databaseWriter).not.toHaveBeenCalled();
+        releaseFinalize();
+
+        await expect(transition).resolves.toEqual({
+            direction: "externalize",
+            values: 2,
+            meta: 1,
+        });
+        await expect(saveDuringTransition).resolves.toEqual({ status: "committed" });
+        expect(databaseWriter).toHaveBeenCalledOnce();
+
+        expect(commitPersistentPluginStorageTransition).not.toHaveBeenCalled();
+        const begin = beginPersistentPluginStorageTransition.mock.calls.at(-1)![0];
+        expect(begin).not.toHaveProperty("database");
+        expect(begin.rows).toHaveLength(3);
+        expect(begin.rows.every(row => Object.keys(row).sort().join(",") === "size,storageKey"))
+            .toBe(true);
+        const uploads = uploadPersistentPluginStorageTransitionRow.mock.calls.slice(-3);
+        expect(uploads).toHaveLength(3);
+        expect(uploads.every(call => call[2] instanceof Uint8Array)).toBe(true);
+        expect(finalizePersistentPluginStorageTransition).toHaveBeenCalled();
+        expect(database.optimizePluginMemory).toBe(true);
+        expect(database.pluginStorageGeneration).toEqual(expect.any(String));
+        expect(database.pluginCustomStorage).toEqual({});
+        expect(database.pluginStorageMeta).toBeUndefined();
+        expect(onProgress).toHaveBeenCalledTimes(3);
+        expect(onProgress.mock.calls.at(-1)![0]).toMatchObject({
+            completed: 3,
+            total: 3,
+            completedBytes: expect.any(Number),
+            totalBytes: expect.any(Number),
         });
     });
 
@@ -4019,5 +4200,54 @@ describe("transitionPluginStorageMode", () => {
         expect(durable.get(encoded(PLUGIN_SAVE_PREFIX, "delta"))).toEqual({
             nested: { value: "async-snapshot" },
         });
+    });
+
+    // Keep this test last: an unknown production commit deliberately has no
+    // in-process reset. Reload/module reinitialization is the recovery path.
+    test("an unresolved staged finalize latches V2, V3, and database saves until reload", async () => {
+        database.optimizePluginMemory = false;
+        database.pluginCustomStorage = { alpha: "must-not-be-reused" };
+        const { finalizePersistentPluginStorageTransition } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        const { StorageError } = await import("../storage/storageError");
+        finalizePersistentPluginStorageTransition.mockRejectedValueOnce(new StorageError(
+            "finalize and status were both lost",
+            {
+                code: "COMMIT_OUTCOME_UNKNOWN",
+                operation: "transition",
+                commitOutcomeUnknown: true,
+            },
+        ));
+
+        await expect(transitionPluginStorageMode(true)).rejects.toMatchObject({
+            code: "COMMIT_OUTCOME_UNKNOWN",
+            commitOutcomeUnknown: true,
+        });
+        expect(isPluginStorageModeTransitioning()).toBe(true);
+
+        const v2Storage = getV2PluginAPIs().pluginStorage;
+        v2Storage.setItem("late-v2", "blocked");
+        v2Storage.removeItem("alpha");
+        expect(v2Storage.getItem("late-v2")).toBeNull();
+        expect(database.pluginCustomStorage).not.toHaveProperty("late-v2");
+
+        const controller = new AbortController();
+        const v3Writer = vi.fn();
+        const queuedV3 = setPluginSaveStorageItem(
+            "late-v3",
+            "blocked",
+            controller.signal,
+        ).then(v3Writer);
+        await Promise.resolve();
+        expect(v3Writer).not.toHaveBeenCalled();
+        controller.abort();
+        await expect(queuedV3).rejects.toMatchObject({ name: "AbortError" });
+
+        const { DatabaseSaveCoordinator } = await import("../storage/databaseSave");
+        const databaseWriter = vi.fn(async () => ({ status: "committed" as const }));
+        const outcome = await new DatabaseSaveCoordinator().run(databaseWriter);
+        expect(outcome).toMatchObject({ status: "failed" });
+        expect(databaseWriter).not.toHaveBeenCalled();
     });
 });

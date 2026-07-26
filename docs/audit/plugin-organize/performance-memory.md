@@ -143,6 +143,85 @@ the selected version (`src/ts/storage/resourceCache.ts:356-407`,
 - Add heap/peak-allocation tests with multi-MiB rows, a 50–100 MiB store,
   non-ASCII strings, and the resource cache both on and off.
 
+### Resolution
+
+**Fixed 2026-07-27.** Manual mode changes now use a durable staged v2 protocol
+instead of sending an aggregate transition envelope. The protocol is
+`begin` → per-row upload/read → `finalize`, with exact `status` and idempotent
+`abort` operations for retry, cancellation, restart, and lost-ack recovery.
+Private row files and receipts are fsynced before acknowledgement, are never
+listed as live storage, and are swept on abort, failed construction, displaced
+session, or restart. A committed SQLite transaction whose response is lost is
+recovered as committed from the durable publication; unpublished stages are
+removed.
+
+Externalization first durably saves the source-mode database. The server then
+derives the authoritative value and owner-metadata inventory from that exact
+ETag-bound database: canonical storage key, exact serialized UTF-8 size, and
+SHA-256 for every row. The client's declaration must be the same complete set;
+omissions, extras, duplicates, namespace/key substitutions, size changes, and
+same-size content substitutions are rejected. Each upload is hash-bound to its
+authoritative row, and finalize re-derives the complete source inventory and
+rechecks the database ETag plus every staged file's size and hash before
+publication.
+
+The browser retains only row descriptors, serializes and uploads one live
+inline value at a time, and removes that row from the live map only after its
+stage acknowledgement. This progressive deletion is intentionally an
+in-memory reference release, not a partial publication: the mode flag remains
+in the source mode, lifecycle and storage-exclusive barriers prevent plugin
+operations from observing the temporary map, the server stage remains private,
+and all database saves are paused. A definitive failure restores acknowledged
+rows one at a time from the private stage before aborting and releasing those
+guards. Finalize atomically publishes the exact rows, ownership manifest,
+generation, target database, PM1 quota usage, and recovery-dirty state.
+
+Internalization begins from the exact generation-bound ownership manifest.
+The server stages each owned row independently and stream-spools the target
+database while preserving live chat stubs. The client reads one staged row at
+a time and builds one final inline map, but continues routing through the old
+external generation until committed finalize. Finalize atomically installs the
+spooled database and deletes only the manifest-owned external rows; quarantined
+physical rows are untouched. The client assigns the completed map only after
+that acknowledgement, so neither direction uses the former aggregate v1 wire
+format or exposes a half-switched mode.
+
+Transition plans enforce exact UTF-8 bounds before moving data: 32 MiB per
+row, 64 MiB total for the one-map internalization path, and 100,000 rows. The
+server repeats those checks, applies the final-state PM1 quota plan inside the
+publication transaction, and requires disk headroom for the database spool,
+stage files, SQLite/WAL work, and rollback safety. The settings UI reports
+entry and byte progress, exposes cancellation, and surfaces actionable row,
+aggregate, disk, and quota errors. Cache validators now come from manifest
+metadata; a server-selected cached body is loaded and verified once instead of
+loading and re-hashing every retained historical body before the request.
+
+Finalize ambiguity is fail-closed. Only an exact, validated status response
+may resolve it as committed or definitively not committed. If finalize and its
+status lookup time out, lose the network, return an unavailable/session status,
+or return malformed, mismatched, or unknown state, the client preserves
+`commitOutcomeUnknown` with both errors and permanently blocks V2 storage,
+holds the V3/storage barrier, and rejects every later database save until the
+page reloads. It does not restore inline rows when the server may already have
+committed.
+
+The reproducible `pnpm test:performance` gate runs cache-off and cache-on in
+fresh processes with exposed GC, the real production save loop and public mode
+transition, a real Node server/SQLite database, PM1 multi-chunk rows, and no
+transition dependency injection. Each run moves eight distinct exact 7 MiB
+Unicode JSON rows (56 MiB total). Forced-GC progress checkpoints prove that
+external live keys disappear one acknowledgement at a time and that more than
+four rows' worth of heap becomes collectible; internalization retains only the
+bounded final map plus row-local transient buffers. Verified runs measured
+external heap release from roughly 203 MiB to 159 MiB, about 59 MiB peak
+ArrayBuffer growth, and about 109 MiB peak RSS growth, with approximately
+21 MiB transient ArrayBuffer growth during internalization. The cache-on run
+also proves a real hash-validator/204 selection, while cache-off sends no cache
+validators. Boundary and recovery suites cover 64/65 MiB, 100,000/100,001
+rows, exact/one-byte-short disk headroom, PM1 row and aggregate quota rollback,
+disconnect and restart cleanup, acknowledgement loss, stage invisibility, and
+full-chat-row plus live-stub preservation in both directions.
+
 <a id="pm3"></a>
 ## PM3 — Recovery and tooling paths rematerialize the whole store
 

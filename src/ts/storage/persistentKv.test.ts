@@ -14,6 +14,8 @@ const mutatePluginStorage = vi.hoisted(() => vi.fn<
 
 const storage = vi.hoisted(() => ({
     Init: vi.fn(async () => undefined),
+    getStorageCapacity: vi.fn(async () => ({ freeBytes: 1234 })),
+    listEntriesWithSizes: vi.fn(async () => [{ key: 'pluginsave/a.json', size: 17 }]),
     getItem: vi.fn(async () => new TextEncoder().encode('{"source":"plain"}')),
     getItemCached: vi.fn(async () => new TextEncoder().encode('{"source":"cached"}')),
     mutatePluginStorage,
@@ -35,7 +37,9 @@ Reflect.deleteProperty(String.prototype, 'isWellFormed')
 const {
     decodeStorageKeyComponent,
     clearExternalizedPluginStorage,
+    getPersistentStorageFreeBytes,
     hasNativeStringWellFormed,
+    listPersistentEntriesWithSizes,
     makeEncodedStorageKey,
     mutatePersistentPluginStorage,
     preparePersistentJson,
@@ -71,9 +75,25 @@ beforeEach(() => {
         operation: request.operation,
         verification: 'verified',
     }))
+    storage.getStorageCapacity.mockClear()
+    storage.listEntriesWithSizes.mockClear()
 })
 
 describe('persistent JSON read transport', () => {
+    it('forwards authoritative save-volume capacity without materializing values', async () => {
+        await expect(getPersistentStorageFreeBytes()).resolves.toBe(1234)
+        expect(storage.getStorageCapacity).toHaveBeenCalledOnce()
+    })
+
+    it('forwards authoritative logical row sizes without reading row bodies', async () => {
+        await expect(listPersistentEntriesWithSizes('pluginsave/')).resolves.toEqual([
+            { key: 'pluginsave/a.json', size: 17 },
+        ])
+        expect(storage.listEntriesWithSizes).toHaveBeenCalledWith('pluginsave/')
+        expect(storage.getItem).not.toHaveBeenCalled()
+        expect(storage.getItemCached).not.toHaveBeenCalled()
+    })
+
     it('uses the ordinary read unless the caller explicitly opts into caching', async () => {
         await expect(readPersistentJson<{ source: string }>('draft/key')).resolves.toEqual({ source: 'plain' })
         expect(storage.getItem).toHaveBeenCalledWith('draft/key')

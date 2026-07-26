@@ -192,6 +192,81 @@ export interface PluginStorageTransitionTransport {
     expectedEtag?: string
 }
 
+export interface PluginStorageStagedTransitionBegin {
+    version: 2
+    transitionId: string
+    source: PluginStorageTransitionTransport['source']
+    targetOptimized: boolean
+    targetGeneration: string
+    rows: { storageKey: string, size: number }[]
+    expectedEtag?: string
+}
+
+export interface PluginStorageStagedTransitionStatus {
+    success: true
+    transitionId: string
+    state: 'uploading' | 'ready' | 'committed' | 'aborted'
+    direction: 'externalize' | 'internalize'
+    targetGeneration: string
+    rows: {
+        storageKey: string
+        size: number
+        sha256: string | null
+        uploaded: boolean
+    }[]
+    uploaded: number
+    total: number
+    totalBytes: number
+    etag?: string
+}
+
+const PLUGIN_TRANSITION_STATES = new Set(['uploading', 'ready', 'committed', 'aborted'])
+
+function isPluginStorageStagedTransitionStatus(
+    value: unknown,
+    transitionId: string,
+): value is PluginStorageStagedTransitionStatus {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const result = value as Record<string, unknown>
+    if (result.success !== true
+        || result.transitionId !== transitionId
+        || typeof result.state !== 'string'
+        || !PLUGIN_TRANSITION_STATES.has(result.state)
+        || (result.direction !== 'externalize' && result.direction !== 'internalize')
+        || typeof result.targetGeneration !== 'string'
+        || !PLUGIN_STORAGE_UUID_PATTERN.test(result.targetGeneration)
+        || !Array.isArray(result.rows)
+        || result.rows.length > 100_000
+        || !Number.isSafeInteger(result.uploaded)
+        || !Number.isSafeInteger(result.total)
+        || !Number.isSafeInteger(result.totalBytes)
+        || result.total !== result.rows.length) return false
+    let uploaded = 0
+    let totalBytes = 0
+    const storageKeys = new Set<string>()
+    for (const rowValue of result.rows) {
+        if (!rowValue || typeof rowValue !== 'object' || Array.isArray(rowValue)) return false
+        const row = rowValue as Record<string, unknown>
+        if (typeof row.storageKey !== 'string'
+            || !Number.isSafeInteger(row.size)
+            || (row.size as number) <= 0
+            || (row.size as number) > 32 * 1024 * 1024
+            || typeof row.uploaded !== 'boolean'
+            || !(row.sha256 === null || isSha256Hex(row.sha256))) return false
+        if (storageKeys.has(row.storageKey as string)
+            || (row.uploaded && !isSha256Hex(row.sha256))) return false
+        storageKeys.add(row.storageKey as string)
+        if (row.uploaded) uploaded += 1
+        totalBytes += row.size as number
+        if (!Number.isSafeInteger(totalBytes)) return false
+    }
+    return result.uploaded === uploaded
+        && result.totalBytes === totalBytes
+        && (result.etag === undefined || typeof result.etag === 'string')
+        && (result.state !== 'committed'
+            || (typeof result.etag === 'string' && /^[0-9a-f]{32}$/.test(result.etag)))
+}
+
 function normalizeStorageReadOptions(
     options: StorageReadOptions | AbortSignal | null | undefined,
 ): StorageReadOptions {
@@ -218,6 +293,15 @@ export interface ChatBackupVersion {
     size: number
     storage: 'loose' | 'bundle'
     bundleFile?: string
+}
+
+export interface StorageCapacity {
+    freeBytes: number | null
+}
+
+export interface StorageEntrySize {
+    key: string
+    size: number
 }
 
 // Custom error class for database conflict detection
@@ -909,6 +993,255 @@ export class NodeStorage{
         )
     }
 
+    private async stagedPluginStorageControl(
+        path: string,
+        transitionId: string,
+        method: 'GET' | 'POST',
+        body?: PluginStorageStagedTransitionBegin,
+        externalSignal?: AbortSignal | null,
+        mutation = false,
+    ): Promise<PluginStorageStagedTransitionStatus> {
+        const execute = () => runBoundedAuthoritativeStorageOperation(
+            async (signal, outcome) => {
+                const response = await this.authFetch(path, {
+                    method,
+                    headers: {
+                        'content-type': 'application/json',
+                        'x-plugin-storage-transition': transitionId,
+                    },
+                    body: body ? JSON.stringify(body) : undefined,
+                    signal,
+                }, mutation, outcome)
+                if (mutation) outcome.markRequestDispatched()
+                const result = await awaitWithAbort(response.json(), signal) as any
+                if (response.status === 409) {
+                    if (mutation) outcome.markDefinitiveResponse()
+                    throw new ConflictError(
+                        result?.error ?? 'Plugin transition conflict',
+                        result?.currentEtag ?? this._lastDbEtag ?? '',
+                    )
+                }
+                if (!response.ok || result?.success !== true) {
+                    const definitiveFailure = response.status < 500
+                        || (result?.commitOutcome === 'not-committed'
+                            && result?.commitOutcomeUnknown === false)
+                    if (mutation && definitiveFailure) outcome.markDefinitiveResponse()
+                    throw new StorageError(result?.error ?? 'Invalid staged transition response', {
+                        status: response.status,
+                        code: result?.code ?? (mutation && !definitiveFailure
+                            ? 'COMMIT_OUTCOME_UNKNOWN'
+                            : 'PLUGIN_STORAGE_TRANSITION_FAILED'),
+                        retryable: definitiveFailure && response.status >= 500,
+                        commitOutcomeUnknown: mutation && !definitiveFailure,
+                        operation: 'transition',
+                    })
+                }
+                if (!isPluginStorageStagedTransitionStatus(result, transitionId)) {
+                    throw new StorageError('Invalid staged transition acknowledgement', {
+                        status: response.status,
+                        code: mutation
+                            ? 'COMMIT_OUTCOME_UNKNOWN'
+                            : 'STORAGE_RESPONSE_ERROR',
+                        retryable: false,
+                        commitOutcomeUnknown: mutation,
+                        operation: 'transition',
+                    })
+                }
+                if (mutation) outcome.markDefinitiveResponse()
+                if (typeof result.etag === 'string') this._lastDbEtag = result.etag
+                return result as PluginStorageStagedTransitionStatus
+            },
+            mutation ? 'transition' : 'read',
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+        try {
+            return await execute()
+        } catch (error) {
+            if (!mutation
+                || !(error instanceof StorageError)
+                || !error.commitOutcomeUnknown) throw error
+            let status: PluginStorageStagedTransitionStatus
+            try {
+                status = await this.getPluginStorageTransitionStatus(transitionId)
+            } catch (statusError) {
+                // Losing the original ambiguous mutation behind a status
+                // timeout/404/session-reset would let the caller resume in an
+                // unknown mode. Only an authoritative status body may clear
+                // commitOutcomeUnknown.
+                throw new StorageError(
+                    'Plugin storage transition outcome could not be resolved; reload is required.',
+                    {
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcomeUnknown: true,
+                        operation: 'transition',
+                        cause: new AggregateError(
+                            [error, statusError],
+                            'Transition mutation and status lookup both failed',
+                        ),
+                    },
+                )
+            }
+            if (status.state === 'committed') return status
+            // The status request is serialized behind the server mutation. A
+            // non-committed result therefore proves finalize did not publish,
+            // while begin/abort have themselves reached a definitive state.
+            if (path.endsWith('/begin') || path.endsWith('/abort')) return status
+            if (path.endsWith('/finalize')) {
+                throw new StorageError('Plugin storage transition was not committed.', {
+                    code: 'PLUGIN_STORAGE_TRANSITION_NOT_COMMITTED',
+                    retryable: true,
+                    commitOutcomeUnknown: false,
+                    operation: 'transition',
+                    cause: error,
+                })
+            }
+            throw error
+        }
+    }
+
+    async beginPluginStorageTransition(
+        plan: PluginStorageStagedTransitionBegin,
+        signal?: AbortSignal | null,
+    ): Promise<PluginStorageStagedTransitionStatus> {
+        return await this.stagedPluginStorageControl(
+            '/api/plugin-storage/transition/stage/begin',
+            plan.transitionId,
+            'POST',
+            plan,
+            signal,
+            true,
+        )
+    }
+
+    async uploadPluginStorageTransitionRow(
+        transitionId: string,
+        storageKey: string,
+        bytes: Uint8Array,
+        externalSignal?: AbortSignal | null,
+    ): Promise<PluginStorageStagedTransitionStatus> {
+        try {
+            return await runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
+                const response = await this.authFetch(
+                    '/api/plugin-storage/transition/stage/upload',
+                    {
+                        method: 'POST',
+                        headers: {
+                            'content-type': 'application/octet-stream',
+                            'x-plugin-storage-transition': transitionId,
+                            'x-plugin-storage-key': storageKey,
+                        },
+                        body: bytes as any,
+                        signal,
+                    },
+                    true,
+                    outcome,
+                )
+                outcome.markRequestDispatched()
+                const result = await awaitWithAbort(response.json(), signal) as any
+                if (!response.ok || result?.success !== true) {
+                    outcome.markDefinitiveResponse()
+                    throw new StorageError(result?.error ?? 'Plugin transition upload failed', {
+                        status: response.status,
+                        code: result?.code ?? 'PLUGIN_STORAGE_TRANSITION_UPLOAD_FAILED',
+                        retryable: response.status >= 500,
+                        commitOutcomeUnknown: false,
+                        operation: 'transition',
+                    })
+                }
+                outcome.markDefinitiveResponse()
+                return result as PluginStorageStagedTransitionStatus
+            }, 'transition', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+        } catch (error) {
+            if (!(error instanceof StorageError) || !error.commitOutcomeUnknown) throw error
+            let status: PluginStorageStagedTransitionStatus
+            try {
+                status = await this.getPluginStorageTransitionStatus(transitionId)
+            } catch (statusError) {
+                throw new StorageError(
+                    'Plugin storage transition upload outcome could not be resolved.',
+                    {
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcomeUnknown: true,
+                        operation: 'transition',
+                        cause: new AggregateError(
+                            [error, statusError],
+                            'Transition upload and status lookup both failed',
+                        ),
+                    },
+                )
+            }
+            const row = status.rows.find(entry => entry.storageKey === storageKey)
+            if (row?.uploaded) return status
+            throw error
+        }
+    }
+
+    async readPluginStorageTransitionRow(
+        transitionId: string,
+        storageKey: string,
+        externalSignal?: AbortSignal | null,
+    ): Promise<Buffer> {
+        return await runBoundedAuthoritativeStorageOperation(async signal => {
+            const response = await this.authFetch(
+                '/api/plugin-storage/transition/stage/row',
+                {
+                    method: 'GET',
+                    headers: {
+                        'x-plugin-storage-transition': transitionId,
+                        'x-plugin-storage-key': storageKey,
+                    },
+                    signal,
+                },
+            )
+            if (!response.ok) throw new Error(`Plugin transition row read failed: ${response.status}`)
+            return Buffer.from(await awaitWithAbort(response.arrayBuffer(), signal))
+        }, 'read', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+    }
+
+    async getPluginStorageTransitionStatus(
+        transitionId: string,
+        signal?: AbortSignal | null,
+    ): Promise<PluginStorageStagedTransitionStatus> {
+        return await this.stagedPluginStorageControl(
+            '/api/plugin-storage/transition/stage/status',
+            transitionId,
+            'GET',
+            undefined,
+            signal,
+        )
+    }
+
+    async finalizePluginStorageTransition(
+        transitionId: string,
+        signal?: AbortSignal | null,
+    ): Promise<PluginStorageStagedTransitionStatus> {
+        return await this.stagedPluginStorageControl(
+            '/api/plugin-storage/transition/stage/finalize',
+            transitionId,
+            'POST',
+            undefined,
+            signal,
+            true,
+        )
+    }
+
+    async abortPluginStorageTransition(
+        transitionId: string,
+        signal?: AbortSignal | null,
+    ): Promise<PluginStorageStagedTransitionStatus> {
+        return await this.stagedPluginStorageControl(
+            '/api/plugin-storage/transition/stage/abort',
+            transitionId,
+            'POST',
+            undefined,
+            signal,
+            true,
+        )
+    }
+
     async setItem(
         key:string,
         value:Uint8Array,
@@ -1444,10 +1777,14 @@ export class NodeStorage{
         const resourceKey = `kv:${key}`
         let manifestHashes: string[] = []
         try {
-            manifestHashes = (await settleBestEffortResourceCache(
-                getVerifiedManifestSnapshot(resourceKey),
-                null,
-            ))?.hashes ?? []
+            // Validators are manifest metadata. Do not load and re-hash every
+            // retained historical body merely to ask which version is current;
+            // the selected hash is verified once below when the server returns
+            // a 204 cache selection.
+            manifestHashes = await settleBestEffortResourceCache(
+                getManifestHashes(resourceKey),
+                [],
+            )
         } catch {
             // Cache failures degrade to the ordinary read below.
         }
@@ -1553,6 +1890,73 @@ export class NodeStorage{
             AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
             externalSignal,
         )
+    }
+
+    async getStorageCapacity(
+        externalSignal?: AbortSignal | null,
+    ): Promise<StorageCapacity> {
+        return runBoundedAuthoritativeStorageOperation(
+            signal => this.getStorageCapacityAuthoritative(signal),
+            "read",
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+    }
+
+    async listEntriesWithSizes(
+        prefix: string,
+        externalSignal?: AbortSignal | null,
+    ): Promise<StorageEntrySize[]> {
+        return runBoundedAuthoritativeStorageOperation(
+            signal => this.listEntriesWithSizesAuthoritative(prefix, signal),
+            "list",
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+    }
+
+    private async listEntriesWithSizesAuthoritative(
+        prefix: string,
+        signal: AbortSignal,
+    ): Promise<StorageEntrySize[]> {
+        const response = await this.authFetch('/api/storage/list-sizes', {
+            method: 'GET',
+            headers: { 'key-prefix': prefix },
+            signal,
+        })
+        if (response.status < 200 || response.status >= 300) {
+            throw new Error(`storage size inventory error: ${response.status}`)
+        }
+        const data = await awaitWithAbort(response.json(), signal)
+        if (!Array.isArray(data?.content)
+            || !data.content.every((entry: unknown) => {
+                if (!entry || typeof entry !== 'object') return false
+                const candidate = entry as Partial<StorageEntrySize>
+                return typeof candidate.key === 'string'
+                    && Number.isSafeInteger(candidate.size)
+                    && (candidate.size ?? -1) >= 0
+            })) {
+            throw new Error('Invalid storage size inventory response')
+        }
+        return data.content
+    }
+
+    private async getStorageCapacityAuthoritative(
+        signal: AbortSignal,
+    ): Promise<StorageCapacity> {
+        const response = await this.authFetch('/api/storage/capacity', {
+            method: 'GET',
+            signal,
+        })
+        if (response.status < 200 || response.status >= 300) {
+            throw new Error(`storage capacity error: ${response.status}`)
+        }
+        const data = await awaitWithAbort(response.json(), signal)
+        if (data?.freeBytes !== null
+            && (!Number.isSafeInteger(data?.freeBytes) || data.freeBytes < 0)) {
+            throw new Error('Invalid storage capacity response')
+        }
+        return { freeBytes: data.freeBytes }
     }
 
     private async keysAuthoritative(prefix: string, signal: AbortSignal): Promise<string[]> {

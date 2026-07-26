@@ -4,18 +4,16 @@
     import SettingPage from "src/lib/UI/GUI/SettingPage.svelte";
     import ShButton from "src/lib/UI/GUI/ShButton.svelte";
     import {
-        alertClear,
         alertConfirm,
         alertMd,
         alertSelect,
-        alertWait,
         notifyError,
         notifySuccess,
         notifyWarning,
     } from "src/ts/alert";
     import { TriangleAlert } from '@lucide/svelte';
 
-    import { DBState, hotReloading } from "src/ts/stores.svelte";
+    import { DBState, hotReloading, loadingOverlayStore } from "src/ts/stores.svelte";
     import {
         checkPluginUpdate,
         createBlankPlugin,
@@ -45,6 +43,7 @@
         createPluginStorageRecoveryDiagnostic,
         pluginStorageRecoveryStore,
     } from "src/ts/plugins/pluginStorageRecovery";
+    import { formatPluginStorageTransitionBytes } from "src/ts/plugins/pluginStorageTransitionUi";
 
     let showParams = $state([])
     let reconcilingPluginStorage = $state(false)
@@ -57,24 +56,44 @@
         if (reconcilingPluginStorage) return
 
         reconcilingPluginStorage = true
-        let blockingAlert = false
+        const controller = new AbortController()
+        const cancelTransition = () => controller.abort(
+            new DOMException("Plugin storage transition cancelled.", "AbortError"),
+        )
 
         try {
             await waitForPluginLifecycleIdle()
             if (enabled && !canOptimizePluginMemory(DBState.db.plugins)) return
+            loadingOverlayStore.set({
+                active: true,
+                text: language.optimizePluginMemoryEstimating,
+                onCancel: cancelTransition,
+            })
             await transitionPluginStorageMode(enabled, {
-                onStart: ({ total }) => {
-                    // Key values can be arbitrarily large, so count alone is
-                    // not a reliable size threshold. Block whenever data moves.
-                    blockingAlert = total > 0
-                    if (blockingAlert) {
-                        alertWait(language.optimizePluginMemoryProgress(0, total))
-                    }
+                signal: controller.signal,
+                onStart: ({ completed, total, completedBytes, totalBytes }) => {
+                    loadingOverlayStore.set({
+                        active: total > 0,
+                        text: language.optimizePluginMemoryProgress(
+                            completed,
+                            total,
+                            formatPluginStorageTransitionBytes(completedBytes ?? 0),
+                            formatPluginStorageTransitionBytes(totalBytes ?? 0),
+                        ),
+                        onCancel: cancelTransition,
+                    })
                 },
-                onProgress: ({ completed, total: progressTotal }) => {
-                    if (blockingAlert) {
-                        alertWait(language.optimizePluginMemoryProgress(completed, progressTotal))
-                    }
+                onProgress: ({ completed, total, completedBytes, totalBytes }) => {
+                    loadingOverlayStore.set({
+                        active: true,
+                        text: language.optimizePluginMemoryProgress(
+                            completed,
+                            total,
+                            formatPluginStorageTransitionBytes(completedBytes ?? 0),
+                            formatPluginStorageTransitionBytes(totalBytes ?? 0),
+                        ),
+                        onCancel: cancelTransition,
+                    })
                 },
             })
             notifySuccess(
@@ -82,10 +101,28 @@
                     ? language.optimizePluginMemoryEnabled
                     : language.optimizePluginMemoryDisabled,
             )
-        } catch {
-            notifyError(language.optimizePluginMemoryFailedSafe)
+        } catch (error) {
+            if (error instanceof Error && error.name === "AbortError") {
+                notifyWarning(language.optimizePluginMemoryCancelled)
+            } else {
+                const code = typeof error === "object" && error !== null && "code" in error
+                    ? String(error.code)
+                    : ""
+                const detailedCodes = new Set([
+                    "PLUGIN_STORAGE_SIZE_LIMIT",
+                    "PLUGIN_STORAGE_MEMORY_LIMIT",
+                    "PLUGIN_STORAGE_DISK_LIMIT",
+                    "PLUGIN_VALUE_TOO_LARGE",
+                    "PLUGIN_STORAGE_TOTAL_TOO_LARGE",
+                ])
+                if (error instanceof Error && detailedCodes.has(code)) {
+                    notifyError(language.optimizePluginMemoryFailed(error.message))
+                } else {
+                    notifyError(language.optimizePluginMemoryFailedSafe)
+                }
+            }
         } finally {
-            if (blockingAlert) alertClear()
+            loadingOverlayStore.set({ active: false, text: "", onCancel: null })
             reconcilingPluginStorage = false
         }
     }

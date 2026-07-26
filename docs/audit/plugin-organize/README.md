@@ -45,7 +45,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [BR3](backup-recovery.md#br3) | Medium | Open | Corrupt-database boot fallback ignores a marked snapshot's exact plugin-row set |
 | [BR4](backup-recovery.md#br4) | Medium | Fixed | Valid long keys produce Node backups the same server refuses to import |
 | [PM1](performance-memory.md#pm1) | Medium | Fixed | Large plugin values bypass chunking and incur multiple full-size client/server copies |
-| [PM2](performance-memory.md#pm2) | Medium | Open | Mode transitions are not memory-bounded in either direction; the UI guards on entry count only |
+| [PM2](performance-memory.md#pm2) | Medium | Fixed | Mode transitions are not memory-bounded in either direction; the UI guards on entry count only |
 | [PM3](performance-memory.md#pm3) | Medium | Open | Viewer, partial backup, and snapshot restore eagerly rematerialize the whole external store |
 | [PM4](performance-memory.md#pm4) | Medium | Open | Remaining write/cache amplification: independent logical writes still repeat full-value hashing/copies and cache pruning |
 | [IP1](integration-patterns.md#ip1) | High | Open | Treating a failed read as a missing key turns transient I/O errors into destructive whole-value overwrites |
@@ -113,14 +113,15 @@ database/storage mixing, startup readiness and timeout behavior, transition
 ordering, key validation and canonical enumeration, server ingest, import
 barriers, atomic value/owner mutation, atomic clear and batch/CAS outcomes,
 unload admission/draining, failpoint rollback, acknowledgement loss, and
-old-or-new state after a real server restart. They still do not exercise:
+old-or-new state after a real server restart. PM2 additionally covers the
+production save loop and staged transition path with a 56 MiB Unicode store,
+forced-GC checkpoints, PM1 chunks, and the resource cache both off and on.
+The suites still do not exercise:
 
 - the production save loop as the reconciliation durability callback
   (pre-initialization no-op, in-flight save join, 409/500/network failure);
 - marked-snapshot restore through the corrupt-database boot fallback;
 - key-length boundaries for backup export/import symmetry;
-- transition peak memory for a 50–100 MiB aggregate store, including
-  non-ASCII values and the resource cache on and off;
 - read failure followed by a fallback-derived overwrite;
 - corrupt-row boot recovery.
 
@@ -147,10 +148,11 @@ old-or-new state after a real server restart. They still do not exercise:
    missing/failed read outcomes, per-key revisions/CAS, atomic batch, and a
    non-destructive invalidate/rewrite operation.
 
-The former compatibility, startup, mutation, and primary recovery blockers
-MT1–MT3, AC1–AC4, SA1–SA4, AA1–AA3, BR1–BR2, and BR4 are fixed and covered.
+The former compatibility, startup, mutation, primary recovery, and transition
+capacity blockers MT1–MT3, AC1–AC4, SA1–SA4, AA1–AA3, BR1–BR2, BR4, and PM2
+are fixed and covered.
 The beta still should not be treated as risk-free for every V3 workload: BR3,
-PM2–PM4, and IP1–IP5 remain open. The AA3 primitives make safe compound-write
+PM3–PM4, and IP1–IP5 remain open. The AA3 primitives make safe compound-write
 guidance possible, but do not automatically repair existing plugin protocols.
-Verify a backup before transitions, and avoid very large mode transitions until
-the remaining transition-capacity work lands.
+Verify a backup before transitions and before using the remaining open recovery
+and tooling paths with very large repositories.

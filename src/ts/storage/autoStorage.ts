@@ -2,6 +2,7 @@ import {
     NodeStorage,
     type PatchItemResult,
     type PluginStorageMutationTransport,
+    type PluginStorageStagedTransitionBegin,
     type PluginStorageTransitionTransport,
     type StorageReadOptions,
 } from "./nodeStorage"
@@ -52,6 +53,18 @@ export class AutoStorage{
         return signal
             ? await this.realStorage.keys(prefix, signal)
             : await this.realStorage.keys(prefix)
+    }
+    async getStorageCapacity(signal?: AbortSignal | null) {
+        await this.Init()
+        return signal
+            ? await this.realStorage.getStorageCapacity(signal)
+            : await this.realStorage.getStorageCapacity()
+    }
+    async listEntriesWithSizes(prefix: string, signal?: AbortSignal | null) {
+        await this.Init()
+        return signal
+            ? await this.realStorage.listEntriesWithSizes(prefix, signal)
+            : await this.realStorage.listEntriesWithSizes(prefix)
     }
     async removeItem(key:string, signal?: AbortSignal | null){
         return signal
@@ -141,6 +154,66 @@ export class AutoStorage{
     ) {
         await this.Init()
         return await this.realStorage.commitPluginStorageTransition(plan, signal)
+    }
+
+    async beginPluginStorageTransition(
+        plan: PluginStorageStagedTransitionBegin,
+        signal?: AbortSignal | null,
+    ) {
+        await this.Init()
+        return await this.realStorage.beginPluginStorageTransition(plan, signal)
+    }
+
+    async uploadPluginStorageTransitionRow(
+        transitionId: string,
+        storageKey: string,
+        bytes: Uint8Array,
+        signal?: AbortSignal | null,
+    ) {
+        await this.Init()
+        return await this.realStorage.uploadPluginStorageTransitionRow(
+            transitionId,
+            storageKey,
+            bytes,
+            signal,
+        )
+    }
+
+    async readPluginStorageTransitionRow(
+        transitionId: string,
+        storageKey: string,
+        signal?: AbortSignal | null,
+    ) {
+        await this.Init()
+        return await this.realStorage.readPluginStorageTransitionRow(
+            transitionId,
+            storageKey,
+            signal,
+        )
+    }
+
+    async getPluginStorageTransitionStatus(
+        transitionId: string,
+        signal?: AbortSignal | null,
+    ) {
+        await this.Init()
+        return await this.realStorage.getPluginStorageTransitionStatus(transitionId, signal)
+    }
+
+    async finalizePluginStorageTransition(
+        transitionId: string,
+        signal?: AbortSignal | null,
+    ) {
+        await this.Init()
+        return await this.realStorage.finalizePluginStorageTransition(transitionId, signal)
+    }
+
+    async abortPluginStorageTransition(
+        transitionId: string,
+        signal?: AbortSignal | null,
+    ) {
+        await this.Init()
+        return await this.realStorage.abortPluginStorageTransition(transitionId, signal)
     }
 
     /** Get the last known ETag for database.bin */

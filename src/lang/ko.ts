@@ -1805,8 +1805,10 @@ export const languageKorean = {
     `플러그인 "${plugin}"을(를) 시작하지 못했습니다.`,
   optimizePluginMemoryEnabled: "플러그인 메모리 최적화를 켰습니다.",
   optimizePluginMemoryDisabled: "플러그인 메모리 최적화를 껐습니다.",
-  optimizePluginMemoryProgress: (completed: number, total: number) =>
-    `플러그인 저장소 이동 중… ${completed} / ${total}`,
+  optimizePluginMemoryEstimating: "플러그인 저장소 크기를 계산하는 중…",
+  optimizePluginMemoryProgress: (completed: number, total: number, completedBytes: string, totalBytes: string) =>
+    `플러그인 저장소 이동 중… ${completed} / ${total} (${completedBytes} / ${totalBytes})`,
+  optimizePluginMemoryCancelled: "플러그인 저장 방식 변경을 취소했습니다.",
   optimizePluginMemoryFailed: (message: string) =>
     `플러그인 저장 방식을 변경하지 못했습니다: ${message}`,
   optimizePluginMemoryFailedSafe:

@@ -1654,7 +1654,10 @@ export const languageEnglish = {
     pluginInitializationFailed: (plugin: string) => `Plugin "${plugin}" failed to start.`,
     optimizePluginMemoryEnabled: "Plugin memory optimization enabled.",
     optimizePluginMemoryDisabled: "Plugin memory optimization disabled.",
-    optimizePluginMemoryProgress: (completed: number, total: number) => `Moving plugin storage… ${completed} / ${total}`,
+    optimizePluginMemoryEstimating: "Measuring plugin storage…",
+    optimizePluginMemoryProgress: (completed: number, total: number, completedBytes: string, totalBytes: string) =>
+        `Moving plugin storage… ${completed} / ${total} (${completedBytes} / ${totalBytes})`,
+    optimizePluginMemoryCancelled: "Plugin storage mode change cancelled.",
     optimizePluginMemoryFailed: (message: string) => `Could not change plugin storage mode: ${message}`,
     optimizePluginMemoryFailedSafe: "Could not change plugin storage mode. No row details were shown; review the encoded-key recovery diagnostics.",
     pluginStorageRecoveryBootWarning: (count: number) => `PocketRisu quarantined ${count} plugin storage reconciliation issue(s). The app and unaffected plugins will continue loading. Review the recovery panel in Settings → Plugins.`,

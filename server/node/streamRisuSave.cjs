@@ -95,6 +95,7 @@ async function streamRisuSaveToFile({
     filePath,
     readChatRow,
     pluginStorage = null,
+    foldChatRows = true,
     markPluginStorageFolded = false,
     shouldAbort = () => false,
     onMissingChatRow = throwMissingChatRow,
@@ -242,7 +243,7 @@ async function streamRisuSaveToFile({
         await write(mapHeader(topKeys.length));
         for (const key of topKeys) {
             await writeValue(key);
-            if (key === 'characters' && Array.isArray(characters)) {
+            if (key === 'characters' && foldChatRows && Array.isArray(characters)) {
                 await write(arrayHeader(characters.length));
                 for (const char of characters) await writeCharacter(char);
             } else if (key === 'pluginCustomStorage' && valuePlan) {

@@ -3,6 +3,7 @@ import type { RisuPlugin } from "./plugins.svelte";
 type PluginVersion = RisuPlugin["version"];
 
 let pluginStorageModeTransitionDepth = 0;
+let pluginStorageModeTransitionLatched = false;
 let pluginLifecycleQueue: Promise<unknown> = Promise.resolve();
 let activePluginLifecycleLease: PluginLifecycleLease | undefined;
 
@@ -61,8 +62,13 @@ export function beginPluginStorageModeTransition(): () => void {
     };
 }
 
+/** Keep synchronous legacy access disabled until a reload can re-read truth. */
+export function latchPluginStorageModeTransitionUntilReload(): void {
+    pluginStorageModeTransitionLatched = true;
+}
+
 export function isPluginStorageModeTransitioning(): boolean {
-    return pluginStorageModeTransitionDepth > 0;
+    return pluginStorageModeTransitionDepth > 0 || pluginStorageModeTransitionLatched;
 }
 
 export function isLegacyPluginVersion(version: PluginVersion): boolean {

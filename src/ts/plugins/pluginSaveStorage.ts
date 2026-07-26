@@ -1,25 +1,35 @@
 import { getDatabase, type Database } from "../storage/database.svelte";
 import {
     batchPersistentPluginStorage,
+    abortPersistentPluginStorageTransition,
+    beginPersistentPluginStorageTransition,
     clearExternalizedPluginStorage,
     clearPersistentPrefix,
     commitPersistentPluginStorageMutation,
-    commitPersistentPluginStorageTransition,
     decodeStorageKeyComponent,
+    getPersistentStorageFreeBytes,
+    finalizePersistentPluginStorageTransition,
+    listPersistentEntriesWithSizes,
     listPersistentKeys,
     makeEncodedStorageKey,
     mutatePersistentPluginStorage,
     preparePersistentJson,
     readPersistentPluginStorageState,
+    readPersistentPluginStorageTransitionRow,
     readPersistentJson,
     readPersistentJsonRow,
     removePersistentKey,
     restorePersistentPluginStoragePair,
+    uploadPersistentPluginStorageTransitionRow,
     writePersistentJson,
 } from "../storage/persistentKv";
 import { snapshotJsonValue, stringifyJsonValue } from "../storage/jsonValue";
 import { assertWellFormedUnicode } from "../storage/unicodeWellFormed";
-import { requireCommittedDatabaseSave } from "../storage/databaseSave";
+import {
+    beginDatabaseSavePause,
+    blockDatabaseSavesUntilReload,
+    requireCommittedDatabaseSave,
+} from "../storage/databaseSave";
 import { StorageError } from "../storage/storageError";
 import { abortReason, awaitWithAbort, throwIfAborted } from "../storage/abort";
 import {
@@ -32,6 +42,7 @@ import { v4 as uuidv4 } from "uuid";
 import {
     beginPluginStorageModeTransition,
     hasEnabledLegacyPlugins,
+    latchPluginStorageModeTransitionUntilReload,
     withPluginLifecycleLock,
 } from "./pluginMemoryOptimization";
 import {
@@ -80,6 +91,10 @@ interface PluginStorageOwnership {
 
 export const PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS = 30_000;
 export const PLUGIN_STORAGE_BOOT_RECOVERY_TIMEOUT_MS = 30_000;
+export const PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES = 64 * 1024 * 1024;
+export const PLUGIN_STORAGE_INTERNALIZE_MAX_ENTRIES = 100_000;
+export const PLUGIN_STORAGE_INTERNALIZE_DISK_MULTIPLIER = 3;
+export const PLUGIN_STORAGE_TRANSITION_MAX_ROW_BYTES = 32 * 1024 * 1024;
 
 type BarrierWaiter = {
     kind: "shared" | "exclusive";
@@ -194,6 +209,7 @@ class PluginStorageBarrier {
 }
 
 const storageBarrier = new PluginStorageBarrier();
+let pluginStorageBarrierLatchedUntilReload = false;
 const storageScopeQueues = new Map<string, Promise<void>>();
 let inlinePluginStoragePublishQueue: Promise<void> = Promise.resolve();
 let storageEnumerationSnapshot: {
@@ -319,7 +335,7 @@ export function withPluginSaveStorageLock<T>(
             throwIfAborted(signal);
             return await operation();
         } finally {
-            release();
+            if (!pluginStorageBarrierLatchedUntilReload) release();
         }
     })();
 }
@@ -1842,6 +1858,9 @@ export interface PluginStorageReconcileProgress {
     direction: "externalize" | "internalize";
     completed: number;
     total: number;
+    completedBytes?: number;
+    totalBytes?: number;
+    maxBytes?: number | null;
 }
 
 export interface PluginStorageReconcileResult {
@@ -1856,6 +1875,8 @@ export interface PluginStorageBootReconcileResult extends PluginStorageReconcile
 
 interface ReconcileDependencies {
     getDatabase: () => Database;
+    getPersistentStorageFreeBytes: typeof getPersistentStorageFreeBytes;
+    listPersistentEntriesWithSizes: typeof listPersistentEntriesWithSizes;
     listPersistentKeys: typeof listPersistentKeys;
     readPersistentJson: typeof readPersistentJson;
     readPersistentJsonRow: typeof readPersistentJsonRow;
@@ -1886,6 +1907,8 @@ function resolveReconcileDependencies(
 ): ReconcileDependencies {
     return {
         getDatabase,
+        getPersistentStorageFreeBytes,
+        listPersistentEntriesWithSizes,
         listPersistentKeys,
         readPersistentJson,
         readPersistentJsonRow,
@@ -1894,6 +1917,344 @@ function resolveReconcileDependencies(
         removePersistentKey,
         persistDatabase: persistDatabaseImmediately,
         ...overrides,
+    };
+}
+
+interface PluginStorageTransitionPreflight {
+    direction: "externalize" | "internalize";
+    orderedBytes: number[];
+    baselineEntries: number;
+    baselineBytes: number;
+    totalBytes: number;
+    maxBytes: number | null;
+    entries: Array<{
+        rawKey: string;
+        storageKey: string;
+        size: number;
+        prefix: PluginSaveStoragePrefix;
+    }>;
+}
+
+function utf8ByteLength(value: string): number {
+    let bytes = 0;
+    for (let index = 0; index < value.length; index += 1) {
+        const codeUnit = value.charCodeAt(index);
+        if (codeUnit <= 0x7f) bytes += 1;
+        else if (codeUnit <= 0x7ff) bytes += 2;
+        else if (codeUnit >= 0xd800 && codeUnit <= 0xdbff && index + 1 < value.length) {
+            const next = value.charCodeAt(index + 1);
+            if (next >= 0xdc00 && next <= 0xdfff) {
+                bytes += 4;
+                index += 1;
+            } else bytes += 3;
+        } else bytes += 3;
+    }
+    return bytes;
+}
+
+function addTransitionBytes(total: number, next: number): number {
+    const result = total + next;
+    if (!Number.isSafeInteger(result)) {
+        throw new StorageError("Plugin storage is too large to measure safely.", {
+            code: "PLUGIN_STORAGE_SIZE_LIMIT",
+            operation: "transition",
+        });
+    }
+    return result;
+}
+
+function transitionLimitError(
+    kind: "row" | "aggregate" | "entries",
+    actual: number,
+    limit: number,
+): StorageError {
+    const units = kind === "entries" ? "entries" : "bytes";
+    return new StorageError(
+        `Plugin storage has ${actual} ${units}; this transition is limited to ${limit} ${units}.`,
+        {
+            code: kind === "aggregate"
+                ? "PLUGIN_STORAGE_MEMORY_LIMIT"
+                : "PLUGIN_STORAGE_SIZE_LIMIT",
+            operation: "transition",
+        },
+    );
+}
+
+function validateTransitionRowSize(size: number): void {
+    if (!Number.isSafeInteger(size) || size < 0) {
+        throw new StorageError("Plugin storage returned an invalid logical row size.", {
+            code: "PLUGIN_STORAGE_SIZE_LIMIT",
+            operation: "transition",
+        });
+    }
+    if (size > PLUGIN_STORAGE_TRANSITION_MAX_ROW_BYTES) {
+        throw transitionLimitError("row", size, PLUGIN_STORAGE_TRANSITION_MAX_ROW_BYTES);
+    }
+}
+
+function measureInlineTransitionEntries(
+    source: unknown,
+    fieldName: string,
+    prefix: PluginSaveStoragePrefix,
+    signal?: AbortSignal | null,
+): Array<{ key: string; storageKey: string; size: number }> {
+    if (source === undefined) return [];
+    if (source === null || typeof source !== "object" || Array.isArray(source)) {
+        throw new TypeError(`${fieldName} must be a JSON object.`);
+    }
+    const prototype = Reflect.getPrototypeOf(source);
+    if (prototype !== Object.prototype && prototype !== null) {
+        throw new TypeError(`${fieldName} must be a plain JSON object.`);
+    }
+    const keys: string[] = [];
+    const seen = new Set<PropertyKey>();
+    const validateKey = (key: PropertyKey) => {
+        if (seen.has(key)) return;
+        seen.add(key);
+        if (typeof key !== "string") {
+            throw new TypeError(`${fieldName} does not accept symbol keys.`);
+        }
+        assertWellFormedUnicode(key);
+        const descriptor = Reflect.getOwnPropertyDescriptor(source, key);
+        if (!descriptor || !("value" in descriptor)) {
+            throw new TypeError(`${fieldName} does not accept an accessor for ${key}.`);
+        }
+        if (!descriptor.enumerable) {
+            throw new TypeError(`${fieldName} requires an enumerable data property for ${key}.`);
+        }
+        keys.push(key);
+    };
+    for (const key of Reflect.ownKeys(source)) validateKey(key);
+    for (const key of getPluginStorageRecordKeys(source as Record<string, unknown>)) {
+        validateKey(key);
+    }
+    return orderPluginStorageKeys(keys).map(key => {
+        throwIfAborted(signal);
+        const descriptor = Reflect.getOwnPropertyDescriptor(source, key)!;
+        const storageKey = makeArchiveSafePluginSaveStorageKey(prefix, key);
+        const size = utf8ByteLength(stringifyJsonValue(descriptor.value));
+        return { key, storageKey, size };
+    });
+}
+
+/**
+ * Inventory and bound a manual transition before any authoritative row body is
+ * loaded or the live routing flag changes. Physical orphan/quarantine rows are
+ * deliberately excluded through the active generation manifest.
+ */
+async function preflightPluginStorageTransition(
+    deps: ReconcileDependencies,
+    target: boolean,
+    signal?: AbortSignal | null,
+): Promise<PluginStorageTransitionPreflight> {
+    throwIfAborted(signal);
+    const db = deps.getDatabase();
+    // Reject hostile inline descriptors before touching persistent storage.
+    const inlineValues = measureInlineTransitionEntries(
+        db.pluginCustomStorage,
+        "pluginCustomStorage",
+        PLUGIN_SAVE_PREFIX,
+        signal,
+    );
+    const inlineMeta = measureInlineTransitionEntries(
+        db.pluginStorageMeta,
+        "pluginStorageMeta",
+        PLUGIN_SAVE_META_PREFIX,
+        signal,
+    );
+    const [valueInventory, metaInventory] = await Promise.all([
+        deps.listPersistentEntriesWithSizes(PLUGIN_SAVE_PREFIX, signal),
+        deps.listPersistentEntriesWithSizes(PLUGIN_SAVE_META_PREFIX, signal),
+    ]);
+    throwIfAborted(signal);
+
+    const valueSizeByKey = new Map(valueInventory.map(entry => [entry.key, entry.size]));
+    const metaSizeByKey = new Map(metaInventory.map(entry => [entry.key, entry.size]));
+    const ownership = await resolvePluginStorageOwnership(
+        db,
+        valueInventory.map(entry => entry.key),
+        metaInventory.map(entry => entry.key),
+        deps.readPersistentJson,
+        signal,
+    );
+    const ownedValueKeys = db.optimizePluginMemory === true ? ownership.valueKeys : [];
+    const ownedMetaKeys = db.optimizePluginMemory === true ? ownership.metaKeys : [];
+    const ownedValueRawKeys = new Set<string>();
+    const ownedMetaRawKeys = new Set<string>();
+    const ownedBytes: number[] = [];
+    const ownedEntries: PluginStorageTransitionPreflight["entries"] = [];
+    for (const storageKey of ownedValueKeys) {
+        const rawKey = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
+        const size = valueSizeByKey.get(storageKey);
+        if (rawKey === null || size === undefined) {
+            throw new StorageError("Plugin storage changed during size inventory; retry.", {
+                code: "PLUGIN_STORAGE_CHANGED",
+                operation: "transition",
+                retryable: true,
+            });
+        }
+        validateTransitionRowSize(size);
+        ownedValueRawKeys.add(rawKey);
+        ownedBytes.push(size);
+        ownedEntries.push({
+            rawKey,
+            storageKey,
+            size,
+            prefix: PLUGIN_SAVE_PREFIX,
+        });
+    }
+    for (const storageKey of ownedMetaKeys) {
+        const rawKey = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
+        const size = metaSizeByKey.get(storageKey);
+        if (rawKey === null || size === undefined) {
+            throw new StorageError("Plugin storage changed during size inventory; retry.", {
+                code: "PLUGIN_STORAGE_CHANGED",
+                operation: "transition",
+                retryable: true,
+            });
+        }
+        validateTransitionRowSize(size);
+        ownedMetaRawKeys.add(rawKey);
+        ownedBytes.push(size);
+        ownedEntries.push({
+            rawKey,
+            storageKey,
+            size,
+            prefix: PLUGIN_SAVE_META_PREFIX,
+        });
+    }
+
+    const inlineBytes: number[] = [];
+    let baselineEntries = 0;
+    let baselineBytes = 0;
+    const accountInline = (
+        entries: Array<{ key: string; size: number }>,
+        externalWinners: Set<string>,
+    ) => {
+        for (const entry of entries) {
+            if (!target && externalWinners.has(entry.key)) continue;
+            validateTransitionRowSize(entry.size);
+            if (target) inlineBytes.push(entry.size);
+            else {
+                baselineEntries += 1;
+                baselineBytes = addTransitionBytes(baselineBytes, entry.size);
+            }
+        }
+    };
+    accountInline(inlineValues, ownedValueRawKeys);
+    accountInline(inlineMeta, ownedMetaRawKeys);
+
+    if (target) {
+        const overwrittenValueKeys = new Set(inlineValues.map(entry => entry.storageKey));
+        const overwrittenMetaKeys = new Set(inlineMeta.map(entry => entry.storageKey));
+        const retainedBytes: number[] = [];
+        ownedValueKeys.forEach((key, index) => {
+            if (!overwrittenValueKeys.has(key)) retainedBytes.push(ownedBytes[index]);
+        });
+        ownedMetaKeys.forEach((key, index) => {
+            if (!overwrittenMetaKeys.has(key)) {
+                retainedBytes.push(ownedBytes[ownedValueKeys.length + index]);
+            }
+        });
+        const totalEntries = inlineBytes.length + retainedBytes.length;
+        if (totalEntries > PLUGIN_STORAGE_INTERNALIZE_MAX_ENTRIES) {
+            throw transitionLimitError(
+                "entries",
+                totalEntries,
+                PLUGIN_STORAGE_INTERNALIZE_MAX_ENTRIES,
+            );
+        }
+        const retainedTotal = retainedBytes.reduce(addTransitionBytes, 0);
+        const totalBytes = inlineBytes.reduce(addTransitionBytes, retainedTotal);
+        return {
+            direction: "externalize",
+            orderedBytes: inlineBytes,
+            baselineEntries: retainedBytes.length,
+            baselineBytes: retainedTotal,
+            totalBytes,
+            maxBytes: null,
+            entries: [...inlineValues, ...inlineMeta].map(entry => ({
+                rawKey: entry.key,
+                storageKey: entry.storageKey,
+                size: entry.size,
+                prefix: entry.storageKey.startsWith(PLUGIN_SAVE_META_PREFIX)
+                    ? PLUGIN_SAVE_META_PREFIX
+                    : PLUGIN_SAVE_PREFIX,
+            })),
+        };
+    }
+
+    const totalEntries = ownedBytes.length + baselineEntries;
+    if (totalEntries > PLUGIN_STORAGE_INTERNALIZE_MAX_ENTRIES) {
+        throw transitionLimitError(
+            "entries",
+            totalEntries,
+            PLUGIN_STORAGE_INTERNALIZE_MAX_ENTRIES,
+        );
+    }
+    let totalBytes = baselineBytes;
+    for (const size of ownedBytes) {
+        totalBytes = addTransitionBytes(totalBytes, size);
+        if (totalBytes > PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES) {
+            throw transitionLimitError(
+                "aggregate",
+                totalBytes,
+                PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES,
+            );
+        }
+    }
+    if (totalBytes > 0) {
+        const requiredBytes = totalBytes * PLUGIN_STORAGE_INTERNALIZE_DISK_MULTIPLIER;
+        if (!Number.isSafeInteger(requiredBytes)) {
+            throw transitionLimitError(
+                "aggregate",
+                totalBytes,
+                PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES,
+            );
+        }
+        const freeBytes = await deps.getPersistentStorageFreeBytes(signal);
+        if (freeBytes !== null && freeBytes < requiredBytes) {
+            throw new StorageError(
+                `Plugin storage needs approximately ${requiredBytes} free bytes to internalize safely, but only ${freeBytes} bytes are available.`,
+                { code: "PLUGIN_STORAGE_DISK_LIMIT", operation: "transition" },
+            );
+        }
+    }
+    return {
+        direction: "internalize",
+        orderedBytes: ownedBytes,
+        baselineEntries,
+        baselineBytes,
+        totalBytes,
+        maxBytes: PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES,
+        entries: ownedEntries,
+    };
+}
+
+function withTransitionByteProgress(
+    options: Omit<PluginStorageReconcileOptions, "dependencies">,
+    preflight: PluginStorageTransitionPreflight,
+): Omit<PluginStorageReconcileOptions, "dependencies"> {
+    const prefixBytes = [preflight.baselineBytes];
+    for (const size of preflight.orderedBytes) {
+        prefixBytes.push(addTransitionBytes(prefixBytes[prefixBytes.length - 1], size));
+    }
+    const expand = (progress: PluginStorageReconcileProgress): PluginStorageReconcileProgress => {
+        const moved = Math.max(0, Math.min(progress.completed, preflight.orderedBytes.length));
+        return {
+            ...progress,
+            direction: preflight.direction,
+            completed: preflight.baselineEntries + moved,
+            total: preflight.baselineEntries + preflight.orderedBytes.length,
+            completedBytes: prefixBytes[moved],
+            totalBytes: preflight.totalBytes,
+            maxBytes: preflight.maxBytes,
+        };
+    };
+    return {
+        ...options,
+        onStart: progress => options.onStart?.(expand(progress)),
+        onProgress: progress => options.onProgress?.(expand(progress)),
     };
 }
 
@@ -2236,98 +2597,284 @@ async function applyPluginStorageReconciliation(
     };
 }
 
-async function applyAtomicPluginStorageReconciliation(
-    prepared: PreparedReconciliation,
+/**
+ * Production manual transitions use an unpublished server stage. Only one
+ * detached JSON row crosses the transport at a time; the generation, exact
+ * manifest, database mode, old-row deletion, and recovery token are published
+ * together by the final server transaction.
+ */
+function latchPluginStorageTransitionForReload(
+    target: boolean,
+    error: unknown,
+): StorageError {
+    const reloadError = new StorageError(
+        "Plugin storage state could not be recovered safely. Reload before using plugins or saving again.",
+        {
+            code: "COMMIT_OUTCOME_UNKNOWN",
+            operation: "transition",
+            commitOutcomeUnknown: true,
+            cause: error,
+        },
+    );
+    pluginStorageBarrierLatchedUntilReload = true;
+    latchPluginStorageModeTransitionUntilReload();
+    blockDatabaseSavesUntilReload(reloadError);
+    setPluginStorageRecoveryState({
+        direction: target ? "externalize" : "internalize",
+        issues: [{ code: "persist-failed", encodedKey: PLUGIN_STORAGE_MANIFEST_KEY }],
+    });
+    return reloadError;
+}
+
+async function applyStagedPluginStorageTransition(
     deps: ReconcileDependencies,
+    target: boolean,
+    preflight: PluginStorageTransitionPreflight,
     options: Omit<PluginStorageReconcileOptions, "dependencies">,
 ): Promise<PluginStorageReconcileResult> {
-    if (prepared.direction === "none") return prepared;
     const db = deps.getDatabase();
     const sourceOwnership = await readCurrentOwnership(db, options.signal);
     if (
         !sourceOwnership.manifestValid
         || (db.pluginStorageGeneration
-            && sourceOwnership.manifest?.generation !== db.pluginStorageGeneration)
+            && sourceOwnership.manifest?.generation !== db.pluginStorageGeneration
+            && db.optimizePluginMemory === true)
     ) {
-        throw new Error("Cannot replace an invalid plugin storage ownership manifest.");
-    }
-    const { cloneDatabaseState } = await import("../storage/databaseClone");
-    const target = cloneDatabaseState(db);
-    target.pluginStorageGeneration = prepared.generation;
-    if (prepared.direction === "externalize") {
-        target.optimizePluginMemory = true;
-        target.pluginCustomStorage = copyDatabasePluginStorageRecord(prepared.nextValues);
-        if (getPluginStorageRecordKeys(prepared.nextMeta).length > 0) {
-            target.pluginStorageMeta = copyDatabasePluginStorageRecord(prepared.nextMeta);
-        } else {
-            delete target.pluginStorageMeta;
-        }
-    } else {
-        target.optimizePluginMemory = false;
-        target.pluginCustomStorage = copyDatabasePluginStorageRecord(prepared.nextValues);
-        if (getPluginStorageRecordKeys(prepared.nextMeta).length > 0) {
-            target.pluginStorageMeta = copyDatabasePluginStorageRecord(prepared.nextMeta);
-        } else {
-            delete target.pluginStorageMeta;
-        }
+        throw new StorageError("Cannot transition an invalid plugin storage publication.", {
+            code: "PLUGIN_STORAGE_CHANGED",
+            operation: "transition",
+            retryable: true,
+        });
     }
 
-    const { RisuSaveEncoder } = await import("../storage/risuSave");
-    const encoder = new RisuSaveEncoder();
-    await encoder.init(target, {
-        compression: false,
-        skipRemoteSavingOnCharacters: false,
-    });
-    const encoded = encoder.encode();
-    if (!encoded) throw new Error("Failed to encode plugin storage transition");
-    await commitPersistentPluginStorageTransition({
-        version: 1,
+    // Bind the stage to the latest durable non-plugin database state. The
+    // server transforms that saved source directly, so no target DB envelope
+    // or aggregate plugin map is sent back through the browser.
+    await deps.persistDatabase();
+    throwIfAborted(options.signal);
+    const transitionId = uuidv4();
+    const targetGeneration = uuidv4();
+    const stage = await beginPersistentPluginStorageTransition({
+        version: 2,
+        transitionId,
         source: {
             optimized: db.optimizePluginMemory === true,
             generation: db.pluginStorageGeneration ?? null,
             manifest: sourceOwnership.manifest,
         },
-        database: new Uint8Array(encoded),
+        targetOptimized: target,
+        targetGeneration,
+        rows: target
+            ? preflight.entries.map(entry => ({
+                storageKey: entry.storageKey,
+                size: entry.size,
+            }))
+            : [],
     }, options.signal);
+    const total = target ? preflight.entries.length : stage.rows.length;
+    const totalBytes = target
+        ? preflight.entries.reduce((sum, entry) => addTransitionBytes(sum, entry.size), 0)
+        : stage.rows.reduce((sum, entry) => addTransitionBytes(sum, entry.size), 0);
+    options.onStart?.({
+        direction: target ? "externalize" : "internalize",
+        completed: 0,
+        total,
+        completedBytes: 0,
+        totalBytes,
+        maxBytes: target ? null : PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES,
+    });
 
-    // Publish the same routing state in memory only after SQLite has committed
-    // the database generation, exact manifest, and every affected row.
-    db.optimizePluginMemory = target.optimizePluginMemory;
-    db.pluginStorageGeneration = prepared.generation;
-    if (prepared.direction === "externalize") {
-        db.pluginCustomStorage = createDatabasePluginStorageRecord();
-        delete db.pluginStorageMeta;
-        const total = prepared.valueEntries.length + prepared.metaEntries.length;
-        let completed = 0;
-        for (let index = 0; index < total; index++) {
-            options.onProgress?.({
-                direction: "externalize",
-                completed: ++completed,
-                total,
+    // The authoritative baseline above is already durable. Acknowledged rows
+    // are deliberately removed from the live inline map one at a time so their
+    // payloads become collectible. The lifecycle/storage barriers keep plugin
+    // operations from observing that temporary map, the source-mode flag stays
+    // unchanged, the server stage is unpublished, and this save pause prevents
+    // a partial old-mode map from becoming durable. Failure restores each row
+    // from the private stage before any of those guards are released.
+    const resumeDatabaseSaves = beginDatabaseSavePause();
+    let finalizeDispatched = false;
+    const uploaded: PluginStorageTransitionPreflight["entries"] = [];
+    let completedBytes = 0;
+    try {
+        if (target) {
+            for (const entry of preflight.entries) {
+                throwIfAborted(options.signal);
+                const source = entry.prefix === PLUGIN_SAVE_PREFIX
+                    ? db.pluginCustomStorage
+                    : db.pluginStorageMeta;
+                const descriptor = Reflect.getOwnPropertyDescriptor(source ?? {}, entry.rawKey);
+                if (!descriptor || !("value" in descriptor)) {
+                    throw new StorageError("Plugin storage changed during staging; retry.", {
+                        code: "PLUGIN_STORAGE_CHANGED",
+                        operation: "transition",
+                        retryable: true,
+                    });
+                }
+                const prepared = preparePersistentJson(descriptor.value, {
+                    pluginValue: entry.prefix === PLUGIN_SAVE_PREFIX,
+                });
+                if (prepared.byteLength !== entry.size) {
+                    throw new StorageError("Plugin storage changed during staging; retry.", {
+                        code: "PLUGIN_STORAGE_CHANGED",
+                        operation: "transition",
+                        retryable: true,
+                    });
+                }
+                await uploadPersistentPluginStorageTransitionRow(
+                    transitionId,
+                    entry.storageKey,
+                    prepared.bytes,
+                    options.signal,
+                );
+                if (entry.prefix === PLUGIN_SAVE_PREFIX) {
+                    delete db.pluginCustomStorage[entry.rawKey];
+                } else if (db.pluginStorageMeta) {
+                    delete db.pluginStorageMeta[entry.rawKey];
+                }
+                uploaded.push(entry);
+                completedBytes = addTransitionBytes(completedBytes, entry.size);
+                options.onProgress?.({
+                    direction: "externalize",
+                    completed: uploaded.length,
+                    total,
+                    completedBytes,
+                    totalBytes,
+                    maxBytes: null,
+                });
+            }
+        }
+
+        let nextValues: Record<string, unknown> | null = null;
+        let nextMeta: NonNullable<Database["pluginStorageMeta"]> | null = null;
+        if (!target) {
+            nextValues = copyDatabasePluginStorageRecord(db.pluginCustomStorage);
+            nextMeta = copyDatabasePluginStorageRecord(
+                db.pluginStorageMeta,
+            ) as NonNullable<Database["pluginStorageMeta"]>;
+            let completed = 0;
+            for (const row of stage.rows) {
+                throwIfAborted(options.signal);
+                const prefix = row.storageKey.startsWith(PLUGIN_SAVE_META_PREFIX)
+                    ? PLUGIN_SAVE_META_PREFIX
+                    : PLUGIN_SAVE_PREFIX;
+                const rawKey = decodeListedStorageKey(row.storageKey, prefix);
+                if (rawKey === null) {
+                    throw new StorageError("The staged transition returned an invalid key.", {
+                        code: "PLUGIN_STORAGE_CHANGED",
+                        operation: "transition",
+                    });
+                }
+                const bytes = await readPersistentPluginStorageTransitionRow(
+                    transitionId,
+                    row.storageKey,
+                    options.signal,
+                );
+                if (bytes.byteLength !== row.size) {
+                    throw new StorageError("The staged transition row changed size.", {
+                        code: "PLUGIN_STORAGE_CHANGED",
+                        operation: "transition",
+                    });
+                }
+                const value = JSON.parse(new TextDecoder().decode(bytes));
+                if (prefix === PLUGIN_SAVE_PREFIX) {
+                    definePluginStorageRecordValue(nextValues, rawKey, value);
+                } else {
+                    definePluginStorageRecordValue(
+                        nextMeta,
+                        rawKey,
+                        value as NonNullable<Database["pluginStorageMeta"]>[string],
+                    );
+                }
+                completedBytes = addTransitionBytes(completedBytes, row.size);
+                options.onProgress?.({
+                    direction: "internalize",
+                    completed: ++completed,
+                    total,
+                    completedBytes,
+                    totalBytes,
+                    maxBytes: PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES,
+                });
+            }
+        }
+
+        throwIfAborted(options.signal);
+        finalizeDispatched = true;
+        const committed = await finalizePersistentPluginStorageTransition(transitionId);
+        if (committed.state !== "committed") {
+            throw new StorageError("Plugin storage finalize was not acknowledged.", {
+                code: "COMMIT_OUTCOME_UNKNOWN",
+                operation: "transition",
+                commitOutcomeUnknown: true,
             });
         }
-        const { setPatchSyncBaseline } = await import("../globalApi.svelte");
-        setPatchSyncBaseline?.(db);
-        return {
-            direction: "externalize",
-            values: prepared.valueEntries.length,
-            meta: prepared.metaEntries.length,
-        };
-    }
 
-    db.pluginCustomStorage = copyDatabasePluginStorageRecord(prepared.nextValues);
-    if (getPluginStorageRecordKeys(prepared.nextMeta).length > 0) {
-        db.pluginStorageMeta = copyDatabasePluginStorageRecord(prepared.nextMeta);
-    } else {
-        delete db.pluginStorageMeta;
+        db.optimizePluginMemory = target;
+        db.pluginStorageGeneration = targetGeneration;
+        if (target) {
+            db.pluginCustomStorage = createDatabasePluginStorageRecord();
+            delete db.pluginStorageMeta;
+        } else {
+            db.pluginCustomStorage = nextValues!;
+            if (nextMeta && getPluginStorageRecordKeys(nextMeta).length > 0) {
+                db.pluginStorageMeta = nextMeta;
+            } else {
+                delete db.pluginStorageMeta;
+            }
+        }
+        return {
+            direction: target ? "externalize" : "internalize",
+            values: stage.rows.filter(row => row.storageKey.startsWith(PLUGIN_SAVE_PREFIX)).length,
+            meta: stage.rows.filter(row => row.storageKey.startsWith(PLUGIN_SAVE_META_PREFIX)).length,
+        };
+    } catch (error) {
+        const outcomeUnknown = error instanceof StorageError
+            && error.commitOutcomeUnknown;
+        let restoreFailed = false;
+        if (!finalizeDispatched || !outcomeUnknown) {
+            // Restore one acknowledged row at a time before allowing database
+            // saves to resume. No aggregate rollback copy is retained.
+            for (const entry of uploaded) {
+                try {
+                    const bytes = await readPersistentPluginStorageTransitionRow(
+                        transitionId,
+                        entry.storageKey,
+                    );
+                    const value = JSON.parse(new TextDecoder().decode(bytes));
+                    if (entry.prefix === PLUGIN_SAVE_PREFIX) {
+                        definePluginStorageRecordValue(db.pluginCustomStorage, entry.rawKey, value);
+                    } else {
+                        if (!db.pluginStorageMeta) {
+                            db.pluginStorageMeta = createDatabasePluginStorageRecord<
+                                NonNullable<Database["pluginStorageMeta"]>[string]
+                            >();
+                        }
+                        definePluginStorageRecordValue(
+                            db.pluginStorageMeta,
+                            entry.rawKey,
+                            value as NonNullable<Database["pluginStorageMeta"]>[string],
+                        );
+                    }
+                } catch (restoreError) {
+                    restoreFailed = true;
+                    console.error("[Plugin storage] staged row restore failed", restoreError);
+                }
+            }
+            try {
+                await abortPersistentPluginStorageTransition(transitionId);
+            } catch (abortError) {
+                console.error("[Plugin storage] staged transition abort failed", abortError);
+            }
+        }
+        if (restoreFailed) {
+            throw latchPluginStorageTransitionForReload(target, error);
+        }
+        if (finalizeDispatched && outcomeUnknown) {
+            throw latchPluginStorageTransitionForReload(target, error);
+        }
+        throw error;
+    } finally {
+        resumeDatabaseSaves();
     }
-    const { setPatchSyncBaseline } = await import("../globalApi.svelte");
-    setPatchSyncBaseline?.(db);
-    return {
-        direction: "internalize",
-        values: prepared.valueStorageKeys.length,
-        meta: prepared.metaStorageKeys.length,
-    };
 }
 
 /**
@@ -2341,19 +2888,21 @@ async function applyAtomicPluginStorageReconciliation(
 export async function reconcilePluginStorageMode(
     options: PluginStorageReconcileOptions = {},
 ): Promise<PluginStorageReconcileResult> {
+    if (options.dependencies === undefined) {
+        throw new Error(
+            "Production plugin storage changes must use transitionPluginStorageMode or boot recovery.",
+        );
+    }
     const deps = resolveReconcileDependencies(options.dependencies);
     return withPluginSaveStorageLock(async () => {
         const target = deps.getDatabase().optimizePluginMemory === true;
-        const productionAtomic = options.dependencies === undefined;
         const prepared = await preparePluginStorageReconciliation(
             deps,
             target,
             options,
-            productionAtomic,
+            false,
         );
-        return productionAtomic
-            ? applyAtomicPluginStorageReconciliation(prepared, deps, options)
-            : applyPluginStorageReconciliation(prepared, deps, options);
+        return applyPluginStorageReconciliation(prepared, deps, options);
     }, options.signal);
 }
 
@@ -2575,34 +3124,6 @@ export async function reconcilePluginStorageModeForBoot(
     );
     const signal = controller.signal;
     try {
-        if (options.dependencies === undefined) {
-            const db = getDatabase();
-            const direction = db.optimizePluginMemory === true
-                ? "externalize"
-                : "internalize";
-            try {
-                const result = await reconcilePluginStorageMode({
-                    ...options,
-                    signal,
-                    dependencies: undefined,
-                });
-                setPluginStorageRecoveryState(null);
-                return { ...result, issues: [] };
-            } catch (error) {
-                const issue = bootRecoveryIssue(
-                    error,
-                    "plugin-storage/manifest.json",
-                    "persist-failed",
-                );
-                setPluginStorageRecoveryState({ direction, issues: [issue] });
-                return {
-                    direction,
-                    values: 0,
-                    meta: 0,
-                    issues: [issue],
-                };
-            }
-        }
         return await withPluginSaveStorageLock(async () => {
         throwIfAborted(signal);
         invalidateStorageEnumerationSnapshot();
@@ -2903,28 +3424,35 @@ export async function transitionPluginStorageMode(
                     );
                 }
                 const previous = db.optimizePluginMemory === true;
+                const preflight = await preflightPluginStorageTransition(
+                    deps,
+                    target,
+                    options.signal,
+                );
+                if (options.dependencies === undefined) {
+                    return await applyStagedPluginStorageTransition(
+                        deps,
+                        target,
+                        preflight,
+                        options,
+                    );
+                }
+                const transitionOptions = withTransitionByteProgress(options, preflight);
                 // This may perform reads, but no mode/backend/database mutation.
                 // A malformed source therefore rejects without needing rollback.
                 const prepared = await preparePluginStorageReconciliation(
                     deps,
                     target,
-                    options,
+                    transitionOptions,
                     true,
                 );
-                if (options.dependencies === undefined) {
-                    return await applyAtomicPluginStorageReconciliation(
-                        prepared,
-                        deps,
-                        options,
-                    );
-                }
                 db.optimizePluginMemory = target;
 
                 try {
                     const result = await applyPluginStorageReconciliation(
                         prepared,
                         deps,
-                        options,
+                        transitionOptions,
                     );
                     // With no rows to move, reconciliation has no reason to save. An
                     // actual flag transition still needs its own durable acknowledgement.

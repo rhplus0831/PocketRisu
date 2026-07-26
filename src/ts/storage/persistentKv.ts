@@ -16,6 +16,8 @@ import type {
 import { PluginStorageBatchError } from "./pluginStorageBatch";
 import type {
     PluginStorageManifestTransport,
+    PluginStorageStagedTransitionBegin,
+    PluginStorageStagedTransitionStatus,
     PluginStorageTransitionTransport,
 } from "./nodeStorage";
 import {
@@ -319,6 +321,33 @@ export async function listPersistentKeys(
         : await forageStorage.keys(prefix);
 }
 
+/** Free bytes on the authoritative save volume, or null when unavailable. */
+export async function getPersistentStorageFreeBytes(
+    signal?: AbortSignal | null,
+): Promise<number | null> {
+    await ensureStorageReady(signal);
+    const capacity = signal
+        ? await forageStorage.getStorageCapacity(signal)
+        : await forageStorage.getStorageCapacity();
+    return capacity.freeBytes;
+}
+
+export interface PersistentEntrySize {
+    key: string;
+    size: number;
+}
+
+/** Logical authoritative sizes without downloading or parsing row bodies. */
+export async function listPersistentEntriesWithSizes(
+    prefix: string,
+    signal?: AbortSignal | null,
+): Promise<PersistentEntrySize[]> {
+    await ensureStorageReady(signal);
+    return signal
+        ? await forageStorage.listEntriesWithSizes(prefix, signal)
+        : await forageStorage.listEntriesWithSizes(prefix);
+}
+
 export async function clearPersistentPrefix(
     prefix: string,
     signal?: AbortSignal | null,
@@ -391,6 +420,73 @@ export async function commitPersistentPluginStorageTransition(
     return signal
         ? await forageStorage.commitPluginStorageTransition(plan, signal)
         : await forageStorage.commitPluginStorageTransition(plan);
+}
+
+export async function beginPersistentPluginStorageTransition(
+    plan: PluginStorageStagedTransitionBegin,
+    signal?: AbortSignal | null,
+): Promise<PluginStorageStagedTransitionStatus> {
+    throwIfAborted(signal);
+    await ensureStorageReady(signal);
+    return await forageStorage.beginPluginStorageTransition({
+        ...plan,
+        expectedEtag: plan.expectedEtag
+            ?? forageStorage.getDbEtag()
+            ?? undefined,
+    }, signal);
+}
+
+export async function uploadPersistentPluginStorageTransitionRow(
+    transitionId: string,
+    storageKey: string,
+    bytes: Uint8Array,
+    signal?: AbortSignal | null,
+): Promise<PluginStorageStagedTransitionStatus> {
+    throwIfAborted(signal);
+    await ensureStorageReady(signal);
+    return await forageStorage.uploadPluginStorageTransitionRow(
+        transitionId,
+        storageKey,
+        bytes,
+        signal,
+    );
+}
+
+export async function readPersistentPluginStorageTransitionRow(
+    transitionId: string,
+    storageKey: string,
+    signal?: AbortSignal | null,
+): Promise<Uint8Array> {
+    throwIfAborted(signal);
+    await ensureStorageReady(signal);
+    return await forageStorage.readPluginStorageTransitionRow(
+        transitionId,
+        storageKey,
+        signal,
+    );
+}
+
+export async function getPersistentPluginStorageTransitionStatus(
+    transitionId: string,
+    signal?: AbortSignal | null,
+): Promise<PluginStorageStagedTransitionStatus> {
+    await ensureStorageReady(signal);
+    return await forageStorage.getPluginStorageTransitionStatus(transitionId, signal);
+}
+
+export async function finalizePersistentPluginStorageTransition(
+    transitionId: string,
+    signal?: AbortSignal | null,
+): Promise<PluginStorageStagedTransitionStatus> {
+    await ensureStorageReady(signal);
+    return await forageStorage.finalizePluginStorageTransition(transitionId, signal);
+}
+
+export async function abortPersistentPluginStorageTransition(
+    transitionId: string,
+): Promise<PluginStorageStagedTransitionStatus> {
+    await ensureStorageReady();
+    return await forageStorage.abortPluginStorageTransition(transitionId);
 }
 
 export async function makeHashedStorageKey(prefix: string, rawKey: string): Promise<string> {
