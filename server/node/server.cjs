@@ -352,6 +352,14 @@ function snapshotUsage() {
     return { count: keys.length, bytes, logicalBytes };
 }
 
+function warnAndPreserveMissingChatRow(source, chaId, chatId) {
+    // The referenced payload is already lost. Recovery-oriented backups keep
+    // the remaining database usable by retaining its metadata-only stub.
+    logger.warn(
+        `[${source}] Missing referenced chat row ${chaId}/${chatId}; preserving bare stub`
+    );
+}
+
 async function createBackupAndRotate() {
     const now = Date.now();
     if (lastBackupTime && now - lastBackupTime < BACKUP_INTERVAL_MS) {
@@ -370,9 +378,7 @@ async function createBackupAndRotate() {
             foldPluginStorage: true,
             markPluginStorageFolded: true,
             onMissingChatRow: (chaId, chatId) => {
-                logger.warn(
-                    `[Snapshot] Missing referenced chat row ${chaId}/${chatId}; preserving bare stub`
-                );
+                warnAndPreserveMissingChatRow('Snapshot', chaId, chatId);
             },
         });
         kvSetFromFile(backupKey, backupDbSpool.filePath);
@@ -2543,6 +2549,7 @@ async function spoolSelfContainedBackupDatabase(
 async function buildSelfContainedBackupDatabase({
     foldPluginStorage = true,
     shouldAbort = () => false,
+    onMissingChatRow,
     snapshot: externalSnapshot = null,
 } = {}) {
     let snapshot = externalSnapshot;
@@ -2563,6 +2570,7 @@ async function buildSelfContainedBackupDatabase({
             foldPluginStorage,
             shouldAbort,
             reader: snapshot,
+            onMissingChatRow,
         });
     } finally {
         if (ownsSnapshot) snapshot?.close();
@@ -4721,6 +4729,9 @@ app.get('/api/backup/export', async (req, res, next) => {
         backupDbSpool = await buildSelfContainedBackupDatabase({
             foldPluginStorage: target === 'upstream',
             shouldAbort: () => closed,
+            onMissingChatRow: (chaId, chatId) => {
+                warnAndPreserveMissingChatRow('Backup Export', chaId, chatId);
+            },
             snapshot: backupSnapshot,
         });
         if (closed) return;
@@ -4823,6 +4834,7 @@ app.get('/api/backup/export', async (req, res, next) => {
         if (!closed) res.end();
     } catch (error) {
         if (!closed && error?.code === 'BACKUP_MISSING_CHAT_ROW') {
+            logger.error('[Backup Export] Failed:', error);
             res.status(500).json({ error: error.message, code: error.code });
         } else if (!closed) {
             next(error);
