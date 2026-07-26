@@ -97,9 +97,11 @@ const {
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
 const { inspectRisuSaveSource, shouldStreamRisuSave } = require('./streamRisuLoad.cjs');
 const {
+    BACKUP_ENTRY_NAME_MAX_BYTES,
     PLUGIN_SAVE_PREFIX,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_STORAGE_FOLDED_MARKER,
+    assertArchiveSafePluginSaveStorageKey,
     decodePluginSaveStorageKey,
     encodePluginSaveStorageKey,
 } = require('./pluginSaveKeys.cjs');
@@ -1036,7 +1038,6 @@ const IMPORT_JOURNAL_PATH = path.join(savePath, 'import_journal.json')
 const IMPORT_JOURNAL_MARKER_KEY = 'import_journal/marker'
 const hexRegex = /^[0-9a-fA-F]+$/;
 const BACKUP_IMPORT_MAX_BYTES = Number(process.env.RISU_BACKUP_IMPORT_MAX_BYTES ?? '0');
-const BACKUP_ENTRY_NAME_MAX_BYTES = 1024;
 // Minimum free disk space headroom multiplier: require 2× the backup size to be free
 const BACKUP_DISK_HEADROOM = 2;
 // Heartbeat interval for NDJSON import progress stream. 5 s by default —
@@ -2177,6 +2178,7 @@ function setupProxyStreamWebSocket(server) {
 }
 
 function encodeBackupEntryHeader(name, dataSize) {
+    assertBackupEntryNameWithinLimit(name);
     const encodedName = Buffer.from(name, 'utf-8');
     const nameLength = Buffer.allocUnsafe(4);
     nameLength.writeUInt32LE(encodedName.length, 0);
@@ -2582,20 +2584,35 @@ async function buildSelfContainedBackupDatabase({
 
 function listPluginBackupEntries(reader = { kvListWithSizes }) {
     return [PLUGIN_SAVE_PREFIX, PLUGIN_SAVE_META_PREFIX].flatMap((prefix) => (
-        reader.kvListWithSizes(prefix).map((entry) => ({
-            kind: 'kv',
-            key: entry.key,
-            backupName: entry.key,
-            sortKey: entry.key,
-            size: entry.size,
-        }))
+        reader.kvListWithSizes(prefix).map((entry) => {
+            // Export and import use the same validator. This catches legacy or
+            // manually inserted rows before an archive is published.
+            resolveBackupStorageKey(entry.key);
+            return {
+                kind: 'kv',
+                key: entry.key,
+                backupName: entry.key,
+                sortKey: entry.key,
+                size: entry.size,
+            };
+        })
     ));
 }
 
-function resolveBackupStorageKey(name) {
+function assertBackupEntryNameWithinLimit(name) {
     if (Buffer.byteLength(name, 'utf-8') > BACKUP_ENTRY_NAME_MAX_BYTES) {
-        throw new Error(`Backup entry name too long: ${name.slice(0, 64)}`);
+        throw new RangeError(`Backup entry name exceeds ${BACKUP_ENTRY_NAME_MAX_BYTES} UTF-8 bytes`);
     }
+}
+
+function preflightBackupEntryNames(entries) {
+    for (const entry of entries) {
+        assertBackupEntryNameWithinLimit(entry.backupName);
+    }
+}
+
+function resolveBackupStorageKey(name) {
+    assertBackupEntryNameWithinLimit(name);
 
     if (name === 'database.risudat') {
         return 'database/database.bin';
@@ -4234,6 +4251,23 @@ app.post('/api/write', async (req, res, next) => {
         await queueStorageMutation(async () => {
             const key = Buffer.from(filePath, 'hex').toString('utf-8');
             let persistedDatabaseContent = fileContent;
+            if (
+                key.startsWith(PLUGIN_SAVE_PREFIX)
+                || key.startsWith(PLUGIN_SAVE_META_PREFIX)
+            ) {
+                try {
+                    // The generic KV API historically permits noncanonical
+                    // short keys in these namespaces. Preserve that contract,
+                    // but never admit a name the backup parser cannot frame.
+                    assertArchiveSafePluginSaveStorageKey(key);
+                } catch (error) {
+                    res.status(400).json({
+                        error: error?.message || 'Invalid plugin storage key',
+                        code: 'invalid_plugin_storage_key',
+                    });
+                    return;
+                }
+            }
             const assetVerification = key.startsWith('assets/')
                 ? verifyAssetHash(key, fileContent)
                 : null;
@@ -4795,6 +4829,7 @@ app.get('/api/backup/export', async (req, res, next) => {
             ...inlayEntries,
             ...sidecarEntries.filter(Boolean),
         ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+        preflightBackupEntryNames(namespacedEntries);
         const dbSize = backupDbSpool?.size ?? 0;
         const totalBytes = namespacedEntries.reduce((sum, entry) => {
             return sum + backupEntrySize(entry.backupName, entry.size);
@@ -5055,6 +5090,9 @@ app.post('/api/backup/server/save', async (req, res, next) => {
             ...inlayEntries,
             ...sidecarEntries,
         ];
+        // Validate the complete plan before response headers, a temporary
+        // archive, or a final filename can advertise an unrestorable backup.
+        preflightBackupEntryNames(namespacedEntries);
 
         const totalEntries = namespacedEntries.length + 1; // +1 for database
         const totalBytes = namespacedEntries.reduce(

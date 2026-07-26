@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import path from 'node:path'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, writeFile } from 'node:fs/promises'
 import Database from 'better-sqlite3'
 import { Packr } from 'msgpackr'
 import { zipSync } from 'fflate'
@@ -51,6 +51,17 @@ async function writeKv(client: RisuClient, key: string, value: Buffer): Promise<
   expect(response.status).toBe(200)
 }
 
+async function writeKvResponse(client: RisuClient, key: string, value: Buffer): Promise<Response> {
+  return client.fetch('/api/write', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'file-path': Buffer.from(key, 'utf-8').toString('hex'),
+    },
+    body: new Uint8Array(value),
+  })
+}
+
 function readKvValue(cwd: string, key: string): Buffer | null {
   const database = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
   try {
@@ -90,6 +101,89 @@ function entriesByName(backup: Buffer): Map<string, Buffer> {
 }
 
 describe('external plugin rows in backup archives', () => {
+  test('runtime boundaries agree with Node backup export and import for long identifiers', async () => {
+    const source = await spawnServer()
+    servers.push(source)
+    const sourceClient = await createClient(source.port, source.password)
+    const seed = withDatabaseFields(createSeedBackup({ characterCount: 1 }), {
+      optimizePluginMemory: true,
+      pluginCustomStorage: {},
+    })
+    expect((await sourceClient.importBackup(seed)).ok).toBe(true)
+
+    const maxOwnedRawKey = 'o'.repeat(752)
+    const maxValueOnlyRawKey = 'v'.repeat(756)
+    const maxOwnedValueKey = pluginStorageKey('pluginsave/', maxOwnedRawKey)
+    const maxOwnedMetaKey = pluginStorageKey('pluginsave-meta/', maxOwnedRawKey)
+    const maxValueOnlyKey = pluginStorageKey('pluginsave/', maxValueOnlyRawKey)
+    expect(Buffer.byteLength(maxOwnedMetaKey, 'utf-8')).toBe(1024)
+    expect(Buffer.byteLength(maxValueOnlyKey, 'utf-8')).toBe(1024)
+
+    await writeKv(sourceClient, maxOwnedValueKey, Buffer.from('{"long":"identifier"}'))
+    await writeKv(sourceClient, maxOwnedMetaKey, Buffer.from('{"plugin":"Boundary","updatedAt":1}'))
+    await writeKv(sourceClient, maxValueOnlyKey, Buffer.from('"value-only-maximum"'))
+
+    const oversizedValueKey = pluginStorageKey('pluginsave/', 'x'.repeat(757))
+    const oversizedMetaKey = pluginStorageKey('pluginsave-meta/', 'x'.repeat(753))
+    const oversizedValueResponse = await writeKvResponse(
+      sourceClient,
+      oversizedValueKey,
+      Buffer.from('1'),
+    )
+    const oversizedMetaResponse = await writeKvResponse(
+      sourceClient,
+      oversizedMetaKey,
+      Buffer.from('{}'),
+    )
+    expect(oversizedValueResponse.status).toBe(400)
+    expect(oversizedMetaResponse.status).toBe(400)
+    expect(readKvValue(source.cwd, oversizedValueKey)).toBeNull()
+    expect(readKvValue(source.cwd, oversizedMetaKey)).toBeNull()
+
+    const nodeBackup = await sourceClient.exportBackup()
+    const nodeEntries = entriesByName(nodeBackup)
+    expect(nodeEntries.get(maxOwnedValueKey)).toEqual(Buffer.from('{"long":"identifier"}'))
+    expect(nodeEntries.get(maxOwnedMetaKey)).toEqual(Buffer.from('{"plugin":"Boundary","updatedAt":1}'))
+    expect(nodeEntries.get(maxValueOnlyKey)).toEqual(Buffer.from('"value-only-maximum"'))
+
+    const destination = await spawnServer()
+    servers.push(destination)
+    const destinationClient = await createClient(destination.port, destination.password)
+    expect((await destinationClient.importBackup(nodeBackup)).ok).toBe(true)
+    expect(readKvValue(destination.cwd, maxOwnedValueKey)).toEqual(Buffer.from('{"long":"identifier"}'))
+    expect(readKvValue(destination.cwd, maxOwnedMetaKey)).toEqual(Buffer.from('{"plugin":"Boundary","updatedAt":1}'))
+    expect(readKvValue(destination.cwd, maxValueOnlyKey)).toEqual(Buffer.from('"value-only-maximum"'))
+  })
+
+  test('exports reject a legacy oversized row before publishing an archive', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const oversizedKey = pluginStorageKey('pluginsave-meta/', 'legacy'.repeat(126))
+    expect(Buffer.byteLength(oversizedKey, 'utf-8')).toBeGreaterThan(1024)
+
+    const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'))
+    try {
+      sqlite.prepare(
+        'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+      ).run(oversizedKey, Buffer.from('{}'), Date.now())
+    } finally {
+      sqlite.close()
+    }
+
+    const exportResponse = await client.fetch('/api/backup/export')
+    expect(exportResponse.status).toBe(500)
+    expect(exportResponse.headers.get('content-disposition')).toBeNull()
+    expect(exportResponse.headers.get('content-type')).not.toContain('application/octet-stream')
+
+    const backupsPath = path.join(server.cwd, 'backups')
+    const beforeFiles = await readdir(backupsPath)
+    const saveResponse = await client.fetch('/api/backup/server/save', { method: 'POST' })
+    expect(saveResponse.status).toBe(500)
+    expect(saveResponse.headers.get('content-type')).not.toContain('application/x-ndjson')
+    expect(await readdir(backupsPath)).toEqual(beforeFiles)
+  })
+
   test('Node-only exports and server saves stream rows, upstream folds them, and import restores bytes', async () => {
     const source = await spawnServer()
     servers.push(source)

@@ -12,6 +12,12 @@ import { snapshotJsonValue } from "../storage/jsonValue";
 import { assertWellFormedUnicode } from "../storage/unicodeWellFormed";
 import { requireCommittedDatabaseSave } from "../storage/databaseSave";
 import {
+    makeArchiveSafePluginSaveStorageKey,
+    PLUGIN_SAVE_META_PREFIX,
+    PLUGIN_SAVE_PREFIX,
+    type PluginSaveStoragePrefix,
+} from "../storage/pluginSaveKeyPolicy";
+import {
     beginPluginStorageModeTransition,
     hasEnabledLegacyPlugins,
     withPluginLifecycleLock,
@@ -26,8 +32,7 @@ import {
     orderPluginStorageKeys,
 } from "./pluginStorageRecord";
 
-export const PLUGIN_SAVE_PREFIX = "pluginsave/";
-export const PLUGIN_SAVE_META_PREFIX = "pluginsave-meta/";
+export { PLUGIN_SAVE_META_PREFIX, PLUGIN_SAVE_PREFIX };
 
 let storageOperationQueue: Promise<unknown> = Promise.resolve();
 
@@ -186,16 +191,6 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
     const replacement = pluginCustomStorage === undefined
         ? undefined
         : cloneJsonPluginStorageRecord(pluginCustomStorage);
-    const prepared = replacement === undefined
-        ? []
-        : getPluginStorageRecordKeys(replacement).map((key) => ({
-            key,
-            storageKey: makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key),
-            value: replacement[key],
-        }));
-    if (new Set(prepared.map(entry => entry.storageKey)).size !== prepared.length) {
-        throw new Error("Plugin storage key collision while replacing V3 database storage.");
-    }
 
     return withPluginSaveStorageLock(async () => {
         const db = getDatabase();
@@ -212,15 +207,55 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
         );
         if (db.optimizePluginMemory) {
             if (replacement !== undefined) {
+                // Archive constraints apply only once the locked, live
+                // backend is known to be external. Prepare every destination
+                // before any persistent or database mutation.
+                const prepared = getPluginStorageRecordKeys(replacement).map((key) => ({
+                    key,
+                    storageKey: makeArchiveSafePluginSaveStorageKey(
+                        PLUGIN_SAVE_PREFIX,
+                        key,
+                    ),
+                    value: replacement[key],
+                }));
+                if (new Set(prepared.map(entry => entry.storageKey)).size !== prepared.length) {
+                    throw new Error(
+                        "Plugin storage key collision while replacing V3 database storage.",
+                    );
+                }
                 const [existingKeys, existingMetaKeys] = await Promise.all([
                     listPersistentKeys(PLUGIN_SAVE_PREFIX),
                     listPersistentKeys(PLUGIN_SAVE_META_PREFIX),
                 ]);
                 const destinationKeys = new Set(prepared.map(entry => entry.storageKey));
                 const existingKeySet = new Set(existingKeys);
-                const retainedMetaKeys = new Set(prepared
-                    .filter(entry => existingKeySet.has(entry.storageKey))
-                    .map(entry => makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, entry.key)));
+                const retainedMetaKeys = new Set<string>();
+                // Only actual metadata rows can be retained. In particular,
+                // do not fabricate a stricter metadata destination for an
+                // existing value-only key at the value prefix's 756-byte raw
+                // boundary.
+                for (const existingMetaKey of existingMetaKeys) {
+                    const rawKey = decodeListedStorageKey(
+                        existingMetaKey,
+                        PLUGIN_SAVE_META_PREFIX,
+                    );
+                    if (
+                        rawKey === null
+                        || !hasPluginStorageRecordValue(replacement, rawKey)
+                    ) continue;
+                    const existingValueKey = makeArchiveSafePluginSaveStorageKey(
+                        PLUGIN_SAVE_PREFIX,
+                        rawKey,
+                    );
+                    if (!existingKeySet.has(existingValueKey)) continue;
+                    const canonicalMetaKey = makeArchiveSafePluginSaveStorageKey(
+                        PLUGIN_SAVE_META_PREFIX,
+                        rawKey,
+                    );
+                    if (existingMetaKey === canonicalMetaKey) {
+                        retainedMetaKeys.add(existingMetaKey);
+                    }
+                }
                 // Upsert the complete replacement before deleting omitted rows.
                 for (const entry of prepared) {
                     await writePersistentJson(entry.storageKey, entry.value);
@@ -315,7 +350,7 @@ export async function setPluginSaveStorageItem<T>(key: string, value: T): Promis
             return;
         }
         await writePersistentJson(
-            makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey),
+            makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey),
             snapshot,
         );
     });
@@ -333,15 +368,19 @@ export async function setOwnedPluginSaveStorageItem<T>(
         const db = getDatabase();
         const ownerRecord = { plugin: owner, updatedAt: Date.now() };
         if (db.optimizePluginMemory) {
-            await writePersistentJson(
-                makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey),
-                snapshot,
+            // Metadata has the longer prefix. Prepare every destination before
+            // the primary value write so a rejected owner row cannot leave a
+            // durable, unowned value behind.
+            const valueStorageKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_PREFIX,
+                normalizedKey,
             );
+            const ownerStorageKey = owner
+                ? makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_META_PREFIX, normalizedKey)
+                : null;
+            await writePersistentJson(valueStorageKey, snapshot);
             if (owner) {
-                await writePersistentJson(
-                    makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, normalizedKey),
-                    ownerRecord,
-                );
+                await writePersistentJson(ownerStorageKey!, ownerRecord);
             }
             return;
         }
@@ -570,10 +609,10 @@ async function preparePluginStorageReconciliation(
         const destinationStorageKeys = new Set<string>();
         const prepareEntries = (
             source: Record<string, unknown>,
-            prefix: string,
+            prefix: PluginSaveStoragePrefix,
         ): PreparedStorageEntry[] => (
             getPluginStorageRecordKeys(source).map((key) => {
-                const storageKey = makeEncodedStorageKey(prefix, key);
+                const storageKey = makeArchiveSafePluginSaveStorageKey(prefix, key);
                 if (destinationStorageKeys.has(storageKey)) {
                     throw new Error(
                         `Plugin storage key collision while externalizing: ${JSON.stringify(key)}`,

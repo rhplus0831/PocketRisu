@@ -27,6 +27,7 @@ import {
     removePersistentKey,
     clearPersistentPrefix,
 } from "../storage/persistentKv";
+import { makeArchiveSafePluginSaveStorageKey } from "../storage/pluginSaveKeyPolicy";
 import {
     PLUGIN_SAVE_META_PREFIX,
     withPluginSaveStorageLock,
@@ -76,7 +77,7 @@ export function recordOwner(backend: PluginStorageBackend, key: string, plugin: 
             const db = getDatabase();
             if (db.optimizePluginMemory) {
                 await writePersistentJson(
-                    makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, key),
+                    makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_META_PREFIX, key),
                     record,
                 );
                 return;

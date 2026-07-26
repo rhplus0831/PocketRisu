@@ -167,3 +167,28 @@ reachable.
 - Export must fail before publishing an archive it cannot restore.
 - Cover raw-key boundaries 752/753 and 756/757 for value and metadata rows,
   then round-trip a backup containing a long imported identifier.
+
+### Resolution
+
+**Fixed 2026-07-26.** Browser and Node code now consume one shared archive
+policy: a 1,024-byte UTF-8 entry-name limit with canonical value and owner
+prefixes/suffixes. Raw ASCII value keys accept 756 bytes and reject 757; owner
+metadata keys accept 752 and reject 753. Non-ASCII limits are calculated from
+the encoded UTF-8 path rather than JavaScript character count, while AC3's
+well-formed-Unicode validation remains the first boundary.
+
+Owned V3 writes precompute and validate both destinations before the value row
+can mutate, making the stricter owner path the effective limit. Direct server
+writes reject oversized plugin paths without creating a row, while compatible
+short generic/noncanonical KV keys remain supported. Import parsing uses the
+same limit. Download and server-side export build and validate the complete
+entry plan before sending attachment headers, NDJSON data, or publishing a
+temporary/final archive, so legacy oversized rows cannot produce a backup the
+server refuses to restore.
+
+Regression coverage exercises 752/753 and 756/757 boundaries, non-ASCII byte
+accounting, zero-write rejection, no-publication export failures, legacy short
+keys, and a maximum-length value+owner Node backup round trip. Independent
+verification passed 58 focused client tests, 7 focused server tests, 10 focused
+compatibility tests, all full client/server/compatibility suites, `pnpm check`,
+and a production build.

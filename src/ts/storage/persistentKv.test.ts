@@ -25,6 +25,12 @@ const {
     readPersistentJson,
     writePersistentJson,
 } = await import('./persistentKv')
+const {
+    BACKUP_ENTRY_NAME_MAX_BYTES,
+    makeArchiveSafePluginSaveStorageKey,
+    PLUGIN_SAVE_META_PREFIX,
+    PLUGIN_SAVE_PREFIX,
+} = await import('./pluginSaveKeyPolicy')
 
 afterAll(() => {
     if (nativeIsWellFormedDescriptor) {
@@ -101,5 +107,43 @@ describe('encoded storage keys', () => {
 
     it('encodes a literal replacement character normally', () => {
         expect(makeEncodedStorageKey('pluginsave/', '�')).toBe('pluginsave/77-9.json')
+    })
+
+    it('enforces the exact value and metadata archive-name boundaries', () => {
+        const maxValueName = makeArchiveSafePluginSaveStorageKey(
+            PLUGIN_SAVE_PREFIX,
+            'v'.repeat(756),
+        )
+        const maxMetaName = makeArchiveSafePluginSaveStorageKey(
+            PLUGIN_SAVE_META_PREFIX,
+            'm'.repeat(752),
+        )
+
+        expect(new TextEncoder().encode(maxValueName)).toHaveLength(BACKUP_ENTRY_NAME_MAX_BYTES)
+        expect(new TextEncoder().encode(maxMetaName)).toHaveLength(BACKUP_ENTRY_NAME_MAX_BYTES)
+        expect(() => makeArchiveSafePluginSaveStorageKey(
+            PLUGIN_SAVE_PREFIX,
+            'v'.repeat(757),
+        )).toThrow('too long for backup archives')
+        expect(() => makeArchiveSafePluginSaveStorageKey(
+            PLUGIN_SAVE_META_PREFIX,
+            'm'.repeat(753),
+        )).toThrow('too long for backup archives')
+    })
+
+    it('measures multibyte identifiers by encoded UTF-8 bytes, not string length', () => {
+        const maxUtf8Key = 'é'.repeat(376) // 376 UTF-16 code units, 752 UTF-8 bytes
+        expect(new TextEncoder().encode(maxUtf8Key)).toHaveLength(752)
+        expect(() => makeArchiveSafePluginSaveStorageKey(
+            PLUGIN_SAVE_META_PREFIX,
+            maxUtf8Key,
+        )).not.toThrow()
+
+        const oversizedUtf8Key = `${maxUtf8Key}a` // 377 code units, 753 UTF-8 bytes
+        expect(oversizedUtf8Key).toHaveLength(377)
+        expect(() => makeArchiveSafePluginSaveStorageKey(
+            PLUGIN_SAVE_META_PREFIX,
+            oversizedUtf8Key,
+        )).toThrow('too long for backup archives')
     })
 })

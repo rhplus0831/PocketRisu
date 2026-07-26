@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest'
 import pluginSaveKeysPkg from './pluginSaveKeys.cjs'
 
 const {
+    BACKUP_ENTRY_NAME_MAX_BYTES,
     PLUGIN_SAVE_PREFIX,
     PLUGIN_SAVE_META_PREFIX,
     decodePluginSaveStorageKey,
     encodePluginSaveStorageKey,
 } = pluginSaveKeysPkg as {
+    BACKUP_ENTRY_NAME_MAX_BYTES: number
     PLUGIN_SAVE_PREFIX: string
     PLUGIN_SAVE_META_PREFIX: string
     decodePluginSaveStorageKey: (storageKey: string, prefix: string) => string
@@ -33,5 +35,26 @@ describe('plugin save storage keys', () => {
     it('continues to reject non-canonical encoded forms', () => {
         expect(() => decodePluginSaveStorageKey('pluginsave/_w.json', PLUGIN_SAVE_PREFIX))
             .toThrow('Non-canonical plugin storage key')
+    })
+
+    it('enforces exact value and metadata archive-name boundaries', () => {
+        const maxValueName = encodePluginSaveStorageKey('v'.repeat(756), PLUGIN_SAVE_PREFIX)
+        const maxMetaName = encodePluginSaveStorageKey('m'.repeat(752), PLUGIN_SAVE_META_PREFIX)
+
+        expect(Buffer.byteLength(maxValueName, 'utf-8')).toBe(BACKUP_ENTRY_NAME_MAX_BYTES)
+        expect(Buffer.byteLength(maxMetaName, 'utf-8')).toBe(BACKUP_ENTRY_NAME_MAX_BYTES)
+        expect(() => encodePluginSaveStorageKey('v'.repeat(757), PLUGIN_SAVE_PREFIX))
+            .toThrow('too long for backup archives')
+        expect(() => encodePluginSaveStorageKey('m'.repeat(753), PLUGIN_SAVE_META_PREFIX))
+            .toThrow('too long for backup archives')
+    })
+
+    it('uses encoded UTF-8 bytes for non-ASCII raw keys', () => {
+        const maxUtf8Key = 'é'.repeat(376)
+        expect(Buffer.byteLength(maxUtf8Key, 'utf-8')).toBe(752)
+        expect(() => encodePluginSaveStorageKey(maxUtf8Key, PLUGIN_SAVE_META_PREFIX))
+            .not.toThrow()
+        expect(() => encodePluginSaveStorageKey(`${maxUtf8Key}a`, PLUGIN_SAVE_META_PREFIX))
+            .toThrow('too long for backup archives')
     })
 })

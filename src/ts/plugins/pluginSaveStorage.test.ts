@@ -126,6 +126,7 @@ const {
     setOwnedPluginSaveStorageItem,
     setPluginSaveStorageItem,
     transitionPluginStorageMode,
+    updateDatabaseWithPluginStorageSnapshot,
     withPluginSaveStorageLock,
 } = await import("./pluginSaveStorage");
 const {
@@ -379,6 +380,132 @@ describe("plugin save storage transport", () => {
         expect(persistent.size).toBe(0);
         expect(writePersistentJson).not.toHaveBeenCalled();
         expect(readPersistentJson).not.toHaveBeenCalled();
+    });
+
+    test("owned writes reject the metadata boundary before writing either row", async () => {
+        database.optimizePluginMemory = true;
+        const { writePersistentJson } = await import("../storage/persistentKv");
+
+        await expect(setOwnedPluginSaveStorageItem(
+            "k".repeat(753),
+            { value: 1 },
+            "Boundary Plugin",
+        )).rejects.toThrow("too long for backup archives");
+
+        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(persistent.size).toBe(0);
+    });
+
+    test("owned writes accept the maximum metadata-safe raw ASCII identifier", async () => {
+        database.optimizePluginMemory = true;
+        const rawKey = "k".repeat(752);
+        const { writePersistentJson } = await import("../storage/persistentKv");
+
+        await expect(setOwnedPluginSaveStorageItem(
+            rawKey,
+            { value: "maximum" },
+            "Boundary Plugin",
+        )).resolves.toBeUndefined();
+
+        expect(writePersistentJson).toHaveBeenNthCalledWith(
+            1,
+            encoded(PLUGIN_SAVE_PREFIX, rawKey),
+            { value: "maximum" },
+        );
+        expect(writePersistentJson).toHaveBeenNthCalledWith(
+            2,
+            encoded(PLUGIN_SAVE_META_PREFIX, rawKey),
+            expect.objectContaining({ plugin: "Boundary Plugin" }),
+        );
+    });
+
+    test("snapshots an inline oversized-key replacement before waiting without archive limits", async () => {
+        database.optimizePluginMemory = false;
+        const rawKey = "i".repeat(757);
+        let release!: () => void;
+        let started!: () => void;
+        const held = new Promise<void>(resolve => { release = resolve; });
+        const lockStarted = new Promise<void>(resolve => { started = resolve; });
+        const holding = withPluginSaveStorageLock(async () => {
+            started();
+            await held;
+        });
+        await lockStarted;
+
+        const caller = { [rawKey]: { source: "before-queue" } };
+        const mutateDatabase = vi.fn();
+        const replacing = updateDatabaseWithPluginStorageSnapshot(
+            caller,
+            mutateDatabase,
+        );
+        caller[rawKey].source = "caller-mutated";
+        release();
+        await Promise.all([holding, replacing]);
+
+        expect(database.pluginCustomStorage[rawKey]).toEqual({
+            source: "before-queue",
+        });
+        expect(mutateDatabase).toHaveBeenCalledOnce();
+        const { writePersistentJson } = await import("../storage/persistentKv");
+        expect(writePersistentJson).not.toHaveBeenCalled();
+    });
+
+    test("keeps an optimized value-only 756-byte key through exact and omitted replacements", async () => {
+        database.optimizePluginMemory = true;
+        database.pluginCustomStorage = {};
+        const rawKey = "v".repeat(756);
+        const valueStorageKey = encoded(PLUGIN_SAVE_PREFIX, rawKey);
+        persistent.set(valueStorageKey, { source: "existing-value-only" });
+
+        await expect(updateDatabaseWithPluginStorageSnapshot(
+            { [rawKey]: { source: "exact-replacement" } },
+            vi.fn(),
+        )).resolves.toBeUndefined();
+        expect(persistent.get(valueStorageKey)).toEqual({
+            source: "exact-replacement",
+        });
+        expect([...persistent.keys()].filter(key =>
+            key.startsWith(PLUGIN_SAVE_META_PREFIX))).toEqual([]);
+
+        const { writePersistentJson, removePersistentKey } = await import(
+            "../storage/persistentKv"
+        );
+        vi.mocked(writePersistentJson).mockClear();
+        vi.mocked(removePersistentKey).mockClear();
+        await expect(updateDatabaseWithPluginStorageSnapshot(
+            undefined,
+            vi.fn(),
+        )).resolves.toBeUndefined();
+        expect(persistent.get(valueStorageKey)).toEqual({
+            source: "exact-replacement",
+        });
+        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(removePersistentKey).not.toHaveBeenCalled();
+    });
+
+    test("rejects an oversized optimized value replacement before any mutation", async () => {
+        database.optimizePluginMemory = true;
+        database.pluginCustomStorage = {};
+        const retainedValueKey = encoded(PLUGIN_SAVE_PREFIX, "retained");
+        const retainedMetaKey = encoded(PLUGIN_SAVE_META_PREFIX, "retained");
+        persistent.set(retainedValueKey, { source: "retained" });
+        persistent.set(retainedMetaKey, { plugin: "Owner", updatedAt: 1 });
+        const before = new Map(persistent);
+        const mutateDatabase = vi.fn();
+        const { writePersistentJson, removePersistentKey } = await import(
+            "../storage/persistentKv"
+        );
+
+        await expect(updateDatabaseWithPluginStorageSnapshot(
+            { ["x".repeat(757)]: { source: "oversized" } },
+            mutateDatabase,
+        )).rejects.toThrow("too long for backup archives");
+
+        expect(persistent).toEqual(before);
+        expect(database.pluginCustomStorage).toEqual({});
+        expect(writePersistentJson).not.toHaveBeenCalled();
+        expect(removePersistentKey).not.toHaveBeenCalled();
+        expect(mutateDatabase).not.toHaveBeenCalled();
     });
 
     test("inline reads return a structured-cloneable copy, not the reactive proxy", async () => {

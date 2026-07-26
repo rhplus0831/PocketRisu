@@ -43,7 +43,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [BR1](backup-recovery.md#br1) | Medium | Open | Optimized-only mutations never advance automatic recovery snapshots |
 | [BR2](backup-recovery.md#br2) | Medium | Open | Cross-mode snapshot ownership is ambiguous: unmarked just-disabled snapshots and no storage generation |
 | [BR3](backup-recovery.md#br3) | Medium | Open | Corrupt-database boot fallback ignores a marked snapshot's exact plugin-row set |
-| [BR4](backup-recovery.md#br4) | Medium | Open | Valid long keys produce Node backups the same server refuses to import |
+| [BR4](backup-recovery.md#br4) | Medium | Fixed | Valid long keys produce Node backups the same server refuses to import |
 | [PM1](performance-memory.md#pm1) | Medium | Open | Large plugin values bypass chunking and incur multiple full-size copies while holding the global lock |
 | [PM2](performance-memory.md#pm2) | Medium | Open | Mode transitions are not memory-bounded in either direction; the UI guards on entry count only |
 | [PM3](performance-memory.md#pm3) | Medium | Open | Viewer, partial backup, and snapshot restore eagerly rematerialize the whole external store |
