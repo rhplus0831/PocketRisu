@@ -158,7 +158,11 @@ export jobs add bounded polling through preparation beyond 15 seconds, admission
 and dual-volume disk preflight, caller cancellation, lost-create acknowledgement,
 TTL/disconnect/restart cleanup, immutable same-volume filesystem pins,
 equal-size replacement safety, PM2 private-stage exclusion, and upstream archive
-compatibility.
+compatibility. Folded-export coverage also exercises multi-MiB external
+`__proto__` value and metadata rows: ordinary rows precede the lazily read,
+structurally encoded legacy escapes, while exact decode/import, reserved-field
+collision, cancellation, read failure, and malicious-descriptor cleanup remain
+bounded.
 PM4 additionally covers compact manifest CAS, exact server value hashes,
 50-row snapshot reuse, canonical manifest-key validation and cancellation,
 donated 128-row and four-by-2-MiB batches, one IndexedDB mutation transaction,

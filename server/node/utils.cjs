@@ -912,5 +912,6 @@ module.exports = {
     magicPluginStorageStreamHeader,
     magicRisuSaveHeader,
     pluginStorageLegacyEscapeField,
+    pluginStorageLegacyEscapeMarker,
     presetTemplate
 };

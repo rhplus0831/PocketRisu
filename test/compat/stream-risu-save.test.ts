@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import chatRowsPkg from '../../server/node/chatRows.cjs'
+import streamRisuLoadPkg from '../../server/node/streamRisuLoad.cjs'
 import streamRisuSavePkg from '../../server/node/streamRisuSave.cjs'
 import utilsPkg from '../../server/node/utils.cjs'
 
@@ -25,6 +26,9 @@ const { streamRisuSaveToFile } = streamRisuSavePkg as {
     } | null
     shouldAbort?: () => boolean
   }) => Promise<{ filePath: string; size: number }>
+}
+const { walkRisuSave } = streamRisuLoadPkg as {
+  walkRisuSave: (input: unknown, options: Record<string, unknown>) => Promise<any>
 }
 const { decodeRisuSave, encodeRisuSaveLegacy } = utilsPkg as {
   decodeRisuSave: (value: Uint8Array) => Promise<any>
@@ -284,6 +288,215 @@ describe('disk-backed streaming Risu save encoding', () => {
     expect(Object.keys(decoded.pluginCustomStorage)).toHaveLength(rowCount)
     const lastKey = `record/${(rowCount - 1).toString().padStart(5, '0')}`
     expect(decoded.pluginCustomStorage[lastKey].body).toHaveLength(4 * 1024 * 1024)
+  })
+
+  test('defers multi-megabyte external __proto__ rows and streams their exact escape entries', async () => {
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'risu-stream-save-proto-'))
+    tempDirs.push(tempDir)
+    const filePath = path.join(tempDir, 'database-proto.risudat.tmp')
+    const valueSize = 3 * 1024 * 1024
+    const metaSize = 2 * 1024 * 1024
+    const reads: string[] = []
+    let activeReads = 0
+    let maxActiveReads = 0
+    let sizeBeforeSecondEscapeRead = 0
+    const reservedCollision = { user: 'retained', nested: ['not', 'a', 'sidecar'] }
+    const dbObj: Record<string, unknown> = {
+      botPresets: [{ id: 'stable-preset', name: 'Stable' }],
+      characters: [],
+      optimizePluginMemory: true,
+      pluginCustomStorage: {},
+      pluginStorageMeta: {},
+    }
+    Object.defineProperty(dbObj, '__pocketRisuPluginStorageEscapesV1', {
+      configurable: true,
+      enumerable: true,
+      value: reservedCollision,
+      writable: true,
+    })
+
+    const pluginStorage = {
+      valueRows: [
+        { key: '__proto__', source: 'value-proto-superseded' },
+        { key: 'constructor', source: 'value-constructor' },
+        { key: '__proto_\0/../', source: 'value-lookalike' },
+        { key: '', source: 'value-empty' },
+        { key: '10', source: 'value-ten' },
+        { key: '2', source: 'value-two' },
+        { key: 'hasOwnProperty', source: 'value-has-own' },
+        {
+          key: '__pocketRisuPluginStorageEscapesV1',
+          source: 'value-reserved-lookalike',
+        },
+        { key: '__proto__', source: 'value-proto' },
+      ],
+      metaRows: [
+        { key: 'prototype', source: 'meta-prototype' },
+        { key: '__proto__', source: 'meta-proto' },
+        { key: 'toString', source: 'meta-to-string' },
+      ],
+      readRow: async (source: string) => {
+        activeReads++
+        maxActiveReads = Math.max(maxActiveReads, activeReads)
+        reads.push(source)
+        if (source === 'meta-proto') {
+          sizeBeforeSecondEscapeRead = (await stat(filePath)).size
+        }
+        await Promise.resolve()
+        const value = source === 'value-proto'
+          ? { kind: source, body: 'v'.repeat(valueSize) }
+          : source === 'meta-proto'
+            ? { kind: source, body: 'm'.repeat(metaSize) }
+            : { kind: source }
+        activeReads--
+        return value
+      },
+    }
+
+    await streamRisuSaveToFile({
+      dbObj,
+      filePath,
+      readChatRow: async () => null,
+      pluginStorage,
+    })
+
+    expect(maxActiveReads).toBe(1)
+    expect(sizeBeforeSecondEscapeRead).toBeGreaterThan(valueSize)
+    expect(reads).toEqual([
+      'value-two',
+      'value-ten',
+      'value-constructor',
+      'value-lookalike',
+      'value-empty',
+      'value-has-own',
+      'value-reserved-lookalike',
+      'meta-prototype',
+      'meta-to-string',
+      'value-proto',
+      'meta-proto',
+    ])
+
+    const bytes = await readFile(filePath)
+    expect(bytes[10]).toBe(10)
+    const decoded = await decodeRisuSave(bytes)
+    expect(Object.keys(decoded.pluginCustomStorage)).toEqual([
+      '2',
+      '10',
+      '__proto__',
+      'constructor',
+      '__proto_\0/../',
+      '',
+      'hasOwnProperty',
+      '__pocketRisuPluginStorageEscapesV1',
+    ])
+    expect(Object.keys(decoded.pluginStorageMeta)).toEqual([
+      'prototype', '__proto__', 'toString',
+    ])
+    expect(Object.hasOwn(decoded.pluginCustomStorage, '__proto__')).toBe(true)
+    expect(Object.hasOwn(decoded.pluginStorageMeta, '__proto__')).toBe(true)
+    expect(Object.getPrototypeOf(decoded.pluginCustomStorage)).toBe(Object.prototype)
+    expect(Object.getPrototypeOf(decoded.pluginStorageMeta)).toBe(Object.prototype)
+    expect((Object.prototype as any).kind).toBeUndefined()
+    expect(decoded.pluginCustomStorage.__proto__.kind).toBe('value-proto')
+    expect(decoded.pluginCustomStorage.__proto__.body).toHaveLength(valueSize)
+    expect(decoded.pluginStorageMeta.__proto__.kind).toBe('meta-proto')
+    expect(decoded.pluginStorageMeta.__proto__.body).toHaveLength(metaSize)
+    expect(decoded.__pocketRisuPluginStorageEscapesV1).toEqual(reservedCollision)
+
+    const imported: Array<{ field: string; key: string; value: any }> = []
+    const walked = await walkRisuSave({ filePath }, {
+      externalizePluginStorage: true,
+      onPluginStorageEntry: (entry: { field: string; key: string; value: any }) => {
+        imported.push(entry)
+      },
+    })
+    expect(imported.map(entry => [entry.field, entry.key])).toEqual([
+      ['pluginCustomStorage', '2'],
+      ['pluginCustomStorage', '10'],
+      ['pluginCustomStorage', '__proto__'],
+      ['pluginCustomStorage', 'constructor'],
+      ['pluginCustomStorage', '__proto_\0/../'],
+      ['pluginCustomStorage', ''],
+      ['pluginCustomStorage', 'hasOwnProperty'],
+      ['pluginCustomStorage', '__pocketRisuPluginStorageEscapesV1'],
+      ['pluginStorageMeta', 'prototype'],
+      ['pluginStorageMeta', '__proto__'],
+      ['pluginStorageMeta', 'toString'],
+    ])
+    expect(imported[2].value.body).toHaveLength(valueSize)
+    expect(imported[9].value.body).toHaveLength(metaSize)
+    expect(walked.remainder.__pocketRisuPluginStorageEscapesV1)
+      .toEqual(reservedCollision)
+  })
+
+  test('cleans multi-megabyte proto spools after cancellation, row failure, or invalid descriptors', async () => {
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'risu-stream-save-proto-fail-'))
+    tempDirs.push(tempDir)
+    const rows = {
+      valueRows: [
+        { key: 'ordinary', source: 'ordinary' },
+        { key: '__proto__', source: 'value-proto' },
+      ],
+      metaRows: [{ key: '__proto__', source: 'meta-proto' }],
+    }
+    const makeLargeRow = (source: string) => ({
+      source,
+      body: (source === 'value-proto' ? 'v' : 'm').repeat(2 * 1024 * 1024),
+    })
+
+    const cancelledPath = path.join(tempDir, 'cancelled.risudat.tmp')
+    let cancel = false
+    const cancelledReads: string[] = []
+    await expect(streamRisuSaveToFile({
+      dbObj: { optimizePluginMemory: true, characters: [], pluginCustomStorage: {} },
+      filePath: cancelledPath,
+      readChatRow: async () => null,
+      pluginStorage: {
+        ...rows,
+        readRow: (source: string) => {
+          cancelledReads.push(source)
+          if (source === 'ordinary') cancel = true
+          return source === 'ordinary' ? { source } : makeLargeRow(source)
+        },
+      },
+      shouldAbort: () => cancel,
+    } as any)).rejects.toMatchObject({ code: 'BACKUP_STREAM_ABORTED' })
+    expect(cancelledReads).toEqual(['ordinary'])
+    await expect(stat(cancelledPath)).rejects.toMatchObject({ code: 'ENOENT' })
+
+    const failedPath = path.join(tempDir, 'failed.risudat.tmp')
+    const failedReads: string[] = []
+    await expect(streamRisuSaveToFile({
+      dbObj: { optimizePluginMemory: true, characters: [], pluginCustomStorage: {} },
+      filePath: failedPath,
+      readChatRow: async () => null,
+      pluginStorage: {
+        ...rows,
+        readRow: async (source: string) => {
+          failedReads.push(source)
+          if (source === 'meta-proto') {
+            expect((await stat(failedPath)).size).toBeGreaterThan(2 * 1024 * 1024)
+            throw new Error('injected metadata row read failure')
+          }
+          return source === 'ordinary' ? { source } : makeLargeRow(source)
+        },
+      },
+    } as any)).rejects.toThrow('injected metadata row read failure')
+    expect(failedReads).toEqual(['ordinary', 'value-proto', 'meta-proto'])
+    await expect(stat(failedPath)).rejects.toMatchObject({ code: 'ENOENT' })
+
+    const invalidPath = path.join(tempDir, 'invalid.risudat.tmp')
+    await expect(streamRisuSaveToFile({
+      dbObj: { optimizePluginMemory: true, characters: [], pluginCustomStorage: {} },
+      filePath: invalidPath,
+      readChatRow: async () => null,
+      pluginStorage: {
+        valueRows: [{ key: { toString: () => '__proto__' }, source: 'malicious' }],
+        metaRows: [],
+        readRow: () => makeLargeRow('value-proto'),
+      },
+    } as any)).rejects.toThrow('Invalid plugin storage row descriptor')
+    await expect(stat(invalidPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   test('cancellation removes an incomplete folded database spool', async () => {

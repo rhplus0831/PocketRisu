@@ -461,6 +461,18 @@ snapshot, and permits the next mutation. Client tests exercise fragmented UTF-8,
 strict negative NDJSON/token cases, aborts during body and post-EOF hashing, and
 a mounted UI filter change whose obsolete late response cannot commit.
 
+The marked legacy escape needed for an own external `__proto__` key is streamed
+under the same bound. Export planning retains only each validated row source
+descriptor and its insertion index, removes that reserved key from the ordinary
+map stream, and defers reading it until the final escape sidecar. The writer
+encodes the sidecar's fixed MessagePack array shape directly, then reads,
+JSON-stringifies, writes, and releases one value or metadata escape row before
+fetching the next. It never builds the former aggregate parsed/stringified
+envelope. Numeric-key ordering, duplicate-key last-write semantics, exact own
+special keys, and a user value colliding with the reserved sidecar field are
+preserved; malformed, accessor-backed, non-string, and ill-formed-Unicode row
+descriptors fail before publication.
+
 Coverage uses deterministic bounds rather than raw-heap timing: a 10,000-key
 viewer asserts a 50-value page and one in-flight read; partial folding exercises
 1,000 rows plus a 4 MiB body with one parsed row in flight and upstream
@@ -509,6 +521,11 @@ response loss after commit, and PM2 staged-source invalidation; the committed
 `NodeStorage` path separately asserts PM4 database-cache invalidation.
 Stalled-body regressions advance both an external abort and the full restore
 timeout while requiring `423` to remain non-committed with no UI reload.
+Two additional multi-MiB `__proto__` value/metadata cases prove every
+ordinary row is emitted first, the first escape has reached disk before the
+second is read, exact marked decode and streaming re-import preserve order and
+the reserved-field collision, and cancellation, row failure, or a malicious
+descriptor removes the incomplete spool.
 
 <a id="pm4"></a>
 ## PM4 — Write amplification and cache overhead

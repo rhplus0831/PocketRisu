@@ -6,10 +6,10 @@ const { once } = require('events');
 const { finished } = require('stream/promises');
 const { Packr } = require('msgpackr');
 const {
-    createLegacyPluginStorageEnvelope,
     magicHeader,
     magicPluginStorageHeader,
     pluginStorageLegacyEscapeField,
+    pluginStorageLegacyEscapeMarker,
 } = require('./utils.cjs');
 const { mergeChatStubWithFullChat } = require('./chatRows.cjs');
 const { PLUGIN_STORAGE_FOLDED_MARKER } = require('./pluginSaveKeys.cjs');
@@ -68,16 +68,30 @@ function buildPluginMapPlan(baseValue, rows, readRow) {
     }
 
     const rowByKey = new Map();
-    for (const row of rows) rowByKey.set(row.key, row.source);
-
-    const keys = Object.keys(base);
-    const knownKeys = new Set(keys);
+    const keySkeleton = Object.create(null);
+    for (const key of Object.keys(base)) keySkeleton[key] = true;
     for (const row of rows) {
-        if (!knownKeys.has(row.key)) {
-            knownKeys.add(row.key);
-            keys.push(row.key);
+        if (!row || typeof row !== 'object' || Array.isArray(row)) {
+            throw new TypeError('Invalid plugin storage row descriptor');
         }
+        const keyDescriptor = Reflect.getOwnPropertyDescriptor(row, 'key');
+        const sourceDescriptor = Reflect.getOwnPropertyDescriptor(row, 'source');
+        if (!keyDescriptor || !sourceDescriptor
+            || !Object.prototype.hasOwnProperty.call(keyDescriptor, 'value')
+            || !Object.prototype.hasOwnProperty.call(sourceDescriptor, 'value')
+            || typeof keyDescriptor.value !== 'string'
+            || !keyDescriptor.value.isWellFormed()) {
+            throw new TypeError('Invalid plugin storage row descriptor');
+        }
+        const key = keyDescriptor.value;
+        rowByKey.set(key, sourceDescriptor.value);
+        keySkeleton[key] = true;
     }
+
+    // Match the property order of the legacy object-assembly path, including
+    // JavaScript's numeric-index ordering. Repeated rows overwrite their
+    // source while retaining the first insertion position.
+    const keys = Object.keys(keySkeleton);
 
     return { base, keys, rowByKey, readRow };
 }
@@ -128,30 +142,35 @@ async function streamRisuSaveToFile({
         ? buildPluginMapPlan(dbObj.pluginStorageMeta, metaRows, readPluginRow)
         : null;
 
-    async function extractProtoEscape(plan, field) {
+    function extractProtoEscapePlan(plan, field) {
         if (!plan) return null;
         const index = plan.keys.indexOf('__proto__');
         if (index === -1) return null;
         plan.keys.splice(index, 1);
-        const value = plan.rowByKey.has('__proto__')
-            ? await plan.readRow(plan.rowByKey.get('__proto__'))
-            : plan.base.__proto__;
-        return { field, index, value };
+        if (plan.rowByKey.has('__proto__')) {
+            // Retain only the already-validated opaque row descriptor. The
+            // parsed value must not be read until its envelope entry is the
+            // next thing written to the spool.
+            return {
+                field,
+                index,
+                readRow: plan.readRow,
+                source: plan.rowByKey.get('__proto__'),
+            };
+        }
+        return { field, index, inlineValue: plan.base.__proto__ };
     }
 
-    const pluginStorageEscapes = [];
-    const valueEscape = await extractProtoEscape(valuePlan, 'pluginCustomStorage');
-    const metaEscape = await extractProtoEscape(metaPlan, 'pluginStorageMeta');
-    if (valueEscape) pluginStorageEscapes.push(valueEscape);
-    if (metaEscape) pluginStorageEscapes.push(metaEscape);
-    const pluginStorageEscapeEnvelope = createLegacyPluginStorageEnvelope(
-        dbObj,
-        pluginStorageEscapes,
-    );
+    const pluginStorageEscapePlans = [];
+    const valueEscape = extractProtoEscapePlan(valuePlan, 'pluginCustomStorage');
+    const metaEscape = extractProtoEscapePlan(metaPlan, 'pluginStorageMeta');
+    if (valueEscape) pluginStorageEscapePlans.push(valueEscape);
+    if (metaEscape) pluginStorageEscapePlans.push(metaEscape);
+    const hasPluginStorageEscapes = pluginStorageEscapePlans.length > 0;
 
     const topKeys = Object.keys(dbObj).filter(key =>
         key !== PLUGIN_STORAGE_FOLDED_MARKER
-        && (pluginStorageEscapeEnvelope === null || key !== pluginStorageLegacyEscapeField)
+        && (!hasPluginStorageEscapes || key !== pluginStorageLegacyEscapeField)
     );
     const characters = dbObj.characters;
     if (Array.isArray(characters) && !topKeys.includes('characters')) {
@@ -166,7 +185,7 @@ async function streamRisuSaveToFile({
     if (shouldMarkPluginStorageFolded) {
         topKeys.push(PLUGIN_STORAGE_FOLDED_MARKER);
     }
-    if (pluginStorageEscapeEnvelope !== null) {
+    if (hasPluginStorageEscapes) {
         topKeys.push(pluginStorageLegacyEscapeField);
     }
 
@@ -198,6 +217,51 @@ async function streamRisuSaveToFile({
             } else {
                 await writeValue(plan.base[key]);
             }
+        }
+    }
+
+    async function writeSerializedLegacyEscapeValue(value) {
+        const json = JSON.stringify(value);
+        if (json === undefined) {
+            await write(arrayHeader(1));
+            await writeValue(0);
+            return;
+        }
+        await write(arrayHeader(2));
+        await writeValue(1);
+        await writeValue(json);
+    }
+
+    async function writePluginStorageEscape(plan) {
+        await write(arrayHeader(3));
+        await writeValue(plan.field);
+        await writeValue(plan.index);
+        if (Object.prototype.hasOwnProperty.call(plan, 'source')) {
+            // Scope the parsed row to this one entry. After the serialized
+            // value has drained, this frame returns before the next escape is
+            // read, so value and metadata rows can never accumulate here.
+            const rowValue = await plan.readRow(plan.source);
+            await writeSerializedLegacyEscapeValue(rowValue);
+        } else {
+            await writeSerializedLegacyEscapeValue(plan.inlineValue);
+        }
+    }
+
+    async function writePluginStorageEscapeEnvelope() {
+        // Encode the fixed legacy sidecar shape directly instead of building
+        // an aggregate object containing both parsed and JSON-stringified
+        // __proto__ rows.
+        await write(arrayHeader(4));
+        await writeValue(pluginStorageLegacyEscapeMarker);
+        await writeValue(1);
+        if (Object.prototype.hasOwnProperty.call(dbObj, pluginStorageLegacyEscapeField)) {
+            await writeSerializedLegacyEscapeValue(dbObj[pluginStorageLegacyEscapeField]);
+        } else {
+            await writeValue(null);
+        }
+        await write(arrayHeader(pluginStorageEscapePlans.length));
+        for (const plan of pluginStorageEscapePlans) {
+            await writePluginStorageEscape(plan);
         }
     }
 
@@ -238,7 +302,7 @@ async function streamRisuSaveToFile({
 
     try {
         await write(Buffer.from(
-            pluginStorageEscapeEnvelope === null ? magicHeader : magicPluginStorageHeader
+            hasPluginStorageEscapes ? magicPluginStorageHeader : magicHeader
         ));
         await write(mapHeader(topKeys.length));
         for (const key of topKeys) {
@@ -253,8 +317,8 @@ async function streamRisuSaveToFile({
             } else if (key === PLUGIN_STORAGE_FOLDED_MARKER) {
                 await writeValue(true);
             } else if (key === pluginStorageLegacyEscapeField
-                && pluginStorageEscapeEnvelope !== null) {
-                await writeValue(pluginStorageEscapeEnvelope);
+                && hasPluginStorageEscapes) {
+                await writePluginStorageEscapeEnvelope();
             } else {
                 await writeValue(dbObj[key]);
             }
