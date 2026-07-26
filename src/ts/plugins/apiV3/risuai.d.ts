@@ -974,9 +974,51 @@ interface SafeMutationObserver {
  * const keys = await risuai.pluginStorage.keys();
  * ```
  */
-type PluginStorageVersionedValue =
+type PluginStorageVersionedValue<T = any> =
     | { status: 'missing'; value: null; revision: null; generation: string | null }
-    | { status: 'value'; value: any; revision: string; generation: string | null };
+    | { status: 'value'; value: T; revision: string; generation: string | null };
+
+/** Stable, serializable storage failure fields preserved across the V3 bridge. */
+interface PluginStorageFailure {
+    name: string;
+    message: string;
+    status: number | null;
+    code: string | null;
+    retryAfter: number | null;
+    retryable: boolean;
+    commitOutcomeUnknown: boolean;
+    operation: 'read' | 'batch';
+}
+
+type PluginStorageReadSnapshot<T = any> =
+    | {
+        status: 'missing';
+        key: string;
+        value: null;
+        revision: null;
+        generation: string | null;
+    }
+    | {
+        status: 'value';
+        key: string;
+        value: T;
+        revision: string;
+        generation: string | null;
+    };
+
+type PluginStorageReadResult<T = any> = PluginStorageReadSnapshot<T> | {
+    status: 'failed';
+    key: string;
+    error: PluginStorageFailure;
+};
+
+type PluginStorageGuardedSetResult =
+    | { status: 'committed'; generation: string; revision: string }
+    | {
+        status: 'conflict';
+        conflicts: { key: string; revision: string | null; generation: string | null }[];
+    }
+    | { status: 'failed'; stage: 'read' | 'write'; error: PluginStorageFailure };
 
 type PluginStorageAtomicMutation =
     | { type: 'set'; key: string; value: any; expectedRevision?: string | null }
@@ -1002,7 +1044,34 @@ interface PluginStorage {
     getItem(key: string): Promise<any | null>;
 
     /** Reads a value without conflating stored JSON null with a missing key. */
-    getWithRevision(key: string): Promise<PluginStorageVersionedValue>;
+    getWithRevision<T = any>(key: string): Promise<PluginStorageVersionedValue<T>>;
+
+    /**
+     * Reads a value as an explicit `missing | value | failed` result. A stored
+     * JSON null has status `value`; only an absent row has status `missing`.
+     * Prefer this over catch-to-default code before any write.
+     */
+    readItem<T = any>(key: string): Promise<PluginStorageReadResult<T>>;
+
+    /**
+     * Sets a value with the exact revision from readItem(). A failed read is a
+     * no-op and a stale/mistaken-missing read returns `conflict`.
+     */
+    setFromRead<T>(
+        read: PluginStorageReadResult<any>,
+        value: T,
+    ): Promise<PluginStorageGuardedSetResult>;
+
+    /**
+     * Safe single-key read/modify/write. The callback runs only after a
+     * successful missing/value read, and publication uses revision CAS.
+     * Conflicts are not retried automatically because callbacks may have side
+     * effects; call updateItem() again explicitly with an idempotent callback.
+     */
+    updateItem<TCurrent = any, TNext = any>(
+        key: string,
+        update: (read: PluginStorageReadSnapshot<TCurrent>) => TNext | Promise<TNext>,
+    ): Promise<PluginStorageGuardedSetResult>;
 
     /**
      * Atomically applies 1-128 distinct-key mutations. `expectedRevision`

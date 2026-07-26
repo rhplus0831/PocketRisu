@@ -241,3 +241,129 @@ describe("SandboxHost V3 startup lifecycle", () => {
         expect(receivedSignal?.aborted).toBe(true);
     });
 });
+
+describe("V3 plugin storage safe update helpers", () => {
+    function safeStorageApi(overrides: Record<string, unknown> = {}) {
+        return startupApi({
+            _getAliases: () => ({
+                pluginStorage: {
+                    getItem: "_getPluginStorage",
+                    getWithRevision: "_getVersionedPluginStorage",
+                    readItem: "_readPluginStorageResult",
+                    setFromRead: "_setPluginStorageFromRead",
+                    atomicBatch: "_atomicBatchPluginStorage",
+                },
+            }),
+            _getVersionedPluginStorage: vi.fn(),
+            _readPluginStorageResult: vi.fn(),
+            _setPluginStorageFromRead: vi.fn(),
+            _atomicBatchPluginStorage: vi.fn(),
+            ...overrides,
+        });
+    }
+
+    test("bridge read failures abort config, credential, index, ledger, and shard fallbacks", async () => {
+        const keys = ["config", "credential", "index", "ledger", "shard"];
+        const durable = new Map(keys.map(key => [key, { old: key }]));
+        const setFromRead = vi.fn(async (read: any, value: unknown) => {
+            durable.set(read.key, value as { old: string });
+            return { status: "committed", generation: "unexpected", revision: `sha256:${"a".repeat(64)}` };
+        });
+        const recordResults = vi.fn();
+        const api = safeStorageApi({
+            _readPluginStorageResult: vi.fn(async (key: string) => {
+                throw Object.assign(new Error(`temporary ${key} GET failure`), {
+                    name: "StorageError",
+                    status: 503,
+                    code: "TEMPORARY_STORAGE_FAILURE",
+                    retryAfter: 0,
+                    retryable: true,
+                    commitOutcomeUnknown: false,
+                    operation: "read",
+                });
+            }),
+            _setPluginStorageFromRead: setFromRead,
+            recordResults,
+        });
+        const iframe = document.createElement("iframe");
+        document.body.appendChild(iframe);
+        const host = new SandboxHost(api);
+        const startup = host.run(iframe, `
+            const keys = ["config", "credential", "index", "ledger", "shard"];
+            let transformations = 0;
+            const results = [];
+            for (const key of keys) {
+                results.push(await risuai.pluginStorage.updateItem(key, () => {
+                    transformations += 1;
+                    return key === "credential" ? "" : {};
+                }));
+            }
+            await risuai.recordResults(results, transformations);
+        `);
+        const restoreRelay = executeGeneratedGuest(iframe);
+
+        await startup;
+        expect(recordResults).toHaveBeenCalledOnce();
+        const [results, transformations] = recordResults.mock.calls[0];
+        expect(transformations).toBe(0);
+        expect(results).toHaveLength(keys.length);
+        expect(results.every((result: any) => (
+            result.status === "failed"
+            && result.stage === "read"
+            && result.error.code === "TEMPORARY_STORAGE_FAILURE"
+            && result.error.operation === "read"
+        ))).toBe(true);
+        expect(setFromRead).not.toHaveBeenCalled();
+        expect([...durable.entries()]).toEqual(keys.map(key => [key, { old: key }]));
+        host.terminate();
+        restoreRelay();
+    });
+
+    test("bridge helpers preserve missing versus stored null and bind both writes to CAS", async () => {
+        const revision = `sha256:${"b".repeat(64)}`;
+        const setFromRead = vi.fn(async () => ({
+            status: "committed",
+            generation: "new-generation",
+            revision: `sha256:${"c".repeat(64)}`,
+        }));
+        const recordResults = vi.fn();
+        const api = safeStorageApi({
+            _readPluginStorageResult: vi.fn(async (key: string) => key === "missing"
+                ? { status: "missing", key, value: null, revision: null, generation: null }
+                : { status: "value", key, value: null, revision, generation: null }),
+            _setPluginStorageFromRead: setFromRead,
+            recordResults,
+        });
+        const iframe = document.createElement("iframe");
+        document.body.appendChild(iframe);
+        const host = new SandboxHost(api);
+        const startup = host.run(iframe, `
+            const missing = await risuai.pluginStorage.readItem("missing");
+            const nullable = await risuai.pluginStorage.readItem("nullable");
+            const created = await risuai.pluginStorage.setFromRead(missing, { created: true });
+            const replaced = await risuai.pluginStorage.setFromRead(nullable, { replaced: true });
+            await risuai.recordResults({ missing, nullable, created, replaced });
+        `);
+        const restoreRelay = executeGeneratedGuest(iframe);
+
+        await startup;
+        expect(recordResults).toHaveBeenCalledWith(expect.objectContaining({
+            missing: expect.objectContaining({ status: "missing", revision: null }),
+            nullable: expect.objectContaining({ status: "value", value: null, revision }),
+        }));
+        expect(setFromRead).toHaveBeenNthCalledWith(
+            1,
+            expect.objectContaining({ key: "missing", status: "missing", revision: null }),
+            { created: true },
+            expect.any(AbortSignal),
+        );
+        expect(setFromRead).toHaveBeenNthCalledWith(
+            2,
+            expect.objectContaining({ key: "nullable", status: "value", revision }),
+            { replaced: true },
+            expect.any(AbortSignal),
+        );
+        host.terminate();
+        restoreRelay();
+    });
+});

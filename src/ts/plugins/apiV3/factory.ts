@@ -20,6 +20,8 @@ const ABORTABLE_ROOT_METHODS = new Set([
     'setDatabaseLite',
     '_getPluginStorage',
     '_getVersionedPluginStorage',
+    '_readPluginStorageResult',
+    '_setPluginStorageFromRead',
     '_atomicBatchPluginStorage',
     '_setPluginStorage',
     '_removePluginStorage',
@@ -38,6 +40,7 @@ const UNLOAD_STORAGE_ROOT_METHODS = new Set([
 
 const UNLOAD_STORAGE_MUTATION_METHODS = new Set([
     '_atomicBatchPluginStorage',
+    '_setPluginStorageFromRead',
     '_setPluginStorage',
     '_removePluginStorage',
     '_clearPluginStorage',
@@ -188,6 +191,7 @@ export function createV3BridgeRequestRegistry(options: {
     }>();
     const rootMutations: Record<string, "write" | "remove" | "batch"> = {
         _atomicBatchPluginStorage: 'batch',
+        _setPluginStorageFromRead: 'batch',
         _setPluginStorage: 'write',
         _removePluginStorage: 'remove',
         _clearPluginStorage: 'remove',
@@ -528,6 +532,87 @@ export function snapshotV3PluginStorageBatchForTransport(input: unknown): unknow
     return output;
 }
 
+/**
+ * Install the compound-update helpers inside the guest realm. Keeping the
+ * transform callback in the iframe avoids callback-registry retention and
+ * guarantees it is never invoked when the prerequisite read failed.
+ * Self-contained because its source is installed in the generated guest.
+ */
+export function installV3PluginStorageHelpers(pluginStorage: Record<string, any>): void {
+    if (!pluginStorage
+        || typeof pluginStorage.readItem !== "function"
+        || typeof pluginStorage.setFromRead !== "function") return;
+
+    const rawReadItem = pluginStorage.readItem;
+    const rawSetFromRead = pluginStorage.setFromRead;
+    const describeFailure = (error: unknown, operation: "read" | "batch") => {
+        const source = error && typeof error === "object"
+            ? error as Record<string, unknown>
+            : null;
+        return {
+            name: typeof source?.name === "string" && source.name.length > 0
+                ? source.name
+                : "StorageError",
+            message: typeof source?.message === "string" && source.message.length > 0
+                ? source.message
+                : error === undefined || error === null
+                    ? "Plugin storage operation failed."
+                    : String(error),
+            status: typeof source?.status === "number" ? source.status : null,
+            code: typeof source?.code === "string"
+                ? source.code
+                : operation === "read" ? "STORAGE_READ_FAILED" : "STORAGE_WRITE_FAILED",
+            retryAfter: typeof source?.retryAfter === "number" ? source.retryAfter : null,
+            retryable: source?.retryable === true,
+            commitOutcomeUnknown: operation === "batch"
+                && source?.commitOutcomeUnknown === true,
+            operation,
+        };
+    };
+
+    pluginStorage.readItem = async (key: string) => {
+        try {
+            return await rawReadItem(key);
+        } catch (error) {
+            return {
+                status: "failed",
+                key: String(key),
+                error: describeFailure(error, "read"),
+            };
+        }
+    };
+    pluginStorage.setFromRead = async (read: Record<string, unknown>, value: unknown) => {
+        if (read?.status === "failed") {
+            return { status: "failed", stage: "read", error: read.error };
+        }
+        try {
+            return await rawSetFromRead(read, value);
+        } catch (error) {
+            return {
+                status: "failed",
+                stage: "write",
+                error: describeFailure(error, "batch"),
+            };
+        }
+    };
+    pluginStorage.updateItem = async (
+        key: string,
+        update: (read: Record<string, unknown>) => unknown | Promise<unknown>,
+    ) => {
+        if (typeof update !== "function") {
+            throw new TypeError("pluginStorage.updateItem requires an update function.");
+        }
+        const read = await pluginStorage.readItem(key);
+        if (read.status === "failed") {
+            return { status: "failed", stage: "read", error: read.error };
+        }
+        // Deliberately do not catch plugin code errors. Only storage failures
+        // are result values; programming errors still reject normally.
+        const value = await update(read);
+        return await pluginStorage.setFromRead(read, value);
+    };
+}
+
 
 const GUEST_BRIDGE_SCRIPT = `
 await (async function() {
@@ -542,6 +627,7 @@ await (async function() {
     const allocateBridgeId = (prefix) => prefix + bridgeGeneration + ':' + nextBridgeId++;
     const validateDatabaseMutationForTransport = ${validateV3DatabaseMutationForTransport.toString()};
     const snapshotPluginStorageBatchForTransport = ${snapshotV3PluginStorageBatchForTransport.toString()};
+    const installPluginStorageHelpers = ${installV3PluginStorageHelpers.toString()};
     const serializeBridgeError = ${serializeV3BridgeError.toString()};
     const deserializeBridgeError = ${deserializeV3BridgeError.toString()};
     const createRequestRegistry = ${createV3BridgeRequestRegistry.toString()};
@@ -794,6 +880,8 @@ await (async function() {
             }
             propertyCache.set(aliasKey, aliasObj);
         }
+
+        installPluginStorageHelpers(propertyCache.get('pluginStorage'));
 
         // Initialize helper functions defined in the guest
 

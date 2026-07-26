@@ -381,6 +381,7 @@ const {
     countExternalizedPluginStorageEntries,
     getPluginSaveStorageItem,
     getPluginSaveStorageItemWithRevision,
+    readPluginSaveStorageItemResult,
     getPluginSaveStorageKey,
     getPluginSaveStorageKeys,
     getPluginSaveStorageLength,
@@ -394,6 +395,7 @@ const {
     reconcilePluginStorageModeForBoot,
     removePluginSaveStorageItem,
     setOwnedPluginSaveStorageItem,
+    setOwnedPluginSaveStorageItemFromRead,
     setPluginSaveStorageItem,
     transitionPluginStorageMode,
     updateDatabaseWithPluginStorageSnapshot,
@@ -638,6 +640,104 @@ beforeEach(async () => {
 });
 
 describe("AA3 versioned atomic plugin storage", () => {
+    test.each([
+        "config",
+        "credential",
+        "index",
+        "ledger",
+        "shard",
+    ])("a failed %s read cannot publish its destructive fallback", async (key) => {
+        database.optimizePluginMemory = true;
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, key);
+        const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, key);
+        persistent.set(valueKey, { durable: key, entries: ["old"] });
+        persistent.set(metaKey, { plugin: "Existing", updatedAt: 1 });
+        installOwnershipManifest("selected-generation", [valueKey], [metaKey]);
+
+        const { batchPersistentPluginStorage, readPersistentPluginStorageState } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        readPersistentPluginStorageState.mockRejectedValueOnce(Object.assign(
+            new Error(`temporary ${key} read failure`),
+            {
+                name: "StorageError",
+                status: 503,
+                code: "TEMPORARY_STORAGE_FAILURE",
+                retryAfter: 0,
+                retryable: true,
+                commitOutcomeUnknown: false,
+                operation: "read",
+            },
+        ));
+
+        const read = await readPluginSaveStorageItemResult(key);
+        expect(read).toMatchObject({
+            status: "failed",
+            key,
+            error: {
+                code: "TEMPORARY_STORAGE_FAILURE",
+                retryable: true,
+                operation: "read",
+            },
+        });
+        const result = await setOwnedPluginSaveStorageItemFromRead(
+            read,
+            key === "credential" ? "" : { entries: [] },
+            "IP1",
+        );
+
+        expect(result).toMatchObject({ status: "failed", stage: "read" });
+        expect(batchPersistentPluginStorage).not.toHaveBeenCalled();
+        expect(persistent.get(valueKey)).toEqual({ durable: key, entries: ["old"] });
+    });
+
+    test("the public read result keeps missing distinct from a stored null", async () => {
+        database.pluginCustomStorage = { nullable: null };
+        database.pluginStorageMeta = { nullable: { plugin: "IP1", updatedAt: 1 } };
+
+        const nullable = await readPluginSaveStorageItemResult("nullable");
+        const missing = await readPluginSaveStorageItemResult("missing");
+
+        expect(nullable).toMatchObject({
+            status: "value",
+            key: "nullable",
+            value: null,
+            revision: expect.stringMatching(/^sha256:/),
+        });
+        expect(missing).toEqual({
+            status: "missing",
+            key: "missing",
+            value: null,
+            revision: null,
+            generation: null,
+        });
+    });
+
+    test("setFromRead conflicts instead of overwriting a changed or mistaken-missing row", async () => {
+        database.pluginCustomStorage = { record: { version: 1 } };
+        database.pluginStorageMeta = { record: { plugin: "IP1", updatedAt: 1 } };
+        const oldRecord = await readPluginSaveStorageItemResult("record");
+        const missing = await readPluginSaveStorageItemResult("new-record");
+
+        await setOwnedPluginSaveStorageItem("record", { version: 2 }, "Concurrent");
+        await setOwnedPluginSaveStorageItem("new-record", { version: "current" }, "Concurrent");
+
+        await expect(setOwnedPluginSaveStorageItemFromRead(
+            oldRecord,
+            { version: "stale-fallback" },
+            "IP1",
+        )).resolves.toMatchObject({ status: "conflict" });
+        await expect(setOwnedPluginSaveStorageItemFromRead(
+            missing,
+            { version: "empty-fallback" },
+            "IP1",
+        )).resolves.toMatchObject({ status: "conflict" });
+        expect(database.pluginCustomStorage).toMatchObject({
+            record: { version: 2 },
+            "new-record": { version: "current" },
+        });
+    });
+
     test("publishes an inline multi-key generation without an observable prefix", async () => {
         database.pluginCustomStorage = { retained: { generation: "old" } };
         const result = await atomicBatchOwnedPluginSaveStorage([

@@ -8,9 +8,9 @@ and protocols. At the audit point the host offered no versioned read or atomic
 write primitive. AA3 is now fixed: bounded `getWithRevision()` and
 `atomicBatch()` provide per-key revisions/CAS and atomic generation publish.
 That enables safe guidance for the patterns below, but does not repair plugin
-fallbacks, loaders, or cancellation by itself; those integration findings stay
-open until guidance and plugin adoption land. See [README.md](README.md) for
-the full index.
+fallbacks, loaders, or cancellation by itself. IP1's host primitives and
+guidance are now fixed; existing third-party plugins still have to adopt them.
+See [README.md](README.md) for the full index.
 
 <a id="ip1"></a>
 ## IP1 — A failed read treated as a missing key becomes a destructive overwrite
@@ -60,6 +60,38 @@ Confirmed destructive read/modify/write shapes:
 - Fault-inject one failed GET followed by a healthy SET for configuration,
   credentials, indexes, ledgers, and shard reads; assert the old value
   survives.
+
+### Resolution
+
+**Fixed 2026-07-27 within the host and integration-guidance boundary.** V3 now
+exposes `pluginStorage.readItem()` as an explicit `missing | value | failed`
+result. The failed branch preserves the stable bridge-safe `name`, `message`,
+HTTP `status`, `code`, `retryAfter`, `retryable`, `commitOutcomeUnknown`, and
+`operation` fields. A stored JSON `null` is a `value`; only authoritative
+absence is `missing`.
+
+`setFromRead()` accepts that read result and publishes through AA3 CAS. A
+failed prerequisite read is a guaranteed no-op, a missing read uses
+`expectedRevision: null`, and a stale value/mistaken-missing snapshot returns
+an explicit conflict without changing the row. Guest-local `updateItem()`
+performs the read/transform/guarded-set pattern and never invokes its transform
+after a failed read. Guarded writes retain the existing abort, lifecycle-drain,
+structured failure, atomic owner, and mode-transition behavior.
+
+[Public integration guidance](../../en/plugin-storage.md) documents safe
+configuration, credential, index, ledger, and shard migration patterns,
+including conflict retry and committed-unknown reconciliation. Client and real
+iframe-bridge fault tests prove those five fallback transforms do not run or
+publish after a failed GET. A real Node server failpoint then attempts the
+same fallback values with absence CAS and verifies a 409
+`PLUGIN_STORAGE_REVISION_CONFLICT` response plus byte-for-byte preservation of
+the old rows. Client and server coverage also distinguish stored JSON `null`
+from a missing key.
+
+The compatibility boundary is explicit: the host cannot infer that a legacy
+unconditional `setItem()` was derived from a swallowed read error. Existing
+third-party plugins must migrate compound update paths to `readItem()` plus
+`setFromRead()`/`updateItem()` (or explicit AA3 revision-bound batches).
 
 <a id="ip2"></a>
 ## IP2 — Remove-then-rewrite maintenance flows durably delete rows

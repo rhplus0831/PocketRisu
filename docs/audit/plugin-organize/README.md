@@ -48,7 +48,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [PM2](performance-memory.md#pm2) | Medium | Fixed | Mode transitions are not memory-bounded in either direction; the UI guards on entry count only |
 | [PM3](performance-memory.md#pm3) | Medium | Fixed | Viewer, partial backup, and snapshot restore eagerly rematerialize the whole external store |
 | [PM4](performance-memory.md#pm4) | Medium | Fixed | Batch writes now use compact CAS, donated bytes, server hashes, one cache transaction, and amortized pruning |
-| [IP1](integration-patterns.md#ip1) | High | Open | Treating a failed read as a missing key turns transient I/O errors into destructive whole-value overwrites |
+| [IP1](integration-patterns.md#ip1) | High | Fixed | Treating a failed read as a missing key turns transient I/O errors into destructive whole-value overwrites |
 | [IP2](integration-patterns.md#ip2) | High | Open | Remove-then-rewrite maintenance flows durably delete rows mid-sequence and report success |
 | [IP3](integration-patterns.md#ip3) | Medium | Open | Swallowed mutation failures desynchronize plugin caches and success counters from durable server state |
 | [IP4](integration-patterns.md#ip4) | Medium | Open | Reused sub-row keys with manifest-last publishing let an old manifest resolve to newer bodies; loaders do not verify generations |
@@ -56,10 +56,11 @@ listed with rationale in [Excluded findings](#excluded-findings).
 
 The IP items describe plugin-side coding patterns that only become unsafe once
 the beta turns local map operations into independent, fallible, durable server
-commits. They are integration findings: the host cannot fix them alone. AA3
-now supplies bounded versioned reads and atomic batch/CAS, which enables later
-plugin guidance and migrations for IP1, IP4, and IP5; the IP findings remain
-open until that guidance exists and affected plugins adopt safe protocols.
+commits. They are integration findings: the host cannot fix existing plugin
+code on its behalf. AA3 supplies bounded versioned reads and atomic batch/CAS;
+IP1 now adds explicit failed-read results, guarded single-key CAS helpers, and
+public migration guidance. Existing third-party plugins must adopt those safe
+protocols. IP2–IP5 remain open in this audit state.
 
 ## Intentional enabled-mode behavior (not defects)
 
@@ -126,11 +127,9 @@ bounded real inventory scans, and versioned reads held across a late-failing
 streamed import. PM2 staged receipts are exact and plan-bound, and downloaded
 private rows are checked against their advertised SHA-256 before publication;
 status refresh cannot consume a matching but tentative import publication.
-The suites still do not exercise:
-
-- the production save loop as the reconciliation durability callback
-  (pre-initialization no-op, in-flight save join, 409/500/network failure);
-- read failure followed by a fallback-derived overwrite.
+The original consolidated validation gaps are now covered, including the
+production save loop, exact marked-snapshot restore, backup key boundaries,
+large transition memory, corrupt-row recovery, and read-failure fallbacks.
 
 ## Original recommended fix order
 
@@ -156,8 +155,8 @@ The suites still do not exercise:
 
 The former compatibility, startup, mutation, primary recovery, transition
 capacity, and tooling-memory blockers MT1–MT3, AC1–AC4, SA1–SA4, AA1–AA3,
-BR1–BR4, and PM1–PM4 are fixed and covered. The beta still should not be
-treated as risk-free for every V3 workload: IP1–IP5 remain open. The AA3
+BR1–BR4, PM1–PM4, and IP1 are fixed and covered. The beta still should not be
+treated as risk-free for every V3 workload: IP2–IP5 remain open. The AA3
 primitives make safe compound-write guidance possible, but do not automatically
 repair existing plugin protocols.
 Verify a backup before transitions and before using the remaining open

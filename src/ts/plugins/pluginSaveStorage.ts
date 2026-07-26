@@ -1263,6 +1263,55 @@ export type PluginSaveStorageVersionedResult =
     | { status: "missing"; value: null; revision: null; generation: string | null }
     | { status: "value"; value: unknown; revision: string; generation: string | null };
 
+export interface PluginSaveStorageFailure {
+    name: string;
+    message: string;
+    status: number | null;
+    code: string | null;
+    retryAfter: number | null;
+    retryable: boolean;
+    commitOutcomeUnknown: boolean;
+    operation: "read" | "batch";
+}
+
+export type PluginSaveStorageReadSnapshot =
+    | {
+        status: "missing";
+        key: string;
+        value: null;
+        revision: null;
+        generation: string | null;
+    }
+    | {
+        status: "value";
+        key: string;
+        value: unknown;
+        revision: string;
+        generation: string | null;
+    };
+
+export type PluginSaveStorageReadResult = PluginSaveStorageReadSnapshot | {
+    status: "failed";
+    key: string;
+    error: PluginSaveStorageFailure;
+};
+
+export type PluginSaveStorageGuardedSetResult =
+    | {
+        status: "committed";
+        generation: string;
+        revision: string;
+    }
+    | {
+        status: "conflict";
+        conflicts: { key: string; revision: string | null; generation: string | null }[];
+    }
+    | {
+        status: "failed";
+        stage: "read" | "write";
+        error: PluginSaveStorageFailure;
+    };
+
 export type PluginSaveStorageAtomicBatchResult =
     | {
         committed: true;
@@ -1275,6 +1324,35 @@ export type PluginSaveStorageAtomicBatchResult =
     };
 
 const pluginStorageBatchEncoder = new TextEncoder();
+
+function describePluginStorageFailure(
+    error: unknown,
+    operation: "read" | "batch",
+): PluginSaveStorageFailure {
+    const source = error && typeof error === "object"
+        ? error as Record<string, unknown>
+        : null;
+    const message = typeof source?.message === "string" && source.message.length > 0
+        ? source.message
+        : error === undefined || error === null
+            ? "Plugin storage operation failed."
+            : String(error);
+    return {
+        name: typeof source?.name === "string" && source.name.length > 0
+            ? source.name
+            : "StorageError",
+        message,
+        status: typeof source?.status === "number" ? source.status : null,
+        code: typeof source?.code === "string"
+            ? source.code
+            : operation === "read" ? "STORAGE_READ_FAILED" : "STORAGE_WRITE_FAILED",
+        retryAfter: typeof source?.retryAfter === "number" ? source.retryAfter : null,
+        retryable: source?.retryable === true,
+        commitOutcomeUnknown: operation === "batch"
+            && source?.commitOutcomeUnknown === true,
+        operation,
+    };
+}
 
 /** Snapshot bridge-realm JSON without trusting getters, toJSON, or prototypes. */
 function snapshotPluginBatchValue(
@@ -1439,6 +1517,90 @@ export async function getPluginSaveStorageItemWithRevision(
                 : null,
         };
     }, signal);
+}
+
+/**
+ * Public V3 read shape for compound updates. Unlike getItem(), a missing row,
+ * a stored JSON null, and an unavailable authoritative read are three distinct
+ * outcomes. The failure branch contains only stable, bridge-cloneable fields.
+ */
+export async function readPluginSaveStorageItemResult(
+    key: unknown,
+    signal?: AbortSignal | null,
+): Promise<PluginSaveStorageReadResult> {
+    // Key coercion/Unicode validation is a caller error, not an I/O result.
+    const normalizedKey = normalizePluginStorageKey(key);
+    try {
+        const result = await getPluginSaveStorageItemWithRevision(normalizedKey, signal);
+        return { key: normalizedKey, ...result } as PluginSaveStorageReadSnapshot;
+    } catch (error) {
+        return {
+            status: "failed",
+            key: normalizedKey,
+            error: describePluginStorageFailure(error, "read"),
+        };
+    }
+}
+
+/**
+ * Publish a value only against an exact successful read. Passing a failed read
+ * is a no-op, while missing uses expectedRevision:null and therefore cannot
+ * overwrite a row that appeared (or was merely mistaken for missing).
+ */
+export async function setOwnedPluginSaveStorageItemFromRead(
+    read: PluginSaveStorageReadResult,
+    value: unknown,
+    owner: string,
+    signal?: AbortSignal | null,
+): Promise<PluginSaveStorageGuardedSetResult> {
+    if (!read || typeof read !== "object" || typeof read.key !== "string") {
+        throw new TypeError("pluginStorage.setFromRead requires a readItem() result.");
+    }
+    const key = normalizePluginStorageKey(read.key);
+    if (read.status === "failed") {
+        if (!read.error || typeof read.error !== "object") {
+            throw new TypeError("pluginStorage.setFromRead received an invalid failed read.");
+        }
+        return { status: "failed", stage: "read", error: read.error };
+    }
+    if (read.status !== "missing" && read.status !== "value") {
+        throw new TypeError("pluginStorage.setFromRead received an invalid read status.");
+    }
+    if (read.status === "missing") {
+        if (read.revision !== null || read.value !== null) {
+            throw new TypeError("A missing plugin storage read must carry a null revision and value.");
+        }
+    } else if (typeof read.revision !== "string"
+        || !PLUGIN_STORAGE_REVISION_PATTERN.test(read.revision)) {
+        throw new TypeError("A plugin storage value read must carry a valid revision.");
+    }
+
+    try {
+        const result = await atomicBatchOwnedPluginSaveStorage([{
+            type: "set",
+            key,
+            value,
+            expectedRevision: read.revision,
+        }], owner, signal);
+        if ("conflicts" in result) {
+            return { status: "conflict", conflicts: result.conflicts };
+        }
+        const revision = result.revisions.find(row => row.key === key)?.revision;
+        if (typeof revision !== "string") {
+            throw new StorageError("Plugin storage guarded set omitted its committed revision.", {
+                code: "STORAGE_RESPONSE_ERROR",
+                operation: "batch",
+                retryable: true,
+            });
+        }
+        return { status: "committed", generation: result.generation, revision };
+    } catch (error) {
+        return {
+            status: "failed",
+            stage: "write",
+            error: describePluginStorageFailure(error, "batch"),
+        };
+    }
 }
 
 /**

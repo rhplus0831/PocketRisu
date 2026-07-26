@@ -327,6 +327,12 @@ const pluginStorageBatchFailpoint = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_PLUGIN_BATCH_FAILPOINT ?? '').trim()
     : '';
 
+// Test-only authoritative read failure used by the IP1 integration contract.
+// It is intentionally scoped to the versioned state endpoint.
+const pluginStorageStateFailpoint = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_PLUGIN_STATE_FAILPOINT ?? '').trim()
+    : '';
+
 function hitPluginStorageBatchFailpoint(boundary) {
     if (pluginStorageBatchFailpoint === boundary) {
         throw new Error(`Injected plugin storage batch failure at ${boundary}`);
@@ -5529,6 +5535,17 @@ app.get('/api/plugin-storage/state', async (req, res, next) => {
             success: false,
             error: 'Plugin storage generation must be a non-empty string.',
             code: 'INVALID_PLUGIN_STORAGE_STATE_READ',
+        });
+    }
+
+    if (pluginStorageStateFailpoint === 'read') {
+        res.setHeader('Retry-After', '0');
+        return res.status(503).json({
+            success: false,
+            error: 'Injected plugin storage state read failure.',
+            code: 'TEMPORARY_STORAGE_FAILURE',
+            retryAfter: 0,
+            retryable: true,
         });
     }
 

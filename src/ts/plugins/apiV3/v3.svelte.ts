@@ -13,11 +13,13 @@ import {
     atomicBatchOwnedPluginSaveStorage,
     getPluginSaveStorageItem,
     getPluginSaveStorageItemWithRevision,
+    readPluginSaveStorageItemResult,
     getPluginSaveStorageKey,
     getPluginSaveStorageKeys,
     getPluginSaveStorageLength,
     getPluginSaveStorageSnapshot,
     removeOwnedPluginSaveStorageItem,
+    setOwnedPluginSaveStorageItemFromRead,
     setOwnedPluginSaveStorageItem,
     updateDatabaseWithPluginStorageSnapshot,
 } from "../pluginSaveStorage";
@@ -1667,6 +1669,14 @@ export const makeRisuaiAPIV3 = (
         _getVersionedPluginStorage: (key: string, signal?: AbortSignal) => {
             return getPluginSaveStorageItemWithRevision(key, signal)
         },
+        _readPluginStorageResult: (key: string, signal?: AbortSignal) => {
+            return readPluginSaveStorageItemResult(key, signal)
+        },
+        _setPluginStorageFromRead: (
+            read: Parameters<typeof setOwnedPluginSaveStorageItemFromRead>[0],
+            value: unknown,
+            signal?: AbortSignal,
+        ) => setOwnedPluginSaveStorageItemFromRead(read, value, plugin.name, signal),
         _atomicBatchPluginStorage: (
             operations: Parameters<typeof atomicBatchOwnedPluginSaveStorage>[0],
             _unloadCapabilityOrRequestSignal?: AbortSignal,
@@ -1719,6 +1729,8 @@ export const makeRisuaiAPIV3 = (
                 'pluginStorage':{
                     'getItem': '_getPluginStorage',
                     'getWithRevision': '_getVersionedPluginStorage',
+                    'readItem': '_readPluginStorageResult',
+                    'setFromRead': '_setPluginStorageFromRead',
                     'atomicBatch': '_atomicBatchPluginStorage',
                     'setItem': '_setPluginStorage',
                     'removeItem': '_removePluginStorage',
