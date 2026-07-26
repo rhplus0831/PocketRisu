@@ -49,20 +49,34 @@ success only after it resolves, surfaces initialization errors through the UI
 and persistent log, removes failed instances, and waits for every plugin in a
 generation with `Promise.allSettled` before reporting aggregate failure.
 
+A 30-second host watchdog also bounds guest initialization that never reaches
+either readiness outcome (for example, a never-settling top-level await). It
+rejects with the structured, non-retryable
+`PLUGIN_INITIALIZATION_TIMEOUT`/`PluginInitializationTimeoutError` outcome,
+closes new RPC and registration traffic, and then follows the same production
+unload path as an explicit guest failure. The user receives the plugin-startup
+notification, while other plugins in the generation finish independently and
+the aggregate generation promise settles after cleanup.
+
 Teardown marks the instance terminating and detaches all identity-owned
 providers, hooks, UI, MCP, channels, listeners, observers, callbacks, and
 remote references before awaiting the bounded unload callback. Late root or
 instance RPC cannot mutate storage/database or resurrect registrations;
 pending executions reject and abort controllers are aborted. Reentrant teardown
 joins the same promise, while the captured unload callback retains only its
-explicitly authorized cleanup surface.
+explicitly authorized cleanup surface. A timed-out name is removed from the
+live-instance registry before termination completes, so a corrected plugin can
+be loaded again under the same name without retaining registrations from the
+failed generation.
 
 Regression coverage executes generated `srcdoc` and exercises delayed storage
 before registration, syntax/runtime/bridge rejection, spoofed/late readiness,
 wrapper escape, literal closing-script text, partial registration rollback,
-hanging unload, late durable writes, multiple plugins, and termination cleanup.
-Independent verification passed 81 focused tests, the full client suite (1,036
-passed, 3 skipped), compatibility tests, `pnpm check`, and a production build.
+hanging unload, late durable writes, multiple plugins, termination cleanup, and
+the production 30-second watchdog through `loadV3PluginGeneration()`. The
+watchdog regression verifies its structured outcome and notification, failed
+instance/residue cleanup, healthy-peer survival, aggregate settlement, and a
+successful same-name reload.
 
 <a id="sa2"></a>
 ## SA2 — One stalled operation wedges every plugin and the mode transition
@@ -108,6 +122,40 @@ full server-list requests instead of local `Object.keys()` work.
 - Fetch a key snapshot once for enumeration, or expose an iterator/page API.
 - Test a never-resolving write while a different plugin reads another key and
   while the user requests a mode transition.
+
+### Resolution
+
+**Fixed 2026-07-26.** Ordinary plugin-storage work now enters a fair shared
+barrier and serializes only by logical key; unrelated keys and plugins proceed
+concurrently. Exact snapshots/replacements, clear, and mode transitions use a
+writer-preferring exclusive admission that drains already admitted old-mode
+work and blocks later work until the new mode is authoritative. Acquisition is
+bounded and fails before the mode flag mutates. Canceled middle waiters reject
+promptly but keep their queue token chained to the predecessor, so later
+same-key operations cannot overtake.
+
+Authoritative auth, fetch, response-body, persistent-KV, permission, database
+bridge, and iframe work carry `AbortSignal` end to end. Timed-out session and
+refresh promises are evicted; exact database snapshot/replacement cancellation
+checks every list/read/write/remove step, releases barriers, and suppresses
+late responses/mutations. Mutation failures are `COMMIT_OUTCOME_UNKNOWN` only
+while the target request can truly be in flight; definitive non-commit
+responses clear ambiguity. The guest cancels host requests and classifies root
+and safe-local mutations conservatively.
+
+Verified resource-cache reads and detached post-commit hash/seeding are
+bounded best-effort work. A stalled cache write cannot hold the authoritative
+key or poison later cache work. Enumeration caches one invalidated key
+snapshot, so a conventional `length()`/`key(i)` loop issues one list request
+instead of about `2N`.
+
+Regression coverage includes stalled unrelated keys, bounded transition
+failure, same-key cancellation ordering, auth/pending recovery, exact bridge
+cancellation, permission waits, cache hash/store stalls, late messages,
+definitive-response ambiguity, and enumeration request counts. Independent
+verification passed 95 focused tests, the full client suite (1,049 passed, 3
+skipped), `pnpm check`, and a production build; the fixer also passed server
+and compatibility suites.
 
 <a id="sa3"></a>
 ## SA3 — Reconciliation failure aborts application boot

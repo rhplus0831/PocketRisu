@@ -32,6 +32,7 @@ import {
     hasPluginStorageRecordValue,
     setDatabasePluginStorageRecordValue,
 } from "./pluginStorageRecord";
+import { markPluginStorageKeySetChanged } from "./pluginStorageEnumeration";
 
 export const customProviderStore = writable([] as string[])
 
@@ -1144,6 +1145,7 @@ export const getV2PluginAPIs = () => {
         const next = copyDatabasePluginStorageRecord(db.pluginCustomStorage)
         definePluginStorageRecordValue(next, key, cloneLegacyStorageJson(value))
         db.pluginCustomStorage = next
+        markPluginStorageKeySetChanged()
     }
     const removeLegacyStorageValue = (
         db: ReturnType<typeof getDatabase>,
@@ -1153,6 +1155,7 @@ export const getV2PluginAPIs = () => {
         const next = copyDatabasePluginStorageRecord(db.pluginCustomStorage)
         Reflect.deleteProperty(next, key)
         db.pluginCustomStorage = next
+        markPluginStorageKeySetChanged()
         return true
     }
     const snapshotLegacyStorage = (): Record<string, unknown> => {
@@ -1468,6 +1471,9 @@ export const getV2PluginAPIs = () => {
                         (target as any)[prop] = prop === 'pluginCustomStorage'
                             ? cloneLegacyStorageJson(value)
                             : unwrapGuardedValue(value);
+                        if (prop === 'pluginCustomStorage') {
+                            markPluginStorageKeySetChanged()
+                        }
                         return true;
                     }
                     else{
@@ -1518,12 +1524,16 @@ export const getV2PluginAPIs = () => {
                     assertSynchronousPluginStorageAccess()
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
                         if (!("value" in descriptor)) return false
-                        return Reflect.defineProperty(target, prop, {
+                        const defined = Reflect.defineProperty(target, prop, {
                             ...descriptor,
                             value: prop === 'pluginCustomStorage'
                                 ? validateLegacyStorageDescriptor(descriptor)
                                 : unwrapGuardedValue(descriptor.value),
                         })
+                        if (defined && prop === 'pluginCustomStorage') {
+                            markPluginStorageKeySetChanged()
+                        }
+                        return defined
                     }
                     replaceLegacyStorageValue(
                         target,
@@ -1581,6 +1591,7 @@ export const getV2PluginAPIs = () => {
                 if (!canUseSynchronousPluginStorage()) return
                 const db = getDatabase();
                 db.pluginCustomStorage = createDatabasePluginStorageRecord();
+                markPluginStorageKeySetChanged()
             },
             key: (index: number) => {
                 if (!canUseSynchronousPluginStorage()) return null
@@ -1610,9 +1621,16 @@ export const getV2PluginAPIs = () => {
             db.pluginCustomStorage ??= createDatabasePluginStorageRecord()
             for (const key of Object.keys(newDb)) {
                 if (allowedDbKeys.includes(key)) {
-                    (db as any)[key] = key === 'pluginCustomStorage'
-                        ? readLegacyStorageInput(newDb, key)
-                        : newDb[key];
+                    if (key === 'pluginCustomStorage') {
+                        // Publish invalidation with the successful key-set
+                        // replacement itself. A later field may throw, so an
+                        // end-of-loop marker cannot keep V3 key()/length()
+                        // coherent with this already-visible mutation.
+                        db.pluginCustomStorage = readLegacyStorageInput(newDb, key) as any
+                        markPluginStorageKeySetChanged()
+                    } else {
+                        (db as any)[key] = newDb[key]
+                    }
                 }
                 else{
                     replaceLegacyStorageValue(db, key, readLegacyStorageInput(newDb, key))
@@ -1635,9 +1653,15 @@ export const getV2PluginAPIs = () => {
                 if (!canUseSynchronousPluginStorage()) return
                 
                 if (allowedDbKeys.includes(key)) {
-                    (db as any)[key] = key === 'pluginCustomStorage'
-                        ? readLegacyStorageInput(newDb, key)
-                        : newDb[key];
+                    if (key === 'pluginCustomStorage') {
+                        // The following iteration may await plugin approval,
+                        // reject, or interleave with V3 enumeration. Mark this
+                        // replacement immediately after it becomes live.
+                        db.pluginCustomStorage = readLegacyStorageInput(newDb, key) as any
+                        markPluginStorageKeySetChanged()
+                    } else {
+                        (db as any)[key] = newDb[key]
+                    }
                 }
                 else{
                     replaceLegacyStorageValue(db, key, readLegacyStorageInput(newDb, key))

@@ -6,6 +6,19 @@ import { recordOwner, removeOwner, clearOwners } from "./pluginStorageMeta";
 const pluginStorage = new Map<string, unknown>();
 const pluginStoragePrefix = 'cache/plugin-storage/';
 
+function hasUnknownCommitOutcome(error: unknown): boolean {
+    return !!error
+        && typeof error === 'object'
+        && ((error as { commitOutcomeUnknown?: unknown }).commitOutcomeUnknown === true
+            || (error as { code?: unknown }).code === 'COMMIT_OUTCOME_UNKNOWN');
+}
+
+function clearPluginStorageCache(): void {
+    for (const key of [...pluginStorage.keys()]) {
+        if (key.startsWith('safe_plugin_')) pluginStorage.delete(key);
+    }
+}
+
 export class SafeLocalStorage {
     getItem(key: string): string | null {
         return localStorage.getItem(`safe_plugin_${key}`);
@@ -50,6 +63,7 @@ export class SafeLocalStorage {
 
 export class SafeLocalPluginStorage {
     __classType = 'REMOTE_REQUIRED' as const;
+    __requestAbortMethods = new Set(['getItem', 'setItem', 'removeItem', 'keys', 'clear']);
     // The originating plugin, set when the instance is created via the V3
     // getLocalPluginStorage() API. Used to tag new writes with their origin in
     // the sidecar meta store. Undefined (e.g. when instantiated by the built-in
@@ -58,49 +72,82 @@ export class SafeLocalPluginStorage {
     constructor(owner?: string) {
         this.owner = owner;
     }
-    async getItem<T>(key: string): Promise<T | null> {
+    async getItem<T>(key: string, signal?: AbortSignal): Promise<T | null> {
+        signal?.throwIfAborted();
         const cacheKey = `safe_plugin_${key}`;
         if (pluginStorage.has(cacheKey)) {
-            return (pluginStorage.get(cacheKey) as T) ?? null;
+            return snapshotJsonValue(pluginStorage.get(cacheKey)) as T;
         }
-        const payload = await readPersistentJson<T>(makeEncodedStorageKey(pluginStoragePrefix, key));
+        const storageKey = makeEncodedStorageKey(pluginStoragePrefix, key);
+        const payload = signal
+            ? await readPersistentJson<T>(storageKey, { signal })
+            : await readPersistentJson<T>(storageKey);
         if (payload !== null) {
-            pluginStorage.set(cacheKey, payload);
+            const snapshot = snapshotJsonValue(payload);
+            pluginStorage.set(cacheKey, snapshot);
+            return snapshotJsonValue(snapshot) as T;
         }
-        return payload;
+        return null;
     }
-    async setItem<T>(key: string, value: T): Promise<void> {
+    async setItem<T>(key: string, value: T, signal?: AbortSignal): Promise<void> {
+        signal?.throwIfAborted();
         const cacheKey = `safe_plugin_${key}`;
         // Capture and validate synchronously, then publish the detached value
         // only after persistence succeeds. Rejected writes leave any previous
         // cache entry authoritative and cannot retain a caller-owned alias.
         const snapshot = snapshotJsonValue(value);
-        await writePersistentJson(makeEncodedStorageKey(pluginStoragePrefix, key), snapshot);
+        const storageKey = makeEncodedStorageKey(pluginStoragePrefix, key);
+        try {
+            if (signal) await writePersistentJson(storageKey, snapshot, signal);
+            else await writePersistentJson(storageKey, snapshot);
+        } catch (error) {
+            if (hasUnknownCommitOutcome(error)) pluginStorage.delete(cacheKey);
+            throw error;
+        }
         pluginStorage.set(cacheKey, snapshot);
-        if (this.owner) await recordOwner('idb', key, this.owner);
+        if (this.owner) await recordOwner('idb', key, this.owner, signal);
     }
-    async removeItem(key: string): Promise<void> {
+    async removeItem(key: string, signal?: AbortSignal): Promise<void> {
+        signal?.throwIfAborted();
+        const storageKey = makeEncodedStorageKey(pluginStoragePrefix, key);
+        try {
+            if (signal) await removePersistentKey(storageKey, signal);
+            else await removePersistentKey(storageKey);
+        } catch (error) {
+            if (hasUnknownCommitOutcome(error)) pluginStorage.delete(`safe_plugin_${key}`);
+            throw error;
+        }
         pluginStorage.delete(`safe_plugin_${key}`);
-        await removePersistentKey(makeEncodedStorageKey(pluginStoragePrefix, key));
-        if (this.owner) await removeOwner('idb', key);
+        if (this.owner) await removeOwner('idb', key, signal);
     }
-    async keys(): Promise<string[]> {
+    async keys(signal?: AbortSignal): Promise<string[]> {
+        signal?.throwIfAborted();
         const keys: string[] = [];
-        const storageKeys = await listPersistentKeys(pluginStoragePrefix);
+        const storageKeys = signal
+            ? await listPersistentKeys(pluginStoragePrefix, signal)
+            : await listPersistentKeys(pluginStoragePrefix);
         for (const key of storageKeys) {
             const encodedKey = key.slice(pluginStoragePrefix.length, -'.json'.length);
             keys.push(decodeStorageKeyComponent(encodedKey));
         }
         return keys;
     }
-    async clear(): Promise<void> {
-        for (const key of [...pluginStorage.keys()]) {
-            if (key.startsWith('safe_plugin_')) {
-                pluginStorage.delete(key);
-            }
+    async clear(signal?: AbortSignal): Promise<void> {
+        signal?.throwIfAborted();
+        let clearAttempted = false;
+        try {
+            clearAttempted = true;
+            if (signal) await clearPersistentPrefix(pluginStoragePrefix, signal);
+            else await clearPersistentPrefix(pluginStoragePrefix);
+            clearPluginStorageCache();
+            if (this.owner) await clearOwners('idb', signal);
+        } catch (error) {
+            // Generic prefix clear is sequential, so any attempted failure can
+            // follow earlier durable deletions even when the final error is
+            // explicitly safe. Never retain ghost entries after a partial run.
+            if (clearAttempted) clearPluginStorageCache();
+            throw error;
         }
-        await clearPersistentPrefix(pluginStoragePrefix);
-        if (this.owner) await clearOwners('idb');
     }
 }
 

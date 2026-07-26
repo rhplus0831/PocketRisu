@@ -20,6 +20,13 @@ vi.mock('./resourceCache', () => ({
     isSha256Hex: () => false,
     persistResourceCacheManifests: vi.fn(),
     sha256Bytes: vi.fn(),
+    settleBestEffortResourceCache: async <T>(operation: Promise<T>, fallback: T) => {
+        try {
+            return await operation
+        } catch {
+            return fallback
+        }
+    },
     storeBytes: vi.fn(),
     touchResourceCacheManifest: vi.fn(),
 }))
@@ -409,5 +416,31 @@ describe('NodeStorage plugin error contract', () => {
         await vi.advanceTimersByTimeAsync(1)
         await expect(pending).resolves.toBeUndefined()
         expect(fetchMock).toHaveBeenCalledTimes(2)
+    })
+
+    test('aborting during Retry-After prevents a late mutation retry', async () => {
+        vi.useFakeTimers()
+        fetchMock
+            .mockResolvedValueOnce(retryableNotCommitted('5'))
+            .mockResolvedValueOnce(jsonResponse({ success: true }))
+        const controller = new AbortController()
+
+        const pending = readyStorage().setItem(
+            'pluginsave/cmV0cnktYWJvcnQ.json',
+            new Uint8Array([1]),
+            undefined,
+            controller.signal,
+        ).catch(error => error)
+        await vi.advanceTimersByTimeAsync(0)
+        expect(fetchMock).toHaveBeenCalledOnce()
+
+        controller.abort(new DOMException('cancel retry', 'AbortError'))
+        await expect(pending).resolves.toMatchObject({
+            code: 'STORAGE_TIMEOUT',
+            retryable: true,
+            commitOutcomeUnknown: false,
+        })
+        await vi.advanceTimersByTimeAsync(10_000)
+        expect(fetchMock).toHaveBeenCalledOnce()
     })
 })

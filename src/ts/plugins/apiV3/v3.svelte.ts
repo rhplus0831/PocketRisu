@@ -35,6 +35,7 @@ import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
 import { hasher } from "src/ts/parser/parser.svelte";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
 import { readPersistentJson, removePersistentKey, writePersistentJson } from "src/ts/storage/persistentKv";
+import { awaitWithAbort, forwardAbortSignal, throwIfAborted } from "src/ts/storage/abort";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
 import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
@@ -672,15 +673,19 @@ const permissionDeniedPlugins: Set<string> = new Set();
 const permissionCache = new Map<string, boolean | number>();
 const pluginPermissionStateKey = 'cache/plugin-permissions/state.json';
 let pluginPermissionLoadPromise: Promise<void> | null = null;
+let pluginPermissionLoadController: AbortController | null = null;
 
-async function ensurePluginPermissionStateLoaded() {
+async function ensurePluginPermissionStateLoaded(signal?: AbortSignal | null) {
+    throwIfAborted(signal)
     if (!pluginPermissionLoadPromise) {
-        pluginPermissionLoadPromise = (async () => {
+        const controller = new AbortController()
+        const created = (async () => {
             const payload = await readPersistentJson<{
                 given: string[]
                 denied: string[]
                 cache: [string, boolean | number][]
-            }>(pluginPermissionStateKey)
+            }>(pluginPermissionStateKey, { signal: controller.signal })
+            throwIfAborted(controller.signal)
             if (!payload) {
                 return
             }
@@ -697,11 +702,45 @@ async function ensurePluginPermissionStateLoaded() {
                 permissionCache.set(key, value)
             }
         })()
+        pluginPermissionLoadPromise = created
+        pluginPermissionLoadController = controller
+        void created.then(
+            () => {
+                if (pluginPermissionLoadPromise === created) {
+                    pluginPermissionLoadController = null
+                }
+            },
+            () => {
+                if (pluginPermissionLoadPromise === created) {
+                    pluginPermissionLoadPromise = null
+                    pluginPermissionLoadController = null
+                }
+            },
+        )
     }
-    await pluginPermissionLoadPromise
+    const activePromise = pluginPermissionLoadPromise
+    const activeController = pluginPermissionLoadController
+    const stopForwardingAbort = activeController
+        ? forwardAbortSignal(signal, activeController)
+        : () => undefined
+    const evictOnAbort = () => {
+        if (pluginPermissionLoadPromise === activePromise) {
+            pluginPermissionLoadPromise = null
+            pluginPermissionLoadController = null
+        }
+    }
+    signal?.addEventListener("abort", evictOnAbort, { once: true })
+    try {
+        await awaitWithAbort(activePromise, signal)
+    } finally {
+        stopForwardingAbort()
+        signal?.removeEventListener("abort", evictOnAbort)
+    }
 }
 
 export async function resetAllPluginPermissions() {
+    pluginPermissionLoadController?.abort()
+    pluginPermissionLoadController = null
     permissionGivenPlugins.clear()
     permissionDeniedPlugins.clear()
     permissionCache.clear()
@@ -735,12 +774,14 @@ export async function resetPluginPermission(pluginName: string) {
     await persistPluginPermissionState()
 }
 
-async function persistPluginPermissionState() {
-    await writePersistentJson(pluginPermissionStateKey, {
+async function persistPluginPermissionState(signal?: AbortSignal | null) {
+    const state = {
         given: [...permissionGivenPlugins],
         denied: [...permissionDeniedPlugins],
         cache: [...permissionCache.entries()]
-    })
+    }
+    if (signal) await writePersistentJson(pluginPermissionStateKey, state, signal)
+    else await writePersistentJson(pluginPermissionStateKey, state)
 }
 
 type PluginV3ProviderOptions = PluginV2ProviderOptions & {
@@ -760,7 +801,9 @@ const isPermissionResolved = async (
     pluginName: string,
     permissionDesc: PluginPermissionDesc,
     requiresReconfirm: boolean,
+    signal?: AbortSignal | null,
 ): Promise<{ resolved: boolean; value: boolean; pluginHash: string }> => {
+    throwIfAborted(signal)
     const permissionKey = permissionKeyOf(pluginName, permissionDesc);
     if (!requiresReconfirm && permissionGivenPlugins.has(permissionKey)) {
         return { resolved: true, value: true, pluginHash: '' }
@@ -769,11 +812,11 @@ const isPermissionResolved = async (
         return { resolved: true, value: false, pluginHash: '' }
     }
 
-    const pluginHash = await hasher(
+    const pluginHash = await awaitWithAbort(hasher(
         new TextEncoder().encode(
             DBState.db.plugins.find(p => p.name === pluginName)?.script
         )
-    ) + `_${permissionDesc}`;
+    ), signal) + `_${permissionDesc}`;
 
     if (!requiresReconfirm && permissionCache.get(pluginHash)) {
         permissionGivenPlugins.add(permissionKey);
@@ -783,8 +826,14 @@ const isPermissionResolved = async (
     return { resolved: false, value: false, pluginHash }
 }
 
-const getPluginPermission = async (pluginName: string, permissionDesc: PluginPermissionDesc, reconfirm: boolean|'periodically' = false) => {
-    await ensurePluginPermissionStateLoaded()
+const getPluginPermission = async (
+    pluginName: string,
+    permissionDesc: PluginPermissionDesc,
+    reconfirm: boolean|'periodically' = false,
+    signal?: AbortSignal | null,
+) => {
+    throwIfAborted(signal)
+    await ensurePluginPermissionStateLoaded(signal)
 
     // Recomputed (not captured) so a periodic reconfirm reflects the latest
     // lastGrantTime: when several identical requests queue together, an earlier
@@ -799,17 +848,28 @@ const getPluginPermission = async (pluginName: string, permissionDesc: PluginPer
 
     // Fast path: if the answer is already known, skip the serialization queue
     // entirely so cached/granted permissions never block on a pending dialog.
-    const early = await isPermissionResolved(pluginName, permissionDesc, computeRequiresReconfirm())
+    const early = await isPermissionResolved(
+        pluginName,
+        permissionDesc,
+        computeRequiresReconfirm(),
+        signal,
+    )
     if (early.resolved) {
         return early.value
     }
 
     const showDialog = async (): Promise<boolean> => {
+        throwIfAborted(signal)
         // Re-check under the lock: an earlier queued dialog for the same plugin
         // may have already granted/denied (or refreshed a periodic grant) while
         // we were waiting our turn — recompute reconfirm so we don't re-prompt.
         const requiresReconfirm = computeRequiresReconfirm()
-        const recheck = await isPermissionResolved(pluginName, permissionDesc, requiresReconfirm)
+        const recheck = await isPermissionResolved(
+            pluginName,
+            permissionDesc,
+            requiresReconfirm,
+            signal,
+        )
         if (recheck.resolved) {
             return recheck.value
         }
@@ -827,7 +887,8 @@ const getPluginPermission = async (pluginName: string, permissionDesc: PluginPer
             return false;
         }
         const permissionKey = permissionKeyOf(pluginName, permissionDesc);
-        const conf = await alertConfirm(alertTitle)
+        const conf = await awaitWithAbort(alertConfirm(alertTitle), signal)
+        throwIfAborted(signal)
         if(conf && pluginHash){
             permissionGivenPlugins.add(permissionKey);
             permissionDeniedPlugins.delete(permissionKey);
@@ -835,21 +896,26 @@ const getPluginPermission = async (pluginName: string, permissionDesc: PluginPer
             if(reconfirm === 'periodically'){
                 permissionCache.set(permissionKeyOf(pluginName, permissionDesc) + '_lastGrantTime', Date.now());
             }
-            await persistPluginPermissionState()
+            await persistPluginPermissionState(signal)
             return true;
         }
         permissionDeniedPlugins.add(permissionKey);
-        await persistPluginPermissionState()
+        await persistPluginPermissionState(signal)
         return false;
     }
 
     // Append to the dialog chain so only one permission dialog is shown at a
     // time. finally restores the chain even if showDialog throws, so a single
     // failure never deadlocks every later permission request.
-    const run = pluginPermissionDialogChain
-        .catch(() => {})
+    const predecessor = pluginPermissionDialogChain.catch(() => {})
+    const run = awaitWithAbort(predecessor, signal)
         .then(() => showDialog())
-    pluginPermissionDialogChain = run.catch(() => {})
+    // Keep the queue tail behind its predecessor even if this caller aborts
+    // while waiting. Otherwise a cancelled middle waiter could let a later
+    // dialog overtake the still-open earlier one.
+    pluginPermissionDialogChain = predecessor
+        .then(() => run)
+        .catch(() => {})
     return run
 }
 
@@ -885,7 +951,8 @@ export const makeRisuaiAPIV3 = (
         snapshotField: (key, value) => cloneDatabaseField(key, value),
         getPluginStorageSnapshot: getPluginSaveStorageSnapshot,
         updateWithPluginStorageSnapshot: updateDatabaseWithPluginStorageSnapshot,
-        normalizePluginMutation: () => {
+        normalizePluginMutation: (signal) => {
+            throwIfAborted(signal);
             const liveDatabase = getDatabase();
             const disabledPlugins = disableEnabledLegacyPluginsForOptimizedMemory(
                 liveDatabase.plugins,
@@ -897,20 +964,35 @@ export const makeRisuaiAPIV3 = (
                 ));
             }
         },
-        applyLite: (mutation) => {
+        applyLite: (mutation, signal) => {
             const db = getDatabase();
             for (const key of Object.keys(mutation)) {
+                throwIfAborted(signal);
                 (db as any)[key] = mutation[key];
             }
+            throwIfAborted(signal);
             DBState.db = db;
         },
-        applyFull: async (mutation) => {
+        applyFull: async (mutation, signal) => {
             const db = getDatabase();
+            const preparedEntries: [string, unknown][] = [];
             for (const key of Object.keys(mutation)) {
-                (db as any)[key] = key === "plugins"
-                    ? await handlePluginInstallViaPlugin(mutation[key] as RisuPlugin[])
+                throwIfAborted(signal);
+                const value = key === "plugins"
+                    ? await awaitWithAbort(
+                        handlePluginInstallViaPlugin(mutation[key] as RisuPlugin[]),
+                        signal,
+                    )
                     : mutation[key];
+                throwIfAborted(signal);
+                preparedEntries.push([key, value]);
             }
+            // Commit ordinary database fields together only after every
+            // potentially async preparation step has completed.
+            for (const [key, value] of preparedEntries) {
+                (db as any)[key] = value;
+            }
+            throwIfAborted(signal);
             setDatabaseState(db);
         },
     });
@@ -1035,26 +1117,47 @@ export const makeRisuaiAPIV3 = (
             lifecycle.addCleanup(() => oldApis.removeRisuReplacer(name, guardedFunc as any));
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
-        setDatabaseLite: async (database: unknown) => {
-            const conf = await getPluginPermission(plugin.name, 'db', 'periodically');
+        setDatabaseLite: async (database: unknown, signal?: AbortSignal) => {
+            const conf = await getPluginPermission(
+                plugin.name,
+                'db',
+                'periodically',
+                signal,
+            );
             if (!conf) return;
-            await databaseBridge.setDatabaseLite(database);
+            throwIfAborted(signal);
+            await databaseBridge.setDatabaseLite(database, signal);
         },
-        setDatabase: async (database: unknown) => {
-            const conf = await getPluginPermission(plugin.name, 'db', 'periodically');
+        setDatabase: async (database: unknown, signal?: AbortSignal) => {
+            const conf = await getPluginPermission(
+                plugin.name,
+                'db',
+                'periodically',
+                signal,
+            );
             if (!conf) return;
-            await databaseBridge.setDatabase(database);
+            throwIfAborted(signal);
+            await databaseBridge.setDatabase(database, signal);
         },
         loadPlugins: oldApis.loadPlugins,
         readImage: oldApis.readImage,
         saveAsset: oldApis.saveAsset,
         //Same functionality, but new implementation
-        getDatabase: async (includeOnly:string[]|'all' = 'all') => {
-            const conf = await getPluginPermission(plugin.name, 'db', 'periodically');
+        getDatabase: async (
+            includeOnly:string[]|'all' = 'all',
+            signal?: AbortSignal,
+        ) => {
+            const conf = await getPluginPermission(
+                plugin.name,
+                'db',
+                'periodically',
+                signal,
+            );
             if(!conf){
                 return null;
             }
-            return await databaseBridge.getDatabase(includeOnly);
+            throwIfAborted(signal);
+            return await databaseBridge.getDatabase(includeOnly, signal);
         },
 
         installPlugin: handlePluginInstallViaPlugin,
@@ -1523,33 +1626,38 @@ export const makeRisuaiAPIV3 = (
         // V3 calls cross the async iframe bridge, so these can switch between
         // inline save data and the on-demand pluginsave/ KV backend without an
         // observable API change. V2 keeps using oldApis.pluginStorage directly.
-        _getPluginStorage: (key: string) => {
-            return getPluginSaveStorageItem(key)
+        _getPluginStorage: (key: string, signal?: AbortSignal) => {
+            return getPluginSaveStorageItem(key, signal)
         },
-        _setPluginStorage: async (key: string, value: any) => {
-            await setOwnedPluginSaveStorageItem(key, value, plugin.name)
+        _setPluginStorage: async (key: string, value: any, signal?: AbortSignal) => {
+            await setOwnedPluginSaveStorageItem(key, value, plugin.name, signal)
         },
-        _removePluginStorage: async (key: string) => {
-            await removeOwnedPluginSaveStorageItem(key)
+        _removePluginStorage: async (key: string, signal?: AbortSignal) => {
+            await removeOwnedPluginSaveStorageItem(key, signal)
         },
-        _clearPluginStorage: async () => {
-            await clearOwnedPluginSaveStorage()
+        _clearPluginStorage: async (signal?: AbortSignal) => {
+            await clearOwnedPluginSaveStorage(signal)
         },
-        _keyPluginStorage: (index: number) => getPluginSaveStorageKey(index),
-        _keysPluginStorage: () => getPluginSaveStorageKeys(),
-        _lengthPluginStorage: () => getPluginSaveStorageLength(),
+        _keyPluginStorage: (index: number, signal?: AbortSignal) => (
+            getPluginSaveStorageKey(index, signal)
+        ),
+        _keysPluginStorage: (signal?: AbortSignal) => getPluginSaveStorageKeys(signal),
+        _lengthPluginStorage: (signal?: AbortSignal) => getPluginSaveStorageLength(signal),
         _getSafeLocalStorage: oldApis.safeLocalStorage.getItem,
-        _setSafeLocalStorage: (key: string, value: string) => {
+        _setSafeLocalStorage: (key: string, value: string, signal?: AbortSignal) => {
+            signal?.throwIfAborted()
             oldApis.safeLocalStorage.setItem(key, value)
-            recordOwner('local', key, plugin.name)
+            recordOwner('local', key, plugin.name, signal)
         },
-        _removeSafeLocalStorage: (key: string) => {
+        _removeSafeLocalStorage: (key: string, signal?: AbortSignal) => {
+            signal?.throwIfAborted()
             oldApis.safeLocalStorage.removeItem(key)
-            removeOwner('local', key)
+            removeOwner('local', key, signal)
         },
-        _clearSafeLocalStorage: () => {
+        _clearSafeLocalStorage: (signal?: AbortSignal) => {
+            signal?.throwIfAborted()
             oldApis.safeLocalStorage.clear()
-            clearOwners('local')
+            clearOwners('local', signal)
         },
         _keySafeLocalStorage: oldApis.safeLocalStorage.key,
         _keysSafeLocalStorage: oldApis.safeLocalStorage.keys,

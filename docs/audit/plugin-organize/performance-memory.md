@@ -22,12 +22,15 @@ patterns (large embedding/vector sets, media stored as plugin values, many
 snapshot-record bodies).
 
 On the client, the complete value is `JSON.stringify()`-encoded before the
-request (`src/ts/storage/persistentKv.ts:55-58`). With resource caching
-enabled, `NodeStorage.setItem()` copies and hashes the full byte array, and
-`storeBytes()` copies it again before optional IndexedDB persistence
+request (`src/ts/storage/persistentKv.ts:55-58`). SA2 moved ordinary work to
+per-key queues and detached bounded cache seeding after the authoritative
+acknowledgement, so an unrelated key is no longer held behind this work.
+PM1 remains open: `NodeStorage.setItem()` still makes a defensive full-byte
+copy and begins a full hash, and detached `storeBytes()` makes another
+copy/hash before optional IndexedDB persistence
 (`src/ts/storage/nodeStorage.ts:298-346`,
-`src/ts/storage/resourceCache.ts:437-467`). The global queue (SA2) remains
-held throughout.
+`src/ts/storage/resourceCache.ts:437-467`). Server buffering and the absence
+of value/aggregate limits are unchanged.
 
 ### Required correction
 
@@ -35,7 +38,8 @@ held throughout.
 - Make plugin value rows chunk-capable (keeping live and snapshot size
   enumeration chunk-aware), and use a bounded/streaming request path for
   genuinely large rows instead of the 2 GB buffered generic endpoint.
-- Avoid redundant cache copies/hashes while the plugin-wide lock is held.
+- Avoid redundant full-value cache copies/hashes while preserving detached,
+  bounded best-effort seeding.
 - Test large vectors, media, many record bodies, and resource-cache
   enabled/disabled combinations.
 
@@ -141,26 +145,26 @@ value, then owner sidecar (`src/ts/plugins/apiV3/v3.svelte.ts:1328-1331`) —
 and in optimized mode each becomes its own `/api/write` and SQLite mutation
 (`src/ts/plugins/pluginSaveStorage.ts:87-96`,
 `src/ts/plugins/pluginStorageMeta.ts:60-75`,
-`server/node/server.cjs:4209-4370`), all serialized through the shared global
-queue (SA2). Measured against audited workloads:
+`server/node/server.cjs:4209-4370`). They remain separate mutations within the
+same key-scoped operation, while unrelated keys can now proceed independently.
+Measured against audited workloads:
 
 - one read-touch that also rewrites an index can become six serialized writes
   (value plus owner for three logical records);
 - persisting one sharded record can multiply into dozens of sequential
-  mutations, awaited on critical before/after-request paths; and
-- a conventional `length()`/`key(i)` enumeration loop performs ~`2N` full
-  server-list requests (`src/ts/plugins/pluginSaveStorage.ts:121-138`).
+  mutations, awaited on critical before/after-request paths.
 
 With the verified resource cache enabled, each value write also copies and
-hashes the payload and awaits `storeBytes()`
-(`src/ts/storage/nodeStorage.ts:298-345`), and that helper prunes by reading
-all manifest keys, manifests, and entry keys after every write
-(`src/ts/storage/resourceCache.ts:441-467`, `:726-754`) — repeated global
-cache scans before the main request is dispatched or its response released.
+hashes the payload. Cache seeding is now detached after the authoritative
+commit, so it no longer delays acknowledgement or holds the key-scoped queue,
+but `storeBytes()` still copies/hashes the complete value and prunes by reading
+manifest and entry keys for each seed
+(`src/ts/storage/nodeStorage.ts:298-345`,
+`src/ts/storage/resourceCache.ts:441-467`, `:726-754`). The remaining cost is
+CPU, allocation, IndexedDB write amplification, and repeated cache scans.
 
 ### Required correction
 
 - Coalesce value+owner writes and add batch APIs.
-- Use key-scoped queues plus an exclusive transition barrier, bounded I/O,
-  and amortized cache pruning.
-- Provide an iterator/page API for enumeration (see SA2).
+- Reuse one defensive byte copy/hash through acknowledgement and detached
+  seeding, and amortize cache pruning across writes.

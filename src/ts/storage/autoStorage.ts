@@ -5,31 +5,47 @@ export class AutoStorage{
 
     realStorage:NodeStorage
 
-    async setItem(key:string, value:Uint8Array, etag?:string):Promise<string|null> {
-        await this.realStorage.setItem(key, value, etag)
+    async setItem(
+        key:string,
+        value:Uint8Array,
+        etag?:string,
+        signal?: AbortSignal | null,
+    ):Promise<string|null> {
+        if (signal) await this.realStorage.setItem(key, value, etag, signal)
+        else await this.realStorage.setItem(key, value, etag)
         return null
     }
-    async getItem(key:string):Promise<Buffer> {
-        return await this.realStorage.getItem(key)
+    async getItem(key:string, signal?: AbortSignal | null):Promise<Buffer> {
+        return signal
+            ? await this.realStorage.getItem(key, signal)
+            : await this.realStorage.getItem(key)
     }
-    async getItemCached(key: string): Promise<Buffer | null> {
+    async getItemCached(key: string, signal?: AbortSignal | null): Promise<Buffer | null> {
         await this.Init()
-        return await this.realStorage.getItemCached(key)
+        return signal
+            ? await this.realStorage.getItemCached(key, signal)
+            : await this.realStorage.getItemCached(key)
     }
     async readDatabaseForBoot() {
         await this.Init()
         return await this.realStorage.readDatabaseForBoot()
     }
-    async keys(prefix: string = ''):Promise<string[]>{
+    async keys(prefix: string = '', signal?: AbortSignal | null):Promise<string[]>{
         await this.Init()
-        return await this.realStorage.keys(prefix)
+        return signal
+            ? await this.realStorage.keys(prefix, signal)
+            : await this.realStorage.keys(prefix)
     }
-    async removeItem(key:string){
-        return await this.realStorage.removeItem(key)
+    async removeItem(key:string, signal?: AbortSignal | null){
+        return signal
+            ? await this.realStorage.removeItem(key, signal)
+            : await this.realStorage.removeItem(key)
     }
-    async clearPluginSaveStorage() {
+    async clearPluginSaveStorage(signal?: AbortSignal | null) {
         await this.Init()
-        return await this.realStorage.clearPluginSaveStorage()
+        return signal
+            ? await this.realStorage.clearPluginSaveStorage(signal)
+            : await this.realStorage.clearPluginSaveStorage()
     }
 
     async checkAccountSync(){
@@ -43,11 +59,13 @@ export class AutoStorage{
         }
     }
 
-    async createAuth(): Promise<string> {
+    async createAuth(signal?: AbortSignal | null): Promise<string> {
         if (!this.realStorage) {
             this.realStorage = new NodeStorage()
         }
-        return this.realStorage.createAuth()
+        return signal
+            ? this.realStorage.createAuth(signal)
+            : this.realStorage.createAuth()
     }
 
     async exportBackup(opts?: { target?: 'upstream' }) {

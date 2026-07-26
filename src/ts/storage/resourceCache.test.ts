@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
     RESOURCE_CACHE_LOCAL_STORAGE_KEY,
+    RESOURCE_CACHE_IO_TIMEOUT_MS,
     RESOURCE_CACHE_MAX_DB_HASHES_PER_MANIFEST,
+    chainBestEffortResourceCacheOperation,
     formatHashBytes,
     getResourceCacheStats,
     isResourceCacheEnabled,
@@ -9,6 +11,7 @@ import {
     planResourceCacheRetention,
     resourceCacheManifestHashLimit,
     selectResidentManifestHashes,
+    settleBestEffortResourceCache,
     setResourceCacheEnabled,
     sha256Bytes,
 } from './resourceCache'
@@ -20,6 +23,44 @@ afterEach(() => {
 })
 
 describe('byte resource cache helpers', () => {
+    it('bounds a cache operation that never settles', async () => {
+        vi.useFakeTimers()
+        try {
+            const result = settleBestEffortResourceCache(
+                new Promise<string>(() => undefined),
+                'authoritative-fallback',
+            )
+            await vi.advanceTimersByTimeAsync(RESOURCE_CACHE_IO_TIMEOUT_MS)
+            await expect(result).resolves.toBe('authoritative-fallback')
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('recovers a cache write chain from stalled predecessors and work', async () => {
+        vi.useFakeTimers()
+        try {
+            const firstWork = vi.fn(() => new Promise<never>(() => undefined))
+            const first = chainBestEffortResourceCacheOperation(
+                new Promise<never>(() => undefined),
+                firstWork,
+            )
+
+            await vi.advanceTimersByTimeAsync(RESOURCE_CACHE_IO_TIMEOUT_MS)
+            expect(firstWork).toHaveBeenCalledOnce()
+            await vi.advanceTimersByTimeAsync(RESOURCE_CACHE_IO_TIMEOUT_MS)
+            await expect(first).resolves.toBeUndefined()
+
+            const laterWork = vi.fn(async () => undefined)
+            const later = chainBestEffortResourceCacheOperation(first, laterWork)
+            await vi.advanceTimersByTimeAsync(0)
+            await expect(later).resolves.toBeUndefined()
+            expect(laterWork).toHaveBeenCalledOnce()
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
     it('formats and hashes exact bytes as lowercase SHA-256 hex', async () => {
         expect(formatHashBytes(new Uint8Array([0, 10, 255]))).toBe('000aff')
         await expect(sha256Bytes(new TextEncoder().encode('hello'))).resolves.toBe(

@@ -115,7 +115,11 @@ vi.mock("../storage/persistentKv", () => {
         removePersistentKey: vi.fn(async (key: string) => {
             persistent.delete(key);
         }),
-        writePersistentJson: vi.fn(async (key: string, value: unknown) => {
+        writePersistentJson: vi.fn(async (
+            key: string,
+            value: unknown,
+            _signal?: AbortSignal | null,
+        ) => {
             persistent.set(key, value);
         }),
     };
@@ -125,7 +129,10 @@ const {
     clearOwnedPluginSaveStorage,
     countExternalizedPluginStorageEntries,
     getPluginSaveStorageItem,
+    getPluginSaveStorageKey,
     getPluginSaveStorageKeys,
+    getPluginSaveStorageLength,
+    PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_SAVE_PREFIX,
     readExternalizedPluginStorage,
@@ -135,6 +142,7 @@ const {
     setPluginSaveStorageItem,
     transitionPluginStorageMode,
     updateDatabaseWithPluginStorageSnapshot,
+    withPluginSaveStorageKeyLock,
     withPluginSaveStorageLock,
 } = await import("./pluginSaveStorage");
 const {
@@ -155,6 +163,11 @@ const {
     createPluginStorageRecord,
     definePluginStorageRecordValue,
 } = await import("./pluginStorageRecord");
+const {
+    clearOwners,
+    recordOwner,
+    removeOwner,
+} = await import("./pluginStorageMeta");
 
 const SPECIAL_PLUGIN_STORAGE_KEYS = [
     "__proto__",
@@ -254,7 +267,11 @@ beforeEach(async () => {
     removePersistentKey.mockImplementation(async (key: string) => {
         persistent.delete(key);
     });
-    writePersistentJson.mockImplementation(async (key: string, value: unknown) => {
+    writePersistentJson.mockImplementation(async (
+        key: string,
+        value: unknown,
+        _signal?: AbortSignal | null,
+    ) => {
         persistent.set(key, value);
     });
 });
@@ -364,6 +381,61 @@ describe("readExternalizedPluginStorage", () => {
 });
 
 describe("plugin save storage transport", () => {
+    test("cancels optimized owner sidecar persistence with the caller signal", async () => {
+        database.optimizePluginMemory = true;
+        const controller = new AbortController();
+        const { writePersistentJson } = await import("../storage/persistentKv");
+        let markWriteStarted!: () => void;
+        const writeStarted = new Promise<void>((resolve) => {
+            markWriteStarted = resolve;
+        });
+        vi.mocked(writePersistentJson).mockImplementation(async (_key, _value, signal) => {
+            markWriteStarted();
+            await new Promise<void>((resolve, reject) => {
+                const onAbort = () => reject(signal?.reason);
+                signal?.addEventListener("abort", onAbort, { once: true });
+                if (signal?.aborted) onAbort();
+            });
+        });
+
+        const writing = Promise.resolve(recordOwner(
+            "save",
+            "sidecar-key",
+            "Sidecar Plugin",
+            controller.signal,
+        ));
+        await writeStarted;
+        controller.abort(new DOMException("sidecar cancelled", "AbortError"));
+
+        await expect(writing).rejects.toMatchObject({ name: "AbortError" });
+        expect(writePersistentJson).toHaveBeenCalledWith(
+            encoded(PLUGIN_SAVE_META_PREFIX, "sidecar-key"),
+            expect.objectContaining({ plugin: "Sidecar Plugin" }),
+            controller.signal,
+        );
+    });
+
+    test("forwards one signal through optimized owner remove and clear persistence", async () => {
+        database.optimizePluginMemory = true;
+        const controller = new AbortController();
+        const {
+            clearPersistentPrefix,
+            removePersistentKey,
+        } = await import("../storage/persistentKv");
+
+        await removeOwner("save", "sidecar-key", controller.signal);
+        await clearOwners("save", controller.signal);
+
+        expect(removePersistentKey).toHaveBeenCalledWith(
+            encoded(PLUGIN_SAVE_META_PREFIX, "sidecar-key"),
+            controller.signal,
+        );
+        expect(clearPersistentPrefix).toHaveBeenCalledWith(
+            PLUGIN_SAVE_META_PREFIX,
+            controller.signal,
+        );
+    });
+
     test("optimized owned clear is one fixed-namespace server mutation", async () => {
         database.optimizePluginMemory = true;
         persistent.set(encoded(PLUGIN_SAVE_PREFIX, "alpha"), { value: 1 });
@@ -701,6 +773,130 @@ describe("plugin save storage transport", () => {
         persistent.delete(movedKey);
         persistent.set(movedKey, value);
         await expect(getPluginSaveStorageKeys()).resolves.toEqual(expected);
+    });
+
+    test("a stalled write does not block another key and bounds a requested transition", async () => {
+        vi.useFakeTimers();
+        database.optimizePluginMemory = true;
+        persistent.set(encoded(PLUGIN_SAVE_PREFIX, "beta"), { available: true });
+        const { writePersistentJson } = await import("../storage/persistentKv");
+        let markWriteStarted!: () => void;
+        let releaseWrite!: () => void;
+        const writeStarted = new Promise<void>(resolve => { markWriteStarted = resolve; });
+        const stalledWrite = new Promise<void>(resolve => { releaseWrite = resolve; });
+        vi.mocked(writePersistentJson).mockImplementation(async (storageKey, value) => {
+            if (storageKey === encoded(PLUGIN_SAVE_PREFIX, "alpha")) {
+                markWriteStarted();
+                await stalledWrite;
+            }
+            persistent.set(storageKey, value);
+        });
+
+        try {
+            const write = setPluginSaveStorageItem("alpha", { delayed: true });
+            await writeStarted;
+
+            // A process-wide promise chain would leave this read pending.
+            await expect(getPluginSaveStorageItem("beta"))
+                .resolves.toEqual({ available: true });
+
+            const transition = transitionPluginStorageMode(false, {
+                dependencies: { persistDatabase: vi.fn(async () => undefined) },
+            });
+            const transitionFailure = transition.catch(error => error);
+            await vi.advanceTimersByTimeAsync(PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS);
+
+            const error = await transitionFailure;
+            expect(error).toMatchObject({
+                name: "StorageError",
+                code: "STORAGE_TIMEOUT",
+                operation: "transition",
+                retryable: true,
+                commitOutcomeUnknown: false,
+            });
+            expect(database.optimizePluginMemory).toBe(true);
+
+            // Test-only cleanup: production transport timeouts abort this work.
+            releaseWrite();
+            await write;
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    test("a cancelled queued key operation cannot let its successor overtake", async () => {
+        const order: string[] = [];
+        let releaseFirst!: () => void;
+        let markFirstStarted!: () => void;
+        const firstBlocked = new Promise<void>(resolve => { releaseFirst = resolve; });
+        const firstStarted = new Promise<void>(resolve => { markFirstStarted = resolve; });
+
+        const first = withPluginSaveStorageKeyLock("same-key", async () => {
+            order.push("first:start");
+            markFirstStarted();
+            await firstBlocked;
+            order.push("first:end");
+        });
+        await firstStarted;
+
+        const controller = new AbortController();
+        const secondResult = withPluginSaveStorageKeyLock("same-key", async () => {
+            order.push("second:must-not-run");
+        }, controller.signal).catch(error => error);
+        // Let the second call install its queue token behind the first.
+        await Promise.resolve();
+
+        let thirdStarted = false;
+        const third = withPluginSaveStorageKeyLock("same-key", async () => {
+            thirdStarted = true;
+            order.push("third");
+        });
+        // Let the third call capture the second token as its predecessor.
+        await Promise.resolve();
+
+        controller.abort(new DOMException("cancel queued operation", "AbortError"));
+        await expect(secondResult).resolves.toMatchObject({ name: "AbortError" });
+        await Promise.resolve();
+        expect(thirdStarted).toBe(false);
+        expect(order).toEqual(["first:start"]);
+
+        let transitionStarted = false;
+        const transitionBarrier = withPluginSaveStorageLock(async () => {
+            transitionStarted = true;
+            order.push("transition");
+        });
+        await Promise.resolve();
+        expect(transitionStarted).toBe(false);
+
+        releaseFirst();
+        await Promise.all([first, third, transitionBarrier]);
+
+        expect(order).toEqual([
+            "first:start",
+            "first:end",
+            "third",
+            "transition",
+        ]);
+        expect(thirdStarted).toBe(true);
+        expect(transitionStarted).toBe(true);
+    });
+
+    test("length/key enumeration reuses one authoritative key snapshot", async () => {
+        database.optimizePluginMemory = true;
+        for (const key of ["alpha", "beta", "gamma"]) {
+            persistent.set(encoded(PLUGIN_SAVE_PREFIX, key), key);
+        }
+        const { listPersistentKeys } = await import("../storage/persistentKv");
+
+        const enumerated: string[] = [];
+        for (let index = 0; index < await getPluginSaveStorageLength(); index += 1) {
+            const key = await getPluginSaveStorageKey(index);
+            if (key !== null) enumerated.push(key);
+        }
+
+        expect(enumerated).toEqual(["alpha", "beta", "gamma"]);
+        expect(listPersistentKeys).toHaveBeenCalledTimes(1);
+        expect(listPersistentKeys).toHaveBeenCalledWith(PLUGIN_SAVE_PREFIX);
     });
 });
 
@@ -1541,8 +1737,12 @@ describe("transitionPluginStorageMode", () => {
         expect(database.optimizePluginMemory).toBe(false);
         expect(Object.getPrototypeOf(database.pluginCustomStorage)).toBe(Object.prototype);
         expect(Object.getPrototypeOf(database.pluginStorageMeta)).toBe(Object.prototype);
-        expect(Object.keys(database.pluginCustomStorage)).toEqual(SPECIAL_PLUGIN_STORAGE_KEYS);
-        expect(Object.keys(database.pluginStorageMeta)).toEqual(SPECIAL_PLUGIN_STORAGE_KEYS);
+        expect(Object.keys(database.pluginCustomStorage)).toEqual(
+            ORDERED_SPECIAL_PLUGIN_STORAGE_KEYS,
+        );
+        expect(Object.keys(database.pluginStorageMeta)).toEqual(
+            ORDERED_SPECIAL_PLUGIN_STORAGE_KEYS,
+        );
         for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
             await expect(getPluginSaveStorageItem(key)).resolves.toEqual({ index });
             expect(Object.hasOwn(database.pluginCustomStorage, key)).toBe(true);
@@ -2148,6 +2348,154 @@ describe("transitionPluginStorageMode", () => {
         v2Apis.pluginStorage.setItem("", "empty-first");
         expect(v2Apis.pluginStorage.key(0)).toBe("");
         expect(v2Apis.pluginStorage.getItem("")).toBe("empty-first");
+    });
+
+    test("V2 inline mutations invalidate a V3 length/key enumeration snapshot", async () => {
+        const v2Apis = getV2PluginAPIs();
+        database.pluginCustomStorage = { alpha: 1 };
+
+        await expect(getPluginSaveStorageLength()).resolves.toBe(1);
+        await expect(getPluginSaveStorageKey(0)).resolves.toBe("alpha");
+
+        v2Apis.pluginStorage.setItem("beta", "two");
+        await expect(getPluginSaveStorageLength()).resolves.toBe(2);
+        await expect(getPluginSaveStorageKey(1)).resolves.toBe("beta");
+
+        v2Apis.pluginStorage.removeItem("alpha");
+        await expect(getPluginSaveStorageLength()).resolves.toBe(1);
+        await expect(getPluginSaveStorageKey(0)).resolves.toBe("beta");
+
+        v2Apis.pluginStorage.clear();
+        await expect(getPluginSaveStorageLength()).resolves.toBe(0);
+        await expect(getPluginSaveStorageKey(0)).resolves.toBeNull();
+
+        v2Apis.setDatabaseLite({ pluginCustomStorage: { gamma: 3 } });
+        await expect(getPluginSaveStorageLength()).resolves.toBe(1);
+        await expect(getPluginSaveStorageKey(0)).resolves.toBe("gamma");
+
+        await v2Apis.setDatabase({ pluginCustomStorage: { delta: 4 } });
+        await expect(getPluginSaveStorageLength()).resolves.toBe(1);
+        await expect(getPluginSaveStorageKey(0)).resolves.toBe("delta");
+    });
+
+    test("V2 lite replacement invalidates V3 enumeration before a later field throws", async () => {
+        const v2Apis = getV2PluginAPIs();
+        database.pluginCustomStorage = { stale: true };
+        await expect(getPluginSaveStorageLength()).resolves.toBe(1);
+        await expect(getPluginSaveStorageKey(0)).resolves.toBe("stale");
+        const mutation = {
+            pluginCustomStorage: { replacement: true },
+        } as Record<string, unknown>;
+        Object.defineProperty(mutation, "temperature", {
+            configurable: true,
+            enumerable: true,
+            get: () => {
+                throw new Error("later lite field failed");
+            },
+        });
+
+        expect(() => v2Apis.setDatabaseLite(mutation))
+            .toThrow("later lite field failed");
+
+        await expect(getPluginSaveStorageLength()).resolves.toBe(1);
+        await expect(getPluginSaveStorageKey(0)).resolves.toBe("replacement");
+    });
+
+    test("V2 full replacement invalidates while later plugin approval is pending and rejected", async () => {
+        const v2Apis = getV2PluginAPIs();
+        database.pluginCustomStorage = { stale: true };
+        await expect(getPluginSaveStorageLength()).resolves.toBe(1);
+        await expect(getPluginSaveStorageKey(0)).resolves.toBe("stale");
+        const { alertConfirm } = await import("../alert");
+        let markApprovalStarted!: () => void;
+        let rejectApproval!: (error: Error) => void;
+        const approvalStarted = new Promise<void>((resolve) => {
+            markApprovalStarted = resolve;
+        });
+        vi.mocked(alertConfirm).mockImplementationOnce(() => {
+            markApprovalStarted();
+            return new Promise<boolean>((_resolve, reject) => {
+                rejectApproval = reject;
+            });
+        });
+        const installCandidate = {
+            name: "Interleaved V3 install",
+            script: "// pending approval",
+            arguments: {},
+            realArg: {},
+            version: "3.0" as const,
+            customLink: [],
+            argMeta: {},
+            enabled: true,
+        };
+
+        const mutation = v2Apis.setDatabase({
+            pluginCustomStorage: { replacement: true },
+            plugins: [installCandidate],
+        });
+        await approvalStarted;
+
+        // The async setter is still interleaved inside plugin approval, but
+        // the earlier storage replacement is already authoritative.
+        await expect(getPluginSaveStorageLength()).resolves.toBe(1);
+        await expect(getPluginSaveStorageKey(0)).resolves.toBe("replacement");
+
+        rejectApproval(new Error("plugin approval rejected"));
+        await expect(mutation).rejects.toThrow("plugin approval rejected");
+        await expect(getPluginSaveStorageLength()).resolves.toBe(1);
+        await expect(getPluginSaveStorageKey(0)).resolves.toBe("replacement");
+    });
+
+    test("V2 full replacement invalidates after an interleaved plugin approval and before a later throw", async () => {
+        const v2Apis = getV2PluginAPIs();
+        database.pluginCustomStorage = { alpha: 1 };
+        await expect(getPluginSaveStorageLength()).resolves.toBe(1);
+        await expect(getPluginSaveStorageKey(0)).resolves.toBe("alpha");
+        const { alertConfirm } = await import("../alert");
+        let markApprovalStarted!: () => void;
+        let resolveApproval!: (confirmed: boolean) => void;
+        const approvalStarted = new Promise<void>((resolve) => {
+            markApprovalStarted = resolve;
+        });
+        vi.mocked(alertConfirm).mockImplementationOnce(() => {
+            markApprovalStarted();
+            return new Promise<boolean>((resolve) => {
+                resolveApproval = resolve;
+            });
+        });
+        const installCandidate = {
+            name: "Approved interleaved V3 install",
+            script: "// approved after interleaving",
+            arguments: {},
+            realArg: {},
+            version: "3.0" as const,
+            customLink: [],
+            argMeta: {},
+            enabled: true,
+        };
+        const mutationInput = {
+            plugins: [installCandidate],
+            pluginCustomStorage: { final: 3 },
+        } as Record<string, unknown>;
+        Object.defineProperty(mutationInput, "temperature", {
+            configurable: true,
+            enumerable: true,
+            get: () => {
+                throw new Error("later full field failed");
+            },
+        });
+
+        const mutation = v2Apis.setDatabase(mutationInput);
+        await approvalStarted;
+        v2Apis.pluginStorage.setItem("interleaved", "two");
+        await expect(getPluginSaveStorageLength()).resolves.toBe(2);
+        await expect(getPluginSaveStorageKey(1)).resolves.toBe("interleaved");
+
+        resolveApproval(true);
+        await expect(mutation).rejects.toThrow("later full field failed");
+        expect(database.pluginCustomStorage).toEqual({ final: 3 });
+        await expect(getPluginSaveStorageLength()).resolves.toBe(1);
+        await expect(getPluginSaveStorageKey(0)).resolves.toBe("final");
     });
 
     test("V2.0 rechecks the transition guard immediately before execution", async () => {

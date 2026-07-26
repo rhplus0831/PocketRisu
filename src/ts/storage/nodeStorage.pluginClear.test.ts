@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 const cache = vi.hoisted(() => ({
     invalidateResourceCachePrefix: vi.fn(async () => undefined),
@@ -24,11 +24,18 @@ vi.mock('./resourceCache', () => ({
     isSha256Hex: () => false,
     persistResourceCacheManifests: vi.fn(),
     sha256Bytes: vi.fn(),
+    settleBestEffortResourceCache: async <T>(operation: Promise<T>, fallback: T) => {
+        try {
+            return await operation
+        } catch {
+            return fallback
+        }
+    },
     storeBytes: vi.fn(),
     touchResourceCacheManifest: vi.fn(),
 }))
 
-const { NodeStorage } = await import('./nodeStorage')
+const { AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, NodeStorage } = await import('./nodeStorage')
 const { StorageError } = await import('./storageError')
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -40,8 +47,18 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 function createStorage(result: Response | Error): InstanceType<typeof NodeStorage> {
     const storage = Object.create(NodeStorage.prototype) as InstanceType<typeof NodeStorage>
-    vi.spyOn(storage as any, 'authFetch').mockImplementation(async () => {
+    vi.spyOn(storage as any, 'authFetch').mockImplementation(async (
+        _input: RequestInfo | URL,
+        _init?: RequestInit,
+        _retry?: boolean,
+        mutationOutcome?: {
+            markRequestDispatched: () => void
+            markDefinitiveResponse: () => void
+        },
+    ) => {
+        mutationOutcome?.markRequestDispatched()
         if (result instanceof Error) throw result
+        mutationOutcome?.markDefinitiveResponse()
         return result
     })
     return storage
@@ -49,6 +66,10 @@ function createStorage(result: Response | Error): InstanceType<typeof NodeStorag
 
 beforeEach(() => {
     cache.invalidateResourceCachePrefix.mockClear()
+})
+
+afterEach(() => {
+    vi.useRealTimers()
 })
 
 describe('NodeStorage atomic plugin clear outcomes', () => {
@@ -139,5 +160,40 @@ describe('NodeStorage atomic plugin clear outcomes', () => {
             commitOutcomeUnknown: true,
             operation: 'remove',
         })
+    })
+
+    test('keeps a stalled HTTP 200 commit envelope outcome unknown', async () => {
+        vi.useFakeTimers()
+        const response = new Response(new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode('{"success":true'))
+                // Deliberately never close: every cloned body remains pending.
+            },
+        }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+        })
+        const storage = createStorage(response)
+        let settled = false
+
+        const pending = storage.clearPluginSaveStorage()
+            .then(value => value, error => error)
+            .finally(() => { settled = true })
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS - 1)
+        await Promise.resolve()
+        expect(settled).toBe(false)
+        expect(cache.invalidateResourceCachePrefix).not.toHaveBeenCalled()
+
+        await vi.advanceTimersByTimeAsync(1)
+
+        const error = await pending
+        expect(error).toBeInstanceOf(StorageError)
+        expect(error).toMatchObject({
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            retryable: false,
+            commitOutcomeUnknown: true,
+            operation: 'remove',
+        })
+        expect(cache.invalidateResourceCachePrefix).not.toHaveBeenCalled()
     })
 })

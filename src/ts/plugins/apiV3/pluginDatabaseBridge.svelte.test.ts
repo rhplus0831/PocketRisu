@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import { awaitWithAbort, throwIfAborted } from "../../storage/abort";
 
 const storageMocks = vi.hoisted(() => ({
     persistent: new Map<string, unknown>(),
-    readGate: null as null | ((key: string) => Promise<void>),
-    writeGate: null as null | ((key: string) => Promise<void>),
-    removeGate: null as null | ((key: string) => Promise<void>),
-    clearGate: null as null | ((prefix: string) => Promise<void>),
+    readGate: null as null | ((key: string, signal?: AbortSignal | null) => Promise<void>),
+    writeGate: null as null | ((key: string, signal?: AbortSignal | null) => Promise<void>),
+    removeGate: null as null | ((key: string, signal?: AbortSignal | null) => Promise<void>),
+    clearGate: null as null | ((prefix: string, signal?: AbortSignal | null) => Promise<void>),
 }));
 const alertConfirmMock = vi.hoisted(() => vi.fn(async () => true));
 const notifyErrorMock = vi.hoisted(() => vi.fn());
@@ -51,35 +52,51 @@ vi.mock("../../globalApi.svelte", () => ({
 vi.mock("../../storage/chatStorage", () => ({ chatToStub: (chat: unknown) => chat }));
 
 vi.mock("../../storage/persistentKv", () => ({
-    clearExternalizedPluginStorage: async () => {
-        await storageMocks.clearGate?.("pluginsave/");
+    clearExternalizedPluginStorage: async (signal?: AbortSignal | null) => {
+        await storageMocks.clearGate?.("pluginsave/", signal);
+        throwIfAborted(signal);
         for (const key of [...storageMocks.persistent.keys()]) {
+            throwIfAborted(signal);
             if (key.startsWith("pluginsave/") || key.startsWith("pluginsave-meta/")) {
                 storageMocks.persistent.delete(key);
             }
         }
     },
-    clearPersistentPrefix: async (prefix: string) => {
-        await storageMocks.clearGate?.(prefix);
+    clearPersistentPrefix: async (prefix: string, signal?: AbortSignal | null) => {
+        await storageMocks.clearGate?.(prefix, signal);
+        throwIfAborted(signal);
         for (const key of [...storageMocks.persistent.keys()]) {
+            throwIfAborted(signal);
             if (key.startsWith(prefix)) storageMocks.persistent.delete(key);
         }
     },
     decodeStorageKeyComponent: decodeKey,
-    listPersistentKeys: async (prefix = "") => [...storageMocks.persistent.keys()]
-        .filter(key => key.startsWith(prefix)),
+    listPersistentKeys: async (prefix = "", signal?: AbortSignal | null) => {
+        throwIfAborted(signal);
+        return [...storageMocks.persistent.keys()].filter(key => key.startsWith(prefix));
+    },
     makeEncodedStorageKey: (prefix: string, key: string) => `${prefix}${encodeKey(key)}.json`,
-    readPersistentJson: async <T>(key: string) => {
-        await storageMocks.readGate?.(key);
+    readPersistentJson: async <T>(
+        key: string,
+        options: { signal?: AbortSignal | null } = {},
+    ) => {
+        await storageMocks.readGate?.(key, options.signal);
+        throwIfAborted(options.signal);
         const value = storageMocks.persistent.get(key);
         return value === undefined ? null : cloneJson(value) as T;
     },
-    removePersistentKey: async (key: string) => {
-        await storageMocks.removeGate?.(key);
+    removePersistentKey: async (key: string, signal?: AbortSignal | null) => {
+        await storageMocks.removeGate?.(key, signal);
+        throwIfAborted(signal);
         storageMocks.persistent.delete(key);
     },
-    writePersistentJson: async (key: string, value: unknown) => {
-        await storageMocks.writeGate?.(key);
+    writePersistentJson: async (
+        key: string,
+        value: unknown,
+        signal?: AbortSignal | null,
+    ) => {
+        await storageMocks.writeGate?.(key, signal);
+        throwIfAborted(signal);
         storageMocks.persistent.set(key, cloneJson(value));
     },
 }));
@@ -98,6 +115,7 @@ const {
     getPluginSaveStorageSnapshot,
     setPluginSaveStorageItem,
     updateDatabaseWithPluginStorageSnapshot,
+    withPluginSaveStorageLock,
 } = await import("../pluginSaveStorage");
 const { cloneDatabaseField, cloneDatabaseState } = await import("../../storage/databaseClone");
 const { normalizeJSON, RisuSavePatcher } = await import("../../storage/risuSave");
@@ -130,7 +148,14 @@ const { customProviderStore, pluginV2 } = await import("../plugins.svelte");
 const { get } = await import("svelte/store");
 const { registeredCustomPluginMCPs } = await import("../../process/mcp/pluginmcp");
 const { getTTSPostprocessors, getTTSPreprocessors } = await import("../../process/ttsHooks");
-const { validateV3DatabaseMutationForTransport } = await import("./factory");
+const {
+    PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS,
+    PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS,
+    SandboxHost,
+    createV3BridgeRequestRegistry,
+    deserializeV3BridgeError,
+    validateV3DatabaseMutationForTransport,
+} = await import("./factory");
 const serverUtilsPath = "../../../../server/node/utils.cjs";
 const serverUtils = await import(/* @vite-ignore */ serverUtilsPath) as {
     calculateHash: (value: unknown) => number;
@@ -398,6 +423,66 @@ describe("V3 mode-aware database bridge", () => {
         expect(await getOwners("save")).toEqual({});
     });
 
+    test.each([false, true])(
+        "returns canonical detached pluginCustomStorage key order with optimized mode %s",
+        async (optimized) => {
+            const insertionOrder = [
+                "beta",
+                "10",
+                "2",
+                "01",
+                "alpha",
+                "�",
+                "🔑",
+                "0",
+                "",
+            ];
+            const expected = ["0", "2", "10", "", "01", "alpha", "beta", "🔑", "�"];
+            testState.database.optimizePluginMemory = optimized;
+            testState.database.pluginCustomStorage = {};
+            for (const key of insertionOrder) {
+                if (optimized) storageMocks.persistent.set(storageKey(key), { key });
+                else testState.database.pluginCustomStorage[key] = { key };
+            }
+            const bridge = createBridge();
+
+            const snapshot = await bridge.getDatabase(["pluginCustomStorage"]);
+
+            expect(Object.keys(snapshot.pluginCustomStorage)).toEqual(expected);
+            expect(snapshot.pluginCustomStorage["🔑"]).toEqual({ key: "🔑" });
+            expect(snapshot.pluginCustomStorage["�"]).toEqual({ key: "�" });
+            expect(snapshot.pluginCustomStorage).not.toBe(testState.database.pluginCustomStorage);
+        },
+    );
+
+    test.each([false, true])(
+        "rejects malformed Unicode replacement keys before mutating optimized mode %s",
+        async (optimized) => {
+            testState.database.optimizePluginMemory = optimized;
+            testState.database.pluginCustomStorage = { inlineExisting: { retained: true } };
+            storageMocks.persistent.set(storageKey("externalExisting"), { retained: true });
+            const beforePersistent = new Map(storageMocks.persistent);
+            const beforeInline = cloneJson(testState.database.pluginCustomStorage);
+            const malformed = {} as Record<string, unknown>;
+            Object.defineProperty(malformed, "\uD800", {
+                configurable: true,
+                enumerable: true,
+                value: { invalid: true },
+                writable: true,
+            });
+            const bridge = createBridge();
+
+            await expect(bridge.setDatabaseLite({
+                pluginCustomStorage: malformed,
+                temperature: 99,
+            })).rejects.toThrow("well-formed Unicode");
+
+            expect(testState.database.temperature).toBe(10);
+            expect(testState.database.pluginCustomStorage).toEqual(beforeInline);
+            expect(storageMocks.persistent).toEqual(beforePersistent);
+        },
+    );
+
     test("serializes exact replacement with concurrent pluginStorage writes", async () => {
         const bridge = createBridge();
         let release!: () => void;
@@ -531,6 +616,17 @@ describe("V3 mode-aware database bridge", () => {
         expect(() => validateV3DatabaseMutationForTransport({
             pluginCustomStorage: symbolStorage,
         })).toThrow("does not accept symbol keys");
+
+        const malformedUnicode = {} as Record<string, unknown>;
+        Object.defineProperty(malformedUnicode, "\uD800", {
+            configurable: true,
+            enumerable: true,
+            value: true,
+            writable: true,
+        });
+        expect(() => validateV3DatabaseMutationForTransport({
+            pluginCustomStorage: malformedUnicode,
+        })).toThrow("well-formed Unicode");
     });
 
     test("scrubs every Object.prototype-named value and owner hidden by live Svelte state", async () => {
@@ -773,6 +869,204 @@ describe("V3 mode-aware database bridge", () => {
         expect(await getOwners("save")).toEqual({});
     });
 
+    test("real bridge cancellation stops an exact replacement and releases queued storage", async () => {
+        const plugin = {
+            name: "Cancelled Database Plugin",
+            script: "// cancelled database replacement",
+            arguments: {},
+            realArg: {},
+            customLink: [],
+            argMeta: {},
+            version: "3.0",
+            enabled: true,
+        } as const;
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+        storageMocks.persistent.set(storageKey("existing"), { source: "existing" });
+
+        const iframe = document.createElement("iframe");
+        document.body.appendChild(iframe);
+        const api = makeRisuaiAPIV3(iframe, plugin as any) as any;
+        // Resolve and cache the permission before timing the storage request.
+        await api.setDatabaseLite({});
+
+        let releaseWrite!: () => void;
+        let markWriteStarted!: () => void;
+        const blockedWrite = new Promise<void>(resolve => { releaseWrite = resolve; });
+        const writeStarted = new Promise<void>(resolve => { markWriteStarted = resolve; });
+        storageMocks.writeGate = async (key, signal) => {
+            if (key !== storageKey("replacement")) return;
+            markWriteStarted();
+            await awaitWithAbort(blockedWrite, signal);
+        };
+
+        const host = new SandboxHost(api);
+        const startup = host.run(iframe, "").catch(() => undefined);
+        const source = iframe.contentWindow!;
+        const sent: any[] = [];
+        const hostResponses: any[] = [];
+        let registry!: ReturnType<typeof createV3BridgeRequestRegistry>;
+        vi.spyOn(source, "postMessage").mockImplementation((message: any) => {
+            if (message?.type === "RESPONSE") {
+                hostResponses.push(message);
+                registry.handleResponse(message);
+            }
+        });
+        registry = createV3BridgeRequestRegistry({
+            requestTimeoutMs: PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS,
+            serializeArgs: args => args,
+            collectTransferables: () => [],
+            send: message => {
+                sent.push(message);
+                window.dispatchEvent(new MessageEvent("message", {
+                    source,
+                    origin: "null",
+                    data: message,
+                }));
+            },
+            deserializeError: deserializeV3BridgeError,
+            deserializeResult: value => value,
+        });
+
+        vi.useFakeTimers();
+        try {
+            const replacement = registry.sendRequest("CALL_ROOT", {
+                method: "setDatabaseLite",
+                args: [{
+                    pluginCustomStorage: {
+                        replacement: { source: "replacement" },
+                    },
+                    temperature: 99,
+                }],
+            }).catch(error => error);
+            await writeStarted;
+
+            let unrelatedSettled = false;
+            const unrelated = getPluginSaveStorageItem("existing").then(value => {
+                unrelatedSettled = true;
+                return value;
+            });
+            let transitionSettled = false;
+            const transitionBarrier = withPluginSaveStorageLock(async () => {
+                transitionSettled = true;
+            });
+            await Promise.resolve();
+            expect(unrelatedSettled).toBe(false);
+            expect(transitionSettled).toBe(false);
+
+            await vi.advanceTimersByTimeAsync(PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS);
+            await expect(replacement).resolves.toMatchObject({
+                code: "COMMIT_OUTCOME_UNKNOWN",
+                commitOutcomeUnknown: true,
+                operation: "write",
+            });
+            await expect(unrelated).resolves.toEqual({ source: "existing" });
+            await expect(transitionBarrier).resolves.toBeUndefined();
+
+            expect(storageMocks.persistent.has(storageKey("replacement"))).toBe(false);
+            expect(testState.database.temperature).toBe(10);
+            expect(hostResponses).toEqual([]);
+            expect(registry.pendingCount()).toBe(0);
+
+            const reqId = sent.find(message => message.type === "CALL_ROOT")?.reqId;
+            expect(sent).toContainEqual({ type: "CANCEL_REQUEST", reqId });
+            expect(registry.handleResponse({
+                type: "RESPONSE",
+                reqId,
+                result: "late",
+            })).toBe(false);
+
+            releaseWrite();
+            await vi.advanceTimersByTimeAsync(0);
+            expect(storageMocks.persistent.has(storageKey("replacement"))).toBe(false);
+            expect(hostResponses).toEqual([]);
+
+            storageMocks.writeGate = null;
+            let releaseRead!: () => void;
+            let markReadStarted!: () => void;
+            const blockedRead = new Promise<void>(resolve => { releaseRead = resolve; });
+            const readStarted = new Promise<void>(resolve => { markReadStarted = resolve; });
+            storageMocks.readGate = async (key, signal) => {
+                if (key !== storageKey("existing")) return;
+                markReadStarted();
+                await awaitWithAbort(blockedRead, signal);
+            };
+
+            const snapshot = registry.sendRequest("CALL_ROOT", {
+                method: "getDatabase",
+                args: [["pluginCustomStorage"]],
+            }).catch(error => error);
+            await readStarted;
+            const queuedWrite = setPluginSaveStorageItem("unrelated", { available: true });
+
+            await vi.advanceTimersByTimeAsync(PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS);
+            await expect(snapshot).resolves.toMatchObject({
+                code: "STORAGE_TIMEOUT",
+                commitOutcomeUnknown: false,
+                retryable: true,
+            });
+            await expect(queuedWrite).resolves.toBeUndefined();
+            expect(storageMocks.persistent.get(storageKey("unrelated")))
+                .toEqual({ available: true });
+            expect(hostResponses).toEqual([]);
+
+            const getReqId = sent.find(message => message.type === "CALL_ROOT"
+                && message.method === "getDatabase")?.reqId;
+            expect(registry.handleResponse({
+                type: "RESPONSE",
+                reqId: getReqId,
+                result: { pluginCustomStorage: { late: true } },
+            })).toBe(false);
+            releaseRead();
+            await vi.advanceTimersByTimeAsync(0);
+            expect(hostResponses).toEqual([]);
+        } finally {
+            storageMocks.writeGate = null;
+            storageMocks.readGate = null;
+            host.terminate();
+            await startup;
+            vi.useRealTimers();
+        }
+    });
+
+    test("database cancellation stops a pending permission wait before mutation", async () => {
+        const plugin = {
+            name: "Permission Cancellation Plugin",
+            script: "// permission cancellation",
+            arguments: {},
+            realArg: {},
+            customLink: [],
+            argMeta: {},
+            version: "3.0",
+            enabled: true,
+        } as const;
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+        let releaseDialog!: (allowed: boolean) => void;
+        alertConfirmMock.mockImplementationOnce(() => new Promise<boolean>(resolve => {
+            releaseDialog = resolve;
+        }));
+        const api = makeRisuaiAPIV3(document.createElement("iframe"), plugin as any) as any;
+        const controller = new AbortController();
+
+        const setting = api.setDatabaseLite(
+            { temperature: 77 },
+            controller.signal,
+        );
+        await vi.waitFor(() => expect(alertConfirmMock).toHaveBeenCalledOnce());
+        controller.abort(new DOMException("cancelled permission", "AbortError"));
+
+        await expect(setting).rejects.toMatchObject({ name: "AbortError" });
+        releaseDialog(true);
+        await Promise.resolve();
+        expect(testState.database.temperature).toBe(10);
+
+        alertConfirmMock.mockResolvedValueOnce(false);
+        await api.setDatabaseLite({ temperature: 88 });
+        expect(alertConfirmMock).toHaveBeenCalledTimes(2);
+        expect(testState.database.temperature).toBe(10);
+    });
+
     test("actual full V3 setter preserves plugin-install filtering", async () => {
         const caller = {
             name: "Caller Plugin",
@@ -834,6 +1128,118 @@ describe("V3 mode-aware database bridge", () => {
 });
 
 describe("V3 guest startup handshake", () => {
+    test("watchdog cleans a timed-out production instance without harming its peer or reload", async () => {
+        vi.useFakeTimers();
+        const timedOut = startupPlugin("Timed Out Production Startup", `
+            await risuai.addProvider("timed-residue", async () => ({ success: true, content: "bad" }));
+            await new Promise(() => {});
+        `);
+        const healthy = startupPlugin("Healthy Production Startup", `
+            await risuai.addProvider("healthy-provider", async () => ({ success: true, content: "ok" }));
+        `);
+        testState.database.plugins = [timedOut, healthy];
+        DBState.db = testState.database;
+        let restoreTimedOutRelay: (() => void) | undefined;
+        let restoreHealthyRelay: (() => void) | undefined;
+        let restoreReloadRelay: (() => void) | undefined;
+
+        try {
+            let generationSettled = false;
+            const startedAt = Date.now();
+            const loading = loadV3PluginGeneration([timedOut, healthy]);
+            const loadingOutcome = loading.then(
+                () => null,
+                error => error,
+            ).finally(() => {
+                generationSettled = true;
+            });
+            const [timedOutIframe, healthyIframe] = [
+                ...document.body.querySelectorAll("iframe"),
+            ];
+            restoreTimedOutRelay = executeGeneratedGuest(timedOutIframe);
+            restoreHealthyRelay = executeGeneratedGuest(healthyIframe);
+            const healthyInstance = getV3PluginInstance(healthy.name)!;
+            await healthyInstance.initialization;
+
+            expect(pluginV2.providers.has("timed-residue")).toBe(true);
+            expect(pluginV2.providers.has("healthy-provider")).toBe(true);
+            expect(getV3PluginInstance(timedOut.name)).toBeDefined();
+            expect(getV3PluginInstance(healthy.name)).toBe(healthyInstance);
+            expect(generationSettled).toBe(false);
+            const elapsed = Date.now() - startedAt;
+            expect(elapsed).toBeLessThan(PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS);
+
+            await vi.advanceTimersByTimeAsync(
+                PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS - elapsed - 1,
+            );
+            expect(generationSettled).toBe(false);
+            expect(timedOutIframe.isConnected).toBe(true);
+            expect(pluginV2.providers.has("timed-residue")).toBe(true);
+
+            await vi.advanceTimersByTimeAsync(1);
+            const failure = await loadingOutcome;
+
+            expect(failure).toBeInstanceOf(AggregateError);
+            expect(failure).toMatchObject({
+                message: "One or more V3 plugins failed to initialize.",
+                errors: [expect.objectContaining({
+                    name: "PluginInitializationTimeoutError",
+                    code: "PLUGIN_INITIALIZATION_TIMEOUT",
+                    retryable: false,
+                    commitOutcomeUnknown: false,
+                    operation: "initialization",
+                    message: `Plugin initialization timed out after ${PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS}ms.`,
+                })],
+            });
+            expect(notifyErrorMock).toHaveBeenCalledOnce();
+            expect(notifyErrorMock).toHaveBeenCalledWith(
+                `Plugin "${timedOut.name}" failed to start.`,
+                {
+                    description: `Plugin initialization timed out after ${PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS}ms.`,
+                    source: "plugin-startup",
+                },
+            );
+
+            expect(timedOutIframe.isConnected).toBe(false);
+            expect(getV3PluginInstance(timedOut.name)).toBeUndefined();
+            expect(pluginV2.providers.has("timed-residue")).toBe(false);
+            expect(pluginV2.providerOptions.has("timed-residue")).toBe(false);
+            expect(get(customProviderStore)).not.toContain("timed-residue");
+            expect(customV3ProviderMetaStore.some(
+                model => model.id === "pluginmodel:::timed-residue",
+            )).toBe(false);
+
+            expect(healthyIframe.isConnected).toBe(true);
+            expect(getV3PluginInstance(healthy.name)).toBe(healthyInstance);
+            expect(pluginV2.providers.has("healthy-provider")).toBe(true);
+            expect(pluginV2.providerOptions.has("healthy-provider")).toBe(true);
+            expect(get(customProviderStore)).toContain("healthy-provider");
+            expect(customV3ProviderMetaStore.some(
+                model => model.id === "pluginmodel:::healthy-provider",
+            )).toBe(true);
+
+            const reloaded = startupPlugin(timedOut.name, `
+                await risuai.addProvider("reloaded-provider", async () => ({ success: true, content: "recovered" }));
+            `);
+            const reload = loadV3PluginGeneration([reloaded]);
+            const reloadIframe = [...document.body.querySelectorAll("iframe")]
+                .find(iframe => iframe !== healthyIframe)!;
+            restoreReloadRelay = executeGeneratedGuest(reloadIframe);
+            await reload;
+
+            expect(getV3PluginInstance(timedOut.name)).toBeDefined();
+            expect(pluginV2.providers.has("reloaded-provider")).toBe(true);
+            expect(pluginV2.providers.has("timed-residue")).toBe(false);
+            expect(notifyErrorMock).toHaveBeenCalledOnce();
+        } finally {
+            vi.useRealTimers();
+            await teardownV3Plugins().catch(() => undefined);
+            restoreReloadRelay?.();
+            restoreHealthyRelay?.();
+            restoreTimedOutRelay?.();
+        }
+    });
+
     test("teardown closes registration before awaiting a hanging pre-ready unload callback", async () => {
         const startupReadStarted = deferred();
         const releaseStartupRead = deferred();

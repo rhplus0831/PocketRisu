@@ -2,6 +2,7 @@ import { hasher } from "../parser/parser.svelte";
 import { forageStorage } from "../globalApi.svelte";
 import { stringifyJsonValue } from "./jsonValue";
 import { assertWellFormedUnicode } from "./unicodeWellFormed";
+import { awaitWithAbort, throwIfAborted } from "./abort";
 
 export { hasNativeStringWellFormed } from "./unicodeWellFormed";
 
@@ -10,11 +11,12 @@ const decoder = new TextDecoder();
 
 let initPromise: Promise<void> | null = null;
 
-async function ensureStorageReady() {
+async function ensureStorageReady(signal?: AbortSignal | null) {
+    throwIfAborted(signal);
     if (!initPromise) {
         initPromise = forageStorage.Init();
     }
-    await initPromise;
+    await awaitWithAbort(initPromise, signal);
 }
 
 function encodeKeyComponent(value: string) {
@@ -36,55 +38,87 @@ function decodeKeyComponent(value: string) {
 
 export interface PersistentJsonReadOptions {
     cached?: boolean;
+    signal?: AbortSignal | null;
 }
 
 export async function readPersistentJson<T>(
     storageKey: string,
     options: PersistentJsonReadOptions = {},
 ): Promise<T | null> {
-    await ensureStorageReady();
+    await ensureStorageReady(options.signal);
     const data = options.cached
-        ? await forageStorage.getItemCached(storageKey)
-        : await forageStorage.getItem(storageKey);
+        ? options.signal
+            ? await forageStorage.getItemCached(storageKey, options.signal)
+            : await forageStorage.getItemCached(storageKey)
+        : options.signal
+            ? await forageStorage.getItem(storageKey, options.signal)
+            : await forageStorage.getItem(storageKey);
     if (!data) {
         return null;
     }
     return JSON.parse(decoder.decode(data)) as T;
 }
 
-export async function writePersistentJson<T>(storageKey: string, value: T): Promise<void> {
+export async function writePersistentJson<T>(
+    storageKey: string,
+    value: T,
+    signal?: AbortSignal | null,
+): Promise<void> {
+    throwIfAborted(signal);
     // Snapshot and validate before the first await. Callers may mutate their
     // object after invoking this async method, and storage initialization must
     // not turn that into an unacknowledged change to the bytes being written.
     const json = stringifyJsonValue(value);
-    await ensureStorageReady();
-    await forageStorage.setItem(storageKey, encoder.encode(json));
+    await ensureStorageReady(signal);
+    const bytes = encoder.encode(json);
+    if (signal) await forageStorage.setItem(storageKey, bytes, undefined, signal);
+    else await forageStorage.setItem(storageKey, bytes);
 }
 
-export async function removePersistentKey(storageKey: string): Promise<void> {
-    await ensureStorageReady();
-    await forageStorage.removeItem(storageKey);
+export async function removePersistentKey(
+    storageKey: string,
+    signal?: AbortSignal | null,
+): Promise<void> {
+    await ensureStorageReady(signal);
+    if (signal) await forageStorage.removeItem(storageKey, signal);
+    else await forageStorage.removeItem(storageKey);
 }
 
-export async function listPersistentKeys(prefix = ""): Promise<string[]> {
-    await ensureStorageReady();
-    return await forageStorage.keys(prefix);
+export async function listPersistentKeys(
+    prefix = "",
+    signal?: AbortSignal | null,
+): Promise<string[]> {
+    await ensureStorageReady(signal);
+    return signal
+        ? await forageStorage.keys(prefix, signal)
+        : await forageStorage.keys(prefix);
 }
 
-export async function clearPersistentPrefix(prefix: string): Promise<void> {
-    const keys = await listPersistentKeys(prefix);
+export async function clearPersistentPrefix(
+    prefix: string,
+    signal?: AbortSignal | null,
+): Promise<void> {
+    const keys = signal
+        ? await listPersistentKeys(prefix, signal)
+        : await listPersistentKeys(prefix);
     // Generic/device-local prefixes do not have a server transaction, but they
     // must still avoid launching an unbounded number of mutations at once.
-    for (const key of keys) await removePersistentKey(key);
+    for (const key of keys) {
+        if (signal) await removePersistentKey(key, signal);
+        else await removePersistentKey(key);
+    }
 }
 
 /**
  * Clear the server-owned optimized plugin value and owner namespaces in one
  * transaction. This deliberately accepts no caller-selected prefix.
  */
-export async function clearExternalizedPluginStorage(): Promise<void> {
-    await ensureStorageReady();
-    await forageStorage.clearPluginSaveStorage();
+export async function clearExternalizedPluginStorage(
+    signal?: AbortSignal | null,
+): Promise<void> {
+    await ensureStorageReady(signal);
+    if (signal) await forageStorage.clearPluginSaveStorage(signal);
+    else await forageStorage.clearPluginSaveStorage();
 }
 
 export async function makeHashedStorageKey(prefix: string, rawKey: string): Promise<string> {

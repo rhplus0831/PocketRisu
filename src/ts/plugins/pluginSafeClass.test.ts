@@ -1,7 +1,14 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 const kv = vi.hoisted(() => ({
-    readPersistentJson: vi.fn(async () => null as unknown),
+    clearPersistentPrefix: vi.fn(async (
+        _prefix: string,
+        _signal?: AbortSignal | null,
+    ) => undefined),
+    readPersistentJson: vi.fn(async (
+        _key: string,
+        _options?: { signal?: AbortSignal | null },
+    ) => null as unknown),
     writePersistentJson: vi.fn(async (_key: string, _value: unknown) => undefined),
     removePersistentKey: vi.fn(async () => undefined),
 }));
@@ -17,7 +24,7 @@ vi.mock("../globalApi.svelte", () => ({
 }));
 
 vi.mock("../storage/persistentKv", () => ({
-    clearPersistentPrefix: vi.fn(async () => undefined),
+    clearPersistentPrefix: kv.clearPersistentPrefix,
     decodeStorageKeyComponent: (value: string) => value,
     listPersistentKeys: vi.fn(async () => []),
     makeEncodedStorageKey: (prefix: string, key: string) => `${prefix}${key}.json`,
@@ -40,6 +47,8 @@ beforeEach(() => {
     kv.writePersistentJson.mockResolvedValue(undefined);
     kv.removePersistentKey.mockReset();
     kv.removePersistentKey.mockResolvedValue(undefined);
+    kv.clearPersistentPrefix.mockReset();
+    kv.clearPersistentPrefix.mockResolvedValue(undefined);
     ownership.recordOwner.mockClear();
     ownership.removeOwner.mockClear();
     ownership.clearOwners.mockClear();
@@ -111,5 +120,103 @@ describe("SafeLocalPluginStorage write acknowledgement", () => {
 
         await expect(storage.getItem(key)).resolves.toEqual({ state: "previous" });
         expect(kv.readPersistentJson).not.toHaveBeenCalled();
+    });
+
+    test("returns detached snapshots on cache misses and hits", async () => {
+        const storage = new SafeLocalPluginStorage();
+        const key = `read-detached-${keySequence}`;
+        const persistentValue = { nested: { state: "durable" } };
+        kv.readPersistentJson.mockResolvedValueOnce(persistentValue);
+
+        const first = await storage.getItem<typeof persistentValue>(key);
+        expect(first).toEqual({ nested: { state: "durable" } });
+        expect(first).not.toBe(persistentValue);
+        persistentValue.nested.state = "mutated-source";
+        first!.nested.state = "mutated-result";
+
+        const second = await storage.getItem<typeof persistentValue>(key);
+        expect(second).toEqual({ nested: { state: "durable" } });
+        expect(second).not.toBe(first);
+        expect(kv.readPersistentJson).toHaveBeenCalledOnce();
+    });
+
+    test("a caller cannot mutate a value already published in the cache", async () => {
+        const storage = new SafeLocalPluginStorage();
+        const key = `cache-egress-${keySequence}`;
+        await storage.setItem(key, { nested: { state: "durable" } });
+
+        const first = await storage.getItem<{ nested: { state: string } }>(key);
+        first!.nested.state = "caller-only";
+
+        await expect(storage.getItem(key)).resolves.toEqual({
+            nested: { state: "durable" },
+        });
+    });
+
+    test("an unknown write outcome evicts the affected cached value", async () => {
+        const storage = new SafeLocalPluginStorage();
+        const key = `unknown-write-${keySequence}`;
+        await storage.setItem(key, { state: "cached-before" });
+        kv.writePersistentJson.mockRejectedValueOnce(Object.assign(
+            new Error("write acknowledgement lost"),
+            { commitOutcomeUnknown: true, code: "COMMIT_OUTCOME_UNKNOWN" },
+        ));
+        kv.readPersistentJson.mockResolvedValueOnce({ state: "authoritative-after" });
+
+        await expect(storage.setItem(key, { state: "attempted" }))
+            .rejects.toThrow("write acknowledgement lost");
+        await expect(storage.getItem(key)).resolves.toEqual({ state: "authoritative-after" });
+        expect(kv.readPersistentJson).toHaveBeenCalledOnce();
+    });
+
+    test("an unknown remove outcome evicts the affected cached value", async () => {
+        const storage = new SafeLocalPluginStorage();
+        const key = `unknown-remove-${keySequence}`;
+        await storage.setItem(key, { state: "cached-before" });
+        kv.removePersistentKey.mockRejectedValueOnce(Object.assign(
+            new Error("remove acknowledgement lost"),
+            { commitOutcomeUnknown: true, code: "COMMIT_OUTCOME_UNKNOWN" },
+        ));
+        kv.readPersistentJson.mockResolvedValueOnce({ state: "authoritative-after" });
+
+        await expect(storage.removeItem(key)).rejects.toThrow("remove acknowledgement lost");
+        await expect(storage.getItem(key)).resolves.toEqual({ state: "authoritative-after" });
+        expect(kv.readPersistentJson).toHaveBeenCalledOnce();
+    });
+
+    test("a partially attempted clear evicts every cached value", async () => {
+        const storage = new SafeLocalPluginStorage();
+        const firstKey = `partial-clear-a-${keySequence}`;
+        const secondKey = `partial-clear-b-${keySequence}`;
+        await storage.setItem(firstKey, { cached: "a" });
+        await storage.setItem(secondKey, { cached: "b" });
+        kv.clearPersistentPrefix.mockRejectedValueOnce(new Error("second delete failed"));
+        kv.readPersistentJson.mockImplementation(async (storageKey) => ({
+            authoritative: storageKey.includes(firstKey) ? "a" : "b",
+        }));
+
+        await expect(storage.clear()).rejects.toThrow("second delete failed");
+        await expect(storage.getItem(firstKey)).resolves.toEqual({ authoritative: "a" });
+        await expect(storage.getItem(secondKey)).resolves.toEqual({ authoritative: "b" });
+        expect(kv.readPersistentJson).toHaveBeenCalledTimes(2);
+    });
+
+    test("forwards one request signal through every owner sidecar mutation", async () => {
+        const storage = new SafeLocalPluginStorage("Owner");
+        const key = `owner-signal-${keySequence}`;
+        const controller = new AbortController();
+
+        await storage.setItem(key, { durable: true }, controller.signal);
+        await storage.removeItem(key, controller.signal);
+        await storage.clear(controller.signal);
+
+        expect(ownership.recordOwner).toHaveBeenCalledWith(
+            "idb",
+            key,
+            "Owner",
+            controller.signal,
+        );
+        expect(ownership.removeOwner).toHaveBeenCalledWith("idb", key, controller.signal);
+        expect(ownership.clearOwners).toHaveBeenCalledWith("idb", controller.signal);
     });
 });

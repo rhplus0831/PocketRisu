@@ -34,7 +34,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [AC3](api-compatibility.md#ac3) | High on affected runtimes | Fixed | Unguarded ES2024 key validation disables optimized storage on older WebViews; key coercion differs between modes |
 | [AC4](api-compatibility.md#ac4) | Low–Medium | Fixed | Value and enumeration parity gaps: unrepresentable JSON is acknowledged, and key order is unstable |
 | [SA1](startup-availability.md#sa1) | High | Fixed | V3 startup is reported complete before async initialization settles; a slow or rejected optimized read silently prevents registration |
-| [SA2](startup-availability.md#sa2) | High | Open | One process-wide unbounded storage queue: a single stalled operation wedges every plugin and the mode transition |
+| [SA2](startup-availability.md#sa2) | High | Fixed | One process-wide unbounded storage queue: a single stalled operation wedges every plugin and the mode transition |
 | [SA3](startup-availability.md#sa3) | Medium | Open | A reconciliation failure on boot prevents the whole application from loading |
 | [SA4](startup-availability.md#sa4) | High impact, window-dependent | Fixed | Import and retry failures abort startup or expose uncommitted state to optimized reads |
 | [AA1](atomicity-acknowledgement.md#aa1) | Medium | Open | Value and owner metadata are separate commits; a rejection can follow a durable primary mutation |
@@ -44,10 +44,10 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [BR2](backup-recovery.md#br2) | Medium | Open | Cross-mode snapshot ownership is ambiguous: unmarked just-disabled snapshots and no storage generation |
 | [BR3](backup-recovery.md#br3) | Medium | Open | Corrupt-database boot fallback ignores a marked snapshot's exact plugin-row set |
 | [BR4](backup-recovery.md#br4) | Medium | Fixed | Valid long keys produce Node backups the same server refuses to import |
-| [PM1](performance-memory.md#pm1) | Medium | Open | Large plugin values bypass chunking and incur multiple full-size copies while holding the global lock |
+| [PM1](performance-memory.md#pm1) | Medium | Open | Large plugin values bypass chunking and incur multiple full-size client/server copies |
 | [PM2](performance-memory.md#pm2) | Medium | Open | Mode transitions are not memory-bounded in either direction; the UI guards on entry count only |
 | [PM3](performance-memory.md#pm3) | Medium | Open | Viewer, partial backup, and snapshot restore eagerly rematerialize the whole external store |
-| [PM4](performance-memory.md#pm4) | Medium | Open | Write amplification: two HTTP mutations per logical write, repeated cache hashing and pruning, and ~2N-request enumeration |
+| [PM4](performance-memory.md#pm4) | Medium | Open | Write amplification: value and owner use separate HTTP mutations, while cache seeding repeats full-value hashing/copies and prunes per write |
 | [IP1](integration-patterns.md#ip1) | High | Open | Treating a failed read as a missing key turns transient I/O errors into destructive whole-value overwrites |
 | [IP2](integration-patterns.md#ip2) | High | Open | Remove-then-rewrite maintenance flows durably delete rows mid-sequence and report success |
 | [IP3](integration-patterns.md#ip3) | Medium | Open | Swallowed mutation failures desynchronize plugin caches and success counters from durable server state |
@@ -107,32 +107,24 @@ point. They matter for triaging reports from older builds, not as open work.
 
 ## Consolidated validation gaps
 
-The passing suites at the audit point cover happy-path key transport,
-single-threaded migration ordering, key validation, server ingest, and
-steady-state backup folding. They do not exercise:
+The current passing suites cover happy-path key transport, mode-aware V3
+database/storage mixing, startup readiness and timeout behavior, transition
+ordering, key validation and canonical enumeration, server ingest, import
+barriers, atomic clear outcomes, and steady-state backup folding. They still
+do not exercise:
 
-- a real V3 iframe plugin mixing `getDatabase()` with `pluginStorage`;
-- delayed or rejected guest initialization before provider/hook registration;
 - the production save loop as the reconciliation durability callback
   (pre-initialization no-op, in-flight save join, 409/500/network failure);
-- operations queued during the disable-path count request, or concurrent
-  operations during any mode toggle;
-- delayed V2 unload callbacks racing eligibility;
-- a never-resolving fetch or IndexedDB transaction under the global queue;
-- a WebView without `String.prototype.isWellFormed()`;
-- plugin reads and writes during a held or rolled-back import;
-- value-success/owner-failure acknowledgement, and partial prefix clear;
+- value-success/owner-failure acknowledgement;
 - unload terminated at intermediate positions of a multi-row commit;
 - plugin-only automatic snapshot cadence;
 - marked-snapshot restore through the corrupt-database boot fallback;
-- key-length boundaries for backup export/import symmetry;
 - a very large individual value or aggregate store (including transition
   memory, with the resource cache on and off);
 - read failure followed by a fallback-derived overwrite;
-- key order parity between modes; and
 - corrupt-row boot recovery.
 
-## Recommended fix order
+## Original recommended fix order
 
 1. **Stop destructive disable transitions** (MT1, MT2): add an exact-snapshot
    durability outcome and make the mode change one locked transaction.
@@ -155,8 +147,8 @@ steady-state backup folding. They do not exercise:
    missing/failed read outcomes, per-key revisions/CAS, atomic batch, and a
    non-destructive invalidate/rewrite operation.
 
-Until MT1–MT2, AC1, SA1–SA2, SA4, and AC3 are fixed and covered by
-browser-level tests, the beta should not be described as compatible with all
-V3 plugins. Operationally: create and verify a backup before changing the
-setting, quiesce plugin work before disabling it, and avoid toggling the mode
-repeatedly as a troubleshooting step.
+The former compatibility blockers MT1–MT2, AC1, SA1–SA2, SA4, and AC3 are
+fixed and covered. The beta still should not be treated as risk-free for every
+V3 workload: SA3, AA1/AA3, BR1–BR3, PM1–PM4, and IP1–IP5 remain open. Verify a
+backup before transitions, and avoid very large values or stores until the
+capacity work lands.

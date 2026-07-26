@@ -6,6 +6,7 @@ export const RESOURCE_CACHE_MAX_DB_HASHES_PER_MANIFEST = 8192
 export const RESOURCE_CACHE_MAX_ENTRIES = 32_768
 export const RESOURCE_CACHE_MAX_STORED_BYTES = 64 * 1024 * 1024
 export const RESOURCE_CACHE_MAX_VALUE_BYTES = 32 * 1024 * 1024
+export const RESOURCE_CACHE_IO_TIMEOUT_MS = 2_000
 
 const RESOURCE_CACHE_DATABASE_VERSION = 1
 const RESOURCE_CACHE_ENTRY_STORE = 'entries'
@@ -82,6 +83,55 @@ const DEFAULT_LIMITS: ResourceCacheLimits = {
 let resourceCacheDatabasePromise: Promise<IDBDatabase | null> | null = null
 let resourceCacheWriteChain: Promise<void> = Promise.resolve()
 let resourceCacheEpoch = 0
+
+/** Bound disposable cache work so it can only delay an authoritative read briefly. */
+export async function settleBestEffortResourceCache<T>(
+    operation: Promise<T>,
+    fallback: T,
+    timeoutMs = RESOURCE_CACHE_IO_TIMEOUT_MS,
+): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+        return await Promise.race([
+            operation,
+            new Promise<T>((resolve) => {
+                timer = setTimeout(() => resolve(fallback), timeoutMs)
+            }),
+        ])
+    } catch {
+        return fallback
+    } finally {
+        if (timer) clearTimeout(timer)
+    }
+}
+
+/**
+ * Continue after a stalled predecessor and bound the new disposable operation.
+ * The returned promise always settles, so it is safe to retain as the next
+ * resource-cache chain head.
+ */
+export function chainBestEffortResourceCacheOperation(
+    predecessor: Promise<unknown>,
+    operation: () => Promise<unknown>,
+    timeoutMs = RESOURCE_CACHE_IO_TIMEOUT_MS,
+): Promise<void> {
+    return settleBestEffortResourceCache(predecessor, undefined, timeoutMs)
+        .then(() => settleBestEffortResourceCache(
+            Promise.resolve().then(operation),
+            undefined,
+            timeoutMs,
+        ))
+        .then(() => undefined)
+}
+
+function enqueueResourceCacheWrite(operation: () => Promise<unknown>): Promise<void> {
+    const next = chainBestEffortResourceCacheOperation(
+        resourceCacheWriteChain,
+        operation,
+    )
+    resourceCacheWriteChain = next
+    return next
+}
 
 export function isSha256Hex(value: unknown): value is string {
     return typeof value === 'string' && RESOURCE_CACHE_HASH_PATTERN.test(value)
@@ -438,10 +488,14 @@ export async function getVerifiedCachedBytes(hash: string): Promise<Uint8Array |
  * Hash and persist authoritative wire bytes. Cache failures are swallowed;
  * hashing failures can only occur if Web Crypto disappears after enablement.
  */
-export async function storeBytes(resourceKey: string, bytes: Uint8Array): Promise<string> {
+export async function storeBytes(
+    resourceKey: string,
+    bytes: Uint8Array,
+): Promise<string | null> {
     const copied = new Uint8Array(bytes.byteLength)
     copied.set(bytes)
-    const hash = await sha256Bytes(copied)
+    const hash = await settleBestEffortResourceCache(sha256Bytes(copied), null)
+    if (!hash) return null
     if (
         !isResourceCacheEnabled()
         || !nonEmptyString(resourceKey)
@@ -451,9 +505,7 @@ export async function storeBytes(resourceKey: string, bytes: Uint8Array): Promis
     }
 
     const epoch = resourceCacheEpoch
-    const operation = resourceCacheWriteChain
-        .catch(() => undefined)
-        .then(async () => {
+    const operation = enqueueResourceCacheWrite(async () => {
             if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
             const database = await openResourceCacheDatabase()
             if (!database) return
@@ -461,8 +513,6 @@ export async function storeBytes(resourceKey: string, bytes: Uint8Array): Promis
             if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
             await pruneResourceCache(database)
         })
-        .catch(() => undefined)
-    resourceCacheWriteChain = operation
     await operation
     return hash
 }
@@ -476,9 +526,7 @@ export function persistResourceCacheManifests(
     if (prepared.length === 0) return Promise.resolve()
 
     const epoch = resourceCacheEpoch
-    const operation = resourceCacheWriteChain
-        .catch(() => undefined)
-        .then(async () => {
+    const operation = enqueueResourceCacheWrite(async () => {
             if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
             const database = await openResourceCacheDatabase()
             if (!database) return
@@ -486,8 +534,6 @@ export function persistResourceCacheManifests(
             if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
             await pruneResourceCache(database)
         })
-        .catch(() => undefined)
-    resourceCacheWriteChain = operation
     return operation
 }
 
@@ -495,16 +541,12 @@ export function persistResourceCacheManifests(
 export function touchResourceCacheManifest(resourceKey: string): Promise<void> {
     if (!isResourceCacheEnabled() || !nonEmptyString(resourceKey)) return Promise.resolve()
     const epoch = resourceCacheEpoch
-    const operation = resourceCacheWriteChain
-        .catch(() => undefined)
-        .then(async () => {
+    const operation = enqueueResourceCacheWrite(async () => {
             if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
             const database = await openResourceCacheDatabase()
             if (!database) return
             await touchStoredManifest(database, resourceKey)
         })
-        .catch(() => undefined)
-    resourceCacheWriteChain = operation
     return operation
 }
 

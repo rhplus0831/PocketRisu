@@ -24,10 +24,112 @@ import {
     isSha256Hex,
     persistResourceCacheManifests,
     sha256Bytes,
+    settleBestEffortResourceCache,
     storeBytes,
     touchResourceCacheManifest,
 } from "./resourceCache"
 import { getThrownMessage, StorageError } from "./storageError"
+import { awaitWithAbort, forwardAbortSignal, throwIfAborted } from "./abort"
+
+export const AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS = 15_000
+type BoundedStorageOperation = 'read' | 'list' | 'write' | 'remove' | 'transition'
+
+interface AuthoritativeStorageOutcomeTracker {
+    markRequestDispatched: () => void
+    markDefinitiveResponse: () => void
+    isRequestInFlight: () => boolean
+}
+
+function abortErrorName(error: unknown): boolean {
+    return error instanceof DOMException
+        ? error.name === "AbortError"
+        : error instanceof Error && error.name === "AbortError"
+}
+
+/** Total availability bound for authentication, fetch, and response-body I/O. */
+export async function runBoundedAuthoritativeStorageOperation<T>(
+    operation: (
+        signal: AbortSignal,
+        outcome: AuthoritativeStorageOutcomeTracker,
+    ) => Promise<T>,
+    kind: BoundedStorageOperation,
+    timeoutMs = AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+    externalSignal?: AbortSignal | null,
+): Promise<T> {
+    const controller = new AbortController()
+    let timedOut = false
+    let mutationRequestInFlight = false
+    const stopForwardingAbort = forwardAbortSignal(externalSignal, controller)
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+            timedOut = true
+            controller.abort()
+            const message = `Authoritative storage ${kind} timed out after ${timeoutMs}ms.`
+            const ambiguousMutation = mutationRequestInFlight
+                && (kind === "write" || kind === "remove")
+            reject(new StorageError(message, {
+                code: ambiguousMutation
+                    ? "COMMIT_OUTCOME_UNKNOWN"
+                    : "STORAGE_TIMEOUT",
+                retryable: !ambiguousMutation,
+                commitOutcomeUnknown: ambiguousMutation,
+                operation: kind,
+            }))
+        }, timeoutMs)
+    })
+
+    try {
+        return await Promise.race([
+            operation(controller.signal, {
+                markRequestDispatched: () => { mutationRequestInFlight = true },
+                markDefinitiveResponse: () => { mutationRequestInFlight = false },
+                isRequestInFlight: () => mutationRequestInFlight,
+            }),
+            timeout,
+        ])
+    } catch (error) {
+        const mutation = kind === "write" || kind === "remove"
+        if (mutation && mutationRequestInFlight) {
+            if (error instanceof StorageError && error.commitOutcomeUnknown) throw error
+            throw new StorageError(
+                getThrownMessage(
+                    error,
+                    `The authoritative storage ${kind} may have committed, but its outcome could not be confirmed.`,
+                ),
+                {
+                    code: "COMMIT_OUTCOME_UNKNOWN",
+                    retryable: false,
+                    commitOutcomeUnknown: true,
+                    operation: kind,
+                    cause: error,
+                },
+            )
+        }
+        if (mutation && !mutationRequestInFlight) {
+            if (error instanceof StorageError) throw error
+            const timeoutOrAbort = timedOut || abortErrorName(error)
+            throw new StorageError(
+                getThrownMessage(
+                    error,
+                    `The authoritative storage ${kind} stopped with no mutation request in flight.`,
+                ),
+                {
+                    code: timeoutOrAbort ? "STORAGE_TIMEOUT" : "STORAGE_TRANSPORT_ERROR",
+                    retryable: true,
+                    commitOutcomeUnknown: false,
+                    operation: kind,
+                    cause: error,
+                },
+            )
+        }
+        throw error
+    } finally {
+        if (timer) clearTimeout(timer)
+        stopForwardingAbort()
+    }
+}
 
 export type BootDatabaseReadResult =
     | { kind: 'bytes', bytes: Buffer | null }
@@ -223,86 +325,153 @@ export class NodeStorage{
     authChecked = false
     private cachedJwt: { token: string; expiresAt: number } | null = null
     private static sessionInitialized = false
-    private static sessionPending: Promise<void> | null = null
-    private refreshPending: Promise<string> | null = null
+    private static sessionPending: {
+        controller: AbortController
+        promise: Promise<void>
+    } | null = null
+    private refreshPending: {
+        controller: AbortController
+        promise: Promise<string>
+    } | null = null
 
-    async createAuth(){
+    async createAuth(signal?: AbortSignal | null){
+        throwIfAborted(signal)
         const now = Date.now()
         if (this.cachedJwt && this.cachedJwt.expiresAt - now > 30_000) {
             return this.cachedJwt.token
         }
-        const token = await this._refreshToken()
+        const token = await this._refreshToken(signal)
         return token
     }
 
     // Called once after JWT auth is confirmed. Issues a session cookie so that
     // <img src="/api/asset/..."> can be served without JS-injected headers.
-    private async initSession() {
+    private async initSession(signal?: AbortSignal | null) {
+        throwIfAborted(signal)
         if (NodeStorage.sessionInitialized) return
-        if (NodeStorage.sessionPending) return NodeStorage.sessionPending
-        NodeStorage.sessionPending = this._doInitSession()
-        return NodeStorage.sessionPending
+        let pending = NodeStorage.sessionPending
+        if (pending?.controller.signal.aborted) {
+            NodeStorage.sessionPending = null
+            pending = null
+        }
+        if (!pending) {
+            const controller = new AbortController()
+            const created = {
+                controller,
+                promise: Promise.resolve() as Promise<void>,
+            }
+            created.promise = this._doInitSession(controller.signal).finally(() => {
+                if (NodeStorage.sessionPending === created) NodeStorage.sessionPending = null
+            })
+            NodeStorage.sessionPending = created
+            pending = created
+        }
+        const active = pending
+        const stopForwardingAbort = forwardAbortSignal(signal, active.controller)
+        const evictOnAbort = () => {
+            if (NodeStorage.sessionPending === active) NodeStorage.sessionPending = null
+        }
+        signal?.addEventListener("abort", evictOnAbort, { once: true })
+        try {
+            return await awaitWithAbort(active.promise, signal)
+        } finally {
+            stopForwardingAbort()
+            signal?.removeEventListener("abort", evictOnAbort)
+        }
     }
 
-    private async _doInitSession() {
+    private async _doInitSession(signal: AbortSignal) {
         try {
+            throwIfAborted(signal)
             const res = await fetch('/api/session', {
                 method: 'POST',
                 headers: {
-                    'risu-auth': await this.createAuth(),
+                    'risu-auth': await this.createAuth(signal),
                     'x-session-id': NodeStorage.sessionId,
                 },
+                signal,
             })
+            await awaitWithAbort(res.arrayBuffer(), signal)
             if (res.ok) {
                 NodeStorage.sessionInitialized = true
             }
             // Non-ok (400/401/500): will retry on next checkAuth() call.
-        } catch {
+        } catch (error) {
+            if (signal.aborted) throw error
             // Network error: will retry on next checkAuth() call.
-        } finally {
-            NodeStorage.sessionPending = null
         }
     }
 
-    private async _refreshToken(): Promise<string> {
-        if (this.refreshPending) return this.refreshPending
-        this.refreshPending = this._doRefreshToken()
-        try { return await this.refreshPending }
-        finally { this.refreshPending = null }
+    private async _refreshToken(signal?: AbortSignal | null): Promise<string> {
+        throwIfAborted(signal)
+        let pending = this.refreshPending
+        if (pending?.controller.signal.aborted) {
+            this.refreshPending = null
+            pending = null
+        }
+        if (!pending) {
+            const controller = new AbortController()
+            const created = {
+                controller,
+                promise: Promise.resolve("") as Promise<string>,
+            }
+            created.promise = this._doRefreshToken(controller.signal).finally(() => {
+                if (this.refreshPending === created) this.refreshPending = null
+            })
+            this.refreshPending = created
+            pending = created
+        }
+        const active = pending
+        const stopForwardingAbort = forwardAbortSignal(signal, active.controller)
+        const evictOnAbort = () => {
+            if (this.refreshPending === active) this.refreshPending = null
+        }
+        signal?.addEventListener("abort", evictOnAbort, { once: true })
+        try {
+            return await awaitWithAbort(active.promise, signal)
+        } finally {
+            stopForwardingAbort()
+            signal?.removeEventListener("abort", evictOnAbort)
+        }
     }
 
-    private async _doRefreshToken(): Promise<string> {
+    private async _doRefreshToken(signal: AbortSignal): Promise<string> {
+        throwIfAborted(signal)
         const res = await fetch('/api/token/refresh', {
             method: 'POST',
-            headers: { 'risu-auth': this.cachedJwt?.token ?? '' }
+            headers: { 'risu-auth': this.cachedJwt?.token ?? '' },
+            signal,
         })
         if (res.ok) {
-            const data = await res.json()
+            const data = await awaitWithAbort(res.json(), signal)
             this.cachedJwt = { token: data.token, expiresAt: Date.now() + 5 * 60 * 1000 }
             return data.token
         }
+        await awaitWithAbort(res.arrayBuffer(), signal)
         return this.cachedJwt?.token ?? ''
     }
 
-    private async loginWithPassword(password: string) {
+    private async loginWithPassword(password: string, signal: AbortSignal) {
+        throwIfAborted(signal)
         const response = await fetch('/api/login', {
             method: "POST",
             body: JSON.stringify({ password }),
             headers: {
                 'content-type': 'application/json'
-            }
+            },
+            signal,
         })
 
         if(response.status === 429){
             notifyError(`Too many attempts. Please wait and try again later.`)
-            await waitAlert()
+            await awaitWithAbort(waitAlert(), signal)
             throw new Error('Too many login attempts')
         }
 
         if(response.status < 200 || response.status >= 300){
             let message = 'Node login failed'
             try {
-                const data = await response.json()
+                const data = await awaitWithAbort(response.json(), signal)
                 message = data.error ?? message
             } catch {
                 // noop
@@ -310,20 +479,20 @@ export class NodeStorage{
             throw new Error(message)
         }
 
-        const data = await response.json()
+        const data = await awaitWithAbort(response.json(), signal)
         if (data.token) {
             this.cachedJwt = { token: data.token, expiresAt: Date.now() + 5 * 60 * 1000 }
         }
         this.authChecked = true
     }
 
-    private async shouldRetryAuth(response: Response) {
+    private async shouldRetryAuth(response: Response, signal: AbortSignal) {
         if(response.status !== 400 && response.status !== 401){
             return false
         }
 
         try {
-            const data = await response.clone().json()
+            const data = await awaitWithAbort(response.clone().json(), signal)
             return [
                 'No auth header',
                 'Invalid Signature',
@@ -334,40 +503,88 @@ export class NodeStorage{
         }
     }
 
-    private async authFetch(input: RequestInfo | URL, init: RequestInit = {}, retry = true) {
-        await this.checkAuth()
-        const headers = new Headers(init.headers)
-        headers.set('risu-auth', await this.createAuth())
-        headers.set('x-session-id', NodeStorage.sessionId)
+    private async authFetch(
+        input: RequestInfo | URL,
+        init: RequestInit = {},
+        retry = true,
+        mutationOutcome?: AuthoritativeStorageOutcomeTracker,
+    ) {
+        const execute = async (
+            signal: AbortSignal,
+            outcome: AuthoritativeStorageOutcomeTracker,
+        ): Promise<Response> => {
+            await this.checkAuth(signal)
+            const headers = new Headers(init.headers)
+            headers.set('risu-auth', await this.createAuth(signal))
+            headers.set('x-session-id', NodeStorage.sessionId)
 
-        const response = await fetch(input, {
-            ...init,
-            headers
-        })
+            throwIfAborted(signal)
+            outcome.markRequestDispatched()
+            mutationOutcome?.markRequestDispatched()
+            let response: Response
+            try {
+                response = await fetch(input, {
+                    ...init,
+                    headers,
+                    signal,
+                })
+            } catch (error) {
+                // No definitive HTTP response exists, so mutation ambiguity
+                // intentionally remains active for the outer operation.
+                throw error
+            }
+            outcome.markDefinitiveResponse()
+            mutationOutcome?.markDefinitiveResponse()
 
-        if (response.status === 423) {
-            window.dispatchEvent(new CustomEvent('risu-session-deactivated'))
+            if (response.status === 423) {
+                window.dispatchEvent(new CustomEvent('risu-session-deactivated'))
+            }
+
+            if(retry && await this.shouldRetryAuth(response, signal)){
+                this.authChecked = false
+                this.cachedJwt = null
+                await this.checkAuth(signal)
+                return this.authFetch(
+                    input,
+                    { ...init, signal },
+                    false,
+                    mutationOutcome,
+                )
+            }
+
+            return response
         }
 
-        if(retry && await this.shouldRetryAuth(response)){
-            this.authChecked = false
-            this.cachedJwt = null
-            await this.checkAuth()
-            return this.authFetch(input, init, false)
+        // Storage calls already own a total-operation controller. Reuse that
+        // exact signal for fetch so aborting while a response body is being
+        // consumed also aborts the underlying network request. Other callers
+        // still receive authFetch's ordinary bounded controller.
+        if (init.signal) {
+            return execute(init.signal, {
+                markRequestDispatched: () => undefined,
+                markDefinitiveResponse: () => undefined,
+                isRequestInFlight: () => false,
+            })
         }
-
-        return response
+        return runBoundedAuthoritativeStorageOperation(
+            execute,
+            "read",
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+        )
     }
 
     private async parseStorageFailureResponse(
         response: Response,
         operation: StorageOperation,
         mutation: boolean,
+        signal?: AbortSignal | null,
     ): Promise<StorageError> {
         let payload: StorageFailurePayload | null = null
         let responseText = ''
+        const jsonResponse = response.clone()
+        const textResponse = response.clone()
         try {
-            const parsed = await response.clone().json() as unknown
+            const parsed = await awaitWithAbort(jsonResponse.json(), signal) as unknown
             if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
                 payload = parsed as StorageFailurePayload
             } else if (typeof parsed === 'string') {
@@ -375,7 +592,7 @@ export class NodeStorage{
             }
         } catch {
             try {
-                responseText = await response.clone().text()
+                responseText = await awaitWithAbort(textResponse.text(), signal)
             } catch {
                 // A status and operation still provide a useful structured error.
             }
@@ -424,14 +641,22 @@ export class NodeStorage{
         )
     }
 
-    private async waitForPluginStorageRetry(error: StorageError, retryIndex: number): Promise<void> {
+    private async waitForPluginStorageRetry(
+        error: StorageError,
+        retryIndex: number,
+        signal?: AbortSignal | null,
+    ): Promise<void> {
         const delaySeconds = Math.min(
             error.retryAfter
                 ?? PLUGIN_STORAGE_DEFAULT_RETRY_SECONDS * (2 ** retryIndex),
             PLUGIN_STORAGE_MAX_RETRY_DELAY_SECONDS,
         )
+        throwIfAborted(signal)
         if (delaySeconds <= 0) return
-        await new Promise<void>(resolve => setTimeout(resolve, delaySeconds * 1000))
+        await awaitWithAbort(
+            new Promise<void>(resolve => setTimeout(resolve, delaySeconds * 1000)),
+            signal,
+        )
     }
 
     /**
@@ -445,31 +670,46 @@ export class NodeStorage{
         mutation: boolean,
         request: () => Promise<Response>,
         allowedStatuses: readonly number[] = [],
+        signal?: AbortSignal | null,
+        outcome?: AuthoritativeStorageOutcomeTracker,
     ): Promise<Response> {
         const retryPluginOperation = isPluginStorageTarget(target)
         for (let retryIndex = 0; ; retryIndex++) {
+            throwIfAborted(signal)
             let response: Response
             try {
                 response = await request()
             } catch (error) {
-                const storageError = this.makeStorageTransportError(error, operation, mutation)
+                if (signal?.aborted) throw error
+                const mutationOutcomeUnknown = mutation
+                    && (outcome?.isRequestInFlight() ?? true)
+                const storageError = this.makeStorageTransportError(
+                    error,
+                    operation,
+                    mutationOutcomeUnknown,
+                )
                 if (retryPluginOperation
                     && storageError.retryable
                     && !storageError.commitOutcomeUnknown
                     && retryIndex < PLUGIN_STORAGE_MAX_RETRIES) {
-                    await this.waitForPluginStorageRetry(storageError, retryIndex)
+                    await this.waitForPluginStorageRetry(storageError, retryIndex, signal)
                     continue
                 }
                 throw storageError
             }
 
             if (response.ok || allowedStatuses.includes(response.status)) return response
-            const storageError = await this.parseStorageFailureResponse(response, operation, mutation)
+            const storageError = await this.parseStorageFailureResponse(
+                response,
+                operation,
+                mutation,
+                signal,
+            )
             if (retryPluginOperation
                 && storageError.retryable
                 && !storageError.commitOutcomeUnknown
                 && retryIndex < PLUGIN_STORAGE_MAX_RETRIES) {
-                await this.waitForPluginStorageRetry(storageError, retryIndex)
+                await this.waitForPluginStorageRetry(storageError, retryIndex, signal)
                 continue
             }
             throw storageError
@@ -499,6 +739,7 @@ export class NodeStorage{
         response: Response,
         key: string,
         requestedEtag: string | undefined,
+        signal?: AbortSignal | null,
     ): Promise<{ message: string; currentEtag: string } | null> {
         if (response.status !== 409
             || key !== 'database/database.bin'
@@ -507,7 +748,7 @@ export class NodeStorage{
             return null
         }
         try {
-            const payload = await response.clone().json() as unknown
+            const payload = await awaitWithAbort(response.json(), signal) as unknown
             if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null
             const record = payload as Record<string, unknown>
             if (typeof record.error !== 'string' || record.error.length === 0) return null
@@ -521,11 +762,37 @@ export class NodeStorage{
         }
     }
 
-    async setItem(key:string, value:Uint8Array, etag?:string) {
+    async setItem(
+        key:string,
+        value:Uint8Array,
+        etag?:string,
+        externalSignal?: AbortSignal | null,
+    ) {
+        return runBoundedAuthoritativeStorageOperation(
+            (signal, outcome) => this.setItemAuthoritative(
+                key,
+                value,
+                etag,
+                signal,
+                outcome,
+            ),
+            "write",
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+    }
+
+    private async setItemAuthoritative(
+        key: string,
+        value: Uint8Array,
+        etag: string | undefined,
+        signal: AbortSignal,
+        outcome: AuthoritativeStorageOutcomeTracker,
+    ) {
         const shouldSeedResourceCache = isResourceCacheEnabled() && key.startsWith('pluginsave/')
         const requestBytes = shouldSeedResourceCache ? new Uint8Array(value) : value
         const requestHash = shouldSeedResourceCache
-            ? sha256Bytes(requestBytes).catch(() => null)
+            ? settleBestEffortResourceCache(sha256Bytes(requestBytes), null)
             : null
         const headers: Record<string, string> = {
             'content-type': 'application/octet-stream',
@@ -537,16 +804,17 @@ export class NodeStorage{
         const da = await this.requestStorage(key, 'write', true, () => this.authFetch('/api/write', {
             method: "POST",
             body: requestBytes as any,
-            headers
-        }), [409])
+            headers,
+            signal,
+        }, true, outcome), [409], signal, outcome)
         if(da.status === 409){
-            const conflict = await this.parseDatabaseConflict(da, key, etag)
+            const conflict = await this.parseDatabaseConflict(da.clone(), key, etag, signal)
             if (conflict) {
                 throw new ConflictError(conflict.message, conflict.currentEtag)
             }
-            throw await this.parseStorageFailureResponse(da, 'write', true)
+            throw await this.parseStorageFailureResponse(da, 'write', true, signal)
         }
-        const data = await da.json()
+        const data = await awaitWithAbort(da.json(), signal)
         if(data.error){
             throw this.storagePayloadError(data, 'write', true, da.status)
         }
@@ -555,24 +823,36 @@ export class NodeStorage{
             this._lastDbEtag = nextEtag
         }
         if (requestHash && isSha256Hex(data.hash)) {
-            const encodedHash = await requestHash
-            if (encodedHash === data.hash) {
-                try {
-                    await storeBytes(`kv:${key}`, requestBytes)
-                } catch {
-                    // The authoritative write succeeded; cache seeding is best-effort.
-                }
-            }
+            // Cache hashing/persistence is disposable and must not extend the
+            // authoritative key lock after the server has acknowledged commit.
+            void requestHash.then((encodedHash) => {
+                if (encodedHash !== data.hash) return
+                return settleBestEffortResourceCache(
+                    storeBytes(`kv:${key}`, requestBytes),
+                    null,
+                )
+            }).catch(() => {
+                // The authoritative write succeeded; cache seeding is best-effort.
+            })
         }
     }
-    async getItem(key:string):Promise<Buffer> {
+    async getItem(key:string, externalSignal?: AbortSignal | null):Promise<Buffer> {
+        return runBoundedAuthoritativeStorageOperation(
+            signal => this.getItemAuthoritative(key, signal),
+            "read",
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+    }
+
+    private async getItemAuthoritative(key: string, signal: AbortSignal): Promise<Buffer> {
         const headers: Record<string, string> = {
             'file-path': Buffer.from(key, 'utf-8').toString('hex')
         }
 
         const da = await this.requestStorage(key, 'read', false, () => (
-            this.authFetch('/api/read', { method: "GET", headers })
-        ))
+            this.authFetch('/api/read', { method: "GET", headers, signal })
+        ), [], signal)
 
         // Capture ETag for database.bin
         const etag = da.headers.get('x-db-etag')
@@ -580,7 +860,7 @@ export class NodeStorage{
             this._lastDbEtag = etag
         }
 
-        const data = Buffer.from(await da.arrayBuffer())
+        const data = Buffer.from(await awaitWithAbort(da.arrayBuffer(), signal))
         if (data.length === 0){
             return null
         }
@@ -588,15 +868,33 @@ export class NodeStorage{
         return data
     }
 
-    async getItemCached(key: string): Promise<Buffer | null> {
+    async getItemCached(
+        key: string,
+        externalSignal?: AbortSignal | null,
+    ): Promise<Buffer | null> {
+        return runBoundedAuthoritativeStorageOperation(
+            signal => this.getItemCachedAuthoritative(key, signal),
+            "read",
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+    }
+
+    private async getItemCachedAuthoritative(
+        key: string,
+        signal: AbortSignal,
+    ): Promise<Buffer | null> {
         if (!isResourceCacheEnabled() || key === 'database/database.bin') {
-            return await this.getItem(key)
+            return await this.getItemAuthoritative(key, signal)
         }
 
         const resourceKey = `kv:${key}`
         let manifestHashes: string[] = []
         try {
-            manifestHashes = (await getVerifiedManifestSnapshot(resourceKey))?.hashes ?? []
+            manifestHashes = (await settleBestEffortResourceCache(
+                getVerifiedManifestSnapshot(resourceKey),
+                null,
+            ))?.hashes ?? []
         } catch {
             // Cache failures degrade to the ordinary read below.
         }
@@ -610,26 +908,29 @@ export class NodeStorage{
         }
 
         let response = await this.requestStorage(key, 'read', false, () => (
-            this.authFetch('/api/read', { method: 'GET', headers })
-        ))
+            this.authFetch('/api/read', { method: 'GET', headers, signal })
+        ), [], signal)
         if (response.status === 204) {
             try {
                 const contentHash = response.headers.get('x-content-hash')
                 if (!isSha256Hex(contentHash) || !manifestHashes.includes(contentHash)) {
                     throw new Error('Invalid cached KV response')
                 }
-                const cachedBytes = await getVerifiedCachedBytes(contentHash)
+                const cachedBytes = await settleBestEffortResourceCache(
+                    getVerifiedCachedBytes(contentHash),
+                    null,
+                )
                 if (!cachedBytes) throw new Error('Cached KV bytes are unavailable')
                 void touchResourceCacheManifest(resourceKey)
                 return cachedBytes.byteLength === 0 ? null : Buffer.from(cachedBytes)
             } catch {
                 response = await this.requestStorage(key, 'read', false, () => (
-                    this.authFetch('/api/read', { method: 'GET', headers: plainHeaders })
-                ))
+                    this.authFetch('/api/read', { method: 'GET', headers: plainHeaders, signal })
+                ), [], signal)
             }
         }
 
-        const bytes = Buffer.from(await response.arrayBuffer())
+        const bytes = Buffer.from(await awaitWithAbort(response.arrayBuffer(), signal))
         if (bytes.length === 0) return null
         void storeBytes(resourceKey, bytes).catch(() => {
             // IndexedDB, quota, and Web Crypto anomalies are non-authoritative.
@@ -689,21 +990,31 @@ export class NodeStorage{
             return { kind: 'bytes', bytes: await this.getItem('database/database.bin') }
         }
     }
-    async keys(prefix: string = ''):Promise<string[]>{
+    async keys(prefix: string = '', externalSignal?: AbortSignal | null):Promise<string[]>{
+        return runBoundedAuthoritativeStorageOperation(
+            signal => this.keysAuthoritative(prefix, signal),
+            "list",
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+    }
+
+    private async keysAuthoritative(prefix: string, signal: AbortSignal): Promise<string[]> {
         const headers: Record<string, string> = {}
         if (prefix) {
             headers['key-prefix'] = prefix
         }
-        const cached = await listCacheGet(prefix)
+        const cached = await settleBestEffortResourceCache(listCacheGet(prefix), null)
         if (cached) {
             headers['x-last-sync'] = String(cached.timestamp)
             headers['x-list-epoch'] = cached.epoch
         }
         const da = await this.requestStorage(prefix, 'list', false, () => this.authFetch('/api/list', {
             method: "GET",
-            headers
-        }))
-        const data = await da.json()
+            headers,
+            signal,
+        }), [], signal)
+        const data = await awaitWithAbort(da.json(), signal)
         if(data.error){
             throw this.storagePayloadError(data, 'list', false, da.status)
         }
@@ -734,31 +1045,75 @@ export class NodeStorage{
         }
         return content
     }
-    async removeItem(key:string){
+    async removeItem(key:string, externalSignal?: AbortSignal | null){
+        return runBoundedAuthoritativeStorageOperation(
+            (signal, outcome) => this.removeItemAuthoritative(
+                key,
+                signal,
+                outcome,
+            ),
+            "remove",
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+    }
+
+    private async removeItemAuthoritative(
+        key: string,
+        signal: AbortSignal,
+        outcome: AuthoritativeStorageOutcomeTracker,
+    ) {
         const da = await this.requestStorage(key, 'remove', true, () => this.authFetch('/api/remove', {
             method: "GET",
             headers: {
                 'file-path': Buffer.from(key, 'utf-8').toString('hex')
-            }
-        }))
-        const data = await da.json()
+            },
+            signal,
+        }, true, outcome), [], signal, outcome)
+        const data = await awaitWithAbort(da.json(), signal)
         if(data.error){
             throw this.storagePayloadError(data, 'remove', true, da.status)
         }
     }
 
     /** Atomically clear the complete optimized save value + owner namespace. */
-    async clearPluginSaveStorage(): Promise<'committed'> {
+    async clearPluginSaveStorage(
+        externalSignal?: AbortSignal | null,
+    ): Promise<'committed'> {
+        return runBoundedAuthoritativeStorageOperation(
+            (signal, outcome) => this.clearPluginSaveStorageAuthoritative(signal, outcome),
+            'remove',
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+    }
+
+    private async clearPluginSaveStorageAuthoritative(
+        signal: AbortSignal,
+        outcome: AuthoritativeStorageOutcomeTracker,
+    ): Promise<'committed'> {
         const response = await this.requestStorage(
             PLUGIN_STORAGE_PREFIXES[0],
             'remove',
             true,
-            () => this.authFetch('/api/plugin-storage/clear', { method: 'POST' }),
+            () => this.authFetch(
+                '/api/plugin-storage/clear',
+                { method: 'POST', signal },
+                true,
+                outcome,
+            ),
+            [],
+            signal,
+            outcome,
         )
 
+        // A 2xx response alone is not the clear transaction's commit
+        // acknowledgement. Keep the outcome ambiguous until the exact body
+        // envelope below has been consumed and validated.
+        outcome.markRequestDispatched()
         let payload: StorageFailurePayload & { success?: unknown } = {}
         try {
-            const parsed = await response.clone().json() as unknown
+            const parsed = await awaitWithAbort(response.clone().json(), signal) as unknown
             if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
                 payload = parsed as StorageFailurePayload & { success?: unknown }
             }
@@ -779,6 +1134,7 @@ export class NodeStorage{
                 operation: 'remove',
             })
         }
+        outcome.markDefinitiveResponse()
 
         // A committed whole-namespace clear invalidates both cached key lists
         // and any hash-addressed plugin manifests. Cache cleanup is
@@ -789,17 +1145,25 @@ export class NodeStorage{
         return 'committed'
     }
 
-    private async checkAuth(){
+    private async checkAuth(signal: AbortSignal){
+        throwIfAborted(signal)
 
         if(!this.authChecked){
-            const data = await (await fetch('/api/test_auth',{
+            const authResponse = await fetch('/api/test_auth',{
                 headers: {
                     'risu-auth': this.cachedJwt?.token ?? ''
-                }
-            })).json()
+                },
+                signal,
+            })
+            const data = await awaitWithAbort(authResponse.json(), signal)
 
             if(data.status === 'unset'){
-                const input = await digestPassword(await alertInput(language.setNodePassword))
+                const password = await awaitWithAbort(
+                    alertInput(language.setNodePassword),
+                    signal,
+                )
+                const input = await digestPassword(password, signal)
+                throwIfAborted(signal)
                 const response = await fetch('/api/set_password',{
                     method: "POST",
                     body:JSON.stringify({
@@ -807,21 +1171,28 @@ export class NodeStorage{
                     }),
                     headers: {
                         'content-type': 'application/json'
-                    }
+                    },
+                    signal,
                 })
 
                 if(response.status < 200 || response.status >= 300){
+                    await awaitWithAbort(response.arrayBuffer(), signal)
                     throw new Error('Failed to set node password')
                 }
+                await awaitWithAbort(response.arrayBuffer(), signal)
 
-                await this.loginWithPassword(input)
-                await this.initSession()
+                await this.loginWithPassword(input, signal)
+                await this.initSession(signal)
                 return
             }
             else if(data.status === 'incorrect'){
-                const input = await digestPassword(await alertInput(language.inputNodePassword))
-                await this.loginWithPassword(input)
-                await this.initSession()
+                const password = await awaitWithAbort(
+                    alertInput(language.inputNodePassword),
+                    signal,
+                )
+                const input = await digestPassword(password, signal)
+                await this.loginWithPassword(input, signal)
+                await this.initSession(signal)
                 return
             }
             else{
@@ -831,7 +1202,7 @@ export class NodeStorage{
                 this.authChecked = true
             }
         }
-        await this.initSession()
+        await this.initSession(signal)
     }
 
     listItem = this.keys
@@ -1354,7 +1725,8 @@ export class NodeStorage{
 
 }
 
-async function digestPassword(message:string) {
+async function digestPassword(message:string, signal: AbortSignal) {
+    throwIfAborted(signal)
     const res = await fetch('/api/crypto', {
         body: JSON.stringify({
             data: message
@@ -1362,10 +1734,11 @@ async function digestPassword(message:string) {
         headers: {
             'content-type': 'application/json'
         },
-        method: "POST"
+        method: "POST",
+        signal,
     })
     if(res.status < 200 || res.status >= 300){
         throw new Error(`Password hashing failed (${res.status})`)
     }
-    return await res.text()
+    return await awaitWithAbort(res.text(), signal)
 }

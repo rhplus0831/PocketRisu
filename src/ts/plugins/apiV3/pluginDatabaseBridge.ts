@@ -1,15 +1,18 @@
+import { throwIfAborted } from "../../storage/abort";
+
 export interface PluginDatabaseBridgeDependencies {
     allowedDbKeys: readonly string[];
     getLiveDatabase: () => Record<string, unknown>;
     snapshotField: (key: string, value: unknown) => unknown;
-    getPluginStorageSnapshot: () => Promise<Record<string, unknown>>;
+    getPluginStorageSnapshot: (signal?: AbortSignal | null) => Promise<Record<string, unknown>>;
     updateWithPluginStorageSnapshot: <T>(
         pluginCustomStorage: Record<string, unknown> | undefined,
-        mutateDatabase: () => T | Promise<T>,
+        mutateDatabase: (signal?: AbortSignal) => T | Promise<T>,
+        signal?: AbortSignal | null,
     ) => Promise<T>;
-    normalizePluginMutation?: () => void | Promise<void>;
-    applyLite: (database: Record<string, unknown>) => void | Promise<void>;
-    applyFull: (database: Record<string, unknown>) => void | Promise<void>;
+    normalizePluginMutation?: (signal?: AbortSignal) => void | Promise<void>;
+    applyLite: (database: Record<string, unknown>, signal?: AbortSignal) => void | Promise<void>;
+    applyFull: (database: Record<string, unknown>, signal?: AbortSignal) => void | Promise<void>;
 }
 
 function defineOwn(target: Record<string, unknown>, key: string, value: unknown): void {
@@ -80,42 +83,62 @@ function prepareMutation(
  * accessors, non-enumerable properties, and unsupported keys are rejected.
  */
 export function createPluginDatabaseBridge(dependencies: PluginDatabaseBridgeDependencies) {
-    const getDatabase = async (includeOnly: string[] | "all" = "all") => {
+    const getDatabase = async (
+        includeOnly: string[] | "all" = "all",
+        signal?: AbortSignal | null,
+    ) => {
+        throwIfAborted(signal);
         const live = dependencies.getLiveDatabase();
         const result = {} as Record<string, unknown>;
         for (const key of dependencies.allowedDbKeys) {
+            throwIfAborted(signal);
             if (includeOnly !== "all" && !includeOnly.includes(key)) continue;
             const value = key === "pluginCustomStorage"
-                ? await dependencies.getPluginStorageSnapshot()
+                ? await dependencies.getPluginStorageSnapshot(signal)
                 : dependencies.snapshotField(key, live[key]);
+            throwIfAborted(signal);
             defineOwn(result, key, value);
         }
         return result;
     };
 
-    const setDatabaseLite = async (input: unknown): Promise<void> => {
+    const setDatabaseLite = async (
+        input: unknown,
+        signal?: AbortSignal | null,
+    ): Promise<void> => {
+        throwIfAborted(signal);
         const prepared = prepareMutation(input, dependencies);
         await dependencies.updateWithPluginStorageSnapshot(
             prepared.pluginCustomStorage,
-            async () => {
-                await dependencies.applyLite(prepared.database);
+            async (operationSignal) => {
+                throwIfAborted(operationSignal);
+                await dependencies.applyLite(prepared.database, operationSignal);
+                throwIfAborted(operationSignal);
                 if (Object.hasOwn(prepared.database, "plugins")) {
-                    await dependencies.normalizePluginMutation?.();
+                    await dependencies.normalizePluginMutation?.(operationSignal);
                 }
             },
+            signal,
         );
     };
 
-    const setDatabase = async (input: unknown): Promise<void> => {
+    const setDatabase = async (
+        input: unknown,
+        signal?: AbortSignal | null,
+    ): Promise<void> => {
+        throwIfAborted(signal);
         const prepared = prepareMutation(input, dependencies);
         await dependencies.updateWithPluginStorageSnapshot(
             prepared.pluginCustomStorage,
-            async () => {
-                await dependencies.applyFull(prepared.database);
+            async (operationSignal) => {
+                throwIfAborted(operationSignal);
+                await dependencies.applyFull(prepared.database, operationSignal);
+                throwIfAborted(operationSignal);
                 if (Object.hasOwn(prepared.database, "plugins")) {
-                    await dependencies.normalizePluginMutation?.();
+                    await dependencies.normalizePluginMutation?.(operationSignal);
                 }
             },
+            signal,
         );
     };
 

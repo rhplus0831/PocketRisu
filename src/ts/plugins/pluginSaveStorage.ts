@@ -12,6 +12,8 @@ import {
 import { snapshotJsonValue } from "../storage/jsonValue";
 import { assertWellFormedUnicode } from "../storage/unicodeWellFormed";
 import { requireCommittedDatabaseSave } from "../storage/databaseSave";
+import { StorageError } from "../storage/storageError";
+import { abortReason, awaitWithAbort, throwIfAborted } from "../storage/abort";
 import {
     makeArchiveSafePluginSaveStorageKey,
     PLUGIN_SAVE_META_PREFIX,
@@ -32,10 +34,183 @@ import {
     hasPluginStorageRecordValue,
     orderPluginStorageKeys,
 } from "./pluginStorageRecord";
+import {
+    getPluginStorageKeySetGeneration,
+    markPluginStorageKeySetChanged,
+} from "./pluginStorageEnumeration";
 
 export { PLUGIN_SAVE_META_PREFIX, PLUGIN_SAVE_PREFIX };
 
-let storageOperationQueue: Promise<unknown> = Promise.resolve();
+export const PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS = 30_000;
+
+type BarrierWaiter = {
+    kind: "shared" | "exclusive";
+    resolve: (release: () => void) => void;
+    reject: (error: unknown) => void;
+    cleanup?: () => void;
+    timer?: ReturnType<typeof setTimeout>;
+};
+
+/** Fair writer-preferring barrier used to preserve MT2 routing order. */
+class PluginStorageBarrier {
+    private activeShared = 0;
+    private exclusiveActive = false;
+    private readonly waiters: BarrierWaiter[] = [];
+
+    acquireShared(signal?: AbortSignal | null): Promise<() => void> {
+        throwIfAborted(signal);
+        if (!this.exclusiveActive && this.waiters.length === 0) {
+            this.activeShared += 1;
+            return Promise.resolve(this.sharedRelease());
+        }
+        return new Promise((resolve, reject) => {
+            const waiter: BarrierWaiter = { kind: "shared", resolve, reject };
+            if (signal) {
+                const onAbort = () => this.cancelWaiter(waiter, abortReason(signal));
+                signal.addEventListener("abort", onAbort, { once: true });
+                waiter.cleanup = () => signal.removeEventListener("abort", onAbort);
+            }
+            this.waiters.push(waiter);
+            this.drain();
+        });
+    }
+
+    acquireExclusive(
+        timeoutMs = PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS,
+        signal?: AbortSignal | null,
+    ): Promise<() => void> {
+        throwIfAborted(signal);
+        if (!this.exclusiveActive && this.activeShared === 0 && this.waiters.length === 0) {
+            this.exclusiveActive = true;
+            return Promise.resolve(this.exclusiveRelease());
+        }
+        return new Promise((resolve, reject) => {
+            const waiter: BarrierWaiter = { kind: "exclusive", resolve, reject };
+            waiter.timer = setTimeout(() => {
+                this.cancelWaiter(waiter, new StorageError(
+                    "Plugin storage transition timed out waiting for earlier storage work.",
+                    {
+                        code: "STORAGE_TIMEOUT",
+                        operation: "transition",
+                        retryable: true,
+                    },
+                ));
+            }, timeoutMs);
+            if (signal) {
+                const onAbort = () => this.cancelWaiter(waiter, abortReason(signal));
+                signal.addEventListener("abort", onAbort, { once: true });
+                waiter.cleanup = () => signal.removeEventListener("abort", onAbort);
+            }
+            this.waiters.push(waiter);
+            this.drain();
+        });
+    }
+
+    private cancelWaiter(waiter: BarrierWaiter, error: unknown): void {
+        const index = this.waiters.indexOf(waiter);
+        if (index < 0) return;
+        this.waiters.splice(index, 1);
+        if (waiter.timer) clearTimeout(waiter.timer);
+        waiter.cleanup?.();
+        waiter.reject(error);
+        this.drain();
+    }
+
+    private sharedRelease(): () => void {
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            this.activeShared -= 1;
+            this.drain();
+        };
+    }
+
+    private exclusiveRelease(): () => void {
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            this.exclusiveActive = false;
+            this.drain();
+        };
+    }
+
+    private drain(): void {
+        if (this.exclusiveActive || this.activeShared > 0 || this.waiters.length === 0) return;
+        if (this.waiters[0].kind === "exclusive") {
+            const waiter = this.waiters.shift()!;
+            if (waiter.timer) clearTimeout(waiter.timer);
+            waiter.cleanup?.();
+            this.exclusiveActive = true;
+            waiter.resolve(this.exclusiveRelease());
+            return;
+        }
+        while (this.waiters[0]?.kind === "shared") {
+            const waiter = this.waiters.shift()!;
+            waiter.cleanup?.();
+            this.activeShared += 1;
+            waiter.resolve(this.sharedRelease());
+        }
+    }
+}
+
+const storageBarrier = new PluginStorageBarrier();
+const storageScopeQueues = new Map<string, Promise<void>>();
+let storageEnumerationSnapshot: {
+    database: Database;
+    optimized: boolean;
+    generation: number;
+    keys: string[];
+} | null = null;
+
+function invalidateStorageEnumerationSnapshot(): void {
+    storageEnumerationSnapshot = null;
+    markPluginStorageKeySetChanged();
+}
+
+async function withPluginSaveStorageScope<T>(
+    scope: string,
+    operation: () => Promise<T>,
+    signal?: AbortSignal | null,
+): Promise<T> {
+    // Acquire shared admission immediately. This makes every ordinary call
+    // submitted before a transition part of the old-mode drain, while calls
+    // submitted after it wait for the new mode.
+    const releaseBarrier = await storageBarrier.acquireShared(signal);
+    const previous = storageScopeQueues.get(scope) ?? Promise.resolve();
+    let resolveResult!: (value: T | PromiseLike<T>) => void;
+    let rejectResult!: (error: unknown) => void;
+    const result = new Promise<T>((resolve, reject) => {
+        resolveResult = resolve;
+        rejectResult = reject;
+    });
+    // Cancellation may already be observable before awaitWithAbort attaches;
+    // the returned raced promise still carries the error to the caller.
+    void result.catch(() => undefined);
+
+    // The queue token is intentionally separate from the caller-facing
+    // promise. A queued caller can reject immediately on abort, but its token
+    // must remain behind the predecessor until that predecessor settles. This
+    // prevents a later same-key operation from overtaking active work.
+    const current = previous
+        .catch(() => undefined)
+        .then(async () => {
+            try {
+                throwIfAborted(signal);
+                resolveResult(await operation());
+            } catch (error) {
+                rejectResult(error);
+            }
+        });
+    storageScopeQueues.set(scope, current);
+    void current.then(() => {
+        if (storageScopeQueues.get(scope) === current) storageScopeQueues.delete(scope);
+        releaseBarrier();
+    });
+
+    return await awaitWithAbort(result, signal);
+}
 
 function normalizePluginStorageKey(key: unknown): string {
     // The inline object backend historically applies ordinary property-key
@@ -47,13 +222,34 @@ function normalizePluginStorageKey(key: unknown): string {
 
 /**
  * Serialize mode transitions with V3/viewer storage operations. V2 calls are
- * synchronous and cannot join this queue, which is why the UI forbids this
+ * synchronous and cannot join this barrier, which is why the UI forbids this
  * mode while an enabled V2/V2.1 plugin exists.
  */
-export function withPluginSaveStorageLock<T>(operation: () => Promise<T>): Promise<T> {
-    const run = storageOperationQueue.then(operation, operation);
-    storageOperationQueue = run.then(() => undefined, () => undefined);
-    return run;
+export function withPluginSaveStorageLock<T>(
+    operation: () => Promise<T>,
+    signal?: AbortSignal | null,
+): Promise<T> {
+    return (async () => {
+        const release = await storageBarrier.acquireExclusive(
+            PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS,
+            signal,
+        );
+        try {
+            throwIfAborted(signal);
+            return await operation();
+        } finally {
+            release();
+        }
+    })();
+}
+
+/** Serialize one logical save key without blocking unrelated plugin keys. */
+export function withPluginSaveStorageKeyLock<T>(
+    key: string,
+    operation: () => Promise<T>,
+    signal?: AbortSignal | null,
+): Promise<T> {
+    return withPluginSaveStorageScope(`save:${key}`, operation, signal);
 }
 
 function decodeListedStorageKey(fullKey: string, prefix: string): string | null {
@@ -90,6 +286,7 @@ function cloneJsonPluginStorageRecord(
         if (typeof key !== "string") {
             throw new TypeError(`${fieldName} does not accept symbol keys.`);
         }
+        assertWellFormedUnicode(key);
         const descriptor = Reflect.getOwnPropertyDescriptor(source, key);
         if (!descriptor || !("value" in descriptor)) {
             throw new TypeError(`${fieldName} does not accept an accessor for ${key}.`);
@@ -110,20 +307,27 @@ function cloneJsonPluginStorageRecord(
     }
 
     const snapshot = createDatabasePluginStorageRecord<unknown>();
-    for (const key of keys) {
+    for (const key of orderPluginStorageKeys(keys)) {
         const descriptor = Reflect.getOwnPropertyDescriptor(source, key)!;
         definePluginStorageRecordValue(snapshot, key, snapshotJsonValue(descriptor.value));
     }
     return snapshot;
 }
 
-async function readExternalizedPluginStorageUnlocked(): Promise<{
+async function readExternalizedPluginStorageUnlocked(
+    signal?: AbortSignal | null,
+): Promise<{
     values: Record<string, unknown>;
     meta: NonNullable<Database["pluginStorageMeta"]>;
 }> {
+    throwIfAborted(signal);
     const [listedValueKeys, listedMetaKeys] = await Promise.all([
-        listPersistentKeys(PLUGIN_SAVE_PREFIX),
-        listPersistentKeys(PLUGIN_SAVE_META_PREFIX),
+        signal
+            ? listPersistentKeys(PLUGIN_SAVE_PREFIX, signal)
+            : listPersistentKeys(PLUGIN_SAVE_PREFIX),
+        signal
+            ? listPersistentKeys(PLUGIN_SAVE_META_PREFIX, signal)
+            : listPersistentKeys(PLUGIN_SAVE_META_PREFIX),
     ]);
     const values = createPluginStorageRecord<unknown>();
     const meta = createPluginStorageRecord<
@@ -131,25 +335,36 @@ async function readExternalizedPluginStorageUnlocked(): Promise<{
     >();
 
     for (const storageKey of listedValueKeys) {
+        throwIfAborted(signal);
         const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
         if (key === null) continue;
+        const options = signal ? { cached: true, signal } : { cached: true };
         definePluginStorageRecordValue(
             values,
             key,
-            await readPersistentJson(storageKey, { cached: true }),
+            await readPersistentJson(storageKey, options),
         );
     }
     for (const storageKey of listedMetaKeys) {
+        throwIfAborted(signal);
         const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
         if (key === null) continue;
-        definePluginStorageRecordValue(meta, key, await readPersistentJson(storageKey));
+        const value = signal
+            ? await readPersistentJson(storageKey, { signal })
+            : await readPersistentJson(storageKey);
+        definePluginStorageRecordValue(meta, key, value);
     }
 
     return { values, meta };
 }
 
-async function listDecodedStorageKeys(prefix: string): Promise<string[]> {
-    const storageKeys = await listPersistentKeys(prefix);
+async function listDecodedStorageKeys(
+    prefix: string,
+    signal?: AbortSignal | null,
+): Promise<string[]> {
+    const storageKeys = signal
+        ? await listPersistentKeys(prefix, signal)
+        : await listPersistentKeys(prefix);
     const keys: string[] = [];
     for (const storageKey of storageKeys) {
         const decoded = decodeListedStorageKey(storageKey, prefix);
@@ -166,148 +381,182 @@ export async function readExternalizedPluginStorage(): Promise<{
 }
 
 /** Detached authoritative snapshot used by the V3 database bridge. */
-export async function getPluginSaveStorageSnapshot(): Promise<Record<string, unknown>> {
+export async function getPluginSaveStorageSnapshot(
+    signal?: AbortSignal | null,
+): Promise<Record<string, unknown>> {
     return withPluginSaveStorageLock(async () => {
+        throwIfAborted(signal);
         const db = getDatabase();
         const source = db.optimizePluginMemory
-            ? (await readExternalizedPluginStorageUnlocked()).values
+            ? (await readExternalizedPluginStorageUnlocked(signal)).values
             : db.pluginCustomStorage;
+        throwIfAborted(signal);
         return cloneJsonPluginStorageRecord(
             source ?? createDatabasePluginStorageRecord(),
         );
-    });
+    }, signal);
 }
 
 /**
- * Apply a V3 database mutation while holding the same queue as pluginStorage.
+ * Apply a V3 database mutation while holding the exclusive pluginStorage barrier.
  * A provided plugin map is an exact replacement; `undefined` leaves the
  * authoritative key set unchanged. Optimized mode never retains inline rows.
  */
 export async function updateDatabaseWithPluginStorageSnapshot<T>(
     pluginCustomStorage: Record<string, unknown> | undefined,
-    mutateDatabase: () => T | Promise<T>,
+    mutateDatabase: (signal?: AbortSignal) => T | Promise<T>,
+    signal?: AbortSignal | null,
 ): Promise<T> {
+    throwIfAborted(signal);
     // Snapshot and validate before waiting so caller-owned objects cannot
     // change underneath the queued operation.
     const replacement = pluginCustomStorage === undefined
         ? undefined
         : cloneJsonPluginStorageRecord(pluginCustomStorage);
 
-    return withPluginSaveStorageLock(async () => {
-        const db = getDatabase();
-        // Validate live records descriptor-by-descriptor before this database
-        // operation can clear, replace, or preserve any part of them.
-        const previousValues = cloneJsonPluginStorageRecord(
-            db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
-        );
-        const previousMeta = cloneJsonPluginStorageRecord(
-            db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
-                NonNullable<Database["pluginStorageMeta"]>[string]
-            >(),
-            "pluginStorageMeta",
-        );
-        if (db.optimizePluginMemory) {
-            if (replacement !== undefined) {
-                // Archive constraints apply only once the locked, live
-                // backend is known to be external. Prepare every destination
-                // before any persistent or database mutation.
-                const prepared = getPluginStorageRecordKeys(replacement).map((key) => ({
-                    key,
-                    storageKey: makeArchiveSafePluginSaveStorageKey(
-                        PLUGIN_SAVE_PREFIX,
+    try {
+        return await withPluginSaveStorageLock(async () => {
+            throwIfAborted(signal);
+            const db = getDatabase();
+            // Validate live records descriptor-by-descriptor before this
+            // database operation can clear, replace, or preserve any part.
+            const previousValues = cloneJsonPluginStorageRecord(
+                db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
+            );
+            const previousMeta = cloneJsonPluginStorageRecord(
+                db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
+                    NonNullable<Database["pluginStorageMeta"]>[string]
+                >(),
+                "pluginStorageMeta",
+            );
+            if (db.optimizePluginMemory) {
+                if (replacement !== undefined) {
+                    // Archive constraints apply only once the locked, live
+                    // backend is known to be external. Prepare every
+                    // destination before any persistent or database mutation.
+                    const prepared = getPluginStorageRecordKeys(replacement).map((key) => ({
                         key,
-                    ),
-                    value: replacement[key],
-                }));
-                if (new Set(prepared.map(entry => entry.storageKey)).size !== prepared.length) {
-                    throw new Error(
-                        "Plugin storage key collision while replacing V3 database storage.",
-                    );
+                        storageKey: makeArchiveSafePluginSaveStorageKey(
+                            PLUGIN_SAVE_PREFIX,
+                            key,
+                        ),
+                        value: replacement[key],
+                    }));
+                    if (new Set(prepared.map(entry => entry.storageKey)).size !== prepared.length) {
+                        throw new Error(
+                            "Plugin storage key collision while replacing V3 database storage.",
+                        );
+                    }
+                    const [existingKeys, existingMetaKeys] = await Promise.all([
+                        signal
+                            ? listPersistentKeys(PLUGIN_SAVE_PREFIX, signal)
+                            : listPersistentKeys(PLUGIN_SAVE_PREFIX),
+                        signal
+                            ? listPersistentKeys(PLUGIN_SAVE_META_PREFIX, signal)
+                            : listPersistentKeys(PLUGIN_SAVE_META_PREFIX),
+                    ]);
+                    throwIfAborted(signal);
+                    const destinationKeys = new Set(prepared.map(entry => entry.storageKey));
+                    const existingKeySet = new Set(existingKeys);
+                    const retainedMetaKeys = new Set<string>();
+                    // Only actual metadata rows can be retained. In
+                    // particular, do not fabricate a stricter metadata
+                    // destination for a value-only key at the value prefix's
+                    // archive-size boundary.
+                    for (const existingMetaKey of existingMetaKeys) {
+                        const rawKey = decodeListedStorageKey(
+                            existingMetaKey,
+                            PLUGIN_SAVE_META_PREFIX,
+                        );
+                        if (
+                            rawKey === null
+                            || !hasPluginStorageRecordValue(replacement, rawKey)
+                        ) continue;
+                        const existingValueKey = makeArchiveSafePluginSaveStorageKey(
+                            PLUGIN_SAVE_PREFIX,
+                            rawKey,
+                        );
+                        if (!existingKeySet.has(existingValueKey)) continue;
+                        const canonicalMetaKey = makeArchiveSafePluginSaveStorageKey(
+                            PLUGIN_SAVE_META_PREFIX,
+                            rawKey,
+                        );
+                        if (existingMetaKey === canonicalMetaKey) {
+                            retainedMetaKeys.add(existingMetaKey);
+                        }
+                    }
+                    // Upsert the complete replacement before deleting omitted rows.
+                    for (const entry of prepared) {
+                        throwIfAborted(signal);
+                        if (signal) {
+                            await writePersistentJson(entry.storageKey, entry.value, signal);
+                        } else {
+                            await writePersistentJson(entry.storageKey, entry.value);
+                        }
+                    }
+                    for (const storageKey of existingKeys) {
+                        if (!destinationKeys.has(storageKey)) {
+                            throwIfAborted(signal);
+                            if (signal) await removePersistentKey(storageKey, signal);
+                            else await removePersistentKey(storageKey);
+                        }
+                    }
+                    // A direct database replacement has no plugin-owner context.
+                    // Preserve metadata for retained keys, discard it for deleted
+                    // keys, and leave new keys unowned.
+                    for (const storageKey of existingMetaKeys) {
+                        if (!retainedMetaKeys.has(storageKey)) {
+                            throwIfAborted(signal);
+                            if (signal) await removePersistentKey(storageKey, signal);
+                            else await removePersistentKey(storageKey);
+                        }
+                    }
                 }
-                const [existingKeys, existingMetaKeys] = await Promise.all([
-                    listPersistentKeys(PLUGIN_SAVE_PREFIX),
-                    listPersistentKeys(PLUGIN_SAVE_META_PREFIX),
-                ]);
-                const destinationKeys = new Set(prepared.map(entry => entry.storageKey));
-                const existingKeySet = new Set(existingKeys);
-                const retainedMetaKeys = new Set<string>();
-                // Only actual metadata rows can be retained. In particular,
-                // do not fabricate a stricter metadata destination for an
-                // existing value-only key at the value prefix's 756-byte raw
-                // boundary.
-                for (const existingMetaKey of existingMetaKeys) {
-                    const rawKey = decodeListedStorageKey(
-                        existingMetaKey,
-                        PLUGIN_SAVE_META_PREFIX,
-                    );
+                throwIfAborted(signal);
+                if (getPluginStorageRecordKeys(previousValues).length > 0) {
+                    db.pluginCustomStorage = createDatabasePluginStorageRecord();
+                }
+                if (getPluginStorageRecordKeys(previousMeta).length > 0) {
+                    delete db.pluginStorageMeta;
+                }
+            } else if (replacement !== undefined) {
+                throwIfAborted(signal);
+                db.pluginCustomStorage = copyDatabasePluginStorageRecord(replacement);
+                const nextMeta = createDatabasePluginStorageRecord<
+                    NonNullable<Database["pluginStorageMeta"]>[string]
+                >();
+                for (const key of getPluginStorageRecordKeys(replacement)) {
                     if (
-                        rawKey === null
-                        || !hasPluginStorageRecordValue(replacement, rawKey)
-                    ) continue;
-                    const existingValueKey = makeArchiveSafePluginSaveStorageKey(
-                        PLUGIN_SAVE_PREFIX,
-                        rawKey,
-                    );
-                    if (!existingKeySet.has(existingValueKey)) continue;
-                    const canonicalMetaKey = makeArchiveSafePluginSaveStorageKey(
-                        PLUGIN_SAVE_META_PREFIX,
-                        rawKey,
-                    );
-                    if (existingMetaKey === canonicalMetaKey) {
-                        retainedMetaKeys.add(existingMetaKey);
+                        hasPluginStorageRecordValue(previousValues, key)
+                        && hasPluginStorageRecordValue(previousMeta, key)
+                    ) {
+                        definePluginStorageRecordValue(nextMeta, key, previousMeta[key]);
                     }
                 }
-                // Upsert the complete replacement before deleting omitted rows.
-                for (const entry of prepared) {
-                    await writePersistentJson(entry.storageKey, entry.value);
-                }
-                for (const storageKey of existingKeys) {
-                    if (!destinationKeys.has(storageKey)) {
-                        await removePersistentKey(storageKey);
-                    }
-                }
-                // A direct database replacement has no plugin-owner context.
-                // Preserve metadata for retained keys, discard it for deleted
-                // keys, and leave new keys unowned.
-                for (const storageKey of existingMetaKeys) {
-                    if (!retainedMetaKeys.has(storageKey)) {
-                        await removePersistentKey(storageKey);
-                    }
+                if (Object.keys(nextMeta).length > 0) {
+                    db.pluginStorageMeta = nextMeta;
+                } else {
+                    delete db.pluginStorageMeta;
                 }
             }
-            if (getPluginStorageRecordKeys(previousValues).length > 0) {
-                db.pluginCustomStorage = createDatabasePluginStorageRecord();
-            }
-            if (getPluginStorageRecordKeys(previousMeta).length > 0) {
-                delete db.pluginStorageMeta;
-            }
-        } else if (replacement !== undefined) {
-            db.pluginCustomStorage = copyDatabasePluginStorageRecord(replacement);
-            const nextMeta = createDatabasePluginStorageRecord<
-                NonNullable<Database["pluginStorageMeta"]>[string]
-            >();
-            for (const key of getPluginStorageRecordKeys(replacement)) {
-                if (
-                    hasPluginStorageRecordValue(previousValues, key)
-                    && hasPluginStorageRecordValue(previousMeta, key)
-                ) {
-                    definePluginStorageRecordValue(nextMeta, key, previousMeta[key]);
-                }
-            }
-            if (Object.keys(nextMeta).length > 0) {
-                db.pluginStorageMeta = nextMeta;
-            } else {
-                delete db.pluginStorageMeta;
-            }
-        }
 
-        return await mutateDatabase();
-    });
+            throwIfAborted(signal);
+            const result = await mutateDatabase(signal ?? undefined);
+            throwIfAborted(signal);
+            return result;
+        }, signal);
+    } finally {
+        if (replacement !== undefined) invalidateStorageEnumerationSnapshot();
+    }
 }
 
-export async function getPluginSaveStorageItem<T>(key: string): Promise<T | null> {
+export async function getPluginSaveStorageItem<T>(
+    key: string,
+    signal?: AbortSignal | null,
+): Promise<T | null> {
     const normalizedKey = normalizePluginStorageKey(key);
-    return withPluginSaveStorageLock(async () => {
+    return withPluginSaveStorageKeyLock(normalizedKey, async () => {
+        throwIfAborted(signal);
         const db = getDatabase();
         if (!db.optimizePluginMemory) {
             const descriptor = Reflect.getOwnPropertyDescriptor(
@@ -333,28 +582,46 @@ export async function getPluginSaveStorageItem<T>(key: string): Promise<T | null
             // JSON round-trip the optimized branch produces.
             return snapshotJsonValue(value) as T;
         }
-        return await readPersistentJson<T>(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey), { cached: true });
-    });
+        const options = signal ? { cached: true, signal } : { cached: true };
+        return await readPersistentJson<T>(
+            makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey),
+            options,
+        );
+    }, signal);
 }
 
-export async function setPluginSaveStorageItem<T>(key: string, value: T): Promise<void> {
+export async function setPluginSaveStorageItem<T>(
+    key: string,
+    value: T,
+    signal?: AbortSignal | null,
+): Promise<void> {
+    throwIfAborted(signal);
     const normalizedKey = normalizePluginStorageKey(key);
     const snapshot = snapshotJsonValue(value);
-    await withPluginSaveStorageLock(async () => {
-        const db = getDatabase();
-        if (!db.optimizePluginMemory) {
-            const next = cloneJsonPluginStorageRecord(
-                db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
+    try {
+        await withPluginSaveStorageKeyLock(normalizedKey, async () => {
+            throwIfAborted(signal);
+            const db = getDatabase();
+            if (!db.optimizePluginMemory) {
+                const next = cloneJsonPluginStorageRecord(
+                    db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
+                );
+                definePluginStorageRecordValue(next, normalizedKey, snapshot);
+                db.pluginCustomStorage = next;
+                return;
+            }
+            const storageKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_PREFIX,
+                normalizedKey,
             );
-            definePluginStorageRecordValue(next, normalizedKey, snapshot);
-            db.pluginCustomStorage = next;
-            return;
-        }
-        await writePersistentJson(
-            makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey),
-            snapshot,
-        );
-    });
+            if (signal) await writePersistentJson(storageKey, snapshot, signal);
+            else await writePersistentJson(storageKey, snapshot);
+        }, signal);
+    } finally {
+        // A timed-out remote mutation may have committed even though its
+        // acknowledgement was lost, so no enumeration snapshot remains valid.
+        invalidateStorageEnumerationSnapshot();
+    }
 }
 
 /** Set a V3 save value and its owner as one ordered storage operation. */
@@ -362,144 +629,225 @@ export async function setOwnedPluginSaveStorageItem<T>(
     key: string,
     value: T,
     owner: string,
+    signal?: AbortSignal | null,
 ): Promise<void> {
+    throwIfAborted(signal);
     const normalizedKey = normalizePluginStorageKey(key);
     const snapshot = snapshotJsonValue(value);
-    await withPluginSaveStorageLock(async () => {
-        const db = getDatabase();
-        const ownerRecord = { plugin: owner, updatedAt: Date.now() };
-        if (db.optimizePluginMemory) {
-            // Metadata has the longer prefix. Prepare every destination before
-            // the primary value write so a rejected owner row cannot leave a
-            // durable, unowned value behind.
-            const valueStorageKey = makeArchiveSafePluginSaveStorageKey(
-                PLUGIN_SAVE_PREFIX,
-                normalizedKey,
-            );
-            const ownerStorageKey = owner
-                ? makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_META_PREFIX, normalizedKey)
-                : null;
-            await writePersistentJson(valueStorageKey, snapshot);
-            if (owner) {
-                await writePersistentJson(ownerStorageKey!, ownerRecord);
+    try {
+        await withPluginSaveStorageKeyLock(normalizedKey, async () => {
+            throwIfAborted(signal);
+            const db = getDatabase();
+            const ownerRecord = { plugin: owner, updatedAt: Date.now() };
+            if (db.optimizePluginMemory) {
+                // Metadata has the longer prefix. Prepare every destination
+                // before the primary value write so a rejected owner row
+                // cannot leave a durable, unowned value behind.
+                const valueStorageKey = makeArchiveSafePluginSaveStorageKey(
+                    PLUGIN_SAVE_PREFIX,
+                    normalizedKey,
+                );
+                const ownerStorageKey = owner
+                    ? makeArchiveSafePluginSaveStorageKey(
+                        PLUGIN_SAVE_META_PREFIX,
+                        normalizedKey,
+                    )
+                    : null;
+                if (signal) await writePersistentJson(valueStorageKey, snapshot, signal);
+                else await writePersistentJson(valueStorageKey, snapshot);
+                if (owner) {
+                    if (signal) await writePersistentJson(ownerStorageKey!, ownerRecord, signal);
+                    else await writePersistentJson(ownerStorageKey!, ownerRecord);
+                }
+                return;
             }
-            return;
-        }
 
-        const nextValues = cloneJsonPluginStorageRecord(
-            db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
-        );
-        const nextMeta = owner
-            ? cloneJsonPluginStorageRecord(
+            const nextValues = cloneJsonPluginStorageRecord(
+                db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
+            );
+            const nextMeta = owner
+                ? cloneJsonPluginStorageRecord(
+                    db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
+                        NonNullable<Database["pluginStorageMeta"]>[string]
+                    >(),
+                    "pluginStorageMeta",
+                )
+                : undefined;
+            definePluginStorageRecordValue(nextValues, normalizedKey, snapshot);
+            if (nextMeta) {
+                definePluginStorageRecordValue(nextMeta, normalizedKey, ownerRecord);
+            }
+            // Both live records have passed preflight; only now publish either.
+            db.pluginCustomStorage = nextValues;
+            if (nextMeta) db.pluginStorageMeta = nextMeta;
+        }, signal);
+    } finally {
+        invalidateStorageEnumerationSnapshot();
+    }
+}
+
+export async function removePluginSaveStorageItem(
+    key: string,
+    signal?: AbortSignal | null,
+): Promise<void> {
+    const normalizedKey = normalizePluginStorageKey(key);
+    try {
+        await withPluginSaveStorageKeyLock(normalizedKey, async () => {
+            throwIfAborted(signal);
+            const db = getDatabase();
+            if (!db.optimizePluginMemory) {
+                if (!hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) return;
+                const next = cloneJsonPluginStorageRecord(
+                    db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
+                );
+                delete next[normalizedKey];
+                db.pluginCustomStorage = next;
+                return;
+            }
+            const storageKey = makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey);
+            if (signal) await removePersistentKey(storageKey, signal);
+            else await removePersistentKey(storageKey);
+        }, signal);
+    } finally {
+        invalidateStorageEnumerationSnapshot();
+    }
+}
+
+/** Remove a V3 save value and its owner as one ordered storage operation. */
+export async function removeOwnedPluginSaveStorageItem(
+    key: string,
+    signal?: AbortSignal | null,
+): Promise<void> {
+    const normalizedKey = normalizePluginStorageKey(key);
+    try {
+        await withPluginSaveStorageKeyLock(normalizedKey, async () => {
+            throwIfAborted(signal);
+            const db = getDatabase();
+            if (db.optimizePluginMemory) {
+                const valueStorageKey = makeEncodedStorageKey(
+                    PLUGIN_SAVE_PREFIX,
+                    normalizedKey,
+                );
+                const metaStorageKey = makeEncodedStorageKey(
+                    PLUGIN_SAVE_META_PREFIX,
+                    normalizedKey,
+                );
+                if (signal) {
+                    await removePersistentKey(valueStorageKey, signal);
+                    await removePersistentKey(metaStorageKey, signal);
+                } else {
+                    await removePersistentKey(valueStorageKey);
+                    await removePersistentKey(metaStorageKey);
+                }
+                return;
+            }
+
+            const nextValues = cloneJsonPluginStorageRecord(
+                db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
+            );
+            const nextMeta = cloneJsonPluginStorageRecord(
                 db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
                     NonNullable<Database["pluginStorageMeta"]>[string]
                 >(),
                 "pluginStorageMeta",
-            )
-            : undefined;
-        definePluginStorageRecordValue(nextValues, normalizedKey, snapshot);
-        if (nextMeta) {
-            definePluginStorageRecordValue(nextMeta, normalizedKey, ownerRecord);
-        }
-        // Both live records have passed preflight; only now publish either.
-        db.pluginCustomStorage = nextValues;
-        if (nextMeta) db.pluginStorageMeta = nextMeta;
-    });
-}
-
-export async function removePluginSaveStorageItem(key: string): Promise<void> {
-    const normalizedKey = normalizePluginStorageKey(key);
-    await withPluginSaveStorageLock(async () => {
-        const db = getDatabase();
-        if (!db.optimizePluginMemory) {
-            if (!hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) return;
-            const next = cloneJsonPluginStorageRecord(
-                db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
             );
-            delete next[normalizedKey];
-            db.pluginCustomStorage = next;
-            return;
-        }
-        await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey));
-    });
+            if (hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) {
+                delete nextValues[normalizedKey];
+                db.pluginCustomStorage = nextValues;
+            }
+            if (hasPluginStorageRecordValue(db.pluginStorageMeta, normalizedKey)) {
+                delete nextMeta[normalizedKey];
+                if (getPluginStorageRecordKeys(nextMeta).length > 0) db.pluginStorageMeta = nextMeta;
+                else delete db.pluginStorageMeta;
+            }
+        }, signal);
+    } finally {
+        invalidateStorageEnumerationSnapshot();
+    }
 }
 
-/** Remove a V3 save value and its owner as one ordered storage operation. */
-export async function removeOwnedPluginSaveStorageItem(key: string): Promise<void> {
-    const normalizedKey = normalizePluginStorageKey(key);
-    await withPluginSaveStorageLock(async () => {
-        const db = getDatabase();
-        if (db.optimizePluginMemory) {
-            await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, normalizedKey));
-            await removePersistentKey(makeEncodedStorageKey(PLUGIN_SAVE_META_PREFIX, normalizedKey));
-            return;
-        }
-
-        const nextValues = cloneJsonPluginStorageRecord(
-            db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
-        );
-        const nextMeta = cloneJsonPluginStorageRecord(
-            db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
-                NonNullable<Database["pluginStorageMeta"]>[string]
-            >(),
-            "pluginStorageMeta",
-        );
-        if (hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) {
-            delete nextValues[normalizedKey];
-            db.pluginCustomStorage = nextValues;
-        }
-        if (hasPluginStorageRecordValue(db.pluginStorageMeta, normalizedKey)) {
-            delete nextMeta[normalizedKey];
-            if (getPluginStorageRecordKeys(nextMeta).length > 0) db.pluginStorageMeta = nextMeta;
-            else delete db.pluginStorageMeta;
-        }
-    });
-}
-
-export async function clearPluginSaveStorage(): Promise<void> {
-    await withPluginSaveStorageLock(async () => {
-        const db = getDatabase();
-        if (!db.optimizePluginMemory) {
-            db.pluginCustomStorage = createDatabasePluginStorageRecord();
-            return;
-        }
-        await clearPersistentPrefix(PLUGIN_SAVE_PREFIX);
-    });
+export async function clearPluginSaveStorage(signal?: AbortSignal | null): Promise<void> {
+    try {
+        await withPluginSaveStorageLock(async () => {
+            throwIfAborted(signal);
+            const db = getDatabase();
+            if (!db.optimizePluginMemory) {
+                db.pluginCustomStorage = createDatabasePluginStorageRecord();
+                return;
+            }
+            if (signal) await clearPersistentPrefix(PLUGIN_SAVE_PREFIX, signal);
+            else await clearPersistentPrefix(PLUGIN_SAVE_PREFIX);
+        }, signal);
+    } finally {
+        invalidateStorageEnumerationSnapshot();
+    }
 }
 
 /** Clear all V3 save values and owners as one ordered storage operation. */
-export async function clearOwnedPluginSaveStorage(): Promise<void> {
-    await withPluginSaveStorageLock(async () => {
-        const db = getDatabase();
-        if (db.optimizePluginMemory) {
-            await clearExternalizedPluginStorage();
-            return;
-        }
-        db.pluginCustomStorage = createDatabasePluginStorageRecord();
-        delete db.pluginStorageMeta;
-    });
+export async function clearOwnedPluginSaveStorage(signal?: AbortSignal | null): Promise<void> {
+    try {
+        await withPluginSaveStorageLock(async () => {
+            throwIfAborted(signal);
+            const db = getDatabase();
+            if (db.optimizePluginMemory) {
+                await clearExternalizedPluginStorage(signal);
+                return;
+            }
+            db.pluginCustomStorage = createDatabasePluginStorageRecord();
+            delete db.pluginStorageMeta;
+        }, signal);
+    } finally {
+        invalidateStorageEnumerationSnapshot();
+    }
 }
 
-export async function getPluginSaveStorageKeys(): Promise<string[]> {
-    return withPluginSaveStorageLock(async () => {
+async function getPluginSaveStorageEnumerationSnapshot(
+    refresh: boolean,
+    signal?: AbortSignal | null,
+): Promise<string[]> {
+    return withPluginSaveStorageScope("enumeration", async () => {
+        throwIfAborted(signal);
         const db = getDatabase();
-        if (!db.optimizePluginMemory) {
-            const snapshot = cloneJsonPluginStorageRecord(
+        if (!refresh
+            && storageEnumerationSnapshot?.database === db
+            && storageEnumerationSnapshot.optimized === (db.optimizePluginMemory === true)
+            && storageEnumerationSnapshot.generation === getPluginStorageKeySetGeneration()
+        ) {
+            return [...storageEnumerationSnapshot.keys];
+        }
+        const generation = getPluginStorageKeySetGeneration();
+        const keys = !db.optimizePluginMemory
+            ? getPluginStorageRecordKeys(cloneJsonPluginStorageRecord(
                 db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
-            );
-            return orderPluginStorageKeys(getPluginStorageRecordKeys(snapshot));
+            ))
+            : await listDecodedStorageKeys(PLUGIN_SAVE_PREFIX, signal);
+        const orderedKeys = orderPluginStorageKeys(keys);
+        if (generation === getPluginStorageKeySetGeneration()) {
+            storageEnumerationSnapshot = {
+                database: db,
+                optimized: db.optimizePluginMemory === true,
+                generation,
+                keys: [...orderedKeys],
+            };
         }
-        return orderPluginStorageKeys(await listDecodedStorageKeys(PLUGIN_SAVE_PREFIX));
-    });
+        return [...orderedKeys];
+    }, signal);
 }
 
-export async function getPluginSaveStorageKey(index: number): Promise<string | null> {
-    const keys = await getPluginSaveStorageKeys();
+export async function getPluginSaveStorageKeys(signal?: AbortSignal | null): Promise<string[]> {
+    return getPluginSaveStorageEnumerationSnapshot(true, signal);
+}
+
+export async function getPluginSaveStorageKey(
+    index: number,
+    signal?: AbortSignal | null,
+): Promise<string | null> {
+    const keys = await getPluginSaveStorageEnumerationSnapshot(false, signal);
     return keys[index] ?? null;
 }
 
-export async function getPluginSaveStorageLength(): Promise<number> {
-    return (await getPluginSaveStorageKeys()).length;
+export async function getPluginSaveStorageLength(signal?: AbortSignal | null): Promise<number> {
+    return (await getPluginSaveStorageEnumerationSnapshot(false, signal)).length;
 }
 
 export async function countExternalizedPluginStorageEntries(): Promise<number> {
@@ -594,6 +942,7 @@ async function preparePluginStorageReconciliation(
     target: boolean,
     options: Omit<PluginStorageReconcileOptions, "dependencies">,
 ): Promise<PreparedReconciliation> {
+    invalidateStorageEnumerationSnapshot();
     const db = deps.getDatabase();
 
     if (target) {

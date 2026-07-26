@@ -8,7 +8,27 @@ type MsgType =
     | 'RESPONSE'
     | 'RELEASE_INSTANCE'
     | 'ABORT_SIGNAL'
-    | 'EXEC_RESULT';
+    | 'EXEC_RESULT'
+    | 'CANCEL_REQUEST';
+
+export const PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS = 20_000;
+export const PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS = 30_000;
+
+const ABORTABLE_ROOT_METHODS = new Set([
+    'getDatabase',
+    'setDatabase',
+    'setDatabaseLite',
+    '_getPluginStorage',
+    '_setPluginStorage',
+    '_removePluginStorage',
+    '_clearPluginStorage',
+    '_keyPluginStorage',
+    '_keysPluginStorage',
+    '_lengthPluginStorage',
+    '_setSafeLocalStorage',
+    '_removeSafeLocalStorage',
+    '_clearSafeLocalStorage',
+]);
 
 interface RpcMessage {
     type: MsgType;
@@ -88,13 +108,14 @@ export function deserializeV3BridgeError(input: unknown): Error {
         commitOutcomeUnknown?: boolean;
         operation?: string | null;
     };
-    if (typeof source?.name === 'string' && source.name.length > 0) error.name = source.name;
+    const name = source?.name;
     const status = source?.status;
     const code = source?.code;
     const retryAfter = source?.retryAfter;
     const retryable = source?.retryable;
     const commitOutcomeUnknown = source?.commitOutcomeUnknown;
     const operation = source?.operation;
+    if (typeof name === 'string' && name.length > 0) error.name = name;
     if (typeof status === 'number') error.status = status;
     else if (status === null) error.status = null;
     if (typeof code === 'string') error.code = code;
@@ -130,6 +151,116 @@ function validateAsyncFunctionBody(source: string): void {
     new AsyncFunction(source);
 }
 
+/** Self-contained because its source is also installed in the iframe guest. */
+export function createV3BridgeRequestRegistry(options: {
+    requestTimeoutMs: number;
+    serializeArgs: (args: any[]) => any[];
+    collectTransferables: (message: any) => Transferable[];
+    send: (message: any, transferables?: Transferable[]) => void;
+    deserializeError: (error: unknown) => Error;
+    deserializeResult: (result: unknown) => unknown;
+}) {
+    const requestGeneration = globalThis.crypto.randomUUID();
+    let requestSequence = 0;
+    const pendingRequests = new Map<string, {
+        resolve: (value: unknown) => void;
+        reject: (error: unknown) => void;
+        timer: ReturnType<typeof setTimeout>;
+    }>();
+    const rootMutations: Record<string, "write" | "remove"> = {
+        _setPluginStorage: 'write',
+        _removePluginStorage: 'remove',
+        _clearPluginStorage: 'remove',
+        setDatabase: 'write',
+        setDatabaseLite: 'write',
+        _setSafeLocalStorage: 'write',
+        _removeSafeLocalStorage: 'remove',
+        _clearSafeLocalStorage: 'remove',
+    };
+    const instanceMutations: Record<string, "write" | "remove"> = {
+        setItem: 'write',
+        removeItem: 'remove',
+        clear: 'remove',
+    };
+
+    const mutationOperation = (type: string, method: string | undefined) => (
+        type === 'CALL_ROOT'
+            ? rootMutations[method ?? '']
+            : type === 'CALL_INSTANCE'
+                ? instanceMutations[method ?? '']
+                : undefined
+    );
+
+    const sendRequest = (type: string, payload: any) => new Promise((resolve, reject) => {
+        // A generation-unique prefix prevents a late response from an older
+        // registry instance from matching a new request. The monotonic suffix
+        // cannot collide within this registry, including after timeouts.
+        const reqId = `${requestGeneration}:${requestSequence++}`;
+        const timer = setTimeout(() => {
+            if (!pendingRequests.delete(reqId)) return;
+            try {
+                options.send({ type: 'CANCEL_REQUEST', reqId });
+            } catch {
+                // Cancellation is advisory; the local request is already bounded.
+            }
+            const operation = mutationOperation(type, payload.method);
+            const error = new Error(
+                'Plugin bridge request timed out after ' + options.requestTimeoutMs + 'ms.',
+            ) as Error & Record<string, unknown>;
+            error.name = 'StorageError';
+            error.code = operation ? 'COMMIT_OUTCOME_UNKNOWN' : 'STORAGE_TIMEOUT';
+            error.retryable = !operation;
+            error.commitOutcomeUnknown = !!operation;
+            error.operation = operation || null;
+            reject(error);
+        }, options.requestTimeoutMs);
+        pendingRequests.set(reqId, { resolve, reject, timer });
+
+        try {
+            const args = payload.args
+                ? options.serializeArgs(payload.args)
+                : payload.args;
+            const message = { type, reqId, ...payload, args };
+            const transferables = options.collectTransferables(message);
+            options.send(message, transferables);
+        } catch (error) {
+            clearTimeout(timer);
+            pendingRequests.delete(reqId);
+            reject(error);
+        }
+    });
+
+    const handleResponse = (data: any): boolean => {
+        const request = data?.reqId ? pendingRequests.get(data.reqId) : undefined;
+        if (!request) return false;
+        pendingRequests.delete(data.reqId);
+        clearTimeout(request.timer);
+        if (data.error) request.reject(options.deserializeError(data.error));
+        else request.resolve(options.deserializeResult(data.result));
+        return true;
+    };
+
+    const cancelAll = (reason = new Error('Plugin bridge terminated.')) => {
+        for (const [reqId, request] of pendingRequests) {
+            clearTimeout(request.timer);
+            request.reject(reason);
+            try {
+                options.send({ type: 'CANCEL_REQUEST', reqId });
+            } catch {
+                // The iframe may already be detached.
+            }
+        }
+        pendingRequests.clear();
+    };
+
+    return {
+        sendRequest,
+        handleResponse,
+        cancelAll,
+        pendingCount: () => pendingRequests.size,
+    };
+}
+
 interface RemoteRef {
     __type: 'REMOTE_REF';
     id: string;
@@ -152,6 +283,20 @@ interface AbortSignalRef {
  * self-contained because its compiled source is installed in the guest.
  */
 export function validateV3DatabaseMutationForTransport(input: unknown): void {
+    const assertTransportKey = (value: string): void => {
+        for (let index = 0; index < value.length; index += 1) {
+            const codeUnit = value.charCodeAt(index);
+            if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
+                const trailing = value.charCodeAt(index + 1);
+                if (!(trailing >= 0xDC00 && trailing <= 0xDFFF)) {
+                    throw new Error("Plugin storage keys must be well-formed Unicode.");
+                }
+                index += 1;
+            } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
+                throw new Error("Plugin storage keys must be well-formed Unicode.");
+            }
+        }
+    };
     if (input === null || typeof input !== "object" || Array.isArray(input)) {
         throw new TypeError("V3 database updates require a DatabaseSubset object.");
     }
@@ -180,6 +325,7 @@ export function validateV3DatabaseMutationForTransport(input: unknown): void {
             if (typeof storageKey !== "string") {
                 throw new TypeError("pluginCustomStorage does not accept symbol keys.");
             }
+            assertTransportKey(storageKey);
             const storageDescriptor = Reflect.getOwnPropertyDescriptor(storage, storageKey);
             if (!storageDescriptor || !("value" in storageDescriptor)) {
                 throw new TypeError(
@@ -198,14 +344,18 @@ export function validateV3DatabaseMutationForTransport(input: unknown): void {
 
 const GUEST_BRIDGE_SCRIPT = `
 await (async function() {
-    const pendingRequests = new Map();
+    const requestTimeoutMs = ${PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS};
     const callbackRegistry = new Map();
     const callbackIdByFunction = new WeakMap();
     const proxyRefRegistry = new Map();
     const abortControllers = new Map();
+    const bridgeGeneration = globalThis.crypto.randomUUID();
+    let nextBridgeId = 0;
+    const allocateBridgeId = (prefix) => prefix + bridgeGeneration + ':' + nextBridgeId++;
     const validateDatabaseMutationForTransport = ${validateV3DatabaseMutationForTransport.toString()};
     const serializeBridgeError = ${serializeV3BridgeError.toString()};
     const deserializeBridgeError = ${deserializeV3BridgeError.toString()};
+    const createRequestRegistry = ${createV3BridgeRequestRegistry.toString()};
 
     function serializeArg(arg) {
         if (typeof arg === 'function') {
@@ -213,7 +363,7 @@ await (async function() {
             if (existingId) {
                 return { __type: 'CALLBACK_REF', id: existingId };
             }
-            const id = 'cb_' + Math.random().toString(36).substring(2);
+            const id = allocateBridgeId('cb_');
             callbackRegistry.set(id, arg);
             callbackIdByFunction.set(arg, id);
             return { __type: 'CALLBACK_REF', id: id };
@@ -228,7 +378,7 @@ await (async function() {
                 for (const [key, val] of Object.entries(arg)) {
                     if (val instanceof AbortSignal) {
                         if (!out) out = { ...arg };
-                        const abortId = 'abort_' + Math.random().toString(36).substring(2);
+                        const abortId = allocateBridgeId('abort_');
 
                         if (!val.aborted) {
                             val.addEventListener('abort', () => {
@@ -303,6 +453,15 @@ await (async function() {
         window.parent.postMessage(payload, '*', transferables);
     }
 
+    const requestRegistry = createRequestRegistry({
+        requestTimeoutMs,
+        serializeArgs: (args) => args.map(serializeArg),
+        collectTransferables,
+        send,
+        deserializeError: deserializeBridgeError,
+        deserializeResult,
+    });
+
     function sendRequest(type, payload) {
         if (type === 'CALL_ROOT'
             && (payload.method === 'setDatabase' || payload.method === 'setDatabaseLite')) {
@@ -312,19 +471,7 @@ await (async function() {
                 return Promise.reject(error);
             }
         }
-        return new Promise((resolve, reject) => {
-            const reqId = Math.random().toString(36).substring(7);
-            pendingRequests.set(reqId, { resolve, reject });
-
-
-            if (payload.args) {
-                payload.args = payload.args.map(serializeArg);
-            }
-
-            const message = { type: type, reqId: reqId, ...payload };
-            const transferables = collectTransferables(message);
-            send(message, transferables);
-        });
+        return requestRegistry.sendRequest(type, payload);
     }
 
     
@@ -336,12 +483,7 @@ await (async function() {
 
 
         if (data.type === 'RESPONSE' && data.reqId) {
-            const req = pendingRequests.get(data.reqId);
-            if (req) {
-                if (data.error) req.reject(deserializeBridgeError(data.error));
-                else req.resolve(deserializeResult(data.result));
-                pendingRequests.delete(data.reqId);
-            }
+            requestRegistry.handleResponse(data);
         }
 
         else if (data.type === 'EXECUTE_CODE' && data.reqId) {
@@ -543,6 +685,8 @@ export class SandboxHost {
 
     private instanceRegistry = new Map<string, any>();
     private abortControllers = new Map<string, AbortController>();
+    private activeRequestControllers = new Map<string, AbortController>();
+    private cancelledRequestControllers = new WeakSet<AbortController>();
     private callbackWrapperCache = new Map<string, Function>();
 
     private pendingCallbacks = new Map<string, { resolve: Function, reject: Function }>();
@@ -552,12 +696,19 @@ export class SandboxHost {
     private resolveInitialization?: () => void;
     private rejectInitialization?: (reason: unknown) => void;
     private initializationSettled = false;
+    private initializationTimer?: ReturnType<typeof setTimeout>;
+    private readonly idGeneration = crypto.randomUUID();
+    private nextId = 0;
     private started = false;
     private terminating = false;
     private terminated = false;
 
     constructor(apiFactory: any) {
         this.apiFactory = apiFactory;
+    }
+
+    private allocateId(prefix: string): string {
+        return `${prefix}${this.idGeneration}:${this.nextId++}`;
     }
 
     public executeInIframe(code: string): Promise<any> {
@@ -568,7 +719,7 @@ export class SandboxHost {
             return Promise.reject(new Error("Plugin sandbox has not started."));
         }
         return new Promise((resolve, reject) => {
-            const reqId = 'exec_' + Math.random().toString(36).substring(2);
+            const reqId = this.allocateId('exec_');
             this.pendingExecutions.set(reqId, { resolve, reject });
 
             this.iframe.contentWindow?.postMessage({
@@ -615,7 +766,7 @@ export class SandboxHost {
             if (Array.isArray(val)) return val;
 
 
-            const id = 'ref_' + Math.random().toString(36).substring(2);
+            const id = this.allocateId('ref_');
             this.instanceRegistry.set(id, val);
             return { __type: 'REMOTE_REF', id } as RemoteRef;
         }
@@ -662,7 +813,7 @@ export class SandboxHost {
                         throw new Error("Plugin sandbox is terminating; callback invocation was rejected.");
                     }
                     return new Promise((resolve, reject) => {
-                        const reqId = 'cb_req_' + Math.random().toString(36).substring(2);
+                        const reqId = this.allocateId('cb_req_');
                         this.pendingCallbacks.set(reqId, { resolve, reject });
 
                         // AbortSignal cannot be structured-cloned for postMessage.
@@ -670,7 +821,7 @@ export class SandboxHost {
                         // via a separate ABORT_SIGNAL message.
                         const sanitizedArgs = innerArgs.map(arg => {
                             if (arg instanceof AbortSignal) {
-                                const abortId = 'abort_' + Math.random().toString(36).substring(2);
+                                const abortId = this.allocateId('abort_');
                                 const ref: AbortSignalRef = {
                                     __type: 'ABORT_SIGNAL_REF',
                                     abortId,
@@ -734,6 +885,10 @@ export class SandboxHost {
     private settleInitialization(error?: unknown) {
         if (this.initializationSettled) return;
         this.initializationSettled = true;
+        if (this.initializationTimer !== undefined) {
+            clearTimeout(this.initializationTimer);
+            this.initializationTimer = undefined;
+        }
         const resolve = this.resolveInitialization;
         const reject = this.rejectInitialization;
         this.resolveInitialization = undefined;
@@ -748,7 +903,10 @@ export class SandboxHost {
         this.settleInitialization(
             new Error("Plugin initialization was cancelled during teardown."),
         );
-        this.detachRemoteState();
+        // Let an operation that was already admitted finish during the bounded
+        // unload grace period. Its rejection/success lets guest code leave the
+        // startup await and observe that all later registrations are closed.
+        this.detachRemoteState(false);
     }
 
     public run(container: HTMLElement|HTMLIFrameElement, userCode: string): Promise<void> {
@@ -794,6 +952,21 @@ export class SandboxHost {
             this.resolveInitialization = resolve;
             this.rejectInitialization = reject;
         });
+        this.initializationTimer = setTimeout(() => {
+            const error = new Error(
+                `Plugin initialization timed out after ${PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS}ms.`,
+            ) as Error & Record<string, unknown>;
+            error.name = "PluginInitializationTimeoutError";
+            error.code = "PLUGIN_INITIALIZATION_TIMEOUT";
+            error.retryable = false;
+            error.commitOutcomeUnknown = false;
+            error.operation = "initialization";
+            this.settleInitialization(error);
+            // Close new RPC/registration traffic immediately. The owning V3
+            // lifecycle catches the rejection, runs registered cleanup and
+            // bounded unload callbacks, then performs final iframe removal.
+            this.beginTermination();
+        }, PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS);
 
         const messageHandler = async (event: MessageEvent) => {
             // sandboxed srcdoc without allow-same-origin has an opaque origin,
@@ -844,6 +1017,19 @@ export class SandboxHost {
                 return;
             }
 
+            if (data.type === 'CANCEL_REQUEST' && data.reqId) {
+                const controller = this.activeRequestControllers.get(data.reqId);
+                if (controller) {
+                    this.activeRequestControllers.delete(data.reqId);
+                    this.cancelledRequestControllers.add(controller);
+                    controller.abort(new DOMException(
+                        'Plugin bridge request was cancelled.',
+                        'AbortError',
+                    ));
+                }
+                return;
+            }
+
 
             if (data.type === 'CALLBACK_RETURN') {
                 const req = this.pendingCallbacks.get(data.reqId!);
@@ -874,6 +1060,10 @@ export class SandboxHost {
             if (data.type === 'CALL_ROOT' || data.type === 'CALL_INSTANCE') {
                 const response: RpcMessage = { type: 'RESPONSE', reqId: data.reqId };
                 const usedAbortIds: string[] = [];
+                const requestController = new AbortController();
+                if (data.reqId) {
+                    this.activeRequestControllers.set(data.reqId, requestController);
+                }
 
                 try {
                     if (this.terminating || this.terminated) {
@@ -887,11 +1077,22 @@ export class SandboxHost {
                     if (data.type === 'CALL_ROOT') {
                         const fn = this.apiFactory[data.method!];
                         if (typeof fn !== 'function') throw new Error(`API method ${data.method} not found`);
+                        if (ABORTABLE_ROOT_METHODS.has(data.method!)) {
+                            // getDatabase() has an optional includeOnly argument;
+                            // preserve its default before appending the signal.
+                            if (data.method === 'getDatabase' && args.length === 0) {
+                                args.push(undefined);
+                            }
+                            args.push(requestController.signal);
+                        }
                         result = await fn(...args);
                     } else {
                         const instance = this.instanceRegistry.get(data.id!);
                         if (!instance) throw new Error("Instance not found or released");
                         if (typeof instance[data.method!] !== 'function') throw new Error(`Method ${data.method} missing on instance`);
+                        if (instance.__requestAbortMethods?.has?.(data.method!)) {
+                            args.push(requestController.signal);
+                        }
                         result = await instance[data.method!](...args);
                     }
 
@@ -923,10 +1124,17 @@ export class SandboxHost {
                 } catch (err: any) {
                     response.error = serializeV3BridgeError(err);
                 } finally {
+                    if (data.reqId
+                        && this.activeRequestControllers.get(data.reqId) === requestController) {
+                        this.activeRequestControllers.delete(data.reqId);
+                    }
                     for (const id of usedAbortIds) this.abortControllers.delete(id);
                 }
 
-                if (this.terminated) return;
+                // The guest has already rejected and removed a cancelled
+                // request. Do not emit a stale response after abort cleanup.
+                if (this.terminated
+                    || this.cancelledRequestControllers.has(requestController)) return;
                 const transferables = this.collectTransferables(response);
                 console.log("Original request:", data);
                 console.log('Original response:', response, transferables);
@@ -990,7 +1198,7 @@ export class SandboxHost {
         return initialization;
     }
 
-    private detachRemoteState() {
+    private detachRemoteState(abortActiveRequests = true) {
         const terminationError = new Error("Plugin sandbox is terminating.");
         for (const request of this.pendingCallbacks.values()) {
             request.reject(terminationError);
@@ -1004,6 +1212,12 @@ export class SandboxHost {
         this.instanceRegistry.clear();
         this.pendingCallbacks.clear();
         this.pendingExecutions.clear();
+        if (abortActiveRequests) {
+            for (const controller of this.activeRequestControllers.values()) {
+                controller.abort();
+            }
+            this.activeRequestControllers.clear();
+        }
         this.abortControllers.clear();
         this.callbackWrapperCache.clear();
     }
