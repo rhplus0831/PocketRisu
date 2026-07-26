@@ -1,4 +1,4 @@
-import { alertError, alertStore, alertWait, alertMd, alertConfirm, waitAlert, notifySuccess, notifyInfo, notifyError } from "../alert";
+import { alertClear, alertError, alertStore, alertWait, alertMd, alertConfirm, waitAlert, notifySuccess, notifyInfo, notifyError } from "../alert";
 import { downloadFile, forageStorage } from "../globalApi.svelte";
 import { language } from "src/lang";
 
@@ -9,7 +9,18 @@ function formatBytes(bytes: number): string {
     return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
 
-async function streamBackupToDisk(response: Response, fallbackName: string){
+function throwIfBackupAborted(signal?: AbortSignal | null) {
+    if (!signal?.aborted) return
+    throw signal.reason instanceof Error
+        ? signal.reason
+        : new DOMException('The backup was cancelled.', 'AbortError')
+}
+
+async function streamBackupToDisk(
+    response: Response,
+    fallbackName: string,
+    signal?: AbortSignal | null,
+){
     const disposition = response.headers.get('content-disposition') ?? ''
     const fileName = disposition.match(/filename=\"?([^"]+)\"?/)?.[1] ?? fallbackName
     const totalBytes = Number(response.headers.get('content-length') ?? '0')
@@ -23,6 +34,7 @@ async function streamBackupToDisk(response: Response, fallbackName: string){
 
         try {
             while (true) {
+                throwIfBackupAborted(signal)
                 const { done, value } = await reader.read()
                 if (done) {
                     break
@@ -43,7 +55,9 @@ async function streamBackupToDisk(response: Response, fallbackName: string){
             throw error
         }
     } else {
+        throwIfBackupAborted(signal)
         await downloadFile(fileName, new Uint8Array(await response.arrayBuffer()))
+        throwIfBackupAborted(signal)
     }
 }
 
@@ -81,7 +95,7 @@ export async function SaveLocalBackupForUpstream(){
  * - Faster and more efficient for quick backups
  * - Ideal for backing up core visual identity without bulk data
  */
-export async function SavePartialLocalBackup(){
+export async function SavePartialLocalBackup(signal?: AbortSignal | null){
     // First confirmation: Explain the difference from regular backup
     const firstConfirm = await alertConfirm(language.partialBackupFirstConfirm)
     
@@ -97,20 +111,38 @@ export async function SavePartialLocalBackup(){
     }
     
     try {
-        alertWait("Saving partial local backup...")
+        const localController = signal ? null : new AbortController()
+        const activeSignal = signal ?? localController!.signal
+        const cancelAction = localController
+            ? () => localController.abort(new DOMException('Backup cancelled', 'AbortError'))
+            : undefined
+        alertWait("Saving partial local backup...", cancelAction)
         // The server pins one SQLite snapshot, folds external plugin rows into
         // database.risudat one entry at a time, and streams the finished archive.
         // This retains the historical upstream-compatible partial-backup shape
         // without materializing plugin storage in the browser.
-        const response = await forageStorage.exportBackup({ scope: 'partial' })
+        const response = await forageStorage.exportBackup({
+            scope: 'partial',
+            signal: activeSignal,
+            onPreparationProgress: ({ phase, current, total, bytes }) => {
+                const count = total > 0 ? ` ${current}/${total}` : ''
+                const copied = bytes > 0 ? `, ${formatBytes(bytes)}` : ''
+                alertWait(`Preparing partial local backup (${phase}${count}${copied})...`, cancelAction)
+            },
+        })
         const missingAssets = Number(response.headers.get('x-risu-backup-missing-assets') ?? '0')
-        await streamBackupToDisk(response, `risu-backup-${Date.now()}-partial.bin`)
+        await streamBackupToDisk(response, `risu-backup-${Date.now()}-partial.bin`, activeSignal)
         if (Number.isFinite(missingAssets) && missingAssets > 0) {
             alertMd(`Partial backup successful, but ${missingAssets} referenced profile image(s) were missing and skipped.`)
         } else {
             notifySuccess('Success')
         }
     } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') {
+            alertClear()
+            notifyInfo('Backup cancelled')
+            return
+        }
         console.error(error)
         alertError('Failed')
     }

@@ -34,6 +34,7 @@ import {
 } from "./resourceCache"
 import { getThrownMessage, StorageError } from "./storageError"
 import { awaitWithAbort, forwardAbortSignal, throwIfAborted } from "./abort"
+import { v4 as uuidv4 } from "uuid"
 import type {
     PluginStorageMutationRequest,
     PluginStorageMutationResult,
@@ -3168,13 +3169,126 @@ export class NodeStorage{
         }
     }
 
-    async exportBackup(opts?: { target?: 'upstream'; scope?: 'partial' }): Promise<Response> {
+    async exportBackup(
+        opts?: {
+            target?: 'upstream'
+            scope?: 'partial'
+            signal?: AbortSignal | null
+            onPreparationProgress?: (progress: {
+                phase: string
+                current: number
+                total: number
+                bytes: number
+            }) => void
+        },
+        externalSignal?: AbortSignal | null,
+    ): Promise<Response> {
+        const callerSignal = externalSignal ?? opts?.signal
+        throwIfAborted(callerSignal)
+
+        if (opts?.scope === 'partial') {
+            // The client chooses the stable id before POST so a lost create
+            // acknowledgement can still be cancelled deterministically.
+            let jobId: string | null = uuidv4()
+            const boundedJson = async <T>(url: string, init: RequestInit = {}): Promise<{
+                response: Response
+                body: T
+            }> => runBoundedAuthoritativeStorageOperation(
+                async (signal) => {
+                    const response = await this.authFetch(url, { ...init, signal })
+                    const body = await awaitWithAbort(response.json(), signal) as T
+                    return { response, body }
+                },
+                'read',
+                AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+                callerSignal,
+            )
+            const cancelJob = async () => {
+                if (!jobId) return
+                // Cleanup must not inherit an already-aborted caller signal.
+                const cleanupController = new AbortController()
+                const cleanupTimer = setTimeout(() => cleanupController.abort(), 2_000)
+                try {
+                    await this.authFetch(`/api/backup/export/jobs/${encodeURIComponent(jobId)}`, {
+                        method: 'DELETE',
+                        signal: cleanupController.signal,
+                    }).catch(() => {})
+                } finally {
+                    clearTimeout(cleanupTimer)
+                }
+            }
+
+            try {
+                const created = await boundedJson<{
+                    jobId?: string
+                    error?: string
+                }>('/api/backup/export/jobs', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ scope: 'partial', jobId }),
+                })
+                if (!created.response.ok || typeof created.body.jobId !== 'string') {
+                    throw new Error(created.body.error || `backup export prepare error: ${created.response.status}`)
+                }
+                jobId = created.body.jobId
+
+                while (true) {
+                    throwIfAborted(callerSignal)
+                    const statusResult = await boundedJson<{
+                        state?: string
+                        phase?: string
+                        current?: number
+                        total?: number
+                        bytes?: number
+                        error?: string
+                    }>(`/api/backup/export/jobs/${encodeURIComponent(jobId)}`)
+                    if (!statusResult.response.ok) {
+                        throw new Error(statusResult.body.error || `backup export status error: ${statusResult.response.status}`)
+                    }
+                    const status = statusResult.body
+                    opts?.onPreparationProgress?.({
+                        phase: typeof status.phase === 'string' ? status.phase : 'preparing',
+                        current: Number(status.current ?? 0),
+                        total: Number(status.total ?? 0),
+                        bytes: Number(status.bytes ?? 0),
+                    })
+                    if (status.state === 'ready') break
+                    if (status.state === 'failed' || status.state === 'cancelled') {
+                        throw new Error(status.error || `Partial backup export ${status.state}`)
+                    }
+                    await awaitWithAbort(
+                        new Promise<void>(resolve => setTimeout(resolve, 250)),
+                        callerSignal,
+                    )
+                }
+
+                // This request only opens an already-prepared private spool.
+                // Its lifetime belongs to the caller (including body reads),
+                // not the generic 15-second authoritative-read deadline.
+                const downloadUrl = `/api/backup/export/jobs/${encodeURIComponent(jobId)}/download`
+                const response = callerSignal
+                    ? await this.authFetch(downloadUrl, { signal: callerSignal })
+                    : await this.authFetch(downloadUrl)
+                if (!response.ok) {
+                    throw new Error(`backup export download error: ${response.status}`)
+                }
+                return response
+            } catch (error) {
+                await cancelJob()
+                throw error
+            }
+        }
+
         const params = new URLSearchParams()
         if (opts?.target === 'upstream') params.set('target', 'upstream')
-        if (opts?.scope === 'partial') params.set('scope', 'partial')
         const query = params.toString()
         const url = `/api/backup/export${query ? `?${query}` : ''}`
-        const da = await this.authFetch(url)
+        // Backup preparation can legitimately take longer than ordinary KV
+        // reads. Keep it caller-cancellable without applying the generic 15s
+        // pre-header timeout.
+        const da = callerSignal
+            ? await this.authFetch(url, { signal: callerSignal })
+            : await this.authFetch(url)
         if (da.status < 200 || da.status >= 300) throw `backup export error: ${da.status}`
         return da
     }

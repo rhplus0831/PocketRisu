@@ -29,6 +29,7 @@ export interface alertData{
     stackTrace?: string;
     defaultValue?: string
     actions?: AlertAction[]
+    cancelAction?: () => void
 }
 
 export interface NotifyOptions {
@@ -250,10 +251,11 @@ export function notifySuccess(msg: unknown, opts?: Pick<NotifyOptions, 'descript
     toast.success(message, opts?.description ? { description: opts.description } : undefined)
 }
 
-export function alertWait(msg:string){
+export function alertWait(msg:string, cancelAction?: () => void){
     alertStoreImported.set({
         'type': 'wait',
-        'msg': msg
+        'msg': msg,
+        cancelAction,
     })
 
 }

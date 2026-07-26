@@ -1032,6 +1032,8 @@
     message={$alertStore.msg}
     submessage={$alertStore.type !== 'progress' ? ($alertStore.submsg ?? '') : ''}
     progress={$alertStore.type === 'progress' ? parseFloat($alertStore.submsg ?? '0') : null}
+    onCancel={$alertStore.cancelAction ?? null}
+    cancelLabel={language.cancel}
 />
 
 <ShAlertDialog

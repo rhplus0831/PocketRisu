@@ -9,6 +9,7 @@
     import { LoaderCircleIcon } from '@lucide/svelte';
     import { cn } from 'src/lib/utils';
     import type { ShDialogTier } from './ShDialog.svelte';
+    import ShButton from './ShButton.svelte';
 
     interface Props {
         open?: boolean;
@@ -18,6 +19,8 @@
         tier?: ShDialogTier;
         contentClass?: string;
         extra?: Snippet;
+        onCancel?: (() => void) | null;
+        cancelLabel?: string;
     }
 
     let {
@@ -28,6 +31,8 @@
         tier = 'alert',
         contentClass = '',
         extra,
+        onCancel = null,
+        cancelLabel = 'Cancel',
     }: Props = $props();
 
     const clampedProgress = $derived(
@@ -96,6 +101,10 @@
 
             {#if extra}
                 {@render extra()}
+            {/if}
+
+            {#if onCancel}
+                <ShButton variant="outline" onclick={onCancel}>{cancelLabel}</ShButton>
             {/if}
         </Dialog.Content>
     </Dialog.Portal>

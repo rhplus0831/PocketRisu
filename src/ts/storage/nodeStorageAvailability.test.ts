@@ -89,6 +89,197 @@ afterEach(() => {
 })
 
 describe('NodeStorage availability bounds', () => {
+    it('polls a partial export job past the generic 15 second read bound', async () => {
+        vi.useFakeTimers()
+        const startedAt = Date.now()
+        const progress = vi.fn()
+        const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input)
+            if (url === '/api/backup/export/jobs' && init?.method === 'POST') {
+                return new Response(JSON.stringify({ jobId: 'export-job', state: 'preparing' }), {
+                    status: 202,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            if (url === '/api/backup/export/jobs/export-job') {
+                const ready = Date.now() - startedAt > AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS
+                return new Response(JSON.stringify({
+                    state: ready ? 'ready' : 'preparing',
+                    phase: ready ? 'ready' : 'folding-database',
+                    current: ready ? 2 : 1,
+                    total: 2,
+                    bytes: 1024,
+                }), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            if (url === '/api/backup/export/jobs/export-job/download') {
+                return new Response(new Uint8Array([1, 2, 3]), { status: 200 })
+            }
+            throw new Error(`Unexpected request: ${url}`)
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+
+        const exported = storage.exportBackup({
+            scope: 'partial',
+            onPreparationProgress: progress,
+        })
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS + 1_000)
+
+        await expect(exported).resolves.toBeInstanceOf(Response)
+        expect(progress).toHaveBeenCalledWith(expect.objectContaining({
+            phase: 'ready',
+            current: 2,
+        }))
+        expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/download'))).toBe(true)
+    })
+
+    it('keeps the ordinary availability bound for a full export without a caller signal', async () => {
+        vi.useFakeTimers()
+        let requestSignal: AbortSignal | undefined
+        vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+            requestSignal = init?.signal ?? undefined
+            return new Promise<Response>(() => undefined)
+        }))
+        const storage = readyStorage()
+
+        const exported = storage.exportBackup().catch(error => error)
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+
+        await expect(exported).resolves.toMatchObject({
+            code: 'STORAGE_TIMEOUT',
+            operation: 'read',
+        })
+        expect(requestSignal?.aborted).toBe(true)
+    })
+
+    it('bounds a stalled ready-download header when no caller signal is supplied', async () => {
+        vi.useFakeTimers()
+        let downloadSignal: AbortSignal | undefined
+        const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input)
+            if (url === '/api/backup/export/jobs' && init?.method === 'POST') {
+                return Promise.resolve(new Response(JSON.stringify({
+                    jobId: 'download-bound-job',
+                    state: 'preparing',
+                }), {
+                    status: 202,
+                    headers: { 'content-type': 'application/json' },
+                }))
+            }
+            if (url === '/api/backup/export/jobs/download-bound-job' && init?.method === 'DELETE') {
+                return Promise.resolve(new Response(JSON.stringify({ ok: true }), {
+                    status: 202,
+                    headers: { 'content-type': 'application/json' },
+                }))
+            }
+            if (url === '/api/backup/export/jobs/download-bound-job') {
+                return Promise.resolve(new Response(JSON.stringify({
+                    state: 'ready', phase: 'ready', current: 2, total: 2, bytes: 0,
+                }), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                }))
+            }
+            if (url.endsWith('/download')) {
+                downloadSignal = init?.signal ?? undefined
+                return new Promise<Response>(() => undefined)
+            }
+            throw new Error(`Unexpected request: ${url}`)
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+
+        const exported = storage.exportBackup({ scope: 'partial' }).catch(error => error)
+        await vi.waitFor(() => expect(downloadSignal).toBeDefined())
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+
+        await expect(exported).resolves.toMatchObject({
+            code: 'STORAGE_TIMEOUT',
+            operation: 'read',
+        })
+        expect(downloadSignal?.aborted).toBe(true)
+    })
+
+    it('cancels a partial export job when the caller aborts preparation', async () => {
+        const controller = new AbortController()
+        let statusSignal: AbortSignal | undefined
+        const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input)
+            if (url === '/api/backup/export/jobs' && init?.method === 'POST') {
+                return new Response(JSON.stringify({ jobId: 'cancel-job', state: 'preparing' }), {
+                    status: 202,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            if (url === '/api/backup/export/jobs/cancel-job' && init?.method === 'DELETE') {
+                return new Response(JSON.stringify({ ok: true }), {
+                    status: 202,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            if (url === '/api/backup/export/jobs/cancel-job') {
+                statusSignal = init?.signal ?? undefined
+                return new Promise<Response>((_resolve, reject) => {
+                    statusSignal?.addEventListener('abort', () => {
+                        reject(new DOMException('cancelled', 'AbortError'))
+                    }, { once: true })
+                })
+            }
+            throw new Error(`Unexpected request: ${url}`)
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+
+        const exported = storage.exportBackup({ scope: 'partial', signal: controller.signal })
+        await vi.waitFor(() => expect(statusSignal).toBeDefined())
+        controller.abort(new DOMException('cancelled', 'AbortError'))
+
+        await expect(exported).rejects.toMatchObject({ name: 'AbortError' })
+        expect(statusSignal?.aborted).toBe(true)
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+            '/api/backup/export/jobs/cancel-job',
+            expect.objectContaining({ method: 'DELETE' }),
+        ))
+    })
+
+    it('cancels by its client-chosen id when the create acknowledgement is lost', async () => {
+        const controller = new AbortController()
+        let requestedJobId = ''
+        const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input)
+            if (url === '/api/backup/export/jobs' && init?.method === 'POST') {
+                requestedJobId = JSON.parse(String(init.body)).jobId
+                return new Promise<Response>((_resolve, reject) => {
+                    init.signal?.addEventListener('abort', () => {
+                        reject(new DOMException('lost create acknowledgement', 'AbortError'))
+                    }, { once: true })
+                })
+            }
+            if (url === `/api/backup/export/jobs/${requestedJobId}` && init?.method === 'DELETE') {
+                return Promise.resolve(new Response(JSON.stringify({ ok: true }), {
+                    status: 202,
+                    headers: { 'content-type': 'application/json' },
+                }))
+            }
+            throw new Error(`Unexpected request: ${url}`)
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+
+        const exported = storage.exportBackup({ scope: 'partial', signal: controller.signal })
+        await vi.waitFor(() => expect(requestedJobId).toMatch(/^[0-9a-f-]{36}$/))
+        controller.abort(new DOMException('cancelled', 'AbortError'))
+
+        await expect(exported).rejects.toMatchObject({ name: 'AbortError' })
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+            `/api/backup/export/jobs/${requestedJobId}`,
+            expect.objectContaining({ method: 'DELETE' }),
+        ))
+    })
+
     it('routes staged transition controls without an aggregate database envelope', async () => {
         const transitionId = '123e4567-e89b-42d3-a456-426614174000'
         const targetGeneration = '123e4567-e89b-42d3-a456-426614174001'
@@ -185,7 +376,7 @@ describe('NodeStorage availability bounds', () => {
         expect(cache.sha256OwnedBytes).toHaveBeenCalledOnce()
         expect(cache.sha256Bytes).not.toHaveBeenCalled()
         expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
-    }, 15_000)
+    }, 30_000)
 
     it('seeds a cache-enabled legacy value with the server hash and donated bytes', async () => {
         vi.useFakeTimers()

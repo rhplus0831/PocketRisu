@@ -2,8 +2,11 @@ import { beforeEach, describe, expect, test, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
     alertConfirm: vi.fn(),
+    alertClear: vi.fn(),
     alertError: vi.fn(),
     alertMd: vi.fn(),
+    alertWait: vi.fn(),
+    notifyInfo: vi.fn(),
     notifySuccess: vi.fn(),
     exportBackup: vi.fn(),
     downloadFile: vi.fn(),
@@ -11,12 +14,13 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../alert', () => ({
     alertConfirm: mocks.alertConfirm,
+    alertClear: mocks.alertClear,
     alertError: mocks.alertError,
     alertMd: mocks.alertMd,
     alertStore: { set: vi.fn() },
-    alertWait: vi.fn(),
+    alertWait: mocks.alertWait,
     notifyError: vi.fn(),
-    notifyInfo: vi.fn(),
+    notifyInfo: mocks.notifyInfo,
     notifySuccess: mocks.notifySuccess,
     waitAlert: vi.fn(),
 }))
@@ -62,12 +66,58 @@ describe('SavePartialLocalBackup', () => {
 
         expect(mocks.alertConfirm).toHaveBeenNthCalledWith(1, 'first')
         expect(mocks.alertConfirm).toHaveBeenNthCalledWith(2, 'second')
-        expect(mocks.exportBackup).toHaveBeenCalledWith({ scope: 'partial' })
+        expect(mocks.exportBackup).toHaveBeenCalledWith(expect.objectContaining({
+            scope: 'partial',
+            onPreparationProgress: expect.any(Function),
+        }))
         expect(mocks.downloadFile).toHaveBeenCalledWith(
             'server-partial.bin',
             new Uint8Array([1, 2, 3, 4]),
         )
         expect(mocks.notifySuccess).toHaveBeenCalledWith('Success')
+    })
+
+    test('reports bounded server preparation progress before downloading', async () => {
+        mocks.exportBackup.mockImplementationOnce(async (options) => {
+            options.onPreparationProgress({
+                phase: 'pinning-assets',
+                current: 2,
+                total: 4,
+                bytes: 2048,
+            })
+            return backupResponse()
+        })
+
+        await SavePartialLocalBackup()
+
+        expect(mocks.alertWait).toHaveBeenCalledWith(
+            expect.stringContaining('pinning-assets 2/4, 2.0 KB'),
+            expect.any(Function),
+        )
+    })
+
+    test('offers a cancel action that aborts preparation and closes the wait dialog', async () => {
+        mocks.exportBackup.mockImplementationOnce(async (options) => (
+            new Promise((_resolve, reject) => {
+                options.signal.addEventListener('abort', () => {
+                    reject(options.signal.reason)
+                }, { once: true })
+            })
+        ))
+
+        const saving = SavePartialLocalBackup()
+        await vi.waitFor(() => expect(mocks.exportBackup).toHaveBeenCalled())
+        const cancelAction = mocks.alertWait.mock.calls
+            .map(call => call[1])
+            .find(action => typeof action === 'function')
+        expect(cancelAction).toBeTypeOf('function')
+        cancelAction()
+        await saving
+
+        expect(mocks.alertClear).toHaveBeenCalledOnce()
+        expect(mocks.notifyInfo).toHaveBeenCalledWith('Backup cancelled')
+        expect(mocks.alertError).not.toHaveBeenCalled()
+        expect(mocks.notifySuccess).not.toHaveBeenCalled()
     })
 
     test('reports server-detected missing profile assets after a successful stream', async () => {

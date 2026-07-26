@@ -51,6 +51,7 @@ const {
     createAssetStore,
     ensureAssetDir,
     isSafeAssetName,
+    assetPathFor,
     writeAssetFile,
     writeAssetFileIfChanged,
     readAssetFile,
@@ -1459,6 +1460,12 @@ if(!existsSync(savePath)){
 }
 
 const DATABASE_SPOOL_FILE_PREFIX = '.database-risudat-';
+const PARTIAL_EXPORT_JOB_PREFIX = '.partial-export-';
+const PARTIAL_EXPORT_JOB_TTL_MS = 15 * 60 * 1000;
+// This is a single-user server and each job can hold a WAL snapshot plus two
+// archive-sized spools. Serial admission makes the statfs preflight an actual
+// reservation instead of letting concurrent jobs all spend the same bytes.
+const PARTIAL_EXPORT_MAX_ACTIVE_JOBS = 1;
 const PLUGIN_VALUE_SPOOL_FILE_PREFIX = '.plugin-value-';
 const PLUGIN_TRANSITION_STAGE_PREFIX = '.plugin-transition-stage-';
 const PLUGIN_TRANSITION_STAGE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -1469,18 +1476,47 @@ const configuredDatabaseSpoolDir = String(process.env.POCKETRISU_SPOOL_DIR ?? ''
 const databaseSpoolDir = configuredDatabaseSpoolDir
     ? path.resolve(configuredDatabaseSpoolDir)
     : path.join(savePath, '.spool');
+// Filesystem asset pins stay on the save volume so an export can take one
+// coherent SQLite/filesystem cut without relying on cross-device links.
+const partialExportSpoolDir = path.join(savePath, '.partial-export-spool');
 let databaseSpoolReady = true;
 const pluginTransitionStageDir = path.join(savePath, '.plugin-transition-staging');
 try {
     mkdirSync(databaseSpoolDir, { recursive: true });
+    mkdirSync(partialExportSpoolDir, { recursive: true, mode: 0o700 });
     mkdirSync(pluginTransitionStageDir, { recursive: true, mode: 0o700 });
 } catch (error) {
     databaseSpoolReady = false;
     logger.error(`[Backup] Could not create database spool directory ${databaseSpoolDir}:`, error);
 }
+try {
+    for (const entry of readdirSync(partialExportSpoolDir, { withFileTypes: true })) {
+        if (!entry.name.startsWith(PARTIAL_EXPORT_JOB_PREFIX)) continue;
+        fsSync.rmSync(path.join(partialExportSpoolDir, entry.name), {
+            recursive: true,
+            force: true,
+        });
+    }
+} catch (error) {
+    logger.warn('[Backup] Could not sweep partial export spool directory:', error);
+}
 if (databaseSpoolReady) {
     try {
         for (const entry of readdirSync(databaseSpoolDir, { withFileTypes: true })) {
+            if (
+                entry.name.startsWith(PARTIAL_EXPORT_JOB_PREFIX)
+                && entry.name !== path.basename(partialExportSpoolDir)
+            ) {
+                try {
+                    fsSync.rmSync(path.join(databaseSpoolDir, entry.name), {
+                        recursive: true,
+                        force: true,
+                    });
+                } catch (error) {
+                    logger.warn(`[Backup] Could not remove orphaned partial export ${entry.name}:`, error);
+                }
+                continue;
+            }
             if (!entry.isFile() || !(
                 entry.name.startsWith(DATABASE_SPOOL_FILE_PREFIX)
                 || entry.name.startsWith(PLUGIN_VALUE_SPOOL_FILE_PREFIX)
@@ -2444,7 +2480,7 @@ const ASSET_EXT_MIME = {
     mp3: 'audio/mpeg', ogg: 'audio/ogg', wav: 'audio/wav',
 }
 
-async function checkDiskSpace(requiredBytes) {
+async function checkDiskSpace(requiredBytes, targetPath = path.join(process.cwd(), 'save')) {
     if (process.env.POCKETRISU_PLUGIN_STORAGE_TEST_FAILPOINTS === '1'
         && process.env.POCKETRISU_PLUGIN_TRANSITION_TEST_AVAILABLE_BYTES !== undefined) {
         const available = Number(
@@ -2455,8 +2491,7 @@ async function checkDiskSpace(requiredBytes) {
         }
     }
     try {
-        const saveDir = path.join(process.cwd(), 'save');
-        const stats = await fs.statfs(saveDir);
+        const stats = await fs.statfs(targetPath);
         const availableBytes = stats.bavail * stats.bsize;
         return { ok: availableBytes >= requiredBytes, available: availableBytes };
     } catch {
@@ -4030,10 +4065,304 @@ function listPartialBackupAssetEntries(database, reader) {
             backupName: path.basename(entry.key),
             sortKey: entry.key,
             size: entry.size,
+            source: entry.source,
         });
     }
     entries.sort((a, b) => a.sortKey.localeCompare(b.sortKey));
     return { entries, missing };
+}
+
+const partialExportJobs = new Map();
+
+function partialExportOwner(req) {
+    const sessionId = req.headers['x-session-id'];
+    return typeof sessionId === 'string' ? sessionId : '';
+}
+
+function partialExportJobForRequest(req, res) {
+    const job = partialExportJobs.get(req.params.jobId);
+    if (!job || job.owner !== partialExportOwner(req)) {
+        res.status(404).json({ error: 'Partial export job not found' });
+        return null;
+    }
+    return job;
+}
+
+function throwIfPartialExportCancelled(job) {
+    if (job.abortController.signal.aborted) {
+        const error = new Error('Partial export was cancelled');
+        error.name = 'AbortError';
+        throw error;
+    }
+}
+
+async function cleanupPartialExportArtifacts(job) {
+    try { job.snapshot?.close(); } catch {}
+    job.snapshot = null;
+    if (job.databaseSpool?.filePath) {
+        await fs.unlink(job.databaseSpool.filePath).catch(() => {});
+    }
+    job.databaseSpool = null;
+    await fs.rm(job.spoolDir, { recursive: true, force: true }).catch(() => {});
+}
+
+async function cleanupPartialExportJob(job) {
+    if (job.cleaned) return;
+    job.cleaned = true;
+    partialExportJobs.delete(job.id);
+    job.abortController.abort();
+    await cleanupPartialExportArtifacts(job);
+}
+
+async function copyPartialExportAsset(job, entry, destination) {
+    const sourceName = assetNameForKey(entry.key);
+    if (!sourceName || !isSafeAssetName(sourceName)) {
+        throw new Error(`Invalid partial export asset: ${entry.key}`);
+    }
+    const source = await fs.open(assetPathFor(sourceName), 'r');
+    let output;
+    try {
+        const before = await source.stat();
+        if (!before.isFile() || before.size !== entry.size) {
+            throw new Error(`Partial export asset changed before it could be pinned: ${entry.key}`);
+        }
+        output = await fs.open(destination, 'wx', 0o600);
+        const hash = nodeCrypto.createHash('sha256');
+        const buffer = Buffer.allocUnsafe(256 * 1024);
+        let offset = 0;
+        while (true) {
+            throwIfPartialExportCancelled(job);
+            const { bytesRead } = await source.read(buffer, 0, buffer.length, offset);
+            if (bytesRead === 0) break;
+            const chunk = buffer.subarray(0, bytesRead);
+            hash.update(chunk);
+            let written = 0;
+            while (written < bytesRead) {
+                const result = await output.write(chunk, written, bytesRead - written, offset + written);
+                written += result.bytesWritten;
+            }
+            offset += bytesRead;
+            job.progress.bytes += bytesRead;
+        }
+        const after = await source.stat();
+        if (
+            offset !== before.size
+            || after.size !== before.size
+            || after.dev !== before.dev
+            || after.ino !== before.ino
+            || after.mtimeMs !== before.mtimeMs
+        ) {
+            throw new Error(`Partial export asset changed while it was being pinned: ${entry.key}`);
+        }
+        await output.sync();
+        await output.close();
+        output = null;
+        const digest = hash.digest('hex');
+        const verification = sourceName.match(/^([0-9a-f]{64})\.[A-Za-z0-9]{1,10}$/);
+        if (verification && verification[1] !== digest) {
+            throw new Error(`Partial export asset hash mismatch: ${entry.key}`);
+        }
+        return {
+            kind: 'file',
+            sourcePath: destination,
+            backupName: entry.backupName,
+            sortKey: entry.sortKey,
+            size: offset,
+            sha256: digest,
+        };
+    } finally {
+        await output?.close().catch(() => {});
+        await source.close().catch(() => {});
+    }
+}
+
+async function pinPartialExportState(job) {
+    return queueStorageReadAfterImports(async () => {
+        throwIfPartialExportCancelled(job);
+        await flushPendingDb();
+        const snapshot = createKvSnapshot();
+        job.snapshot = snapshot;
+        try {
+            const raw = snapshot.kvGet('database/database.bin');
+            if (!raw) throw new Error('No database is available to export');
+            const strippedDb = await loadStrippedDatabase(raw, 'Partial Backup');
+            const database = { ...strippedDb, account: undefined };
+            const selected = listPartialBackupAssetEntries(database, snapshot);
+            preflightBackupEntryNames(selected.entries);
+            const assemblyBytes = [
+                ...snapshot.kvListWithSizes('chats/'),
+                ...snapshot.kvListWithSizes(PLUGIN_SAVE_PREFIX),
+                ...snapshot.kvListWithSizes(PLUGIN_SAVE_META_PREFIX),
+            ].reduce(
+                (sum, entry) => sum + entry.size + Buffer.byteLength(entry.key, 'utf-8'),
+                raw.length,
+            );
+            const selectedAssetBytes = selected.entries.reduce(
+                (sum, entry) => sum + entry.size,
+                0,
+            );
+            const requiredBytes = (
+                (assemblyBytes + selectedAssetBytes) * BACKUP_DISK_HEADROOM
+                + 16 * 1024 * 1024
+            );
+            if (!Number.isSafeInteger(requiredBytes)) {
+                throw new Error('Partial export size exceeds the safe integer range');
+            }
+            const disk = await checkDiskSpace(requiredBytes);
+            if (!disk.ok) {
+                const error = new Error(
+                    `Insufficient disk space for partial export (requires ${requiredBytes} bytes)`,
+                );
+                error.code = 'ENOSPC';
+                throw error;
+            }
+            const databaseSpoolDisk = await checkDiskSpace(
+                assemblyBytes + 8 * 1024 * 1024,
+                databaseSpoolDir,
+            );
+            if (!databaseSpoolDisk.ok) {
+                const error = new Error(
+                    'Insufficient disk space on the configured database spool volume',
+                );
+                error.code = 'ENOSPC';
+                throw error;
+            }
+            job.missingAssets = selected.missing;
+            job.progress.phase = 'pinning-assets';
+            job.progress.total = selected.entries.length + 2;
+
+            const pinnedEntries = [];
+            let pinIndex = 0;
+            for (const entry of selected.entries) {
+                throwIfPartialExportCancelled(job);
+                if (entry.source === 'fs') {
+                    const destination = path.join(job.pinDir, `${String(pinIndex).padStart(8, '0')}.asset`);
+                    pinnedEntries.push(await copyPartialExportAsset(job, entry, destination));
+                    pinIndex++;
+                } else {
+                    // Preserve the source selected at the snapshot boundary.
+                    // A later filesystem file must never shadow this KV row.
+                    pinnedEntries.push({ ...entry, kind: 'kv' });
+                }
+                job.progress.current++;
+            }
+            return { snapshot, database, entries: pinnedEntries };
+        } catch (error) {
+            snapshot.close();
+            job.snapshot = null;
+            throw error;
+        }
+    });
+}
+
+async function writePartialExportArchive(job, database, entries) {
+    const output = createWriteStream(job.archiveTempPath, { flags: 'wx', mode: 0o600 });
+    try {
+        for (const entry of entries) {
+            throwIfPartialExportCancelled(job);
+            if (!await writeWithBackpressure(
+                output,
+                encodeBackupEntryHeader(entry.backupName, entry.size),
+                () => job.abortController.signal.aborted,
+            )) throwIfPartialExportCancelled(job);
+            if (entry.kind === 'file') {
+                if (!await streamFileToWritable(
+                    entry.sourcePath,
+                    output,
+                    () => job.abortController.signal.aborted,
+                )) throwIfPartialExportCancelled(job);
+            } else {
+                const value = job.snapshot.kvGet(entry.key);
+                if (value === null || value.length !== entry.size) {
+                    throw new Error(`Pinned partial export row is unavailable: ${entry.key}`);
+                }
+                if (!await writeWithBackpressure(
+                    output,
+                    value,
+                    () => job.abortController.signal.aborted,
+                )) throwIfPartialExportCancelled(job);
+            }
+        }
+
+        job.progress.phase = 'folding-database';
+        job.databaseSpool = await spoolSelfContainedBackupDatabase(database, {
+            foldPluginStorage: true,
+            shouldAbort: () => job.abortController.signal.aborted,
+            reader: job.snapshot,
+            onMissingChatRow: (chaId, chatId) => {
+                warnAndPreserveMissingChatRow('Partial Backup Export', chaId, chatId);
+            },
+        });
+        throwIfPartialExportCancelled(job);
+        job.progress.current++;
+        if (!await writeWithBackpressure(
+            output,
+            encodeBackupEntryHeader('database.risudat', job.databaseSpool.size),
+            () => job.abortController.signal.aborted,
+        )) throwIfPartialExportCancelled(job);
+        if (!await streamFileToWritable(
+            job.databaseSpool.filePath,
+            output,
+            () => job.abortController.signal.aborted,
+        )) throwIfPartialExportCancelled(job);
+        job.progress.current++;
+        output.end();
+        await finished(output);
+        await fs.rename(job.archiveTempPath, job.archivePath);
+    } catch (error) {
+        output.destroy();
+        await finished(output).catch(() => {});
+        throw error;
+    }
+}
+
+async function preparePartialExportJob(job) {
+    try {
+        job.progress.phase = 'snapshot';
+        const pinned = await pinPartialExportState(job);
+        job.progress.phase = 'assembling';
+
+        const testDelay = process.env.NODE_ENV === 'test'
+            ? Number(process.env.POCKETRISU_TEST_PARTIAL_EXPORT_DELAY_MS ?? 0)
+            : 0;
+        if (Number.isFinite(testDelay) && testDelay > 0) {
+            throwIfPartialExportCancelled(job);
+            await new Promise((resolve, reject) => {
+                const timer = setTimeout(resolve, testDelay);
+                job.abortController.signal.addEventListener('abort', () => {
+                    clearTimeout(timer);
+                    reject(Object.assign(new Error('Partial export was cancelled'), { name: 'AbortError' }));
+                }, { once: true });
+            });
+        }
+
+        await writePartialExportArchive(job, pinned.database, pinned.entries);
+        throwIfPartialExportCancelled(job);
+        const stat = await fs.stat(job.archivePath);
+        job.size = stat.size;
+        job.state = 'ready';
+        job.progress.phase = 'ready';
+        job.expiresAt = Date.now() + PARTIAL_EXPORT_JOB_TTL_MS;
+        try { job.snapshot?.close(); } catch {}
+        job.snapshot = null;
+        if (job.databaseSpool?.filePath) {
+            await fs.unlink(job.databaseSpool.filePath).catch(() => {});
+        }
+        job.databaseSpool = null;
+        await fs.rm(job.pinDir, { recursive: true, force: true }).catch(() => {});
+    } catch (error) {
+        if (!job.abortController.signal.aborted) {
+            logger.error('[Partial Backup Export] Preparation failed:', error);
+            job.state = 'failed';
+            job.error = error?.message || String(error);
+            job.progress.phase = 'failed';
+            job.expiresAt = Date.now() + PARTIAL_EXPORT_JOB_TTL_MS;
+            await cleanupPartialExportArtifacts(job);
+        } else {
+            job.state = 'cancelled';
+            await cleanupPartialExportJob(job);
+        }
+    }
 }
 
 function assertBackupEntryNameWithinLimit(name) {
@@ -8926,8 +9255,173 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
     }
 });
 
+app.post('/api/backup/export/jobs', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        if (req.body?.scope !== 'partial') {
+            res.status(400).json({ error: 'Only partial export jobs are supported' });
+            return;
+        }
+        const owner = partialExportOwner(req);
+        const requestedId = req.body?.jobId;
+        if (typeof requestedId !== 'string' || !PLUGIN_STORAGE_UUID_PATTERN.test(requestedId)) {
+            res.status(400).json({ error: 'Partial export jobId must be a canonical UUID' });
+            return;
+        }
+        const existingById = partialExportJobs.get(requestedId);
+        if (existingById) {
+            if (existingById.owner !== owner) {
+                res.status(409).json({ error: 'Partial export jobId is already in use' });
+                return;
+            }
+            res.status(202).json({ jobId: existingById.id, state: existingById.state });
+            return;
+        }
+        const existingForOwner = [...partialExportJobs.values()].find(job => job.owner === owner);
+        if (existingForOwner) {
+            res.status(409).json({
+                error: 'A partial export job is already active for this session',
+                jobId: existingForOwner.id,
+                state: existingForOwner.state,
+            });
+            return;
+        }
+        if (partialExportJobs.size >= PARTIAL_EXPORT_MAX_ACTIVE_JOBS) {
+            res.status(429).json({
+                error: 'Too many partial export jobs are active',
+                retryable: true,
+            });
+            return;
+        }
+        const id = requestedId;
+        const spoolDir = path.join(partialExportSpoolDir, `${PARTIAL_EXPORT_JOB_PREFIX}${id}`);
+        const pinDir = path.join(spoolDir, 'assets');
+        const job = {
+            id,
+            owner,
+            state: 'creating',
+            createdAt: Date.now(),
+            expiresAt: Date.now() + PARTIAL_EXPORT_JOB_TTL_MS,
+            abortController: new AbortController(),
+            spoolDir,
+            pinDir,
+            archiveTempPath: path.join(spoolDir, 'partial-backup.bin.tmp'),
+            archivePath: path.join(spoolDir, 'partial-backup.bin'),
+            filename: `risu-backup-${Date.now()}-partial.bin`,
+            snapshot: null,
+            databaseSpool: null,
+            missingAssets: 0,
+            size: 0,
+            error: null,
+            cleaned: false,
+            progress: { phase: 'queued', current: 0, total: 0, bytes: 0 },
+        };
+        // Reserve identity, owner admission, and the sole disk budget before
+        // the first await. Duplicate creates, concurrent creates, and DELETE
+        // now observe this job even while its directory is being created.
+        partialExportJobs.set(id, job);
+        try {
+            await fs.mkdir(pinDir, { recursive: true, mode: 0o700 });
+        } catch (error) {
+            await cleanupPartialExportJob(job);
+            throw error;
+        }
+        if (job.cleaned || job.abortController.signal.aborted) {
+            await cleanupPartialExportArtifacts(job);
+            if (!res.headersSent) {
+                res.status(409).json({ error: 'Partial export job was cancelled during creation' });
+            }
+            return;
+        }
+        job.state = 'preparing';
+        res.status(202).json({ jobId: id, state: job.state });
+        job.preparation = Promise.resolve().then(() => preparePartialExportJob(job));
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.get('/api/backup/export/jobs/:jobId', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const job = partialExportJobForRequest(req, res);
+        if (!job) return;
+        res.setHeader('cache-control', 'no-store');
+        res.json({
+            jobId: job.id,
+            state: job.state,
+            phase: job.progress.phase,
+            current: job.progress.current,
+            total: job.progress.total,
+            bytes: job.progress.bytes,
+            size: job.state === 'ready' ? job.size : undefined,
+            missingAssets: job.missingAssets,
+            error: job.state === 'failed' ? job.error : undefined,
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.delete('/api/backup/export/jobs/:jobId', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const job = partialExportJobForRequest(req, res);
+        if (!job) return;
+        job.state = 'cancelled';
+        job.abortController.abort();
+        partialExportJobs.delete(job.id);
+        if (!job.preparation || job.progress.phase === 'ready' || job.progress.phase === 'failed') {
+            await cleanupPartialExportJob(job);
+        }
+        res.status(202).json({ ok: true, state: 'cancelled' });
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.get('/api/backup/export/jobs/:jobId/download', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    let job;
+    let closed = false;
+    let consuming = false;
+    try {
+        job = partialExportJobForRequest(req, res);
+        if (!job) return;
+        if (job.state !== 'ready') {
+            res.status(409).json({ error: 'Partial export is not ready', state: job.state });
+            return;
+        }
+        consuming = true;
+        job.state = 'streaming';
+        job.progress.phase = 'streaming';
+        res.once('close', () => { closed = true; });
+        res.setHeader('cache-control', 'no-store');
+        res.setHeader('content-type', 'application/octet-stream');
+        res.setHeader('content-disposition', `attachment; filename="${job.filename}"`);
+        res.setHeader('content-length', job.size);
+        res.setHeader('x-risu-backup-assets', Math.max(0, job.progress.total - 2));
+        res.setHeader('x-risu-backup-missing-assets', job.missingAssets);
+        if (!await streamFileToWritable(job.archivePath, res, () => closed)) return;
+        if (!closed) res.end();
+    } catch (error) {
+        if (!closed && !res.headersSent) next(error);
+        else if (!closed) res.destroy(error);
+    } finally {
+        if (job && consuming) await cleanupPartialExportJob(job);
+    }
+});
+
 app.get('/api/backup/export', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
+    if (req.query.scope === 'partial') {
+        res.status(409).json({
+            error: 'Partial exports use the cancellable export-job protocol',
+            code: 'PARTIAL_EXPORT_JOB_REQUIRED',
+            create: '/api/backup/export/jobs',
+        });
+        return;
+    }
     let backupDbSpool = null;
     let backupSnapshot = null;
     let closed = false;
@@ -11923,6 +12417,17 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
             }
             if (!job.done && now - job.updatedAt > Math.max(PROXY_STREAM_DEFAULT_TIMEOUT_MS, job.timeoutMs * 2)) {
                 cleanupJob(jobId);
+            }
+        }
+        for (const job of partialExportJobs.values()) {
+            if (now < job.expiresAt) continue;
+            job.state = 'cancelled';
+            job.abortController.abort();
+            partialExportJobs.delete(job.id);
+            if (!job.preparation || job.progress.phase === 'ready' || job.progress.phase === 'failed') {
+                cleanupPartialExportJob(job).catch(error => {
+                    logger.warn('[Partial Backup Export] TTL cleanup failed:', error);
+                });
             }
         }
     }, PROXY_STREAM_GC_INTERVAL_MS);

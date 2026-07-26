@@ -153,7 +153,12 @@ read-only SQLite snapshot,
 canonical key order and publication-wide owner facets, strict content-bound
 NDJSON/page tokens, a 10,000-key same-membership race, real response
 backpressure/disconnect cleanup, complete load supersession/unmount/hash aborts,
-and generation-owned partial folding.
+and generation-owned partial folding. Owner-scoped, idempotent two-phase partial
+export jobs add bounded polling through preparation beyond 15 seconds, admission
+and dual-volume disk preflight, caller cancellation, lost-create acknowledgement,
+TTL/disconnect/restart cleanup, immutable same-volume filesystem pins,
+equal-size replacement safety, PM2 private-stage exclusion, and upstream archive
+compatibility.
 PM4 additionally covers compact manifest CAS, exact server value hashes,
 50-row snapshot reuse, canonical manifest-key validation and cancellation,
 donated 128-row and four-by-2-MiB batches, one IndexedDB mutation transaction,

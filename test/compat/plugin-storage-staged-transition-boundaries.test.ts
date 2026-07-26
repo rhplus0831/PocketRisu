@@ -418,7 +418,22 @@ describe('staged plugin transition verifier boundaries (real server)', () => {
     expect(readSqliteValue(server, valueKey)).toBeNull()
     expect((await readdir(stageDir(server))).some(name => name.endsWith('.row'))).toBe(true)
 
-    const response = await client.fetch('/api/backup/export?scope=partial')
+    const create = await client.fetch('/api/backup/export/jobs', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ scope: 'partial', jobId: randomUUID() }),
+    })
+    expect(create.status).toBe(202)
+    const { jobId } = await create.json() as { jobId: string }
+    let state = 'preparing'
+    for (let attempt = 0; attempt < 200 && state === 'preparing'; attempt++) {
+      const status = await client.fetch(`/api/backup/export/jobs/${jobId}`)
+      expect(status.status).toBe(200)
+      state = ((await status.json()) as { state: string }).state
+      if (state === 'preparing') await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    expect(state).toBe('ready')
+    const response = await client.fetch(`/api/backup/export/jobs/${jobId}/download`)
     expect(response.status).toBe(200)
     const entries = decodeBackup(Buffer.from(await response.arrayBuffer()))
     expect(entries.map(entry => entry.name)).toEqual(['database.risudat'])

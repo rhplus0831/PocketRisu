@@ -181,9 +181,22 @@ export class AutoStorage{
             : this.realStorage.createAuth()
     }
 
-    async exportBackup(opts?: { target?: 'upstream'; scope?: 'partial' }) {
+    async exportBackup(
+        opts?: {
+            target?: 'upstream'
+            scope?: 'partial'
+            signal?: AbortSignal | null
+            onPreparationProgress?: (progress: {
+                phase: string
+                current: number
+                total: number
+                bytes: number
+            }) => void
+        },
+        signal?: AbortSignal | null,
+    ) {
         await this.Init()
-        return this.realStorage.exportBackup(opts)
+        return this.realStorage.exportBackup(opts, signal)
     }
 
     async importBackup(file: Blob, onProgress?: (loaded: number, total: number) => void) {

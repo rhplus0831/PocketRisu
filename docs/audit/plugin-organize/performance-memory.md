@@ -295,6 +295,44 @@ a time. Owner chips, unknown-owner counts, filtered totals, and page counts are
 derived from the same complete publication through a transactionally maintained
 owner index, rather than inferred from the resident page.
 
+Partial local export is now an authenticated, owner-scoped two-phase job rather
+than one request that stays open while the archive is prepared. The browser
+chooses a canonical UUID before `POST /api/backup/export/jobs`, so repeating a
+create after a lost acknowledgement returns the same job and cancellation can
+still address it. Identity, per-owner admission, and the single global
+archive/disk reservation are installed before the first asynchronous operation;
+a different id for the same owner is rejected and concurrent owners cannot each
+spend the same preflighted capacity. Preparation preflights both the save volume
+and a separately configured database-spool volume, returns `202` promptly, and
+publishes status and byte/entry progress. Create and each status request retain
+an independent 15-second availability bound, while the job as a whole may run
+for longer than 15 seconds under the caller's `AbortSignal`.
+
+Status, cancel, and the one-shot ready download remain bound to the creating
+owner even if its writer lease is displaced. Cancel uses an independent bounded
+cleanup request when the caller signal is already aborted. Cancellation,
+failure, successful consumption, download disconnect, and the 15-minute TTL
+destroy private artifacts; boot cleanup removes only owned orphan directories
+and preserves unrelated files. The partial-backup dialog displays server
+progress and exposes a real Cancel action. The legacy synchronous partial route
+is rejected so it cannot bypass this lifecycle.
+
+Preparation flushes pending writes and holds one SQLite snapshot while choosing
+the database, optimized plugin rows, and referenced assets. External plugin
+values are folded into `database.risudat` one row at a time. A selected
+filesystem asset is copied from an open descriptor through a fixed 256 KiB
+buffer to a mode-private pin on the same save volume; size, device, inode,
+modification time, and content-addressed SHA-256 are checked before the live
+path is released. A selected KV asset remains bound to the SQLite snapshot even
+if a filesystem file later shadows it. Archive assembly reads only those pins
+and the snapshot, writes a temporary private archive, and atomically publishes
+the immutable ready spool. Thus an equal-size replacement after pinning yields
+the old bytes or aborts, never the replacement. PM2 transition-stage rows and
+receipts are outside the public snapshot and selected-asset set and cannot leak
+into a partial archive. The selected-asset archive remains upstream compatible,
+omits account data, and applies the same BR4 archive-key validation as other
+folded exports.
+
 Every streamed page is point-in-time and self-verifying. Its metadata carries
 the exact generation, manifest revision, database revision, page, global
 facets, and counts. NDJSON records have exact schemas; blank records, duplicate
@@ -425,8 +463,15 @@ a mounted UI filter change whose obsolete late response cannot commit.
 
 Coverage uses deterministic bounds rather than raw-heap timing: a 10,000-key
 viewer asserts a 50-value page and one in-flight read; partial folding exercises
-1,000 rows plus a 4 MiB body with one parsed row in flight and archive/import
-round trips; chunk restore asserts one chunk in flight, a 64 KiB maximum chunk,
+1,000 rows plus a 4 MiB body with one parsed row in flight and upstream
+archive/import round trips. Real-server export tests cover prompt creation with
+preparation exceeding 15 seconds, idempotent duplicate creates, concurrent
+admission, writer-session displacement, cancellation and exact spool cleanup,
+restart orphan cleanup, a 16 MiB download disconnect, equal-size asset
+replacement, account omission, and PM2 private-stage exclusion. Client tests
+cover progress, UI cancellation, a stalled status request, a lost create
+acknowledgement, and preservation of the ordinary pre-header bound for non-job
+downloads. Chunk restore asserts one chunk in flight, a 64 KiB maximum chunk,
 hundreds of chunks, exact bytes, folded-snapshot recovery, and cancellation/error
 cleanup. A combined real-server test pauses after the exact prior ownership set
 has been fully proven but before deletion, disconnects the client, and verifies

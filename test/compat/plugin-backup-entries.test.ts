@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { mkdir, readdir, writeFile } from 'node:fs/promises'
 import Database from 'better-sqlite3'
 import { Packr } from 'msgpackr'
@@ -167,6 +168,67 @@ function expectExternalPluginRows(
 
 function entriesByName(backup: Buffer): Map<string, Buffer> {
   return new Map(decodeBackup(backup).map(entry => [entry.name, entry.data]))
+}
+
+type PartialExportStatus = {
+  state: string
+  phase: string
+  current: number
+  total: number
+  bytes: number
+  error?: string
+}
+
+async function startPartialExport(client: RisuClient): Promise<string> {
+  const response = await client.fetch('/api/backup/export/jobs', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ scope: 'partial', jobId: randomUUID() }),
+  })
+  expect(response.status).toBe(202)
+  const body = await response.json() as { jobId: string }
+  expect(body.jobId).toMatch(/^[0-9a-f-]{36}$/)
+  return body.jobId
+}
+
+async function waitForPartialExport(
+  client: RisuClient,
+  jobId: string,
+  predicate: (status: PartialExportStatus) => boolean,
+  timeoutMs = 30_000,
+): Promise<PartialExportStatus> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const response = await client.fetch(`/api/backup/export/jobs/${jobId}`)
+    expect(response.status).toBe(200)
+    const status = await response.json() as PartialExportStatus
+    if (predicate(status)) return status
+    if (status.state === 'failed' || status.state === 'cancelled') {
+      throw new Error(status.error || `Partial export ${status.state}`)
+    }
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  throw new Error(`Timed out waiting for partial export job ${jobId}`)
+}
+
+async function downloadPartialExport(client: RisuClient, jobId: string): Promise<Buffer> {
+  await waitForPartialExport(client, jobId, status => status.state === 'ready')
+  const response = await client.fetch(`/api/backup/export/jobs/${jobId}/download`)
+  expect(response.status).toBe(200)
+  const backup = Buffer.from(await response.arrayBuffer())
+  expect(Number(response.headers.get('content-length'))).toBe(backup.length)
+  return backup
+}
+
+async function waitForNoPartialExportSpools(cwd: string): Promise<void> {
+  const spoolDir = path.join(cwd, 'save', '.partial-export-spool')
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const entries = await readdir(spoolDir).catch(() => [])
+    if (!entries.some(entry => entry.startsWith('.partial-export-'))) return
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  throw new Error('Partial export spool was not cleaned')
 }
 
 describe('external plugin rows in backup archives', () => {
@@ -509,11 +571,8 @@ describe('external plugin rows in backup archives', () => {
     })
     expect(transition.status).toBe(200)
 
-    const response = await sourceClient.fetch('/api/backup/export?scope=partial')
-    expect(response.status).toBe(200)
-    expect(response.headers.get('content-disposition')).toContain('-partial.bin')
-    const backup = Buffer.from(await response.arrayBuffer())
-    expect(Number(response.headers.get('content-length'))).toBe(backup.length)
+    const jobId = await startPartialExport(sourceClient)
+    const backup = await downloadPartialExport(sourceClient, jobId)
     const entries = decodeBackup(backup)
     expect(entries.map(entry => entry.name)).toEqual(['database.risudat'])
     const folded = decodeRisuDat(entries[0].data)
@@ -530,6 +589,175 @@ describe('external plugin rows in backup archives', () => {
       pluginStorageKey('pluginsave/', 'partial/999'),
     )!.toString('utf-8')).body).toHaveLength(4 * 1024 * 1024)
   })
+
+  test('partial export pins selected filesystem assets before equal-size replacement', async () => {
+    const oldBytes = Buffer.from('OLD-PROFILE-BYTES')
+    const newBytes = Buffer.from('NEW-PROFILE-BYTES')
+    expect(newBytes.length).toBe(oldBytes.length)
+    const source = await spawnServer({
+      env: { POCKETRISU_TEST_PARTIAL_EXPORT_DELAY_MS: '500' },
+    })
+    servers.push(source)
+    const client = await createClient(source.port, source.password)
+    const seedEntries = decodeBackup(createSeedBackup({ characterCount: 1 }))
+    const databaseEntry = seedEntries.find(entry => entry.name === 'database.risudat')!
+    const database = decodeRisuDat(databaseEntry.data)
+    ;(database.characters as Array<Record<string, unknown>>)[0].image = 'assets/profile.png'
+    database.account = { token: 'must-not-enter-partial-backup' }
+    databaseEntry.data = encodeRisuDat(database)
+    seedEntries.push({ name: 'profile.png', data: oldBytes })
+    expect((await client.importBackup(encodeBackup(seedEntries))).ok).toBe(true)
+
+    const jobId = await startPartialExport(client)
+    await waitForPartialExport(client, jobId, status => status.phase === 'assembling')
+    await writeKv(client, 'assets/profile.png', newBytes)
+
+    const archive = entriesByName(await downloadPartialExport(client, jobId))
+    expect(archive.get('profile.png')).toEqual(oldBytes)
+    expect(archive.get('profile.png')).not.toEqual(newBytes)
+    const folded = decodeRisuDat(archive.get('database.risudat')!)
+    expect(folded.account).toBeUndefined()
+    await waitForNoPartialExportSpools(source.cwd)
+  })
+
+  test('partial export creation returns promptly while real preparation exceeds 15 seconds', async () => {
+    const source = await spawnServer({
+      env: { POCKETRISU_TEST_PARTIAL_EXPORT_DELAY_MS: '15250' },
+    })
+    servers.push(source)
+    const client = await createClient(source.port, source.password)
+    expect((await client.importBackup(createSeedBackup())).ok).toBe(true)
+
+    const before = Date.now()
+    const jobId = await startPartialExport(client)
+    expect(Date.now() - before).toBeLessThan(2_000)
+    const status = await waitForPartialExport(
+      client,
+      jobId,
+      current => current.state === 'ready',
+      25_000,
+    )
+    expect(Date.now() - before).toBeGreaterThan(15_000)
+    expect(status.phase).toBe('ready')
+    expect(decodeBackup(await downloadPartialExport(client, jobId))).toHaveLength(1)
+  }, 30_000)
+
+  test('cancelling preparation cleans private spools and restart sweeps exact orphans', async () => {
+    const source = await spawnServer({
+      env: { POCKETRISU_TEST_PARTIAL_EXPORT_DELAY_MS: '30000' },
+    })
+    servers.push(source)
+    const client = await createClient(source.port, source.password)
+    expect((await client.importBackup(createSeedBackup())).ok).toBe(true)
+
+    const jobId = await startPartialExport(client)
+    await waitForPartialExport(client, jobId, status => status.phase === 'assembling')
+    const cancel = await client.fetch(`/api/backup/export/jobs/${jobId}`, { method: 'DELETE' })
+    expect(cancel.status).toBe(202)
+    await cancel.text()
+    await waitForNoPartialExportSpools(source.cwd)
+
+    const spoolDir = path.join(source.cwd, 'save', '.partial-export-spool')
+    const orphan = path.join(spoolDir, '.partial-export-orphan')
+    await mkdir(orphan, { recursive: true })
+    await writeFile(path.join(orphan, 'partial-backup.bin.tmp'), 'orphan')
+    await writeFile(path.join(spoolDir, 'unrelated.keep'), 'keep')
+    await source.restart({ POCKETRISU_TEST_PARTIAL_EXPORT_DELAY_MS: '0' })
+    const afterRestart = await readdir(spoolDir)
+    expect(afterRestart).not.toContain('.partial-export-orphan')
+    expect(afterRestart).toContain('unrelated.keep')
+  }, 30_000)
+
+  test('job identity is idempotent, single-owner, and survives writer-session displacement', async () => {
+    const source = await spawnServer({
+      env: { POCKETRISU_TEST_PARTIAL_EXPORT_DELAY_MS: '30000' },
+    })
+    servers.push(source)
+    const client = await createClient(source.port, source.password)
+    expect((await client.importBackup(createSeedBackup())).ok).toBe(true)
+    const jobId = randomUUID()
+    const create = (id: string) => client.fetch('/api/backup/export/jobs', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-session-id': 'export-owner',
+      },
+      body: JSON.stringify({ scope: 'partial', jobId: id }),
+    })
+
+    const [first, duplicate] = await Promise.all([create(jobId), create(jobId)])
+    expect(first.status).toBe(202)
+    expect(duplicate.status).toBe(202)
+    await expect(first.json()).resolves.toMatchObject({ jobId })
+    await expect(duplicate.json()).resolves.toMatchObject({ jobId })
+    const secondId = await create(randomUUID())
+    expect(secondId.status).toBe(409)
+    await secondId.text()
+
+    const displace = await client.fetch('/api/session', {
+      method: 'POST',
+      headers: { 'x-session-id': 'different-writer' },
+    })
+    expect(displace.status).toBe(200)
+    await displace.text()
+    const ownerHeaders = { 'x-session-id': 'export-owner' }
+    const status = await client.fetch(`/api/backup/export/jobs/${jobId}`, {
+      headers: ownerHeaders,
+    })
+    expect(status.status).toBe(200)
+    await status.text()
+    const cancel = await client.fetch(`/api/backup/export/jobs/${jobId}`, {
+      method: 'DELETE',
+      headers: ownerHeaders,
+    })
+    expect(cancel.status).toBe(202)
+    await cancel.text()
+    await waitForNoPartialExportSpools(source.cwd)
+
+    const concurrentIds = [randomUUID(), randomUUID()]
+    const concurrent = await Promise.all(concurrentIds.map(id => create(id)))
+    expect(concurrent.map(response => response.status).sort()).toEqual([202, 409])
+    const admittedIndex = concurrent.findIndex(response => response.status === 202)
+    await Promise.all(concurrent.map(response => response.text()))
+    const admittedId = concurrentIds[admittedIndex]
+    const finalCancel = await client.fetch(`/api/backup/export/jobs/${admittedId}`, {
+      method: 'DELETE',
+      headers: ownerHeaders,
+    })
+    expect(finalCancel.status).toBe(202)
+    await finalCancel.text()
+    await waitForNoPartialExportSpools(source.cwd)
+  }, 30_000)
+
+  test('download disconnect destroys the one-shot private archive', async () => {
+    const source = await spawnServer()
+    servers.push(source)
+    const client = await createClient(source.port, source.password)
+    const seedEntries = decodeBackup(createSeedBackup({ characterCount: 1 }))
+    const databaseEntry = seedEntries.find(entry => entry.name === 'database.risudat')!
+    const database = decodeRisuDat(databaseEntry.data)
+    ;(database.characters as Array<Record<string, unknown>>)[0].image = 'assets/disconnect.png'
+    databaseEntry.data = encodeRisuDat(database)
+    expect((await client.importBackup(encodeBackup(seedEntries))).ok).toBe(true)
+    await writeKv(client, 'assets/disconnect.png', Buffer.alloc(16 * 1024 * 1024, 0x5a))
+
+    const jobId = await startPartialExport(client)
+    await waitForPartialExport(client, jobId, status => status.state === 'ready')
+    const controller = new AbortController()
+    const response = await client.fetch(`/api/backup/export/jobs/${jobId}/download`, {
+      signal: controller.signal,
+    })
+    expect(response.status).toBe(200)
+    const reader = response.body!.getReader()
+    const first = await reader.read()
+    expect(first.value?.byteLength).toBeGreaterThan(0)
+    controller.abort()
+    await reader.cancel().catch(() => {})
+
+    await waitForNoPartialExportSpools(source.cwd)
+    const stillHealthy = await client.fetch('/api/backup/export/jobs/not-a-job')
+    expect(stillHealthy.status).toBe(404)
+  }, 30_000)
 
   test('legacy optimized backups externalize folded plugin storage and clear stale rows', async () => {
     const server = await spawnServer()
