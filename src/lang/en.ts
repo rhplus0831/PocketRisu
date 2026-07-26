@@ -1651,6 +1651,7 @@ export const languageEnglish = {
     optimizePluginMemoryLegacyOff: "V2/V2.1 plugins stay powered off while optimization is enabled. Turn optimization off to use them.",
     optimizePluginMemoryLegacyAutoDisabled: (plugins: string) => `Optimized plugin memory was already enabled, so these V2/V2.1 plugins were powered off: ${plugins}`,
     pluginReloadDeferredPending: "A plugin reload is still pending after repeated reload attempts. Try reloading plugins again or restart the app.",
+    pluginInitializationFailed: (plugin: string) => `Plugin "${plugin}" failed to start.`,
     optimizePluginMemoryEnabled: "Plugin memory optimization enabled.",
     optimizePluginMemoryDisabled: "Plugin memory optimization disabled.",
     optimizePluginMemoryProgress: (completed: number, total: number) => `Moving plugin storage… ${completed} / ${total}`,

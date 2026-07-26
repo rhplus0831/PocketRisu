@@ -33,7 +33,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [AC2](api-compatibility.md#ac2) | Medium | Fixed | V2 lifecycle gaps: eligibility races unload completion, and invalid persisted states look enabled but never run |
 | [AC3](api-compatibility.md#ac3) | High on affected runtimes | Fixed | Unguarded ES2024 key validation disables optimized storage on older WebViews; key coercion differs between modes |
 | [AC4](api-compatibility.md#ac4) | Low–Medium | Fixed | Value and enumeration parity gaps: unrepresentable JSON is acknowledged, and key order is unstable |
-| [SA1](startup-availability.md#sa1) | High | Open | V3 startup is reported complete before async initialization settles; a slow or rejected optimized read silently prevents registration |
+| [SA1](startup-availability.md#sa1) | High | Fixed | V3 startup is reported complete before async initialization settles; a slow or rejected optimized read silently prevents registration |
 | [SA2](startup-availability.md#sa2) | High | Open | One process-wide unbounded storage queue: a single stalled operation wedges every plugin and the mode transition |
 | [SA3](startup-availability.md#sa3) | Medium | Open | A reconciliation failure on boot prevents the whole application from loading |
 | [SA4](startup-availability.md#sa4) | High impact, window-dependent | Fixed | Import and retry failures abort startup or expose uncommitted state to optimized reads |

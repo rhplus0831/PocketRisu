@@ -34,6 +34,36 @@ registering no UI, provider, or hooks.
   reports completion.
 - Surface initialization failures in the UI.
 
+### Resolution
+
+**Fixed 2026-07-26.** V3 startup now uses a private, token-bound
+`MessageChannel` handshake that resolves only after bridge setup and the exact
+top-level async plugin body complete. Host-side async-function-body validation
+runs before `srcdoc` is installed; user source is safely encoded so wrapper
+breakout and literal `</script>` cannot launch detached work or truncate the
+handshake. Host RPC also requires the expected iframe source and opaque sandbox
+origin.
+
+`SandboxHost.run()` returns the instance readiness promise. The loader logs
+success only after it resolves, surfaces initialization errors through the UI
+and persistent log, removes failed instances, and waits for every plugin in a
+generation with `Promise.allSettled` before reporting aggregate failure.
+
+Teardown marks the instance terminating and detaches all identity-owned
+providers, hooks, UI, MCP, channels, listeners, observers, callbacks, and
+remote references before awaiting the bounded unload callback. Late root or
+instance RPC cannot mutate storage/database or resurrect registrations;
+pending executions reject and abort controllers are aborted. Reentrant teardown
+joins the same promise, while the captured unload callback retains only its
+explicitly authorized cleanup surface.
+
+Regression coverage executes generated `srcdoc` and exercises delayed storage
+before registration, syntax/runtime/bridge rejection, spoofed/late readiness,
+wrapper escape, literal closing-script text, partial registration rollback,
+hanging unload, late durable writes, multiple plugins, and termination cleanup.
+Independent verification passed 81 focused tests, the full client suite (1,036
+passed, 3 skipped), compatibility tests, `pnpm check`, and a production build.
+
 <a id="sa2"></a>
 ## SA2 — One stalled operation wedges every plugin and the mode transition
 

@@ -1,5 +1,5 @@
-import { allowedDbKeys, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
-import { SandboxHost } from "./factory";
+import { allowedDbKeys, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginV2, type EditFunction, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
+import { authorizeSandboxCallbackDuringTermination, SandboxHost } from "./factory";
 import {
     getDatabase,
     normalizeChat,
@@ -25,12 +25,12 @@ import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
-import { alertConfirm, alertError, alertNormal, notifyWarning } from "src/ts/alert";
+import { alertConfirm, alertError, alertNormal, notifyError, notifyWarning } from "src/ts/alert";
 import { language } from "src/lang";
 import { checkCharOrder, forageStorage, getFetchLogs } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
 import { get } from "svelte/store";
-import { registerMCPModule, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
+import { registerMCPModule, registeredCustomPluginMCPs, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
 import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
 import { hasher } from "src/ts/parser/parser.svelte";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
@@ -72,17 +72,99 @@ import {
         - Note that Class or Callbacks inside arrays or objects are not supported
 */
 
-const pluginChannel = new Map<string, Function>();
+export const pluginChannel = new Map<string, Function>();
+
+type V3LifecycleCallback = () => void | Promise<void>;
+type V3ScriptMode = 'input' | 'output' | 'process' | 'display';
+
+class V3PluginLifecycleScope {
+    private state: 'initializing' | 'ready' | 'terminating' | 'terminated' = 'initializing';
+    private cleanupCallbacks: V3LifecycleCallback[] = [];
+    private unloadCallbacks: V3LifecycleCallback[] = [];
+
+    constructor(private pluginName: string) {}
+
+    assertCanRegister() {
+        if (this.state === 'terminating' || this.state === 'terminated') {
+            throw new Error(`Plugin ${this.pluginName} is terminating; registrations are closed.`);
+        }
+    }
+
+    canInvokeCallbacks() {
+        return this.state !== 'terminating' && this.state !== 'terminated';
+    }
+
+    assertCanInvokeCallbacks() {
+        if (!this.canInvokeCallbacks()) {
+            throw new Error(`Plugin ${this.pluginName} is terminating; callback invocation was rejected.`);
+        }
+    }
+
+    addCleanup(callback: V3LifecycleCallback) {
+        this.assertCanRegister();
+        this.cleanupCallbacks.push(callback);
+    }
+
+    addUnload(callback: V3LifecycleCallback) {
+        this.assertCanRegister();
+        this.unloadCallbacks.push(callback);
+    }
+
+    markReady() {
+        if (this.state !== 'initializing') return false;
+        this.state = 'ready';
+        return true;
+    }
+
+    beginTermination() {
+        if (this.state === 'terminating' || this.state === 'terminated') return false;
+        this.state = 'terminating';
+        return true;
+    }
+
+    async runUnloadCallbacks(timeoutMs = 1000): Promise<unknown[]> {
+        const callbacks = this.unloadCallbacks.splice(0);
+        if (callbacks.length === 0) return [];
+        const completion = Promise.allSettled(callbacks.map(callback =>
+            Promise.resolve().then(() => callback()),
+        ));
+        const timeout = Symbol('timeout');
+        const result = await Promise.race([
+            completion,
+            sleep(timeoutMs).then(() => timeout),
+        ]);
+        if (!Array.isArray(result)) return [];
+        return result
+            .filter((entry): entry is PromiseRejectedResult => entry.status === 'rejected')
+            .map(entry => entry.reason);
+    }
+
+    async cleanup(): Promise<unknown[]> {
+        const callbacks = this.cleanupCallbacks.splice(0).reverse();
+        const errors: unknown[] = [];
+        for (const callback of callbacks) {
+            try {
+                await callback();
+            } catch (error) {
+                errors.push(error);
+            }
+        }
+        this.state = 'terminated';
+        return errors;
+    }
+}
 
 class SafeElement {
     #element: HTMLElement;
+    #lifecycle?: V3PluginLifecycleScope;
     __classType = 'REMOTE_REQUIRED' as const;
 
-    constructor(element: HTMLElement) {
+    constructor(element: HTMLElement, lifecycle?: V3PluginLifecycleScope) {
         if(element.getAttribute('freezed')){
             throw new Error("This element cannot be accessed by SafeELement")
         }
         this.#element = element;
+        this.#lifecycle = lifecycle;
     }
 
     public appendChild(child: SafeElement) {
@@ -103,7 +185,7 @@ class SafeElement {
 
     public cloneNode(deep: boolean = false): SafeElement {
         const cloned = this.#element.cloneNode(deep);
-        return new SafeElement(cloned as HTMLElement);
+        return new SafeElement(cloned as HTMLElement, this.#lifecycle);
     }
 
     public prepend(child: SafeElement) {
@@ -180,14 +262,14 @@ class SafeElement {
         const children: SafeElement[] = [];
         this.#element.childNodes.forEach(node => {
             if(node instanceof HTMLElement) {
-                children.push(new SafeElement(node));
+                children.push(new SafeElement(node, this.#lifecycle));
             }
         });
         return new SafeClassArray<SafeElement>(children);
     }
     public getParent(): SafeElement | null {
         if(this.#element.parentElement) {
-            return new SafeElement(this.#element.parentElement);
+            return new SafeElement(this.#element.parentElement, this.#lifecycle);
         }
         return null;
     }
@@ -220,7 +302,7 @@ class SafeElement {
         const elements: SafeElement[] = [];
         nodeList.forEach(node => {
             if(node instanceof HTMLElement) {
-                elements.push(new SafeElement(node));
+                elements.push(new SafeElement(node, this.#lifecycle));
             }
         });
         return new SafeClassArray<SafeElement>(elements);
@@ -228,7 +310,7 @@ class SafeElement {
     public querySelector(selector: string): SafeElement | null {
         const element = this.#element.querySelector(selector);
         if(element instanceof HTMLElement) {
-            return new SafeElement(element);
+            return new SafeElement(element, this.#lifecycle);
         }
         return null;
     }
@@ -256,9 +338,14 @@ class SafeElement {
     public scrollIntoView(options?: boolean | ScrollIntoViewOptions) {
         this.#element.scrollIntoView(options);
     }
-    #eventIdMap = new Map<string, Function>()
+    #eventIdMap = new Map<string, {
+        type: string;
+        listener: EventListener;
+        options: AddEventListenerOptions;
+    }>()
 
     public async addEventListener(type:string, listener: (event: any) => void, options?: boolean | AddEventListenerOptions):Promise<string> {
+        this.#lifecycle?.assertCanRegister();
         const realOptions = typeof options === 'boolean' ? { capture: options } : options || {};
 
         //allowed with unlimited
@@ -329,24 +416,29 @@ class SafeElement {
 
         if(allowedDocumentEventListeners.includes(type)){
             const modifiedListener = (event: any) => {
+                if (this.#lifecycle && !this.#lifecycle.canInvokeCallbacks()) return;
                 listener(trimEvent(event))
             }
-            this.#eventIdMap.set(id, modifiedListener)
+            this.#eventIdMap.set(id, { type, listener: modifiedListener, options: realOptions })
             document.addEventListener(type, modifiedListener, realOptions)
+            this.#lifecycle?.addCleanup(() => this.removeEventListener(type, id, realOptions))
             return id;
         }
         else if(allowedDelayedEventListeners.includes(type)){
             const modifiedListener = (event: any) => {
+                if (this.#lifecycle && !this.#lifecycle.canInvokeCallbacks()) return;
                 let delay = 0;
                 try {
                     delay = (crypto.getRandomValues(new Uint32Array(1))[0] / 100) % 100; //0-99 ms              
                 } catch (error) {}
                 setTimeout(() => {
+                    if (this.#lifecycle && !this.#lifecycle.canInvokeCallbacks()) return;
                     listener(trimEvent(event));
                 }, delay);
             }
-            this.#eventIdMap.set(id, modifiedListener)
+            this.#eventIdMap.set(id, { type, listener: modifiedListener, options: realOptions })
             document.addEventListener(type, modifiedListener, realOptions);
+            this.#lifecycle?.addCleanup(() => this.removeEventListener(type, id, realOptions))
             return id;
         }
         else{
@@ -355,10 +447,14 @@ class SafeElement {
     }
 
     public removeEventListener(type:string, id:string, options?: boolean | EventListenerOptions) {
-        const listener = this.#eventIdMap.get(id);
-        if(listener){
+        const registration = this.#eventIdMap.get(id);
+        if(registration){
             const realOptions = typeof options === 'boolean' ? { capture: options } : options || {};
-            document.removeEventListener(type, listener as EventListenerOrEventListenerObject, realOptions);
+            document.removeEventListener(
+                registration.type,
+                registration.listener,
+                options === undefined ? registration.options : realOptions,
+            );
             this.#eventIdMap.delete(id);
         }
     }
@@ -370,8 +466,10 @@ class SafeElement {
 
 class SafeDocument extends SafeElement {
     __classType = 'REMOTE_REQUIRED' as const;
-    constructor(document: Document) {
-        super(document.documentElement);
+    #lifecycle?: V3PluginLifecycleScope;
+    constructor(document: Document, lifecycle?: V3PluginLifecycleScope) {
+        super(document.documentElement, lifecycle);
+        this.#lifecycle = lifecycle;
     }
     createElement(tagName: string): SafeElement {
         if(!tagWhitelist.includes(tagName.toLowerCase())) {
@@ -382,7 +480,7 @@ class SafeDocument extends SafeElement {
             console.warn(`<a> can be created but href attribute cannot be set directly for security reasons. Use .createAnchorElement(href: string) to create safe anchor elements.`);
         }
         const element = document.createElement(tagName);
-        return new SafeElement(element);
+        return new SafeElement(element, this.#lifecycle);
     }
     createAnchorElement(href: string): SafeElement {
         const anchor = document.createElement('a');
@@ -396,7 +494,7 @@ class SafeDocument extends SafeElement {
             console.warn(`Invalid URL provided for anchor element: ${href}. Setting href to '#' instead.`);
             anchor.setAttribute('href', '#');
         }
-        return new SafeElement(anchor);
+        return new SafeElement(anchor, this.#lifecycle);
     }
 }
 
@@ -448,16 +546,19 @@ type SafeMutationCallback = (mutations: SafeClassArray<SafeMutationRecord>) => v
 
 class SafeMutationObserver {
     #observer: MutationObserver;
+    #lifecycle?: V3PluginLifecycleScope;
     __classType = 'REMOTE_REQUIRED' as const;
-    constructor(callback: SafeMutationCallback) {
+    constructor(callback: SafeMutationCallback, lifecycle?: V3PluginLifecycleScope) {
+        this.#lifecycle = lifecycle;
         this.#observer = new MutationObserver((mutations) => {
+            if (this.#lifecycle && !this.#lifecycle.canInvokeCallbacks()) return;
             const safeMutations: SafeMutationRecordObject[] = mutations.map(mutation => {
 
                 const elementMapHelper = (nodeList: NodeList): SafeElement[] => {
                     const elements: SafeElement[] = [];
                     nodeList.forEach(node => {
                         if(node instanceof HTMLElement) {
-                            elements.push(new SafeElement(node));
+                            elements.push(new SafeElement(node, this.#lifecycle));
                         }
                     })
                     return elements;
@@ -465,7 +566,7 @@ class SafeMutationObserver {
 
                 return {
                     type: mutation.type,
-                    target: new SafeElement(mutation.target as HTMLElement),
+                    target: new SafeElement(mutation.target as HTMLElement, this.#lifecycle),
                     addedNodes: elementMapHelper(mutation.addedNodes),
                     removedNodes: elementMapHelper(mutation.removedNodes)
                     
@@ -485,6 +586,7 @@ class SafeMutationObserver {
     }
 
     observe(element:SafeElement, options: MutationObserverInit) {
+        this.#lifecycle?.assertCanRegister();
         const identifier = v4();
         element.setAttribute('x-identifier', identifier);
         const rawElement = document.querySelector(`[x-identifier="${identifier}"]`) as HTMLElement;
@@ -494,20 +596,15 @@ class SafeMutationObserver {
         }
     }
 
-}
-
-const pluginUnloadCallbacks: Map<string, Function[]> = new Map();
-
-const addPluginUnloadCallback = (pluginName: string, callback: Function) => {
-    if(!pluginUnloadCallbacks.has(pluginName)){
-        pluginUnloadCallbacks.set(pluginName, []);
+    disconnect() {
+        this.#observer.disconnect();
     }
-    pluginUnloadCallbacks.get(pluginName)?.push(callback);
+
 }
 
-const makeMenuUnloadCallback = (menuId:string, menuStore: MenuDef[]) =>{
+const makeMenuUnloadCallback = (menuDef: MenuDef, menuStore: MenuDef[]) =>{
     return () => {
-        const index = menuStore.findIndex(item => item.id === menuId);
+        const index = menuStore.indexOf(menuDef);
         if(index !== -1){
             menuStore.splice(index, 1);
         }
@@ -521,43 +618,43 @@ const removeChatPanel = (id: string) => {
     }
 }
 
-const removePluginChatPanels = (pluginName: string) => {
-    for(let i = chatPanelStore.length - 1; i >= 0; i--){
-        if(chatPanelStore[i].pluginName === pluginName){
-            chatPanelStore.splice(i, 1);
-        }
+const unloadV3PluginInstance = async (instance: V3PluginInstance) => {
+    if (!instance.teardown) {
+        instance.teardown = (async () => {
+            const index = v3PluginInstances.indexOf(instance);
+            if (index !== -1) v3PluginInstances.splice(index, 1);
+
+            // Close all registration/RPC surfaces first. The captured onUnload
+            // callbacks may finish local guest work during their bounded grace
+            // period, but cannot mutate host state or resurrect the generation.
+            instance.scope.beginTermination();
+            instance.host.beginTermination();
+
+            const errors: unknown[] = [];
+            try {
+                // Remove every globally reachable callback/registration first.
+                // Only the separately captured onUnload callbacks remain
+                // authorized during the bounded guest grace period.
+                errors.push(...await instance.scope.cleanup());
+            } finally {
+                try {
+                    errors.push(...await instance.scope.runUnloadCallbacks());
+                } finally {
+                    instance.host.terminate();
+                }
+            }
+
+            if (errors.length > 0) {
+                throw new AggregateError(errors, `Plugin ${instance.name} teardown failed.`);
+            }
+        })();
     }
+    await instance.teardown;
 }
 
 const unloadV3Plugin = async (pluginName: string) => {
-    const callbacks = pluginUnloadCallbacks.get(pluginName);
     const instance = v3PluginInstances.find(p => p.name === pluginName);
-    if(instance){
-        const index = v3PluginInstances.findIndex(p => p.name === pluginName);
-        if(index !== -1){
-            v3PluginInstances.splice(index, 1);
-        }
-    }
-    if(callbacks){
-        pluginUnloadCallbacks.delete(pluginName); 
-        let promises: Promise<void>[] = [];
-        for(const callback of callbacks){
-            const result = callback();
-            if(result instanceof Promise){
-                promises.push(result);
-            }
-        }
-
-        await Promise.any([
-            Promise.all(promises),
-            sleep(1000) //timeout after 1 second
-        ])
-    }
-    try {
-        instance?.host?.terminate();        
-    } catch (error) {
-        console.error(`Error terminating plugin ${pluginName}:`, error);
-    }
+    if (instance) await unloadV3PluginInstance(instance);
 }
 
 type PluginPermissionDesc = 'fetchLogs'|'db'|'mainDom'|'replacer'|'provider'|'sendChat';
@@ -768,7 +865,18 @@ const authorizationHeaders = [
     'proxy-authorization',
 ]
 
-export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
+export const makeRisuaiAPIV3 = (
+    iframe: HTMLIFrameElement,
+    plugin: RisuPlugin,
+    lifecycle = new V3PluginLifecycleScope(plugin.name),
+) => {
+
+    const guardPluginCallback = <T extends (...args: any[]) => any>(callback: T): T => {
+        return ((...args: Parameters<T>): ReturnType<T> => {
+            lifecycle.assertCanInvokeCallbacks();
+            return callback(...args);
+        }) as T;
+    };
 
     const oldApis = getV2PluginAPIs();
     const databaseBridge = createPluginDatabaseBridge({
@@ -845,16 +953,20 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         getChar: oldApis.getChar,
         setChar: oldApis.setChar,
         addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string }>, options?: PluginV3ProviderOptions) => {
+            lifecycle.assertCanRegister();
             console.warn(`[WARN] addProvider is a powerful API that can potentially be unsafe if used incorrectly. addProvider's functionality might be limited or changed in future updates to ensure security. please use other APIs if possible.`);
             let provs = get(customProviderStore)
             provs.push(name)
-            pluginV2.providers.set(name, async (arg, abortSignal) => {
+            const provider = async (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => {
+               lifecycle.assertCanInvokeCallbacks();
                await getPluginPermission(plugin.name, 'provider', 'periodically');
+               lifecycle.assertCanInvokeCallbacks();
                //mode is overridden to v3, due to vulnerabilities using mode.
                //Alternative to mode will be added in future
                arg.mode = 'v3'
                return await func(arg, abortSignal);
-            }),
+            };
+            pluginV2.providers.set(name, provider)
             pluginV2.providerOptions.set(name, options ?? {})
             customProviderStore.set(provs)
 
@@ -871,28 +983,56 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 tokenizer:options?.model?.tokenizer ??  LLMTokenizer.Unknown
             }
             customV3ProviderMetaStore.push(modelData);
+            lifecycle.addCleanup(() => {
+                if (pluginV2.providers.get(name) === provider) {
+                    pluginV2.providers.delete(name);
+                    pluginV2.providerOptions.delete(name);
+                }
+                const modelIndex = customV3ProviderMetaStore.indexOf(modelData);
+                if (modelIndex !== -1) customV3ProviderMetaStore.splice(modelIndex, 1);
+                if (!pluginV2.providers.has(name)) {
+                    customProviderStore.update(values => values.filter(value => value !== name));
+                }
+            });
         },
         addTTSPreprocessor: async (
             func: TTSHookFn<BeforeTTSContext, BeforeTTSResult>,
         ) => {
-            registerTTSPreprocessor(func);
-            addPluginUnloadCallback(plugin.name, () => unregisterTTSPreprocessor(func));
+            lifecycle.assertCanRegister();
+            const guardedFunc = guardPluginCallback(func);
+            registerTTSPreprocessor(guardedFunc);
+            lifecycle.addCleanup(() => unregisterTTSPreprocessor(guardedFunc));
         },
         addTTSPostprocessor: async (
             func: TTSHookFn<AfterTTSContext, AfterTTSResult>,
         ) => {
-            registerTTSPostprocessor(func);
-            addPluginUnloadCallback(plugin.name, () => unregisterTTSPostprocessor(func));
+            lifecycle.assertCanRegister();
+            const guardedFunc = guardPluginCallback(func);
+            registerTTSPostprocessor(guardedFunc);
+            lifecycle.addCleanup(() => unregisterTTSPostprocessor(guardedFunc));
         },
-        addRisuScriptHandler: oldApis.addRisuScriptHandler,
+        addRisuScriptHandler: (name: V3ScriptMode, func: EditFunction) => {
+            lifecycle.assertCanRegister();
+            // The V3 surface uses "display" while the legacy declaration still
+            // calls that mode "editdisplay"; the legacy implementation itself
+            // prepends "edit", so preserve the V3 runtime value here.
+            const legacyName = name as unknown as Parameters<typeof oldApis.addRisuScriptHandler>[0];
+            const guardedFunc = guardPluginCallback(func);
+            oldApis.addRisuScriptHandler(legacyName, guardedFunc);
+            lifecycle.addCleanup(() => oldApis.removeRisuScriptHandler(legacyName, guardedFunc));
+        },
         removeRisuScriptHandler: oldApis.removeRisuScriptHandler,
         addRisuReplacer: async (name:string,func:Function) => {
+            lifecycle.assertCanRegister();
             //permission check for replacer
             const conf = await getPluginPermission(plugin.name, 'replacer', 'periodically');
             if(!conf){
                 return;
             }
-            oldApis.addRisuReplacer(name, func as any);
+            lifecycle.assertCanRegister();
+            const guardedFunc = guardPluginCallback(func as (...args: any[]) => any);
+            oldApis.addRisuReplacer(name, guardedFunc as any);
+            lifecycle.addCleanup(() => oldApis.removeRisuReplacer(name, guardedFunc as any));
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
         setDatabaseLite: async (database: unknown) => {
@@ -1104,7 +1244,8 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             if(!conf){
                 return null;
             }
-            return new SafeDocument(document);
+            lifecycle.assertCanRegister();
+            return new SafeDocument(document, lifecycle);
         },
         registerSetting: (
             name:string,
@@ -1113,6 +1254,7 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             iconType:'html'|'img'|'none' = 'none',
             id?:string
         ) => {
+            lifecycle.assertCanRegister();
             if(iconType !== 'html' && iconType !== 'img' && iconType !== 'none'){
                 throw new Error("iconType must be 'html', 'img' or 'none'");
             }
@@ -1125,37 +1267,33 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 name,
                 icon,
                 iconType,
-                callback
+                callback: guardPluginCallback(callback)
             }
             const existingIndex = additionalSettingsMenu.findIndex(item => item.id === menuId)
             if(existingIndex !== -1){
                 additionalSettingsMenu[existingIndex] = menuDef
-                addPluginUnloadCallback(
-                    plugin.name,
-                    makeMenuUnloadCallback(menuId, additionalSettingsMenu)
-                )
+                lifecycle.addCleanup(makeMenuUnloadCallback(additionalSettingsMenu[existingIndex], additionalSettingsMenu))
                 return {id: menuId}
             }
             additionalSettingsMenu.push(menuDef)
-            addPluginUnloadCallback(
-                plugin.name,
-                makeMenuUnloadCallback(menuId, additionalSettingsMenu)
-            )
+            lifecycle.addCleanup(makeMenuUnloadCallback(additionalSettingsMenu[additionalSettingsMenu.length - 1], additionalSettingsMenu))
             return {id: menuId};
         },
         registerBodyIntercepter: async (callback: (body: any, type: string) => any) => {
-
+            lifecycle.assertCanRegister();
             if(await getPluginPermission(plugin.name, 'replacer') === false){
                 return null;
             }
-            
+            lifecycle.assertCanRegister();
             const id = v4();
-            bodyIntercepterStore.push({
+            const registration = {
                 id,
-                callback
-            })
-            addPluginUnloadCallback(plugin.name, () => {
-                const index = bodyIntercepterStore.findIndex(item => item.id === id);
+                callback: guardPluginCallback(callback)
+            };
+            bodyIntercepterStore.push(registration)
+            const storedRegistration = bodyIntercepterStore[bodyIntercepterStore.length - 1];
+            lifecycle.addCleanup(() => {
+                const index = bodyIntercepterStore.indexOf(storedRegistration);
                 if(index !== -1){
                     bodyIntercepterStore.splice(index, 1);
                 }
@@ -1180,6 +1318,7 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             },
             callback: () => void
         ) => {
+            lifecycle.assertCanRegister();
             let { name, icon, iconType, location, id: providedId } = arg;
             location = location || 'action';
             if(iconType !== 'html' && iconType !== 'img' && iconType !== 'none'){
@@ -1196,7 +1335,7 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 name,
                 icon,
                 iconType,
-                callback,
+                callback: guardPluginCallback(callback),
                 id
             }
 
@@ -1205,10 +1344,7 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 const existingIndex = store.findIndex(item => item.id === id)
                 if(existingIndex !== -1){
                     store[existingIndex] = menuDef
-                    addPluginUnloadCallback(
-                        plugin.name,
-                        makeMenuUnloadCallback(id, store)
-                    )
+                    lifecycle.addCleanup(makeMenuUnloadCallback(store[existingIndex], store))
                     return {id}
                 }
             }
@@ -1216,26 +1352,17 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             switch(location){
                 case 'action':{
                     additionalFloatingActionButtons.push(menuDef)
-                    addPluginUnloadCallback(
-                        plugin.name,
-                        makeMenuUnloadCallback(menuDef.id, additionalFloatingActionButtons)
-                    )
+                    lifecycle.addCleanup(makeMenuUnloadCallback(additionalFloatingActionButtons[additionalFloatingActionButtons.length - 1], additionalFloatingActionButtons))
                     break
                 }
                 case 'hamburger':{
                     additionalHamburgerMenu.push(menuDef)
-                    addPluginUnloadCallback(
-                        plugin.name,
-                        makeMenuUnloadCallback(menuDef.id, additionalHamburgerMenu)
-                    )
+                    lifecycle.addCleanup(makeMenuUnloadCallback(additionalHamburgerMenu[additionalHamburgerMenu.length - 1], additionalHamburgerMenu))
                     break
                 }
                 case 'chat':{
                     additionalChatMenu.push(menuDef)
-                    addPluginUnloadCallback(
-                        plugin.name,
-                        makeMenuUnloadCallback(menuDef.id, additionalChatMenu)
-                    )
+                    lifecycle.addCleanup(makeMenuUnloadCallback(additionalChatMenu[additionalChatMenu.length - 1], additionalChatMenu))
                     break
                 }
                 default:{
@@ -1251,6 +1378,7 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
                 className?: string,
             } = {}
         ) => {
+            lifecycle.assertCanRegister();
             const id = options.id || `${plugin.name}:default`;
 
             if(content === null || content === ''){
@@ -1278,10 +1406,36 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             else{
                 chatPanelStore.push(panel);
             }
-            addPluginUnloadCallback(plugin.name, () => removePluginChatPanels(plugin.name));
+            const storedPanel = chatPanelStore.find(item => item.id === id);
+            lifecycle.addCleanup(() => {
+                const panelIndex = storedPanel ? chatPanelStore.indexOf(storedPanel) : -1;
+                if (panelIndex !== -1) chatPanelStore.splice(panelIndex, 1);
+            });
             return {id};
         },
-        registerMCP: registerMCPModule,
+        registerMCP: async (...args: Parameters<typeof registerMCPModule>) => {
+            lifecycle.assertCanRegister();
+            const guardedArgs: Parameters<typeof registerMCPModule> = [
+                args[0],
+                guardPluginCallback(args[1]),
+                guardPluginCallback(args[2]),
+            ];
+            await registerMCPModule(...guardedArgs);
+            const identifier = args[0].identifier;
+            const client = registeredCustomPluginMCPs.get(identifier);
+            try {
+                lifecycle.addCleanup(() => {
+                    if (registeredCustomPluginMCPs.get(identifier) === client) {
+                        return unregisterMCPModule(identifier);
+                    }
+                });
+            } catch (error) {
+                if (registeredCustomPluginMCPs.get(identifier) === client) {
+                    await unregisterMCPModule(identifier);
+                }
+                throw error;
+            }
+        },
         unregisterMCP: unregisterMCPModule,
         unregisterUIPart: (id: string) => {
             const removeFromMenuStore = (menuStore: MenuDef[]) => {
@@ -1301,10 +1455,13 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             console.log(`[RisuAI Plugin: ${plugin.name}] ${message}`);
         },
         createMutationObserver(callback: SafeMutationCallback): SafeMutationObserver {
-            return new SafeMutationObserver(callback)
+            lifecycle.assertCanRegister();
+            const observer = new SafeMutationObserver(callback, lifecycle);
+            lifecycle.addCleanup(() => observer.disconnect());
+            return observer;
         },
         onUnload: (callback: () => void) => {
-            addPluginUnloadCallback(plugin.name, callback);
+            lifecycle.addUnload(authorizeSandboxCallbackDuringTermination(callback));
         },
         getFetchLogs: async () => {
             const unsafeFetchLog = getFetchLogs()
@@ -1493,7 +1650,13 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return true;
         },
         addPluginChannelListener: (channelName: string, callback: Function) => {
-            pluginChannel.set(plugin.name + channelName, callback);
+            lifecycle.assertCanRegister();
+            const key = plugin.name + channelName;
+            const guardedCallback = guardPluginCallback(callback as (...args: any[]) => any);
+            pluginChannel.set(key, guardedCallback);
+            lifecycle.addCleanup(() => {
+                if (pluginChannel.get(key) === guardedCallback) pluginChannel.delete(key);
+            });
         },
         postPluginChannelMessage: (pluginName: string, channelName: string, message: any) => {
 
@@ -1535,6 +1698,9 @@ export const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
 type V3PluginInstance = {
     name: string;
     host: SandboxHost;
+    scope: V3PluginLifecycleScope;
+    initialization: Promise<void>;
+    teardown?: Promise<void>;
 }
 
 const v3PluginInstances: V3PluginInstance[] = [];
@@ -1542,14 +1708,30 @@ const v3PluginInstances: V3PluginInstance[] = [];
 export async function teardownV3Plugins(){
     // unloadV3Plugin removes from the live array synchronously, so iterate a
     // snapshot or every shifted second instance would be skipped.
-    await Promise.all([...v3PluginInstances].map(async (instance) => {
-        await unloadV3Plugin(instance.name);
-    }));
+    const results = await Promise.allSettled(
+        [...v3PluginInstances].map(instance => unloadV3PluginInstance(instance)),
+    );
+    const errors = results
+        .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+        .map(result => result.reason);
+    if (errors.length > 0) {
+        throw new AggregateError(errors, 'One or more V3 plugin teardowns failed.');
+    }
 }
 
 export async function loadV3PluginGeneration(plugins:RisuPlugin[]){
-    const loadPromises = plugins.map(plugin => executePluginV3(plugin));
-    await Promise.all(loadPromises);
+    // Promise.all rejects as soon as one guest fails. A generation must not be
+    // reported settled while another guest is still initializing, otherwise a
+    // lifecycle transition could tear down registrations that arrive later.
+    const results = await Promise.allSettled(
+        plugins.map(plugin => executePluginV3(plugin)),
+    );
+    const errors = results
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+        .map(result => result.reason);
+    if (errors.length > 0) {
+        throw new AggregateError(errors, "One or more V3 plugins failed to initialize.");
+    }
 }
 
 export async function loadV3Plugins(plugins:RisuPlugin[]){
@@ -1561,6 +1743,10 @@ export async function executePluginV3(plugin:RisuPlugin){
 
     const alreadyRunning = v3PluginInstances.find(p => p.name === plugin.name);
     if(alreadyRunning){
+        // The matching instance may still be inside its async guest startup.
+        // Joining it preserves executePluginV3's readiness contract even for
+        // overlapping or duplicate direct calls.
+        await alreadyRunning.initialization;
         console.log(`[RisuAI Plugin: ${plugin.name}] Plugin is already running. Skipping load.`);
         return;
     }
@@ -1568,13 +1754,48 @@ export async function executePluginV3(plugin:RisuPlugin){
     const iframe = document.createElement('iframe');
     iframe.style.display = "none";
     document.body.appendChild(iframe);
-    const host = new SandboxHost(makeRisuaiAPIV3(iframe, plugin));
-    v3PluginInstances.push({
+    const scope = new V3PluginLifecycleScope(plugin.name);
+    const host = new SandboxHost(makeRisuaiAPIV3(iframe, plugin, scope));
+    const initialization = host.run(iframe, plugin.script);
+    const instance: V3PluginInstance = {
         name: plugin.name,
-        host
-    });
-    host.run(iframe, plugin.script);
-    console.log(`[RisuAI Plugin: ${plugin.name}] Loaded API V3 plugin.`);
+        host,
+        scope,
+        initialization,
+    };
+    v3PluginInstances.push(instance);
+    try {
+        await initialization;
+        if (!scope.markReady()) {
+            throw new Error("Plugin initialization was cancelled during teardown.");
+        }
+        console.log(`[RisuAI Plugin: ${plugin.name}] Loaded API V3 plugin.`);
+    } catch (error) {
+        // A guest can register UI/hooks before a later awaited initialization
+        // step rejects. Run its normal unload path and always terminate the
+        // iframe so a late ready message cannot resurrect this generation.
+        let teardownError: unknown;
+        try {
+            await unloadV3PluginInstance(instance);
+        } catch (cleanupError) {
+            teardownError = cleanupError;
+            host.terminate();
+        }
+
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[RisuAI Plugin: ${plugin.name}] Failed to initialize API V3 plugin.`, error);
+        notifyError(language.pluginInitializationFailed(plugin.name), {
+            description: message,
+            source: "plugin-startup",
+        });
+        if (teardownError !== undefined) {
+            throw new AggregateError(
+                [error, teardownError],
+                `Plugin ${plugin.name} initialization and cleanup failed.`,
+            );
+        }
+        throw error;
+    }
 }
 
 export function getV3PluginInstance(name: string) {

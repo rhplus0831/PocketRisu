@@ -7,7 +7,8 @@ type MsgType =
     | 'CALLBACK_RETURN'
     | 'RESPONSE'
     | 'RELEASE_INSTANCE'
-    | 'ABORT_SIGNAL';
+    | 'ABORT_SIGNAL'
+    | 'EXEC_RESULT';
 
 interface RpcMessage {
     type: MsgType;
@@ -17,6 +18,7 @@ interface RpcMessage {
     args?: any[];
     result?: any;
     error?: V3BridgeErrorPayload | string;
+    errorStack?: string;
     abortId?: string;
 }
 
@@ -106,6 +108,26 @@ export function deserializeV3BridgeError(input: unknown): Error {
     if (typeof operation === 'string') error.operation = operation;
     else if (operation === null) error.operation = null;
     return error;
+}
+
+type GuestControlMessage = {
+    type: 'READY' | 'ERROR';
+    error?: V3BridgeErrorPayload | string;
+    errorStack?: string;
+};
+
+const unloadAuthorizedCallbacks = new WeakSet<Function>();
+
+export function authorizeSandboxCallbackDuringTermination<T extends Function>(callback: T): T {
+    unloadAuthorizedCallbacks.add(callback);
+    return callback;
+}
+
+function validateAsyncFunctionBody(source: string): void {
+    const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
+    // Compile only. This enforces that plugin source remains an async function
+    // body and cannot close the generated runner wrapper before srcdoc exists.
+    new AsyncFunction(source);
 }
 
 interface RemoteRef {
@@ -260,7 +282,7 @@ await (async function() {
 
         if (obj instanceof ArrayBuffer ||
             obj instanceof MessagePort ||
-            obj instanceof ImageBitmap ||
+            (typeof ImageBitmap !== 'undefined' && obj instanceof ImageBitmap) ||
             (typeof OffscreenCanvas !== 'undefined' && obj instanceof OffscreenCanvas)) {
             transferables.push(obj);
         }
@@ -425,6 +447,7 @@ await (async function() {
         });
     } catch (e) {
         console.error('Failed to initialize risuai properties:', e);
+        throw e;
     }
 
     window.initOldApiGlobal = () => {
@@ -438,10 +461,84 @@ await (async function() {
 })();
 `;
 
+const GUEST_RUNNER_REGISTRATION = '__RISU_REGISTER_PLUGIN_RUNNER__';
+
+function escapeInlineScriptSource(source: string): string {
+    // HTML's script-data parser terminates on a literal </script regardless of
+    // whether JavaScript sees it inside a string, template, regex, or comment.
+    // Escaping the slash preserves the JavaScript value while keeping the
+    // generated wrapper intact.
+    return source.replace(/<\/script/gi, '<\\/script');
+}
+
+function createGuestRuntimeScript(controlToken: string): string {
+    return `
+(() => {
+    const hostWindow = window.parent;
+    const controlChannel = new MessageChannel();
+    const controlPort = controlChannel.port1;
+    const serializeBridgeError = ${serializeV3BridgeError.toString()};
+    let runnerResolve;
+    const runnerPromise = new Promise(resolve => { runnerResolve = resolve; });
+    let sourceError;
+    let reported = false;
+
+    controlPort.start?.();
+    hostWindow.postMessage({
+        type: 'RISU_PLUGIN_CONTROL_INIT',
+        token: ${JSON.stringify(controlToken)},
+        port: controlChannel.port2,
+    }, '*', [controlChannel.port2]);
+
+    const errorDetails = (error) => ({
+        error: serializeBridgeError(error),
+        errorStack: error instanceof Error && typeof error.stack === 'string'
+            ? error.stack
+            : undefined,
+    });
+    const report = (message) => {
+        if (reported) return;
+        reported = true;
+        controlPort.postMessage(message);
+    };
+    const sourceErrorHandler = (event) => {
+        sourceError = event.error || new Error(event.message || 'Plugin source failed to parse.');
+        report({ type: 'ERROR', ...errorDetails(sourceError) });
+    };
+    window.addEventListener('error', sourceErrorHandler);
+
+    Object.defineProperty(window, '${GUEST_RUNNER_REGISTRATION}', {
+        configurable: true,
+        value: (runner) => {
+            delete window.${GUEST_RUNNER_REGISTRATION};
+            runnerResolve(runner);
+        },
+    });
+
+    (async () => {
+        try {
+            if (sourceError) throw sourceError;
+            ${GUEST_BRIDGE_SCRIPT}
+            if (sourceError) throw sourceError;
+            const runner = await runnerPromise;
+            if (typeof runner !== 'function') throw new Error('Plugin runner is unavailable.');
+            await runner();
+            report({ type: 'READY' });
+        } catch (error) {
+            report({ type: 'ERROR', ...errorDetails(error) });
+        } finally {
+            window.removeEventListener('error', sourceErrorHandler);
+        }
+    })();
+})();
+`;
+}
+
 export class SandboxHost {
     private iframe: HTMLIFrameElement;
     private apiFactory: any;
     private nonce = crypto.randomUUID();
+    private controlToken = crypto.randomUUID();
     private csp = `connect-src 'none'; script-src 'nonce-${this.nonce}' 'wasm-unsafe-eval'; frame-src 'none'; object-src 'none'; style-src * 'unsafe-inline'; default-src 'none'; img-src * data: blob:; font-src * data: blob:; media-src * data: blob:; base-uri 'none';`;
 
     private instanceRegistry = new Map<string, any>();
@@ -449,30 +546,30 @@ export class SandboxHost {
     private callbackWrapperCache = new Map<string, Function>();
 
     private pendingCallbacks = new Map<string, { resolve: Function, reject: Function }>();
+    private pendingExecutions = new Map<string, { resolve: Function, reject: Function }>();
+    private messageHandler?: (event: MessageEvent) => void;
+    private controlPort?: MessagePort;
+    private resolveInitialization?: () => void;
+    private rejectInitialization?: (reason: unknown) => void;
+    private initializationSettled = false;
+    private started = false;
+    private terminating = false;
+    private terminated = false;
 
     constructor(apiFactory: any) {
         this.apiFactory = apiFactory;
     }
 
     public executeInIframe(code: string): Promise<any> {
+        if (this.terminating || this.terminated) {
+            return Promise.reject(new Error("Plugin sandbox is terminating."));
+        }
+        if (!this.started || !this.iframe) {
+            return Promise.reject(new Error("Plugin sandbox has not started."));
+        }
         return new Promise((resolve, reject) => {
             const reqId = 'exec_' + Math.random().toString(36).substring(2);
-
-            const handler = (event: MessageEvent) => {
-                if (event.source !== this.iframe.contentWindow) return;
-                const data = event.data;
-
-                if (data.type === 'EXEC_RESULT' && data.reqId === reqId) {
-                    window.removeEventListener('message', handler);
-                    if (data.error) {
-                        reject(deserializeV3BridgeError(data.error));
-                    } else {
-                        resolve(data.result);
-                    }
-                }
-            };
-
-            window.addEventListener('message', handler);
+            this.pendingExecutions.set(reqId, { resolve, reject });
 
             this.iframe.contentWindow?.postMessage({
                 type: 'EXECUTE_CODE',
@@ -487,7 +584,7 @@ export class SandboxHost {
 
         if (obj instanceof ArrayBuffer ||
             obj instanceof MessagePort ||
-            obj instanceof ImageBitmap ||
+            (typeof ImageBitmap !== 'undefined' && obj instanceof ImageBitmap) ||
             obj instanceof ReadableStream ||
             obj instanceof WritableStream ||
             obj instanceof TransformStream ||
@@ -560,6 +657,10 @@ export class SandboxHost {
                 if (cached) return cached;
 
                 const wrapper = async (...innerArgs: any[]) => {
+                    if (this.terminated
+                        || (this.terminating && !unloadAuthorizedCallbacks.has(wrapper))) {
+                        throw new Error("Plugin sandbox is terminating; callback invocation was rejected.");
+                    }
                     return new Promise((resolve, reject) => {
                         const reqId = 'cb_req_' + Math.random().toString(36).substring(2);
                         this.pendingCallbacks.set(reqId, { resolve, reject });
@@ -630,7 +731,45 @@ export class SandboxHost {
         });
     }
 
-    public run(container: HTMLElement|HTMLIFrameElement, userCode: string) {
+    private settleInitialization(error?: unknown) {
+        if (this.initializationSettled) return;
+        this.initializationSettled = true;
+        const resolve = this.resolveInitialization;
+        const reject = this.rejectInitialization;
+        this.resolveInitialization = undefined;
+        this.rejectInitialization = undefined;
+        if (error === undefined) resolve?.();
+        else reject?.(error);
+    }
+
+    public beginTermination() {
+        if (this.terminating || this.terminated) return;
+        this.terminating = true;
+        this.settleInitialization(
+            new Error("Plugin initialization was cancelled during teardown."),
+        );
+        this.detachRemoteState();
+    }
+
+    public run(container: HTMLElement|HTMLIFrameElement, userCode: string): Promise<void> {
+        if (this.started) {
+            return Promise.reject(new Error("SandboxHost.run() may only be called once."));
+        }
+        if (this.terminating || this.terminated) {
+            return Promise.reject(new Error("Plugin sandbox was terminated before startup."));
+        }
+        // Retain an explicitly supplied iframe so terminate() can remove it if
+        // validation fails. No document content is installed before validation.
+        if (container instanceof HTMLIFrameElement) {
+            this.iframe = container;
+        }
+        try {
+            validateAsyncFunctionBody(userCode);
+        } catch (error) {
+            return Promise.reject(error);
+        }
+        this.started = true;
+
         if(container instanceof HTMLIFrameElement) {
             this.iframe = container;
         } else {
@@ -651,9 +790,59 @@ export class SandboxHost {
 
         this.iframe.setAttribute('csp', this.csp);
 
+        const initialization = new Promise<void>((resolve, reject) => {
+            this.resolveInitialization = resolve;
+            this.rejectInitialization = reject;
+        });
+
         const messageHandler = async (event: MessageEvent) => {
-            if (event.source !== this.iframe.contentWindow) return;
-            const data = event.data as RpcMessage;
+            // sandboxed srcdoc without allow-same-origin has an opaque origin,
+            // serialized as "null". Source alone is insufficient because an
+            // unrelated same-frame message must not enter the RPC dispatcher.
+            if (event.source !== this.iframe.contentWindow || event.origin !== 'null') return;
+            const rawData = event.data;
+            if (!rawData || typeof rawData !== 'object') return;
+            if (rawData?.type === 'RISU_PLUGIN_CONTROL_INIT') {
+                const transferredPort = event.ports?.[0] || rawData.port;
+                if (rawData.token !== this.controlToken
+                    || this.controlPort
+                    || !transferredPort
+                    || typeof transferredPort.postMessage !== 'function') {
+                    return;
+                }
+                if (this.terminating || this.terminated) {
+                    transferredPort.close?.();
+                    return;
+                }
+                this.controlPort = transferredPort;
+                this.controlPort.onmessage = (controlEvent: MessageEvent<GuestControlMessage>) => {
+                    if (this.terminating || this.terminated || this.initializationSettled) return;
+                    const controlData = controlEvent.data;
+                    if (controlData?.type === 'READY') {
+                        this.settleInitialization();
+                    } else if (controlData?.type === 'ERROR') {
+                        const error = controlData.error === undefined
+                            ? new Error("Plugin initialization failed.")
+                            : deserializeV3BridgeError(controlData.error);
+                        if (controlData.errorStack) error.stack = controlData.errorStack;
+                        this.settleInitialization(error);
+                    }
+                };
+                this.controlPort.start();
+                return;
+            }
+
+            const data = rawData as RpcMessage;
+
+            if (data.type === 'EXEC_RESULT' && data.reqId) {
+                const pending = this.pendingExecutions.get(data.reqId);
+                if (pending) {
+                    this.pendingExecutions.delete(data.reqId);
+                    if (data.error) pending.reject(deserializeV3BridgeError(data.error));
+                    else pending.resolve(data.result);
+                }
+                return;
+            }
 
 
             if (data.type === 'CALLBACK_RETURN') {
@@ -687,6 +876,9 @@ export class SandboxHost {
                 const usedAbortIds: string[] = [];
 
                 try {
+                    if (this.terminating || this.terminated) {
+                        throw new Error("Plugin sandbox is terminating; RPC invocation was rejected.");
+                    }
 
                     const args = this.deserializeArgs(data.args || [], usedAbortIds);
                     let result: any;
@@ -734,6 +926,7 @@ export class SandboxHost {
                     for (const id of usedAbortIds) this.abortControllers.delete(id);
                 }
 
+                if (this.terminated) return;
                 const transferables = this.collectTransferables(response);
                 console.log("Original request:", data);
                 console.log('Original response:', response, transferables);
@@ -761,9 +954,11 @@ export class SandboxHost {
             }
         };
 
+        this.messageHandler = messageHandler;
         window.addEventListener('message', messageHandler);
 
-
+        const runtimeScript = createGuestRuntimeScript(this.controlToken);
+        const escapedUserCode = escapeInlineScriptSource(userCode);
         const html = `
       <!DOCTYPE html>
       <html>
@@ -779,13 +974,12 @@ export class SandboxHost {
         </style>
         <script nonce="${this.nonce}">
             document.querySelector('meta#csp-meta')?.remove();
-            (async () => {
-                ${GUEST_BRIDGE_SCRIPT}
-                    
-                (async () => {
-                    ${userCode}
-                })()
-            })();
+            ${runtimeScript}
+        </script>
+        <script nonce="${this.nonce}">
+            window.${GUEST_RUNNER_REGISTRATION}(async () => {
+                ${escapedUserCode}
+            });
         </script>
       </body>
       </html>
@@ -793,23 +987,40 @@ export class SandboxHost {
 
         this.iframe.srcdoc = html;
 
-        return () => {
-            window.removeEventListener('message', messageHandler);
-            this.iframe.remove();
-            this.instanceRegistry.clear();
-            this.pendingCallbacks.clear();
-            this.abortControllers.clear();
-            this.callbackWrapperCache.clear();
-        };
+        return initialization;
     }
 
-    public terminate() {
-        if (this.iframe) {
-            this.iframe.remove();
+    private detachRemoteState() {
+        const terminationError = new Error("Plugin sandbox is terminating.");
+        for (const request of this.pendingCallbacks.values()) {
+            request.reject(terminationError);
+        }
+        for (const request of this.pendingExecutions.values()) {
+            request.reject(terminationError);
+        }
+        for (const controller of this.abortControllers.values()) {
+            controller.abort();
         }
         this.instanceRegistry.clear();
         this.pendingCallbacks.clear();
+        this.pendingExecutions.clear();
         this.abortControllers.clear();
         this.callbackWrapperCache.clear();
+    }
+
+    public terminate() {
+        if (this.terminated) return;
+        this.beginTermination();
+        this.terminated = true;
+        if (this.messageHandler) {
+            window.removeEventListener('message', this.messageHandler);
+            this.messageHandler = undefined;
+        }
+        this.controlPort?.close();
+        this.controlPort = undefined;
+        if (this.iframe) {
+            this.iframe.remove();
+        }
+        this.detachRemoteState();
     }
 }

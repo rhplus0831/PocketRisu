@@ -2,11 +2,13 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 
 const storageMocks = vi.hoisted(() => ({
     persistent: new Map<string, unknown>(),
+    readGate: null as null | ((key: string) => Promise<void>),
     writeGate: null as null | ((key: string) => Promise<void>),
     removeGate: null as null | ((key: string) => Promise<void>),
     clearGate: null as null | ((prefix: string) => Promise<void>),
 }));
 const alertConfirmMock = vi.hoisted(() => vi.fn(async () => true));
+const notifyErrorMock = vi.hoisted(() => vi.fn());
 const testState = $state({ database: {} as any });
 
 const encodeKey = (value: string) => Buffer.from(value, "utf-8").toString("base64")
@@ -68,6 +70,7 @@ vi.mock("../../storage/persistentKv", () => ({
         .filter(key => key.startsWith(prefix)),
     makeEncodedStorageKey: (prefix: string, key: string) => `${prefix}${encodeKey(key)}.json`,
     readPersistentJson: async <T>(key: string) => {
+        await storageMocks.readGate?.(key);
         const value = storageMocks.persistent.get(key);
         return value === undefined ? null : cloneJson(value) as T;
     },
@@ -85,6 +88,8 @@ vi.mock("../../alert", () => ({
     alertConfirm: alertConfirmMock,
     alertError: vi.fn(),
     alertNormal: vi.fn(),
+    notifyError: notifyErrorMock,
+    notifyWarning: vi.fn(),
 }));
 
 const {
@@ -105,8 +110,26 @@ const {
     setDatabasePluginStorageRecordValue,
 } = await import("../pluginStorageRecord");
 const { applyPatch } = await import("fast-json-patch");
-const { DBState } = await import("../../stores.svelte");
-const { makeRisuaiAPIV3, resetAllPluginPermissions } = await import("./v3.svelte");
+const {
+    additionalFloatingActionButtons,
+    additionalSettingsMenu,
+    bodyIntercepterStore,
+    chatPanelStore,
+    DBState,
+} = await import("../../stores.svelte");
+const {
+    customV3ProviderMetaStore,
+    getV3PluginInstance,
+    loadV3PluginGeneration,
+    makeRisuaiAPIV3,
+    resetAllPluginPermissions,
+    teardownV3Plugins,
+    pluginChannel,
+} = await import("./v3.svelte");
+const { customProviderStore, pluginV2 } = await import("../plugins.svelte");
+const { get } = await import("svelte/store");
+const { registeredCustomPluginMCPs } = await import("../../process/mcp/pluginmcp");
+const { getTTSPostprocessors, getTTSPreprocessors } = await import("../../process/ttsHooks");
 const { validateV3DatabaseMutationForTransport } = await import("./factory");
 const serverUtilsPath = "../../../../server/node/utils.cjs";
 const serverUtils = await import(/* @vite-ignore */ serverUtilsPath) as {
@@ -149,12 +172,94 @@ function emptyToSave() {
     };
 }
 
+function deferred() {
+    let resolve!: () => void;
+    let reject!: (reason: unknown) => void;
+    const promise = new Promise<void>((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    return { promise, resolve, reject };
+}
+
+/**
+ * happy-dom materializes iframe srcdoc but does not execute its scripts. Run
+ * the exact generated guest script manually and preserve a browser-realistic
+ * MessageEvent.source so SandboxHost's source check remains exercised.
+ */
+function executeGeneratedGuest(iframe: HTMLIFrameElement) {
+    const guestWindow = iframe.contentWindow;
+    const scripts = [...(iframe.contentDocument?.querySelectorAll("script") ?? [])];
+    if (!guestWindow || scripts.length !== 2) throw new Error("Generated V3 guest scripts are unavailable.");
+    if (!(guestWindow as any).ImageBitmap) {
+        (guestWindow as any).ImageBitmap = class ImageBitmap {};
+    }
+    if (!(guestWindow as any).MessageChannel) {
+        (guestWindow as any).MessageChannel = MessageChannel;
+    }
+    const originalParent = Object.getOwnPropertyDescriptor(guestWindow, "parent");
+    Object.defineProperty(guestWindow, "parent", {
+        configurable: true,
+        value: {
+            postMessage(data: unknown) {
+                window.dispatchEvent(new MessageEvent("message", {
+                    data,
+                    origin: "null",
+                    source: guestWindow,
+                }));
+            },
+        },
+    });
+    for (const script of scripts) {
+        try {
+            (guestWindow as any).eval(script.textContent ?? "");
+        } catch (error) {
+            guestWindow.dispatchEvent(new ErrorEvent("error", {
+                error,
+                message: error instanceof Error ? error.message : String(error),
+            }));
+        }
+    }
+    return () => {
+        if (originalParent) Object.defineProperty(guestWindow, "parent", originalParent);
+    };
+}
+
+function startupPlugin(name: string, script: string) {
+    return {
+        name,
+        script,
+        arguments: {},
+        realArg: {},
+        customLink: [],
+        argMeta: {},
+        version: "3.0" as const,
+        enabled: true,
+    };
+}
+
 beforeEach(async () => {
+    await teardownV3Plugins();
+    document.body.replaceChildren();
     storageMocks.persistent.clear();
+    storageMocks.readGate = null;
     storageMocks.writeGate = null;
     storageMocks.removeGate = null;
     storageMocks.clearGate = null;
     alertConfirmMock.mockClear();
+    notifyErrorMock.mockClear();
+    pluginV2.providers.clear();
+    pluginV2.providerOptions.clear();
+    pluginV2.editdisplay.clear();
+    pluginV2.replacerbeforeRequest.clear();
+    customProviderStore.set([]);
+    customV3ProviderMetaStore.splice(0);
+    pluginChannel.clear();
+    registeredCustomPluginMCPs.clear();
+    additionalSettingsMenu.splice(0);
+    additionalFloatingActionButtons.splice(0);
+    bodyIntercepterStore.splice(0);
+    chatPanelStore.splice(0);
     testState.database = {
         characters: [],
         botPresets: [],
@@ -725,5 +830,281 @@ describe("V3 mode-aware database bridge", () => {
         expect(testState.database.plugins).toEqual([installed]);
         expect(testState.database.theme).toBe("night");
         expect(alertConfirmMock).toHaveBeenCalled();
+    });
+});
+
+describe("V3 guest startup handshake", () => {
+    test("teardown closes registration before awaiting a hanging pre-ready unload callback", async () => {
+        const startupReadStarted = deferred();
+        const releaseStartupRead = deferred();
+        const preprocessorCount = getTTSPreprocessors().length;
+        storageMocks.readGate = async (key) => {
+            if (key === storageKey("startup-held")) {
+                startupReadStarted.resolve();
+                await releaseStartupRead.promise;
+            }
+        };
+        const plugin = startupPlugin("Teardown Before Ready", `
+            globalThis.callbackCount = 0;
+            const callback = async (value) => {
+                globalThis.callbackCount += 1;
+                return value;
+            };
+            await risuai.addProvider("pre-unload-provider", async () => {
+                globalThis.callbackCount += 1;
+                return { success: true, content: "unexpected" };
+            });
+            await risuai.addRisuScriptHandler("display", callback);
+            await risuai.addTTSPreprocessor(callback);
+            await risuai.addPluginChannelListener("pre-unload-channel", callback);
+            await risuai.onUnload(async () => {
+                globalThis.unloadStarted = true;
+                await new Promise(() => {});
+            });
+            await risuai.pluginStorage.getItem("startup-held");
+            try {
+                await risuai.pluginStorage.setItem("late-write", { durable: true });
+            } catch (error) {
+                globalThis.lateWriteRejected = true;
+            }
+            try {
+                await risuai.addProvider("too-late-provider", async () => ({ success: true, content: "late" }));
+            } catch (error) {
+                globalThis.lateRegistrationRejected = true;
+            }
+        `);
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+        const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+        const loading = loadV3PluginGeneration([plugin]);
+        const loadingOutcome = loading.then(
+            () => null,
+            error => error,
+        );
+        const iframe = document.body.querySelector("iframe")!;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await startupReadStarted.promise;
+        const capturedProvider = pluginV2.providers.get("pre-unload-provider")!;
+        const capturedScriptHandler = [...pluginV2.editdisplay][0];
+        const capturedPreprocessor = getTTSPreprocessors()[preprocessorCount];
+        const channelKey = `${plugin.name}pre-unload-channel`;
+        const capturedChannel = pluginChannel.get(channelKey)!;
+
+        const teardown = teardownV3Plugins();
+        await vi.waitFor(() => expect((iframe.contentWindow as any).unloadStarted).toBe(true));
+        expect(getV3PluginInstance(plugin.name)).toBeUndefined();
+        expect(pluginV2.providers.has("pre-unload-provider")).toBe(false);
+        expect(pluginV2.editdisplay.size).toBe(0);
+        expect(getTTSPreprocessors()).toHaveLength(preprocessorCount);
+        expect(pluginChannel.has(channelKey)).toBe(false);
+        expect(pluginV2.providers.has("too-late-provider")).toBe(false);
+        await expect(capturedProvider({} as any)).rejects.toThrow("terminating");
+        expect(() => capturedScriptHandler("")).toThrow("terminating");
+        expect(() => capturedPreprocessor({
+            text: "detached",
+            ttsMode: "test",
+            characterId: "test",
+        })).toThrow("terminating");
+        expect(() => capturedChannel("detached")).toThrow("terminating");
+        expect((iframe.contentWindow as any).callbackCount).toBe(0);
+
+        releaseStartupRead.resolve();
+        await vi.waitFor(() => {
+            expect((iframe.contentWindow as any).lateWriteRejected).toBe(true);
+            expect((iframe.contentWindow as any).lateRegistrationRejected).toBe(true);
+        });
+        expect(storageMocks.persistent.has(storageKey("late-write"))).toBe(false);
+        expect(pluginV2.providers.has("too-late-provider")).toBe(false);
+        await teardown;
+        const loadingError = await loadingOutcome;
+
+        expect(loadingError).toBeInstanceOf(AggregateError);
+        expect(pluginV2.providers.has("too-late-provider")).toBe(false);
+        expect(get(customProviderStore)).not.toContain("too-late-provider");
+        expect(logSpy.mock.calls.some(([message]) =>
+            String(message).includes(`[RisuAI Plugin: ${plugin.name}] Loaded API V3 plugin.`),
+        )).toBe(false);
+        expect(iframe.isConnected).toBe(false);
+        restoreRelay();
+        errorSpy.mockRestore();
+        logSpy.mockRestore();
+    });
+
+    test("keeps a plugin generation pending until delayed storage finishes before registration", async () => {
+        const readStarted = deferred();
+        const releaseRead = deferred();
+        const postRegistrationReadStarted = deferred();
+        const releasePostRegistrationRead = deferred();
+        storageMocks.persistent.set(storageKey("startup-config"), { enabled: true });
+        storageMocks.readGate = async (key) => {
+            if (key === storageKey("startup-config")) {
+                readStarted.resolve();
+                await releaseRead.promise;
+            }
+            if (key === storageKey("post-registration")) {
+                postRegistrationReadStarted.resolve();
+                await releasePostRegistrationRead.promise;
+            }
+        };
+        const plugin = startupPlugin("Delayed Startup", `
+            await risuai.pluginStorage.getItem("startup-config");
+            await risuai.addProvider("delayed-provider", async () => ({ success: true, content: "ok" }));
+            await risuai.pluginStorage.getItem("post-registration");
+        `);
+
+        let generationSettled = false;
+        const loading = loadV3PluginGeneration([plugin]);
+        void loading.then(
+            () => { generationSettled = true; },
+            () => { generationSettled = true; },
+        );
+        const iframe = document.body.querySelector("iframe");
+        expect(iframe).toBeInstanceOf(HTMLIFrameElement);
+        const restoreRelay = executeGeneratedGuest(iframe!);
+
+        await readStarted.promise;
+        expect(generationSettled).toBe(false);
+        expect(pluginV2.providers.has("delayed-provider")).toBe(false);
+
+        releaseRead.resolve();
+        await postRegistrationReadStarted.promise;
+        expect(pluginV2.providers.has("delayed-provider")).toBe(true);
+        expect(generationSettled).toBe(false);
+
+        releasePostRegistrationRead.resolve();
+        await loading;
+
+        expect(pluginV2.providers.has("delayed-provider")).toBe(true);
+        expect(getV3PluginInstance(plugin.name)).toBeDefined();
+        expect(notifyErrorMock).not.toHaveBeenCalled();
+        restoreRelay();
+    });
+
+    test("waits for every guest, reports rejection visibly, and never logs the failed guest as loaded", async () => {
+        const slowReadStarted = deferred();
+        const releaseSlowRead = deferred();
+        storageMocks.readGate = async (key) => {
+            if (key === storageKey("rejected-config")) {
+                throw new Error("optimized storage unavailable");
+            }
+            if (key === storageKey("slow-config")) {
+                slowReadStarted.resolve();
+                await releaseSlowRead.promise;
+            }
+        };
+        const rejected = startupPlugin("Rejected Startup", `
+            await risuai.pluginStorage.getItem("rejected-config");
+            await risuai.addProvider("rejected-provider", async () => ({ success: true, content: "bad" }));
+        `);
+        const slow = startupPlugin("Slow Startup", `
+            await risuai.pluginStorage.getItem("slow-config");
+            await risuai.addProvider("slow-provider", async () => ({ success: true, content: "ok" }));
+        `);
+        const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+        let generationSettled = false;
+        const loading = loadV3PluginGeneration([rejected, slow]);
+        void loading.then(
+            () => { generationSettled = true; },
+            () => { generationSettled = true; },
+        );
+        const iframes = [...document.body.querySelectorAll("iframe")];
+        expect(iframes).toHaveLength(2);
+        const restoreRejectedRelay = executeGeneratedGuest(iframes[0]);
+        const restoreSlowRelay = executeGeneratedGuest(iframes[1]);
+        await slowReadStarted.promise;
+        await vi.waitFor(() => expect(notifyErrorMock).toHaveBeenCalledOnce());
+        expect(generationSettled).toBe(false);
+        expect(pluginV2.providers.has("slow-provider")).toBe(false);
+        expect(pluginV2.providers.has("rejected-provider")).toBe(false);
+        expect(getV3PluginInstance(rejected.name)).toBeUndefined();
+        expect(logSpy.mock.calls.some(([message]) =>
+            String(message).includes(`[RisuAI Plugin: ${rejected.name}] Loaded API V3 plugin.`),
+        )).toBe(false);
+
+        releaseSlowRead.resolve();
+        await expect(loading).rejects.toThrow("One or more V3 plugins failed to initialize.");
+
+        expect(pluginV2.providers.has("slow-provider")).toBe(true);
+        expect(getV3PluginInstance(slow.name)).toBeDefined();
+        expect(notifyErrorMock).toHaveBeenCalledWith(
+            `Plugin "${rejected.name}" failed to start.`,
+            expect.objectContaining({
+                description: "optimized storage unavailable",
+                source: "plugin-startup",
+            }),
+        );
+        restoreRejectedRelay();
+        restoreSlowRelay();
+        errorSpy.mockRestore();
+        logSpy.mockRestore();
+    });
+
+    test("reject-after-register rolls back every plugin-owned registration", async () => {
+        const preprocessorCount = getTTSPreprocessors().length;
+        const postprocessorCount = getTTSPostprocessors().length;
+        const disconnectSpy = vi.spyOn(MutationObserver.prototype, "disconnect");
+        const removeEventListenerSpy = vi.spyOn(document, "removeEventListener");
+        storageMocks.readGate = async (key) => {
+            if (key === storageKey("fail-after-register")) {
+                throw new Error("late startup rejection");
+            }
+        };
+        const plugin = startupPlugin("Residue Startup", `
+            const callback = async (value) => value;
+            await risuai.addProvider("residue-provider", async () => ({ success: true, content: "bad" }));
+            await risuai.addRisuScriptHandler("display", callback);
+            await risuai.addRisuReplacer("beforeRequest", callback);
+            await risuai.addTTSPreprocessor(callback);
+            await risuai.addTTSPostprocessor(callback);
+            await risuai.registerSetting("Residue", callback, "", "none", "residue-setting");
+            await risuai.registerButton({ name: "Residue", icon: "", iconType: "none", id: "residue-button" }, callback);
+            await risuai.registerBodyIntercepter(callback);
+            await risuai.setChatPanel("residue", { id: "residue-panel" });
+            await risuai.registerMCP(
+                { identifier: "plugin:residue", name: "Residue", version: "1", description: "test" },
+                async () => [],
+                async () => []
+            );
+            await risuai.addPluginChannelListener("channel", callback);
+            const root = await risuai.getRootDocument();
+            await root.addEventListener("click", callback);
+            const observer = await risuai.createMutationObserver(callback);
+            await observer.observe(root, { childList: true });
+            await risuai.pluginStorage.getItem("fail-after-register");
+        `);
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const restoreRelay = executeGeneratedGuest(iframe);
+
+        await expect(loading).rejects.toThrow("One or more V3 plugins failed to initialize.");
+
+        expect(getV3PluginInstance(plugin.name)).toBeUndefined();
+        expect(pluginV2.providers.has("residue-provider")).toBe(false);
+        expect(pluginV2.providerOptions.has("residue-provider")).toBe(false);
+        expect(get(customProviderStore)).not.toContain("residue-provider");
+        expect(customV3ProviderMetaStore.some(model => model.id === "pluginmodel:::residue-provider"))
+            .toBe(false);
+        expect(pluginV2.editdisplay.size).toBe(0);
+        expect(pluginV2.replacerbeforeRequest.size).toBe(0);
+        expect(getTTSPreprocessors()).toHaveLength(preprocessorCount);
+        expect(getTTSPostprocessors()).toHaveLength(postprocessorCount);
+        expect(additionalSettingsMenu.some(item => item.id === "residue-setting")).toBe(false);
+        expect(additionalFloatingActionButtons.some(item => item.id === "residue-button")).toBe(false);
+        expect(bodyIntercepterStore).toHaveLength(0);
+        expect(chatPanelStore.some(item => item.id === "residue-panel")).toBe(false);
+        expect(registeredCustomPluginMCPs.has("plugin:residue")).toBe(false);
+        expect(pluginChannel.has(`${plugin.name}channel`)).toBe(false);
+        expect(disconnectSpy).toHaveBeenCalled();
+        expect(removeEventListenerSpy.mock.calls.some(([type]) => type === "click")).toBe(true);
+        expect(iframe.isConnected).toBe(false);
+        restoreRelay();
+        disconnectSpy.mockRestore();
+        removeEventListenerSpy.mockRestore();
     });
 });

@@ -25,7 +25,8 @@ async function captureHostStartupCallError(thrown: unknown): Promise<V3BridgeErr
     const host = new SandboxHost({
         startupStorageCall: async () => { throw thrown },
     })
-    cleanups.push(host.run(iframe, 'await risuai.startupStorageCall()'))
+    cleanups.push(() => host.terminate())
+    void host.run(iframe, 'await risuai.startupStorageCall()').catch(() => {})
 
     const responses: any[] = []
     vi.spyOn(iframe.contentWindow!, 'postMessage').mockImplementation((message: any) => {
@@ -33,6 +34,7 @@ async function captureHostStartupCallError(thrown: unknown): Promise<V3BridgeErr
     })
     window.dispatchEvent(new MessageEvent('message', {
         source: iframe.contentWindow,
+        origin: 'null',
         data: {
             type: 'CALL_ROOT',
             reqId: 'startup-storage-request',
@@ -62,7 +64,8 @@ async function captureGuestHostGuestError(
     const host = new SandboxHost({
         invokeStartupCallback: async (callback: () => Promise<unknown>) => await callback(),
     })
-    cleanups.push(host.run(iframe, 'await risuai.invokeStartupCallback(async () => {})'))
+    cleanups.push(() => host.terminate())
+    void host.run(iframe, 'await risuai.invokeStartupCallback(async () => {})').catch(() => {})
 
     const posted: any[] = []
     vi.spyOn(iframe.contentWindow!, 'postMessage').mockImplementation((message: any) => {
@@ -71,6 +74,7 @@ async function captureGuestHostGuestError(
     const source = iframe.contentWindow
     window.dispatchEvent(new MessageEvent('message', {
         source,
+        origin: 'null',
         data: {
             type: 'CALL_ROOT',
             reqId: 'guest-host-guest-root',
@@ -91,6 +95,7 @@ async function captureGuestHostGuestError(
 
     window.dispatchEvent(new MessageEvent('message', {
         source,
+        origin: 'null',
         data: {
             type: 'CALLBACK_RETURN',
             reqId: callbackRequest.reqId,
