@@ -50,6 +50,42 @@ not test plugin-only snapshot cadence.
 - With a short test interval, mutate only a plugin row and assert a new
   snapshot restores it; also cover post-chat plugin commit ordering.
 
+### Resolution
+
+**Fixed 2026-07-27.** Every successful logical plugin-storage mutation and
+mode transition now publishes a durable recovery-dirty token inside the same
+SQLite transaction as its value rows, owner-metadata rows, manifest, storage
+generation, and database change. A snapshot captures the current token before
+assembling its folded database and clears only that exact token, atomically
+with publishing the snapshot. A newer token therefore survives completion of
+an older in-flight snapshot and remains eligible for its own recovery point.
+
+A single coalescing scheduler honors the existing snapshot cooldown while
+guaranteeing eventual progress for plugin-only sequences. It enters the shared
+storage queue after the logical publication, flushes pending database changes
+before snapshotting, waits behind imports and mode transitions, and resumes a
+persisted dirty token after process restart. A plugin commit after a chat
+snapshot consequently produces a later point containing both commits rather
+than being lost to the chat snapshot's cooldown.
+
+Snapshot assembly/publication failures leave the token durable and retryable.
+Database flush failures likewise block snapshot acknowledgement until the
+pending cache persists; if an integrity guard deliberately invalidates a
+malformed cache, that discarded state is not retained as an impossible retry
+and the scheduler continues from authoritative live bytes. Pre-generation
+legacy rows can still be adopted through the atomic transition endpoint, but
+generic write/remove/bulk staging into the canonical plugin namespace is now
+rejected so it cannot bypass the logical publication and recovery token.
+
+Regression coverage uses short intervals and deterministic gates/failpoints
+for plugin-only set/remove/coalescing, exact value/owner restoration,
+post-chat ordering, rollback and one-shot snapshot failure, failed database
+flush plus stub-loss cache invalidation, active import and transition barriers,
+restart/restore, T1/T2 token replacement during snapshot publication, and a
+real concurrent mutation queued behind snapshot assembly. The resulting
+snapshots contain only complete generation-consistent publications, never an
+intermediate value/owner pair.
+
 <a id="br2"></a>
 ## BR2 — Cross-mode snapshot ownership is ambiguous
 

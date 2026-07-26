@@ -40,7 +40,7 @@ listed with rationale in [Excluded findings](#excluded-findings).
 | [AA1](atomicity-acknowledgement.md#aa1) | Medium | Fixed | Value and owner metadata are separate commits; a rejection can follow a durable primary mutation |
 | [AA2](atomicity-acknowledgement.md#aa2) | Medium | Fixed | Optimized `clear()` can partially apply |
 | [AA3](atomicity-acknowledgement.md#aa3) | High | Open | No batch/transaction/CAS primitive: the one-second unload deadline can terminate a multi-row commit, leaving a torn but durable generation |
-| [BR1](backup-recovery.md#br1) | Medium | Open | Optimized-only mutations never advance automatic recovery snapshots |
+| [BR1](backup-recovery.md#br1) | Medium | Fixed | Optimized-only mutations never advance automatic recovery snapshots |
 | [BR2](backup-recovery.md#br2) | Medium | Fixed | Cross-mode snapshot ownership is ambiguous: unmarked just-disabled snapshots and no storage generation |
 | [BR3](backup-recovery.md#br3) | Medium | Open | Corrupt-database boot fallback ignores a marked snapshot's exact plugin-row set |
 | [BR4](backup-recovery.md#br4) | Medium | Fixed | Valid long keys produce Node backups the same server refuses to import |

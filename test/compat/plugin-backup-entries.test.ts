@@ -227,8 +227,10 @@ describe('external plugin rows in backup archives', () => {
       [pluginStorageKey('pluginsave-meta/', 'plain/key'), Buffer.from('{"plugin":"Plugin A","updatedAt":10}')],
       [pluginStorageKey('pluginsave-meta/', '유니코드 키'), Buffer.from('{"plugin":"Plugin B","updatedAt":20}')],
     ])
+    // These are pre-BR2 legacy rows. Current servers reject new generic
+    // pluginsave staging, so seed the historical fixture at rest.
     for (const [key, value] of [...valueRows, ...metaRows]) {
-      await writeKv(sourceClient, key, value)
+      writeFixtureKvValue(source.cwd, key, value)
     }
     const storageGeneration = 'node-backup-generation'
     const storageManifest = Buffer.from(JSON.stringify({
@@ -376,7 +378,7 @@ describe('external plugin rows in backup archives', () => {
       },
     }))).ok).toBe(true)
     const staleKey = pluginStorageKey('pluginsave/', 'stale')
-    await writeKv(destinationClient, staleKey, Buffer.from('"stale"'))
+    writeFixtureKvValue(destination.cwd, staleKey, Buffer.from('"stale"'))
 
     expect((await destinationClient.importBackup(nodeBackup)).ok).toBe(true)
     expect(readKvValue(destination.cwd, staleKey)).toBeNull()
@@ -403,8 +405,8 @@ describe('external plugin rows in backup archives', () => {
     }))).ok).toBe(true)
     const staleValueKey = pluginStorageKey('pluginsave/', 'stale')
     const staleMetaKey = pluginStorageKey('pluginsave-meta/', 'stale')
-    await writeKv(client, staleValueKey, Buffer.from('1'))
-    await writeKv(client, staleMetaKey, Buffer.from('{}'))
+    writeFixtureKvValue(server.cwd, staleValueKey, Buffer.from('1'))
+    writeFixtureKvValue(server.cwd, staleMetaKey, Buffer.from('{}'))
 
     const legacyValues = {
       'legacy/key': { nested: ['value'], enabled: true },

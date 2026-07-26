@@ -5,16 +5,26 @@ import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { gzipSync } from 'node:zlib'
 import Database from 'better-sqlite3'
+import { Packr } from 'msgpackr'
 import utilsPkg from './utils.cjs'
 import pluginSaveKeysPkg from './pluginSaveKeys.cjs'
 import streamLoadPkg from './streamRisuLoad.cjs'
+import { encodeBackup } from '../../test/compat/helpers/encode.js'
 
-const { decodeRisuSave, encodeRisuSaveLegacy, calculateHash, normalizeJSON } = utilsPkg as {
+const {
+    decodeRisuSave,
+    encodeRisuSaveLegacy,
+    calculateHash,
+    normalizeJSON,
+    magicCompressedHeader,
+} = utilsPkg as {
     decodeRisuSave: (value: Buffer) => Promise<any>
     encodeRisuSaveLegacy: (value: unknown) => Uint8Array
     calculateHash: (value: unknown) => number
     normalizeJSON: (value: unknown) => any
+    magicCompressedHeader: Uint8Array
 }
 const { shouldStreamRisuSave } = streamLoadPkg as {
     shouldStreamRisuSave: (input: Buffer, options?: { minBytes?: number }) => Promise<boolean>
@@ -33,6 +43,8 @@ const {
 
 const serverEntry = path.resolve(process.cwd(), 'server/node/server.cjs')
 const testPasswordDigest = crypto.createHash('sha256').update('snapshot-plugin-test').digest('hex')
+const packr = new Packr({ useRecords: false })
+const pluginRecoveryDirtyKey = 'config/plugin-storage-recovery-dirty'
 
 interface RunningServer {
     child: ChildProcessWithoutNullStreams
@@ -51,6 +63,24 @@ const tempDirs: string[] = []
 
 function delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitFor(
+    predicate: () => Promise<boolean>,
+    timeoutMs = 5_000,
+): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    let lastError: unknown = null
+    while (Date.now() < deadline) {
+        try {
+            if (await predicate()) return
+        } catch (error) {
+            lastError = error
+        }
+        await delay(25)
+    }
+    if (lastError) throw lastError
+    throw new Error(`Condition did not settle within ${timeoutMs}ms`)
 }
 
 async function getFreePort(): Promise<number> {
@@ -158,6 +188,52 @@ function openFixtureDatabase(cwd: string) {
         )
     `)
     return raw
+}
+
+function replacePluginPublicationOutsideServer(
+    cwd: string,
+    {
+        rawKey,
+        value,
+        meta,
+        recoveryToken,
+    }: {
+        rawKey: string
+        value: unknown
+        meta: unknown
+        recoveryToken: string
+    },
+): void {
+    const raw = openFixtureDatabase(cwd)
+    const set = raw.prepare(
+        'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+    )
+    raw.transaction(() => {
+        const now = Date.now()
+        set.run(valueRowKey(rawKey), Buffer.from(JSON.stringify(value)), now)
+        set.run(metaRowKey(rawKey), Buffer.from(JSON.stringify(meta)), now)
+        set.run(pluginRecoveryDirtyKey, Buffer.from(recoveryToken), now)
+    })()
+    raw.close()
+}
+
+async function armSnapshotPublicationGate(gateDir: string): Promise<void> {
+    await fs.promises.mkdir(gateDir, { recursive: true })
+    await fs.promises.writeFile(path.join(gateDir, 'hold'), 'hold')
+}
+
+async function waitForSnapshotPublicationGate(gateDir: string): Promise<void> {
+    await waitFor(async () => fs.existsSync(path.join(gateDir, 'entered')))
+}
+
+async function releaseSnapshotPublicationGate(gateDir: string): Promise<void> {
+    await fs.promises.writeFile(path.join(gateDir, 'release'), 'release')
+}
+
+async function disarmSnapshotPublicationGate(gateDir: string): Promise<void> {
+    await Promise.all(['hold', 'entered', 'release'].map(
+        (name) => fs.promises.rm(path.join(gateDir, name), { force: true }),
+    ))
 }
 
 async function authenticate(server: RunningServer): Promise<AuthHeaders> {
@@ -330,6 +406,21 @@ function manifestBytes(generation: string, valueKeys: string[], metaKeys: string
     }))
 }
 
+function lateFailingDatabase(payloadBytes = 64 * 1024): Buffer {
+    const gzipped = gzipSync(packr.encode({
+        characters: [{
+            chaId: 'plugin-snapshot-import',
+            name: 'Import barrier',
+            chats: [{
+                id: 'plugin-snapshot-import-chat',
+                message: [{ role: 'char', data: 'x'.repeat(payloadBytes) }],
+            }],
+        }],
+    }), { level: 1 })
+    gzipped[gzipped.length - 1] ^= 0xff
+    return Buffer.concat([Buffer.from(magicCompressedHeader), gzipped])
+}
+
 async function transitionStorage(
     server: RunningServer,
     auth: AuthHeaders,
@@ -369,6 +460,57 @@ async function mutateStorage(
     })
 }
 
+async function mutateCurrentStorage(
+    server: RunningServer,
+    auth: AuthHeaders,
+    changes: {
+        writes?: Array<{ storageKey: string; value: unknown }>
+        deletes?: string[]
+    },
+    failpoint?: string,
+): Promise<Response> {
+    const db = await decodeRisuSave(
+        await readKey(server, auth, 'database/database.bin'),
+    )
+    const generation = db.pluginStorageGeneration as string
+    const expectedManifest = JSON.parse(
+        (await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toString('utf-8'),
+    )
+    const valueKeys = new Set<string>(expectedManifest.valueKeys)
+    const metaKeys = new Set<string>(expectedManifest.metaKeys)
+    const selectKeys = (storageKey: string) => (
+        storageKey.startsWith(PLUGIN_SAVE_META_PREFIX) ? metaKeys : valueKeys
+    )
+    for (const write of changes.writes ?? []) selectKeys(write.storageKey).add(write.storageKey)
+    for (const storageKey of changes.deletes ?? []) selectKeys(storageKey).delete(storageKey)
+    return await mutateStorage(server, auth, {
+        version: 1,
+        generation,
+        expectedManifest,
+        nextManifest: {
+            ...expectedManifest,
+            valueKeys: [...valueKeys],
+            metaKeys: [...metaKeys],
+        },
+        writes: (changes.writes ?? []).map(({ storageKey, value }) => ({
+            storageKey,
+            valueJson: JSON.stringify(value),
+        })),
+        deletes: changes.deletes ?? [],
+    }, failpoint)
+}
+
+async function readSnapshotDatabases(
+    server: RunningServer,
+    auth: AuthHeaders,
+): Promise<Array<{ key: string; db: any }>> {
+    const keys = await listSnapshotKeys(server, auth)
+    return await Promise.all(keys.map(async (key) => ({
+        key,
+        db: await decodeRisuSave(await readKey(server, auth, key)),
+    })))
+}
+
 afterEach(async () => {
     await Promise.all([...runningServers].map((server) => stopServer(server)))
     await Promise.all(tempDirs.splice(0).map(
@@ -388,12 +530,17 @@ describe('atomic plugin storage publication', () => {
             optimizePluginMemory: true,
             pluginCustomStorage: {},
         }))
-        await writeKey(
-            server,
-            auth,
+        // Simulate a row left by a pre-BR2 server. New generic writes are
+        // rejected, but existing legacy rows still need atomic adoption.
+        const legacyFixture = openFixtureDatabase(cwd)
+        legacyFixture.prepare(
+            'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+        ).run(
             valueRowKey('legacy'),
             Buffer.from(JSON.stringify({ durable: true })),
+            Date.now(),
         )
+        legacyFixture.close()
         const response = await transitionStorage(server, auth, {
             optimized: true,
             generation: null,
@@ -719,7 +866,7 @@ describe('atomic plugin storage publication', () => {
         await assertUnchanged()
     }, 30_000)
 
-    it('allows one absent legacy staging write but reserves it once implicitly owned', async () => {
+    it('rejects generic staging into the pre-generation legacy namespace', async () => {
         const server = await startServer(makeWorkDir())
         const auth = await authenticate(server)
         const legacyKey = valueRowKey('legacy-owned')
@@ -745,22 +892,23 @@ describe('atomic plugin storage publication', () => {
             optimizePluginMemory: true,
             pluginCustomStorage: {},
         }))
+        const snapshotsBeforeRejectedStaging = await listSnapshotKeys(server, auth)
 
-        await writeKey(server, auth, legacyKey, Buffer.from(JSON.stringify('first')))
         expect((await writeKeyResponse(
             server,
             auth,
             legacyKey,
-            Buffer.from(JSON.stringify('overwrite')),
+            Buffer.from(JSON.stringify('must-not-stage')),
         )).status).toBe(409)
         expect((await removeKeyResponse(server, auth, legacyKey)).status).toBe(409)
         expect((await bulkWriteResponse(server, auth, [{
             key: legacyKey,
-            value: Buffer.from(JSON.stringify('bulk-overwrite')),
+            value: Buffer.from(JSON.stringify('bulk-must-not-stage')),
         }])).status).toBe(409)
-        expect(JSON.parse((await readKey(server, auth, legacyKey)).toString('utf-8')))
-            .toBe('first')
+        expect((await readKey(server, auth, legacyKey)).length).toBe(0)
         expect((await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).length).toBe(0)
+        await delay(150)
+        expect(await listSnapshotKeys(server, auth)).toEqual(snapshotsBeforeRejectedStaging)
     }, 30_000)
 
     it.each(['after-row', 'after-manifest'])(
@@ -945,13 +1093,588 @@ describe('atomic plugin storage publication', () => {
     }, 30_000)
 })
 
+describe('plugin publication recovery snapshot scheduling', () => {
+    it('coalesces plugin-only sets and removes into one exact restorable point', async () => {
+        const cwd = makeWorkDir()
+        let server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '250',
+        })
+        let auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'old', removed: 'delete-me' },
+            meta: {
+                alpha: { plugin: 'owner-a' },
+                removed: { plugin: 'owner-r' },
+            },
+        }))
+        expect(await listSnapshotKeys(server, auth)).toHaveLength(1)
+
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [
+                { storageKey: valueRowKey('alpha'), value: 'new' },
+                { storageKey: metaRowKey('alpha'), value: { plugin: 'owner-a2' } },
+            ],
+        })).status).toBe(200)
+        expect((await mutateCurrentStorage(server, auth, {
+            deletes: [valueRowKey('removed'), metaRowKey('removed')],
+        })).status).toBe(200)
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [
+                { storageKey: valueRowKey('added'), value: { final: true } },
+                { storageKey: metaRowKey('added'), value: { plugin: 'owner-added' } },
+            ],
+        })).status).toBe(200)
+
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
+        await delay(350)
+        expect(await listSnapshotKeys(server, auth)).toHaveLength(2)
+        const [latest] = await readSnapshotDatabases(server, auth)
+        expect(latest.db.pluginCustomStorage).toEqual({
+            alpha: 'new',
+            added: { final: true },
+        })
+        expect(latest.db.pluginStorageMeta).toEqual({
+            alpha: { plugin: 'owner-a2' },
+            added: { plugin: 'owner-added' },
+        })
+
+        await restoreSnapshot(server, auth, latest.key)
+        await stopServer(server)
+        server = await startServer(cwd, { POCKETRISU_BACKUP_INTERVAL_MS: '250' })
+        auth = await authenticate(server)
+        const restoredDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        const restoredGeneration = restoredDb.pluginStorageGeneration as string
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('alpha'),
+            restoredGeneration,
+        )).toString('utf-8'))).toBe('new')
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            metaRowKey('added'),
+            restoredGeneration,
+        )).toString('utf-8'))).toEqual({ plugin: 'owner-added' })
+        expect((await readKey(
+            server,
+            auth,
+            valueRowKey('removed'),
+            restoredGeneration,
+        )).length).toBe(0)
+    }, 30_000)
+
+    it('creates a later consistent point for a plugin commit after a chat snapshot', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '250',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', encodeRisuSaveLegacy({
+            characters: [{
+                chaId: 'char-post-chat',
+                name: 'Character',
+                chats: [{
+                    id: 'chat-post-chat',
+                    name: 'Chat',
+                    message: [{ role: 'user', data: 'before' }],
+                }],
+            }],
+            optimizePluginMemory: true,
+            pluginCustomStorage: { alpha: 'before-plugin' },
+            pluginStorageMeta: { alpha: { plugin: 'owner' } },
+        }))
+        await delay(275)
+
+        const chatResponse = await fetch(
+            `${server.origin}/api/chat-content/char-post-chat/0`,
+            {
+                method: 'POST',
+                headers: {
+                    ...auth,
+                    'content-type': 'application/octet-stream',
+                    'x-chat-id': 'chat-post-chat',
+                },
+                body: encodeRisuSaveLegacy({
+                    id: 'chat-post-chat',
+                    name: 'Chat',
+                    message: [{ role: 'assistant', data: 'after-chat' }],
+                }),
+            },
+        )
+        expect(chatResponse.status).toBe(200)
+        expect(await listSnapshotKeys(server, auth)).toHaveLength(2)
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [
+                { storageKey: valueRowKey('alpha'), value: 'after-plugin' },
+                { storageKey: metaRowKey('alpha'), value: { plugin: 'owner-after' } },
+            ],
+        })).status).toBe(200)
+
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 3)
+        const [latest] = await readSnapshotDatabases(server, auth)
+        expect(latest.db.pluginCustomStorage?.alpha).toBe('after-plugin')
+        expect(latest.db.pluginStorageMeta?.alpha).toEqual({ plugin: 'owner-after' })
+        expect(latest.db.characters?.[0]?.chats?.[0]?.message).toEqual([
+            { role: 'assistant', data: 'after-chat' },
+        ])
+    }, 30_000)
+
+    it('does not schedule a point for a rolled-back plugin mutation', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '250',
+            POCKETRISU_PLUGIN_STORAGE_TEST_FAILPOINTS: '1',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'old' },
+        }))
+        const response = await mutateCurrentStorage(server, auth, {
+            writes: [{ storageKey: valueRowKey('alpha'), value: 'must-roll-back' }],
+        }, 'after-manifest')
+        expect(response.status).toBe(500)
+        await delay(400)
+        expect(await listSnapshotKeys(server, auth)).toHaveLength(1)
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('alpha'),
+        )).toString('utf-8'))).toBe('old')
+    }, 30_000)
+
+    it('retains the dirty token across a one-shot snapshot publication failure and retries', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '300',
+            POCKETRISU_TEST_FAILPOINT: 'prefix:database/dbbackup-:2',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'before-failure' },
+            meta: { alpha: { plugin: 'owner-before' } },
+        }))
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [
+                { storageKey: valueRowKey('alpha'), value: 'after-failure' },
+                { storageKey: metaRowKey('alpha'), value: { plugin: 'owner-after' } },
+            ],
+        })).status).toBe(200)
+
+        await waitFor(async () => server.logs().includes(
+            'Injected kvSet failure for database/dbbackup-',
+        ))
+        expect((await readKey(server, auth, pluginRecoveryDirtyKey)).length).toBeGreaterThan(0)
+        expect(await listSnapshotKeys(server, auth)).toHaveLength(1)
+
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
+        const [latest] = await readSnapshotDatabases(server, auth)
+        expect(latest.db.pluginCustomStorage?.alpha).toBe('after-failure')
+        expect(latest.db.pluginStorageMeta?.alpha).toEqual({ plugin: 'owner-after' })
+        expect((await readKey(server, auth, pluginRecoveryDirtyKey)).length).toBe(0)
+    }, 30_000)
+
+    it('cannot clear T2 when T2 replaces T1 after T1 assembly but before publication', async () => {
+        const cwd = makeWorkDir()
+        const gateDir = path.join(cwd, 'plugin-snapshot-gate')
+        const server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '500',
+            POCKETRISU_PLUGIN_RECOVERY_SNAPSHOT_TEST_GATE_DIR: gateDir,
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'initial' },
+            meta: { alpha: { plugin: 'owner-initial' } },
+        }))
+        await armSnapshotPublicationGate(gateDir)
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [
+                { storageKey: valueRowKey('alpha'), value: 'T1' },
+                { storageKey: metaRowKey('alpha'), value: { plugin: 'owner-T1' } },
+            ],
+        })).status).toBe(200)
+        await waitForSnapshotPublicationGate(gateDir)
+
+        replacePluginPublicationOutsideServer(cwd, {
+            rawKey: 'alpha',
+            value: 'T2',
+            meta: { plugin: 'owner-T2' },
+            recoveryToken: 'token-T2',
+        })
+        await releaseSnapshotPublicationGate(gateDir)
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
+
+        // T1's already-assembled spool publishes, but its captured token must
+        // not acknowledge the newer T2 transaction.
+        let [latest] = await readSnapshotDatabases(server, auth)
+        expect(latest.db.pluginCustomStorage?.alpha).toBe('T1')
+        expect(latest.db.pluginStorageMeta?.alpha).toEqual({ plugin: 'owner-T1' })
+        expect((await readKey(server, auth, pluginRecoveryDirtyKey)).toString('utf-8'))
+            .toBe('token-T2')
+
+        await disarmSnapshotPublicationGate(gateDir)
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 3)
+        ;[latest] = await readSnapshotDatabases(server, auth)
+        expect(latest.db.pluginCustomStorage?.alpha).toBe('T2')
+        expect(latest.db.pluginStorageMeta?.alpha).toEqual({ plugin: 'owner-T2' })
+        expect((await readKey(server, auth, pluginRecoveryDirtyKey)).length).toBe(0)
+    }, 30_000)
+
+    it('serializes a concurrent logical mutation behind assembly and later snapshots its exact pair', async () => {
+        const cwd = makeWorkDir()
+        const gateDir = path.join(cwd, 'plugin-snapshot-gate')
+        const server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '500',
+            POCKETRISU_PLUGIN_RECOVERY_SNAPSHOT_TEST_GATE_DIR: gateDir,
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'initial' },
+            meta: { alpha: { plugin: 'owner-initial' } },
+        }))
+        await armSnapshotPublicationGate(gateDir)
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [
+                { storageKey: valueRowKey('alpha'), value: 'T1' },
+                { storageKey: metaRowKey('alpha'), value: { plugin: 'owner-T1' } },
+            ],
+        })).status).toBe(200)
+        const liveDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        const manifest = JSON.parse(
+            (await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toString('utf-8'),
+        )
+        await waitForSnapshotPublicationGate(gateDir)
+
+        let concurrentSettled = false
+        const concurrentMutation = mutateStorage(server, auth, {
+            version: 1,
+            generation: liveDb.pluginStorageGeneration,
+            expectedManifest: manifest,
+            nextManifest: manifest,
+            writes: [
+                { storageKey: valueRowKey('alpha'), valueJson: JSON.stringify('T2') },
+                {
+                    storageKey: metaRowKey('alpha'),
+                    valueJson: JSON.stringify({ plugin: 'owner-T2' }),
+                },
+            ],
+            deletes: [],
+        }).finally(() => { concurrentSettled = true })
+        await delay(100)
+        expect(concurrentSettled).toBe(false)
+
+        await releaseSnapshotPublicationGate(gateDir)
+        expect((await concurrentMutation).status).toBe(200)
+        await disarmSnapshotPublicationGate(gateDir)
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 3)
+
+        const snapshots = await readSnapshotDatabases(server, auth)
+        expect(snapshots.map(({ db }) => [
+            db.pluginCustomStorage?.alpha,
+            db.pluginStorageMeta?.alpha?.plugin,
+        ])).toEqual([
+            ['T2', 'owner-T2'],
+            ['T1', 'owner-T1'],
+            ['initial', 'owner-initial'],
+        ])
+        expect(snapshots.every(({ db }) => (
+            db.pluginStorageGeneration === liveDb.pluginStorageGeneration
+            && db.pluginStorageFolded === true
+        ))).toBe(true)
+    }, 30_000)
+
+    it('keeps a failed pending database patch ahead of plugin snapshot acknowledgement', async () => {
+        const cwd = makeWorkDir()
+        const server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '300',
+            POCKETRISU_TEST_FAILPOINT: 'prefix:database/database.bin:2',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'before-flush' },
+            meta: { alpha: { plugin: 'owner-before' } },
+        }))
+        const liveDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [
+                { storageKey: valueRowKey('alpha'), value: 'after-flush' },
+                { storageKey: metaRowKey('alpha'), value: { plugin: 'owner-after' } },
+            ],
+        })).status).toBe(200)
+        const patch = await patchDatabaseResponse(
+            server,
+            auth,
+            calculateHash(normalizeJSON(liveDb)).toString(16),
+            [{ op: 'replace', path: '/formatPadding', value: 'after-flush' }],
+        )
+        expect(patch.status).toBe(200)
+
+        await waitFor(async () => server.logs().includes(
+            'Injected kvSet failure for database/database.bin',
+        ))
+        expect((await readKey(server, auth, pluginRecoveryDirtyKey)).length).toBeGreaterThan(0)
+        expect(await listSnapshotKeys(server, auth)).toHaveLength(1)
+        const fixtureBeforeRetry = openFixtureDatabase(cwd)
+        const persistedBeforeRetry = fixtureBeforeRetry.prepare(
+            'SELECT value FROM kv WHERE key = ?',
+        ).get('database/database.bin') as { value: Buffer }
+        fixtureBeforeRetry.close()
+        expect((await decodeRisuSave(Buffer.from(persistedBeforeRetry.value))).formatPadding)
+            .not.toBe('after-flush')
+
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
+        const [latest] = await readSnapshotDatabases(server, auth)
+        expect(latest.db.formatPadding).toBe('after-flush')
+        expect(latest.db.pluginCustomStorage?.alpha).toBe('after-flush')
+        expect(latest.db.pluginStorageMeta?.alpha).toEqual({ plugin: 'owner-after' })
+        expect((await readKey(server, auth, pluginRecoveryDirtyKey)).length).toBe(0)
+    }, 30_000)
+
+    it('supersedes an invalidated malformed chat cache and completes plugin recovery', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '400',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', encodeRisuSaveLegacy({
+            characters: [{
+                chaId: 'stub-loss-char',
+                name: 'Character',
+                chats: [{
+                    id: 'stub-loss-chat',
+                    name: 'Authoritative chat',
+                    message: [{ role: 'user', data: 'must-survive' }],
+                }],
+            }],
+            optimizePluginMemory: true,
+            pluginCustomStorage: { alpha: 'before-stub-loss' },
+            pluginStorageMeta: { alpha: { plugin: 'owner-before' } },
+        }))
+        const liveDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [
+                { storageKey: valueRowKey('alpha'), value: 'after-stub-loss' },
+                { storageKey: metaRowKey('alpha'), value: { plugin: 'owner-after' } },
+            ],
+        })).status).toBe(200)
+
+        // Whole-chat replacement is intentionally allowed at the patch
+        // boundary; the persist guard detects that this metadata-only object is
+        // neither a stub nor a hydrated chat and invalidates the cache.
+        const malformedPatch = await patchDatabaseResponse(
+            server,
+            auth,
+            calculateHash(normalizeJSON(liveDb)).toString(16),
+            [{
+                op: 'replace',
+                path: '/characters/0/chats/0',
+                value: { id: 'stub-loss-chat', name: 'Malformed replacement' },
+            }],
+        )
+        expect(malformedPatch.status).toBe(200)
+
+        await waitFor(async () => server.logs().includes(
+            'persist aborted: 1 chat(s) lost _stub flag',
+        ))
+        expect((await readKey(server, auth, pluginRecoveryDirtyKey)).length).toBeGreaterThan(0)
+        expect(await listSnapshotKeys(server, auth)).toHaveLength(1)
+
+        // The retry observes no retained cache, reloads authoritative live DB,
+        // and can therefore satisfy the plugin recovery obligation.
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
+        const [latest] = await readSnapshotDatabases(server, auth)
+        expect(latest.db.pluginCustomStorage?.alpha).toBe('after-stub-loss')
+        expect(latest.db.pluginStorageMeta?.alpha).toEqual({ plugin: 'owner-after' })
+        expect(latest.db.characters?.[0]?.chats?.[0]?.message).toEqual([
+            { role: 'user', data: 'must-survive' },
+        ])
+        expect(latest.db.characters?.[0]?.chats?.[0]?.name).toBe('Authoritative chat')
+        expect((await readKey(server, auth, pluginRecoveryDirtyKey)).length).toBe(0)
+    }, 30_000)
+
+    it('keeps a pending mutation behind a transition and snapshots only the final publication', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '250',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'old' },
+            meta: { alpha: { plugin: 'owner-old' } },
+        }))
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [
+                { storageKey: valueRowKey('alpha'), value: 'new' },
+                { storageKey: metaRowKey('alpha'), value: { plugin: 'owner-new' } },
+            ],
+        })).status).toBe(200)
+        const sourceDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        const sourceManifest = JSON.parse(
+            (await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toString('utf-8'),
+        )
+        const disabledGeneration = crypto.randomUUID()
+        const transition = await transitionStorage(server, auth, {
+            optimized: true,
+            generation: sourceDb.pluginStorageGeneration,
+            manifest: sourceManifest,
+        }, encodeRisuSaveLegacy({
+            ...sourceDb,
+            optimizePluginMemory: false,
+            pluginStorageGeneration: disabledGeneration,
+            pluginCustomStorage: { alpha: 'new' },
+            pluginStorageMeta: { alpha: { plugin: 'owner-new' } },
+        }))
+        expect(transition.status).toBe(200)
+
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
+        const snapshots = await readSnapshotDatabases(server, auth)
+        expect(snapshots[0].db).toMatchObject({
+            optimizePluginMemory: false,
+            pluginStorageGeneration: disabledGeneration,
+            pluginCustomStorage: { alpha: 'new' },
+            pluginStorageMeta: { alpha: { plugin: 'owner-new' } },
+        })
+        expect(snapshots.some(({ db }) => (
+            db.optimizePluginMemory === true
+            && db.pluginCustomStorage?.alpha === 'new'
+        ))).toBe(false)
+    }, 30_000)
+
+    it('waits for an active backup-import barrier before retrying the deferred point', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '250',
+            RISU_STREAM_INGEST_MIN_BYTES: '1',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'before-import' },
+        }))
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [{ storageKey: valueRowKey('alpha'), value: 'after-import' }],
+        })).status).toBe(200)
+
+        const backup = encodeBackup([{
+            name: 'database.risudat',
+            data: lateFailingDatabase(),
+        }])
+        let releaseUpload!: () => void
+        const uploadGate = new Promise<void>((resolve) => { releaseUpload = resolve })
+        const body = new ReadableStream<Uint8Array>({
+            async pull(controller) {
+                controller.enqueue(new Uint8Array(backup))
+                await uploadGate
+                controller.close()
+            },
+        })
+        const importDone = fetch(`${server.origin}/api/backup/import`, {
+            method: 'POST',
+            headers: {
+                ...auth,
+                'content-type': 'application/x-risu-backup',
+            },
+            body,
+            // @ts-expect-error -- Node requires duplex for streaming request bodies.
+            duplex: 'half',
+        })
+
+        // The scheduler becomes eligible while the importer holds its raw
+        // transaction, but must neither snapshot inside it nor retry-spin.
+        await delay(500)
+        expect(await listSnapshotKeys(server, auth)).toHaveLength(1)
+        releaseUpload()
+        const importResponse = await importDone
+        await importResponse.text()
+        expect(importResponse.ok).toBe(false)
+
+        await waitFor(async () => {
+            const snapshots = await readSnapshotDatabases(server, auth)
+            return snapshots.length === 2 && snapshots.some(({ db }) => (
+                db.pluginCustomStorage?.alpha === 'after-import'
+            ))
+        })
+    }, 30_000)
+
+    it('defers through the snapshot-restore import barrier without resurrecting a newer row', async () => {
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '250',
+        })
+        const auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'selected-old' },
+        }))
+        const [selectedSnapshot] = await listSnapshotKeys(server, auth)
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [{ storageKey: valueRowKey('alpha'), value: 'newer-live' }],
+        })).status).toBe(200)
+        await restoreSnapshot(server, auth, selectedSnapshot)
+
+        await waitFor(async () => {
+            const snapshots = await readSnapshotDatabases(server, auth)
+            return snapshots.some(({ db }) => (
+                db.pluginCustomStorage?.alpha === 'selected-old'
+            )) && snapshots.length === 2
+        })
+        const [latest] = await readSnapshotDatabases(server, auth)
+        expect(latest.db.pluginCustomStorage?.alpha).toBe('selected-old')
+        expect((await readSnapshotDatabases(server, auth)).some(({ db }) => (
+            db.pluginCustomStorage?.alpha === 'newer-live'
+        ))).toBe(false)
+    }, 30_000)
+
+    it('resumes a cooldown-deferred plugin snapshot after process restart', async () => {
+        const cwd = makeWorkDir()
+        let server = await startServer(cwd, {
+            POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+        })
+        let auth = await authenticate(server)
+        await writeKey(server, auth, 'database/database.bin', buildDatabase({
+            values: { alpha: 'before-restart' },
+        }))
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [{ storageKey: valueRowKey('alpha'), value: 'after-restart' }],
+        })).status).toBe(200)
+        await stopServer(server)
+
+        server = await startServer(cwd, { POCKETRISU_BACKUP_INTERVAL_MS: '10000' })
+        auth = await authenticate(server)
+        await waitFor(async () => {
+            const snapshots = await readSnapshotDatabases(server, auth)
+            return snapshots.some(({ db }) => (
+                db.pluginCustomStorage?.alpha === 'after-restart'
+            ))
+        })
+        const [latest] = await readSnapshotDatabases(server, auth)
+        await restoreSnapshot(server, auth, latest.key)
+        const restoredDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        expect(JSON.parse((await readKey(
+            server,
+            auth,
+            valueRowKey('alpha'),
+            restoredDb.pluginStorageGeneration,
+        )).toString('utf-8'))).toBe('after-restart')
+    }, 30_000)
+})
+
 // The audit regression (docs/audit/snapshots-omit-optimized-plugin-storage.md):
 // snapshot V1 → change to V2, delete an old key, add a new key → restore →
 // the exact snapshot-time key set and values must come back.
 async function runRoundTrip(options: { streamIngestMinBytes?: number }): Promise<void> {
-    const extraEnv = options.streamIngestMinBytes !== undefined
-        ? { RISU_STREAM_INGEST_MIN_BYTES: String(options.streamIngestMinBytes) }
-        : {}
+    // This case explicitly restores the pre-mutation point. Keep the new BR1
+    // deferred snapshot outside the test window so it cannot replace the same
+    // 100 ms timestamp bucket before restore.
+    const extraEnv = {
+        POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+        ...(options.streamIngestMinBytes !== undefined
+            ? { RISU_STREAM_INGEST_MIN_BYTES: String(options.streamIngestMinBytes) }
+            : {}),
+    }
     const server = await startServer(makeWorkDir(), extraEnv)
     const auth = await authenticate(server)
 
@@ -1267,17 +1990,35 @@ describe('automatic snapshots × optimized plugin storage', () => {
     })
 
     it('restoring a folded-empty snapshot clears plugin rows added afterwards', async () => {
-        const server = await startServer(makeWorkDir())
+        const server = await startServer(makeWorkDir(), {
+            POCKETRISU_BACKUP_INTERVAL_MS: '10000',
+        })
         const auth = await authenticate(server)
 
         await writeKey(server, auth, 'database/database.bin', buildDatabase({ values: {} }))
         const snapshots = await listSnapshotKeys(server, auth)
         expect(snapshots.length).toBe(1)
 
-        // The row is absent and the database is still a pre-generation legacy
-        // publication, so this is the one generic staging case that remains
-        // intentionally accepted before atomic adoption.
-        await writeKey(server, auth, valueRowKey('keyX'), Buffer.from(JSON.stringify('post-snapshot')))
+        const legacyDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        const adoption = await transitionStorage(server, auth, {
+            optimized: true,
+            generation: null,
+            manifest: null,
+        }, encodeRisuSaveLegacy({
+            ...legacyDb,
+            pluginStorageGeneration: crypto.randomUUID(),
+            pluginCustomStorage: {},
+        }))
+        expect(adoption.status).toBe(200)
+
+        expect((await mutateCurrentStorage(server, auth, {
+            writes: [{
+                storageKey: valueRowKey('keyX'),
+                value: 'post-snapshot',
+            }],
+        })).status).toBe(200)
         await restoreSnapshot(server, auth, snapshots[0])
 
         expect((await readKey(server, auth, valueRowKey('keyX'))).length).toBe(0)

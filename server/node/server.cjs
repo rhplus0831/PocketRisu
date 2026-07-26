@@ -150,6 +150,7 @@ const HUB_HOSTING_MODE = ['true', '1'].includes(String(process.env.POCKETRISU_HU
 // dbCache stores the STRIPPED (stubs-only) version matching what the client sees.
 let dbCache = {};
 let saveTimers = {};
+let dbPersistRetryPending = false;
 const pendingChatRowDeletions = new Set();
 const SAVE_INTERVAL = 5000;
 
@@ -322,8 +323,54 @@ const HUB_SNAPSHOT_CAP_BYTES = (() => {
 const BACKUP_INTERVAL_MS = process.env.POCKETRISU_BACKUP_INTERVAL_MS
     ? Number(process.env.POCKETRISU_BACKUP_INTERVAL_MS)
     : 5 * 60 * 1000; // 5 minutes (override for tests to force snapshot creation)
+// A plugin publication can commit after an ordinary database/chat snapshot has
+// consumed the cooldown. Keep that later recovery obligation durable so a
+// restart cannot lose the deferred snapshot. The marker is replaced inside the
+// same SQLite transaction as each logical plugin mutation/transition, then
+// cleared atomically with the snapshot that folded that exact-or-later state.
+const PLUGIN_RECOVERY_SNAPSHOT_DIRTY_KEY = 'config/plugin-storage-recovery-dirty';
+const PLUGIN_RECOVERY_SNAPSHOT_TEST_GATE_DIR
+    = process.env.POCKETRISU_PLUGIN_RECOVERY_SNAPSHOT_TEST_GATE_DIR || null;
+const PLUGIN_RECOVERY_SNAPSHOT_RETRY_MS = Math.min(
+    5000,
+    Math.max(100, Number.isFinite(BACKUP_INTERVAL_MS) ? BACKUP_INTERVAL_MS : 1000),
+);
 let lastBackupTime = null;
 let backupCreationInFlight = false;
+let pluginRecoverySnapshotTimer = null;
+let pluginRecoverySnapshotRun = null;
+
+function newPluginRecoverySnapshotToken() {
+    return Buffer.from(nodeCrypto.randomUUID(), 'utf-8');
+}
+
+function markPluginRecoverySnapshotDirty(token) {
+    kvSet(PLUGIN_RECOVERY_SNAPSHOT_DIRTY_KEY, token);
+}
+
+function clearCapturedPluginRecoverySnapshotDirty(capturedToken) {
+    if (!capturedToken) return;
+    const currentToken = kvGet(PLUGIN_RECOVERY_SNAPSHOT_DIRTY_KEY);
+    if (currentToken?.equals(capturedToken)) {
+        kvDel(PLUGIN_RECOVERY_SNAPSHOT_DIRTY_KEY);
+    }
+}
+
+async function waitAtPluginRecoverySnapshotTestGate() {
+    if (!PLUGIN_RECOVERY_SNAPSHOT_TEST_GATE_DIR) return;
+    const holdPath = path.join(PLUGIN_RECOVERY_SNAPSHOT_TEST_GATE_DIR, 'hold');
+    if (!existsSync(holdPath)) return;
+    await fs.mkdir(PLUGIN_RECOVERY_SNAPSHOT_TEST_GATE_DIR, { recursive: true });
+    await fs.writeFile(
+        path.join(PLUGIN_RECOVERY_SNAPSHOT_TEST_GATE_DIR, 'entered'),
+        'before-publication',
+        'utf-8',
+    );
+    const releasePath = path.join(PLUGIN_RECOVERY_SNAPSHOT_TEST_GATE_DIR, 'release');
+    while (existsSync(holdPath) && !existsSync(releasePath)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+}
 
 function readSnapshotConfigInt(key, fallback, min, max) {
     try {
@@ -400,17 +447,28 @@ function warnAndPreserveMissingChatRow(source, chaId, chatId) {
 
 async function createBackupAndRotate() {
     const now = Date.now();
-    if (lastBackupTime && now - lastBackupTime < BACKUP_INTERVAL_MS) {
-        return;
+    if (dbPersistRetryPending) {
+        return { created: false, retryAfterMs: PLUGIN_RECOVERY_SNAPSHOT_RETRY_MS };
     }
-    if (backupCreationInFlight) return;
+    if (lastBackupTime && now - lastBackupTime < BACKUP_INTERVAL_MS) {
+        return {
+            created: false,
+            retryAfterMs: BACKUP_INTERVAL_MS - (now - lastBackupTime),
+        };
+    }
+    if (backupCreationInFlight) {
+        return { created: false, retryAfterMs: 50 };
+    }
 
     backupCreationInFlight = true;
     let backupDbSpool = null;
     try {
         const backupKey = `${DB_BACKUP_PREFIX}${(now / 100).toFixed()}.bin`;
         const raw = kvGet('database/database.bin');
-        if (!raw) return;
+        if (!raw) {
+            return { created: false, retryAfterMs: PLUGIN_RECOVERY_SNAPSHOT_RETRY_MS };
+        }
+        const capturedPluginRecoveryToken = kvGet(PLUGIN_RECOVERY_SNAPSHOT_DIRTY_KEY);
         const strippedDb = dbCache[DB_HEX_KEY] || await loadStrippedDatabase(raw, 'snapshot');
         backupDbSpool = await spoolSelfContainedBackupDatabase(strippedDb, {
             foldPluginStorage: true,
@@ -419,14 +477,27 @@ async function createBackupAndRotate() {
                 warnAndPreserveMissingChatRow('Snapshot', chaId, chatId);
             },
         });
-        kvSetFromFile(backupKey, backupDbSpool.filePath);
+        // Test-only, opt-in publication gate. It sits after assembly so tests
+        // can replace T1 with T2 while the T1 spool is genuinely in flight and
+        // verify the compare-token acknowledgement at publication.
+        await waitAtPluginRecoverySnapshotTestGate();
+        // Snapshot publication and recovery-obligation acknowledgement move
+        // together. If a future non-queued caller replaces the token while the
+        // spool is being assembled, the equality check deliberately leaves the
+        // newer obligation pending.
+        sqliteDb.transaction(() => {
+            kvSetFromFile(backupKey, backupDbSpool.filePath);
+            clearCapturedPluginRecoverySnapshotDirty(capturedPluginRecoveryToken);
+        })();
         lastBackupTime = Date.now();
         trimSnapshotsToLimits();
+        return { created: true, retryAfterMs: 0 };
     } catch (error) {
         logger.error(
             `[Snapshot] Failed to create database snapshot using spool ${databaseSpoolDir}:`,
             error
         );
+        return { created: false, retryAfterMs: PLUGIN_RECOVERY_SNAPSHOT_RETRY_MS };
     } finally {
         if (backupDbSpool) {
             await fs.unlink(backupDbSpool.filePath).catch(() => {});
@@ -435,20 +506,78 @@ async function createBackupAndRotate() {
     }
 }
 
+function pluginRecoverySnapshotDelay(extraDelayMs = 0) {
+    const cooldownDelay = lastBackupTime
+        ? Math.max(0, BACKUP_INTERVAL_MS - (Date.now() - lastBackupTime))
+        : 0;
+    return Math.max(0, cooldownDelay, extraDelayMs);
+}
+
+function schedulePluginRecoverySnapshot(extraDelayMs = 0) {
+    if (!kvGet(PLUGIN_RECOVERY_SNAPSHOT_DIRTY_KEY)) return;
+    if (pluginRecoverySnapshotTimer || pluginRecoverySnapshotRun) return;
+    pluginRecoverySnapshotTimer = setTimeout(() => {
+        pluginRecoverySnapshotTimer = null;
+        let retryAfterMs = 0;
+        pluginRecoverySnapshotRun = (async () => {
+            try {
+                await queueStorageMutation(async () => {
+                    if (!kvGet(PLUGIN_RECOVERY_SNAPSHOT_DIRTY_KEY)) return;
+                    // A pending database patch must become durable first. Its
+                    // normal snapshot call may itself satisfy this obligation.
+                    await flushPendingDb();
+                    if (!kvGet(PLUGIN_RECOVERY_SNAPSHOT_DIRTY_KEY)) return;
+                    const result = await createBackupAndRotate();
+                    retryAfterMs = result?.retryAfterMs ?? PLUGIN_RECOVERY_SNAPSHOT_RETRY_MS;
+                });
+            } catch (error) {
+                retryAfterMs = PLUGIN_RECOVERY_SNAPSHOT_RETRY_MS;
+                if (isImportInProgressError(error)) {
+                    // Do not spin while an import owns the SQLite connection.
+                    // Its replacement state is the next safe recovery point.
+                    await importBarrier.waitUntilIdle();
+                } else {
+                    logger.error('[Plugin storage] Deferred recovery snapshot failed:', error);
+                }
+            } finally {
+                pluginRecoverySnapshotRun = null;
+                if (kvGet(PLUGIN_RECOVERY_SNAPSHOT_DIRTY_KEY)) {
+                    schedulePluginRecoverySnapshot(retryAfterMs);
+                }
+            }
+        })();
+    }, pluginRecoverySnapshotDelay(extraDelayMs));
+    pluginRecoverySnapshotTimer.unref?.();
+}
+
 async function flushPendingDb() {
-    if (saveTimers[DB_HEX_KEY]) {
-        clearTimeout(saveTimers[DB_HEX_KEY]);
+    if (saveTimers[DB_HEX_KEY] || dbPersistRetryPending) {
+        if (saveTimers[DB_HEX_KEY]) clearTimeout(saveTimers[DB_HEX_KEY]);
         delete saveTimers[DB_HEX_KEY];
         if (dbCache[DB_HEX_KEY]) {
-            await persistDbCache(DB_HEX_KEY, 'database/database.bin');
-            clearPersistFailure();
-            await createBackupAndRotate();
+            try {
+                await persistDbCache(DB_HEX_KEY, 'database/database.bin');
+                dbPersistRetryPending = false;
+                clearPersistFailure();
+                await createBackupAndRotate();
+            } catch (error) {
+                // Retain an actionable pending state after consuming the timer.
+                // A plugin recovery retry must reattempt this database persist,
+                // never snapshot dbCache and clear its token over stale live bytes.
+                dbPersistRetryPending = Boolean(dbCache[DB_HEX_KEY]);
+                throw error;
+            }
+        } else {
+            // Integrity guards deliberately invalidate malformed cache state.
+            // That state is superseded by authoritative live bytes, not retryable.
+            dbPersistRetryPending = false;
         }
     }
 }
 
 function invalidateDbCache() {
     delete dbCache[DB_HEX_KEY];
+    dbPersistRetryPending = false;
     pendingChatRowDeletions.clear();
     if (saveTimers[DB_HEX_KEY]) {
         clearTimeout(saveTimers[DB_HEX_KEY]);
@@ -2724,13 +2853,10 @@ function assertGenericPluginStorageMutationAllowed(storageKey, publication) {
         );
     }
 
-    // The sole generic compatibility path is an absent row staged after a
-    // pre-generation optimized database has selected legacy external storage.
-    // Existing legacy rows are implicitly owned; disabled/missing databases do
-    // not authorize a generic pluginsave namespace at all.
-    if (dbObj?.optimizePluginMemory === true && kvGet(storageKey) === null) return;
     throw pluginStorageNamespaceConflict(
-        'Only an absent legacy plugin storage row may be staged generically',
+        dbObj?.optimizePluginMemory === true
+            ? 'Legacy plugin storage must be adopted before rows can be changed atomically'
+            : 'The generated plugin storage namespace is not writable in the selected mode',
     );
 }
 
@@ -5173,6 +5299,7 @@ async function handlePluginStorageManifestMutation(req, res, next) {
                 });
             }
 
+            const recoverySnapshotToken = newPluginRecoverySnapshotToken();
             sqliteDb.transaction(() => {
                 for (const write of preparedWrites) {
                     kvSet(write.storageKey, write.value);
@@ -5184,7 +5311,9 @@ async function handlePluginStorageManifestMutation(req, res, next) {
                 }
                 writePluginStorageManifest(nextManifest);
                 maybeFailPluginStorageTransaction(req, 'after-manifest');
+                markPluginRecoverySnapshotDirty(recoverySnapshotToken);
             })();
+            schedulePluginRecoverySnapshot();
             res.json({ success: true });
         });
     } catch (error) {
@@ -5292,6 +5421,7 @@ app.post('/api/plugin-storage/transition', async (req, res, next) => {
                 encodeRisuSaveLegacy(pluginExternalization.strippedDb),
             );
 
+            const recoverySnapshotToken = newPluginRecoverySnapshotToken();
             sqliteDb.transaction(() => {
                 for (const row of pluginExternalization.rows) {
                     kvSet(row.storageKey, row.value);
@@ -5314,11 +5444,13 @@ app.post('/api/plugin-storage/transition', async (req, res, next) => {
                 kvSet('database/database.bin', persistedDatabaseContent);
                 chatRowStore.deleteRemovedChatRows(liveDb, pluginExternalization.strippedDb);
                 maybeFailPluginStorageTransaction(req, 'after-database');
+                markPluginRecoverySnapshotDirty(recoverySnapshotToken);
             })();
 
             invalidateDbCache();
             dbEtag = computeBufferEtag(persistedDatabaseContent);
             rememberSessionPluginStorageState(req, pluginExternalization.strippedDb);
+            schedulePluginRecoverySnapshot();
             try {
                 await createBackupAndRotate();
             } catch (error) {
@@ -5761,6 +5893,7 @@ app.post('/api/patch', async (req, res, next) => {
                     try {
                         if (decodedKey === 'database/database.bin') {
                             await persistDbCache(filePath, decodedKey);
+                            dbPersistRetryPending = false;
                         } else {
                             const data = Buffer.from(encodeRisuSaveLegacy(dbCache[filePath]));
                             try {
@@ -5783,6 +5916,12 @@ app.post('/api/patch', async (req, res, next) => {
                             }
                         }
                     } catch (error) {
+                        if (decodedKey === 'database/database.bin') {
+                            // persistDbCache may intentionally invalidate a
+                            // malformed cache. Only retained cache state can be
+                            // retried; otherwise the live database supersedes it.
+                            dbPersistRetryPending = Boolean(dbCache[filePath]);
+                        }
                         logger.error(`[Patch] Error saving ${decodedKey}:`, error);
                         recordPersistFailure(error, `patch:${decodedKey}`);
                     } finally {
@@ -8675,6 +8814,9 @@ async function startServer() {
         const bootDatabase = kvGet('database/database.bin');
         if (bootDatabase) await loadStrippedDatabase(bootDatabase, 'Migration');
         await migrateRemoteBlocksIfNeeded();
+        // A prior process may have exited while the snapshot cooldown was
+        // deferring an already-committed plugin publication.
+        schedulePluginRecoverySnapshot();
         const port = process.env.PORT || 6001;
         // HOST limits the bind address (e.g. 127.0.0.1 behind a reverse
         // proxy). Unset keeps the historical all-interfaces behavior.
