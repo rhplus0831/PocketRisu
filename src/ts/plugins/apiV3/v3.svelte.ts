@@ -90,9 +90,11 @@ export const pluginChannel = new Map<string, Function>();
 
 type V3LifecycleCallback = (signal?: AbortSignal) => void | Promise<void>;
 type V3ScriptMode = 'input' | 'output' | 'process' | 'display';
+export const STRICT_PLUGIN_UNLOAD_TIMEOUT_MS = 1_000;
+export const LEGACY_PLUGIN_UNLOAD_TIMEOUT_MS = 5_000;
 
 class V3PluginLifecycleScope {
-    private state: 'initializing' | 'ready' | 'terminating' | 'terminated' = 'initializing';
+    private state: 'initializing' | 'ready' | 'draining' | 'terminating' | 'terminated' = 'initializing';
     private cleanupCallbacks: V3LifecycleCallback[] = [];
     private unloadCallbacks: V3LifecycleCallback[] = [];
     private postUnloadDrains: Array<() => void | Promise<void>> = [];
@@ -100,13 +102,13 @@ class V3PluginLifecycleScope {
     constructor(private pluginName: string) {}
 
     assertCanRegister() {
-        if (this.state === 'terminating' || this.state === 'terminated') {
+        if (this.state === 'draining' || this.state === 'terminating' || this.state === 'terminated') {
             throw new Error(`Plugin ${this.pluginName} is terminating; registrations are closed.`);
         }
     }
 
     canInvokeCallbacks() {
-        return this.state !== 'terminating' && this.state !== 'terminated';
+        return this.state !== 'draining' && this.state !== 'terminating' && this.state !== 'terminated';
     }
 
     assertCanInvokeCallbacks() {
@@ -142,7 +144,28 @@ class V3PluginLifecycleScope {
         return true;
     }
 
-    async runUnloadCallbacks(host: SandboxHost, timeoutMs = 1000): Promise<unknown[]> {
+    beginCompatibilityDrain() {
+        if (this.state === 'draining' || this.state === 'terminating' || this.state === 'terminated') {
+            return false;
+        }
+        this.state = 'draining';
+        return true;
+    }
+
+    assertCanUseCompatibilityCleanup() {
+        if (this.state === 'terminating' || this.state === 'terminated') {
+            throw new Error(`Plugin ${this.pluginName} is terminating; cleanup API access was rejected.`);
+        }
+    }
+
+    markTerminated() {
+        this.state = 'terminated';
+    }
+
+    async runUnloadCallbacks(
+        host: SandboxHost,
+        timeoutMs = STRICT_PLUGIN_UNLOAD_TIMEOUT_MS,
+    ): Promise<unknown[]> {
         const callbacks = this.unloadCallbacks.splice(0);
         if (callbacks.length === 0) {
             await host.drainUnloadStorageMutations();
@@ -202,7 +225,6 @@ class V3PluginLifecycleScope {
                 errors.push(error);
             }
         }
-        this.state = 'terminated';
         return errors;
     }
 
@@ -685,11 +707,14 @@ const unloadV3PluginInstance = async (instance: V3PluginInstance) => {
             const index = v3PluginInstances.indexOf(instance);
             if (index !== -1) v3PluginInstances.splice(index, 1);
 
-            // Close all registration/RPC surfaces first. The captured onUnload
-            // callbacks may finish local guest work during their bounded grace
-            // period, but cannot mutate host state or resurrect the generation.
-            instance.scope.beginTermination();
-            instance.host.beginTermination();
+            const legacyCompatibility = getDatabase().legacyPluginCompatibility === true;
+            if (legacyCompatibility) {
+                instance.scope.beginCompatibilityDrain();
+                instance.host.beginCompatibilityDrain();
+            } else {
+                instance.scope.beginTermination();
+                instance.host.beginTermination();
+            }
 
             const errors: unknown[] = [];
             try {
@@ -699,7 +724,12 @@ const unloadV3PluginInstance = async (instance: V3PluginInstance) => {
                 errors.push(...await instance.scope.cleanup());
             } finally {
                 try {
-                    errors.push(...await instance.scope.runUnloadCallbacks(instance.host));
+                    errors.push(...await instance.scope.runUnloadCallbacks(
+                        instance.host,
+                        legacyCompatibility
+                            ? LEGACY_PLUGIN_UNLOAD_TIMEOUT_MS
+                            : STRICT_PLUGIN_UNLOAD_TIMEOUT_MS,
+                    ));
                 } finally {
                     try {
                         // onUnload may admit a storage CAS after ordinary
@@ -707,7 +737,10 @@ const unloadV3PluginInstance = async (instance: V3PluginInstance) => {
                         // such non-cancellable publication has acknowledged.
                         errors.push(...await instance.scope.drainPostUnloadWork());
                     } finally {
+                        instance.scope.beginTermination();
+                        instance.host.beginTermination();
                         instance.host.terminate();
+                        instance.scope.markTerminated();
                     }
                 }
             }
@@ -1532,7 +1565,11 @@ export const makeRisuaiAPIV3 = (
             if(!conf){
                 return null;
             }
-            lifecycle.assertCanRegister();
+            if (getDatabase().legacyPluginCompatibility === true) {
+                lifecycle.assertCanUseCompatibilityCleanup();
+            } else {
+                lifecycle.assertCanRegister();
+            }
             return new SafeDocument(document, lifecycle);
         },
         registerSetting: (

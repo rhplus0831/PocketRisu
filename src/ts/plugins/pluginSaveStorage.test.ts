@@ -3606,6 +3606,31 @@ describe("transitionPluginStorageMode", () => {
         expect(requestImmediateSave).toHaveBeenCalledWith({ forceFullWrite: true });
     });
 
+    test("compatibility mode keeps an import after an unrelated teardown failure", async () => {
+        database.legacyPluginCompatibility = true;
+        teardownV3PluginsMock.mockRejectedValueOnce(new AggregateError(
+            [new Error("legacy unload failed")],
+            "V3 teardown failed",
+        ));
+
+        await importPlugin("//@name Compatible durable import\n//@api 3.0\n");
+
+        expect(database.plugins).toEqual([
+            expect.objectContaining({
+                name: "Compatible durable import",
+                version: "3.0",
+                enabled: true,
+            }),
+        ]);
+        expect(requestImmediateSave).toHaveBeenCalledOnce();
+        expect(requestImmediateSave).toHaveBeenCalledWith({ forceFullWrite: true });
+        const { alertError, notifyWarning } = vi.mocked(await import("../alert"));
+        expect(alertError).not.toHaveBeenCalled();
+        expect(notifyWarning).toHaveBeenCalledWith(
+            "One or more plugins did not unload cleanly. Compatibility mode terminated them and continued the plugin reload.",
+        );
+    });
+
     test("durably saves removal before surfacing a rejecting unload", async () => {
         database.plugins = [{
             name: "Remove despite unload error",

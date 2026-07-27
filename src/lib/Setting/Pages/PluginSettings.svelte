@@ -257,6 +257,22 @@
 
 <div class="my-4 rounded border border-darkborderc bg-darkbg/40 p-3">
     <CheckInput
+        check={DBState.db.legacyPluginCompatibility === true}
+        onChange={(enabled) => {
+            DBState.db.legacyPluginCompatibility = enabled
+        }}
+        margin={false}
+        name={language.legacyPluginCompatibility}
+    >
+        <ShBadge variant="warning">Compatibility</ShBadge>
+    </CheckInput>
+    <p class="mt-1 text-xs text-textcolor2">
+        {language.legacyPluginCompatibilityDesc}
+    </p>
+</div>
+
+<div class="my-4 rounded border border-darkborderc bg-darkbg/40 p-3">
+    <CheckInput
         check={DBState.db.optimizePluginMemory === true}
         onChange={togglePluginMemoryOptimization}
         disabled={reconcilingPluginStorage || (

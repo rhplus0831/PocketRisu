@@ -78,6 +78,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - Supported API headers are `2.0`, `2.1`, and `3.0`; missing `//@api` defaults to 2.0 behavior (`src/ts/plugins/plugins.svelte.ts:182`, `src/ts/plugins/plugins.svelte.ts:193`).
   - `loadPlugins()` divides enabled plugins into V2/V2.1 and V3 loaders (`src/ts/plugins/plugins.svelte.ts:435`).
   - `pluginV2` is the shared registry for providers, edit handlers, before/after request replacers, and unload callbacks (`src/ts/plugins/plugins.svelte.ts:469`).
+  - Plugin-list changes reload under a serialized transaction. Strict mode rolls imports back on lifecycle failure; the opt-in legacy compatibility policy downgrades teardown-only failures to warnings while keeping load and persistence failures strict.
   - `getV2PluginAPIs()` exposes model registration, script/replacer registration, limited database access, safe globals/storage/document wrappers, and asset operations (`src/ts/plugins/plugins.svelte.ts:508`).
   - `addProvider()` registers a provider callback and optional tokenizer metadata (`src/ts/plugins/plugins.svelte.ts:530`).
   - `loadV2Plugin()` unloads prior hooks and executes transformed source through `new Function`; V2.0 execution additionally requires `allowV2Plugin` (`src/ts/plugins/plugins.svelte.ts:813`, `src/ts/plugins/plugins.svelte.ts:885`, `src/ts/plugins/plugins.svelte.ts:899`).
@@ -112,6 +113,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - `GUEST_BRIDGE_SCRIPT` constructs the iframe-side `risuai`/`Risuai` proxy and RPC protocol (`src/ts/plugins/apiV3/factory.ts:38`).
   - Callback functions, abort signals, transferable streams, and remote class instances have explicit bridge representations (`src/ts/plugins/apiV3/factory.ts:46`, `src/ts/plugins/apiV3/factory.ts:84`).
   - `SandboxHost` owns iframe lifecycle and host-side dispatch (`src/ts/plugins/apiV3/factory.ts:291`).
+  - Strict teardown closes RPC immediately. Legacy compatibility adds a bounded draining state that admits only storage flushes and cleanup-oriented root/remote-instance methods before final termination.
   - Remote-required instances are stored in an instance registry and surfaced as proxy references (`src/ts/plugins/apiV3/factory.ts:361`).
   - `run()` applies an iframe sandbox allowing scripts, modals, and downloads, plus a CSP with `connect-src 'none'`, then executes the bridge and plugin source in `srcdoc` (`src/ts/plugins/apiV3/factory.ts:483`, `src/ts/plugins/apiV3/factory.ts:498`, `src/ts/plugins/apiV3/factory.ts:606`).
   - `terminate()` removes the iframe and clears remote/callback state (`src/ts/plugins/apiV3/factory.ts:645`).
@@ -120,6 +122,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - `SafeElement` exposes remotely proxied DOM operations; HTML setters use DOMPurify (`src/ts/plugins/apiV3/v3.svelte.ts:59`, `src/ts/plugins/apiV3/v3.svelte.ts:230`).
   - `SafeDocument` restricts created tags and sanitizes anchor protocols (`src/ts/plugins/apiV3/v3.svelte.ts:353`).
   - Plugin unload handling cleans callbacks, UI, and iframe instances (`src/ts/plugins/apiV3/v3.svelte.ts:481`, `src/ts/plugins/apiV3/v3.svelte.ts:514`).
+  - V3 unload uses a one-second strict grace period or a five-second legacy-compatibility grace period; both paths forcibly terminate the iframe afterward.
   - Permission-backed capabilities are `fetchLogs`, `db`, `mainDom`, `replacer`, `provider`, and `sendChat`; decisions are persisted and keyed by plugin/permission plus plugin source hash (`src/ts/plugins/apiV3/v3.svelte.ts:545`, `src/ts/plugins/apiV3/v3.svelte.ts:552`, `src/ts/plugins/apiV3/v3.svelte.ts:644`).
   - `makeRisuaiAPIV3()` constructs the host API (`src/ts/plugins/apiV3/v3.svelte.ts:753`).
   - Major API groups include:

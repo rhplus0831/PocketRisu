@@ -1438,6 +1438,10 @@ export interface Database{
     // converted, while functions, cycles, accessors, symbols, and custom
     // classes remain rejected.
     autoConvertPluginStorageValues?: boolean
+    // Opt-in compatibility policy for plugins written against upstream's
+    // permissive unload lifecycle. Cleanup RPCs receive a longer bounded drain
+    // window, and teardown-only failures do not abort unrelated list changes.
+    legacyPluginCompatibility?: boolean
     // PocketRisu-only ownership epoch for external plugin rows. The matching
     // Node manifest defines their exact active set; unknown fields remain safe
     // in upstream RisuAI saves.

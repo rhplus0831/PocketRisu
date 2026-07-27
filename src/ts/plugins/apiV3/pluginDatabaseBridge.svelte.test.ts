@@ -1852,6 +1852,44 @@ describe("V3 guest startup handshake", () => {
         logSpy.mockRestore();
     });
 
+    test("legacy compatibility admits unload storage cleanup but rejects new registrations", async () => {
+        testState.database.legacyPluginCompatibility = true;
+        const plugin = startupPlugin("Compatible Unload", `
+            const localStore = await risuai.getLocalPluginStorage();
+            await risuai.onUnload(async () => {
+                await localStore.setItem("compat-unload", "durable");
+                globalThis.compatWriteComplete = true;
+                try {
+                    await risuai.addProvider(
+                        "compat-too-late",
+                        async () => ({ success: true, content: "late" }),
+                    );
+                } catch (error) {
+                    globalThis.compatRegistrationRejected = true;
+                }
+            });
+        `);
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+
+        await expect(teardownV3Plugins()).resolves.toBeUndefined();
+
+        expect(guestWindow.compatWriteComplete).toBe(true);
+        expect(guestWindow.compatRegistrationRejected).toBe(true);
+        expect(storageMocks.persistent.get(
+            `cache/plugin-storage/${encodeKey("compat-unload")}.json`,
+        )).toBe("durable");
+        expect(pluginV2.providers.has("compat-too-late")).toBe(false);
+        expect(iframe.isConnected).toBe(false);
+        restoreRelay();
+    });
+
     test("exposes a non-destructive rewrite helper with a confirmed result", async () => {
         storageMocks.persistent.set(storageKey("maintenance-index"), {
             entries: ["kept"],

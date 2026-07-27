@@ -579,6 +579,7 @@ async function drainDeferredPluginApiReload(): Promise<void> {
 async function loadPluginsUnlocked(_lifecycleLease: PluginLifecycleLease) {
     console.log('Loading plugins...')
     const db = getDatabase()
+    const legacyPluginCompatibility = db.legacyPluginCompatibility === true
     const autoDisabledPlugins = disableEnabledLegacyPluginsForOptimizedMemory(
         db.plugins,
         db.optimizePluginMemory,
@@ -612,6 +613,17 @@ async function loadPluginsUnlocked(_lifecycleLease: PluginLifecycleLease) {
         await teardownV3Plugins()
     } catch (error) {
         v3TeardownError = error
+    }
+
+    if (legacyPluginCompatibility && (v2TeardownError || v3TeardownError)) {
+        console.warn(
+            "[Plugins] Compatibility mode ignored one or more teardown failures.",
+            v2TeardownError,
+            v3TeardownError,
+        )
+        notifyWarning(language.legacyPluginCompatibilityTeardownWarning)
+        v2TeardownError = undefined
+        v3TeardownError = undefined
     }
 
     activePluginReloadPhase = "loading"

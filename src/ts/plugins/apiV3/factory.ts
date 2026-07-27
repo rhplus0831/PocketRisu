@@ -61,6 +61,71 @@ const UNLOAD_STORAGE_MUTATION_METHODS = new Set([
     '_clearPluginStorage',
 ]);
 
+// Upstream allowed every API until the iframe was removed. Compatibility mode
+// keeps only the operations commonly needed to flush state and undo UI/hooks.
+const LEGACY_UNLOAD_ROOT_METHODS = new Set([
+    '_getPluginStorage',
+    '_getVersionedPluginStorage',
+    '_readPluginStorageResult',
+    '_setPluginStorageFromRead',
+    '_atomicBatchPluginStorage',
+    '_rewritePluginStorage',
+    '_updatePluginStorage',
+    '_setPluginStorage',
+    '_setPluginStorageWithOutcome',
+    '_removePluginStorage',
+    '_removePluginStorageWithOutcome',
+    '_removePluginStorageConfirmed',
+    '_clearPluginStorage',
+    '_keyPluginStorage',
+    '_keysPluginStorage',
+    '_lengthPluginStorage',
+    '_getSafeLocalStorage',
+    '_setSafeLocalStorage',
+    '_removeSafeLocalStorage',
+    '_clearSafeLocalStorage',
+    '_keySafeLocalStorage',
+    '_keysSafeLocalStorage',
+    'getLocalPluginStorage',
+    'removeRisuScriptHandler',
+    'removeRisuReplacer',
+    'unregisterBodyIntercepter',
+    'unregisterMCP',
+    'unregisterUIPart',
+    'hideContainer',
+    'getRootDocument',
+    'log',
+]);
+
+const LEGACY_UNLOAD_INSTANCE_METHODS = new Set([
+    // Persistent plugin storage returned by getLocalPluginStorage().
+    'getItem',
+    'setItem',
+    'removeItem',
+    'keys',
+    'clear',
+    // Read-only traversal used to locate UI installed by the plugin.
+    'at',
+    'length',
+    'getChildren',
+    'getParent',
+    'querySelector',
+    'querySelectorAll',
+    'getElementById',
+    'getElementsByClassName',
+    // Destructive cleanup, without admitting new DOM registrations/content.
+    'remove',
+    'removeChild',
+    'removeEventListener',
+    'disconnect',
+]);
+
+const LEGACY_UNLOAD_INSTANCE_MUTATION_METHODS = new Set([
+    'setItem',
+    'removeItem',
+    'clear',
+]);
+
 interface RpcMessage {
     type: MsgType;
     reqId?: string;
@@ -1057,6 +1122,7 @@ export class SandboxHost {
     private readonly idGeneration = crypto.randomUUID();
     private nextId = 0;
     private started = false;
+    private compatibilityDraining = false;
     private terminating = false;
     private terminated = false;
 
@@ -1170,7 +1236,8 @@ export class SandboxHost {
                     ];
                     const invocationAuthorized = authorization?.callback === wrapper;
                     if (this.terminated
-                        || (this.terminating && !invocationAuthorized)) {
+                        || ((this.terminating || this.compatibilityDraining)
+                            && !invocationAuthorized)) {
                         throw new Error("Plugin sandbox is terminating; callback invocation was rejected.");
                     }
                     return new Promise((resolve, reject) => {
@@ -1308,6 +1375,7 @@ export class SandboxHost {
 
     public beginTermination() {
         if (this.terminating || this.terminated) return;
+        this.compatibilityDraining = false;
         this.terminating = true;
         // Cancel pre-publication work immediately. If an update already
         // crossed into CAS publication, the coordinator reports an unknown
@@ -1325,6 +1393,24 @@ export class SandboxHost {
         // unload grace period. Its rejection/success lets guest code leave the
         // startup await and observe that all later registrations are closed.
         this.detachRemoteState(false);
+    }
+
+    /**
+     * Close startup and callback entry points while retaining remote instances
+     * for a bounded, method-allowlisted legacy onUnload window.
+     */
+    public beginCompatibilityDrain() {
+        if (this.compatibilityDraining || this.terminating || this.terminated) return;
+        this.compatibilityDraining = true;
+        for (const controller of this.activePluginStorageUpdateControllers) {
+            controller.abort(new DOMException(
+                "Plugin storage update was cancelled during teardown.",
+                "AbortError",
+            ));
+        }
+        this.settleInitialization(
+            new Error("Plugin initialization was cancelled during teardown."),
+        );
     }
 
     /** Permit only plugin-storage calls made by the captured unload callback. */
@@ -1516,6 +1602,11 @@ export class SandboxHost {
                         && this.unloadStorageAdmission
                         && hasUnloadCapability
                         && UNLOAD_STORAGE_ROOT_METHODS.has(data.method);
+                    const legacyUnloadCall = this.compatibilityDraining
+                        && typeof data.method === 'string'
+                        && (data.type === 'CALL_ROOT'
+                            ? LEGACY_UNLOAD_ROOT_METHODS.has(data.method)
+                            : LEGACY_UNLOAD_INSTANCE_METHODS.has(data.method));
                     if (unloadStorageCall
                         && data.method === '_updatePluginStorage'
                         && typeof args[1] === 'function') {
@@ -1530,7 +1621,9 @@ export class SandboxHost {
                             false,
                         );
                     }
-                    if (this.terminated || (this.terminating && !unloadStorageCall)) {
+                    if (this.terminated
+                        || (this.terminating && !unloadStorageCall)
+                        || (this.compatibilityDraining && !legacyUnloadCall)) {
                         throw new Error("Plugin sandbox is terminating; RPC invocation was rejected.");
                     }
                     let result: any;
@@ -1564,7 +1657,19 @@ export class SandboxHost {
                         if (instance.__requestAbortMethods?.has?.(data.method!)) {
                             args.push(requestController.signal);
                         }
-                        result = await instance[data.method!](...args);
+                        const invocation = Promise.resolve().then(
+                            () => instance[data.method!](...args),
+                        );
+                        if (this.compatibilityDraining
+                            && LEGACY_UNLOAD_INSTANCE_MUTATION_METHODS.has(data.method!)) {
+                            let tracked!: Promise<void>;
+                            tracked = invocation.then(
+                                () => undefined,
+                                () => undefined,
+                            ).finally(() => this.unloadStorageMutations.delete(tracked));
+                            this.unloadStorageMutations.add(tracked);
+                        }
+                        result = await invocation;
                     }
 
 
