@@ -572,8 +572,9 @@ is validated incrementally, including arbitrarily long valid numeric lexemes
 and exact exponent/mantissa cancellation, without retaining the complete
 token.
 
-Network bodies and archive entries are staged in private mode-`0600` files
-inside mode-`0700` directories. Reads, writes, copies, ZIP central-directory
+Network bodies and archive entries are staged in private mode-0600 files.
+Per-import entry and save-folder staging directories are mode-0700. Reads,
+writes, copies, ZIP central-directory
 inspection, extraction, JSON validation, and database cursor ingestion use
 pages no larger than 64 KiB. Preflight and post-spool checks require twice the
 source or expanded byte count to be available on the relevant staging volume.
