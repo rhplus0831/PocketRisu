@@ -16,6 +16,7 @@ import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classify
 import { prepareChatPersistStage } from "./storage/chatPersistStage";
 import { AutoStorage } from "./storage/autoStorage";
 import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
+import { withAssetSaveRetry } from "./storage/assetSaveRetry";
 import { supportsPatchSync } from "./platform";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
@@ -221,11 +222,13 @@ export async function saveAsset(data: Uint8Array, customId: string = '', fileNam
         fileExtension = fileName.split('.').pop()
     }
     let form = `assets/${id}.${fileExtension}`
-    const replacer = await forageStorage.setItem(form, data)
-    if (replacer) {
-        return replacer
-    }
-    return form
+    return await withAssetSaveRetry(form, async () => {
+        const replacer = await forageStorage.setItem(form, data)
+        if (replacer) {
+            return replacer
+        }
+        return form
+    })
 }
 
 /**
