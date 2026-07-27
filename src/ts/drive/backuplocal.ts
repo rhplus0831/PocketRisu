@@ -237,40 +237,74 @@ export function LoadLocalBackup(){
 }
 
 export async function ImportFromSaveZip() {
+    let input: HTMLInputElement | null = null
     try {
-        const input = document.createElement('input')
+        input = document.createElement('input')
         input.type = 'file'
         input.accept = '.zip'
-        input.onchange = async () => {
-            if (!input.files || input.files.length === 0) {
+        input.onchange = () => {
+            const file = input?.files?.[0]
+            if (input) {
+                input.onchange = null
                 input.remove()
-                return
             }
-            const file = input.files[0]
-            input.remove()
+            input = null
+            if (!file) return
 
-            if (!(await alertConfirm(language.importSaveFolderConfirmZip(file.name, formatBytes(file.size))))) return
-            if (!(await alertConfirm(language.backupLoadConfirm2))) return
-
-            alertWait(`Uploading ${file.name}...`)
-            const result = await forageStorage.uploadSaveFolderZip(file, (loaded, total) => {
-                const progress = total > 0 ? ((loaded / total) * 100).toFixed(2) : '0.00'
-                alertWait(`Uploading ${file.name}... (${progress}%)`)
+            // Event callbacks do not propagate their async failures to this
+            // function's outer try/catch. Own the promise explicitly so even a
+            // warning/render callback failure cannot become an unhandled
+            // rejection after the destructive request has completed.
+            void runSaveFolderZipImport(file).catch((error) => {
+                console.error(error)
             })
-
-            alertStore.set({
-                type: "wait",
-                msg: `${language.importSaveFolderSuccess} (${result.imported} files). Refreshing...`
-            })
-            location.search = ''
-            location.reload()
         }
 
         input.click()
     } catch (error) {
+        if (input) {
+            input.onchange = null
+            input.remove()
+        }
         console.error(error)
         alertError(error instanceof Error ? error.message : 'Import failed')
     }
+}
+
+export async function runSaveFolderZipImport(file: File) {
+    if (!(await alertConfirm(language.importSaveFolderConfirmZip(file.name, formatBytes(file.size))))) return
+    if (!(await alertConfirm(language.backupLoadConfirm2))) return
+
+    alertWait(`Uploading ${file.name}...`)
+    return await runBackupReplacementUi({
+        replace: () => forageStorage.uploadSaveFolderZip(file, (loaded, total) => {
+            const progress = total > 0 ? ((loaded / total) * 100).toFixed(2) : '0.00'
+            alertWait(`Uploading ${file.name}... (${progress}%)`)
+        }),
+        onCommitted: (result) => {
+            alertStore.set({
+                type: "wait",
+                msg: `${language.importSaveFolderSuccess} (${result.imported} files). Refreshing...`
+            })
+        },
+        onCommittedFailure: async (error) => {
+            alertError(`${language.importSaveFolderCommittedFailure}\n\n${error.message}`)
+            await waitAlert()
+        },
+        onDefinitiveFailure: (error) => {
+            console.error(error)
+            const message = error instanceof Error ? error.message : String(error)
+            alertError(`${language.importSaveFolderFailure}\n\n${message}`)
+        },
+        onCommitUnknown: async (error) => {
+            alertError(`${language.importSaveFolderOutcomeUnknown}\n\n${error.message}`)
+            await waitAlert()
+        },
+        hardReload: () => {
+            location.search = ''
+            location.reload()
+        },
+    })
 }
 
 export async function CleanupMigratedFiles() {

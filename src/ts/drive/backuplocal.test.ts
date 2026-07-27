@@ -1,16 +1,21 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest'
+import { StorageError } from '../storage/storageError'
 
 const mocks = vi.hoisted(() => ({
     alertConfirm: vi.fn(),
     alertClear: vi.fn(),
     alertError: vi.fn(),
     alertMd: vi.fn(),
+    alertStoreSet: vi.fn(),
     alertWait: vi.fn(),
     notifyInfo: vi.fn(),
     notifySuccess: vi.fn(),
+    waitAlert: vi.fn(),
     exportBackup: vi.fn(),
+    uploadSaveFolderZip: vi.fn(),
     downloadFile: vi.fn(),
     createWriteStream: vi.fn(),
+    reload: vi.fn(),
 }))
 
 vi.mock('../alert', () => ({
@@ -18,18 +23,19 @@ vi.mock('../alert', () => ({
     alertClear: mocks.alertClear,
     alertError: mocks.alertError,
     alertMd: mocks.alertMd,
-    alertStore: { set: vi.fn() },
+    alertStore: { set: mocks.alertStoreSet },
     alertWait: mocks.alertWait,
     notifyError: vi.fn(),
     notifyInfo: mocks.notifyInfo,
     notifySuccess: mocks.notifySuccess,
-    waitAlert: vi.fn(),
+    waitAlert: mocks.waitAlert,
 }))
 
 vi.mock('../globalApi.svelte', () => ({
     downloadFile: mocks.downloadFile,
     forageStorage: {
         exportBackup: mocks.exportBackup,
+        uploadSaveFolderZip: mocks.uploadSaveFolderZip,
     },
 }))
 
@@ -37,6 +43,12 @@ vi.mock('src/lang', () => ({
     language: {
         partialBackupFirstConfirm: 'first',
         partialBackupSecondConfirm: 'second',
+        backupLoadConfirm2: 'replace current data',
+        importSaveFolderConfirmZip: (name: string, size: string) => `import ${name} (${size})`,
+        importSaveFolderSuccess: 'save-folder import complete',
+        importSaveFolderCommittedFailure: 'save-folder import committed with an error',
+        importSaveFolderOutcomeUnknown: 'save-folder import outcome unknown',
+        importSaveFolderFailure: 'save-folder import not committed',
     },
 }))
 
@@ -44,7 +56,7 @@ vi.mock('streamsaver', () => ({
     createWriteStream: mocks.createWriteStream,
 }))
 
-const { SavePartialLocalBackup } = await import('./backuplocal')
+const { ImportFromSaveZip, SavePartialLocalBackup, runSaveFolderZipImport } = await import('./backuplocal')
 
 function backupResponse(missingAssets = 0) {
     const bytes = new Uint8Array([1, 2, 3, 4])
@@ -62,8 +74,131 @@ beforeEach(() => {
     vi.clearAllMocks()
     mocks.alertConfirm.mockResolvedValue(true)
     mocks.exportBackup.mockResolvedValue(backupResponse())
+    mocks.uploadSaveFolderZip.mockResolvedValue({ ok: true, imported: 7 })
     mocks.downloadFile.mockResolvedValue(undefined)
     mocks.createWriteStream.mockReset()
+    vi.stubGlobal('location', { search: '?stale-client-state', reload: mocks.reload })
+})
+
+function saveFolderFailure(
+    outcome: 'committed' | 'not-committed' | 'unknown',
+    message = `injected ${outcome} failure`,
+) {
+    return new StorageError(message, {
+        status: 500,
+        code: outcome === 'unknown' ? 'COMMIT_OUTCOME_UNKNOWN' : 'SAVE_FOLDER_IMPORT_FAILED',
+        retryable: outcome === 'not-committed',
+        commitOutcome: outcome,
+        commitOutcomeUnknown: outcome === 'unknown',
+        operation: 'write',
+    })
+}
+
+describe('save-folder ZIP replacement UI', () => {
+    test('reports success and reloads once after one authoritative upload', async () => {
+        const file = new File(['zip'], 'save.zip', { type: 'application/zip' })
+
+        await expect(runSaveFolderZipImport(file)).resolves.toBe('committed')
+
+        expect(mocks.uploadSaveFolderZip).toHaveBeenCalledOnce()
+        expect(mocks.alertStoreSet).toHaveBeenCalledWith({
+            type: 'wait',
+            msg: 'save-folder import complete (7 files). Refreshing...',
+        })
+        expect(mocks.reload).toHaveBeenCalledOnce()
+        expect(location.search).toBe('')
+    })
+
+    test('warns and reloads once for a committed failure without replaying', async () => {
+        const failure = saveFolderFailure('committed')
+        mocks.uploadSaveFolderZip.mockRejectedValueOnce(failure)
+
+        await expect(runSaveFolderZipImport(new File(['zip'], 'save.zip')))
+            .resolves.toBe('committed-with-error')
+
+        expect(mocks.uploadSaveFolderZip).toHaveBeenCalledOnce()
+        expect(mocks.alertError).toHaveBeenCalledWith(expect.stringContaining('save-folder import committed with an error'))
+        expect(mocks.waitAlert).toHaveBeenCalledOnce()
+        expect(mocks.reload).toHaveBeenCalledOnce()
+    })
+
+    test('warns and reloads once for an unknown outcome without replaying', async () => {
+        const failure = saveFolderFailure('unknown')
+        mocks.uploadSaveFolderZip.mockRejectedValueOnce(failure)
+
+        await expect(runSaveFolderZipImport(new File(['zip'], 'save.zip')))
+            .resolves.toBe('commit-unknown')
+
+        expect(mocks.uploadSaveFolderZip).toHaveBeenCalledOnce()
+        expect(mocks.alertError).toHaveBeenCalledWith(expect.stringContaining('save-folder import outcome unknown'))
+        expect(mocks.waitAlert).toHaveBeenCalledOnce()
+        expect(mocks.reload).toHaveBeenCalledOnce()
+    })
+
+    test('reports a definitive not-committed failure without reloading or replaying', async () => {
+        const failure = saveFolderFailure('not-committed')
+        mocks.uploadSaveFolderZip.mockRejectedValueOnce(failure)
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+        await expect(runSaveFolderZipImport(new File(['zip'], 'save.zip')))
+            .resolves.toBe('not-committed')
+
+        expect(mocks.uploadSaveFolderZip).toHaveBeenCalledOnce()
+        expect(mocks.alertError).toHaveBeenCalledWith(expect.stringContaining('save-folder import not committed'))
+        expect(mocks.reload).not.toHaveBeenCalled()
+        expect(consoleError).toHaveBeenCalledWith(failure)
+        consoleError.mockRestore()
+    })
+
+    test('owns the mounted picker promise and removes its callback before upload', async () => {
+        const originalCreateElement = document.createElement.bind(document)
+        let picker: HTMLInputElement | undefined
+        const createElement = vi.spyOn(document, 'createElement').mockImplementation(((tagName: string) => {
+            const element = originalCreateElement(tagName)
+            if (tagName.toLowerCase() === 'input') picker = element as HTMLInputElement
+            return element
+        }) as typeof document.createElement)
+
+        await ImportFromSaveZip()
+        expect(picker).toBeDefined()
+        const file = new File(['zip'], 'mounted.zip', { type: 'application/zip' })
+        Object.defineProperty(picker!, 'files', { configurable: true, value: [file] })
+        picker!.dispatchEvent(new Event('change'))
+
+        await vi.waitFor(() => expect(mocks.reload).toHaveBeenCalledOnce())
+        expect(mocks.uploadSaveFolderZip).toHaveBeenCalledOnce()
+        expect(picker!.onchange).toBeNull()
+        expect(picker!.isConnected).toBe(false)
+        createElement.mockRestore()
+    })
+
+    test('catches a mounted success-callback throw while still reloading exactly once', async () => {
+        const callbackFailure = new Error('injected alert render failure')
+        mocks.alertStoreSet.mockImplementationOnce(() => { throw callbackFailure })
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const originalCreateElement = document.createElement.bind(document)
+        let picker: HTMLInputElement | undefined
+        const createElement = vi.spyOn(document, 'createElement').mockImplementation(((tagName: string) => {
+            const element = originalCreateElement(tagName)
+            if (tagName.toLowerCase() === 'input') picker = element as HTMLInputElement
+            return element
+        }) as typeof document.createElement)
+
+        await ImportFromSaveZip()
+        Object.defineProperty(picker!, 'files', {
+            configurable: true,
+            value: [new File(['zip'], 'callback.zip', { type: 'application/zip' })],
+        })
+        picker!.dispatchEvent(new Event('change'))
+
+        await vi.waitFor(() => expect(consoleError).toHaveBeenCalledWith(callbackFailure))
+        expect(mocks.uploadSaveFolderZip).toHaveBeenCalledOnce()
+        expect(mocks.reload).toHaveBeenCalledOnce()
+        expect(mocks.alertError).not.toHaveBeenCalled()
+        expect(picker!.onchange).toBeNull()
+        createElement.mockRestore()
+        consoleError.mockRestore()
+    })
 })
 
 describe('SavePartialLocalBackup', () => {

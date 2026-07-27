@@ -1940,6 +1940,12 @@ export const languageKorean = {
   importSaveFolderNoDatabase:
     "Save 폴더에 데이터베이스 파일(database/database.bin)이 없습니다. 불러오기를 진행할 수 없습니다.",
   importSaveFolderSuccess: "불러오기 완료.",
+  importSaveFolderCommittedFailure:
+    "서버가 Save 폴더 불러오기를 커밋했지만 이후 오류를 보고했습니다. 이 경고를 닫으면 권한 있는 서버 상태를 다시 불러옵니다.",
+  importSaveFolderOutcomeUnknown:
+    "서버가 Save 폴더 불러오기를 커밋했을 수 있지만 응답이 유실되었거나 올바르지 않습니다. PocketRisu는 불러오기를 재시도하지 않습니다. 이 경고를 닫으면 권한 있는 서버 상태를 다시 불러와 확인합니다.",
+  importSaveFolderFailure:
+    "서버가 Save 폴더 불러오기를 커밋하지 않았음을 확인했습니다. 현재 데이터는 그대로 유지됩니다.",
   cleanupMigratedFiles: "마이그레이션된 Save 파일 정리",
   cleanupMigratedDesc:
     "save 폴더를 직접 덮어씌워 마이그레이션한 경우, 이미 데이터베이스에 저장된 원본 파일을 삭제하여 디스크 공간을 확보합니다.",
