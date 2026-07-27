@@ -83,7 +83,7 @@ recheck, one atomic CAS, and a total cancellation deadline. Guarded writes
 retain the existing abort, lifecycle-drain, structured failure, atomic owner,
 and mode-transition behavior.
 
-[Public integration guidance](../../en/plugin-storage.md) documents safe
+[Public integration guidance](../../docs/en/plugin-storage.md) documents safe
 configuration, credential, index, ledger, and shard migration patterns,
 including conflict retry and committed-unknown reconciliation. Client and real
 iframe-bridge fault tests prove those five fallback transforms do not run or
@@ -152,7 +152,7 @@ protocol, propagates errors, and increments its maintenance counter only for
 Focused unit and sandbox tests cover public API exposure, detached argument
 transport, stale CAS, cancellation, confirmed-only counting, and cache
 publication. The real-server failpoint matrix in
-`test/compat/plugin-storage-batch-atomicity.test.ts` stops the rewrite before
+`../../test/compat/plugin-storage-batch-atomicity.test.ts` stops the rewrite before
 the transaction and after value, owner, operation, manifest, and pre-commit
 boundaries. Every known failure retains the exact original value/owner pair;
 acknowledgement loss retains the same value and is exactly reconcilable by a
@@ -211,7 +211,7 @@ value. The result also retains the original mutation outcome, so callers can
 distinguish an acknowledged delete from absence confirmed after a lost
 acknowledgement.
 
-The public types and [safe mutation workflow guide](../../plugin-storage-mutation-outcomes.md)
+The public types and [safe mutation workflow guide](../../docs/plugin-storage-mutation-outcomes.md)
 show plugin authors how to publish cache entries only after confirmed SET,
 retain dirty edits after known refusal, evict and re-read after an unknown
 outcome, clear deletion dirtiness only after authoritative absence, and derive
@@ -382,9 +382,9 @@ server may already have committed; the caller instead receives the
 non-retryable `COMMIT_OUTCOME_UNKNOWN` storage error with
 `commitOutcomeUnknown: true`. The CAS itself continues without the caller's
 signal, remains tracked, and must be re-read before any deliberate retry.
-Official guidance in `src/ts/plugins/migrationGuide.md` documents this rule,
+Official guidance in `../../src/ts/plugins/migrationGuide.md` documents this rule,
 requires pure transforms, and shows both startup and bounded unload updates.
-The public contract is mirrored in `src/ts/plugins/apiV3/risuai.d.ts`.
+The public contract is mirrored in `../../src/ts/plugins/apiV3/risuai.d.ts`.
 
 Teardown now aborts active pre-publication updates, runs admitted unload
 callbacks, and then drains all outstanding CAS publications before terminating
@@ -397,13 +397,13 @@ transform. The transform therefore cannot use its internal signal to open a
 new storage RPC during termination.
 
 Unit and iframe-bridge coverage in
-`src/ts/plugins/apiV3/pluginStorageUpdate.test.ts` and
-`src/ts/plugins/apiV3/pluginDatabaseBridge.svelte.test.ts` exercises total
+`../../src/ts/plugins/apiV3/pluginStorageUpdate.test.ts` and
+`../../src/ts/plugins/apiV3/pluginDatabaseBridge.svelte.test.ts` exercises total
 deadlines at the mutex, both reads, transform, and CAS; fair writer exclusion;
 a newer write during transform; final-read and final-CAS conflicts; no late
 SET; committed-but-lost acknowledgements; teardown cancellation;
 post-`onUnload` publication drain; and same-function capability overlap.
-Real-server coverage in `server/node/snapshotPluginStorage.e2e.test.ts`
+Real-server coverage in `../../server/node/snapshotPluginStorage.e2e.test.ts`
 verifies stale CAS preservation and a commit followed by delayed
 acknowledgement and caller abort. Independent verification passed all 50
 focused coordinator/bridge tests, 1,314 frontend tests (3 skipped), 196 server

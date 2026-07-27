@@ -101,7 +101,7 @@ before deleting external rows; a snapshot in that window folds those rows
 without the marker. Restoring it over newer external rows does not clear the
 newer prefix, so boot internalization can overlay newer state onto the
 requested older snapshot. Documented in
-[`../v3/warning/disabled-mode-snapshots-retain-newer-external-plugin-rows-on-restore.md`](../v3/warning/disabled-mode-snapshots-retain-newer-external-plugin-rows-on-restore.md).
+[`../../docs/audit/v3/warning/disabled-mode-snapshots-retain-newer-external-plugin-rows-on-restore.md`](../../docs/audit/v3/warning/disabled-mode-snapshots-retain-newer-external-plugin-rows-on-restore.md).
 
 More generally, the inline and external copies carry no migration generation
 or ownership epoch. Enabling returns `direction: "none"` when the inline maps

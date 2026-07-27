@@ -52,7 +52,7 @@ and asserts no rows are removed
 (`src/ts/plugins/pluginSaveStorage.test.ts:453-475`). It does not model the
 production save layer swallowing/retrying failures or joining an older save;
 the contrary conclusion in
-[`../v3/appendix/plugin-api-serialization-sweep.md`](../v3/appendix/plugin-api-serialization-sweep.md)
+[`../../docs/audit/v3/appendix/plugin-api-serialization-sweep.md`](../../docs/audit/v3/appendix/plugin-api-serialization-sweep.md)
 holds only for that injected dependency.
 
 ### Required correction
@@ -86,9 +86,9 @@ aborts without publishing the target, while an unresolved finalize latches
 plugin operations and database saves until reload rather than risking a second
 publication from ambiguous state.
 
-Regression coverage in `src/ts/storage/databaseSave.test.ts` verifies the
+Regression coverage in `../../src/ts/storage/databaseSave.test.ts` verifies the
 queued force-save and every non-commit outcome. Coverage in
-`src/ts/plugins/pluginSaveStorage.test.ts` verifies save-before-delete, row
+`../../src/ts/plugins/pluginSaveStorage.test.ts` verifies save-before-delete, row
 preservation after a rejected internalizing save, refresh after successful
 cleanup, staged identity/content rejection, rollback, and the unresolved
 finalize latch.
@@ -161,7 +161,7 @@ are validated as JSON and snapshotted from own data descriptors, so neither
 caller-retained aliases, getters, inherited `toJSON`, Proxy `get` traps,
 inherited setters, nor prototype mutation can bypass the transition barrier.
 
-Regression coverage in `src/ts/plugins/pluginSaveStorage.test.ts` holds list,
+Regression coverage in `../../src/ts/plugins/pluginSaveStorage.test.ts` holds list,
 read, persistence, and serialized-write boundaries while exercising queued
 SET/remove operations, rollback, actual retained V2 APIs, caller-owned aliases,
 unsafe descriptors/prototypes, and the V2.0 execution boundary. The independent

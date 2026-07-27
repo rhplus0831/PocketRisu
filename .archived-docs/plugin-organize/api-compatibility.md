@@ -251,7 +251,7 @@ fields vanish; non-finite numbers become `null`; cycles/`BigInt` throw. The
 public contract says JSON-serializable values, so many of these inputs are
 plugin errors, but the host must not acknowledge an unrepresentable value and
 then fail later during read, backup, or mode transition. See
-[`../v3/warning/persistent-json-acknowledges-unrepresentable-values.md`](../v3/warning/persistent-json-acknowledges-unrepresentable-values.md).
+[`../../docs/audit/v3/warning/persistent-json-acknowledges-unrepresentable-values.md`](../../docs/audit/v3/warning/persistent-json-acknowledges-unrepresentable-values.md).
 
 ### Key ordering
 
