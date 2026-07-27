@@ -104,6 +104,28 @@ function resetPermission(state: ReturnType<typeof makePermissionState>, pluginNa
     }
 }
 
+// Mirrors the settings editor's grant/revoke mutation. A manual grant starts
+// the periodic reconfirmation window; a revoke removes that timestamp and must
+// remain denied until the user changes it.
+function setPermissionDecision(
+    state: ReturnType<typeof makePermissionState>,
+    pluginName: string,
+    permissionDesc: string,
+    decision: 'granted' | 'revoked',
+    now: number,
+) {
+    const key = keyOf(pluginName, permissionDesc)
+    if (decision === 'granted') {
+        state.given.add(key)
+        state.denied.delete(key)
+        state.cache.set(key + '_lastGrantTime', now)
+    } else {
+        state.given.delete(key)
+        state.denied.add(key)
+        state.cache.delete(key + '_lastGrantTime')
+    }
+}
+
 // ─── BUGGY variant: original flow, no serialization ──────────────────────────
 
 function makeBuggyGetPermission(
@@ -224,8 +246,8 @@ function makePeriodicGetPermission(
         return !last || now() - last > windowMs
     }
     const resolved = (key: string, requiresReconfirm: boolean) => {
+        if (state.denied.has(key)) return { resolved: true, value: false }
         if (!requiresReconfirm && state.given.has(key)) return { resolved: true, value: true }
-        if (!requiresReconfirm && state.denied.has(key)) return { resolved: true, value: false }
         return { resolved: false, value: false }
     }
 
@@ -243,10 +265,13 @@ function makePeriodicGetPermission(
             const conf = await alertConfirm(`Allow ${pluginName} → ${permissionDesc}?`)
             if (conf) {
                 state.given.add(key)
+                state.denied.delete(key)
                 state.cache.set(key + '_lastGrantTime', now())
                 return true
             }
+            state.given.delete(key)
             state.denied.add(key)
+            state.cache.delete(key + '_lastGrantTime')
             return false
         }
 
@@ -417,6 +442,26 @@ describe('plugin permission dialog serialization', () => {
         expect(state.denied.size).toBe(0)
     })
 
+    it('EDITOR: granting and revoking update only the selected permission', () => {
+        const state = makePermissionState()
+        state.denied.add(keyOf('Plug', 'db'))
+        state.given.add(keyOf('Plug', 'fetchLogs'))
+
+        setPermissionDecision(state, 'Plug', 'db', 'granted', 123)
+
+        expect(state.given.has(keyOf('Plug', 'db'))).toBe(true)
+        expect(state.denied.has(keyOf('Plug', 'db'))).toBe(false)
+        expect(state.cache.get(keyOf('Plug', 'db') + '_lastGrantTime')).toBe(123)
+        expect(state.given.has(keyOf('Plug', 'fetchLogs'))).toBe(true)
+
+        setPermissionDecision(state, 'Plug', 'db', 'revoked', 456)
+
+        expect(state.given.has(keyOf('Plug', 'db'))).toBe(false)
+        expect(state.denied.has(keyOf('Plug', 'db'))).toBe(true)
+        expect(state.cache.has(keyOf('Plug', 'db') + '_lastGrantTime')).toBe(false)
+        expect(state.given.has(keyOf('Plug', 'fetchLogs'))).toBe(true)
+    })
+
     it('LEGACY: a name-only entry "foo_db" does NOT grant plugin "foo" the db permission', async () => {
         const harness = makeAlertHarness()
         const state = makePermissionState()
@@ -494,6 +539,68 @@ describe('plugin permission dialog serialization', () => {
         // Only the first prompted; the rest saw the refreshed lastGrantTime
         // (recomputed under the lock) and the recorded grant, so no re-prompt.
         expect(dialogs).toBe(1)
+    })
+
+    it('EDITOR: a manual grant satisfies periodic access without another prompt', async () => {
+        const harness = makeAlertHarness()
+        const state = makePermissionState()
+        const now = () => 1_000_000
+        setPermissionDecision(state, 'Plug', 'db', 'granted', now())
+        const getPerm = makePeriodicGetPermission(state, harness.alertConfirm, now, true)
+
+        // No responder is running: opening a dialog would make this test hang.
+        await expect(getPerm('Plug', 'db')).resolves.toBe(true)
+        expect(harness.getMaxConcurrentLive()).toBe(0)
+    })
+
+    it('EDITOR: a revoked periodic permission stays blocked without re-prompting', async () => {
+        const harness = makeAlertHarness()
+        const state = makePermissionState()
+        const now = () => 1_000_000
+        setPermissionDecision(state, 'Plug', 'db', 'revoked', now())
+        const getPerm = makePeriodicGetPermission(state, harness.alertConfirm, now, true)
+
+        // Revocation is a durable user choice, not a request to immediately ask
+        // again merely because periodic permissions have no grant timestamp.
+        await expect(getPerm('Plug', 'db')).resolves.toBe(false)
+        expect(harness.getMaxConcurrentLive()).toBe(0)
+    })
+
+    it('PERIODIC: denying reconfirmation replaces the expired grant', async () => {
+        const harness = makeAlertHarness()
+        const state = makePermissionState()
+        const now = () => 1_000_000
+        const key = keyOf('Plug', 'db')
+        state.given.add(key)
+        state.cache.set(key + '_lastGrantTime', 1)
+        const getPerm = makePeriodicGetPermission(state, harness.alertConfirm, now, true, 100)
+
+        let dialogs = 0
+        const denier = (() => {
+            let stopped = false
+            const loop = async () => {
+                while (!stopped) {
+                    if (get(harness.alertStore).type === 'ask') {
+                        harness.alertStore.set({ type: 'none', msg: 'no' })
+                        dialogs++
+                    }
+                    await sleep(2)
+                }
+            }
+            const done = loop()
+            return { stop: async () => { stopped = true; await done } }
+        })()
+
+        await expect(getPerm('Plug', 'db')).resolves.toBe(false)
+        // The saved denial must short-circuit instead of showing the periodic
+        // confirmation again on the next call.
+        await expect(getPerm('Plug', 'db')).resolves.toBe(false)
+        await denier.stop()
+
+        expect(dialogs).toBe(1)
+        expect(state.given.has(key)).toBe(false)
+        expect(state.denied.has(key)).toBe(true)
+        expect(state.cache.has(key + '_lastGrantTime')).toBe(false)
     })
 
     it('PERIODIC: without recompute, the same burst re-prompts (guards the fix)', async () => {

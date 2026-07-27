@@ -22,7 +22,13 @@
         setPluginEnabledAndReload,
         updatePlugin,
     } from "src/ts/plugins/plugins.svelte";
-    import { resetPluginPermission } from "src/ts/plugins/apiV3/v3.svelte";
+    import {
+        getPluginPermissionDecisions,
+        pluginPermissionDescs,
+        setPluginPermissionDecision,
+        type PluginPermissionDecision,
+        type PluginPermissionDesc,
+    } from "src/ts/plugins/apiV3/v3.svelte";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import NumberInput from "src/lib/UI/GUI/NumberInput.svelte";
     import SelectInput from "src/lib/UI/GUI/SelectInput.svelte";
@@ -48,6 +54,11 @@
     let showParams = $state([])
     let reconcilingPluginStorage = $state(false)
     let retryingPluginStorageRecovery = $state(false)
+    let permissionEditorPlugin = $state<string | null>(null)
+    let permissionEditorLoading = $state(false)
+    let permissionDecisions = $state<Partial<Record<PluginPermissionDesc, PluginPermissionDecision>>>({})
+    let permissionSaving = $state<PluginPermissionDesc[]>([])
+    let permissionLoadVersion = 0
     const optimizePluginMemoryEligible = $derived(
         canOptimizePluginMemory(DBState.db.plugins),
     )
@@ -155,6 +166,60 @@
             notifySuccess(language.pluginStorageRecoveryCopySuccess)
         } catch {
             notifyError(language.pluginStorageRecoveryCopyFailed)
+        }
+    }
+
+    function pluginPermissionLabel(permission: PluginPermissionDesc) {
+        switch (permission) {
+            case "fetchLogs": return language.pluginPermissionFetchLogs
+            case "db": return language.pluginPermissionDatabase
+            case "mainDom": return language.pluginPermissionMainDom
+            case "replacer": return language.pluginPermissionReplacer
+            case "provider": return language.pluginPermissionProvider
+            case "sendChat": return language.pluginPermissionSendChat
+        }
+    }
+
+    async function togglePermissionEditor(pluginName: string) {
+        const loadVersion = ++permissionLoadVersion
+        if (permissionEditorPlugin === pluginName) {
+            permissionEditorPlugin = null
+            permissionDecisions = {}
+            return
+        }
+
+        permissionEditorPlugin = pluginName
+        permissionEditorLoading = true
+        permissionDecisions = {}
+        try {
+            const decisions = await getPluginPermissionDecisions(pluginName)
+            if (loadVersion === permissionLoadVersion && permissionEditorPlugin === pluginName) {
+                permissionDecisions = decisions
+            }
+        } catch (error) {
+            if (loadVersion === permissionLoadVersion) permissionEditorPlugin = null
+            notifyError(error)
+        } finally {
+            if (loadVersion === permissionLoadVersion) permissionEditorLoading = false
+        }
+    }
+
+    async function updatePermission(
+        pluginName: string,
+        permission: PluginPermissionDesc,
+        decision: Exclude<PluginPermissionDecision, "ask">,
+    ) {
+        if (permissionSaving.includes(permission)) return
+        permissionSaving.push(permission)
+        try {
+            await setPluginPermissionDecision(pluginName, permission, decision)
+            if (permissionEditorPlugin === pluginName) {
+                permissionDecisions = { ...permissionDecisions, [permission]: decision }
+            }
+        } catch (error) {
+            notifyError(error)
+        } finally {
+            permissionSaving = permissionSaving.filter((item) => item !== permission)
         }
     }
 </script>
@@ -342,17 +407,15 @@
             </button>
 
             <button
-                class="textcolor2 hover:text-primary cursor-pointer"
-                title={language.resetPluginPermission}
+                class={permissionEditorPlugin === plugin.name
+                    ? "text-primary cursor-pointer"
+                    : "textcolor2 hover:text-primary cursor-pointer"}
+                title={language.managePluginPermissions}
+                aria-label={language.managePluginPermissions}
+                aria-expanded={permissionEditorPlugin === plugin.name}
                 onclick={async (e) => {
                     e.stopPropagation()
-                    const v = await alertConfirm(
-                        language.resetPluginPermissionConfirm.replace("{}", plugin.displayName ?? plugin.name)
-                    )
-                    if (v) {
-                        await resetPluginPermission(plugin.name)
-                        notifySuccess(language.resetPluginPermissionDone.replace("{}", plugin.displayName ?? plugin.name))
-                    }
+                    await togglePermissionEditor(plugin.name)
                 }}
             >
                 <ShieldIcon />
@@ -378,6 +441,69 @@
                 <TrashIcon />
             </button>
         </div>
+        {#if permissionEditorPlugin === plugin.name}
+            <div class="mt-3 rounded-md border border-darkborderc bg-darkbg/60 p-3">
+                <div class="font-medium">
+                    {language.pluginPermissionsFor.replace("{}", plugin.displayName ?? plugin.name)}
+                </div>
+                <p class="mt-1 text-xs text-textcolor2">{language.pluginPermissionEditorHint}</p>
+
+                {#if permissionEditorLoading}
+                    <div class="mt-3 text-sm text-textcolor2">{language.loading}…</div>
+                {:else}
+                    <div class="mt-3 flex flex-col gap-2">
+                        {#each pluginPermissionDescs as permission}
+                            {@const decision = permissionDecisions[permission] ?? "ask"}
+                            <div class="flex flex-col gap-2 rounded-md border border-darkborderc/70 p-2 sm:flex-row sm:items-center">
+                                <div class="flex min-w-0 grow items-center gap-2">
+                                    <span class="min-w-0 grow">{pluginPermissionLabel(permission)}</span>
+                                    <ShBadge
+                                        variant={decision === "granted"
+                                            ? "success"
+                                            : decision === "revoked"
+                                                ? "destructive"
+                                                : "warning"}
+                                        aria-live="polite"
+                                    >
+                                        {decision === "granted"
+                                            ? language.pluginPermissionGranted
+                                            : decision === "revoked"
+                                                ? language.pluginPermissionRevoked
+                                                : language.pluginPermissionAsk}
+                                    </ShBadge>
+                                </div>
+                                <div class="flex shrink-0 gap-2">
+                                    <ShButton
+                                        size="xs"
+                                        variant={decision === "granted" ? "success" : "outline"}
+                                        aria-pressed={decision === "granted"}
+                                        disabled={permissionSaving.includes(permission)}
+                                        onclick={async (e) => {
+                                            e.stopPropagation()
+                                            await updatePermission(plugin.name, permission, "granted")
+                                        }}
+                                    >
+                                        {language.pluginPermissionGrant}
+                                    </ShButton>
+                                    <ShButton
+                                        size="xs"
+                                        variant={decision === "revoked" ? "destructive" : "outline"}
+                                        aria-pressed={decision === "revoked"}
+                                        disabled={permissionSaving.includes(permission)}
+                                        onclick={async (e) => {
+                                            e.stopPropagation()
+                                            await updatePermission(plugin.name, permission, "revoked")
+                                        }}
+                                    >
+                                        {language.pluginPermissionRevoke}
+                                    </ShButton>
+                                </div>
+                            </div>
+                        {/each}
+                    </div>
+                {/if}
+            </div>
+        {/if}
         {#if plugin.version === 1}
             <span class="text-draculared text-xs">
                 {language.pluginVersionWarn

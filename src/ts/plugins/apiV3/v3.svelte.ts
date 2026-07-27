@@ -725,8 +725,9 @@ const unloadV3Plugin = async (pluginName: string) => {
     if (instance) await unloadV3PluginInstance(instance);
 }
 
-type PluginPermissionDesc = 'fetchLogs'|'db'|'mainDom'|'replacer'|'provider'|'sendChat';
-const pluginPermissionDescs: PluginPermissionDesc[] = ['fetchLogs', 'db', 'mainDom', 'replacer', 'provider', 'sendChat'];
+export type PluginPermissionDesc = 'fetchLogs'|'db'|'mainDom'|'replacer'|'provider'|'sendChat';
+export type PluginPermissionDecision = 'granted'|'revoked'|'ask';
+export const pluginPermissionDescs: readonly PluginPermissionDesc[] = ['fetchLogs', 'db', 'mainDom', 'replacer', 'provider', 'sendChat'];
 
 // Plugin names are free text (the //@name directive), so `${name}_${desc}` keys
 // can collide — both across permissions and with a legacy name-only entry that
@@ -741,6 +742,7 @@ const permissionCache = new Map<string, boolean | number>();
 const pluginPermissionStateKey = 'cache/plugin-permissions/state.json';
 let pluginPermissionLoadPromise: Promise<void> | null = null;
 let pluginPermissionLoadController: AbortController | null = null;
+let pluginPermissionMutationChain: Promise<unknown> = Promise.resolve();
 
 async function ensurePluginPermissionStateLoaded(signal?: AbortSignal | null) {
     throwIfAborted(signal)
@@ -841,6 +843,64 @@ export async function resetPluginPermission(pluginName: string) {
     await persistPluginPermissionState()
 }
 
+export async function getPluginPermissionDecisions(
+    pluginName: string,
+): Promise<Record<PluginPermissionDesc, PluginPermissionDecision>> {
+    await ensurePluginPermissionStateLoaded()
+    return Object.fromEntries(pluginPermissionDescs.map((desc) => {
+        const permissionKey = permissionKeyOf(pluginName, desc)
+        const decision: PluginPermissionDecision = permissionDeniedPlugins.has(permissionKey)
+            ? 'revoked'
+            : permissionGivenPlugins.has(permissionKey)
+                ? 'granted'
+                : 'ask'
+        return [desc, decision]
+    })) as Record<PluginPermissionDesc, PluginPermissionDecision>
+}
+
+export function setPluginPermissionDecision(
+    pluginName: string,
+    permissionDesc: PluginPermissionDesc,
+    decision: Exclude<PluginPermissionDecision, 'ask'>,
+) {
+    const run = pluginPermissionMutationChain.catch(() => {}).then(async () => {
+        await ensurePluginPermissionStateLoaded()
+        const permissionKey = permissionKeyOf(pluginName, permissionDesc)
+        const lastGrantTimeKey = permissionKey + '_lastGrantTime'
+        const previous = {
+            given: permissionGivenPlugins.has(permissionKey),
+            denied: permissionDeniedPlugins.has(permissionKey),
+            lastGrantTime: permissionCache.get(lastGrantTimeKey),
+        }
+
+        if (decision === 'granted') {
+            permissionGivenPlugins.add(permissionKey)
+            permissionDeniedPlugins.delete(permissionKey)
+            // Periodically reconfirmed permissions should respect a grant made
+            // here instead of immediately opening another prompt.
+            permissionCache.set(lastGrantTimeKey, Date.now())
+        } else {
+            permissionGivenPlugins.delete(permissionKey)
+            permissionDeniedPlugins.add(permissionKey)
+            permissionCache.delete(lastGrantTimeKey)
+        }
+
+        try {
+            await persistPluginPermissionState()
+        } catch (error) {
+            if (previous.given) permissionGivenPlugins.add(permissionKey)
+            else permissionGivenPlugins.delete(permissionKey)
+            if (previous.denied) permissionDeniedPlugins.add(permissionKey)
+            else permissionDeniedPlugins.delete(permissionKey)
+            if (previous.lastGrantTime === undefined) permissionCache.delete(lastGrantTimeKey)
+            else permissionCache.set(lastGrantTimeKey, previous.lastGrantTime)
+            throw error
+        }
+    })
+    pluginPermissionMutationChain = run.catch(() => {})
+    return run
+}
+
 async function persistPluginPermissionState(signal?: AbortSignal | null) {
     const state = {
         given: [...permissionGivenPlugins],
@@ -872,11 +932,14 @@ const isPermissionResolved = async (
 ): Promise<{ resolved: boolean; value: boolean; pluginHash: string }> => {
     throwIfAborted(signal)
     const permissionKey = permissionKeyOf(pluginName, permissionDesc);
+    // A revoked permission stays blocked until the user grants or resets it.
+    // Periodic reconfirmation only applies to grants; otherwise a denied
+    // periodic permission would immediately prompt again on every use.
+    if (permissionDeniedPlugins.has(permissionKey)) {
+        return { resolved: true, value: false, pluginHash: '' }
+    }
     if (!requiresReconfirm && permissionGivenPlugins.has(permissionKey)) {
         return { resolved: true, value: true, pluginHash: '' }
-    }
-    if (!requiresReconfirm && permissionDeniedPlugins.has(permissionKey)) {
-        return { resolved: true, value: false, pluginHash: '' }
     }
 
     const pluginHash = await awaitWithAbort(hasher(
@@ -966,7 +1029,9 @@ const getPluginPermission = async (
             await persistPluginPermissionState(signal)
             return true;
         }
+        permissionGivenPlugins.delete(permissionKey);
         permissionDeniedPlugins.add(permissionKey);
+        permissionCache.delete(permissionKey + '_lastGrantTime');
         await persistPluginPermissionState(signal)
         return false;
     }
