@@ -439,6 +439,26 @@ observable. The browser upload and restore parsers preserve the authoritative
 outcome fields rather than replacing a late 413, validation failure, or rollback
 with a generic message.
 
+Supplemental implementation `86d2a0b7` closes the acknowledgement-loss side of
+that contract. Upload and server-file restore accept only exact heartbeat,
+progress, done, and error event schemas. A malformed event, missing terminal,
+status-zero XHR completion, or response transport/body failure after dispatch
+becomes a non-retryable `COMMIT_OUTCOME_UNKNOWN` with `commitOutcome: "unknown"`
+and `commitOutcomeUnknown: true`; an XHR error, timeout, or abort cannot turn an
+already parsed but not cleanly completed `done` into success. Exact structured
+server error outcomes remain authoritative, while arbitrary transport-thrown
+errors are normalized to unknown and retained only as diagnostic causes. A
+synchronous failure before XHR dispatch remains definitively not committed.
+
+Both local-upload and server-file restore UI paths issue exactly one destructive
+request. A confirmed commit reloads the replacement, a definitive rejection
+stays on the current page, and an unknown outcome warns then hard-reloads to
+observe the authoritative server state without replaying the mutation. This is
+conservative reconciliation: the client does not infer whether a response-lost
+request actually committed. Final supplemental coverage passed 49 focused
+client contract/UI-policy tests, the full client suite (1,541 passed, 3
+skipped), `pnpm check`, the production build, and the EN/KO help-key audit.
+
 The import transaction and filesystem-swap journal remain one recovery unit.
 Injected failure after save-folder asset swap restores the old database and
 asset set, removes newly staged files and the journal, survives restart with

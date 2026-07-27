@@ -134,6 +134,7 @@ E1+E2 export path. Verification was repeated after each repair.
 | E1 partial-export lifecycle | `892d6eed`, `5b8db647`, `9f4e96e3`, `76fb1cbf` | lost-create cancellation tombstone, held-import cancellation with pre-release spool cleanup and replacement admission, stalled-download TTL cleanup, sink-setup cancellation, immutable asset/database pins |
 | E2 legacy special-key export | `a60e175e`, `9f4e96e3` | real export/decode/import with 3 MiB own `__proto__` value, 2 MiB metadata, reserved-field collision, and selected asset |
 | R6 bounded import ingress | `f1931989` | finite archive/ZIP/expanded/legacy/entry/row limits; private paged disk staging; ZIP integrity checks; disconnect-safe barrier acquisition; exact NDJSON errors and heartbeats; 52 MiB, exact/+1, rollback/restart, and orphan-cleanup gates |
+| R6 terminal-loss follow-up | `86d2a0b7` | strict heartbeat/progress/done/error schemas; malformed, missing, status-zero, or post-dispatch transport loss becomes non-retryable commit-unknown; exact server outcomes survive; one request with authoritative UI reload instead of replay |
 
 The viewer bound is one page of at most 50 logical rows. A chunked logical row
 may still be synchronously reassembled, page tokens bind the selected page (not
@@ -164,7 +165,12 @@ next escape read; it is not an RSS/heap ceiling.
 R6 extends the bounded PM3 boundary to backup archive and save-folder ingress.
 Its 64 KiB page instrumentation, finite byte/entry limits, and private-spool
 cleanup prove bounded reads and staging behavior, not a global resident-heap
-ceiling. Details and final verification counts are recorded in
+ceiling. Supplemental client verification for `86d2a0b7` passed 49 focused
+backup-terminal/UI-policy tests and the full client suite (1,541 passed, 3
+skipped), plus type checking, production build, and complete EN/KO help-key
+audits. These checks prove conservative client classification and no automatic
+replay; they do not make a lost network acknowledgement reveal whether the
+server committed. Details and final verification counts are recorded in
 [Performance and memory](performance-memory.md#pm3-r6-bounded-import-ingress),
 with the restore transport contract cross-referenced from
 [Backup, snapshot, and recovery](backup-recovery.md#pm3-r6-import-recovery-follow-up).
