@@ -103,7 +103,7 @@ Nhấp "Cập nhật ngay" trong popup cập nhật trên màn hình chính củ
 - **Windows**: Nhấp đúp `update.bat`
 - **macOS / Linux**: `./update.sh`
 
-Dữ liệu trong thư mục `save/` được bảo toàn.
+Dữ liệu trong thư mục `../../save` được bảo toàn.
 
 
 ---
@@ -181,7 +181,7 @@ cd ~/pocketrisu
 ./update.sh
 ```
 
-> **Lưu ý một lần cho v1.5.x → v1.6.0**: Nếu bạn đã cài đặt qua `install.sh` trong thời kỳ Risuai-NodeOnly (v1.5.x trở về trước), hãy thay `update.sh` bằng phiên bản mới một lần trước lần cập nhật v1.6.0 đầu tiên. (Repository đã được đổi tên thành PocketRisu và `update.sh` cũ không thể tìm thấy thư mục mã nguồn mới.)
+> **Lưu ý một lần cho v1.5.x → v1.6.0**: Nếu bạn đã cài đặt qua `../../install.sh` trong thời kỳ Risuai-NodeOnly (v1.5.x trở về trước), hãy thay `../../update.sh` bằng phiên bản mới một lần trước lần cập nhật v1.6.0 đầu tiên. (Repository đã được đổi tên thành PocketRisu và `../../update.sh` cũ không thể tìm thấy thư mục mã nguồn mới.)
 >
 > ```bash
 > curl -fsSL https://raw.githubusercontent.com/PocketRisu/PocketRisu/main/update.sh -o update.sh && chmod +x update.sh

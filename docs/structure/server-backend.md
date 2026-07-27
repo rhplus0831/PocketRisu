@@ -403,7 +403,7 @@ outcome contracts are canonical in [Backup and recovery](backup-recovery.md).
 
 - `/hub-proxy/*` is not universally guarded by `checkAuth()`. `x-risu-node-path` can select an arbitrary target, and the special authorization/header conversion path is compatibility-sensitive. Treat target validation and header changes as a deliberate security review.
 
-- Tailscale has no backend implementation. It is an external reverse-access recommendation using `tailscale serve --bg http://localhost:6001`, documented in `docs/en/remote.md`.
+- Tailscale has no backend implementation. It is an external reverse-access recommendation using `tailscale serve --bg http://localhost:6001`, documented in `../../docs-human/en/remote.md`.
 
 - Self-update is portable-only and mutates the installation tree. Deployment type is inferred near `server/node/server.cjs:1083`, and only a `.portable` deployment can call the replacement flow at `:6901`. The keep sets, rollback staging, Windows locked-binary handling, and restart logic are data-safety behavior.
 

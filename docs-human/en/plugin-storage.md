@@ -125,4 +125,4 @@ These helpers protect plugins that adopt them. The host cannot infer whether
 an unconditional legacy `setItem()` was derived from a swallowed read error,
 so existing third-party plugins must migrate their compound update paths.
 
-For ambiguous mutation outcomes, see [Safe V3 plugin-storage mutations](../plugin-storage-mutation-outcomes.md). For multi-row publication and generation rules, see the [plugin-storage architecture](../structure/plugin-storage.md#immutable-generations).
+For ambiguous mutation outcomes, see [Safe V3 plugin-storage mutations](../../docs/plugin-storage-mutation-outcomes.md). For multi-row publication and generation rules, see the [plugin-storage architecture](../../docs/structure/plugin-storage.md#immutable-generations).

@@ -83,7 +83,7 @@ recheck, one atomic CAS, and a total cancellation deadline. Guarded writes
 retain the existing abort, lifecycle-drain, structured failure, atomic owner,
 and mode-transition behavior.
 
-[Public integration guidance](../../docs/en/plugin-storage.md) documents safe
+[Public integration guidance](../../docs-human/en/plugin-storage.md) documents safe
 configuration, credential, index, ledger, and shard migration patterns,
 including conflict retry and committed-unknown reconciliation. Client and real
 iframe-bridge fault tests prove those five fallback transforms do not run or

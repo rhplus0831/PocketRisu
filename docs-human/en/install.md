@@ -101,7 +101,7 @@ Click "Update now" in the update popup on the web UI home screen, or run the upd
 - **Windows**: Double-click `update.bat`
 - **macOS / Linux**: `./update.sh`
 
-Data in the `save/` folder is preserved.
+Data in the `../../save` folder is preserved.
 
 
 ---
@@ -179,7 +179,7 @@ cd ~/pocketrisu
 ./update.sh
 ```
 
-> **One-time note for v1.5.x → v1.6.0**: If you installed via `install.sh` during the Risuai-NodeOnly era (v1.5.x or earlier), replace `update.sh` with the new version once before your first v1.6.0 update. (The repository was renamed to PocketRisu, and the old `update.sh` cannot find the new source directory.)
+> **One-time note for v1.5.x → v1.6.0**: If you installed via `../../install.sh` during the Risuai-NodeOnly era (v1.5.x or earlier), replace `../../update.sh` with the new version once before your first v1.6.0 update. (The repository was renamed to PocketRisu, and the old `../../update.sh` cannot find the new source directory.)
 >
 > ```bash
 > curl -fsSL https://raw.githubusercontent.com/PocketRisu/PocketRisu/main/update.sh -o update.sh && chmod +x update.sh

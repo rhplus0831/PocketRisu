@@ -103,7 +103,7 @@ cd PocketRisu-${VERSION}-macos-arm64
 - **Windows**: 雙擊 `update.bat`
 - **macOS / Linux**: `./update.sh`
 
-`save/` 資料夾中的資料會保留。
+`../../save` 資料夾中的資料會保留。
 
 
 ---
@@ -181,7 +181,7 @@ cd ~/pocketrisu
 ./update.sh
 ```
 
-> **v1.5.x → v1.6.0 一次性提示**: 若您在 Risuai-NodeOnly 時代(v1.5.x 或更早)透過 `install.sh` 安裝,請在首次 v1.6.0 更新前一次性將 `update.sh` 替換為新版本。(儲存庫已重新命名為 PocketRisu,舊 `update.sh` 無法找到新的原始目錄。)
+> **v1.5.x → v1.6.0 一次性提示**: 若您在 Risuai-NodeOnly 時代(v1.5.x 或更早)透過 `../../install.sh` 安裝,請在首次 v1.6.0 更新前一次性將 `../../update.sh` 替換為新版本。(儲存庫已重新命名為 PocketRisu,舊 `../../update.sh` 無法找到新的原始目錄。)
 >
 > ```bash
 > curl -fsSL https://raw.githubusercontent.com/PocketRisu/PocketRisu/main/update.sh -o update.sh && chmod +x update.sh

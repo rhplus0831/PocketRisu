@@ -101,7 +101,7 @@ cd PocketRisu-${VERSION}-macos-arm64
 - **Windows**: `update.bat` 더블클릭
 - **macOS / Linux**: `./update.sh`
 
-`save/` 폴더의 데이터는 그대로 보존됩니다.
+`../../save` 폴더의 데이터는 그대로 보존됩니다.
 
 
 ---
@@ -179,7 +179,7 @@ cd ~/pocketrisu
 ./update.sh
 ```
 
-> **v1.5.x → v1.6.0 1회성 안내**: Risuai-NodeOnly 시절(v1.5.x 이하)에 `install.sh`로 설치하셨다면, v1.6.0으로 첫 업데이트 전에 `update.sh`를 새 버전으로 한 번만 교체해주세요. (repo 이름이 PocketRisu로 바뀌어 옛 `update.sh`가 새 소스 디렉토리를 찾지 못합니다.)
+> **v1.5.x → v1.6.0 1회성 안내**: Risuai-NodeOnly 시절(v1.5.x 이하)에 `../../install.sh`로 설치하셨다면, v1.6.0으로 첫 업데이트 전에 `../../update.sh`를 새 버전으로 한 번만 교체해주세요. (repo 이름이 PocketRisu로 바뀌어 옛 `../../update.sh`가 새 소스 디렉토리를 찾지 못합니다.)
 >
 > ```bash
 > curl -fsSL https://raw.githubusercontent.com/PocketRisu/PocketRisu/main/update.sh -o update.sh && chmod +x update.sh

@@ -103,7 +103,7 @@ Haz clic en "Actualizar ahora" en el popup de actualización en la pantalla prin
 - **Windows**: Doble clic en `update.bat`
 - **macOS / Linux**: `./update.sh`
 
-Los datos en la carpeta `save/` se conservan.
+Los datos en la carpeta `../../save` se conservan.
 
 
 ---
@@ -181,7 +181,7 @@ cd ~/pocketrisu
 ./update.sh
 ```
 
-> **Nota única para v1.5.x → v1.6.0**: Si instalaste mediante `install.sh` durante la era Risuai-NodeOnly (v1.5.x o anterior), reemplaza `update.sh` con la nueva versión una vez antes de tu primera actualización a v1.6.0. (El repositorio se renombró a PocketRisu y el `update.sh` antiguo no puede encontrar el nuevo directorio fuente.)
+> **Nota única para v1.5.x → v1.6.0**: Si instalaste mediante `../../install.sh` durante la era Risuai-NodeOnly (v1.5.x o anterior), reemplaza `../../update.sh` con la nueva versión una vez antes de tu primera actualización a v1.6.0. (El repositorio se renombró a PocketRisu y el `../../update.sh` antiguo no puede encontrar el nuevo directorio fuente.)
 >
 > ```bash
 > curl -fsSL https://raw.githubusercontent.com/PocketRisu/PocketRisu/main/update.sh -o update.sh && chmod +x update.sh

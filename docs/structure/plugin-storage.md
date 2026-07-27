@@ -244,7 +244,7 @@ Run the client, server, and compat suites; no one command aggregates them.
 
 - [Plugin development guide](../../plugins.md)
 - [V2-to-V3 migration guide](../../src/ts/plugins/migrationGuide.md)
-- [Safe compound plugin-storage updates](../en/plugin-storage.md)
+- [Safe compound plugin-storage updates](../../docs-human/en/plugin-storage.md)
 - [Mutation outcome handling](../plugin-storage-mutation-outcomes.md)
 - [Scripting and extensions](scripting-extensions.md)
 - [Client storage](client-storage.md)

@@ -38,10 +38,10 @@ PocketRisu is a self-hosted AI roleplay chat platform you run on your PC or pers
 
 ## Documentation
 
-- [Installation guide](docs/en/install.md)
-- [RisuAI migration guide](docs/en/migration.md)
-- [Remote access guide](docs/en/remote.md)
-- [Termux installation guide (Android)](docs/en/termux.md)
+- [Installation guide](docs-human/en/install.md)
+- [RisuAI migration guide](docs-human/en/migration.md)
+- [Remote access guide](docs-human/en/remote.md)
+- [Termux installation guide (Android)](docs-human/en/termux.md)
 - [Developer codebase map](STRUCTURE.md)
 
 
@@ -54,7 +54,7 @@ PocketRisu is derived from [RisuAI](https://github.com/kwaroran/RisuAI) and refi
 - Modules, lorebooks, presets
 - Backup files (`.bin`) with two-way compatibility
 
-For migration from an existing RisuAI installation, see the [migration guide](docs/en/migration.md).
+For migration from an existing RisuAI installation, see the [migration guide](docs-human/en/migration.md).
 
 
 ## Features

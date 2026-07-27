@@ -38,10 +38,10 @@ PocketRisu는 PC나 개인 서버에 띄워두고, PC·태블릿·스마트폰 �
 
 ## 문서
 
-- [설치 가이드](../docs/ko/install.md)
-- [RisuAI 데이터 이전 가이드](../docs/ko/migration.md)
-- [원격 접속 가이드](../docs/ko/remote.md)
-- [Termux 설치 가이드 (Android)](../docs/ko/termux.md)
+- [설치 가이드](../docs-human/ko/install.md)
+- [RisuAI 데이터 이전 가이드](../docs-human/ko/migration.md)
+- [원격 접속 가이드](../docs-human/ko/remote.md)
+- [Termux 설치 가이드 (Android)](../docs-human/ko/termux.md)
 
 
 ## RisuAI 호환
@@ -53,7 +53,7 @@ PocketRisu는 [RisuAI](https://github.com/kwaroran/RisuAI)에서 파생되어, �
 - 모듈, 로어북, 프리셋
 - 백업 파일 (`.bin`) 양방향 호환
 
-기존 RisuAI에서 이전하는 방법은 [데이터 이전 가이드](../docs/ko/migration.md)를 참고하세요.
+기존 RisuAI에서 이전하는 방법은 [데이터 이전 가이드](../docs-human/ko/migration.md)를 참고하세요.
 
 
 ## 주요 기능

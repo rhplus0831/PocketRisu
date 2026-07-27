@@ -40,10 +40,10 @@ PocketRisu 是一个自托管的 AI 角色扮演聊天平台,您可以在自己�
 
 ## 文档
 
-- [安装指南](../docs/cn/install.md)
-- [RisuAI 迁移指南](../docs/cn/migration.md)
-- [远程访问指南](../docs/cn/remote.md)
-- [Termux 安装指南 (Android)](../docs/cn/termux.md)
+- [安装指南](../docs-human/cn/install.md)
+- [RisuAI 迁移指南](../docs-human/cn/migration.md)
+- [远程访问指南](../docs-human/cn/remote.md)
+- [Termux 安装指南 (Android)](../docs-human/cn/termux.md)
 
 
 ## RisuAI 兼容性
@@ -55,7 +55,7 @@ PocketRisu 派生自 [RisuAI](https://github.com/kwaroran/RisuAI),针对自托�
 - 模块、世界书、预设
 - 备份文件(`.bin`)双向兼容
 
-从现有 RisuAI 迁移的方法请参考[迁移指南](../docs/cn/migration.md)。
+从现有 RisuAI 迁移的方法请参考[迁移指南](../docs-human/cn/migration.md)。
 
 
 ## 主要功能

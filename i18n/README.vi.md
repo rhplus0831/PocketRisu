@@ -40,10 +40,10 @@ PocketRisu là một nền tảng trò chuyện nhập vai AI tự lưu trữ, c
 
 ## Tài liệu
 
-- [Hướng dẫn cài đặt](../docs/vi/install.md)
-- [Hướng dẫn di chuyển từ RisuAI](../docs/vi/migration.md)
-- [Truy cập từ xa](../docs/vi/remote.md)
-- [Hướng dẫn cài đặt Termux (Android)](../docs/vi/termux.md)
+- [Hướng dẫn cài đặt](../docs-human/vi/install.md)
+- [Hướng dẫn di chuyển từ RisuAI](../docs-human/vi/migration.md)
+- [Truy cập từ xa](../docs-human/vi/remote.md)
+- [Hướng dẫn cài đặt Termux (Android)](../docs-human/vi/termux.md)
 
 
 ## Tương thích với RisuAI
@@ -55,7 +55,7 @@ PocketRisu được phát triển từ [RisuAI](https://github.com/kwaroran/Risu
 - Module, lorebook, preset
 - Tệp sao lưu (`.bin`) tương thích hai chiều
 
-Để di chuyển từ cài đặt RisuAI hiện có, xem [hướng dẫn di chuyển](../docs/vi/migration.md).
+Để di chuyển từ cài đặt RisuAI hiện có, xem [hướng dẫn di chuyển](../docs-human/vi/migration.md).
 
 
 ## Tính năng
