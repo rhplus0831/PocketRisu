@@ -557,6 +557,69 @@ decode/re-import preserve the reserved-field collision and selected pinned
 asset. Separate cancellation and row-failure cases remove the incomplete spool;
 malicious descriptors are rejected without leaving one.
 
+<a id="pm3-full-server-export-follow-up"></a>
+### Full and server export point-in-time follow-up
+
+**Fixed 2026-07-27 in `f3efd3b1`.** `GET /api/backup/export` and
+`POST /api/backup/server/save` now wait behind active imports and enter the
+storage read queue only long enough to flush pending database state and create
+one job-private cut. That cut holds a read-only SQLite snapshot and copies the
+selected filesystem assets and inlays to private pins while filesystem
+mutations, including inlay-compression publication, remain serialized. Every
+file pin is SHA-256 hashed and checked against its open-file size, device,
+inode, and timestamps, so a same-name, same-size replacement yields the pinned
+epoch or aborts. Assembly happens after the queue is released and therefore
+cannot combine a pre-import database with post-import filesystem content.
+
+The self-contained database assembler reads SQLite rows, pinned files, chat
+bodies, plugin rows, cold-storage rows, JSON tokens, and MessagePack output in
+pages of at most 64 KiB. It supports standard MessagePack plus normal
+`RISUSAVE\0` raw and gzip blocks and preserves legacy raw/gzip MessagePack
+compatibility. The streaming block reducer preserves the established ROOT
+first-truthy and duplicate-collapse behavior, ROOT_COMPONENT ordering and
+last-wins behavior, type overwrite, character append order, and queued REMOTE
+append order. JSON depth, metadata, numeric syntax, decoded block bytes, REMOTE
+count/depth/bytes, and cold-source validation are finite; large cold JSON is
+validated in a worker without materializing it in the main server process.
+
+Admission uses an exact ledger keyed by backing volume. PIN and DATABASE
+requirements are reserved for both routes, and server save also reserves
+ARCHIVE capacity; shared volumes aggregate roles and concurrent jobs cannot
+overcommit the same reported free bytes. Reservations include physical source
+rows, REMOTE rows, the growing final database, intermediate database/row
+representations, and the final server archive. The route preflights every
+archive entry against the unsigned 32-bit payload field before sending headers
+or publishing: exactly `0xffffffff` bytes is representable and one byte more is
+rejected.
+
+Socket cancellation is threaded through import waiting, pinning, database and
+JSON/MessagePack transformation, decompression, archive streaming, and server
+publication. Success, cancellation, failure, and startup sweeping remove
+job-private pins and `.row`, `.block`, JSON, database, and archive temporaries.
+Server save writes an exclusive random mode-0600 temporary, verifies its exact
+planned size, and publishes it through a no-overwrite hard link with timestamp
+collision probing only after the final cancellation gate. A disconnect before
+the terminal acknowledgement removes both temporary and newly linked archive,
+so a partial or unacknowledged server backup is not left published.
+
+Production coverage streamed a 52 MiB gzip UI ROOT value, a 52 MiB external
+chat body, and separate 52 MiB chunked plugin and cold-storage rows through the
+full download and server-save routes; the plugin case also covered upstream
+folding. Each relevant workload remained below a measured 48 MiB process-RSS
+increase gate. The same suite exercised a 56 MiB filesystem asset, an 8 MiB
+inlay, import/pin and same-size-replacement races, gzip corruption, exact and
++1 capacity/archive limits, concurrent reservations, cancellation during each
+stage, cleanup, and atomic publication. This is process-level RSS evidence for
+those measured gates, not a general heap ceiling or a promise that every full
+export remains below a fixed resident-memory value.
+
+Independent cycle-5 verification of the frozen `f3efd3b1` candidate passed the
+full server suite (284/284), compatibility suite (271 passed, 5 skipped), and
+browser suite (1,575 passed, 3 skipped), plus `pnpm check`, the production
+build, and the EN/KO help-key audit. Focused verification additionally passed
+81 server cases, 55 compatibility cases, and 12 direct block-transform
+differential cases.
+
 <a id="pm3-r6-bounded-import-ingress"></a>
 ### R6 — Bounded backup and save-folder import ingress
 

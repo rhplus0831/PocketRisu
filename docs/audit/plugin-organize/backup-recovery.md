@@ -420,6 +420,57 @@ verification passed 58 focused client tests, 7 focused server tests, 10 focused
 compatibility tests, all full client/server/compatibility suites, `pnpm check`,
 and a production build.
 
+<a id="full-server-export-coherence-follow-up"></a>
+### Full/server export coherence follow-up
+
+Implementation `f3efd3b1` makes both the downloadable full backup and the
+server-side backup file one import-aware recovery point. Each route waits
+behind imports, flushes pending database state, and pins the SQLite snapshot,
+filesystem assets, inlays, cold-storage rows, and any exported optimized
+plugin publication before releasing the storage queue. SHA-256 plus open-file
+identity and timestamp checks protect filesystem pins; inlay compression uses
+the same mutation boundary. The resulting archive therefore represents one
+database/filesystem epoch rather than an arbitrary mixture around an import,
+same-name replacement, or concurrent compression.
+
+Database reconstruction is fail-closed. A character chat stub must resolve to
+the exact pinned chat row or both routes fail with `BACKUP_MISSING_CHAT_ROW`;
+metadata-only partial chat recovery is not exported. Node-target optimized
+plugin rows are included only when the database generation, manifest
+generation, declared value/owner sets, and every declared physical row form
+one complete owned publication. Quarantined, stale, foreign, missing, or
+malformed rows do not become live backup content. Upstream-target export folds
+that same validated logical publication into the database through the bounded
+streaming transform.
+
+REMOTE block references accept only known block types and are resolved with
+finite count, nesting depth, and cumulative decoded-byte limits. The resolver
+checks exact row size before spooling, caches repeated references, preserves
+queued character order, and removes its private rows on every outcome. Chunked
+database/chat/plugin/cold rows must have complete dense manifests, exact
+logical sizes, and matching hashes; corrupt gzip CRC/ISIZE, truncated data,
+or changed sources fail before response headers or server publication. Archive
+entry planning likewise enforces the unsigned 32-bit payload boundary, with
+the exact maximum accepted and maximum plus one rejected before an entry
+header can be emitted.
+
+Server backups reserve PIN, DATABASE, and ARCHIVE capacity per actual backing
+volume before staging. They are written to exclusive private temporaries,
+fsynced and length-checked, then published atomically with a no-overwrite hard
+link; timestamp collisions select another filename instead of replacing an
+existing recovery point. Cancellation and disconnect checks bracket pinning,
+assembly, transcode, output, and publication. Normal completion, errors,
+cancellation, disconnects, and startup recovery sweep private pins and
+database, row, block, JSON, and archive temporaries. If the final server-save
+acknowledgement does not complete, the newly linked archive is removed rather
+than being exposed as an ambiguously acknowledged backup.
+
+Cycle-5 verification passed 284/284 server tests, 271 compatibility tests (5
+skipped), and 1,575 browser tests (3 skipped), with type checking, production
+build, and EN/KO help-key validation also green. The capacity and memory
+evidence is detailed in
+[PM3 full and server export point-in-time follow-up](performance-memory.md#pm3-full-server-export-follow-up).
+
 <a id="pm3-r6-import-recovery-follow-up"></a>
 ### PM3 R6 import/recovery follow-up
 

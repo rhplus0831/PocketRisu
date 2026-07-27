@@ -133,6 +133,7 @@ E1+E2 export path. Verification was repeated after each repair.
 | V1 point-in-time viewer | `fc51fe5a`, `68621c86` | real 10,000-row publication, 50-row page, stale edit/delete CAS rejection, backpressure and import-wait abort |
 | E1 partial-export lifecycle | `892d6eed`, `5b8db647`, `9f4e96e3`, `76fb1cbf` | lost-create cancellation tombstone, held-import cancellation with pre-release spool cleanup and replacement admission, stalled-download TTL cleanup, sink-setup cancellation, immutable asset/database pins |
 | E2 legacy special-key export | `a60e175e`, `9f4e96e3` | real export/decode/import with 3 MiB own `__proto__` value, 2 MiB metadata, reserved-field collision, and selected asset |
+| E3 full/server export coherence | `f3efd3b1` | import-aware SQLite/filesystem cut; 64 KiB database/chat/plugin/cold streaming; strict ownership, REMOTE, corruption, and 32-bit archive boundaries; per-volume reservations; cancellation cleanup; atomic server publication |
 | R6 bounded import ingress | `f1931989` | finite archive/ZIP/expanded/legacy/entry/row limits; private paged disk staging; ZIP integrity checks; disconnect-safe barrier acquisition; exact NDJSON errors and heartbeats; 52 MiB, exact/+1, rollback/restart, and orphan-cleanup gates |
 | R6 terminal-loss follow-up | `86d2a0b7`, `77eac26a` | strict heartbeat/progress/done/error schemas; malformed, missing, status-zero, or post-dispatch transport loss becomes non-retryable commit-unknown; exact committed-with-error and unknown outcomes warn then reload; one request with no replay |
 | R6 save-folder outcome follow-up | `52740be1` | direct and ZIP exact committed/not-committed/unknown envelopes; post-COMMIT cleanup and marker durability; rollback-ambiguity restart recovery; finite auth/XHR deadlines; exact JSON schemas, status-zero handling, and private local-timeout provenance; one request with no replay |
@@ -162,6 +163,31 @@ completion, failure, cancellation, and startup orphan recovery remove private
 artifacts; cleanup is best-effort with startup retry. E2 instrumentation proves
 at most one escape-row read is active and that the spool advances before the
 next escape read; it is not an RSS/heap ceiling.
+
+E3 applies a corresponding point-in-time boundary to the full download and
+server-save routes. Both wait behind imports, flush pending database state, and
+pin one SQLite snapshot plus the selected filesystem assets and inlays before
+assembling `database.risudat`. The assembler pages database, chat, optimized
+plugin, cold-storage, JSON, MessagePack, and raw/gzip block sources in chunks of
+at most 64 KiB. It retains legacy MessagePack and block compatibility while
+requiring complete chat rows, an exact generated plugin publication, finite
+and exact REMOTE resolution, valid chunk publications, and archive entries
+within the unsigned 32-bit payload boundary. PIN, DATABASE, and (for server
+save) ARCHIVE bytes are reserved per backing volume, including concurrent
+jobs and intermediate representations. Disconnect, cancellation, failure, and
+startup sweeping remove private pins and row/block/database/archive spools;
+server save publishes a completed validated temporary archive with a
+no-overwrite hard link and removes it again if the final acknowledgement does
+not complete.
+
+Cycle-5 verification of the exact `f3efd3b1` candidate passed all 284 server
+tests, 271 compatibility tests (5 skipped), and 1,575 browser tests (3
+skipped), plus type checking, the production build, and complete EN/KO help-key
+audits. Production cases exercised 52 MiB gzip UI database content, a 52 MiB
+external chat, and 52 MiB plugin and cold-storage rows on both full-download
+and server-save paths, including upstream plugin folding. Each relevant case
+stayed below its measured 48 MiB process-RSS increase gate. That evidence is a
+workload-specific measured gate, not a general Node heap or RSS ceiling.
 
 R6 extends the bounded PM3 boundary to backup archive and save-folder ingress.
 Its 64 KiB page instrumentation, finite byte/entry limits, and private-spool
