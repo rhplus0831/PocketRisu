@@ -133,7 +133,7 @@ E1+E2 export path. Verification was repeated after each repair.
 | V1 point-in-time viewer | `fc51fe5a`, `68621c86` | real 10,000-row publication, 50-row page, stale edit/delete CAS rejection, backpressure and import-wait abort |
 | E1 partial-export lifecycle | `892d6eed`, `5b8db647`, `9f4e96e3`, `76fb1cbf` | lost-create cancellation tombstone, held-import cancellation with pre-release spool cleanup and replacement admission, stalled-download TTL cleanup, sink-setup cancellation, immutable asset/database pins |
 | E2 legacy special-key export | `a60e175e`, `9f4e96e3` | real export/decode/import with 3 MiB own `__proto__` value, 2 MiB metadata, reserved-field collision, and selected asset |
-| E3 full/server export coherence | `f3efd3b1` | import-aware SQLite/filesystem cut; 64 KiB database/chat/plugin/cold streaming; strict ownership, REMOTE, corruption, and 32-bit archive boundaries; per-volume reservations; cancellation cleanup; atomic server publication |
+| E3 full/server export coherence | `f3efd3b1`, `283c8314` | import-aware SQLite/filesystem cut; mandatory live-database validation before route headers or publication; 64 KiB database/chat/plugin/cold streaming; strict ownership, REMOTE, corruption, and 32-bit archive boundaries; per-volume reservations; cancellation cleanup; atomic server publication |
 | R6 bounded import ingress | `f1931989` | finite archive/ZIP/expanded/legacy/entry/row limits; private paged disk staging; ZIP integrity checks; disconnect-safe barrier acquisition; exact NDJSON errors and heartbeats; 52 MiB, exact/+1, rollback/restart, and orphan-cleanup gates |
 | R6 terminal-loss follow-up | `86d2a0b7`, `77eac26a` | strict heartbeat/progress/done/error schemas; malformed, missing, status-zero, or post-dispatch transport loss becomes non-retryable commit-unknown; exact committed-with-error and unknown outcomes warn then reload; one request with no replay |
 | R6 save-folder outcome follow-up | `52740be1`, `39303d78` | direct and ZIP exact committed/not-committed/unknown envelopes; post-COMMIT cleanup and marker durability; rollback-ambiguity restart recovery; finite auth/XHR deadlines; exact JSON schemas, status-zero handling, and private local-timeout provenance; mounted ZIP picker warning/reload policy with one request and no replay |
@@ -180,6 +180,18 @@ startup sweeping remove private pins and row/block/database/archive spools;
 server save publishes a completed validated temporary archive with a
 no-overwrite hard link and removes it again if the final acknowledgement does
 not complete.
+
+Supplemental E3 implementation `283c8314` requires the authoritative live
+`database/database.bin` row to exist and decode structurally from that same
+SQLite snapshot before either route creates filesystem export pins, charges
+the export reservation ledger, sends attachment/NDJSON headers, or can publish
+an archive. Missing, zero-byte, unreadable, and corrupt rows fail with the same
+stable `BACKUP_DATABASE_UNAVAILABLE` response. A valid older
+`database/dbbackup-*` recovery snapshot is not substituted for the missing
+live row. Validation and later assembly retain bounded file-backed row reads;
+failure removes the validation spool and leaves no pin, archive temporary,
+final server backup, or reservation behind. A present encoded empty logical
+database remains valid and exports, server-saves, and re-imports normally.
 
 Cycle-5 verification of the exact `f3efd3b1` candidate passed all 284 server
 tests, 271 compatibility tests (5 skipped), and 1,575 browser tests (3
@@ -267,6 +279,14 @@ rollback, acknowledgement-loss, and listener-cleanup restore cases, the new
 held-import regression, syntax/diff checks, and `pnpm check` with zero errors
 (four pre-existing accessibility warnings). See the detailed trace in
 [Backup, snapshot, and recovery](backup-recovery.md#pm3-r6-queued-snapshot-restore-cancellation).
+
+Final composition verification added E3 live-database implementation
+`283c8314` on top of queued snapshot-cancellation implementation `ee33db8b`.
+The composed full server suite passed 285/285 and the compatibility suite
+passed 272 with 5 skipped. Focused composition gates passed all four
+missing/corrupt-database, missing-chat, and both-route export cases plus the
+real held-import snapshot-disconnect case. Independent review accepted both
+the issue diff and the rebased composition before these documentation commits.
 
 ## Original recommended fix order
 

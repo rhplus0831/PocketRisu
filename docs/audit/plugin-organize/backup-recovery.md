@@ -433,6 +433,21 @@ the same mutation boundary. The resulting archive therefore represents one
 database/filesystem epoch rather than an arbitrary mixture around an import,
 same-name replacement, or concurrent compression.
 
+Supplemental implementation `283c8314` makes the live database itself a
+mandatory member of that recovery point. The exact SQLite snapshot must expose
+a positive-size authoritative `database/database.bin` row, and the bounded
+file-backed reader must accept its structure before either route creates
+filesystem export pins, charges the reservation ledger, sends download or
+NDJSON headers, or can publish a server archive. Missing, zero-byte, unreadable,
+and corrupt rows fail identically with `BACKUP_DATABASE_UNAVAILABLE`; an older
+valid `database/dbbackup-*` row is recovery input only and is never substituted
+for the absent live source. Validation failure removes its private spool and
+leaves no pin, temporary/final archive, or retained reservation. A physically
+present encoding of an empty logical database remains a valid recovery point
+and is covered through download, server save, and re-import. This supplements
+the existing bounded-row and cleanup contract without claiming an additional
+general disk-capacity bound for the validation copy.
+
 Database reconstruction is fail-closed. A character chat stub must resolve to
 the exact pinned chat row or both routes fail with `BACKUP_MISSING_CHAT_ROW`;
 metadata-only partial chat recovery is not exported. Node-target optimized
@@ -628,3 +643,11 @@ four pre-existing accessibility warnings, and Node syntax plus Git whitespace
 checks were clean. The evidence proves prompt cancellation, cleanup, and fresh
 admission at this queue boundary; it does not infer a committed outcome after
 an acknowledgement is actually lost.
+
+Composition with E3 live-database implementation `283c8314` retained this
+boundary unchanged. The resulting full server suite passed 285/285 and the
+compatibility suite passed 272 with 5 skipped; the added compatibility case is
+the both-route authoritative-database regression. A focused composition run
+passed all four full-export integrity cases and the held-import disconnect
+case, and independent review accepted the rebased composition before the
+documentation update.

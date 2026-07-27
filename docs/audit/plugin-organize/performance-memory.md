@@ -571,6 +571,20 @@ inode, and timestamps, so a same-name, same-size replacement yields the pinned
 epoch or aborts. Assembly happens after the queue is released and therefore
 cannot combine a pre-import database with post-import filesystem content.
 
+Supplemental implementation `283c8314` closes the absent-source case before
+that cut can become a publishable export. The authoritative
+`database/database.bin` row must have a positive physical size and pass the
+bounded structural reader from the same SQLite snapshot before filesystem
+export pins, reservation-ledger admission, response headers, or server archive
+publication. The validation copy is file-backed and written through the
+existing bounded snapshot spool path; it is removed on every outcome. Missing,
+zero-byte, unreadable, or structurally corrupt live rows return the same stable
+`BACKUP_DATABASE_UNAVAILABLE` failure on both routes. The implementation does
+not search `database/dbbackup-*` for a replacement. A present encoded empty
+logical database remains valid. These guarantees cover bounded authoritative-
+row reading and cleanup, not a new general disk-capacity or process-memory
+ceiling for validation.
+
 The self-contained database assembler reads SQLite rows, pinned files, chat
 bodies, plugin rows, cold-storage rows, JSON tokens, and MessagePack output in
 pages of at most 64 KiB. It supports standard MessagePack plus normal
@@ -619,6 +633,13 @@ browser suite (1,575 passed, 3 skipped), plus `pnpm check`, the production
 build, and the EN/KO help-key audit. Focused verification additionally passed
 81 server cases, 55 compatibility cases, and 12 direct block-transform
 differential cases.
+
+After `283c8314` was composed with queued snapshot-cancellation implementation
+`ee33db8b`, the full server suite passed 285/285 and the compatibility suite
+passed 272 with 5 skipped. The focused composition run passed the four
+missing/corrupt-database, missing-chat, and both-route export cases and the
+held-import snapshot-disconnect case. This later count supplements rather than
+relabels the original cycle-5 workload-specific RSS evidence above.
 
 <a id="pm3-r6-bounded-import-ingress"></a>
 ### R6 — Bounded backup and save-folder import ingress
