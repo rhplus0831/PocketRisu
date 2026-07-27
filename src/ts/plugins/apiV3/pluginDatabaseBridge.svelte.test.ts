@@ -593,6 +593,54 @@ describe("V3 mode-aware database bridge", () => {
         },
     );
 
+    test("shows one actionable notification when optimized storage rejects a plugin value", async () => {
+        const plugin = startupPlugin("Legacy Value Plugin", "");
+        testState.database.plugins = [plugin];
+        const api = makeRisuaiAPIV3(document.createElement("iframe"), plugin as any) as any;
+
+        await expect(api._setPluginStorage("unsupported-map", new Map([["key", "value"]])))
+            .rejects.toMatchObject({
+                name: "StorageError",
+                code: "PLUGIN_STORAGE_VALUE_UNSUPPORTED",
+                status: 400,
+                retryable: false,
+                commitOutcomeUnknown: false,
+            });
+        await expect(api._setPluginStorage("unsupported-set", new Set(["value"])))
+            .rejects.toMatchObject({ code: "PLUGIN_STORAGE_VALUE_UNSUPPORTED" });
+
+        expect(notifyErrorMock).toHaveBeenCalledOnce();
+        expect(notifyErrorMock).toHaveBeenCalledWith(
+            `Plugin "${plugin.name}" could not save its data.`,
+            {
+                description: expect.stringContaining(
+                    "Use only JSON-compatible data: null, booleans, finite numbers, strings, dense arrays, and plain objects.",
+                ),
+                source: "plugin-storage",
+            },
+        );
+    });
+
+    test("keeps structured-clone values compatible without storage optimization", async () => {
+        const plugin = startupPlugin("Structured Clone Plugin", "");
+        testState.database.optimizePluginMemory = false;
+        testState.database.pluginStorageGeneration = undefined;
+        testState.database.pluginCustomStorage = {};
+        testState.database.plugins = [plugin];
+        const api = makeRisuaiAPIV3(document.createElement("iframe"), plugin as any) as any;
+        const value = {
+            createdAt: new Date("2026-01-02T03:04:05.000Z"),
+            lookup: new Map([["key", "value"]]),
+            exact: 1n,
+        };
+
+        await expect(api._setPluginStorage("legacy-value", value))
+            .resolves.toBeUndefined();
+        await expect(api._getPluginStorage("legacy-value")).resolves.toEqual(value);
+        expect(notifyErrorMock).not.toHaveBeenCalled();
+        expect(storageMocks.persistent.size).toBe(1); // Existing manifest only.
+    });
+
     test("carries network, import, session, and ack-loss mutation outcomes through the guest bridge", async () => {
         const calls = new Map<string, number>();
         const count = (key: string) => calls.set(key, (calls.get(key) ?? 0) + 1);

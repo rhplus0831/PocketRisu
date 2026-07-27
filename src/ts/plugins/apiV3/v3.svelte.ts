@@ -1074,6 +1074,43 @@ export const makeRisuaiAPIV3 = (
             }], plugin.name, signal)
         ),
     });
+    const reportedPluginStorageCompatibilityErrors = new Set<string>();
+    const reportPluginStorageCompatibilityError = (candidate: unknown): void => {
+        if (getDatabase().optimizePluginMemory !== true
+            || candidate === null
+            || typeof candidate !== "object") return;
+        const source = candidate as Record<string, unknown>;
+        const nested = source.error && typeof source.error === "object"
+            ? source.error as Record<string, unknown>
+            : source;
+        const code = typeof nested.code === "string" ? nested.code : "";
+        if (code !== "PLUGIN_STORAGE_VALUE_UNSUPPORTED"
+            && code !== "PLUGIN_VALUE_TOO_LARGE") return;
+        if (reportedPluginStorageCompatibilityErrors.has(code)) return;
+        reportedPluginStorageCompatibilityErrors.add(code);
+        notifyError(language.pluginStorageWriteRejected(plugin.name), {
+            description: typeof nested.message === "string" && nested.message.length > 0
+                ? nested.message
+                : "Optimized plugin storage rejected an unsupported value.",
+            source: "plugin-storage",
+        });
+    };
+    const observePluginStorageOperation = async <T>(operation: Promise<T>): Promise<T> => {
+        try {
+            const result = await operation;
+            reportPluginStorageCompatibilityError(result);
+            return result;
+        } catch (error) {
+            reportPluginStorageCompatibilityError(error);
+            throw error;
+        }
+    };
+    const runPluginStorageWriter = <T>(
+        operation: () => Promise<T>,
+        signal?: AbortSignal,
+    ): Promise<T> => observePluginStorageOperation(
+        pluginStorageUpdates.runWriter(operation, signal),
+    );
     lifecycle.addPostUnloadDrain(() => pluginStorageUpdates.drainPendingPublications());
     return {
 
@@ -1197,7 +1234,7 @@ export const makeRisuaiAPIV3 = (
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
         setDatabaseLite: async (database: unknown, signal?: AbortSignal) => {
-            await pluginStorageUpdates.runWriter(async () => {
+            await runPluginStorageWriter(async () => {
                 const conf = await getPluginPermission(
                     plugin.name,
                     'db',
@@ -1210,7 +1247,7 @@ export const makeRisuaiAPIV3 = (
             }, signal);
         },
         setDatabase: async (database: unknown, signal?: AbortSignal) => {
-            await pluginStorageUpdates.runWriter(async () => {
+            await runPluginStorageWriter(async () => {
                 const conf = await getPluginPermission(
                     plugin.name,
                     'db',
@@ -1743,7 +1780,7 @@ export const makeRisuaiAPIV3 = (
             read: Parameters<typeof setOwnedPluginSaveStorageItemFromRead>[0],
             value: unknown,
             signal?: AbortSignal,
-        ) => pluginStorageUpdates.runWriter(
+        ) => runPluginStorageWriter(
             () => setOwnedPluginSaveStorageItemFromRead(read, value, plugin.name, signal),
             signal,
         ),
@@ -1751,7 +1788,7 @@ export const makeRisuaiAPIV3 = (
             operations: Parameters<typeof atomicBatchOwnedPluginSaveStorage>[0],
             _unloadCapabilityOrRequestSignal?: AbortSignal,
             requestSignal?: AbortSignal,
-        ) => pluginStorageUpdates.runWriter(
+        ) => runPluginStorageWriter(
             () => atomicBatchOwnedPluginSaveStorage(
                 operations,
                 plugin.name,
@@ -1765,7 +1802,7 @@ export const makeRisuaiAPIV3 = (
             expectedRevision?: string | null,
             _unloadCapabilityOrRequestSignal?: AbortSignal,
             requestSignal?: AbortSignal,
-        ) => pluginStorageUpdates.runWriter(
+        ) => runPluginStorageWriter(
             () => rewriteOwnedPluginSaveStorageItem(
                 key,
                 value,
@@ -1781,44 +1818,46 @@ export const makeRisuaiAPIV3 = (
             options?: PluginStorageUpdateOptions,
             unloadSignal?: AbortSignal,
             requestSignal?: AbortSignal,
-        ) => pluginStorageUpdates.updateItem(
-            key,
-            transform,
-            options,
-            [unloadSignal, requestSignal],
+        ) => observePluginStorageOperation(
+            pluginStorageUpdates.updateItem(
+                key,
+                transform,
+                options,
+                [unloadSignal, requestSignal],
+            ),
         ),
         _setPluginStorage: async (key: string, value: any, signal?: AbortSignal) => {
-            await pluginStorageUpdates.runWriter(
+            await runPluginStorageWriter(
                 () => setOwnedPluginSaveStorageItem(key, value, plugin.name, signal),
                 signal,
             )
         },
         _setPluginStorageWithOutcome: (key: string, value: any, signal?: AbortSignal) => (
-            pluginStorageUpdates.runWriter(
+            runPluginStorageWriter(
                 () => setOwnedPluginSaveStorageItemWithOutcome(key, value, plugin.name, signal),
                 signal,
             )
         ),
         _removePluginStorage: async (key: string, signal?: AbortSignal) => {
-            await pluginStorageUpdates.runWriter(
+            await runPluginStorageWriter(
                 () => removeOwnedPluginSaveStorageItem(key, signal),
                 signal,
             )
         },
         _removePluginStorageWithOutcome: (key: string, signal?: AbortSignal) => (
-            pluginStorageUpdates.runWriter(
+            runPluginStorageWriter(
                 () => removeOwnedPluginSaveStorageItemWithOutcome(key, signal),
                 signal,
             )
         ),
         _removePluginStorageConfirmed: (key: string, signal?: AbortSignal) => (
-            pluginStorageUpdates.runWriter(
+            runPluginStorageWriter(
                 () => removeOwnedPluginSaveStorageItemConfirmed(key, signal),
                 signal,
             )
         ),
         _clearPluginStorage: async (signal?: AbortSignal) => {
-            await pluginStorageUpdates.runWriter(
+            await runPluginStorageWriter(
                 () => clearOwnedPluginSaveStorage(signal),
                 signal,
             )

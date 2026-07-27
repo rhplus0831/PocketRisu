@@ -271,13 +271,24 @@ while the SQLite queries have no `ORDER BY` (`server/node/db.cjs:136-139`,
 
 ### Resolution
 
-**Fixed 2026-07-26.** Plugin storage now accepts a strict, detached JSON value
-tree in both modes. Descriptor-based validation rejects accessors, symbols,
-non-enumerable properties, sparse arrays, custom prototypes/`toJSON`, cycles,
-non-finite numbers, `BigInt`, and other lossy values before any asynchronous
-write or inline mutation. Caller-owned objects are snapshotted at ingress;
-the save-backed and safe-local facades publish caches only after persistence
-succeeds, so later caller mutation or a rejected write cannot poison reads.
+**Adjusted 2026-07-27.** The compatibility boundary is mode-specific. With
+plugin-memory optimization disabled, the basic V3 save-storage get/set path
+and database bridge retain the legacy structured-clone value behavior instead
+of imposing the new JSON and per-value limits. With optimization enabled,
+descriptor-based validation rejects accessors, symbols, non-enumerable
+properties, sparse arrays, custom prototypes/`toJSON`, cycles, non-finite
+numbers, `BigInt`, and other lossy values before asynchronous storage I/O.
+Caller-owned values are still detached at ingress so later mutation cannot
+change a queued write. Versioned, atomic, and generation APIs remain JSON-only
+in either mode because their revisions and content hashes require canonical
+JSON bytes.
+
+Optimized runtime rejection now uses the stable
+`PLUGIN_STORAGE_VALUE_UNSUPPORTED` code, an actionable explanation, and a
+deduplicated user notification that identifies the plugin. Enabling the mode
+over incompatible existing data fails before mutation with the same code and
+a transition-specific explanation. `PLUGIN_VALUE_TOO_LARGE` similarly gains
+plugin/mode context while preserving its existing limit details.
 
 Mode reconciliation uses separate prepare/apply phases. It validates complete
 inline value and owner records plus every retained external orphan before the

@@ -112,6 +112,7 @@
                     "PLUGIN_STORAGE_SIZE_LIMIT",
                     "PLUGIN_STORAGE_MEMORY_LIMIT",
                     "PLUGIN_STORAGE_DISK_LIMIT",
+                    "PLUGIN_STORAGE_VALUE_UNSUPPORTED",
                     "PLUGIN_VALUE_TOO_LARGE",
                     "PLUGIN_STORAGE_TOTAL_TOO_LARGE",
                 ])

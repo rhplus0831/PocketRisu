@@ -1228,8 +1228,13 @@ interface PluginStorage {
     /**
      * Sets an item in storage
      * @param key - Storage key
-     * @param value - Value to store (a JSON value: null, boolean, finite number,
-     * string, dense array, or plain object containing only JSON values)
+     * @param value - Value to store. With “Optimize plugin memory usage” off,
+     * the legacy inline backend accepts structured-clone-compatible values.
+     * With optimization on, values must be JSON-compatible: null, booleans,
+     * finite numbers, strings, dense arrays, and plain objects containing only
+     * JSON values. Unsupported optimized values reject with StorageError code
+     * `PLUGIN_STORAGE_VALUE_UNSUPPORTED`; oversized values use
+     * `PLUGIN_VALUE_TOO_LARGE`.
      * @returns Promise that resolves when item is stored
      */
     setItem(key: string, value: any): Promise<void>;

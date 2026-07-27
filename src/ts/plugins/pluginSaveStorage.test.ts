@@ -1984,34 +1984,87 @@ describe("plugin save storage transport", () => {
         await expect(getPluginSaveStorageKeys()).resolves.toEqual([]);
     });
 
-    test.each([false, true])(
-        "rejects unrepresentable JSON without mutating %s mode",
-        async (optimized) => {
-            database.optimizePluginMemory = optimized;
-            const invalidValues: unknown[] = [
-                undefined,
-                () => undefined,
-                new Map([["key", "value"]]),
-                new Set(["value"]),
-                { nested: undefined },
-                { nested: Number.NaN },
-                { nested: 1n },
-            ];
-            const cycle: Record<string, unknown> = {};
-            cycle.self = cycle;
-            invalidValues.push(cycle);
+    test("preserves structured-clone storage behavior while optimization is disabled", async () => {
+        const cycle: Record<string, unknown> = { label: "cycle" };
+        cycle.self = cycle;
+        const sparse = new Array(2);
+        sparse[1] = "present";
+        const values = [
+            undefined,
+            new Date("2026-01-02T03:04:05.000Z"),
+            new Map([["key", "value"]]),
+            new Set(["value"]),
+            { nested: Number.NaN },
+            { nested: 1n },
+            sparse,
+            cycle,
+        ];
 
-            const { writePersistentJson } = await import("../storage/persistentKv");
-            for (const [index, value] of invalidValues.entries()) {
-                await expect(setPluginSaveStorageItem(`invalid-${index}`, value))
-                    .rejects.toThrow(TypeError);
-            }
+        for (const [index, value] of values.entries()) {
+            await expect(setPluginSaveStorageItem(`legacy-${index}`, value))
+                .resolves.toBeUndefined();
+        }
 
-            expect(Object.keys(database.pluginCustomStorage)).toEqual([]);
-            expect(persistent.size).toBe(0);
-            expect(writePersistentJson).not.toHaveBeenCalled();
-        },
-    );
+        await expect(getPluginSaveStorageItem("legacy-0")).resolves.toBeNull();
+        await expect(getPluginSaveStorageItem("legacy-1"))
+            .resolves.toEqual(new Date("2026-01-02T03:04:05.000Z"));
+        await expect(getPluginSaveStorageItem("legacy-2"))
+            .resolves.toEqual(new Map([["key", "value"]]));
+        await expect(getPluginSaveStorageItem("legacy-3"))
+            .resolves.toEqual(new Set(["value"]));
+        expect((await getPluginSaveStorageItem<any>("legacy-4")).nested).toBeNaN();
+        await expect(getPluginSaveStorageItem("legacy-5"))
+            .resolves.toEqual({ nested: 1n });
+        const storedSparse = await getPluginSaveStorageItem<any[]>("legacy-6");
+        expect(storedSparse).toHaveLength(2);
+        expect(Object.hasOwn(storedSparse!, 0)).toBe(false);
+        const storedCycle = await getPluginSaveStorageItem<any>("legacy-7");
+        expect(storedCycle.self).toBe(storedCycle);
+        const { preparePersistentJson } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        expect(preparePersistentJson).not.toHaveBeenCalled();
+        expect(persistent.size).toBe(0);
+    });
+
+    test("optimized writes reject unsupported values with an actionable error", async () => {
+        database.optimizePluginMemory = true;
+        const invalidValues: unknown[] = [
+            undefined,
+            () => undefined,
+            new Map([["key", "value"]]),
+            new Set(["value"]),
+            { nested: undefined },
+            { nested: Number.NaN },
+            { nested: 1n },
+        ];
+        const cycle: Record<string, unknown> = {};
+        cycle.self = cycle;
+        invalidValues.push(cycle);
+
+        const { writePersistentJson } = await import("../storage/persistentKv");
+        for (const [index, value] of invalidValues.entries()) {
+            await expect(setOwnedPluginSaveStorageItem(
+                `invalid-${index}`,
+                value,
+                "Compatibility Test",
+            )).rejects.toMatchObject({
+                name: "StorageError",
+                status: 400,
+                code: "PLUGIN_STORAGE_VALUE_UNSUPPORTED",
+                operation: "write",
+                retryable: false,
+                commitOutcomeUnknown: false,
+                message: expect.stringContaining(
+                    "Plugin \"Compatibility Test\" cannot save this value while “Optimize plugin memory usage” is enabled.",
+                ),
+            });
+        }
+
+        expect(Object.keys(database.pluginCustomStorage)).toEqual([]);
+        expect(persistent.size).toBe(0);
+        expect(writePersistentJson).not.toHaveBeenCalled();
+    });
 
     test("inline get rejects an accessor without invoking it", async () => {
         let getterCalls = 0;
@@ -3246,6 +3299,47 @@ describe("transitionPluginStorageMode", () => {
         expect(database.pluginCustomStorage).toEqual({ alpha: { retained: true } });
     });
 
+    test("production enable explains unsupported existing plugin values", async () => {
+        database.optimizePluginMemory = false;
+        database.pluginCustomStorage = {
+            compatible: { retained: true },
+            unsupported: new Map([["key", "value"]]),
+        };
+
+        await expect(transitionPluginStorageMode(true)).rejects.toMatchObject({
+            name: "StorageError",
+            status: 400,
+            code: "PLUGIN_STORAGE_VALUE_UNSUPPORTED",
+            operation: "transition",
+            retryable: false,
+            commitOutcomeUnknown: false,
+            message: expect.stringContaining(
+                "Some existing plugin data cannot be moved into optimized storage",
+            ),
+        });
+
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginCustomStorage.compatible).toEqual({ retained: true });
+        expect(database.pluginCustomStorage.unsupported).toBeInstanceOf(Map);
+    });
+
+    test("production enable does not misreport a network TypeError as incompatible data", async () => {
+        database.optimizePluginMemory = false;
+        database.pluginCustomStorage = { compatible: { retained: true } };
+        const { listPersistentEntriesWithSizes } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        const networkError = new TypeError("network unavailable during inventory");
+        listPersistentEntriesWithSizes.mockRejectedValueOnce(networkError);
+
+        await expect(transitionPluginStorageMode(true)).rejects.toBe(networkError);
+
+        expect(database.optimizePluginMemory).toBe(false);
+        expect(database.pluginCustomStorage).toEqual({
+            compatible: { retained: true },
+        });
+    });
+
     test("production enable releases acknowledged rows and switches routing only after commit", async () => {
         database.optimizePluginMemory = false;
         database.pluginCustomStorage = {
@@ -3934,7 +4028,13 @@ describe("transitionPluginStorageMode", () => {
                     removePersistentKey,
                     persistDatabase,
                 },
-            })).rejects.toThrow(TypeError);
+            })).rejects.toMatchObject({
+                name: "StorageError",
+                code: "PLUGIN_STORAGE_VALUE_UNSUPPORTED",
+                operation: "transition",
+                retryable: false,
+                commitOutcomeUnknown: false,
+            });
 
             expect(database.optimizePluginMemory).toBe(false);
             expect(database.pluginCustomStorage).toBe(originalValues);
