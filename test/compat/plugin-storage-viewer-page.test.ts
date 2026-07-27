@@ -6,6 +6,7 @@ import { existsSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
+import { encodeBackup } from './helpers/encode.js'
 import utilsPkg from '../../server/node/utils.cjs'
 
 const { encodeRisuSaveLegacy } = utilsPkg as {
@@ -105,6 +106,30 @@ function batchBody(keys: string[], manifest: any, phase: string): Uint8Array {
       owner: `Owner ${index % 7}`,
     })),
   }))
+}
+
+function revisionBatchBody(
+  manifestRevision: string,
+  operations: Array<Record<string, unknown>>,
+): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify({
+    version: 2,
+    generation: GENERATION,
+    expectedManifestRevision: manifestRevision,
+    operations,
+  }))
+}
+
+async function revisionBatch(
+  client: RisuClient,
+  manifestRevision: string,
+  operations: Array<Record<string, unknown>>,
+): Promise<Response> {
+  return client.fetch('/api/plugin-storage/batch', {
+    method: 'POST',
+    headers: { 'content-type': 'application/octet-stream' },
+    body: revisionBatchBody(manifestRevision, operations),
+  })
 }
 
 async function mutate(
@@ -243,6 +268,76 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
     expect(unknown.entries.every(entry => entry.owner === null)).toBe(true)
   })
 
+  test('viewer revisions reject stale same-key edits and deletes, then permit a fresh edit', async () => {
+    const server = await spawnServer({ seedSave: async saveDir => { seedViewer(saveDir, 1) } })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const initial = await readViewer(await viewer(client))
+    const entry = initial.entries[0]
+    expect(entry.revision).toMatch(/^sha256:[0-9a-f]{64}$/)
+
+    expect((await mutate(client, [entry.key], {
+      version: 1,
+      generation: GENERATION,
+      valueKeys: [valueKey(entry.key)],
+      metaKeys: [ownerKey(entry.key)],
+    }, 'concurrent')).status).toBe(200)
+    const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
+    const readPair = () => ({
+      value: Buffer.from((sqlite.prepare('SELECT value FROM kv WHERE key = ?')
+        .get(valueKey(entry.key)) as { value: Buffer }).value),
+      owner: Buffer.from((sqlite.prepare('SELECT value FROM kv WHERE key = ?')
+        .get(ownerKey(entry.key)) as { value: Buffer }).value),
+    })
+    const concurrentPair = readPair()
+
+    const staleSet = await revisionBatch(client, initial.meta.manifestRevision, [{
+      operation: 'set',
+      key: entry.key,
+      value: Buffer.from('{"phase":"stale-overwrite"}').toString('base64'),
+      owner: entry.owner,
+      expectedRevision: entry.revision,
+    }])
+    expect(staleSet.status).toBe(409)
+    expect(await staleSet.json()).toMatchObject({
+      code: 'PLUGIN_STORAGE_REVISION_CONFLICT',
+      outcome: 'not-committed',
+      retryable: false,
+    })
+    expect(readPair()).toEqual(concurrentPair)
+
+    const staleDelete = await revisionBatch(client, initial.meta.manifestRevision, [{
+      operation: 'remove',
+      key: entry.key,
+      expectedRevision: entry.revision,
+    }])
+    expect(staleDelete.status).toBe(409)
+    expect(await staleDelete.json()).toMatchObject({
+      code: 'PLUGIN_STORAGE_REVISION_CONFLICT',
+      outcome: 'not-committed',
+      retryable: false,
+    })
+    expect(readPair()).toEqual(concurrentPair)
+
+    const fresh = await readViewer(await viewer(client))
+    expect(fresh.entries[0].revision).not.toBe(entry.revision)
+    const freshSet = await revisionBatch(client, fresh.meta.manifestRevision, [{
+      operation: 'set',
+      key: entry.key,
+      value: Buffer.from('{"phase":"fresh-edit"}').toString('base64'),
+      owner: fresh.entries[0].owner,
+      expectedRevision: fresh.entries[0].revision,
+    }])
+    expect(freshSet.status).toBe(200)
+    expect(await freshSet.json()).toMatchObject({
+      success: true,
+      outcome: 'committed',
+      verification: 'verified',
+    })
+    expect(JSON.parse(readPair().value.toString())).toEqual({ phase: 'fresh-edit' })
+    sqlite.close()
+  })
+
   test('a same-membership body update cannot tear a pinned page and is not blocked by it', async () => {
     let seeded!: ReturnType<typeof seedViewer>
     let gateDir = ''
@@ -358,6 +453,67 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
 
     const mutation = await mutate(client, seeded.keys.slice(0, 1), seeded.manifest, 'after-abort')
     expect(mutation.status).toBe(200)
+  }, 30_000)
+
+  test('disconnect while an import owns the barrier cancels before that import releases', async () => {
+    let gateRoot = ''
+    const server = await spawnServer({
+      seedSave: async saveDir => {
+        seedViewer(saveDir, 1)
+        gateRoot = path.dirname(saveDir)
+        await mkdir(path.join(gateRoot, 'import-gate'), { recursive: true })
+        await mkdir(path.join(gateRoot, 'viewer-import-abort'), { recursive: true })
+        await writeFile(path.join(gateRoot, 'import-gate', 'hold'), '')
+      },
+      env: {
+        RISU_STREAM_INGEST_MIN_BYTES: '1',
+        POCKETRISU_BACKUP_IMPORT_TEST_GATE_DIR: 'import-gate',
+        POCKETRISU_TEST_BACKUP_IMPORT_FAILPOINT: 'after-database-ingestion',
+        POCKETRISU_TEST_PLUGIN_VIEWER_GATE_DIR: 'viewer-import-abort',
+      },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const backup = encodeBackup([{
+      name: 'database.risudat',
+      data: Buffer.from(encodeRisuSaveLegacy({ characters: [] })),
+    }])
+    expect((await client.fetch('/api/backup/import/prepare', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ size: backup.byteLength }),
+    })).status).toBe(200)
+    const importing = client.fetch('/api/backup/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-risu-backup' },
+      body: backup,
+    })
+    await waitForFile(path.join(gateRoot, 'import-gate', 'entered'), 10_000)
+
+    const controller = new AbortController()
+    const pendingViewer = client.fetch('/api/plugin-storage/viewer-page', {
+      headers: { 'x-plugin-storage-generation': GENERATION },
+      signal: controller.signal,
+    })
+    await new Promise(resolve => setTimeout(resolve, 100))
+    controller.abort(new DOMException('viewer superseded during import', 'AbortError'))
+    await expect(pendingViewer).rejects.toMatchObject({ name: 'AbortError' })
+
+    // The server-side waiter must finish while the import still owns the
+    // barrier. Waiting for import release would keep an abandoned request and
+    // its closures alive for the entire streamed import.
+    const resultPath = path.join(gateRoot, 'viewer-import-abort', 'result.json')
+    await waitForFile(resultPath, 2_000)
+    expect(JSON.parse(await readFile(resultPath, 'utf-8'))).toMatchObject({
+      aborted: true,
+      valueReads: 0,
+      ownerReads: 0,
+    })
+
+    await writeFile(path.join(gateRoot, 'import-gate', 'release'), '')
+    const importResponse = await importing
+    await importResponse.text()
+    expect(importResponse.ok).toBe(false)
   }, 30_000)
 
   test('rejects stale generations and page sizes above the hard maximum', async () => {

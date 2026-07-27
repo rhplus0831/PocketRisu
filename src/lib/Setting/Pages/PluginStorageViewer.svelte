@@ -30,11 +30,13 @@
     import { getOwners, removeOwner } from 'src/ts/plugins/pluginStorageMeta'
     import { language } from 'src/lang'
     import {
+        atomicBatchOwnedPluginSaveStorage,
         clearOwnedPluginSaveStorage,
         getPluginSaveStorageViewerPage,
-        removeOwnedPluginSaveStorageItem,
-        setPluginSaveStorageItem,
+        rewriteOwnedPluginSaveStorageItem,
     } from 'src/ts/plugins/pluginSaveStorage'
+    import { PLUGIN_STORAGE_REVISION_PATTERN } from 'src/ts/storage/pluginStorageBatch'
+    import { StorageError } from 'src/ts/storage/storageError'
     import {
         loadPluginStorageViewerPage,
         PluginStorageViewerLoadCoordinator,
@@ -51,6 +53,13 @@
     const UNKNOWN = '__risu_unknown__'
 
     type Entry = PluginStorageViewerEntry
+
+    class PluginStorageViewerConflict extends Error {
+        constructor() {
+            super('Plugin storage changed after this page was loaded.')
+            this.name = 'PluginStorageViewerConflict'
+        }
+    }
 
     const BACKENDS: { id: BackendId; label: () => string; desc: () => string }[] = [
         { id: 'save', label: () => language.pluginStorageBackendSave, desc: () => language.pluginStorageBackendSaveDesc },
@@ -147,31 +156,71 @@
     }
 
     // ── backend access ───────────────────────────────────────────────────────
-    async function backendSet(key: string, value: unknown): Promise<void> {
+    function requireSaveRevision(entry: PluginStorageViewerEntry): string {
+        if (typeof entry.revision !== 'string'
+            || !PLUGIN_STORAGE_REVISION_PATTERN.test(entry.revision)) {
+            throw new Error('The save-storage entry has no valid point-in-time revision.')
+        }
+        return entry.revision
+    }
+
+    async function backendSet(entry: Entry, value: unknown): Promise<void> {
         if (backend === 'save') {
-            await setPluginSaveStorageItem(key, value)
+            const result = await rewriteOwnedPluginSaveStorageItem(
+                entry.key,
+                value,
+                entry.owner ?? '',
+                requireSaveRevision(entry),
+            )
+            if (!result.committed) throw new PluginStorageViewerConflict()
             return
         }
         if (backend === 'local') {
-            safeLocal.setItem(key, value as string)
+            safeLocal.setItem(entry.key, value as string)
             return
         }
-        await idb.setItem(key, value)
+        await idb.setItem(entry.key, value)
     }
 
-    async function backendRemove(key: string): Promise<void> {
+    async function removeSaveEntries(targets: readonly Entry[]): Promise<void> {
+        const result = await atomicBatchOwnedPluginSaveStorage(
+            targets.map((entry) => ({
+                type: 'remove' as const,
+                key: entry.key,
+                expectedRevision: requireSaveRevision(entry),
+            })),
+            '',
+        )
+        if (!result.committed) throw new PluginStorageViewerConflict()
+    }
+
+    async function backendRemove(entry: PluginStorageViewerKey): Promise<void> {
         // Drop the value, then its origin record so the sidecar doesn't keep a
         // dangling entry. (The idb instance here has no owner, so its own
         // removeItem won't touch meta — we clean it explicitly.)
         if (backend === 'save') {
-            await removeOwnedPluginSaveStorageItem(key)
+            await removeSaveEntries([entry as Entry])
             return
         } else if (backend === 'local') {
-            safeLocal.removeItem(key)
+            safeLocal.removeItem(entry.key)
         } else {
-            await idb.removeItem(key)
+            await idb.removeItem(entry.key)
         }
-        await removeOwner(backend, key)
+        await removeOwner(backend, entry.key)
+    }
+
+    async function reportMutationFailure(error: unknown): Promise<void> {
+        if (error instanceof PluginStorageViewerConflict) {
+            notifyError(language.pluginStorageViewerStale)
+            await load()
+            return
+        }
+        if (error instanceof StorageError && error.commitOutcomeUnknown) {
+            notifyError(language.pluginStorageViewerOutcomeUnknown)
+            await load()
+            return
+        }
+        notifyError(error instanceof Error ? error.message : String(error))
     }
 
     // ── actions ────────────────────────────────────────────────────────────
@@ -343,7 +392,7 @@
                     saveValue = editText
                 }
             }
-            await backendSet(selected.key, saveValue)
+            await backendSet(selected, saveValue)
             const savedKey = selected.key
             await loadPage(page)
             selected = entries.find((e) => e.key === savedKey) ?? null
@@ -351,7 +400,7 @@
             if (!selected) detailOpen = false
             notifySuccess(language.pluginStorageSaved(savedKey))
         } catch (e) {
-            notifyError(e instanceof Error ? e.message : String(e))
+            await reportMutationFailure(e)
         } finally {
             saving = false
         }
@@ -361,12 +410,12 @@
         const ok = await alertConfirm(language.pluginStorageDeleteConfirm(entry.key))
         if (!ok) return
         try {
-            await backendRemove(entry.key)
+            await backendRemove(entry)
             if (selected?.key === entry.key) detailOpen = false
             await load()
             notifySuccess(language.pluginStorageDeleted)
         } catch (e) {
-            notifyError(e instanceof Error ? e.message : String(e))
+            await reportMutationFailure(e)
         }
     }
 
@@ -375,11 +424,13 @@
     // serves both partial and full clears. The label reflects which it is.
     async function removeFiltered() {
         // Snapshot before load() swaps `entries` out from under `filtered`.
-        const targets = !isFiltered
-            ? keyEntries.slice()
-            : searchVal.trim() !== ''
-                ? filtered.slice()
-                : filteredKeys.slice()
+        const targets = backend === 'save' && isFiltered
+            ? filtered.slice()
+            : !isFiltered
+                ? keyEntries.slice()
+                : searchVal.trim() !== ''
+                    ? filtered.slice()
+                    : filteredKeys.slice()
         if (targets.length === 0) return
 
         const isAll = !isFiltered
@@ -397,16 +448,16 @@
                 // server transaction; inline mode publishes one empty value
                 // map through the same primitive.
                 await clearOwnedPluginSaveStorage()
+            } else if (backend === 'save') {
+                await removeSaveEntries(targets as Entry[])
             } else {
-                for (const e of targets) await backendRemove(e.key)
+                for (const e of targets) await backendRemove(e)
             }
             detailOpen = false
             await load()
             notifySuccess(language.pluginStorageBulkDeleted(targetCount))
         } catch (e) {
-            notifyError(e instanceof Error ? e.message : String(e))
-            // Re-sync the UI to whatever actually got removed on partial failure.
-            await load()
+            await reportMutationFailure(e)
         }
     }
 

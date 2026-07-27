@@ -1765,6 +1765,10 @@ describe("plugin save storage transport", () => {
         });
 
         expect(result.entries).toHaveLength(50);
+        expect(result.entries[37]).toMatchObject({
+            key: "key-37",
+            revision: `sha256:${(37).toString(16).padStart(64, "0")}`,
+        });
         expect(result.total).toBe(10_000);
         expect(readPersistentPluginStorageViewerPage).toHaveBeenCalledOnce();
         expect(readPersistentPluginStorageViewerPage).toHaveBeenCalledWith(
@@ -1798,6 +1802,23 @@ describe("plugin save storage transport", () => {
             ownerQuery: "Owner A",
         });
         expect(owned.entries.map(entry => entry.key)).toEqual(["alpha"]);
+        const versionedAlpha = await getPluginSaveStorageItemWithRevision("alpha");
+        expect(owned.entries[0].revision).toBe(versionedAlpha.revision);
+        const firstAlphaRevision = owned.entries[0].revision;
+        const firstAlphaPageToken = owned.pageToken;
+        database.pluginStorageMeta.alpha = {
+            plugin: "Owner A",
+            updatedAt: 2,
+            revision: "123e4567-e89b-42d3-a456-426614174000",
+            generation: "123e4567-e89b-42d3-a456-426614174001",
+        };
+        const republishedAlpha = await getPluginSaveStorageViewerPage({
+            page: 1,
+            pageSize: 1,
+            ownerQuery: "Owner A",
+        });
+        expect(republishedAlpha.entries[0].revision).not.toBe(firstAlphaRevision);
+        expect(republishedAlpha.pageToken).not.toBe(firstAlphaPageToken);
         expect(owned).toMatchObject({
             page: 1,
             pageCount: 2,

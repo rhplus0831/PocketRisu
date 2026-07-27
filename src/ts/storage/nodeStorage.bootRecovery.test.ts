@@ -348,6 +348,7 @@ describe('NodeStorage boot snapshot recovery', () => {
             status: 200,
             body: {
                 ok: true,
+                key: 'database/dbbackup-456.bin',
                 commitOutcome: 'committed',
                 commitOutcomeUnknown: false,
                 extra: true,
@@ -358,6 +359,7 @@ describe('NodeStorage boot snapshot recovery', () => {
             status: 201,
             body: {
                 ok: true,
+                key: 'database/dbbackup-456.bin',
                 commitOutcome: 'committed',
                 commitOutcomeUnknown: false,
             },
@@ -410,6 +412,7 @@ describe('NodeStorage boot snapshot recovery', () => {
         )).rejects.toMatchObject({
             status: 500,
             code: 'SNAPSHOT_RESTORE_NOT_COMMITTED',
+            commitOutcome: 'not-committed',
             commitOutcomeUnknown: false,
             retryable: true,
         } satisfies Partial<InstanceType<typeof StorageError>>)

@@ -559,14 +559,22 @@ function reconcilePluginStorageUsage() {
 }
 
 function reconcilePluginStorageOwners() {
-    const rows = db.prepare(
+    // A better-sqlite3 connection cannot write while one of its own iterators
+    // is active. Use a short-lived read connection so boot can rebuild the
+    // derived index without retaining every owner body in an `.all()` array.
+    const ownerSource = new Database(dbPath, { readonly: true });
+    const rows = ownerSource.prepare(
         `SELECT key, value FROM kv WHERE key LIKE 'pluginsave-meta/%'`,
-    ).all();
+    );
     const reconcile = db.transaction(() => {
         db.prepare('DELETE FROM plugin_storage_owners').run();
-        for (const row of rows) updatePluginStorageOwnerIndex(row.key, row.value);
+        for (const row of rows.iterate()) updatePluginStorageOwnerIndex(row.key, row.value);
     });
-    reconcile();
+    try {
+        reconcile();
+    } finally {
+        ownerSource.close();
+    }
 }
 
 // The counter is an optimization, not an authority. Rebuild it on every boot

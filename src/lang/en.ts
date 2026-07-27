@@ -1892,6 +1892,8 @@ export const languageEnglish = {
     pluginStorageBulkDeleteConfirm: (backend: string, n: number) => `Delete ${n} item(s) from the ${backend} backend? This cannot be undone.`,
     pluginStorageBulkDeleteAllConfirm: (backend: string, n: number) => `Delete ALL ${n} plugin storage item(s) from the ${backend} backend? This cannot be undone.`,
     pluginStorageBulkDeleted: (n: number) => `Deleted ${n} item(s)`,
+    pluginStorageViewerStale: "Plugin storage changed after this page loaded. The latest value has been reloaded; review it before trying again.",
+    pluginStorageViewerOutcomeUnknown: "The server may have applied this plugin-storage change. The authoritative value has been reloaded; do not retry automatically.",
     systemLogsFilters: "Filters",
     systemLogsFilterLevel: "Level",
     systemLogsFilterOrigin: "Origin",

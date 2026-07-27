@@ -2766,12 +2766,16 @@ export class NodeStorage{
                         retryAfter: parseRetryAfterSeconds(failure?.retryAfter),
                         retryable: definitive && failure?.retryable === true,
                         commitOutcomeUnknown: !definitive,
+                        commitOutcome: explicitlyNotCommitted
+                            ? 'not-committed'
+                            : (!definitive ? 'unknown' : null),
                         operation: 'transition',
                     },
                 )
             }
 
-            if (!isExactInternalSnapshotRestoreAcknowledgement(payload, key)) {
+            if (response.status !== 200
+                || !isExactInternalSnapshotRestoreAcknowledgement(payload, key)) {
                 throw new StorageError('Snapshot restore returned an invalid commit acknowledgement', {
                     status: response.status,
                     code: 'COMMIT_OUTCOME_UNKNOWN',

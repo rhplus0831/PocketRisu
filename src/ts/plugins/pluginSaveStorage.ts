@@ -2026,7 +2026,7 @@ async function getPluginSaveStorageEnumerationSnapshot(
 }
 
 export interface PluginSaveStorageViewerPage {
-    entries: PluginStorageViewerEntry[];
+    entries: (PluginStorageViewerEntry & { revision: string })[];
     generation: string | null;
     manifestRevision: string | null;
     databaseRevision: string | null;
@@ -2107,6 +2107,7 @@ export async function getPluginSaveStorageViewerPage(
                     text: entry.text,
                     size: entry.size,
                     type: entry.valueType,
+                    revision: entry.revision,
                 })),
             };
         }
@@ -2144,18 +2145,37 @@ export async function getPluginSaveStorageViewerPage(
         );
         // No await occurs while these rows are detached, so every selected
         // value and owner belongs to the same in-memory publication turn.
-        const entries = selectedKeys.map((key) => {
-            const value = snapshotJsonValue(values[key]);
-            const text = valueToPluginStorageViewerText(value);
-            const owner = meta[key]?.plugin;
+        const selectedSources = selectedKeys.map((key) => {
+            const ownerRowPresent = hasPluginStorageRecordValue(meta, key);
             return {
                 key,
+                value: snapshotJsonValue(values[key]),
+                ownerRowPresent,
+                ownerRecord: ownerRowPresent ? snapshotJsonValue(meta[key]) : undefined,
+            };
+        });
+        const entries: (PluginStorageViewerEntry & { revision: string })[] = [];
+        for (const source of selectedSources) {
+            throwIfAborted(options.signal);
+            const text = valueToPluginStorageViewerText(source.value);
+            const owner = source.ownerRecord
+                && typeof source.ownerRecord === "object"
+                && !Array.isArray(source.ownerRecord)
+                ? (source.ownerRecord as { plugin?: unknown }).plugin
+                : undefined;
+            entries.push({
+                key: source.key,
                 ...(typeof owner === "string" && owner ? { owner } : {}),
                 text,
                 size: new TextEncoder().encode(text).byteLength,
-                type: detectPluginStorageViewerType(value, text),
-            };
-        });
+                type: detectPluginStorageViewerType(source.value, text),
+                revision: await inlinePluginStorageRevision(
+                    source.value,
+                    source.ownerRecord,
+                    source.ownerRowPresent,
+                ),
+            });
+        }
         throwIfAborted(options.signal);
         const pageToken = `sha256:${await sha256OwnedBytes(new TextEncoder().encode(
             stringifyJsonValue([
@@ -2174,6 +2194,7 @@ export async function getPluginSaveStorageViewerPage(
                     entry.text,
                     entry.size,
                     entry.type,
+                    entry.revision,
                 ]),
             ]),
         ))}`;

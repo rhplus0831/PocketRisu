@@ -5,7 +5,7 @@ const { createImportBarrier } = pkg as {
     createImportBarrier: (opts?: { drainMutations?: () => Promise<unknown> }) => {
         acquire: () => Promise<() => void>
         isHeld: () => boolean
-        waitUntilIdle: () => Promise<void>
+        waitUntilIdle: (signal?: AbortSignal | null) => Promise<void>
     }
 }
 
@@ -63,6 +63,21 @@ describe('import barrier', () => {
     it('lets a waiter pass immediately while idle', async () => {
         const barrier = createImportBarrier()
 
+        await expect(barrier.waitUntilIdle()).resolves.toBeUndefined()
+    })
+
+    it('lets an abandoned waiter cancel while the holder remains active', async () => {
+        const barrier = createImportBarrier()
+        const release = await barrier.acquire()
+        const controller = new AbortController()
+        const reason = new DOMException('viewer closed', 'AbortError')
+        const waiter = barrier.waitUntilIdle(controller.signal)
+
+        controller.abort(reason)
+        await expect(waiter).rejects.toBe(reason)
+        expect(barrier.isHeld()).toBe(true)
+
+        release()
         await expect(barrier.waitUntilIdle()).resolves.toBeUndefined()
     })
 

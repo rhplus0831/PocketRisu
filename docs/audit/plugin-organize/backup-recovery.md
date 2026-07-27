@@ -218,8 +218,9 @@ Snapshot list, restore, and delete share one canonical key parser: only
 `database/dbbackup-<canonical-digits>.bin` with no leading zeros and safe parsed
 and millisecond timestamps is visible or actionable. The client repeats that
 validation, requires an exact list schema and newest-first order, and accepts a
-restore acknowledgement only for HTTP 200 with exactly the three expected
-fields and values. Extra fields, another 2xx status, truncation, or response loss
+restore acknowledgement only for HTTP 200 with exactly the four expected fields
+and values, including the echoed snapshot key. Extra fields, another 2xx status,
+truncation, or response loss
 remain `COMMIT_OUTCOME_UNKNOWN`.
 
 Corrupt boot is nonmutating until a recovery point is selected. Before the

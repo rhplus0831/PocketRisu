@@ -10,6 +10,8 @@ export interface PluginStorageViewerEntry extends PluginStorageViewerKey {
     text: string
     size: number
     type: string
+    /** Exact save-publication CAS token; absent for device-local backends. */
+    revision?: string
 }
 
 export class PluginStorageViewerLoadCancelled extends Error {

@@ -226,10 +226,21 @@ function queueStorageMutation(operation) {
 // entering the queue, then re-check from inside it: if an import won the race,
 // retry after that holder releases. If the read wins, the import's queue drain
 // stays behind it and cannot open its transaction until the read completes.
-async function queueStorageReadAfterImports(operation) {
+function throwIfSignalAborted(signal) {
+    if (!signal?.aborted) return;
+    if (signal.reason !== undefined) throw signal.reason;
+    const error = new Error('The operation was aborted');
+    error.name = 'AbortError';
+    throw error;
+}
+
+async function queueStorageReadAfterImports(operation, signal = null) {
     while (true) {
-        await importBarrier.waitUntilIdle();
+        throwIfSignalAborted(signal);
+        await importBarrier.waitUntilIdle(signal);
+        throwIfSignalAborted(signal);
         const attempt = await queueStorageOperation(async () => {
+            throwIfSignalAborted(signal);
             if (importBarrier.isHeld()) return { retry: true };
             return { retry: false, value: await operation() };
         });
@@ -6268,6 +6279,7 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
     let snapshot = null;
     let closed = false;
     let completed = false;
+    const requestAbort = new AbortController();
     const metrics = {
         manifestParses: 0,
         valueReads: 0,
@@ -6276,7 +6288,10 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
     };
     const isClosed = () => closed || req.aborted || res.destroyed;
     const onClose = () => {
-        if (!completed) closed = true;
+        if (!completed) {
+            closed = true;
+            requestAbort.abort(new DOMException('Plugin storage viewer closed', 'AbortError'));
+        }
     };
     req.once('aborted', onClose);
     res.once('close', onClose);
@@ -6286,8 +6301,9 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
         // queue, so a slow or abandoned viewer cannot block PM4 mutations.
         snapshot = await queueStorageReadAfterImports(async () => {
             await flushPendingDb();
+            throwIfSignalAborted(requestAbort.signal);
             return createKvSnapshot();
-        });
+        }, requestAbort.signal);
         if (isClosed()) return;
 
         const rawDatabase = snapshot.kvGet('database/database.bin');

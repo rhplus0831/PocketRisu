@@ -2057,6 +2057,8 @@ export const languageKorean = {
   pluginStorageBulkDeleteConfirm: (backend: string, n: number) => `${backend} 백엔드의 ${n}개 항목을 삭제합니다. 되돌릴 수 없습니다.`,
   pluginStorageBulkDeleteAllConfirm: (backend: string, n: number) => `${backend} 백엔드의 모든 플러그인 데이터 ${n}개를 삭제합니다. 되돌릴 수 없습니다.`,
   pluginStorageBulkDeleted: (n: number) => `${n}개 항목을 삭제했습니다`,
+  pluginStorageViewerStale: "이 페이지를 불러온 뒤 플러그인 저장소가 변경되었습니다. 최신 값을 다시 불러왔으니 재시도 전에 확인하세요.",
+  pluginStorageViewerOutcomeUnknown: "서버가 이 플러그인 저장소 변경을 적용했을 수 있습니다. 자동 재시도하지 않고 최신 값을 다시 불러왔습니다.",
   systemLogsFilters: "필터",
   systemLogsFilterLevel: "레벨",
   systemLogsFilterOrigin: "오리진",

@@ -58,10 +58,39 @@ function createImportBarrier({ drainMutations = null } = {}) {
         return heldCount > 0;
     }
 
-    async function waitUntilIdle() {
+    function abortReason(signal) {
+        if (signal?.reason !== undefined) return signal.reason;
+        const error = new Error('The operation was aborted');
+        error.name = 'AbortError';
+        return error;
+    }
+
+    async function waitUntilIdle(signal = null) {
         while (true) {
+            if (signal?.aborted) throw abortReason(signal);
             const pending = tail;
-            await pending;
+            if (!signal) {
+                await pending;
+            } else {
+                await new Promise((resolve, reject) => {
+                    let settled = false;
+                    const finish = (operation) => (value) => {
+                        if (settled) return;
+                        settled = true;
+                        signal.removeEventListener('abort', onAbort);
+                        operation(value);
+                    };
+                    const resolveOnce = finish(resolve);
+                    const rejectOnce = finish(reject);
+                    const onAbort = () => rejectOnce(abortReason(signal));
+                    signal.addEventListener('abort', onAbort, { once: true });
+                    if (signal.aborted) {
+                        onAbort();
+                        return;
+                    }
+                    pending.then(resolveOnce, rejectOnce);
+                });
+            }
             if (pending === tail) return;
         }
     }

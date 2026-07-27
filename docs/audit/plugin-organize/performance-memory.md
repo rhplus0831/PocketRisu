@@ -432,7 +432,8 @@ Settings restore no longer bypasses the storage adapter with an unbounded raw
 `fetch()`. Settings and corrupt-boot fallback share
 `AutoStorage.restoreInternalSnapshot()` and the same authoritative
 `NodeStorage` implementation. It accepts only the exact
-`database/dbbackup-<digits>.bin` key form, sends one non-retried POST with the
+canonical `database/dbbackup-<digits>.bin` key form with no leading zero and a
+safe timestamp, sends one non-retried POST with the
 active writer-session header, and allows a finite, abortable ten-minute window
 for large file-cursor ingestion rather than the ordinary 15-second storage I/O
 bound. The server applies the same exact-key check and the client accepts only
