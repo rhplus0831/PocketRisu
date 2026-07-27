@@ -75,7 +75,54 @@ interface BackupNdjsonErrorEvent {
     status: number
 }
 
-function backupNdjsonStorageError(value: unknown): StorageError | null {
+interface BackupNdjsonHeartbeatEvent {
+    type: 'heartbeat'
+}
+
+interface BackupNdjsonProgressEvent {
+    type: 'progress'
+    bytes: number
+    totalBytes: number
+}
+
+interface BackupNdjsonDoneEvent {
+    type: 'done'
+    ok: true
+    assetsRestored: number
+    coldStorageFailed?: number
+}
+
+type BackupNdjsonEvent = BackupNdjsonHeartbeatEvent
+    | BackupNdjsonProgressEvent
+    | BackupNdjsonDoneEvent
+    | BackupNdjsonErrorEvent
+
+function hasExactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+    const allowedKeys = new Set(allowed)
+    return Object.keys(value).length === allowed.length
+        && Object.keys(value).every(key => allowedKeys.has(key))
+}
+
+function isNonnegativeSafeInteger(value: unknown): value is number {
+    return Number.isSafeInteger(value) && Number(value) >= 0
+}
+
+function backupCommitOutcomeUnknown(message: string, cause?: unknown): StorageError {
+    return new StorageError(message, {
+        status: cause instanceof StorageError ? cause.status : null,
+        code: 'COMMIT_OUTCOME_UNKNOWN',
+        retryable: false,
+        commitOutcome: 'unknown',
+        commitOutcomeUnknown: true,
+        operation: 'write',
+        cause,
+    })
+}
+
+function backupNdjsonStorageError(
+    value: unknown,
+    source = 'Backup import',
+): StorageError | null {
     if (!value || typeof value !== 'object' || (value as { type?: unknown }).type !== 'error') {
         return null
     }
@@ -83,7 +130,12 @@ function backupNdjsonStorageError(value: unknown): StorageError | null {
     const validOutcome = event.commitOutcome === 'not-committed'
         || event.commitOutcome === 'committed'
         || event.commitOutcome === 'unknown'
-    const valid = typeof event.message === 'string'
+    const valid = !Array.isArray(value)
+        && hasExactKeys(value as Record<string, unknown>, [
+            'type', 'message', 'code', 'retryable', 'commitOutcome',
+            'commitOutcomeUnknown', 'status',
+        ])
+        && typeof event.message === 'string'
         && event.message.length > 0
         && typeof event.code === 'string'
         && event.code.length > 0
@@ -95,13 +147,7 @@ function backupNdjsonStorageError(value: unknown): StorageError | null {
         && Number(event.status) >= 100
         && Number(event.status) <= 599
     if (!valid) {
-        return new StorageError('Backup import returned a malformed terminal error event.', {
-            code: 'COMMIT_OUTCOME_UNKNOWN',
-            retryable: false,
-            commitOutcome: 'unknown',
-            commitOutcomeUnknown: true,
-            operation: 'write',
-        })
+        return backupCommitOutcomeUnknown(`${source} returned a malformed terminal error event.`)
     }
     return new StorageError(event.message!, {
         status: event.status!,
@@ -111,6 +157,61 @@ function backupNdjsonStorageError(value: unknown): StorageError | null {
         commitOutcomeUnknown: event.commitOutcomeUnknown!,
         operation: 'write',
     })
+}
+
+function parseBackupNdjsonLine(line: string, source: string): BackupNdjsonEvent {
+    if (line.length === 0) {
+        throw backupCommitOutcomeUnknown(`${source} returned a blank NDJSON record.`)
+    }
+
+    let parsed: unknown
+    try {
+        parsed = JSON.parse(line)
+    } catch (error) {
+        throw backupCommitOutcomeUnknown(`${source} returned malformed NDJSON.`, error)
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw backupCommitOutcomeUnknown(`${source} returned a malformed NDJSON event.`)
+    }
+    const event = parsed as Record<string, unknown>
+    if (event.type === 'error') {
+        const storageError = backupNdjsonStorageError(event, source)
+        if (!storageError) {
+            throw backupCommitOutcomeUnknown(`${source} returned a malformed terminal error event.`)
+        }
+        if (storageError.commitOutcomeUnknown) throw storageError
+        return event as unknown as BackupNdjsonErrorEvent
+    }
+    if (event.type === 'heartbeat') {
+        if (!hasExactKeys(event, ['type'])) {
+            throw backupCommitOutcomeUnknown(`${source} returned a malformed heartbeat event.`)
+        }
+        return event as unknown as BackupNdjsonHeartbeatEvent
+    }
+    if (event.type === 'progress') {
+        if (!hasExactKeys(event, ['type', 'bytes', 'totalBytes'])
+            || !isNonnegativeSafeInteger(event.bytes)
+            || !isNonnegativeSafeInteger(event.totalBytes)
+            || Number(event.bytes) > Number(event.totalBytes)) {
+            throw backupCommitOutcomeUnknown(`${source} returned a malformed progress event.`)
+        }
+        return event as unknown as BackupNdjsonProgressEvent
+    }
+    if (event.type === 'done') {
+        const requiredKeys = ['type', 'ok', 'assetsRestored']
+        const keys = event.coldStorageFailed === undefined
+            ? requiredKeys
+            : [...requiredKeys, 'coldStorageFailed']
+        if (!hasExactKeys(event, keys)
+            || event.ok !== true
+            || !isNonnegativeSafeInteger(event.assetsRestored)
+            || (event.coldStorageFailed !== undefined
+                && !isNonnegativeSafeInteger(event.coldStorageFailed))) {
+            throw backupCommitOutcomeUnknown(`${source} returned a malformed terminal done event.`)
+        }
+        return event as unknown as BackupNdjsonDoneEvent
+    }
+    throw backupCommitOutcomeUnknown(`${source} returned an unknown NDJSON event.`)
 }
 
 interface AuthoritativeStorageOutcomeTracker {
@@ -3391,21 +3492,50 @@ export class NodeStorage{
             let leftover = ''
             let result: {ok: boolean, assetsRestored: number, coldStorageFailed?: number} | null = null
             let serverError: StorageError | null = null
+            let protocolError: StorageError | null = null
+            let terminalSeen = false
+            let settled = false
 
             const consumeNdjsonLine = (line: string) => {
-                if (!line) return
-                let msg: any
-                try { msg = JSON.parse(line) } catch { return }
+                let msg: BackupNdjsonEvent
+                try {
+                    msg = parseBackupNdjsonLine(line, 'Backup import')
+                } catch (error) {
+                    if (error instanceof StorageError
+                        && error.code !== 'COMMIT_OUTCOME_UNKNOWN') {
+                        serverError = error
+                    } else if (!protocolError) {
+                        protocolError = error instanceof StorageError
+                            ? error
+                            : backupCommitOutcomeUnknown(
+                                'Backup import returned malformed NDJSON.',
+                                error,
+                            )
+                    }
+                    return
+                }
+                if (msg.type === 'error') {
+                    // An exact explicit server error is authoritative even when
+                    // a proxy delivered it after a provisional done event.
+                    serverError = backupNdjsonStorageError(msg, 'Backup import')
+                    terminalSeen = true
+                    return
+                }
+                if (terminalSeen) {
+                    protocolError ??= backupCommitOutcomeUnknown(
+                        'Backup import returned an event after its terminal outcome.',
+                    )
+                    return
+                }
                 if (msg.type === 'progress' && uploadComplete) {
                     // After upload finishes, surface server-side processing
                     // progress through the same callback for UI continuity.
                     onProgress?.(msg.bytes, msg.totalBytes)
                 } else if (msg.type === 'done') {
                     result = msg
-                } else if (msg.type === 'error') {
-                    serverError = backupNdjsonStorageError(msg)
+                    terminalSeen = true
                 }
-                // Ignore 'heartbeat' and unknown event types.
+                // A strict heartbeat is intentionally a no-op.
             }
             const drainNdjson = (flush = false) => {
                 const text = xhr.responseText
@@ -3422,25 +3552,83 @@ export class NodeStorage{
                 }
             }
 
+            const settleFromTerminalOrUnknown = (
+                fallbackMessage: string,
+                cause?: unknown,
+                cleanCompletion = true,
+            ) => {
+                if (settled) return
+                settled = true
+                try {
+                    drainNdjson(true)
+                } catch (error) {
+                    protocolError ??= backupCommitOutcomeUnknown(
+                        'Backup import response could not be parsed.',
+                        error,
+                    )
+                }
+                if (serverError) reject(serverError)
+                else if (protocolError) reject(protocolError)
+                else if (cleanCompletion && result) resolve(result)
+                else reject(backupCommitOutcomeUnknown(fallbackMessage, cause))
+            }
+
             xhr.onprogress = () => drainNdjson()
-            xhr.onerror = () => reject(new Error('backup import request failed'))
+            xhr.onerror = (event) => settleFromTerminalOrUnknown(
+                'Backup import transport failed before a terminal outcome was received.',
+                event,
+                false,
+            )
+            xhr.ontimeout = (event) => settleFromTerminalOrUnknown(
+                'Backup import transport timed out before a terminal outcome was received.',
+                event,
+                false,
+            )
+            xhr.onabort = (event) => settleFromTerminalOrUnknown(
+                'Backup import transport was aborted before a terminal outcome was received.',
+                event,
+                false,
+            )
             xhr.onload = () => {
+                if (settled) return
+                if (xhr.status === 0) {
+                    settleFromTerminalOrUnknown(
+                        'Backup import transport ended without an HTTP response.',
+                        undefined,
+                        false,
+                    )
+                    return
+                }
                 if (xhr.status < 200 || xhr.status >= 300) {
                     let msg = `backup import error: ${xhr.status}`
                     try {
                         const body = JSON.parse(xhr.responseText)
                         if (body?.error) msg = String(body.error)
                     } catch {}
+                    settled = true
                     reject(new Error(msg))
                     return
                 }
-                drainNdjson(true)
-                if (serverError) reject(serverError)
-                else if (result) resolve(result)
-                else reject(new Error('backup import: no result received'))
+                settleFromTerminalOrUnknown(
+                    'Backup import response ended before a terminal outcome was received.',
+                )
             }
 
-            xhr.send(file)
+            try {
+                xhr.send(file)
+            } catch (error) {
+                // A synchronous send failure occurs before XMLHttpRequest can
+                // dispatch the mutation and is therefore definitively safe.
+                settled = true
+                reject(new StorageError('Backup import request could not be dispatched.', {
+                    code: 'STORAGE_TRANSPORT_ERROR',
+                    retryable: true,
+                    commitOutcome: 'not-committed',
+                    commitOutcomeUnknown: false,
+                    operation: 'write',
+                    cause: error,
+                }))
+            }
         })
     }
 
@@ -3498,61 +3686,101 @@ export class NodeStorage{
         filename: string,
         onProgress?: (bytes: number, totalBytes: number) => void
     ): Promise<{ok: boolean, assetsRestored: number, coldStorageFailed?: number}> {
-        const da = await this.authFetch('/api/backup/server/restore', {
-            method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                'x-session-id': NodeStorage.sessionId,
-            },
-            body: JSON.stringify({ filename }),
-        })
+        let requestInFlight = false
+        const mutationOutcome: AuthoritativeStorageOutcomeTracker = {
+            markRequestDispatched: () => { requestInFlight = true },
+            markDefinitiveResponse: () => { requestInFlight = false },
+            isRequestInFlight: () => requestInFlight,
+        }
+        let da: Response
+        try {
+            da = await this.authFetch('/api/backup/server/restore', {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-session-id': NodeStorage.sessionId,
+                },
+                body: JSON.stringify({ filename }),
+            }, true, mutationOutcome)
+        } catch (error) {
+            if (mutationOutcome.isRequestInFlight()) {
+                throw backupCommitOutcomeUnknown(
+                    'Server backup restore transport failed before a response was received.',
+                    error,
+                )
+            }
+            throw error
+        }
         if (da.status === 404) throw new Error('Backup file not found')
         if (da.status === 409) throw new Error('Another import is already in progress')
         if (da.status < 200 || da.status >= 300) {
-            const body = await da.json().catch(() => ({}))
-            throw new Error(body.error || `server backup restore error: ${da.status}`)
+            throw await this.parseStorageFailureResponse(da, 'write', true)
         }
 
-        const reader = da.body!.getReader()
+        if (!da.body) {
+            throw backupCommitOutcomeUnknown(
+                'Server backup restore response ended before a terminal outcome was received.',
+            )
+        }
+        const reader = da.body.getReader()
         const decoder = new TextDecoder()
         let buffer = ''
         let result: {ok: boolean, assetsRestored: number, coldStorageFailed?: number} | null = null
+        let terminalSeen = false
+        let responseStorageError: StorageError | null = null
 
         const consumeLine = (line: string) => {
-            if (!line) return
-            let msg: any
+            let msg: BackupNdjsonEvent
             try {
-                msg = JSON.parse(line)
+                msg = parseBackupNdjsonLine(line, 'Server backup restore')
             } catch (error) {
-                throw new StorageError('Server backup restore returned malformed NDJSON.', {
-                    code: 'COMMIT_OUTCOME_UNKNOWN',
-                    retryable: false,
-                    commitOutcome: 'unknown',
-                    commitOutcomeUnknown: true,
-                    operation: 'write',
-                    cause: error,
-                })
+                if (error instanceof StorageError) responseStorageError = error
+                throw error
+            }
+            if (msg.type === 'error') {
+                responseStorageError = backupNdjsonStorageError(msg, 'Server backup restore')!
+                throw responseStorageError
+            }
+            if (terminalSeen) {
+                throw backupCommitOutcomeUnknown(
+                    'Server backup restore returned an event after its terminal outcome.',
+                )
             }
             if (msg.type === 'progress') {
                 onProgress?.(msg.bytes, msg.totalBytes)
             } else if (msg.type === 'done') {
                 result = msg
-            } else if (msg.type === 'error') {
-                throw backupNdjsonStorageError(msg)
+                terminalSeen = true
             }
         }
 
-        while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-            buffer += decoder.decode(value, { stream: true })
-            const lines = buffer.split('\n')
-            buffer = lines.pop()!
-            for (const line of lines) consumeLine(line)
+        try {
+            while (true) {
+                const { done, value } = await reader.read()
+                if (done) break
+                buffer += decoder.decode(value, { stream: true })
+                const lines = buffer.split('\n')
+                buffer = lines.pop()!
+                for (const line of lines) consumeLine(line)
+            }
+            buffer += decoder.decode()
+            if (buffer) consumeLine(buffer)
+        } catch (error) {
+            // Only errors deliberately constructed from the response protocol
+            // can authoritatively describe the publication. A stream reader,
+            // decoder, or progress callback may itself reject with an arbitrary
+            // StorageError; that transport failure remains commit-unknown.
+            if (error === responseStorageError) throw error
+            throw backupCommitOutcomeUnknown(
+                'Server backup restore response was lost before a terminal outcome was received.',
+                error,
+            )
         }
-        buffer += decoder.decode()
-        if (buffer) consumeLine(buffer)
-        if (!result) throw new Error('Server backup restore: no result received')
+        if (!result) {
+            throw backupCommitOutcomeUnknown(
+                'Server backup restore response ended before a terminal outcome was received.',
+            )
+        }
         return result
     }
 

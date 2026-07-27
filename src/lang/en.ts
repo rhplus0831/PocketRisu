@@ -1686,6 +1686,7 @@ export const languageEnglish = {
     serverBackupDownload: "Download",
     serverBackupDelete: "Delete",
     serverBackupRestoring: "Restoring backup from server...",
+    backupRestoreOutcomeUnknown: "The server may have committed this backup restore, but its acknowledgement was lost or invalid. PocketRisu will not retry it. Dismiss this warning to reload and reconcile the authoritative server state.",
     serverBackupDownloading: "Downloading backup...",
     serverBackupDeleteConfirm: (filename: string) => `Delete backup "${filename}"? This cannot be undone.`,
     serverBackupDeleteSuccess: "Backup deleted.",

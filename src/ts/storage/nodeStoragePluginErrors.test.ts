@@ -84,6 +84,19 @@ const backupLateError = {
     status: 500,
 }
 
+function expectCommitOutcomeUnknown(error: unknown) {
+    expect(error).toBeInstanceOf(StorageError)
+    expect(error).toMatchObject({
+        status: null,
+        code: 'COMMIT_OUTCOME_UNKNOWN',
+        retryAfter: null,
+        retryable: false,
+        commitOutcome: 'unknown',
+        commitOutcomeUnknown: true,
+        operation: 'write',
+    })
+}
+
 describe('NodeStorage plugin error contract', () => {
     beforeEach(() => {
         fetchMock.mockReset()
@@ -168,6 +181,327 @@ describe('NodeStorage plugin error contract', () => {
             commitOutcomeUnknown: false,
             operation: 'write',
         })
+    })
+
+    test.each([
+        ['malformed JSON', '{not-json}\n'],
+        ['a malformed terminal schema', '{"type":"done","ok":true,"assetsRestored":"1"}\n'],
+        ['an unknown event schema', '{"type":"mystery"}\n'],
+        ['a blank NDJSON record', '{"type":"heartbeat"}\n\n'],
+        ['EOF without a terminal event', '{"type":"heartbeat"}\n'],
+    ])('classifies upload %s as commit-outcome unknown without replay', async (_label, responseText) => {
+        fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }))
+        let sendCalls = 0
+
+        class FakeXmlHttpRequest {
+            status = 200
+            responseText = ''
+            upload: Record<string, any> = {}
+            onprogress: (() => void) | null = null
+            onerror: (() => void) | null = null
+            ontimeout: (() => void) | null = null
+            onabort: (() => void) | null = null
+            onload: (() => void) | null = null
+            open() {}
+            setRequestHeader() {}
+            send() {
+                sendCalls += 1
+                this.upload.onload?.()
+                this.responseText = responseText
+                this.onprogress?.()
+                this.onload?.()
+            }
+        }
+        vi.stubGlobal('XMLHttpRequest', FakeXmlHttpRequest)
+
+        const error = await readyStorage().importBackup(new Blob(['archive'])).catch(value => value)
+
+        expectCommitOutcomeUnknown(error)
+        expect(sendCalls).toBe(1)
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    test.each(['error', 'timeout', 'abort'] as const)(
+        'classifies upload XHR %s after dispatch as commit-outcome unknown without replay',
+        async (eventName) => {
+            fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }))
+            let sendCalls = 0
+
+            class FakeXmlHttpRequest {
+                status = 0
+                responseText = '{"type":"heartbeat"}\n'
+                upload: Record<string, any> = {}
+                onprogress: (() => void) | null = null
+                onerror: (() => void) | null = null
+                ontimeout: (() => void) | null = null
+                onabort: (() => void) | null = null
+                onload: (() => void) | null = null
+                open() {}
+                setRequestHeader() {}
+                send() {
+                    sendCalls += 1
+                    this.upload.onload?.()
+                    this.onprogress?.()
+                    if (eventName === 'error') this.onerror?.()
+                    if (eventName === 'timeout') this.ontimeout?.()
+                    if (eventName === 'abort') this.onabort?.()
+                }
+            }
+            vi.stubGlobal('XMLHttpRequest', FakeXmlHttpRequest)
+
+            const error = await readyStorage().importBackup(new Blob(['archive'])).catch(value => value)
+
+            expectCommitOutcomeUnknown(error)
+            expect(sendCalls).toBe(1)
+            expect(fetchMock).toHaveBeenCalledOnce()
+        },
+    )
+
+    test.each(['error', 'timeout', 'abort'] as const)(
+        'does not accept a parsed upload done event when XHR later reports %s',
+        async (eventName) => {
+            fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }))
+            let sendCalls = 0
+
+            class FakeXmlHttpRequest {
+                status = 200
+                responseText = '{"type":"done","ok":true,"assetsRestored":1}\n'
+                upload: Record<string, any> = {}
+                onprogress: (() => void) | null = null
+                onerror: (() => void) | null = null
+                ontimeout: (() => void) | null = null
+                onabort: (() => void) | null = null
+                onload: (() => void) | null = null
+                open() {}
+                setRequestHeader() {}
+                send() {
+                    sendCalls += 1
+                    this.upload.onload?.()
+                    this.onprogress?.()
+                    if (eventName === 'error') this.onerror?.()
+                    if (eventName === 'timeout') this.ontimeout?.()
+                    if (eventName === 'abort') this.onabort?.()
+                }
+            }
+            vi.stubGlobal('XMLHttpRequest', FakeXmlHttpRequest)
+
+            const error = await readyStorage().importBackup(new Blob(['archive'])).catch(value => value)
+
+            expectCommitOutcomeUnknown(error)
+            expect(sendCalls).toBe(1)
+            expect(fetchMock).toHaveBeenCalledOnce()
+        },
+    )
+
+    test('classifies an XHR load with status zero as commit-outcome unknown after dispatch', async () => {
+        fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }))
+        let sendCalls = 0
+
+        class FakeXmlHttpRequest {
+            status = 0
+            responseText = '{"type":"done","ok":true,"assetsRestored":1}\n'
+            upload: Record<string, any> = {}
+            onprogress: (() => void) | null = null
+            onerror: (() => void) | null = null
+            ontimeout: (() => void) | null = null
+            onabort: (() => void) | null = null
+            onload: (() => void) | null = null
+            open() {}
+            setRequestHeader() {}
+            send() {
+                sendCalls += 1
+                this.upload.onload?.()
+                this.onprogress?.()
+                this.onload?.()
+            }
+        }
+        vi.stubGlobal('XMLHttpRequest', FakeXmlHttpRequest)
+
+        const error = await readyStorage().importBackup(new Blob(['archive'])).catch(value => value)
+
+        expectCommitOutcomeUnknown(error)
+        expect(sendCalls).toBe(1)
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    test('keeps a synchronous pre-dispatch upload failure definitively not committed', async () => {
+        fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }))
+
+        class FakeXmlHttpRequest {
+            status = 0
+            responseText = ''
+            upload: Record<string, any> = {}
+            onprogress: (() => void) | null = null
+            onerror: (() => void) | null = null
+            ontimeout: (() => void) | null = null
+            onabort: (() => void) | null = null
+            onload: (() => void) | null = null
+            open() {}
+            setRequestHeader() {}
+            send() { throw new Error('local send rejected') }
+        }
+        vi.stubGlobal('XMLHttpRequest', FakeXmlHttpRequest)
+
+        const error = await readyStorage().importBackup(new Blob(['archive'])).catch(value => value)
+
+        expect(error).toBeInstanceOf(StorageError)
+        expect(error).toMatchObject({
+            code: 'STORAGE_TRANSPORT_ERROR',
+            retryable: true,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+            operation: 'write',
+        })
+    })
+
+    test('keeps strict upload heartbeat/progress handling and accepts one exact terminal', async () => {
+        fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }))
+        const progress = vi.fn()
+
+        class FakeXmlHttpRequest {
+            status = 200
+            responseText = ''
+            upload: Record<string, any> = {}
+            onprogress: (() => void) | null = null
+            onerror: (() => void) | null = null
+            ontimeout: (() => void) | null = null
+            onabort: (() => void) | null = null
+            onload: (() => void) | null = null
+            open() {}
+            setRequestHeader() {}
+            send() {
+                this.upload.onload?.()
+                this.responseText = [
+                    '{"type":"heartbeat"}',
+                    '{"type":"progress","bytes":4,"totalBytes":8}',
+                    '{"type":"done","ok":true,"assetsRestored":2,"coldStorageFailed":0}',
+                    '',
+                ].join('\n')
+                this.onprogress?.()
+                this.onload?.()
+            }
+        }
+        vi.stubGlobal('XMLHttpRequest', FakeXmlHttpRequest)
+
+        await expect(readyStorage().importBackup(new Blob(['archive']), progress))
+            .resolves.toEqual({
+                type: 'done',
+                ok: true,
+                assetsRestored: 2,
+                coldStorageFailed: 0,
+            })
+        expect(progress).toHaveBeenCalledWith(4, 8)
+    })
+
+    test.each([
+        ['malformed JSON', '{not-json}\n'],
+        ['a malformed terminal schema', '{"type":"done","ok":false,"assetsRestored":1}\n'],
+        ['an unknown event schema', '{"type":"mystery"}\n'],
+        ['a blank NDJSON record', '{"type":"heartbeat"}\n\n'],
+        ['EOF without a terminal event', '{"type":"heartbeat"}\n'],
+    ])('classifies server-file restore %s as commit-outcome unknown without replay', async (
+        _label,
+        responseText,
+    ) => {
+        fetchMock.mockResolvedValueOnce(new Response(responseText, {
+            status: 200,
+            headers: { 'content-type': 'application/x-ndjson' },
+        }))
+
+        const error = await readyStorage().restoreServerBackup('risu-backup-1.bin')
+            .catch(value => value)
+
+        expectCommitOutcomeUnknown(error)
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    test('classifies server-file restore response-body loss as commit-outcome unknown', async () => {
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode('{"type":"heartbeat"}\n'))
+                controller.error(new Error('proxy response lost'))
+            },
+        })
+        fetchMock.mockResolvedValueOnce(new Response(body, {
+            status: 200,
+            headers: { 'content-type': 'application/x-ndjson' },
+        }))
+
+        const error = await readyStorage().restoreServerBackup('risu-backup-1.bin')
+            .catch(value => value)
+
+        expectCommitOutcomeUnknown(error)
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    test('normalizes an arbitrary StorageError from the restore reader as commit-outcome unknown', async () => {
+        const streamFailure = new StorageError('proxy reader classified this incorrectly', {
+            status: 502,
+            code: 'UPSTREAM_BODY_FAILURE',
+            retryable: true,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+            operation: 'read',
+        })
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode('{"type":"heartbeat"}\n'))
+                controller.error(streamFailure)
+            },
+        })
+        fetchMock.mockResolvedValueOnce(new Response(body, {
+            status: 200,
+            headers: { 'content-type': 'application/x-ndjson' },
+        }))
+
+        const error = await readyStorage().restoreServerBackup('risu-backup-1.bin')
+            .catch(value => value)
+
+        expect(error).toBeInstanceOf(StorageError)
+        expect(error).toMatchObject({
+            status: 502,
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            retryAfter: null,
+            retryable: false,
+            commitOutcome: 'unknown',
+            commitOutcomeUnknown: true,
+            operation: 'write',
+        })
+        expect((error as Error).cause).toBe(streamFailure)
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    test('classifies server-file restore transport loss after dispatch as commit-outcome unknown', async () => {
+        fetchMock.mockRejectedValueOnce(new TypeError('connection reset'))
+
+        const error = await readyStorage().restoreServerBackup('risu-backup-1.bin')
+            .catch(value => value)
+
+        expectCommitOutcomeUnknown(error)
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    test('keeps strict server-file heartbeat/progress handling and accepts one exact terminal', async () => {
+        const progress = vi.fn()
+        fetchMock.mockResolvedValueOnce(new Response([
+            '{"type":"heartbeat"}',
+            '{"type":"progress","bytes":4,"totalBytes":8}',
+            '{"type":"done","ok":true,"assetsRestored":2,"coldStorageFailed":0}',
+            '',
+        ].join('\n'), {
+            status: 200,
+            headers: { 'content-type': 'application/x-ndjson' },
+        }))
+
+        await expect(readyStorage().restoreServerBackup('risu-backup-1.bin', progress))
+            .resolves.toEqual({
+                type: 'done',
+                ok: true,
+                assetsRestored: 2,
+                coldStorageFailed: 0,
+            })
+        expect(progress).toHaveBeenCalledWith(4, 8)
+        expect(fetchMock).toHaveBeenCalledOnce()
     })
 
     test('retries an explicitly retryable idempotent plugin write within a fixed bound', async () => {

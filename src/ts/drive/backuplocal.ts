@@ -1,6 +1,7 @@
 import { alertClear, alertError, alertStore, alertWait, alertMd, alertConfirm, waitAlert, notifySuccess, notifyInfo, notifyError } from "../alert";
 import { downloadFile, forageStorage } from "../globalApi.svelte";
 import { language } from "src/lang";
+import { runBackupReplacementUi } from "../storage/backupReplacementUi";
 
 function formatBytes(bytes: number): string {
     if (bytes < 1024) return `${bytes} B`
@@ -193,21 +194,35 @@ export function LoadLocalBackup(){
             const file = input.files[0];
             input.remove();
             alertWait(`Loading local Backup... (Uploading ${file.name})`);
-            const result = await forageStorage.importBackup(file, (loaded, total) => {
-                const progress = total > 0 ? ((loaded / total) * 100).toFixed(2) : '0.00'
-                alertWait(`Loading local Backup... (${progress}%)`)
+            await runBackupReplacementUi({
+                replace: () => forageStorage.importBackup(file, (loaded, total) => {
+                    const progress = total > 0 ? ((loaded / total) * 100).toFixed(2) : '0.00'
+                    alertWait(`Loading local Backup... (${progress}%)`)
+                }),
+                onCommitted: async (result) => {
+                    if (result.coldStorageFailed && result.coldStorageFailed > 0) {
+                        alertError(`Warning: ${result.coldStorageFailed} character(s) could not be restored from cold storage. The imported save may be incomplete. The app will now reload.`)
+                        await waitAlert()
+                    } else {
+                        alertStore.set({
+                            type: "wait",
+                            msg: "Success, Refreshing your app."
+                        });
+                    }
+                },
+                onDefinitiveFailure: (error) => {
+                    console.error(error)
+                    alertError('Failed, Is file corrupted?')
+                },
+                onCommitUnknown: async (error) => {
+                    alertError(`${language.backupRestoreOutcomeUnknown}\n\n${error.message}`)
+                    await waitAlert()
+                },
+                hardReload: () => {
+                    location.search = ''
+                    location.reload()
+                },
             })
-            if (result.coldStorageFailed && result.coldStorageFailed > 0) {
-                alertError(`Warning: ${result.coldStorageFailed} character(s) could not be restored from cold storage. The imported save may be incomplete. The app will now reload.`)
-                await waitAlert()
-            } else {
-                alertStore.set({
-                    type: "wait",
-                    msg: "Success, Refreshing your app."
-                });
-            }
-            location.search = ''
-            location.reload()
         };
 
         input.click();

@@ -9,6 +9,7 @@
     import { language } from "src/lang";
     import { alertConfirm, alertError, alertWait, alertStore, waitAlert, notifySuccess, notifyError } from "src/ts/alert";
     import { forageStorage, downloadFile } from "src/ts/globalApi.svelte";
+    import { runBackupReplacementUi } from "src/ts/storage/backupReplacementUi";
     import { RotateCcwIcon, DownloadIcon, TrashIcon } from "@lucide/svelte";
 
     interface Props {
@@ -47,24 +48,33 @@
         if (!(await alertConfirm(language.backupLoadConfirm))) return;
         if (!(await alertConfirm(language.backupLoadConfirm2))) return;
         alertWait(language.serverBackupRestoring);
-        try {
-            const result = await forageStorage.restoreServerBackup(backup.filename, (bytes, totalBytes) => {
+        await runBackupReplacementUi({
+            replace: () => forageStorage.restoreServerBackup(backup.filename, (bytes, totalBytes) => {
                 if (totalBytes > 0) {
                     const pct = ((bytes / totalBytes) * 100).toFixed(1);
                     alertWait(`${language.serverBackupRestoring} (${pct}%)`);
                 }
-            });
-            if (result.coldStorageFailed && result.coldStorageFailed > 0) {
-                alertError(`Warning: ${result.coldStorageFailed} character(s) could not be restored from cold storage. The restored save may be incomplete. The app will now reload.`);
+            }),
+            onCommitted: async (result) => {
+                if (result.coldStorageFailed && result.coldStorageFailed > 0) {
+                    alertError(`Warning: ${result.coldStorageFailed} character(s) could not be restored from cold storage. The restored save may be incomplete. The app will now reload.`);
+                    await waitAlert();
+                } else {
+                    alertStore.set({ type: "wait", msg: "Success, Refreshing your app." });
+                }
+            },
+            onDefinitiveFailure: (error) => {
+                alertError(error instanceof Error ? error.message : 'Restore failed');
+            },
+            onCommitUnknown: async (error) => {
+                alertError(`${language.backupRestoreOutcomeUnknown}\n\n${error.message}`);
                 await waitAlert();
-            } else {
-                alertStore.set({ type: "wait", msg: "Success, Refreshing your app." });
-            }
-            location.search = '';
-            location.reload();
-        } catch (error) {
-            alertError(error instanceof Error ? error.message : 'Restore failed');
-        }
+            },
+            hardReload: () => {
+                location.search = '';
+                location.reload();
+            },
+        });
     }
 
     async function downloadBackup(backup: BackupEntry) {
