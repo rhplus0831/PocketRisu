@@ -120,8 +120,8 @@ and repaired issues that were not visible in the source branches: strict restore
 acknowledgements, fallback across unreadable/corrupt candidates, legacy chunk
 upgrade recovery, strict block/REMOTE decoding, viewer revision-CAS mutations,
 bounded owner-index rebuilding, abandoned import-barrier reads, partial-export
-create/DELETE and TTL races, client stream cleanup, and the real E1+E2 export
-path. Verification was repeated after each repair.
+create/DELETE, import-wait, and TTL races, client stream cleanup, and the real
+E1+E2 export path. Verification was repeated after each repair.
 
 | PM3 item | Effective commits | Representative production-path gate |
 |---|---|---|
@@ -131,7 +131,7 @@ path. Verification was repeated after each repair.
 | R4 bounded compatibility decode | `c246028b`, `e8a58ad5` | gzip/zlib limits and cancellation; malformed inline and REMOTE-resolved character blocks roll back |
 | R5 shared restore API | `89aff392`, `68621c86`, `e8a58ad5` | HTTP 200 plus exact four-field echoed-key acknowledgement; explicit rollback fallback; unknown outcome is never retried |
 | V1 point-in-time viewer | `fc51fe5a`, `68621c86` | real 10,000-row publication, 50-row page, stale edit/delete CAS rejection, backpressure and import-wait abort |
-| E1 partial-export lifecycle | `892d6eed`, `5b8db647`, `9f4e96e3` | lost-create cancellation tombstone, stalled-download TTL cleanup, sink-setup cancellation, immutable asset/database pins |
+| E1 partial-export lifecycle | `892d6eed`, `5b8db647`, `9f4e96e3`, `76fb1cbf` | lost-create cancellation tombstone, held-import cancellation with pre-release spool cleanup and replacement admission, stalled-download TTL cleanup, sink-setup cancellation, immutable asset/database pins |
 | E2 legacy special-key export | `a60e175e`, `9f4e96e3` | real export/decode/import with 3 MiB own `__proto__` value, 2 MiB metadata, reserved-field collision, and selected asset |
 
 The viewer bound is one page of at most 50 logical rows. A chunked logical row
