@@ -26,13 +26,22 @@ async function streamBackupToDisk(
     const totalBytes = Number(response.headers.get('content-length') ?? '0')
 
     if (response.body) {
-        const streamSaver = await import('streamsaver')
-        const writableStream = streamSaver.createWriteStream(fileName)
-        const writer = writableStream.getWriter()
-        const reader = response.body.getReader()
+        const body = response.body
+        let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+        let writableStream: WritableStream<Uint8Array> | undefined
+        let writer: WritableStreamDefaultWriter<Uint8Array> | undefined
         let downloadedBytes = 0
 
         try {
+            // Own the response stream before any optional sink setup can fail so
+            // every setup failure can release the server-side export promptly.
+            reader = body.getReader()
+            throwIfBackupAborted(signal)
+            const streamSaver = await import('streamsaver')
+            throwIfBackupAborted(signal)
+            writableStream = streamSaver.createWriteStream(fileName)
+            writer = writableStream.getWriter()
+
             while (true) {
                 throwIfBackupAborted(signal)
                 const { done, value } = await reader.read()
@@ -50,14 +59,37 @@ async function streamBackupToDisk(
             }
             await writer.close()
         } catch (error) {
-            await reader.cancel(error).catch(() => {})
-            await writer.abort(error).catch(() => {})
+            // Cleanup is deliberately best-effort: a failing cancel/abort must
+            // never hide or indefinitely delay the primary backup failure.
+            startBackupCleanup(() => reader ? reader.cancel(error) : body.cancel(error))
+            startBackupCleanup(() => writer
+                ? writer.abort(error)
+                : writableStream?.abort(error))
             throw error
+        } finally {
+            try {
+                reader?.releaseLock()
+            } catch {
+                // A broken stream implementation must not replace the primary error.
+            }
+            try {
+                writer?.releaseLock()
+            } catch {
+                // A broken sink implementation must not replace the primary error.
+            }
         }
     } else {
         throwIfBackupAborted(signal)
         await downloadFile(fileName, new Uint8Array(await response.arrayBuffer()))
         throwIfBackupAborted(signal)
+    }
+}
+
+function startBackupCleanup(cleanup: () => Promise<unknown> | undefined) {
+    try {
+        void Promise.resolve(cleanup()).catch(() => {})
+    } catch {
+        // Preserve the failure that initiated cleanup.
     }
 }
 

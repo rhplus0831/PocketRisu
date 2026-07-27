@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
     notifySuccess: vi.fn(),
     exportBackup: vi.fn(),
     downloadFile: vi.fn(),
+    createWriteStream: vi.fn(),
 }))
 
 vi.mock('../alert', () => ({
@@ -39,6 +40,10 @@ vi.mock('src/lang', () => ({
     },
 }))
 
+vi.mock('streamsaver', () => ({
+    createWriteStream: mocks.createWriteStream,
+}))
+
 const { SavePartialLocalBackup } = await import('./backuplocal')
 
 function backupResponse(missingAssets = 0) {
@@ -58,6 +63,7 @@ beforeEach(() => {
     mocks.alertConfirm.mockResolvedValue(true)
     mocks.exportBackup.mockResolvedValue(backupResponse())
     mocks.downloadFile.mockResolvedValue(undefined)
+    mocks.createWriteStream.mockReset()
 })
 
 describe('SavePartialLocalBackup', () => {
@@ -138,5 +144,148 @@ describe('SavePartialLocalBackup', () => {
         await SavePartialLocalBackup()
         expect(mocks.alertError).toHaveBeenCalledWith('Failed')
         expect(mocks.notifySuccess).not.toHaveBeenCalled()
+    })
+
+    test('cancels the response body when browser sink construction fails', async () => {
+        const sinkError = new Error('injected sink construction failure')
+        const cleanupError = new Error('injected response cancellation failure')
+        const cancel = vi.fn().mockRejectedValue(cleanupError)
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const body = new ReadableStream<Uint8Array>({ cancel })
+        mocks.exportBackup.mockResolvedValue({
+            body,
+            headers: new Headers(),
+        } as Response)
+        mocks.createWriteStream.mockImplementationOnce(() => {
+            throw sinkError
+        })
+
+        await SavePartialLocalBackup()
+
+        expect(cancel).toHaveBeenCalledOnce()
+        expect(cancel).toHaveBeenCalledWith(sinkError)
+        expect(consoleError).toHaveBeenCalledWith(sinkError)
+        expect(consoleError).not.toHaveBeenCalledWith(cleanupError)
+        expect(mocks.alertError).toHaveBeenCalledWith('Failed')
+        expect(mocks.notifySuccess).not.toHaveBeenCalled()
+        consoleError.mockRestore()
+    })
+
+    test('aborts a constructed sink when acquiring its writer fails', async () => {
+        const writerError = new Error('injected writer acquisition failure')
+        const sourceCancel = vi.fn()
+        const sinkAbort = vi.fn().mockResolvedValue(undefined)
+        const body = new ReadableStream<Uint8Array>({ cancel: sourceCancel })
+        mocks.exportBackup.mockResolvedValue({
+            body,
+            headers: new Headers(),
+        } as Response)
+        mocks.createWriteStream.mockReturnValueOnce({
+            getWriter: vi.fn(() => {
+                throw writerError
+            }),
+            abort: sinkAbort,
+        })
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+        await SavePartialLocalBackup()
+
+        expect(sourceCancel).toHaveBeenCalledWith(writerError)
+        expect(sinkAbort).toHaveBeenCalledWith(writerError)
+        expect(consoleError).toHaveBeenCalledWith(writerError)
+        expect(mocks.alertError).toHaveBeenCalledWith('Failed')
+        expect(mocks.notifySuccess).not.toHaveBeenCalled()
+        consoleError.mockRestore()
+    })
+
+    test('does not wait for pending response cancellation and sink abort hooks', async () => {
+        const primaryError = new Error('injected setup failure after sink acquisition')
+        const controller = new AbortController()
+        const neverSettles = new Promise<void>(() => {})
+        const sourceCancel = vi.fn(() => neverSettles)
+        const sinkAbort = vi.fn(() => neverSettles)
+        const body = new ReadableStream<Uint8Array>({ cancel: sourceCancel })
+        mocks.exportBackup.mockResolvedValue({
+            body,
+            headers: new Headers(),
+        } as Response)
+        mocks.createWriteStream.mockImplementationOnce(() => {
+            controller.abort(primaryError)
+            return new WritableStream<Uint8Array>({ abort: sinkAbort })
+        })
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+        const outcome = await Promise.race([
+            SavePartialLocalBackup(controller.signal).then(() => 'settled'),
+            new Promise<'timed-out'>(resolve => setTimeout(() => resolve('timed-out'), 250)),
+        ])
+
+        expect(outcome).toBe('settled')
+        expect(sourceCancel).toHaveBeenCalledWith(primaryError)
+        expect(sinkAbort).toHaveBeenCalledWith(primaryError)
+        expect(consoleError).toHaveBeenCalledWith(primaryError)
+        expect(mocks.alertError).toHaveBeenCalledWith('Failed')
+        consoleError.mockRestore()
+    })
+
+    test('preserves the primary failure when response cancellation and sink abort both reject', async () => {
+        const primaryError = new Error('injected primary failure')
+        const controller = new AbortController()
+        const sourceCancel = vi.fn().mockRejectedValue(new Error('injected cancel failure'))
+        const sinkAbort = vi.fn().mockRejectedValue(new Error('injected abort failure'))
+        const body = new ReadableStream<Uint8Array>({ cancel: sourceCancel })
+        mocks.exportBackup.mockResolvedValue({
+            body,
+            headers: new Headers(),
+        } as Response)
+        mocks.createWriteStream.mockImplementationOnce(() => {
+            controller.abort(primaryError)
+            return new WritableStream<Uint8Array>({ abort: sinkAbort })
+        })
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+        await SavePartialLocalBackup(controller.signal)
+        await Promise.resolve()
+
+        expect(sourceCancel).toHaveBeenCalledWith(primaryError)
+        expect(sinkAbort).toHaveBeenCalledWith(primaryError)
+        expect(consoleError).toHaveBeenCalledWith(primaryError)
+        expect(consoleError).toHaveBeenCalledTimes(1)
+        expect(mocks.alertError).toHaveBeenCalledWith('Failed')
+        consoleError.mockRestore()
+    })
+
+    test('closes the sink and releases both stream locks after a successful download', async () => {
+        const first = new Uint8Array([1, 2])
+        const second = new Uint8Array([3, 4])
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(first)
+                controller.enqueue(second)
+                controller.close()
+            },
+        })
+        const written: Uint8Array[] = []
+        const close = vi.fn()
+        const writable = new WritableStream<Uint8Array>({
+            write(value) {
+                written.push(value)
+            },
+            close,
+        })
+        mocks.exportBackup.mockResolvedValue({
+            body,
+            headers: new Headers({ 'content-length': '4' }),
+        } as Response)
+        mocks.createWriteStream.mockReturnValueOnce(writable)
+
+        await SavePartialLocalBackup()
+
+        expect(written).toEqual([first, second])
+        expect(close).toHaveBeenCalledOnce()
+        expect(body.locked).toBe(false)
+        expect(writable.locked).toBe(false)
+        expect(mocks.notifySuccess).toHaveBeenCalledWith('Success')
+        expect(mocks.alertError).not.toHaveBeenCalled()
     })
 })
