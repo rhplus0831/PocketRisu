@@ -27,6 +27,7 @@ import {
     PLUGIN_VALUE_MAX_BYTES,
     pluginStorageLimitMessage,
 } from "./pluginStorageLimits";
+import { encodeUtf8Base64Url } from "./base64Url";
 
 export { hasNativeStringWellFormed } from "./unicodeWellFormed";
 
@@ -45,11 +46,7 @@ async function ensureStorageReady(signal?: AbortSignal | null) {
 
 function encodeKeyComponent(value: string) {
     assertWellFormedUnicode(value);
-    return Buffer.from(value, "utf-8")
-        .toString("base64")
-        .replace(/\+/g, "-")
-        .replace(/\//g, "_")
-        .replace(/=+$/g, "");
+    return encodeUtf8Base64Url(value);
 }
 
 function decodeKeyComponent(value: string) {

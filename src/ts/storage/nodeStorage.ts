@@ -34,6 +34,7 @@ import {
 } from "./resourceCache"
 import { getThrownMessage, StorageError } from "./storageError"
 import { awaitWithAbort, forwardAbortSignal, throwIfAborted } from "./abort"
+import { encodeBase64UrlBytes, encodeUtf8Base64Url } from "./base64Url"
 import { v4 as uuidv4 } from "uuid"
 import type {
     PluginStorageMutationRequest,
@@ -2015,17 +2016,16 @@ export class NodeStorage{
                 if (stableRequest.valueBytes!.byteLength >= PLUGIN_VALUE_STREAM_THRESHOLD_BYTES) {
                     headers['x-plugin-storage-stream'] = '1'
                 }
-                headers['x-plugin-storage-owner'] = Buffer.from(
+                headers['x-plugin-storage-owner'] = encodeUtf8Base64Url(
                     stableRequest.owner ?? '',
-                    'utf-8',
-                ).toString('base64url')
+                )
                 if (stableRequest.preserveOwner) {
                     headers['x-plugin-storage-owner-policy'] = 'preserve'
                 } else if (stableRequest.ownerRecordBytes) {
                     headers['x-plugin-storage-owner-policy'] = 'record'
-                    headers['x-plugin-storage-owner-record'] = Buffer.from(
+                    headers['x-plugin-storage-owner-record'] = encodeBase64UrlBytes(
                         stableRequest.ownerRecordBytes,
-                    ).toString('base64url')
+                    )
                 }
             } else if (stableRequest.preserveOwner) {
                 headers['x-plugin-storage-owner-policy'] = 'preserve'
@@ -2209,10 +2209,9 @@ export class NodeStorage{
             if (result.outcome === 'committed' && isResourceCacheEnabled()) {
                 void settleBestEffortResourceCache(
                     applyOwnedResourceCacheMutations(request.operations.map((operation, index) => {
-                    const valueKey = `${PLUGIN_STORAGE_PREFIXES[0]}${Buffer.from(
+                    const valueKey = `${PLUGIN_STORAGE_PREFIXES[0]}${encodeUtf8Base64Url(
                         operation.key,
-                        'utf-8',
-                    ).toString('base64url')}.json`
+                    )}.json`
                     if (operation.operation === 'set') {
                         return {
                             type: 'set' as const,

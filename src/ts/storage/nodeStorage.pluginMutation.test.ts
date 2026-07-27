@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import { Buffer as BrowserBuffer } from 'buffer'
+import { Buffer as NodeBuffer } from 'node:buffer'
 import { createHash } from 'node:crypto'
 
 const cache = vi.hoisted(() => ({
@@ -141,6 +143,31 @@ afterEach(() => {
 })
 
 describe('NodeStorage atomic plugin mutation cache publication', () => {
+    test('encodes owner headers with the Buffer polyfill used by the browser app', async () => {
+        vi.stubGlobal('Buffer', BrowserBuffer)
+        const owner = '☸에로스 타워'
+        const ownerRecordBytes = new TextEncoder().encode(JSON.stringify({
+            plugin: owner,
+            updatedAt: 7,
+        }))
+        const storage = storageWithResponse(committedSet())
+
+        await expect(storage.mutatePluginStorage({
+            operation: 'set',
+            valueKey,
+            valueBytes,
+            owner,
+            ownerRecordBytes,
+        })).resolves.toMatchObject({ outcome: 'committed' })
+
+        const init = (storage as any).authFetch.mock.calls[0][1] as RequestInit
+        const headers = init.headers as Record<string, string>
+        expect(headers['x-plugin-storage-owner'])
+            .toBe(NodeBuffer.from(owner, 'utf8').toString('base64url'))
+        expect(headers['x-plugin-storage-owner-record'])
+            .toBe(NodeBuffer.from(ownerRecordBytes).toString('base64url'))
+    })
+
     test.each([
         ['record', { ownerRecordBytes: new TextEncoder().encode('{"plugin":"Exact","updatedAt":7}') }],
         ['preserve', { preserveOwner: true }],
@@ -660,6 +687,23 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
         if (cachedSet.type === 'set') {
             expect(cachedSet.ownedBytes).not.toBe(batchRequest.operations[0].valueBytes)
         }
+    })
+
+    test('publishes cache keys with the Buffer polyfill used by the browser app', async () => {
+        vi.stubGlobal('Buffer', BrowserBuffer)
+        const storage = new NodeStorage()
+        ;(storage as any).authFetch = vi.fn(async (
+            _input: RequestInfo | URL,
+            init: RequestInit,
+        ) => committedBatch(init))
+
+        await expect(storage.batchPluginStorage(batchRequest)).resolves.toMatchObject({
+            outcome: 'committed',
+        })
+        expect(cache.applyOwnedResourceCacheMutations).toHaveBeenCalledWith([
+            expect.objectContaining({ resourceKey: 'kv:pluginsave/YWEzLWJvZHk.json' }),
+            expect.objectContaining({ resourceKey: 'kv:pluginsave/YWEzLW9sZA.json' }),
+        ])
     })
 
     test('a one-SET rewrite refreshes cache after commit without an invalidation gap', async () => {
