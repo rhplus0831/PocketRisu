@@ -3,7 +3,7 @@ import pkg from './importBarrier.cjs'
 
 const { createImportBarrier } = pkg as {
     createImportBarrier: (opts?: { drainMutations?: () => Promise<unknown> }) => {
-        acquire: () => Promise<() => void>
+        acquire: (signal?: AbortSignal | null) => Promise<() => void>
         isHeld: () => boolean
         waitUntilIdle: (signal?: AbortSignal | null) => Promise<void>
     }
@@ -141,5 +141,42 @@ describe('import barrier', () => {
         const release = await barrier.acquire().catch(() => null)
         expect(release).toBeNull()
         await expect(barrier.waitUntilIdle()).resolves.toBeUndefined()
+    })
+
+    it('removes an aborted acquisition that is queued behind another holder', async () => {
+        const barrier = createImportBarrier()
+        const releaseFirst = await barrier.acquire()
+        const controller = new AbortController()
+        const reason = new DOMException('import peer closed', 'AbortError')
+        const abandoned = barrier.acquire(controller.signal)
+
+        controller.abort(reason)
+        await expect(abandoned).rejects.toBe(reason)
+        expect(barrier.isHeld()).toBe(true)
+
+        releaseFirst()
+        const releaseNext = await barrier.acquire()
+        releaseNext()
+        await expect(barrier.waitUntilIdle()).resolves.toBeUndefined()
+    })
+
+    it('finishes an in-flight mutation drain before rejecting an aborted acquisition', async () => {
+        let releaseDrain!: () => void
+        const drainHeld = new Promise<void>((resolve) => { releaseDrain = resolve })
+        const barrier = createImportBarrier({ drainMutations: () => drainHeld })
+        const controller = new AbortController()
+        const acquisition = barrier.acquire(controller.signal)
+
+        await nextTurn()
+        expect(barrier.isHeld()).toBe(true)
+        controller.abort(new DOMException('import peer closed', 'AbortError'))
+        let settled = false
+        void acquisition.finally(() => { settled = true }).catch(() => {})
+        await nextTurn()
+        expect(settled).toBe(false)
+
+        releaseDrain()
+        await expect(acquisition).rejects.toMatchObject({ name: 'AbortError' })
+        expect(barrier.isHeld()).toBe(false)
     })
 })

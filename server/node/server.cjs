@@ -102,11 +102,30 @@ const {
     validateDatabaseShape,
 } = require('./chatRows.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
+const { isChunkableKey } = require('./chunkStore.cjs');
 const {
     decodeBoundedLegacyRisuSave,
     inspectRisuSaveSource,
     shouldStreamRisuSave,
 } = require('./streamRisuLoad.cjs');
+const {
+    IMPORT_IO_PAGE_BYTES,
+    SAVE_FOLDER_IMPORT_STAGE_PREFIX,
+    ImportIngressError,
+    finiteByteLimit,
+    importSizeError,
+    importFormatError,
+    importErrorPayload,
+    assertImportSize,
+    throwIfAborted: throwIfImportAborted,
+    createImportAbortTracker,
+    spoolAsyncIterable,
+    copyFileToSpool,
+    readFileToBufferBounded,
+    validateJsonFileStreaming,
+    inspectZipFile,
+    extractZipEntries,
+} = require('./importSpool.cjs');
 const {
     BACKUP_ENTRY_NAME_MAX_BYTES,
     PLUGIN_SAVE_PREFIX,
@@ -196,12 +215,42 @@ function queueStorageOperation(operation) {
 }
 
 let importInProgress = false;
+const IMPORT_BARRIER_DRAIN_TEST_GATE_DIR = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_IMPORT_BARRIER_DRAIN_TEST_GATE_DIR ?? '').trim() || null
+    : null;
+let importBarrierAcquireFailures = process.env.NODE_ENV === 'test'
+    ? Math.max(0, Number.parseInt(process.env.POCKETRISU_TEST_IMPORT_BARRIER_ACQUIRE_FAILURES ?? '0', 10) || 0)
+    : 0;
+
+async function drainStorageMutationsForImport() {
+    await queueStorageOperation(async () => {
+        if (!IMPORT_BARRIER_DRAIN_TEST_GATE_DIR) return;
+        const holdPath = path.join(IMPORT_BARRIER_DRAIN_TEST_GATE_DIR, 'hold');
+        if (!existsSync(holdPath)) return;
+        await fs.mkdir(IMPORT_BARRIER_DRAIN_TEST_GATE_DIR, { recursive: true });
+        await fs.writeFile(path.join(IMPORT_BARRIER_DRAIN_TEST_GATE_DIR, 'entered'), 'draining', 'utf-8');
+        const releasePath = path.join(IMPORT_BARRIER_DRAIN_TEST_GATE_DIR, 'release');
+        // This queue boundary must finish even if the importing peer leaves;
+        // abandoning it would let a later transaction overtake older writes.
+        while (existsSync(holdPath) && !existsSync(releasePath)) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+    });
+    if (importBarrierAcquireFailures > 0) {
+        importBarrierAcquireFailures--;
+        throw new ImportIngressError('Import barrier acquisition failed before publication', {
+            code: 'IMPORT_BARRIER_ACQUIRE_FAILED',
+            statusCode: 500,
+            retryable: true,
+        });
+    }
+}
 // Imports keep one raw transaction open across streamed decompression, msgpack
 // walking and directory swaps. The barrier drains this queue before an import
 // begins, so mutations either land entirely before BEGIN or are refused —
 // never acknowledged and then discarded by the import's ROLLBACK.
 const importBarrier = createImportBarrier({
-    drainMutations: () => queueStorageOperation(() => {}),
+    drainMutations: drainStorageMutationsForImport,
 });
 
 class ImportInProgressError extends Error {
@@ -311,6 +360,9 @@ const BACKUP_IMPORT_TEST_GATE_DIR = process.env.NODE_ENV === 'test'
 const backupImportFailpoint = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_BACKUP_IMPORT_FAILPOINT ?? '').trim()
     : '';
+const saveFolderImportFailpoint = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT ?? '').trim()
+    : '';
 
 function throwIfStreamingRestoreAborted(shouldAbort) {
     if (typeof shouldAbort !== 'function' || !shouldAbort()) return;
@@ -355,7 +407,7 @@ async function waitAtSnapshotRestoreDecodeTestGate(signal) {
     }
 }
 
-async function waitAtBackupImportTestGate() {
+async function waitAtBackupImportTestGate(signal = null) {
     if (!BACKUP_IMPORT_TEST_GATE_DIR) return;
     const holdPath = path.join(BACKUP_IMPORT_TEST_GATE_DIR, 'hold');
     if (!existsSync(holdPath)) return;
@@ -366,9 +418,10 @@ async function waitAtBackupImportTestGate() {
         'utf-8',
     );
     const releasePath = path.join(BACKUP_IMPORT_TEST_GATE_DIR, 'release');
-    while (existsSync(holdPath) && !existsSync(releasePath)) {
+    while (!signal?.aborted && existsSync(holdPath) && !existsSync(releasePath)) {
         await new Promise((resolve) => setTimeout(resolve, 10));
     }
+    throwIfImportAborted(signal);
 }
 
 function hitPluginStorageMutationFailpoint(boundary) {
@@ -1392,6 +1445,7 @@ app.use((req, res, next) => {
         = req.path === '/api/plugin-storage/transition/stage/upload';
     if (
         req.path === '/api/backup/import'
+        || req.path === '/api/migrate/save-folder/upload'
         || isStreamingPluginMutation
         || isStreamingPluginTransitionUpload
     ) return next();
@@ -1471,6 +1525,8 @@ if(!existsSync(savePath)){
 }
 
 const DATABASE_SPOOL_FILE_PREFIX = '.database-risudat-';
+const BACKUP_IMPORT_SPOOL_FILE_PREFIX = '.backup-import-';
+const BACKUP_ENTRY_STAGE_PREFIX = '.backup-entry-stage-';
 const PARTIAL_EXPORT_JOB_PREFIX = '.partial-export-';
 const configuredPartialExportJobTtlMs = Number(
     process.env.NODE_ENV === 'test'
@@ -1550,8 +1606,31 @@ if (databaseSpoolReady) {
                 }
                 continue;
             }
+            if (entry.isDirectory() && entry.name.startsWith(SAVE_FOLDER_IMPORT_STAGE_PREFIX)) {
+                try {
+                    fsSync.rmSync(path.join(databaseSpoolDir, entry.name), {
+                        recursive: true,
+                        force: true,
+                    });
+                } catch (error) {
+                    logger.warn(`[Backup] Could not remove orphaned save-folder import ${entry.name}:`, error);
+                }
+                continue;
+            }
+            if (entry.isDirectory() && entry.name.startsWith(BACKUP_ENTRY_STAGE_PREFIX)) {
+                try {
+                    fsSync.rmSync(path.join(databaseSpoolDir, entry.name), {
+                        recursive: true,
+                        force: true,
+                    });
+                } catch (error) {
+                    logger.warn(`[Backup] Could not remove orphaned backup-entry stage ${entry.name}:`, error);
+                }
+                continue;
+            }
             if (!entry.isFile() || !(
                 entry.name.startsWith(DATABASE_SPOOL_FILE_PREFIX)
+                || entry.name.startsWith(BACKUP_IMPORT_SPOOL_FILE_PREFIX)
                 || entry.name.startsWith(PLUGIN_VALUE_SPOOL_FILE_PREFIX)
             )) continue;
             try {
@@ -1871,7 +1950,32 @@ const inlayMigrationMarker = path.join(inlayDir, '.migrated_to_fs')
 const IMPORT_JOURNAL_PATH = path.join(savePath, 'import_journal.json')
 const IMPORT_JOURNAL_MARKER_KEY = 'import_journal/marker'
 const hexRegex = /^[0-9a-fA-F]+$/;
-const BACKUP_IMPORT_MAX_BYTES = Number(process.env.RISU_BACKUP_IMPORT_MAX_BYTES ?? '0');
+const DEFAULT_BACKUP_IMPORT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+const DEFAULT_LEGACY_DATABASE_IMPORT_MAX_BYTES = 64 * 1024 * 1024;
+const BACKUP_IMPORT_MAX_BYTES = finiteByteLimit(
+    process.env.RISU_BACKUP_IMPORT_MAX_BYTES,
+    DEFAULT_BACKUP_IMPORT_MAX_BYTES,
+);
+const LEGACY_DATABASE_IMPORT_MAX_BYTES = finiteByteLimit(
+    process.env.RISU_LEGACY_DATABASE_IMPORT_MAX_BYTES,
+    DEFAULT_LEGACY_DATABASE_IMPORT_MAX_BYTES,
+    { max: BACKUP_IMPORT_MAX_BYTES },
+);
+const SAVE_FOLDER_IMPORT_MAX_ENTRIES = finiteByteLimit(
+    process.env.RISU_SAVE_FOLDER_IMPORT_MAX_ENTRIES,
+    100_000,
+    { max: 1_000_000 },
+);
+const BACKUP_IMPORT_MAX_ENTRIES = finiteByteLimit(
+    process.env.RISU_BACKUP_IMPORT_MAX_ENTRIES,
+    100_000,
+    { max: 1_000_000 },
+);
+const IMPORT_BUFFERED_ENTRY_MAX_BYTES = finiteByteLimit(
+    process.env.RISU_IMPORT_BUFFERED_ENTRY_MAX_BYTES,
+    32 * 1024 * 1024,
+    { max: BACKUP_IMPORT_MAX_BYTES },
+);
 // Minimum free disk space headroom multiplier: require 2× the backup size to be free
 const BACKUP_DISK_HEADROOM = 2;
 // Heartbeat interval for NDJSON import progress stream. 5 s by default —
@@ -1882,6 +1986,91 @@ const BACKUP_NDJSON_HEARTBEAT_MS = Math.max(
     100,
     Number(process.env.BACKUP_NDJSON_HEARTBEAT_MS ?? '5000') || 5000,
 );
+
+function importDiskSpaceError(required, available) {
+    const error = new ImportIngressError('Insufficient disk space for import staging', {
+        code: 'IMPORT_DISK_SPACE',
+        statusCode: 507,
+        limit: available,
+        actual: required,
+    });
+    error.available = available;
+    error.required = required;
+    return error;
+}
+
+function sendImportIngressError(res, error, { ndjson = false } = {}) {
+    const payload = importErrorPayload(error) ?? (
+        error?.risuSavePreparationLimit === true
+        || error?.risuSavePreparationInvalid === true
+        || error instanceof PluginStorageLimitError
+            ? {
+                error: error.message,
+                code: error.code,
+                ...(error.limit === undefined ? {} : { limit: error.limit }),
+                ...(error.actual === undefined ? {} : { actual: error.actual }),
+                retryable: false,
+                commitOutcome: error.commitOutcome ?? 'not-committed',
+                commitOutcomeUnknown: error.commitOutcomeUnknown ?? false,
+            }
+            : null
+    );
+    if (!payload) return false;
+    // A disconnected importer has no response channel left. Treat its
+    // structured cancellation as handled rather than handing it to Express,
+    // which can only produce a secondary socket-write failure.
+    if (res.destroyed) return true;
+    if (error.available !== undefined) payload.available = error.available;
+    if (error.required !== undefined) payload.required = error.required;
+    if (ndjson && res.headersSent) {
+        if (!res.writableEnded && !res.destroyed) {
+            res.write(`${JSON.stringify(importNdjsonErrorEvent(error, payload))}\n`);
+            res.end();
+        }
+        return true;
+    }
+    if (!res.headersSent) res.status(error.statusCode ?? error.status ?? 400).json(payload);
+    return true;
+}
+
+function importNdjsonErrorEvent(error, payload = null, fallbackCode = 'BACKUP_IMPORT_FAILED') {
+    const claimedOutcome = payload?.commitOutcome ?? error?.commitOutcome;
+    const claimedUnknown = payload?.commitOutcomeUnknown ?? error?.commitOutcomeUnknown;
+    const commitOutcome = claimedUnknown === true || claimedOutcome === 'unknown'
+        ? 'unknown'
+        : claimedOutcome === 'not-committed' || claimedOutcome === 'committed'
+            ? claimedOutcome
+            : 'unknown';
+    return {
+        type: 'error',
+        message: String(payload?.message ?? payload?.error ?? error?.message ?? 'Backup import failed'),
+        code: String(payload?.code ?? error?.code ?? fallbackCode),
+        retryable: payload?.retryable === true || error?.retryable === true,
+        commitOutcome,
+        commitOutcomeUnknown: commitOutcome === 'unknown',
+        status: Number(error?.statusCode ?? error?.status ?? payload?.status ?? 500),
+    };
+}
+
+function importContentLength(req, label) {
+    const raw = req.headers['content-length'];
+    if (raw === undefined) return null;
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < 0) {
+        throw importFormatError(`${label} has an invalid Content-Length`, 'INVALID_IMPORT_SIZE');
+    }
+    return value;
+}
+
+async function assertImportDiskSpace(sourceBytes, targetPath = databaseSpoolDir) {
+    const required = sourceBytes * BACKUP_DISK_HEADROOM;
+    if (!Number.isSafeInteger(required)) {
+        throw importFormatError('Import disk requirement is not a safe byte count', 'INVALID_IMPORT_SIZE');
+    }
+    const disk = await checkDiskSpace(required, targetPath);
+    if (!disk.ok) throw importDiskSpaceError(required, disk.available);
+    return disk;
+}
 
 function recoverPendingImportSwap(source) {
     const journal = readImportJournal(IMPORT_JOURNAL_PATH);
@@ -2389,6 +2578,61 @@ function writeImportedAsset(assetStage, key, value, source, writeKv = kvSet) {
     return 'kv';
 }
 
+async function writeImportedAssetFromFile(assetStage, key, source, signal, label) {
+    const name = assetNameForKey(key);
+    if (name !== null && isSafeAssetName(name)) {
+        await copyFileToSpool(source.filePath, assetStage.store.assetPathFor(name), {
+            maxBytes: BACKUP_IMPORT_MAX_BYTES,
+            signal,
+        });
+        kvClearDeletion(key);
+        return 'fs';
+    }
+    const value = await readFileToBufferBounded(source.filePath, {
+        size: source.size,
+        maxBytes: Math.min(IMPORT_BUFFERED_ENTRY_MAX_BYTES, BACKUP_IMPORT_MAX_BYTES),
+        label: `${label} unsafe asset ${key}`,
+        code: 'IMPORT_BUFFERED_ENTRY_LIMIT',
+        signal,
+    });
+    kvSet(key, value);
+    logger.warn(`[AssetFS] ${label} retained unsafe asset key ${key} in SQLite`);
+    return 'kv';
+}
+
+async function validateAndImportPluginValueFile(key, source, signal, label) {
+    decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_PREFIX);
+    const maxBytes = Math.min(BACKUP_IMPORT_MAX_BYTES, PLUGIN_VALUE_MAX_BYTES);
+    try {
+        await validateJsonFileStreaming(source.filePath, {
+            size: source.size,
+            maxBytes,
+            signal,
+        });
+    } catch (error) {
+        if (error?.code === 'INVALID_PLUGIN_STORAGE_ROW') {
+            throw new PluginStorageValidationError(key);
+        }
+        throw error;
+    }
+    throwIfImportAborted(signal);
+    if (!isChunkableKey(key)) {
+        throw new Error(`${label} plugin value is not eligible for file-backed storage`);
+    }
+    kvSetFromFile(key, source.filePath);
+}
+
+async function importBoundedOpaqueRow(key, source, signal, label, code = 'IMPORT_BUFFERED_ENTRY_LIMIT') {
+    const value = await readFileToBufferBounded(source.filePath, {
+        size: source.size,
+        maxBytes: Math.min(IMPORT_BUFFERED_ENTRY_MAX_BYTES, BACKUP_IMPORT_MAX_BYTES),
+        label,
+        code,
+        signal,
+    });
+    kvSet(key, value);
+}
+
 function migrateAssetsToFilesystem() {
     ensureAssetDir();
     if (existsSync(assetMigrationMarker)) return;
@@ -2514,6 +2758,13 @@ const ASSET_EXT_MIME = {
 }
 
 async function checkDiskSpace(requiredBytes, targetPath = path.join(process.cwd(), 'save')) {
+    if (process.env.NODE_ENV === 'test'
+        && process.env.POCKETRISU_TEST_IMPORT_AVAILABLE_BYTES !== undefined) {
+        const available = Number(process.env.POCKETRISU_TEST_IMPORT_AVAILABLE_BYTES);
+        if (Number.isSafeInteger(available) && available >= 0) {
+            return { ok: available >= requiredBytes, available };
+        }
+    }
     if (process.env.POCKETRISU_PLUGIN_STORAGE_TEST_FAILPOINTS === '1'
         && process.env.POCKETRISU_PLUGIN_TRANSITION_TEST_AVAILABLE_BYTES !== undefined) {
         const available = Number(
@@ -4508,13 +4759,23 @@ function resolveBackupStorageKey(name) {
 
 // ─── Shared backup import logic ─────────────────────────────────────────────
 // Accepts any async iterable of Buffer chunks (HTTP request body, file stream, etc.)
-async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0, onProgress = null } = {}) {
+async function importBackupFromSource(dataSource, {
+    maxBytes = BACKUP_IMPORT_MAX_BYTES,
+    totalBytes = 0,
+    onProgress = null,
+    signal = null,
+} = {}) {
+    maxBytes = finiteByteLimit(maxBytes, BACKUP_IMPORT_MAX_BYTES);
+    if (totalBytes > 0) assertImportSize(totalBytes, maxBytes, 'Backup archive');
+    throwIfImportAborted(signal);
     recoverPendingImportSwap('Backup import preparation');
     let hasDatabase = false;
     let databaseSpool = null;
-    let databaseWriteStream = null;
-    let databaseWriteFinished = null;
+    let activeEntryWriteStream = null;
+    let activeEntryWriteFinished = null;
     let databaseIngestion = null;
+    let backupEntryStageDir = null;
+    let backupEntryIndex = 0;
     let assetsRestored = 0;
     let bytesReceived = 0;
     const seenEntryNames = new Set();
@@ -4571,11 +4832,19 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         writeFileSync(stagingSidecarPath(id), JSON.stringify(sidecar));
     }
 
-    function importBufferedEntry(name, data) {
+    async function importStagedEntry(name, source) {
         const inlayRaw = parseInlayBackupName(name);
         const inlaySidecar = parseInlaySidecarBackupName(name);
+        const readBuffered = () => readFileToBufferBounded(source.filePath, {
+            size: source.size,
+            maxBytes: IMPORT_BUFFERED_ENTRY_MAX_BYTES,
+            label: `Backup entry ${name}`,
+            code: 'IMPORT_BUFFERED_ENTRY_LIMIT',
+            signal,
+        });
 
         if (inlayRaw) {
+            const data = await readBuffered();
             importedInlayIds.add(inlayRaw.id);
             if (inlayRaw.ext) {
                 writeStagingInlayFileSync(inlayRaw.id, inlayRaw.ext, data, legacyInlayInfoMap.get(inlayRaw.id) || { ext: inlayRaw.ext, name: inlayRaw.id, type: 'image' });
@@ -4609,11 +4878,13 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
             kvClearDeletion(`inlay/${inlayRaw.id}`);
             assetsRestored += 1;
         } else if (inlaySidecar) {
+            const data = await readBuffered();
             const parsed = JSON.parse(data.toString('utf-8'));
             explicitSidecarMap.set(inlaySidecar.id, parsed);
             writeStagingSidecarSync(inlaySidecar.id, parsed);
             importedSidecarIds.add(inlaySidecar.id);
         } else if (name.startsWith('inlay_info/')) {
+            const data = await readBuffered();
             const id = name.slice('inlay_info/'.length);
             if (!isSafeInlayId(id)) {
                 throw new Error(`Invalid legacy inlay info entry name: ${name}`);
@@ -4633,23 +4904,55 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
             // Skip deprecated thumbnail entries from legacy backups.
         } else {
             const storageKey = resolveBackupStorageKey(name);
-            const storageValue = storageKey.startsWith('coldstorage/')
-                ? encodeColdStorageCanonicalBuffer(
-                    parseColdStorageJsonBuffer(data, name, { allowPlainJson: true }).coldData
-                )
-                : data;
-            validatePluginStorageRow(storageKey, storageValue);
             if (storageKey.startsWith('assets/')) {
-                writeImportedAsset(assetStage, storageKey, storageValue, 'Backup import');
-            } else {
+                await writeImportedAssetFromFile(
+                    assetStage,
+                    storageKey,
+                    source,
+                    signal,
+                    'Backup import',
+                );
+            } else if (storageKey.startsWith(PLUGIN_SAVE_PREFIX)) {
+                await validateAndImportPluginValueFile(
+                    storageKey,
+                    source,
+                    signal,
+                    'Backup import',
+                );
+            } else if (storageKey.startsWith('coldstorage/')) {
+                const data = await readBuffered();
+                const storageValue = encodeColdStorageCanonicalBuffer(
+                    parseColdStorageJsonBuffer(data, name, { allowPlainJson: true }).coldData
+                );
+                validatePluginStorageRow(storageKey, storageValue);
                 kvSet(storageKey, storageValue);
+            } else if (storageKey.startsWith(PLUGIN_SAVE_META_PREFIX)
+                || storageKey === PLUGIN_STORAGE_MANIFEST_KEY) {
+                const data = await readBuffered();
+                validatePluginStorageRow(storageKey, data);
+                kvSet(storageKey, data);
+            } else {
+                await importBoundedOpaqueRow(
+                    storageKey,
+                    source,
+                    signal,
+                    `Backup row ${storageKey}`,
+                );
             }
             assetsRestored += 1;
         }
     }
 
+    throwIfImportAborted(signal);
     await flushPendingDb();
+    throwIfImportAborted(signal);
     await createBackupAndRotate();
+    throwIfImportAborted(signal);
+    backupEntryStageDir = path.join(
+        databaseSpoolDir,
+        `${BACKUP_ENTRY_STAGE_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}`,
+    );
+    await fs.mkdir(backupEntryStageDir, { recursive: false, mode: 0o700 });
 
     sqliteDb.pragma('synchronous = OFF');
 
@@ -4698,93 +5001,128 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
 
         let pending = Buffer.alloc(0);
         let currentEntry = null;
-        for await (const chunk of dataSource) {
-            bytesReceived += chunk.length;
-            if (maxBytes > 0 && bytesReceived > maxBytes) {
-                throw new Error(`Backup exceeds max allowed size (${maxBytes} bytes)`);
-            }
-            if (onProgress) onProgress(bytesReceived, totalBytes);
+        for await (const sourceChunk of dataSource) {
+            throwIfImportAborted(signal);
+            const sourceBuffer = Buffer.isBuffer(sourceChunk)
+                ? sourceChunk
+                : Buffer.from(sourceChunk);
+            for (let pageOffset = 0; pageOffset < sourceBuffer.length; pageOffset += IMPORT_IO_PAGE_BYTES) {
+                throwIfImportAborted(signal);
+                const chunk = sourceBuffer.subarray(
+                    pageOffset,
+                    Math.min(sourceBuffer.length, pageOffset + IMPORT_IO_PAGE_BYTES),
+                );
+                const nextBytesReceived = bytesReceived + chunk.length;
+                assertImportSize(nextBytesReceived, maxBytes, 'Backup archive');
+                bytesReceived = nextBytesReceived;
+                if (onProgress) onProgress(bytesReceived, totalBytes);
 
-            let buffer = pending.length > 0
-                ? Buffer.concat([pending, Buffer.from(chunk)])
-                : Buffer.from(chunk);
-            pending = Buffer.alloc(0);
+                let buffer = pending.length > 0
+                    ? Buffer.concat([pending, chunk])
+                    : chunk;
+                pending = Buffer.alloc(0);
 
-            while (buffer.length > 0) {
-                if (!currentEntry) {
-                    if (buffer.length < 4) {
-                        pending = Buffer.from(buffer);
-                        break;
-                    }
-                    const nameLength = buffer.readUInt32LE(0);
-                    if (nameLength > BACKUP_ENTRY_NAME_MAX_BYTES) {
-                        throw new Error(`Backup entry name exceeds ${BACKUP_ENTRY_NAME_MAX_BYTES} bytes`);
-                    }
-                    const headerLength = 4 + nameLength + 4;
-                    if (buffer.length < headerLength) {
-                        pending = Buffer.from(buffer);
-                        break;
-                    }
-
-                    const name = buffer.subarray(4, 4 + nameLength).toString('utf-8');
-                    const dataLength = buffer.readUInt32LE(4 + nameLength);
-                    buffer = buffer.subarray(headerLength);
-
-                    if (seenEntryNames.has(name)) {
-                        throw new Error(`Duplicate backup entry: ${name}`);
-                    }
-                    seenEntryNames.add(name);
-                    if (name === 'encryption.risudat') {
-                        throw new Error('Encrypted risuai.xyz account backups cannot be imported. Re-export the backup without account encryption and try again.');
-                    }
-
-                    currentEntry = {
-                        name,
-                        remaining: dataLength,
-                        chunks: name === 'database.risudat' ? null : [],
-                        total: 0,
-                    };
-                    if (name === 'database.risudat') {
-                        const filePath = path.join(
-                            savePath,
-                            `.database-import-${process.pid}-${nodeCrypto.randomUUID()}.tmp`
-                        );
-                        databaseSpool = { filePath, size: dataLength };
-                        databaseWriteStream = createWriteStream(filePath, { flags: 'wx' });
-                        databaseWriteFinished = finished(databaseWriteStream);
-                        databaseWriteFinished.catch(() => {});
-                    }
-                }
-
-                const take = Math.min(currentEntry.remaining, buffer.length);
-                if (take > 0) {
-                    const piece = buffer.subarray(0, take);
-                    if (currentEntry.name === 'database.risudat') {
-                        if (!await writeWithBackpressure(databaseWriteStream, piece)) {
-                            throw new Error('Database spool closed during backup import');
+                while (buffer.length > 0) {
+                    if (!currentEntry) {
+                        if (buffer.length < 4) {
+                            pending = Buffer.from(buffer);
+                            break;
                         }
-                    } else {
-                        currentEntry.chunks.push(Buffer.from(piece));
-                        currentEntry.total += piece.length;
-                    }
-                    currentEntry.remaining -= take;
-                    buffer = buffer.subarray(take);
-                }
+                        const nameLength = buffer.readUInt32LE(0);
+                        if (nameLength > BACKUP_ENTRY_NAME_MAX_BYTES) {
+                            throw importFormatError(
+                                `Backup entry name exceeds ${BACKUP_ENTRY_NAME_MAX_BYTES} bytes`,
+                                'INVALID_BACKUP_ENTRY_NAME',
+                            );
+                        }
+                        const headerLength = 4 + nameLength + 4;
+                        if (buffer.length < headerLength) {
+                            pending = Buffer.from(buffer);
+                            break;
+                        }
 
-                if (currentEntry.remaining === 0) {
-                    if (currentEntry.name === 'database.risudat') {
-                        databaseWriteStream.end();
-                        await databaseWriteFinished;
-                        databaseWriteStream = null;
-                        databaseWriteFinished = null;
-                        hasDatabase = true;
-                    } else {
-                        const data = currentEntry.chunks.length === 1
-                            ? currentEntry.chunks[0]
-                            : Buffer.concat(currentEntry.chunks, currentEntry.total);
-                        importBufferedEntry(currentEntry.name, data);
+                        const name = buffer.subarray(4, 4 + nameLength).toString('utf-8');
+                        const dataLength = buffer.readUInt32LE(4 + nameLength);
+                        assertImportSize(dataLength, maxBytes, `Backup entry ${name}`);
+                        buffer = buffer.subarray(headerLength);
+
+                        if (seenEntryNames.has(name)) {
+                            throw importFormatError(`Duplicate backup entry: ${name}`, 'DUPLICATE_BACKUP_ENTRY');
+                        }
+                        seenEntryNames.add(name);
+                        if (seenEntryNames.size > BACKUP_IMPORT_MAX_ENTRIES) {
+                            throw importSizeError(
+                                'Backup entry count',
+                                BACKUP_IMPORT_MAX_ENTRIES,
+                                seenEntryNames.size,
+                                'IMPORT_ENTRY_COUNT_LIMIT',
+                            );
+                        }
+                        if (name === 'encryption.risudat') {
+                            throw importFormatError(
+                                'Encrypted risuai.xyz account backups cannot be imported. Re-export the backup without account encryption and try again.',
+                                'ENCRYPTED_BACKUP_UNSUPPORTED',
+                            );
+                        }
+
+                        let filePath;
+                        if (name === 'database.risudat') {
+                            filePath = path.join(
+                                databaseSpoolDir,
+                                `${DATABASE_SPOOL_FILE_PREFIX}backup-import-${process.pid}-${nodeCrypto.randomUUID()}.tmp`,
+                            );
+                            databaseSpool = { filePath, size: dataLength };
+                        } else {
+                            filePath = path.join(
+                                backupEntryStageDir,
+                                `${String(backupEntryIndex++).padStart(8, '0')}.row`,
+                            );
+                        }
+                        const writeStream = createWriteStream(filePath, {
+                            flags: 'wx',
+                            mode: 0o600,
+                            highWaterMark: IMPORT_IO_PAGE_BYTES,
+                        });
+                        const writeFinished = finished(writeStream);
+                        writeFinished.catch(() => {});
+                        activeEntryWriteStream = writeStream;
+                        activeEntryWriteFinished = writeFinished;
+                        currentEntry = {
+                            name,
+                            remaining: dataLength,
+                            filePath,
+                            size: dataLength,
+                            writeStream,
+                            writeFinished,
+                        };
                     }
-                    currentEntry = null;
+
+                    const take = Math.min(currentEntry.remaining, buffer.length);
+                    if (take > 0) {
+                        const piece = buffer.subarray(0, take);
+                        if (!await writeWithBackpressure(currentEntry.writeStream, piece)) {
+                            throw new Error('Entry spool closed during backup import');
+                        }
+                        currentEntry.remaining -= take;
+                        buffer = buffer.subarray(take);
+                    }
+
+                    if (currentEntry.remaining === 0) {
+                        currentEntry.writeStream.end();
+                        await currentEntry.writeFinished;
+                        activeEntryWriteStream = null;
+                        activeEntryWriteFinished = null;
+                        if (currentEntry.name === 'database.risudat') {
+                            hasDatabase = true;
+                        } else {
+                            await importStagedEntry(currentEntry.name, {
+                                filePath: currentEntry.filePath,
+                                size: currentEntry.size,
+                            });
+                            await fs.unlink(currentEntry.filePath).catch(() => {});
+                        }
+                        currentEntry = null;
+                    }
                 }
             }
         }
@@ -4800,28 +5138,48 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
             filePath: databaseSpool.filePath,
             size: databaseSpool.size,
         };
+        throwIfImportAborted(signal);
         const databaseInspection = await inspectRisuSaveSource(databaseSource);
-        if (await shouldStreamRisuSave(databaseSource, { inspection: databaseInspection })) {
+        if (databaseInspection.supported) {
             databaseIngestion = await ingestDatabaseStreaming(databaseSource, {
                 inspection: databaseInspection,
+                shouldAbort: () => signal?.aborted === true,
+                signal,
             });
             // Supported legacy/gzip saves cannot contain REMOTE blocks.
             markRemoteMigrationDone();
         } else {
-            // Publish the raw candidate only inside the replacement
-            // transaction, then run the same strict folded-plugin preparation
-            // before any directory swap or COMMIT. A validation/ingest failure
-            // therefore rolls the old database and all old rows back together.
-            const databaseRaw = await fs.readFile(databaseSpool.filePath);
-            kvSet(DB_BLOB_KEY, databaseRaw);
-            databaseIngestion = await ingestDatabase(databaseRaw);
+            assertImportSize(
+                databaseSpool.size,
+                LEGACY_DATABASE_IMPORT_MAX_BYTES,
+                'Legacy database',
+                'LEGACY_DATABASE_IMPORT_LIMIT',
+            );
+            const decoded = await decodeBoundedLegacyRisuSave(databaseSource, {
+                inspection: databaseInspection,
+                tempDir: databaseSpoolDir,
+                maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
+                shouldAbort: () => signal?.aborted === true,
+                signal,
+                resolveRemoteSize: async (name) => kvSize(`remotes/${name}.local.bin`),
+                resolveRemote: async (name) => kvGet(`remotes/${name}.local.bin`),
+            });
+            databaseIngestion = await ingestDatabase(decoded, {
+                skipLiveRemoteMigration: true,
+            });
+            markRemoteMigrationDone();
         }
         // Deterministically hold the hardest reader race in compatibility
         // tests: the candidate database is visible inside SQLite's uncommitted
         // replacement transaction, but the import has not published it.
-        await waitAtBackupImportTestGate();
+        await waitAtBackupImportTestGate(signal);
+        throwIfImportAborted(signal);
         if (backupImportFailpoint === 'after-database-ingestion') {
-            throw new Error('Injected backup import failure after database ingestion');
+            throw new ImportIngressError('Backup import was rolled back before publication', {
+                code: 'BACKUP_IMPORT_NOT_COMMITTED',
+                statusCode: 500,
+                retryable: true,
+            });
         }
         for (const [id, info] of legacyInlayInfoMap.entries()) {
             if (importedInlayIds.has(id) && !importedSidecarIds.has(id)) {
@@ -4869,6 +5227,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         // logical writes are ready. A list served mid-import is then invalidated
         // when this transaction commits.
         kvBumpListEpoch();
+        throwIfImportAborted(signal);
         sqliteDb.exec('COMMIT');
         transactionCommitted = true;
 
@@ -4927,16 +5286,31 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
                     logger.error('[Backup Import] Failed to clear rolled-back import journal:', cleanupError);
                 }
             }
+            if (error instanceof ImportIngressError && !rollbackSucceeded) {
+                error.commitOutcome = 'unknown';
+                error.commitOutcomeUnknown = true;
+                error.statusCode = 500;
+            }
+            if (rollbackSucceeded && error && typeof error === 'object') {
+                error.commitOutcome = 'not-committed';
+                error.commitOutcomeUnknown = false;
+            }
+        } else if (error && typeof error === 'object') {
+            error.commitOutcome = 'committed';
+            error.commitOutcomeUnknown = false;
         }
         throw error;
     } finally {
         sqliteDb.pragma('synchronous = NORMAL');
-        if (databaseWriteStream) {
-            databaseWriteStream.destroy();
-            await databaseWriteFinished?.catch(() => {});
+        if (activeEntryWriteStream) {
+            activeEntryWriteStream.destroy();
+            await activeEntryWriteFinished?.catch(() => {});
         }
         if (databaseSpool) {
             await fs.unlink(databaseSpool.filePath).catch(() => {});
+        }
+        if (backupEntryStageDir) {
+            await fs.rm(backupEntryStageDir, { recursive: true, force: true }).catch(() => {});
         }
     }
 
@@ -9725,44 +10099,43 @@ app.post('/api/backup/import/prepare', async (req, res, next) => {
         }
 
         const size = Number(req.body?.size ?? 0);
-        if (BACKUP_IMPORT_MAX_BYTES > 0 && size > BACKUP_IMPORT_MAX_BYTES) {
-            res.status(413).json({ error: `Backup exceeds max allowed size (${BACKUP_IMPORT_MAX_BYTES} bytes)` });
-            return;
+        if (!Number.isSafeInteger(size) || size < 0) {
+            throw importFormatError('Backup has an invalid byte length', 'INVALID_IMPORT_SIZE');
         }
+        assertImportSize(size, BACKUP_IMPORT_MAX_BYTES, 'Backup archive');
 
         if (size > 0) {
-            const disk = await checkDiskSpace(size * BACKUP_DISK_HEADROOM);
-            if (!disk.ok) {
-                res.status(507).json({
-                    error: 'Insufficient disk space',
-                    available: disk.available,
-                    required: size * BACKUP_DISK_HEADROOM,
-                });
-                return;
-            }
+            await assertImportDiskSpace(size);
         }
 
         res.json({ ok: true });
     } catch (error) {
-        next(error);
+        if (!sendImportIngressError(res, error)) next(error);
     }
 });
 
 app.post('/api/backup/import', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
     if (!checkActiveSession(req, res)) return;
-
-    if (importInProgress) {
-        res.status(409).json({ error: 'Another import is already in progress' });
-        return;
-    }
-    importInProgress = true;
-    const releaseImportBarrier = await importBarrier.acquire();
+    const abortTracker = createImportAbortTracker(req, res);
+    let ownsImportSlot = false;
+    let releaseImportBarrier = null;
     let prevRequestTimeout;
     let wantsNdjson = false;
     let heartbeatTimer = null;
+    let uploadSpool = null;
+    let uploadStream = null;
 
     try {
+        if (importInProgress) {
+            res.status(409).json({ error: 'Another import is already in progress' });
+            return;
+        }
+        importInProgress = true;
+        ownsImportSlot = true;
+        releaseImportBarrier = await importBarrier.acquire(abortTracker.signal);
+        throwIfImportAborted(abortTracker.signal);
+
         // Disable timeouts for large backup uploads
         prevRequestTimeout = req.socket.server?.requestTimeout;
         req.socket.setTimeout(0);
@@ -9780,11 +10153,26 @@ app.post('/api/backup/import', async (req, res, next) => {
             return;
         }
 
-        const contentLength = Number(req.headers['content-length'] ?? '0');
-        if (BACKUP_IMPORT_MAX_BYTES > 0 && Number.isFinite(contentLength) && contentLength > BACKUP_IMPORT_MAX_BYTES) {
-            res.status(413).json({ error: `Backup exceeds max allowed size (${BACKUP_IMPORT_MAX_BYTES} bytes)` });
-            return;
+        const contentLength = importContentLength(req, 'Backup archive');
+        if (contentLength !== null) {
+            assertImportSize(contentLength, BACKUP_IMPORT_MAX_BYTES, 'Backup archive');
+            await assertImportDiskSpace(contentLength);
         }
+
+        const uploadPath = path.join(
+            databaseSpoolDir,
+            `${BACKUP_IMPORT_SPOOL_FILE_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}.tmp`,
+        );
+        uploadSpool = await spoolAsyncIterable(req, uploadPath, {
+            maxBytes: BACKUP_IMPORT_MAX_BYTES,
+            expectedBytes: contentLength,
+            signal: abortTracker.signal,
+        });
+        await assertImportDiskSpace(uploadSpool.size);
+        throwIfImportAborted(abortTracker.signal);
+        uploadStream = createReadStream(uploadSpool.filePath, {
+            highWaterMark: IMPORT_IO_PAGE_BYTES,
+        });
 
         if (wantsNdjson) {
             res.setHeader('content-type', 'application/x-ndjson');
@@ -9792,6 +10180,10 @@ app.post('/api/backup/import', async (req, res, next) => {
             // Disable nginx response buffering so progress events flush immediately.
             res.setHeader('x-accel-buffering', 'no');
             res.flushHeaders();
+            // The upload was deliberately validated before response headers so
+            // cap violations can remain literal HTTP 413 responses. Emit one
+            // immediate keepalive when the post-validation NDJSON phase starts.
+            res.write('{"type":"heartbeat"}\n');
 
             // Periodic keepalive — covers the post-stream phase (commit,
             // inlay dir swap, cold storage migration) where onProgress is silent.
@@ -9800,10 +10192,11 @@ app.post('/api/backup/import', async (req, res, next) => {
             }, BACKUP_NDJSON_HEARTBEAT_MS);
 
             let lastProgressWrite = 0;
-            const totalBytes = Number.isFinite(contentLength) ? contentLength : 0;
-            const result = await importBackupFromSource(req, {
+            const totalBytes = uploadSpool.size;
+            const result = await importBackupFromSource(uploadStream, {
                 maxBytes: BACKUP_IMPORT_MAX_BYTES,
                 totalBytes,
+                signal: abortTracker.signal,
                 onProgress: (received, total) => {
                     const now = Date.now();
                     if (now - lastProgressWrite < 200) return;
@@ -9811,6 +10204,10 @@ app.post('/api/backup/import', async (req, res, next) => {
                     res.write(JSON.stringify({ type: 'progress', bytes: received, totalBytes: total }) + '\n');
                 },
             });
+            uploadStream.destroy();
+            uploadStream = null;
+            await fs.unlink(uploadSpool.filePath).catch(() => {});
+            uploadSpool = null;
             res.write(JSON.stringify({
                 type: 'done',
                 ok: true,
@@ -9819,7 +10216,15 @@ app.post('/api/backup/import', async (req, res, next) => {
             }) + '\n');
             res.end();
         } else {
-            const result = await importBackupFromSource(req, { maxBytes: BACKUP_IMPORT_MAX_BYTES });
+            const result = await importBackupFromSource(uploadStream, {
+                maxBytes: BACKUP_IMPORT_MAX_BYTES,
+                totalBytes: uploadSpool.size,
+                signal: abortTracker.signal,
+            });
+            uploadStream.destroy();
+            uploadStream = null;
+            await fs.unlink(uploadSpool.filePath).catch(() => {});
+            uploadSpool = null;
             res.json({
                 ok: true,
                 assetsRestored: result.assetsRestored,
@@ -9831,11 +10236,11 @@ app.post('/api/backup/import', async (req, res, next) => {
             '[PluginStorage] Rejected invalid backup import row',
             error
         );
-        if (wantsNdjson && res.headersSent) {
+        if (sendImportIngressError(res, error, { ndjson: wantsNdjson })) {
+            // Structured ingress failures always report their publication outcome.
+        } else if (wantsNdjson && res.headersSent) {
             try {
-                res.write(JSON.stringify(diagnostic
-                    ? { type: 'error', ...diagnostic }
-                    : { type: 'error', message: error?.message || 'backup import failed' }) + '\n');
+                res.write(JSON.stringify(importNdjsonErrorEvent(error, diagnostic)) + '\n');
                 res.end();
             } catch (_) {}
         } else if (diagnostic) {
@@ -9845,8 +10250,11 @@ app.post('/api/backup/import', async (req, res, next) => {
         }
     } finally {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
-        importInProgress = false;
-        releaseImportBarrier();
+        abortTracker.cleanup();
+        uploadStream?.destroy();
+        if (uploadSpool) await fs.unlink(uploadSpool.filePath).catch(() => {});
+        releaseImportBarrier?.();
+        if (ownsImportSlot) importInProgress = false;
         if (req.socket.server && prevRequestTimeout !== undefined) {
             req.socket.server.requestTimeout = prevRequestTimeout;
         }
@@ -10060,14 +10468,22 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     if (HUB_HOSTING_MODE) return res.status(403).json({ error: 'Server backups are disabled on this instance' });
 
-    if (importInProgress) {
-        res.status(409).json({ error: 'Another import is already in progress' });
-        return;
-    }
-    importInProgress = true;
-    const releaseImportBarrier = await importBarrier.acquire();
+    const abortTracker = createImportAbortTracker(req, res);
+    let ownsImportSlot = false;
+    let releaseImportBarrier = null;
+    let heartbeatTimer = null;
+    let restoreStream = null;
 
     try {
+        if (importInProgress) {
+            res.status(409).json({ error: 'Another import is already in progress' });
+            return;
+        }
+        importInProgress = true;
+        ownsImportSlot = true;
+        releaseImportBarrier = await importBarrier.acquire(abortTracker.signal);
+        throwIfImportAborted(abortTracker.signal);
+
         const filename = req.body?.filename;
         if (!filename || !BACKUP_FILENAME_REGEX.test(filename)) {
             res.status(400).json({ error: 'Invalid backup filename' });
@@ -10082,24 +10498,26 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
             return;
         }
 
-        const disk = await checkDiskSpace(fileStat.size * BACKUP_DISK_HEADROOM);
-        if (!disk.ok) {
-            res.status(507).json({
-                error: 'Insufficient disk space',
-                available: disk.available,
-                required: fileStat.size * BACKUP_DISK_HEADROOM,
-            });
-            return;
-        }
+        assertImportSize(fileStat.size, BACKUP_IMPORT_MAX_BYTES, 'Server backup');
+
+        await assertImportDiskSpace(fileStat.size);
 
         res.setHeader('content-type', 'application/x-ndjson');
+        res.setHeader('cache-control', 'no-cache, no-transform');
+        res.setHeader('x-accel-buffering', 'no');
         res.flushHeaders();
+        res.write('{"type":"heartbeat"}\n');
+        heartbeatTimer = setInterval(() => {
+            if (!res.writableEnded && !res.destroyed) res.write('{"type":"heartbeat"}\n');
+        }, BACKUP_NDJSON_HEARTBEAT_MS);
 
         let lastProgressWrite = 0;
         const { createReadStream } = require('fs');
-        const stream = createReadStream(filePath, { highWaterMark: 256 * 1024 });
-        const result = await importBackupFromSource(stream, {
+        restoreStream = createReadStream(filePath, { highWaterMark: IMPORT_IO_PAGE_BYTES });
+        const result = await importBackupFromSource(restoreStream, {
+            maxBytes: BACKUP_IMPORT_MAX_BYTES,
             totalBytes: fileStat.size,
+            signal: abortTracker.signal,
             onProgress: (received, total) => {
                 const now = Date.now();
                 if (now - lastProgressWrite < 200) return;
@@ -10119,18 +10537,21 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
             '[PluginStorage] Rejected invalid server-backup row',
             error
         );
-        if (!res.headersSent) {
+        if (sendImportIngressError(res, error, { ndjson: true })) {
+            // Structured import failures include a stable publication outcome.
+        } else if (!res.headersSent) {
             if (diagnostic) res.status(400).json(diagnostic);
             else next(error);
         } else {
-            res.write(JSON.stringify(diagnostic
-                ? { type: 'error', ...diagnostic }
-                : { type: 'error', message: error.message }) + '\n');
+            res.write(JSON.stringify(importNdjsonErrorEvent(error, diagnostic)) + '\n');
             res.end();
         }
     } finally {
-        importInProgress = false;
-        releaseImportBarrier();
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        abortTracker.cleanup();
+        restoreStream?.destroy();
+        releaseImportBarrier?.();
+        if (ownsImportSlot) importInProgress = false;
     }
 });
 
@@ -10483,6 +10904,18 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 // ── Save-folder migration endpoints ──────────────────────────────────────────
 const migrationMarkerPath = path.join(savePath, '.migrated_to_sqlite');
 
+function decodeCanonicalHexStorageKey(filename) {
+    if (typeof filename !== 'string'
+        || filename.length === 0
+        || filename.length % 2 !== 0
+        || !hexRegex.test(filename)) return null;
+    const bytes = Buffer.from(filename, 'hex');
+    const key = bytes.toString('utf8');
+    if (key.length === 0
+        || Buffer.from(key, 'utf8').toString('hex') !== filename.toLowerCase()) return null;
+    return key;
+}
+
 function scanHexFilesInDir(dirPath) {
     let files;
     try {
@@ -10490,17 +10923,18 @@ function scanHexFilesInDir(dirPath) {
     } catch {
         return { hexFiles: [], count: 0, totalSize: 0, hasDatabase: false };
     }
-    const hexFiles = files.filter(f => hexRegex.test(f));
+    const hexFiles = files.filter(f => decodeCanonicalHexStorageKey(f) !== null);
     let totalSize = 0;
     let hasDatabase = false;
     for (const f of hexFiles) {
         try {
-            const stat = require('fs').statSync(path.join(dirPath, f));
-            totalSize += stat.size;
-        } catch { /* skip unreadable files */ }
-        try {
-            if (Buffer.from(f, 'hex').toString('utf-8') === 'database/database.bin') hasDatabase = true;
-        } catch { /* invalid hex */ }
+            const stat = fsSync.lstatSync(path.join(dirPath, f));
+            if (!stat.isFile() || stat.isSymbolicLink()) continue;
+            const nextSize = totalSize + stat.size;
+            if (!Number.isSafeInteger(nextSize)) continue;
+            totalSize = nextSize;
+            if (decodeCanonicalHexStorageKey(f) === DB_BLOB_KEY) hasDatabase = true;
+        } catch { /* scan reports only accessible regular files */ }
     }
     return { hexFiles, count: hexFiles.length, totalSize, hasDatabase };
 }
@@ -10533,20 +10967,33 @@ function clearExistingData() {
     clearEntities();
 }
 
-async function importLegacySaveEntries(sources, missingDatabaseMessage) {
+async function importLegacySaveEntries(sources, missingDatabaseMessage, { signal = null } = {}) {
+    throwIfImportAborted(signal);
     recoverPendingImportSwap('Save-folder import preparation');
     if (sources.length === 0) return { imported: 0 };
     const databaseEntry = sources.find((entry) => entry.key === DB_BLOB_KEY);
     if (!databaseEntry) {
         throw new Error(missingDatabaseMessage);
     }
-    const databaseSource = databaseEntry.streamSource ?? databaseEntry.read();
+    const databaseSource = {
+        filePath: databaseEntry.filePath,
+        size: databaseEntry.size,
+    };
     const databaseInspection = await inspectRisuSaveSource(databaseSource);
-    const streamDatabase = await shouldStreamRisuSave(databaseSource, {
-        inspection: databaseInspection,
-    });
+    const streamDatabase = databaseInspection.supported;
+    if (!streamDatabase) {
+        assertImportSize(
+            databaseEntry.size,
+            LEGACY_DATABASE_IMPORT_MAX_BYTES,
+            'Legacy database',
+            'LEGACY_DATABASE_IMPORT_LIMIT',
+        );
+    }
+    throwIfImportAborted(signal);
     await flushPendingDb();
+    throwIfImportAborted(signal);
     await createBackupAndRotate();
+    throwIfImportAborted(signal);
     invalidateDbCache();
     const existingAssetKeys = listAssetEntriesWithSizes()
         .filter((entry) => entry.source === 'fs')
@@ -10562,47 +11009,87 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
         for (const key of existingAssetKeys) kvRecordDeletion(key);
         clearExistingData();
         for (const source of sources) {
+            throwIfImportAborted(signal);
             const { key } = source;
             if (key === DB_BLOB_KEY && streamDatabase) continue;
-            const value = key === DB_BLOB_KEY && !source.streamSource
-                ? databaseSource
-                : source.read();
+            if (key === DB_BLOB_KEY) continue;
             if (key.startsWith('assets/')) {
-                writeImportedAsset(
+                await writeImportedAssetFromFile(
                     assetStage,
                     key,
-                    value,
-                    'Save-folder import'
+                    source,
+                    signal,
+                    'Save-folder import',
                 );
                 continue;
             }
-            // Modern save folders may also contain externalized chat and plugin
-            // rows. Plugin rows use the generic raw-row insert below; route the
-            // chunk-capable namespaces through the safe bind path.
-            if (key === DB_BLOB_KEY
-                || key.startsWith('database/dbbackup-')
-                || key.startsWith('chats/')) {
-                kvSet(key, value);
+            // Only namespaces implemented by chunkStore may stay file-backed
+            // above the row-local materialization cap.
+            if (key.startsWith('database/dbbackup-') || key.startsWith('chats/')) {
+                if (!isChunkableKey(key)) {
+                    throw new Error(`Save-folder row is not eligible for file-backed storage: ${key}`);
+                }
+                kvSetFromFile(key, source.filePath);
                 continue;
             }
-            validatePluginStorageRow(key, value);
-            kvSet(key, value);
+            if (key.startsWith(PLUGIN_SAVE_PREFIX)) {
+                await validateAndImportPluginValueFile(
+                    key,
+                    source,
+                    signal,
+                    'Save-folder import',
+                );
+                continue;
+            }
+            if (key.startsWith(PLUGIN_SAVE_META_PREFIX)
+                || key === PLUGIN_STORAGE_MANIFEST_KEY) {
+                const value = await readFileToBufferBounded(source.filePath, {
+                    size: source.size,
+                    maxBytes: Math.min(
+                        IMPORT_BUFFERED_ENTRY_MAX_BYTES,
+                        BACKUP_IMPORT_MAX_BYTES,
+                        PLUGIN_VALUE_MAX_BYTES,
+                    ),
+                    label: `Save-folder plugin row ${key}`,
+                    code: 'IMPORT_BUFFERED_ENTRY_LIMIT',
+                    signal,
+                });
+                validatePluginStorageRow(key, value);
+                kvSet(key, value);
+            } else {
+                await importBoundedOpaqueRow(
+                    key,
+                    source,
+                    signal,
+                    `Save-folder row ${key}`,
+                );
+            }
         }
 
         if (streamDatabase) {
             databaseIngestion = await ingestDatabaseStreaming(databaseSource, {
                 inspection: databaseInspection,
+                shouldAbort: () => signal?.aborted === true,
+                signal,
             });
             markRemoteMigrationDone();
         } else {
-            // The raw database row was inserted by the source loop above.
-            // Decode, validate, externalize, and rewrite it while the broad
-            // replacement transaction still protects the prior save.
-            const databaseRaw = kvGet(DB_BLOB_KEY);
-            if (!databaseRaw) throw new Error('Imported database row is missing');
-            databaseIngestion = await ingestDatabase(databaseRaw);
+            const decoded = await decodeBoundedLegacyRisuSave(databaseSource, {
+                inspection: databaseInspection,
+                tempDir: databaseSpoolDir,
+                maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
+                shouldAbort: () => signal?.aborted === true,
+                signal,
+                resolveRemoteSize: async (name) => kvSize(`remotes/${name}.local.bin`),
+                resolveRemote: async (name) => kvGet(`remotes/${name}.local.bin`),
+            });
+            databaseIngestion = await ingestDatabase(decoded, {
+                skipLiveRemoteMigration: true,
+            });
+            markRemoteMigrationDone();
         }
 
+        throwIfImportAborted(signal);
         fsyncDirectoryTree(assetImportStagingDir);
         journal = {
             id: nodeCrypto.randomUUID(),
@@ -10621,6 +11108,14 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
             assetImportBackupDir
         );
         kvBumpListEpoch();
+        throwIfImportAborted(signal);
+        if (saveFolderImportFailpoint === 'after-asset-swap') {
+            throw new ImportIngressError('Save-folder import was rolled back before publication', {
+                code: 'SAVE_FOLDER_IMPORT_NOT_COMMITTED',
+                statusCode: 500,
+                retryable: true,
+            });
+        }
         sqliteDb.exec('COMMIT');
         transactionCommitted = true;
 
@@ -10664,6 +11159,18 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
                     logger.error('[Save-folder Import] Failed to clear rolled-back import journal:', cleanupError);
                 }
             }
+            if (error instanceof ImportIngressError && !rollbackSucceeded) {
+                error.commitOutcome = 'unknown';
+                error.commitOutcomeUnknown = true;
+                error.statusCode = 500;
+            }
+            if (rollbackSucceeded && error && typeof error === 'object') {
+                error.commitOutcome = 'not-committed';
+                error.commitOutcomeUnknown = false;
+            }
+        } else if (error && typeof error === 'object') {
+            error.commitOutcome = 'committed';
+            error.commitOutcomeUnknown = false;
         }
         throw error;
     }
@@ -10672,37 +11179,87 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
     return { imported: sources.length };
 }
 
-async function importHexFilesFromDir(dirPath) {
-    const { hexFiles, hasDatabase } = scanHexFilesInDir(dirPath);
-    if (hexFiles.length === 0) return { imported: 0 };
-    if (!hasDatabase) throw new Error('Save folder does not contain database/database.bin');
-    const sources = hexFiles.map((hexFile) => {
-        const key = Buffer.from(hexFile, 'hex').toString('utf-8');
-        const filePath = path.join(dirPath, hexFile);
-        return {
-            key,
-            streamSource: key === DB_BLOB_KEY
-                ? { filePath, size: require('fs').statSync(filePath).size }
-                : null,
-            read: () => readFileSync(filePath),
-        };
-    });
-    return importLegacySaveEntries(
-        sources,
-        'Save folder does not contain database/database.bin'
+function createSaveFolderImportStage() {
+    const stageDir = path.join(
+        databaseSpoolDir,
+        `${SAVE_FOLDER_IMPORT_STAGE_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}`,
     );
+    mkdirSync(stageDir, { recursive: false, mode: 0o700 });
+    return stageDir;
 }
 
-async function importHexEntries(entries) {
-    const sources = entries.map(({ key, value }) => ({
-        key,
-        streamSource: key === DB_BLOB_KEY ? value : null,
-        read: () => value,
-    }));
-    return importLegacySaveEntries(
-        sources,
-        'Data does not contain database/database.bin'
-    );
+async function stageHexFilesFromDir(dirPath, stageDir, { signal = null } = {}) {
+    const keys = new Set();
+    const sources = [];
+    let stagedBytes = 0;
+    const directory = await fs.opendir(dirPath);
+    try {
+        for await (const entry of directory) {
+            throwIfImportAborted(signal);
+            const key = decodeCanonicalHexStorageKey(entry.name);
+            if (key === null) continue;
+            const nextCount = sources.length + 1;
+            if (nextCount > SAVE_FOLDER_IMPORT_MAX_ENTRIES) {
+                throw importSizeError(
+                    'Save-folder entry count',
+                    SAVE_FOLDER_IMPORT_MAX_ENTRIES,
+                    nextCount,
+                    'IMPORT_ENTRY_COUNT_LIMIT',
+                );
+            }
+            if (!entry.isFile()) {
+                throw importFormatError(`Save-folder entry is not a regular file: ${entry.name}`, 'INVALID_SAVE_FOLDER_ENTRY');
+            }
+            if (keys.has(key)) {
+                throw importFormatError(`Duplicate save-folder entry: ${key}`, 'DUPLICATE_SAVE_FOLDER_ENTRY');
+            }
+            keys.add(key);
+            const sourcePath = path.join(dirPath, entry.name);
+            const stat = await fs.lstat(sourcePath);
+            if (!stat.isFile() || stat.isSymbolicLink()) {
+                throw importFormatError(`Save-folder entry is not a regular file: ${entry.name}`, 'INVALID_SAVE_FOLDER_ENTRY');
+            }
+            const nextBytes = stagedBytes + stat.size;
+            assertImportSize(nextBytes, BACKUP_IMPORT_MAX_BYTES, 'Save folder');
+            const destination = path.join(stageDir, `${String(sources.length).padStart(8, '0')}.row`);
+            const staged = await copyFileToSpool(sourcePath, destination, {
+                maxBytes: BACKUP_IMPORT_MAX_BYTES,
+                signal,
+            });
+            const actualNextBytes = stagedBytes + staged.size;
+            assertImportSize(actualNextBytes, BACKUP_IMPORT_MAX_BYTES, 'Save folder');
+            stagedBytes = actualNextBytes;
+            sources.push({ key, filePath: staged.filePath, size: staged.size });
+        }
+    } finally {
+        await directory.close().catch((error) => {
+            if (error?.code !== 'ERR_DIR_CLOSED') throw error;
+        });
+    }
+    if (sources.length === 0) return [];
+    if (!keys.has(DB_BLOB_KEY)) {
+        throw importFormatError(
+            'Save folder does not contain database/database.bin',
+            'SAVE_FOLDER_DATABASE_MISSING',
+        );
+    }
+    await assertImportDiskSpace(stagedBytes);
+    return sources;
+}
+
+async function importHexFilesFromDir(dirPath, options = {}) {
+    const stageDir = createSaveFolderImportStage();
+    try {
+        const sources = await stageHexFilesFromDir(dirPath, stageDir, options);
+        if (sources.length === 0) return { imported: 0 };
+        return await importLegacySaveEntries(
+            sources,
+            'Save folder does not contain database/database.bin',
+            options,
+        );
+    } finally {
+        await fs.rm(stageDir, { recursive: true, force: true }).catch(() => {});
+    }
 }
 
 app.post('/api/migrate/save-folder/scan', async (req, res, next) => {
@@ -10731,13 +11288,19 @@ app.post('/api/migrate/save-folder/scan', async (req, res, next) => {
 app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
-    if (importInProgress) {
-        res.status(409).json({ error: 'Another import is already in progress' });
-        return;
-    }
-    importInProgress = true;
-    const releaseImportBarrier = await importBarrier.acquire();
+    const abortTracker = createImportAbortTracker(req, res);
+    let ownsImportSlot = false;
+    let releaseImportBarrier = null;
     try {
+        if (importInProgress) {
+            res.status(409).json({ error: 'Another import is already in progress' });
+            return;
+        }
+        importInProgress = true;
+        ownsImportSlot = true;
+        releaseImportBarrier = await importBarrier.acquire(abortTracker.signal);
+        throwIfImportAborted(abortTracker.signal);
+
         const folderPath = req.body?.path || savePath;
         const resolved = path.resolve(folderPath);
         try {
@@ -10750,85 +11313,123 @@ app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
             res.status(400).json({ error: 'Cannot access directory' });
             return;
         }
-        const result = await importHexFilesFromDir(resolved);
+        const result = await importHexFilesFromDir(resolved, {
+            signal: abortTracker.signal,
+        });
         res.json({ ok: true, imported: result.imported });
     } catch (error) {
         const diagnostic = logPluginStorageValidationFailure(
             '[PluginStorage] Rejected invalid save-folder row',
             error
         );
-        res.status(400).json(diagnostic ?? { error: error.message || 'Import failed' });
+        if (error?.risuSavePreparationInvalid === true && !res.headersSent) {
+            res.status(400).json({ error: error.message });
+        } else if (!sendImportIngressError(res, error)) {
+            res.status(400).json(diagnostic ?? { error: error.message || 'Import failed' });
+        }
     } finally {
-        importInProgress = false;
-        releaseImportBarrier();
+        abortTracker.cleanup();
+        releaseImportBarrier?.();
+        if (ownsImportSlot) importInProgress = false;
     }
 });
 
 app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
-    if (importInProgress) {
-        res.status(409).json({ error: 'Another import is already in progress' });
-        return;
-    }
-    importInProgress = true;
-    const releaseImportBarrier = await importBarrier.acquire();
+    const abortTracker = createImportAbortTracker(req, res);
+    let ownsImportSlot = false;
+    let releaseImportBarrier = null;
     let prevRequestTimeout;
+    let stageDir = null;
 
     try {
+        if (importInProgress) {
+            res.status(409).json({ error: 'Another import is already in progress' });
+            return;
+        }
+        importInProgress = true;
+        ownsImportSlot = true;
+        releaseImportBarrier = await importBarrier.acquire(abortTracker.signal);
+        throwIfImportAborted(abortTracker.signal);
+
         req.socket.setTimeout(0);
         req.socket.setKeepAlive(true);
         prevRequestTimeout = req.socket.server?.requestTimeout;
         if (req.socket.server) req.socket.server.requestTimeout = 0;
 
-        const chunks = [];
-        let totalSize = 0;
-        for await (const chunk of req) {
-            totalSize += chunk.length;
-            if (BACKUP_IMPORT_MAX_BYTES > 0 && totalSize > BACKUP_IMPORT_MAX_BYTES) {
-                res.status(413).json({ error: 'Zip file exceeds max allowed size' });
-                return;
-            }
-            chunks.push(chunk);
-        }
-        const zipBuffer = Buffer.concat(chunks);
-
-        const fflate = require('fflate');
-        let unzipped;
-        try {
-            unzipped = fflate.unzipSync(new Uint8Array(zipBuffer));
-        } catch {
-            res.status(400).json({ error: 'Invalid or corrupted zip file' });
+        const contentType = String(req.headers['content-type'] ?? '');
+        if (contentType
+            && !contentType.includes('application/zip')
+            && !contentType.includes('application/octet-stream')) {
+            res.status(415).json({ error: 'Unsupported save-folder archive content-type' });
             return;
         }
-
-        const entries = [];
-        for (const [entryPath, data] of Object.entries(unzipped)) {
-            if (data.length === 0) continue;
-            const basename = path.basename(entryPath);
-            if (!hexRegex.test(basename)) continue;
-            try {
-                const key = Buffer.from(basename, 'hex').toString('utf-8');
-                entries.push({ key, value: Buffer.from(data) });
-            } catch { /* invalid hex filename */ }
+        const contentLength = importContentLength(req, 'Save-folder ZIP');
+        if (contentLength !== null) {
+            assertImportSize(contentLength, BACKUP_IMPORT_MAX_BYTES, 'Save-folder ZIP');
+            await assertImportDiskSpace(contentLength);
         }
 
-        if (entries.length === 0) {
-            res.status(400).json({ error: 'No compatible hex files found in zip' });
-            return;
+        stageDir = createSaveFolderImportStage();
+        const zipPath = path.join(stageDir, 'upload.zip');
+        const zipSpool = await spoolAsyncIterable(req, zipPath, {
+            maxBytes: BACKUP_IMPORT_MAX_BYTES,
+            expectedBytes: contentLength,
+            signal: abortTracker.signal,
+        });
+        await assertImportDiskSpace(zipSpool.size);
+        const inventory = await inspectZipFile(zipSpool.filePath, {
+            acceptEntry: (entryPath) => {
+                const basename = path.posix.basename(entryPath.replaceAll('\\', '/'));
+                const key = decodeCanonicalHexStorageKey(basename);
+                return key === null ? null : { key };
+            },
+            maxEntries: SAVE_FOLDER_IMPORT_MAX_ENTRIES,
+            maxExpandedBytes: BACKUP_IMPORT_MAX_BYTES,
+            signal: abortTracker.signal,
+        });
+        if (inventory.entries.length === 0) {
+            throw importFormatError('No compatible hex files found in ZIP', 'SAVE_FOLDER_ENTRIES_MISSING');
         }
-
-        const result = await importHexEntries(entries);
+        if (!inventory.entries.some((entry) => entry.key === DB_BLOB_KEY)) {
+            throw importFormatError(
+                'Data does not contain database/database.bin',
+                'SAVE_FOLDER_DATABASE_MISSING',
+            );
+        }
+        await assertImportDiskSpace(inventory.expandedBytes);
+        const sources = await extractZipEntries(
+            inventory,
+            path.join(stageDir, 'rows'),
+            { signal: abortTracker.signal },
+        );
+        throwIfImportAborted(abortTracker.signal);
+        const result = await importLegacySaveEntries(
+            sources,
+            'Data does not contain database/database.bin',
+            { signal: abortTracker.signal },
+        );
+        await fs.rm(stageDir, { recursive: true, force: true });
+        stageDir = null;
         res.json({ ok: true, imported: result.imported });
     } catch (error) {
         const diagnostic = logPluginStorageValidationFailure(
             '[PluginStorage] Rejected invalid uploaded save-folder row',
             error
         );
-        res.status(400).json(diagnostic ?? { error: error.message || 'Import failed' });
+        if (error?.risuSavePreparationInvalid === true && !res.headersSent) {
+            res.status(400).json({ error: error.message });
+        } else if (!sendImportIngressError(res, error)) {
+            if (!res.headersSent) {
+                res.status(400).json(diagnostic ?? { error: error.message || 'Import failed' });
+            }
+        }
     } finally {
-        importInProgress = false;
-        releaseImportBarrier();
+        abortTracker.cleanup();
+        if (stageDir) await fs.rm(stageDir, { recursive: true, force: true }).catch(() => {});
+        releaseImportBarrier?.();
+        if (ownsImportSlot) importInProgress = false;
         if (req.socket.server && prevRequestTimeout !== undefined) {
             req.socket.server.requestTimeout = prevRequestTimeout;
         }

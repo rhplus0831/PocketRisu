@@ -74,6 +74,16 @@ function readyStorage(): NodeStorage {
     return storage
 }
 
+const backupLateError = {
+    type: 'error' as const,
+    message: 'Backup import rolled back: 데이터',
+    code: 'BACKUP_IMPORT_NOT_COMMITTED',
+    retryable: true,
+    commitOutcome: 'not-committed' as const,
+    commitOutcomeUnknown: false,
+    status: 500,
+}
+
 describe('NodeStorage plugin error contract', () => {
     beforeEach(() => {
         fetchMock.mockReset()
@@ -85,6 +95,79 @@ describe('NodeStorage plugin error contract', () => {
     afterEach(() => {
         vi.useRealTimers()
         vi.unstubAllGlobals()
+    })
+
+    test('preserves the exact structured late upload error even after a done event', async () => {
+        fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }))
+
+        class FakeXmlHttpRequest {
+            status = 200
+            responseText = ''
+            upload: Record<string, any> = {}
+            onprogress: (() => void) | null = null
+            onerror: (() => void) | null = null
+            onload: (() => void) | null = null
+            open() {}
+            setRequestHeader() {}
+            send() {
+                this.upload.onload?.()
+                const stream = [
+                    '{"type":"heartbeat"}\n{"type":"done","ok":true,"assetsRestored":1}\n',
+                    JSON.stringify(backupLateError).slice(0, 47),
+                    JSON.stringify(backupLateError).slice(47),
+                ]
+                for (const chunk of stream) {
+                    this.responseText += chunk
+                    this.onprogress?.()
+                }
+                this.onload?.()
+            }
+        }
+        vi.stubGlobal('XMLHttpRequest', FakeXmlHttpRequest)
+
+        const error = await readyStorage().importBackup(new Blob(['archive'])).catch(value => value)
+        expect(error).toBeInstanceOf(StorageError)
+        expect(error).toMatchObject({
+            message: backupLateError.message,
+            status: 500,
+            code: backupLateError.code,
+            retryable: true,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+            operation: 'write',
+        })
+    })
+
+    test('preserves a split UTF-8 late server-restore error without a final newline', async () => {
+        const encoded = new TextEncoder().encode(
+            '{"type":"heartbeat"}\n' + JSON.stringify(backupLateError),
+        )
+        const messageBytes = new TextEncoder().encode('데')
+        const splitAt = encoded.indexOf(messageBytes[0]) + 1
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(encoded.subarray(0, splitAt))
+                controller.enqueue(encoded.subarray(splitAt, splitAt + 1))
+                controller.enqueue(encoded.subarray(splitAt + 1))
+                controller.close()
+            },
+        })
+        fetchMock.mockResolvedValueOnce(new Response(body, {
+            status: 200,
+            headers: { 'content-type': 'application/x-ndjson' },
+        }))
+
+        const error = await readyStorage().restoreServerBackup('risu-backup-1.bin').catch(value => value)
+        expect(error).toBeInstanceOf(StorageError)
+        expect(error).toMatchObject({
+            message: backupLateError.message,
+            status: 500,
+            code: backupLateError.code,
+            retryable: true,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+            operation: 'write',
+        })
     })
 
     test('retries an explicitly retryable idempotent plugin write within a fixed bound', async () => {

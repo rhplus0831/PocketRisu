@@ -22,14 +22,57 @@ function createImportBarrier({ drainMutations = null } = {}) {
     let tail = Promise.resolve();
     let heldCount = 0;
 
-    async function acquire() {
+    function abortReason(signal) {
+        if (signal?.reason !== undefined) return signal.reason;
+        const error = new Error('The operation was aborted');
+        error.name = 'AbortError';
+        return error;
+    }
+
+    function waitForTurn(pending, signal) {
+        if (!signal) return pending;
+        if (signal.aborted) return Promise.reject(abortReason(signal));
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (operation) => (value) => {
+                if (settled) return;
+                settled = true;
+                signal.removeEventListener('abort', onAbort);
+                operation(value);
+            };
+            const resolveOnce = finish(resolve);
+            const rejectOnce = finish(reject);
+            const onAbort = () => rejectOnce(abortReason(signal));
+            signal.addEventListener('abort', onAbort, { once: true });
+            if (signal.aborted) {
+                onAbort();
+                return;
+            }
+            pending.then(resolveOnce, rejectOnce);
+        });
+    }
+
+    async function acquire(signal = null) {
+        if (signal?.aborted) throw abortReason(signal);
         let releaseHold;
         const hold = new Promise((resolve) => {
             releaseHold = resolve;
         });
         const previous = tail;
         tail = previous.then(() => hold);
-        await previous;
+        try {
+            await waitForTurn(previous, signal);
+        } catch (error) {
+            // Remove this abandoned turn from the tail. It remains ordered
+            // behind `previous`, but resolves immediately when that holder
+            // releases so later imports are not wedged behind a dead request.
+            releaseHold();
+            throw error;
+        }
+        if (signal?.aborted) {
+            releaseHold();
+            throw abortReason(signal);
+        }
 
         heldCount += 1;
         let released = false;
@@ -42,11 +85,19 @@ function createImportBarrier({ drainMutations = null } = {}) {
 
         if (drainMutations) {
             try {
+                // The FIFO drain cannot itself be abandoned: releasing the hold
+                // before it completes would allow the next import to open a raw
+                // transaction alongside an older mutation. Observe cancellation
+                // immediately after the drain and refuse to return a live hold.
                 await drainMutations();
+                if (signal?.aborted) throw abortReason(signal);
             } catch (error) {
                 release();
                 throw error;
             }
+        } else if (signal?.aborted) {
+            release();
+            throw abortReason(signal);
         }
         return release;
     }
@@ -56,13 +107,6 @@ function createImportBarrier({ drainMutations = null } = {}) {
     // request scope alone races with an import that starts mid-request.
     function isHeld() {
         return heldCount > 0;
-    }
-
-    function abortReason(signal) {
-        if (signal?.reason !== undefined) return signal.reason;
-        const error = new Error('The operation was aborted');
-        error.name = 'AbortError';
-        return error;
     }
 
     async function waitUntilIdle(signal = null) {

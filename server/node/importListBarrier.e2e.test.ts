@@ -7,6 +7,7 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { Packr } from 'msgpackr'
+import { zipSync } from 'fflate'
 
 const serverEntry = path.resolve(process.cwd(), 'server/node/server.cjs')
 const testPasswordDigest = crypto.createHash('sha256').update('list-delta-test').digest('hex')
@@ -14,6 +15,7 @@ const testPasswordDigest = crypto.createHash('sha256').update('list-delta-test')
 interface RunningServer {
     child: ChildProcessWithoutNullStreams
     origin: string
+    cwd: string
     logs: () => string
 }
 
@@ -111,7 +113,7 @@ async function waitForServer(server: RunningServer): Promise<void> {
     throw new Error(`Server did not become ready:\n${server.logs()}`)
 }
 
-async function startServer(cwd: string): Promise<RunningServer> {
+async function startServer(cwd: string, extraEnv: Record<string, string> = {}): Promise<RunningServer> {
     for (let attempt = 0; attempt < 3; attempt++) {
         const port = await getFreePort()
         let output = ''
@@ -121,7 +123,10 @@ async function startServer(cwd: string): Promise<RunningServer> {
                 ...process.env,
                 HOST: '127.0.0.1',
                 PORT: String(port),
+                NODE_ENV: 'test',
+                POCKETRISU_BACKUP_IMPORT_TEST_GATE_DIR: path.join(cwd, 'import-gate'),
                 RISU_UPDATE_CHECK: 'false',
+                ...extraEnv,
             },
             stdio: ['pipe', 'pipe', 'pipe'],
         })
@@ -130,6 +135,7 @@ async function startServer(cwd: string): Promise<RunningServer> {
         const server = {
             child,
             origin: `http://127.0.0.1:${port}`,
+            cwd,
             logs: () => output,
         }
         runningServers.add(server)
@@ -294,13 +300,120 @@ function validPluginStorageBackup(key: string, value: Buffer): Buffer {
     ])
 }
 
+function validDatabaseBackup(): Buffer {
+    return validPluginStorageBackup(
+        `pluginsave/${Buffer.from('pause-marker').toString('base64url')}.json`,
+        Buffer.from('{"pause":true}'),
+    )
+}
+
+function validDatabaseBytes(note = 'candidate'): Buffer {
+    return Buffer.concat([rawSaveHeader, packr.encode({
+        characters: [],
+        personas: [],
+        botPresets: [],
+        modules: [],
+        pluginCustomStorage: {},
+        optimizePluginMemory: true,
+        globalNote: note,
+    })])
+}
+
+function validSaveFolderZip(note = 'candidate'): Buffer {
+    const databaseHex = Buffer.from('database/database.bin').toString('hex')
+    return Buffer.from(zipSync({
+        [databaseHex]: validDatabaseBytes(note),
+    }, { level: 0 }))
+}
+
+function importSpoolArtifacts(cwd: string): string[] {
+    const spoolDir = path.join(cwd, 'save', '.spool')
+    return fs.readdirSync(spoolDir, { withFileTypes: true })
+        .map(entry => entry.name)
+        .filter(name => name.startsWith('.backup-import-')
+            || name.startsWith('.database-risudat-backup-import-')
+            || name.startsWith('.backup-entry-stage-')
+            || name.startsWith('.save-folder-import-'))
+}
+
+async function waitForImportCleanup(server: RunningServer, auth: AuthHeaders): Promise<void> {
+    await withTimeout((async () => {
+        while (true) {
+            const response = await fetch(`${server.origin}/api/backup/import/prepare`, {
+                method: 'POST',
+                headers: { ...auth, 'content-type': 'application/json' },
+                body: JSON.stringify({ size: 1 }),
+            })
+            if (response.status === 200) break
+            if (response.status !== 409) {
+                throw new Error(`Unexpected import prepare status ${response.status}: ${await response.text()}`)
+            }
+            await delay(10)
+        }
+        while (importSpoolArtifacts(server.cwd).length > 0) await delay(10)
+    })(), 15_000, 'import lifecycle cleanup')
+}
+
+async function disconnectAtBarrierDrain(
+    server: RunningServer,
+    auth: AuthHeaders,
+    route: string,
+    contentType: string,
+    body: Buffer,
+): Promise<void> {
+    const gateDir = path.join(server.cwd, 'barrier-drain-gate')
+    fs.mkdirSync(gateDir, { recursive: true })
+    fs.rmSync(path.join(gateDir, 'entered'), { force: true })
+    fs.rmSync(path.join(gateDir, 'release'), { force: true })
+    fs.writeFileSync(path.join(gateDir, 'hold'), 'hold')
+
+    const request = http.request(`${server.origin}${route}`, {
+        method: 'POST',
+        headers: {
+            ...auth,
+            'content-type': contentType,
+            'content-length': String(body.length),
+        },
+    })
+    request.on('error', () => {})
+    request.on('response', response => response.resume())
+    request.end(body)
+    await withTimeout((async () => {
+        while (!fs.existsSync(path.join(gateDir, 'entered'))) await delay(10)
+    })(), 15_000, `${route} barrier drain`)
+
+    const busy = await fetch(`${server.origin}/api/backup/import/prepare`, {
+        method: 'POST',
+        headers: { ...auth, 'content-type': 'application/json' },
+        body: JSON.stringify({ size: 1 }),
+    })
+    expect(busy.status).toBe(409)
+    request.destroy()
+    await delay(50)
+    const stillBusy = await fetch(`${server.origin}/api/backup/import/prepare`, {
+        method: 'POST',
+        headers: { ...auth, 'content-type': 'application/json' },
+        body: JSON.stringify({ size: 1 }),
+    })
+    expect(stillBusy.status).toBe(409)
+
+    fs.writeFileSync(path.join(gateDir, 'release'), 'release')
+    fs.rmSync(path.join(gateDir, 'hold'), { force: true })
+    await waitForImportCleanup(server, auth)
+    expect(importSpoolArtifacts(server.cwd)).toEqual([])
+}
+
 async function startPausedImport(
     server: RunningServer,
     auth: AuthHeaders,
-    initialBytes = partialDatabaseEntry(),
+    initialBytes = validDatabaseBackup(),
 ): Promise<PausedImport> {
     let response: IncomingMessage | undefined
-    let progressSeen = false
+    const gateDir = path.join(server.cwd, 'import-gate')
+    fs.mkdirSync(gateDir, { recursive: true })
+    fs.rmSync(path.join(gateDir, 'entered'), { force: true })
+    fs.rmSync(path.join(gateDir, 'release'), { force: true })
+    fs.writeFileSync(path.join(gateDir, 'hold'), 'hold')
     const request = http.request(`${server.origin}/api/backup/import`, {
         method: 'POST',
         headers: {
@@ -311,46 +424,38 @@ async function startPausedImport(
     })
     request.on('error', () => {})
 
-    let finishImport: (() => Promise<{ status: number; body: string }>) | undefined
-    const progress = new Promise<void>((resolve, reject) => {
+    let resolveCompleted: (result: { status: number; body: string }) => void
+    let rejectCompleted: (error: unknown) => void
+    const completed = new Promise<{ status: number; body: string }>((resolveDone, rejectDone) => {
+        resolveCompleted = resolveDone
+        rejectCompleted = rejectDone
+    })
+    void completed.catch(() => {})
+    const responseReady = new Promise<void>((resolve, reject) => {
         request.once('response', (incoming) => {
             response = incoming
             incoming.setEncoding('utf8')
             let body = ''
-            let resolveCompleted: (result: { status: number; body: string }) => void
-            let rejectCompleted: (error: unknown) => void
-            const completed = new Promise<{ status: number; body: string }>((resolveDone, rejectDone) => {
-                resolveCompleted = resolveDone
-                rejectCompleted = rejectDone
-            })
-            // Rollback/crash tests intentionally destroy this response instead
-            // of awaiting finish(); keep that expected rejection handled.
-            void completed.catch(() => {})
-            finishImport = async () => {
-                request.end()
-                return await completed
-            }
             incoming.on('data', (chunk) => {
                 body += chunk
-                if (!progressSeen && body.includes('"type":"progress"')) {
-                    progressSeen = true
-                    resolve()
-                }
             })
             incoming.on('error', (error) => {
-                if (!progressSeen) reject(error)
                 rejectCompleted(error)
             })
             incoming.on('end', () => {
-                if (!progressSeen) reject(new Error(`Import ended before pausing: ${body}`))
                 resolveCompleted({ status: incoming.statusCode ?? 0, body })
             })
+            resolve()
         })
+        request.once('error', reject)
     })
 
-    request.write(initialBytes)
-    await withTimeout(progress, 15_000, 'paused import progress')
-    if (!response || !finishImport) throw new Error('Import response was not created')
+    request.end(initialBytes)
+    await withTimeout((async () => {
+        while (!fs.existsSync(path.join(gateDir, 'entered'))) await delay(10)
+    })(), 15_000, 'paused import gate')
+    await withTimeout(responseReady, 15_000, 'paused import response')
+    if (!response) throw new Error('Import response was not created')
     return {
         request,
         response,
@@ -358,7 +463,11 @@ async function startPausedImport(
             response?.destroy()
             request.destroy()
         },
-        finish: finishImport,
+        finish: async () => {
+            fs.writeFileSync(path.join(gateDir, 'release'), 'release')
+            fs.rmSync(path.join(gateDir, 'hold'), { force: true })
+            return await completed
+        },
     }
 }
 
@@ -413,7 +522,11 @@ describe('list delta import isolation', () => {
         pausedImport.abort()
 
         const restarted = await startServer(cwd)
-        const recovered = await listKeys(restarted, auth, baseline)
+        // A SIGKILL can occur before a newly-created JWT secret is durable.
+        // Re-authenticate against the restarted process; the list generation
+        // cursor itself is independent of the bearer token.
+        const restartedAuth = await authenticate(restarted)
+        const recovered = await listKeys(restarted, restartedAuth, baseline)
         expect(recovered.epoch).not.toBe(baseline.epoch)
         expect(recovered.mode).toBe('full')
         expect(recovered.content).toContain(seededKey)
@@ -476,5 +589,194 @@ describe('storage reads and mutations during import', () => {
         pausedImport.abort()
         expect(await withTimeout(pendingRead, 15_000, 'post-rollback read')).toEqual(before)
         expect(await readKey(server, auth, key)).toEqual(before)
+    }, 60_000)
+})
+
+describe('import acquisition lifecycle', () => {
+    it('cancels archive and save-folder uploads disconnected during the mutation drain', async () => {
+        const cwd = makeWorkDir()
+        const server = await startServer(cwd, {
+            POCKETRISU_IMPORT_BARRIER_DRAIN_TEST_GATE_DIR: path.join(cwd, 'barrier-drain-gate'),
+        })
+        const auth = await authenticate(server)
+        const durableKey = `pluginsave/${Buffer.from('drain-durable').toString('base64url')}.json`
+        const durable = Buffer.from('{"generation":"before-drain"}')
+        await seedKey(server, auth, durableKey, durable)
+
+        await disconnectAtBarrierDrain(
+            server,
+            auth,
+            '/api/backup/import',
+            'application/x-risu-backup',
+            validDatabaseBackup(),
+        )
+        expect(await readKey(server, auth, durableKey)).toEqual(durable)
+
+        await disconnectAtBarrierDrain(
+            server,
+            auth,
+            '/api/migrate/save-folder/upload',
+            'application/zip',
+            validSaveFolderZip('must-not-publish'),
+        )
+        expect(await readKey(server, auth, durableKey)).toEqual(durable)
+
+        const admitted = await fetch(`${server.origin}/api/backup/import`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/x-risu-backup' },
+            body: validDatabaseBackup(),
+        })
+        expect(admitted.status).toBe(200)
+    }, 60_000)
+
+    it('clears the import slot after forced acquisition rejection on all four routes', async () => {
+        const cwd = makeWorkDir()
+        const server = await startServer(cwd, {
+            POCKETRISU_TEST_IMPORT_BARRIER_ACQUIRE_FAILURES: '4',
+        })
+        const auth = await authenticate(server)
+        const directDir = path.join(cwd, 'direct-import')
+        fs.mkdirSync(directDir)
+        fs.writeFileSync(
+            path.join(directDir, Buffer.from('database/database.bin').toString('hex')),
+            validDatabaseBytes('direct'),
+        )
+        const requests: Array<() => Promise<Response>> = [
+            () => fetch(`${server.origin}/api/backup/import`, {
+                method: 'POST',
+                headers: { ...auth, 'content-type': 'application/x-risu-backup' },
+                body: validDatabaseBackup(),
+            }),
+            () => fetch(`${server.origin}/api/backup/server/restore`, {
+                method: 'POST',
+                headers: { ...auth, 'content-type': 'application/json' },
+                body: JSON.stringify({ filename: 'risu-backup-1.bin' }),
+            }),
+            () => fetch(`${server.origin}/api/migrate/save-folder/execute`, {
+                method: 'POST',
+                headers: { ...auth, 'content-type': 'application/json' },
+                body: JSON.stringify({ path: directDir }),
+            }),
+            () => fetch(`${server.origin}/api/migrate/save-folder/upload`, {
+                method: 'POST',
+                headers: { ...auth, 'content-type': 'application/zip' },
+                body: validSaveFolderZip('zip'),
+            }),
+        ]
+
+        for (const issueRequest of requests) {
+            const response = await issueRequest()
+            expect(response.status).toBe(500)
+            expect(await response.json()).toMatchObject({
+                code: 'IMPORT_BARRIER_ACQUIRE_FAILED',
+                retryable: true,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            })
+            await waitForImportCleanup(server, auth)
+            expect(importSpoolArtifacts(server.cwd)).toEqual([])
+        }
+
+        const admitted = await fetch(`${server.origin}/api/backup/import`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/x-risu-backup' },
+            body: validDatabaseBackup(),
+        })
+        expect(admitted.status).toBe(200)
+    }, 60_000)
+})
+
+describe('backup import NDJSON lifecycle', () => {
+    it('keeps server restore alive with immediate and periodic heartbeats', async () => {
+        const cwd = makeWorkDir()
+        fs.mkdirSync(path.join(cwd, 'backups'))
+        fs.writeFileSync(path.join(cwd, 'backups', 'risu-backup-1.bin'), validDatabaseBackup())
+        const server = await startServer(cwd, { BACKUP_NDJSON_HEARTBEAT_MS: '100' })
+        const auth = await authenticate(server)
+        const gateDir = path.join(cwd, 'import-gate')
+        fs.mkdirSync(gateDir, { recursive: true })
+        fs.rmSync(path.join(gateDir, 'entered'), { force: true })
+        fs.rmSync(path.join(gateDir, 'release'), { force: true })
+        fs.writeFileSync(path.join(gateDir, 'hold'), 'hold')
+
+        const response = await fetch(`${server.origin}/api/backup/server/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ filename: 'risu-backup-1.bin' }),
+        })
+        expect(response.status).toBe(200)
+        expect(response.headers.get('cache-control')).toBe('no-cache, no-transform')
+        expect(response.headers.get('x-accel-buffering')).toBe('no')
+        const reader = response.body!.getReader()
+        const decoder = new TextDecoder()
+        let text = ''
+        await withTimeout((async () => {
+            while (!fs.existsSync(path.join(gateDir, 'entered'))) await delay(10)
+            while ((text.match(/"type":"heartbeat"/g) ?? []).length < 2) {
+                const { done, value } = await reader.read()
+                if (done) throw new Error('restore stream ended before periodic heartbeat')
+                text += decoder.decode(value, { stream: true })
+            }
+        })(), 15_000, 'restore periodic heartbeat')
+
+        fs.writeFileSync(path.join(gateDir, 'release'), 'release')
+        fs.rmSync(path.join(gateDir, 'hold'), { force: true })
+        while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            text += decoder.decode(value, { stream: true })
+        }
+        text += decoder.decode()
+        expect(text).toContain('"type":"done"')
+    }, 60_000)
+
+    it('emits the same exact structured late error for upload and server restore', async () => {
+        const cwd = makeWorkDir()
+        fs.mkdirSync(path.join(cwd, 'backups'))
+        fs.writeFileSync(path.join(cwd, 'backups', 'risu-backup-1.bin'), validDatabaseBackup())
+        const baseline = await startServer(cwd)
+        const baselineAuth = await authenticate(baseline)
+        const durableKey = `pluginsave/${Buffer.from('late-error-durable').toString('base64url')}.json`
+        const durable = Buffer.from('{"generation":"before-late-error"}')
+        await seedKey(baseline, baselineAuth, durableKey, durable)
+        await stopServer(baseline)
+
+        const server = await startServer(cwd, {
+            POCKETRISU_TEST_BACKUP_IMPORT_FAILPOINT: 'after-database-ingestion',
+            BACKUP_NDJSON_HEARTBEAT_MS: '100',
+        })
+        const auth = await authenticate(server)
+        const requests = [
+            () => fetch(`${server.origin}/api/backup/import`, {
+                method: 'POST',
+                headers: {
+                    ...auth,
+                    accept: 'application/x-ndjson',
+                    'content-type': 'application/x-risu-backup',
+                },
+                body: validDatabaseBackup(),
+            }),
+            () => fetch(`${server.origin}/api/backup/server/restore`, {
+                method: 'POST',
+                headers: { ...auth, 'content-type': 'application/json' },
+                body: JSON.stringify({ filename: 'risu-backup-1.bin' }),
+            }),
+        ]
+        for (const issueRequest of requests) {
+            const response = await issueRequest()
+            expect(response.status).toBe(200)
+            const events = (await response.text()).trim().split('\n').map(line => JSON.parse(line))
+            expect(events.some(event => event.type === 'done')).toBe(false)
+            expect(events.find(event => event.type === 'error')).toEqual({
+                type: 'error',
+                message: 'Backup import was rolled back before publication',
+                code: 'BACKUP_IMPORT_NOT_COMMITTED',
+                retryable: true,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+                status: 500,
+            })
+            expect(await readKey(server, auth, durableKey)).toEqual(durable)
+        }
     }, 60_000)
 })

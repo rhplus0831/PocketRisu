@@ -37,7 +37,7 @@ const {
 } = require('./pluginStorageJson.cjs');
 
 const DEFAULT_STREAM_INGEST_MIN_BYTES = 32 * 1024 * 1024;
-const CURSOR_CACHE_BYTES = 256 * 1024;
+const CURSOR_CACHE_BYTES = 64 * 1024;
 const DECODE_OUTPUT_CHUNK_BYTES = 64 * 1024;
 const DEFAULT_MAX_DECODED_BYTES = 4 * 1024 * 1024 * 1024;
 const DEFAULT_DECODE_DISK_HEADROOM_BYTES = 256 * 1024 * 1024;
@@ -335,7 +335,12 @@ class RandomAccessSource {
         const result = Buffer.allocUnsafe(length);
         let written = 0;
         while (written < length) {
-            const read = await this.handle.read(result, written, length - written, offset + written);
+            const read = await this.handle.read(
+                result,
+                written,
+                Math.min(CURSOR_CACHE_BYTES, length - written),
+                offset + written,
+            );
             if (read.bytesRead === 0) {
                 throw new Error(`Truncated MessagePack payload at byte ${offset + written}`);
             }

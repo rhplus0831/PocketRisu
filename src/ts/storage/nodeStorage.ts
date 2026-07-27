@@ -65,6 +65,54 @@ export const INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS = 10 * 60_000
 export const INTERNAL_SNAPSHOT_KEY_PATTERN = /^database\/dbbackup-(0|[1-9]\d*)\.bin$/
 type BoundedStorageOperation = 'read' | 'list' | 'write' | 'remove' | 'transition' | 'batch'
 
+interface BackupNdjsonErrorEvent {
+    type: 'error'
+    message: string
+    code: string
+    retryable: boolean
+    commitOutcome: 'not-committed' | 'committed' | 'unknown'
+    commitOutcomeUnknown: boolean
+    status: number
+}
+
+function backupNdjsonStorageError(value: unknown): StorageError | null {
+    if (!value || typeof value !== 'object' || (value as { type?: unknown }).type !== 'error') {
+        return null
+    }
+    const event = value as Partial<BackupNdjsonErrorEvent>
+    const validOutcome = event.commitOutcome === 'not-committed'
+        || event.commitOutcome === 'committed'
+        || event.commitOutcome === 'unknown'
+    const valid = typeof event.message === 'string'
+        && event.message.length > 0
+        && typeof event.code === 'string'
+        && event.code.length > 0
+        && typeof event.retryable === 'boolean'
+        && validOutcome
+        && typeof event.commitOutcomeUnknown === 'boolean'
+        && event.commitOutcomeUnknown === (event.commitOutcome === 'unknown')
+        && Number.isInteger(event.status)
+        && Number(event.status) >= 100
+        && Number(event.status) <= 599
+    if (!valid) {
+        return new StorageError('Backup import returned a malformed terminal error event.', {
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            retryable: false,
+            commitOutcome: 'unknown',
+            commitOutcomeUnknown: true,
+            operation: 'write',
+        })
+    }
+    return new StorageError(event.message!, {
+        status: event.status!,
+        code: event.code!,
+        retryable: event.retryable!,
+        commitOutcome: event.commitOutcome!,
+        commitOutcomeUnknown: event.commitOutcomeUnknown!,
+        operation: 'write',
+    })
+}
+
 interface AuthoritativeStorageOutcomeTracker {
     markRequestDispatched: () => void
     markDefinitiveResponse: () => void
@@ -3342,33 +3390,39 @@ export class NodeStorage{
             let parsedIndex = 0
             let leftover = ''
             let result: {ok: boolean, assetsRestored: number, coldStorageFailed?: number} | null = null
-            let serverErrorMsg: string | null = null
+            let serverError: StorageError | null = null
 
-            const drainNdjson = () => {
+            const consumeNdjsonLine = (line: string) => {
+                if (!line) return
+                let msg: any
+                try { msg = JSON.parse(line) } catch { return }
+                if (msg.type === 'progress' && uploadComplete) {
+                    // After upload finishes, surface server-side processing
+                    // progress through the same callback for UI continuity.
+                    onProgress?.(msg.bytes, msg.totalBytes)
+                } else if (msg.type === 'done') {
+                    result = msg
+                } else if (msg.type === 'error') {
+                    serverError = backupNdjsonStorageError(msg)
+                }
+                // Ignore 'heartbeat' and unknown event types.
+            }
+            const drainNdjson = (flush = false) => {
                 const text = xhr.responseText
-                if (text.length <= parsedIndex) return
-                leftover += text.slice(parsedIndex)
-                parsedIndex = text.length
+                if (text.length > parsedIndex) {
+                    leftover += text.slice(parsedIndex)
+                    parsedIndex = text.length
+                }
                 const lines = leftover.split('\n')
                 leftover = lines.pop() ?? ''
-                for (const line of lines) {
-                    if (!line) continue
-                    let msg: any
-                    try { msg = JSON.parse(line) } catch { continue }
-                    if (msg.type === 'progress' && uploadComplete) {
-                        // After upload finishes, surface server-side processing
-                        // progress through the same callback for UI continuity.
-                        onProgress?.(msg.bytes, msg.totalBytes)
-                    } else if (msg.type === 'done') {
-                        result = msg
-                    } else if (msg.type === 'error') {
-                        serverErrorMsg = typeof msg.message === 'string' ? msg.message : 'backup import failed'
-                    }
-                    // Ignore 'heartbeat' and unknown event types.
+                for (const line of lines) consumeNdjsonLine(line)
+                if (flush && leftover) {
+                    consumeNdjsonLine(leftover)
+                    leftover = ''
                 }
             }
 
-            xhr.onprogress = drainNdjson
+            xhr.onprogress = () => drainNdjson()
             xhr.onerror = () => reject(new Error('backup import request failed'))
             xhr.onload = () => {
                 if (xhr.status < 200 || xhr.status >= 300) {
@@ -3380,8 +3434,8 @@ export class NodeStorage{
                     reject(new Error(msg))
                     return
                 }
-                drainNdjson()
-                if (serverErrorMsg) reject(new Error(serverErrorMsg))
+                drainNdjson(true)
+                if (serverError) reject(serverError)
                 else if (result) resolve(result)
                 else reject(new Error('backup import: no result received'))
             }
@@ -3464,24 +3518,40 @@ export class NodeStorage{
         let buffer = ''
         let result: {ok: boolean, assetsRestored: number, coldStorageFailed?: number} | null = null
 
+        const consumeLine = (line: string) => {
+            if (!line) return
+            let msg: any
+            try {
+                msg = JSON.parse(line)
+            } catch (error) {
+                throw new StorageError('Server backup restore returned malformed NDJSON.', {
+                    code: 'COMMIT_OUTCOME_UNKNOWN',
+                    retryable: false,
+                    commitOutcome: 'unknown',
+                    commitOutcomeUnknown: true,
+                    operation: 'write',
+                    cause: error,
+                })
+            }
+            if (msg.type === 'progress') {
+                onProgress?.(msg.bytes, msg.totalBytes)
+            } else if (msg.type === 'done') {
+                result = msg
+            } else if (msg.type === 'error') {
+                throw backupNdjsonStorageError(msg)
+            }
+        }
+
         while (true) {
             const { done, value } = await reader.read()
             if (done) break
             buffer += decoder.decode(value, { stream: true })
             const lines = buffer.split('\n')
             buffer = lines.pop()!
-            for (const line of lines) {
-                if (!line) continue
-                const msg = JSON.parse(line)
-                if (msg.type === 'progress') {
-                    onProgress?.(msg.bytes, msg.totalBytes)
-                } else if (msg.type === 'done') {
-                    result = msg
-                } else if (msg.type === 'error') {
-                    throw new Error(msg.message)
-                }
-            }
+            for (const line of lines) consumeLine(line)
         }
+        buffer += decoder.decode()
+        if (buffer) consumeLine(buffer)
         if (!result) throw new Error('Server backup restore: no result received')
         return result
     }
