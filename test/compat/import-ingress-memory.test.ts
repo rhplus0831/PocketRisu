@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import http from 'node:http'
 import path from 'node:path'
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import Database from 'better-sqlite3'
 import { zipSync } from 'fflate'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
@@ -43,6 +43,21 @@ function saveFolderZipWithRows(database: Buffer, rows: Array<{ key: string; valu
     [DB_HEX, new Uint8Array(database)],
     ...rows.map(row => [Buffer.from(row.key).toString('hex'), new Uint8Array(row.value)]),
   ]), { level: 0 }))
+}
+
+async function writeSaveFolderSource(
+  sourceDir: string,
+  database: Buffer,
+  rows: Array<{ key: string; value: Buffer }>,
+): Promise<void> {
+  await mkdir(sourceDir, { recursive: true })
+  await writeFile(path.join(sourceDir, DB_HEX), database)
+  for (const row of rows) {
+    await writeFile(
+      path.join(sourceDir, Buffer.from(row.key).toString('hex')),
+      row.value,
+    )
+  }
 }
 
 function validJsonBytes(size: number): Buffer {
@@ -565,6 +580,187 @@ describe('bounded archive and save-folder ingress (real server)', () => {
     await expectNote(restarted, 'must-not-publish-save-folder')
     expect(await readFile(path.join(server.cwd, 'save', assetKey))).toEqual(candidateAsset)
     expect(await readFile(path.join(server.cwd, 'save', newAssetKey))).toEqual(candidateAsset)
+    await waitForNoImportSpools(server)
+  }, 60_000)
+
+  test('validation failure reports unknown when rollback cleanup cannot be proven', async () => {
+    const { server, client } = await boot()
+    const oldDatabase = databaseEntry(createSeedBackup({
+      databaseFields: { globalNote: 'before-validation-rollback-ambiguity' },
+    }))
+    const invalidDatabase = databaseEntry(createSeedBackup({
+      databaseFields: {
+        globalNote: 'invalid-validation-candidate',
+        optimizePluginMemory: true,
+        pluginStorageFolded: true,
+        pluginCustomStorage: [],
+      },
+    }))
+    const baseline = await uploadSaveFolder(client, saveFolderZip(oldDatabase))
+    expect(baseline.status).toBe(200)
+    await baseline.json()
+
+    await server.restart({
+      POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT: 'rollback-cleanup',
+    })
+    const failingClient = await createClient(server.port, server.password)
+    const response = await uploadSaveFolder(failingClient, saveFolderZip(invalidDatabase))
+    expect(response.status).toBe(500)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Save-folder import outcome is unknown because rollback recovery failed',
+      code: 'SAVE_FOLDER_IMPORT_OUTCOME_UNKNOWN',
+      retryable: false,
+      commitOutcome: 'unknown',
+      commitOutcomeUnknown: true,
+    })
+    await expectNote(failingClient, 'before-validation-rollback-ambiguity')
+
+    await server.restart({ POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT: '' })
+    const restarted = await createClient(server.port, server.password)
+    await expectNote(restarted, 'before-validation-rollback-ambiguity')
+    await waitForNoImportSpools(server)
+  }, 60_000)
+
+  test('asset-swap rollback failure reports unknown and restart reconciles old state', async () => {
+    const { server, client } = await boot()
+    const assetKey = 'assets/save-folder-unknown-rollback.bin'
+    const oldAsset = Buffer.from('old rollback-ambiguity asset')
+    const candidateAsset = Buffer.from('candidate rollback-ambiguity asset')
+    const oldDatabase = databaseEntry(createSeedBackup({
+      databaseFields: { globalNote: 'before-generic-rollback-ambiguity' },
+    }))
+    const candidateDatabase = databaseEntry(createSeedBackup({
+      databaseFields: { globalNote: 'candidate-generic-rollback-ambiguity' },
+    }))
+    const baseline = await uploadSaveFolder(
+      client,
+      saveFolderZipWithRows(oldDatabase, [{ key: assetKey, value: oldAsset }]),
+    )
+    expect(baseline.status).toBe(200)
+    await baseline.json()
+
+    await server.restart({
+      POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT: 'after-asset-swap,rollback-cleanup',
+    })
+    const failingClient = await createClient(server.port, server.password)
+    const response = await uploadSaveFolder(
+      failingClient,
+      saveFolderZipWithRows(candidateDatabase, [{ key: assetKey, value: candidateAsset }]),
+    )
+    expect(response.status).toBe(500)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Save-folder import outcome is unknown because rollback recovery failed',
+      code: 'SAVE_FOLDER_IMPORT_OUTCOME_UNKNOWN',
+      retryable: false,
+      commitOutcome: 'unknown',
+      commitOutcomeUnknown: true,
+    })
+    // SQLite rollback and failed filesystem rollback leave a deliberately
+    // uncertain mixed view until journal recovery runs at restart.
+    await expectNote(failingClient, 'before-generic-rollback-ambiguity')
+    expect(await readFile(path.join(server.cwd, 'save', assetKey))).toEqual(candidateAsset)
+
+    await server.restart({ POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT: '' })
+    const restarted = await createClient(server.port, server.password)
+    await expectNote(restarted, 'before-generic-rollback-ambiguity')
+    expect(await readFile(path.join(server.cwd, 'save', assetKey))).toEqual(oldAsset)
+    expect(await readdir(path.join(server.cwd, 'save'))).not.toContain('import_journal.json')
+    await waitForNoImportSpools(server)
+  }, 60_000)
+
+  test('ZIP import reports post-COMMIT cleanup failure as committed and stays durable', async () => {
+    const { server, client } = await boot()
+    const assetKey = 'assets/save-folder-post-commit.bin'
+    const oldAsset = Buffer.from('old post-commit asset')
+    const candidateAsset = Buffer.from('new post-commit asset')
+    const oldDatabase = databaseEntry(createSeedBackup({
+      databaseFields: { globalNote: 'before-post-commit-cleanup' },
+    }))
+    const candidateDatabase = databaseEntry(createSeedBackup({
+      databaseFields: { globalNote: 'committed-post-commit-cleanup' },
+    }))
+    const baseline = await uploadSaveFolder(
+      client,
+      saveFolderZipWithRows(oldDatabase, [{ key: assetKey, value: oldAsset }]),
+    )
+    expect(baseline.status).toBe(200)
+    await baseline.json()
+
+    await server.restart({
+      POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT: 'post-commit-cleanup',
+    })
+    const failingClient = await createClient(server.port, server.password)
+    const response = await uploadSaveFolder(
+      failingClient,
+      saveFolderZipWithRows(candidateDatabase, [{ key: assetKey, value: candidateAsset }]),
+    )
+    expect(response.status).toBe(500)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Injected save-folder cleanup failure after commit',
+      code: 'SAVE_FOLDER_IMPORT_POST_COMMIT_CLEANUP_FAILED',
+      retryable: false,
+      commitOutcome: 'committed',
+      commitOutcomeUnknown: false,
+    })
+    await expectNote(failingClient, 'committed-post-commit-cleanup')
+    expect(await readFile(path.join(server.cwd, 'save', assetKey))).toEqual(candidateAsset)
+
+    await server.restart({ POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT: '' })
+    const restarted = await createClient(server.port, server.password)
+    await expectNote(restarted, 'committed-post-commit-cleanup')
+    expect(await readFile(path.join(server.cwd, 'save', assetKey))).toEqual(candidateAsset)
+    expect(await readdir(path.join(server.cwd, 'save'))).not.toContain('import_journal.json')
+    await waitForNoImportSpools(server)
+  }, 60_000)
+
+  test('direct import reports migration-marker failure as committed and stays durable', async () => {
+    const { server, client } = await boot()
+    const assetKey = 'assets/save-folder-marker.bin'
+    const oldAsset = Buffer.from('old marker asset')
+    const candidateAsset = Buffer.from('new marker asset')
+    const oldDatabase = databaseEntry(createSeedBackup({
+      databaseFields: { globalNote: 'before-marker-failure' },
+    }))
+    const candidateDatabase = databaseEntry(createSeedBackup({
+      databaseFields: { globalNote: 'committed-marker-failure' },
+    }))
+    const baseline = await uploadSaveFolder(
+      client,
+      saveFolderZipWithRows(oldDatabase, [{ key: assetKey, value: oldAsset }]),
+    )
+    expect(baseline.status).toBe(200)
+    await baseline.json()
+
+    const sourceDir = path.join(server.cwd, 'marker-failure-source')
+    await writeSaveFolderSource(
+      sourceDir,
+      candidateDatabase,
+      [{ key: assetKey, value: candidateAsset }],
+    )
+    const migrationMarker = path.join(server.cwd, 'save', '.migrated_to_sqlite')
+    await rm(migrationMarker, { force: true })
+    await server.restart({
+      POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT: 'migration-marker',
+    })
+    const failingClient = await createClient(server.port, server.password)
+    const response = await executeSaveFolder(failingClient, sourceDir)
+    expect(response.status).toBe(500)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Injected save-folder migration-marker failure after commit',
+      code: 'SAVE_FOLDER_IMPORT_MIGRATION_MARKER_FAILED',
+      retryable: false,
+      commitOutcome: 'committed',
+      commitOutcomeUnknown: false,
+    })
+    await expectNote(failingClient, 'committed-marker-failure')
+    expect(await readFile(path.join(server.cwd, 'save', assetKey))).toEqual(candidateAsset)
+    await expect(stat(migrationMarker)).rejects.toMatchObject({ code: 'ENOENT' })
+
+    await server.restart({ POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT: '' })
+    const restarted = await createClient(server.port, server.password)
+    await expectNote(restarted, 'committed-marker-failure')
+    expect(await readFile(path.join(server.cwd, 'save', assetKey))).toEqual(candidateAsset)
+    expect(await readdir(path.join(server.cwd, 'save'))).not.toContain('import_journal.json')
     await waitForNoImportSpools(server)
   }, 60_000)
 })

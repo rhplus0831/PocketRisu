@@ -62,8 +62,13 @@ import { comparePluginStorageKeys } from "../plugins/pluginStorageRecord"
 export const AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS = 15_000
 /** Snapshot ingestion can legitimately stream hundreds of MiB from chunk storage. */
 export const INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS = 10 * 60_000
+/** Save-folder uploads share the same finite end-to-end restore deadline. */
+export const SAVE_FOLDER_IMPORT_TIMEOUT_MS = INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS
 export const INTERNAL_SNAPSHOT_KEY_PATTERN = /^database\/dbbackup-(0|[1-9]\d*)\.bin$/
 type BoundedStorageOperation = 'read' | 'list' | 'write' | 'remove' | 'transition' | 'batch'
+
+/** Internal provenance that cannot be supplied by an HTTP response payload. */
+class LocalAuthoritativeStorageTimeoutError extends StorageError {}
 
 interface BackupNdjsonErrorEvent {
     type: 'error'
@@ -250,7 +255,7 @@ export async function runBoundedAuthoritativeStorageOperation<T>(
             const ambiguousMutation = mutationRequestInFlight
                 && (kind === "write" || kind === "remove"
                     || kind === "transition" || kind === "batch")
-            reject(new StorageError(message, {
+            reject(new LocalAuthoritativeStorageTimeoutError(message, {
                 code: ambiguousMutation
                     ? "COMMIT_OUTCOME_UNKNOWN"
                     : "STORAGE_TIMEOUT",
@@ -652,6 +657,252 @@ function payloadMessage(payload: StorageFailurePayload | null): string | null {
     if (typeof payload?.error === 'string' && payload.error.length > 0) return payload.error
     if (typeof payload?.message === 'string' && payload.message.length > 0) return payload.message
     return null
+}
+
+function jsonStringEnd(value: string, start: number): number {
+    let escaped = false
+    for (let index = start + 1; index < value.length; index++) {
+        if (escaped) {
+            escaped = false
+        } else if (value[index] === '\\') {
+            escaped = true
+        } else if (value[index] === '"') {
+            return index + 1
+        }
+    }
+    throw new SyntaxError('Unterminated JSON string')
+}
+
+function assertNoDuplicateTopLevelJsonKeys(text: string): void {
+    const skipWhitespace = (start: number) => {
+        let index = start
+        while (/\s/.test(text[index] ?? '')) index++
+        return index
+    }
+    let index = skipWhitespace(0)
+    if (text[index] !== '{') return
+    index = skipWhitespace(index + 1)
+    const seen = new Set<string>()
+    while (text[index] !== '}') {
+        if (text[index] !== '"') throw new SyntaxError('Invalid JSON object key')
+        const keyEnd = jsonStringEnd(text, index)
+        const key = JSON.parse(text.slice(index, keyEnd)) as string
+        if (seen.has(key)) throw new SyntaxError(`Duplicate JSON object key: ${key}`)
+        seen.add(key)
+        index = skipWhitespace(keyEnd)
+        if (text[index] !== ':') throw new SyntaxError('Invalid JSON object separator')
+        index = skipWhitespace(index + 1)
+
+        let objectDepth = 0
+        let arrayDepth = 0
+        while (index < text.length) {
+            const token = text[index]
+            if (token === '"') {
+                index = jsonStringEnd(text, index)
+                continue
+            }
+            if (token === '{') objectDepth++
+            else if (token === '[') arrayDepth++
+            else if (token === '}') {
+                if (objectDepth === 0 && arrayDepth === 0) break
+                objectDepth--
+            } else if (token === ']') {
+                arrayDepth--
+            } else if (token === ',' && objectDepth === 0 && arrayDepth === 0) {
+                break
+            }
+            index++
+        }
+        index = skipWhitespace(index)
+        if (text[index] === ',') index = skipWhitespace(index + 1)
+        else if (text[index] !== '}') throw new SyntaxError('Invalid JSON object terminator')
+    }
+}
+
+function parseStrictSaveFolderJson(text: string): unknown {
+    const value = JSON.parse(text) as unknown
+    assertNoDuplicateTopLevelJsonKeys(text)
+    return value
+}
+
+interface SaveFolderImportAcknowledgement {
+    ok: true
+    imported: number
+}
+
+function isExactSaveFolderImportAcknowledgement(
+    value: unknown,
+): value is SaveFolderImportAcknowledgement {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const result = value as Record<string, unknown>
+    return Object.keys(result).sort().join(',') === 'imported,ok'
+        && result.ok === true
+        && Number.isSafeInteger(result.imported)
+        && Number(result.imported) >= 0
+}
+
+function saveFolderImportStorageError(
+    value: unknown,
+    status: number,
+    fallbackMessage: string,
+): { error: StorageError, authoritative: boolean } {
+    const payload = value && typeof value === 'object' && !Array.isArray(value)
+        ? value as StorageFailurePayload
+        : null
+    const message = payloadMessage(payload) ?? fallbackMessage
+    const validOutcome = payload?.commitOutcome === 'not-committed'
+        || payload?.commitOutcome === 'committed'
+        || payload?.commitOutcome === 'unknown'
+    const keys = payload ? Object.keys(payload).sort().join(',') : ''
+    const exactOutcomeKeys = keys === 'code,commitOutcome,commitOutcomeUnknown,error,retryable'
+        || keys === 'actual,code,commitOutcome,commitOutcomeUnknown,error,limit,retryable'
+        || keys === 'code,commitOutcome,commitOutcomeUnknown,error,retryAfter,retryable'
+        || keys === 'actual,available,code,commitOutcome,commitOutcomeUnknown,error,limit,required,retryable'
+    const validLimitFields = !('limit' in (payload ?? {}))
+        || (Number.isSafeInteger((payload as any).limit)
+            && Number((payload as any).limit) >= 0
+            && Number.isSafeInteger((payload as any).actual)
+            && Number((payload as any).actual) >= 0)
+    const validDiskFields = !('available' in (payload ?? {}))
+        || (Number.isSafeInteger((payload as any).available)
+            && Number((payload as any).available) >= 0
+            && Number.isSafeInteger((payload as any).required)
+            && Number((payload as any).required) >= 0)
+    const validRetryAfter = !('retryAfter' in (payload ?? {}))
+        || parseRetryAfterSeconds(payload?.retryAfter) !== null
+    const exactOutcomeEnvelope = exactOutcomeKeys
+        && validOutcome
+        && typeof payload?.commitOutcomeUnknown === 'boolean'
+        && payload.commitOutcomeUnknown === (payload.commitOutcome === 'unknown')
+        && typeof payload.code === 'string'
+        && payload.code.length > 0
+        && typeof payload.retryable === 'boolean'
+        && payloadMessage(payload) !== null
+        && validLimitFields
+        && validDiskFields
+        && validRetryAfter
+    if (exactOutcomeEnvelope) {
+        return {
+            authoritative: true,
+            error: new StorageError(message, {
+                status,
+                code: payload.code as string,
+                retryAfter: parseRetryAfterSeconds(payload.retryAfter),
+                retryable: payload.retryable === true,
+                commitOutcome: payload.commitOutcome as 'not-committed' | 'committed' | 'unknown',
+                commitOutcomeUnknown: payload.commitOutcomeUnknown === true,
+                operation: 'write',
+            }),
+        }
+    }
+
+    // These save-folder route statuses are emitted before publication begins.
+    // The exact historical missing-REMOTE response is deliberately only
+    // `{error}`; keep that compatibility shape definitive without weakening
+    // malformed 5xx/transport handling after a transaction may have run.
+    const rejectedBeforePublication = status === 400
+        || status === 401
+        || status === 403
+        || status === 404
+        || status === 409
+        || status === 413
+        || status === 415
+        || status === 423
+    const exactLegacyError = keys === 'error'
+        && typeof payload?.error === 'string'
+        && payload.error.length > 0
+    const exactPluginDiagnostic = status === 400
+        && keys === 'code,encodedKey,error'
+        && typeof payload?.error === 'string'
+        && payload.error.length > 0
+        && typeof payload?.code === 'string'
+        && payload.code.length > 0
+        && typeof (payload as any).encodedKey === 'string'
+    if (rejectedBeforePublication && (exactLegacyError || exactPluginDiagnostic)) {
+        return {
+            authoritative: true,
+            error: new StorageError(message, {
+                status,
+                code: typeof payload?.code === 'string' && payload.code.length > 0
+                    ? payload.code
+                    : `HTTP_${status}`,
+                retryAfter: parseRetryAfterSeconds(payload?.retryAfter),
+                retryable: payload?.retryable === true,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+                operation: 'write',
+            }),
+        }
+    }
+
+    return {
+        authoritative: false,
+        error: new StorageError(message, {
+            status,
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            retryable: false,
+            commitOutcome: 'unknown',
+            commitOutcomeUnknown: true,
+            operation: 'write',
+        }),
+    }
+}
+
+function saveFolderImportPreDispatchError(
+    error: unknown,
+    code: 'SAVE_FOLDER_IMPORT_AUTH_FAILED' | 'SAVE_FOLDER_IMPORT_NOT_DISPATCHED',
+): StorageError {
+    return new StorageError(
+        getThrownMessage(error, 'Save-folder import failed before the mutation request was dispatched'),
+        {
+            code,
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+            operation: 'write',
+            cause: error,
+        },
+    )
+}
+
+function normalizeSaveFolderImportOperationError(
+    error: unknown,
+    source: 'Save-folder import' | 'Save-folder ZIP import',
+): unknown {
+    // The bounded-operation tracker only emits STORAGE_TIMEOUT while no
+    // mutation request is in flight. Save-folder replacement is intentionally
+    // non-retryable even at that predispatch boundary: callers must require a
+    // fresh user action rather than automatically replaying the import.
+    if (error instanceof LocalAuthoritativeStorageTimeoutError
+        && error.code === 'STORAGE_TIMEOUT'
+        && !error.commitOutcomeUnknown) {
+        return new StorageError(`${source} timed out before mutation dispatch`, {
+            code: 'SAVE_FOLDER_IMPORT_TIMEOUT',
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+            operation: 'write',
+            cause: error,
+        })
+    }
+    // The generic authoritative-operation wrapper records the ambiguity bit,
+    // but older call sites can omit the corresponding textual outcome. Keep
+    // the save-folder boundary exact for fetch rejection and total timeout.
+    if (error instanceof StorageError
+        && error.commitOutcomeUnknown
+        && error.commitOutcome !== 'unknown') {
+        return new StorageError(error.message, {
+            status: error.status,
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            retryAfter: error.retryAfter,
+            retryable: false,
+            commitOutcome: 'unknown',
+            commitOutcomeUnknown: true,
+            operation: 'write',
+            cause: error,
+        })
+    }
+    return error
 }
 
 // Warning the server attaches to /api/patch responses when the most recent
@@ -3934,54 +4185,262 @@ export class NodeStorage{
     }
 
     async executeSaveFolderImport(folderPath?: string): Promise<{ok: boolean, imported: number}> {
-        const da = await this.authFetch('/api/migrate/save-folder/execute', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ path: folderPath }),
-        })
-        if (da.status === 409) throw new Error('Another import is already in progress')
-        if (da.status < 200 || da.status >= 300) {
-            const body = await da.json().catch(() => ({}))
-            throw new Error(body.error || `import error: ${da.status}`)
+        try {
+            return await runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
+                // A save-folder import replaces authoritative state. Authentication
+                // must finish before its single POST; never replay the mutation on
+                // an expired-token response or after any committed/unknown result.
+                let response: Response
+                try {
+                    response = await this.authFetch('/api/migrate/save-folder/execute', {
+                        method: 'POST',
+                        headers: { 'content-type': 'application/json' },
+                        body: JSON.stringify({ path: folderPath }),
+                        signal,
+                    }, false, outcome)
+                } catch (error) {
+                    // authFetch marks the shared tracker immediately before the
+                    // mutation fetch. Authentication/token failures happen before
+                    // that boundary and are therefore definitively not committed;
+                    // a fetch failure after the mark remains unknown in the outer
+                    // bounded write operation.
+                    if (!outcome.isRequestInFlight()) {
+                        throw saveFolderImportPreDispatchError(
+                            error,
+                            'SAVE_FOLDER_IMPORT_AUTH_FAILED',
+                        )
+                    }
+                    throw error
+                }
+
+                // Header receipt alone cannot acknowledge the replacement. Keep
+                // the request in flight through strict, complete body parsing.
+                outcome.markRequestDispatched()
+                let payload: unknown
+                try {
+                    payload = parseStrictSaveFolderJson(
+                        await awaitWithAbort(response.text(), signal),
+                    )
+                } catch (error) {
+                    throw new StorageError('Save-folder import response was truncated or malformed', {
+                        status: response.status,
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcome: 'unknown',
+                        commitOutcomeUnknown: true,
+                        operation: 'write',
+                        cause: error,
+                    })
+                }
+
+                if (!response.ok) {
+                    const failure = saveFolderImportStorageError(
+                        payload,
+                        response.status,
+                        `Save-folder import failed with HTTP ${response.status}`,
+                    )
+                    if (failure.authoritative) outcome.markDefinitiveResponse()
+                    throw failure.error
+                }
+                if (response.status !== 200
+                    || !isExactSaveFolderImportAcknowledgement(payload)) {
+                    throw new StorageError('Save-folder import returned an invalid commit acknowledgement', {
+                        status: response.status,
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcome: 'unknown',
+                        commitOutcomeUnknown: true,
+                        operation: 'write',
+                    })
+                }
+                outcome.markDefinitiveResponse()
+                return payload
+            }, 'write', SAVE_FOLDER_IMPORT_TIMEOUT_MS)
+        } catch (error) {
+            throw normalizeSaveFolderImportOperationError(error, 'Save-folder import')
         }
-        return da.json()
     }
 
     async uploadSaveFolderZip(
         file: Blob,
         onProgress?: (loaded: number, total: number) => void
     ): Promise<{ok: boolean, imported: number}> {
-        const authHeader = await this.createAuth()
+        const startedAt = Date.now()
+        try {
+            return await runBoundedAuthoritativeStorageOperation(
+                (signal, outcome) => this.uploadSaveFolderZipAuthoritative(
+                    file,
+                    onProgress,
+                    signal,
+                    outcome,
+                    startedAt,
+                ),
+                'write',
+                SAVE_FOLDER_IMPORT_TIMEOUT_MS,
+            )
+        } catch (error) {
+            throw normalizeSaveFolderImportOperationError(error, 'Save-folder ZIP import')
+        }
+    }
+
+    private async uploadSaveFolderZipAuthoritative(
+        file: Blob,
+        onProgress: ((loaded: number, total: number) => void) | undefined,
+        signal: AbortSignal,
+        outcome: AuthoritativeStorageOutcomeTracker,
+        startedAt: number,
+    ): Promise<{ok: boolean, imported: number}> {
+        let authHeader: string
+        try {
+            // Authentication is completed before the one allowed mutation
+            // dispatch. Its failure is therefore definitively not committed.
+            authHeader = await this.createAuth(signal)
+        } catch (error) {
+            throw saveFolderImportPreDispatchError(error, 'SAVE_FOLDER_IMPORT_AUTH_FAILED')
+        }
 
         return await new Promise((resolve, reject) => {
-            const xhr = new XMLHttpRequest()
-            xhr.open('POST', '/api/migrate/save-folder/upload')
-            xhr.setRequestHeader('content-type', 'application/zip')
-            xhr.setRequestHeader('risu-auth', authHeader)
-            xhr.setRequestHeader('x-session-id', NodeStorage.sessionId)
+            let xhr: XMLHttpRequest
+            let settled = false
+            let dispatched = false
+            let onSignalAbort: () => void = () => undefined
+            try {
+                xhr = new XMLHttpRequest()
+                xhr.open('POST', '/api/migrate/save-folder/upload')
+                xhr.timeout = Math.max(
+                    1,
+                    SAVE_FOLDER_IMPORT_TIMEOUT_MS - (Date.now() - startedAt),
+                )
+                xhr.setRequestHeader('content-type', 'application/zip')
+                xhr.setRequestHeader('risu-auth', authHeader)
+                xhr.setRequestHeader('x-session-id', NodeStorage.sessionId)
+            } catch (error) {
+                reject(saveFolderImportPreDispatchError(
+                    error,
+                    'SAVE_FOLDER_IMPORT_NOT_DISPATCHED',
+                ))
+                return
+            }
+
+            const cleanup = () => {
+                signal.removeEventListener('abort', onSignalAbort)
+                xhr.upload.onprogress = null
+                xhr.onerror = null
+                xhr.onabort = null
+                xhr.ontimeout = null
+                xhr.onload = null
+                try { xhr.timeout = 0 } catch {
+                    // Some test/browser implementations expose a readonly
+                    // timeout after completion; handler cleanup is sufficient.
+                }
+            }
+            const resolveOnce = (value: {ok: boolean, imported: number}) => {
+                if (settled) return
+                settled = true
+                cleanup()
+                resolve(value)
+            }
+            const rejectOnce = (error: StorageError) => {
+                if (settled) return
+                settled = true
+                cleanup()
+                reject(error)
+            }
+            const unknownError = (message: string) => new StorageError(message, {
+                status: Number.isInteger(xhr.status) && xhr.status > 0 ? xhr.status : null,
+                code: 'COMMIT_OUTCOME_UNKNOWN',
+                retryable: false,
+                commitOutcome: 'unknown',
+                commitOutcomeUnknown: true,
+                operation: 'write',
+            })
+            const rejectUnknown = (message: string) => rejectOnce(unknownError(message))
 
             xhr.upload.onprogress = (event) => {
                 if (event.lengthComputable) {
                     onProgress?.(event.loaded, event.total)
                 }
             }
-
-            xhr.onerror = () => reject(new Error('zip upload failed'))
-            xhr.onload = () => {
-                if (xhr.status < 200 || xhr.status >= 300) {
-                    let msg = `zip import error: ${xhr.status}`
-                    try { msg = JSON.parse(xhr.responseText).error || msg } catch {}
-                    reject(new Error(msg))
-                    return
-                }
-                try {
-                    resolve(JSON.parse(xhr.responseText))
-                } catch (error) {
-                    reject(error)
+            xhr.onerror = () => rejectUnknown('Save-folder ZIP upload response was lost')
+            xhr.onabort = () => {
+                if (dispatched) {
+                    rejectUnknown('Save-folder ZIP upload was aborted after dispatch')
+                } else {
+                    rejectOnce(saveFolderImportPreDispatchError(
+                        signal.reason ?? new DOMException('Save-folder ZIP upload aborted', 'AbortError'),
+                        'SAVE_FOLDER_IMPORT_NOT_DISPATCHED',
+                    ))
                 }
             }
+            xhr.ontimeout = () => rejectUnknown('Save-folder ZIP upload timed out after dispatch')
+            xhr.onload = () => {
+                // XHR status 0 means no authoritative HTTP response exists.
+                // Ignore even an exact-looking cached/proxy body: after send()
+                // the replacement outcome must remain unknown.
+                if (xhr.status === 0) {
+                    rejectUnknown('Save-folder ZIP upload response was lost')
+                    return
+                }
+                let payload: unknown
+                try {
+                    payload = parseStrictSaveFolderJson(xhr.responseText)
+                } catch {
+                    rejectUnknown('Save-folder ZIP import response was truncated or malformed')
+                    return
+                }
+                if (xhr.status < 200 || xhr.status >= 300) {
+                    const failure = saveFolderImportStorageError(
+                        payload,
+                        xhr.status,
+                        `Save-folder ZIP import failed with HTTP ${xhr.status}`,
+                    )
+                    if (failure.authoritative) outcome.markDefinitiveResponse()
+                    rejectOnce(failure.error)
+                    return
+                }
+                if (xhr.status !== 200
+                    || !isExactSaveFolderImportAcknowledgement(payload)) {
+                    rejectUnknown('Save-folder ZIP import returned an invalid commit acknowledgement')
+                    return
+                }
+                outcome.markDefinitiveResponse()
+                resolveOnce(payload)
+            }
 
-            xhr.send(file)
+            onSignalAbort = () => {
+                const failure = dispatched
+                    ? unknownError('Save-folder ZIP upload timed out after dispatch')
+                    : saveFolderImportPreDispatchError(
+                        signal.reason ?? new DOMException('Save-folder ZIP upload timed out', 'TimeoutError'),
+                        'SAVE_FOLDER_IMPORT_NOT_DISPATCHED',
+                    )
+                try { xhr.abort() } catch {
+                    // The classified timeout below remains authoritative even
+                    // when a partial XHR shim cannot abort itself.
+                }
+                rejectOnce(failure)
+            }
+            signal.addEventListener('abort', onSignalAbort, { once: true })
+            if (signal.aborted) {
+                onSignalAbort()
+                return
+            }
+
+            try {
+                // Synchronous send() exceptions occur before XHR dispatch.
+                // Once send() returns, every terminal callback above is
+                // conservatively classified at the post-dispatch boundary.
+                xhr.send(file)
+                if (!settled) {
+                    dispatched = true
+                    outcome.markRequestDispatched()
+                }
+            } catch (error) {
+                rejectOnce(saveFolderImportPreDispatchError(
+                    error,
+                    'SAVE_FOLDER_IMPORT_NOT_DISPATCHED',
+                ))
+            }
         })
     }
 

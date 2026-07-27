@@ -364,6 +364,14 @@ const saveFolderImportFailpoint = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT ?? '').trim()
     : '';
 
+function hasSaveFolderImportFailpoint(name) {
+    return saveFolderImportFailpoint
+        .split(',')
+        .map(value => value.trim())
+        .filter(Boolean)
+        .includes(name);
+}
+
 function throwIfStreamingRestoreAborted(shouldAbort) {
     if (typeof shouldAbort !== 'function' || !shouldAbort()) return;
     const error = new Error('Streaming Risu load cancelled');
@@ -1999,8 +2007,39 @@ function importDiskSpaceError(required, available) {
     return error;
 }
 
-function sendImportIngressError(res, error, { ndjson = false } = {}) {
-    const payload = importErrorPayload(error) ?? (
+function authoritativeImportErrorPayload(error, fallbackCode) {
+    if (!error || typeof error !== 'object') return null;
+    const claimedOutcome = error.commitOutcome;
+    const claimedUnknown = error.commitOutcomeUnknown;
+    const commitOutcome = claimedUnknown === true || claimedOutcome === 'unknown'
+        ? 'unknown'
+        : claimedOutcome === 'not-committed' || claimedOutcome === 'committed'
+            ? claimedOutcome
+            : null;
+    if (commitOutcome === null
+        || typeof claimedUnknown !== 'boolean'
+        || claimedUnknown !== (commitOutcome === 'unknown')) return null;
+    return {
+        error: String(error.message ?? 'Import failed'),
+        code: typeof error.code === 'string' && error.code.length > 0
+            ? error.code
+            : fallbackCode,
+        retryable: error.retryable === true,
+        commitOutcome,
+        commitOutcomeUnknown: commitOutcome === 'unknown',
+    };
+}
+
+function sendImportIngressError(res, error, {
+    ndjson = false,
+    fallbackCode = 'BACKUP_IMPORT_FAILED',
+    includeAnnotatedOutcome = false,
+} = {}) {
+    const payload = importErrorPayload(error)
+        ?? (includeAnnotatedOutcome
+            ? authoritativeImportErrorPayload(error, fallbackCode)
+            : null)
+        ?? (
         error?.risuSavePreparationLimit === true
         || error?.risuSavePreparationInvalid === true
         || error instanceof PluginStorageLimitError
@@ -11109,7 +11148,7 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage, { signal
         );
         kvBumpListEpoch();
         throwIfImportAborted(signal);
-        if (saveFolderImportFailpoint === 'after-asset-swap') {
+        if (hasSaveFolderImportFailpoint('after-asset-swap')) {
             throw new ImportIngressError('Save-folder import was rolled back before publication', {
                 code: 'SAVE_FOLDER_IMPORT_NOT_COMMITTED',
                 statusCode: 500,
@@ -11122,9 +11161,20 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage, { signal
         checkpointWal('TRUNCATE');
         journal = { ...journal, phase: 'committed' };
         writeImportJournal(IMPORT_JOURNAL_PATH, journal);
+        if (hasSaveFolderImportFailpoint('post-commit-cleanup')) {
+            const failure = new Error('Injected save-folder cleanup failure after commit');
+            failure.code = 'SAVE_FOLDER_IMPORT_POST_COMMIT_CLEANUP_FAILED';
+            throw failure;
+        }
         assetSwap.finalize();
         kvDel(IMPORT_JOURNAL_MARKER_KEY);
         clearImportJournal(IMPORT_JOURNAL_PATH);
+        if (hasSaveFolderImportFailpoint('migration-marker')) {
+            const failure = new Error('Injected save-folder migration-marker failure after commit');
+            failure.code = 'SAVE_FOLDER_IMPORT_MIGRATION_MARKER_FAILED';
+            throw failure;
+        }
+        writeFileSync(migrationMarkerPath, new Date().toISOString(), 'utf-8');
     } catch (error) {
         if (!transactionCommitted) {
             let rollbackSucceeded = !error?.restoreError;
@@ -11140,12 +11190,20 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage, { signal
                 logger.error('[Save-folder Import] Failed to bump list epoch after rollback:', epochError);
             }
             if (assetSwap) {
-                try { assetSwap.rollback(); } catch (rollbackError) {
+                try {
+                    if (hasSaveFolderImportFailpoint('rollback-cleanup')) {
+                        throw new Error('Injected save-folder asset rollback failure');
+                    }
+                    assetSwap.rollback();
+                } catch (rollbackError) {
                     rollbackSucceeded = false;
                     logger.error('[Save-folder Import] Failed to restore previous asset directory:', rollbackError);
                 }
             } else {
                 try {
+                    if (hasSaveFolderImportFailpoint('rollback-cleanup')) {
+                        throw new Error('Injected save-folder staging cleanup failure');
+                    }
                     await fs.rm(assetImportStagingDir, { recursive: true, force: true });
                 } catch (cleanupError) {
                     rollbackSucceeded = false;
@@ -11159,10 +11217,13 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage, { signal
                     logger.error('[Save-folder Import] Failed to clear rolled-back import journal:', cleanupError);
                 }
             }
-            if (error instanceof ImportIngressError && !rollbackSucceeded) {
+            if (!rollbackSucceeded && error && typeof error === 'object') {
+                error.message = 'Save-folder import outcome is unknown because rollback recovery failed';
+                error.code = 'SAVE_FOLDER_IMPORT_OUTCOME_UNKNOWN';
                 error.commitOutcome = 'unknown';
                 error.commitOutcomeUnknown = true;
                 error.statusCode = 500;
+                error.retryable = false;
             }
             if (rollbackSucceeded && error && typeof error === 'object') {
                 error.commitOutcome = 'not-committed';
@@ -11171,11 +11232,12 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage, { signal
         } else if (error && typeof error === 'object') {
             error.commitOutcome = 'committed';
             error.commitOutcomeUnknown = false;
+            error.statusCode = 500;
+            error.retryable = false;
         }
         throw error;
     }
 
-    writeFileSync(migrationMarkerPath, new Date().toISOString(), 'utf-8');
     return { imported: sources.length };
 }
 
@@ -11262,6 +11324,33 @@ async function importHexFilesFromDir(dirPath, options = {}) {
     }
 }
 
+function sendSaveFolderImportFailure(res, error, diagnostic) {
+    const annotated = authoritativeImportErrorPayload(
+        error,
+        'SAVE_FOLDER_IMPORT_FAILED',
+    );
+    // A committed or unknown transaction outcome always outranks legacy
+    // validation response shapes. Those shapes are safe only after a known
+    // rollback; otherwise they would falsely invite the client to replay a
+    // replacement whose publication could not be recovered conclusively.
+    const preserveLegacyValidation = annotated === null
+        || annotated.commitOutcome === 'not-committed';
+    if (preserveLegacyValidation && diagnostic && !res.headersSent) {
+        res.status(400).json(diagnostic);
+        return true;
+    }
+    if (preserveLegacyValidation
+        && error?.risuSavePreparationInvalid === true
+        && !res.headersSent) {
+        res.status(400).json({ error: error.message });
+        return true;
+    }
+    return sendImportIngressError(res, error, {
+        fallbackCode: 'SAVE_FOLDER_IMPORT_FAILED',
+        includeAnnotatedOutcome: true,
+    });
+}
+
 app.post('/api/migrate/save-folder/scan', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
@@ -11322,9 +11411,7 @@ app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
             '[PluginStorage] Rejected invalid save-folder row',
             error
         );
-        if (error?.risuSavePreparationInvalid === true && !res.headersSent) {
-            res.status(400).json({ error: error.message });
-        } else if (!sendImportIngressError(res, error)) {
+        if (!sendSaveFolderImportFailure(res, error, diagnostic)) {
             res.status(400).json(diagnostic ?? { error: error.message || 'Import failed' });
         }
     } finally {
@@ -11418,9 +11505,7 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
             '[PluginStorage] Rejected invalid uploaded save-folder row',
             error
         );
-        if (error?.risuSavePreparationInvalid === true && !res.headersSent) {
-            res.status(400).json({ error: error.message });
-        } else if (!sendImportIngressError(res, error)) {
+        if (!sendSaveFolderImportFailure(res, error, diagnostic)) {
             if (!res.headersSent) {
                 res.status(400).json(diagnostic ?? { error: error.message || 'Import failed' });
             }
