@@ -345,6 +345,7 @@ describe('external plugin rows in backup archives', () => {
     const server = await spawnServer()
     servers.push(server)
     const client = await createClient(server.port, server.password)
+    expect((await client.importBackup(createSeedBackup({ characterCount: 0 }))).ok).toBe(true)
     const oversizedKey = pluginStorageKey('pluginsave-meta/', 'legacy'.repeat(126))
     expect(Buffer.byteLength(oversizedKey, 'utf-8')).toBeGreaterThan(1024)
 

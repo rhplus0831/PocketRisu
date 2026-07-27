@@ -5182,6 +5182,65 @@ function estimateFullBackupDatabaseAssemblyBytes(reader, key, physicalSize) {
     return decodedBytes;
 }
 
+function fullBackupDatabaseUnavailableError(cause = null) {
+    const error = new Error('The authoritative live database is unavailable for backup', {
+        ...(cause ? { cause } : {}),
+    });
+    error.code = 'BACKUP_DATABASE_UNAVAILABLE';
+    error.statusCode = 500;
+    return error;
+}
+
+async function validateFullBackupDatabase(snapshot, key, size, signal) {
+    if (!Number.isSafeInteger(size) || size <= 0) {
+        throw fullBackupDatabaseUnavailableError();
+    }
+    const validationPath = path.join(
+        databaseSpoolDir,
+        `${DATABASE_SPOOL_FILE_PREFIX}full-export-validation-${process.pid}-${nodeCrypto.randomUUID()}.tmp`,
+    );
+    try {
+        const validationSpool = await snapshot.kvWriteToFile(
+            key,
+            validationPath,
+            fullExportSnapshotSpoolOptions(signal),
+        );
+        if (!validationSpool || validationSpool.size !== size) {
+            throw new Error('Snapshot database changed while validating');
+        }
+        const databaseSource = { filePath: validationPath, size };
+        return await readBackupRisuSaveTopLevelFields(
+            databaseSource,
+            ['optimizePluginMemory', PLUGIN_STORAGE_GENERATION_FIELD],
+            {
+                tempDir: databaseSpoolDir,
+                signal,
+                shouldAbort: () => signal?.aborted,
+                readRemoteRowSize: (name) => snapshot.kvSize(
+                    `remotes/${name}.local.bin`,
+                ),
+                readRemoteRowSource: (name) => spoolBackupSnapshotRow(
+                    snapshot,
+                    `remotes/${name}.local.bin`,
+                    {
+                        signal,
+                        shouldAbort: () => signal?.aborted,
+                    },
+                ),
+            },
+        );
+    } catch (cause) {
+        if (signal?.aborted || cause?.name === 'AbortError'
+            || cause?.code === 'RISU_STREAM_ABORTED') {
+            throw cause;
+        }
+        if (cause?.code === 'BACKUP_DATABASE_UNAVAILABLE') throw cause;
+        throw fullBackupDatabaseUnavailableError(cause);
+    } finally {
+        await fs.unlink(validationPath).catch(() => {});
+    }
+}
+
 async function pinFullBackupState({ target, signal, archiveTargetPath = null }) {
     throwIfBackupExportAborted(signal);
     if (activeFullExportPins.size >= FULL_EXPORT_MAX_ACTIVE_PINS) {
@@ -5200,12 +5259,30 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
             snapshot = createKvSnapshot();
 
             const databaseKey = 'database/database.bin';
-            const databaseSize = snapshot.kvSize(databaseKey) ?? 0;
-            const databaseAssemblyBytes = estimateFullBackupDatabaseAssemblyBytes(
-                snapshot,
-                databaseKey,
-                databaseSize,
-            );
+            let databaseSize;
+            let databaseState;
+            let databaseAssemblyBytes;
+            try {
+                databaseSize = snapshot.kvSize(databaseKey);
+                databaseState = await validateFullBackupDatabase(
+                    snapshot,
+                    databaseKey,
+                    databaseSize,
+                    signal,
+                );
+                databaseAssemblyBytes = estimateFullBackupDatabaseAssemblyBytes(
+                    snapshot,
+                    databaseKey,
+                    databaseSize,
+                );
+            } catch (cause) {
+                if (signal?.aborted || cause?.name === 'AbortError'
+                    || cause?.code === 'RISU_STREAM_ABORTED'
+                    || cause?.code === 'BACKUP_DATABASE_UNAVAILABLE') {
+                    throw cause;
+                }
+                throw fullBackupDatabaseUnavailableError(cause);
+            }
             const filesystemEntries = await planFullBackupFilesystemEntries(snapshot, target);
             const baseSnapshotEntries = [
                 ...planFullBackupColdStorageEntries(snapshot),
@@ -5313,39 +5390,17 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
             await fs.mkdir(pinDir, { recursive: false, mode: 0o700 });
             await waitAtFullExportDuringPinTestGate(signal);
             const databaseSourcePath = path.join(pinDir, 'database.pin');
-            let databaseSource = null;
-            let databaseState = null;
-            if (databaseSize > 0) {
-                const databasePin = await snapshot.kvWriteToFile(
-                    'database/database.bin',
-                    databaseSourcePath,
-                    fullExportSnapshotSpoolOptions(signal),
-                );
-                if (!databasePin || databasePin.size !== databaseSize) {
-                    throw new Error('Snapshot database changed while pinning');
-                }
-                databaseSource = { filePath: databaseSourcePath, size: databaseSize };
-                databaseState = await readBackupRisuSaveTopLevelFields(
-                    databaseSource,
-                    ['optimizePluginMemory', PLUGIN_STORAGE_GENERATION_FIELD],
-                    {
-                        tempDir: databaseSpoolDir,
-                        signal,
-                        shouldAbort: () => signal?.aborted,
-                        readRemoteRowSize: (name) => snapshot.kvSize(
-                            `remotes/${name}.local.bin`,
-                        ),
-                        readRemoteRowSource: (name) => spoolBackupSnapshotRow(
-                            snapshot,
-                            `remotes/${name}.local.bin`,
-                            {
-                                signal,
-                                shouldAbort: () => signal?.aborted,
-                            },
-                        ),
-                    },
+            const databasePin = await snapshot.kvWriteToFile(
+                databaseKey,
+                databaseSourcePath,
+                fullExportSnapshotSpoolOptions(signal),
+            );
+            if (!databasePin || databasePin.size !== databaseSize) {
+                throw fullBackupDatabaseUnavailableError(
+                    new Error('Snapshot database changed while pinning'),
                 );
             }
+            const databaseSource = { filePath: databaseSourcePath, size: databaseSize };
             const snapshotEntries = [
                 ...baseSnapshotEntries,
                 ...(target === 'upstream'
@@ -5376,9 +5431,7 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
             }
             preflightBackupEntries([
                 ...pinnedEntries,
-                ...(databaseSource
-                    ? [{ backupName: 'database.risudat', size: databaseSource.size }]
-                    : []),
+                { backupName: 'database.risudat', size: databaseSource.size },
             ]);
             return {
                 token,
