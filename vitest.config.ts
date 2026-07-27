@@ -1,14 +1,23 @@
 import { svelte } from "@sveltejs/vite-plugin-svelte"
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
+
+const browserBufferPath = fileURLToPath(
+  new URL('./node_modules/buffer/index.js', import.meta.url),
+)
 
 export default defineConfig({
   plugins: [
     svelte(),
   ],
   resolve: {
-    alias: {
-      src: '/src',
-    },
+    alias: [
+      { find: 'src', replacement: '/src' },
+      // Vitest executes through Vite's SSR pipeline, where bare "buffer"
+      // otherwise resolves to Node's built-in implementation. Client tests
+      // must exercise the npm polyfill that the browser bundle actually uses.
+      { find: /^buffer$/, replacement: browserBufferPath },
+    ],
     conditions: ['browser'],
   },
   test: {
