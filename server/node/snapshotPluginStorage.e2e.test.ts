@@ -2944,7 +2944,7 @@ describe('automatic snapshots × optimized plugin storage', () => {
         raw.close()
     })
 
-    it('folds an exact empty set when physical rows belong to another generation', async () => {
+    it('refuses to fold a mismatched generation as an empty snapshot publication', async () => {
         const cwd = makeWorkDir()
         const foreignKey = valueRowKey('foreign')
         const selectedDatabase = Buffer.from(encodeRisuSaveLegacy({
@@ -2974,23 +2974,27 @@ describe('automatic snapshots × optimized plugin storage', () => {
         const auth = await authenticate(server)
         await writeKey(server, auth, 'database/database.bin', selectedDatabase)
 
-        const [snapshotKey] = await listSnapshotKeys(server, auth)
-        const snapshotDb = await decodeRisuSave(await readKey(server, auth, snapshotKey))
-        expect(snapshotDb.pluginStorageFolded).toBe(true)
-        expect(snapshotDb.pluginCustomStorage).toEqual({})
-
-        await restoreSnapshot(server, auth, snapshotKey)
-        expect((await readKey(server, auth, foreignKey)).length).toBe(0)
-        expect(JSON.parse((await readKey(
-            server,
-            auth,
-            PLUGIN_STORAGE_MANIFEST_KEY,
-        )).toString('utf-8'))).toEqual({
+        // A generated optimized publication needs a complete matching
+        // manifest. Treating this mismatch as an authoritative empty set would
+        // publish a lossy recovery snapshot.
+        expect(await listSnapshotKeys(server, auth)).toEqual([])
+        expect((await readKeyResponse(server, auth, foreignKey)).status).toBe(409)
+        await stopServer(server)
+        const preserved = openFixtureDatabase(cwd)
+        const foreignRow = preserved.prepare('SELECT value FROM kv WHERE key = ?')
+            .get(foreignKey) as { value: Buffer }
+        const manifestRow = preserved.prepare('SELECT value FROM kv WHERE key = ?')
+            .get(PLUGIN_STORAGE_MANIFEST_KEY) as { value: Buffer }
+        expect(Buffer.from(foreignRow.value)).toEqual(
+            Buffer.from(JSON.stringify('foreign-value')),
+        )
+        expect(JSON.parse(Buffer.from(manifestRow.value).toString('utf-8'))).toEqual({
             version: 1,
-            generation: 'selected-generation',
-            valueKeys: [],
+            generation: 'foreign-generation',
+            valueKeys: [foreignKey],
             metaKeys: [],
         })
+        preserved.close()
     })
 
     it('restoring a pre-fix stub snapshot leaves current plugin rows untouched', async () => {

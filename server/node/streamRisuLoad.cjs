@@ -39,6 +39,7 @@ const {
 const DEFAULT_STREAM_INGEST_MIN_BYTES = 32 * 1024 * 1024;
 const CURSOR_CACHE_BYTES = 64 * 1024;
 const DECODE_OUTPUT_CHUNK_BYTES = 64 * 1024;
+const TOP_LEVEL_METADATA_MAX_BYTES = 64 * 1024;
 const DEFAULT_MAX_DECODED_BYTES = 4 * 1024 * 1024 * 1024;
 const DEFAULT_DECODE_DISK_HEADROOM_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_LEGACY_RESTORE_BYTES = 64 * 1024 * 1024;
@@ -519,6 +520,21 @@ async function descriptorCollectionKind(source, descriptor) {
 async function decodeDescriptor(source, descriptor) {
     const bytes = await source.readRange(descriptor.offset, descriptor.length);
     return unpackr.decode(bytes);
+}
+
+async function decodeBoundedTopLevelMetadata(source, descriptor, label) {
+    source.throwIfAborted();
+    if (descriptor.length > TOP_LEVEL_METADATA_MAX_BYTES) {
+        throw new RisuSavePreparationLimitError(
+            `${label} exceeds the bounded top-level metadata limit (${TOP_LEVEL_METADATA_MAX_BYTES} bytes)`,
+            {
+                code: 'RISU_SAVE_METADATA_TOO_LARGE',
+                limit: TOP_LEVEL_METADATA_MAX_BYTES,
+                actual: descriptor.length,
+            },
+        );
+    }
+    return decodeDescriptor(source, descriptor);
 }
 
 async function readMapDescriptors(source, descriptor) {
@@ -1623,6 +1639,65 @@ async function walkRisuSave(input, options = {}) {
     }
 }
 
+// Read a small, explicit set of root fields without decoding unrelated bodies.
+// Full-export planning uses this for publication metadata so a large database
+// field never has to become a monolithic Buffer or JavaScript object merely to
+// determine which external plugin rows are owned.
+async function readRisuSaveTopLevelFields(input, requestedKeys, options = {}) {
+    const requested = new Set(requestedKeys);
+    const inspection = options.inspection ?? await inspectRisuSaveSource(input);
+    if (!inspection.supported) {
+        throw new Error('Risu save format is not supported by the streaming loader');
+    }
+    const prepared = await prepareMessagePackSource(
+        input,
+        inspection,
+        options.tempDir,
+        options.shouldAbort,
+        {
+            signal: options.signal,
+            maxDecodedBytes: options.maxDecodedBytes,
+            diskHeadroomBytes: options.diskHeadroomBytes,
+            availableDiskBytes: options.availableDiskBytes,
+            onDecodedChunk: options.onDecodedChunk,
+        },
+    );
+    try {
+        const cursor = prepared.source.cursor(prepared.payloadOffset);
+        const count = await readCollectionCount(cursor, 'map');
+        const fields = {};
+        for (let index = 0; index < count; index++) {
+            const keyDescriptor = await skipMessagePackValue(cursor);
+            const keyValue = await decodeBoundedTopLevelMetadata(
+                prepared.source,
+                keyDescriptor,
+                'MessagePack root key',
+            );
+            const key = typeof keyValue === 'string' ? keyValue : String(keyValue);
+            const valueDescriptor = await skipMessagePackValue(cursor);
+            prepared.source.throwIfAborted();
+            if (requested.has(key)) {
+                assignNormalizedProperty(
+                    fields,
+                    key,
+                    await decodeBoundedTopLevelMetadata(
+                        prepared.source,
+                        valueDescriptor,
+                        `MessagePack root field ${JSON.stringify(key)}`,
+                    ),
+                );
+            }
+        }
+        prepared.source.throwIfAborted();
+        if (cursor.position !== prepared.source.size) {
+            throw new Error(`Trailing bytes after MessagePack root at byte ${cursor.position}`);
+        }
+        return fields;
+    } finally {
+        await prepared.cleanup();
+    }
+}
+
 async function scanMessagePackValue(input) {
     const normalized = normalizeInput(input);
     if (!normalized.buffer) {
@@ -1652,8 +1727,12 @@ module.exports = {
     decodeBoundedLegacyRisuSave,
     inspectRisuSaveSource,
     prepareMessagePackSource,
+    readCollectionCount,
+    descriptorCollectionKind,
+    decodeDescriptor,
     shouldStreamRisuSave,
     scanMessagePackValue,
+    readRisuSaveTopLevelFields,
     skipMessagePackValue,
     walkRisuSave,
 };

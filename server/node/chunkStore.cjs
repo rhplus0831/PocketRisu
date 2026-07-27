@@ -105,6 +105,22 @@ function createSnapshotReader(db) {
     const selManifestPublication = db.prepare(
         'SELECT 1 FROM chunk_manifest_publications WHERE manifest_key = ?',
     );
+    const selValueStreamMetadata = db.prepare(
+        `SELECT LENGTH(value) AS raw_size, value = @chunk_marker AS has_chunk_marker
+         FROM kv WHERE key = @key`,
+    );
+    const selRawValuePart = db.prepare(
+        'SELECT substr(value, @offset, @length) AS data FROM kv WHERE key = @key',
+    );
+    const selManifestPart = db.prepare(
+        `SELECT m.seq AS seq, m.hash AS hash, LENGTH(c.data) AS stored_size
+         FROM manifest_chunks m
+         LEFT JOIN chunks c ON c.hash = m.hash
+         WHERE m.manifest_key = @key AND m.seq = @seq`,
+    );
+    const selChunkDataPart = db.prepare(
+        'SELECT substr(data, 1, @read_length) AS data FROM chunks WHERE hash = @hash',
+    );
     const selSize = db.prepare(
         'SELECT SUM(LENGTH(c.data)) AS n FROM manifest_chunks m JOIN chunks c ON c.hash = m.hash WHERE m.manifest_key = ?',
     );
@@ -181,7 +197,197 @@ function createSnapshotReader(db) {
         });
     }
 
-    return { kvGet, kvList, kvListWithSizes };
+    function snapshotPublicationState(key, row) {
+        if (!row?.has_chunk_marker) {
+            return { chunked: false, size: row?.raw_size ?? null, metadata: null, inventory: null };
+        }
+        const published = !!selManifestPublication.get(key);
+        const hasManifest = !!selManifestExists.get(key);
+        const metadata = selManifestMeta.get(key) ?? null;
+        if (!published) {
+            if (hasManifest || metadata) {
+                throw chunkCorruption(`Chunk manifest ${key} has inconsistent protection state`);
+            }
+            return { chunked: false, size: row.raw_size, metadata: null, inventory: null };
+        }
+        const inventory = selManifestInventory.get(key);
+        const storedSize = selSize.get(key).n;
+        if (!hasManifest || !metadata
+            || !Number.isSafeInteger(metadata.chunk_count) || metadata.chunk_count <= 0
+            || !Number.isSafeInteger(metadata.logical_size) || metadata.logical_size <= 0
+            || !/^[0-9a-f]{64}$/.test(metadata.logical_sha256)
+            || inventory.chunk_count !== metadata.chunk_count
+            || inventory.min_seq !== 0 || inventory.max_seq !== inventory.chunk_count - 1
+            || storedSize !== metadata.logical_size) {
+            throw chunkCorruption(`Protected chunk manifest ${key} is incomplete`);
+        }
+        return {
+            chunked: true,
+            size: metadata.logical_size,
+            metadata,
+            inventory,
+        };
+    }
+
+    function snapshotPart(key, index) {
+        const part = selManifestPart.get({ key, seq: index });
+        if (!part || part.seq !== index
+            || !Number.isSafeInteger(part.stored_size)
+            || part.stored_size <= 0 || part.stored_size > MAX_SIZE
+            || !/^[0-9a-f]{64}$/.test(part.hash)) {
+            throw chunkCorruption(`Chunk manifest row ${index} is missing or invalid`);
+        }
+        return part;
+    }
+
+    function snapshotChunk(part, index) {
+        const row = selChunkDataPart.get({ hash: part.hash, read_length: MAX_SIZE });
+        if (!Buffer.isBuffer(row?.data) || row.data.length !== part.stored_size
+            || crypto.createHash('sha256').update(row.data).digest('hex') !== part.hash) {
+            throw chunkCorruption(`Chunk manifest row ${index} failed verification`);
+        }
+        return row.data;
+    }
+
+    function snapshotStreamAbort(options) {
+        if (!options.signal?.aborted && !options.shouldAbort?.()) return;
+        const error = options.signal?.reason instanceof Error
+            ? options.signal.reason
+            : new Error('KV snapshot stream cancelled');
+        if (!error.code) {
+            try { error.code = 'KV_STREAM_ABORTED'; } catch {}
+        }
+        throw error;
+    }
+
+    async function writeSnapshotPart(fileHandle, data) {
+        let written = 0;
+        while (written < data.length) {
+            const result = await fileHandle.write(data, written, data.length - written, null);
+            if (result.bytesWritten <= 0) throw new Error('KV snapshot spool write made no progress');
+            written += result.bytesWritten;
+        }
+    }
+
+    const yieldToEventLoop = () => new Promise((resolve) => setImmediate(resolve));
+
+    // Snapshot-backed counterpart to createChunkStore.writeValueToFile(). One
+    // completed SQLite statement produces each <=64 KiB page; no cursor remains
+    // live while file I/O or abort delivery yields to the event loop.
+    async function kvWriteToFile(key, filePath, options = {}) {
+        const row = selValueStreamMetadata.get({ key, chunk_marker: CHUNK_MARKER });
+        if (!row) return null;
+        const state = snapshotPublicationState(key, row);
+        const fileHandle = await fs.promises.open(filePath, 'wx', 0o600);
+        let size = 0;
+        let chunks = 0;
+        let maxChunkBytes = 0;
+        const logicalHash = crypto.createHash('sha256');
+        const writePart = async (data) => {
+            await yieldToEventLoop();
+            snapshotStreamAbort(options);
+            await writeSnapshotPart(fileHandle, data);
+            size += data.length;
+            chunks++;
+            maxChunkBytes = Math.max(maxChunkBytes, data.length);
+            logicalHash.update(data);
+            await options.onChunk?.({ index: chunks - 1, size: data.length });
+            await yieldToEventLoop();
+            snapshotStreamAbort(options);
+        };
+        try {
+            snapshotStreamAbort(options);
+            if (state.chunked) {
+                for (let index = 0; index < state.inventory.chunk_count; index++) {
+                    snapshotStreamAbort(options);
+                    const part = snapshotPart(key, index);
+                    await writePart(snapshotChunk(part, index));
+                }
+                if (chunks !== state.metadata.chunk_count
+                    || size !== state.metadata.logical_size
+                    || logicalHash.digest('hex') !== state.metadata.logical_sha256) {
+                    throw chunkCorruption(`Chunk manifest ${key} failed logical verification`);
+                }
+            } else {
+                if (!Number.isSafeInteger(state.size) || state.size < 0) {
+                    throw chunkCorruption(`Raw KV value ${key} has an invalid size`);
+                }
+                let offset = 0;
+                while (offset < state.size) {
+                    snapshotStreamAbort(options);
+                    const part = selRawValuePart.get({
+                        key,
+                        offset: offset + 1,
+                        length: Math.min(MAX_SIZE, state.size - offset),
+                    });
+                    if (!Buffer.isBuffer(part?.data)
+                        || part.data.length <= 0 || part.data.length > MAX_SIZE) {
+                        throw chunkCorruption(`Raw KV value ${key} is missing bytes at ${offset}`);
+                    }
+                    await writePart(part.data);
+                    offset += part.data.length;
+                }
+                if (state.size === 0) logicalHash.digest('hex');
+            }
+            await fileHandle.sync();
+            await fileHandle.close();
+            return { filePath, size, chunks, maxChunkBytes };
+        } catch (error) {
+            try { await fileHandle.close(); } catch {}
+            try { await fs.promises.unlink(filePath); } catch {}
+            throw error;
+        }
+    }
+
+    // Bounded metadata probe used for gzip headers/footers. The returned body
+    // is explicitly limited to one storage page and never assembles a value.
+    function kvReadRange(key, offset, length) {
+        if (!Number.isSafeInteger(offset) || offset < 0
+            || !Number.isSafeInteger(length) || length < 0 || length > MAX_SIZE) {
+            throw new RangeError(`Invalid KV snapshot range for ${key}`);
+        }
+        const row = selValueStreamMetadata.get({ key, chunk_marker: CHUNK_MARKER });
+        if (!row) return null;
+        const state = snapshotPublicationState(key, row);
+        if (offset > state.size || offset + length > state.size) {
+            throw new RangeError(`KV snapshot range exceeds ${key}`);
+        }
+        if (length === 0) return Buffer.alloc(0);
+        if (!state.chunked) {
+            const part = selRawValuePart.get({ key, offset: offset + 1, length });
+            if (!Buffer.isBuffer(part?.data) || part.data.length !== length) {
+                throw chunkCorruption(`Raw KV value ${key} is missing a requested range`);
+            }
+            return part.data;
+        }
+        const output = Buffer.allocUnsafe(length);
+        let logicalOffset = 0;
+        let copied = 0;
+        for (let index = 0; index < state.inventory.chunk_count && copied < length; index++) {
+            const part = snapshotPart(key, index);
+            const partEnd = logicalOffset + part.stored_size;
+            if (partEnd > offset && logicalOffset < offset + length) {
+                const chunk = snapshotChunk(part, index);
+                const from = Math.max(0, offset - logicalOffset);
+                const to = Math.min(chunk.length, offset + length - logicalOffset);
+                chunk.copy(output, copied, from, to);
+                copied += to - from;
+            }
+            logicalOffset = partEnd;
+        }
+        if (copied !== length) {
+            throw chunkCorruption(`Chunked KV value ${key} is missing a requested range`);
+        }
+        return output;
+    }
+
+    function kvSize(key) {
+        const row = selValueStreamMetadata.get({ key, chunk_marker: CHUNK_MARKER });
+        if (!row) return null;
+        return snapshotPublicationState(key, row).size;
+    }
+
+    return { kvGet, kvList, kvListWithSizes, kvWriteToFile, kvReadRange, kvSize };
 }
 
 // Bind chunk-aware get/put to a specific better-sqlite3 instance. db.cjs wires

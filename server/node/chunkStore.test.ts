@@ -44,6 +44,17 @@ const {
     createSnapshotReader: (db: any) => {
         kvGet: (key: string) => Buffer | null
         kvListWithSizes: (prefix: string) => Array<{ key: string; size: number }>
+        kvSize: (key: string) => number | null
+        kvReadRange: (key: string, offset: number, length: number) => Buffer | null
+        kvWriteToFile: (
+            key: string,
+            filePath: string,
+            options?: {
+                shouldAbort?: () => boolean
+                signal?: AbortSignal
+                onChunk?: (chunk: { index: number; size: number }) => void | Promise<void>
+            },
+        ) => Promise<{ filePath: string; size: number; chunks: number; maxChunkBytes: number } | null>
     }
     normalizeThreshold: (value: unknown) => number
     CHUNK_MARKER: Buffer
@@ -852,6 +863,205 @@ describe('writeValueToFile — bounded snapshot restore source', () => {
             code: 'KV_CHUNK_CORRUPT',
         })
         expect(fs.existsSync(filePath)).toBe(false)
+    })
+
+    it('F11: readonly snapshots page chunked and legacy rows with ranges, integrity, and cancellation', async () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const chunkedKey = 'pluginsave/snapshot-cursor.json'
+        const chunked = seededBytes(20 * 1024 * 1024, 181)
+        const rawKey = 'coldstorage/snapshot-cursor'
+        const raw = seededBytes(20 * 1024 * 1024, 191)
+        store.putValue(chunkedKey, chunked)
+        db.prepare('INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)').run(
+            rawKey,
+            raw,
+            Date.now(),
+        )
+        const reader = createSnapshotReader(db)
+
+        for (const [key, value] of [[chunkedKey, chunked], [rawKey, raw]] as const) {
+            const filePath = path.join(fileDir, `${path.basename(key)}.snapshot.tmp`)
+            const pages: number[] = []
+            const result = await reader.kvWriteToFile(key, filePath, {
+                onChunk: async ({ size }) => {
+                    pages.push(size)
+                    await new Promise(resolve => setImmediate(resolve))
+                },
+            })
+            expect(result).toMatchObject({ size: value.length })
+            expect(result!.maxChunkBytes).toBeLessThanOrEqual(65536)
+            expect(Math.max(...pages)).toBeLessThanOrEqual(65536)
+            expect(fs.readFileSync(filePath).equals(value)).toBe(true)
+            expect(reader.kvSize(key)).toBe(value.length)
+            expect(reader.kvReadRange(key, 0, 2)).toEqual(value.subarray(0, 2))
+            expect(reader.kvReadRange(key, value.length - 4, 4)).toEqual(value.subarray(-4))
+            expect(reader.kvReadRange(key, 65_500, 100)).toEqual(value.subarray(65_500, 65_600))
+        }
+
+        const cancelledPath = path.join(fileDir, 'snapshot-cursor-cancelled.tmp')
+        const controller = new AbortController()
+        let chunks = 0
+        await expect(reader.kvWriteToFile(chunkedKey, cancelledPath, {
+            signal: controller.signal,
+            onChunk: () => {
+                chunks++
+                if (chunks === 4) controller.abort(new Error('cancel snapshot cursor'))
+            },
+        })).rejects.toThrow('cancel snapshot cursor')
+        expect(chunks).toBe(4)
+        expect(fs.existsSync(cancelledPath)).toBe(false)
+
+        const corruptPath = path.join(fileDir, 'snapshot-cursor-corrupt.tmp')
+        const victim = db.prepare(
+            'SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq LIMIT 1 OFFSET 2',
+        ).get(chunkedKey) as { hash: string }
+        db.prepare('UPDATE chunks SET data = ? WHERE hash = ?').run(Buffer.from('bad'), victim.hash)
+        await expect(reader.kvWriteToFile(chunkedKey, corruptPath)).rejects.toMatchObject({
+            code: 'KV_CHUNK_CORRUPT',
+        })
+        expect(fs.existsSync(corruptPath)).toBe(false)
+    })
+
+    it('F12: readonly snapshot cursors reject every raw/chunk corruption and remove partial files', async () => {
+        const absentDb = freshDb()
+        createChunkStore(absentDb, T)
+        const absentReader = createSnapshotReader(absentDb)
+        const absentPath = path.join(fileDir, 'snapshot-absent.tmp')
+        await expect(absentReader.kvWriteToFile('missing', absentPath)).resolves.toBeNull()
+        expect(fs.existsSync(absentPath)).toBe(false)
+
+        const rawDb = freshDb()
+        createChunkStore(rawDb, T)
+        const rawKey = 'coldstorage/raw-truncated-during-cursor'
+        const raw = seededBytes(4 * 65536 + 7, 211)
+        rawDb.prepare('INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)')
+            .run(rawKey, raw, Date.now())
+        const rawReader = createSnapshotReader(rawDb)
+        const rawPath = path.join(fileDir, 'snapshot-raw-truncated.tmp')
+        await expect(rawReader.kvWriteToFile(rawKey, rawPath, {
+            onChunk: ({ index }) => {
+                if (index === 0) {
+                    rawDb.prepare('UPDATE kv SET value = ? WHERE key = ?')
+                        .run(raw.subarray(0, 65536), rawKey)
+                }
+            },
+        })).rejects.toMatchObject({ code: 'KV_CHUNK_CORRUPT' })
+        expect(fs.existsSync(rawPath)).toBe(false)
+
+        const corruptions: Array<{
+            name: string
+            mutate: (db: any, key: string) => void
+            rangeFails?: boolean
+        }> = [
+            {
+                name: 'missing-manifest-row',
+                mutate(db, key) {
+                    db.prepare('DELETE FROM manifest_chunks WHERE manifest_key = ? AND seq = 1')
+                        .run(key)
+                },
+            },
+            {
+                name: 'missing-chunk-row',
+                mutate(db, key) {
+                    const { hash } = db.prepare(
+                        'SELECT hash FROM manifest_chunks WHERE manifest_key = ? AND seq = 0',
+                    ).get(key) as { hash: string }
+                    db.prepare('DELETE FROM chunks WHERE hash = ?').run(hash)
+                },
+                rangeFails: true,
+            },
+            {
+                name: 'duplicated-logical-chunk',
+                mutate(db, key) {
+                    const rows = db.prepare(
+                        'SELECT seq, hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq LIMIT 2',
+                    ).all(key) as Array<{ seq: number; hash: string }>
+                    db.prepare('UPDATE manifest_chunks SET hash = ? WHERE manifest_key = ? AND seq = ?')
+                        .run(rows[0].hash, key, rows[1].seq)
+                    const { size } = db.prepare(
+                        `SELECT SUM(LENGTH(c.data)) AS size FROM manifest_chunks m
+                         JOIN chunks c ON c.hash = m.hash WHERE m.manifest_key = ?`,
+                    ).get(key) as { size: number }
+                    db.prepare('UPDATE chunk_manifest_meta SET logical_size = ? WHERE manifest_key = ?')
+                        .run(size, key)
+                },
+            },
+            {
+                name: 'reordered-chunks',
+                mutate(db, key) {
+                    const rows = db.prepare(
+                        'SELECT seq, hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq LIMIT 2',
+                    ).all(key) as Array<{ seq: number; hash: string }>
+                    db.prepare('UPDATE manifest_chunks SET hash = ? WHERE manifest_key = ? AND seq = ?')
+                        .run(rows[1].hash, key, rows[0].seq)
+                    db.prepare('UPDATE manifest_chunks SET hash = ? WHERE manifest_key = ? AND seq = ?')
+                        .run(rows[0].hash, key, rows[1].seq)
+                },
+            },
+            {
+                name: 'chunk-hash-mismatch',
+                mutate(db, key) {
+                    const { hash } = db.prepare(
+                        'SELECT hash FROM manifest_chunks WHERE manifest_key = ? AND seq = 0',
+                    ).get(key) as { hash: string }
+                    const { data } = db.prepare('SELECT data FROM chunks WHERE hash = ?')
+                        .get(hash) as { data: Buffer }
+                    const changed = Buffer.from(data)
+                    changed[0] ^= 0xff
+                    db.prepare('UPDATE chunks SET data = ? WHERE hash = ?').run(changed, hash)
+                },
+                rangeFails: true,
+            },
+            {
+                name: 'logical-size',
+                mutate(db, key) {
+                    db.prepare(
+                        'UPDATE chunk_manifest_meta SET logical_size = logical_size + 1 WHERE manifest_key = ?',
+                    ).run(key)
+                },
+            },
+            {
+                name: 'logical-sha',
+                mutate(db, key) {
+                    db.prepare(
+                        'UPDATE chunk_manifest_meta SET logical_sha256 = ? WHERE manifest_key = ?',
+                    ).run('0'.repeat(64), key)
+                },
+            },
+            {
+                name: 'missing-meta',
+                mutate(db, key) {
+                    db.prepare('DELETE FROM chunk_manifest_meta WHERE manifest_key = ?').run(key)
+                },
+            },
+            {
+                name: 'missing-publication',
+                mutate(db, key) {
+                    db.prepare('DELETE FROM chunk_manifest_publications WHERE manifest_key = ?').run(key)
+                },
+            },
+        ]
+
+        for (const corruption of corruptions) {
+            const db = freshDb()
+            const store = createChunkStore(db, T)
+            const key = `pluginsave/snapshot-${corruption.name}.json`
+            const value = seededBytes(400_000, 223)
+            store.putValue(key, value)
+            corruption.mutate(db, key)
+            const reader = createSnapshotReader(db)
+            const output = path.join(fileDir, `snapshot-${corruption.name}.tmp`)
+            await expect(reader.kvWriteToFile(key, output)).rejects.toMatchObject({
+                code: 'KV_CHUNK_CORRUPT',
+            })
+            expect(fs.existsSync(output)).toBe(false)
+            if (corruption.rangeFails) {
+                expect(() => reader.kvReadRange(key, 0, 64))
+                    .toThrow(expect.objectContaining({ code: 'KV_CHUNK_CORRUPT' }))
+            }
+            db.close()
+        }
     })
 })
 

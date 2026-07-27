@@ -2,7 +2,7 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import { afterAll, describe, expect, test } from 'vitest'
 import { createClient } from './helpers/client.js'
-import { decodeRisuDat, normalizeBackup } from './helpers/normalize.js'
+import { decodeRisuDat } from './helpers/normalize.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { Packr } from 'msgpackr'
 
@@ -33,7 +33,7 @@ function readKvRows(cwd: string, prefix: string): Array<{ key: string; value: Bu
 }
 
 describe('backup missing chat-row integrity', () => {
-  test('local export preserves an importable stub while strict server save still fails', async () => {
+  test('full download and server save both reject a missing authoritative chat row', async () => {
     const server = await spawnServer()
     servers.push(server)
     const client = await createClient(server.port, server.password)
@@ -64,28 +64,12 @@ describe('backup missing chat-row integrity', () => {
     )
 
     const exportResponse = await client.fetch('/api/backup/export')
-    expect(exportResponse.status).toBe(200)
-    const exported = Buffer.from(await exportResponse.arrayBuffer())
-    expect(Number(exportResponse.headers.get('content-length'))).toBe(exported.length)
-    expect((normalizeBackup(exported).raw as any).characters[0].chats[0]).toEqual(
-      expect.objectContaining({ id: chatId, name: 'Lost chat', _stub: true }),
-    )
-
-    const restoredServer = await spawnServer()
-    servers.push(restoredServer)
-    const restoredClient = await createClient(restoredServer.port, restoredServer.password)
-    await expect(restoredClient.importBackup(exported)).resolves.toMatchObject({ ok: true })
-
-    const restoredDatabase = readKvRows(restoredServer.cwd, 'database/database.bin')
-    expect(restoredDatabase).toHaveLength(1)
-    expect(decodeRisuDat(restoredDatabase[0].value).characters[0].chats[0]).toEqual(
-      expect.objectContaining({ id: chatId, name: 'Lost chat', _stub: true }),
-    )
-    expect(readKvRows(restoredServer.cwd, 'chats/')).toHaveLength(0)
-    expect((normalizeBackup(await restoredClient.exportBackup()).raw as any)
-      .characters[0].chats[0]).toEqual(
-      expect.objectContaining({ id: chatId, name: 'Lost chat', _stub: true }),
-    )
+    expect(exportResponse.status).toBe(500)
+    expect(exportResponse.headers.get('content-disposition')).toBeNull()
+    await expect(exportResponse.json()).resolves.toMatchObject({
+      code: 'BACKUP_MISSING_CHAT_ROW',
+      error: expect.stringContaining(`${chaId}/${chatId}`),
+    })
 
     const serverSaveResponse = await client.fetch('/api/backup/server/save', { method: 'POST' })
     expect(serverSaveResponse.status).toBe(500)

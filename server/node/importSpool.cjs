@@ -4,7 +4,6 @@ const fsSync = require('fs');
 const fs = require('fs/promises');
 const path = require('path');
 const zlib = require('zlib');
-const { TextDecoder } = require('util');
 const { Readable } = require('stream');
 
 const IMPORT_IO_PAGE_BYTES = 64 * 1024;
@@ -297,11 +296,13 @@ async function validateJsonFileStreaming(filePath, {
     maxDepth = 1024,
 } = {}) {
     const fileHandle = await fs.open(filePath, 'r');
-    const decoder = new TextDecoder('utf-8', { fatal: true });
     const stack = [];
     let rootState = 'value';
     let token = null;
     let offset = 0;
+    let utf8Remaining = 0;
+    let utf8NextMin = 0x80;
+    let utf8NextMax = 0xbf;
     // A decimal exponent only needs to remain exact while it can cancel the
     // mantissa's decimal offset. That offset is bounded by the finite source
     // size. Beyond this threshold, a positive exponent is unavoidably overflow
@@ -351,43 +352,45 @@ async function validateJsonFileStreaming(filePath, {
         stack.pop();
         completeValue();
     };
-    const beginValue = (character) => {
-        if (character === '{') pushContainer('object');
-        else if (character === '[') pushContainer('array');
-        else if (character === '"') token = { kind: 'string', role: 'value', escape: false, unicode: 0 };
-        else if (character === 't') token = { kind: 'literal', expected: 'true', index: 1 };
-        else if (character === 'f') token = { kind: 'literal', expected: 'false', index: 1 };
-        else if (character === 'n') token = { kind: 'literal', expected: 'null', index: 1 };
-        else if (character === '-' || (character >= '0' && character <= '9')) {
+    const beginValue = (byte) => {
+        if (byte === 0x7b) pushContainer('object');
+        else if (byte === 0x5b) pushContainer('array');
+        else if (byte === 0x22) token = { kind: 'string', role: 'value', escape: false, unicode: 0 };
+        else if (byte === 0x74) token = { kind: 'literal', expected: 'true', index: 1 };
+        else if (byte === 0x66) token = { kind: 'literal', expected: 'false', index: 1 };
+        else if (byte === 0x6e) token = { kind: 'literal', expected: 'null', index: 1 };
+        else if (byte === 0x2d || (byte >= 0x30 && byte <= 0x39)) {
             token = {
                 kind: 'number',
-                state: character === '-' ? 'minus' : character === '0' ? 'zero' : 'integer',
-                mantissaDigits: character === '-' ? 0 : 1,
-                digitsBeforeDecimal: character === '-' ? 0 : 1,
-                firstNonZeroIndex: character >= '1' && character <= '9' ? 0 : null,
-                significantPrefix: character >= '1' && character <= '9' ? character : '',
+                state: byte === 0x2d ? 'minus' : byte === 0x30 ? 'zero' : 'integer',
+                mantissaDigits: byte === 0x2d ? 0 : 1,
+                digitsBeforeDecimal: byte === 0x2d ? 0 : 1,
+                firstNonZeroIndex: byte >= 0x31 && byte <= 0x39 ? 0 : null,
+                significantPrefix: byte >= 0x31 && byte <= 0x39
+                    ? String.fromCharCode(byte)
+                    : '',
                 exponentNegative: false,
                 exponentValue: 0,
                 exponentSaturated: false,
             };
         } else throw invalid();
     };
-    const recordMantissaDigit = (number, character, beforeDecimal) => {
+    const recordMantissaDigit = (number, byte, beforeDecimal) => {
         const index = number.mantissaDigits++;
         if (beforeDecimal) number.digitsBeforeDecimal++;
-        if (number.firstNonZeroIndex === null && character !== '0') {
+        if (number.firstNonZeroIndex === null && byte !== 0x30) {
             number.firstNonZeroIndex = index;
         }
         // A fixed prefix is enough to decide IEEE-754 overflow at magnitude
         // 308 without retaining an arbitrarily long numeric token. Digits past
         // this point are far below binary64 rounding precision.
         if (number.firstNonZeroIndex !== null && number.significantPrefix.length < 320) {
-            number.significantPrefix += character;
+            number.significantPrefix += String.fromCharCode(byte);
         }
     };
-    const recordExponentDigit = (number, character) => {
+    const recordExponentDigit = (number, byte) => {
         if (number.exponentSaturated) return;
-        const digit = character.charCodeAt(0) - 0x30;
+        const digit = byte - 0x30;
         if (number.exponentValue > Math.floor((exponentSaturation - digit) / 10)) {
             number.exponentValue = exponentSaturation;
             number.exponentSaturated = true;
@@ -418,38 +421,42 @@ async function validateJsonFileStreaming(filePath, {
             if (!Number.isFinite(Number(normalized))) throw invalid();
         }
     };
-    const processCharacter = (character) => {
+    const processCharacter = (byte) => {
         let reprocess = true;
         while (reprocess) {
             reprocess = false;
             if (token?.kind === 'string') {
                 if (token.unicode > 0) {
-                    if (!/[0-9a-fA-F]/.test(character)) throw invalid();
+                    if (!((byte >= 0x30 && byte <= 0x39)
+                        || (byte >= 0x41 && byte <= 0x46)
+                        || (byte >= 0x61 && byte <= 0x66))) throw invalid();
                     token.unicode--;
                     return;
                 }
                 if (token.escape) {
                     token.escape = false;
-                    if (character === 'u') token.unicode = 4;
-                    else if (!'"\\/bfnrt'.includes(character)) throw invalid();
+                    if (byte === 0x75) token.unicode = 4;
+                    else if (![0x22, 0x5c, 0x2f, 0x62, 0x66, 0x6e, 0x72, 0x74].includes(byte)) {
+                        throw invalid();
+                    }
                     return;
                 }
-                if (character === '\\') {
+                if (byte === 0x5c) {
                     token.escape = true;
                     return;
                 }
-                if (character === '"') {
+                if (byte === 0x22) {
                     const role = token.role;
                     token = null;
                     if (role === 'key') stack[stack.length - 1].state = 'colon';
                     else completeValue();
                     return;
                 }
-                if (character.charCodeAt(0) < 0x20) throw invalid();
+                if (byte < 0x20) throw invalid();
                 return;
             }
             if (token?.kind === 'literal') {
-                if (character !== token.expected[token.index]) throw invalid();
+                if (byte !== token.expected.charCodeAt(token.index)) throw invalid();
                 token.index++;
                 if (token.index === token.expected.length) {
                     token = null;
@@ -459,68 +466,68 @@ async function validateJsonFileStreaming(filePath, {
             }
             if (token?.kind === 'number') {
                 const number = token;
-                const digit = character >= '0' && character <= '9';
+                const digit = byte >= 0x30 && byte <= 0x39;
                 if (number.state === 'minus') {
                     if (!digit) throw invalid();
-                    number.state = character === '0' ? 'zero' : 'integer';
-                    recordMantissaDigit(number, character, true);
+                    number.state = byte === 0x30 ? 'zero' : 'integer';
+                    recordMantissaDigit(number, byte, true);
                     return;
                 }
                 if (number.state === 'zero') {
                     if (digit) throw invalid();
-                    if (character === '.') {
+                    if (byte === 0x2e) {
                         number.state = 'decimal-point';
                         return;
                     }
-                    if (character === 'e' || character === 'E') {
+                    if (byte === 0x65 || byte === 0x45) {
                         number.state = 'exponent';
                         return;
                     }
                 } else if (number.state === 'integer') {
                     if (digit) {
-                        recordMantissaDigit(number, character, true);
+                        recordMantissaDigit(number, byte, true);
                         return;
                     }
-                    if (character === '.') {
+                    if (byte === 0x2e) {
                         number.state = 'decimal-point';
                         return;
                     }
-                    if (character === 'e' || character === 'E') {
+                    if (byte === 0x65 || byte === 0x45) {
                         number.state = 'exponent';
                         return;
                     }
                 } else if (number.state === 'decimal-point') {
                     if (!digit) throw invalid();
                     number.state = 'fraction';
-                    recordMantissaDigit(number, character, false);
+                    recordMantissaDigit(number, byte, false);
                     return;
                 } else if (number.state === 'fraction') {
                     if (digit) {
-                        recordMantissaDigit(number, character, false);
+                        recordMantissaDigit(number, byte, false);
                         return;
                     }
-                    if (character === 'e' || character === 'E') {
+                    if (byte === 0x65 || byte === 0x45) {
                         number.state = 'exponent';
                         return;
                     }
                 } else if (number.state === 'exponent') {
-                    if (character === '+' || character === '-') {
-                        number.exponentNegative = character === '-';
+                    if (byte === 0x2b || byte === 0x2d) {
+                        number.exponentNegative = byte === 0x2d;
                         number.state = 'exponent-sign';
                         return;
                     }
                     if (!digit) throw invalid();
                     number.state = 'exponent-digits';
-                    recordExponentDigit(number, character);
+                    recordExponentDigit(number, byte);
                     return;
                 } else if (number.state === 'exponent-sign') {
                     if (!digit) throw invalid();
                     number.state = 'exponent-digits';
-                    recordExponentDigit(number, character);
+                    recordExponentDigit(number, byte);
                     return;
                 } else if (number.state === 'exponent-digits') {
                     if (digit) {
-                        recordExponentDigit(number, character);
+                        recordExponentDigit(number, byte);
                         return;
                     }
                 }
@@ -531,67 +538,104 @@ async function validateJsonFileStreaming(filePath, {
                 continue;
             }
 
-            if (character === ' ' || character === '\t'
-                || character === '\r' || character === '\n') return;
+            if (byte === 0x20 || byte === 0x09 || byte === 0x0d || byte === 0x0a) return;
             const current = stack[stack.length - 1];
             if (!current) {
                 if (rootState !== 'value') throw invalid();
-                beginValue(character);
+                beginValue(byte);
                 return;
             }
             if (current.kind === 'array') {
                 if (current.state === 'value_or_end') {
-                    if (character === ']') closeContainer('array');
-                    else beginValue(character);
+                    if (byte === 0x5d) closeContainer('array');
+                    else beginValue(byte);
                     return;
                 }
                 if (current.state === 'value') {
-                    beginValue(character);
+                    beginValue(byte);
                     return;
                 }
                 if (current.state === 'comma_or_end') {
-                    if (character === ']') closeContainer('array');
-                    else if (character === ',') current.state = 'value';
+                    if (byte === 0x5d) closeContainer('array');
+                    else if (byte === 0x2c) current.state = 'value';
                     else throw invalid();
                     return;
                 }
                 throw invalid();
             }
             if (current.state === 'key_or_end') {
-                if (character === '}') closeContainer('object');
-                else if (character === '"') {
+                if (byte === 0x7d) closeContainer('object');
+                else if (byte === 0x22) {
                     token = { kind: 'string', role: 'key', escape: false, unicode: 0 };
                 } else throw invalid();
                 return;
             }
             if (current.state === 'key') {
-                if (character !== '"') throw invalid();
+                if (byte !== 0x22) throw invalid();
                 token = { kind: 'string', role: 'key', escape: false, unicode: 0 };
                 return;
             }
             if (current.state === 'colon') {
-                if (character !== ':') throw invalid();
+                if (byte !== 0x3a) throw invalid();
                 current.state = 'value';
                 return;
             }
             if (current.state === 'value') {
-                beginValue(character);
+                beginValue(byte);
                 return;
             }
             if (current.state === 'comma_or_end') {
-                if (character === '}') closeContainer('object');
-                else if (character === ',') current.state = 'key';
+                if (byte === 0x7d) closeContainer('object');
+                else if (byte === 0x2c) current.state = 'key';
                 else throw invalid();
                 return;
             }
             throw invalid();
         }
     };
-    const processText = (text) => {
-        if (token === null && stack.length === 0 && rootState === 'end' && /^[ \t\r\n]*$/.test(text)) {
-            return;
+    const processBytes = (buffer) => {
+        for (const byte of buffer) {
+            if (utf8Remaining > 0) {
+                if (byte < utf8NextMin || byte > utf8NextMax) throw invalid();
+                utf8Remaining--;
+                utf8NextMin = 0x80;
+                utf8NextMax = 0xbf;
+                continue;
+            }
+            if (byte < 0x80) {
+                processCharacter(byte);
+                continue;
+            }
+            // Every non-ASCII code point in JSON must occur inside a string.
+            // Validate UTF-8 directly from bytes so a very large string does
+            // not make V8 retain page-sized decoded JS strings during export.
+            if (token?.kind !== 'string' || token.escape || token.unicode > 0) {
+                throw invalid();
+            }
+            if (byte >= 0xc2 && byte <= 0xdf) {
+                utf8Remaining = 1;
+            } else if (byte === 0xe0) {
+                utf8Remaining = 2;
+                utf8NextMin = 0xa0;
+            } else if (byte >= 0xe1 && byte <= 0xec) {
+                utf8Remaining = 2;
+            } else if (byte === 0xed) {
+                utf8Remaining = 2;
+                utf8NextMax = 0x9f;
+            } else if (byte >= 0xee && byte <= 0xef) {
+                utf8Remaining = 2;
+            } else if (byte === 0xf0) {
+                utf8Remaining = 3;
+                utf8NextMin = 0x90;
+            } else if (byte >= 0xf1 && byte <= 0xf3) {
+                utf8Remaining = 3;
+            } else if (byte === 0xf4) {
+                utf8Remaining = 3;
+                utf8NextMax = 0x8f;
+            } else {
+                throw invalid();
+            }
         }
-        for (const character of text) processCharacter(character);
     };
 
     try {
@@ -613,11 +657,11 @@ async function validateJsonFileStreaming(filePath, {
             if (read.bytesRead <= 0) {
                 throw importFormatError('Plugin storage row is truncated', 'TRUNCATED_IMPORT_SOURCE');
             }
-            processText(decoder.decode(page.subarray(0, read.bytesRead), { stream: true }));
+            processBytes(page.subarray(0, read.bytesRead));
             offset += read.bytesRead;
             await yieldToEventLoop();
         }
-        processText(decoder.decode());
+        if (utf8Remaining !== 0) throw invalid();
         if (token?.kind === 'number') {
             finishNumber(token);
             token = null;

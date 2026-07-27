@@ -17,6 +17,8 @@ const TEST_PASSWORD = 'compat-test-pass'
 
 export interface ServerHandle {
   port: number
+  /** PID of the active isolated server process. */
+  pid: number
   password: string
   cwd: string
   /** Restart the same save directory on a fresh port. */
@@ -69,6 +71,7 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Server
   let exited = true
   const handle = {
     port: 0,
+    pid: 0,
     password: TEST_PASSWORD,
     cwd: tempDir,
   } as ServerHandle
@@ -92,6 +95,7 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Server
       },
     )
     child = launched
+    handle.pid = launched.pid ?? 0
     exited = launched.exitCode !== null
     launched.stderr?.on('data', (chunk: Buffer) => { stderrBuf += chunk.toString() })
     launched.on('exit', () => {
@@ -142,6 +146,7 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Server
     }
     if (child === active) {
       child = null
+      handle.pid = 0
       exited = true
     }
   }

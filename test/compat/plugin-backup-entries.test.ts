@@ -627,6 +627,7 @@ describe('external plugin rows in backup archives', () => {
     database.__pocketRisuPluginStorageEscapesV1 = {
       user: 'reserved-field-collision',
       nested: ['must', 'survive'],
+      body: 'r'.repeat(5 * 1024 * 1024),
     }
     databaseEntry.data = encodeRisuDat(database)
     seedEntries.push({ name: 'proto-selected.png', data: oldAsset })
@@ -683,6 +684,38 @@ describe('external plugin rows in backup archives', () => {
     await transition.text()
 
     const protoValueKey = pluginStorageKey('pluginsave/', '__proto__')
+    const rawNegativeZeroProto = Buffer.from(
+      `{"kind":"pinned-value-proto","negativeZero":-0,"body":"${'v'.repeat(3 * 1024 * 1024)}"}`,
+    )
+    const rawProtoMutation = await sourceClient.fetch('/api/plugin-storage/mutate', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': Buffer.from(protoValueKey, 'utf-8').toString('hex'),
+        'x-plugin-storage-operation': 'set',
+        'x-plugin-storage-generation': generation,
+        'x-plugin-storage-owner-policy': 'preserve',
+      },
+      body: new Uint8Array(rawNegativeZeroProto),
+    })
+    expect(rawProtoMutation.status).toBe(200)
+    await rawProtoMutation.text()
+
+    const fullUpstreamResponse = await sourceClient.fetch('/api/backup/export?target=upstream')
+    expect(fullUpstreamResponse.status).toBe(200)
+    const fullUpstream = entriesByName(Buffer.from(await fullUpstreamResponse.arrayBuffer()))
+    const fullFolded = await decodeRisuSave(fullUpstream.get('database.risudat')!)
+    expect(fullFolded.__pocketRisuPluginStorageEscapesV1).toMatchObject({
+      user: 'reserved-field-collision',
+      nested: ['must', 'survive'],
+    })
+    expect(fullFolded.__pocketRisuPluginStorageEscapesV1.body).toHaveLength(5 * 1024 * 1024)
+    expect(Object.hasOwn(fullFolded.pluginCustomStorage, '__proto__')).toBe(true)
+    expect(Object.hasOwn(fullFolded.pluginStorageMeta, '__proto__')).toBe(true)
+    expect(fullFolded.pluginCustomStorage.__proto__.body).toHaveLength(3 * 1024 * 1024)
+    expect(fullFolded.pluginCustomStorage.__proto__.negativeZero).toBe(0)
+    expect(Object.is(fullFolded.pluginCustomStorage.__proto__.negativeZero, -0)).toBe(false)
+    expect(fullFolded.pluginStorageMeta.__proto__.body).toHaveLength(2 * 1024 * 1024)
 
     const jobId = await startPartialExport(sourceClient)
     await waitForPartialExport(sourceClient, jobId, status => status.phase === 'assembling')
@@ -724,12 +757,14 @@ describe('external plugin rows in backup archives', () => {
     })
     expect(folded.pluginCustomStorage.__proto__.kind).toBe('pinned-value-proto')
     expect(folded.pluginCustomStorage.__proto__.body).toHaveLength(3 * 1024 * 1024)
+    expect(Object.is(folded.pluginCustomStorage.__proto__.negativeZero, -0)).toBe(false)
     expect(folded.pluginStorageMeta.__proto__.plugin).toBe('Pinned Proto Owner')
     expect(folded.pluginStorageMeta.__proto__.body).toHaveLength(2 * 1024 * 1024)
-    expect(folded.__pocketRisuPluginStorageEscapesV1).toEqual({
+    expect(folded.__pocketRisuPluginStorageEscapesV1).toMatchObject({
       user: 'reserved-field-collision',
       nested: ['must', 'survive'],
     })
+    expect(folded.__pocketRisuPluginStorageEscapesV1.body).toHaveLength(5 * 1024 * 1024)
 
     const destination = await spawnServer()
     servers.push(destination)
@@ -750,16 +785,19 @@ describe('external plugin rows in backup archives', () => {
     expect(restoredOrdinary).toEqual({ version: 'pinned', body: 'ordinary-value' })
     expect(restoredProto.kind).toBe('pinned-value-proto')
     expect(restoredProto.body).toHaveLength(3 * 1024 * 1024)
+    expect(Object.is(restoredProto.negativeZero, -0)).toBe(false)
     expect(restoredProtoMeta.plugin).toBe('Pinned Proto Owner')
     expect(restoredProtoMeta.body).toHaveLength(2 * 1024 * 1024)
     const restoredDatabase = decodeRisuDat(
       readKvValue(destination.cwd, 'database/database.bin')!,
     )
     expect(restoredDatabase.pluginCustomStorage).toEqual({})
-    expect(restoredDatabase.__pocketRisuPluginStorageEscapesV1).toEqual({
+    expect(restoredDatabase.__pocketRisuPluginStorageEscapesV1).toMatchObject({
       user: 'reserved-field-collision',
       nested: ['must', 'survive'],
     })
+    expect(restoredDatabase.__pocketRisuPluginStorageEscapesV1.body)
+      .toHaveLength(5 * 1024 * 1024)
     expect(await readFile(path.join(
       destination.cwd,
       'save',

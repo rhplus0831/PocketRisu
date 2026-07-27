@@ -83,6 +83,7 @@ const {
     calculateHash,
     normalizeJSON,
     hasRemoteBlocks,
+    magicRisuSaveHeader,
     parseCachedHashesHeader,
     sha256Hex,
 } = require('./utils.cjs');
@@ -102,12 +103,28 @@ const {
     validateDatabaseShape,
 } = require('./chatRows.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
+const {
+    readBlockRisuSaveTopLevelFields,
+    streamBackupRisuSaveToFile,
+} = require('./streamBackupRisuSave.cjs');
 const { isChunkableKey } = require('./chunkStore.cjs');
 const {
     decodeBoundedLegacyRisuSave,
     inspectRisuSaveSource,
+    readRisuSaveTopLevelFields,
     shouldStreamRisuSave,
 } = require('./streamRisuLoad.cjs');
+
+async function readBackupRisuSaveTopLevelFields(input, requestedKeys, options = {}) {
+    const inspection = await inspectRisuSaveSource(input);
+    if (inspection.format === 'risusave') {
+        return readBlockRisuSaveTopLevelFields(input, requestedKeys, options);
+    }
+    return readRisuSaveTopLevelFields(input, requestedKeys, {
+        ...options,
+        inspection,
+    });
+}
 const {
     IMPORT_IO_PAGE_BYTES,
     SAVE_FOLDER_IMPORT_STAGE_PREFIX,
@@ -139,6 +156,12 @@ const {
     decodePluginSaveStorageKey,
     encodePluginSaveStorageKey,
 } = require('./pluginSaveKeys.cjs');
+const {
+    assertBackupEntryNameWithinLimit,
+    encodeBackupEntryHeader,
+    backupEntrySize,
+    preflightBackupEntries,
+} = require('./backupEntryFormat.cjs');
 const {
     PluginStorageValidationError,
     assertPluginStorageRow,
@@ -1536,6 +1559,8 @@ const DATABASE_SPOOL_FILE_PREFIX = '.database-risudat-';
 const BACKUP_IMPORT_SPOOL_FILE_PREFIX = '.backup-import-';
 const BACKUP_ENTRY_STAGE_PREFIX = '.backup-entry-stage-';
 const PARTIAL_EXPORT_JOB_PREFIX = '.partial-export-';
+const FULL_EXPORT_PIN_PREFIX = '.full-export-';
+const SERVER_BACKUP_TEMP_PREFIX = '.risu-backup-save-';
 const configuredPartialExportJobTtlMs = Number(
     process.env.NODE_ENV === 'test'
         ? process.env.POCKETRISU_TEST_PARTIAL_EXPORT_TTL_MS
@@ -1588,7 +1613,8 @@ try {
 }
 try {
     for (const entry of readdirSync(partialExportSpoolDir, { withFileTypes: true })) {
-        if (!entry.name.startsWith(PARTIAL_EXPORT_JOB_PREFIX)) continue;
+        if (!entry.name.startsWith(PARTIAL_EXPORT_JOB_PREFIX)
+            && !entry.name.startsWith(FULL_EXPORT_PIN_PREFIX)) continue;
         fsSync.rmSync(path.join(partialExportSpoolDir, entry.name), {
             recursive: true,
             force: true,
@@ -1904,6 +1930,23 @@ if(!HUB_HOSTING_MODE && !existsSync(backupsDir)){
     try { mkdirSync(backupsDir, { recursive: true }); }
     catch { backupsDir = DEFAULT_BACKUPS_DIR; mkdirSync(backupsDir, { recursive: true }); }
 }
+function sweepServerBackupTemps(directory) {
+    try {
+        for (const entry of readdirSync(directory, { withFileTypes: true })) {
+            if (!entry.isFile() || !entry.name.startsWith(SERVER_BACKUP_TEMP_PREFIX)) continue;
+            try {
+                unlinkSync(path.join(directory, entry.name));
+            } catch (error) {
+                logger.warn(`[Backup] Could not remove orphaned server backup temp ${entry.name}:`, error);
+            }
+        }
+    } catch (error) {
+        if (error?.code !== 'ENOENT') {
+            logger.warn(`[Backup] Could not sweep server backup directory ${directory}:`, error);
+        }
+    }
+}
+sweepServerBackupTemps(backupsDir);
 writeBackupPathMarker(backupsDir);
 const chatBackupsDir = resolveChatBackupDir({ savePath });
 writeChatBackupPathMarker(chatBackupsDir);
@@ -3326,22 +3369,8 @@ function setupProxyStreamWebSocket(server) {
     });
 }
 
-function encodeBackupEntryHeader(name, dataSize) {
-    assertBackupEntryNameWithinLimit(name);
-    const encodedName = Buffer.from(name, 'utf-8');
-    const nameLength = Buffer.allocUnsafe(4);
-    nameLength.writeUInt32LE(encodedName.length, 0);
-    const dataLength = Buffer.allocUnsafe(4);
-    dataLength.writeUInt32LE(dataSize, 0);
-    return Buffer.concat([nameLength, encodedName, dataLength]);
-}
-
 function encodeBackupEntry(name, data) {
     return Buffer.concat([encodeBackupEntryHeader(name, data.length), data]);
-}
-
-function backupEntrySize(name, dataSize) {
-    return 8 + Buffer.byteLength(name, 'utf-8') + dataSize;
 }
 
 async function writeWithBackpressure(
@@ -3402,7 +3431,7 @@ async function writeWithBackpressure(
 }
 
 async function streamFileToWritable(filePath, writable, isClosed = () => false) {
-    const input = createReadStream(filePath, { highWaterMark: 256 * 1024 });
+    const input = createReadStream(filePath, { highWaterMark: IMPORT_IO_PAGE_BYTES });
     try {
         for await (const chunk of input) {
             if (!await writeWithBackpressure(writable, chunk, isClosed)) return false;
@@ -3411,6 +3440,18 @@ async function streamFileToWritable(filePath, writable, isClosed = () => false) 
     } finally {
         input.destroy();
     }
+}
+
+async function writePinnedBackupEntry(writable, entry, isClosed) {
+    if (!await writeWithBackpressure(
+        writable,
+        encodeBackupEntryHeader(entry.backupName, entry.size),
+        isClosed,
+    )) return false;
+    if (entry.kind !== 'file') {
+        throw new Error(`Backup entry was not pinned to a private file: ${entry.backupName}`);
+    }
+    return streamFileToWritable(entry.sourcePath, writable, isClosed);
 }
 
 function isInvalidBackupPathSegment(name) {
@@ -4123,27 +4164,55 @@ function assertPluginStorageSource(source, liveDb, manifestState) {
 }
 
 function resolveOwnedPluginStorageKeys(dbObj, reader = { kvGet, kvList }) {
-    const manifestState = readPluginStorageManifestState(reader.kvGet);
+    if (dbObj?.optimizePluginMemory !== true) {
+        return { valueKeys: [], metaKeys: [] };
+    }
+
     const generation = pluginStorageGeneration(dbObj);
-    if (generation && manifestState.valid && manifestState.manifest?.generation === generation) {
+    if (generation) {
+        const ownership = readStrictPluginStorageOwnershipManifest(reader.kvGet);
+        if (!ownership.manifest) {
+            throw new TypeError(
+                'The selected plugin storage generation has no authoritative manifest',
+            );
+        }
+        if (ownership.manifest.generation !== generation) {
+            throw new TypeError(
+                'The selected plugin storage generation does not match its manifest',
+            );
+        }
         const physicalValues = new Set(reader.kvList(PLUGIN_SAVE_PREFIX));
         const physicalMeta = new Set(reader.kvList(PLUGIN_SAVE_META_PREFIX));
+        for (const storageKey of ownership.valueKeys) {
+            if (!physicalValues.has(storageKey)) {
+                throw new TypeError(
+                    `The plugin storage manifest references a missing row: ${storageKey}`,
+                );
+            }
+        }
+        for (const storageKey of ownership.metaKeys) {
+            if (!physicalMeta.has(storageKey)) {
+                throw new TypeError(
+                    `The plugin storage manifest references a missing row: ${storageKey}`,
+                );
+            }
+        }
         return {
-            valueKeys: manifestState.manifest.valueKeys.filter(key => physicalValues.has(key)),
-            metaKeys: manifestState.manifest.metaKeys.filter(key => physicalMeta.has(key)),
+            valueKeys: ownership.valueKeys,
+            metaKeys: ownership.metaKeys,
         };
     }
-    if (
-        !generation
-        && !manifestState.present
-        && dbObj?.optimizePluginMemory === true
-    ) {
-        return {
-            valueKeys: reader.kvList(PLUGIN_SAVE_PREFIX),
-            metaKeys: reader.kvList(PLUGIN_SAVE_META_PREFIX),
-        };
+
+    const manifestState = readPluginStorageManifestState(reader.kvGet);
+    if (manifestState.present) {
+        throw new TypeError(
+            'Legacy optimized plugin storage cannot select a generated manifest',
+        );
     }
-    return { valueKeys: [], metaKeys: [] };
+    return {
+        valueKeys: reader.kvList(PLUGIN_SAVE_PREFIX),
+        metaKeys: reader.kvList(PLUGIN_SAVE_META_PREFIX),
+    };
 }
 
 function maybeFailPluginStorageTransaction(req, boundary) {
@@ -4263,6 +4332,32 @@ async function spoolSelfContainedBackupDatabase(
     }
 }
 
+async function spoolBackupSnapshotRow(snapshot, key, { signal, shouldAbort } = {}) {
+    const size = snapshot.kvSize(key);
+    if (!Number.isSafeInteger(size) || size < 0) return null;
+    const rowPath = path.join(
+        databaseSpoolDir,
+        `${DATABASE_SPOOL_FILE_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}.row`,
+    );
+    try {
+        const result = await snapshot.kvWriteToFile(key, rowPath, {
+            signal,
+            shouldAbort,
+        });
+        if (!result || result.size !== size) {
+            throw new Error(`Snapshot row changed while spooling: ${key}`);
+        }
+        return {
+            filePath: rowPath,
+            size,
+            cleanup: () => fs.unlink(rowPath).catch(() => {}),
+        };
+    } catch (error) {
+        await fs.unlink(rowPath).catch(() => {});
+        throw error;
+    }
+}
+
 /**
  * Chat rows are always assembled into database.risudat. Upstream exports also
  * fold external plugin rows into that database; Node-only exports keep them as
@@ -4273,6 +4368,9 @@ async function buildSelfContainedBackupDatabase({
     shouldAbort = () => false,
     onMissingChatRow,
     snapshot: externalSnapshot = null,
+    databaseSource = null,
+    databaseState = null,
+    signal = null,
     onDatabaseLoaded,
     omitAccount = false,
 } = {}) {
@@ -4286,10 +4384,53 @@ async function buildSelfContainedBackupDatabase({
             });
             ownsSnapshot = true;
         }
+        if (databaseSource) {
+            const finalPath = path.join(
+                databaseSpoolDir,
+                `${DATABASE_SPOOL_FILE_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}`,
+            );
+            const filePath = finalPath + '.tmp';
+            const spoolSnapshotRow = (key) => spoolBackupSnapshotRow(snapshot, key, {
+                signal,
+                shouldAbort,
+            });
+            const pluginStorage = foldPluginStorage
+                ? resolveOwnedPluginStorageRows(databaseState ?? {}, snapshot)
+                : null;
+            try {
+                return await streamBackupRisuSaveToFile({
+                    databaseSource,
+                    filePath,
+                    readChatRowSource: (chaId, chatId) => spoolSnapshotRow(
+                        chatRowKey(chaId, chatId),
+                    ),
+                    readRemoteRowSource: (name) => spoolSnapshotRow(
+                        `remotes/${name}.local.bin`,
+                    ),
+                    readRemoteRowSize: (name) => snapshot.kvSize(
+                        `remotes/${name}.local.bin`,
+                    ),
+                    pluginStorage: pluginStorage
+                        ? {
+                            valueRows: pluginStorage.valueRows,
+                            metaRows: pluginStorage.metaRows,
+                            readRowSource: spoolSnapshotRow,
+                        }
+                        : null,
+                    shouldAbort,
+                    signal,
+                    tempDir: databaseSpoolDir,
+                    onMissingChatRow,
+                });
+            } catch (error) {
+                await fs.unlink(filePath).catch(() => {});
+                throw error;
+            }
+        }
+        let strippedDb;
         const raw = snapshot.kvGet('database/database.bin');
         if (!raw) return null;
-
-        const strippedDb = await loadStrippedDatabase(raw, 'Backup');
+        strippedDb = await loadStrippedDatabase(raw, 'Backup');
         const backupDatabase = omitAccount
             ? { ...strippedDb, account: undefined }
             : strippedDb;
@@ -4307,10 +4448,14 @@ async function buildSelfContainedBackupDatabase({
 
 async function listPluginBackupEntries(
     reader = { kvGet, kvList, kvListWithSizes },
+    databaseState = null,
 ) {
-    const rawDatabase = reader.kvGet('database/database.bin');
-    if (!rawDatabase) return [];
-    const dbObj = await decodeRisuSave(rawDatabase);
+    let dbObj = databaseState;
+    if (!dbObj) {
+        const rawDatabase = reader.kvGet('database/database.bin');
+        if (!rawDatabase) return [];
+        dbObj = await decodeRisuSave(rawDatabase);
+    }
     const owned = resolveOwnedPluginStorageKeys(dbObj, reader);
     const sizes = new Map([
         ...reader.kvListWithSizes(PLUGIN_SAVE_PREFIX),
@@ -4320,27 +4465,33 @@ async function listPluginBackupEntries(
         // Export and import use the same validator. This catches legacy or
         // manually inserted rows before an archive is published.
         resolveBackupStorageKey(key);
+        const size = sizes.get(key);
+        if (!Number.isSafeInteger(size) || size < 0) {
+            throw new Error(`Owned plugin storage row is unavailable: ${key}`);
+        }
         return {
-            kind: 'kv',
+            kind: 'kv-source',
             key,
             backupName: key,
             sortKey: key,
-            size: sizes.get(key) ?? Buffer.byteLength(reader.kvGet(key) ?? Buffer.alloc(0)),
+            size,
         };
     });
     const manifestState = readPluginStorageManifestState(reader.kvGet);
     const generation = pluginStorageGeneration(dbObj);
     const manifestSize = reader.kvListWithSizes(PLUGIN_STORAGE_MANIFEST_KEY)
         .find(entry => entry.key === PLUGIN_STORAGE_MANIFEST_KEY)?.size;
-    if (
-        dbObj.optimizePluginMemory === true
-        && generation
-        && manifestState.valid
-        && manifestState.manifest?.generation === generation
-        && manifestSize !== undefined
-    ) {
+    if (dbObj.optimizePluginMemory === true && generation) {
+        if (!manifestState.valid
+            || manifestState.manifest?.generation !== generation
+            || !Number.isSafeInteger(manifestSize)
+            || manifestSize < 0) {
+            throw new TypeError(
+                'The selected plugin storage manifest is not physically available',
+            );
+        }
         rows.push({
-            kind: 'kv',
+            kind: 'kv-source',
             key: PLUGIN_STORAGE_MANIFEST_KEY,
             backupName: PLUGIN_STORAGE_MANIFEST_KEY,
             sortKey: PLUGIN_STORAGE_MANIFEST_KEY,
@@ -4348,6 +4499,913 @@ async function listPluginBackupEntries(
         });
     }
     return rows;
+}
+
+// Full downloads and server-side saves can each retain a SQLite WAL snapshot,
+// a database assembly spool, and a private copy of every filesystem asset.
+// Keep admission bounded so concurrent requests cannot all reserve the same
+// free space reported by statfs.
+const FULL_EXPORT_MAX_ACTIVE_PINS = 2;
+const activeFullExportPins = new Set();
+const fullExportReservedBytesByVolume = new Map();
+
+function createBackupExportAbortTracker(req, res) {
+    const controller = new AbortController();
+    const socket = req.socket;
+    const abort = () => {
+        if (controller.signal.aborted || res.writableFinished) return;
+        const error = new Error('Backup export client disconnected');
+        error.name = 'AbortError';
+        controller.abort(error);
+    };
+    req.once('aborted', abort);
+    socket?.once('close', abort);
+    socket?.once('error', abort);
+    res.once('error', abort);
+    res.once('close', abort);
+    const disconnectPoll = setInterval(() => {
+        if (req.aborted || socket?.destroyed || res.destroyed) abort();
+    }, 25);
+    disconnectPoll.unref?.();
+    if (req.aborted || socket?.destroyed || res.destroyed) abort();
+    return {
+        signal: controller.signal,
+        cleanup() {
+            clearInterval(disconnectPoll);
+            req.removeListener('aborted', abort);
+            socket?.removeListener('close', abort);
+            socket?.removeListener('error', abort);
+            res.removeListener('error', abort);
+            res.removeListener('close', abort);
+        },
+    };
+}
+
+function backupExportCapacityError() {
+    const error = new Error('Too many full backup exports are active');
+    error.code = 'BACKUP_EXPORT_CAPACITY';
+    error.statusCode = 503;
+    return error;
+}
+
+function backupExportErrorPayload(error) {
+    return {
+        error: error.message,
+        code: error.code,
+        ...(error.required === undefined ? {} : { required: error.required }),
+        ...(error.available === undefined ? {} : { available: error.available }),
+        ...(error.reserved === undefined ? {} : { reserved: error.reserved }),
+        ...(error.roles === undefined ? {} : { roles: error.roles }),
+    };
+}
+
+function throwIfBackupExportAborted(signal) {
+    throwIfSignalAborted(signal);
+}
+
+function samePinnedSourceStat(actual, planned) {
+    return actual.isFile()
+        && actual.size === planned.size
+        && actual.dev === planned.dev
+        && actual.ino === planned.ino
+        && actual.mtimeMs === planned.mtimeMs
+        && actual.ctimeMs === planned.ctimeMs;
+}
+
+async function hashBackupExportFile(entry, signal) {
+    const source = await fs.open(entry.sourcePath, 'r');
+    try {
+        const before = await source.stat();
+        if (!samePinnedSourceStat(before, entry.sourceStat)) {
+            throw new Error(`Backup source changed before hashing: ${entry.backupName}`);
+        }
+        const digest = nodeCrypto.createHash('sha256');
+        const page = Buffer.allocUnsafe(IMPORT_IO_PAGE_BYTES);
+        let offset = 0;
+        while (offset < before.size) {
+            throwIfBackupExportAborted(signal);
+            const length = Math.min(page.length, before.size - offset);
+            const { bytesRead } = await source.read(page, 0, length, offset);
+            if (bytesRead <= 0) break;
+            digest.update(page.subarray(0, bytesRead));
+            offset += bytesRead;
+        }
+        const after = await source.stat();
+        if (offset !== before.size || !samePinnedSourceStat(after, entry.sourceStat)) {
+            throw new Error(`Backup source changed while hashing: ${entry.backupName}`);
+        }
+        return digest.digest('hex');
+    } finally {
+        await source.close().catch(() => {});
+    }
+}
+
+async function copyBackupExportFile(entry, destination, signal) {
+    const source = await fs.open(entry.sourcePath, 'r');
+    let output = null;
+    try {
+        const before = await source.stat();
+        if (!samePinnedSourceStat(before, entry.sourceStat)) {
+            throw new Error(`Backup source changed before pinning: ${entry.backupName}`);
+        }
+        output = await fs.open(destination, 'wx', 0o600);
+        const page = Buffer.allocUnsafe(IMPORT_IO_PAGE_BYTES);
+        const digest = nodeCrypto.createHash('sha256');
+        const pageDelayMs = process.env.NODE_ENV === 'test'
+            ? Math.max(0, Number(process.env.POCKETRISU_TEST_FULL_EXPORT_FILE_PAGE_DELAY_MS) || 0)
+            : 0;
+        let offset = 0;
+        while (offset < before.size) {
+            throwIfBackupExportAborted(signal);
+            const length = Math.min(page.length, before.size - offset);
+            const { bytesRead } = await source.read(page, 0, length, offset);
+            if (bytesRead === 0) break;
+            const chunk = page.subarray(0, bytesRead);
+            let written = 0;
+            while (written < bytesRead) {
+                throwIfBackupExportAborted(signal);
+                const result = await output.write(
+                    chunk,
+                    written,
+                    bytesRead - written,
+                    offset + written,
+                );
+                written += result.bytesWritten;
+            }
+            digest.update(chunk);
+            offset += bytesRead;
+            if (pageDelayMs > 0) {
+                await new Promise((resolve) => setTimeout(resolve, pageDelayMs));
+            }
+        }
+        const after = await source.stat();
+        const pathAfter = await fs.stat(entry.sourcePath).catch(() => null);
+        if (offset !== before.size || !samePinnedSourceStat(after, entry.sourceStat)
+            || !pathAfter || !samePinnedSourceStat(pathAfter, entry.sourceStat)) {
+            throw new Error(`Backup source changed while pinning: ${entry.backupName}`);
+        }
+        const pinnedHash = digest.digest('hex');
+        const stableHash = await hashBackupExportFile(entry, signal);
+        if (pinnedHash !== stableHash) {
+            throw new Error(`Backup source content changed while pinning: ${entry.backupName}`);
+        }
+        await output.sync();
+        await output.close();
+        output = null;
+        return {
+            kind: 'file',
+            sourcePath: destination,
+            backupName: entry.backupName,
+            sortKey: entry.sortKey,
+            size: offset,
+        };
+    } finally {
+        await output?.close().catch(() => {});
+        await source.close().catch(() => {});
+    }
+}
+
+async function planFullBackupFilesystemEntries(snapshot, target) {
+    const entries = [];
+    for (const asset of listAssetEntriesWithSizes(snapshot)) {
+        const backupName = path.basename(asset.key);
+        if (asset.source === 'fs') {
+            const sourcePath = assetPathFor(assetNameForKey(asset.key));
+            const sourceStat = await fs.stat(sourcePath);
+            entries.push({
+                kind: 'source-file',
+                sourcePath,
+                sourceStat,
+                backupName,
+                sortKey: asset.key,
+                size: sourceStat.size,
+            });
+        } else {
+            // Preserve the source chosen at the cut. A filesystem file created
+            // after this point must never shadow the pinned SQLite row.
+            entries.push({
+                kind: 'kv-source',
+                key: asset.key,
+                backupName,
+                sortKey: asset.key,
+                size: asset.size,
+            });
+        }
+    }
+    if (target === 'upstream') return entries;
+
+    for (const inlay of await listInlayFiles()) {
+        const sourceStat = await fs.stat(inlay.filePath);
+        entries.push({
+            kind: 'source-file',
+            sourcePath: inlay.filePath,
+            sourceStat,
+            backupName: `inlay/${inlay.id}.${inlay.ext}`,
+            sortKey: `inlay/${inlay.id}`,
+            size: sourceStat.size,
+        });
+        const sidecarPath = getInlaySidecarPath(inlay.id);
+        try {
+            const sidecarStat = await fs.stat(sidecarPath);
+            entries.push({
+                kind: 'source-file',
+                sourcePath: sidecarPath,
+                sourceStat: sidecarStat,
+                backupName: `inlay_sidecar/${inlay.id}`,
+                sortKey: `inlay_sidecar/${inlay.id}`,
+                size: sidecarStat.size,
+            });
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+    }
+    return entries;
+}
+
+function planFullBackupColdStorageEntries(snapshot) {
+    const sizes = new Map(
+        snapshot.kvListWithSizes('coldstorage/').map((entry) => [entry.key, entry.size]),
+    );
+    const canonicalKeys = Array.from(new Set(
+        [...sizes.keys()].map((key) => normalizeColdStorageStorageKey(key)),
+    )).sort((a, b) => a.localeCompare(b));
+    return canonicalKeys.map((canonicalKey) => {
+        const legacyKey = `${canonicalKey}.json`;
+        const key = sizes.has(canonicalKey) ? canonicalKey : legacyKey;
+        const sourceSize = sizes.get(key);
+        if (!Number.isSafeInteger(sourceSize) || sourceSize < 0) {
+            throw new Error(`Cold storage row is unavailable: ${canonicalKey}`);
+        }
+        const header = sourceSize >= 2 ? snapshot.kvReadRange(key, 0, 2) : Buffer.alloc(0);
+        const compressed = header?.[0] === 0x1f && header?.[1] === 0x8b;
+        let size = sourceSize;
+        if (compressed) {
+            if (sourceSize < 18) {
+                throw new Error(`Cold storage gzip row is truncated: ${canonicalKey}`);
+            }
+            const footer = snapshot.kvReadRange(key, sourceSize - 4, 4);
+            size = footer.readUInt32LE(0);
+            if (size > BACKUP_IMPORT_MAX_BYTES) {
+                const error = new Error(`Cold storage row exceeds the backup export limit: ${canonicalKey}`);
+                error.code = 'BACKUP_EXPORT_COLD_LIMIT';
+                error.statusCode = 413;
+                throw error;
+            }
+        }
+        return {
+            kind: 'cold-source',
+            key,
+            compressed,
+            sourceSize,
+            backupName: toColdStorageBackupName(canonicalKey),
+            sortKey: toColdStorageBackupName(canonicalKey),
+            size,
+            // A gzip transform briefly owns both its exact source spool and
+            // exact expanded output. Plain rows need only their final pin.
+            peakPinBytes: compressed ? sourceSize + size : size,
+        };
+    });
+}
+
+function fullExportTestDiskValue(role, suffix) {
+    if (process.env.NODE_ENV !== 'test') return null;
+    const value = process.env[`POCKETRISU_TEST_FULL_EXPORT_${role}_${suffix}`];
+    return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+async function resolveFullExportVolume(targetPath, role) {
+    const testVolume = fullExportTestDiskValue(role, 'VOLUME');
+    const testAvailableRaw = fullExportTestDiskValue(role, 'AVAILABLE_BYTES');
+    const testAvailable = testAvailableRaw === null ? NaN : Number(testAvailableRaw);
+    let key;
+    if (testVolume) {
+        key = `test:${testVolume}`;
+    } else {
+        const stat = await fs.stat(targetPath);
+        key = `dev:${stat.dev}`;
+    }
+    let available;
+    if (Number.isSafeInteger(testAvailable) && testAvailable >= 0) {
+        available = testAvailable;
+    } else {
+        try {
+            const statfs = await fs.statfs(targetPath);
+            available = statfs.bavail * statfs.bsize;
+        } catch {
+            available = -1;
+        }
+    }
+    return { key, available, targetPath, role };
+}
+
+async function reserveFullExportDisk(token, requirements) {
+    const resolved = await Promise.all(requirements.map(async (requirement) => ({
+        ...await resolveFullExportVolume(requirement.targetPath, requirement.role),
+        bytes: requirement.bytes,
+    })));
+    const byVolume = new Map();
+    for (const entry of resolved) {
+        if (!Number.isSafeInteger(entry.bytes) || entry.bytes < 0) {
+            throw new Error('Full backup disk reservation is not a safe byte count');
+        }
+        const current = byVolume.get(entry.key) ?? {
+            key: entry.key,
+            bytes: 0,
+            available: entry.available,
+            roles: [],
+            roleBytes: new Map(),
+        };
+        current.bytes += entry.bytes;
+        if (!Number.isSafeInteger(current.bytes)) {
+            throw new Error('Full backup disk reservation exceeds the safe integer range');
+        }
+        if (current.available < 0) current.available = entry.available;
+        else if (entry.available >= 0) current.available = Math.min(current.available, entry.available);
+        current.roles.push(entry.role);
+        current.roleBytes.set(
+            entry.role,
+            (current.roleBytes.get(entry.role) ?? 0) + entry.bytes,
+        );
+        byVolume.set(entry.key, current);
+    }
+
+    // JavaScript runs this check-and-charge synchronously after all stat calls,
+    // so two cuts cannot both spend the same free-space observation.
+    for (const entry of byVolume.values()) {
+        const existing = fullExportReservedBytesByVolume.get(entry.key) ?? null;
+        const reserved = existing?.reserved ?? 0;
+        let capacity = existing?.capacity ?? entry.available;
+        // statfs already reflects private bytes written by older reservations.
+        // Add their whole reservation back before tightening the original
+        // capacity, otherwise those bytes are charged once as used space and a
+        // second time as reserved space. External consumption can still lower
+        // the active ledger conservatively.
+        if (entry.available >= 0) {
+            const observedCapacity = entry.available + reserved;
+            capacity = capacity < 0 ? observedCapacity : Math.min(capacity, observedCapacity);
+        }
+        entry.capacity = capacity;
+        if (capacity >= 0 && capacity - reserved < entry.bytes) {
+            const error = new Error(
+                `Insufficient disk space for full backup ${entry.roles.join('+')} reservation`,
+            );
+            error.code = 'BACKUP_EXPORT_DISK_SPACE';
+            error.statusCode = 507;
+            error.required = entry.bytes;
+            error.available = entry.available;
+            error.reserved = reserved;
+            error.volume = entry.key;
+            error.roles = entry.roles;
+            throw error;
+        }
+    }
+    for (const entry of byVolume.values()) {
+        const existing = fullExportReservedBytesByVolume.get(entry.key);
+        fullExportReservedBytesByVolume.set(entry.key, {
+            capacity: entry.capacity,
+            reserved: (existing?.reserved ?? 0) + entry.bytes,
+        });
+    }
+    return { token, volumes: [...byVolume.values()] };
+}
+
+function markFullExportReservationConsumed(reservation, role, bytes) {
+    if (!reservation || !Number.isSafeInteger(bytes) || bytes < 0) {
+        throw new Error('Invalid committed full backup reservation size');
+    }
+    const entry = reservation.volumes.find((volume) => volume.roleBytes?.has(role));
+    const reservedForRole = entry?.roleBytes?.get(role) ?? -1;
+    if (!entry || bytes > reservedForRole) {
+        throw new Error(`Committed ${role} bytes exceed the full backup reservation`);
+    }
+    const ledger = fullExportReservedBytesByVolume.get(entry.key);
+    if (ledger?.capacity >= 0) {
+        ledger.capacity = Math.max(0, ledger.capacity - bytes);
+    }
+    entry.committedBytes = (entry.committedBytes ?? 0) + bytes;
+}
+
+function releaseFullExportDiskReservation(reservation) {
+    if (!reservation) return;
+    for (const entry of reservation.volumes) {
+        const existing = fullExportReservedBytesByVolume.get(entry.key);
+        const remaining = Math.max(
+            0,
+            (existing?.reserved ?? 0) - entry.bytes,
+        );
+        if (remaining === 0) fullExportReservedBytesByVolume.delete(entry.key);
+        else fullExportReservedBytesByVolume.set(entry.key, {
+            capacity: existing.capacity,
+            reserved: remaining,
+        });
+    }
+    reservation.volumes = [];
+}
+
+async function waitAtFullExportAfterPinTestGate(signal) {
+    if (process.env.NODE_ENV !== 'test') return;
+    const configured = String(
+        process.env.POCKETRISU_TEST_FULL_EXPORT_AFTER_PIN_GATE_DIR ?? '',
+    ).trim();
+    if (!configured) return;
+    const gateDir = path.resolve(configured);
+    const holdPath = path.join(gateDir, 'hold');
+    if (!existsSync(holdPath)) return;
+    await fs.mkdir(gateDir, { recursive: true });
+    await fs.writeFile(path.join(gateDir, 'entered'), 'pinned', 'utf-8');
+    const releasePath = path.join(gateDir, 'release');
+    while (existsSync(holdPath) && !existsSync(releasePath)) {
+        throwIfBackupExportAborted(signal);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throwIfBackupExportAborted(signal);
+}
+
+async function waitAtFullExportDuringPinTestGate(signal) {
+    if (process.env.NODE_ENV !== 'test') return;
+    const configured = String(
+        process.env.POCKETRISU_TEST_FULL_EXPORT_DURING_PIN_GATE_DIR ?? '',
+    ).trim();
+    if (!configured) return;
+    const gateDir = path.resolve(configured);
+    const holdPath = path.join(gateDir, 'hold');
+    if (!existsSync(holdPath)) return;
+    await fs.mkdir(gateDir, { recursive: true });
+    await fs.writeFile(path.join(gateDir, 'entered'), 'pinning', 'utf-8');
+    const releasePath = path.join(gateDir, 'release');
+    while (existsSync(holdPath) && !existsSync(releasePath)) {
+        throwIfBackupExportAborted(signal);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throwIfBackupExportAborted(signal);
+}
+
+async function waitAtServerBackupBeforePublishTestGate(signal) {
+    if (process.env.NODE_ENV !== 'test') return;
+    const configured = String(
+        process.env.POCKETRISU_TEST_SERVER_BACKUP_BEFORE_PUBLISH_GATE_DIR ?? '',
+    ).trim();
+    if (!configured) return;
+    const gateDir = path.resolve(configured);
+    const holdPath = path.join(gateDir, 'hold');
+    if (!existsSync(holdPath)) return;
+    await fs.mkdir(gateDir, { recursive: true });
+    await fs.writeFile(path.join(gateDir, 'entered'), 'ready-to-publish', 'utf-8');
+    const releasePath = path.join(gateDir, 'release');
+    while (existsSync(holdPath) && !existsSync(releasePath)) {
+        throwIfBackupExportAborted(signal);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throwIfBackupExportAborted(signal);
+}
+
+async function expandPinnedColdStorage(sourcePath, destination, expectedSize, signal) {
+    const input = createReadStream(sourcePath, { highWaterMark: IMPORT_IO_PAGE_BYTES });
+    const gunzip = zlib.createGunzip({ chunkSize: IMPORT_IO_PAGE_BYTES });
+    const inputFinished = finished(input);
+    inputFinished.catch(() => {});
+    const output = await fs.open(destination, 'wx', 0o600);
+    const forwardInputError = (error) => gunzip.destroy(error);
+    input.once('error', forwardInputError);
+    const abort = () => {
+        const reason = signal?.reason instanceof Error ? signal.reason : new Error('Backup export cancelled');
+        input.destroy(reason);
+        gunzip.destroy(reason);
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+    let size = 0;
+    try {
+        throwIfBackupExportAborted(signal);
+        input.pipe(gunzip);
+        for await (const chunk of gunzip) {
+            for (let offset = 0; offset < chunk.length; offset += IMPORT_IO_PAGE_BYTES) {
+                throwIfBackupExportAborted(signal);
+                const page = chunk.subarray(
+                    offset,
+                    Math.min(chunk.length, offset + IMPORT_IO_PAGE_BYTES),
+                );
+                if (size + page.length > expectedSize) {
+                    throw new Error('Cold storage gzip expanded beyond its declared size');
+                }
+                let written = 0;
+                while (written < page.length) {
+                    const result = await output.write(
+                        page,
+                        written,
+                        page.length - written,
+                        size + written,
+                    );
+                    if (result.bytesWritten <= 0) {
+                        throw new Error('Cold storage pin write made no progress');
+                    }
+                    written += result.bytesWritten;
+                }
+                size += page.length;
+            }
+        }
+        if (size !== expectedSize) {
+            throw new Error('Cold storage gzip length does not match its declared size');
+        }
+        await output.sync();
+        await output.close();
+        return { size };
+    } catch (error) {
+        input.destroy();
+        gunzip.destroy();
+        try { await output.close(); } catch {}
+        await fs.unlink(destination).catch(() => {});
+        throw error;
+    } finally {
+        signal?.removeEventListener('abort', abort);
+        await inputFinished.catch(() => {});
+    }
+}
+
+async function validatePinnedColdStorage(destination, entry, signal) {
+    try {
+        if (entry.size <= 8 * 1024 * 1024) {
+            await validateJsonFileStreaming(destination, {
+                size: entry.size,
+                maxBytes: BACKUP_IMPORT_MAX_BYTES,
+                signal,
+            });
+        } else {
+            await new Promise((resolve, reject) => {
+                throwIfBackupExportAborted(signal);
+                const worker = spawn(process.execPath, [
+                    path.join(__dirname, 'jsonValidateWorker.cjs'),
+                    destination,
+                    String(entry.size),
+                    String(BACKUP_IMPORT_MAX_BYTES),
+                ], {
+                    stdio: 'ignore',
+                    windowsHide: true,
+                });
+                let settled = false;
+                const finishWorker = (operation, value) => {
+                    if (settled) return;
+                    settled = true;
+                    signal?.removeEventListener('abort', abortWorker);
+                    operation(value);
+                };
+                const abortWorker = () => {
+                    worker.kill('SIGTERM');
+                    finishWorker(
+                        reject,
+                        signal?.reason instanceof Error
+                            ? signal.reason
+                            : new Error('Backup export cancelled'),
+                    );
+                };
+                signal?.addEventListener('abort', abortWorker, { once: true });
+                worker.once('error', (error) => finishWorker(reject, error));
+                worker.once('exit', (code, signalName) => {
+                    if (code === 0) finishWorker(resolve);
+                    else {
+                        const error = new Error(
+                            signalName
+                                ? `Cold storage JSON validator exited on ${signalName}`
+                                : 'Invalid plugin storage JSON row',
+                        );
+                        error.code = code === 2
+                            ? 'INVALID_PLUGIN_STORAGE_ROW'
+                            : 'COLD_STORAGE_VALIDATOR_FAILED';
+                        finishWorker(reject, error);
+                    }
+                });
+                if (signal?.aborted) abortWorker();
+            });
+        }
+    } catch (error) {
+        if (error?.code !== 'INVALID_PLUGIN_STORAGE_ROW') throw error;
+        const invalid = new Error(`Invalid cold storage JSON row: ${entry.backupName}`);
+        invalid.code = 'INVALID_COLD_STORAGE_ROW';
+        invalid.statusCode = 400;
+        throw invalid;
+    }
+}
+
+function fullExportSnapshotSpoolOptions(signal) {
+    const delayMs = process.env.NODE_ENV === 'test'
+        ? Math.max(0, Number(process.env.POCKETRISU_TEST_FULL_EXPORT_PAGE_DELAY_MS) || 0)
+        : 0;
+    return {
+        signal,
+        onChunk: delayMs > 0
+            ? () => new Promise((resolve) => setTimeout(resolve, delayMs))
+            : undefined,
+    };
+}
+
+async function pinFullBackupSnapshotEntry(snapshot, entry, destination, signal) {
+    if (entry.kind === 'kv-source') {
+        const spool = await snapshot.kvWriteToFile(
+            entry.key,
+            destination,
+            fullExportSnapshotSpoolOptions(signal),
+        );
+        if (!spool || spool.size !== entry.size) {
+            throw new Error(`Snapshot row changed while pinning: ${entry.backupName}`);
+        }
+        return { ...entry, kind: 'file', sourcePath: destination };
+    }
+    if (entry.kind !== 'cold-source') {
+        throw new Error(`Unsupported full backup pin source: ${entry.kind}`);
+    }
+    if (!entry.compressed) {
+        const spool = await snapshot.kvWriteToFile(
+            entry.key,
+            destination,
+            fullExportSnapshotSpoolOptions(signal),
+        );
+        if (!spool || spool.size !== entry.size) {
+            throw new Error(`Cold storage row changed while pinning: ${entry.backupName}`);
+        }
+        await validatePinnedColdStorage(destination, entry, signal);
+        return { ...entry, kind: 'file', sourcePath: destination };
+    }
+    const rawPath = `${destination}.gz`;
+    try {
+        const raw = await snapshot.kvWriteToFile(
+            entry.key,
+            rawPath,
+            fullExportSnapshotSpoolOptions(signal),
+        );
+        if (!raw || raw.size !== entry.sourceSize) {
+            throw new Error(`Cold storage gzip changed while pinning: ${entry.backupName}`);
+        }
+        await expandPinnedColdStorage(rawPath, destination, entry.size, signal);
+        await validatePinnedColdStorage(destination, entry, signal);
+        return { ...entry, kind: 'file', sourcePath: destination };
+    } finally {
+        await fs.unlink(rawPath).catch(() => {});
+    }
+}
+
+function estimateFullBackupDatabaseAssemblyBytes(reader, key, physicalSize) {
+    if (physicalSize < magicRisuSaveHeader.length) return physicalSize;
+    const prefix = reader.kvReadRange(key, 0, magicRisuSaveHeader.length);
+    if (!prefix?.equals(Buffer.from(magicRisuSaveHeader))) return physicalSize;
+    let offset = magicRisuSaveHeader.length;
+    let decodedBytes = 0;
+    let blocks = 0;
+    while (offset < physicalSize) {
+        if (++blocks > 1_000_000 || offset + 7 > physicalSize) {
+            throw new Error('Invalid or excessive RisuSave block inventory');
+        }
+        const header = reader.kvReadRange(key, offset, 3);
+        const compression = header[1];
+        const nameLength = header[2];
+        if (compression !== 0 && compression !== 1) {
+            throw new Error('Invalid RisuSave block compression flag');
+        }
+        offset += 3;
+        if (offset + nameLength + 4 > physicalSize) {
+            throw new Error('Truncated RisuSave block name');
+        }
+        offset += nameLength;
+        const length = reader.kvReadRange(key, offset, 4).readUInt32LE(0);
+        offset += 4;
+        if (offset + length > physicalSize) throw new Error('Truncated RisuSave block body');
+        let decodedSize = length;
+        if (compression === 1) {
+            if (length < 18) throw new Error('Truncated gzip RisuSave block');
+            decodedSize = reader.kvReadRange(key, offset + length - 4, 4).readUInt32LE(0);
+        }
+        decodedBytes += decodedSize;
+        if (!Number.isSafeInteger(decodedBytes)
+            || decodedBytes > 4 * 1024 * 1024 * 1024) {
+            throw new Error('RisuSave blocks exceed the bounded decode limit');
+        }
+        offset += length;
+    }
+    return decodedBytes;
+}
+
+async function pinFullBackupState({ target, signal, archiveTargetPath = null }) {
+    throwIfBackupExportAborted(signal);
+    if (activeFullExportPins.size >= FULL_EXPORT_MAX_ACTIVE_PINS) {
+        throw backupExportCapacityError();
+    }
+    const token = nodeCrypto.randomUUID();
+    activeFullExportPins.add(token);
+    let snapshot = null;
+    let pinDir = null;
+    let reservation = null;
+    try {
+        return await queueStorageReadAfterImports(async () => {
+            throwIfBackupExportAborted(signal);
+            await flushPendingDb();
+            throwIfBackupExportAborted(signal);
+            snapshot = createKvSnapshot();
+
+            const databaseKey = 'database/database.bin';
+            const databaseSize = snapshot.kvSize(databaseKey) ?? 0;
+            const databaseAssemblyBytes = estimateFullBackupDatabaseAssemblyBytes(
+                snapshot,
+                databaseKey,
+                databaseSize,
+            );
+            const filesystemEntries = await planFullBackupFilesystemEntries(snapshot, target);
+            const baseSnapshotEntries = [
+                ...planFullBackupColdStorageEntries(snapshot),
+                ...(target === 'upstream' ? [] : snapshot.kvListWithSizes('inlay_meta/').map((entry) => ({
+                    kind: 'kv-source',
+                    key: entry.key,
+                    backupName: entry.key,
+                    sortKey: entry.key,
+                    size: entry.size,
+                }))),
+            ];
+            // Admission is deliberately conservative: reserve every physical
+            // plugin candidate before decoding the tiny ownership metadata
+            // from the pinned database file. Only owned rows are published.
+            const pluginCandidates = target === 'upstream' ? [] : [
+                ...snapshot.kvListWithSizes(PLUGIN_SAVE_PREFIX),
+                ...snapshot.kvListWithSizes(PLUGIN_SAVE_META_PREFIX),
+                ...snapshot.kvListWithSizes(PLUGIN_STORAGE_MANIFEST_KEY),
+            ].map((entry) => ({
+                kind: 'kv-source',
+                key: entry.key,
+                backupName: entry.key,
+                sortKey: entry.key,
+                size: entry.size,
+            }));
+            const reservationEntries = [
+                ...filesystemEntries,
+                ...baseSnapshotEntries,
+                ...pluginCandidates,
+            ];
+            // Plugin candidates deliberately include quarantined physical rows
+            // that may not belong to the selected publication. Reserve their
+            // bytes conservatively, but enforce archive limits only after the
+            // authoritative manifest selects actual backup entries.
+            preflightBackupEntries([
+                { backupName: 'database.risudat', size: databaseSize },
+                ...filesystemEntries,
+                ...baseSnapshotEntries,
+            ]);
+
+            const pinPayloadBytes = reservationEntries.reduce(
+                (sum, entry) => sum + (
+                    entry.kind === 'cold-source' ? entry.peakPinBytes : entry.size
+                ),
+                databaseSize,
+            );
+            const remoteCandidates = snapshot.kvListWithSizes('remotes/');
+            if (remoteCandidates.length > 1_000_000) {
+                throw new Error('RisuSave REMOTE inventory exceeds the bounded limit');
+            }
+            const assemblyRows = [
+                ...snapshot.kvListWithSizes('chats/'),
+                ...(target === 'upstream' ? snapshot.kvListWithSizes(PLUGIN_SAVE_PREFIX) : []),
+                ...(target === 'upstream' ? snapshot.kvListWithSizes(PLUGIN_SAVE_META_PREFIX) : []),
+                // REMOTE rows are not archive entries. They are private source
+                // spools used while rebuilding database.risudat, so reserve
+                // every physical candidate conservatively before resolving
+                // the bounded pointer graph.
+                ...remoteCandidates,
+            ];
+            const assemblyBytes = assemblyRows.reduce(
+                (sum, entry) => sum + entry.size + Buffer.byteLength(entry.key, 'utf-8'),
+                databaseAssemblyBytes,
+            );
+            const pinRequired = pinPayloadBytes * BACKUP_DISK_HEADROOM + 16 * 1024 * 1024;
+            // The source-to-source assembler may simultaneously retain one
+            // complete intermediate database (or one row pin) and the growing
+            // final database spool. Reserve both before either is created.
+            const assemblyRequired = assemblyBytes * 2 * BACKUP_DISK_HEADROOM
+                + 16 * 1024 * 1024;
+            const archivePayloadUpperBound = archiveTargetPath === null
+                ? 0
+                : reservationEntries.reduce(
+                    (sum, entry) => sum
+                        + 8
+                        + Buffer.byteLength(entry.backupName, 'utf-8')
+                        + entry.size,
+                    8 + Buffer.byteLength('database.risudat', 'utf-8') + assemblyRequired,
+                );
+            const archiveRequired = archiveTargetPath === null
+                ? 0
+                : archivePayloadUpperBound * BACKUP_DISK_HEADROOM + 16 * 1024 * 1024;
+            if (!Number.isSafeInteger(pinRequired)
+                || !Number.isSafeInteger(assemblyRequired)
+                || !Number.isSafeInteger(archiveRequired)) {
+                throw new Error('Full backup export size exceeds the safe integer range');
+            }
+            const requirements = [
+                { targetPath: partialExportSpoolDir, role: 'PIN', bytes: pinRequired },
+                { targetPath: databaseSpoolDir, role: 'DATABASE', bytes: assemblyRequired },
+            ];
+            if (archiveTargetPath !== null) {
+                requirements.push({
+                    targetPath: archiveTargetPath,
+                    role: 'ARCHIVE',
+                    bytes: archiveRequired,
+                });
+            }
+            reservation = await reserveFullExportDisk(token, requirements);
+
+            pinDir = path.join(
+                partialExportSpoolDir,
+                `${FULL_EXPORT_PIN_PREFIX}${process.pid}-${token}`,
+            );
+            await fs.mkdir(pinDir, { recursive: false, mode: 0o700 });
+            await waitAtFullExportDuringPinTestGate(signal);
+            const databaseSourcePath = path.join(pinDir, 'database.pin');
+            let databaseSource = null;
+            let databaseState = null;
+            if (databaseSize > 0) {
+                const databasePin = await snapshot.kvWriteToFile(
+                    'database/database.bin',
+                    databaseSourcePath,
+                    fullExportSnapshotSpoolOptions(signal),
+                );
+                if (!databasePin || databasePin.size !== databaseSize) {
+                    throw new Error('Snapshot database changed while pinning');
+                }
+                databaseSource = { filePath: databaseSourcePath, size: databaseSize };
+                databaseState = await readBackupRisuSaveTopLevelFields(
+                    databaseSource,
+                    ['optimizePluginMemory', PLUGIN_STORAGE_GENERATION_FIELD],
+                    {
+                        tempDir: databaseSpoolDir,
+                        signal,
+                        shouldAbort: () => signal?.aborted,
+                        readRemoteRowSize: (name) => snapshot.kvSize(
+                            `remotes/${name}.local.bin`,
+                        ),
+                        readRemoteRowSource: (name) => spoolBackupSnapshotRow(
+                            snapshot,
+                            `remotes/${name}.local.bin`,
+                            {
+                                signal,
+                                shouldAbort: () => signal?.aborted,
+                            },
+                        ),
+                    },
+                );
+            }
+            const snapshotEntries = [
+                ...baseSnapshotEntries,
+                ...(target === 'upstream'
+                    ? []
+                    : await listPluginBackupEntries(snapshot, databaseState)),
+            ];
+            const plannedEntries = [...filesystemEntries, ...snapshotEntries]
+                .sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+            preflightBackupEntries(plannedEntries);
+            const pinnedEntries = [];
+            let index = 0;
+            for (const entry of plannedEntries) {
+                throwIfBackupExportAborted(signal);
+                if (entry.kind !== 'source-file') {
+                    const destination = path.join(pinDir, `${String(index).padStart(8, '0')}.pin`);
+                    pinnedEntries.push(await pinFullBackupSnapshotEntry(
+                        snapshot,
+                        entry,
+                        destination,
+                        signal,
+                    ));
+                    index++;
+                    continue;
+                }
+                const destination = path.join(pinDir, `${String(index).padStart(8, '0')}.pin`);
+                pinnedEntries.push(await copyBackupExportFile(entry, destination, signal));
+                index++;
+            }
+            preflightBackupEntries([
+                ...pinnedEntries,
+                ...(databaseSource
+                    ? [{ backupName: 'database.risudat', size: databaseSource.size }]
+                    : []),
+            ]);
+            return {
+                token,
+                snapshot,
+                databaseSource,
+                databaseState,
+                pinDir,
+                entries: pinnedEntries,
+                reservation,
+                archiveReservedBytes: archiveRequired,
+            };
+        }, signal);
+    } catch (error) {
+        try { snapshot?.close(); } catch {}
+        if (pinDir) await fs.rm(pinDir, { recursive: true, force: true }).catch(() => {});
+        releaseFullExportDiskReservation(reservation);
+        activeFullExportPins.delete(token);
+        throw error;
+    }
+}
+
+async function cleanupFullBackupState(state) {
+    if (!state) return;
+    try { state.snapshot?.close(); } catch {}
+    await fs.rm(state.pinDir, { recursive: true, force: true }).catch(() => {});
+    releaseFullExportDiskReservation(state.reservation);
+    activeFullExportPins.delete(state.token);
 }
 
 function partialBackupAssetKeys(database) {
@@ -4546,7 +5604,10 @@ async function pinPartialExportState(job) {
             const strippedDb = await loadStrippedDatabase(raw, 'Partial Backup');
             const database = { ...strippedDb, account: undefined };
             const selected = listPartialBackupAssetEntries(database, snapshot);
-            preflightBackupEntryNames(selected.entries);
+            preflightBackupEntries([
+                { backupName: 'database.risudat', size: raw.length },
+                ...selected.entries,
+            ]);
             const assemblyBytes = [
                 ...snapshot.kvListWithSizes('chats/'),
                 ...snapshot.kvListWithSizes(PLUGIN_SAVE_PREFIX),
@@ -4604,6 +5665,7 @@ async function pinPartialExportState(job) {
                 }
                 job.progress.current++;
             }
+            preflightBackupEntries(pinnedEntries);
             return { snapshot, database, entries: pinnedEntries };
         } catch (error) {
             snapshot.close();
@@ -4652,6 +5714,10 @@ async function writePartialExportArchive(job, database, entries) {
             },
         });
         throwIfPartialExportCancelled(job);
+        preflightBackupEntries([{
+            backupName: 'database.risudat',
+            size: job.databaseSpool.size,
+        }]);
         job.progress.current++;
         if (!await writeWithBackpressure(
             output,
@@ -4720,18 +5786,6 @@ async function preparePartialExportJob(job) {
             job.state = 'cancelled';
             await cleanupPartialExportJob(job);
         }
-    }
-}
-
-function assertBackupEntryNameWithinLimit(name) {
-    if (Buffer.byteLength(name, 'utf-8') > BACKUP_ENTRY_NAME_MAX_BYTES) {
-        throw new RangeError(`Backup entry name exceeds ${BACKUP_ENTRY_NAME_MAX_BYTES} UTF-8 bytes`);
-    }
-}
-
-function preflightBackupEntryNames(entries) {
-    for (const entry of entries) {
-        assertBackupEntryNameWithinLimit(entry.backupName);
     }
 }
 
@@ -9974,156 +11028,80 @@ app.get('/api/backup/export', async (req, res, next) => {
         });
         return;
     }
+    const abortTracker = createBackupExportAbortTracker(req, res);
     let backupDbSpool = null;
-    let backupSnapshot = null;
-    let closed = false;
-    res.once('close', () => { closed = true; });
+    let pinnedState = null;
+    const shouldAbort = () => abortTracker.signal.aborted || res.destroyed;
     try {
-        backupSnapshot = await queueStorageOperation(async () => {
-            await flushPendingDb();
-            return createKvSnapshot();
-        });
-
-        const partial = req.query.scope === 'partial';
         // ?target=upstream excludes NodeOnly-only slashed namespaces: plugin
         // rows plus inlay/, inlay_sidecar/, and inlay_meta/. Upstream RisuAI's
         // import treats those names as paths under assets/ and fails with
         // ENOENT. Plugin rows are folded inline; inlay images remain lossy.
-        // Partial archives retain their historical upstream-compatible shape:
-        // selected PNGs plus one folded database.risudat and no slashed rows.
-        const target = partial || req.query.target === 'upstream' ? 'upstream' : 'nodeonly';
-        let backupDatabase = null;
+        const target = req.query.target === 'upstream' ? 'upstream' : 'nodeonly';
+        pinnedState = await pinFullBackupState({
+            target,
+            signal: abortTracker.signal,
+        });
+        await waitAtFullExportAfterPinTestGate(abortTracker.signal);
+        throwIfBackupExportAborted(abortTracker.signal);
         backupDbSpool = await buildSelfContainedBackupDatabase({
             foldPluginStorage: target === 'upstream',
-            shouldAbort: () => closed,
-            onMissingChatRow: (chaId, chatId) => {
-                warnAndPreserveMissingChatRow('Backup Export', chaId, chatId);
-            },
-            snapshot: backupSnapshot,
-            onDatabaseLoaded: (database) => { backupDatabase = database; },
-            omitAccount: partial,
+            shouldAbort,
+            snapshot: pinnedState.snapshot,
+            databaseSource: pinnedState.databaseSource,
+            databaseState: pinnedState.databaseState,
+            signal: abortTracker.signal,
         });
-        if (closed) return;
-        const inlayFiles = target === 'upstream' ? [] : await listInlayFiles();
-        const inlayEntries = await Promise.all(inlayFiles.map(async (entry) => {
-            const stat = await fs.stat(entry.filePath);
-            return {
-                kind: 'file',
-                sourcePath: entry.filePath,
-                backupName: `inlay/${entry.id}.${entry.ext}`,
-                sortKey: `inlay/${entry.id}`,
-                size: stat.size,
-            };
-        }));
-        const sidecarEntries = await Promise.all(inlayFiles.map(async (entry) => {
-            const sidecarPath = getInlaySidecarPath(entry.id);
-            try {
-                const stat = await fs.stat(sidecarPath);
-                return {
-                    kind: 'sidecar',
-                    sourcePath: sidecarPath,
-                    backupName: `inlay_sidecar/${entry.id}`,
-                    sortKey: `inlay_sidecar/${entry.id}`,
-                    size: stat.size,
-                };
-            } catch {
-                return null;
-            }
-        }));
-        const inlayMetaEntries = target === 'upstream' ? [] : backupSnapshot.kvListWithSizes('inlay_meta/').map((entry) => ({
-            kind: 'kv',
-            key: entry.key,
-            backupName: entry.key,
-            sortKey: entry.key,
-            size: entry.size,
-        }));
-        const pluginEntries = target === 'upstream'
-            ? []
-            : await listPluginBackupEntries(backupSnapshot);
-        const partialAssets = partial
-            ? listPartialBackupAssetEntries(backupDatabase, backupSnapshot)
-            : null;
-        const namespacedEntries = partial
-            ? partialAssets.entries
-            : [
-                ...listAssetEntriesWithSizes(backupSnapshot).map((entry) => ({
-                    kind: 'asset',
-                    key: entry.key,
-                    backupName: path.basename(entry.key),
-                    sortKey: entry.key,
-                    size: entry.size,
-                })),
-                ...listColdStorageBackupEntries({
-                    reader: backupSnapshot,
-                    migrateLegacy: false,
-                }),
-                ...pluginEntries,
-                ...inlayMetaEntries,
-                ...inlayEntries,
-                ...sidecarEntries.filter(Boolean),
-            ].sort((a, b) => a.sortKey.localeCompare(b.sortKey));
-        preflightBackupEntryNames(namespacedEntries);
+        throwIfBackupExportAborted(abortTracker.signal);
+        const namespacedEntries = pinnedState.entries;
         const dbSize = backupDbSpool?.size ?? 0;
+        preflightBackupEntries([
+            ...namespacedEntries,
+            ...(dbSize ? [{ backupName: 'database.risudat', size: dbSize }] : []),
+        ]);
         const totalBytes = namespacedEntries.reduce((sum, entry) => {
             return sum + backupEntrySize(entry.backupName, entry.size);
         }, 0) + (dbSize ? backupEntrySize('database.risudat', dbSize) : 0);
 
-        const filenameSuffix = partial ? '-partial' : target === 'upstream' ? '-upstream' : '';
+        const filenameSuffix = target === 'upstream' ? '-upstream' : '';
         res.setHeader('content-type', 'application/octet-stream');
         res.setHeader('content-disposition', `attachment; filename="risu-backup-${Date.now()}${filenameSuffix}.bin"`);
         res.setHeader('content-length', totalBytes);
         res.setHeader('x-risu-backup-assets', namespacedEntries.length);
-        if (partial) {
-            res.setHeader('x-risu-backup-missing-assets', partialAssets.missing);
-        }
 
         for (const entry of namespacedEntries) {
-            if (closed) break;
-            const value = entry.kind === 'asset'
-                ? readAssetValue(entry.key, backupSnapshot)
-                : entry.kind === 'kv'
-                    ? backupSnapshot.kvGet(entry.key)
-                : entry.kind === 'buffer'
-                    ? entry.buffer
-                    : await fs.readFile(entry.sourcePath);
-            if (closed) break;
-            if (value === null || value?.length !== entry.size) {
-                const actualSize = value === null ? 'missing' : value?.length;
-                const error = new Error(
-                    `Backup entry changed while exporting: ${entry.backupName} `
-                    + `(planned ${entry.size} bytes, found ${actualSize})`
-                );
-                logger.error('[Backup Export] Aborting inconsistent stream', error);
-                closed = true;
-                res.destroy(error);
-                return;
-            }
-            if (!await writeWithBackpressure(
+            throwIfBackupExportAborted(abortTracker.signal);
+            if (!await writePinnedBackupEntry(
                 res,
-                encodeBackupEntry(entry.backupName, value),
-                () => closed
+                entry,
+                shouldAbort,
             )) break;
         }
 
-        if (!closed && dbSize && backupDbSpool) {
+        if (!shouldAbort() && dbSize && backupDbSpool) {
             const header = encodeBackupEntryHeader('database.risudat', dbSize);
-            if (await writeWithBackpressure(res, header, () => closed)) {
-                await streamFileToWritable(backupDbSpool.filePath, res, () => closed);
+            if (await writeWithBackpressure(res, header, shouldAbort)) {
+                await streamFileToWritable(backupDbSpool.filePath, res, shouldAbort);
             }
         }
-        if (!closed) res.end();
+        if (!shouldAbort()) res.end();
     } catch (error) {
-        if (!closed && error?.code === 'BACKUP_MISSING_CHAT_ROW') {
+        if (abortTracker.signal.aborted || res.destroyed) {
+            return;
+        } else if (error?.code === 'BACKUP_MISSING_CHAT_ROW') {
             logger.error('[Backup Export] Failed:', error);
             res.status(500).json({ error: error.message, code: error.code });
-        } else if (!closed) {
+        } else if (!res.headersSent && error?.statusCode) {
+            res.status(error.statusCode).json(backupExportErrorPayload(error));
+        } else {
             next(error);
         }
     } finally {
-        backupSnapshot?.close();
+        abortTracker.cleanup();
         if (backupDbSpool) {
             await fs.unlink(backupDbSpool.filePath).catch(() => {});
         }
+        await cleanupFullBackupState(pinnedState);
     }
 });
 
@@ -10307,156 +11285,175 @@ app.post('/api/backup/server/save', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
     if (!checkActiveSession(req, res)) return;
     if (HUB_HOSTING_MODE) return res.status(403).json({ error: 'Server backups are disabled on this instance' });
+    const abortTracker = createBackupExportAbortTracker(req, res);
+    const destinationDir = path.resolve(backupsDir);
     let backupDbSpool = null;
-    let backupSnapshot = null;
-    let closed = false;
-    res.once('close', () => { closed = true; });
+    let pinnedState = null;
+    const shouldAbort = () => abortTracker.signal.aborted || res.destroyed;
     try {
-        backupSnapshot = await queueStorageOperation(async () => {
-            await flushPendingDb();
-            return createKvSnapshot();
+        pinnedState = await pinFullBackupState({
+            target: 'nodeonly',
+            signal: abortTracker.signal,
+            archiveTargetPath: destinationDir,
         });
+        await waitAtFullExportAfterPinTestGate(abortTracker.signal);
+        throwIfBackupExportAborted(abortTracker.signal);
         backupDbSpool = await buildSelfContainedBackupDatabase({
             foldPluginStorage: false,
-            shouldAbort: () => closed,
-            snapshot: backupSnapshot,
+            shouldAbort,
+            snapshot: pinnedState.snapshot,
+            databaseSource: pinnedState.databaseSource,
+            databaseState: pinnedState.databaseState,
+            signal: abortTracker.signal,
         });
-        if (closed) return;
+        throwIfBackupExportAborted(abortTracker.signal);
 
-        // Pre-flight disk check — bail before streaming if the target dir
-        // can't fit the backup. Avoids wasted minutes + half-written tmp files.
-        try {
-            const estimate = await estimateServerBackupSize(backupSnapshot);
-            const required = Math.ceil(estimate * 1.05); // 5% safety margin
-            const sf = await fs.statfs(backupsDir);
-            const free = sf.bsize * sf.bavail;
-            if (estimate > 0 && free < required) {
-                return res.status(400).json({
-                    error: `Insufficient disk space (need ~${(required / 1024 / 1024).toFixed(0)} MB, free ${(free / 1024 / 1024).toFixed(0)} MB)`,
-                    code: 'insufficient_space',
-                    required,
-                    free,
-                });
-            }
-        } catch (e) {
-            // Non-fatal: log and proceed. statfs may be unavailable, in which
-            // case the streaming fallback path below still fails gracefully.
-            console.warn('[Backup] pre-flight disk check failed:', e?.message || e);
-        }
-
-        const inlayFiles = await listInlayFiles();
-        const inlayEntries = await Promise.all(inlayFiles.map(async (entry) => {
-            const stat = await fs.stat(entry.filePath);
-            return { kind: 'file', sourcePath: entry.filePath, backupName: `inlay/${entry.id}.${entry.ext}`, size: stat.size };
-        }));
-        const sidecarEntries = (await Promise.all(inlayFiles.map(async (entry) => {
-            const sidecarPath = getInlaySidecarPath(entry.id);
-            try {
-                const stat = await fs.stat(sidecarPath);
-                return { kind: 'sidecar', sourcePath: sidecarPath, backupName: `inlay_sidecar/${entry.id}`, size: stat.size };
-            } catch { return null; }
-        }))).filter(Boolean);
-
-        const namespacedEntries = [
-            ...listAssetEntriesWithSizes(backupSnapshot).map((e) => ({ kind: 'asset', key: e.key, backupName: path.basename(e.key), size: e.size })),
-            ...listColdStorageBackupEntries({
-                reader: backupSnapshot,
-                migrateLegacy: false,
-            }),
-            ...await listPluginBackupEntries(backupSnapshot),
-            ...backupSnapshot.kvListWithSizes('inlay_meta/').map((e) => ({ kind: 'kv', key: e.key, backupName: e.key, size: e.size })),
-            ...inlayEntries,
-            ...sidecarEntries,
-        ];
-        // Validate the complete plan before response headers, a temporary
-        // archive, or a final filename can advertise an unrestorable backup.
-        preflightBackupEntryNames(namespacedEntries);
-
+        const namespacedEntries = pinnedState.entries;
+        preflightBackupEntries([
+            ...namespacedEntries,
+            ...(backupDbSpool
+                ? [{ backupName: 'database.risudat', size: backupDbSpool.size }]
+                : []),
+        ]);
         const totalEntries = namespacedEntries.length + 1; // +1 for database
         const totalBytes = namespacedEntries.reduce(
             (sum, entry) => sum + backupEntrySize(entry.backupName, entry.size),
-            0
+            0,
         ) + (backupDbSpool
             ? backupEntrySize('database.risudat', backupDbSpool.size)
             : 0);
+        if (totalBytes > pinnedState.archiveReservedBytes) {
+            throw new Error('Server backup archive exceeds its admitted disk reservation');
+        }
 
         // Stream progress as NDJSON
         res.setHeader('content-type', 'application/x-ndjson');
         res.flushHeaders();
 
-        const filename = `risu-backup-${Date.now()}.bin`;
-        const finalPath = path.join(backupsDir, filename);
-        const tmpPath = finalPath + '.tmp';
-        const writeStream = createWriteStream(tmpPath);
+        const tmpPath = path.join(
+            destinationDir,
+            `${SERVER_BACKUP_TEMP_PREFIX}${process.pid}-${pinnedState.token}.tmp`,
+        );
+        const writeStream = createWriteStream(tmpPath, {
+            flags: 'wx',
+            mode: 0o600,
+            flush: true,
+        });
         const writeStreamFinished = finished(writeStream);
         writeStreamFinished.catch(() => {});
+        const abortLocalWrite = () => {
+            const reason = abortTracker.signal.reason instanceof Error
+                ? abortTracker.signal.reason
+                : new Error('Server backup save cancelled');
+            writeStream.destroy(reason);
+        };
+        abortTracker.signal.addEventListener('abort', abortLocalWrite, { once: true });
 
-        let writeComplete = false;
+        let finalPath = null;
+        let filename = null;
+        let responseComplete = false;
 
         try {
             let written = 0;
             let bytesWritten = 0;
             for (const entry of namespacedEntries) {
-                if (closed) break;
-                const value = entry.kind === 'asset'
-                    ? readAssetValue(entry.key, backupSnapshot)
-                    : entry.kind === 'kv'
-                        ? backupSnapshot.kvGet(entry.key)
-                    : entry.kind === 'buffer'
-                        ? entry.buffer
-                        : await fs.readFile(entry.sourcePath);
-                if (value === null || value?.length !== entry.size) {
-                    const actualSize = value === null ? 'missing' : value?.length;
-                    throw new Error(
-                        `Backup entry changed while saving: ${entry.backupName} `
-                        + `(planned ${entry.size} bytes, found ${actualSize})`
-                    );
-                }
-                const encodedEntry = encodeBackupEntry(entry.backupName, value);
-                if (!await writeWithBackpressure(writeStream, encodedEntry, () => closed)) break;
-                bytesWritten += encodedEntry.length;
+                throwIfBackupExportAborted(abortTracker.signal);
+                if (!await writePinnedBackupEntry(
+                    writeStream,
+                    entry,
+                    shouldAbort,
+                )) break;
+                bytesWritten += backupEntrySize(entry.backupName, entry.size);
                 written++;
                 if (written % 50 === 0 || written === namespacedEntries.length) {
-                    res.write(JSON.stringify({ type: 'progress', current: written, total: totalEntries, bytes: bytesWritten, totalBytes }) + '\n');
+                    if (!await writeWithBackpressure(
+                        res,
+                        JSON.stringify({ type: 'progress', current: written, total: totalEntries, bytes: bytesWritten, totalBytes }) + '\n',
+                        shouldAbort,
+                    )) throw new Error('Client disconnected during backup save');
                 }
             }
-            if (closed) throw new Error('Client disconnected during backup save');
+            throwIfBackupExportAborted(abortTracker.signal);
             if (backupDbSpool) {
                 const header = encodeBackupEntryHeader('database.risudat', backupDbSpool.size);
-                if (!await writeWithBackpressure(writeStream, header, () => closed)) {
+                if (!await writeWithBackpressure(writeStream, header, shouldAbort)) {
                     throw new Error('Client disconnected during backup save');
                 }
-                if (!await streamFileToWritable(backupDbSpool.filePath, writeStream, () => closed)) {
+                if (!await streamFileToWritable(backupDbSpool.filePath, writeStream, shouldAbort)) {
                     throw new Error('Client disconnected during backup save');
                 }
                 bytesWritten += header.length + backupDbSpool.size;
             }
-            res.write(JSON.stringify({ type: 'progress', current: totalEntries, total: totalEntries, bytes: bytesWritten, totalBytes }) + '\n');
+            if (!await writeWithBackpressure(
+                res,
+                JSON.stringify({ type: 'progress', current: totalEntries, total: totalEntries, bytes: bytesWritten, totalBytes }) + '\n',
+                shouldAbort,
+            )) throw new Error('Client disconnected during backup save');
             writeStream.end();
             await writeStreamFinished;
+            await waitAtServerBackupBeforePublishTestGate(abortTracker.signal);
+            throwIfBackupExportAborted(abortTracker.signal);
+            const tempStat = await fs.stat(tmpPath);
+            if (tempStat.size !== totalBytes) {
+                throw new Error('Server backup temp file length does not match its plan');
+            }
 
-            // Atomic rename: only expose the file after successful write
-            await fs.rename(tmpPath, finalPath);
-            writeComplete = true;
+            // Hard-link publication is atomic and never replaces an existing
+            // backup. Numeric suffix probing preserves the public filename
+            // contract while making same-millisecond saves collision-safe.
+            const timestamp = Date.now();
+            for (let attempt = 0; attempt < 10_000; attempt++) {
+                throwIfBackupExportAborted(abortTracker.signal);
+                filename = `risu-backup-${timestamp + attempt}.bin`;
+                finalPath = path.join(destinationDir, filename);
+                try {
+                    await fs.link(tmpPath, finalPath);
+                    break;
+                } catch (error) {
+                    if (error?.code !== 'EEXIST') throw error;
+                    finalPath = null;
+                    filename = null;
+                }
+            }
+            if (!finalPath || !filename) {
+                throw new Error('Could not allocate a unique server backup filename');
+            }
+            throwIfBackupExportAborted(abortTracker.signal);
+            await fs.unlink(tmpPath);
 
             const stat = await fs.stat(finalPath);
             console.log(`[Server Backup] Saved: ${filename} (${(stat.size / 1024 / 1024).toFixed(1)} MB)`);
-            res.write(JSON.stringify({ type: 'done', ok: true, filename, size: stat.size }) + '\n');
+            if (!await writeWithBackpressure(
+                res,
+                JSON.stringify({ type: 'done', ok: true, filename, size: stat.size }) + '\n',
+                shouldAbort,
+            )) throw new Error('Client disconnected before backup publication acknowledgement');
             res.end();
+            await finished(res);
+            responseComplete = true;
+            markFullExportReservationConsumed(
+                pinnedState.reservation,
+                'ARCHIVE',
+                stat.size,
+            );
         } catch (innerError) {
-            // Clean up incomplete temp file
-            if (!writeComplete) {
-                writeStream.destroy();
-                await writeStreamFinished.catch(() => {});
-                await fs.unlink(tmpPath).catch(() => {});
+            writeStream.destroy();
+            await writeStreamFinished.catch(() => {});
+            await fs.unlink(tmpPath).catch(() => {});
+            if (!responseComplete && finalPath) {
+                await fs.unlink(finalPath).catch(() => {});
             }
             throw innerError;
+        } finally {
+            abortTracker.signal.removeEventListener('abort', abortLocalWrite);
         }
     } catch (error) {
-        if (closed) {
+        if (abortTracker.signal.aborted || res.destroyed) {
             return;
         } else if (!res.headersSent && error?.code === 'BACKUP_MISSING_CHAT_ROW') {
             res.status(500).json({ error: error.message, code: error.code });
+        } else if (!res.headersSent && error?.statusCode) {
+            res.status(error.statusCode).json(backupExportErrorPayload(error));
         } else if (!res.headersSent) {
             next(error);
         } else {
@@ -10464,10 +11461,11 @@ app.post('/api/backup/server/save', async (req, res, next) => {
             res.end();
         }
     } finally {
-        backupSnapshot?.close();
+        abortTracker.cleanup();
         if (backupDbSpool) {
             await fs.unlink(backupDbSpool.filePath).catch(() => {});
         }
+        await cleanupFullBackupState(pinnedState);
     }
 });
 
@@ -12597,6 +13595,7 @@ app.put('/api/backup/server/path', async (req, res, next) => {
             kvSet(BACKUP_PATH_CONFIG_KEY, Buffer.from(resolved, 'utf-8'));
         });
         backupsDir = resolved;
+        sweepServerBackupTemps(backupsDir);
         writeBackupPathMarker(resolved);
         res.json({
             path: backupsDir,
@@ -12612,6 +13611,23 @@ app.put('/api/backup/server/path', async (req, res, next) => {
 
 // ── Inlay bulk compression endpoint ──────────────────────────────────────────
 const COMPRESS_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp']);
+
+async function waitAtInlayCompressionBeforeCommitTestGate() {
+    if (process.env.NODE_ENV !== 'test') return;
+    const configured = String(
+        process.env.POCKETRISU_TEST_INLAY_COMPRESS_BEFORE_COMMIT_GATE_DIR ?? '',
+    ).trim();
+    if (!configured) return;
+    const gateDir = path.resolve(configured);
+    const holdPath = path.join(gateDir, 'hold');
+    if (!existsSync(holdPath)) return;
+    await fs.mkdir(gateDir, { recursive: true });
+    await fs.writeFile(path.join(gateDir, 'entered'), 'converted', 'utf-8');
+    const releasePath = path.join(gateDir, 'release');
+    while (existsSync(holdPath) && !existsSync(releasePath)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+}
 
 app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
     if (!checkActiveSession(req, res)) return;
@@ -12657,7 +13673,19 @@ app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
         for (let i = 0; i < imageFiles.length; i++) {
             const entry = imageFiles[i];
             try {
-                const original = await fs.readFile(entry.filePath);
+                const source = await fs.open(entry.filePath, 'r');
+                let sourceStat;
+                let original;
+                try {
+                    sourceStat = await source.stat();
+                    original = await source.readFile();
+                    const afterRead = await source.stat();
+                    if (!samePinnedSourceStat(afterRead, sourceStat)) {
+                        throw new Error('Inlay changed while preparing compression');
+                    }
+                } finally {
+                    await source.close().catch(() => {});
+                }
                 const img = vips.Image.newFromBuffer(original)
                 let webpBuf
                 try {
@@ -12668,14 +13696,32 @@ app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
                 }
 
                 if (webpBuf.length < original.length) {
-                    const sidecar = await readInlaySidecar(entry.id);
-                    const info = sidecar || {};
-                    await writeInlayFile(entry.id, 'webp', webpBuf, { ...info, ext: 'webp' });
-                    // invalidate thumbnail cache
-                    await queueStorageMutation(() => kvDel(`inlay_thumb/${entry.id}`));
-                    const saved = original.length - webpBuf.length;
-                    totalSaved += saved;
-                    compressed++;
+                    await waitAtInlayCompressionBeforeCommitTestGate();
+                    const published = await queueStorageMutation(async () => {
+                        const currentPath = await resolveInlayFilePath(entry.id);
+                        if (currentPath !== entry.filePath) return false;
+                        const currentStat = await fs.stat(currentPath).catch(() => null);
+                        if (!currentStat || !samePinnedSourceStat(currentStat, sourceStat)) {
+                            return false;
+                        }
+                        const sidecar = await readInlaySidecar(entry.id);
+                        const info = sidecar || {};
+                        await writeInlayFile(
+                            entry.id,
+                            'webp',
+                            webpBuf,
+                            { ...info, ext: 'webp' },
+                        );
+                        kvDel(`inlay_thumb/${entry.id}`);
+                        return true;
+                    });
+                    if (published) {
+                        const saved = original.length - webpBuf.length;
+                        totalSaved += saved;
+                        compressed++;
+                    } else {
+                        skipped++;
+                    }
                 } else {
                     skipped++;
                 }
