@@ -68,6 +68,31 @@ holds only for that injected dependency.
   409, 500, network failure, writer displacement, and close-before-retry. In
   every non-commit case all external rows must remain.
 
+### Resolution
+
+**Fixed 2026-07-26 in `75b0f28f`.** Database saves now return an explicit
+`committed | retry | failed | displaced` outcome, and a durability-sensitive
+force request queues its own save after any older in-flight save instead of
+inheriting that save's promise. Cleanup accepts only `committed`; the direct
+reconciler persists the complete inline database before deleting external
+rows, and a failed persistence attempt leaves every external value and owner
+row intact.
+
+The later staged-transition protocol strengthens that boundary in production:
+it first durably saves and binds the source database, keeps migrated rows in a
+private stage, and publishes the target database, mode, generation, manifest,
+and row ownership together at finalize. A definitive failure restores or
+aborts without publishing the target, while an unresolved finalize latches
+plugin operations and database saves until reload rather than risking a second
+publication from ambiguous state.
+
+Regression coverage in `src/ts/storage/databaseSave.test.ts` verifies the
+queued force-save and every non-commit outcome. Coverage in
+`src/ts/plugins/pluginSaveStorage.test.ts` verifies save-before-delete, row
+preservation after a rejected internalizing save, refresh after successful
+cleanup, staged identity/content rejection, rollback, and the unresolved
+finalize latch.
+
 <a id="mt2"></a>
 ## MT2 — The mode flag changes outside the storage queue
 

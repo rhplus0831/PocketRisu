@@ -25,12 +25,13 @@ On the client, the complete value is `JSON.stringify()`-encoded before the
 request (`src/ts/storage/persistentKv.ts:55-58`). SA2 moved ordinary work to
 per-key queues and detached bounded cache seeding after the authoritative
 acknowledgement, so an unrelated key is no longer held behind this work.
-PM1 remains open: `NodeStorage.setItem()` still makes a defensive full-byte
-copy and begins a full hash, and detached `storeBytes()` makes another
-copy/hash before optional IndexedDB persistence
+At this original audit point, PM1 remained open: `NodeStorage.setItem()` still
+made a defensive full-byte copy and began a full hash, and detached
+`storeBytes()` made another copy/hash before optional IndexedDB persistence
 (`src/ts/storage/nodeStorage.ts:298-346`,
 `src/ts/storage/resourceCache.ts:437-467`). Server buffering and the absence
-of value/aggregate limits are unchanged.
+of value/aggregate limits were also unchanged. The Resolution below records
+the subsequent remediation.
 
 ### Required correction
 
