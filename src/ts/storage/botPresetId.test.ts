@@ -39,6 +39,7 @@ const {
     getActiveBotPresetId,
     getBotPresetById,
     getBotPresetIndexById,
+    setDatabase,
     setActiveBotPresetById,
     withStableActivePreset,
 } = databaseModule
@@ -73,6 +74,22 @@ describe('createBotPresetTemplate', () => {
         const b = createBotPresetTemplate()
         a.name = 'Mutated'
         expect(b.name).not.toBe('Mutated')
+    })
+})
+
+describe('database defaults', () => {
+    test('enables legacy plugin compatibility when no preference is stored', () => {
+        setDatabase(DBState.db)
+
+        expect(DBState.db.legacyPluginCompatibility).toBe(true)
+    })
+
+    test('preserves an explicit opt-out of legacy plugin compatibility', () => {
+        DBState.db.legacyPluginCompatibility = false
+
+        setDatabase(DBState.db)
+
+        expect(DBState.db.legacyPluginCompatibility).toBe(false)
     })
 })
 

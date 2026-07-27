@@ -725,6 +725,7 @@ export function setDatabase(data:Database){
     if (typeof data.localNetworkMode !== 'boolean') data.localNetworkMode = false
     data.localNetworkTimeoutSec ??= 600
     if (typeof data.localNetworkTimeoutSec !== 'number' || Number.isNaN(data.localNetworkTimeoutSec)) data.localNetworkTimeoutSec = 600
+    data.legacyPluginCompatibility ??= true
     // Optimized mode deliberately retains only this empty compatibility map;
     // V3 values are read on demand from pluginsave/ by pluginSaveStorage.ts.
     data.pluginCustomStorage = copyDatabasePluginStorageRecord(data.pluginCustomStorage)
@@ -1438,9 +1439,9 @@ export interface Database{
     // converted, while functions, cycles, accessors, symbols, and custom
     // classes remain rejected.
     autoConvertPluginStorageValues?: boolean
-    // Opt-in compatibility policy for plugins written against upstream's
-    // permissive unload lifecycle. Cleanup RPCs receive a longer bounded drain
-    // window, and teardown-only failures do not abort unrelated list changes.
+    // Compatibility policy for plugins written against upstream's permissive
+    // unload lifecycle. Enabled by default; cleanup RPCs receive a longer bounded
+    // drain window, and teardown-only failures do not abort unrelated list changes.
     legacyPluginCompatibility?: boolean
     // PocketRisu-only ownership epoch for external plugin rows. The matching
     // Node manifest defines their exact active set; unknown fields remain safe

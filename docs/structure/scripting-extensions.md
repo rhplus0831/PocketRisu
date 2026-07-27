@@ -78,7 +78,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - Supported API headers are `2.0`, `2.1`, and `3.0`; missing `//@api` defaults to 2.0 behavior (`src/ts/plugins/plugins.svelte.ts:182`, `src/ts/plugins/plugins.svelte.ts:193`).
   - `loadPlugins()` divides enabled plugins into V2/V2.1 and V3 loaders (`src/ts/plugins/plugins.svelte.ts:435`).
   - `pluginV2` is the shared registry for providers, edit handlers, before/after request replacers, and unload callbacks (`src/ts/plugins/plugins.svelte.ts:469`).
-  - Plugin-list changes reload under a serialized transaction. Strict mode rolls imports back on lifecycle failure; the opt-in legacy compatibility policy downgrades teardown-only failures to warnings while keeping load and persistence failures strict.
+  - Plugin-list changes reload under a serialized transaction. Strict mode rolls imports back on lifecycle failure; the default-on legacy compatibility policy downgrades teardown-only failures to warnings while keeping load and persistence failures strict.
   - `getV2PluginAPIs()` exposes model registration, script/replacer registration, limited database access, safe globals/storage/document wrappers, and asset operations (`src/ts/plugins/plugins.svelte.ts:508`).
   - `addProvider()` registers a provider callback and optional tokenizer metadata (`src/ts/plugins/plugins.svelte.ts:530`).
   - `loadV2Plugin()` unloads prior hooks and executes transformed source through `new Function`; V2.0 execution additionally requires `allowV2Plugin` (`src/ts/plugins/plugins.svelte.ts:813`, `src/ts/plugins/plugins.svelte.ts:885`, `src/ts/plugins/plugins.svelte.ts:899`).
