@@ -237,6 +237,18 @@ async function waitForNoPartialExportSpools(cwd: string): Promise<void> {
   throw new Error('Partial export spool was not cleaned')
 }
 
+async function waitForFile(filePath: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      await readFile(filePath)
+      return
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Timed out waiting for ${filePath}`)
+}
+
 describe('external plugin rows in backup archives', () => {
   test('runtime boundaries agree with Node backup export and import for long identifiers', async () => {
     const source = await spawnServer()
@@ -834,6 +846,83 @@ describe('external plugin rows in backup archives', () => {
     const afterRestart = await readdir(spoolDir)
     expect(afterRestart).not.toContain('.partial-export-orphan')
     expect(afterRestart).toContain('unrelated.keep')
+  }, 30_000)
+
+  test('cancelling preparation behind a held import cleans before import release', async () => {
+    let gateRoot = ''
+    const source = await spawnServer({
+      seedSave: async saveDir => {
+        gateRoot = path.dirname(saveDir)
+        await mkdir(path.join(gateRoot, 'import-gate'), { recursive: true })
+        await writeFile(path.join(gateRoot, 'import-gate', 'hold'), '')
+      },
+      env: {
+        RISU_STREAM_INGEST_MIN_BYTES: '1',
+        POCKETRISU_BACKUP_IMPORT_TEST_GATE_DIR: 'import-gate',
+        POCKETRISU_TEST_BACKUP_IMPORT_FAILPOINT: 'after-database-ingestion',
+      },
+    })
+    servers.push(source)
+    const client = await createClient(source.port, source.password)
+    const backup = createSeedBackup()
+    expect((await client.fetch('/api/backup/import/prepare', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ size: backup.byteLength }),
+    })).status).toBe(200)
+    const importing = client.fetch('/api/backup/import', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-risu-backup' },
+      body: new Uint8Array(backup),
+    })
+    const releasePath = path.join(gateRoot, 'import-gate', 'release')
+
+    let firstJobId = ''
+    let replacementJobId = ''
+    try {
+      await waitForFile(path.join(gateRoot, 'import-gate', 'entered'), 10_000)
+
+      firstJobId = await startPartialExport(client)
+      await waitForPartialExport(client, firstJobId, status => status.phase === 'snapshot')
+      const cancel = await client.fetch(`/api/backup/export/jobs/${firstJobId}`, {
+        method: 'DELETE',
+      })
+      expect(cancel.status).toBe(202)
+      await cancel.text()
+
+      // Cancellation must wake the barrier waiter and run its normal artifact
+      // cleanup while the import still owns its raw SQLite transaction.
+      await waitForNoPartialExportSpools(source.cwd)
+      const cancelled = await client.fetch(`/api/backup/export/jobs/${firstJobId}`)
+      expect(cancelled.status).toBe(404)
+      await cancelled.text()
+
+      // The cancelled preparation must also release the sole export admission
+      // without waiting for the import or leaving a private directory behind.
+      replacementJobId = await startPartialExport(client)
+      await waitForPartialExport(client, replacementJobId, status => status.phase === 'snapshot')
+      const replacementCancel = await client.fetch(
+        `/api/backup/export/jobs/${replacementJobId}`,
+        { method: 'DELETE' },
+      )
+      expect(replacementCancel.status).toBe(202)
+      await replacementCancel.text()
+      await waitForNoPartialExportSpools(source.cwd)
+    } finally {
+      await writeFile(releasePath, '')
+      const importResponse = await importing
+      await importResponse.text()
+      expect(importResponse.ok).toBe(false)
+    }
+
+    // Releasing the import must not let either abandoned preparation run late
+    // and resurrect a public job or recreate its private artifacts.
+    for (const jobId of [firstJobId, replacementJobId]) {
+      const status = await client.fetch(`/api/backup/export/jobs/${jobId}`)
+      expect(status.status).toBe(404)
+      await status.text()
+    }
+    await waitForNoPartialExportSpools(source.cwd)
   }, 30_000)
 
   test('job identity is idempotent, single-owner, and survives writer-session displacement', async () => {

@@ -4320,7 +4320,7 @@ async function pinPartialExportState(job) {
             job.snapshot = null;
             throw error;
         }
-    });
+    }, job.abortController.signal);
 }
 
 async function writePartialExportArchive(job, database, entries) {
