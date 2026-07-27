@@ -70,7 +70,8 @@ const {
     addLogBatch, queryLogs, clearLogs, countLogs,
     logger, installProcessHandlers, expressErrorMiddleware,
 } = require('./logs.cjs');
-const { applyPatch } = require('fast-json-patch');
+const { applyPatchAtomic } = require('./atomicJsonPatch.cjs');
+const { createGenerationMemo } = require('./generationMemo.cjs');
 const {
     decodeRisuSave,
     encodeRisuSaveLegacy,
@@ -134,6 +135,7 @@ const HUB_HOSTING_MODE = ['true', '1'].includes(String(process.env.POCKETRISU_HU
 // In-memory database cache for patch-based sync
 // dbCache stores the STRIPPED (stubs-only) version matching what the client sees.
 let dbCache = {};
+const dbDerivedValueMemo = createGenerationMemo();
 let saveTimers = {};
 const pendingChatRowDeletions = new Set();
 const SAVE_INTERVAL = 5000;
@@ -153,6 +155,47 @@ let dbEtag = null;
 
 function computeDatabaseEtagFromObject(databaseObject) {
     return computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(databaseObject)));
+}
+
+// Keep every cache replacement/eviction behind these helpers: derived values
+// are valid only for the exact mutation generation in which they were built.
+function replaceDbCacheValue(filePath, value) {
+    if (dbCache[filePath] === value) return;
+    dbCache[filePath] = value;
+    dbDerivedValueMemo.bump(filePath);
+}
+
+function deleteDbCacheValue(filePath) {
+    delete dbCache[filePath];
+    dbDerivedValueMemo.bump(filePath);
+}
+
+function invalidateDbCacheEntry(filePath) {
+    deleteDbCacheValue(filePath);
+    if (saveTimers[filePath]) {
+        clearTimeout(saveTimers[filePath]);
+        delete saveTimers[filePath];
+    }
+}
+
+function getDbCacheHash(filePath) {
+    return dbDerivedValueMemo.getOrCompute(
+        filePath,
+        'hash',
+        () => calculateHash(dbCache[filePath]).toString(16),
+    );
+}
+
+function getDbCacheEtag(filePath) {
+    return dbDerivedValueMemo.getOrCompute(
+        filePath,
+        'etag',
+        () => computeDatabaseEtagFromObject(dbCache[filePath]),
+    );
+}
+
+function seedDbCacheEtag(filePath, etag) {
+    dbDerivedValueMemo.seed(filePath, 'etag', etag);
 }
 
 let storageOperationQueue = Promise.resolve();
@@ -286,6 +329,7 @@ const BACKUP_INTERVAL_MS = process.env.POCKETRISU_BACKUP_INTERVAL_MS
     : 5 * 60 * 1000; // 5 minutes (override for tests to force snapshot creation)
 let lastBackupTime = null;
 let backupCreationInFlight = false;
+let deferredBackupPending = false;
 
 function readSnapshotConfigInt(key, fallback, min, max) {
     try {
@@ -397,6 +441,31 @@ async function createBackupAndRotate() {
     }
 }
 
+function scheduleBackupAndRotate() {
+    if (deferredBackupPending) return;
+    deferredBackupPending = true;
+    setImmediate(async () => {
+        try {
+            while (true) {
+                await importBarrier.waitUntilIdle();
+                try {
+                    await queueStorageMutation(() => createBackupAndRotate());
+                    break;
+                } catch (error) {
+                    // An import can claim the barrier between waitUntilIdle and
+                    // the queued check. Wait for that import and retry the backup.
+                    if (isImportInProgressError(error)) continue;
+                    throw error;
+                }
+            }
+        } catch (error) {
+            logger.warn('[Snapshot] Deferred snapshot scheduling failed:', error);
+        } finally {
+            deferredBackupPending = false;
+        }
+    });
+}
+
 async function flushPendingDb() {
     if (saveTimers[DB_HEX_KEY]) {
         clearTimeout(saveTimers[DB_HEX_KEY]);
@@ -410,12 +479,16 @@ async function flushPendingDb() {
 }
 
 function invalidateDbCache() {
-    delete dbCache[DB_HEX_KEY];
+    invalidateDbCacheEntry(DB_HEX_KEY);
     pendingChatRowDeletions.clear();
-    if (saveTimers[DB_HEX_KEY]) {
-        clearTimeout(saveTimers[DB_HEX_KEY]);
-        delete saveTimers[DB_HEX_KEY];
-    }
+    dbEtag = null;
+}
+
+function invalidateAllDbCaches() {
+    const filePaths = new Set([...Object.keys(dbCache), ...Object.keys(saveTimers)]);
+    filePaths.add(DB_HEX_KEY);
+    for (const filePath of filePaths) invalidateDbCacheEntry(filePath);
+    pendingChatRowDeletions.clear();
     dbEtag = null;
 }
 
@@ -614,8 +687,9 @@ async function loadStrippedDatabase(raw, source) {
 
 async function prepareLiveDatabaseRead(raw, source) {
     const strippedDatabase = await loadStrippedDatabase(raw, source);
-    dbCache[DB_HEX_KEY] = strippedDatabase;
+    replaceDbCacheValue(DB_HEX_KEY, strippedDatabase);
     const prepared = prepareDatabaseReadPayload(strippedDatabase);
+    seedDbCacheEtag(DB_HEX_KEY, prepared.etag);
     dbEtag = prepared.etag;
     return prepared;
 }
@@ -804,7 +878,7 @@ async function persistDbCache(filePath, decodedKey) {
         throw err;
     }
     if (decodedKey === 'database/database.bin') {
-        dbCache[filePath] = strippedDb;
+        replaceDbCacheValue(filePath, strippedDb);
         pendingChatRowDeletions.clear();
     }
 }
@@ -3069,7 +3143,7 @@ async function importBackupFromSource(dataSource, { maxBytes = 0, totalBytes = 0
         }
     }
 
-    invalidateDbCache();
+    invalidateAllDbCaches();
 
     // Small/exotic formats still externalize after commit through the legacy
     // decoder. Supported large formats were ingested inside the import transaction.
@@ -4221,6 +4295,7 @@ app.post('/api/write', async (req, res, next) => {
         res.status(400).send({ error:'Invaild Path' });
         return;
     }
+    let shouldCreateBackup = false;
     try {
         await queueStorageMutation(async () => {
             const key = Buffer.from(filePath, 'hex').toString('utf-8');
@@ -4355,12 +4430,17 @@ app.post('/api/write', async (req, res, next) => {
                 kvSet(key, fileContent);
             }
 
-            // Update ETag, backup, and invalidate cache after database.bin write
+            // Update ETag and invalidate cache after database.bin write. The
+            // snapshot is queued only after this user-visible mutation returns.
             if (key === 'database/database.bin') {
                 invalidateDbCache();
                 // ETag based on stripped version (what client sees)
                 dbEtag = computeBufferEtag(persistedDatabaseContent);
-                await createBackupAndRotate();
+                shouldCreateBackup = true;
+            } else if (Object.hasOwn(dbCache, filePath) || saveTimers[filePath]) {
+                // A full write supersedes any cached/debounced patch state for
+                // the same non-database key.
+                invalidateDbCacheEntry(filePath);
             }
 
             res.send({
@@ -4369,6 +4449,7 @@ app.post('/api/write', async (req, res, next) => {
                 hash: key.startsWith(PLUGIN_SAVE_PREFIX) ? sha256Hex(fileContent) : undefined,
             });
         });
+        if (shouldCreateBackup) scheduleBackupAndRotate();
     } catch (error) {
         if (isImportInProgressError(error)) return sendImportBusy(res);
         next(error);
@@ -4426,9 +4507,9 @@ app.post('/api/patch', async (req, res, next) => {
                     const decoded = decodedKey === 'database/database.bin'
                         ? await loadStrippedDatabase(fileContent, 'Patch')
                         : normalizeJSON(await decodeRisuSave(fileContent));
-                    dbCache[filePath] = decoded;
+                    replaceDbCacheValue(filePath, decoded);
                 } else {
-                    dbCache[filePath] = {};
+                    replaceDbCacheValue(filePath, {});
                 }
             }
 
@@ -4453,7 +4534,7 @@ app.post('/api/patch', async (req, res, next) => {
                 );
                 let currentEtag;
                 try {
-                    currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                    currentEtag = getDbCacheEtag(filePath);
                     dbEtag = currentEtag;
                 } catch {}
                 res.status(409).send({
@@ -4465,13 +4546,13 @@ app.post('/api/patch', async (req, res, next) => {
                 return;
             }
 
-            const serverHash = calculateHash(dbCache[filePath]).toString(16);
+            const serverHash = getDbCacheHash(filePath);
 
             if (expectedHash !== serverHash) {
                 console.log(`[Patch] Hash mismatch for ${decodedKey}: expected=${expectedHash}, server=${serverHash}`);
                 let currentEtag = undefined;
                 if (decodedKey === 'database/database.bin') {
-                    currentEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                    currentEtag = getDbCacheEtag(filePath);
                     dbEtag = currentEtag;
                 }
                 res.status(409).send({
@@ -4481,25 +4562,28 @@ app.post('/api/patch', async (req, res, next) => {
                 return;
             }
 
-            // Apply patch to in-memory database (clone first to prevent partial mutation on failure)
-            const snapshot = JSON.parse(JSON.stringify(dbCache[filePath]));
-            let result;
-            try {
-                result = applyPatch(snapshot, patch, true);
-            } catch (patchErr) {
-                // Invalidate corrupted cache entry to force reload on next request
-                if (decodedKey === 'database/database.bin') invalidateDbCache();
-                else delete dbCache[filePath];
-                throw patchErr;
-            }
+            // Only patch-path ancestors are copied. Until the complete sequence
+            // succeeds, every object reachable from dbCache remains untouched.
+            const cachedDb = dbCache[filePath];
+            const result = applyPatchAtomic(cachedDb, patch);
+            const snapshot = result.newDocument;
             if (decodedKey === 'database/database.bin') {
                 // Keep dbCache and the ETag on the same optimized stub shape
                 // that the debounced persist will write.
-                externalizePluginStorageIfNeeded(snapshot);
-                chatRowStore.extractPayloadChats(snapshot);
-                trackPendingChatRowDeletions(dbCache[filePath], snapshot);
+                const externalized = externalizePluginStorageIfNeeded(snapshot);
+                const extracted = chatRowStore.extractPayloadChats(snapshot);
+                trackPendingChatRowDeletions(cachedDb, snapshot);
+                // A patch with no mutating op (empty, or test-only) returns the
+                // cached object itself, so replaceDbCacheValue sees no identity
+                // change and skips the generation bump. These two normalizations
+                // edit in place, so bump explicitly when they actually changed
+                // something — otherwise the memoized hash/ETag would keep
+                // describing the pre-normalization shape.
+                if (snapshot === cachedDb && (externalized.changed || extracted > 0)) {
+                    dbDerivedValueMemo.bump(filePath);
+                }
             }
-            dbCache[filePath] = snapshot;
+            replaceDbCacheValue(filePath, snapshot);
 
             // Schedule stubs-only save to KV (debounced).
             if (saveTimers[filePath]) {
@@ -4553,7 +4637,7 @@ app.post('/api/patch', async (req, res, next) => {
 
             // Update ETag after successful patch (based on stripped version)
             if (decodedKey === 'database/database.bin') {
-                dbEtag = computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(dbCache[filePath])));
+                dbEtag = getDbCacheEtag(filePath);
             }
 
             const responsePayload = {
@@ -5661,7 +5745,7 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage) {
     });
     await flushPendingDb();
     await createBackupAndRotate();
-    invalidateDbCache();
+    invalidateAllDbCaches();
     const existingAssetKeys = listAssetEntriesWithSizes()
         .filter((entry) => entry.source === 'fs')
         .map((entry) => entry.key);
@@ -6654,7 +6738,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                     // Avoid copying the snapshot monolith into the live key. The
                     // streaming ingest atomically writes rows + stripped DB instead.
                     kvDel(REMOTE_MIGRATION_MARKER_KEY);
-                    invalidateDbCache();
+                    invalidateAllDbCaches();
                     ingestion = await ingestDatabaseStreaming(blob, { inspection });
                     markRemoteMigrationDone();
                 } else {
@@ -6663,7 +6747,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                     // so migrateRemoteBlocksIfNeeded re-evaluates against the restored
                     // bytes instead of skipping based on the prior post-migration state.
                     kvDel(REMOTE_MIGRATION_MARKER_KEY);
-                    invalidateDbCache();
+                    invalidateAllDbCaches();
                     const raw = kvGet(DB_BLOB_KEY);
                     if (raw) ingestion = await ingestDatabase(raw);
                 }
