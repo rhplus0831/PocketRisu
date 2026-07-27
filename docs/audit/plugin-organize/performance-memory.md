@@ -556,6 +556,75 @@ decode/re-import preserve the reserved-field collision and selected pinned
 asset. Separate cancellation and row-failure cases remove the incomplete spool;
 malicious descriptors are rejected without leaving one.
 
+<a id="pm3-r6-bounded-import-ingress"></a>
+### R6 — Bounded backup and save-folder import ingress
+
+**Fixed 2026-07-27 in `f1931989`.** Backup uploads, server-backup restores,
+save-folder ZIP uploads, and direct save-folder adoption now enter through one
+finite ingress policy. The default archive, ZIP, and expanded-data ceiling is
+2 GiB; zero, fractional, non-finite, unsafe, or out-of-range overrides fall
+back to that finite default rather than disabling the limit. The default ZIP
+and directory entry ceiling is 100,000. Cursor-unsupported legacy databases
+have a separate 64 MiB compatibility ceiling. Row-local materialization is
+capped at 32 MiB, while supported databases, database backups, chats, valid
+plugin-value rows, and safe filesystem assets remain file-backed. Plugin JSON
+is validated incrementally, including arbitrarily long valid numeric lexemes
+and exact exponent/mantissa cancellation, without retaining the complete
+token.
+
+Network bodies and archive entries are staged in private mode-`0600` files
+inside mode-`0700` directories. Reads, writes, copies, ZIP central-directory
+inspection, extraction, JSON validation, and database cursor ingestion use
+pages no larger than 64 KiB. Preflight and post-spool checks require twice the
+source or expanded byte count to be available on the relevant staging volume.
+The disk gate is exact at the configured boundary, but filesystem capacity can
+change after preflight and cleanup remains best-effort with startup retry.
+These are finite I/O and staging guarantees; they are not a hard RSS or heap
+ceiling for the complete Node process.
+
+ZIP inventory is completed before publication. ZIP64 sentinels, excessive or
+duplicate decoded entries, unsupported compression, traditional/strong/masked
+encryption flags in either central or local headers, inconsistent flags,
+names, CRCs, or sizes, malformed zero-byte deflate streams, expansion beyond
+the declared size, CRC mismatch, and bytes trailing the raw-deflate end marker
+are rejected. Store and raw-deflate are the only admitted methods. Extraction
+proves exact compressed-range consumption and removes the complete tentative
+stage on cancellation or failure.
+
+Every import installs disconnect tracking before waiting for the mutation
+barrier. The tracker seeds already-aborted or prematurely destroyed requests
+without misclassifying a normally completed JSON body, and barrier acquisition
+accepts the resulting `AbortSignal`. An abandoned queued turn is removed;
+cancellation during the FIFO mutation drain waits for that drain to finish
+before releasing the hold, so a later transaction cannot overtake an older
+write. Acquisition, `importInProgress`, route spools, heartbeat timers, streams,
+listeners, and barrier release share an outer `try`/`finally` on all four
+routes. A drain rejection clears the slot and admits the next import.
+
+Archive upload and server restore both send an immediate NDJSON heartbeat and
+periodic heartbeats through decode, fsync, directory swap, commit, and cleanup.
+Late terminal failures use one exact event containing `type`, `message`,
+`code`, `retryable`, `commitOutcome`, `commitOutcomeUnknown`, and `status`.
+Both browser parsers retain those fields in `StorageError`, including a final
+line without a newline and a UTF-8 code point split across response chunks.
+Rollback restores SQLite and swapped asset/inlay directories together;
+normal failure, socket abort, success, and restart cleanup remove upload,
+entry, database, and save-folder stages. Startup sweeps owned orphan stages.
+
+Production-path coverage imports a supported database and a non-database asset
+larger than 52 MiB through archive and save-folder routes, retains a plugin
+value larger than the 32 MiB buffered-row cap through file-backed ZIP and
+directory paths, and exercises exact/+1 archive, ZIP, expanded-byte, entry,
+buffered-row, legacy, and two-times-disk-headroom boundaries. Real socket tests
+disconnect while barrier acquisition drains, force acquisition rejection on
+all four routes, hold restore through multiple heartbeats, compare exact late
+errors from upload and restore, and verify save-folder failure after the asset
+swap rolls database and files back before and after restart. Five independent
+fix/verification cycles closed numeric, ZIP, lifecycle, response-contract, and
+cleanup edge cases. The final runs passed 1,515 browser tests (3 skipped), 233
+compatibility tests (5 skipped), and 269 server tests, with `svelte-check`
+reporting zero errors and four pre-existing warnings.
+
 <a id="pm4"></a>
 ## PM4 — Write amplification and cache overhead
 

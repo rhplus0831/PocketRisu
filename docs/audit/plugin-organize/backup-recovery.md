@@ -419,3 +419,31 @@ keys, and a maximum-length value+owner Node backup round trip. Independent
 verification passed 58 focused client tests, 7 focused server tests, 10 focused
 compatibility tests, all full client/server/compatibility suites, `pnpm check`,
 and a production build.
+
+<a id="pm3-r6-import-recovery-follow-up"></a>
+### PM3 R6 import/recovery follow-up
+
+Implementation commit `f1931989` makes archive and save-folder restore staging
+finite and recovery-safe. All four import routes attach disconnect tracking
+before AbortSignal-aware barrier acquisition and keep acquisition, the global
+import slot, listeners, streams, timers, private stages, and barrier release in
+one outer cleanup boundary. Disconnect during an older queued mutation cannot
+later resume import publication, and drain/acquisition failure cannot leave the
+server permanently reporting an import in progress.
+
+Upload and server-restore NDJSON use the same exact late-error envelope:
+`type`, `message`, `code`, `retryable`, `commitOutcome`,
+`commitOutcomeUnknown`, and `status`. Both send immediate and periodic
+heartbeats after headers so long decode, fsync, swap, and commit phases remain
+observable. The browser upload and restore parsers preserve the authoritative
+outcome fields rather than replacing a late 413, validation failure, or rollback
+with a generic message.
+
+The import transaction and filesystem-swap journal remain one recovery unit.
+Injected failure after save-folder asset swap restores the old database and
+asset set, removes newly staged files and the journal, survives restart with
+the exact old state, and permits a later successful import. Socket-abort,
+rollback, success, restart, and startup orphan tests require private archive,
+database, entry, and save-folder stages to disappear. The full R6 capacity,
+ZIP-validation, paging, and five-cycle verification record is in
+[PM3 R6 — Bounded backup and save-folder import ingress](performance-memory.md#pm3-r6-bounded-import-ingress).

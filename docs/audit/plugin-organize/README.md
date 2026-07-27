@@ -133,6 +133,7 @@ E1+E2 export path. Verification was repeated after each repair.
 | V1 point-in-time viewer | `fc51fe5a`, `68621c86` | real 10,000-row publication, 50-row page, stale edit/delete CAS rejection, backpressure and import-wait abort |
 | E1 partial-export lifecycle | `892d6eed`, `5b8db647`, `9f4e96e3`, `76fb1cbf` | lost-create cancellation tombstone, held-import cancellation with pre-release spool cleanup and replacement admission, stalled-download TTL cleanup, sink-setup cancellation, immutable asset/database pins |
 | E2 legacy special-key export | `a60e175e`, `9f4e96e3` | real export/decode/import with 3 MiB own `__proto__` value, 2 MiB metadata, reserved-field collision, and selected asset |
+| R6 bounded import ingress | `f1931989` | finite archive/ZIP/expanded/legacy/entry/row limits; private paged disk staging; ZIP integrity checks; disconnect-safe barrier acquisition; exact NDJSON errors and heartbeats; 52 MiB, exact/+1, rollback/restart, and orphan-cleanup gates |
 
 The viewer bound is one page of at most 50 logical rows. A chunked logical row
 may still be synchronously reassembled, page tokens bind the selected page (not
@@ -159,6 +160,14 @@ completion, failure, cancellation, and startup orphan recovery remove private
 artifacts; cleanup is best-effort with startup retry. E2 instrumentation proves
 at most one escape-row read is active and that the spool advances before the
 next escape read; it is not an RSS/heap ceiling.
+
+R6 extends the bounded PM3 boundary to backup archive and save-folder ingress.
+Its 64 KiB page instrumentation, finite byte/entry limits, and private-spool
+cleanup prove bounded reads and staging behavior, not a global resident-heap
+ceiling. Details and final verification counts are recorded in
+[Performance and memory](performance-memory.md#pm3-r6-bounded-import-ingress),
+with the restore transport contract cross-referenced from
+[Backup, snapshot, and recovery](backup-recovery.md#pm3-r6-import-recovery-follow-up).
 
 ## Original recommended fix order
 
