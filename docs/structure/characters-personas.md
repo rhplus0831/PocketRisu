@@ -1,11 +1,11 @@
-# characters-personas
+# Characters and personas
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-27 against `abee0232`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
-The characters-personas subsystem owns PocketRisu’s persistent character and user-persona models, character creation and selection, portrait/emotion/additional-asset references, and interchange with the RisuAI character-card ecosystem. It imports and exports Character Card V2/V3 JSON and PNG cards, V3 CharX archives, legacy encrypted RCC cards, persona PNGs, and PocketRisu character-package ZIPs containing chats, personas, and inlays. It also integrates the RisuRealm browser/download service and routes adjacent `.risup` preset and `.risum` module formats.
+The characters-personas subsystem owns PocketRisu’s persistent character and user-persona models, character creation and selection, portrait/emotion/additional-asset references, and interchange with the RisuAI character-card ecosystem. It imports V2/V3 JSON and PNG cards, V3 CharX/CharX-JPEG, and legacy encrypted RCC metadata. It exports current V3 JSON/PNG/CharX plus compatibility V2 PNG; RCC is import-only. Persona PNGs and PocketRisu character-package ZIPs have separate, intentionally narrower schemas. Adjacent `.risup` preset and `.risum` module files are routed to their own subsystems.
 
 Character metadata lives inside the main database object, while image and other binary payloads are stored separately under opaque `assets/...` keys. Consequently, card and package code translates between portable embedded bytes/URIs and local storage references.
 
@@ -13,7 +13,7 @@ Character metadata lives inside the main database object, while image and other 
 
 ### Core character model and operations
 
-- `src/ts/storage/database.svelte.ts` — about 3,058 lines / 99 KiB; canonical persistent data types and database normalization.
+- `src/ts/storage/database.svelte.ts` — canonical persistent data types and database normalization.
 
   - `RisuPersona` defines `name`, `personaPrompt`, `icon`, optional stable `id`, `note`, `largePortrait`, and `embeddedModule` at `src/ts/storage/database.svelte.ts:949`.
   - `Database.characters`, `Database.personas`, `selectedPersona`, and the active persona working-copy fields are declared from `src/ts/storage/database.svelte.ts:959`.
@@ -23,7 +23,7 @@ Character metadata lives inside the main database object, while image and other 
   - `Chat.bindedPersona` is an optional persona ID, not an array index, at `src/ts/storage/database.svelte.ts:2034`.
   - `saveImage` is an alias of the shared content-addressed `saveAsset` helper at `src/ts/storage/database.svelte.ts:2181`.
 
-- `src/ts/characters.ts` — about 805 lines / 27 KiB; character lifecycle, image management, compatibility normalization, and co-located chat import/export.
+- `src/ts/characters.ts` — character lifecycle, image management, compatibility normalization, and co-located chat import/export.
 
   - `createNewCharacter()` appends `createBlankChar()` and repairs character ordering at `src/ts/characters.ts:20`.
   - `getCharImage()` resolves an asset key into a browser URL/CSS declaration and honors `hideAllImages` at `src/ts/characters.ts:27`.
@@ -39,7 +39,7 @@ Character metadata lives inside the main database object, while image and other 
 
 ### Card and Realm interchange
 
-- `src/ts/characterCards.ts` — about 1,824 lines / 66 KiB; main card-format and RisuRealm boundary.
+- `src/ts/characterCards.ts` — main card-format and RisuRealm boundary.
 
   - `importCharacter()` is the multi-file picker entry point at `src/ts/characterCards.ts:25`.
   - `importCharacterProcess()` dispatches JSON, PNG, CharX, and CharX-JPEG input at `src/ts/characterCards.ts:45`.
@@ -62,7 +62,7 @@ Character metadata lives inside the main database object, while image and other 
 
 ### Character packages
 
-- `src/ts/characterPackage.ts` — about 757 lines / 28 KiB; PocketRisu package ZIPs bundling a character card with optional chats, bound personas, and inlays.
+- `src/ts/characterPackage.ts` — PocketRisu package ZIPs bundling a character card with optional chats, bound personas, and inlays.
 
   - `PackageManifest` defines `type: "risuCharacterPackage"` and `version: 1` at `src/ts/characterPackage.ts:21`.
   - `scanCharacterInlayIds()` finds `{{inlay::...}}`, `{{inlayed::...}}`, and `{{inlayeddata::...}}` references in chat message text at `src/ts/characterPackage.ts:65`.
@@ -78,7 +78,7 @@ Character metadata lives inside the main database object, while image and other 
 
 ### Persona cards
 
-- `src/ts/persona.ts` — about 143 lines / 4 KiB; active-persona synchronization and standalone persona PNG interchange.
+- `src/ts/persona.ts` — active-persona synchronization and standalone persona PNG interchange.
 
   - `selectUserImg()` stores an uploaded portrait and updates the selected persona at `src/ts/persona.ts:10`.
   - `saveUserPersona()` copies the global working fields into `db.personas[selectedPersona]` at `src/ts/persona.ts:29`.
@@ -88,7 +88,7 @@ Character metadata lives inside the main database object, while image and other 
 
 ### PNG and CharX primitives
 
-- `src/ts/pngChunk.ts` — about 324 lines / 11 KiB; low-level PNG `tEXt` chunk reader/writer.
+- `src/ts/pngChunk.ts` — low-level PNG `tEXt` chunk reader/writer.
 
   - `StreamChunkWriter` copies the base PNG while replacing existing `chara`/`ccv3` metadata and appending new text chunks at `src/ts/pngChunk.ts:6`.
   - `PngChunk.read()` performs non-streaming selected-key extraction at `src/ts/pngChunk.ts:93`.
@@ -97,7 +97,7 @@ Character metadata lives inside the main database object, while image and other 
   - `PngChunk.write()` writes a replacement set of text chunks and recalculates CRCs at `src/ts/pngChunk.ts:246`.
   - `PngChunk.streamWriter` exposes `StreamChunkWriter` for card export at `src/ts/pngChunk.ts:323`.
 
-- `src/ts/process/processzip.ts` — about 450 lines / 15 KiB; streaming CharX ZIP writer/importer.
+- `src/ts/process/processzip.ts` — streaming CharX ZIP writer/importer.
 
   - `processZip()` is an unrelated image-generation helper that extracts the first image from a ZIP at `src/ts/process/processzip.ts:19`.
   - `CharXWriter` incrementally writes ZIP members, sanitizes filenames, and supports JPEG-prefixed output at `src/ts/process/processzip.ts:46`.
@@ -109,7 +109,7 @@ Character metadata lives inside the main database object, while image and other 
 
 ### RPack, `.risum`, and `.risup`
 
-- `src/ts/rpack/rpack_js.js` — 32 lines / 0.9 KiB; fixed byte-substitution compatibility codec.
+- `src/ts/rpack/rpack_js.js` — fixed byte-substitution compatibility codec.
 
   - `initRPack()` loads the 512-byte map at `src/ts/rpack/rpack_js.js:9`.
   - `encodeRPack()` uses the first 256 map bytes at `src/ts/rpack/rpack_js.js:18`.
@@ -117,9 +117,9 @@ Character metadata lives inside the main database object, while image and other 
 
 - `src/ts/rpack/rpack_map.bin` — 512 bytes; encode and decode substitution tables.
 
-- `src/ts/rpack/README` — 4 lines; identifies RPack as compatibility obfuscation rather than encryption.
+- `src/ts/rpack/README` — identifies RPack as compatibility obfuscation rather than encryption.
 
-- `src/ts/process/modules.ts` — about 590 lines / 16 KiB; adjacent module subsystem, significant here because CharX embeds `module.risum`.
+- `src/ts/process/modules.ts` — adjacent module subsystem, significant here because CharX embeds `module.risum`.
 
   - `RisuModule` is defined at `src/ts/process/modules.ts:19`.
   - Current standalone module export converts a module to a V3 CharX at `src/ts/process/modules.ts:37`.
@@ -134,13 +134,13 @@ Character metadata lives inside the main database object, while image and other 
 
 ### Realm UI
 
-- `src/lib/UI/Realm/RealmMain.svelte` — about 213 lines / 7.7 KiB; catalog search, sorting, pagination, card selection, and manual URL/ID import. Its query wrapper calls `getRisuHub()` at `src/lib/UI/Realm/RealmMain.svelte:21`; URL/ID import calls `downloadRisuHub()` at `src/lib/UI/Realm/RealmMain.svelte:196`.
+- `src/lib/UI/Realm/RealmMain.svelte` — catalog search, sorting, pagination, card selection, and manual URL/ID import. Its query wrapper calls `getRisuHub()` at `src/lib/UI/Realm/RealmMain.svelte:21`; URL/ID import calls `downloadRisuHub()` at `src/lib/UI/Realm/RealmMain.svelte:196`.
 
-- `src/lib/UI/Realm/RealmPopUp.svelte` — about 131 lines / 6 KiB; detail modal, fork navigation, download, sharing, reporting, and owner-only removal. Download is triggered at `src/lib/UI/Realm/RealmPopUp.svelte:123`.
+- `src/lib/UI/Realm/RealmPopUp.svelte` — detail modal, fork navigation, download, sharing, reporting, and owner-only removal. Download is triggered at `src/lib/UI/Realm/RealmPopUp.svelte:123`.
 
-- `src/lib/UI/Realm/RealmHubIcon.svelte` — about 60 lines / 3 KiB; catalog tile with image hiding and asset/lore indicators. Remote thumbnails use `/hub-proxy/resource/...` at `src/lib/UI/Realm/RealmHubIcon.svelte:25`.
+- `src/lib/UI/Realm/RealmHubIcon.svelte` — catalog tile with image hiding and asset/lore indicators. Remote thumbnails use `/hub-proxy/resource/...` at `src/lib/UI/Realm/RealmHubIcon.svelte:25`.
 
-- `src/lib/UI/Realm/RealmLicense.svelte` — about 35 lines / 1.2 KiB; maps known licenses to Creative Commons links at `src/lib/UI/Realm/RealmLicense.svelte:13`.
+- `src/lib/UI/Realm/RealmLicense.svelte` — maps known licenses to Creative Commons links at `src/lib/UI/Realm/RealmLicense.svelte:13`.
 
 ### Binary storage support
 
@@ -269,6 +269,8 @@ For V3:
 
 For V2, `createBaseV2()` emits standard V2 fields plus `extensions.risuai` and writes base64 card JSON under `chara`. V2 is explicitly a compatibility path; current export does not populate its commented-out emotion or additional-asset arrays.
 
+The low-level exporter can also write a V2 card object as ordinary JSON; base64 wrapping applies to PNG `chara` metadata, not to standalone JSON files. The normal export chooser exposes V2 PNG rather than a separate V2 JSON option.
+
 ### Character-package flow
 
 Export:
@@ -344,6 +346,7 @@ The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streami
 - New chats should include `newChatModelDefaults()` so model-mode preferences are snapshotted at chat birth.
 - Character Card imports always generate a fresh local `chaId`; card IDs are not used as database identities.
 - Standard character cards do not carry chats or personas. Use a character-package ZIP when those must travel together.
+- Character-card and package formats are not interchangeable snapshots of the local character object. Each conversion has an explicit field/asset allowlist; inspect `src/ts/interchangeability.ts` and the target builder before promising a lossless round trip.
 - The misspelled `extentions` field is persisted compatibility data and must not be casually renamed. Card export copies unknown extension keys back into `data.extensions`.
 - There are duplicated creator/version representations: UI edits and export use `additionalData.creator` and `additionalData.character_version`, while imports also fill top-level `creator` and `characterVersion`.
 - `post_history_instructions` maps to `replaceGlobalNote` in current card import/export. The older `postHistoryInstructions` property is migrated into the current chat note by `characterFormatUpdate()` and then cleared.
@@ -353,14 +356,14 @@ The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streami
 - Card filename dispatch uses case-sensitive `endsWith()` checks inside `importCharacterProcess()`. A direct caller should normalize names or uppercase extensions may fail.
 - Plain `.jpg`/`.jpeg` input is treated as CharX-JPEG, not as a portrait-only card.
 - V3 asset import accepts `__asset:`, `embeded://`, `ccdefault:`, and bounded `data:` URIs. Other URI schemes are skipped.
-- V3 inline `data:` assets are capped at 50 MiB per decoded base64 string check at `src/ts/characterCards.ts:787`.
-- PNG `chara` and `ccv3` metadata are each capped at roughly 5 MiB during import at `src/ts/characterCards.ts:177`.
+- V3 inline `data:` assets compare the base64 text length to 50 MiB, so the decoded-byte ceiling is lower than 50 MiB (`src/ts/characterCards.ts:787`).
+- The intended 5 MiB PNG `chara`/`ccv3` guard checks the previous accumulator length before assignment and therefore does not currently bound the incoming chunk. Do not rely on it as an effective import limit (`src/ts/characterCards.ts:177`).
 - `ccv3` takes precedence when a PNG contains both V2 `chara` and V3 `ccv3`.
 - `exportCharacterCard()` sets `char.image = ""` after reading it at `src/ts/characterCards.ts:1173`. Normal UI callers pass a clone, but a new direct caller must not assume its argument remains unchanged.
 - `exportCharacterCard()` declares a `password` option, but current export code never uses it. Password-protected RCC is import-only compatibility.
 - Current V2 export leaves emotion and additional-asset properties commented out in `createBaseV2()`. Use V3 CharX for lossless asset export.
 - The export UI warns against non-CharX formats when assets exist at `src/lib/Others/AlertComp.svelte:504`; JSON/PNG can embed assets but are less suitable for large collections.
-- CharX keeps scripts/lore in `module.risum`; do not remove that member without accepting loss of Risu-specific fidelity.
+- CharX keeps selected scripts/lore in `module.risum`, but it is not a lossless copy of every PocketRisu character/module field. Do not remove that member without accepting further loss of Risu-specific fidelity.
 - CharX archive paths are referenced verbatim by `embeded://...`; writer path generation and importer asset keys must remain synchronized.
 - `CharXImporter.done()` is mandatory. Reading `assets` immediately after `parse()` can race pending saves.
 - The documented pre-size guard in `CharXImporter.#handleFile()` uses `file.originalSize ?? 0 < MAX_ASSET_SIZE_BYTES` at `src/ts/process/processzip.ts:342`. Because of operator precedence, a defined nonzero size is treated as truthy rather than actually compared; the later buffered-size check remains the effective 50 MiB exclusion.
@@ -378,6 +381,8 @@ The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streami
 - Inlay IDs are not regenerated. Existing local IDs are skipped, so a collision reuses the local inlay even if the package contains different bytes.
 - Package persona duplicate detection includes the original persona ID and original icon storage string at `src/ts/characterPackage.ts:229`; cross-install duplicates therefore rarely qualify as exact duplicates.
 - Package persona import does not currently copy the manifest’s `largePortrait` value into newly appended personas, despite exporting it.
+- Standalone persona PNG interchange preserves only name, prompt, note, and the PNG used as icon. Stable IDs, large portraits, embedded modules, and other advanced persona state do not round-trip.
+- Package chat IDs are regenerated and bound persona IDs are remapped, but chat IDs recorded inside imported inlay ownership metadata are not remapped to the new chat IDs.
 - If new-character package import fails after adding personas or inlays, rollback explicitly removes only the newly created character at `src/ts/characterPackage.ts:690`; associated writes may remain.
 - License restrictions are enforced by the character-config UI, not by `exportCharacterPackage()` itself. Restricted licenses disable ordinary card export and force `includeCharacter: false` at `src/lib/SideBars/CharConfig.svelte:630`.
 - Any new character/persona asset-reference field must be added to both client cleanup protection (`getUncleanables()`) and the server mirror (`buildUncleanableSet()` at `server/node/server.cjs:5980`) or cleanup can delete live binaries.
@@ -415,10 +420,10 @@ The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streami
 - To change export-format warnings or choices, inspect `src/lib/Others/AlertComp.svelte:471`.
 - To change character-package license gating, inspect `src/lib/SideBars/CharConfig.svelte:630`.
 
-## Out of scope, noticed
+## 7. Related structure docs
 
-- `src/ts/interchangeability.ts` contains character ↔ module ↔ persona conversions, including lore indicator records used to preserve first messages and post-history instructions.
-- `src/ts/process/files/inlays` and `src/ts/process/files/inlayMeta` own actual inlay persistence and metadata.
-- `src/ts/storage/chatStorage.ts` owns placeholder/cold-chat hydration used by character and package export.
-- Most chat JSON/JSONL/TXT/HTML interchange is co-located in `src/ts/characters.ts:164` but belongs primarily to the chat subsystem.
-- Full preset editing, module execution, and prompt assembly are adjacent subsystems; only their character/persona interchange edges are covered here.
+- `src/ts/interchangeability.ts` is the character ↔ module ↔ persona conversion map, including lore indicators used to preserve selected fields.
+- [Media and translation](media-translation.md) covers inlay persistence and ownership metadata.
+- [Client storage](client-storage.md) covers placeholder/cold-chat hydration used by package export.
+- [Chat pipeline](chat-pipeline.md) covers chat behavior; chat JSON/JSONL/TXT/HTML interchange remains co-located in `src/ts/characters.ts`.
+- [Memory and lorebook](memory-lorebook.md) covers live module projection and lore execution.

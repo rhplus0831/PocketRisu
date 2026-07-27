@@ -1,17 +1,17 @@
-# media-translation
+# Media and translation
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-27 against `abee0232`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
-This subsystem handles language translation, speech synthesis, image generation, notification audio, and chat-embedded media. Translation supports remote services, an auxiliary LLM, and browser-local Bergamot models; TTS supports browser speech plus several hosted/self-hosted providers and plugin hooks. Inlays give images, audio, video, and model signatures stable IDs that can be stored outside chat records, referenced by Risu-compatible `{{inlay...}}` tokens, sent as multimodal model input, and lazily rendered. The Node server stores ordinary assets and inlay metadata in SQLite, while current inlay payloads live as raw files with JSON sidecars.
+This subsystem handles language translation, speech synthesis, image generation, notification audio, and chat-embedded media. Translation supports remote services, an auxiliary LLM, and browser-local Bergamot models; TTS supports browser speech plus several hosted/self-hosted providers and plugin hooks. Inlays give images, audio, video, and model signatures stable IDs outside chat records. On Node, safe content-addressed ordinary assets and current inlay payloads live as files; unsafe/legacy asset names and ownership metadata remain in SQLite, while inlay display metadata is mirrored in filesystem sidecars.
 
 ## 2. Key files
 
 ### Translation
 
-- `src/ts/translator/translator.ts` — approximately 685 lines; central translation dispatcher, HTML translator, and LLM cache.
+- `src/ts/translator/translator.ts` — central translation dispatcher, HTML translator, and LLM cache.
 
   - `getCurrentTranslatorPreset()` selects the normalized active preset (`src/ts/translator/translator.ts:51`).
   - `translate(text, reverse)` is the normal UI entry point and consults a small in-memory forward/reverse cache (`src/ts/translator/translator.ts:55`).
@@ -23,14 +23,14 @@ This subsystem handles language translation, speech synthesis, image generation,
   - `translateLLM(...)` builds the auxiliary-model request, masks `<risu-style>` blocks, restores them, and populates the cache (`src/ts/translator/translator.ts:520`).
   - Cache administration is exported through `clearLLMCache`, `getLLMCache`, `searchLLMCache`, `setLLMCache`, `exportLLMCacheAsJSON`, and `importLLMCacheFromJSON` (`src/ts/translator/translator.ts:600`, `src/ts/translator/translator.ts:605`, `src/ts/translator/translator.ts:609`, `src/ts/translator/translator.ts:631`, `src/ts/translator/translator.ts:636`, `src/ts/translator/translator.ts:651`).
 
-- `src/ts/translator/bergamotTranslator.ts` — approximately 145 lines; browser-local Firefox/Bergamot translation.
+- `src/ts/translator/bergamotTranslator.ts` — browser-local Firefox/Bergamot translation.
 
   - `CacheDB` stores downloaded model files in IndexedDB and validates entries by registry checksum (`src/ts/translator/bergamotTranslator.ts:6`, `src/ts/translator/bergamotTranslator.ts:30`).
   - `FirefoxBacking` rewrites model registry paths to Mozilla’s GitHub-hosted compressed model files (`src/ts/translator/bergamotTranslator.ts:76`, `src/ts/translator/bergamotTranslator.ts:88`).
   - `bergamotTranslate(...)` lazily constructs `LatencyOptimisedTranslator` and serializes translation tasks (`src/ts/translator/bergamotTranslator.ts:128`).
   - `clearCache()` removes downloaded models from IndexedDB (`src/ts/translator/bergamotTranslator.ts:144`).
 
-- `src/ts/translator/presets.ts` — approximately 240 lines; LLM translation preset schema, legacy normalization, and encrypted `.risutl` codec.
+- `src/ts/translator/presets.ts` — LLM translation preset schema, legacy normalization, and encrypted `.risutl` codec.
 
   - `TranslatorPreset` contains `name`, `prompt`, and `maxResponse` (`src/ts/translator/presets.ts:6`).
   - `defaultTranslatorPrompt` and the `.risutl` extension are defined at `src/ts/translator/presets.ts:25`.
@@ -40,11 +40,11 @@ This subsystem handles language translation, speech synthesis, image generation,
   - `getCurrentTranslatorPresetFromState()` safely returns the selected preset (`src/ts/translator/presets.ts:147`).
   - `encodeTranslatorPresetFile()` and `decodeTranslatorPresetFile()` use MessagePack, encryption, compression, and RPack wrapping (`src/ts/translator/presets.ts:217`, `src/ts/translator/presets.ts:234`).
 
-- `src/ts/translator/presets.test.ts` — approximately 155 lines; covers legacy-state migration, selected-preset synchronization, encrypted `.risutl` round trips, and invalid file rejection (`src/ts/translator/presets.test.ts:28`, `src/ts/translator/presets.test.ts:98`).
+- `src/ts/translator/presets.test.ts` — covers legacy-state migration, selected-preset synchronization, encrypted `.risutl` round trips, and invalid file rejection (`src/ts/translator/presets.test.ts:28`, `src/ts/translator/presets.test.ts:98`).
 
 ### TTS and notification audio
 
-- `src/ts/process/tts.ts` — approximately 504 lines; TTS preprocessing, provider requests, audio decoding, and playback.
+- `src/ts/process/tts.ts` — TTS preprocessing, provider requests, audio decoding, and playback.
 
   - `sayTTS(character, text)` is the synthesis entry point (`src/ts/process/tts.ts:80`).
   - Provider modes are `webspeech`, `elevenlab`, `VOICEVOX`, `openai`, `novelai`, `huggingface`, `vits`, `gptsovits`, and `fishspeech` (`src/ts/process/tts.ts:113`).
@@ -53,15 +53,15 @@ This subsystem handles language translation, speech synthesis, image generation,
   - Voice discovery helpers are `getWebSpeechTTSVoices`, `getElevenTTSVoices`, `getVOICEVOXVoices`, and `getNovelAIVoices` (`src/ts/process/tts.ts:439`, `src/ts/process/tts.ts:445`, `src/ts/process/tts.ts:459`, `src/ts/process/tts.ts:473`).
   - `FixNAITTS()` supplies missing NovelAI TTS defaults on legacy characters (`src/ts/process/tts.ts:490`).
 
-- `src/ts/process/ttsHooks.ts` — approximately 105 lines; global pre/post synthesis plugin-hook registries.
+- `src/ts/process/ttsHooks.ts` — global pre/post synthesis plugin-hook registries.
 
   - Hook context/result interfaces distinguish text preprocessing from binary-audio postprocessing (`src/ts/process/ttsHooks.ts:3`, `src/ts/process/ttsHooks.ts:14`).
   - Registration and unregistration APIs begin at `src/ts/process/ttsHooks.ts:32`.
   - `getTTSPreprocessors()` and `getTTSPostprocessors()` return defensive array copies (`src/ts/process/ttsHooks.ts:50`, `src/ts/process/ttsHooks.ts:57`).
   - `runHookPipeline(...)` chains field replacements, stops on `skip`, and isolates thrown or timed-out hooks (`src/ts/process/ttsHooks.ts:61`).
-  - `src/ts/process/ttsHooks.test.ts` is approximately 91 lines and covers chaining, skipping, errors, timeouts, undefined fields, and synchronous hooks (`src/ts/process/ttsHooks.test.ts:16`).
+  - `src/ts/process/ttsHooks.test.ts` and covers chaining, skipping, errors, timeouts, undefined fields, and synchronous hooks (`src/ts/process/ttsHooks.test.ts:16`).
 
-- `src/ts/notificationSound.ts` — approximately 94 lines; message/translation completion sounds and picker previews.
+- `src/ts/notificationSound.ts` — message/translation completion sounds and picker previews.
 
   - `bundledSounds` maps stable preset IDs to Vite-built audio URLs (`src/ts/notificationSound.ts:27`).
   - `resolveSoundUrl()` resolves either a bundled ID or an uploaded `assets/...` path (`src/ts/notificationSound.ts:49`).
@@ -84,27 +84,21 @@ src/ts/media/
     └── tests/compressImage.test.ts
 ```
 
-- `src/ts/media/index.ts` — 2 lines; barrel export for `compressImage` and `getImageType`.
-- `src/ts/media/imageType.ts` — approximately 46 lines.
-
-  - `ImageType` covers JPEG, PNG, GIF, BMP, AVIF, WEBP, and Unknown (`src/ts/media/imageType.ts:1`).
+- `src/ts/media/index.ts` — barrel export for `compressImage` and `getImageType`.
+- `src/ts/media/imageType.ts` — `ImageType` covers JPEG, PNG, GIF, BMP, AVIF, WEBP, and Unknown (`src/ts/media/imageType.ts:1`).
   - `getImageType()` detects formats from magic bytes (`src/ts/media/imageType.ts:3`).
 
-- `src/ts/media/compressImage/compressImage.ts` — approximately 16 lines.
+- `src/ts/media/compressImage/compressImage.ts` — `compressImage()` obeys `DBState.db.imageCompression`, leaves WebP/AVIF/unknown bytes untouched, and recompresses other recognized formats (`src/ts/media/compressImage/compressImage.ts:5`).
 
-  - `compressImage()` obeys `DBState.db.imageCompression`, leaves WebP/AVIF/unknown bytes untouched, and recompresses other recognized formats (`src/ts/media/compressImage/compressImage.ts:5`).
+- `src/ts/media/compressImage/lossyCompression.ts` — `doLossyCompression()` limits either dimension to 3000 pixels, draws through a canvas, and emits WebP quality 0.75 with JPEG fallback (`src/ts/media/compressImage/lossyCompression.ts:1`).
 
-- `src/ts/media/compressImage/lossyCompression.ts` — approximately 43 lines.
-
-  - `doLossyCompression()` limits either dimension to 3000 pixels, draws through a canvas, and emits WebP quality 0.75 with JPEG fallback (`src/ts/media/compressImage/lossyCompression.ts:1`).
-
-- `src/ts/media/tests/imageType.test.ts` and `src/ts/media/compressImage/tests/compressImage.test.ts` — approximately 80 and 130 lines; cover all detected signatures and compression routing (`src/ts/media/tests/imageType.test.ts:4`, `src/ts/media/compressImage/tests/compressImage.test.ts:26`).
+- `src/ts/media/tests/imageType.test.ts` and `src/ts/media/compressImage/tests/compressImage.test.ts` cover detected signatures and compression routing (`src/ts/media/tests/imageType.test.ts:4`, `src/ts/media/compressImage/tests/compressImage.test.ts:26`).
 
 There are no dedicated audio or video modules under `src/ts/media/`; upload classification, storage, and rendering for those formats live in the inlay pipeline.
 
 ### Inlays and generated images
 
-- `src/ts/process/files/inlays.ts` — approximately 717 lines; inlay asset model, upload classification, serialization, LRU caching, explorer data, reference scanning, and deletion.
+- `src/ts/process/files/inlays.ts` — inlay asset model, upload classification, serialization, LRU caching, explorer data, reference scanning, and deletion.
 
   - `InlayAsset` supports `image`, `video`, `audio`, and `signature` types (`src/ts/process/files/inlays.ts:16`).
   - Asset bytes use `inlay/<id>`; display/type information uses `inlay_info/<id>` (`src/ts/process/files/inlays.ts:76`).
@@ -114,49 +108,49 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
   - `writeInlayImage()` resizes images to at most 1,048,576 pixels and stores PNG or WebP according to `inlayImageLossless` (`src/ts/process/files/inlays.ts:438`).
   - `saveInlayedSignature()` stores structured model signature data under the same ID system (`src/ts/process/files/inlays.ts:479`).
   - `getInlayAsset()` returns a base64 data URI; `getInlayAssetBlob()` returns a Blob (`src/ts/process/files/inlays.ts:490`, `src/ts/process/files/inlays.ts:507`).
-  - `setInlayAsset()` writes payload, explorer info, and ownership/time metadata (`src/ts/process/files/inlays.ts:600`).
+  - `setInlayAsset()` writes payload, explorer info, and ownership/time metadata sequentially (`src/ts/process/files/inlays.ts:600`).
   - `removeInlayAsset()` removes all three records (`src/ts/process/files/inlays.ts:609`).
   - `scanInlayReferences()` counts token references across all in-memory chat messages (`src/ts/process/files/inlays.ts:670`).
   - `supportsInlayImage()` checks the current model’s `hasImageInput` flag (`src/ts/process/files/inlays.ts:697`).
-  - `src/ts/process/files/tests/inlays.test.ts` is approximately 674 lines and exercises storage round trips, explorer metadata, uploads, resizing, and deletion (`src/ts/process/files/tests/inlays.test.ts:141`, `src/ts/process/files/tests/inlays.test.ts:407`, `src/ts/process/files/tests/inlays.test.ts:497`).
+  - `src/ts/process/files/tests/inlays.test.ts` and exercises storage round trips, explorer metadata, uploads, resizing, and deletion (`src/ts/process/files/tests/inlays.test.ts:141`, `src/ts/process/files/tests/inlays.test.ts:407`, `src/ts/process/files/tests/inlays.test.ts:497`).
 
-- `src/ts/process/files/inlayMeta.ts` — approximately 119 lines; creation/update metadata stored under `inlay_meta/<id>`.
+- `src/ts/process/files/inlayMeta.ts` — creation/update metadata stored under `inlay_meta/<id>`.
 
   - `InlayAssetMeta` records timestamps plus optional character/chat ownership (`src/ts/process/files/inlayMeta.ts:6`).
   - `setInlayMeta`, `getInlayMeta`, and batch/list helpers wrap `NodeStorage` (`src/ts/process/files/inlayMeta.ts:86`, `src/ts/process/files/inlayMeta.ts:98`).
   - `buildInlayMeta()` captures the currently selected character and chat while preserving existing ownership and creation time (`src/ts/process/files/inlayMeta.ts:106`).
 
-- `src/ts/util/inlayTokens.ts` — 4 lines; shared compatibility regex matching `inlay`, `inlayed`, and `inlayeddata` tokens (`src/ts/util/inlayTokens.ts:3`).
+- `src/ts/util/inlayTokens.ts` — shared compatibility regex matching `inlay`, `inlayed`, and `inlayeddata` tokens (`src/ts/util/inlayTokens.ts:3`).
 
-- `src/ts/process/inlayScreen.ts` — approximately 96 lines; converts model-emitted view-screen commands into emotion or generated-image inlays.
+- `src/ts/process/inlayScreen.ts` — converts model-emitted view-screen commands into emotion or generated-image inlays.
 
   - `runInlayScreen()` converts `<Emotion="...">` or processes `<ImgGen="...">`/`{{ImgGen="..."}}` (`src/ts/process/inlayScreen.ts:7`).
   - In image mode it calls `generateAIImage(..., "inlay")`, persists the result through `writeInlayImage()`, and substitutes `{{inlay::<id>}}` (`src/ts/process/inlayScreen.ts:15`).
   - `updateInlayScreen()` supplies compatibility prompts/instructions for emotion and image-generation view modes (`src/ts/process/inlayScreen.ts:52`).
 
-- `src/ts/process/stableDiff.ts` — approximately 914 lines; provider-specific image-generation requests.
+- `src/ts/process/stableDiff.ts` — provider-specific image-generation requests.
 
   - `stableDiff()` first asks the auxiliary model to turn chat context into an image prompt, then calls `generateAIImage()` (`src/ts/process/stableDiff.ts:11`).
   - `generateAIImage()` supports Stable Diffusion WebUI, NovelAI, DALL-E 3, Stability AI, ComfyUI, fal, Google Imagen, OpenAI-compatible APIs, and WaveSpeed (`src/ts/process/stableDiff.ts:63`).
   - In inlay mode, provider branches generally return a data URI or remote image URL; normal view-screen mode generally updates `CharEmotion` (`src/ts/process/stableDiff.ts:92`, `src/ts/process/stableDiff.ts:358`, `src/ts/process/stableDiff.ts:567`).
 
-- `src/ts/3d/threeload.ts` — approximately 15 lines; explicitly marked legacy/not currently used and only re-exports dynamically imported Three.js/MMD classes (`src/ts/3d/threeload.ts:1`, `src/ts/3d/threeload.ts:4`).
+- `src/ts/3d/threeload.ts` — explicitly marked legacy/not currently used and only re-exports dynamically imported Three.js/MMD classes (`src/ts/3d/threeload.ts:1`, `src/ts/3d/threeload.ts:4`).
 
 ### Rendering and server storage edges
 
-- `src/ts/parser/parser.svelte.ts` — approximately 1,994 lines overall; inlay rendering occupies `src/ts/parser/parser.svelte.ts:666-868`.
+- `src/ts/parser/parser.svelte.ts` — inlay rendering occupies `src/ts/parser/parser.svelte.ts:666-868`.
 
   - `parseInlayAssets()` replaces tokens with cached elements or lazy placeholders (`src/ts/parser/parser.svelte.ts:692`).
   - `resolveInlayPlaceholders()` uses an `IntersectionObserver` with a 200-pixel root margin (`src/ts/parser/parser.svelte.ts:847`).
   - Missing type data can be fetched in batches; direct media URLs are `/api/asset/<hex key>` (`src/ts/parser/parser.svelte.ts:746`).
 
-- `src/ts/storage/nodeStorage.ts` — approximately 1,113 lines; authenticated client for server storage.
+- `src/ts/storage/nodeStorage.ts` — authenticated client for server storage.
 
   - `setItem`, `getItem`, `keys`, and `removeItem` use `/api/write`, `/api/read`, `/api/list`, and `/api/remove` (`src/ts/storage/nodeStorage.ts:298`, `:348`, `:470`, `:518`).
   - `getItems()` and `setItems()` use the bulk asset endpoints (`src/ts/storage/nodeStorage.ts:626`, `:659`).
   - `/api/session` establishes the cookie required for direct `<img>`, `<audio>`, and `<video>` URLs (`src/ts/storage/nodeStorage.ts:185`).
 
-- `server/node/server.cjs` — approximately 7,399 lines overall; relevant storage code is distributed through the server.
+- `server/node/server.cjs` — relevant storage code is distributed through the server.
 
   - Current inlays are stored under `save/inlays` (`server/node/server.cjs:1024`).
   - Safe ID/extension validation and filesystem path construction start at `server/node/server.cjs:1111`.
@@ -167,7 +161,7 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
   - `/api/assets/bulk-read` and `/api/assets/bulk-write` support batched metadata/KV access (`server/node/server.cjs:4573`, `:4645`).
   - `/api/inlays/compress` recompresses eligible filesystem images to WebP and streams progress as SSE (`server/node/server.cjs:6777`).
 
-- `server/node/db.cjs` — approximately 379 lines; SQLite KV implementation.
+- `server/node/db.cjs` — SQLite KV implementation.
 
   - It opens `save/risuai.db` with `better-sqlite3` (`server/node/db.cjs:3`, `:13-16`).
   - The `kv` table stores key, BLOB value, and update timestamp (`server/node/db.cjs:29-36`).
@@ -233,7 +227,7 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 
 4. On `/api/write`, the Node server decodes an `inlay/<id>` data URI and writes `save/inlays/<id>.<ext>` plus `<id>.meta.json`; `inlay_meta` remains a SQLite KV record (`server/node/server.cjs:4244-4267`).
 5. Chats store only tokens. Composer attachments become `{{inlayed::<id>}}` before the user message is appended (`src/lib/ChatScreens/DefaultChatScreen.svelte:349`). Generated inline images normally use `{{inlay::<id>}}` (`src/ts/process/inlayScreen.ts:29`).
-6. When preparing model input, user-message inlays become multimodal parts if supported. Images fall back to image captioning for non-vision models; audio/video become multimodal parts; assistant-side handling retains only `inlayeddata` tokens as model input (`src/ts/process/index.svelte.ts:819`, `src/ts/process/index.svelte.ts:841`).
+6. When preparing model input, user-message inlays become multimodal parts if supported. Images fall back to image captioning for non-vision models. At most one audio/video item is added, and only while the multimodal list is still empty; assistant-side handling retains only `inlayeddata` tokens as model input (`src/ts/process/index.svelte.ts:819`, `src/ts/process/index.svelte.ts:841`).
 7. Rendering calls `parseInlayAssets()`, producing placeholders when type/URL data is not already cached. `ChatBody` invokes `resolveInlayPlaceholders()` after the Svelte HTML block is mounted (`src/lib/ChatScreens/ChatBody.svelte:244`, `src/lib/ChatScreens/ChatBody.svelte:252`).
 8. Near-viewport placeholders are resolved in batches of 20, classified from `inlay_info` unless image-priority mode is enabled, and replaced with `<img>`, `<video>`, or `<audio>` pointing to `/api/asset/<hex("inlay/<id>")>` (`src/ts/parser/parser.svelte.ts:739`, `src/ts/parser/parser.svelte.ts:746`, `src/ts/parser/parser.svelte.ts:768`).
 9. The server authenticates direct tags through the `risu-session` cookie and streams the raw file with its detected MIME type (`server/node/server.cjs:1647`, `:3747`).
@@ -279,6 +273,7 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 - `translateHTML()` deliberately avoids starting uncached LLM/DeepL/DeepLX work while a chat request is active (`src/ts/translator/translator.ts:293`).
 - LLM cache writes are fire-and-forget in normal translation (`src/ts/translator/translator.ts:595`); memory is updated before persistent storage finishes.
 - `runTranslator()` protects separate lines beginning with `{{img`, `{{raw`, `{{video`, or `{{audio`, but not the subsystem’s `{{inlay...}}` tokens (`src/ts/translator/translator.ts:87`). Translation-order changes can therefore affect inlay compatibility.
+- Chat HTML export has its own optional translation pass in `exportChat()`; it is an export feature, not character-card translation (`src/ts/characters.ts:164`).
 - DeepLX is the only HTML translator using the special 5,000-character `■` batching path (`src/ts/translator/translator.ts:516`).
 - Translation errors frequently return the original text rather than throwing. Image-generation failures use a mixture of `false` and empty strings; callers check both.
 - Translator preset legacy fields are still authoritative compatibility surfaces. New code should update presets through normalization/synchronization rather than removing `translatorPrompt` or `translatorMaxResponse`.
@@ -295,11 +290,14 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
   - `{{inlayeddata::<id>}}` carries assistant-side multimodal/signature data.
 
 - Chat messages store IDs, never embedded bytes. Deleting an inlay can therefore leave permanent unresolved tokens; use `scanInlayReferences()` before cleanup.
+- `scanInlayReferences()` is advisory: it scans only messages currently present in memory and skips lazy placeholder chat rows. Hydrate or use a server-aware reference scan before destructive cleanup.
+- Signature inlays are not rendered as visible media. They preserve provider/model metadata so a later request can replay the signature alongside the corresponding assistant content.
 - Image inlays are always re-encoded. Lossless mode stores PNG; default mode stores WebP quality 0.85. Original filenames/extensions are informational and do not dictate the encoded image format.
 - `postChatFile()` accepts `mpeg` and `avi`, while `postInlayAsset()` recognizes video only as `webm`, `mp4`, or `mkv` (`src/ts/process/files/multisend.ts:284`, `src/ts/process/files/inlays.ts:72`). Those accepted picker formats can consequently be discarded.
 - Upload extension matching is lowercase and case-sensitive; callers should normalize extensions before expanding format support.
 - `compressImage()` can route GIF through canvas recompression, which collapses animated input to a rasterized frame.
 - Current inlay payloads are filesystem files, despite the client-facing `NodeStorage` KV abstraction. Explorer info is mirrored in sidecars; ownership/time metadata remains in SQLite.
+- Safe `assets/<content-hash>.<ext>` values are also filesystem-backed. Unsafe or legacy names retain the SQLite fallback, so code must use the storage helpers instead of assuming one physical backend for every asset key.
 - The server still reads and migrates legacy SQLite `inlay/<id>` JSON records (`server/node/server.cjs:1352-1433`). Preserve this fallback when changing storage format.
 - Direct asset URLs use one-year `immutable` caching (`server/node/server.cjs:3755-3762`). Reusing and overwriting an explicit inlay ID can leave a browser with a stale cached URL; new content normally needs a new ID.
 - Inlay IDs are validated against separators and traversal components before filesystem access (`server/node/server.cjs:1111-1139`).
@@ -335,8 +333,10 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 - To change model-emitted `<ImgGen>` behavior, inspect `src/ts/process/inlayScreen.ts:5` and `src/ts/process/inlayScreen.ts:15`.
 - To change completion sounds or add bundled presets, inspect `src/ts/notificationSound.ts:27` and `src/ts/notificationSound.ts:49`.
 
-### Out of scope, noticed
+## 7. Related structure docs
 
-- `src/lib/Setting/Pages/InlayImageGallery.svelte` is the large inlay-management UI rather than storage logic.
-- `src/lib/Playground/PlaygroundImageGen.svelte`, `PlaygroundImageTrans.svelte`, and `PlaygroundSubtitle.svelte` are specialist playground consumers of this subsystem.
+- [Chat pipeline](chat-pipeline.md) covers attachment extraction, model input, and response-side inlay handling.
+- [Characters and personas](characters-personas.md) covers inlays included in character packages.
+- [Client storage](client-storage.md) and [server backend](server-backend.md) cover the logical storage API and physical asset/inlay backends.
+- [UI layer](ui-layer.md) covers the inlay gallery and specialist playground surfaces.
 - `src/lib/UI/3DLoader.svelte` is also marked legacy/not currently used and directly imports Three.js instead of using `src/ts/3d/threeload.ts`.

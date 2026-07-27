@@ -1,160 +1,237 @@
-# PocketRisu — Codebase Structure Guide
+# PocketRisu codebase structure guide
 
-Navigation map for developers and AI agents. Read this first, then open the relevant
-detail doc under [docs/structure/](docs/structure/) — each one covers a subsystem's key
-files, runtime flows, cross-subsystem edges, invariants/gotchas, and "to change X, look
-at Y" hints with `file:line` references.
-
-Audited 2026-07-25 against `2e3d4f05`. Line numbers in the detail docs drift as code
-changes; verify with `rg` before relying on them.
+Navigation map for developers and AI agents. Start here, choose the owning subsystem,
+then use the change maps and symbol names in `docs/structure/`. Ownership and runtime
+behavior were audited on 2026-07-27 against `abee0232`. File paths and symbols are the
+durable references; line-number hints in the detail docs are approximate and should be
+confirmed with `rg`.
 
 ## What PocketRisu is
 
-A self-hosted fork of [RisuAI](https://github.com/kwaroran/RisuAI) (AI roleplay chat):
-one Node server on your PC/homeserver, accessed from any browser. Frontend is a Svelte 5
-+ Vite SPA (`src/`); backend is an Express server (`server/node/server.cjs`) with a
-SQLite KV core plus filesystem stores for assets, inlays, and backup archives.
-**RisuAI ecosystem compatibility is a hard constraint** — character cards, presets,
-modules, and `.bin` backups must round-trip with upstream.
+PocketRisu is a self-hosted fork of [RisuAI](https://github.com/kwaroran/RisuAI): a
+Svelte 5 + Vite browser client backed by one Express/Node process and a SQLite KV core.
+Chats, optimized plugin values, ordinary assets, inlays, backups, and recovery history
+use specialized row or filesystem stores around that core.
 
-## Runtime topology
+PocketRisu maintains selected RisuAI interchange surfaces, including Character Card
+V2/V3, `.risup` prompt presets, `.risum` modules, and RisuSave `.bin` migration.
+Compatibility is surface-specific rather than universally lossless. Upstream-target
+backups omit PocketRisu inlay namespaces, encrypted risuai.xyz account backups are not
+accepted, and PocketRisu-only state may have no upstream runtime meaning.
 
-```text
-Browser SPA (src/)                          Node server (server/node/)
-┌────────────────────────────┐   HTTP/WS   ┌────────────────────────────────┐
-│ index.html → src/main.ts   │ ─────────── │ server.cjs (Express, ~6.8k)    │
-│ → App.svelte               │  /api/*     │ ├ db.cjs     → SQLite KV       │
-│   store-driven screens,    │  /proxy2    │ │  stub DB + chats/* + chunks │
-│   no URL router            │  /proxy-    │ ├ logs.cjs   → save/logs.db    │
-│ NodeStorage (HTTP client)  │  stream-jobs│ ├ assets/inlays/history → files│
-│ forageStorage = server KV  │             │ └ snapshots/backups → spools  │
-│ optional verified IDB cache│             │                                │
-└────────────────────────────┘             └────────────────────────────────┘
-```
+## Find where to make a change
 
-- The client holds the whole `Database` object in memory (`DBState.db`, a Svelte 5
-  `$state` rune) with chats **stubbed out**; full chat bodies are fetched lazily and
-  saved individually. A staged reactive save loop writes authoritative chat rows
-  before committing their stubs, checkpoints active generations, and syncs metadata
-  via JSON Patch (`/api/patch`) with full-write fallback (`/api/write`).
-- An opt-in, disposable IndexedDB resource cache can reuse SHA-256-verified database
-  segments, chat rows, and optimized plugin values. The server remains authoritative;
-  every cache hit is hash-negotiated and locally re-verified.
-- Model API calls go direct from the browser when possible, otherwise through the
-  server's `/proxy2`; streaming local-network requests use WebSocket proxy jobs.
-- `server/hono/` is a **non-functional scaffold** (only `GET /`), not an alternate
-  backend. `server.cjs` treats `process.cwd()` as the app root and does not parse
-  `.env`.
+| I need to change… | Start here | Coordinate with |
+|---|---|---|
+| Screens, settings, chat rendering, mobile layout, themes | [UI layer](docs/structure/ui-layer.md) | Chat pipeline, client storage |
+| Sending, prompt assembly, token budgeting, attachments | [Chat pipeline](docs/structure/chat-pipeline.md) | Memory, extensions, providers, media |
+| Provider wire formats, streaming, tools, or transport | [Model providers](docs/structure/model-providers.md) | Presets/profiles, server backend |
+| Model profiles, prompt presets, credentials, bindings, Gemini cache | [Presets and profiles](docs/structure/presets-profiles.md) | Model providers, chat pipeline |
+| Database fields, save timing, chat hydration, drafts, browser cache | [Client storage](docs/structure/client-storage.md) | Server backend, backup/recovery |
+| Routes, auth, SQLite, chunks, proxying, filesystem stores | [Server backend](docs/structure/server-backend.md) | Client storage, backup/recovery |
+| Backups, partial exports, imports, snapshots, destructive restore | [Backup and recovery](docs/structure/backup-recovery.md) | Server backend, client storage |
+| Plugin KV semantics, CAS/batches, generations, transitions, viewer | [Plugin storage](docs/structure/plugin-storage.md) | Extensions, client/server storage |
+| Cards, personas, packages, Realm, character interchange | [Characters and personas](docs/structure/characters-personas.md) | Media, memory, presets |
+| Lore activation, Hypa V3, embeddings, modules | [Memory and lorebook](docs/structure/memory-lorebook.md) | Chat pipeline, characters |
+| CBS, regex, triggers, Lua, plugin lifecycle, MCP | [Scripting and extensions](docs/structure/scripting-extensions.md) | Chat pipeline, providers, plugin storage |
+| Translation, TTS, inlays, image generation, sounds | [Media and translation](docs/structure/media-translation.md) | Chat pipeline, server backend |
 
-## Commands
+## Run and verify
+
+Use pnpm 10.34.1 and Node 22.12 or newer; Node 24 is recommended and used by current
+Docker/release builds. The four test commands below are separate suites—there is no
+aggregate `test:all` command.
 
 | Command | Purpose |
 |---|---|
-| `pnpm dev` | Vite dev server (port 5174) |
-| `pnpm build` | Production build to `dist/` |
-| `pnpm runserver` | Start the Node backend (serves `dist/`, port 6001 or `$PORT`) |
-| `pnpm check` | `svelte-check` type checking |
-| `pnpm test` | Default vitest suite (happy-dom, colocated `*.test.ts` in `src/`) |
-| `pnpm test:server` | Server-side tests (`server/node/**/*.test.ts`, node env, real better-sqlite3) |
-| `pnpm test:compat` | RisuAI compatibility suite (`test/compat/`, backup/preset/DB round-trips) |
+| `pnpm dev` | Frontend-only Vite server on `0.0.0.0:5174` with a strict port; no `/api` proxy |
+| `pnpm build` | Production build with sourcemaps to `dist/` |
+| `pnpm preview` | Preview the built frontend; still no backend API |
+| `pnpm runserver` | Start Express from the repository root; serves `dist/` on `$HOST:$PORT` (default port 6001) |
+| `pnpm check` | Svelte and TypeScript diagnostics |
+| `pnpm check:help` | Validate localized help-key coverage |
+| `pnpm test` | Browser/client unit tests under `src/` in happy-dom |
+| `pnpm test:server` | Node server unit tests with real `better-sqlite3` |
+| `pnpm test:compat` | Real-server storage/interchange integration tests: imports, exports, atomicity, caches, plugin storage |
+| `pnpm test:performance` | Isolated performance suite, run with resource cache disabled and enabled |
+
+The upstream-backup fixture suite runs only when the ignored local file
+`test/fixtures/upstream/upstream-backup.bin` is supplied. Most `test/compat/` coverage
+tests PocketRisu persistence and interchange behavior, not execution inside upstream.
+
+## Architecture at a glance
+
+```text
+Browser client (src/)                         Node server (server/node/)
+┌───────────────────────────────┐   HTTP/WS   ┌──────────────────────────────────┐
+│ index.html → src/main.ts      │ ─────────── │ server.cjs (Express)             │
+│ → App.svelte + loadData()     │  /api/*     │ ├ SQLite KV + protected chunks  │
+│ stores/runes select screens   │  /proxy2    │ ├ chats/* + pluginsave/* rows   │
+│                               │  WS jobs    │ ├ assets/inlays/history files   │
+│ DBState.db holds placeholders │             │ └ pins/spools/backups/recovery  │
+│ NodeStorage-backed, KV-shaped │             │                                  │
+│ server storage API            │             │ logs.cjs → save/logs.db         │
+│ optional verified IDB cache   │             │                                  │
+└───────────────────────────────┘             └──────────────────────────────────┘
+```
+
+- The browser holds the whole `Database` proxy in `DBState.db`. Unopened chats are
+  runtime `_placeholder` objects; full bodies hydrate lazily. Database persistence
+  replaces every chat with a wire `_stub` and saves authoritative chat rows first.
+- The opt-in IndexedDB resource cache stores verified, hash-addressed bytes plus
+  resource manifests. It is disposable; the Node server remains authoritative.
+- Model traffic goes directly from the browser when allowed or through `/proxy2`.
+  Classic OpenAI-style local streaming can use restricted WebSocket proxy jobs with
+  `/proxy2` fallback. ModelPreset and non-streaming local requests use `/proxy2`.
+- `server/hono/` remains a non-functional scaffold. The production server treats
+  `process.cwd()` as the application root and does not load `.env` itself.
+- Remote non-localhost use requires a secure browser context by default. Use HTTPS;
+  `POCKETRISU_ALLOW_INSECURE_CONTEXT` is an explicit operator escape hatch.
 
 ## Directory map
 
 | Path | Contents |
 |---|---|
-| `src/ts/` | All application logic, grouped by domain (see subsystem index) |
-| `src/lib/` | Svelte components: `ChatScreens/`, `SideBars/`, `Setting/`, `UI/`, `Mobile/`, `LiteUI/`, `Playground/`, `Others/`, `_dev/` |
-| `src/lang/` | UI translations (`en.ts`, `ko.ts`, …) + help texts (`help.*.ts`) |
-| `src/etc/` | Bundled assets (sounds, default images, patch notes) |
-| `server/node/` | The production Express backend |
-| `server/hono/` | Inactive multi-runtime scaffold |
-| `docs/` | User docs (`en/`, `ko/`, …) and these structure docs (`structure/`) |
-| `test/compat/` | Upstream-compatibility integration tests |
-| `scripts/` | Portable launcher (C), Termux build, standalone updater (`updater.cjs`) |
-| `public/` | Static assets copied into the build |
-| `util/` | Userscript helper for CORS-free fetches |
+| `src/ts/` | Application logic grouped by domain |
+| `src/lib/` | Svelte screens, settings, sidebars, mobile shells, and shared UI |
+| `src/styles/`, `src/styles.css` | Theme/layout CSS, including the default Node-only presentation |
+| `src/lang/`, `src/etc/docs/` | UI translations and embedded help content |
+| `server/node/` | Production Express backend and storage/recovery modules |
+| `server/hono/` | Incomplete multi-runtime scaffold |
+| `shared/` | Contracts consumed by both client and server, currently plugin key policy |
+| `docs/structure/` | This architecture guide's subsystem references |
+| `docs/audit/`, `.archived-docs/` | Point-in-time risk reports and historical material, not canonical architecture |
+| `test/compat/` | Real-server integration and storage/interchange regressions |
+| `test/performance/` | Resource-cache and storage performance scenarios |
+| `scripts/` | Portable/Termux build helpers, updater, and verification scripts |
+| `public/` | Static files copied into the frontend build |
+| `util/` | Legacy/upstream userscript support; not part of the PocketRisu runtime |
 
-## Subsystem index
+## Core runtime flows
 
-| Doc | Scope |
+### Send a message
+
+`DefaultChatScreen.sendMain()` handles commands and input transforms, then
+`sendChatMain()` owns the UI generation lock and delegates to `sendChat()` in
+`src/ts/process/index.svelte.ts`. The process layer assembles prompt buckets, lore,
+memory, attachments, and token budgets; `requestChatData()` applies request hooks,
+classic-versus-ModelPreset dispatch, retries, and provider/tool loops. Cumulative
+response snapshots return through output transforms and triggers before the save loop
+persists the mutation. See [chat pipeline](docs/structure/chat-pipeline.md),
+[model providers](docs/structure/model-providers.md), and
+[scripting and extensions](docs/structure/scripting-extensions.md).
+
+### Persist database and chat state
+
+Ordinary UI code mutates `DBState.db`. `saveDb()` tracks deep reactive reads, stages
+changed chat bodies to `/api/chat-content`, then commits the stubs-only database through
+JSON Patch or an ETag-guarded full write. Generation checkpoints can persist active chat
+rows before final completion. Plugin storage, drafts, assets, inlays, and destructive
+recovery use explicit protocols rather than this implicit save loop. See
+[client storage](docs/structure/client-storage.md),
+[server backend](docs/structure/server-backend.md), and
+[plugin storage](docs/structure/plugin-storage.md).
+
+### Extend behavior
+
+CBS expressions, regex scripts, Lua/triggers, JavaScript plugins, and MCP tools enter at
+different lifecycle points. For `processScriptFull()`, Lua runs first; display triggers
+run only for `editdisplay`; plugin handlers, CBS, and regex scripts follow. V2/V2.1
+plugins execute in the page realm with compatibility guards; V3 plugins use an iframe
+bridge and permissioned host APIs. See
+[scripting and extensions](docs/structure/scripting-extensions.md).
+
+### Export, import, and recover
+
+Full/server exports require a valid live database and every referenced chat, then bind a
+pinned WAL view to verified private filesystem copies. Partial exports and automatic
+snapshots have explicit recovery-oriented missing-chat policies. Destructive imports and
+restores stage bounded input behind the import barrier and report committed,
+not-committed, or unknown outcomes. See
+[backup and recovery](docs/structure/backup-recovery.md).
+
+## Vocabulary that prevents expensive mistakes
+
+| Term | Meaning |
 |---|---|
-| [server-backend](docs/structure/server-backend.md) | Express server: HTTP route catalog, JWT/session auth, stubs-only database + externalized chat rows in SQLite KV, content-defined chunking, cached/delta reads, atomic patch/full-write persistence, exclusive import barrier + crash journal, pinned-snapshot backup assembly, recoverable snapshots, per-chat pre-image history, storage dashboard, proxies, self-update. |
-| [client-storage](docs/structure/client-storage.md) | The `Database` model and `setDatabase()` defaults, `NodeStorage` HTTP adapter, verified IndexedDB resource cache, staged reactive save loop in `globalApi.svelte.ts`, generation checkpoints, RisuSave codecs + JSON-Patch sync, chat stub/placeholder hydration, drafts, chat-version recovery, partial/portable backups, bootstrap ordering. |
-| [chat-pipeline](docs/structure/chat-pipeline.md) | `sendChat()` end to end: prompt buckets and prompt-card templates, token budgeting, attachment/multimodal conversion, streaming, regenerate/continue, post-processing, suggestions, slash commands. |
-| [model-providers](docs/structure/model-providers.md) | Legacy `LLMModel` registry (`format` dispatch, flags) and provider wire code (OpenAI/Anthropic/Google/NovelAI/Horde/…), ModelPreset adapter path, streaming contracts, proxy/local-network transport, how to add a model or provider. |
-| [presets-profiles](docs/structure/presets-profiles.md) | The three-concept split: registry `ModelProfile` → installed `ModelPreset` (frozen snapshot + adapters) vs upstream-compatible `botPreset` (prompt preset, `.risup`). Registries, custom profiles, key pool, Gemini context cache. |
-| [memory-lorebook](docs/structure/memory-lorebook.md) | Lorebook activation (keys, decorators, recursion, budget), HypaMemory V3 long-term summarization, embedding backends and vector caches, module scoping (`getModules()`) and content projection. |
-| [characters-personas](docs/structure/characters-personas.md) | `character`/`RisuPersona` models, card import/export (PNG V2/V3, CharX, JSON, RCC), character packages, PNG chunk + RPack primitives, `.risum`/`.risup` routing, RisuRealm integration, asset storage. |
-| [scripting-extensions](docs/structure/scripting-extensions.md) | CBS `{{...}}` template engine, regex scripts (4 edit modes), triggers V1/V2/Lua, plugin API V2/V2.1/V3 (iframe sandbox), optimized plugin KV storage and recovery boundaries, MCP clients (remote, internal, plugin) and tool-call flow. |
-| [ui-layer](docs/structure/ui-layer.md) | Component map, root screen switching in `App.svelte`, stores-as-router, settings pages + declarative `SettingRenderer`, chat render chain (`Chats` → `Chat` → `ChatBody`), mobile vs desktop shells, theming/alerts/hotkeys. |
-| [media-translation](docs/structure/media-translation.md) | Translation providers (LLM/DeepL/Bergamot/Google) and caches, TTS providers + plugin hooks, inlay asset lifecycle (upload → storage → lazy render), image generation (`stableDiff`), notification sounds. |
+| `chaId` | Durable character ID and first component of a chat-row key |
+| `Chat.id` | Durable conversation ID used by chat rows, drafts, history, and caches |
+| `Message.chatId` / request `arg.chatId` | Generation ID used by status/logging flows |
+| Numeric script/parser `chatID` | Message-array index, not a durable conversation ID |
+| `ModelPreset` | Installed model configuration with a frozen profile snapshot and per-chat binding |
+| Prompt preset / `botPreset` | RisuAI-format prompt template selected through `botPresetsId` |
+| Ordinary asset | `assets/*`; safe names are normally files under `save/assets/` |
+| Inlay | `inlay/*` payload/sidecar plus `inlay_meta/*` ownership metadata |
 
-## The three flows you'll trace most
+## Cross-cutting contracts
 
-**Send a message** — `DefaultChatScreen.sendMain()` (commands, input scripts) →
-`sendChat()` in `src/ts/process/index.svelte.ts` (prompt assembly, lore/memory hooks,
-token budgeting) → `requestChatData()` in `src/ts/process/request/request.ts` (retries,
-plugin/trigger hooks, classic-vs-preset dispatch) → provider wire code → cumulative
-stream snapshots back into the chat → `editoutput` scripts / output triggers → the save
-loop persists the mutation. Details: chat-pipeline, model-providers.
+### Persistence and identity
 
-**Persist data** — mutate `DBState.db` (that's the convention — no explicit save call)
-→ `$effect`s in `saveDb()` (`src/ts/globalApi.svelte.ts`) mark dirty state →
-`prepareChatPersistStage()` writes changed full chats to `/api/chat-content` before
-their stubs may commit (the first eligible dirty save and later 20-second checkpoints
-continue during generation)
-→ the stub-only database syncs via `/api/patch` (JSON Patch + hash) or ETag-guarded
-`/api/write` → the server captures eligible chat pre-images and commits full-write
-external rows atomically; debounced patch persistence commits the stub row and queued
-chat deletions together. Details: client-storage, server-backend.
+- Chat placeholders must hydrate before message access. `_stub` is the wire marker;
+  `_placeholder` is the browser-runtime marker. Guard layers that prevent message loss
+  are intentional.
+- Stable IDs and persisted numeric enums are compatibility contracts. Append enum values;
+  never renumber them. Where selectors intentionally remain index-based—such as
+  `botPresetsId`, `selectedPersona`, or `character.chatPage`—use their reorder/delete
+  helpers so references move together.
+- The public streaming iterator consumed by `sendChat()` yields cumulative snapshots.
+  Provider and adapter parsers may handle deltas internally but must accumulate at that
+  boundary. Output hooks therefore need to be repeat-safe.
+- `requestImmediateSave()` returns an outcome. Code that requires durability must confirm
+  `committed` or use the committed-save helper; merely awaiting the call is insufficient.
 
-**Extend behavior** — CBS expressions expand during prompt building and display; regex
-scripts run at `editinput`/`editoutput`/`editprocess`/`editdisplay`; triggers fire at
-`input`/`start`/`output`/`display`/`request`/`manual`; plugins hook requests and provide
-models; MCP tools are injected into provider tool-call loops. Execution order for one
-string: Lua listeners → display triggers → plugin handlers → CBS → regex scripts
-(`processScriptFull()` in `src/ts/process/scripts.ts`). Details: scripting-extensions.
+### Client/server storage protocols
 
-## Global invariants (break these and things corrupt quietly)
+- Chat metadata allowlists, patch normalization/hashing, and RisuSave constants have
+  coordinated client/server implementations. The plugin key policy is centralized in
+  `shared/plugin-save-key-policy.json`; other paired contracts still require lockstep
+  changes.
+- Browser caches are non-authoritative. Cache hits, segmented DB assembly, and list deltas
+  must fall back to a full authoritative read on malformed, missing, stale, or
+  unverifiable state.
+- The latest `/api/session` caller owns mutation rights. A displaced writer receives 423
+  and must reload or enter the frozen read-only recovery UI; stale dirty state must not be
+  replayed over the new writer.
+- Runtime KV/chat-row/asset/inlay mutations that can overlap a destructive import must use
+  the storage queue. The held import transaction and startup recovery are deliberate,
+  bounded exceptions.
 
-- **Client/server protocol code is duplicated and must change in lockstep**: chat-stub
-  metadata allowlists, `normalizeJSON()`/`calculateHash()` patch hashing, `RisuSaveType`
-  constants, and the asset "uncleanables" sets all exist in both `src/ts/` and
-  `server/node/`. Each detail doc calls out its pairs.
-- **Chat stubs vs placeholders**: `_stub: true` is the wire marker for chats without
-  messages; `_placeholder: true` is the runtime marker. Hydrate placeholders
-  (`ensureChatHydrated()`) before reading or mutating messages. Multiple guard layers
-  exist specifically to prevent chat-message loss — don't remove any of them.
-- **Persisted numeric enums** (`LLMFlags`, `LLMFormat`, `LLMTokenizer`) and stable IDs
-  (`chaId`, chat IDs, persona IDs, preset UUIDs): append new values, never renumber;
-  never key durable references by array index. Exception: `botPresetsId` stays
-  index-based for upstream backup compatibility.
-- **Two model regimes coexist**: legacy global `LLMModel` selection and per-chat
-  `ModelPreset` bindings with frozen profile snapshots. Many behaviors (tools, retries,
-  key resolution) are implemented separately in both.
-- **Streaming contract**: providers emit *cumulative* text snapshots, not deltas;
-  `editoutput` hooks run on every snapshot and must be repeat-safe.
-- **Browser caches are disposable and non-authoritative**: `resourceCache.ts` stores
-  only hash-addressed wire bytes. Cache negotiation, database segment assembly, and
-  list deltas must always fall back to a full authoritative server read on malformed,
-  missing, stale, or unverifiable state.
-- **Imports are exclusive replacement transactions**: every server mutation must enter
-  `queueStorageMutation()`. An active import refuses new writes with retryable
-  `503 IMPORT_IN_PROGRESS`; bypassing the barrier can acknowledge a write that later
-  disappears in the import rollback. Filesystem directory swaps are paired with the
-  SQLite transaction through `save/import_journal.json` and its KV marker.
-- **Recovery copies need a point-in-time source**: portable/server exports pin a
-  read-only SQLite WAL snapshot; automatic snapshots fold optimized plugin storage and
-  mark it with `pluginStorageFolded`. Keep snapshot assembly on the save-volume spool,
-  and never treat a missing referenced chat or a size-only filesystem match as proven
-  byte equality.
-- **External plugin keys must be well-formed Unicode** before UTF-8/base64url encoding.
-  Validate every destination before a mode transition writes or deletes anything;
-  lone UTF-16 surrogates otherwise collide with the replacement character.
-- **RisuAI compat quirks are intentional**: the misspelled `extentions` field, RPack
-  obfuscation, legacy save-format fallbacks, `GET /api/remove`, index-based
-  `botPresetsId`. Don't "fix" them without a coordinated compat plan (`test/compat/`
-  guards some of this).
-- **Svelte 5 conventions**: runes (`DBState`) and classic writable stores coexist;
-  files with runes need the `.svelte.ts` suffix. UI binds directly into `DBState.db`;
-  the save loop depends on deep reactive reads (`deepTouch`).
+### Plugin publications
+
+- Optimized plugin storage is one generation-bound publication: database mode and
+  `pluginStorageGeneration`, `plugin-storage/manifest.json`, value rows, and owner rows
+  move together. Prefix rows absent from the matching manifest are quarantined physical
+  data, not current state.
+- Use the dedicated versioned mutation, batch, generation, and staged-transition APIs.
+  Generic KV writes and ordinary database patches must not mutate the reserved
+  publication roots.
+- Never replay a storage or destructive-replacement request whose commit outcome is
+  unknown. Re-read or reload authoritative state and reconcile first.
+
+### Backup, import, and compatibility
+
+- Full and server-file exports require a valid live database and all referenced chats.
+  Automatic snapshots and partial jobs deliberately preserve a bare stub for an already
+  missing chat so damaged state still has a recovery point.
+- Full exports combine one pinned SQLite view with verified private filesystem copies.
+  Database assembly uses `POCKETRISU_SPOOL_DIR` or `save/.spool`; filesystem pins remain
+  under `save/.partial-export-spool`.
+- Imports are exclusive replacement transactions. Bounded ingress/staging, the abortable
+  import barrier, SQLite transaction, and filesystem swap journal are one safety protocol.
+- Upstream migration exports are intentionally lossy for PocketRisu-only inlays. RisuAI
+  quirks such as `extentions`, RPack framing, legacy save fallbacks, and index-based
+  `botPresetsId` are deliberate data-format contracts. The mutating `GET /api/remove` is
+  a separate PocketRisu browser/server compatibility contract.
+
+### Frontend conventions
+
+- Svelte 5 runes and classic writable stores coexist. Non-component TypeScript modules
+  that use runes need the `.svelte.ts` suffix. UI code binds directly into `DBState.db`,
+  and the save loop depends on `deepTouch()` establishing deep reactive dependencies.
+
+## Documentation maintenance
+
+Approximate file sizes were removed from the root map because fast-moving storage and
+plugin modules made them misleading. When code moves, prefer updating symbol ownership
+and change maps over refreshing every line number. Treat `docs/audit/` findings as
+historical evidence whose resolution must be checked against current code.

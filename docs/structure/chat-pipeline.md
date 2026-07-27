@@ -1,7 +1,7 @@
-# chat-pipeline
+# Chat pipeline
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-27 against `abee0232`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -11,14 +11,16 @@ The subsystem also contains prompt-card types and preset conversion, legacy text
 
 ## 2. Key files
 
-- `src/ts/process/index.svelte.ts` — ~1,937 lines; the main send/generation state machine.
+- `src/ts/process/index.svelte.ts` — the main send/generation state machine.
   - Defines the provider-neutral `OpenAIChat` and `MultiModal` request-message shapes at `src/ts/process/index.svelte.ts:31` and `src/ts/process/index.svelte.ts:43`.
   - Exposes UI coordination stores `doingChat`, `chatProcessStage`, and `abortChat` at `src/ts/process/index.svelte.ts:55`.
   - Exposes preview/debug state plus `lastActualInputTokens` at `src/ts/process/index.svelte.ts:58`. The developer sidebar displays this most recent final-prompt count alongside broader character/chat estimates.
   - `sendChat()` begins at `src/ts/process/index.svelte.ts:62`.
   - `systemizeChat()` converts user/assistant history into system messages for compatible prompt templates at `src/ts/process/index.svelte.ts:1918`.
 
-- `src/lib/ChatScreens/DefaultChatScreen.svelte` — ~1,393 lines; primary UI entry point.
+- `src/ts/process/request/request.ts` — provider-neutral request boundary, retry/fallback policy, ModelPreset dispatch, plugin replacers, and request-trigger execution.
+
+- `src/lib/ChatScreens/DefaultChatScreen.svelte` — primary UI entry point.
   - `send()` and `sendContinue()` select ordinary versus continuation generation at `src/lib/ChatScreens/DefaultChatScreen.svelte:321`.
   - `sendMain()` processes commands, attachments, input triggers, and `editinput` scripts before inserting the user message at `src/lib/ChatScreens/DefaultChatScreen.svelte:328`.
   - `reroll()` removes the previous generated turn, regenerates it, and records swipe alternatives at `src/lib/ChatScreens/DefaultChatScreen.svelte:448`.
@@ -26,14 +28,14 @@ The subsystem also contains prompt-card types and preset conversion, legacy text
   - The composer dispatches Enter and send-button actions at `src/lib/ChatScreens/DefaultChatScreen.svelte:1014` and `src/lib/ChatScreens/DefaultChatScreen.svelte:1087`.
   - File attachment results are inserted into the composer at `src/lib/ChatScreens/DefaultChatScreen.svelte:950`.
 
-- `src/lib/ChatScreens/Suggestion.svelte` — ~196 lines; automatic user-reply suggestions.
+- `src/lib/ChatScreens/Suggestion.svelte` — automatic user-reply suggestions.
   - Subscribes to `doingChat` and starts suggestion generation when the main generation becomes idle at `src/lib/ChatScreens/Suggestion.svelte:42`.
   - Builds a small prompt from the last ten messages at `src/lib/ChatScreens/Suggestion.svelte:49`.
   - Calls `requestChatData(..., 'submodel')` directly at `src/lib/ChatScreens/Suggestion.svelte:84`.
   - Persists parsed `- item` lines to `Chat.suggestMessages` at `src/lib/ChatScreens/Suggestion.svelte:89`.
   - Selecting a suggestion writes it into the main composer and optionally sends it at `src/lib/ChatScreens/Suggestion.svelte:157`.
 
-- `src/ts/process/prompt.ts` — ~486 lines; prompt-card types, token estimates, and external preset conversion.
+- `src/ts/process/prompt.ts` — prompt-card types, token estimates, and external preset conversion.
   - `PromptItem`, its card variants, and `PromptSettings` are defined at `src/ts/process/prompt.ts:7`.
   - `tokenizePreset()` estimates static prompt-template cost at `src/ts/process/prompt.ts:64`.
   - `detectPromptJSONType()` recognizes SillyTavern chat/context/instruct and parameter JSON at `src/ts/process/prompt.ts:89`.
@@ -41,7 +43,7 @@ The subsystem also contains prompt-card types and preset conversion, legacy text
   - `OobaParams` lists transferable text-generation-webui parameters at `src/ts/process/prompt.ts:241`.
   - `promptConvertion()` creates and installs a PocketRisu bot preset from uploaded JSON files at `src/ts/process/prompt.ts:277`.
 
-- `src/ts/tokenizer.ts` — ~574 lines; model-aware encoding and chat-message budgeting.
+- `src/ts/tokenizer.ts` — model-aware encoding and chat-message budgeting.
   - `encodeWithTokenizer()` explicitly selects a tokenizer implementation at `src/ts/tokenizer.ts:46`.
   - `encode()` selects based on the active model, custom tokenizer, or plugin provider and maintains an LRU result cache at `src/ts/tokenizer.ts:73`.
   - `tokenizeAccurate()` expands prompt placeholders before counting them at `src/ts/tokenizer.ts:359`.
@@ -50,72 +52,72 @@ The subsystem also contains prompt-card types and preset conversion, legacy text
   - `strongBan()` creates and persistently caches expanded token bans at `src/ts/tokenizer.ts:467`.
   - `getCharToken()` and `getChatToken()` provide UI/statistics estimates at `src/ts/tokenizer.ts:527` and `src/ts/tokenizer.ts:559`.
 
-- `src/ts/process/exampleMessages.ts` — ~67 lines; character-card example dialogue parser.
+- `src/ts/process/exampleMessages.ts` — character-card example dialogue parser.
   - `exampleMessage()` parses `<START>`, `{{user}}:`, `{{char}}:`, `<user>:`, and `<bot>:` records into `OpenAIChat[]` at `src/ts/process/exampleMessages.ts:5`.
 
-- `src/ts/process/stringlize.ts` — ~391 lines; legacy/instruct text serialization and response trimming.
+- `src/ts/process/stringlize.ts` — legacy/instruct text serialization and response trimming.
   - `stringlizeChat()` is a simple named transcript serializer at `src/ts/process/stringlize.ts:5`.
   - `stringlizeChatOba()` applies text-generation-webui prefixes and separators at `src/ts/process/stringlize.ts:38`.
   - `getStopStrings()` creates common user-turn stop sequences at `src/ts/process/stringlize.ts:100`.
   - `unstringlizeChat()` truncates generated text at the first detected speaker/system marker at `src/ts/process/stringlize.ts:132`.
   - `stringlizeAINChat()` and `unstringlizeAIN()` implement Japanese quote-oriented AIN formatting at `src/ts/process/stringlize.ts:208` and `src/ts/process/stringlize.ts:288`.
 
-- `src/ts/process/command.ts` — ~319 lines; slash-command preprocessing.
+- `src/ts/process/command.ts` — slash-command preprocessing.
   - `processMultiCommand()` splits unquoted `|` pipelines and passes each result to the next command at `src/ts/process/command.ts:11`.
   - `processCommand()` implements STScript-compatible commands, chat mutation, manual triggers, and `/multisend` at `src/ts/process/command.ts:42`.
   - `commandParser()` resolves positional arguments, `key=value` arguments, `{{pipe}}`, and `{{slot}}` at `src/ts/process/command.ts:297`.
 
-- `src/ts/process/infunctions.ts` — ~160 lines; expression evaluator used by the chat parser.
+- `src/ts/process/infunctions.ts` — expression evaluator used by the chat parser.
   - `calcString()` resolves parentheses and evaluates arithmetic, comparison, boolean, chat-variable (`$name`), and global-variable (`@name`) expressions at `src/ts/process/infunctions.ts:143`.
 
-- `src/ts/process/files/multisend.ts` — ~313 lines; composer-side file ingestion.
+- `src/ts/process/files/multisend.ts` — composer-side file ingestion.
   - `postChatFile()` opens the file picker or consumes supplied bytes, dispatching by extension at `src/ts/process/files/multisend.ts:194`.
   - Images, audio, and video are stored as inlay assets at `src/ts/process/files/multisend.ts:270`.
   - Text files are similarity-searched and embedded in a base64 `{{file::...}}` placeholder at `src/ts/process/files/multisend.ts:299`.
   - PO-file translation repeatedly invokes `sendChat()` through `sendPofile()` at `src/ts/process/files/multisend.ts:15`.
 
-- `src/ts/process/files/inlays.ts` — ~717 lines; durable multimodal asset storage and lookup.
+- `src/ts/process/files/inlays.ts` — durable multimodal asset storage and lookup.
   - `InlayAsset` and explorer-facing types are defined at `src/ts/process/files/inlays.ts:16`.
   - Assets use `NodeStorage` keys under `inlay/`, lightweight info under `inlay_info/`, and a device-sized memory LRU at `src/ts/process/files/inlays.ts:76`.
   - `postInlayAsset()` classifies and stores image/audio/video bytes at `src/ts/process/files/inlays.ts:412`.
   - `writeInlayImage()` downsizes images to at most 1,048,576 pixels and stores PNG or WebP according to settings at `src/ts/process/files/inlays.ts:438`.
   - `getInlayAsset()` returns a base64 data URI for request/display use at `src/ts/process/files/inlays.ts:490`.
-  - `setInlayAsset()` atomically updates the body, explorer info, and metadata stores at `src/ts/process/files/inlays.ts:600`.
+  - `setInlayAsset()` updates the body, explorer info, and metadata stores sequentially at `src/ts/process/files/inlays.ts:600`; callers must tolerate or repair a partial multi-record write.
   - `scanInlayReferences()` counts placeholder references across chat messages at `src/ts/process/files/inlays.ts:670`.
   - `supportsInlayImage()` checks the active model’s image-input flag at `src/ts/process/files/inlays.ts:697`.
 
-- `src/ts/process/files/inlayMeta.ts` — ~119 lines; inlay ownership/timestamp metadata.
+- `src/ts/process/files/inlayMeta.ts` — inlay ownership/timestamp metadata.
   - `InlayAssetMeta` is defined at `src/ts/process/files/inlayMeta.ts:6`.
   - Batch and single-item metadata APIs begin at `src/ts/process/files/inlayMeta.ts:86`.
   - `buildInlayMeta()` associates a new asset with the active character and chat while preserving original creation/ownership fields on overwrite at `src/ts/process/files/inlayMeta.ts:106`.
 
-- `src/ts/process/files/tests/inlays.test.ts` — ~674 lines; storage, conversion, resizing, explorer, and round-trip coverage.
+- `src/ts/process/files/tests/inlays.test.ts` — storage, conversion, resizing, explorer, and round-trip coverage.
   - Core storage tests start at `src/ts/process/files/tests/inlays.test.ts:141`.
   - Image-resize and pixel-limit tests start at `src/ts/process/files/tests/inlays.test.ts:497`.
   - Set/get and set/remove round-trip tests start at `src/ts/process/files/tests/inlays.test.ts:610`.
 
-- `src/ts/process/inlayScreen.ts` — ~97 lines; generated response commands for emotion and image modes.
+- `src/ts/process/inlayScreen.ts` — generated response commands for emotion and image modes.
   - `runInlayScreen()` converts `<Emotion>` commands or asynchronously turns `<ImgGen>` commands into stored inlay images at `src/ts/process/inlayScreen.ts:7`.
   - `updateInlayScreen()` supplies the corresponding model instructions at `src/ts/process/inlayScreen.ts:52`.
 
-- `src/ts/process/dynamicutils/pdf.ts` — ~64 lines; generic PDF rendering/text extraction.
+- `src/ts/process/dynamicutils/pdf.ts` — generic PDF rendering/text extraction.
   - `convertPdfToImages()` renders each page to a data URI at `src/ts/process/dynamicutils/pdf.ts:6`.
   - `extractPdfText()` returns individual PDF text items at `src/ts/process/dynamicutils/pdf.ts:45`.
 
-- `src/ts/process/templates/chatTemplate.ts` — ~101 lines; model-native Jinja chat templates.
+- `src/ts/process/templates/chatTemplate.ts` — model-native Jinja chat templates.
   - `chatTemplates` contains Llama, ChatML, Gemma, Mistral, Vicuna, and Alpaca templates at `src/ts/process/templates/chatTemplate.ts:6`.
   - `templateEffect` declares templates that reject system roles or require strict alternation at `src/ts/process/templates/chatTemplate.ts:17`.
   - `applyChatTemplate()` normalizes roles and renders the chosen Hugging Face Jinja template at `src/ts/process/templates/chatTemplate.ts:27`.
 
-- `src/ts/process/templates/jsonSchema.ts` — ~190 lines; structured-output schema conversion.
+- `src/ts/process/templates/jsonSchema.ts` — structured-output schema conversion.
   - `convertInterfaceToSchema()` converts a restricted TypeScript-interface syntax or parses raw JSON Schema at `src/ts/process/templates/jsonSchema.ts:5`.
   - Provider wrappers are built by `getOpenAIJSONSchema()` and `getGeneralJSONSchema()` at `src/ts/process/templates/jsonSchema.ts:124`.
   - `extractJSON()` trims JSON output and extracts a configured dotted field at `src/ts/process/templates/jsonSchema.ts:153`.
 
-- `src/ts/process/templates/templateCheck.ts` — ~80 lines; prompt-card validation.
+- `src/ts/process/templates/templateCheck.ts` — prompt-card validation.
   - `templateCheck()` warns about missing/duplicate main prompts, notes, descriptions, lorebooks, and disconnected chat ranges at `src/ts/process/templates/templateCheck.ts:3`.
 
-- `src/ts/process/templates/templates.ts` — ~430 lines; built-in bot presets.
+- `src/ts/process/templates/templates.ts` — built-in bot presets.
   - `prebuiltPresets` begins with the NovelAI preset at `src/ts/process/templates/templates.ts:5`, the legacy OAI defaults at `src/ts/process/templates/templates.ts:156`, and the current `OAI2` preset at `src/ts/process/templates/templates.ts:223`.
   - `prebuiltNAIpresets` contains default NovelAI sampler settings at `src/ts/process/templates/templates.ts:416`.
 
@@ -149,13 +151,15 @@ Prompt material is accumulated into named buckets at `src/ts/process/index.svelt
 |---|---|
 | `main` | Legacy `mainPrompt` or character `systemPrompt`, when no prompt-card template is active (`src/ts/process/index.svelte.ts:346`) |
 | `jailbreak` | Global jailbreak when enabled (`src/ts/process/index.svelte.ts:371`) |
+| `globalNote` | Global note material kept distinct from per-chat author notes |
 | `description` | Character description, embedding `additionalInformations()`, personality, scenario (`src/ts/process/index.svelte.ts:398`) |
 | `personaPrompt` | Active persona prompt (`src/ts/process/index.svelte.ts:482`) |
 | `authorNote` | Per-chat note or default author note (`src/ts/process/index.svelte.ts:378`) |
 | `lorebook` | Normal active lore entries from `loadLoreBookV3Prompt()` (`src/ts/process/index.svelte.ts:422`, `src/ts/process/index.svelte.ts:453`) |
 | `postEverything` | Chain-of-thought instruction, inlay-screen instruction, and depth-zero lore (`src/ts/process/index.svelte.ts:391`, `src/ts/process/index.svelte.ts:490`, `src/ts/process/index.svelte.ts:505`) |
 | `chats` / `lastChat` | Example dialogue, greeting, and processed stored history (`src/ts/process/index.svelte.ts:730`, `src/ts/process/index.svelte.ts:767`, `src/ts/process/index.svelte.ts:799`) |
-| `memory` | Memory messages separated from history when a prompt template contains a memory card (`src/ts/process/index.svelte.ts:997`, `src/ts/process/index.svelte.ts:1270`) |
+
+Memory messages are separated from ordinary history and later materialized by the prompt template's memory card; they are not an ordinary named prompt bucket (`src/ts/process/index.svelte.ts:997`, `src/ts/process/index.svelte.ts:1270`).
 
 Lorebook-specific injection points are handled without implementing lore selection here:
 
@@ -190,7 +194,7 @@ Text-file placeholders take a different route: `{{file::filename::base64}}` is d
 
 `ChatTokenizer` is initialized with a per-message framing estimate—five tokens for GPT-family IDs, otherwise three—and an output-token reservation (`src/ts/process/index.svelte.ts:243`).
 
-Budgeting happens in two passes:
+Output reservation is tracked separately from the final input-token count. Budgeting happens in two passes:
 
 1. Static prompt buckets, examples, greeting, and each converted history message are counted while `currentTokens` already includes reserved output and a 50-token safety margin (`src/ts/process/index.svelte.ts:536`, `src/ts/process/index.svelte.ts:570`, `src/ts/process/index.svelte.ts:730`, `src/ts/process/index.svelte.ts:936`).
 
@@ -327,7 +331,7 @@ Legacy multi-speaker history compatibility remains: character messages may carry
 
 - The early token pass reserves `maxResponseTokens + 50`; the final pass counts only actual input and records a clamped `outputTokens` estimate. That clamped value is not passed as `maxTokens` in the main `requestChatData()` call (`src/ts/process/index.svelte.ts:1365`, `src/ts/process/index.svelte.ts:1394`), so provider enforcement remains a request-layer concern.
 
-- History entries marked `removable` are deleted oldest-first only during final overflow correction (`src/ts/process/index.svelte.ts:1347`). Prompt/system material that alone exceeds the context produces an error.
+- During final overflow correction, the first `removable` entry in final prompt order is blanked repeatedly (`src/ts/process/index.svelte.ts:1347`). This commonly approximates oldest-first history removal but is controlled by the materialized prompt order. Prompt/system material that alone exceeds the context produces an error.
 
 - `ChatTokenizer.tokenizeChat()` counts `thoughts` only when explicitly called with `{countThoughts: true}` (`src/ts/tokenizer.ts:378`). The main pipeline uses the default, so extracted historical thought blocks are excluded from its budget.
 
@@ -341,7 +345,7 @@ Legacy multi-speaker history compatibility remains: character messages may carry
 
 - `writeInlayImage()` always re-encodes uploaded images and caps total pixels; it does not preserve the original image bytes or extension (`src/ts/process/files/inlays.ts:438`).
 
-- Inlay bodies, explorer summaries, and ownership metadata are separate NodeStorage records. Any new mutation path must keep all three synchronized as `setInlayAsset()` and `removeInlayAsset()` do (`src/ts/process/files/inlays.ts:600`).
+- Inlay bodies, explorer summaries, and ownership metadata are separate NodeStorage records. `setInlayAsset()` and `removeInlayAsset()` update them sequentially rather than as one transaction, so new mutation and duplication paths must define partial-failure recovery (`src/ts/process/files/inlays.ts:600`). Deep chat/package duplication can otherwise leave ownership metadata associated with the source chat.
 
 - The regular file picker omits PDF and XML even though dispatch cases exist (`src/ts/process/files/multisend.ts:198`, `src/ts/process/files/multisend.ts:247`). Drag/direct-byte callers can still reach those cases.
 
@@ -361,7 +365,13 @@ Legacy multi-speaker history compatibility remains: character messages may carry
 
 - `processScriptFull()` is run against each cumulative streamed snapshot, not only once at stream completion. Output regex/Lua/plugin hooks must be deterministic and safe to repeat.
 
+- Streaming and non-streaming responses do not pass through every post-processing hook in identical order. Review both branches when moving output triggers, inlay processing, TTS, or persistence checkpoints.
+
+- Preview modes avoid storing a generated assistant response, but they still enter prompt construction and its hooks; treat them as diagnostic execution, not a universally read-only operation.
+
 - Generation persistence is checkpointed independently of the provider stream. Do not restore a blanket `doingChat` save skip: it can make a new durable stub point at no chat row or leave an existing row at its pre-turn state. The checkpoint stage throttles writes while preserving row-before-stub ordering and a final idle save.
+
+- Losing writer authority during generation aborts persistence and must surface as a displaced-writer outcome. Do not keep mutating the local chat under the assumption that a later save can overwrite the active writer.
 
 - Aborting a stream clears `isStreaming` but does not remove the already-created partial character message (`src/ts/process/index.svelte.ts:1492`). A normal aborted send can leave partial output in history.
 
@@ -429,9 +439,9 @@ Legacy multi-speaker history compatibility remains: character messages may carry
 
 - To change when generated messages reach SQLite-backed persistence, inspect active-chat tracking at `src/ts/globalApi.svelte.ts:634` and row staging in `src/ts/storage/chatPersistStage.ts`, not the model pipeline.
 
-## Out of scope, noticed
+## 7. Related structure docs
 
-- `src/ts/process/request/` contains provider selection, retries, adapters, tools, stop strings, and wire-format details beyond the `requestChatData()` boundary.
-- `src/ts/process/lorebook.svelte.ts`, `src/ts/process/memory/`, `src/ts/process/scripts.ts`, `src/ts/process/scriptings.ts`, and `src/ts/process/triggers.ts` implement the hook subsystems named above.
-- `src/ts/translator/` and `src/lib/ChatScreens/ChatBody.svelte` own translation and display parsing.
-- `src/ts/globalApi.svelte.ts`, `src/ts/storage/`, and the Node server own reactive persistence, chat hydration, NodeStorage transport, and SQLite writes.
+- [Model providers](model-providers.md) covers selection, retries, adapters, tools, and provider wire formats beyond `requestChatData()`.
+- [Memory and lorebook](memory-lorebook.md) and [scripting and extensions](scripting-extensions.md) cover the principal prompt hooks.
+- [Media and translation](media-translation.md) covers inlays, translation, and display parsing.
+- [Client storage](client-storage.md) and [server backend](server-backend.md) cover chat hydration, save outcomes, writer fencing, and SQLite persistence.

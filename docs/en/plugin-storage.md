@@ -67,8 +67,13 @@ if (result.status === 'conflict') {
 ```
 
 A `missing` read uses an absence CAS (`expectedRevision: null`). If another
-row already exists—or appears before the write—the server returns a conflict
+row already exists—or appears before the write—the host returns a conflict
 instead of overwriting it. Passing a `failed` read is a no-op.
+
+Guarded/versioned values must be strict detached JSON in both inline and
+optimized modes. The legacy basic inline `getItem()`/`setItem()` path can
+retain structured-clone-compatible values, but code intended to survive mode
+changes should use JSON-safe data consistently.
 
 For a single-key update, `updateItem()` uses the host's fair migration barrier,
 performs an initial versioned read plus a final pre-publication re-read, and
@@ -119,3 +124,5 @@ authoritative `missing` result, never as a catch fallback.
 These helpers protect plugins that adopt them. The host cannot infer whether
 an unconditional legacy `setItem()` was derived from a swallowed read error,
 so existing third-party plugins must migrate their compound update paths.
+
+For ambiguous mutation outcomes, see [Safe V3 plugin-storage mutations](../plugin-storage-mutation-outcomes.md). For multi-row publication and generation rules, see the [plugin-storage architecture](../structure/plugin-storage.md#immutable-generations).

@@ -1,7 +1,7 @@
-# scripting-extensions
+# Scripting and extensions
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-27 against `abee0232`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -11,8 +11,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
 
 ### CBS and script execution
 
-- `src/ts/cbs.ts` — approximately 2,489 lines.
-  - Declares the dependency-injected CBS registration contract, not the parser itself.
+- `src/ts/cbs.ts` — Declares the dependency-injected CBS registration contract, not the parser itself.
   - `matcherArg` carries parsing context such as character, chat index, temporary variables, display/tokenization mode, `runVar`, and CBS conditions (`src/ts/cbs.ts:51`).
   - `RegisterCallback` is the callback signature for individual CBS functions (`src/ts/cbs.ts:73`).
   - `CBSRegisterArg` lists the application services exposed to CBS implementations (`src/ts/cbs.ts:78`).
@@ -24,7 +23,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - `bkspc` and `erase` mutate the parser’s current output through `getNested`/`setNestedRoot` (`src/ts/cbs.ts:2165`, `src/ts/cbs.ts:2197`).
   - Block constructs such as `#when`, `:else`, `#puredisplay`, `#escape`, and `#each` are registered as documentation-only entries because the parser implements them specially (`src/ts/cbs.ts:2388`, `src/ts/cbs.ts:2428`, `src/ts/cbs.ts:2445`, `src/ts/cbs.ts:2452`, `src/ts/cbs.ts:2464`).
 
-- `src/ts/parser/parser.svelte.ts` — parser implementation used by this subsystem; approximately 1,994 lines.
+- `src/ts/parser/parser.svelte.ts` — parser implementation used by this subsystem.
   - `matcherMap` is the actual built-in CBS function registry (`src/ts/parser/parser.svelte.ts:1150`).
   - `initMatcher()` calls `registerCBS()` once and stores each callback under its canonical name and aliases; `doc_only` entries are deliberately skipped (`src/ts/parser/parser.svelte.ts:1152`).
   - `matcher()` normalizes names by lowercasing and removing whitespace, `_`, and `-`; it accepts either `:` or `::` argument separators (`src/ts/parser/parser.svelte.ts:1202`).
@@ -33,8 +32,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - The parser maintains nested buffers and block stacks (`src/ts/parser/parser.svelte.ts:1737`), caps recursive function calls at 20 (`src/ts/parser/parser.svelte.ts:1758`), and supports `#func`/`call::` user functions (`src/ts/parser/parser.svelte.ts:1883`, `src/ts/parser/parser.svelte.ts:1907`).
   - `ParseMarkdown()` invokes display scripts before inlay/tool rendering and markdown sanitization (`src/ts/parser/parser.svelte.ts:903`, `src/ts/parser/parser.svelte.ts:921`).
 
-- `src/ts/process/scripts.ts` — approximately 392 lines.
-  - `ScriptMode` defines `editinput`, `editoutput`, `editprocess`, and `editdisplay` (`src/ts/process/scripts.ts:18`).
+- `src/ts/process/scripts.ts` — `ScriptMode` defines `editinput`, `editoutput`, `editprocess`, and `editdisplay` (`src/ts/process/scripts.ts:18`).
   - `processScript()` is the string-only convenience wrapper (`src/ts/process/scripts.ts:26`).
   - `exportRegex()` and `importRegex()` serialize regex-script bundles (`src/ts/process/scripts.ts:30`, `src/ts/process/scripts.ts:41`).
   - `resetScriptCache()` clears the transformation cache (`src/ts/process/scripts.ts:95`).
@@ -45,8 +43,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - `<order n>` metadata is parsed and sorted descending before execution (`src/ts/process/scripts.ts:297`, `src/ts/process/scripts.ts:333`).
   - Dynamic asset fuzzy matching runs after regex replacement (`src/ts/process/scripts.ts:346`).
 
-- `src/ts/process/scriptings.ts` — approximately 1,519 lines.
-  - `runScripted()` owns the Lua/Python execution environment and its host API (`src/ts/process/scriptings.ts:52`).
+- `src/ts/process/scriptings.ts` — `runScripted()` owns the Lua/Python execution environment and its host API (`src/ts/process/scriptings.ts:52`).
   - Engines are cached by mode and serialized through a per-engine `Mutex` (`src/ts/process/scriptings.ts:78`, `src/ts/process/scriptings.ts:80`, `src/ts/process/scriptings.ts:1180`).
   - The API uses ephemeral UUID access keys checked against `ScriptingSafeIds`, `ScriptingEditDisplayIds`, and `ScriptingLowLevelIds` (`src/ts/process/scriptings.ts:22`, `src/ts/process/scriptings.ts:1029`).
   - Ordinary safe APIs cover chat variables, chat mutation, tokenization, alerts, reloads, and CBS parsing (`src/ts/process/scriptings.ts:105`, `src/ts/process/scriptings.ts:154`, `src/ts/process/scriptings.ts:212`, `src/ts/process/scriptings.ts:245`, `src/ts/process/scriptings.ts:267`).
@@ -56,8 +53,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - `runLuaButtonTrigger()` invokes `onButtonClick` across Lua triggers (`src/ts/process/scriptings.ts:1407`).
   - `PyodideContext` runs experimental Python in a worker and proxies declared APIs (`src/ts/process/scriptings.ts:1431`).
 
-- `src/ts/process/triggers.ts` — approximately 2,802 lines.
-  - `triggerscript` defines event type, conditions, effects, and optional low-level access (`src/ts/process/triggers.ts:21`).
+- `src/ts/process/triggers.ts` — `triggerscript` defines event type, conditions, effects, and optional low-level access (`src/ts/process/triggers.ts:21`).
   - `triggerEffect` combines legacy V1 actions, Lua/code entries, and V2 actions (`src/ts/process/triggers.ts:31`).
   - V1 condition and action shapes occupy the beginning of the file; V2’s structured control-flow/action types begin with `triggerV2Header` (`src/ts/process/triggers.ts:177`).
   - `displayAllowList` and `requestAllowList` restrict these side-effect-sensitive modes to state inspection/mutation plus a safe calculation subset (`src/ts/process/triggers.ts:986`, `src/ts/process/triggers.ts:1024`, `src/ts/process/triggers.ts:1030`).
@@ -72,8 +68,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
 
 ### Plugin framework
 
-- `src/ts/plugins/plugins.svelte.ts` — approximately 989 lines.
-  - `RisuPlugin` stores source, metadata headers, arguments, API version, update URL, enablement, and IPC allowlist (`src/ts/plugins/plugins.svelte.ts:17`, `src/ts/plugins/plugins.svelte.ts:36`).
+- `src/ts/plugins/plugins.svelte.ts` — `RisuPlugin` stores source, metadata headers, arguments, API version, update URL, enablement, and IPC allowlist (`src/ts/plugins/plugins.svelte.ts:17`, `src/ts/plugins/plugins.svelte.ts:36`).
   - `importPlugin()` parses plugin headers, optionally transpiles TypeScript, applies V2.1 safety checks, and persists/reloads the plugin (`src/ts/plugins/plugins.svelte.ts:129`).
   - Supported API headers are `2.0`, `2.1`, and `3.0`; missing `//@api` defaults to 2.0 behavior (`src/ts/plugins/plugins.svelte.ts:182`, `src/ts/plugins/plugins.svelte.ts:193`).
   - `loadPlugins()` divides enabled plugins into V2/V2.1 and V3 loaders (`src/ts/plugins/plugins.svelte.ts:435`).
@@ -83,43 +78,35 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - `addProvider()` registers a provider callback and optional tokenizer metadata (`src/ts/plugins/plugins.svelte.ts:530`).
   - `loadV2Plugin()` unloads prior hooks and executes transformed source through `new Function`; V2.0 execution additionally requires `allowV2Plugin` (`src/ts/plugins/plugins.svelte.ts:813`, `src/ts/plugins/plugins.svelte.ts:885`, `src/ts/plugins/plugins.svelte.ts:899`).
 
-- `src/ts/plugins/pluginSafety.ts` — approximately 174 lines.
-  - `checkCodeSafety()` parses V2.1 source with Acorn, rewrites sensitive globals, and caches the transformed result by source hash/checker version (`src/ts/plugins/pluginSafety.ts:59`).
+- `src/ts/plugins/pluginSafety.ts` — `checkCodeSafety()` parses V2.1 source with Acorn, rewrites sensitive globals, and caches the transformed result by source hash/checker version (`src/ts/plugins/pluginSafety.ts:59`).
   - It rejects direct `eval`, `new Function`, `sessionStorage`, and `cookieStore` (`src/ts/plugins/pluginSafety.ts:21`).
   - Identifiers such as `window`, `globalThis`, `localStorage`, `indexedDB`, `document`, `Function`, `prototype`, and `constructor` are rewritten to safe aliases (`src/ts/plugins/pluginSafety.ts:96`).
   - The checker explicitly appends a static-analysis limitation warning, making user review part of the V2.1 import path (`src/ts/plugins/pluginSafety.ts:155`).
 
-- `src/ts/plugins/pluginSafeClass.ts` — approximately 441 lines.
-  - `SafeLocalStorage` places V2 storage in the shared `safe_plugin_` localStorage namespace (`src/ts/plugins/pluginSafeClass.ts:8`).
+- `src/ts/plugins/pluginSafeClass.ts` — `SafeLocalStorage` places V2 storage in the shared `safe_plugin_` localStorage namespace (`src/ts/plugins/pluginSafeClass.ts:8`).
   - `SafeLocalPluginStorage` provides asynchronous persistent storage for V3 and records best-effort owner metadata on writes (`src/ts/plugins/pluginSafeClass.ts:50`).
   - `SafeIdbFactory` prefixes IndexedDB database names with `safe_plugin_` (`src/ts/plugins/pluginSafeClass.ts:102`).
   - `tagWhitelist` controls DOM element creation (`src/ts/plugins/pluginSafeClass.ts:126`).
   - The V2 `SafeDocument` restricts element creation, anchors, and event names, although many query operations still return underlying DOM objects (`src/ts/plugins/pluginSafeClass.ts:304`).
 
-- `src/ts/plugins/pluginMemoryOptimization.ts` — 31 lines.
-  - Encodes the compatibility gate for `optimizePluginMemory`: enabled V2/V2.1 plugins block the mode, imports of those versions are disabled while it is active, and attempts to enable them are refused. V3 plugins remain compatible because their save API is asynchronous.
+- `src/ts/plugins/pluginMemoryOptimization.ts` — Encodes the compatibility gate for `optimizePluginMemory`: enabled V2/V2.1 plugins block the mode, imports of those versions are disabled while it is active, and attempts to enable them are refused. V3 plugins remain compatible because their save API is asynchronous.
 
-- `src/ts/plugins/pluginSaveStorage.ts` — approximately 311 lines.
-  - Routes save-backed plugin values to inline `Database.pluginCustomStorage` or external encoded `pluginsave/*.json` rows based on `optimizePluginMemory`.
-  - Serializes V3/viewer operations and mode transitions through one promise queue. `reconcilePluginStorageMode()` externalizes rows before removing inline copies, or saves complete inline copies before deleting rows, so interrupted transitions leave duplicates rather than data loss.
-  - Externalized reads opt into the verified browser resource cache; key names use reversible unpadded base64url components shared with the server backup/ingest code.
-  - Before externalization mutates either backend, it validates every value/metadata destination and rejects ill-formed Unicode or an encoded collision (`src/ts/plugins/pluginSaveStorage.ts:208-224`; `src/ts/storage/persistentKv.ts:16-27`).
+- `src/ts/plugins/pluginSaveStorage.ts` — Routes save-backed values between inline database maps and externally published `pluginsave/` rows. It owns the manifest/generation authority model, optimistic revisions, batch coordination, staged mode transitions, and boot reconciliation.
+- `src/ts/storage/pluginStorageMutation.ts` and `pluginStorageBatch.ts` — Encode compare-and-set and all-or-nothing multi-key requests for the server authority.
+- `src/ts/plugins/pluginStorageRecovery.ts` — Publishes reconciliation/recovery state to settings and maintenance UI.
 
-- `src/ts/plugins/pluginStorageMeta.ts` — approximately 164 lines.
-  - Maintains sidecar ownership metadata without changing stored plugin values (`src/ts/plugins/pluginStorageMeta.ts:1`).
+- `src/ts/plugins/pluginStorageMeta.ts` — Maintains sidecar ownership metadata without changing stored plugin values (`src/ts/plugins/pluginStorageMeta.ts:1`).
   - Save-local ownership follows the same inline versus `pluginsave-meta/` backend as plugin values; local and persistent-IDB plugin stores keep their established metadata paths.
 
-- `src/ts/plugins/apiV3/factory.ts` — approximately 654 lines.
-  - `GUEST_BRIDGE_SCRIPT` constructs the iframe-side `risuai`/`Risuai` proxy and RPC protocol (`src/ts/plugins/apiV3/factory.ts:38`).
+- `src/ts/plugins/apiV3/factory.ts` — `GUEST_BRIDGE_SCRIPT` constructs the iframe-side `risuai`/`Risuai` proxy and RPC protocol (`src/ts/plugins/apiV3/factory.ts:38`).
   - Callback functions, abort signals, transferable streams, and remote class instances have explicit bridge representations (`src/ts/plugins/apiV3/factory.ts:46`, `src/ts/plugins/apiV3/factory.ts:84`).
   - `SandboxHost` owns iframe lifecycle and host-side dispatch (`src/ts/plugins/apiV3/factory.ts:291`).
-  - Strict teardown closes RPC immediately. Legacy compatibility adds a bounded draining state that admits only storage flushes and cleanup-oriented root/remote-instance methods before final termination.
+  - Strict teardown blocks ordinary RPC but retains a narrow storage authority while `onUnload` drains. Legacy compatibility keeps the broader cleanup-oriented bridge available for up to five seconds before final termination.
   - Remote-required instances are stored in an instance registry and surfaced as proxy references (`src/ts/plugins/apiV3/factory.ts:361`).
-  - `run()` applies an iframe sandbox allowing scripts, modals, and downloads, plus a CSP with `connect-src 'none'`, then executes the bridge and plugin source in `srcdoc` (`src/ts/plugins/apiV3/factory.ts:483`, `src/ts/plugins/apiV3/factory.ts:498`, `src/ts/plugins/apiV3/factory.ts:606`).
+  - `run()` applies an iframe sandbox allowing scripts, modals, and downloads, plus a CSP with `connect-src 'none'`, then executes the bridge and plugin source in `srcdoc`. The CSP blocks iframe-originated fetch/XHR/WebSocket connections; it does not make every resource type or download inert (`src/ts/plugins/apiV3/factory.ts:483`, `src/ts/plugins/apiV3/factory.ts:498`, `src/ts/plugins/apiV3/factory.ts:606`).
   - `terminate()` removes the iframe and clears remote/callback state (`src/ts/plugins/apiV3/factory.ts:645`).
 
-- `src/ts/plugins/apiV3/v3.svelte.ts` — approximately 1,533 lines.
-  - `SafeElement` exposes remotely proxied DOM operations; HTML setters use DOMPurify (`src/ts/plugins/apiV3/v3.svelte.ts:59`, `src/ts/plugins/apiV3/v3.svelte.ts:230`).
+- `src/ts/plugins/apiV3/v3.svelte.ts` — `SafeElement` exposes remotely proxied DOM operations; HTML setters use DOMPurify (`src/ts/plugins/apiV3/v3.svelte.ts:59`, `src/ts/plugins/apiV3/v3.svelte.ts:230`).
   - `SafeDocument` restricts created tags and sanitizes anchor protocols (`src/ts/plugins/apiV3/v3.svelte.ts:353`).
   - Plugin unload handling cleans callbacks, UI, and iframe instances (`src/ts/plugins/apiV3/v3.svelte.ts:481`, `src/ts/plugins/apiV3/v3.svelte.ts:514`).
   - V3 unload uses a one-second strict grace period or a five-second legacy-compatibility grace period; both paths forcibly terminate the iframe afterward.
@@ -136,22 +123,18 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - `loadV3Plugins()` unloads all current instances before parallel reload (`src/ts/plugins/apiV3/v3.svelte.ts:1489`).
   - `executePluginV3()` creates the hidden iframe and starts its `SandboxHost` (`src/ts/plugins/apiV3/v3.svelte.ts:1497`).
 
-- `src/ts/plugins/apiV3/risuai.d.ts` — approximately 1,979 lines.
-  - Authoritative developer-facing V3 type surface; all plugin-side API and remote-object calls return promises (`src/ts/plugins/apiV3/risuai.d.ts:1`).
+- `src/ts/plugins/apiV3/risuai.d.ts` — Authoritative developer-facing V3 type surface; all plugin-side API and remote-object calls return promises (`src/ts/plugins/apiV3/risuai.d.ts:1`).
   - MCP API declarations begin around `src/ts/plugins/apiV3/risuai.d.ts:98`.
   - The public `RisuaiAPI` interface begins around `src/ts/plugins/apiV3/risuai.d.ts:1177`.
   - Provider, TTS, scripts, replacers, MCP, LLM, storage, UI, and IPC declarations occupy `src/ts/plugins/apiV3/risuai.d.ts:1600` onward.
 
-- `src/ts/plugins/apiV3/developMode.ts` — approximately 56 lines.
-  - `hotReloadPluginFiles()` polls a selected JS/TS file every 500 ms and re-imports it; only V3 hot reload is accepted by `importPlugin()` (`src/ts/plugins/apiV3/developMode.ts:5`, `src/ts/plugins/apiV3/developMode.ts:32`).
+- `src/ts/plugins/apiV3/developMode.ts` — `hotReloadPluginFiles()` polls a selected JS/TS file every 500 ms and re-imports it; only V3 hot reload is accepted by `importPlugin()` (`src/ts/plugins/apiV3/developMode.ts:5`, `src/ts/plugins/apiV3/developMode.ts:32`).
 
-- `src/ts/plugins/apiV3/transpiler.ts` — approximately 9 lines.
-  - `pluginCodeTranspiler()` strips TypeScript syntax with Sucrase (`src/ts/plugins/apiV3/transpiler.ts:1`).
+- `src/ts/plugins/apiV3/transpiler.ts` — `pluginCodeTranspiler()` strips TypeScript syntax with Sucrase (`src/ts/plugins/apiV3/transpiler.ts:1`).
 
 ### MCP support
 
-- `src/ts/process/mcp/mcp.ts` — approximately 287 lines.
-  - `MCPs` is the live client registry keyed by module URL/identifier (`src/ts/process/mcp/mcp.ts:16`).
+- `src/ts/process/mcp/mcp.ts` — `MCPs` is the live client registry keyed by module URL/identifier (`src/ts/process/mcp/mcp.ts:16`).
   - `initializeMCPs()` reconciles enabled module MCP URLs, additional request URLs, internal clients, plugin clients, and remote HTTP clients (`src/ts/process/mcp/mcp.ts:18`).
   - Internal identifiers are dispatched at `src/ts/process/mcp/mcp.ts:33`; plugin clients at `src/ts/process/mcp/mcp.ts:71`; remote/`stdio:` URL handling at `src/ts/process/mcp/mcp.ts:79`.
   - `getMCPTools()` aggregates tool schemas and tags each with its source URL (`src/ts/process/mcp/mcp.ts:137`).
@@ -159,8 +142,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - `getTools()`/`callTool()` are model-request-facing wrappers (`src/ts/process/mcp/mcp.ts:178`, `src/ts/process/mcp/mcp.ts:183`).
   - `encodeToolCall()` and `decodeToolCall()` persist model-visible `<tool_call>` history markers outside the chat text (`src/ts/process/mcp/mcp.ts:259`, `src/ts/process/mcp/mcp.ts:266`).
 
-- `src/ts/process/mcp/mcplib.ts` — approximately 859 lines.
-  - Defines MCP prompt/tool/JSON-RPC and multimodal result types (`src/ts/process/mcp/mcplib.ts:5`, `src/ts/process/mcp/mcplib.ts:16`, `src/ts/process/mcp/mcplib.ts:23`, `src/ts/process/mcp/mcplib.ts:53`).
+- `src/ts/process/mcp/mcplib.ts` — Defines MCP prompt/tool/JSON-RPC and multimodal result types (`src/ts/process/mcp/mcplib.ts:5`, `src/ts/process/mcp/mcplib.ts:16`, `src/ts/process/mcp/mcplib.ts:23`, `src/ts/process/mcp/mcplib.ts:53`).
   - `MCPToolHandler` is the handler base used by Risu-access tools (`src/ts/process/mcp/mcplib.ts:75`).
   - `MCPClient` implements remote HTTP/SSE MCP transport (`src/ts/process/mcp/mcplib.ts:80`).
   - `request()` handles JSON-RPC, sessions, bearer authentication, streamed responses, and custom transports (`src/ts/process/mcp/mcplib.ts:228`).
@@ -169,35 +151,29 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - `getToolList()` paginates and caches `tools/list` (`src/ts/process/mcp/mcplib.ts:782`).
   - `callTool()` sends `tools/call` and normalizes RPC errors into text results (`src/ts/process/mcp/mcplib.ts:822`).
 
-- `src/ts/process/mcp/internalmcp.ts` — approximately 54 lines.
-  - `MCPClientLike` is the common adapter for built-in and plugin-provided tools (`src/ts/process/mcp/internalmcp.ts:8`).
+- `src/ts/process/mcp/internalmcp.ts` — `MCPClientLike` is the common adapter for built-in and plugin-provided tools (`src/ts/process/mcp/internalmcp.ts:8`).
 
-- `src/ts/process/mcp/pluginmcp.ts` — approximately 57 lines.
-  - `CustomPluginMCPClient` adapts V3 plugin callbacks to `MCPClientLike` (`src/ts/process/mcp/pluginmcp.ts:6`).
+- `src/ts/process/mcp/pluginmcp.ts` — `CustomPluginMCPClient` adapts V3 plugin callbacks to `MCPClientLike` (`src/ts/process/mcp/pluginmcp.ts:6`).
   - `registerMCPModule()` requires a `plugin:` identifier and stores the client in `registeredCustomPluginMCPs` (`src/ts/process/mcp/pluginmcp.ts:36`).
   - `unregisterMCPModule()` removes the registration (`src/ts/process/mcp/pluginmcp.ts:56`).
 
-- `src/ts/process/mcp/risuaccess/client.ts` — approximately 108 lines.
-  - `RisuAccessClient` combines character, chat, and module handlers and publishes detailed Risu-specific instructions (`src/ts/process/mcp/risuaccess/client.ts:7`).
+- `src/ts/process/mcp/risuaccess/client.ts` — `RisuAccessClient` combines character, chat, and module handlers and publishes detailed Risu-specific instructions (`src/ts/process/mcp/risuaccess/client.ts:7`).
   - Tools are aggregated and dispatched through the handlers at `src/ts/process/mcp/risuaccess/client.ts:76` and `src/ts/process/mcp/risuaccess/client.ts:84`.
 
-- `src/ts/process/mcp/risuaccess/characters.ts` — approximately 992 lines.
-  - `CharacterHandler` exposes character listing/info, lorebook, regex, Lua, and asset mutation tools (`src/ts/process/mcp/risuaccess/characters.ts:9`).
+- `src/ts/process/mcp/risuaccess/characters.ts` — `CharacterHandler` exposes character listing/info, lorebook, regex, Lua, and asset mutation tools (`src/ts/process/mcp/risuaccess/characters.ts:9`).
   - Tool schemas begin at `src/ts/process/mcp/risuaccess/characters.ts:14`; dispatch begins at `src/ts/process/mcp/risuaccess/characters.ts:335`.
 
-- `src/ts/process/mcp/risuaccess/chats.ts` — approximately 74 lines.
-  - `ChatHandler` exposes `risu-get-chat-history` (`src/ts/process/mcp/risuaccess/chats.ts:5`).
+- `src/ts/process/mcp/risuaccess/chats.ts` — `ChatHandler` exposes `risu-get-chat-history` (`src/ts/process/mcp/risuaccess/chats.ts:5`).
 
-- `src/ts/process/mcp/risuaccess/modules.ts` — approximately 844 lines.
-  - `ModuleHandler` exposes module info plus lorebook, regex, and Lua read/write/delete tools (`src/ts/process/mcp/risuaccess/modules.ts:14`).
+- `src/ts/process/mcp/risuaccess/modules.ts` — `ModuleHandler` exposes module info plus lorebook, regex, and Lua read/write/delete tools (`src/ts/process/mcp/risuaccess/modules.ts:14`).
   - Tool schemas begin at `src/ts/process/mcp/risuaccess/modules.ts:19`; dispatch begins at `src/ts/process/mcp/risuaccess/modules.ts:307`.
 
 - Built-in provider clients:
-  - `src/ts/process/mcp/aiaccess.ts` — approximately 83 lines; `AIAccessClient` exposes nested main/aux LLM calls through `runLLM` (`src/ts/process/mcp/aiaccess.ts:7`, `src/ts/process/mcp/aiaccess.ts:53`).
-  - `src/ts/process/mcp/dice.ts` — approximately 60 lines; `DiceClient` exposes `rollDice` (`src/ts/process/mcp/dice.ts:4`).
-  - `src/ts/process/mcp/graphmem.ts` — approximately 165 lines; `GraphMemClient` stores graph memory in chat variables and searches it with embeddings (`src/ts/process/mcp/graphmem.ts:12`, `src/ts/process/mcp/graphmem.ts:87`, `src/ts/process/mcp/graphmem.ts:111`).
-  - `src/ts/process/mcp/googlesearchclient.ts` — approximately 266 lines; prompts for Custom Search credentials and exposes web/image search (`src/ts/process/mcp/googlesearchclient.ts:31`, `src/ts/process/mcp/googlesearchclient.ts:43`, `src/ts/process/mcp/googlesearchclient.ts:66`).
-  - `src/ts/process/mcp/filesystemclient.ts` — approximately 896 lines; scopes file operations to a user-selected File System Access API directory and exposes read/write/search/copy/move/info/tree tools (`src/ts/process/mcp/filesystemclient.ts:4`, `src/ts/process/mcp/filesystemclient.ts:15`, `src/ts/process/mcp/filesystemclient.ts:39`, `src/ts/process/mcp/filesystemclient.ts:252`).
+  - `src/ts/process/mcp/aiaccess.ts` — `AIAccessClient` exposes nested main/aux LLM calls through `runLLM` (`src/ts/process/mcp/aiaccess.ts:7`, `src/ts/process/mcp/aiaccess.ts:53`).
+  - `src/ts/process/mcp/dice.ts` — `DiceClient` exposes `rollDice` (`src/ts/process/mcp/dice.ts:4`).
+  - `src/ts/process/mcp/graphmem.ts` — `GraphMemClient` stores graph memory in chat variables and searches it with embeddings (`src/ts/process/mcp/graphmem.ts:12`, `src/ts/process/mcp/graphmem.ts:87`, `src/ts/process/mcp/graphmem.ts:111`).
+  - `src/ts/process/mcp/googlesearchclient.ts` — prompts for Custom Search credentials and exposes web/image search (`src/ts/process/mcp/googlesearchclient.ts:31`, `src/ts/process/mcp/googlesearchclient.ts:43`, `src/ts/process/mcp/googlesearchclient.ts:66`).
+  - `src/ts/process/mcp/filesystemclient.ts` — scopes file operations to a user-selected File System Access API directory and exposes read/write/search/copy/move/info/tree tools (`src/ts/process/mcp/filesystemclient.ts:4`, `src/ts/process/mcp/filesystemclient.ts:15`, `src/ts/process/mcp/filesystemclient.ts:39`, `src/ts/process/mcp/filesystemclient.ts:252`).
 
 ## 3. Architecture & data flow
 
@@ -229,7 +205,7 @@ The source ordering is concrete at `src/ts/process/scripts.ts:102-135`.
 Pipeline call sites are:
 
 - `editprocess`: each stored history message and the first greeting while constructing the model prompt (`src/ts/process/index.svelte.ts:772`, `src/ts/process/index.svelte.ts:801`).
-- `editoutput`: every streaming update and completed response before it is stored (`src/ts/process/index.svelte.ts:1482`, `src/ts/process/index.svelte.ts:1533`).
+- `editoutput`: each cumulative streaming response snapshot and the completed non-streaming response before storage (`src/ts/process/index.svelte.ts:1482`, `src/ts/process/index.svelte.ts:1533`).
 - `editdisplay`: every rendered chat message through `ParseMarkdown()`, without intending to mutate stored content (`src/ts/parser/parser.svelte.ts:921`).
 - `editinput`: `DefaultChatScreen.sendMain()` calls the `processScript()` wrapper for non-empty character-chat input immediately before appending the user message (`src/lib/ChatScreens/DefaultChatScreen.svelte:368-380`).
 
@@ -270,25 +246,13 @@ Lua edit listeners register through `listenEdit(type, func)` and are called thro
 7. Request dispatch recognizes `LLMFormat.Plugin`, resolves the provider name, and invokes its callback with formatted messages, model parameters, and the abort signal (`src/ts/process/request/request.ts:459`, `src/ts/process/request/request.ts:1336`).
 8. Provider output may be a string or `ReadableStream<string>` and is adapted back into PocketRisu’s request result format (`src/ts/process/request/request.ts:1374`, `src/ts/process/request/request.ts:1388`).
 
-### Optimized plugin save storage
+### Plugin save storage
 
-The optional automatic-conversion setting retries ordinary optimized writes after strict validation fails. It maps Date to ISO text, Map to entry arrays, Set to arrays, BigInt to decimal text, and undefined/non-finite numbers/array holes to null. Functions, circular references, accessors, symbols, and custom classes remain errors; compound/versioned APIs and mode transitions remain strictly JSON-only.
+The persisted `Database.optimizePluginMemory` flag chooses between inline plugin maps and external rows. External storage is published as an exact manifest row set under a fresh opaque generation ID; writers use version guards, compare-and-set, and batch mutations. Mode changes stage and validate the complete destination before publishing it, while boot recovery reconciles the manifest, database generation, and abandoned staging data.
 
-The persisted `Database.optimizePluginMemory` flag changes only the save-backed plugin storage API. When false, values and ownership metadata remain in `pluginCustomStorage`/`pluginStorageMeta` inside the main database, and the basic V3 get/set plus database bridge retain the legacy structured-clone value behavior. When true, each value becomes `pluginsave/<base64url(key)>.json` and each owner record becomes `pluginsave-meta/<base64url(key)>.json`; external value reads may use the verified browser cache. Optimized writes accept only detached JSON values and enforce the per-value limit. An incompatible runtime write returns `PLUGIN_STORAGE_VALUE_UNSUPPORTED` and shows an actionable notification deduplicated per error kind and plugin load; enabling optimization over incompatible existing data fails before mutation with the same actionable code. Versioned, atomic, and generation helpers remain JSON-only in either mode because their revision and content hashes require canonical JSON bytes.
+V2/V2.1 plugins remain inline because their storage facade is synchronous. V3 storage is asynchronous and exposes explicit `committed`, `not-committed`, and `unknown` mutation outcomes. An unknown result must be resolved by a fresh versioned read and must never be replayed blindly.
 
-`reconcilePluginStorageMode()` runs at boot and after a settings toggle. Externalization first encodes and collision-checks every destination, then writes each KV row before deleting its inline copy and full-writing the stub-only database. Internalization loads all rows into the database, full-writes that durable inline copy, and only then removes the rows. Keys must be well-formed Unicode before UTF-8/base64url encoding; lone UTF-16 surrogates are rejected rather than collapsing to U+FFFD.
-
-Server ingestion and backup assembly understand the same split. Node-only portable/server archives carry byte-preserving per-row entries, while upstream-target and selective client exports fold rows into ordinary database maps. Automatic server snapshots also fold the rows, including a deliberately empty key set, and stamp `pluginStorageFolded: true`; restore uses that marker to atomically replace the external prefixes instead of retaining newer plugin state. Pre-marker snapshots preserve existing external rows because they cannot prove what the historical key set was.
-
-V2/V2.1 plugins cannot participate because their save-storage facade is synchronous. The UI refuses this optimization while any legacy plugin is enabled, disables an imported legacy plugin when the mode is active, and prevents later enablement. V3 storage remains asynchronous and uses the serialized `pluginSaveStorage` path.
-
-V3 mutation failures retain `committed`, `not-committed`, and `unknown`
-outcomes across the iframe bridge. `setItemWithOutcome()` and
-`removeItemWithOutcome()` expose those results directly, while
-`removeItemConfirmed()` performs a fresh versioned read and reports success
-only after it observes absence. Ambiguous mutations are never replayed. Plugin
-caches, dirty flags, cleanup counters, and reset UI should follow the confirmed
-outcome workflow in [Safe V3 plugin-storage mutations](../plugin-storage-mutation-outcomes.md).
+See [Plugin storage](plugin-storage.md) for publication authority, generation/batch rules, mode transitions, recovery, backup behavior, viewer semantics, and the coordinated test map. Plugin authors should also follow [Safe V3 plugin-storage mutations](../plugin-storage-mutation-outcomes.md).
 
 ### MCP-to-model flow
 
@@ -297,7 +261,7 @@ outcome workflow in [Safe V3 plugin-storage mutations](../plugin-storage-mutatio
 3. Enabled module MCP URLs come from `getModuleMcps()` (`src/ts/process/modules.ts:510`). Internal, plugin, and remote clients all satisfy the same `getToolList()`/`callTool()` interface.
 4. Classic OpenAI-compatible, Anthropic, and Gemini request paths put those schemas into their provider-specific tool format. When the model emits a tool call, they invoke `callTool()` and recursively request the model with a tool-result message (`src/ts/process/request/openAI/requests.ts:706`, `src/ts/process/request/anthropic.ts:986`, `src/ts/process/request/google.ts:868`).
 5. ModelPreset adapters expose tools only when the preset opts into tool use, the adapter supports tools, and the profile explicitly declares the `tools` capability (`src/ts/process/request/request.ts:694`, `src/ts/process/request/request.ts:707`).
-6. ModelPreset tool calls run through `runModelPresetToolLoop()` and `executeModelPresetTool()` (`src/ts/process/request/request.ts:952`, `src/ts/process/request/request.ts:998`).
+6. ModelPreset tool calls run through `runModelPresetToolLoop()` and `executeModelPresetTool()` with a maximum of eight non-streaming tool rounds (`src/ts/process/request/request.ts:952`, `src/ts/process/request/request.ts:998`).
 7. When `rememberToolUsage` is enabled, the call and response are persisted and the assistant message receives a compact `<tool_call>id…name</tool_call>` marker (`src/ts/process/mcp/mcp.ts:259`). Later requests decode the marker back into structured tool history; display rendering replaces it with a tool-used badge (`src/ts/process/mcp/mcp.ts:266`, `src/ts/parser/parser.svelte.ts:898`).
 
 ## 4. Entry points & dependencies
@@ -341,13 +305,13 @@ outcome workflow in [Safe V3 plugin-storage mutations](../plugin-storage-mutatio
 
 - Regex-script ordering is preset, then character, then module unless `<order n>` causes a global descending sort (`src/ts/process/scripts.ts:134`, `src/ts/process/scripts.ts:333`).
 
-- Regex-script caching keys include data, mode, scripts, chat ID, flags, and CBS-expanded input, but not every mutable dependency a CBS function might read (`src/ts/process/scripts.ts:71`). Scripts that depend on changing external state can receive stale cached output unless cache invalidation is considered.
+- Regex-script caching keys include data, mode, scripts, numeric `chatID` (the message index), flags, and CBS-expanded input, but not every mutable dependency a CBS function might read (`src/ts/process/scripts.ts:71`). Scripts that depend on changing external state can receive stale cached output unless cache invalidation is considered.
 
 - Cache lookup uses `if(cached)`, so an intentionally empty cached result is treated as a miss (`src/ts/process/scripts.ts:136`).
 
 - `@@inject` updates the stored message with the pre-replacement data and removes the matching text from the returned string (`src/ts/process/scripts.ts:207`). This is historical behavior, not conventional regex replacement.
 
-- `editoutput` runs on every streaming chunk (`src/ts/process/index.svelte.ts:1482`). Handlers must be deterministic and cheap; side effects can fire repeatedly during one generation.
+- `editoutput` runs on each cumulative response snapshot while streaming (`src/ts/process/index.svelte.ts:1482`). Handlers must be deterministic and cheap; side effects can fire repeatedly during one generation.
 
 - `editdisplay` runs during re-render and must be treated as repeatable. Its trigger path is restricted and uses temporary variables, but plugin edit handlers have no equivalent automatic purity enforcement.
 
@@ -369,7 +333,7 @@ outcome workflow in [Safe V3 plugin-storage mutations](../plugin-storage-mutatio
 
 - V2.1 safety is AST rewriting plus wrappers, not a secure process boundary. The checker itself warns that static analysis may miss unsafe behavior (`src/ts/plugins/pluginSafety.ts:155`).
 
-- V3 is the actual iframe isolation boundary. Its CSP denies iframe-originated network connections, so plugin network access must cross `nativeFetch`/`risuFetch` RPC (`src/ts/plugins/apiV3/factory.ts:295`).
+- V3 is the actual iframe isolation boundary. Its CSP denies fetch/XHR/WebSocket connections, so ordinary plugin network requests must cross `nativeFetch`/`risuFetch` RPC. Images, fonts, media, and sandbox-authorized downloads have separate browser controls and are not covered by `connect-src` alone (`src/ts/plugins/apiV3/factory.ts:295`).
 
 - V3’s `nativeFetch` blocks several Risu domains, but sensitive authorization headers currently produce only warnings rather than rejection (`src/ts/plugins/apiV3/v3.svelte.ts:776`).
 
@@ -378,8 +342,6 @@ outcome workflow in [Safe V3 plugin-storage mutations](../plugin-storage-mutatio
 - V3 provider registration asks for periodically reconfirmed `provider` permission, but the callback currently ignores the returned boolean and still invokes the provider (`src/ts/plugins/apiV3/v3.svelte.ts:798`). Do not assume a denied provider prompt blocks execution without fixing this path.
 
 - Provider IDs are global names. V3 models become `pluginmodel:::<provider-name>` (`src/ts/plugins/apiV3/v3.svelte.ts:809`); duplicate names overwrite the callback map and can leave duplicate model metadata.
-
-- `customV3ProviderMetaStore` is an array and is not cleared by `loadV3Plugins()` in the shown code. Reloading providers can accumulate stale/duplicate model entries even though plugin iframe instances are unloaded.
 
 - Direct V3 `runLLMModel()` blocks plugin-backed models by default to avoid provider loops; callers must explicitly set `allowPlugins: true` (`src/ts/plugins/apiV3/v3.svelte.ts:1373`, `src/ts/plugins/apiV3/v3.svelte.ts:1391`).
 
@@ -391,13 +353,7 @@ outcome workflow in [Safe V3 plugin-storage mutations](../plugin-storage-mutatio
 
 - `optimizePluginMemory` changes a compatibility boundary, not just performance. Enabled V2/V2.1 plugins must keep it off because their synchronous storage proxy still points at inline `pluginCustomStorage`; V3 callers use asynchronous helpers and can use external rows.
 
-- Plugin-storage mode transitions intentionally prefer duplicates over loss. Externalize row-first then save the empty inline maps; internalize and save the complete maps before deleting rows. Server-side defensive re-externalization follows the same row-first ordering.
-
-- `pluginsave/` and `pluginsave-meta/` key encoding is shared with the server: reversible unpadded base64url plus `.json`. Changing it requires coordinated client, server ingest/backup, viewer, and compatibility-test updates.
-
-- Reversible plugin key encoding accepts only well-formed Unicode. Keep client `makeEncodedStorageKey()` and server `encodePluginSaveStorageKey()`/canonical decoding aligned; validate a whole transition before the first mutation so a rejected key cannot leave a half-externalized map.
-
-- `pluginStorageFolded` is a recovery marker, not application/plugin data. Snapshot restore strips it after atomically clear-and-repopulate of `pluginsave/` and `pluginsave-meta/`; an unmarked historical snapshot must not clear those rows.
+- External plugin rows are authoritative only when named by the published generation manifest. Do not infer completeness by scanning a prefix or from row-write order; see [Plugin storage](plugin-storage.md).
 
 - V3 plugins can register MCP callbacks, but an identifier must begin with `plugin:` and the corresponding URL must still be present in an enabled module before `initializeMCPs()` activates it (`src/ts/process/mcp/pluginmcp.ts:45`, `src/ts/process/mcp/mcp.ts:20`).
 
@@ -459,7 +415,7 @@ outcome workflow in [Safe V3 plugin-storage mutations](../plugin-storage-mutatio
 
 - To add a plugin edit hook, use the registry API at `src/ts/plugins/plugins.svelte.ts:537`; execution is at `src/ts/process/scripts.ts:124`.
 
-- To change optimized plugin storage, update `pluginSaveStorage.ts`, `pluginStorageMeta.ts`, `pluginMemoryOptimization.ts`, `persistentKv.ts`, the settings/viewer UI, boot reconciliation, partial-backup folding, and the server `pluginSaveKeys.cjs` plus `pluginsave/` ingest/backup/snapshot helpers together.
+- To change optimized plugin storage, start with the coordinated ownership and test map in [Plugin storage](plugin-storage.md).
 
 - To add a plugin request-body or response replacer, inspect registration at `src/ts/plugins/plugins.svelte.ts:553` and execution at `src/ts/process/request/request.ts:154` and `src/ts/process/request/request.ts:220`.
 
@@ -475,9 +431,9 @@ outcome workflow in [Safe V3 plugin-storage mutations](../plugin-storage-mutatio
 
 - To change ModelPreset tool gating, edit `requestModelPreset()` at `src/ts/process/request/request.ts:694`; to change execution limits or retry safety, edit `runModelPresetToolLoop()` at `src/ts/process/request/request.ts:952`.
 
-## Out of scope, noticed
+## 7. Related structure docs
 
-- Trigger editors and version-switching UI live under `src/lib/SideBars/Scripts/`, especially `TriggerList.svelte` and `TriggerV2List.svelte`.
-- Module enablement and aggregation live in `src/ts/process/modules.ts`.
-- Provider-specific tool wire formats live in `src/ts/process/request/openAI/requests.ts`, `anthropic.ts`, `google.ts`, and the ModelPreset adapter layer.
-- Plugin settings, storage viewer, menus, and permission dialogs are implemented in Svelte UI files outside `src/ts/plugins/`.
+- [Chat pipeline](chat-pipeline.md) covers the request and response call sites for scripts and hooks.
+- [Model providers](model-providers.md) covers provider-specific tool wire formats and plugin-model dispatch.
+- [Plugin storage](plugin-storage.md) covers generation publication, mutations, transitions, recovery, and backups.
+- [UI layer](ui-layer.md) covers trigger editors, plugin settings, the storage viewer, and permission dialogs.

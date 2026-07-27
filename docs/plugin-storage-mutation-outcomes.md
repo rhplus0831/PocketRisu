@@ -9,10 +9,10 @@ For maintenance and UI workflows, use `setItemWithOutcome()`,
 `removeItemWithOutcome()`, or `removeItemConfirmed()`. They report one of:
 
 - `committed`: the exact request was acknowledged, or
-  `removeItemConfirmed()` observed the requested absence after an ambiguous
-  acknowledgement. Its `mutationOutcome` field distinguishes those cases.
+  `removeItemConfirmed()` observed the requested absence during its fresh
+  versioned read. Its `mutationOutcome` field distinguishes those cases.
 - `not-committed`: the host has a definitive refusal, such as a known import
-  barrier or session failure. A bounded retry is allowed only when
+  barrier. A bounded retry is allowed only when
   `retryable === true` and still fits the operation's deadline.
 - `unknown`: the request may have committed (for example, its response was
   lost), or the desired removal could not be confirmed. Never replay an
@@ -61,10 +61,11 @@ if (result.outcome === "committed") {
 }
 ```
 
-`removeItemConfirmed()` sends one REMOVE only. If its acknowledgement is
-unknown, it verifies absence with a read; it never replays the mutation. A
-missing read can therefore satisfy the requested postcondition safely, while a
-present row or failed read remains unsuccessful.
+`removeItemConfirmed()` sends one REMOVE only. After every result except a
+definitive `not-committed`, it performs a fresh versioned read and succeeds
+only when that read proves absence; it never replays the mutation. A present
+row or failed read remains unsuccessful. In particular, transport/session
+statuses classified as an unknown commit outcome are not safe-retry evidence.
 
 ## Reset and cleanup counters
 

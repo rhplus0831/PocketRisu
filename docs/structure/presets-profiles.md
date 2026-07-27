@@ -1,7 +1,7 @@
-# presets-profiles
+# Presets and profiles
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-27 against `abee0232`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -9,84 +9,83 @@ This subsystem separates PocketRisu’s model/provider configuration from the up
 
 The older `botPreset` remains the prompt preset: it owns prompt text/template, sampling parameters, and compatibility fields used by RisuAI `.risup`/`.risupreset` files. Prompt construction still consumes the active `botPreset`; request dispatch can independently use a chat-bound `ModelPreset` through one of three wire adapters.
 
-The subsystem also manages official/custom profile registries, explicit profile updates, saved API keys, Google service-account tokens, and Gemini explicit context caches.
+The subsystem also manages official registry sync, imported custom-profile fragments, explicit profile updates, saved API keys, Google service-account tokens, and Gemini explicit context caches. Imported custom fragments and backup files are configuration data, not automatically secret-free artifacts.
 
 ## 2. Key files
 
 ### Core types and persistence
 
-| File | Approx. size | Role and important symbols |
-|---|---:|---|
-| `src/ts/preset/types.ts` | 534 lines | Central schema. `AdapterKind` defines the three implemented protocols (`types.ts:3`); `BaseProviderDefinition` holds provider-wide wire/schema defaults (`types.ts:156`); `ModelProfile` describes a registry model (`types.ts:184`); `ResolvedModelProfileSnapshot` is the frozen merged form stored on a preset (`types.ts:233`); `ModelPreset` is the user-editable runtime configuration (`types.ts:252`). `ModelBindingSet` describes per-chat main/sub/aux bindings (`types.ts:379`), `emptyModelBinding()` normalizes empty Svelte bindings (`types.ts:394`), and `ApiKeyPoolEntry` describes saved credentials (`types.ts:398`). Registry/update/cache types start at `types.ts:407`. |
-| `src/ts/storage/database.svelte.ts` | 3,058 lines | Shared database definition and compatibility layer. `setDatabase()` fills prompt defaults and stable prompt-preset IDs (`database.svelte.ts:37`, `database.svelte.ts:183`), then invokes `applyModelPresetDefaults()` at the load boundary (`database.svelte.ts:734`). `Database` stores `botPresets`/`botPresetsId` at `database.svelte.ts:959` and `database.svelte.ts:1024`, and model-profile state at `database.svelte.ts:1376`. `botPreset` is defined at `database.svelte.ts:1723`; `Chat.bindedBotPreset`, `useModelPreset`, `modelBinding`, and `usePromptPresetParams` are at `database.svelte.ts:2034`. |
-| `src/ts/storage/defaultPrompts.ts` | 28 lines | Re-exports `prebuiltPresets.OAI.mainPrompt` and `.jailbreak` as the defaults (`defaultPrompts.ts:3`), preserves exact old prompt strings for migration (`defaultPrompts.ts:5`), and defines the default response-suggestion prompt (`defaultPrompts.ts:7`). |
-| `src/ts/preset/dbDefaults.ts` | 192 lines | Model-preset database normalization. `createEmptyRegistryCache()` returns schema version 4 (`dbDefaults.ts:16`). `applyModelPresetDefaults()` initializes preset/key/cache collections and visibility defaults, sanitizes malformed stored snapshots, and heals resolvable degenerate snapshots (`dbDefaults.ts:174`). Snapshot sanitization is at `dbDefaults.ts:32`; healing is at `dbDefaults.ts:95`. |
-| `src/ts/preset/apiKeyPool.ts` | 61 lines | CRUD over `db.apiKeyPool`. `listApiKeys()` filters by provider and sorts by last update (`apiKeyPool.ts:17`); `getApiKey()` resolves an ID (`apiKeyPool.ts:24`); add/update/remove are at `apiKeyPool.ts:29`, `apiKeyPool.ts:44`, and `apiKeyPool.ts:55`. Every mutation replaces the pool object to trigger Svelte 5 reactivity. |
+| File | Role and important symbols |
+|---|---|
+| `src/ts/preset/types.ts` | Central schema. `AdapterKind` defines the three implemented protocols (`types.ts:3`); `BaseProviderDefinition` holds provider-wide wire/schema defaults (`types.ts:156`); `ModelProfile` describes a registry model (`types.ts:184`); `ResolvedModelProfileSnapshot` is the frozen merged form stored on a preset (`types.ts:233`); `ModelPreset` is the user-editable runtime configuration (`types.ts:252`). `ModelBindingSet` describes per-chat main/sub/aux bindings (`types.ts:379`), `emptyModelBinding()` normalizes empty Svelte bindings (`types.ts:394`), and `ApiKeyPoolEntry` describes saved credentials (`types.ts:398`). Registry/update/cache types start at `types.ts:407`. |
+| `src/ts/storage/database.svelte.ts` | Shared database definition and compatibility layer. `setDatabase()` fills prompt defaults and stable prompt-preset IDs (`database.svelte.ts:37`, `database.svelte.ts:183`), then invokes `applyModelPresetDefaults()` at the load boundary (`database.svelte.ts:734`). `Database` stores `botPresets`/`botPresetsId` at `database.svelte.ts:959` and `database.svelte.ts:1024`, and model-profile state at `database.svelte.ts:1376`. `botPreset` is defined at `database.svelte.ts:1723`; `Chat.bindedBotPreset`, `useModelPreset`, `modelBinding`, and `usePromptPresetParams` are at `database.svelte.ts:2034`. |
+| `src/ts/storage/defaultPrompts.ts` | Re-exports `prebuiltPresets.OAI.mainPrompt` and `.jailbreak` as the defaults (`defaultPrompts.ts:3`), preserves exact old prompt strings for migration (`defaultPrompts.ts:5`), and defines the default response-suggestion prompt (`defaultPrompts.ts:7`). |
+| `src/ts/preset/dbDefaults.ts` | Model-preset database normalization. `createEmptyRegistryCache()` returns schema version 4 (`dbDefaults.ts:16`). `applyModelPresetDefaults()` initializes preset/key/cache collections and visibility defaults, sanitizes malformed stored snapshots, and heals resolvable degenerate snapshots (`dbDefaults.ts:174`). Snapshot sanitization is at `dbDefaults.ts:32`; healing is at `dbDefaults.ts:95`. |
+| `src/ts/preset/apiKeyPool.ts` | CRUD over `db.apiKeyPool`. `listApiKeys()` filters by provider and sorts by last update (`apiKeyPool.ts:17`); `getApiKey()` resolves an ID (`apiKeyPool.ts:24`); add/update/remove are at `apiKeyPool.ts:29`, `apiKeyPool.ts:44`, and `apiKeyPool.ts:55`. Every mutation replaces the pool object to trigger Svelte 5 reactivity. |
 
 ### Registry and profile lifecycle
 
-| File | Approx. size | Role and important symbols |
-|---|---:|---|
-| `src/ts/preset/registry/loader.ts` | 49 lines | Eagerly loads bundled JSON through `import.meta.glob` (`loader.ts:5`, `loader.ts:10`). `loadBundledRegistry()` memoizes the schema-v4 registry (`loader.ts:40`); `getBundledRegistryId()` returns `"bundled"` (`loader.ts:47`). |
-| `src/ts/preset/registry/bundled/base-providers/*.json` | 18 files, about 144 KiB | Provider-wide protocol definitions: adapter kind, common auth field, endpoint kinds, headers/body defaults, capabilities, and UI schema. For example, OpenAI selects `openai-compatible` at `base-providers/openai.json:5` and defines its auth field at `base-providers/openai.json:16`. |
-| `src/ts/preset/registry/bundled/profiles/**/*.json` | 149 files, about 832 KiB | Concrete provider/model profiles. Each supplies model ID, endpoint/auth, model-specific fields, limits, status, timestamps, and capabilities. `profiles/openai/gpt-55.json:2` defines the profile identity, `:19` the model ID, `:20` its update timestamp, and `:32` its extension schema. |
-| `src/ts/preset/registry/snapshot.ts` | 138 lines | Converts a base provider plus profile into a request-ready frozen snapshot. `resolveSnapshot()` merges schemas, UI schemas, defaults, headers, capabilities, and limits (`snapshot.ts:36`). Missing-profile/base-provider errors are at `snapshot.ts:12` and `snapshot.ts:24`. Profile fields override same-key base fields (`snapshot.ts:100`, `snapshot.ts:118`). |
-| `src/ts/preset/registry/remote.ts` | 266 lines | Fetches the official or custom-hosted registry. `syncRemoteRegistry()` uses `index.json` as a content-hash gate and atomically replaces the official cache entry (`remote.ts:158`); it preserves the custom registry at `remote.ts:224`. `getOfficialRegistry()` chooses the populated remote cache or bundled fallback (`remote.ts:247`). `getPresetUpdateStatus()` performs timestamp-based source lookup (`remote.ts:258`). |
-| `src/ts/preset/registry/visibility.ts` | 26 lines | Display-only filtering for current/outdated/deprecated profiles through `isProfileVisible()` (`visibility.ts:13`). |
-| `src/ts/preset/registry/notice.ts` | 80 lines | Builds the “new/updated models” banner. `buildSeenMap()` snapshots profile timestamps (`notice.ts:31`); `computeRegistryNotice()` compares them while respecting visibility (`notice.ts:40`). |
-| `src/ts/preset/registry/i18n.ts` | 40 lines | Locale selection and registry-string fallback. `localizeDisplayName()`, `localizeDescription()`, and `localizeGroupLabel()` are at `i18n.ts:21`, `i18n.ts:28`, and `i18n.ts:35`. |
-| `src/ts/preset/registry/index.ts` | 13 lines | Public registry barrel: bundled loading, snapshot resolution, remote sync, update status, and visibility. |
-| `src/ts/preset/customProfiles.ts` | 276 lines | Custom-profile import/export and production update helpers. Custom objects live under registry ID `"custom"` with `custom::` IDs (`customProfiles.ts:25`). `ProfileFragment` is the self-contained profile-plus-base-provider file shape (`customProfiles.ts:32`); build/validate/import are at `customProfiles.ts:52`, `customProfiles.ts:80`, and `customProfiles.ts:130`. Timestamp update status is at `customProfiles.ts:179`; production value migration is at `customProfiles.ts:200`; snapshot-to-fragment export and deletion are at `customProfiles.ts:223` and `customProfiles.ts:265`. |
-| `src/ts/preset/profileUpdate.ts` | 375 lines | A more detailed, version-oriented snapshot migration API. `getProfileUpdateAvailability()` classifies source/current/downgrade/missing states (`profileUpdate.ts:34`); `diffProfileSnapshot()` produces structural schema/UI/wire diffs (`profileUpdate.ts:95`); `applyProfileSnapshotUpdate()` keeps compatible values and moves removed/type-changed values into `orphanValues` (`profileUpdate.ts:118`). This module is covered by tests but currently has no non-test production importer. |
+| File | Role and important symbols |
+|---|---|
+| `src/ts/preset/registry/loader.ts` | Eagerly loads bundled JSON through `import.meta.glob` (`loader.ts:5`, `loader.ts:10`). `loadBundledRegistry()` memoizes the schema-v4 registry (`loader.ts:40`); `getBundledRegistryId()` returns `"bundled"` (`loader.ts:47`). |
+| `src/ts/preset/registry/bundled/base-providers/*.json` | Provider-wide protocol definitions: adapter kind, common auth field, endpoint kinds, headers/body defaults, capabilities, and UI schema. For example, OpenAI selects `openai-compatible` at `base-providers/openai.json:5` and defines its auth field at `base-providers/openai.json:16`. |
+| `src/ts/preset/registry/bundled/profiles/**/*.json` | Concrete provider/model profiles. Each supplies model ID, endpoint/auth, model-specific fields, limits, status, timestamps, and capabilities. `profiles/openai/gpt-55.json:2` defines the profile identity, `:19` the model ID, `:20` its update timestamp, and `:32` its extension schema. |
+| `src/ts/preset/registry/snapshot.ts` | Converts a base provider plus profile into a request-ready frozen snapshot. `resolveSnapshot()` merges schemas, UI schemas, defaults, headers, capabilities, and limits (`snapshot.ts:36`). Missing-profile/base-provider errors are at `snapshot.ts:12` and `snapshot.ts:24`. Profile fields override same-key base fields (`snapshot.ts:100`, `snapshot.ts:118`). |
+| `src/ts/preset/registry/remote.ts` | Fetches the official or custom-hosted registry. `syncRemoteRegistry()` uses `index.json` as a content-hash gate and atomically replaces the official cache entry (`remote.ts:158`); it preserves the custom registry at `remote.ts:224`. `getOfficialRegistry()` chooses the populated remote cache or bundled fallback (`remote.ts:247`). `getPresetUpdateStatus()` performs timestamp-based source lookup (`remote.ts:258`). |
+| `src/ts/preset/registry/visibility.ts` | Display-only filtering for current/outdated/deprecated profiles through `isProfileVisible()` (`visibility.ts:13`). |
+| `src/ts/preset/registry/notice.ts` | Builds the “new/updated models” banner. `buildSeenMap()` snapshots profile timestamps (`notice.ts:31`); `computeRegistryNotice()` compares them while respecting visibility (`notice.ts:40`). |
+| `src/ts/preset/registry/i18n.ts` | Locale selection and registry-string fallback. `localizeDisplayName()`, `localizeDescription()`, and `localizeGroupLabel()` are at `i18n.ts:21`, `i18n.ts:28`, and `i18n.ts:35`. |
+| `src/ts/preset/registry/index.ts` | Public registry barrel: bundled loading, snapshot resolution, remote sync, update status, and visibility. |
+| `src/ts/preset/customProfiles.ts` | Custom-profile import/export and production update helpers. Custom objects live under registry ID `"custom"` with `custom::` IDs (`customProfiles.ts:25`). `ProfileFragment` is the self-contained profile-plus-base-provider file shape (`customProfiles.ts:32`); build/validate/import are at `customProfiles.ts:52`, `customProfiles.ts:80`, and `customProfiles.ts:130`. Timestamp update status is at `customProfiles.ts:179`; production value migration is at `customProfiles.ts:200`; snapshot-to-fragment export and deletion are at `customProfiles.ts:223` and `customProfiles.ts:265`. |
+| `src/ts/preset/profileUpdate.ts` | A more detailed, version-oriented snapshot migration API. `getProfileUpdateAvailability()` classifies source/current/downgrade/missing states (`profileUpdate.ts:34`); `diffProfileSnapshot()` produces structural schema/UI/wire diffs (`profileUpdate.ts:95`); `applyProfileSnapshotUpdate()` keeps compatible values and moves removed/type-changed values into `orphanValues` (`profileUpdate.ts:118`). This module is covered by tests but currently has no non-test production importer. |
 
 ### Adapter layer
 
-| File | Approx. size | Role and important symbols |
-|---|---:|---|
-| `src/ts/preset/adapter/types.ts` | 188 lines | Adapter-neutral request/response contracts. `AdapterCredential` and `AdapterRequestContext` are at `adapter/types.ts:4` and `adapter/types.ts:9`; chat messages and tool/reasoning/image metadata begin at `adapter/types.ts:58`; `AdapterChatResponse` is at `adapter/types.ts:139`; `AdapterChatOptions`, including Gemini cache context, is at `adapter/types.ts:174`. |
-| `src/ts/preset/adapter/index.ts` | 45 lines | Public adapter barrel. It exports preparation/auth/error helpers and all three send/stream/preview implementations (`adapter/index.ts:21`). |
-| `src/ts/preset/adapter/buildRequest.ts` | 267 lines | Shared request builder. `buildPreparedRequest()` resolves endpoint, merges body/header layers, maps schema fields, parses legacy additional-parameter syntax, and applies auth (`buildRequest.ts:15`). Vertex endpoint resolution begins at `buildRequest.ts:80`; dot-path writes and additional parameters are implemented at `buildRequest.ts:197` and `buildRequest.ts:222`. |
-| `src/ts/preset/adapter/openaiCompatible.ts` | 389 lines | OpenAI Chat Completions-compatible wire. Non-streaming, streaming, and preview entries are `sendChatRequest()` (`openaiCompatible.ts:49`), `streamChatRequest()` (`openaiCompatible.ts:84`), and `previewChatRequest()` (`openaiCompatible.ts:138`). It owns final `messages`, `model`, `stream`, and tool fields (`openaiCompatible.ts:146`). |
-| `src/ts/preset/adapter/anthropicMessages.ts` | 411 lines | Anthropic Messages wire. Send/stream/preview entries are at `anthropicMessages.ts:53`, `anthropicMessages.ts:88`, and `anthropicMessages.ts:143`. `prepareAnthropicBody()` extracts system messages, shapes tool/thinking blocks, and supplies a 4,096-token fallback for old snapshots (`anthropicMessages.ts:151`). |
-| `src/ts/preset/adapter/googleGemini.ts` | 566 lines | Native Gemini wire and cache integration. Send/stream/preview entries are at `googleGemini.ts:78`, `googleGemini.ts:127`, and `googleGemini.ts:193`. `prepareGeminiBody()` builds `contents`, `systemInstruction`, tools, the model URL suffix, and cache boundary (`googleGemini.ts:201`). Cache rejection retries uncached at `googleGemini.ts:95` and `googleGemini.ts:143`. |
-| `src/ts/preset/adapter/auth.ts` | 79 lines | Applies `none`, bearer, API-key header, Google-key header, query-key, and service-account bearer auth (`auth.ts:5`). Auth replacement is case-insensitive so custom headers cannot retain a conflicting credential (`auth.ts:59`). |
-| `src/ts/preset/adapter/resolveCredential.ts` | 97 lines | Async credential preparation. `resolveAdapterCredential()` exchanges service-account JSON for an access token (`resolveCredential.ts:26`); `prepareAdapterRequest()` is the safe entry that resolves credentials before calling the synchronous shared builder (`resolveCredential.ts:74`). |
-| `src/ts/preset/adapter/wireInvariants.ts` | 47 lines | `resolveWireModelId()` resolves model selection from user value, schema default, or snapshot, and prevents `customBody.model` from redirecting the wire (`wireInvariants.ts:13`). |
-| `src/ts/preset/adapter/error.ts` | 157 lines | Typed adapter errors and network/HTTP normalization. `ModelPresetAdapterError` is at `error.ts:10`; retry/fallback policy at `error.ts:40` and `error.ts:56`; fetch and HTTP normalization at `error.ts:68` and `error.ts:127`. |
-| `src/ts/preset/adapter/sse.ts` | 108 lines | Streaming parser. `parseSseStream()` incrementally drains response bodies (`sse.ts:3`); `parseSseEventBlock()` parses a complete event (`sse.ts:25`). |
-| `src/ts/preset/adapter/toolLoop.ts` | 112 lines | Adapter-neutral multi-step function-call loop. `runToolLoop()` repeatedly sends, executes calls, appends assistant/tool turns, and stops at a configured limit (`toolLoop.ts:42`). |
-| `src/ts/preset/adapter/vertexEndpoint.ts` | 126 lines | Vertex OpenAI/Gemini URL construction and project/location validation (`vertexEndpoint.ts:23`, `vertexEndpoint.ts:35`). `resolveVertexProject()` can recover `project_id` from service-account JSON (`vertexEndpoint.ts:71`). |
-| `src/ts/preset/adapter/googleServiceAccount/serviceAccount.ts` | 94 lines | Parses and validates service-account JSON (`serviceAccount.ts:32`). It restricts `token_uri` to Google’s OAuth endpoint to prevent signed-JWT exfiltration/SSRF (`serviceAccount.ts:21`). |
-| `src/ts/preset/adapter/googleServiceAccount/token.ts` | 137 lines | Calls the authenticated Node endpoint for OAuth exchange. `exchangeServiceAccountForAccessToken()` posts raw service-account JSON to `/api/model-preset/google-service-account/token` (`token.ts:15`, `token.ts:40`). |
-| `src/ts/preset/adapter/googleServiceAccount/cache.ts` | 172 lines | In-memory access-token cache. `createServiceAccountTokenCache()` deduplicates refreshes by token URI, email, and scope and refreshes with 60 seconds of skew (`cache.ts:39`). The default singleton is exposed at `cache.ts:134`. |
+| File | Role and important symbols |
+|---|---|
+| `src/ts/preset/adapter/types.ts` | Adapter-neutral request/response contracts. `AdapterCredential` and `AdapterRequestContext` are at `adapter/types.ts:4` and `adapter/types.ts:9`; chat messages and tool/reasoning/image metadata begin at `adapter/types.ts:58`; `AdapterChatResponse` is at `adapter/types.ts:139`; `AdapterChatOptions`, including Gemini cache context, is at `adapter/types.ts:174`. |
+| `src/ts/preset/adapter/index.ts` | Public adapter barrel. It exports preparation/auth/error helpers and all three send/stream/preview implementations (`adapter/index.ts:21`). |
+| `src/ts/preset/adapter/buildRequest.ts` | Shared request builder. `buildPreparedRequest()` resolves endpoint, merges body/header layers, maps schema fields, parses legacy additional-parameter syntax, and applies auth (`buildRequest.ts:15`). Vertex endpoint resolution begins at `buildRequest.ts:80`; dot-path writes and additional parameters are implemented at `buildRequest.ts:197` and `buildRequest.ts:222`. |
+| `src/ts/preset/adapter/openaiCompatible.ts` | OpenAI Chat Completions-compatible wire. Non-streaming, streaming, and preview entries are `sendChatRequest()` (`openaiCompatible.ts:49`), `streamChatRequest()` (`openaiCompatible.ts:84`), and `previewChatRequest()` (`openaiCompatible.ts:138`). It owns final `messages`, `model`, `stream`, and tool fields (`openaiCompatible.ts:146`). |
+| `src/ts/preset/adapter/anthropicMessages.ts` | Anthropic Messages wire. Send/stream/preview entries are at `anthropicMessages.ts:53`, `anthropicMessages.ts:88`, and `anthropicMessages.ts:143`. `prepareAnthropicBody()` extracts system messages, shapes tool/thinking blocks, and supplies a 4,096-token fallback for old snapshots (`anthropicMessages.ts:151`). |
+| `src/ts/preset/adapter/googleGemini.ts` | Native Gemini wire and cache integration. Send/stream/preview entries are at `googleGemini.ts:78`, `googleGemini.ts:127`, and `googleGemini.ts:193`. `prepareGeminiBody()` builds `contents`, `systemInstruction`, tools, the model URL suffix, and cache boundary (`googleGemini.ts:201`). Cache rejection retries uncached at `googleGemini.ts:95` and `googleGemini.ts:143`. |
+| `src/ts/preset/adapter/auth.ts` | Applies `none`, bearer, API-key header, Google-key header, query-key, and service-account bearer auth (`auth.ts:5`). Auth replacement is case-insensitive so custom headers cannot retain a conflicting credential (`auth.ts:59`). |
+| `src/ts/preset/adapter/resolveCredential.ts` | Async credential preparation. `resolveAdapterCredential()` exchanges service-account JSON for an access token (`resolveCredential.ts:26`); `prepareAdapterRequest()` is the safe entry that resolves credentials before calling the synchronous shared builder (`resolveCredential.ts:74`). |
+| `src/ts/preset/adapter/wireInvariants.ts` | `resolveWireModelId()` resolves model selection from user value, schema default, or snapshot, and prevents `customBody.model` from redirecting the wire (`wireInvariants.ts:13`). |
+| `src/ts/preset/adapter/error.ts` | Typed adapter errors and network/HTTP normalization. `ModelPresetAdapterError` is at `error.ts:10`; retry/fallback policy at `error.ts:40` and `error.ts:56`; fetch and HTTP normalization at `error.ts:68` and `error.ts:127`. |
+| `src/ts/preset/adapter/sse.ts` | Streaming parser. `parseSseStream()` incrementally drains response bodies (`sse.ts:3`); `parseSseEventBlock()` parses a complete event (`sse.ts:25`). |
+| `src/ts/preset/adapter/toolLoop.ts` | Adapter-neutral multi-step function-call loop. `runToolLoop()` repeatedly sends, executes calls, appends assistant/tool turns, and stops at a configured limit (`toolLoop.ts:42`). |
+| `src/ts/preset/adapter/vertexEndpoint.ts` | Vertex OpenAI/Gemini URL construction and project/location validation (`vertexEndpoint.ts:23`, `vertexEndpoint.ts:35`). `resolveVertexProject()` can recover `project_id` from service-account JSON (`vertexEndpoint.ts:71`). |
+| `src/ts/preset/adapter/googleServiceAccount/serviceAccount.ts` | Parses and validates service-account JSON (`serviceAccount.ts:32`). It restricts `token_uri` to Google’s OAuth endpoint to prevent signed-JWT exfiltration/SSRF (`serviceAccount.ts:21`). |
+| `src/ts/preset/adapter/googleServiceAccount/token.ts` | Calls the authenticated Node endpoint for OAuth exchange. `exchangeServiceAccountForAccessToken()` posts raw service-account JSON to `/api/model-preset/google-service-account/token` (`token.ts:15`, `token.ts:40`). |
+| `src/ts/preset/adapter/googleServiceAccount/cache.ts` | In-memory access-token cache. `createServiceAccountTokenCache()` deduplicates refreshes by token URI, email, and scope and refreshes with 60 seconds of skew (`cache.ts:39`). The default singleton is exposed at `cache.ts:134`. |
 
 ### Gemini context cache
 
-| File | Approx. size | Role and important symbols |
-|---|---:|---|
-| `src/ts/preset/cache/geminiContextCache.ts` | 593 lines | Core state, pure decisions, body transforms, and REST client for Gemini `cachedContents`. Cache configuration is at `geminiContextCache.ts:37`; transient entries are keyed by chat/task/preset at `geminiContextCache.ts:71` and `geminiContextCache.ts:82`. Pre/post decisions are `evaluateGeminiCacheBeforeRequest()` (`geminiContextCache.ts:284`) and `decideGeminiCacheAfterResponse()` (`geminiContextCache.ts:341`). Body application and REST client creation are at `geminiContextCache.ts:410` and `geminiContextCache.ts:524`. |
-| `src/ts/preset/cache/geminiCacheWiring.ts` | 286 lines | Impure bridge used by the Gemini adapter. `beginGeminiCacheTurn()` loads state, evaluates it, optionally substitutes a cached body, and returns a non-blocking completion hook (`geminiCacheWiring.ts:57`). Per-key generations prevent stale asynchronous cache creation from overwriting newer state (`geminiCacheWiring.ts:172`). |
+| File | Role and important symbols |
+|---|---|
+| `src/ts/preset/cache/geminiContextCache.ts` | Core state, pure decisions, body transforms, and REST client for Gemini `cachedContents`. Cache configuration is at `geminiContextCache.ts:37`; transient entries are keyed by chat/task/preset at `geminiContextCache.ts:71` and `geminiContextCache.ts:82`. Pre/post decisions are `evaluateGeminiCacheBeforeRequest()` (`geminiContextCache.ts:284`) and `decideGeminiCacheAfterResponse()` (`geminiContextCache.ts:341`). Body application and REST client creation are at `geminiContextCache.ts:410` and `geminiContextCache.ts:524`. |
+| `src/ts/preset/cache/geminiCacheWiring.ts` | Impure bridge used by the Gemini adapter. `beginGeminiCacheTurn()` loads state, evaluates it, optionally substitutes a cached body, and returns a non-blocking completion hook (`geminiCacheWiring.ts:57`). Per-key generations prevent stale asynchronous cache creation from overwriting newer state (`geminiCacheWiring.ts:172`). |
 
 ### UI touchpoints
 
-| File | Approx. size | Role |
-|---|---:|---|
-| `src/lib/Setting/modelProfileBrowser.svelte` | 392 lines | Official/custom profile modal. It scopes registries by tab (`modelProfileBrowser.svelte:48`), creates a preset from a resolved snapshot (`modelProfileBrowser.svelte:156`), replaces a preset profile with value migration (`modelProfileBrowser.svelte:187`), and imports/exports `.profile.json` fragments (`modelProfileBrowser.svelte:234`, `modelProfileBrowser.svelte:245`). |
-| `src/lib/Setting/modelpreset.svelte` | 253 lines | Compact model-preset selection/list modal. It supports reorder, duplicate, delete, and callback-based chat binding (`modelpreset.svelte:30`, `modelpreset.svelte:53`, `modelpreset.svelte:66`, `modelpreset.svelte:125`). Editing now routes to the full settings page (`modelpreset.svelte:88`). |
-| `src/lib/Setting/Pages/Model/ModelPresetSettings.svelte` | 523 lines | Current full editor. It syncs the remote registry on mount (`ModelPresetSettings.svelte:47`), renders schema-driven fields, abilities/cache controls, test requests, key-pool manager, and update indicators. Preset creation opens the profile browser at `ModelPresetSettings.svelte:147`. |
-| `src/lib/Setting/Pages/Model/ModelPresetBasicInfo.svelte` | 171 lines | Current profile/source panel. Timestamp-based lookup is at `ModelPresetBasicInfo.svelte:49`; one-click update re-resolves and migrates values at `ModelPresetBasicInfo.svelte:79`; export emits a profile fragment at `ModelPresetBasicInfo.svelte:105`. |
-| `src/lib/Setting/Pages/Model/CredentialField.svelte` | 145 lines | Chooses direct credentials or a single saved `apiKeyRef`. Direct mode clears any pooled reference (`CredentialField.svelte:42`); saving a direct key adds it to the pool and binds the preset (`CredentialField.svelte:68`). |
+| File | Role and important symbols |
+|---|---|
+| `src/lib/Setting/modelProfileBrowser.svelte` | Official/custom profile modal. It scopes registries by tab (`modelProfileBrowser.svelte:48`), creates a preset from a resolved snapshot (`modelProfileBrowser.svelte:156`), replaces a preset profile with value migration (`modelProfileBrowser.svelte:187`), and imports/exports `.profile.json` fragments (`modelProfileBrowser.svelte:234`, `modelProfileBrowser.svelte:245`). |
+| `src/lib/Setting/modelpreset.svelte` | Compact model-preset selection/list modal. It supports reorder, duplicate, delete, and callback-based chat binding (`modelpreset.svelte:30`, `modelpreset.svelte:53`, `modelpreset.svelte:66`, `modelpreset.svelte:125`). Editing now routes to the full settings page (`modelpreset.svelte:88`). |
+| `src/lib/Setting/Pages/Model/ModelPresetSettings.svelte` | Current full editor. It syncs the remote registry on mount (`ModelPresetSettings.svelte:47`), renders schema-driven fields, abilities/cache controls, test requests, key-pool manager, and update indicators. Preset creation opens the profile browser at `ModelPresetSettings.svelte:147`. |
+| `src/lib/Setting/Pages/Model/ModelPresetBasicInfo.svelte` | Current profile/source panel. Timestamp-based lookup is at `ModelPresetBasicInfo.svelte:49`; one-click update re-resolves and migrates values at `ModelPresetBasicInfo.svelte:79`; export emits a profile fragment at `ModelPresetBasicInfo.svelte:105`. |
+| `src/lib/Setting/Pages/Model/CredentialField.svelte` | Chooses direct credentials or a single saved `apiKeyRef`. Direct mode clears any pooled reference (`CredentialField.svelte:42`); saving a direct key adds it to the pool and binds the preset (`CredentialField.svelte:68`). |
 
 ### Tests
 
 The subsystem has extensive unit and integration coverage:
 
-- Core lifecycle: `apiKeyPool.test.ts` (81 lines; suite at `:18`), `customProfiles.test.ts` (218 lines; fragment/update suites at `:61`, `:177`), `dbDefaults.test.ts` (300 lines; suite at `:4`), `profileUpdate.test.ts` (704 lines; availability/diff/apply suites at `:146`, `:350`, `:467`), and `profileUpdate.integration.test.ts` (294 lines; end-to-end migration at `:146`).
-- Registry: `loader.test.ts` (209 lines; `:177`), `snapshot.test.ts` (325 lines; `:6`), `snapshotNullSafety.test.ts` (43 lines; `:7`), `remote.test.ts` (361 lines; sync at `:56`), `notice.test.ts` (69 lines; `:23`), and `visibility.test.ts` (30 lines; `:4`).
-- Shared adapter contracts: `buildRequest.test.ts` (892 lines; `:51`), `auth.test.ts` (142 lines; `:17`), `error.test.ts` (250 lines; `:11`), `resolveCredential.test.ts` (206 lines; `:63`), `wireInvariants.test.ts` (176 lines; `:43`), `sse.test.ts` (105 lines; `:25`), `toolLoop.test.ts` (211 lines; `:30`), and `vertexEndpoint.test.ts` (70 lines; `:5`).
-- Provider adapters: `openaiCompatible.test.ts` (838 lines; send/stream/tools/vision at `:115`, `:285`, `:574`, `:751`), `anthropicMessages.test.ts` (684 lines; `:122`, `:481`, `:649`), and `googleGemini.test.ts` (1,170 lines; `:140`, `:508`, `:727`).
-- Vertex/service-account integration: `openaiCompatibleVertex.test.ts` (154 lines; `:54`), `vertexIntegration.test.ts` (196 lines; `:55`, `:105`), and the service-account parser/token/cache tests (110/234/284 lines; suites at `serviceAccount.test.ts:19`, `token.test.ts:51`, `cache.test.ts:41`).
-- Gemini cache: `geminiContextCache.test.ts` (954 lines), covering configuration (`:92`), key/prefix decisions (`:119`, `:152`), body transforms (`:434`), state (`:590`), REST calls (`:698`), and stale-write races (`:841`).
+- Core lifecycle: `apiKeyPool.test.ts`, `customProfiles.test.ts`, `dbDefaults.test.ts`, `profileUpdate.test.ts`, and `profileUpdate.integration.test.ts`.
+- Registry: `loader.test.ts`, `snapshot.test.ts`, `snapshotNullSafety.test.ts`, `remote.test.ts`, `notice.test.ts`, and `visibility.test.ts`.
+- Shared adapter contracts: `buildRequest.test.ts`, `auth.test.ts`, `error.test.ts`, `resolveCredential.test.ts`, `wireInvariants.test.ts`, `sse.test.ts`, `toolLoop.test.ts`, and `vertexEndpoint.test.ts`.
+- Provider adapters: `openaiCompatible.test.ts`, `anthropicMessages.test.ts`, and `googleGemini.test.ts`.
+- Vertex/service-account integration and Gemini cache behavior have dedicated parser, token, cache, endpoint, and integration suites.
 
 ## 3. Architecture & data flow
 
@@ -98,7 +97,7 @@ PocketRisu uses three similarly named but distinct concepts:
 2. A `ModelPreset` is a user-owned installation of a profile: it freezes a `ResolvedModelProfileSnapshot`, stores user values and credentials, and adds behavior such as streaming, tool use, vision/system-role toggles, context budget, caching, and ordering (`types.ts:252`).
 3. A `botPreset` is the upstream-compatible prompt preset. It stores prompt text/template, sampling values, legacy model/provider fields, regex/tools, and other global chat-bot settings (`database.svelte.ts:1723`).
 
-A “custom profile” is therefore not an upstream RisuAI preset and not a `customModels[]` entry. It is a shareable, key-free profile blueprint stored in `modelProfileRegistryCache.registries.custom`; it must still be instantiated as a `ModelPreset` before a chat can use it.
+A “custom profile” is therefore not an upstream RisuAI preset, a `customModels[]` entry, or the separately configured custom remote registry. It is an imported profile/base-provider fragment stored in `modelProfileRegistryCache.registries.custom`; it must still be instantiated as a `ModelPreset` before a chat can use it.
 
 ### Registry-to-preset flow
 
@@ -122,7 +121,7 @@ request adapter dispatch
 - `loader.ts:17` builds the bundled registry from JSON modules.
 - `remote.ts:158` optionally updates the persisted official entry using a content hash. Failures leave the previous cache/bundle untouched.
 - `modelProfileBrowser.svelte:156` resolves the selected profile.
-- `snapshot.ts:36` combines common provider fields and profile overrides. The base provider typically supplies credentials/common capability defaults; the profile supplies the concrete endpoint/model and model-specific fields.
+- `snapshot.ts:36` combines common provider fields and profile overrides. Schema/UI entries replace same-key base entries; body defaults, headers, and limits shallow-merge. Profile capabilities replace the base capability set when present, rather than forming a union.
 - `modelProfileBrowser.svelte:137` seeds `userValues` from merged schema-field defaults. Snapshot-level `defaults` remain a separate body-default layer.
 - The resulting preset is appended to `db.modelPresets` at `modelProfileBrowser.svelte:178`.
 - Chat binding stores only preset IDs; the persisted snapshot means future registry changes do not silently alter existing requests.
@@ -130,7 +129,7 @@ request adapter dispatch
 ### Custom-profile flow
 
 - Export builds a schema-version-1 fragment containing one profile and its base provider (`customProfiles.ts:31`, `customProfiles.ts:52`).
-- Import validates the untrusted JSON (`customProfiles.ts:80`), namespaces both IDs with `custom::`, fills missing type-only versions/timestamps, and writes the pair into the custom registry (`customProfiles.ts:130`).
+- Import performs shallow structural validation of the untrusted JSON (`customProfiles.ts:80`), namespaces both IDs with `custom::`, fills missing type-only versions/timestamps, and writes the pair into the custom registry (`customProfiles.ts:130`). Nested schema, endpoint, header, and default contents remain user-controlled configuration.
 - The official and custom registries remain separate browser tabs (`modelProfileBrowser.svelte:48`).
 - Removing a custom profile also removes an unreferenced base provider (`customProfiles.ts:265`). Existing `ModelPreset`s continue working from their frozen snapshots, but their source becomes “missing.”
 
@@ -169,7 +168,7 @@ This load-boundary mutation is intentional and persists on the next database sav
 
 - `changeToPreset()` saves the current prompt preset and installs the selected one into global database fields (`database.svelte.ts:2516`).
 - `setPreset()` copies prompt text, prompt template, sampling parameters, and legacy settings into the global database (`database.svelte.ts:2531`).
-- A chat’s `bindedBotPreset` stores a stable ID, but `PromptBind.svelte` resolves it to the current array index and calls `changeToPreset()` so legacy prompt code can continue reading `db.botPresetsId` (`PromptBind.svelte:17`, `PromptBind.svelte:29`).
+- A chat’s `bindedBotPreset` stores a stable ID, but `PromptBind.svelte` resolves it to the current array index and calls `changeToPreset()` so legacy prompt code can continue reading `db.botPresetsId` (`PromptBind.svelte:17`, `PromptBind.svelte:29`). This synchronization is driven by the side-chat binding UI, not by an unconditional request-time resolver.
 - Reorder/delete code should preserve the active stable ID through `withStableActivePreset()` (`database.svelte.ts:2394`).
 
 ### Prompt construction versus model dispatch
@@ -292,7 +291,7 @@ The Risu formats apply to `botPreset`, not `ModelPreset`.
 - NovelAI parameter files and SillyTavern prompt layouts have separate conversion branches (`database.svelte.ts:2922`, `database.svelte.ts:2947`);
 - every imported ordinary preset receives a fresh stable ID before being appended (`database.svelte.ts:3052`).
 
-Model profiles instead use plain `.profile.json` fragments (`modelProfileBrowser.svelte:241`, `ModelPresetBasicInfo.svelte:105`). There is no dedicated standalone `ModelPreset` import/export format; model presets persist as part of the PocketRisu database/backup.
+Model profiles instead use plain `.profile.json` fragments (`modelProfileBrowser.svelte:241`, `ModelPresetBasicInfo.svelte:105`). Fragment export normally omits a preset's direct credentials, but the flexible profile/base-provider fields are not scrubbed recursively; inspect hand-edited or imported fragments before sharing. There is no dedicated standalone `ModelPreset` import/export format; model presets and direct credentials persist as part of the PocketRisu database/backup.
 
 ## 4. Entry points & dependencies
 
@@ -327,8 +326,9 @@ Model profiles instead use plain `.profile.json` fragments (`modelProfileBrowser
 - The richer `profileUpdate.ts` API is not wired into production UI. Its `orphanValues` behavior differs from the live `migrateUserValues()` path, which drops obsolete values after confirmation.
 - Profile replacement preserves same-key values without checking field type (`customProfiles.ts:200`). The unused `applyProfileSnapshotUpdate()` does perform type-change checks.
 - Custom profile/base-provider IDs must remain under `custom::`; otherwise official imports could collide with bundled identities.
-- Custom profile fragments intentionally contain no API keys. Credentials live on `ModelPreset.userValues`, `inlineCredential`, or `apiKeyRef`.
+- Preset credentials normally live in `ModelPreset.userValues`, `inlineCredential`, or `apiKeyRef`; the key-pool UI's provider label is organizational, not a runtime compatibility gate. Credential resolution can still fall through from a missing/empty referenced key to direct values.
 - `resolveSnapshot()` merges by field key. A profile schema/UI entry replaces the corresponding base entry rather than shallow-merging individual attributes (`snapshot.ts:100`, `snapshot.ts:118`).
+- `capabilities` use profile-or-base fallback, not union semantics. Limits and default body/header maps have their own shallow-merge rules.
 - Official remote sync is all-or-nothing. A single malformed profile/base relationship rejects the catalog (`remote.ts:75`).
 - A custom registry base URL must be HTTPS. Enabling a blank/non-HTTPS URL fails loudly instead of falling back to the official registry (`remote.ts:60`).
 - Registry mutations that must update UI should assign new outer objects. Remote sync and API-key CRUD already do this; in-place nested mutation can be missed by Svelte.
@@ -336,6 +336,7 @@ Model profiles instead use plain `.profile.json` fragments (`modelProfileBrowser
 - Switching a prompt preset copies its values into global DB fields. Directly mutating a non-active `botPreset` does not automatically update those globals.
 - Since v6, `setPreset()` deliberately does not replace separated auxiliary model configuration when changing prompt presets (`database.svelte.ts:2611`).
 - A chat-bound prompt preset currently works by synchronizing the global active prompt preset on chat entry. It is not an isolated per-request prompt snapshot.
+- That synchronization depends on `PromptBind` being mounted in the side-chat UI. Code paths that change chats without mounting that surface should not assume `bindedBotPreset` has already updated the global prompt preset.
 - Model presets do not normally influence prompt text. They affect token budgeting, optional prompt-preset sampling overrides, message normalization, and wire dispatch.
 - `usePromptPresetParams` is main-request-only and schema-gated. It never injects output limits or thinking configuration (`modelPresetBinding.ts:205`).
 - Prompt-preset temperature/frequency/presence values use the classic hundredths scale; model preset fields use provider wire values. The bridge converts the former at `modelPresetBinding.ts:231`.
@@ -350,12 +351,13 @@ Model profiles instead use plain `.profile.json` fragments (`modelProfileBrowser
 - Deleting a key does not clear presets that reference it. The UI exposes a dangling-reference state, and runtime credential resolution may fall through to inline/direct values.
 - Updating one key entry changes every preset referencing that ID. This also invalidates Gemini cache reuse through credential fingerprinting.
 - `fallbackModelPresetIds` and the model-preset migration-report types are currently persisted/type-level scaffolding without runtime retry/migration logic.
+- `tokenizerOverride` and profile `recommendedTokenizer` are exposed in settings but do not currently select the chat tokenizer. Persisted ordering/pinning and migration-source metadata also include scaffolding with no request-path effect; verify a consumer before relying on any such field.
 - Gemini context caches require a native `message.cachePoint`; enabling caching alone does not create a boundary.
 - Gemini cache state belongs in `localStorage`, not the database or export files.
 - Google service-account preparation must go through `prepareAdapterRequest()`. Calling `buildPreparedRequest()` directly with raw service-account JSON could treat the JSON as a bearer token.
 - Service-account token refresh is shared across callers and is not cancelled when one request aborts; only that caller’s wait is cancelled (`googleServiceAccount/cache.ts:61`).
 - The current binary exporter produces `.risup`, while `.risupreset` remains an accepted legacy input. Do not infer encoding solely from the internal function argument name.
-- `.risup`/`.risupreset` export scrubs known legacy credentials, but `.profile.json` is the only profile-sharing format and should remain key-free by construction.
+- `.risup`/`.risupreset` export scrubs known legacy credential fields, not arbitrary nested secrets. `.profile.json` export omits the preset credential object but does not recursively prove every flexible configuration field secret-free. Full backups contain model presets and key-pool/direct credentials unless the target format explicitly strips them.
 - Tests exercise malformed/null registry data heavily; preserving null-tolerant resolution and load sanitization is a compatibility requirement.
 
 ## 6. Navigation hints
@@ -387,9 +389,9 @@ Model profiles instead use plain `.profile.json` fragments (`modelProfileBrowser
 - To change Gemini cache eligibility, inspect `src/ts/process/request/request.ts:722`; for decision/state behavior use `src/ts/preset/cache/geminiContextCache.ts:284` and `:341`.
 - To change Gemini cached-body wiring or stale-write handling, inspect `src/ts/preset/cache/geminiCacheWiring.ts:57` and `:172`.
 
-## Out of scope, noticed
+## 7. Related structure docs
 
-- `src/ts/process/request/` owns the broader classic-versus-preset request pipeline, streaming presentation, tool execution, and request-status reporting.
-- `src/ts/process/index.svelte.ts` owns full prompt assembly, memory/lore/template processing, and token trimming.
-- `server/node/server.cjs:3853` implements the authenticated Node-side Google service-account JWT signing and OAuth exchange endpoint.
-- `src/ts/process/prompt.ts` contains SillyTavern/parameter-preset conversion logic beyond the `.risup` compatibility entry points documented above.
+- [Model providers](model-providers.md) covers classic-versus-preset dispatch, streaming, fallback behavior, and provider wire formats.
+- [Chat pipeline](chat-pipeline.md) covers prompt assembly, memory/lore/template processing, and token trimming.
+- [Server backend](server-backend.md) covers the authenticated Google service-account token exchange endpoint.
+- [Backup and recovery](backup-recovery.md) covers secret-bearing full backups and lossy upstream-target exports.

@@ -1,7 +1,7 @@
-# model-providers
+# Model providers
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-25 against `2e3d4f05`. Line numbers are approximate and drift as code changes; verify with `rg` before relying on them.
+> Audited 2026-07-27 against `abee0232`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -13,7 +13,7 @@ In the legacy regime, `LLMModel.format` selects the wire protocol while `provide
 
 ### Registry and model metadata
 
-- `src/ts/model/types.ts` — about 133 lines. Defines the numeric metadata contracts:
+- `src/ts/model/types.ts` — Defines the numeric metadata contracts:
   - `LLMFlags` capability/compatibility constants at `src/ts/model/types.ts:3`.
   - `LLMProvider` grouping constants at `src/ts/model/types.ts:30`.
   - `LLMFormat` wire-dispatch constants at `src/ts/model/types.ts:50`.
@@ -22,7 +22,7 @@ In the legacy regime, `LLMModel.format` selects the wire protocol while `provide
   - `ProviderNames` at `src/ts/model/types.ts:112`.
   - Shared parameter allowlists at `src/ts/model/types.ts:131`.
 
-- `src/ts/model/modellist.ts` — about 826 lines. Aggregates every legacy model and resolves persisted IDs:
+- `src/ts/model/modellist.ts` — Aggregates every legacy model and resolves persisted IDs:
   - `LLMModels` begins at `src/ts/model/modellist.ts:43`.
   - Static defaults for `shortName`, `internalID`, and `fullName` are filled at `src/ts/model/modellist.ts:545`.
   - OpenAI Responses API and Gemini Vertex variants are synthesized at `src/ts/model/modellist.ts:551`.
@@ -30,17 +30,17 @@ In the legacy regime, `LLMModel.format` selects the wire protocol while `provide
   - `getModelInfo()` resolves static, `hf:::`, `horde:::`, `xcustom:::`, and `pluginmodel:::` IDs at `src/ts/model/modellist.ts:676`.
   - `getModelList()` filters/groups models for selectors at `src/ts/model/modellist.ts:778`.
 
-- `src/ts/model/providers/openai.ts` — about 824 lines. `OpenAIModels` is the static OpenAI model catalog (`src/ts/model/providers/openai.ts:3`).
+- `src/ts/model/providers/openai.ts` — `OpenAIModels` is the static OpenAI model catalog (`src/ts/model/providers/openai.ts:3`).
 
-- `src/ts/model/providers/anthropic.ts` — about 399 lines. `AnthropicModels` contains current Messages API models and legacy completion-format Claude entries (`src/ts/model/providers/anthropic.ts:3`).
+- `src/ts/model/providers/anthropic.ts` — `AnthropicModels` contains current Messages API models and legacy completion-format Claude entries (`src/ts/model/providers/anthropic.ts:3`).
 
-- `src/ts/model/providers/google.ts` — about 394 lines. `GoogleModels` contains Gemini model IDs, modality/thinking flags, and parameter allowlists (`src/ts/model/providers/google.ts:3`).
+- `src/ts/model/providers/google.ts` — `GoogleModels` contains Gemini model IDs, modality/thinking flags, and parameter allowlists (`src/ts/model/providers/google.ts:3`).
 
-- `src/ts/model/providers/nanogpt.ts` — 15 lines. Centralizes NanoGPT chat, Responses, Messages, subscription, catalog, balance, and provider endpoints (`src/ts/model/providers/nanogpt.ts:5`).
+- `src/ts/model/providers/nanogpt.ts` — Centralizes NanoGPT endpoint constants. The current selectable NanoGPT entry uses the chat-completions format; the additional NanoGPT format constants are not separate production catalog entries (`src/ts/model/providers/nanogpt.ts:5`).
 
 ### Request dispatch and provider wire formats
 
-- `src/ts/process/request/request.ts` — about 1,934 lines. Main request coordinator:
+- `src/ts/process/request/request.ts` — Main request coordinator:
   - `RequestDataArgumentExtended` at `src/ts/process/request/request.ts:77`.
   - `requestDataResponse` union at `src/ts/process/request/request.ts:89`.
   - `requestChatData()` retry/fallback wrapper at `src/ts/process/request/request.ts:120`.
@@ -52,7 +52,7 @@ In the legacy regime, `LLMModel.format` selects the wire protocol while `provide
   - `testModelPreset()` at `src/ts/process/request/request.ts:927`.
   - Legacy provider implementations begin with NovelAI at `src/ts/process/request/request.ts:1022`, Ooba at `src/ts/process/request/request.ts:1129`, plugins at `src/ts/process/request/request.ts:1336`, Kobold at `src/ts/process/request/request.ts:1438`, Ollama at `src/ts/process/request/request.ts:1585`, Cohere at `src/ts/process/request/request.ts:1633`, Horde at `src/ts/process/request/request.ts:1763`, and browser-local generation at `src/ts/process/request/request.ts:1868`.
 
-- `src/ts/process/request/openAI/requests.ts` — about 1,423 lines. OpenAI-compatible request family:
+- `src/ts/process/request/openAI/requests.ts` — OpenAI-compatible request family:
   - `requestOpenAI()` builds Chat Completions requests at `src/ts/process/request/openAI/requests.ts:35`.
   - `requestHTTPOpenAI()` handles JSON responses and recursive tool calls at `src/ts/process/request/openAI/requests.ts:629`.
   - `requestOpenAILegacyInstruct()` handles `/v1/completions` at `src/ts/process/request/openAI/requests.ts:858`.
@@ -60,15 +60,15 @@ In the legacy regime, `LLMModel.format` selects the wire protocol while `provide
   - `getTranStream()` parses Chat Completions SSE at `src/ts/process/request/openAI/requests.ts:1116`.
   - `wrapToolStream()` executes streamed tool calls and resumes generation at `src/ts/process/request/openAI/requests.ts:1272`.
 
-- `src/ts/process/request/openAI/types.ts` — about 88 lines. Wire types for Responses API items, multimodal content, and tool calls (`src/ts/process/request/openAI/types.ts:3`).
+- `src/ts/process/request/openAI/types.ts` — Wire types for Responses API items, multimodal content, and tool calls (`src/ts/process/request/openAI/types.ts:3`).
 
 - `src/ts/process/request/openAI/index.ts` — one-line compatibility re-export at `src/ts/process/request/openAI/index.ts:1`.
 
-- `src/ts/process/request/anthropic.ts` — about 1,108 lines. `requestClaude()` converts messages, images, cache points, reasoning, and tools to Anthropic or Bedrock form (`src/ts/process/request/anthropic.ts:71`); `requestClaudeHTTP()` handles Anthropic JSON/SSE and tool recursion (`src/ts/process/request/anthropic.ts:796`).
+- `src/ts/process/request/anthropic.ts` — `requestClaude()` converts messages, images, cache points, reasoning, and tools to Anthropic or Bedrock form (`src/ts/process/request/anthropic.ts:71`); `requestClaudeHTTP()` handles Anthropic JSON/SSE and tool recursion (`src/ts/process/request/anthropic.ts:796`).
 
-- `src/ts/process/request/google.ts` — about 1,345 lines. `requestGoogleCloudVertex()` formats Gemini `contents`, modalities, tools, safety, thinking, and authentication (`src/ts/process/request/google.ts:58`); `requestGoogle()` handles JSON/SSE responses and recursive function calls (`src/ts/process/request/google.ts:613`).
+- `src/ts/process/request/google.ts` — `requestGoogleCloudVertex()` formats Gemini `contents`, modalities, tools, safety, thinking, and authentication (`src/ts/process/request/google.ts:58`); `requestGoogle()` handles JSON/SSE responses and recursive function calls (`src/ts/process/request/google.ts:613`).
 
-- `src/ts/process/request/shared.ts` — about 345 lines:
+- `src/ts/process/request/shared.ts` — Provider-neutral request parameters, custom body/header parsing, streaming collection, and parameter application.
   - `LLMParameter` and `ModelModeExtended` at `src/ts/process/request/shared.ts:3`.
   - Custom body/header parsing at `src/ts/process/request/shared.ts:33`.
   - `collectStreamingText()` at `src/ts/process/request/shared.ts:128`.
@@ -76,69 +76,69 @@ In the legacy regime, `LLMModel.format` selects the wire protocol while `provide
 
 ### ModelPreset bridge
 
-- `src/ts/process/request/modelPresetBinding.ts` — about 298 lines:
+- `src/ts/process/request/modelPresetBinding.ts` — Per-chat classic/preset binding, context/output limits, prompt-parameter bridging, and credentials.
   - `resolveChatModelBinding()` chooses classic versus preset and resolves main/sub/aux slots at `src/ts/process/request/modelPresetBinding.ts:42`.
   - `resolvePresetMaxOutputTokens()` at `src/ts/process/request/modelPresetBinding.ts:127`.
   - `resolveChatMaxResponseTokens()` at `src/ts/process/request/modelPresetBinding.ts:181`.
   - `applyPromptPresetParams()` at `src/ts/process/request/modelPresetBinding.ts:237`.
   - `buildModelPresetCredential()` at `src/ts/process/request/modelPresetBinding.ts:278`.
 
-- `src/ts/process/request/modelPresetMessages.ts` — about 126 lines. Converts classic history into adapter messages:
+- `src/ts/process/request/modelPresetMessages.ts` — Converts classic history into adapter messages:
   - `expandAdapterMessages()` restores persisted tool markers at `src/ts/process/request/modelPresetMessages.ts:18`.
   - `toolResponseText()` at `src/ts/process/request/modelPresetMessages.ts:104`.
   - `toAdapterMessage()` maps roles, cache points, and optional images at `src/ts/process/request/modelPresetMessages.ts:112`.
 
-- `src/ts/process/request/presetStreamPump.ts` — about 177 lines:
+- `src/ts/process/request/presetStreamPump.ts` — Delta accumulation, cumulative snapshot delivery, throttling, and backpressure for ModelPreset streams.
   - `StreamFlushThrottle` at `src/ts/process/request/presetStreamPump.ts:24`.
   - `pumpPresetStream()` accumulates adapter deltas and emits throttled cumulative snapshots at `src/ts/process/request/presetStreamPump.ts:109`.
 
 ### Catalog helpers and specialized formats
 
-- `src/ts/model/openrouter.ts` — about 146 lines. Fetches OpenRouter providers/models, derives pricing, and produces generic grid items:
+- `src/ts/model/openrouter.ts` — Fetches OpenRouter providers/models, derives pricing, and produces generic grid items:
   - `getOpenRouterProviders()` at `src/ts/model/openrouter.ts:33`.
   - `getOpenRouterModels()` at `src/ts/model/openrouter.ts:51`.
   - `toModelGridItem()` at `src/ts/model/openrouter.ts:108`.
   - `getFreeOpenRouterModels()` at `src/ts/model/openrouter.ts:139`.
 
-- `src/ts/model/nanogpt.ts` — about 225 lines. Fetches NanoGPT balance, subscription state, provider choices, and model catalogs:
+- `src/ts/model/nanogpt.ts` — Fetches NanoGPT balance, subscription state, provider choices, and model catalogs:
   - Account endpoints at `src/ts/model/nanogpt.ts:60` and `src/ts/model/nanogpt.ts:73`.
   - Per-model provider lookup at `src/ts/model/nanogpt.ts:125`.
   - Subscription model catalog at `src/ts/model/nanogpt.ts:137`.
   - Regular/personalized catalog at `src/ts/model/nanogpt.ts:162`.
   - Grid conversion at `src/ts/model/nanogpt.ts:194`.
 
-- `src/ts/model/modelGrid.ts` — 19 lines. Provider-neutral model-card and pinned-item types (`src/ts/model/modelGrid.ts:2`).
+- `src/ts/model/modelGrid.ts` — Provider-neutral model-card and pinned-item types (`src/ts/model/modelGrid.ts:2`).
 
-- `src/ts/model/ooba.ts` — about 47 lines. Type-only schema for the large Oobabooga sampler surface (`src/ts/model/ooba.ts:1`).
+- `src/ts/model/ooba.ts` — Type-only schema for the large Oobabooga sampler surface (`src/ts/model/ooba.ts:1`).
 
-- `src/ts/process/models/nai.ts` — about 389 lines. `stringlizeNAIChat()` creates NovelAI’s plain-text prompt (`src/ts/process/models/nai.ts:5`); `NovelAIBadWordIds` begins at `src/ts/process/models/nai.ts:72`.
+- `src/ts/process/models/nai.ts` — `stringlizeNAIChat()` creates NovelAI’s plain-text prompt (`src/ts/process/models/nai.ts:5`); `NovelAIBadWordIds` begins at `src/ts/process/models/nai.ts:72`.
 
-- `src/ts/process/models/modelString.ts` — about 27 lines. `getGenerationModelString()` produces user-visible generation labels, including bound presets, OpenRouter, reverse proxy, and NanoGPT (`src/ts/process/models/modelString.ts:3`).
+- `src/ts/process/models/modelString.ts` — `getGenerationModelString()` produces user-visible generation labels, including bound presets, OpenRouter, reverse proxy, and NanoGPT (`src/ts/process/models/modelString.ts:3`).
 
 - `src/ts/process/models/local.ts` — three lines. `tokenizeGGUFModel()` is deliberately unsupported and always throws (`src/ts/process/models/local.ts:1`).
 
-- `src/ts/horde/getModels.ts` — about 43 lines. `getHordeModels()` caches the Horde worker/model status list (`src/ts/horde/getModels.ts:19`).
+- `src/ts/horde/getModels.ts` — `getHordeModels()` caches the Horde worker/model status list (`src/ts/horde/getModels.ts:19`).
 
 ### In-browser inference
 
-- `src/ts/process/transformers.ts` — about 196 lines. Lazily loads `@huggingface/transformers`, configures browser/asset caching, and exposes text generation, summarization, embeddings, image captioning, VITS, and ONNX registration:
+- `src/ts/process/transformers.ts` — Lazily loads `@huggingface/transformers`, configures browser/asset caching, and exposes text generation, summarization, embeddings, image captioning, VITS, and ONNX registration:
   - Initialization at `src/ts/process/transformers.ts:9`.
   - `runTransformers()` at `src/ts/process/transformers.ts:38`.
   - `runEmbedding()` at `src/ts/process/transformers.ts:61`.
   - `runVITS()` at `src/ts/process/transformers.ts:112`.
   - `registerOnnxModel()` at `src/ts/process/transformers.ts:150`.
 
-- `src/ts/process/webllm.ts` — about 61 lines. Maintains a single `@mlc-ai/web-llm` engine for memory summarization:
+- `src/ts/process/webllm.ts` — Maintains a single `@mlc-ai/web-llm` engine for memory summarization:
   - `chatCompletion()` at `src/ts/process/webllm.ts:10`.
   - `unloadEngine()` at `src/ts/process/webllm.ts:55`.
 
 ### Local-network transport helpers
 
-- `src/ts/network/localNetwork.ts` — about 112 lines. Recognizes localhost, `.local`, single-label Docker/LAN names, private IPv4, and local IPv6 (`src/ts/network/localNetwork.ts:74`); `isLocalNetworkUrl()` safely parses URLs at `src/ts/network/localNetwork.ts:104`.
+- `src/ts/network/localNetwork.ts` — Recognizes localhost, `.local`, single-label Docker/LAN names, private IPv4, and local IPv6 (`src/ts/network/localNetwork.ts:74`); `isLocalNetworkUrl()` safely parses URLs at `src/ts/network/localNetwork.ts:104`.
 
-- `src/ts/network/proxyJobWs.ts` — about 31 lines. Defines and parses WebSocket proxy-job events, decodes base64 chunks, and normalizes timeout errors (`src/ts/network/proxyJobWs.ts:1`, `src/ts/network/proxyJobWs.ts:9`, `src/ts/network/proxyJobWs.ts:21`).
+- `src/ts/network/proxyJobWs.ts` — Defines and parses WebSocket proxy-job events, decodes base64 chunks, and normalizes timeout errors (`src/ts/network/proxyJobWs.ts:1`, `src/ts/network/proxyJobWs.ts:9`, `src/ts/network/proxyJobWs.ts:21`).
 
-- Tests are colocated in `modelPresetBinding.test.ts` (282 lines), `modelPresetMessages.test.ts` (164), `presetStreamPump.test.ts` (304), `shared.test.ts` (46), `localNetwork.test.ts` (55), and `proxyJobWs.test.ts` (37). They cover binding invariants, token caps, history interchange, cumulative streams, throttling/backpressure, local-host classification, and proxy event decoding.
+- Tests colocated in `modelPresetBinding.test.ts`, `modelPresetMessages.test.ts`, `presetStreamPump.test.ts`, `shared.test.ts`, `localNetwork.test.ts`, and `proxyJobWs.test.ts` cover binding invariants, token caps, history interchange, cumulative streams, throttling/backpressure, local-host classification, and proxy event decoding.
 
 ## 3. Architecture & data flow
 
@@ -176,7 +176,7 @@ For preset calls, `resolveChatModelBinding()` runs before any classic model look
 4. The switch at `src/ts/process/request/request.ts:442` routes by `LLMFormat`.
 5. Every implementation returns `success`, `fail`, `streaming`, or `multiline` through `requestDataResponse` (`src/ts/process/request/request.ts:89`).
 
-A fallback retry supplies `staticModel`, which deliberately skips per-chat preset binding and separate-model selection. Therefore a failing preset can eventually fall back to classic model IDs from `db.fallbackModels`, but not to `ModelPreset.fallbackModelPresetIds`.
+Each `db.fallbackModels[mode]` entry is supplied as `staticModel`, deliberately skipping per-chat preset binding and separate-model selection. Current loop ordering has an important defect: when the configured fallback list is non-empty, those classic model IDs run but the appended primary-model sentinel is skipped, so the primary preset/classic selection is never attempted. With no configured fallbacks, the primary selection runs normally. `ModelPreset.fallbackModelPresetIds` has no request-path consumer.
 
 ### OpenAI-compatible family
 
@@ -194,7 +194,7 @@ Non-streaming uses `globalFetch()` and parses JSON. Streaming uses `fetchNative(
 
 OpenAI-compatible SSE chunks are converted into cumulative snapshots such as `{ "0": "full text so far" }`. The parser separately accumulates reasoning and partial tool-call arguments (`src/ts/process/request/openAI/requests.ts:1131`).
 
-The Responses API is a separate request builder: chat turns become typed `input_text`, `output_text`, image, and file items; it sends `max_output_tokens` to `/v1/responses` (`src/ts/process/request/openAI/requests.ts:926`).
+The Responses API is a separate, non-streaming request builder: chat turns become typed `input_text`, `output_text`, image, and file items; it sends `max_output_tokens` to `/v1/responses`. This classic path does not attach or execute MCP tools (`src/ts/process/request/openAI/requests.ts:926`).
 
 ### Anthropic and Bedrock family
 
@@ -202,7 +202,9 @@ The Responses API is a separate request builder: chat turns become typed `input_
 
 The body uses `modelInfo.internalID`, `messages`, `system`, `max_tokens`, and optionally `thinking`. Prompt-cache markers become Anthropic `cache_control` entries (`src/ts/process/request/anthropic.ts:145`, `src/ts/process/request/anthropic.ts:350`).
 
-Ordinary Anthropic calls use `x-api-key`, `anthropic-version`, optional beta headers, and JSON or SSE (`src/ts/process/request/anthropic.ts:551`). Streaming converts text, thinking, and redacted-thinking blocks into cumulative output with `<Thoughts>` wrappers (`src/ts/process/request/anthropic.ts:818`).
+Ordinary Anthropic calls use `x-api-key`, `anthropic-version`, optional beta headers, and JSON or SSE (`src/ts/process/request/anthropic.ts:551`). Streaming converts text, thinking, and redacted-thinking blocks into cumulative output with `<Thoughts>` wrappers (`src/ts/process/request/anthropic.ts:818`). The classic recursive tool loop is implemented only for the non-streaming response path.
+
+When Claude batching is enabled, the requester submits `/batches`, polls status, can cancel on abort, and streams the eventual batch result back through the request contract (`src/ts/process/request/anthropic.ts:610`).
 
 Bedrock models use `accessKeyId:secretAccessKey:region`, generate a region/global model path, add `anthropic_version`, and sign the request with AWS Signature V4 (`src/ts/process/request/anthropic.ts:392`). Bedrock streaming is explicitly disabled in this implementation (`src/ts/process/request/anthropic.ts:406`).
 
@@ -219,8 +221,9 @@ Both JSON and SSE responses preserve thought text, function calls, and thought s
 ### Other legacy formats
 
 - NovelAI stringifies chat into one completion prompt and sends NovelAI sampler settings and token bans (`src/ts/process/request/request.ts:1022`).
+- NovelList sends its dedicated NovelList request shape, while the developer-only Echo format returns the configured echo message without a provider call (`src/ts/process/request/request.ts:1423`, `src/ts/process/request/request.ts:1503`).
 - Ooba legacy supports a bespoke WebSocket stream; the newer Ooba path calls `/v1/completions` (`src/ts/process/request/request.ts:1129`, `src/ts/process/request/request.ts:1266`).
-- Plugins call either a v2 provider function or the legacy plugin processor and adapt plugin streams to request chunks (`src/ts/process/request/request.ts:1336`).
+- Plugins call a registered provider callback and adapt plugin streams to request chunks. The legacy `pluginProcess()` fallback is now only an error stub reporting that no provider was found (`src/ts/process/request/request.ts:1336`, `src/ts/plugins/plugins.svelte.ts:1872`).
 - Kobold uses `/api/v1/generate` and renamed sampler fields (`src/ts/process/request/request.ts:1438`).
 - Ollama uses the browser Ollama client and always requests a stream (`src/ts/process/request/request.ts:1585`).
 - Cohere splits the final user message from `chat_history` and maps roles to `USER`, `CHATBOT`, and `SYSTEM` (`src/ts/process/request/request.ts:1633`).
@@ -297,7 +300,7 @@ ModelPreset requests mark local URLs for server routing, but `makeProxiedFetch()
 - The static registry’s module-initialization pass automatically creates:
   - Responses API twins for `provider === OpenAI && format === OpenAICompatible`.
   - Vertex Gemini twins for static `GoogleCloud` entries.
-  
+
   This occurs before `registerModelDynamic()`, so dynamically discovered Google models do not receive Vertex twins (`src/ts/model/modellist.ts:551`).
 
 - Avoid duplicate `id` values. `getModelInfo()` uses the first matching entry (`src/ts/model/modellist.ts:693`), making later duplicates unreachable even when their `internalID` differs.
@@ -314,7 +317,7 @@ ModelPreset requests mark local URLs for server routing, but `makeProxiedFetch()
 
 - A completed ModelPreset tool call must retain `toolExecuted`; otherwise banned-character, blank-response, or plugin-replacer retries can execute the tool twice (`src/ts/process/request/request.ts:189`).
 
-- `ModelPreset.fallbackModelPresetIds` is declared but has no request-path consumer. Runtime fallback currently reads only legacy `db.fallbackModels` (`src/ts/process/request/request.ts:122`).
+- `ModelPreset.fallbackModelPresetIds` is declared but has no request-path consumer. Runtime fallback reads only legacy `db.fallbackModels`; when that list is non-empty, the current loop skips the primary model entirely (`src/ts/process/request/request.ts:122`).
 
 - Additional parameters support nested body paths, typed `json::` values, `header::Name`, and deletion with `{{none}}` (`src/ts/process/request/shared.ts:65`). An `anthropic-beta` supplied this way suppresses automatic beta construction (`src/ts/process/request/anthropic.ts:386`).
 
@@ -342,7 +345,7 @@ ModelPreset requests mark local URLs for server routing, but `makeProxiedFetch()
 
 - To add an OpenAI model, add an `LLMModel` entry to `OpenAIModels` (`src/ts/model/providers/openai.ts:3`). Set a unique stable `id`, the provider’s wire `internalID`, `OpenAICompatible` format, correct flags, parameter allowlist, and tokenizer.
 
-- To add an Anthropic model, add it to `AnthropicModels` (`src/ts/model/providers/anthropic.ts:3`). Current Messages models need `Anthropic` format; only obsolete completion models should use `AnthropicLegacy`.
+- To add an Anthropic model, add it to `AnthropicModels` (`src/ts/model/providers/anthropic.ts:3`). Both `Anthropic` and the historically named `AnthropicLegacy` currently dispatch through the Messages requester; choose the existing catalog convention and verify flags rather than assuming `AnthropicLegacy` selects a completion endpoint.
 
 - To add a Gemini model, add it to `GoogleModels` (`src/ts/model/providers/google.ts:3`). Its static AI Studio entry automatically receives a Vertex twin at `src/ts/model/modellist.ts:564`.
 
@@ -352,7 +355,7 @@ ModelPreset requests mark local URLs for server routing, but `makeProxiedFetch()
   - `format: LLMFormat.OpenAICompatible`
   - `endpoint` for its chat-completions URL
   - `keyIdentifier` for `db.OaiCompAPIKeys`
-  
+
   The URL/key hooks are consumed at `src/ts/process/request/openAI/requests.ts:496` and `src/ts/process/request/openAI/requests.ts:528`.
 
 - Do not mark a third-party OpenAI-compatible service as `LLMProvider.OpenAI` merely for protocol compatibility; that provider value also causes automatic Responses API variants (`src/ts/model/modellist.ts:551`).
@@ -401,11 +404,10 @@ ModelPreset requests mark local URLs for server routing, but `makeProxiedFetch()
 
 - To change browser-local chat generation, inspect `requestWebLLM()` (`src/ts/process/request/request.ts:1868`) and `runTransformers()` (`src/ts/process/transformers.ts:38`), not the MLC helper.
 
-## Out of scope, noticed
+## 7. Related structure docs
 
-- `src/ts/preset/adapter/` owns the actual ModelPreset provider request builders, SSE parsers, credential resolution, errors, and shared tool loop.
-- `src/ts/preset/registry/` and bundled registry JSON files own preset-provider/profile discovery and snapshots.
-- `src/ts/globalApi.svelte.ts` owns fetch logging, interceptors, `/proxy2`, timeouts, and proxy-job client orchestration.
-- `server/node/server.cjs` owns `/proxy2`, `/proxy-stream-jobs`, WebSocket upgrades, authentication, SSRF restrictions, and upstream streaming.
-- `src/ts/storage/database.svelte.ts` owns persisted API keys, model choices, custom model definitions, fallback lists, and ModelPreset state.
-- `src/lib/Setting/Pages/BotSettings.svelte`, `src/lib/UI/ModelList.svelte`, and ModelPreset settings components own provider/model selection UI.
+- [Presets and profiles](presets-profiles.md) covers registry snapshots, ModelPreset persistence, credentials, adapters, and update flow.
+- [Chat pipeline](chat-pipeline.md) covers the provider-neutral prompt and streaming consumer.
+- [Server backend](server-backend.md) covers `/proxy2`, streaming jobs, authentication, and SSRF restrictions.
+- [Scripting and extensions](scripting-extensions.md) covers plugin providers and MCP tool registration.
+- [UI layer](ui-layer.md) covers provider/model selection and settings surfaces.

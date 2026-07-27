@@ -23,7 +23,7 @@ Plugin 3.0
 //@api 3.0
 ```
 
-If no api version is declared, it will be treated as 2.1. however, it will be mandatory to declare api version in future versions.
+If no API version is declared, it is treated as 2.0. Declare the version explicitly for predictable safety and compatibility behavior.
 
 ## API 2.1
 
@@ -38,7 +38,7 @@ API 2.1 works like 2.0, mostly compatible and working in same document context, 
 - Storage APIs: Direct access to localStorage, sessionStorage, cookieStorage, and IndexedDB has been removed. instead, `safeLocalStorage`, and `safeIdbFactory` are provided for secure storage operations.
 `localStorage` will be redirected to `safeLocalStorage`, and `indexedDB` will be redirected to `safeIdbFactory`. `sessionStorage` and `cookieStorage` are no longer accessible.
 
-- Internal APIs: Although it wasn't never intended for plugins to access internal APIs, due to wrongful implementation, internal APIs were accessible. This has been fixed, and plugins can no longer access internal APIs. however, some APIs are added officially for plugin usage, but with limitations. 
+- Internal APIs: Although it wasn't never intended for plugins to access internal APIs, due to wrongful implementation, internal APIs were accessible. This has been fixed, and plugins can no longer access internal APIs. however, some APIs are added officially for plugin usage, but with limitations.
 
 - Now run inside a independent function scope, preventing access to the outer scope.
 
@@ -166,7 +166,7 @@ The following APIs from v2.1 are still available in v3.0:
 - `loadPlugins`: Load additional plugins
 - `readImage`: Read image assets
 - `saveAsset`: Save assets
-- `onUnload`: Cleanup handler (deprecated - cleanup only happens on shutdown)
+- `onUnload`: Cleanup handler invoked when a plugin is disabled, replaced, or reloaded as well as during broader teardown. V3 receives a bounded abort signal; storage work must finish within the teardown grace period.
 - `getArg`: Get plugin arguments (deprecated, use `getArgument` instead)
 - `setArg`: Set plugin arguments (deprecated, use `setArgument` instead)
 
@@ -829,7 +829,7 @@ first, declare the api version at the top of your plugin script:
 //@api 2.0 2.1 3.0
 ```
 
-This will make the software load the plugin in the highest supported api version. then, you can use feature detection to check which api version is currently running, and adjust your code accordingly:
+The importer selects the first recognized version token, not the highest supported version. Prefer declaring exactly one API version. If maintaining a compatibility declaration, order it deliberately and use feature detection for the selected runtime:
 
 ```javascript
 
