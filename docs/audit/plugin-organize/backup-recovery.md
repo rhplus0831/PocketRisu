@@ -593,3 +593,38 @@ rollback, success, restart, and startup orphan tests require private archive,
 database, entry, and save-folder stages to disappear. The full R6 capacity,
 ZIP-validation, paging, and five-cycle verification record is in
 [PM3 R6 — Bounded backup and save-folder import ingress](performance-memory.md#pm3-r6-bounded-import-ingress).
+
+<a id="pm3-r6-queued-snapshot-restore-cancellation"></a>
+### PM3 R6 queued snapshot-restore cancellation follow-up
+
+Supplemental implementation `ee33db8b` makes explicit snapshot restore use the
+same cancellation-aware acquisition discipline as the archive and save-folder
+import routes. The route installs its request-aborted, response-close, and
+socket-close listeners before waiting for the import barrier. Because
+authentication and active-session validation yield before those listeners can
+be installed, it immediately seeds the controller from the current request,
+response, and captured socket state as well. The resulting signal is passed to
+`importBarrier.acquire()` and checked again on acquisition. Barrier release,
+listener removal, and restore-spool deletion live in the route's outer
+`finally`, including cancellation and acquisition-failure paths.
+
+The production-path regression uses a real raw HTTP socket and a backup import
+held after it has acquired the barrier. A snapshot restore is submitted behind
+that holder and its socket is destroyed. The server reports the restore's
+pre-publication cancellation while the original import is still held, proving
+that the abandoned waiter did not remain live until holder release. Before and
+after releasing the holder, the test requires no snapshot-restore spool, no
+snapshot publication, no delayed database resurrection, and no listener-leak
+warning. It then submits the same restore afresh and requires HTTP 200 with the
+exact `ok`, echoed `key`, `commitOutcome: "committed"`, and
+`commitOutcomeUnknown: false` acknowledgement.
+
+Verification passed all 285 server tests and the compatibility suite at 271
+passed with 5 skipped. Five focused snapshot tests rechecked canonical normal
+restore, pre-commit rollback, response-lost committed/unknown handling, session
+fencing, and repeated keep-alive listener cleanup; the held-import disconnect
+regression passed independently as well. `pnpm check` reported zero errors and
+four pre-existing accessibility warnings, and Node syntax plus Git whitespace
+checks were clean. The evidence proves prompt cancellation, cleanup, and fresh
+admission at this queue boundary; it does not infer a committed outcome after
+an acknowledgement is actually lost.

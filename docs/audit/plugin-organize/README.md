@@ -137,6 +137,7 @@ E1+E2 export path. Verification was repeated after each repair.
 | R6 bounded import ingress | `f1931989` | finite archive/ZIP/expanded/legacy/entry/row limits; private paged disk staging; ZIP integrity checks; disconnect-safe barrier acquisition; exact NDJSON errors and heartbeats; 52 MiB, exact/+1, rollback/restart, and orphan-cleanup gates |
 | R6 terminal-loss follow-up | `86d2a0b7`, `77eac26a` | strict heartbeat/progress/done/error schemas; malformed, missing, status-zero, or post-dispatch transport loss becomes non-retryable commit-unknown; exact committed-with-error and unknown outcomes warn then reload; one request with no replay |
 | R6 save-folder outcome follow-up | `52740be1`, `39303d78` | direct and ZIP exact committed/not-committed/unknown envelopes; post-COMMIT cleanup and marker durability; rollback-ambiguity restart recovery; finite auth/XHR deadlines; exact JSON schemas, status-zero handling, and private local-timeout provenance; mounted ZIP picker warning/reload policy with one request and no replay |
+| R6 queued snapshot-restore cancellation | `ee33db8b` | signal-aware barrier acquisition; current request/response/socket state seeded after listener installation; held-import raw-socket disconnect exits before holder release with no restore spool, mutation, or late resurrection; a fresh restore is admitted with the exact committed acknowledgement |
 
 The viewer bound is one page of at most 50 logical rows. A chunked logical row
 may still be synchronously reassembled, page tokens bind the selected page (not
@@ -250,6 +251,22 @@ full browser suite (1,581 passed, 3 skipped), type checking with zero errors,
 the production build, and complete 423/423 EN/KO help-key audits. Independent
 review accepted the mounted and direct success, committed, unknown,
 not-committed, cleanup, no-duplicate, and callback-throw coverage.
+
+Queued snapshot-restore supplement `ee33db8b` closes the corresponding
+disconnect window on `/api/db/snapshots/restore`. The route installs request,
+response, and socket listeners before barrier acquisition, seeds its
+`AbortSignal` from the already-observed stream/socket state, passes that signal
+through `importBarrier.acquire()`, and owns barrier release plus listener and
+spool cleanup from one outer `finally`. A real raw-socket test holds an archive
+import, disconnects a restore queued behind it, and observes cancellation
+before the holder is released. It then proves no snapshot spool, publication,
+or delayed resurrection occurred and that a new restore is admitted with the
+exact committed response. Verification passed the full server suite (285
+tests), compatibility suite (271 passed, 5 skipped), five focused normal,
+rollback, acknowledgement-loss, and listener-cleanup restore cases, the new
+held-import regression, syntax/diff checks, and `pnpm check` with zero errors
+(four pre-existing accessibility warnings). See the detailed trace in
+[Backup, snapshot, and recovery](backup-recovery.md#pm3-r6-queued-snapshot-restore-cancellation).
 
 ## Original recommended fix order
 
