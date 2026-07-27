@@ -1842,6 +1842,8 @@ export const languageKorean = {
   serverBackupDownload: "다운로드",
   serverBackupDelete: "삭제",
   serverBackupRestoring: "서버 백업에서 복원 중...",
+  backupRestoreCommittedFailure:
+    "서버가 백업 복원을 커밋했지만 이후 오류를 보고했습니다. 이 경고를 닫으면 권한 있는 서버 상태를 다시 불러옵니다.",
   backupRestoreOutcomeUnknown:
     "서버가 백업 복원을 커밋했을 수 있지만 응답이 유실되었거나 올바르지 않습니다. PocketRisu는 복원을 재시도하지 않습니다. 이 경고를 닫으면 권한 있는 서버 상태를 다시 불러와 확인합니다.",
   serverBackupDownloading: "백업 다운로드 중...",

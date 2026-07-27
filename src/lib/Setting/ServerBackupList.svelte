@@ -63,6 +63,10 @@
                     alertStore.set({ type: "wait", msg: "Success, Refreshing your app." });
                 }
             },
+            onCommittedFailure: async (error) => {
+                alertError(`${language.backupRestoreCommittedFailure}\n\n${error.message}`);
+                await waitAlert();
+            },
             onDefinitiveFailure: (error) => {
                 alertError(error instanceof Error ? error.message : 'Restore failed');
             },

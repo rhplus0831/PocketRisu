@@ -1,10 +1,15 @@
 import { StorageError } from './storageError'
 
-export type BackupReplacementUiResult = 'committed' | 'not-committed' | 'commit-unknown'
+export type BackupReplacementUiResult =
+    | 'committed'
+    | 'committed-with-error'
+    | 'not-committed'
+    | 'commit-unknown'
 
 export interface BackupReplacementUiDependencies<T> {
     replace: () => Promise<T>
     onCommitted: (result: T) => void | Promise<void>
+    onCommittedFailure: (error: StorageError) => void | Promise<void>
     onDefinitiveFailure: (error: unknown) => void | Promise<void>
     onCommitUnknown: (error: StorageError) => void | Promise<void>
     hardReload: () => void
@@ -29,6 +34,14 @@ export async function runBackupReplacementUi<T>(
                 dependencies.hardReload()
             }
             return 'commit-unknown'
+        }
+        if (error instanceof StorageError && error.commitOutcome === 'committed') {
+            try {
+                await dependencies.onCommittedFailure(error)
+            } finally {
+                dependencies.hardReload()
+            }
+            return 'committed-with-error'
         }
         await dependencies.onDefinitiveFailure(error)
         return 'not-committed'

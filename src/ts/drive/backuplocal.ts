@@ -210,6 +210,10 @@ export function LoadLocalBackup(){
                         });
                     }
                 },
+                onCommittedFailure: async (error) => {
+                    alertError(`${language.backupRestoreCommittedFailure}\n\n${error.message}`)
+                    await waitAlert()
+                },
                 onDefinitiveFailure: (error) => {
                     console.error(error)
                     alertError('Failed, Is file corrupted?')
