@@ -391,6 +391,16 @@ async function listSnapshotKeys(server: RunningServer, auth: AuthHeaders): Promi
     return snapshots.map((snapshot) => snapshot.key)
 }
 
+async function waitForSnapshotKeys(server: RunningServer, auth: AuthHeaders): Promise<string[]> {
+    const deadline = Date.now() + 5_000
+    while (Date.now() < deadline) {
+        const snapshots = await listSnapshotKeys(server, auth)
+        if (snapshots.length > 0) return snapshots
+        await delay(25)
+    }
+    throw new Error(`Deferred snapshot was not created:\n${server.logs()}`)
+}
+
 async function restoreSnapshot(server: RunningServer, auth: AuthHeaders, key: string): Promise<void> {
     const response = await fetch(`${server.origin}/api/db/snapshots/restore`, {
         method: 'POST',
@@ -2274,7 +2284,7 @@ async function runRoundTrip(format: 'canonical' | 'gzip' | 'block'): Promise<voi
         meta: { keyA: { quota: 1 } },
     }))
 
-    const snapshots = await listSnapshotKeys(server, auth)
+    const snapshots = await waitForSnapshotKeys(server, auth)
     expect(snapshots.length).toBe(1)
 
     // Creation-side canary: the snapshot itself carries the folded values and
@@ -2858,7 +2868,7 @@ describe('automatic snapshots × optimized plugin storage', () => {
         const auth = await authenticate(server)
 
         await writeKey(server, auth, 'database/database.bin', buildDatabase({ values: {} }))
-        const snapshots = await listSnapshotKeys(server, auth)
+        const snapshots = await waitForSnapshotKeys(server, auth)
         expect(snapshots.length).toBe(1)
 
         const legacyDb = await decodeRisuSave(
