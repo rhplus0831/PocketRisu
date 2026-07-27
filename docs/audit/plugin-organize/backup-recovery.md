@@ -215,13 +215,14 @@ candidate validation boundary. The browser installs only one committed stripped
 database read back from the server, never the folded ingest-only snapshot object.
 
 Snapshot list, restore, and delete share one canonical key parser: only
-`database/dbbackup-<canonical-digits>.bin` with no leading zeros and safe parsed
-and millisecond timestamps is visible or actionable. The client repeats that
-validation, requires an exact list schema and newest-first order, and accepts a
+`database/dbbackup-<canonical-digits>.bin` with no leading zeros except `0` is
+visible or actionable, and both the suffix and suffix × 100 timestamp must be
+nonnegative safe integers. The client repeats that validation, requires an exact
+newest-first list schema, and retains an unreadable candidate as `size: null` so
+the restore boundary can classify it and continue to an older key. It accepts a
 restore acknowledgement only for HTTP 200 with exactly the four expected fields
 and values, including the echoed snapshot key. Extra fields, another 2xx status,
-truncation, or response loss
-remain `COMMIT_OUTCOME_UNKNOWN`.
+truncation, or response loss remain `COMMIT_OUTCOME_UNKNOWN`.
 
 Corrupt boot is nonmutating until a recovery point is selected. Before the
 list epoch or any asset, inlay, chat, or REMOTE migration can publish a marker,
@@ -263,38 +264,46 @@ The selected snapshot bytes are also protected before that transaction begins.
 Restore pages raw rows and chunk bodies asynchronously in at most 64 KiB parts,
 with no SQLite iterator held across an event-loop yield. Versioned manifest
 metadata and a durable per-key publication guard verify dense order, row and
-chunk presence, canonical hashes, count, length, and logical SHA-256 across
-live reads, pinned reads, sizing, copying, and restore spooling. Deleting both
+chunk presence, count, and logical length. Body-producing live/pinned reads and
+restore spooling additionally verify canonical hashes and logical SHA-256;
+sizing/copying enforce the guard and structural length without hashing every
+same-size body. Deleting both
 manifest tables therefore remains a known corrupt publication rather than
-silently restoring the 13-byte chunk marker. A real 52 MiB socket abort is
-observed during the spool, before `BEGIN`, cleans the partial file, and leaves
-the exact database, manifest, and owned rows durable after restart. Corrupt
-chunks fail with a definitive non-committed envelope, while repeated
-keep-alive restores release all disconnect listeners.
+silently restoring the 13-byte chunk marker. Legacy migration verifies each key
+independently: a corrupt marker-backed key becomes durably protected-corrupt
+without preventing valid siblings or the global migration version from
+publishing. A real 52 MiB socket abort is observed during the spool, before
+`BEGIN`, cleans the partial file, and leaves the exact database, manifest, and
+owned rows durable after restart. Separate corrupt-chunk and repeated keep-alive
+tests prove definitive non-commit and listener cleanup.
 
 The same atomic boundary owns compressed and legacy preparation. Snapshot
 bytes are file-cursor inspected before publication; gzip/zlib output is
 backpressured, AbortSignal-aware, disk-spooled, and capped by decoded bytes and
-disk headroom, while cursor-unsupported compatibility formats have a separate
-finite memory cap. Structural corruption is a known-not-committed 400 and
-capacity exhaustion is a known-not-committed 413. The block compatibility path
+disk headroom when capacity is available, while cursor-unsupported compatibility
+formats use a separately capped full-memory path. Structural corruption is a
+known-not-committed 400 and capacity exhaustion is a known-not-committed 413. The block compatibility path
 publishes the decoded selected snapshot directly and explicitly suppresses the
 ordinary live-monolith REMOTE migration, preventing the current database from
 being substituted for the requested recovery point.
 
 Referenced REMOTE content is also part of the selected snapshot's validity.
 Restore checks logical row size before materialization, meters and caches the
-entire recursive graph, and rejects cycles, excessive depth, missing rows, and
-rows that disappear between size and read. Resolver size/body exceptions are
-never merely logged and omitted: they escape to the restore transaction, which
-returns the stable retryable `SNAPSHOT_RESTORE_NOT_COMMITTED` envelope after
-rollback.
+entire recursive graph, and rejects cycles, excessive depth, missing rows, rows
+that disappear between size and read, unsupported target types, and malformed
+JSON in both inline and resolved known block types. Resolver size/body/decode
+exceptions are never merely logged and omitted: they escape to the restore
+transaction and roll back. Duplicate references are read and charged once but
+may still materialize the decoded target more than once.
 Save-folder adoption follows the same resolver-present rule; a missing payload
 rejects the import and preserves the prior database bytes, REMOTE rows, marker,
 and normalized export across restart.
 
 ETag and authenticated-session generation state are published only after
-COMMIT. The success envelope is strict and explicit; a lost response after
+COMMIT. The success envelope is strict and explicit. Invalid keys, candidates
+deleted after listing, invalid folded-plugin candidates, and other route-known
+precommit failures carry explicit not-committed envelopes; the middleware `423`
+remains a pre-route header-classified rejection. A lost response after
 COMMIT remains `COMMIT_OUTCOME_UNKNOWN`. Bootstrap stops immediately on that
 outcome, or on any post-commit read failure, instead of replaying an older
 candidate over a possibly committed restore. It tries an older candidate only
@@ -316,23 +325,28 @@ active body with forced-GC retained heap below two rows. Further composition
 coverage proves a same-key target cannot mask a malformed final current row,
 cancellation stops before deletion, PM2 private stages remain invisible and
 source-invalidated, and PM4 rejects the pre-restore manifest token before a
-fresh-token mutation commits. Further recovery coverage includes full
-chunk-publication deletion, legacy manifest-protection migration, raw-marker
-compatibility, a real mid-spool disconnect, listener cleanup, newer
-compressed-limit fallback to an older valid block snapshot, exact
-requested-target publication over a distinct live REMOTE
-database, recursive REMOTE failures, and restore-spool cleanup. Independent
-verification passed in each source branch before composition.
+fresh-token mutation commits. Further recovery coverage includes manifest and
+metadata deletion with the durable publication guard retained, legacy
+manifest-protection migration, raw-marker compatibility, a real mid-spool
+disconnect, listener cleanup, an unreadable
+newest legacy chunk publication with valid older fallback, newer
+compressed-limit fallback to an older valid block snapshot, malformed inline
+and resolved character blocks, exact requested-target publication over a
+distinct live REMOTE database, recursive REMOTE failures, and restore-spool
+cleanup. Composition verification found and repaired the cross-layer cases, then
+reran independent recovery verification.
 
 The explicit Settings action and boot fallback now enter that boundary through
 one shared `AutoStorage`/`NodeStorage` restore API. Both sides require the exact
-internal-snapshot key grammar; the client sends exactly one session-fenced POST
-under a finite ten-minute `AbortSignal` bound and accepts only an exact
-committed response whose key echoes the requested snapshot. Auth retry is
-disabled for this destructive request. A schema-invalid `2xx`, truncated body,
+internal-snapshot key grammar. Each restore attempt sends one session-fenced
+POST under a finite ten-minute `AbortSignal` bound, never retries that POST, and
+accepts only an exact committed response whose key echoes the requested
+snapshot. Auth retry is disabled for this destructive request. A schema-invalid `2xx`, truncated body,
 transport loss, or timeout after dispatch is therefore commit-unknown and is
-never automatically retried. Settings warns and hard-reloads to reconcile;
-boot stops its candidate loop.
+never automatically retried. A committed result reloads into the new
+publication; a definitive non-commit leaves Settings in place; an unknown result
+warns and hard-reloads to reconcile. Boot tries an older key only after explicit
+non-commit and stops its candidate loop on unknown.
 
 The active-writer middleware's `423` is different: it rejects before the
 restore route can execute, so `NodeStorage` classifies it as definitively

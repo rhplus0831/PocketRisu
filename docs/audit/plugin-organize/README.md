@@ -113,72 +113,52 @@ point. They matter for triaging reports from older builds, not as open work.
 | UTF-8 key conversion collapsed distinct lone-surrogate keys onto U+FFFD and overwrote values during migration | `0da9d553` |
 | Folded/imported databases relied on a later browser migration, with high memory use and inconsistent recovery | `93e1dd4f` |
 
-## Consolidated validation gaps
+## Consolidated validation evidence and scope
 
-The current passing suites cover happy-path key transport, mode-aware V3
-database/storage mixing, startup readiness and timeout behavior, transition
-ordering, key validation and canonical enumeration, server ingest, import
-barriers, atomic value/owner mutation, atomic clear and batch/CAS outcomes,
-unload admission/draining, failpoint rollback, acknowledgement loss, and
-old-or-new state after a real server restart. PM2 additionally covers the
-production save loop and staged transition path with a 56 MiB Unicode store,
-forced-GC checkpoints, PM1 chunks, and the resource cache both off and on.
-PM3 covers one-page viewer loading, generation-owned partial folding, async
-64 KiB raw/chunk file-cursor restore, and a folded-marker-only live ownership
-proof that validates
-one current row at a time before any exact-set deletion. Its 56 MiB production
-restore case proves a one-row scope with forced GC, while unmarked streams read
-zero ownership bodies and disconnect cancellation rolls back before deletion.
-PM2 private stages remain invisible and source-invalidated by restore, and PM4
-rejects the pre-restore manifest token while accepting the fresh token. Corrupt
-boot also uses an import-safe metadata-only snapshot list and direct server
-restore: a 64 MiB newer-invalid/older-valid pair proves that candidate bodies
-never cross the browser `/api/read` boundary and that the exact older chat
-survives restart. Versioned publication-integrity guards cover every
-read/size/copy path, thresholds are clamped, and a 52 MiB mid-spool socket abort
-proves keep-alive listener cleanup and exact restart durability after
-cancellation or corrupt-chunk rejection. Its restore coverage also includes
-bounded/cancellable gzip and zlib output, legacy memory and disk
-headroom caps, stable pre-commit 400/413 classification, and recursive REMOTE
-size-before-read metering with duplicate caching, cycle/depth rejection, strict
-missing/read failures, exact requested-target publication, and save-folder
-rollback. BR3 boot fallback tries an older candidate only after explicit
-known-not-committed proof; unclassified, transport-ambiguous, and post-commit
-failures stop conservatively. Settings and corrupt boot share one strict
-session-fenced restore call: exact key and echoed commit
-schema, a finite large-restore timeout, no mutation retry, definitive `423`
-classification before body I/O, and warning-plus-hard-reload reconciliation
-only for genuinely unknown outcomes. The point-in-time max-50 viewer uses one
-read-only SQLite snapshot,
-canonical key order and publication-wide owner facets, strict content-bound
-NDJSON/page tokens, a 10,000-key same-membership race, real response
-backpressure/disconnect cleanup, complete load supersession/unmount/hash aborts,
-and generation-owned partial folding. Owner-scoped, idempotent two-phase partial
-export jobs add bounded polling through preparation beyond 15 seconds, admission
-and dual-volume disk preflight, caller cancellation, lost-create acknowledgement,
-TTL/disconnect/restart cleanup, immutable same-volume filesystem pins,
-equal-size replacement safety, PM2 private-stage exclusion, and upstream archive
-compatibility. Folded-export coverage also exercises multi-MiB external
-`__proto__` value and metadata rows: ordinary rows precede the lazily read,
-structurally encoded legacy escapes, while exact decode/import, reserved-field
-collision, cancellation, read failure, and malicious-descriptor cleanup remain
-bounded.
-PM4 additionally covers compact manifest CAS, exact server value hashes,
-50-row snapshot reuse, canonical manifest-key validation and cancellation,
-donated 128-row and four-by-2-MiB batches, one IndexedDB mutation transaction,
-bounded real inventory scans, and versioned reads held across a late-failing
-streamed import. PM2 staged receipts are exact and plan-bound, and downloaded
-private rows are checked against their advertised SHA-256 before publication;
-status refresh cannot consume a matching but tentative import publication.
-Immutable-generation coverage also verifies exact repository lineage,
-complete-body fallback, corruption rejection, protected garbage collection,
-and every body/manifest/head publication boundary.
-Cancellable migration coverage additionally verifies deadlines and stale CAS,
-post-publication acknowledgement loss, teardown publication draining, and
-invocation-scoped unload capabilities.
-The original consolidated validation gaps are now covered, including the
-production save loop, exact marked-snapshot restore, backup key boundaries,
-large transition memory, corrupt-row recovery, and read-failure fallbacks.
+The composed implementation is fixed and verified. Composition testing found
+and repaired issues that were not visible in the source branches: strict restore
+acknowledgements, fallback across unreadable/corrupt candidates, legacy chunk
+upgrade recovery, strict block/REMOTE decoding, viewer revision-CAS mutations,
+bounded owner-index rebuilding, abandoned import-barrier reads, partial-export
+create/DELETE and TTL races, client stream cleanup, and the real E1+E2 export
+path. Verification was repeated after each repair.
+
+| PM3 item | Effective commits | Representative production-path gate |
+|---|---|---|
+| R1 corrupt boot | `44c73095`, `e8a58ad5` | unreadable/corrupt newest snapshot, valid older snapshot, exact older chat after restart, no candidate `/api/read` |
+| R2 ownership proof | `973177aa` | exactly eight 7 MiB current rows, one logical row scope, unmarked zero-body proof, disconnect rollback |
+| R3 restore spool/integrity | `0e5b7875`, `e8a58ad5` | asynchronous parts of at most 64 KiB, corrupt legacy publication does not brick startup, 52 MiB mid-spool abort |
+| R4 bounded compatibility decode | `c246028b`, `e8a58ad5` | gzip/zlib limits and cancellation; malformed inline and REMOTE-resolved character blocks roll back |
+| R5 shared restore API | `89aff392`, `68621c86`, `e8a58ad5` | HTTP 200 plus exact four-field echoed-key acknowledgement; explicit rollback fallback; unknown outcome is never retried |
+| V1 point-in-time viewer | `fc51fe5a`, `68621c86` | real 10,000-row publication, 50-row page, stale edit/delete CAS rejection, backpressure and import-wait abort |
+| E1 partial-export lifecycle | `892d6eed`, `5b8db647`, `9f4e96e3` | lost-create cancellation tombstone, stalled-download TTL cleanup, sink-setup cancellation, immutable asset/database pins |
+| E2 legacy special-key export | `a60e175e`, `9f4e96e3` | real export/decode/import with 3 MiB own `__proto__` value, 2 MiB metadata, reserved-field collision, and selected asset |
+
+The viewer bound is one page of at most 50 logical rows. A chunked logical row
+may still be synchronously reassembled, page tokens bind the selected page (not
+every off-page body), and server cancellation is observed between rows and
+during backpressure. Tests cover load supersession, coordinator disposal,
+body/post-EOF hashing aborts, and an abandoned request waiting behind an import.
+Save-backed UI edit, single delete, and filtered delete use exact row revisions;
+the filtered operation is one atomic page-sized batch. Explicit unfiltered
+clear-all retains its dedicated whole-publication primitive.
+
+Restore spooling reads raw/chunk publications in sequential parts of at most
+64 KiB. Body-producing reads and restore spooling verify content hashes; size,
+list, status, cost, and copy paths enforce the publication guard and structural
+length metadata but do not independently hash every same-size body. Formats
+without a safe cursor use a finite full-memory compatibility path. The 64 MiB
+legacy setting is a serialized-source/cumulative-decoded-payload cap, not a
+resident-heap ceiling, and the final committed stripped database is read and
+decoded through the ordinary full database path.
+
+Partial export reserves one global job slot, not a byte allocation. Capacity is
+preflighted when filesystem capacity is available, and the configured database
+spool may share the save volume or use another volume. TTL, disconnect, normal
+completion, failure, cancellation, and startup orphan recovery remove private
+artifacts; cleanup is best-effort with startup retry. E2 instrumentation proves
+at most one escape-row read is active and that the spool advances before the
+next escape read; it is not an RSS/heap ceiling.
 
 ## Original recommended fix order
 

@@ -283,28 +283,30 @@ preserves plugin rows as independent archive entries
 ### Resolution
 
 **Fixed 2026-07-27.** The Plugin Storage viewer now retains one page of at most
-50 display strings and never constructs a repository-wide value array. In
+50 logical rows and never constructs a repository-wide value array. In
 optimized mode, one viewer-specific request passes the import/read barrier only
 long enough to flush and pin a read-only SQLite snapshot. The response is then
 streamed outside that queue, so a slow viewer cannot hold PM4 mutations. The
 server parses the active generation and ownership manifest once, orders keys by
 the canonical plugin-record rule (array indexes numerically, then raw UTF-16
 code units), selects the page, and reads value and owner bodies serially. At
-most 50 value bodies and 50 owner bodies are touched; only one row is parsed at
-a time. Owner chips, unknown-owner counts, filtered totals, and page counts are
-derived from the same complete publication through a transactionally maintained
-owner index, rather than inferred from the resident page.
+most 50 value bodies and 50 owner bodies are touched; instrumentation records no
+nested row parse, although one chunked logical row may still be synchronously
+reassembled. Owner chips, unknown-owner counts, filtered totals, and page counts
+cover physically present manifest-owned rows matching the key filter. Boot
+rebuilds the transactional owner index with a read-only row iterator instead of
+retaining every owner body in an `.all()` array.
 
 Partial local export is now an authenticated, owner-scoped two-phase job rather
 than one request that stays open while the archive is prepared. The browser
 chooses a canonical UUID before `POST /api/backup/export/jobs`, so repeating a
 create after a lost acknowledgement returns the same job and cancellation can
-still address it. Identity, per-owner admission, and the single global
-archive/disk reservation are installed before the first asynchronous operation;
-a different id for the same owner is rejected and concurrent owners cannot each
-spend the same preflighted capacity. Preparation preflights both the save volume
-and a separately configured database-spool volume, returns `202` promptly, and
-publishes status and byte/entry progress. Create and each status request retain
+still address it. Identity, per-owner admission, and one global job slot are
+installed before the first asynchronous operation; a different id for the same
+owner is rejected while a job is active. Preparation preflights the save volume
+and the configured database-spool path, which may share that volume or use
+another one. It returns `202` promptly and publishes status and byte/entry
+progress. Create and each status request retain
 an independent 15-second availability bound, while the job as a whole may run
 for longer than 15 seconds under the caller's `AbortSignal`.
 
@@ -312,22 +314,26 @@ Status, cancel, and the one-shot ready download remain bound to the creating
 owner even if its writer lease is displaced. Cancel uses an independent bounded
 cleanup request when the caller signal is already aborted. Cancellation,
 failure, successful consumption, download disconnect, and the 15-minute TTL
-destroy private artifacts; boot cleanup removes only owned orphan directories
-and preserves unrelated files. The partial-backup dialog displays server
-progress and exposes a real Cancel action. The legacy synchronous partial route
-is rejected so it cannot bypass this lifecycle.
+trigger private-artifact cleanup; boot cleanup retries owned orphan directories
+and preserves unrelated files. A bounded owner/id tombstone prevents a delayed
+create POST from resurrecting a job after cancellation won the race. The
+partial-backup dialog displays server progress and exposes a real Cancel action.
+The legacy synchronous partial route is rejected so it cannot bypass this
+lifecycle.
 
 Preparation flushes pending writes and holds one SQLite snapshot while choosing
 the database, optimized plugin rows, and referenced assets. External plugin
 values are folded into `database.risudat` one row at a time. A selected
 filesystem asset is copied from an open descriptor through a fixed 256 KiB
-buffer to a mode-private pin on the same save volume; size, device, inode,
-modification time, and content-addressed SHA-256 are checked before the live
-path is released. A selected KV asset remains bound to the SQLite snapshot even
-if a filesystem file later shadows it. Archive assembly reads only those pins
-and the snapshot, writes a temporary private archive, and atomically publishes
-the immutable ready spool. Thus an equal-size replacement after pinning yields
-the old bytes or aborts, never the replacement. PM2 transition-stage rows and
+buffer to a job-private pin on the same save volume; size, device, inode, and
+modification time are checked. SHA-256 is computed for every pin and compared
+with an expected digest for content-addressed filenames. A selected KV asset
+remains bound to the SQLite snapshot even if a filesystem file later shadows
+it. Archive assembly reads the asset pins plus a database spool produced
+row-by-row from the pinned SQLite snapshot, writes a temporary private archive,
+and atomically publishes the immutable ready spool. Thus an equal-size
+replacement after pinning yields the old bytes or aborts, never the replacement.
+PM2 transition-stage rows and
 receipts are outside the public snapshot and selected-asset set and cannot leak
 into a partial archive. The selected-asset archive remains upstream compatible,
 omits account data, and applies the same BR4 archive-key validation as other
@@ -340,33 +346,38 @@ or noncanonical keys, invalid metrics, byte-size/type mismatches, and extra
 fields are rejected. Each entry has a content hash covering key, owner, display
 text, UTF-8 size, type, and value/owner revision. The page token uses injective
 canonical JSON framing (including embedded U+0000 in filters) and binds the
-snapshot metadata, filters, global facets, unknown count, ordered keys, and
-entry content hashes. A body, owner, filter, ordering, or revision change
-therefore cannot reuse the token.
+snapshot metadata, filters, global facets, unknown count, selected ordered keys,
+and selected entry content hashes. A selected body, owner, filter, ordering, or
+revision change therefore cannot reuse that page's token; off-page bodies are
+outside the token by design.
 
 Each UI load owns an `AbortController`. Page, backend, key-filter, or
-owner-filter changes synchronously abort the superseded request; unmount aborts
-the remaining request. Identity checks reject late bodies even if a transport
-resolves after observing abort. Cancellation is checked during body reads,
-before and after every post-EOF content hash, around page-token hashing, after
+owner-filter changes synchronously abort the superseded request, and coordinator
+disposal aborts its remaining lease. Identity checks reject late bodies even if
+a transport resolves after observing abort. Cancellation is checked during body
+reads, before and after every post-EOF content hash, around page-token hashing, after
 the final progress callback, and before publication. On the server, request
 abort or response close stops before the next row, releases backpressure
-listeners, rolls back the read transaction, and closes the snapshot.
+listeners, rolls back the read transaction, and closes the snapshot. An abort
+while waiting behind an import exits before a snapshot is created.
 
-Partial local export now pins a server-side SQLite snapshot and folds external
-values into the streamed `database.risudat` spool one row at a time. Its
-selected-asset archive remains upstream compatible, omits account data, and
-applies the same BR4 archive-key validation as other folded exports.
+Save-backed viewer edits and single deletes carry the exact row revision from
+the pinned page; filtered deletion sends one atomic batch of at most 50 expected
+revisions. A conflict does not mutate, and an unknown commit outcome is never
+retried. Both cases show a distinct error and perform a read-only authoritative
+reload. Explicit unfiltered clear-all retains its dedicated whole-publication
+primitive; device-local backends retain their existing operations.
 
 Snapshot restore now queries only publication metadata up front, then spools a
 raw row through SQLite `substr()` pages or a chunked row through completed
 point queries of at most 64 KiB. It never keeps a `better-sqlite3` iterator open
 across an `await`, yields and checks the socket-derived `AbortSignal` before and
 after every part, and ingests through the resulting file cursor instead of
-beginning with `kvGet()` / `Buffer.concat()`. Cancellation before publication,
-streaming-ingest rollback, failure, success, and startup cleanup all remove an
-incomplete restore/export spool. Request, response, and keep-alive socket abort
-listeners are detached in the route `finally` block.
+beginning with `kvGet()` / `Buffer.concat()`. Cursor-unsupported compatibility
+formats use a separately capped full-memory fallback. Normal-path cancellation,
+rollback, failure, and success unlink incomplete restore/export spools, while
+startup cleanup retries leftovers. Request, response, and keep-alive socket
+abort listeners are detached in the route `finally` block.
 
 Chunk publications now carry expected count, logical length, and logical
 SHA-256 metadata plus a durable per-key publication guard. A transactional,
@@ -374,9 +385,12 @@ versioned one-time migration verifies legacy dense sequences, row presence,
 sizes, and canonical chunk hashes before enabling protection. Afterwards,
 missing metadata, a missing tail, reordered/substituted/altered chunks, or even
 deletion of both manifest tables is corruption rather than a downgrade to the
-13-byte raw marker. The guard is enforced consistently by live and pinned
-reads, size/list queries, snapshot cost/copy, chunk-status checks, and restore
-spooling; a failed copy leaves its destination unchanged. A legitimate
+13-byte raw marker. Body-producing live/pinned reads and restore spooling verify
+the logical hash. Size/list, snapshot cost/copy, and chunk-status paths enforce
+the guard, dense structure, and aggregate length but do not independently hash
+every same-size body; a failed copy leaves its destination unchanged. A corrupt
+legacy publication is protected per key without preventing valid siblings or
+the global migration version from publishing. A legitimate
 unguarded raw value equal to the marker remains byte-compatible. The chunk
 threshold environment override is finite, positive, and lower-only, capped at
 the 16 MiB safe default; invalid/high overrides cannot create new oversized raw
@@ -387,10 +401,12 @@ newest-first metadata list from the import-safe `/api/db/snapshots` read, then
 submits each canonical key directly to the authoritative restore transaction.
 It never enumerates the generic KV namespace, trims recovery points, downloads a
 candidate through `/api/read`, or decodes a folded candidate in browser memory.
-Only after a definitive commit does it read and decode the small stripped live
-database once. List, restore, and delete share canonical no-leading-zero and
-safe-timestamp key validation, while the client also rejects any extended or
-non-200 restore acknowledgement as commit-unknown.
+Only after a definitive commit does it perform one ordinary full read and decode
+of the stripped live database. Snapshot discovery retains an unreadable
+candidate with `size: null`, so direct restore can classify it definitively and
+continue to an older key. List, restore, and delete share canonical
+no-leading-zero and safe-timestamp key validation, while the client also rejects
+any extended or non-200 restore acknowledgement as commit-unknown.
 
 The BR3 live-ownership boundary is also bounded. The streaming loader first
 decodes the folded marker, then invokes a deferred proof before emitting any
@@ -407,12 +423,14 @@ Compressed and compatibility snapshots are bounded at the decode boundary as
 well. Canonical gzip/zlib/stream inputs expand through a backpressured Node
 pipeline with an output-meter transform whose chunks are at most 64 KiB. The
 meter polls both `AbortSignal` and the request disconnect state, enforces a
-finite decoded-byte ceiling plus reserved disk headroom, and removes every
-decoded or compressed-block spool on success, failure, cancellation, and
-restart cleanup. The defaults are a 4 GiB decoded ceiling, 256 MiB disk reserve,
-and a separate 64 MiB in-memory ceiling for formats that the cursor cannot
-safely walk; each remains configurable. Known decoded-size, legacy-memory, and
-disk-headroom failures return a definitive pre-commit 413. Corrupt compressed
+finite decoded-byte ceiling plus reserved disk headroom when filesystem capacity
+is available, and unlinks decoded or compressed-block spools on normal-path
+success, failure, and cancellation with startup retry for leftovers. The
+defaults are a 4 GiB decoded ceiling, 256 MiB disk reserve, and a separate
+64 MiB serialized-source/cumulative-decoded-payload cap for formats that the
+cursor cannot safely walk; this is not a resident-memory ceiling. Known
+decoded-size, legacy-memory, and disk-headroom failures return a definitive
+pre-commit 413. Corrupt compressed
 data and structural cursor failures return a definitive pre-commit
 `RISU_SAVE_INVALID` 400 instead of a retryable 500.
 
@@ -420,7 +438,8 @@ Block-format REMOTE resolution is finite and fail-closed. The restore adapter
 queries each row's logical `kvSize()` before `kvGet()` may concatenate it,
 meters the complete recursive graph cumulatively, caches duplicate references
 so they are neither read nor counted twice, and rejects cycles or nesting past
-32 levels. A referenced missing/disappearing row is invalid input; size/read
+32 levels. Duplicate pointers may still materialize the decoded target more
+than once. A referenced missing/disappearing row is invalid input; size/read
 exceptions propagate to the transaction boundary. Resolver-present decode can
 therefore never commit a database with a silently omitted character. Direct
 legacy decode without a resolver retains its historical skip behavior. The
@@ -432,8 +451,9 @@ Settings restore no longer bypasses the storage adapter with an unbounded raw
 `fetch()`. Settings and corrupt-boot fallback share
 `AutoStorage.restoreInternalSnapshot()` and the same authoritative
 `NodeStorage` implementation. It accepts only the exact
-canonical `database/dbbackup-<digits>.bin` key form with no leading zero and a
-safe timestamp, sends one non-retried POST with the
+canonical `database/dbbackup-<digits>.bin` key form with no leading zero except
+`0`, where both the suffix and suffix × 100 timestamp are nonnegative safe
+integers. Each attempt sends one non-retried POST with the
 active writer-session header, and allows a finite, abortable ten-minute window
 for large file-cursor ingestion rather than the ordinary 15-second storage I/O
 bound. The server applies the same exact-key check and the client accepts only
@@ -458,9 +478,13 @@ tokens for formerly colliding U+0000 filter tuples. A 10,000-key same-membership
 mutation race proves a page is entirely pre- or post-publication while the PM4
 mutation completes without waiting for the viewer. A paused real HTTP response
 reaches backpressure, disconnects, reads fewer than 50 rows, releases its
-snapshot, and permits the next mutation. Client tests exercise fragmented UTF-8,
-strict negative NDJSON/token cases, aborts during body and post-EOF hashing, and
-a mounted UI filter change whose obsolete late response cannot commit.
+snapshot, and permits the next mutation. Another real import race proves a
+disconnected viewer stops while the import still owns the barrier. Client tests
+exercise fragmented UTF-8, strict negative NDJSON/token cases, aborts during
+body and post-EOF hashing, and a mounted UI filter change whose obsolete late
+response cannot commit. UI mutation tests and a real server route prove stale
+same-key edit/delete revisions do not mutate bytes, while a fresh revision
+commits.
 
 The marked legacy escape needed for an own external `__proto__` key is streamed
 under the same bound. Export planning retains only each validated row source
@@ -474,22 +498,25 @@ special keys, and a user value colliding with the reserved sidecar field are
 preserved; malformed, accessor-backed, non-string, and ill-formed-Unicode row
 descriptors fail before publication.
 
-Coverage uses deterministic bounds rather than raw-heap timing: a 10,000-key
-viewer asserts a 50-value page and one in-flight read; partial folding exercises
+Coverage uses deterministic bounds rather than raw-heap timing: the real
+10,000-key viewer asserts a 50-value page, while the generic helper separately
+asserts one active asynchronous read on a 40-row page. Partial folding exercises
 1,000 rows plus a 4 MiB body with one parsed row in flight and upstream
 archive/import round trips. Real-server export tests cover prompt creation with
-preparation exceeding 15 seconds, idempotent duplicate creates, concurrent
-admission, writer-session displacement, cancellation and exact spool cleanup,
-restart orphan cleanup, a 16 MiB download disconnect, equal-size asset
+an injected preparation delay exceeding 15 seconds, idempotent duplicate creates,
+same-owner admission, writer-session displacement, cancellation, restart orphan
+cleanup, a 16 MiB download disconnect, equal-size asset
 replacement, account omission, and PM2 private-stage exclusion. Client tests
 cover progress, UI cancellation, a stalled status request, a lost create
-acknowledgement, and preservation of the ordinary pre-header bound for non-job
-downloads. Chunk restore asserts one chunk in flight, a 64 KiB maximum chunk,
-hundreds of chunks, exact bytes, folded-snapshot recovery, and cancellation/error
+acknowledgement, sink-setup cancellation, and preservation of the ordinary
+pre-header bound for non-job downloads. A real short-TTL stalled download proves
+socket termination, admission release, and private-spool cleanup. Chunk restore
+asserts more than 300 sequential parts of at most 64 KiB, exact bytes,
+folded-snapshot recovery, and cancellation/error
 cleanup. A combined real-server test pauses after the exact prior ownership set
 has been fully proven but before deletion, disconnects the client, and verifies
 transaction rollback, spool cleanup, and old-state durability after restart.
-Another production-path case restores over eight 7 MiB current rows (56 MiB):
+Another production-path case restores exactly eight 7 MiB current rows (56 MiB):
 instrumentation records one active row, and forced-GC retained heap remains
 below two row bodies rather than scaling with the aggregate. A fail-on-first-
 ownership-read guard proves unmarked streamed restore reads zero bodies, while
@@ -501,10 +528,10 @@ fresh revision. A real NodeStorage recovery test supplies two 64 MiB chunked
 candidates (newer invalid, older valid), rejects any candidate `/api/read`,
 observes server-side fallback, hashes the exact recovered chat after restart,
 and requires empty restore spools. A separate 52 MiB real-server test observes
-a genuinely partial spool, closes
-the client socket before `BEGIN`, and verifies less-than-total copying, cleanup,
-exact old-state preservation, and restart durability. Corrupt-middle and
-full-publication-deletion cases return definitive non-committed failures; a
+a partial spool, closes the client socket before `BEGIN`, and verifies cleanup,
+no publication, exact old-state preservation, and restart durability.
+Corrupt-middle and manifest/metadata-deletion cases (with the durable guard
+retained) independently return definitive non-committed failures. A separate
 30-restore single-socket keep-alive run has stable listener counts and no
 `MaxListenersExceededWarning`. Additional fixtures cover actual gzip, zlib,
 raw-deflate, old-prefix,
@@ -522,11 +549,12 @@ response loss after commit, and PM2 staged-source invalidation; the committed
 `NodeStorage` path separately asserts PM4 database-cache invalidation.
 Stalled-body regressions advance both an external abort and the full restore
 timeout while requiring `423` to remain non-committed with no UI reload.
-Two additional multi-MiB `__proto__` value/metadata cases prove every
-ordinary row is emitted first, the first escape has reached disk before the
-second is read, exact marked decode and streaming re-import preserve order and
-the reserved-field collision, and cancellation, row failure, or a malicious
-descriptor removes the incomplete spool.
+A production export/decode/import case with a 3 MiB own `__proto__` value and
+2 MiB metadata proves ordinary rows are emitted first, at most one escape-row
+read is active, the spool advances before the second is read, and exact marked
+decode/re-import preserve the reserved-field collision and selected pinned
+asset. Separate cancellation and row-failure cases remove the incomplete spool;
+malicious descriptors are rejected without leaving one.
 
 <a id="pm4"></a>
 ## PM4 — Write amplification and cache overhead
