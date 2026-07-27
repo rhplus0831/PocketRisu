@@ -336,6 +336,13 @@ function importSpoolArtifacts(cwd: string): string[] {
             || name.startsWith('.save-folder-import-'))
 }
 
+function snapshotRestoreSpoolArtifacts(cwd: string): string[] {
+    const spoolDir = path.join(cwd, 'save', '.spool')
+    return fs.readdirSync(spoolDir, { withFileTypes: true })
+        .map(entry => entry.name)
+        .filter(name => name.includes('snapshot-restore'))
+}
+
 async function waitForImportCleanup(server: RunningServer, auth: AuthHeaders): Promise<void> {
     await withTimeout((async () => {
         while (true) {
@@ -593,6 +600,71 @@ describe('storage reads and mutations during import', () => {
 })
 
 describe('import acquisition lifecycle', () => {
+    it('promptly removes a disconnected snapshot restore waiting behind a held import', async () => {
+        const cwd = makeWorkDir()
+        const server = await startServer(cwd, {
+            NODE_OPTIONS: '--trace-warnings',
+        })
+        const auth = await authenticate(server)
+        const snapshotKey = `database/dbbackup-${Math.floor(Date.now() / 100)}.bin`
+        const snapshotBytes = validDatabaseBytes('disconnected-restore-must-not-publish')
+        await seedKey(server, auth, snapshotKey, snapshotBytes)
+
+        const pausedImport = await startPausedImport(server, auth)
+        const restoreBody = JSON.stringify({ key: snapshotKey })
+        const restoreRequest = http.request(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: {
+                ...auth,
+                'content-type': 'application/json',
+                'content-length': String(Buffer.byteLength(restoreBody)),
+            },
+        })
+        restoreRequest.on('error', () => {})
+        restoreRequest.on('response', response => response.resume())
+        restoreRequest.end(restoreBody)
+        await withTimeout(new Promise<void>((resolve) => {
+            if (restoreRequest.writableFinished) resolve()
+            else restoreRequest.once('finish', resolve)
+        }), 5_000, 'queued snapshot restore upload')
+        await delay(100)
+        restoreRequest.destroy()
+
+        // This warning is emitted only after the route leaves acquire(). Seeing
+        // it while the original importer is still held proves the disconnected
+        // waiter was removed promptly rather than waking after holder release.
+        await withTimeout((async () => {
+            while (!server.logs().includes(
+                '[Snapshot Restore] Client disconnected before publication; partial spool was discarded',
+            )) await delay(10)
+        })(), 5_000, 'queued snapshot restore cancellation')
+        expect(snapshotRestoreSpoolArtifacts(cwd)).toEqual([])
+
+        const importResult = await withTimeout(pausedImport.finish(), 15_000, 'held import release')
+        expect(importResult.status, importResult.body).toBe(200)
+        const postImportDatabase = await readKey(server, auth, 'database/database.bin')
+        expect(postImportDatabase).toBeTruthy()
+        await delay(100)
+        expect(await readKey(server, auth, 'database/database.bin')).toEqual(postImportDatabase)
+        expect(snapshotRestoreSpoolArtifacts(cwd)).toEqual([])
+
+        const admittedRestore = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: restoreBody,
+        })
+        expect(admittedRestore.status).toBe(200)
+        expect(await admittedRestore.json()).toEqual({
+            ok: true,
+            key: snapshotKey,
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+        })
+        expect(await readKey(server, auth, 'database/database.bin')).not.toEqual(postImportDatabase)
+        expect(snapshotRestoreSpoolArtifacts(cwd)).toEqual([])
+        expect(server.logs()).not.toMatch(/MaxListenersExceededWarning|Possible EventEmitter memory leak/)
+    }, 60_000)
+
     it('cancels archive and save-folder uploads disconnected during the mutation drain', async () => {
         const cwd = makeWorkDir()
         const server = await startServer(cwd, {

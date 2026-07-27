@@ -13237,6 +13237,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
     let restoreSpool = null;
     let restorePublicationStarted = false;
     let closed = false;
+    let releaseImportBarrier = null;
     const restoreAbortController = new AbortController();
     const restoreSocket = req.socket;
     const abortRestoreOnDisconnect = () => {
@@ -13255,8 +13256,18 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
         throw error;
     };
     req.once('aborted', abortRestoreOnDisconnect);
-    req.socket?.once('close', abortRestoreOnDisconnect);
+    restoreSocket?.once('close', abortRestoreOnDisconnect);
     res.once('close', abortRestoreOnDisconnect);
+    // Authentication and session validation both yield before this lifecycle
+    // tracker is installed. Seed cancellation from the current stream/socket
+    // state so a disconnect observed during either await cannot be lost before
+    // the restore enters (or waits for) the import barrier.
+    if (req.aborted
+        || (req.destroyed && !req.complete)
+        || res.destroyed
+        || restoreSocket?.destroyed) {
+        abortRestoreOnDisconnect();
+    }
     try {
         const key = typeof req.body?.key === 'string' ? req.body.key : '';
         if (!parseInternalSnapshotKey(key)) {
@@ -13269,10 +13280,14 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
         }
         // Acquire before entering the storage queue: acquire() drains that same
         // queue, so holding a slot while waiting for it would deadlock.
-        const releaseImportBarrier = await importBarrier.acquire();
+        // The disconnect signal must participate in this wait. Otherwise an
+        // abandoned restore remains queued behind a long-running import until
+        // that holder releases, retaining its request lifecycle unnecessarily.
+        releaseImportBarrier = await importBarrier.acquire(restoreAbortController.signal);
+        throwIfRestoreAborted();
         let snapshotFound = true;
         let committedPublication = null;
-        try {
+        {
             await queueStorageOperation(async () => {
                 throwIfRestoreAborted();
                 // Drain any pending debounced persist first — same pattern as
@@ -13398,8 +13413,6 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                     throw error;
                 }
             });
-        } finally {
-            releaseImportBarrier();
         }
         if (!snapshotFound) {
             if (closed) return;
@@ -13504,6 +13517,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             commitOutcomeUnknown: false,
         });
     } finally {
+        releaseImportBarrier?.();
         req.off('aborted', abortRestoreOnDisconnect);
         restoreSocket?.off('close', abortRestoreOnDisconnect);
         res.off('close', abortRestoreOnDisconnect);
