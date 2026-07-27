@@ -135,6 +135,7 @@ E1+E2 export path. Verification was repeated after each repair.
 | E2 legacy special-key export | `a60e175e`, `9f4e96e3` | real export/decode/import with 3 MiB own `__proto__` value, 2 MiB metadata, reserved-field collision, and selected asset |
 | R6 bounded import ingress | `f1931989` | finite archive/ZIP/expanded/legacy/entry/row limits; private paged disk staging; ZIP integrity checks; disconnect-safe barrier acquisition; exact NDJSON errors and heartbeats; 52 MiB, exact/+1, rollback/restart, and orphan-cleanup gates |
 | R6 terminal-loss follow-up | `86d2a0b7`, `77eac26a` | strict heartbeat/progress/done/error schemas; malformed, missing, status-zero, or post-dispatch transport loss becomes non-retryable commit-unknown; exact committed-with-error and unknown outcomes warn then reload; one request with no replay |
+| R6 save-folder outcome follow-up | `52740be1` | direct and ZIP exact committed/not-committed/unknown envelopes; post-COMMIT cleanup and marker durability; rollback-ambiguity restart recovery; finite auth/XHR deadlines; exact JSON schemas, status-zero handling, and private local-timeout provenance; one request with no replay |
 
 The viewer bound is one page of at most 50 logical rows. A chunked logical row
 may still be synchronously reassembled, page tokens bind the selected page (not
@@ -176,6 +177,34 @@ and final verification counts are recorded in
 [Performance and memory](performance-memory.md#pm3-r6-bounded-import-ingress),
 with the restore transport contract cross-referenced from
 [Backup, snapshot, and recovery](backup-recovery.md#pm3-r6-import-recovery-follow-up).
+
+Save-folder outcome supplement `52740be1` extends that no-replay contract to
+both `/api/migrate/save-folder/execute` and the ZIP upload route. Server failures
+carry exact committed, not-committed, or unknown envelopes; committed/unknown
+annotations take precedence over historical validation diagnostics, while the
+exact legacy missing-REMOTE and plugin-key diagnostic bodies remain definitive
+only before publication or after a known rollback. A post-COMMIT cleanup
+failure and a later migration marker write failure report `committed` and retain
+the replacement across restart. If rollback cleanup cannot prove which asset
+set survived, the response is unknown and journal recovery on restart restores
+the prior database and asset set before another import is admitted.
+
+The direct and ZIP clients consume one destructive response without replay.
+The complete direct request and complete ZIP authentication-plus-XHR operation
+each have a finite ten-minute total bound; predispatch local timeout is
+non-retryable and explicitly not committed, while post-dispatch loss, timeout,
+abort, status zero, malformed/duplicate-key JSON, or an inexact success/error
+schema is explicitly unknown. A private local timeout-error identity prevents
+an authoritative server envelope whose code is also `STORAGE_TIMEOUT` from
+being reclassified. Cycle-6 verification passed 78
+focused NodeStorage contract tests, the full client suite (1,575 passed, 3
+skipped), type checking, and a production build. The composed server and
+compatibility suites remained green at 269/269 and 237 passed/5 skipped,
+respectively; independent cycle-6 review accepted the implementation and its
+adversarial direct/ZIP outcome cases. These tests prove classification,
+durability at the injected boundaries, and no automatic replay; they do not
+claim that a lost acknowledgement reveals whether an unobserved request
+committed.
 
 ## Original recommended fix order
 

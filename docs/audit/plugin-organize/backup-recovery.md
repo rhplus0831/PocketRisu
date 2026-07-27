@@ -463,6 +463,55 @@ committed. Final supplemental coverage passed 51 focused client
 contract/UI-policy tests, the full client suite (1,543 passed, 3 skipped),
 `pnpm check`, the production build, and the EN/KO help-key audit.
 
+Save-folder outcome implementation `52740be1` applies the same conservative
+replacement rule to both the direct-directory and ZIP routes. The server emits
+exact error envelopes for `committed`, `not-committed`, and `unknown` outcomes.
+Those transaction annotations outrank the historical missing-REMOTE and
+plugin-key diagnostic response branches; the exact legacy bodies remain
+authoritative only before publication or when rollback is known to have
+succeeded. Injected failure after SQLite COMMIT but before old-asset/journal
+cleanup reports `SAVE_FOLDER_IMPORT_POST_COMMIT_CLEANUP_FAILED` as committed,
+and failure of the later `.migrated_to_sqlite` marker write reports
+`SAVE_FOLDER_IMPORT_MIGRATION_MARKER_FAILED` as committed. In both cases the
+database and selected asset set remain durable across restart. An injected
+rollback-cleanup failure instead reports `SAVE_FOLDER_IMPORT_OUTCOME_UNKNOWN`;
+when that failure follows an asset swap, the journal is retained so startup
+recovery can restore the old database and asset set before a later import
+proceeds. A successful rollback retains the exact not-committed result and
+historical validation compatibility.
+
+`NodeStorage` sends one direct POST or one ZIP XHR and never automatically
+replays either replacement. Both paths require an exact 200 acknowledgement
+with only `ok` and a nonnegative integer `imported`; failure envelopes require
+an exact allowed key set, field types, and a consistent outcome/unknown pair.
+Unexpected or duplicate top-level JSON fields, malformed/truncated bodies, an
+inexact 2xx acknowledgement, and XHR status zero are post-dispatch unknown.
+Exact authoritative committed/not-committed/unknown errors are preserved,
+including a server error whose code happens to be `STORAGE_TIMEOUT`.
+
+The complete direct request (including authentication and response parsing)
+and the complete ZIP authentication-plus-XHR operation each have a finite
+ten-minute deadline. A local deadline reached before dispatch is
+non-retryable `SAVE_FOLDER_IMPORT_TIMEOUT` with
+`commitOutcome: "not-committed"`; once dispatch occurs, response loss or total
+timeout is
+non-retryable `COMMIT_OUTCOME_UNKNOWN` with `commitOutcome: "unknown"`. ZIP
+abort and terminal handlers are removed and the XHR is aborted on deadline.
+The bounded wrapper tags its own timeout with a private in-process error
+identity, so normalization cannot mistake a parsed server `StorageError` for a
+local deadline. Boundary tests resolve authentication one millisecond before
+and after the deadline, prove no late dispatch on the first side and exactly
+one request with no replay on the second, and assert cause chains and timer
+cleanup.
+
+Cycle-6 evidence passed 78 focused NodeStorage tests, the full client suite
+(1,575 passed, 3 skipped), `pnpm check`, and the production build. The composed
+server suite passed 269/269 and compatibility passed 237 with 5 skipped;
+independent cycle-6 verification accepted the exact direct/ZIP outcome and
+timeout-provenance cases. This establishes behavior at the tested validation,
+swap, rollback, COMMIT, cleanup, marker, transport, and deadline boundaries; a
+lost acknowledgement still cannot reveal whether the server committed.
+
 The import transaction and filesystem-swap journal remain one recovery unit.
 Injected failure after save-folder asset swap restores the old database and
 asset set, removes newly staged files and the journal, survives restart with
