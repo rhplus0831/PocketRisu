@@ -1,9 +1,9 @@
 # install.sh can delete the only copy of all user data
 
-- Status: Open
+- Status: Fixed
 - Severity: High
 - Area: deployment scripts
-- Affected code: `install.sh:2` (`set -euo pipefail`), `install.sh:44-45` (mktemp + unconditional `rm -rf` EXIT trap), `install.sh:74-80` (save/backups moved — not copied — into the temp dir, then `rm -rf "$INSTALL_DIR"`), `install.sh:83-93` (restore only after the new tree is in place)
+- Affected code: historical overwrite flow in `install.sh`; fixed by the sibling staging and swap block and covered by `server/node/installScript.test.ts`
 
 ## Risk
 
@@ -36,3 +36,18 @@ removing the temp directory.
 Cover with a scripted test that forces a failure between the move and the
 restore (e.g. read-only `$INSTALL_DIR` parent) and asserts `save/` still exists
 somewhere durable.
+
+## Resolution
+
+Fixed 2026-07-27. The installer now copies and fully builds the release in a
+sibling staging directory while the existing installation remains untouched.
+It renames the old installation aside, rolls it back if placing the staged tree
+fails, transfers `save/` and `backups/` only through same-filesystem sibling
+renames, and deletes the old tree only after both transfers succeed. The EXIT
+trap cleans only the downloaded archive and incomplete release staging tree;
+it never owns the old installation or user data.
+
+`server/node/installScript.test.ts` exercises a successful overwrite and an
+injected failure after the old tree is renamed but before data transfer. The
+failure test verifies that the original installation, database, and backups
+are restored and that staging cleanup cannot remove them.

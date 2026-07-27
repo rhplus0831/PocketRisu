@@ -42,7 +42,15 @@ info "Latest version: $TAG"
 
 TARBALL_URL="https://github.com/$REPO/archive/refs/tags/$TAG.tar.gz"
 TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
+STAGE_DIR=""
+
+cleanup() {
+    rm -rf "$TMP_DIR"
+    if [ -n "$STAGE_DIR" ] && [ "$STAGE_DIR" != "/" ] && [ -d "$STAGE_DIR" ]; then
+        rm -rf "$STAGE_DIR"
+    fi
+}
+trap cleanup EXIT
 
 info "Downloading $TAG..."
 if command -v curl >/dev/null 2>&1; then
@@ -64,35 +72,33 @@ EXTRACTED_DIR=$(find "$TMP_DIR" -maxdepth 1 -type d \
 
 # ── Install ────────────────────────────────────────────────────────────────────
 
+OVERWRITE=0
 if [ -d "$INSTALL_DIR" ]; then
     warn "$INSTALL_DIR already exists."
     printf "Overwrite? (existing save/ and backups/ data will be preserved) [y/N]: "
     read -r answer
     [ "$answer" = "y" ] || [ "$answer" = "Y" ] || error "Aborted."
-
-    # Preserve user data
-    if [ -d "$INSTALL_DIR/save" ]; then
-        mv "$INSTALL_DIR/save" "$TMP_DIR/_save_backup"
-    fi
-    if [ -d "$INSTALL_DIR/backups" ]; then
-        mv "$INSTALL_DIR/backups" "$TMP_DIR/_backups_backup"
-    fi
-    rm -rf "$INSTALL_DIR"
+    OVERWRITE=1
 fi
 
-mv "$EXTRACTED_DIR" "$INSTALL_DIR"
+INSTALL_NAME=$(basename "$INSTALL_DIR")
+case "$INSTALL_NAME" in
+    ""|"."|".."|"/") error "Invalid install directory: $INSTALL_DIR" ;;
+esac
 
-# Restore user data
-if [ -d "$TMP_DIR/_save_backup" ]; then
-    mv "$TMP_DIR/_save_backup" "$INSTALL_DIR/save"
-    info "Restored existing save/ data."
-fi
-if [ -d "$TMP_DIR/_backups_backup" ]; then
-    mv "$TMP_DIR/_backups_backup" "$INSTALL_DIR/backups"
-    info "Restored existing backups/ data."
-fi
+INSTALL_PARENT=$(dirname "$INSTALL_DIR")
+mkdir -p "$INSTALL_PARENT"
+INSTALL_PARENT=$(cd "$INSTALL_PARENT" && pwd -P)
+INSTALL_DIR="$INSTALL_PARENT/$INSTALL_NAME"
 
-cd "$INSTALL_DIR"
+# Build a complete replacement beside the install directory. This keeps the
+# existing tree and all user data untouched until every fallible build step has
+# succeeded, and makes the final directory moves same-filesystem renames.
+STAGE_DIR=$(mktemp -d "$INSTALL_PARENT/.${INSTALL_NAME}.install.XXXXXX")
+cp -a "$EXTRACTED_DIR/." "$STAGE_DIR/"
+chmod 755 "$STAGE_DIR"
+
+cd "$STAGE_DIR"
 
 info "Installing dependencies..."
 pnpm install --frozen-lockfile 2>/dev/null || pnpm install
@@ -103,8 +109,45 @@ NODE_OPTIONS="--max-old-space-size=4096" pnpm build
 info "Removing dev dependencies..."
 pnpm prune --prod
 
-# Write version marker for update script
-echo "$TAG" > "$INSTALL_DIR/.installed-version"
+echo "$TAG" > "$STAGE_DIR/.installed-version"
+
+cd "$INSTALL_PARENT"
+
+if [ "$OVERWRITE" -eq 1 ]; then
+    OLD_DIR=$(mktemp -d "$INSTALL_PARENT/.${INSTALL_NAME}.old.XXXXXX")
+    rmdir "$OLD_DIR"
+
+    mv "$INSTALL_DIR" "$OLD_DIR"
+    if ! mv "$STAGE_DIR" "$INSTALL_DIR"; then
+        if mv "$OLD_DIR" "$INSTALL_DIR"; then
+            error "Failed to install the new release. The existing installation was restored."
+        fi
+        error "Failed to install the new release. Existing data remains at $OLD_DIR."
+    fi
+    STAGE_DIR=""
+
+    # Move user data only between sibling directories on the same filesystem.
+    # OLD_DIR is deliberately outside the cleanup trap and is removed only
+    # after every preserved directory has reached the new installation.
+    for data_dir in save backups; do
+        if [ -d "$OLD_DIR/$data_dir" ]; then
+            if [ -e "$INSTALL_DIR/$data_dir" ]; then
+                error "Cannot preserve $data_dir/: the new release already contains that path. Existing data remains at $OLD_DIR/$data_dir."
+            fi
+            if ! mv "$OLD_DIR/$data_dir" "$INSTALL_DIR/$data_dir"; then
+                error "Failed to restore $data_dir/. Existing data remains at $OLD_DIR/$data_dir."
+            fi
+            info "Restored existing $data_dir/ data."
+        fi
+    done
+
+    rm -rf "$OLD_DIR"
+else
+    mv "$STAGE_DIR" "$INSTALL_DIR"
+    STAGE_DIR=""
+fi
+
+cd "$INSTALL_DIR"
 
 # ── Done ───────────────────────────────────────────────────────────────────────
 
