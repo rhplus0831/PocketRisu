@@ -1234,7 +1234,9 @@ interface PluginStorage {
      * finite numbers, strings, dense arrays, and plain objects containing only
      * JSON values. Unsupported optimized values reject with StorageError code
      * `PLUGIN_STORAGE_VALUE_UNSUPPORTED`; oversized values use
-     * `PLUGIN_VALUE_TOO_LARGE`.
+     * `PLUGIN_VALUE_TOO_LARGE`. The user can opt into conservative automatic
+     * conversion for ordinary setItem writes; compound/versioned APIs remain
+     * strictly JSON-only.
      * @returns Promise that resolves when item is stored
      */
     setItem(key: string, value: any): Promise<void>;

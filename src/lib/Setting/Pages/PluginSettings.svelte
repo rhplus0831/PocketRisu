@@ -274,6 +274,20 @@
     {#if DBState.db.optimizePluginMemory === true}
         <p class="mt-1 text-xs text-yellow-400">{language.optimizePluginMemoryLegacyOff}</p>
     {/if}
+    <div class="mt-3 border-t border-darkborderc pt-3">
+        <CheckInput
+            check={DBState.db.autoConvertPluginStorageValues === true}
+            onChange={(enabled) => {
+                DBState.db.autoConvertPluginStorageValues = enabled
+            }}
+            disabled={reconcilingPluginStorage || DBState.db.optimizePluginMemory !== true}
+            margin={false}
+            name={language.autoConvertPluginStorageValues}
+        />
+        <p class="mt-1 text-xs text-textcolor2">
+            {language.autoConvertPluginStorageValuesDesc}
+        </p>
+    </div>
 </div>
 
 <div class="text-textcolor2 mb-2 flex gap-2 justify-end">

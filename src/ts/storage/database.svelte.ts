@@ -1433,6 +1433,11 @@ export interface Database{
     // on-demand pluginsave/ server entries. V2/V2.1 plugins require the
     // synchronous inline representation and therefore cannot run in this mode.
     optimizePluginMemory?: boolean
+    // Opt-in compatibility fallback for ordinary optimized V3 writes. Strict
+    // validation still runs first; only predictable non-JSON values are
+    // converted, while functions, cycles, accessors, symbols, and custom
+    // classes remain rejected.
+    autoConvertPluginStorageValues?: boolean
     // PocketRisu-only ownership epoch for external plugin rows. The matching
     // Node manifest defines their exact active set; unknown fields remain safe
     // in upstream RisuAI saves.

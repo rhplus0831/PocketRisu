@@ -1804,6 +1804,9 @@ export const languageKorean = {
   optimizePluginMemory: "플러그인 메모리 사용량 최적화",
   optimizePluginMemoryDesc:
     "플러그인 세이브 데이터를 database.bin과 클라이언트 메모리에 두지 않고 필요할 때 불러오는 서버 항목으로 저장합니다.",
+  autoConvertPluginStorageValues: "호환 가능한 플러그인 값 자동 변환",
+  autoConvertPluginStorageValuesDesc:
+    "최적화 저장 값이 JSON과 호환되지 않으면 Date는 ISO 문자열, Map은 항목 배열, Set은 배열, BigInt는 10진수 문자열로 변환하고 undefined, 유한하지 않은 숫자, 배열의 빈 항목은 null로 변환합니다. 함수와 순환 참조는 계속 거부됩니다.",
   optimizePluginMemoryV3Only:
     "활성화된 모든 플러그인이 V3여야 합니다. 먼저 V2/V2.1 플러그인을 모두 비활성화하세요.",
   optimizePluginMemoryImportDisabled:

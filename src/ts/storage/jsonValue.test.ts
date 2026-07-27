@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { snapshotJsonValue, stringifyJsonValue } from "./jsonValue";
+import {
+    convertCompatibleJsonValue,
+    snapshotJsonValue,
+    stringifyJsonValue,
+} from "./jsonValue";
 
 describe("persistent JSON values", () => {
     it.each([
@@ -77,6 +81,48 @@ describe("persistent JSON values", () => {
         });
         expect(Object.is(snapshot.array[0], -0)).toBe(false);
         expect(snapshot.array[1]).not.toBe(snapshot.repeated);
+    });
+
+    it("converts compatible non-JSON values without dropping their data", () => {
+        const sparse = new Array(3);
+        sparse[1] = undefined;
+        sparse[2] = Number.POSITIVE_INFINITY;
+        const input = {
+            date: new Date("2026-01-02T03:04:05.000Z"),
+            map: new Map<unknown, unknown>([[1n, new Set(["a", "b"])]]),
+            bigint: -42n,
+            missing: undefined,
+            sparse,
+        };
+
+        expect(convertCompatibleJsonValue(input)).toEqual({
+            date: "2026-01-02T03:04:05.000Z",
+            map: [["1", ["a", "b"]]],
+            bigint: "-42",
+            missing: null,
+            sparse: [null, null, null],
+        });
+    });
+
+    it("still rejects values that cannot be converted safely", () => {
+        const cycle: Record<string, unknown> = {};
+        cycle.self = cycle;
+        let getterCalled = false;
+        const accessor = {};
+        Object.defineProperty(accessor, "secret", {
+            enumerable: true,
+            get: () => {
+                getterCalled = true;
+                return "hidden";
+            },
+        });
+
+        expect(() => convertCompatibleJsonValue(() => undefined)).toThrow(TypeError);
+        expect(() => convertCompatibleJsonValue(Symbol("value"))).toThrow(TypeError);
+        expect(() => convertCompatibleJsonValue(cycle)).toThrow("circular data");
+        expect(() => convertCompatibleJsonValue(accessor)).toThrow("data properties");
+        expect(() => convertCompatibleJsonValue(new (class Custom {})())).toThrow("plain objects");
+        expect(getterCalled).toBe(false);
     });
 
     it("serializes without consulting poisoned built-in toJSON methods", () => {

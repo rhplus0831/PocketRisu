@@ -1659,6 +1659,8 @@ export const languageEnglish = {
     pluginV2Warning: "Plugin V2 and V2.1 is considered unsafe and will stop working in future versions. **Please do not use these versions of plugins.**. If you are the developer of this plugin, please update to V3 as soon as possible.",
     optimizePluginMemory: "Optimize plugin memory usage",
     optimizePluginMemoryDesc: "Store plugin save data as on-demand server entries instead of keeping it inside database.bin and client memory.",
+    autoConvertPluginStorageValues: "Automatically convert compatible plugin values",
+    autoConvertPluginStorageValuesDesc: "When an optimized write is not JSON-compatible, convert Date to an ISO string, Map to entry arrays, Set to an array, BigInt to a decimal string, and undefined, non-finite numbers, or array holes to null. Functions and circular references are still rejected.",
     optimizePluginMemoryV3Only: "Unavailable because all enabled plugins must be V3. Disable every V2/V2.1 plugin first.",
     optimizePluginMemoryImportDisabled: "The V2/V2.1 plugin was imported disabled because optimized plugin memory requires all enabled plugins to be V3.",
     optimizePluginMemoryEnableBlocked: "Turn off “Optimize plugin memory usage” before enabling a V2/V2.1 plugin.",

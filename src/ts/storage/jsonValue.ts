@@ -138,6 +138,191 @@ export function snapshotJsonValue<T>(input: T): T {
     return createJsonSnapshot(input, false);
 }
 
+const dateGetTime = Date.prototype.getTime;
+const dateToISOString = Date.prototype.toISOString;
+const mapForEach = Map.prototype.forEach;
+const setForEach = Set.prototype.forEach;
+const bigintToString = BigInt.prototype.toString;
+
+function hasNoOwnProperties(value: object, path: string, type: string): void {
+    if (Reflect.ownKeys(value).length > 0) {
+        throw new TypeError(
+            "Automatic JSON conversion does not accept custom properties on "
+            + type + " at " + path + ".",
+        );
+    }
+}
+
+/**
+ * Convert the small set of non-JSON values with predictable representations
+ * without dropping fields or entries. This intentionally does not invoke
+ * getters, toJSON, or replace functions/cycles with lossy placeholders.
+ */
+export function convertCompatibleJsonValue(input: unknown): unknown {
+    const visiting = new Set<object>();
+
+    const convert = (value: unknown, path: string): unknown => {
+        if (value === null || typeof value === "string" || typeof value === "boolean") {
+            return value;
+        }
+        if (typeof value === "number") {
+            if (!Number.isFinite(value)) return null;
+            return Object.is(value, -0) ? 0 : value;
+        }
+        if (typeof value === "bigint") {
+            return Reflect.apply(bigintToString, value, []);
+        }
+        if (value === undefined) return null;
+        if (typeof value !== "object") {
+            throw new TypeError("Automatic JSON conversion cannot represent data at " + path + ".");
+        }
+        if (visiting.has(value)) {
+            throw new TypeError(
+                "Automatic JSON conversion does not accept circular data at " + path + ".",
+            );
+        }
+
+        visiting.add(value);
+        try {
+            if (Array.isArray(value)) {
+                const lengthDescriptor = Reflect.getOwnPropertyDescriptor(value, "length");
+                const length = lengthDescriptor && "value" in lengthDescriptor
+                    ? lengthDescriptor.value
+                    : undefined;
+                if (!Number.isSafeInteger(length) || length < 0) {
+                    throw new TypeError(
+                        "Automatic JSON conversion received an invalid array at " + path + ".",
+                    );
+                }
+                for (const key of Reflect.ownKeys(value)) {
+                    if (key === "length") continue;
+                    if (typeof key !== "string") {
+                        throw new TypeError(
+                            "Automatic JSON conversion does not accept symbol keys at "
+                            + path + ".",
+                        );
+                    }
+                    const index = Number(key);
+                    if (!Number.isInteger(index)
+                        || index < 0
+                        || index >= length
+                        || String(index) !== key) {
+                        throw new TypeError(
+                            "Automatic JSON conversion does not accept extra array property "
+                            + JSON.stringify(key) + " at " + path + ".",
+                        );
+                    }
+                }
+                const result: unknown[] = new Array(length);
+                for (let index = 0; index < length; index += 1) {
+                    const descriptor = Reflect.getOwnPropertyDescriptor(value, String(index));
+                    if (!descriptor) {
+                        result[index] = null;
+                        continue;
+                    }
+                    if (!("value" in descriptor) || !descriptor.enumerable) {
+                        throw new TypeError(
+                            "Automatic JSON conversion requires enumerable array data at "
+                            + path + "[" + index + "].",
+                        );
+                    }
+                    result[index] = convert(
+                        descriptor.value,
+                        path + "[" + index + "]",
+                    );
+                }
+                return result;
+            }
+
+            let dateValue = false;
+            let dateTime = Number.NaN;
+            try {
+                dateTime = Reflect.apply(dateGetTime, value, []);
+                dateValue = true;
+            } catch {
+                // Not a Date; continue with the other supported object types.
+            }
+            if (dateValue) {
+                hasNoOwnProperties(value, path, "Date");
+                if (!Number.isFinite(dateTime)) {
+                    throw new TypeError(
+                        "Automatic JSON conversion does not accept an invalid Date at "
+                        + path + ".",
+                    );
+                }
+                return Reflect.apply(dateToISOString, value, []);
+            }
+
+            let mapEntries: [unknown, unknown][] | null = [];
+            try {
+                Reflect.apply(mapForEach, value, [
+                    (entryValue: unknown, entryKey: unknown) => {
+                        mapEntries!.push([entryKey, entryValue]);
+                    },
+                ]);
+            } catch {
+                mapEntries = null;
+            }
+            if (mapEntries !== null) {
+                hasNoOwnProperties(value, path, "Map");
+                return mapEntries.map(([entryKey, entryValue], index) => [
+                    convert(entryKey, path + "<map>[" + index + "][0]"),
+                    convert(entryValue, path + "<map>[" + index + "][1]"),
+                ]);
+            }
+
+            let setEntries: unknown[] | null = [];
+            try {
+                Reflect.apply(setForEach, value, [
+                    (entryValue: unknown) => setEntries!.push(entryValue),
+                ]);
+            } catch {
+                setEntries = null;
+            }
+            if (setEntries !== null) {
+                hasNoOwnProperties(value, path, "Set");
+                return setEntries.map((entryValue, index) => (
+                    convert(entryValue, path + "<set>[" + index + "]")
+                ));
+            }
+
+            const prototype = Reflect.getPrototypeOf(value);
+            if (prototype !== Object.prototype && prototype !== null) {
+                throw new TypeError(
+                    "Automatic JSON conversion requires plain objects at " + path + ".",
+                );
+            }
+            const result = Object.create(null) as Record<string, unknown>;
+            for (const key of Reflect.ownKeys(value)) {
+                if (typeof key !== "string") {
+                    throw new TypeError(
+                        "Automatic JSON conversion does not accept symbol keys at "
+                        + path + ".",
+                    );
+                }
+                const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+                if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
+                    throw new TypeError(
+                        "Automatic JSON conversion requires enumerable data properties at "
+                        + path + "." + key + ".",
+                    );
+                }
+                Object.defineProperty(result, key, {
+                    configurable: true,
+                    enumerable: true,
+                    value: convert(descriptor.value, path + "." + key),
+                    writable: true,
+                });
+            }
+            return result;
+        } finally {
+            visiting.delete(value);
+        }
+    };
+
+    return snapshotJsonValue(convert(input, "$"));
+}
+
 export function stringifyJsonValue(value: unknown): string {
     const serialized = JSON.stringify(createJsonSnapshot(value, true));
     if (serialized === undefined) {

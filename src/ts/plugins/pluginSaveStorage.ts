@@ -28,7 +28,11 @@ import {
     setPreparedPersistentPluginStoragePreservingOwner,
     writePersistentJson,
 } from "../storage/persistentKv";
-import { snapshotJsonValue, stringifyJsonValue } from "../storage/jsonValue";
+import {
+    convertCompatibleJsonValue,
+    snapshotJsonValue,
+    stringifyJsonValue,
+} from "../storage/jsonValue";
 import { assertWellFormedUnicode } from "../storage/unicodeWellFormed";
 import {
     beginDatabaseSavePause,
@@ -770,8 +774,8 @@ function cloneInlinePluginStorageRecord(
     return snapshot;
 }
 
-interface PreparedOptimizedPluginStorageValue<T> {
-    snapshot: T;
+interface PreparedOptimizedPluginStorageValue {
+    snapshot: unknown;
     prepared: ReturnType<typeof preparePersistentJson>;
 }
 
@@ -779,28 +783,43 @@ function optimizedPluginStorageSubject(owner?: string): string {
     return owner ? `Plugin ${JSON.stringify(owner)}` : "The plugin";
 }
 
-function prepareOptimizedPluginStorageValue<T>(
-    value: T,
+function prepareOptimizedPluginStorageValue(
+    value: unknown,
     owner?: string,
-): PreparedOptimizedPluginStorageValue<T> {
-    let snapshot: T;
+    autoConvert = false,
+): PreparedOptimizedPluginStorageValue {
+    let snapshot: unknown;
     try {
         snapshot = snapshotJsonValue(value);
     } catch (error) {
-        throw new StorageError(
-            `${optimizedPluginStorageSubject(owner)} cannot save this value while “Optimize plugin memory usage” is enabled. `
-            + "Use only JSON-compatible data: null, booleans, finite numbers, strings, dense arrays, and plain objects. "
-            + "Convert values such as Date, Map, Set, BigInt, undefined, functions, circular references, or sparse arrays before saving.",
-            {
-                status: 400,
-                code: "PLUGIN_STORAGE_VALUE_UNSUPPORTED",
-                operation: "write",
-                retryable: false,
-                commitOutcomeUnknown: false,
-                commitOutcome: "not-committed",
-                cause: error,
-            },
-        );
+        let cause = error;
+        let converted = false;
+        if (autoConvert) {
+            try {
+                snapshot = convertCompatibleJsonValue(value);
+                converted = true;
+            } catch (conversionError) {
+                cause = conversionError;
+            }
+        }
+        if (!converted) {
+            throw new StorageError(
+                `${optimizedPluginStorageSubject(owner)} cannot save this value while “Optimize plugin memory usage” is enabled. `
+                + "Use only JSON-compatible data: null, booleans, finite numbers, strings, dense arrays, and plain objects. "
+                + (autoConvert
+                    ? "Automatic conversion could not safely transform a function, circular reference, accessor, symbol, or custom class."
+                    : "Turn on “Automatically convert compatible plugin values” to transform Date, Map, Set, BigInt, undefined, non-finite numbers, and sparse arrays. Functions and circular references still require plugin changes."),
+                {
+                    status: 400,
+                    code: "PLUGIN_STORAGE_VALUE_UNSUPPORTED",
+                    operation: "write",
+                    retryable: false,
+                    commitOutcomeUnknown: false,
+                    commitOutcome: "not-committed",
+                    cause,
+                },
+            );
+        }
     }
 
     try {
@@ -987,7 +1006,11 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
                     const optimizedReplacement = createDatabasePluginStorageRecord<unknown>();
                     const preparedValues = new Map<string, ReturnType<typeof preparePersistentJson>>();
                     for (const key of getPluginStorageRecordKeys(replacement)) {
-                        const optimizedValue = prepareOptimizedPluginStorageValue(replacement[key]);
+                        const optimizedValue = prepareOptimizedPluginStorageValue(
+                            replacement[key],
+                            undefined,
+                            db.autoConvertPluginStorageValues === true,
+                        );
                         definePluginStorageRecordValue(
                             optimizedReplacement,
                             key,
@@ -1189,7 +1212,11 @@ export async function setPluginSaveStorageItem<T>(
                 }, signal);
                 return;
             }
-            const { prepared } = prepareOptimizedPluginStorageValue(inlineSnapshot);
+            const { prepared } = prepareOptimizedPluginStorageValue(
+                inlineSnapshot,
+                undefined,
+                db.autoConvertPluginStorageValues === true,
+            );
             const storageKey = makeArchiveSafePluginSaveStorageKey(
                 PLUGIN_SAVE_PREFIX,
                 normalizedKey,
@@ -1242,6 +1269,7 @@ export async function setOwnedPluginSaveStorageItem<T>(
                 const { snapshot, prepared: preparedValue } = prepareOptimizedPluginStorageValue(
                     inlineSnapshot,
                     owner,
+                    db.autoConvertPluginStorageValues === true,
                 );
                 const valueStorageKey = makeArchiveSafePluginSaveStorageKey(
                     PLUGIN_SAVE_PREFIX,

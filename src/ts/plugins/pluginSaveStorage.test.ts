@@ -2066,6 +2066,58 @@ describe("plugin save storage transport", () => {
         expect(writePersistentJson).not.toHaveBeenCalled();
     });
 
+    test("optimized writes convert compatible values when the fallback is enabled", async () => {
+        database.optimizePluginMemory = true;
+        database.autoConvertPluginStorageValues = true;
+        const sparse = new Array(3);
+        sparse[1] = undefined;
+        sparse[2] = Number.NaN;
+
+        await expect(setOwnedPluginSaveStorageItem(
+            "converted",
+            {
+                date: new Date("2026-01-02T03:04:05.000Z"),
+                map: new Map<unknown, unknown>([[1n, new Set(["a", "b"])]]),
+                bigint: -42n,
+                missing: undefined,
+                sparse,
+            },
+            "Compatibility Test",
+        )).resolves.toBeUndefined();
+
+        expect(persistent.get(encoded(PLUGIN_SAVE_PREFIX, "converted"))).toEqual({
+            date: "2026-01-02T03:04:05.000Z",
+            map: [["1", ["a", "b"]]],
+            bigint: "-42",
+            missing: null,
+            sparse: [null, null, null],
+        });
+    });
+
+    test("automatic conversion still rejects functions and circular references", async () => {
+        database.optimizePluginMemory = true;
+        database.autoConvertPluginStorageValues = true;
+        const cycle: Record<string, unknown> = {};
+        cycle.self = cycle;
+
+        for (const [index, value] of [() => undefined, cycle].entries()) {
+            await expect(setOwnedPluginSaveStorageItem(
+                "unsafe-" + index,
+                value,
+                "Compatibility Test",
+            )).rejects.toMatchObject({
+                name: "StorageError",
+                code: "PLUGIN_STORAGE_VALUE_UNSUPPORTED",
+                operation: "write",
+                message: expect.stringContaining(
+                    "Automatic conversion could not safely transform",
+                ),
+            });
+        }
+
+        expect([...persistent.keys()].filter(key => key.includes("unsafe-"))).toEqual([]);
+    });
+
     test("inline get rejects an accessor without invoking it", async () => {
         let getterCalls = 0;
         database.pluginCustomStorage = makeInvalidRecord("accessor", () => {
