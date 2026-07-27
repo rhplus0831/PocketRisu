@@ -1,7 +1,8 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { mkdir, readdir, writeFile } from 'node:fs/promises'
+import { request as httpRequest, type IncomingMessage } from 'node:http'
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import Database from 'better-sqlite3'
 import { Packr } from 'msgpackr'
 import { zipSync } from 'fflate'
@@ -11,10 +12,15 @@ import { createSeedBackup } from './helpers/seed.js'
 import { decodeBackup } from './helpers/decode.js'
 import { encodeBackup } from './helpers/encode.js'
 import { decodeRisuDat } from './helpers/normalize.js'
+import utilsPkg from '../../server/node/utils.cjs'
 
 const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
 const PLUGIN_STORAGE_MANIFEST_KEY = 'plugin-storage/manifest.json'
 const packr = new Packr({ useRecords: false })
+const { decodeRisuSave, encodeRisuSaveLegacy } = utilsPkg as {
+  decodeRisuSave: (value: Uint8Array) => Promise<any>
+  encodeRisuSaveLegacy: (value: unknown) => Uint8Array
+}
 const servers: ServerHandle[] = []
 
 afterAll(async () => {
@@ -590,6 +596,168 @@ describe('external plugin rows in backup archives', () => {
     )!.toString('utf-8')).body).toHaveLength(4 * 1024 * 1024)
   })
 
+  test('partial export pins and round-trips large external own __proto__ escapes', async () => {
+    const oldAsset = Buffer.from('PINNED-PROTO-ASSET')
+    const newAsset = Buffer.from('MUTATE-PROTO-ASSET')
+    expect(newAsset.length).toBe(oldAsset.length)
+    const source = await spawnServer({
+      env: { POCKETRISU_TEST_PARTIAL_EXPORT_DELAY_MS: '500' },
+    })
+    servers.push(source)
+    const sourceClient = await createClient(source.port, source.password)
+    const seedEntries = decodeBackup(createSeedBackup({ characterCount: 1 }))
+    const databaseEntry = seedEntries.find(entry => entry.name === 'database.risudat')!
+    const database = decodeRisuDat(databaseEntry.data)
+    ;(database.characters as Array<Record<string, unknown>>)[0].image = 'assets/proto-selected.png'
+    database.optimizePluginMemory = true
+    database.pluginCustomStorage = {}
+    database.account = { token: 'must-not-enter-partial-backup' }
+    database.__pocketRisuPluginStorageEscapesV1 = {
+      user: 'reserved-field-collision',
+      nested: ['must', 'survive'],
+    }
+    databaseEntry.data = encodeRisuDat(database)
+    seedEntries.push({ name: 'proto-selected.png', data: oldAsset })
+    expect((await sourceClient.importBackup(encodeBackup(seedEntries))).ok).toBe(true)
+
+    const generation = 'partial-proto-export-generation'
+    const currentDatabase = decodeRisuDat(
+      readKvValue(source.cwd, 'database/database.bin')!,
+    )
+    const pinnedProtoValue = {
+      kind: 'pinned-value-proto',
+      body: 'v'.repeat(3 * 1024 * 1024),
+    }
+    const pinnedProtoMeta = {
+      plugin: 'Pinned Proto Owner',
+      updatedAt: 2,
+      body: 'm'.repeat(2 * 1024 * 1024),
+    }
+    const initialValues: Record<string, unknown> = {
+      'ordinary/first': { version: 'pinned', body: 'ordinary-value' },
+      constructor: { version: 'pinned-constructor' },
+    }
+    const initialMeta: Record<string, unknown> = {
+      'ordinary/first': { plugin: 'Pinned Ordinary', updatedAt: 1 },
+    }
+    Object.defineProperty(initialValues, '__proto__', {
+      configurable: true,
+      enumerable: true,
+      value: pinnedProtoValue,
+      writable: true,
+    })
+    Object.defineProperty(initialMeta, '__proto__', {
+      configurable: true,
+      enumerable: true,
+      value: pinnedProtoMeta,
+      writable: true,
+    })
+    const transition = await sourceClient.fetch('/api/plugin-storage/transition', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: new Uint8Array(encodeRisuDat({
+        version: 1,
+        source: { optimized: true, generation: null, manifest: null },
+        database: encodeRisuSaveLegacy({
+          ...currentDatabase,
+          optimizePluginMemory: true,
+          pluginStorageGeneration: generation,
+          pluginCustomStorage: initialValues,
+          pluginStorageMeta: initialMeta,
+        }),
+      })),
+    })
+    expect(transition.status).toBe(200)
+    await transition.text()
+
+    const protoValueKey = pluginStorageKey('pluginsave/', '__proto__')
+
+    const jobId = await startPartialExport(sourceClient)
+    await waitForPartialExport(sourceClient, jobId, status => status.phase === 'assembling')
+    await mutatePluginValue(
+      sourceClient,
+      generation,
+      pluginStorageKey('pluginsave/', 'ordinary/first'),
+      Buffer.from(JSON.stringify({ version: 'mutated', body: 'new-value' })),
+    )
+    await mutatePluginValue(
+      sourceClient,
+      generation,
+      protoValueKey,
+      Buffer.from(JSON.stringify({ kind: 'mutated-value-proto', body: 'new' })),
+      Buffer.from(JSON.stringify({ plugin: 'Mutated Proto Owner', updatedAt: 3 })),
+    )
+    await writeKv(sourceClient, 'assets/proto-selected.png', newAsset)
+
+    const backup = await downloadPartialExport(sourceClient, jobId)
+    const archive = entriesByName(backup)
+    expect(archive.get('proto-selected.png')).toEqual(oldAsset)
+    expect(archive.get('proto-selected.png')).not.toEqual(newAsset)
+    const folded = await decodeRisuSave(archive.get('database.risudat')!)
+    expect(folded.account).toBeUndefined()
+    expect(Object.keys(folded.pluginCustomStorage)).toEqual([
+      'ordinary/first',
+      'constructor',
+      '__proto__',
+    ])
+    expect(Object.keys(folded.pluginStorageMeta)).toEqual([
+      'ordinary/first',
+      '__proto__',
+    ])
+    expect(Object.hasOwn(folded.pluginCustomStorage, '__proto__')).toBe(true)
+    expect(Object.hasOwn(folded.pluginStorageMeta, '__proto__')).toBe(true)
+    expect(folded.pluginCustomStorage['ordinary/first']).toEqual({
+      version: 'pinned',
+      body: 'ordinary-value',
+    })
+    expect(folded.pluginCustomStorage.__proto__.kind).toBe('pinned-value-proto')
+    expect(folded.pluginCustomStorage.__proto__.body).toHaveLength(3 * 1024 * 1024)
+    expect(folded.pluginStorageMeta.__proto__.plugin).toBe('Pinned Proto Owner')
+    expect(folded.pluginStorageMeta.__proto__.body).toHaveLength(2 * 1024 * 1024)
+    expect(folded.__pocketRisuPluginStorageEscapesV1).toEqual({
+      user: 'reserved-field-collision',
+      nested: ['must', 'survive'],
+    })
+
+    const destination = await spawnServer()
+    servers.push(destination)
+    const destinationClient = await createClient(destination.port, destination.password)
+    expect((await destinationClient.importBackup(backup)).ok).toBe(true)
+    const restoredOrdinary = JSON.parse(readKvValue(
+      destination.cwd,
+      pluginStorageKey('pluginsave/', 'ordinary/first'),
+    )!.toString('utf-8'))
+    const restoredProto = JSON.parse(readKvValue(
+      destination.cwd,
+      protoValueKey,
+    )!.toString('utf-8'))
+    const restoredProtoMeta = JSON.parse(readKvValue(
+      destination.cwd,
+      pluginStorageKey('pluginsave-meta/', '__proto__'),
+    )!.toString('utf-8'))
+    expect(restoredOrdinary).toEqual({ version: 'pinned', body: 'ordinary-value' })
+    expect(restoredProto.kind).toBe('pinned-value-proto')
+    expect(restoredProto.body).toHaveLength(3 * 1024 * 1024)
+    expect(restoredProtoMeta.plugin).toBe('Pinned Proto Owner')
+    expect(restoredProtoMeta.body).toHaveLength(2 * 1024 * 1024)
+    const restoredDatabase = decodeRisuDat(
+      readKvValue(destination.cwd, 'database/database.bin')!,
+    )
+    expect(restoredDatabase.pluginCustomStorage).toEqual({})
+    expect(restoredDatabase.__pocketRisuPluginStorageEscapesV1).toEqual({
+      user: 'reserved-field-collision',
+      nested: ['must', 'survive'],
+    })
+    expect(await readFile(path.join(
+      destination.cwd,
+      'save',
+      'assets',
+      'proto-selected.png',
+    ))).toEqual(oldAsset)
+    await waitForNoPartialExportSpools(source.cwd)
+    await waitForNoPartialExportSpools(destination.cwd)
+  })
+
   test('partial export pins selected filesystem assets before equal-size replacement', async () => {
     const oldBytes = Buffer.from('OLD-PROFILE-BYTES')
     const newBytes = Buffer.from('NEW-PROFILE-BYTES')
@@ -729,6 +897,62 @@ describe('external plugin rows in backup archives', () => {
     await waitForNoPartialExportSpools(source.cwd)
   }, 30_000)
 
+  test('a cancellation arriving before delayed create admission leaves a tombstone', async () => {
+    const source = await spawnServer({
+      env: { POCKETRISU_TEST_PARTIAL_EXPORT_CREATE_DELAY_MS: '400' },
+    })
+    servers.push(source)
+    const client = await createClient(source.port, source.password)
+    expect((await client.importBackup(createSeedBackup())).ok).toBe(true)
+    const jobId = randomUUID()
+    const ownerHeaders = {
+      'content-type': 'application/json',
+      'x-session-id': 'delayed-create-owner',
+    }
+
+    const create = client.fetch('/api/backup/export/jobs', {
+      method: 'POST',
+      headers: ownerHeaders,
+      body: JSON.stringify({ scope: 'partial', jobId }),
+    })
+    // The test-only gate holds the POST after validation but before admission,
+    // deterministically putting DELETE on the problematic side of the race.
+    await new Promise(resolve => setTimeout(resolve, 100))
+    const cancel = await client.fetch(`/api/backup/export/jobs/${jobId}`, {
+      method: 'DELETE',
+      headers: { 'x-session-id': 'delayed-create-owner' },
+    })
+    expect(cancel.status).toBe(202)
+    await expect(cancel.json()).resolves.toMatchObject({ state: 'cancelled' })
+
+    const createResult = await create
+    expect(createResult.status).toBe(409)
+    await expect(createResult.json()).resolves.toMatchObject({ state: 'cancelled' })
+    const status = await client.fetch(`/api/backup/export/jobs/${jobId}`, {
+      headers: { 'x-session-id': 'delayed-create-owner' },
+    })
+    expect(status.status).toBe(404)
+    await status.text()
+    await waitForNoPartialExportSpools(source.cwd)
+
+    // The owner/id-scoped tombstone must not consume global admission.
+    const nextJobId = randomUUID()
+    const next = await client.fetch('/api/backup/export/jobs', {
+      method: 'POST',
+      headers: ownerHeaders,
+      body: JSON.stringify({ scope: 'partial', jobId: nextJobId }),
+    })
+    expect(next.status).toBe(202)
+    await next.text()
+    const nextCancel = await client.fetch(`/api/backup/export/jobs/${nextJobId}`, {
+      method: 'DELETE',
+      headers: { 'x-session-id': 'delayed-create-owner' },
+    })
+    expect(nextCancel.status).toBe(202)
+    await nextCancel.text()
+    await waitForNoPartialExportSpools(source.cwd)
+  })
+
   test('download disconnect destroys the one-shot private archive', async () => {
     const source = await spawnServer()
     servers.push(source)
@@ -757,6 +981,76 @@ describe('external plugin rows in backup archives', () => {
     await waitForNoPartialExportSpools(source.cwd)
     const stillHealthy = await client.fetch('/api/backup/export/jobs/not-a-job')
     expect(stillHealthy.status).toBe(404)
+  }, 30_000)
+
+  test('TTL abort destroys a stalled download and releases admission and spools', async () => {
+    const source = await spawnServer({
+      env: {
+        POCKETRISU_TEST_PARTIAL_EXPORT_TTL_MS: '500',
+        POCKETRISU_TEST_PARTIAL_EXPORT_GC_INTERVAL_MS: '25',
+        POCKETRISU_TEST_PARTIAL_EXPORT_STALL_DOWNLOAD: '1',
+      },
+    })
+    servers.push(source)
+    const client = await createClient(source.port, source.password)
+    const seedEntries = decodeBackup(createSeedBackup({ characterCount: 1 }))
+    const databaseEntry = seedEntries.find(entry => entry.name === 'database.risudat')!
+    const database = decodeRisuDat(databaseEntry.data)
+    ;(database.characters as Array<Record<string, unknown>>)[0].image = 'assets/ttl-stall.png'
+    databaseEntry.data = encodeRisuDat(database)
+    expect((await client.importBackup(encodeBackup(seedEntries))).ok).toBe(true)
+    await writeKv(client, 'assets/ttl-stall.png', Buffer.alloc(1024 * 1024, 0x71))
+
+    const jobId = await startPartialExport(client)
+    await waitForPartialExport(client, jobId, status => status.state === 'ready')
+    const stalled = await new Promise<{
+      response: IncomingMessage
+      closed: Promise<void>
+      firstBytes: number
+    }>((resolve, reject) => {
+      const request = httpRequest({
+        hostname: '127.0.0.1',
+        port: source.port,
+        path: `/api/backup/export/jobs/${jobId}/download`,
+        method: 'GET',
+        headers: { 'risu-auth': client.token },
+      })
+      request.once('error', reject)
+      request.once('response', (response) => {
+        const closed = new Promise<void>((closeResolve) => {
+          response.once('aborted', closeResolve)
+          response.once('close', closeResolve)
+        })
+        response.once('error', reject)
+        response.once('data', (chunk: Buffer) => {
+          response.pause()
+          resolve({ response, closed, firstBytes: chunk.length })
+        })
+      })
+      request.end()
+    })
+    expect(stalled.response.statusCode).toBe(200)
+    expect(stalled.firstBytes).toBeGreaterThan(0)
+    await Promise.race([
+      stalled.closed,
+      new Promise<never>((_, reject) => setTimeout(
+        () => reject(new Error('TTL did not terminate the stalled export download')),
+        5_000,
+      )),
+    ])
+    await waitForNoPartialExportSpools(source.cwd)
+    const expired = await client.fetch(`/api/backup/export/jobs/${jobId}`)
+    expect(expired.status).toBe(404)
+    await expired.text()
+
+    const replacementId = await startPartialExport(client)
+    const replacementCancel = await client.fetch(
+      `/api/backup/export/jobs/${replacementId}`,
+      { method: 'DELETE' },
+    )
+    expect(replacementCancel.status).toBe(202)
+    await replacementCancel.text()
+    await waitForNoPartialExportSpools(source.cwd)
   }, 30_000)
 
   test('legacy optimized backups externalize folded plugin storage and clear stale rows', async () => {

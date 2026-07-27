@@ -1472,7 +1472,29 @@ if(!existsSync(savePath)){
 
 const DATABASE_SPOOL_FILE_PREFIX = '.database-risudat-';
 const PARTIAL_EXPORT_JOB_PREFIX = '.partial-export-';
-const PARTIAL_EXPORT_JOB_TTL_MS = 15 * 60 * 1000;
+const configuredPartialExportJobTtlMs = Number(
+    process.env.NODE_ENV === 'test'
+        ? process.env.POCKETRISU_TEST_PARTIAL_EXPORT_TTL_MS
+        : NaN,
+);
+const PARTIAL_EXPORT_JOB_TTL_MS = Number.isSafeInteger(configuredPartialExportJobTtlMs)
+    && configuredPartialExportJobTtlMs >= 100
+    ? configuredPartialExportJobTtlMs
+    : 15 * 60 * 1000;
+const configuredPartialExportGcIntervalMs = Number(
+    process.env.NODE_ENV === 'test'
+        ? process.env.POCKETRISU_TEST_PARTIAL_EXPORT_GC_INTERVAL_MS
+        : NaN,
+);
+const PARTIAL_EXPORT_GC_INTERVAL_MS = Number.isSafeInteger(configuredPartialExportGcIntervalMs)
+    && configuredPartialExportGcIntervalMs >= 10
+    ? configuredPartialExportGcIntervalMs
+    : 60 * 1000;
+// A client can time out its create POST and send DELETE before the POST reaches
+// admission. Remember that exact owner/id cancellation for a bounded window so
+// the delayed create cannot resurrect a job after cleanup appeared to succeed.
+const PARTIAL_EXPORT_CANCELLATION_TTL_MS = 15 * 60 * 1000;
+const PARTIAL_EXPORT_MAX_CANCELLATION_TOMBSTONES = 256;
 // This is a single-user server and each job can hold a WAL snapshot plus two
 // archive-sized spools. Serial admission makes the statfs preflight an actual
 // reservation instead of letting concurrent jobs all spend the same bytes.
@@ -4084,10 +4106,45 @@ function listPartialBackupAssetEntries(database, reader) {
 }
 
 const partialExportJobs = new Map();
+const partialExportCancellationTombstones = new Map();
 
 function partialExportOwner(req) {
     const sessionId = req.headers['x-session-id'];
     return typeof sessionId === 'string' ? sessionId : '';
+}
+
+function partialExportCancellationKey(owner, jobId) {
+    return JSON.stringify([owner, jobId]);
+}
+
+function prunePartialExportCancellationTombstones(now = Date.now()) {
+    for (const [key, expiresAt] of partialExportCancellationTombstones) {
+        if (expiresAt <= now) partialExportCancellationTombstones.delete(key);
+    }
+}
+
+function recordPartialExportCancellation(owner, jobId) {
+    const now = Date.now();
+    prunePartialExportCancellationTombstones(now);
+    const key = partialExportCancellationKey(owner, jobId);
+    partialExportCancellationTombstones.delete(key);
+    while (partialExportCancellationTombstones.size
+        >= PARTIAL_EXPORT_MAX_CANCELLATION_TOMBSTONES) {
+        partialExportCancellationTombstones.delete(
+            partialExportCancellationTombstones.keys().next().value,
+        );
+    }
+    partialExportCancellationTombstones.set(
+        key,
+        now + PARTIAL_EXPORT_CANCELLATION_TTL_MS,
+    );
+}
+
+function wasPartialExportCancelled(owner, jobId) {
+    prunePartialExportCancellationTombstones();
+    return partialExportCancellationTombstones.has(
+        partialExportCancellationKey(owner, jobId),
+    );
 }
 
 function partialExportJobForRequest(req, res) {
@@ -9284,6 +9341,19 @@ app.post('/api/backup/export/jobs', async (req, res, next) => {
             res.status(400).json({ error: 'Partial export jobId must be a canonical UUID' });
             return;
         }
+        const testCreateDelay = process.env.NODE_ENV === 'test'
+            ? Number(process.env.POCKETRISU_TEST_PARTIAL_EXPORT_CREATE_DELAY_MS ?? 0)
+            : 0;
+        if (Number.isFinite(testCreateDelay) && testCreateDelay > 0) {
+            await new Promise(resolve => setTimeout(resolve, testCreateDelay));
+        }
+        if (wasPartialExportCancelled(owner, requestedId)) {
+            res.status(409).json({
+                error: 'Partial export job was cancelled before creation',
+                state: 'cancelled',
+            });
+            return;
+        }
         const existingById = partialExportJobs.get(requestedId);
         if (existingById) {
             if (existingById.owner !== owner) {
@@ -9382,8 +9452,22 @@ app.get('/api/backup/export/jobs/:jobId', async (req, res, next) => {
 app.delete('/api/backup/export/jobs/:jobId', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
-        const job = partialExportJobForRequest(req, res);
-        if (!job) return;
+        const id = req.params.jobId;
+        if (!PLUGIN_STORAGE_UUID_PATTERN.test(id)) {
+            res.status(404).json({ error: 'Partial export job not found' });
+            return;
+        }
+        const owner = partialExportOwner(req);
+        const job = partialExportJobs.get(id);
+        if (job && job.owner !== owner) {
+            res.status(404).json({ error: 'Partial export job not found' });
+            return;
+        }
+        recordPartialExportCancellation(owner, id);
+        if (!job) {
+            res.status(202).json({ ok: true, state: 'cancelled' });
+            return;
+        }
         job.state = 'cancelled';
         job.abortController.abort();
         partialExportJobs.delete(job.id);
@@ -9401,6 +9485,7 @@ app.get('/api/backup/export/jobs/:jobId/download', async (req, res, next) => {
     let job;
     let closed = false;
     let consuming = false;
+    let onJobAbort = null;
     try {
         job = partialExportJobForRequest(req, res);
         if (!job) return;
@@ -9412,18 +9497,56 @@ app.get('/api/backup/export/jobs/:jobId/download', async (req, res, next) => {
         job.state = 'streaming';
         job.progress.phase = 'streaming';
         res.once('close', () => { closed = true; });
+        onJobAbort = () => {
+            closed = true;
+            if (!res.destroyed) res.destroy();
+        };
+        job.abortController.signal.addEventListener('abort', onJobAbort, { once: true });
         res.setHeader('cache-control', 'no-store');
         res.setHeader('content-type', 'application/octet-stream');
         res.setHeader('content-disposition', `attachment; filename="${job.filename}"`);
         res.setHeader('content-length', job.size);
         res.setHeader('x-risu-backup-assets', Math.max(0, job.progress.total - 2));
         res.setHeader('x-risu-backup-missing-assets', job.missingAssets);
-        if (!await streamFileToWritable(job.archivePath, res, () => closed)) return;
+        if (process.env.NODE_ENV === 'test'
+            && process.env.POCKETRISU_TEST_PARTIAL_EXPORT_STALL_DOWNLOAD === '1') {
+            // Deterministically hold a response after headers and a real
+            // archive chunk have entered the streaming path. TTL must wake
+            // this wait by aborting the job and destroying the response.
+            const archive = await fs.open(job.archivePath, 'r');
+            try {
+                const firstChunk = Buffer.allocUnsafe(Math.min(job.size, 64 * 1024));
+                const { bytesRead } = await archive.read(firstChunk, 0, firstChunk.length, 0);
+                if (bytesRead > 0) {
+                    await writeWithBackpressure(
+                        res,
+                        firstChunk.subarray(0, bytesRead),
+                        () => closed || job.abortController.signal.aborted,
+                    );
+                }
+            } finally {
+                await archive.close();
+            }
+            if (!job.abortController.signal.aborted) {
+                await new Promise(resolve => {
+                    job.abortController.signal.addEventListener('abort', resolve, { once: true });
+                });
+            }
+            return;
+        }
+        if (!await streamFileToWritable(
+            job.archivePath,
+            res,
+            () => closed || job.abortController.signal.aborted,
+        )) return;
         if (!closed) res.end();
     } catch (error) {
         if (!closed && !res.headersSent) next(error);
         else if (!closed) res.destroy(error);
     } finally {
+        if (job && onJobAbort) {
+            job.abortController.signal.removeEventListener('abort', onJobAbort);
+        }
         if (job && consuming) await cleanupPartialExportJob(job);
     }
 });
@@ -12446,7 +12569,8 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
                 });
             }
         }
-    }, PROXY_STREAM_GC_INTERVAL_MS);
+        prunePartialExportCancellationTombstones(now);
+    }, Math.min(PROXY_STREAM_GC_INTERVAL_MS, PARTIAL_EXPORT_GC_INTERVAL_MS));
 
     await startServer();
 
