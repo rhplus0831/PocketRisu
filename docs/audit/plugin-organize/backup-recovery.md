@@ -563,6 +563,28 @@ timeout-provenance cases. This establishes behavior at the tested validation,
 swap, rollback, COMMIT, cleanup, marker, transport, and deadline boundaries; a
 lost acknowledgement still cannot reveal whether the server committed.
 
+Supplemental UI implementation `39303d78` applies that contract at the mounted
+ZIP file picker. The previous async `onchange` callback awaited the destructive
+upload outside the function call frame protected by its outer `try/catch`, so a
+committed or unknown `StorageError` could become an unhandled rejection and
+bypass reconciliation. The picker now clears its callback, removes the input,
+and explicitly owns the operation promise before entering the one-request
+replacement policy. A successful import reloads once; exact committed-with-error
+and unknown failures display localized EN/KO warnings and hard-reload in a
+`finally` path; and an exact not-committed failure reports that the existing
+data remains active without a reload. The upload is never replayed. If a
+success or warning callback itself throws after publication, the policy still
+reloads once and the mounted handler catches the rejection rather than leaving
+an unhandled promise or stale save loop.
+
+Direct and mounted tests cover success, committed-with-error, unknown,
+definitive not-committed, picker/listener cleanup, no duplicate request or
+reload, and callback failure. The combined focused policy run passed 22 tests;
+the full browser suite passed 1,581 with 3 skipped. Type checking reported zero
+errors, the production build completed, the EN/KO help-key audit remained
+complete at 423/423, and independent review accepted the exact implementation
+diff before commit.
+
 The import transaction and filesystem-swap journal remain one recovery unit.
 Injected failure after save-folder asset swap restores the old database and
 asset set, removes newly staged files and the journal, survives restart with
