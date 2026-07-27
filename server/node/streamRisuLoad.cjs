@@ -19,6 +19,7 @@ const {
     magicPluginStorageCompressedHeader,
     magicPluginStorageStreamHeader,
     normalizeJSON,
+    RisuSaveType,
     parseLegacyPluginStorageEnvelope,
     pluginStorageLegacyEscapeField,
     restoreLegacyPluginStorageKeys,
@@ -43,6 +44,7 @@ const DEFAULT_DECODE_DISK_HEADROOM_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_LEGACY_RESTORE_BYTES = 64 * 1024 * 1024;
 const unpackr = new Unpackr({ int64AsType: 'number', useRecords: false });
 const streamingCallbackErrors = new WeakSet();
+const JSON_RISU_SAVE_TYPES = new Set(Object.values(RisuSaveType));
 
 function guardStreamingCallback(callback, synchronous = false) {
     if (typeof callback !== 'function') return callback;
@@ -1080,19 +1082,23 @@ async function verifyRisuSaveBlocksBounded(input, inspection, options) {
                 throw legacySourceLimitError(maxDecodedBytes, decodedBytes);
             }
 
-            if (type === 6) {
-                let remoteInfo;
+            let parsedBody;
+            if (JSON_RISU_SAVE_TYPES.has(type)) {
                 try {
-                    remoteInfo = JSON.parse(body.toString('utf-8'));
+                    parsedBody = JSON.parse(body.toString('utf-8'));
                 } catch (error) {
                     throw new RisuSavePreparationError(
-                        `Invalid REMOTE block metadata: ${error.message}`,
+                        `Invalid JSON in RisuSave block type ${type}: ${error.message}`,
                         { cause: error },
                     );
                 }
+            }
+
+            if (type === RisuSaveType.REMOTE) {
+                const remoteInfo = parsedBody;
                 if (!remoteInfo || typeof remoteInfo.name !== 'string'
                     || remoteInfo.name.length === 0
-                    || !Number.isInteger(remoteInfo.type)) {
+                    || !JSON_RISU_SAVE_TYPES.has(remoteInfo.type)) {
                     throw new RisuSavePreparationError('Invalid REMOTE block metadata');
                 }
             }
@@ -1289,6 +1295,7 @@ async function decodeBoundedLegacyRisuSave(input, options = {}) {
 
     const raw = await readBoundedInput(input, inspection, maxLegacyBytes);
     let boundedRemoteResolver = null;
+    let strictBlockDecodedBytes = null;
     if (inspection.format === 'risusave') {
         const maxDecodedBytes = Math.min(
             maxLegacyBytes,
@@ -1307,11 +1314,17 @@ async function decodeBoundedLegacyRisuSave(input, options = {}) {
             shouldAbort,
             signal: options.signal,
         });
+        strictBlockDecodedBytes = maxDecodedBytes;
     }
     throwIfPreparationAborted(shouldAbort, options.signal);
     try {
         return await decodeRisuSave(raw, {
             resolveRemote: boundedRemoteResolver,
+            strictBlockJson: inspection.format === 'risusave',
+            signal: options.signal,
+            maxDecodedBytes: strictBlockDecodedBytes ?? maxLegacyBytes,
+            onCompressedBlockDecode: options.onCompressedBlockDecode,
+            onCompressedBlockDecodedChunk: options.onCompressedBlockDecodedChunk,
         });
     } catch (error) {
         if (error?.risuSavePreparationLimit

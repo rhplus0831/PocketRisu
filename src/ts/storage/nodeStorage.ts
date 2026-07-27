@@ -2646,10 +2646,11 @@ export class NodeStorage{
                 }
                 const snapshot = value as Record<string, unknown>
                 const keyTimestamp = parseInternalSnapshotKey(snapshot.key)
+                const validSize = snapshot.size === null
+                    || (Number.isSafeInteger(snapshot.size) && (snapshot.size as number) >= 0)
                 if (Object.keys(snapshot).sort().join(',') !== 'key,size,timestamp'
                     || keyTimestamp === null
-                    || !Number.isSafeInteger(snapshot.size)
-                    || (snapshot.size as number) < 0
+                    || !validSize
                     || !Number.isSafeInteger(snapshot.timestamp)
                     || (snapshot.timestamp as number) < 0
                     || (snapshot.timestamp as number) > previousTimestamp
@@ -2667,7 +2668,7 @@ export class NodeStorage{
                 previousTimestamp = snapshot.timestamp as number
                 snapshots.push({
                     key: snapshot.key as string,
-                    size: snapshot.size as number,
+                    size: snapshot.size as number | null,
                     timestamp: snapshot.timestamp as number,
                 })
             }

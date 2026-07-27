@@ -207,6 +207,28 @@ function readyStorage(): InstanceType<typeof NodeStorage> {
     return storage
 }
 
+function encodeRawRisuSaveBlock(type: number, name: string, body: Buffer): Buffer {
+    const nameBytes = Buffer.from(name, 'utf-8')
+    const header = Buffer.alloc(3 + nameBytes.length + 4)
+    header[0] = type
+    header[1] = 0
+    header[2] = nameBytes.length
+    nameBytes.copy(header, 3)
+    header.writeUInt32LE(body.length, 3 + nameBytes.length)
+    return Buffer.concat([header, body])
+}
+
+function encodeBlockSnapshot(blocks: Array<{ type: number; name: string; body: string }>): Buffer {
+    return Buffer.concat([
+        Buffer.from('RISUSAVE\0', 'binary'),
+        ...blocks.map(block => encodeRawRisuSaveBlock(
+            block.type,
+            block.name,
+            Buffer.from(block.body, 'utf-8'),
+        )),
+    ])
+}
+
 beforeEach(() => {
     vi.clearAllMocks()
     ;(NodeStorage as any).sessionInitialized = false
@@ -224,7 +246,7 @@ describe('NodeStorage boot snapshot recovery', () => {
             expect(String(input)).toBe('/api/db/snapshots')
             return new Response(JSON.stringify({
                 snapshots: [
-                    { key: 'database/dbbackup-200.bin', size: 8192, timestamp: 20_000 },
+                    { key: 'database/dbbackup-200.bin', size: null, timestamp: 20_000 },
                     { key: 'database/dbbackup-100.bin', size: 4096, timestamp: 10_000 },
                 ],
             }), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -232,7 +254,7 @@ describe('NodeStorage boot snapshot recovery', () => {
         vi.stubGlobal('fetch', fetchMock)
 
         await expect(readyStorage().listInternalSnapshotsForBoot()).resolves.toEqual([
-            { key: 'database/dbbackup-200.bin', size: 8192, timestamp: 20_000 },
+            { key: 'database/dbbackup-200.bin', size: null, timestamp: 20_000 },
             { key: 'database/dbbackup-100.bin', size: 4096, timestamp: 10_000 },
         ])
         expect(fetchMock).toHaveBeenCalledOnce()
@@ -433,7 +455,7 @@ describe('NodeStorage boot snapshot recovery', () => {
         expect(fetchMock).not.toHaveBeenCalled()
     })
 
-    it('restores an older valid 64 MiB chunked candidate without reading candidate bodies', async () => {
+    it('migrates a corrupt legacy chunk publication and restores an older valid 64 MiB candidate', async () => {
         const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-boot-snapshot-client-'))
         const saveDir = path.join(cwd, 'save')
         fs.mkdirSync(saveDir)
@@ -474,7 +496,18 @@ describe('NodeStorage boot snapshot recovery', () => {
             ).all(olderKey, newerKey) as Array<{ key: string; count: number }>
             expect(chunkCounts).toHaveLength(2)
             expect(chunkCounts.every(row => row.count > 100)).toBe(true)
+            const corruptChunk = seeded.prepare(
+                'SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq LIMIT 1 OFFSET 2',
+            ).get(newerKey) as { hash: string }
             seeded.transaction(() => {
+                // Recreate the pre-protection layout. The next open must
+                // protect the corrupt newest publication without aborting the
+                // valid older publication's migration or server startup.
+                seeded.prepare('DELETE FROM chunk_manifest_meta').run()
+                seeded.prepare('DELETE FROM chunk_manifest_publications').run()
+                seeded.prepare('DELETE FROM chunk_manifest_protection').run()
+                seeded.prepare('UPDATE chunks SET data = ? WHERE hash = ?')
+                    .run(Buffer.from('corrupt'), corruptChunk.hash)
                 seeded.prepare('DELETE FROM manifest_chunks WHERE manifest_key = ?')
                     .run('database/database.bin')
                 seeded.prepare(
@@ -505,10 +538,26 @@ describe('NodeStorage boot snapshot recovery', () => {
                 await decodeServerRisuSave(Buffer.from(bytes))
             ))
 
+            await expect(storage.listInternalSnapshotsForBoot()).resolves.toEqual([
+                { key: newerKey, size: null, timestamp: 7_000_000_000_000_100 },
+                { key: olderKey, size: validCandidate.byteLength, timestamp: 7_000_000_000_000_000 },
+            ])
+            const migrated = new Database(sqlitePath, { readonly: true })
+            expect(migrated.prepare(
+                'SELECT version FROM chunk_manifest_protection WHERE id = 1',
+            ).get()).toEqual({ version: 2 })
+            expect(migrated.prepare(
+                'SELECT 1 FROM chunk_manifest_publications WHERE manifest_key = ?',
+            ).get(newerKey)).toBeDefined()
+            expect(migrated.prepare(
+                'SELECT 1 FROM chunk_manifest_meta WHERE manifest_key = ?',
+            ).get(newerKey)).toBeUndefined()
+            migrated.close()
+
             const restored = await recoverDatabaseFromInternalSnapshots({ storage, decode })
 
             expect(restored).toMatchObject({ bootSnapshotRevision: 'older-valid' })
-            expect(requests.filter(pathname => pathname === '/api/db/snapshots')).toHaveLength(1)
+            expect(requests.filter(pathname => pathname === '/api/db/snapshots')).toHaveLength(2)
             expect(requests.filter(pathname => pathname === '/api/db/snapshots/restore')).toHaveLength(2)
             expect(requests.filter(pathname => pathname === '/api/db/read-raw-for-boot')).toHaveLength(1)
             expect(requests).not.toContain('/api/read')
@@ -550,6 +599,132 @@ describe('NodeStorage boot snapshot recovery', () => {
             fs.rmSync(cwd, { recursive: true, force: true })
         }
     }, 120_000)
+
+    it('falls through deleted and malformed candidates without publishing partial state', async () => {
+        const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-boot-snapshot-errors-'))
+        const saveDir = path.join(cwd, 'save')
+        fs.mkdirSync(saveDir)
+        fs.writeFileSync(path.join(saveDir, '__password'), testPassword)
+        let server: RunningServer | null = null
+        try {
+            server = await startRealServer(cwd)
+            const token = await login(server)
+            const inlineKey = 'database/dbbackup-80000000000004.bin'
+            const remoteKey = 'database/dbbackup-80000000000003.bin'
+            const foldedKey = 'database/dbbackup-80000000000002.bin'
+            const deletedKey = 'database/dbbackup-80000000000001.bin'
+            const olderKey = 'database/dbbackup-80000000000000.bin'
+            await writeRealKey(server, token, inlineKey, encodeBlockSnapshot([
+                { type: 1, name: 'root', body: JSON.stringify({ inline: 'must-not-commit' }) },
+                { type: 2, name: 'broken-character', body: '{"chaId":' },
+            ]))
+            await writeRealKey(server, token, remoteKey, encodeBlockSnapshot([
+                { type: 1, name: 'root', body: JSON.stringify({ remote: 'must-not-commit' }) },
+                {
+                    type: 6,
+                    name: 'broken-remote',
+                    body: JSON.stringify({ v: 1, type: 2, name: 'broken-remote' }),
+                },
+            ]))
+            await writeRealKey(
+                server,
+                token,
+                'remotes/broken-remote.local.bin',
+                Buffer.from('{"chaId":', 'utf-8'),
+            )
+            await writeRealKey(server, token, foldedKey, encodeServerRisuSaveLegacy({
+                characters: [],
+                optimizePluginMemory: true,
+                pluginStorageFolded: true,
+                pluginCustomStorage: { invalid: Number.POSITIVE_INFINITY },
+            }))
+            await writeRealKey(server, token, deletedKey, encodeServerRisuSaveLegacy({
+                characters: [],
+                deletedCandidate: true,
+            }))
+            await writeRealKey(server, token, olderKey, encodeServerRisuSaveLegacy({
+                characters: [],
+                recoveredFrom: 'older-valid-after-definitive-failures',
+            }))
+            await stopRealServer(server)
+            server = null
+
+            const raw = new Database(path.join(saveDir, 'risuai.db'))
+            raw.prepare(
+                'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+            ).run('database/database.bin', Buffer.from('corrupt-live'), Date.now())
+            raw.close()
+
+            server = await startRealServer(cwd)
+            expect(server.logs()).toContain('starting in snapshot-recovery mode')
+            const recoveryToken = await login(server)
+            let deletedAfterList = false
+            const restoreFailures: Array<{ status: number; payload: Record<string, unknown> }> = []
+            const fetchRecorder = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+                const requestPath = String(input)
+                const url = requestPath.startsWith('/')
+                    ? `${server!.origin}${requestPath}`
+                    : requestPath
+                if (requestPath === '/api/db/snapshots/restore') {
+                    const requestedKey = JSON.parse(String(init?.body)).key
+                    if (requestedKey === deletedKey && !deletedAfterList) {
+                        deletedAfterList = true
+                        const deleted = await nodeFetch(
+                            `${server!.origin}/api/db/snapshots?key=${encodeURIComponent(deletedKey)}`,
+                            { method: 'DELETE', headers: init?.headers },
+                        )
+                        expect(deleted.status).toBe(200)
+                    }
+                    const response = await nodeFetch(url, init)
+                    if (!response.ok) {
+                        const payload = await response.clone().json() as Record<string, unknown>
+                        restoreFailures.push({ status: response.status, payload })
+                    }
+                    return response
+                }
+                return await nodeFetch(url, init)
+            })
+            vi.stubGlobal('fetch', fetchRecorder)
+            const storage = readyStorage()
+            vi.mocked(storage.createAuth).mockResolvedValue(recoveryToken)
+
+            await expect(recoverDatabaseFromInternalSnapshots({
+                storage,
+                decode: bytes => decodeServerRisuSave(Buffer.from(bytes)),
+            })).resolves.toMatchObject({
+                recoveredFrom: 'older-valid-after-definitive-failures',
+            })
+
+            expect(deletedAfterList).toBe(true)
+            expect(restoreFailures.map(failure => failure.status)).toEqual([400, 400, 400, 404])
+            expect(restoreFailures[0].payload).toMatchObject({
+                code: 'RISU_SAVE_INVALID',
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            })
+            expect(restoreFailures[1].payload).toMatchObject({
+                code: 'RISU_SAVE_INVALID',
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            })
+            expect(restoreFailures[2].payload).toMatchObject({
+                code: 'INVALID_PLUGIN_STORAGE_ROW',
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            })
+            expect(restoreFailures[3].payload).toEqual({
+                error: 'Snapshot not found',
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            })
+        } finally {
+            vi.unstubAllGlobals()
+            if (server) await stopRealServer(server)
+            fs.rmSync(cwd, { recursive: true, force: true })
+        }
+    }, 60_000)
 
     it('allows a valid large restore to outlive the ordinary 15 second I/O bound', async () => {
         vi.useFakeTimers()

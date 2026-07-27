@@ -1,6 +1,9 @@
 const { Packr, Unpackr, decode } = require('msgpackr');
 const fflate = require('fflate');
 const { createHash, randomUUID } = require('crypto');
+const zlib = require('zlib');
+const { Readable, Writable } = require('stream');
+const { pipeline } = require('stream/promises');
 const { logger } = require('./logs.cjs');
 
 // Magic headers for different save formats
@@ -29,6 +32,58 @@ const RisuSaveType = {
     LOADOUTS: 10,
     PLUGIN_STORAGE: 11,
 };
+
+const JSON_RISU_SAVE_TYPES = new Set(Object.values(RisuSaveType));
+
+function isKnownJsonRisuSaveType(type) {
+    return Number.isInteger(type) && JSON_RISU_SAVE_TYPES.has(type);
+}
+
+function risuSaveDecodeAbortError(signal) {
+    const reason = signal?.reason;
+    const error = reason instanceof Error
+        ? new Error(reason.message, { cause: reason })
+        : new Error('RisuSave block decode cancelled');
+    error.name = 'AbortError';
+    error.code = 'RISU_STREAM_ABORTED';
+    return error;
+}
+
+async function decompressRisuSaveBlock(data, { signal, maxOutputBytes, onOutputChunk }) {
+    const parts = [];
+    let outputBytes = 0;
+    const sink = new Writable({
+        write(chunk, _encoding, callback) {
+            const part = Buffer.from(chunk);
+            outputBytes += part.length;
+            if (!Number.isSafeInteger(outputBytes) || outputBytes > maxOutputBytes) {
+                callback(structuralRisuSaveError('RisuSave block exceeds its verified decode bound'));
+                return;
+            }
+            parts.push(part);
+            try {
+                onOutputChunk?.({ size: part.length, outputBytes });
+            } catch (error) {
+                callback(error);
+                return;
+            }
+            callback();
+        },
+    });
+    try {
+        await pipeline(
+            Readable.from([Buffer.from(data)]),
+            zlib.createGunzip(),
+            sink,
+            ...(signal ? [{ signal }] : []),
+        );
+        if (signal?.aborted) throw risuSaveDecodeAbortError(signal);
+    } catch (error) {
+        if (signal?.aborted) throw risuSaveDecodeAbortError(signal);
+        throw error;
+    }
+    return Buffer.concat(parts, outputBytes);
+}
 
 // Packr/Unpackr instances
 const packr = new Packr({
@@ -412,9 +467,18 @@ class RisuSaveDecoder {
         // skipped (the historical behavior) — which loses any characters that
         // were saved as remote blocks by upstream RisuAI or by an earlier
         // NodeOnly version.
-        const { resolveRemote = null, maxRemoteDepth = 32 } = options;
+        const {
+            resolveRemote = null,
+            maxRemoteDepth = 32,
+            strictBlockJson = false,
+            signal = null,
+            maxDecodedBytes = Number.MAX_SAFE_INTEGER,
+            onCompressedBlockDecode = null,
+            onCompressedBlockDecodedChunk = null,
+        } = options;
         let offset = magicRisuSaveHeader.length;
         let db = {};
+        let decodedBytes = 0;
 
         while (offset < data.length) {
             try {
@@ -447,13 +511,17 @@ class RisuSaveDecoder {
                 offset += length;
 
                 if (compression) {
-                    await checkCompressionStreams();
-                    const cs = new DecompressionStream('gzip');
-                    const writer = cs.writable.getWriter();
-                    writer.write(blockData);
-                    writer.close();
-                    const buf = await new Response(cs.readable).arrayBuffer();
-                    blockData = new Uint8Array(buf);
+                    await onCompressedBlockDecode?.({ name, type });
+                    if (signal?.aborted) throw risuSaveDecodeAbortError(signal);
+                    blockData = await decompressRisuSaveBlock(blockData, {
+                        signal,
+                        maxOutputBytes: maxDecodedBytes - decodedBytes,
+                        onOutputChunk: onCompressedBlockDecodedChunk,
+                    });
+                }
+                decodedBytes += blockData.length;
+                if (!Number.isSafeInteger(decodedBytes) || decodedBytes > maxDecodedBytes) {
+                    throw structuralRisuSaveError('RisuSave blocks exceed the verified decode bound');
                 }
 
                 this.blocks.push({
@@ -464,7 +532,9 @@ class RisuSaveDecoder {
                     remoteChain: [],
                 });
             } catch (error) {
-                if (error?.risuSaveStructuralInvalid) throw error;
+                if (error?.risuSaveStructuralInvalid || error?.code === 'RISU_STREAM_ABORTED') {
+                    throw error;
+                }
                 throw structuralRisuSaveError(
                     `Failed to read RisuSave block at byte ${offset}: ${error?.message ?? error}`,
                     error,
@@ -479,6 +549,12 @@ class RisuSaveDecoder {
         for (let i = 0; i < this.blocks.length; i++) {
             const key = i;
             try {
+                // Authoritative snapshot restore enables this mode. Historical
+                // direct decoders may continue skipping malformed optional
+                // blocks, but recovery must never publish a silently partial DB.
+                if (strictBlockJson && isKnownJsonRisuSaveType(this.blocks[key].type)) {
+                    JSON.parse(this.blocks[key].content);
+                }
                 switch (this.blocks[key].type) {
                     case RisuSaveType.ROOT: {
                         const rootData = JSON.parse(this.blocks[key].content);
@@ -533,7 +609,8 @@ class RisuSaveDecoder {
                         const remoteInfo = JSON.parse(this.blocks[key].content);
                         if (!remoteInfo || typeof remoteInfo.name !== 'string'
                             || remoteInfo.name.length === 0
-                            || !Number.isInteger(remoteInfo.type)) {
+                            || !Number.isInteger(remoteInfo.type)
+                            || (strictBlockJson && !isKnownJsonRisuSaveType(remoteInfo.type))) {
                             throw structuralRisuSaveError('Invalid REMOTE block metadata');
                         }
                         const remoteChain = Array.isArray(this.blocks[key].remoteChain)
@@ -592,6 +669,12 @@ class RisuSaveDecoder {
                     || error?.risuSaveStructuralInvalid
                     || error?.code === 'RISU_STREAM_ABORTED') {
                     throw error;
+                }
+                if (strictBlockJson && isKnownJsonRisuSaveType(this.blocks[key].type)) {
+                    throw structuralRisuSaveError(
+                        `Invalid JSON in RisuSave block ${this.blocks[key].name}`,
+                        error,
+                    );
                 }
                 if (this.blocks[key].type === RisuSaveType.REMOTE) {
                     throw structuralRisuSaveError(

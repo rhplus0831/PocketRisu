@@ -112,9 +112,18 @@ function encodeRisuSaveBlock(
   value: unknown,
   compressed = false,
 ): Buffer {
-  const nameBytes = Buffer.from(name, 'utf-8')
   const json = Buffer.from(JSON.stringify(value), 'utf-8')
   const body = compressed ? gzipSync(json) : json
+  return encodeRawRisuSaveBlock(type, name, body, compressed)
+}
+
+function encodeRawRisuSaveBlock(
+  type: number,
+  name: string,
+  body: Buffer,
+  compressed = false,
+): Buffer {
+  const nameBytes = Buffer.from(name, 'utf-8')
   const header = Buffer.alloc(3 + nameBytes.length + 4)
   header[0] = type
   header[1] = compressed ? 1 : 0
@@ -603,6 +612,88 @@ describe('disk-backed streaming Risu ingest', () => {
         availableDiskBytes: json.length,
       }), name).resolves.toEqual(database)
     }
+  })
+
+  test('strict bounded block restore rejects partial JSON and aborts the second expansion pass', async () => {
+    const malformedInline = Buffer.concat([
+      Buffer.from('RISUSAVE\0', 'binary'),
+      encodeRisuSaveBlock(1, 'root', { marker: 'root-survives-direct-compat' }),
+      encodeRawRisuSaveBlock(2, 'character', Buffer.from('{"chaId":')),
+    ])
+    await expect(decodeRisuSave(malformedInline)).resolves.toMatchObject({
+      marker: 'root-survives-direct-compat',
+      characters: [],
+    })
+    await expect(decodeBoundedLegacyRisuSave(malformedInline, {
+      maxLegacyBytes: 1024 * 1024,
+      maxDecodedBytes: 1024 * 1024,
+    })).rejects.toMatchObject({
+      code: 'RISU_SAVE_INVALID',
+      status: 400,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+
+    const remoteSource = Buffer.concat([
+      Buffer.from('RISUSAVE\0', 'binary'),
+      encodeRisuSaveBlock(1, 'root', { marker: 'remote-source' }),
+      encodeRisuSaveBlock(6, 'remote-character', {
+        v: 1,
+        type: 2,
+        name: 'remote-character',
+      }),
+    ])
+    const malformedRemote = Buffer.from('{"chaId":')
+    await expect(decodeBoundedLegacyRisuSave(remoteSource, {
+      maxLegacyBytes: 1024 * 1024,
+      maxDecodedBytes: 1024 * 1024,
+      resolveRemoteSize: async () => malformedRemote.length,
+      resolveRemote: async () => malformedRemote,
+    })).rejects.toMatchObject({
+      code: 'RISU_SAVE_INVALID',
+      status: 400,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+
+    const unsupportedRemote = Buffer.concat([
+      Buffer.from('RISUSAVE\0', 'binary'),
+      encodeRisuSaveBlock(1, 'root', {}),
+      encodeRisuSaveBlock(6, 'unknown-target', { v: 1, type: 255, name: 'unknown-target' }),
+    ])
+    await expect(decodeBoundedLegacyRisuSave(unsupportedRemote, {
+      maxLegacyBytes: 1024 * 1024,
+      maxDecodedBytes: 1024 * 1024,
+      resolveRemoteSize: async () => 2,
+      resolveRemote: async () => Buffer.from('{}'),
+    })).rejects.toMatchObject({
+      code: 'RISU_SAVE_INVALID',
+      status: 400,
+    })
+
+    const compressed = encodeBlockRisuSave({
+      characters: [{ chaId: 'never-decoded', chats: [] }],
+      padding: 'bounded-cancel-'.repeat(16 * 1024),
+    })
+    const controller = new AbortController()
+    let secondPassStarted = 0
+    await expect(decodeBoundedLegacyRisuSave(compressed, {
+      maxLegacyBytes: 1024 * 1024,
+      maxDecodedBytes: 1024 * 1024,
+      diskHeadroomBytes: 0,
+      availableDiskBytes: 1024 * 1024,
+      signal: controller.signal,
+      onCompressedBlockDecode: () => {
+        secondPassStarted++
+      },
+      onCompressedBlockDecodedChunk: () => {
+        controller.abort(new Error('disconnect during strict block expansion'))
+      },
+    })).rejects.toMatchObject({
+      name: 'AbortError',
+      code: 'RISU_STREAM_ABORTED',
+    })
+    expect(secondPassStarted).toBe(1)
   })
 
   test('bounds nested REMOTEs before materialization, detects cycles, and caches duplicates', async () => {

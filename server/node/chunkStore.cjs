@@ -489,12 +489,13 @@ function createChunkStore(db, opts = {}) {
     }
 
     /**
-     * Older databases have manifests but no publication metadata.  Upgrade
+     * Older databases have manifests but no publication metadata. Upgrade
      * those rows exactly once, in one transaction, before declaring the store
-     * protected.  Every chunk is checked while computing the logical digest;
-     * a malformed legacy publication aborts the migration rather than being
-     * blessed as authoritative.  Once the durable protection row exists,
-     * missing metadata is always corruption, including after restart.
+     * protected. Every key is verified independently: valid publications get
+     * canonical metadata, while a corrupt marker-backed publication gets only
+     * the durable publication guard. The latter deliberately has no metadata,
+     * so every logical API continues to reject it after restart without one bad
+     * snapshot preventing the server from recovering through an older key.
      */
     const migrateLegacyManifestMetadata = db.transaction(() => {
         if ((selManifestProtection.get()?.version ?? 0) >= 2) return;
@@ -503,43 +504,50 @@ function createChunkStore(db, opts = {}) {
             // Ignore stale manifests and raw rows; GC owns those. A marker with
             // manifest rows is the only representation this migration protects.
             if (!row?.has_chunk_marker) continue;
-            const inventory = selManifestStreamMetadata.get(key);
-            if (!Number.isSafeInteger(inventory.chunk_count) || inventory.chunk_count <= 0
-                || inventory.min_seq !== 0 || inventory.max_seq !== inventory.chunk_count - 1) {
-                throw streamError(`Legacy chunk manifest ${key} has an incomplete sequence`);
-            }
-            const logicalHash = crypto.createHash('sha256');
-            let logicalSize = 0;
-            for (let index = 0; index < inventory.chunk_count; index++) {
-                const part = selManifestPart.get({ key, seq: index });
-                if (!part || part.seq !== index
-                    || !Number.isSafeInteger(part.stored_size)
-                    || part.stored_size <= 0 || part.stored_size > MAX_SIZE
-                    || !/^[0-9a-f]{64}$/.test(part.hash)) {
-                    throw streamError(`Legacy chunk manifest ${key} has an invalid row at ${index}`);
+            try {
+                const inventory = selManifestStreamMetadata.get(key);
+                if (!Number.isSafeInteger(inventory.chunk_count) || inventory.chunk_count <= 0
+                    || inventory.min_seq !== 0 || inventory.max_seq !== inventory.chunk_count - 1) {
+                    throw streamError(`Legacy chunk manifest ${key} has an incomplete sequence`);
                 }
-                const chunkRow = selChunkDataPart.get({ hash: part.hash, read_length: MAX_SIZE });
-                if (!Buffer.isBuffer(chunkRow?.data)
-                    || chunkRow.data.length !== part.stored_size
-                    || crypto.createHash('sha256').update(chunkRow.data).digest('hex') !== part.hash) {
-                    throw streamError(`Legacy chunk manifest ${key} failed chunk verification at ${index}`);
+                const logicalHash = crypto.createHash('sha256');
+                let logicalSize = 0;
+                for (let index = 0; index < inventory.chunk_count; index++) {
+                    const part = selManifestPart.get({ key, seq: index });
+                    if (!part || part.seq !== index
+                        || !Number.isSafeInteger(part.stored_size)
+                        || part.stored_size <= 0 || part.stored_size > MAX_SIZE
+                        || !/^[0-9a-f]{64}$/.test(part.hash)) {
+                        throw streamError(`Legacy chunk manifest ${key} has an invalid row at ${index}`);
+                    }
+                    const chunkRow = selChunkDataPart.get({ hash: part.hash, read_length: MAX_SIZE });
+                    if (!Buffer.isBuffer(chunkRow?.data)
+                        || chunkRow.data.length !== part.stored_size
+                        || crypto.createHash('sha256').update(chunkRow.data).digest('hex') !== part.hash) {
+                        throw streamError(`Legacy chunk manifest ${key} failed chunk verification at ${index}`);
+                    }
+                    logicalSize += chunkRow.data.length;
+                    if (!Number.isSafeInteger(logicalSize)) {
+                        throw streamError(`Legacy chunk manifest ${key} exceeds the safe size range`);
+                    }
+                    logicalHash.update(chunkRow.data);
                 }
-                logicalSize += chunkRow.data.length;
-                if (!Number.isSafeInteger(logicalSize)) {
-                    throw streamError(`Legacy chunk manifest ${key} exceeds the safe size range`);
+                const digest = logicalHash.digest('hex');
+                const prior = selManifestMeta.get(key);
+                if (prior && (
+                    prior.chunk_count !== inventory.chunk_count
+                    || prior.logical_size !== logicalSize
+                    || prior.logical_sha256 !== digest
+                )) {
+                    throw streamError(`Legacy chunk manifest ${key} metadata does not match its chunks`);
                 }
-                logicalHash.update(chunkRow.data);
+                insManifestMeta.run(key, inventory.chunk_count, logicalSize, digest);
+            } catch (error) {
+                if (error?.code !== 'KV_CHUNK_CORRUPT') throw error;
+                // Publication without metadata is the durable protected-corrupt
+                // state. Never retain legacy metadata that could bless damage.
+                delManifestMeta.run(key);
             }
-            const digest = logicalHash.digest('hex');
-            const prior = selManifestMeta.get(key);
-            if (prior && (
-                prior.chunk_count !== inventory.chunk_count
-                || prior.logical_size !== logicalSize
-                || prior.logical_sha256 !== digest
-            )) {
-                throw streamError(`Legacy chunk manifest ${key} metadata does not match its chunks`);
-            }
-            insManifestMeta.run(key, inventory.chunk_count, logicalSize, digest);
             insManifestPublication.run(key);
         }
         insManifestProtection.run();

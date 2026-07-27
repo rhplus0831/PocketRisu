@@ -6,7 +6,8 @@ export type BootSnapshotDatabaseRead =
 
 export interface BootInternalSnapshot {
     key: string
-    size: number
+    /** null means the server could not determine this publication's logical size. */
+    size: number | null
     timestamp: number
 }
 

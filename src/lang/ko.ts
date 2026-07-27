@@ -2250,6 +2250,7 @@ export const languageKorean = {
 
   backupSnapshot: "스냅샷 (DB만)",
   backupSnapshotEmpty: "스냅샷이 없습니다.",
+  backupSnapshotUnreadable: "읽을 수 없음",
   backupSnapshotRestore: "이 스냅샷으로 복원",
   backupSnapshotDelete: "스냅샷 삭제",
   backupSnapshotDeleteConfirm: (when: string) =>

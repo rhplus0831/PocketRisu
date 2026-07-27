@@ -10897,8 +10897,15 @@ function parseInternalSnapshotKey(key) {
 function internalSnapshotMetadata(key) {
     const parsed = parseInternalSnapshotKey(key);
     if (!parsed) return null;
-    const size = kvSize(key);
-    if (!Number.isSafeInteger(size) || size < 0) return null;
+    let size = null;
+    try {
+        size = kvSize(key);
+    } catch (error) {
+        // Discovery must retain an exact corrupt candidate so boot recovery can
+        // submit it to the definitive restore boundary, then try an older key.
+        if (error?.code !== 'KV_CHUNK_CORRUPT') throw error;
+    }
+    if (size !== null && (!Number.isSafeInteger(size) || size < 0)) return null;
     return { ...parsed, size };
 }
 
@@ -11569,7 +11576,12 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
     try {
         const key = typeof req.body?.key === 'string' ? req.body.key : '';
         if (!parseInternalSnapshotKey(key)) {
-            return res.status(400).json({ error: 'Invalid snapshot key' });
+            return res.status(400).json({
+                error: 'Invalid snapshot key',
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            });
         }
         // Acquire before entering the storage queue: acquire() drains that same
         // queue, so holding a slot while waiting for it would deadlock.
@@ -11707,7 +11719,12 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
         }
         if (!snapshotFound) {
             if (closed) return;
-            return res.status(404).json({ error: 'Snapshot not found' });
+            return res.status(404).json({
+                error: 'Snapshot not found',
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            });
         }
         if (committedPublication) {
             dbEtag = computeBufferEtag(committedPublication.strippedBytes);
@@ -11755,7 +11772,12 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             return;
         }
         const diagnostic = pluginStorageValidationDiagnostic(err);
-        if (diagnostic) return res.status(400).json(diagnostic);
+        if (diagnostic) return res.status(400).json({
+            ...diagnostic,
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        });
         if (isImportInProgressError(err)) return sendImportBusy(res);
         if (err?.risuSavePreparationInvalid === true) {
             return res.status(400).json({

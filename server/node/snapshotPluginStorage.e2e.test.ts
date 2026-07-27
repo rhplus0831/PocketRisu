@@ -2371,6 +2371,9 @@ describe('automatic snapshots × optimized plugin storage', () => {
             error: 'Invalid plugin storage JSON row',
             code: 'INVALID_PLUGIN_STORAGE_ROW',
             encodedKey: valueRowKey('invalid'),
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
         })
         expect(await readKey(server, auth, 'database/database.bin')).toEqual(liveBefore)
         expect(await readKey(server, auth, valueRowKey('durable'))).toEqual(valueBefore)
@@ -2522,6 +2525,9 @@ describe('automatic snapshots × optimized plugin storage', () => {
             error: 'Invalid plugin storage JSON row',
             code: 'INVALID_PLUGIN_STORAGE_ROW',
             encodedKey: valueRowKey(decodedKey),
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
         })
 
         await delay(20)
@@ -2585,6 +2591,9 @@ describe('automatic snapshots × optimized plugin storage', () => {
                 error: 'Invalid plugin storage JSON row',
                 code: 'INVALID_PLUGIN_STORAGE_ROW',
                 encodedKey: snapshot.encodedKey,
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
             })
         }
     })
@@ -3628,6 +3637,12 @@ describe('corrupt database boot snapshot recovery', () => {
                 body: JSON.stringify({ key: invalidKey }),
             })
             expect(invalidRestore.status).toBe(400)
+            await expect(invalidRestore.json()).resolves.toEqual({
+                error: 'Invalid snapshot key',
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            })
             const invalidDelete = await fetch(
                 `${server.origin}/api/db/snapshots?key=${encodeURIComponent(invalidKey)}`,
                 { method: 'DELETE', headers: auth },
@@ -3762,7 +3777,12 @@ describe('corrupt database boot snapshot recovery', () => {
             body: JSON.stringify({ key: `${snapshotKey}/suffix` }),
         })
         expect(prefixOnly.status).toBe(400)
-        await expect(prefixOnly.json()).resolves.toEqual({ error: 'Invalid snapshot key' })
+        await expect(prefixOnly.json()).resolves.toEqual({
+            error: 'Invalid snapshot key',
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        })
 
         const restored = await fetch(`${server.origin}/api/db/snapshots/restore`, {
             method: 'POST',

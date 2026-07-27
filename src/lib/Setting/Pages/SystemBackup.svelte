@@ -30,7 +30,7 @@
     import { runInternalSnapshotRestoreUi } from 'src/ts/storage/snapshotRestoreUi'
 
     // ── Types ────────────────────────────────────────────────────────────────
-    interface Snapshot { key: string; size: number; timestamp: number | null }
+    interface Snapshot { key: string; size: number | null; timestamp: number | null }
     interface BackupPathInfo { path: string; default: string; isDefault: boolean }
     interface SnapshotLimits {
         maxCount: number
@@ -477,7 +477,9 @@
                         <span class="text-sm text-textcolor">
                             {snap.timestamp ? new Date(snap.timestamp).toLocaleString() : snap.key}
                         </span>
-                        <span class="text-xs text-textcolor2 tabular-nums">{fmtBytes(snap.size)}</span>
+                        <span class="text-xs text-textcolor2 tabular-nums">
+                            {snap.size === null ? language.backupSnapshotUnreadable : fmtBytes(snap.size)}
+                        </span>
                     </div>
                     <div class="flex items-center gap-2 shrink-0">
                         <button class="text-textcolor2 hover:text-primary cursor-pointer" title={language.backupSnapshotRestore} aria-label={language.backupSnapshotRestore}

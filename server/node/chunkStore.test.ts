@@ -748,23 +748,45 @@ describe('writeValueToFile — bounded snapshot restore source', () => {
         }))
     })
 
-    it('F8: rolls back the protection marker when legacy migration finds corruption', () => {
+    it('F8: protects a corrupt legacy key and continues migrating valid siblings', async () => {
         const db = freshDb()
-        const key = 'database/dbbackup-corrupt-legacy.bin'
-        createChunkStore(db, T).putValue(key, seededBytes(300_000, 167))
+        const corruptKey = 'database/dbbackup-corrupt-legacy.bin'
+        const validKey = 'database/dbbackup-valid-legacy.bin'
+        const validBytes = seededBytes(300_000, 169)
+        const seeded = createChunkStore(db, T)
+        seeded.putValue(corruptKey, seededBytes(300_000, 167))
+        seeded.putValue(validKey, validBytes)
         const middle = db.prepare(
             'SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq LIMIT 1 OFFSET 2',
-        ).get(key) as { hash: string }
-        db.prepare('DELETE FROM chunk_manifest_meta WHERE manifest_key = ?').run(key)
-        db.prepare('DELETE FROM chunk_manifest_publications WHERE manifest_key = ?').run(key)
+        ).get(corruptKey) as { hash: string }
+        db.prepare('DELETE FROM chunk_manifest_meta').run()
+        db.prepare('DELETE FROM chunk_manifest_publications').run()
         db.prepare('DELETE FROM chunk_manifest_protection').run()
         db.prepare('UPDATE chunks SET data = ? WHERE hash = ?').run(Buffer.from('corrupt'), middle.hash)
 
-        expect(() => createChunkStore(db, T)).toThrow(/failed chunk verification/)
-        expect(db.prepare('SELECT 1 FROM chunk_manifest_protection').get()).toBeUndefined()
+        const migrated = createChunkStore(db, T)
+        expect(db.prepare('SELECT version FROM chunk_manifest_protection WHERE id = 1').get())
+            .toEqual({ version: 2 })
         expect(db.prepare(
             'SELECT 1 FROM chunk_manifest_meta WHERE manifest_key = ?',
-        ).get(key)).toBeUndefined()
+        ).get(corruptKey)).toBeUndefined()
+        expect(db.prepare(
+            'SELECT 1 FROM chunk_manifest_publications WHERE manifest_key = ?',
+        ).get(corruptKey)).toBeDefined()
+        expect(migrated.getValue(validKey)).toEqual(validBytes)
+
+        for (const operation of [
+            () => migrated.getValue(corruptKey),
+            () => migrated.sizeValue(corruptKey),
+            () => migrated.snapshotCostExclusive(corruptKey),
+        ]) {
+            expect(operation).toThrow(expect.objectContaining({ code: 'KV_CHUNK_CORRUPT' }))
+        }
+        const filePath = path.join(fileDir, 'corrupt-legacy-protected.risudat.tmp')
+        await expect(migrated.writeValueToFile(corruptKey, filePath)).rejects.toMatchObject({
+            code: 'KV_CHUNK_CORRUPT',
+        })
+        expect(fs.existsSync(filePath)).toBe(false)
     })
 
     it('F9: preserves a legitimate raw value equal to the chunk marker', async () => {
