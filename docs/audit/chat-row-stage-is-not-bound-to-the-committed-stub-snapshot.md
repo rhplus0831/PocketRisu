@@ -4,7 +4,7 @@
 - Severity: High
 - Lens: D1, L2, L4
 - Area: Area 4 — client/server sync protocol
-- Extends: [Acknowledged database patches are not durable for up to five seconds](../../v2/fatal/acknowledged-patches-are-not-durable.md)
+- Extends: [Acknowledged database patches are not durable for up to five seconds](acknowledged-patches-are-not-durable.md)
 - Affected code: `src/ts/storage/chatPersistStage.ts:139-143`, `src/ts/storage/chatPersistStage.ts:155-190`, `src/ts/globalApi.svelte.ts:800-827`, `src/ts/globalApi.svelte.ts:994-1041`, `src/ts/globalApi.svelte.ts:1072-1083`, `src/ts/storage/nodeStorage.ts:977-995`, `server/node/chatRows.cjs:321-342`
 
 ## Risk

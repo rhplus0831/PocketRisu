@@ -4,7 +4,7 @@
 - Severity: Medium
 - Lens: D3
 - Area: Area 7 — server file stores
-- Extends: [The inlay gallery's orphan scan classifies referenced inlays as deletable](../../v2/fatal/inlay-orphan-scan-classifies-referenced-inlays-as-deletable.md)
+- Extends: [The inlay gallery's orphan scan classifies referenced inlays as deletable](inlay-orphan-scan-classifies-referenced-inlays-as-deletable.md)
 - Affected code: `src/ts/process/files/inlays.ts:664-695`, `src/lib/Setting/Pages/InlayImageGallery.svelte:77-87`, `src/lib/Setting/Pages/InlayImageGallery.svelte:134-148`, `src/lib/Setting/Pages/InlayImageGallery.svelte:241-258`, `src/lib/Setting/ChatBackupList.svelte:133-150`, `server/node/server.cjs:5320-5336`
 
 ## Risk

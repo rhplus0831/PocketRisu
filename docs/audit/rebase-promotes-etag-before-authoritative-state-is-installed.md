@@ -4,7 +4,7 @@
 - Severity: Medium
 - Lens: D6, L4
 - Area: Area 4 — client↔server sync protocol
-- Related: [A patch conflict promotes the ETag and authorizes a stale full write](../../v2/fatal/patch-conflict-etag-promotion-enables-stale-full-write.md) — same authorization-token defect on a different path (full-write rebase/read, not patch 409)
+- Related: [A patch conflict promotes the ETag and authorizes a stale full write](patch-conflict-etag-promotion-enables-stale-full-write.md) — same authorization-token defect on a different path (full-write rebase/read, not patch 409)
 - Affected code: `src/ts/globalApi.svelte.ts:706-778`, `src/ts/globalApi.svelte.ts:1017-1024`, `src/ts/globalApi.svelte.ts:1072-1083`, `src/ts/storage/nodeStorage.ts:353-364`, `src/ts/plugins/pluginSaveStorage.ts:177-180`, `server/node/server.cjs:4232-4241`, `server/node/server.cjs:4324-4335`
 
 ## Risk
