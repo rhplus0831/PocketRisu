@@ -1,6 +1,6 @@
 # Reroll completion targets the currently selected chat, not the rerolled one
 
-- Status: Open
+- Status: Fixed
 - Severity: High
 - Area: chat pipeline (reroll)
 - Affected code: `src/lib/ChatScreens/DefaultChatScreen.svelte:448-483` (truncates chat A, captures `originalMessages` locally, awaits generation), `src/lib/ChatScreens/DefaultChatScreen.svelte:485-503` (re-reads the **current** selection for restore/comments/swipes), `src/ts/globalApi.svelte.ts:2712-2732` (`changeChatTo` unguarded during generation)
@@ -35,3 +35,16 @@ reroll completion through the live selection.
 Cover with a test that switches chats during a mocked failing generation and
 asserts (a) the second chat is untouched and (b) the rerolled chat gets its
 original messages back.
+
+## Resolution
+
+Fixed 2026-07-29. `reroll()` now captures the initiating `chaId` and `chatId`
+before truncation, mutates the resolved target chat, and passes the same durable
+target into `sendChat()`. After generation completes, failure restoration,
+trailing-comment reattachment, and swipe publication resolve that target again
+instead of reading the live character/chat selection. If the target no longer
+exists, settlement stops without mutating another chat.
+
+`chatSendTarget.test.ts` changes `chatPage` before both failed and successful
+reroll settlement. The regressions verify that the originating chat is restored
+or finalized and the newly selected chat remains untouched.

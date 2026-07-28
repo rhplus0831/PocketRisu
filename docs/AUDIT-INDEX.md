@@ -1,8 +1,8 @@
 # Audit findings — priority index
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
-`Status` column uses `Open`, `Fixed`, or `Deferred`; 51 findings are currently
-`Open`, 8 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
+`Status` column uses `Open`, `Fixed`, or `Deferred`; 50 findings are currently
+`Open`, 9 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
 as a cross-reference).
@@ -45,7 +45,7 @@ resolution against current code before acting on it.
 | [Inlay orphan scan classifies referenced inlays as deletable](audit/inlay-orphan-scan-classifies-referenced-inlays-as-deletable.md) | Fixed | High | Bulk permanent deletion of chat-referenced images (no trash; inlays absent from DB-only snapshots) | The feature invites it: after boot nearly every chat inlay counts as orphaned until its chat is opened; confirming the orphan filter deletes referenced media |
 | [Boot asset GC deletes plugin-owned assets](audit/boot-asset-gc-deletes-plugin-owned-assets.md) | Fixed | High | Every asset stored via the supported plugin `saveAsset` API, permanently; only recovery is an earlier full backup | Automatic, 5 s after **every** boot, for any plugin persisting asset paths in its storage |
 | [Send-input race replaces another chat's history](audit/send-input-race-replaces-another-chats-history.md) | Fixed | High | One chat's entire message history overwritten by another's; pre-image may be cooldown-skipped, making it unrecoverable | Switching chats while input triggers/`editinput` scripts run on send; cards can stretch the window arbitrarily |
-| [Reroll failure restores into the current chat](audit/reroll-failure-restores-into-the-current-chat.md) | Open | High | The currently selected chat's entire history overwritten with the rerolled chat's; the rerolled chat stays truncated | Switching chats during generation, then abort or failure — chat switching is unguarded during generation |
+| [Reroll failure restores into the current chat](audit/reroll-failure-restores-into-the-current-chat.md) | Fixed | High | The currently selected chat's entire history overwritten with the rerolled chat's; the rerolled chat stays truncated | Switching chats during generation, then abort or failure — chat switching is unguarded during generation |
 
 ## P2 — Serious bounded live-data loss, realistic triggers
 
@@ -140,10 +140,10 @@ de-fangs multiple findings at once.
 
 - **Reason-blind pre-image cooldown.** `captureChatPreImage()` skips capture
   inside the cooldown regardless of destructive intent. This still upgrades
-  both reroll findings, card-trigger wipes, and young-chat deletion from
-  "recoverable" to "permanent". A cooldown-exempt destructive-pre-image path
-  addresses all four remaining findings; the send-input race was fixed by
-  binding the operation to durable character/chat IDs instead.
+  the remaining reroll finding, card-trigger wipes, and young-chat deletion
+  from "recoverable" to "permanent". A cooldown-exempt destructive-pre-image
+  path addresses all three remaining findings; the send-input and reroll-target
+  races were fixed by binding their operations to durable character/chat IDs.
 - **DB-only snapshots.** Automatic snapshots never include assets, inlays, or
   the MCP tool-call cache, so every remaining finding that deletes those bytes
   (boot GC, inlay replacement, snapshot/GC interplay, MCP

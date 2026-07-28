@@ -3,6 +3,7 @@ import {
     applyChatInputToTarget,
     captureChatSendTarget,
     resolveChatSendTarget,
+    settleChatRerollToTarget,
 } from './chatSendTarget'
 
 function makeDatabase() {
@@ -72,5 +73,60 @@ describe('chat send target', () => {
         expect(resolved?.characterIndex).toBe(1)
         expect(resolved?.chatIndex).toBe(1)
         expect(resolved?.chat.id).toBe('chat-a')
+    })
+
+    test('restores a failed reroll to its originating chat after selection changes', () => {
+        const db = makeDatabase()
+        db.characters[0].chats[0].message = [
+            { role: 'user', data: 'prompt A' },
+            { role: 'char', data: 'response A', swipes: ['older response A'] },
+        ]
+        const target = captureChatSendTarget(db, 0)!
+        const originalMessages = structuredClone(db.characters[0].chats[0].message)
+
+        db.characters[0].chats[0].message = [{ role: 'user', data: 'prompt A' }]
+        db.characters[0].chatPage = 1
+
+        const settled = settleChatRerollToTarget(db, target, false, {
+            originalMessages,
+            trailingMessages: [],
+            savedSwipes: ['older response A', 'response A'],
+        })
+
+        expect(settled?.chat.id).toBe('chat-a')
+        expect(db.characters[0].chats[0].message).toEqual(originalMessages)
+        expect(db.characters[0].chats[1].message).toEqual([
+            { role: 'char', data: 'history B' },
+        ])
+    })
+
+    test('applies successful reroll comments and swipes to the originating chat', () => {
+        const db = makeDatabase()
+        const target = captureChatSendTarget(db, 0)!
+        db.characters[0].chats[0].message = [
+            { role: 'user', data: 'prompt A' },
+            { role: 'char', data: 'new response A' },
+        ]
+        db.characters[0].chatPage = 1
+
+        settleChatRerollToTarget(db, target, true, {
+            originalMessages: [],
+            trailingMessages: [{ role: 'user', data: 'branch note', isComment: true }],
+            savedSwipes: ['old response A'],
+        })
+
+        expect(db.characters[0].chats[0].message).toEqual([
+            { role: 'user', data: 'prompt A' },
+            {
+                role: 'char',
+                data: 'new response A',
+                swipes: ['old response A', 'new response A'],
+                swipeId: 1,
+            },
+            { role: 'user', data: 'branch note', isComment: true },
+        ])
+        expect(db.characters[0].chats[1].message).toEqual([
+            { role: 'char', data: 'history B' },
+        ])
     })
 })

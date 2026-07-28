@@ -37,8 +37,10 @@ import { isMobile } from 'src/ts/platform'
     import {
         applyChatInputToTarget,
         captureChatSendTarget,
+        findLastCharacterMessage,
         isChatSendTargetActive,
         resolveChatSendTarget,
+        settleChatRerollToTarget,
         type ChatSendTarget,
     } from 'src/ts/process/chatSendTarget';
 
@@ -481,7 +483,12 @@ import { isMobile } from 'src/ts/platform'
 
     async function reroll() {
         if($doingChat) return
-        const lastMsg = getLastCharMsg()
+        const target = captureChatSendTarget(DBState.db, $selectedCharID)
+        if(!target) return
+        const resolvedTarget = resolveChatSendTarget(DBState.db, target)
+        if(!resolvedTarget || resolvedTarget.chat._placeholder) return
+
+        const lastMsg = findLastCharacterMessage(resolvedTarget.chat.message)
         if (!lastMsg) return
 
         // Save existing swipes before clone replaces the array
@@ -489,7 +496,7 @@ import { isMobile } from 'src/ts/platform'
 
         // Generate new response
         // Preserve trailing comment/disabled messages (e.g. branch comments)
-        let cha = safeStructuredClone(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message)
+        let cha = safeStructuredClone(resolvedTarget.chat.message)
         const originalMessages = safeStructuredClone(cha)
         if(cha.length === 0) return
         openMenu = false
@@ -510,32 +517,15 @@ import { isMobile } from 'src/ts/platform'
             let msg = cha.pop()
             if(!msg) return
         }
-        const rerollCharacter = DBState.db.characters[$selectedCharID]
-        const rerollChat = rerollCharacter.chats[rerollCharacter.chatPage]
-        setChatBackupReason(rerollCharacter.chaId, rerollChat.id, 'reroll')
-        DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message = cha
-        const generated = await sendChatMain()
+        setChatBackupReason(target.chaId, target.chatId, 'reroll')
+        resolvedTarget.chat.message = cha
+        const generated = await sendChatMain(false, target)
 
-        const currentMsgs = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message
-
-        // If generation failed, restore original messages
-        if (!generated) {
-            DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message = originalMessages
-            return
-        }
-
-        // Restore trailing comments after the new message
-        if (trailingComments.length > 0) {
-            currentMsgs.push(...trailingComments)
-            DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message = currentMsgs
-        }
-
-        // Save new response to swipes
-        const newLastMsg = getLastCharMsg()
-        if (newLastMsg && !newLastMsg.swipes) {
-            newLastMsg.swipes = [...savedSwipes, newLastMsg.data]
-            newLastMsg.swipeId = newLastMsg.swipes.length - 1
-        }
+        settleChatRerollToTarget(DBState.db, target, generated, {
+            originalMessages,
+            trailingMessages: trailingComments,
+            savedSwipes,
+        })
     }
 
     async function unReroll() {

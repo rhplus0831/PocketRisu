@@ -12,6 +12,12 @@ export interface ResolvedChatSendTarget {
     chatIndex: number
 }
 
+export interface ChatRerollSettlement {
+    originalMessages: Message[]
+    trailingMessages: Message[]
+    savedSwipes: string[]
+}
+
 type ChatTargetDatabase = Pick<Database, 'characters' | 'useSayNothing'>
 
 interface InputTriggerResult {
@@ -54,6 +60,46 @@ export function isChatSendTargetActive(
     const character = db.characters?.[selectedCharacterIndex]
     const chat = character?.chats?.[character.chatPage]
     return character?.chaId === target.chaId && chat?.id === target.chatId
+}
+
+export function findLastCharacterMessage(messages: Message[]): Message | null {
+    for (let index = messages.length - 1; index >= 0; index--) {
+        const message = messages[index]
+        if (message.role === 'char' && !message.isComment && !message.disabled) return message
+    }
+    return null
+}
+
+/**
+ * Apply reroll completion to the chat that initiated the operation. The live
+ * character/chat selection may have changed while generation was awaiting the
+ * model, so every post-await mutation resolves the durable target again.
+ */
+export function settleChatRerollToTarget(
+    db: Pick<Database, 'characters'>,
+    target: ChatSendTarget,
+    generated: boolean,
+    settlement: ChatRerollSettlement,
+): ResolvedChatSendTarget | null {
+    const resolvedTarget = resolveChatSendTarget(db, target)
+    if (!resolvedTarget || resolvedTarget.chat._placeholder) return null
+
+    if (!generated) {
+        resolvedTarget.chat.message = settlement.originalMessages
+        return resolvedTarget
+    }
+
+    if (settlement.trailingMessages.length > 0) {
+        resolvedTarget.chat.message.push(...settlement.trailingMessages)
+    }
+
+    const newLastMessage = findLastCharacterMessage(resolvedTarget.chat.message)
+    if (newLastMessage && !newLastMessage.swipes) {
+        newLastMessage.swipes = [...settlement.savedSwipes, newLastMessage.data]
+        newLastMessage.swipeId = newLastMessage.swipes.length - 1
+    }
+
+    return resolvedTarget
 }
 
 /**
