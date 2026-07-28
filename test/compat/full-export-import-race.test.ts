@@ -91,6 +91,22 @@ async function waitForNoDatabaseSpools(cwd: string, timeoutMs = 10_000): Promise
   throw new Error(`Full backup database spools were not cleaned: ${lastEntries.join(', ')}`)
 }
 
+async function waitForSnapshotCount(
+  client: RisuClient,
+  expectedCount: number,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const response = await client.fetch('/api/db/snapshots')
+    expect(response.status).toBe(200)
+    const body = await response.json() as { snapshots: Array<{ key: string }> }
+    if (body.snapshots.length === expectedCount) return
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error(`Timed out waiting for ${expectedCount} automatic snapshot(s)`)
+}
+
 async function startImport(client: RisuClient, backup: Buffer): Promise<Response> {
   const prepared = await client.fetch('/api/backup/import/prepare', {
     method: 'POST',
@@ -314,6 +330,9 @@ describe('full backup point-in-time filesystem pins', () => {
       body: new Uint8Array(uiDatabase),
     })
     expect(write.status).toBe(200)
+    // Automatic snapshots intentionally run after /api/write responds. Keep
+    // their assembly outside the export-only RSS measurement below.
+    await waitForSnapshotCount(client, 1)
 
     const exported = await withPeakRss(server, () => client.exportBackup())
     expect(exported.increase).toBeLessThan(48 * MIB)
