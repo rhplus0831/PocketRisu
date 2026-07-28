@@ -386,6 +386,10 @@ outcome contracts are canonical in [Backup and recovery](backup-recovery.md).
 
 - Snapshot assembly is independent of file backups. Temporary `database.risudat` files belong in `save/.spool` or `POCKETRISU_SPOOL_DIR`, never under the optional server-backup path. Automatic snapshots stream the finished file through `kvSetFromFile()` and contain their own failures; advance `lastBackupTime` only after the snapshot row commits so a spool failure retries on the next write (`server/node/server.cjs:355-391`, `:872-899`).
 
+- **Hosted proxy policy lives in `server/node/proxyTarget.cjs`.** With `POCKETRISU_HUB_HOSTING` enabled, general proxy requests use a DNS-pinning undici dispatcher that rejects non-public resolved addresses plus literal redirect targets on every connection, `/hub-proxy` header targets are restricted to the configured HTTPS hub origin, and local proxy-stream job creation/WebSocket upgrades are disabled. Standalone general proxy requests keep global `fetch` and local-network access.
+
+- **`/hub-proxy/*` is not universally guarded by `checkAuth()`.** It checks PocketRisu auth only for the special `X-Node-Server-Auth` flow near `server/node/server.cjs:3436-3465`; changes to its target/header behavior need a deliberate compatibility and security review.
+
 - Automatic snapshot timestamps use 100 ms units. Creation divides `Date.now()` by 100 at `server/node/server.cjs:365`; listing multiplies the parsed value by 100 in the snapshot routes.
 
 ### Backup and import boundaries

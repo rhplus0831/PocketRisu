@@ -26,6 +26,7 @@ const nodeCrypto = require('crypto')
 const zlib = require('zlib')
 const rateLimit = require('express-rate-limit')
 const { WebSocketServer } = require('ws')
+const { fetch: undiciFetch } = require('undici')
 const Vips = require('wasm-vips')
 let _vipsPromise = null
 const getVips = () => {
@@ -145,6 +146,11 @@ const {
     extractZipEntries,
 } = require('./importSpool.cjs');
 const {
+    assertProxyTargetAllowed,
+    isProxyTargetBlockedError,
+    resolveHubProxyTarget,
+} = require('./proxyTarget.cjs');
+const {
     BACKUP_ENTRY_NAME_MAX_BYTES,
     PLUGIN_SAVE_PREFIX,
     PLUGIN_SAVE_META_PREFIX,
@@ -205,6 +211,33 @@ const enablePatchSync = true;
 const allowInsecureContext = process.env.POCKETRISU_ALLOW_INSECURE_CONTEXT === '1'
     || process.env.POCKETRISU_ALLOW_INSECURE_CONTEXT === 'true';
 const HUB_HOSTING_MODE = ['true', '1'].includes(String(process.env.POCKETRISU_HUB_HOSTING ?? '').trim().toLowerCase());
+const HOSTED_PROXY_STREAM_BLOCKED_ERROR = 'PROXY_TARGET_BLOCKED: Local proxy stream jobs are disabled in hosted mode';
+
+function proxyTargetBlockedReason(error) {
+    if (error?.code === 'PROXY_TARGET_BLOCKED' && typeof error.message === 'string') {
+        return error.message;
+    }
+    return 'Internal or non-public proxy targets are not allowed';
+}
+
+function handleProxyTargetBlocked(res, logPrefix, error) {
+    if (!isProxyTargetBlockedError(error)) return false;
+    const reason = proxyTargetBlockedReason(error);
+    logger.warn(`[${logPrefix}] PROXY_TARGET_BLOCKED: ${reason}`);
+    if (!res.headersSent) {
+        res.status(403).send({ error: `PROXY_TARGET_BLOCKED: ${reason}` });
+    } else {
+        res.end();
+    }
+    return true;
+}
+
+function fetchProxyTarget(target, options) {
+    if (target.dispatcher) {
+        return undiciFetch(target.url, { ...options, dispatcher: target.dispatcher });
+    }
+    return fetch(target.url, options);
+}
 
 // In-memory database cache for patch-based sync
 // dbCache stores the STRIPPED (stubs-only) version matching what the client sees.
@@ -3651,6 +3684,20 @@ function setupProxyStreamWebSocket(server) {
                 return;
             }
 
+            if (HUB_HOSTING_MODE) {
+                const body = JSON.stringify({ error: HOSTED_PROXY_STREAM_BLOCKED_ERROR });
+                socket.write([
+                    'HTTP/1.1 403 Forbidden',
+                    'Connection: close',
+                    'Content-Type: application/json; charset=utf-8',
+                    `Content-Length: ${Buffer.byteLength(body)}`,
+                    '',
+                    body,
+                ].join('\r\n'));
+                socket.destroy();
+                return;
+            }
+
             const auth = reqUrl.searchParams.get('risu-auth') || normalizeAuthHeader(req.headers['risu-auth']);
             if (!await isAuthorizedProxyRequest({ headers: { 'risu-auth': auth } })) {
                 socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -6973,7 +7020,10 @@ const reverseProxyFunc = async (req, res, next) => {
             }
         }
         // make request to original server
-        originalResponse = await fetch(urlParam, {
+        const proxyTarget = assertProxyTargetAllowed(urlParam, {
+            enforceInternalBlock: HUB_HOSTING_MODE,
+        });
+        originalResponse = await fetchProxyTarget(proxyTarget, {
             method: req.method,
             headers: header,
             body: requestBody,
@@ -7006,6 +7056,9 @@ const reverseProxyFunc = async (req, res, next) => {
 
     }
     catch (err) {
+        if (handleProxyTargetBlocked(res, 'Proxy', err)) {
+            return;
+        }
         if (err?.name === 'AbortError') {
             if (!res.headersSent) {
                 res.status(504).send({
@@ -7057,7 +7110,10 @@ const reverseProxyFunc_get = async (req, res, next) => {
         header['x-forwarded-for'] = req.ip
     }
         // make request to original server
-        originalResponse = await fetch(urlParam, {
+        const proxyTarget = assertProxyTargetAllowed(urlParam, {
+            enforceInternalBlock: HUB_HOSTING_MODE,
+        });
+        originalResponse = await fetchProxyTarget(proxyTarget, {
             method: 'GET',
             headers: header,
             signal: timeout.signal
@@ -7087,6 +7143,9 @@ const reverseProxyFunc_get = async (req, res, next) => {
         await pipeline(originalResponse.body, res);
     }
     catch (err) {
+        if (handleProxyTargetBlocked(res, 'Proxy', err)) {
+            return;
+        }
         if (err?.name === 'AbortError') {
             if (!res.headersSent) {
                 res.status(504).send({
@@ -7176,16 +7235,11 @@ async function hubProxyFunc(req, res) {
     ];
 
     try {
-        let externalURL = '';
-
-        const pathHeader = req.headers['x-risu-node-path'];
-        if (pathHeader) {
-            const decodedPath = decodeURIComponent(pathHeader);
-            externalURL = decodedPath;
-        } else {
-            const pathAndQuery = req.originalUrl.replace(/^\/hub-proxy/, '');
-            externalURL = hubURL + pathAndQuery;
-        }
+        const externalURL = resolveHubProxyTarget({
+            pathHeader: req.headers['x-risu-node-path'],
+            originalUrl: req.originalUrl,
+            hubURL,
+        });
         
         const headersToSend = { ...req.headers };
         delete headersToSend.host;
@@ -7208,13 +7262,31 @@ async function hubProxyFunc(req, res) {
         }
         
         
-        const response = await fetch(externalURL, {
+        const proxyTarget = assertProxyTargetAllowed(externalURL, {
+            enforceInternalBlock: HUB_HOSTING_MODE,
+        });
+        const response = await fetchProxyTarget(proxyTarget, {
             method: req.method,
             headers: headersToSend,
             body: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : undefined,
             redirect: 'manual',
             duplex: 'half'
         });
+
+        let redirectResponse;
+        if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
+            const redirectTarget = assertProxyTargetAllowed(response.headers.get('location'), {
+                enforceInternalBlock: HUB_HOSTING_MODE,
+            });
+            const newHeaders = { ...headersToSend };
+            redirectResponse = await fetchProxyTarget(redirectTarget, {
+                method: req.method,
+                headers: newHeaders,
+                body: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : undefined,
+                redirect: 'manual',
+                duplex: 'half'
+            });
+        }
         
         for (const [key, value] of response.headers.entries()) {
             // Skip encoding-related headers to prevent double decoding
@@ -7225,16 +7297,7 @@ async function hubProxyFunc(req, res) {
         }
         res.status(response.status);
 
-        if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
-            const redirectUrl = response.headers.get('location');
-            const newHeaders = { ...headersToSend };
-            const redirectResponse = await fetch(redirectUrl, {
-                method: req.method,
-                headers: newHeaders,
-                body: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : undefined,
-                redirect: 'manual',
-                duplex: 'half'
-            });
+        if (redirectResponse) {
             for (const [key, value] of redirectResponse.headers.entries()) {
                 if (excludedHeaders.includes(key.toLowerCase())) {
                     continue;
@@ -7257,6 +7320,9 @@ async function hubProxyFunc(req, res) {
         }
         
     } catch (error) {
+        if (handleProxyTargetBlocked(res, 'Hub Proxy', error)) {
+            return;
+        }
         logger.error("[Hub Proxy] Error:", error);
         if (!res.headersSent) {
             res.status(502).send({ error: 'Proxy request failed: ' + error.message });
@@ -7282,6 +7348,10 @@ app.post('/hub-proxy/*', hubProxyFunc);
 
 // --- Proxy Stream Job endpoints ---
 app.post('/proxy-stream-jobs', async (req, res) => {
+    if (HUB_HOSTING_MODE) {
+        res.status(403).send({ error: HOSTED_PROXY_STREAM_BLOCKED_ERROR });
+        return;
+    }
     if (!await checkProxyAuth(req, res)) {
         return;
     }
