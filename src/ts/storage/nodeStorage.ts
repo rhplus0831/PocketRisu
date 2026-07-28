@@ -917,10 +917,19 @@ export interface PersistWarning {
 
 export interface PatchItemResult {
     success: boolean
+    /** A patch hash mismatch requires an authoritative read/rebase before retrying. */
+    conflict?: boolean
+    /** Diagnostic candidate only; it is not accepted until its database body is installed. */
+    currentEtag?: string
     etag?: string
     persistWarning?: PersistWarning
     /** Set when the server's chat-internal-field guard rejected the patch. */
     chatGuardRejected?: boolean
+}
+
+export interface DatabaseReadCandidate {
+    data: Buffer | null
+    etag: string | null
 }
 
 const LIST_CACHE_DB_NAME = 'risu-list-cache'
@@ -2804,6 +2813,41 @@ export class NodeStorage{
         )
     }
 
+    /**
+     * Read the authoritative database and its ETag without changing the ETag
+     * accepted by the current in-memory baseline. Conflict recovery publishes
+     * this candidate only after decode, merge, and baseline installation all
+     * succeed.
+     */
+    async readDatabaseCandidate(
+        externalSignal?: AbortSignal | null,
+    ): Promise<DatabaseReadCandidate> {
+        return runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const response = await this.requestStorage(
+                'database/database.bin',
+                'read',
+                false,
+                () => this.authFetch('/api/read', {
+                    method: 'GET',
+                    headers: {
+                        'file-path': Buffer.from('database/database.bin', 'utf-8').toString('hex'),
+                    },
+                    signal,
+                }),
+                [],
+                signal,
+            )
+            const responseEtag = response.headers.get('x-db-etag')
+            const data = Buffer.from(await awaitWithAbort(response.arrayBuffer(), signal))
+            return {
+                data: data.length === 0 ? null : data,
+                etag: responseEtag && /^[0-9a-f]{32}$/.test(responseEtag)
+                    ? responseEtag
+                    : null,
+            }
+        }, 'read', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+    }
+
     private async getItemAuthoritative(
         key: string,
         signal: AbortSignal,
@@ -3494,17 +3538,31 @@ export class NodeStorage{
 
         if (da.status === 409) {
             const data = await da.json()
-            const currentEtag = data.currentEtag as string | undefined
-            if (key === 'database/database.bin' && currentEtag) {
-                this._lastDbEtag = currentEtag
-            }
+            const rawCurrentEtag = data.currentEtag as unknown
+            const currentEtag = typeof rawCurrentEtag === 'string'
+                && /^[0-9a-f]{32}$/.test(rawCurrentEtag)
+                ? rawCurrentEtag
+                : undefined
             // Server signals chat-guard rejection via explicit fields. The
             // error string fallback is kept for forward-compat with deployed
             // servers that haven't shipped the explicit fields yet.
             const rejectedByChatGuard = data.chatGuardRejected === true
                 || data.code === 'CHAT_GUARD_REJECTED'
                 || (typeof data.error === 'string' && data.error.includes('chat-internal field ops'))
-            return { success: false, etag: currentEtag, chatGuardRejected: rejectedByChatGuard }
+            const patchHashConflict = key === 'database/database.bin'
+                && !rejectedByChatGuard
+                && (data.code === 'DATABASE_PATCH_CONFLICT'
+                    || data.error === 'Hash mismatch - data out of sync'
+                    || currentEtag !== undefined)
+            // Never promote an ETag from a rejected mutation. It describes a
+            // server body the client has not fetched and must remain diagnostic
+            // until conflict recovery installs that body and its baselines.
+            return {
+                success: false,
+                conflict: patchHashConflict,
+                currentEtag,
+                chatGuardRejected: rejectedByChatGuard,
+            }
         }
         if (da.status < 200 || da.status >= 300) {
             return { success: false }

@@ -12,7 +12,7 @@ import { hasher } from "./parser/parser.svelte";
 import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEncoder, RisuSavePatcher, type toSaveType } from "./storage/risuSave";
-import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat } from "./storage/chatStorage";
+import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat, convertStubsToPlaceholders } from "./storage/chatStorage";
 import { prepareChatPersistStage } from "./storage/chatPersistStage";
 import { AutoStorage } from "./storage/autoStorage";
 import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
@@ -712,24 +712,43 @@ export async function saveDb() {
         changeTracker.root = changeTracker.root || toSave.root
     }
 
-    async function rebaseTrackedLocalChangesOnLatestServerDb(conflictEtag: string | null, db: Database, toSave: toSaveType) {
-        forageStorage.setDbEtag(conflictEtag ?? null)
-        const latestData = await forageStorage.getItem('database/database.bin') as unknown as Uint8Array
-        if (latestData && latestData.length > 0) {
-            const latestDb = await decodeRisuSave(latestData) as Database
-            const mergedDb = mergeTrackedDatabaseOnConflict(latestDb, db, toSave)
-            const mergedBaseline = cloneDatabaseState(mergedDb)
-            setDatabase(mergedDb)
-
-            encoder = new RisuSaveEncoder()
-            await encoder.init(getDatabase(), {
-                compression: false
-            })
-            if (supportsPatchSync) {
-                patcher = new RisuSavePatcher()
-                await patcher.init(mergedBaseline)
-            }
+    async function rebaseTrackedLocalChangesOnLatestServerDb(db: Database, toSave: toSaveType) {
+        const candidate = await forageStorage.readDatabaseCandidate()
+        if (!candidate.data || candidate.data.length === 0) {
+            throw new Error('Conflict recovery could not read the authoritative database')
         }
+
+        const latestDb = await decodeRisuSave(candidate.data) as Database
+        // The patch baseline is the body paired with candidate.etag, not the
+        // merged local result. The retry can therefore submit the tracked local
+        // changes as a real patch against the authoritative server state.
+        const latestBaseline = cloneDatabaseState(latestDb)
+        const mergedDb = mergeTrackedDatabaseOnConflict(
+            latestDb,
+            db,
+            toSave,
+            knownChatIdsByCharacter,
+        )
+        for (const character of mergedDb.characters ?? []) {
+            character.chats = convertStubsToPlaceholders(character.chats ?? [])
+        }
+        setDatabase(mergedDb)
+
+        const nextEncoder = new RisuSaveEncoder()
+        await nextEncoder.init(getDatabase(), {
+            compression: false
+        })
+        let nextPatcher = patcher
+        if (supportsPatchSync) {
+            nextPatcher = new RisuSavePatcher()
+            await nextPatcher.init(latestBaseline)
+        }
+
+        encoder = nextEncoder
+        patcher = nextPatcher
+        // Publish the ETag last. Any failure above leaves the rejected response
+        // unable to authorize a full write of stale client state.
+        forageStorage.setDbEtag(candidate.etag)
         requeueTrackedChanges(toSave)
         changed = true
     }
@@ -947,7 +966,7 @@ export async function saveDb() {
             } else {
                 const patchResult = await forageStorage.patchItem('database/database.bin', patchData)
                 saved = patchResult.success
-                if (patchResult.etag) {
+                if (patchResult.success && patchResult.etag) {
                     newEtag = patchResult.etag
                     forageStorage.setDbEtag(patchResult.etag)
                 }
@@ -961,19 +980,28 @@ export async function saveDb() {
                     console.error('[Save] Server rejected patch — chat-internal field ops detected server-side')
                     showChatGuardToastThrottled('server')
                 }
+                if (patchResult.conflict) {
+                    console.warn('[Save] Patch conflict detected, rebasing tracked local changes on latest server DB...')
+                    await rebaseTrackedLocalChangesOnLatestServerDb(db, toSave)
+                    await sleep(Math.min(500 * (savetrys + 1), 3000))
+                    return chatPersistStage.completeStubCommit({ committed: false, result: 'retry' })
+                }
             }
         }
         if (!saved) {
             if (supportsPatchSync && !options?.forceFullWrite) {
-                console.warn('[Save] Patch conflict, falling through to full write...')
+                console.warn('[Save] Patch rejected without a database conflict, falling through to ETag-guarded full write...')
             }
             try {
                 const currentEtag = forageStorage.getDbEtag()
+                if (supportsPatchSync && !currentEtag) {
+                    throw new Error('Refusing an unversioned full database write; authoritative reload required')
+                }
                 await forageStorage.setItem('database/database.bin', dbData, currentEtag ?? undefined)
             } catch (conflictErr) {
                 if (conflictErr instanceof ConflictError) {
                     console.warn('[Save] Full-write conflict detected, rebasing tracked local changes on latest server DB...')
-                    await rebaseTrackedLocalChangesOnLatestServerDb(conflictErr.currentEtag ?? null, db, toSave)
+                    await rebaseTrackedLocalChangesOnLatestServerDb(db, toSave)
                     await sleep(Math.min(500 * (savetrys + 1), 3000))
                     return chatPersistStage.completeStubCommit({ committed: false, result: 'retry' })
                 }

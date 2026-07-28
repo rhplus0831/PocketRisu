@@ -91,17 +91,20 @@ export function mergeTrackedDatabaseOnConflict(
     latest: Database,
     local: Database,
     toSave: toSaveType,
+    knownChatIdsByCharacter?: ReadonlyMap<string, ReadonlySet<string>>,
 ): Database {
     const merged = cloneDatabaseState(latest);
     const localClone = cloneDatabaseState(local);
 
-    for (const key in localClone) {
-        if (
-            key !== "characters" && key !== "botPresets" && key !== "modules"
-            && key !== "plugins" && key !== "pluginCustomStorage"
-            && key !== "pluginStorageMeta"
-        ) {
-            merged[key] = cloneDatabaseField(key, localClone[key]);
+    if (toSave.root) {
+        for (const key in localClone) {
+            if (
+                key !== "characters" && key !== "botPresets" && key !== "modules"
+                && key !== "plugins" && key !== "pluginCustomStorage"
+                && key !== "pluginStorageMeta"
+            ) {
+                merged[key] = cloneDatabaseField(key, localClone[key]);
+            }
         }
     }
 
@@ -126,21 +129,76 @@ export function mergeTrackedDatabaseOnConflict(
     }
 
     const trackedCharIds = new Set<string>(toSave.character.filter(Boolean));
+    const trackedChatIdsByCharacter = new Map<string, Set<string>>();
     for (const trackedChat of toSave.chat) {
-        if (trackedChat?.[0]) trackedCharIds.add(trackedChat[0]);
+        const [chaId, chatId] = trackedChat ?? [];
+        if (!chaId || !chatId) continue;
+        const trackedIds = trackedChatIdsByCharacter.get(chaId) ?? new Set<string>();
+        trackedIds.add(chatId);
+        trackedChatIdsByCharacter.set(chaId, trackedIds);
     }
     const mergedCharacters = Array.isArray(merged.characters) ? merged.characters : [];
     const localCharacters = Array.isArray(localClone.characters) ? localClone.characters : [];
+
+    // Character tracking has no field-level diff, but the committed chat-ID
+    // baseline still distinguishes an intentional local deletion from a chat
+    // added concurrently on the server. Preserve the latter; when that
+    // baseline is unavailable, fail conservatively toward preserving data.
     for (const charId of trackedCharIds) {
         const localChar = localCharacters.find(character => character?.chaId === charId);
         const mergedIndex = mergedCharacters.findIndex(character => character?.chaId === charId);
         if (localChar) {
             const clonedLocalChar = safeStructuredClone(localChar);
+            const latestChats = mergedIndex >= 0 && Array.isArray(mergedCharacters[mergedIndex]?.chats)
+                ? mergedCharacters[mergedIndex].chats
+                : [];
+            const localChatIds = new Set(
+                (clonedLocalChar.chats ?? []).map(chat => chat?.id).filter(Boolean),
+            );
+            const previouslyKnownChatIds = knownChatIdsByCharacter?.get(charId);
+            clonedLocalChar.chats = [
+                ...(clonedLocalChar.chats ?? []),
+                ...latestChats
+                    .filter(chat => chat?.id
+                        && !localChatIds.has(chat.id)
+                        // Missing chats that were already in the client's
+                        // committed baseline are intentional local deletions.
+                        // Preserve only chats that arrived on the server after
+                        // that baseline (or conservatively all when unavailable).
+                        && (!previouslyKnownChatIds || !previouslyKnownChatIds.has(chat.id)))
+                    .map(chat => safeStructuredClone(chat)),
+            ];
             if (mergedIndex >= 0) mergedCharacters[mergedIndex] = clonedLocalChar;
             else mergedCharacters.push(clonedLocalChar);
         } else if (mergedIndex >= 0) {
             mergedCharacters.splice(mergedIndex, 1);
         }
+    }
+
+    // Chat-body tracking is narrower than character tracking. Overlay only
+    // those explicit chats so a local edit cannot remove or replace unrelated
+    // chats that arrived in the authoritative database.
+    for (const [charId, trackedChatIds] of trackedChatIdsByCharacter) {
+        if (trackedCharIds.has(charId)) continue;
+        const localChar = localCharacters.find(character => character?.chaId === charId);
+        let mergedChar = mergedCharacters.find(character => character?.chaId === charId);
+        if (!localChar) continue;
+        if (!mergedChar) {
+            mergedChar = safeStructuredClone(localChar);
+            mergedCharacters.push(mergedChar);
+            continue;
+        }
+        const mergedChats = Array.isArray(mergedChar.chats) ? mergedChar.chats : [];
+        const localChats = Array.isArray(localChar.chats) ? localChar.chats : [];
+        for (const chatId of trackedChatIds) {
+            const localChat = localChats.find(chat => chat?.id === chatId);
+            if (!localChat) continue;
+            const mergedChatIndex = mergedChats.findIndex(chat => chat?.id === chatId);
+            const clonedLocalChat = safeStructuredClone(localChat);
+            if (mergedChatIndex >= 0) mergedChats[mergedChatIndex] = clonedLocalChat;
+            else mergedChats.push(clonedLocalChat);
+        }
+        mergedChar.chats = mergedChats;
     }
     merged.characters = mergedCharacters;
     return merged;

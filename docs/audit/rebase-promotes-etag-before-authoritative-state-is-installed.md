@@ -1,6 +1,6 @@
 # Rebase promotes the ETag before authoritative state is installed
 
-- Status: Open
+- Status: Fixed
 - Severity: Medium
 - Lens: D6, L4
 - Area: Area 4 — client↔server sync protocol
@@ -34,3 +34,14 @@ authorization.
 
 Test a rebase whose authoritative GET fails mid-body, followed by a forced full
 write, and require the server to reject it.
+
+## Resolution (2026-07-28)
+
+Conflict recovery now uses `readDatabaseCandidate()`, which returns the
+authoritative bytes and ETag without mutating the accepted client ETag. The
+candidate ETag is published only after the body is read and decoded, tracked
+changes are merged, stubs are converted to runtime placeholders, the database
+is installed, and both encoder and patcher baselines initialize successfully.
+A truncated candidate-body regression verifies that the prior accepted ETag is
+left unchanged, and unversioned full writes fail closed while patch sync is
+enabled.

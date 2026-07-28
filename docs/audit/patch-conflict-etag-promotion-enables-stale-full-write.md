@@ -1,6 +1,6 @@
 # A patch conflict promotes the server's ETag and authorizes a stale full write
 
-- Status: Open
+- Status: Fixed
 - Severity: High
 - Area: client save loop / sync protocol
 - Affected code: `src/ts/storage/nodeStorage.ts:596-608` (409 `currentEtag` stored into `_lastDbEtag`), `src/ts/globalApi.svelte.ts:980-1013` (full-write fallback uses the promoted ETag; rebase only on `ConflictError`), `server/node/server.cjs:4232-4241` (`/api/write` accepts a matching ETag), `server/node/server.cjs:4326-4335` (`deleteRemovedChatRows` in the same transaction)
@@ -44,3 +44,18 @@ invalidate or quiesce client save loops before the client reloads.
 Cover with a two-client compat test: client A loads state S; the server is
 restored to R; A performs an edit; assert the server still contains R's
 chats with A's edit rebased (or A's write rejected), not S.
+
+## Resolution (2026-07-28)
+
+Patch hash mismatches now return the stable `DATABASE_PATCH_CONFLICT` code.
+`NodeStorage.patchItem()` reports that conflict without changing the accepted
+ETag, and the save loop performs an authoritative read/rebase instead of falling
+through to a full write. The retry patcher is initialized from the fetched
+server body, while merge logic overlays only tracked roots/chats and preserves
+server-only chats. Full database writes also fail closed when patch sync is
+enabled but no accepted ETag is available.
+
+Coverage in `nodeStoragePluginErrors.test.ts`,
+`databaseClone.svelte.test.ts`, and
+`test/compat/database-write-atomicity.test.ts` verifies provisional ETags,
+server-state preservation, and the real-server conflict envelope.

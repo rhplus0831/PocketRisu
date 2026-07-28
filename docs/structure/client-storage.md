@@ -104,8 +104,8 @@ When `supportsPatchSync` is enabled (`src/ts/platform.ts:18`):
 - `RisuSavePatcher.set()` generates an RFC 6902 patch and an expected hash against the captured stub-only baseline (`src/ts/globalApi.svelte.ts:834-842`; `src/ts/storage/risuSave.ts:927`).
 - `findDangerousChatOps()` rejects field-level operations outside the stub metadata allowlist before they leave the browser (`src/ts/globalApi.svelte.ts:842-855`).
 - `/api/patch` applies the patch to the server’s stripped cache; the response updates the cached ETag and may surface deferred persistence warnings (`:980-996`).
-- Any patch rejection or conflict falls through to a full `database.bin` write using the last ETag (`:998-1021`).
-- An ETag conflict fetches the latest server database, overlays tracked local state, reinstalls it with `setDatabase()`, rebuilds encoder/patcher baselines, and retries without promoting the row stage as a committed stub save (`:692-767`, `:1005-1010`).
+- A patch-hash conflict never promotes the rejected response's ETag. The client reads the authoritative database and ETag as one provisional candidate, overlays tracked local state, reinstalls runtime placeholders with `setDatabase()`, rebuilds the encoder from the merge and the patcher from the authoritative baseline, publishes the ETag last, and retries without promoting the row stage as a committed stub save (`:692-767`, `:965-990`).
+- Non-conflict patch rejections such as the chat guard may fall through to an ETag-guarded full `database.bin` write. Patch-enabled clients refuse an unversioned full write, and an ETag conflict enters the same provisional rebase path (`:990-1025`).
 - A successful full write is decoded again to reinitialize the patcher from exactly what was transmitted (`:1015-1020`).
 - If an import owns the server mutation barrier, `/api/write` returns `503 IMPORT_IN_PROGRESS`; `NodeStorage.setItem()` fails the attempt and the save coordinator requeues the tracked changes for a later cycle (`src/ts/storage/nodeStorage.ts:298-327`).
 

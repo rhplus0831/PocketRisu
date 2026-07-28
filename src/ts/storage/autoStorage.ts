@@ -40,6 +40,12 @@ export class AutoStorage{
     ):Promise<Buffer> {
         return await this.realStorage.getItem(key, options)
     }
+    async readDatabaseCandidate(signal?: AbortSignal | null) {
+        await this.Init()
+        return signal
+            ? await this.realStorage.readDatabaseCandidate(signal)
+            : await this.realStorage.readDatabaseCandidate()
+    }
     async getItemCached(
         key: string,
         options: StorageReadOptions | AbortSignal | null = {},

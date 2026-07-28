@@ -78,7 +78,7 @@ describe("database-aware plugin storage cloning", () => {
             pluginCustomStorage: true,
         });
 
-        expect(merged.username).toBe("local");
+        expect(merged.username).toBe("server");
         expect(Object.keys(merged.pluginCustomStorage)).toEqual(["__proto__"]);
         expect(Object.keys(merged.pluginStorageMeta!)).toEqual(["__proto__"]);
         expect(merged.pluginCustomStorage.__proto__).toEqual({ source: "local" });
@@ -89,5 +89,93 @@ describe("database-aware plugin storage cloning", () => {
 
         (local.pluginCustomStorage.__proto__ as any).source = "later-local-mutation";
         expect(merged.pluginCustomStorage.__proto__).toEqual({ source: "local" });
+    });
+
+    test("conflict rebase preserves authoritative root and unrelated chats", () => {
+        const latest = {
+            username: "server-new",
+            characters: [{
+                chaId: "char-a",
+                name: "Server character",
+                chats: [
+                    { id: "chat-a", name: "A", message: [{ role: "user", data: "server old" }] },
+                    { id: "chat-b", name: "B", message: [{ role: "user", data: "server new" }] },
+                ],
+            }],
+        } as any;
+        const local = {
+            username: "local-stale",
+            characters: [{
+                chaId: "char-a",
+                name: "Local stale character",
+                chats: [
+                    { id: "chat-a", name: "A", message: [{ role: "user", data: "local edit" }] },
+                ],
+            }],
+        } as any;
+
+        const merged = mergeTrackedDatabaseOnConflict(latest, local, {
+            ...emptyToSave(),
+            chat: [["char-a", "chat-a"]],
+        });
+
+        expect(merged.username).toBe("server-new");
+        expect(merged.characters[0].name).toBe("Server character");
+        expect(merged.characters[0].chats).toEqual([
+            { id: "chat-a", name: "A", message: [{ role: "user", data: "local edit" }] },
+            { id: "chat-b", name: "B", message: [{ role: "user", data: "server new" }] },
+        ]);
+    });
+
+    test("character-level rebase keeps chats absent from a stale local list", () => {
+        const latest = {
+            characters: [{
+                chaId: "char-a",
+                name: "Server name",
+                chats: [{ id: "server-chat", name: "Server chat", _stub: true }],
+            }],
+        } as any;
+        const local = {
+            characters: [{
+                chaId: "char-a",
+                name: "Local rename",
+                chats: [{ id: "local-chat", name: "Local chat", message: [] }],
+            }],
+        } as any;
+
+        const merged = mergeTrackedDatabaseOnConflict(latest, local, {
+            ...emptyToSave(),
+            character: ["char-a"],
+        }, new Map([["char-a", new Set<string>()]]));
+
+        expect(merged.characters[0].name).toBe("Local rename");
+        expect(merged.characters[0].chats.map((chat: any) => chat.id)).toEqual([
+            "local-chat",
+            "server-chat",
+        ]);
+    });
+
+    test("character-level rebase retains an intentional deletion from the known baseline", () => {
+        const latest = {
+            characters: [{
+                chaId: "char-a",
+                chats: [
+                    { id: "deleted-chat", name: "Delete me", _stub: true },
+                    { id: "concurrent-chat", name: "Keep me", _stub: true },
+                ],
+            }],
+        } as any;
+        const local = {
+            characters: [{ chaId: "char-a", chats: [] }],
+        } as any;
+
+        const merged = mergeTrackedDatabaseOnConflict(latest, local, {
+            ...emptyToSave(),
+            character: ["char-a"],
+        }, new Map([["char-a", new Set(["deleted-chat"])]]));
+
+        expect(merged.characters[0].chats.map((chat: any) => chat.id)).toEqual([
+            "concurrent-chat",
+        ]);
     });
 });

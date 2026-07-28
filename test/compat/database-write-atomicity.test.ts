@@ -281,6 +281,29 @@ describe('atomic database writes with external rows', () => {
     )).toEqual(Buffer.from(JSON.stringify({ plugin: 'old plugin', updatedAt: 1 })))
   })
 
+  test('patch hash mismatch returns a stable database-conflict envelope', async () => {
+    const { client } = await bootSeeded()
+
+    const response = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_PATH_HEX,
+      },
+      body: JSON.stringify({
+        expectedHash: 'stale-client-hash',
+        patch: [{ op: 'replace', path: '/username', value: 'local edit' }],
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toMatchObject({
+      error: 'Hash mismatch - data out of sync',
+      code: 'DATABASE_PATCH_CONFLICT',
+      currentEtag: expect.stringMatching(/^[0-9a-f]{32}$/),
+    })
+  })
+
   test('patch removal keeps its row until database.bin and deletion commit together', async () => {
     const { client, server, strippedDb } = await bootSeeded()
     const removedChat = strippedDb.characters[0].chats[1]

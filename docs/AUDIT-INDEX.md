@@ -1,8 +1,8 @@
 # Audit findings — priority index
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
-`Status` column uses `Open`, `Fixed`, or `Deferred`; 59 findings are currently
-`Open` and 1 is `Fixed`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
+`Status` column uses `Open`, `Fixed`, or `Deferred`; 57 findings are currently
+`Open` and 3 are `Fixed`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
 as a cross-reference).
@@ -39,7 +39,7 @@ resolution against current code before acting on it.
 | Finding | Status | Doc sev. | What could be lost | Trigger / likelihood |
 |---|---|---|---|---|
 | [install.sh can delete the only data copy](audit/install-script-can-delete-the-only-data-copy.md) | Fixed | High | The entire dataset — database, chats, assets, inlays, and all backups — held as the only copy under an unconditional `rm -rf` EXIT trap | Any failure during an overwrite install (ENOSPC on tmpfs is realistic); the prompt promises data is preserved, so users don't copy first |
-| [Patch conflict promotes ETag, enables stale full write](audit/patch-conflict-etag-promotion-enables-stale-full-write.md) | Open | High | Whole server database replaced by a stale client image; chat rows created since the client's baseline deleted in the same transaction | Ordinary multi-tab/multi-device use, or any restore/import while another tab is open — every patch-hash 409 escalates to a force-push |
+| [Patch conflict promotes ETag, enables stale full write](audit/patch-conflict-etag-promotion-enables-stale-full-write.md) | Fixed | High | Whole server database replaced by a stale client image; chat rows created since the client's baseline deleted in the same transaction | Ordinary multi-tab/multi-device use, or any restore/import while another tab is open — every patch-hash 409 escalates to a force-push |
 | [SQLite NORMAL WAL acks before power-loss durability](audit/sqlite-normal-wal-acknowledges-before-power-loss-durability.md) | Open | High | All transactions committed since the last WAL checkpoint, including chat rows and full writes already treated as durable | Host crash or power loss — a routine event for the homeserver audience |
 | [Acknowledged patches are not durable](audit/acknowledged-patches-are-not-durable.md) | Open | High | Up to 5 s of acknowledged metadata; sharpest case: a whole new chat (row orphaned, later swept) | Any server crash; fatal handlers exit **without flushing**, so any server-side bug converts to loss of acknowledged writes |
 | [Inlay orphan scan classifies referenced inlays as deletable](audit/inlay-orphan-scan-classifies-referenced-inlays-as-deletable.md) | Open | High | Bulk permanent deletion of chat-referenced images (no trash; inlays absent from DB-only snapshots) | The feature invites it: after boot nearly every chat inlay counts as orphaned until its chat is opened; confirming the orphan filter deletes referenced media |
@@ -62,7 +62,7 @@ resolution against current code before acting on it.
 | [Non-selected character and chat writes have no save scheduler](audit/non-selected-character-and-chat-writes-have-no-save-scheduler.md) | Open | High | Acknowledged edits to non-selected characters and inactive chats silently reverted on refresh | V3 arbitrary-index setters, Risu-access MCP mutations, background writes; no dirty bridge exists for these targets |
 | [Plugin updates discard configured arguments](audit/plugin-updates-discard-configured-arguments.md) | Open | Medium | API keys, endpoints, models, large prompts, and enablement — reset and immediately persisted | The ordinary plugin Update button; every update |
 | [Partial block decode becomes authoritative](audit/partial-block-decode-becomes-authoritative.md) | Open | Medium | Blocks still intact on disk are permanently discarded once the partial decode is cached and re-encoded | Requires one corrupted block first; the response then amplifies corruption instead of failing over to recovery copies |
-| [Rebase promotes ETag before authoritative state installs](audit/rebase-promotes-etag-before-authoritative-state-is-installed.md) | Open | Medium | Another client's characters and stubs replaced, their rows deleted, via a stale forced write | Mid-rebase failure (fetch/decode/install), then a forced full write; plugin-memory reconciliation is a production caller of forced writes |
+| [Rebase promotes ETag before authoritative state installs](audit/rebase-promotes-etag-before-authoritative-state-is-installed.md) | Fixed | Medium | Another client's characters and stubs replaced, their rows deleted, via a stale forced write | Mid-rebase failure (fetch/decode/install), then a forced full write; plugin-memory reconciliation is a production caller of forced writes |
 | [Save loop idles after five failures](audit/save-loop-idles-after-five-failures.md) | Open | Medium | All queued unsaved edits if the tab closes after the loop goes idle | Five consecutive save failures (a network outage) with no new edit afterwards; nothing restarts the loop on reconnect |
 | [Pre-tracking baseline capture omits six save domains](audit/pre-tracking-baseline-capture-still-omits-six-save-domains.md) | Open | Medium | Boot-time mutations (ID repairs, migrations, URL module imports) absorbed as the clean baseline and left memory-only | Every boot that mutates an untracked domain; bot presets and modules are sharpest because unrelated saves don't rescue them |
 | [Non-optimized plugin save storage acks before persistence](audit/nonoptimized-save-storage-acks-before-persistence.md) | Open | Medium | Plugin state writes acknowledged, then reverted after refresh | Default inline mode resolves before any save is attempted; page loss inside the window |
@@ -147,10 +147,11 @@ de-fangs multiple findings at once.
   the MCP tool-call cache, so every finding that deletes those bytes
   (orphan scan, boot GC, inlay replacement, snapshot/GC interplay, MCP
   omission) has no automatic safety net.
-- **ETag as authorization.** The patch-conflict promotion (P1) and the rebase
-  promotion (P2) are the same defect class: adopting a server ETag before the
-  matching authoritative state is installed, then using it to authorize a
-  stale full write. Fix together.
+- **ETag as authorization (fixed 2026-07-28).** The patch-conflict promotion
+  (P1) and the rebase promotion (P2) were the same defect class: adopting a
+  server ETag before the matching authoritative state was installed, then using
+  it to authorize a stale full write. Conflict ETags are now provisional until
+  the authoritative body and retry baselines install successfully.
 - **Ack-before-durable.** Acknowledged patches, NORMAL-WAL commits,
   inline plugin storage, chat-version import, and server-backup publication
   all report success before durability; the caller then discards its only

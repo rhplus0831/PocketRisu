@@ -718,6 +718,91 @@ describe('NodeStorage plugin error contract', () => {
         })
     })
 
+    test('keeps a patch-conflict ETag provisional until authoritative state is installed', async () => {
+        const acceptedEtag = '1'.repeat(32)
+        const currentEtag = '2'.repeat(32)
+        fetchMock.mockResolvedValueOnce(jsonResponse({
+            error: 'Hash mismatch - data out of sync',
+            code: 'DATABASE_PATCH_CONFLICT',
+            currentEtag,
+        }, 409))
+        const storage = readyStorage()
+        storage._lastDbEtag = acceptedEtag
+
+        const result = await storage.patchItem('database/database.bin', {
+            patch: [{ op: 'replace', path: '/username', value: 'local' }],
+            expectedHash: 'stale-hash',
+        })
+
+        expect(result).toEqual({
+            success: false,
+            conflict: true,
+            currentEtag,
+            chatGuardRejected: false,
+        })
+        expect(storage._lastDbEtag).toBe(acceptedEtag)
+    })
+
+    test('does not promote the ETag from a chat-guard patch rejection', async () => {
+        const acceptedEtag = '3'.repeat(32)
+        const currentEtag = '4'.repeat(32)
+        fetchMock.mockResolvedValueOnce(jsonResponse({
+            error: 'Patch rejected: chat-internal field ops not allowed for lazy-loaded chats',
+            code: 'CHAT_GUARD_REJECTED',
+            chatGuardRejected: true,
+            currentEtag,
+        }, 409))
+        const storage = readyStorage()
+        storage._lastDbEtag = acceptedEtag
+
+        const result = await storage.patchItem('database/database.bin', {
+            patch: [{ op: 'remove', path: '/characters/0/chats/0/message' }],
+            expectedHash: 'guard-baseline',
+        })
+
+        expect(result).toEqual({
+            success: false,
+            conflict: false,
+            currentEtag,
+            chatGuardRejected: true,
+        })
+        expect(storage._lastDbEtag).toBe(acceptedEtag)
+    })
+
+    test('reads a database conflict candidate without accepting its ETag', async () => {
+        const acceptedEtag = '5'.repeat(32)
+        const candidateEtag = '6'.repeat(32)
+        const candidateBytes = new Uint8Array([9, 8, 7])
+        fetchMock.mockResolvedValueOnce(new Response(candidateBytes, {
+            status: 200,
+            headers: { 'x-db-etag': candidateEtag },
+        }))
+        const storage = readyStorage()
+        storage._lastDbEtag = acceptedEtag
+
+        const candidate = await storage.readDatabaseCandidate()
+
+        expect(candidate.etag).toBe(candidateEtag)
+        expect(candidate.data).toEqual(Buffer.from(candidateBytes))
+        expect(storage._lastDbEtag).toBe(acceptedEtag)
+    })
+
+    test('retains the accepted ETag when a conflict candidate body cannot be read', async () => {
+        const acceptedEtag = '7'.repeat(32)
+        const candidateEtag = '8'.repeat(32)
+        const response = new Response(new Uint8Array([1]), {
+            status: 200,
+            headers: { 'x-db-etag': candidateEtag },
+        })
+        vi.spyOn(response, 'arrayBuffer').mockRejectedValue(new Error('body truncated'))
+        fetchMock.mockResolvedValue(response)
+        const storage = readyStorage()
+        storage._lastDbEtag = acceptedEtag
+
+        await expect(storage.readDatabaseCandidate()).rejects.toThrow('body truncated')
+        expect(storage._lastDbEtag).toBe(acceptedEtag)
+    })
+
     test('rejects malformed database 409 envelopes as structured ambiguous writes', async () => {
         fetchMock.mockResolvedValueOnce(jsonResponse({
             error: 'not a valid conflict envelope',

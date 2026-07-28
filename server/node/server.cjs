@@ -10569,6 +10569,7 @@ app.post('/api/patch', async (req, res, next) => {
                 }
                 res.status(409).send({
                     error: 'Hash mismatch - data out of sync',
+                    code: 'DATABASE_PATCH_CONFLICT',
                     currentEtag
                 });
                 return;
