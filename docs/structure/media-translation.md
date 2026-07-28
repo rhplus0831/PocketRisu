@@ -265,6 +265,7 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 - Inlays depend on database/model metadata, `NodeStorage`, browser Blob/canvas APIs, and the parser/model-request pipelines.
 - Server image compression and thumbnails depend on `wasm-vips` (`server/node/server.cjs:25`, `:3734`, `:6777`).
 - Uploaded notification sounds use the ordinary `assets/<hash>.<ext>` path created by `saveAsset()` (`src/ts/globalApi.svelte.ts:203`).
+- Ordinary assets are garbage-collected by the Node server, not the browser. The collector scans the live database and active optimized plugin rows, marks an unreferenced candidate durably, and deletes it only on a later sweep after the configured grace interval.
 - The Hono alternative does not implement these storage routes; it currently only exposes a CSRF-protected hello route (`server/hono/src/app/index.ts:4`, `server/hono/src/app/index.ts:8`).
 
 ## 5. Conventions & gotchas

@@ -1,6 +1,6 @@
 # Boot asset GC can race an asset published from another tab
 
-- Status: Open
+- Status: Fixed
 - Severity: Medium
 - Area: client asset lifecycle
 - Affected code: `src/ts/bootstrap.ts:627-644` (keep-set captured before the key listing; no recheck before deletion), `src/ts/globalApi.svelte.ts:205-226` (`saveAsset` publishes before the DB reference syncs)
@@ -22,3 +22,12 @@ device is an ordinary pattern.
 Run GC server-side against the authoritative database (or recheck references
 immediately before each deletion), and exempt recently created files with a
 grace period so publication can complete across stores.
+
+## Resolution
+
+Fixed 2026-07-29 by the server-owned asset collector described in
+`boot-asset-gc-deletes-plugin-owned-assets.md`. Asset publication and cleanup
+are serialized through the server storage queue. A write clears any existing
+candidate, and a newly unreferenced asset is only marked on its first pass;
+deletion requires a later pass after the persisted grace interval. The client
+no longer captures a stale keep-set or sends per-asset removal requests.

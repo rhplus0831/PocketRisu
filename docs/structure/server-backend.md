@@ -27,6 +27,7 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 | `server/node/dbCachedRead.cjs` | Server half of the optional segmented boot-read protocol. It validates the client's hash inventory, splits the stubs-only database into root/character/preset/module/persona MessagePack segments, and emits bytes only for cache misses while preserving the full-view ETag. |
 | `server/node/listDelta.cjs` | Builds full or delta `/api/list` responses from KV modification timestamps, the deletion journal, filesystem mtimes, and the list epoch. Delta eligibility is capped at six days. |
 | `server/node/assetStore.cjs` | Filesystem-backed implementation for safe `assets/*` keys, including atomic write/rename, SHA-256 filename verification, dual-source listing, migration, clear, and import staging helpers. |
+| `server/node/assetGc.cjs` | Bounded recursive asset-reference discovery, persisted candidate bookkeeping, and two-pass grace planning for server-owned ordinary-asset garbage collection. |
 | `server/node/streamRisuSave.cjs` | Object-based legacy encoder for already-materialized database state and automatic snapshot assembly. |
 | `server/node/streamBackupRisuSave.cjs` | Seekable source-to-source transformer for point-in-time full/partial export and folded external chat/plugin rows without monolithizing state in memory. |
 | `server/node/streamRisuLoad.cjs` | Bounded streaming inspector/decoder for supported RisuSave formats and snapshot/import ingestion. |
@@ -79,6 +80,10 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `HOST` | Optional bind address passed to `server.listen()`; unset preserves the historical all-interfaces bind. Use `127.0.0.1` behind a local reverse proxy. |
 | `POCKETRISU_CHUNK_THRESHOLD` | Lowers the chunk threshold for live DB, snapshot, chat, and plugin-value rows. The effective maximum/default is 16 MiB. |
 | `POCKETRISU_BACKUP_INTERVAL_MS` | Minimum interval between automatic DB snapshots; default five minutes. |
+| `POCKETRISU_ASSET_GC_GRACE_MS` | Minimum time an ordinary asset must remain unreferenced across independent server sweeps before deletion; default seven days. |
+| `POCKETRISU_ASSET_GC_START_DELAY_MS` | Delay before the first server-owned asset sweep; default 30 seconds. |
+| `POCKETRISU_ASSET_GC_INTERVAL_MS` | Delay between later asset sweeps; default 24 hours and clamped to at least one second. |
+| `POCKETRISU_ASSET_GC_AUTO` | Set to `0` to disable automatic sweeps or `1` to force-enable them in test environments. The authenticated `/api/assets/cleanup` maintenance endpoint remains available. |
 | `POCKETRISU_ALLOW_INSECURE_CONTEXT` | Allows client boot outside HTTPS or localhost only when exactly `1` or `true`; bypasses the WebCrypto integrity gate at the operator's risk. |
 | `POCKETRISU_HUB_HOSTING` | Enables shared/multi-instance hub hosting when set to `TRUE`/`true` or `1`. It hides host-disk statistics from `/api/db/stats`, disables the file-based server-backup feature with `403` responses, and pins the snapshot retention byte cap to `POCKETRISU_HUB_SNAPSHOT_CAP_MB` (only the snapshot count stays adjustable). |
 | `POCKETRISU_HUB_SNAPSHOT_CAP_MB` | Hub-mode snapshot byte cap in MB, applied to both the limits endpoints and trim rotation; unset or invalid falls back to 500 MB, clamped to the 10 MB–50 GB safety bounds. Ignored outside hub mode. |
@@ -462,7 +467,7 @@ outcome contracts are canonical in [Backup and recovery](backup-recovery.md).
 
 - To change cold-storage recovery, inspect canonical key/encoding helpers at `server/node/server.cjs:2261` and character/chat restoration at `:5347`.
 
-- To change asset storage, byte-equivalence checks, or import staging, inspect `server/node/assetStore.cjs` plus `/api/read` and `/api/write` prefix special cases at `server/node/server.cjs:3945` and `:4200`.
+- To change asset storage, byte-equivalence checks, or import staging, inspect `server/node/assetStore.cjs` plus `/api/read` and `/api/write` prefix special cases. Server-owned reachability and grace-period planning live in `server/node/assetGc.cjs`; `runServerAssetCleanup()` scans the live database and the manifest-authorized optimized plugin rows inside the storage queue.
 
 - To change inlay filesystem layout or migration, inspect file helpers around `server/node/server.cjs:1215` and `migrateInlaysToFilesystem()` at `:1397`.
 
@@ -474,7 +479,7 @@ outcome contracts are canonical in [Backup and recovery](backup-recovery.md).
 
 - To change snapshot creation, plugin folding, spool location, retention, or cost accounting, inspect `createBackupAndRotate()` at `server/node/server.cjs:355`, `snapshotFootprint()` at `server/node/db.cjs:353`, `server/node/pluginSaveKeys.cjs`, and snapshot routes at `server/node/server.cjs:6512`.
 
-- To change storage-dashboard calculations or orphan cleanup, inspect `buildUncleanableSet()` at `server/node/server.cjs:5980`, `/api/db/stats` at `:6086`, and `/api/db/optimize` at `:6417`; keep asset reachability synchronized with `getUncleanables()` at `src/ts/globalApi.svelte.ts:1450`.
+- To change storage-dashboard calculations or ordinary-asset cleanup, inspect `collectDatabaseAssetReferences()`, `runServerAssetCleanup()`, `buildReachableAssetBasenameSet()`, and `/api/assets/cleanup` in `server/node/server.cjs`, together with `server/node/assetGc.cjs`. Statistics and deletion deliberately share the same plugin-aware reachability scan.
 
 - To change logging retention, filtering, or masking, inspect `server/node/logs.cjs:8`, `server/node/logs.cjs:62`, and `server/node/logs.cjs:257`.
 

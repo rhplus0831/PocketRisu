@@ -79,7 +79,7 @@ Structural/versioned migrations that need broader context live separately in `bo
 6. Reconcile optimized plugin storage before plugin loading through `reconcilePluginStorageModeForBoot()`. It isolates bad rows and surfaces recovery/copy-only diagnostics rather than treating an unavailable source as empty. Publication and mode-switch semantics are owned by [Plugin storage](plugin-storage.md).
 7. Load plugins, run `checkNewFormat()`, and normalize character/module/persona data (`:216-230`, `:433-608`).
 8. Convert on-wire `ChatStub` objects into runtime-safe placeholder `Chat` objects (`:232-239`).
-9. Apply UI state, optionally offer the one-time resource-cache enable prompt, run the backup reminder, mark the app loaded, assign IDs, then start `saveDb()` (`:241-279`). Module updates follow and stale asset/remote cleanup is deferred five seconds.
+9. Apply UI state, optionally offer the one-time resource-cache enable prompt, run the backup reminder, mark the app loaded, assign IDs, then start `saveDb()` (`:241-279`). Module updates follow and stale remote-cache cleanup is deferred five seconds. Ordinary asset garbage collection is server-owned and never runs from the client boot path.
 
 `checkNewFormat()` also purges unsupported group entries (`:339-342`), advances `formatversion` through version 5 (`:408-462`), removes expired trash (`:472-479`), and starts a best-effort sweep of draft keys whose chats no longer exist (`:483-493`).
 

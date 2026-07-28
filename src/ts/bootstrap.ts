@@ -23,7 +23,6 @@ import {
     forageStorage,
     saveDb,
     setPatchSyncBaseline,
-    getUncleanables,
     getBasename,
     checkCharOrder
 } from "./globalApi.svelte";
@@ -322,9 +321,11 @@ export async function loadData() {
             registerModelDynamic()
             saveDb()
             moduleUpdate()
-            // cleanChunks는 화면 진입 후 유휴 시간에 실행 (부트 블로킹 제거)
+            // Remote-cache pruning remains client-side because its last-use
+            // metadata is maintained by the browser. Ordinary asset reachability
+            // and deletion are authoritative server responsibilities.
             setTimeout(() => {
-                cleanChunks().catch(console.error)
+                cleanRemoteCache().catch(console.error)
             }, 5_000)
             checkRisuUpdate()
             fetchPublicStats()
@@ -667,11 +668,10 @@ async function checkNewFormat(): Promise<void> {
 }
 
 /**
- * Purges chunks of data that are not needed.
+ * Purges stale character remote-cache entries.
  */
-async function cleanChunks() {
+async function cleanRemoteCache() {
     const db = getDatabase()
-    const uncleanable = new Set(getUncleanables(db))
     const indexes = await forageStorage.keys()
     const allKeys = new Set(indexes)
     const characterIds = new Set<string>(
@@ -680,12 +680,6 @@ async function cleanChunks() {
     for (const asset of indexes) {
         if (asset.endsWith('.meta')) {
             continue
-        }
-        else if (asset.startsWith('assets/')) {
-            const n = getBasename(asset)
-            if(!uncleanable.has(n)) {
-                await forageStorage.removeItem(asset)
-            }
         }
         else if (asset.startsWith('remotes/')) {
             const name = getBasename(asset).slice(0, -10) //remove .local.bin

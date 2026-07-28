@@ -66,6 +66,11 @@ const {
     verifyAssetHash,
 } = require('./assetStore.cjs');
 const {
+    collectReferencedAssetKeys,
+    createAssetGcCandidateStore,
+    planAssetGc,
+} = require('./assetGc.cjs');
+const {
     writeImportJournal,
     readImportJournal,
     clearImportJournal,
@@ -212,6 +217,32 @@ const allowInsecureContext = process.env.POCKETRISU_ALLOW_INSECURE_CONTEXT === '
     || process.env.POCKETRISU_ALLOW_INSECURE_CONTEXT === 'true';
 const HUB_HOSTING_MODE = ['true', '1'].includes(String(process.env.POCKETRISU_HUB_HOSTING ?? '').trim().toLowerCase());
 const HOSTED_PROXY_STREAM_BLOCKED_ERROR = 'PROXY_TARGET_BLOCKED: Local proxy stream jobs are disabled in hosted mode';
+const ASSET_GC_DEFAULT_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+const ASSET_GC_DEFAULT_START_DELAY_MS = 30 * 1000;
+const ASSET_GC_DEFAULT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+function nonNegativeDurationEnv(name, fallback) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === '') return fallback;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+const ASSET_GC_GRACE_MS = nonNegativeDurationEnv(
+    'POCKETRISU_ASSET_GC_GRACE_MS',
+    ASSET_GC_DEFAULT_GRACE_MS,
+);
+const ASSET_GC_START_DELAY_MS = nonNegativeDurationEnv(
+    'POCKETRISU_ASSET_GC_START_DELAY_MS',
+    ASSET_GC_DEFAULT_START_DELAY_MS,
+);
+const ASSET_GC_INTERVAL_MS = Math.max(1_000, nonNegativeDurationEnv(
+    'POCKETRISU_ASSET_GC_INTERVAL_MS',
+    ASSET_GC_DEFAULT_INTERVAL_MS,
+));
+const ASSET_GC_AUTO_ENABLED = process.env.POCKETRISU_ASSET_GC_AUTO === '1'
+    || (process.env.NODE_ENV !== 'test' && process.env.POCKETRISU_ASSET_GC_AUTO !== '0');
+const assetGcCandidateStore = createAssetGcCandidateStore(sqliteDb);
 
 function proxyTargetBlockedReason(error) {
     if (error?.code === 'PROXY_TARGET_BLOCKED' && typeof error.message === 'string') {
@@ -2964,9 +2995,11 @@ function writeAssetValue(key, value, options = {}) {
         // kvDel records logical removals automatically, but this delete only
         // removes the shadow kv row; the freshly written file remains live.
         kvClearDeletion(key);
+        assetGcCandidateStore.remove(key);
         return wrote;
     }
     kvSet(key, value);
+    assetGcCandidateStore.remove(key);
     return true;
 }
 
@@ -2976,9 +3009,10 @@ function deleteAssetValue(key) {
         deleteAssetFile(name);
     }
     kvDel(key);
+    assetGcCandidateStore.remove(key);
 }
 
-function listAssetEntriesWithSizes(reader = { kvListWithSizes }) {
+function listAssetEntriesWithSizes(reader = { kvListWithSizes, kvGetUpdatedAt }) {
     const entries = new Map();
     for (const file of listAssetFiles()) {
         entries.set(`assets/${file.name}`, {
@@ -2993,7 +3027,9 @@ function listAssetEntriesWithSizes(reader = { kvListWithSizes }) {
             entries.set(row.key, {
                 key: row.key,
                 size: row.size,
-                mtimeMs: null,
+                mtimeMs: typeof reader.kvGetUpdatedAt === 'function'
+                    ? reader.kvGetUpdatedAt(row.key)
+                    : null,
                 source: 'kv',
             });
         }
@@ -4678,6 +4714,114 @@ function resolveOwnedPluginStorageRows(dbObj, reader) {
         })),
         readRow: (storageKey) => parsePluginSaveJson(storageKey, reader.kvGet),
     };
+}
+
+function collectDatabaseAssetReferences(
+    dbObj,
+    assetEntries,
+    reader = { kvGet, kvList },
+) {
+    const knownAssetKeys = new Set(assetEntries.map((entry) => entry.key));
+    const referencedKeys = collectReferencedAssetKeys(dbObj, knownAssetKeys);
+    const pluginStorage = resolveOwnedPluginStorageRows(dbObj, reader);
+    // Optimized values stay external precisely so large stores do not inflate
+    // database.bin. Decode and release one authoritative manifest row at a time.
+    for (const row of pluginStorage.valueRows) {
+        collectReferencedAssetKeys(
+            pluginStorage.readRow(row.source),
+            knownAssetKeys,
+            referencedKeys,
+        );
+    }
+    return referencedKeys;
+}
+
+async function runServerAssetCleanup({ now = Date.now(), source = 'manual' } = {}) {
+    return queueStorageMutation(async () => {
+        await flushPendingDb();
+        const raw = kvGet(DB_BLOB_KEY);
+        if (!raw) {
+            return {
+                ok: true,
+                skipped: true,
+                reason: 'database-missing',
+                source,
+                graceMs: ASSET_GC_GRACE_MS,
+                assets: 0,
+                referenced: 0,
+                marked: 0,
+                retainedByGrace: 0,
+                deleted: 0,
+                candidatesCleared: 0,
+            };
+        }
+
+        // Any decode, manifest, ownership, or plugin-row validation failure
+        // escapes before the candidate table or an asset is changed.
+        const dbObj = await loadStrippedDatabase(raw, 'AssetGC');
+        const assetEntries = listAssetEntriesWithSizes();
+        const referencedKeys = collectDatabaseAssetReferences(dbObj, assetEntries);
+        const candidates = assetGcCandidateStore.list();
+        const plan = planAssetGc({
+            assets: assetEntries,
+            referencedKeys,
+            candidates,
+            now,
+            graceMs: ASSET_GC_GRACE_MS,
+        });
+
+        let candidatesCleared = 0;
+        for (const key of plan.clear) {
+            if (assetGcCandidateStore.remove(key)) candidatesCleared++;
+        }
+        for (const candidate of plan.mark) {
+            assetGcCandidateStore.mark(
+                candidate.key,
+                candidate.firstUnreferencedAt,
+                candidate.identity,
+            );
+        }
+        let deleted = 0;
+        for (const key of plan.remove) {
+            deleteAssetValue(key);
+            deleted++;
+        }
+
+        const result = {
+            ok: true,
+            skipped: false,
+            source,
+            graceMs: ASSET_GC_GRACE_MS,
+            assets: assetEntries.length,
+            referenced: referencedKeys.size,
+            marked: plan.mark.length,
+            retainedByGrace: plan.retainedByGrace,
+            deleted,
+            candidatesCleared,
+        };
+        logger.info(
+            `[AssetGC] ${source}: ${result.referenced}/${result.assets} referenced, `
+            + `${result.marked} newly marked, ${result.retainedByGrace} in grace, `
+            + `${result.deleted} deleted`,
+        );
+        return result;
+    });
+}
+
+let assetGcTimer = null;
+function scheduleServerAssetCleanup(delayMs = ASSET_GC_START_DELAY_MS) {
+    if (!ASSET_GC_AUTO_ENABLED || assetGcTimer) return;
+    assetGcTimer = setTimeout(async () => {
+        assetGcTimer = null;
+        try {
+            await runServerAssetCleanup({ source: 'scheduled' });
+        } catch (error) {
+            logger.error('[AssetGC] Scheduled cleanup failed closed:', error);
+        } finally {
+            scheduleServerAssetCleanup(ASSET_GC_INTERVAL_MS);
+        }
+    }, delayMs);
+    assetGcTimer.unref?.();
 }
 
 /**
@@ -13133,6 +13277,17 @@ const DB_BACKUP_PREFIX = 'database/dbbackup-';
 const INTERNAL_SNAPSHOT_KEY_PATTERN = /^database\/dbbackup-(0|[1-9]\d*)\.bin$/;
 const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/'];
 
+app.post('/api/assets/cleanup', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    try {
+        res.json(await runServerAssetCleanup({ source: 'endpoint' }));
+    } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
+        next(error);
+    }
+});
+
 function parseInternalSnapshotKey(key) {
     if (typeof key !== 'string') return null;
     const match = INTERNAL_SNAPSHOT_KEY_PATTERN.exec(key);
@@ -13164,36 +13319,12 @@ function statsBasename(s) {
     return String(s).replace(/\\/g, '/').split('/').pop();
 }
 
-// Mirrors src/ts/globalApi.svelte.ts:getUncleanables — every asset reference reachable from the DB.
-function buildUncleanableSet(dbObj) {
-    const set = new Set();
-    const add = (v) => {
-        const bn = statsBasename(v);
-        if (bn) set.add(bn);
-    };
-    if (!dbObj) return set;
-    add(dbObj.customBackground);
-    add(dbObj.userIcon);
-    if (Array.isArray(dbObj.characters)) {
-        for (const cha of dbObj.characters) {
-            if (!cha) continue;
-            add(cha.image);
-            if (Array.isArray(cha.emotionImages)) for (const em of cha.emotionImages) add(em?.[1]);
-            if (Array.isArray(cha.additionalAssets)) for (const em of cha.additionalAssets) add(em?.[1]);
-            if (cha.vits?.files) for (const k of Object.keys(cha.vits.files)) add(cha.vits.files[k]);
-            if (Array.isArray(cha.ccAssets)) for (const a of cha.ccAssets) add(a?.uri);
-        }
-    }
-    if (Array.isArray(dbObj.modules)) {
-        for (const m of dbObj.modules) if (Array.isArray(m?.assets)) for (const a of m.assets) add(a?.[1]);
-    }
-    if (Array.isArray(dbObj.personas)) for (const p of dbObj.personas) add(p?.icon);
-    if (Array.isArray(dbObj.characterOrder)) {
-        for (const item of dbObj.characterOrder) {
-            if (item && typeof item === 'object' && 'imgFile' in item) add(item.imgFile);
-        }
-    }
-    return set;
+// Storage statistics and the destructive collector share one reachability
+// implementation, including inline and active-generation optimized plugin data.
+function buildReachableAssetBasenameSet(dbObj) {
+    const assetEntries = listAssetEntriesWithSizes();
+    return new Set([...collectDatabaseAssetReferences(dbObj, assetEntries)]
+        .map((key) => statsBasename(key)));
 }
 
 function statSafe(p) {
@@ -13404,7 +13535,7 @@ app.get('/api/db/stats', async (req, res, next) => {
             trashed.available = true;
         }
         if (stripped) {
-            const uncleanable = buildUncleanableSet(stripped);
+            const uncleanable = buildReachableAssetBasenameSet(stripped);
             for (const it of listAssetEntriesWithSizes()) {
                 if (!uncleanable.has(statsBasename(it.key))) {
                     orphan.count++;
@@ -13528,7 +13659,7 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
             });
         }
 
-        const uncleanable = buildUncleanableSet(dbObj);
+        const uncleanable = buildReachableAssetBasenameSet(dbObj);
         let orphanCount = 0, orphanTotal = 0;
         for (const it of listAssetEntriesWithSizes()) {
             if (!uncleanable.has(statsBasename(it.key))) {
@@ -14958,6 +15089,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 
     await startServer();
     startSqliteDurabilityCheckpointScheduler();
+    scheduleServerAssetCleanup();
 
     chatBackupStore.reconcileChatBackups()
         .then((result) => {

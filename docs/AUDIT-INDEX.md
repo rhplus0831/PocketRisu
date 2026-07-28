@@ -1,8 +1,8 @@
 # Audit findings — priority index
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
-`Status` column uses `Open`, `Fixed`, or `Deferred`; 54 findings are currently
-`Open`, 5 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
+`Status` column uses `Open`, `Fixed`, or `Deferred`; 52 findings are currently
+`Open`, 7 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
 as a cross-reference).
@@ -43,7 +43,7 @@ resolution against current code before acting on it.
 | [SQLite NORMAL WAL acks before power-loss durability](audit/sqlite-normal-wal-acknowledges-before-power-loss-durability.md) | Fixed | High | All transactions committed since the last WAL checkpoint, including chat rows and full writes already treated as durable | Host crash or power loss — a routine event for the homeserver audience |
 | [Acknowledged patches are not durable](audit/acknowledged-patches-are-not-durable.md) | Deferred | High | Up to 5 s of acknowledged metadata; sharpest case: a whole new chat (row orphaned, later swept) | Any server crash; fatal handlers exit **without flushing**, so any server-side bug converts to loss of acknowledged writes |
 | [Inlay orphan scan classifies referenced inlays as deletable](audit/inlay-orphan-scan-classifies-referenced-inlays-as-deletable.md) | Fixed | High | Bulk permanent deletion of chat-referenced images (no trash; inlays absent from DB-only snapshots) | The feature invites it: after boot nearly every chat inlay counts as orphaned until its chat is opened; confirming the orphan filter deletes referenced media |
-| [Boot asset GC deletes plugin-owned assets](audit/boot-asset-gc-deletes-plugin-owned-assets.md) | Open | High | Every asset stored via the supported plugin `saveAsset` API, permanently; only recovery is an earlier full backup | Automatic, 5 s after **every** boot, for any plugin persisting asset paths in its storage |
+| [Boot asset GC deletes plugin-owned assets](audit/boot-asset-gc-deletes-plugin-owned-assets.md) | Fixed | High | Every asset stored via the supported plugin `saveAsset` API, permanently; only recovery is an earlier full backup | Automatic, 5 s after **every** boot, for any plugin persisting asset paths in its storage |
 | [Send-input race replaces another chat's history](audit/send-input-race-replaces-another-chats-history.md) | Open | High | One chat's entire message history overwritten by another's; pre-image may be cooldown-skipped, making it unrecoverable | Switching chats while input triggers/`editinput` scripts run on send; cards can stretch the window arbitrarily |
 | [Reroll failure restores into the current chat](audit/reroll-failure-restores-into-the-current-chat.md) | Open | High | The currently selected chat's entire history overwritten with the rerolled chat's; the rerolled chat stays truncated | Switching chats during generation, then abort or failure — chat switching is unguarded during generation |
 
@@ -76,7 +76,7 @@ resolution against current code before acting on it.
 | [Unmigrated KV inlays omitted from backups](audit/unmigrated-kv-inlays-are-omitted-from-backups.md) | Open | Medium | KV-fallback inlays absent from every archive; a restore then deletes the live copy | Requires a skipped/failed entry in the one-time migration; the loss lands on any later restore |
 | [Interrupted inlay migration discards the source row](audit/interrupted-inlay-migration-discards-the-source-row.md) | Open | Medium | One inlay: the valid KV source deleted in favor of a torn file | Crash inside the one-time migration window, then next-boot resume |
 | [Legacy KV migration marker can outlive the WAL commit](audit/legacy-kv-migration-marker-can-outlive-the-wal-commit.md) | Open | Medium | Whole database hidden (empty DB served); hex sources survive on disk for manual recovery | Power loss during the legacy hex-to-SQLite migration |
-| [Boot asset GC races concurrent publication](audit/boot-asset-gc-races-concurrent-publication.md) | Open | Medium | Single assets uploaded from another tab/device, deleted mid-publication | Boot plus concurrent activity on another device; bounded window |
+| [Boot asset GC races concurrent publication](audit/boot-asset-gc-races-concurrent-publication.md) | Fixed | Medium | Single assets uploaded from another tab/device, deleted mid-publication | Boot plus concurrent activity on another device; bounded window |
 | [External dedup can strand or overwrite a live asset](audit/external-dedup-can-strand-or-overwrite-a-live-asset.md) | Open | Medium | Canonical asset path left absent after a crash; a race can replace a live inode | Running `scripts/dedup-assets.sh` against live servers (it claims to be safe); directly relevant to the multi-instance hardlink-dedup plan |
 | [Preferred jdupes merges cross-instance ownership](audit/preferred-jdupes-merges-cross-instance-ownership.md) | Open | Medium | Assets unreadable/unexportable for one instance after ownership collapses onto another's inode | Root cron dedup across per-user instances |
 | [Boot spool sweep can unlink another instance's active file](audit/boot-spool-sweep-can-unlink-another-instances-active-file.md) | Open | Medium | Another instance's active snapshot spool; automatic snapshots silently lose their recovery point | Shared spool volumes in multi-instance deployments |
@@ -158,11 +158,10 @@ de-fangs multiple findings at once.
   chat-version import, and server-backup publication still report success
   before their respective durability boundaries; the caller can then discard
   its only copy.
-- **Keep-set GC without ownership.** Boot asset GC, its publication race,
-  snapshot asset references, and version-history inlay references all delete
-  based on an incomplete reference scan instead of explicit ownership or a
-  server-side authoritative scan; a grace period/trash generation bounds every
-  omission.
+- **Server-owned asset reachability (partially fixed 2026-07-29).** Boot asset
+  GC and its publication race now use an authoritative, plugin-aware server
+  scan plus a persisted grace interval. Snapshot asset references and
+  version-history inlay references remain separate open ownership gaps.
 - **Deployment sweeps with incomplete preservation lists.** `install.sh`,
   `update.sh`, the best-effort path markers, and the Docker layout all decide
   what survives an update from a hard-coded list that can miss the user's real
