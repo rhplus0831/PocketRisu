@@ -22,7 +22,10 @@ const db = new Database(dbPath);
 
 // WAL mode: better concurrent read performance, single-writer
 db.pragma('journal_mode = WAL');
-db.pragma('synchronous = NORMAL');
+// Start in the power-loss durable mode. server.cjs may apply an explicit
+// operator-selected downgrade after it has loaded the persisted server setting,
+// but missing/invalid settings and early startup migrations must stay safe.
+db.pragma('synchronous = FULL');
 db.pragma('cache_size = -64000');       // 64 MB (default 2 MB) — reduce disk I/O for large blobs
 db.pragma('temp_store = MEMORY');       // keep temp tables in RAM
 db.pragma('busy_timeout = 5000');       // wait up to 5 s on lock contention

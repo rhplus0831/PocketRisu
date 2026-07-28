@@ -1936,6 +1936,21 @@ export const languageEnglish = {
     storageLoading: "Loading...",
     storageFailedLoad: "Failed to load storage stats",
 
+    // SQLite durability
+    storageDurability: "SQLite durability",
+    storageDurabilityDesc: "Choose when acknowledged server writes are forced to stable storage. Durable is the safe default; the other modes reduce disk-sync overhead by accepting a power-loss window.",
+    storageDurabilityDurable: "Durable (recommended)",
+    storageDurabilityDurableDesc: "Uses synchronous=FULL. Each committed transaction is durable before PocketRisu acknowledges it.",
+    storageDurabilityBalanced: "Balanced",
+    storageDurabilityBalancedDesc: "Uses synchronous=NORMAL with a verified checkpoint about every minute. A host crash or power loss can discard recent writes, possibly for longer if a checkpoint is delayed.",
+    storageDurabilityPerformance: "Performance",
+    storageDurabilityPerformanceDesc: "Uses synchronous=NORMAL with a checkpoint about every five minutes. A host crash or power loss can discard several minutes of acknowledged writes.",
+    storageDurabilityManaged: "Managed by server administrator",
+    storageDurabilityDowngradeConfirm: (mode: string, minutes: number) => `Switch to ${mode}? A host crash or power loss may discard approximately ${minutes} minute${minutes === 1 ? '' : 's'} of acknowledged writes, and longer if checkpointing is delayed.`,
+    storageDurabilitySaved: (mode: string) => `SQLite durability changed to ${mode}.`,
+    storageDurabilityLoadFailed: "Failed to load SQLite durability",
+    storageDurabilitySaveFailed: "Failed to change SQLite durability",
+
     // Disk usage section (macOS-style bar)
     storageDiskUsage: "Storage",
     storageDiskHeader: (used: number, total: number) =>
@@ -2008,7 +2023,7 @@ export const languageEnglish = {
 
     storageWalCleanup: "Manual WAL cleanup",
     storageWalCleanupHeader: (walSize: number) => `Current WAL ${(walSize / 1024 / 1024).toFixed(1)} MB`,
-    storageWalCleanupWhat: "SQLite's WAL file (risuai.db-wal) collects recent changes before merging them into the main database. A background checkpoint runs every 5 minutes, but bursts like backup import or large asset uploads can temporarily inflate it.",
+    storageWalCleanupWhat: "SQLite's WAL file (risuai.db-wal) collects recent changes before merging them into the main database. Background checkpoint frequency follows the selected durability mode, but bursts like backup import or large asset uploads can temporarily inflate it.",
     storageWalCleanupWhen: "Use this when the WAL file looks large and you want to reclaim disk space immediately. Lightweight (a few milliseconds) and requires no extra free space, unlike Optimize. Data is not modified.",
     storageWalCleanup_btn: "Clean up WAL",
     storageWalCleanuping: "Cleaning up WAL...",

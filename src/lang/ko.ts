@@ -2113,6 +2113,27 @@ export const languageKorean = {
   storageLoading: "불러오는 중...",
   storageFailedLoad: "스토리지 통계를 불러오지 못했습니다",
 
+  // SQLite 내구성
+  storageDurability: "SQLite 내구성",
+  storageDurabilityDesc:
+    "서버가 저장 성공을 알리기 전에 데이터를 안정적인 저장 장치에 기록할 시점을 선택합니다. 내구성 모드가 안전한 기본값이며, 다른 모드는 정전 시 데이터 손실 가능성을 감수하고 디스크 동기화 부하를 줄입니다.",
+  storageDurabilityDurable: "내구성 (권장)",
+  storageDurabilityDurableDesc:
+    "synchronous=FULL을 사용합니다. PocketRisu가 성공을 알리기 전에 각 트랜잭션을 안전하게 기록합니다.",
+  storageDurabilityBalanced: "균형",
+  storageDurabilityBalancedDesc:
+    "synchronous=NORMAL을 사용하고 약 1분마다 검증된 체크포인트를 실행합니다. 호스트 충돌이나 정전 시 최근 저장 내용이 사라질 수 있으며, 체크포인트가 지연되면 손실 구간이 더 길어질 수 있습니다.",
+  storageDurabilityPerformance: "성능",
+  storageDurabilityPerformanceDesc:
+    "synchronous=NORMAL을 사용하고 약 5분마다 체크포인트를 실행합니다. 호스트 충돌이나 정전 시 성공 처리된 최근 몇 분의 저장 내용이 사라질 수 있습니다.",
+  storageDurabilityManaged: "서버 관리자가 관리함",
+  storageDurabilityDowngradeConfirm: (mode: string, minutes: number) =>
+    `${mode}(으)로 전환할까요? 호스트 충돌이나 정전 시 성공 처리된 약 ${minutes}분의 저장 내용이 사라질 수 있으며, 체크포인트가 지연되면 더 길어질 수 있습니다.`,
+  storageDurabilitySaved: (mode: string) =>
+    `SQLite 내구성이 ${mode}(으)로 변경되었습니다.`,
+  storageDurabilityLoadFailed: "SQLite 내구성 설정을 불러오지 못했습니다",
+  storageDurabilitySaveFailed: "SQLite 내구성 설정을 변경하지 못했습니다",
+
   // 디스크 사용량 (맥OS 스타일 막대)
   storageDiskUsage: "저장공간",
   storageDiskHeader: (used: number, total: number) =>
@@ -2207,7 +2228,7 @@ export const languageKorean = {
   storageWalCleanupHeader: (walSize: number) =>
     `현재 WAL ${(walSize / 1024 / 1024).toFixed(1)} MB`,
   storageWalCleanupWhat:
-    "SQLite의 WAL 파일(risuai.db-wal)은 최근 변경분이 본 DB로 합쳐지기 전 임시로 모아두는 영역입니다. 5분 주기로 자동 정리되지만 백업 임포트나 큰 에셋 업로드 직후 일시적으로 부풀 수 있습니다.",
+    "SQLite의 WAL 파일(risuai.db-wal)은 최근 변경분이 본 DB로 합쳐지기 전 임시로 모아두는 영역입니다. 백그라운드 체크포인트 주기는 선택한 내구성 모드를 따르지만 백업 임포트나 큰 에셋 업로드 직후 일시적으로 부풀 수 있습니다.",
   storageWalCleanupWhen:
     "WAL 파일이 커진 상태에서 디스크 공간을 즉시 회수하고 싶을 때 사용합니다. Optimize와 달리 수 밀리초로 끝나고 추가 디스크 공간도 필요하지 않습니다. 데이터는 변경되지 않습니다.",
   storageWalCleanup_btn: "WAL 정리",

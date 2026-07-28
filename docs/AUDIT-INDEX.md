@@ -1,8 +1,8 @@
 # Audit findings — priority index
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
-`Status` column uses `Open`, `Fixed`, or `Deferred`; 57 findings are currently
-`Open` and 3 are `Fixed`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
+`Status` column uses `Open`, `Fixed`, or `Deferred`; 56 findings are currently
+`Open` and 4 are `Fixed`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
 as a cross-reference).
@@ -40,7 +40,7 @@ resolution against current code before acting on it.
 |---|---|---|---|---|
 | [install.sh can delete the only data copy](audit/install-script-can-delete-the-only-data-copy.md) | Fixed | High | The entire dataset — database, chats, assets, inlays, and all backups — held as the only copy under an unconditional `rm -rf` EXIT trap | Any failure during an overwrite install (ENOSPC on tmpfs is realistic); the prompt promises data is preserved, so users don't copy first |
 | [Patch conflict promotes ETag, enables stale full write](audit/patch-conflict-etag-promotion-enables-stale-full-write.md) | Fixed | High | Whole server database replaced by a stale client image; chat rows created since the client's baseline deleted in the same transaction | Ordinary multi-tab/multi-device use, or any restore/import while another tab is open — every patch-hash 409 escalates to a force-push |
-| [SQLite NORMAL WAL acks before power-loss durability](audit/sqlite-normal-wal-acknowledges-before-power-loss-durability.md) | Open | High | All transactions committed since the last WAL checkpoint, including chat rows and full writes already treated as durable | Host crash or power loss — a routine event for the homeserver audience |
+| [SQLite NORMAL WAL acks before power-loss durability](audit/sqlite-normal-wal-acknowledges-before-power-loss-durability.md) | Fixed | High | All transactions committed since the last WAL checkpoint, including chat rows and full writes already treated as durable | Host crash or power loss — a routine event for the homeserver audience |
 | [Acknowledged patches are not durable](audit/acknowledged-patches-are-not-durable.md) | Open | High | Up to 5 s of acknowledged metadata; sharpest case: a whole new chat (row orphaned, later swept) | Any server crash; fatal handlers exit **without flushing**, so any server-side bug converts to loss of acknowledged writes |
 | [Inlay orphan scan classifies referenced inlays as deletable](audit/inlay-orphan-scan-classifies-referenced-inlays-as-deletable.md) | Open | High | Bulk permanent deletion of chat-referenced images (no trash; inlays absent from DB-only snapshots) | The feature invites it: after boot nearly every chat inlay counts as orphaned until its chat is opened; confirming the orphan filter deletes referenced media |
 | [Boot asset GC deletes plugin-owned assets](audit/boot-asset-gc-deletes-plugin-owned-assets.md) | Open | High | Every asset stored via the supported plugin `saveAsset` API, permanently; only recovery is an earlier full backup | Automatic, 5 s after **every** boot, for any plugin persisting asset paths in its storage |
@@ -152,10 +152,12 @@ de-fangs multiple findings at once.
   server ETag before the matching authoritative state was installed, then using
   it to authorize a stale full write. Conflict ETags are now provisional until
   the authoritative body and retry baselines install successfully.
-- **Ack-before-durable.** Acknowledged patches, NORMAL-WAL commits,
-  inline plugin storage, chat-version import, and server-backup publication
-  all report success before durability; the caller then discards its only
-  copy.
+- **Ack-before-durable.** The authoritative SQLite default and explicit flush
+  boundary are now durable; deliberately selected balanced/performance modes
+  expose a labeled bounded power-loss window. Inline plugin storage,
+  chat-version import, and server-backup publication still report success
+  before their respective durability boundaries; the caller can then discard
+  its only copy.
 - **Keep-set GC without ownership.** Boot asset GC, its publication race,
   snapshot asset references, and version-history inlay references all delete
   based on an incomplete reference scan instead of explicit ownership or a

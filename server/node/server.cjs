@@ -294,6 +294,175 @@ function queueStorageMutation(operation) {
     });
 }
 
+// ─── SQLite durability policy ───────────────────────────────────────────────
+// The database module opens in FULL so early migrations and invalid/missing
+// configuration fail safe. Self-hosted administrators can explicitly trade a
+// bounded power-loss window for fewer commit-time fsyncs; hub mode is always
+// server-admin managed through POCKETRISU_SQLITE_DURABILITY_MODE.
+const SQLITE_DURABILITY_CONFIG_KEY = 'config/sqlite-durability-mode';
+const SQLITE_DURABILITY_ENV_KEY = 'POCKETRISU_SQLITE_DURABILITY_MODE';
+const SQLITE_MAINTENANCE_CHECKPOINT_INTERVAL_MS = 5 * 60 * 1000;
+const SQLITE_CHECKPOINT_RETRY_MS = 10 * 1000;
+const SQLITE_DURABILITY_PROFILES = Object.freeze({
+    durable: Object.freeze({
+        synchronous: 'FULL',
+        checkpointIntervalMs: null,
+        powerLossWindowMs: 0,
+    }),
+    balanced: Object.freeze({
+        synchronous: 'NORMAL',
+        checkpointIntervalMs: 60 * 1000,
+        powerLossWindowMs: 60 * 1000,
+    }),
+    performance: Object.freeze({
+        synchronous: 'NORMAL',
+        checkpointIntervalMs: 5 * 60 * 1000,
+        powerLossWindowMs: 5 * 60 * 1000,
+    }),
+});
+
+function normalizeSqliteDurabilityMode(value) {
+    const normalized = String(value ?? '').trim().toLowerCase();
+    return Object.prototype.hasOwnProperty.call(SQLITE_DURABILITY_PROFILES, normalized)
+        ? normalized
+        : null;
+}
+
+const sqliteDurabilityEnvRaw = String(process.env[SQLITE_DURABILITY_ENV_KEY] ?? '').trim();
+const sqliteDurabilityEnvMode = normalizeSqliteDurabilityMode(sqliteDurabilityEnvRaw);
+const sqliteDurabilityManaged = HUB_HOSTING_MODE || sqliteDurabilityEnvRaw.length > 0;
+
+function readPersistedSqliteDurabilityMode() {
+    try {
+        const raw = kvGet(SQLITE_DURABILITY_CONFIG_KEY);
+        return raw ? normalizeSqliteDurabilityMode(Buffer.from(raw).toString('utf-8')) : null;
+    } catch {
+        return null;
+    }
+}
+
+let sqliteDurabilityMode = sqliteDurabilityManaged
+    ? (sqliteDurabilityEnvMode || 'durable')
+    : (readPersistedSqliteDurabilityMode() || 'durable');
+let sqliteDurabilityTimer = null;
+let sqliteDurabilitySchedulerStarted = false;
+let lastWalCheckpointAttempt = null;
+let lastSuccessfulWalCheckpointAt = null;
+let lastMaintenanceWalCheckpointAt = Date.now();
+
+if (sqliteDurabilityEnvRaw && !sqliteDurabilityEnvMode) {
+    logger.warn(
+        `[SQLite] Invalid ${SQLITE_DURABILITY_ENV_KEY}=${JSON.stringify(sqliteDurabilityEnvRaw)}; `
+        + 'using durable mode',
+    );
+}
+
+function sqliteDurabilityProfile() {
+    return SQLITE_DURABILITY_PROFILES[sqliteDurabilityMode];
+}
+
+function applySqliteDurabilityMode() {
+    sqliteDb.pragma(`synchronous = ${sqliteDurabilityProfile().synchronous}`);
+}
+
+function normalizeWalCheckpointResult(rawResult, mode, reason) {
+    const row = Array.isArray(rawResult) && rawResult[0] ? rawResult[0] : {};
+    const busy = Number(row.busy ?? 1);
+    const result = {
+        mode,
+        reason,
+        complete: busy === 0,
+        busy,
+        logFrames: Number(row.log ?? -1),
+        checkpointedFrames: Number(row.checkpointed ?? -1),
+        attemptedAt: Date.now(),
+    };
+    lastWalCheckpointAttempt = result;
+    if (result.complete) {
+        lastSuccessfulWalCheckpointAt = result.attemptedAt;
+        if (mode === 'TRUNCATE') lastMaintenanceWalCheckpointAt = result.attemptedAt;
+    }
+    return result;
+}
+
+function runTrackedWalCheckpoint(mode, reason) {
+    return normalizeWalCheckpointResult(checkpointWal(mode), mode, reason);
+}
+
+function sqliteDurabilityState() {
+    const profile = sqliteDurabilityProfile();
+    return {
+        mode: sqliteDurabilityMode,
+        managed: sqliteDurabilityManaged,
+        managedBy: sqliteDurabilityManaged
+            ? (sqliteDurabilityEnvRaw ? 'environment' : 'hub')
+            : null,
+        synchronous: profile.synchronous,
+        checkpointIntervalMs: profile.checkpointIntervalMs,
+        maintenanceCheckpointIntervalMs: SQLITE_MAINTENANCE_CHECKPOINT_INTERVAL_MS,
+        powerLossWindowMs: profile.powerLossWindowMs,
+        lastSuccessfulCheckpointAt: lastSuccessfulWalCheckpointAt,
+        lastCheckpoint: lastWalCheckpointAttempt,
+    };
+}
+
+function sqliteCheckpointDelay(intervalMs) {
+    if (!HUB_HOSTING_MODE) return intervalMs;
+    // Stagger independently hosted tenant processes so a shared volume does not
+    // receive a synchronized flush burst every minute.
+    return Math.max(1000, Math.round(intervalMs * (0.9 + Math.random() * 0.2)));
+}
+
+function scheduleSqliteDurabilityCheckpoint(delayMs = null) {
+    if (!sqliteDurabilitySchedulerStarted) return;
+    if (sqliteDurabilityTimer) clearTimeout(sqliteDurabilityTimer);
+    const profile = sqliteDurabilityProfile();
+    const interval = profile.checkpointIntervalMs
+        ?? SQLITE_MAINTENANCE_CHECKPOINT_INTERVAL_MS;
+    sqliteDurabilityTimer = setTimeout(async () => {
+        sqliteDurabilityTimer = null;
+        let retry = false;
+        try {
+            const now = Date.now();
+            const mode = now - lastMaintenanceWalCheckpointAt
+                >= SQLITE_MAINTENANCE_CHECKPOINT_INTERVAL_MS
+                ? 'TRUNCATE'
+                : profile.synchronous === 'NORMAL' ? 'FULL' : 'TRUNCATE';
+            const result = await queueStorageMutation(() => (
+                runTrackedWalCheckpoint(mode, 'scheduled')
+            ));
+            retry = !result.complete;
+            if (!result.complete) {
+                logger.warn(`[SQLite] Scheduled ${mode} checkpoint was busy; retrying`);
+            }
+        } catch (error) {
+            retry = true;
+            if (!isImportInProgressError(error)) {
+                logger.warn('[SQLite] Scheduled durability checkpoint failed:', error?.message || error);
+            }
+        } finally {
+            scheduleSqliteDurabilityCheckpoint(
+                retry ? SQLITE_CHECKPOINT_RETRY_MS : null,
+            );
+        }
+    }, sqliteCheckpointDelay(delayMs ?? interval));
+    sqliteDurabilityTimer.unref?.();
+}
+
+function startSqliteDurabilityCheckpointScheduler() {
+    sqliteDurabilitySchedulerStarted = true;
+    lastMaintenanceWalCheckpointAt = Date.now();
+    scheduleSqliteDurabilityCheckpoint();
+}
+
+function rescheduleSqliteDurabilityCheckpoint() {
+    if (sqliteDurabilitySchedulerStarted) scheduleSqliteDurabilityCheckpoint();
+}
+
+// db.cjs deliberately started in FULL. This is the only startup point that may
+// downgrade it, and only after an explicit valid persisted/admin choice exists.
+applySqliteDurabilityMode();
+
 // Imports hold a raw transaction outside the storage queue. Wait before
 // entering the queue, then re-check from inside it: if an import won the race,
 // retry after that holder releases. If the read wins, the import's queue drain
@@ -6377,8 +6546,8 @@ async function importBackupFromSource(dataSource, {
         sqliteDb.exec('COMMIT');
         transactionCommitted = true;
 
-        sqliteDb.pragma('synchronous = NORMAL');
-        checkpointWal('TRUNCATE');
+        applySqliteDurabilityMode();
+        runTrackedWalCheckpoint('TRUNCATE', 'backup-import-commit');
         journal = { ...journal, phase: 'committed' };
         writeImportJournal(IMPORT_JOURNAL_PATH, journal);
         assetSwap.finalize();
@@ -6447,7 +6616,7 @@ async function importBackupFromSource(dataSource, {
         }
         throw error;
     } finally {
-        sqliteDb.pragma('synchronous = NORMAL');
+        applySqliteDurabilityMode();
         if (activeEntryWriteStream) {
             activeEntryWriteStream.destroy();
             await activeEntryWriteFinished?.catch(() => {});
@@ -6465,7 +6634,7 @@ async function importBackupFromSource(dataSource, {
     const coldStorageFailed = databaseIngestion?.stats.failed || 0;
 
     try {
-        checkpointWal('TRUNCATE');
+        runTrackedWalCheckpoint('TRUNCATE', 'backup-import-cleanup');
     } catch (checkpointError) {
         logger.warn('[Backup Import] WAL checkpoint after import failed:', checkpointError);
     }
@@ -10433,8 +10602,22 @@ app.post('/api/db/flush', sessionAuthMiddleware, async (req, res, next) => {
     try {
         await queueStorageMutation(async () => {
             await flushPendingDb();
+            const checkpoint = runTrackedWalCheckpoint('FULL', 'explicit-flush');
+            if (!checkpoint.complete) {
+                return res.status(503).send({
+                    success: false,
+                    durable: false,
+                    outcome: 'unknown',
+                    retryable: true,
+                    error: 'SQLite durability checkpoint is busy; retry the flush',
+                    checkpoint,
+                    etag: dbEtag ?? undefined,
+                });
+            }
             res.send({
                 success: true,
+                durable: true,
+                checkpoint,
                 etag: dbEtag ?? undefined
             });
         });
@@ -12210,7 +12393,7 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage, { signal
         sqliteDb.exec('COMMIT');
         transactionCommitted = true;
 
-        checkpointWal('TRUNCATE');
+        runTrackedWalCheckpoint('TRUNCATE', 'save-folder-import');
         journal = { ...journal, phase: 'committed' };
         writeImportJournal(IMPORT_JOURNAL_PATH, journal);
         if (hasSaveFolderImportFailpoint('post-commit-cleanup')) {
@@ -12798,6 +12981,7 @@ app.get('/api/db/stats', async (req, res, next) => {
         const pageCount = sqliteDb.pragma('page_count', { simple: true });
         const freelistCount = sqliteDb.pragma('freelist_count', { simple: true });
         const journalMode = sqliteDb.pragma('journal_mode', { simple: true });
+        const synchronous = sqliteDb.pragma('synchronous', { simple: true });
         const autoVacuum = sqliteDb.pragma('auto_vacuum', { simple: true });
         const reclaimable = freelistCount * pageSize;
 
@@ -12925,7 +13109,7 @@ app.get('/api/db/stats', async (req, res, next) => {
             files,
             disk,
             ...(backupDisk ? { backupDisk } : {}),
-            sqlite: { pageSize, pageCount, freelistCount, reclaimable, journalMode, autoVacuum },
+            sqlite: { pageSize, pageCount, freelistCount, reclaimable, journalMode, synchronous, autoVacuum },
             chunks: { count: chunkStat.c, bytes: chunkStat.b, orphanBytes: orphanChunkBytes, liveChunked },
             prefixes,
             kvRows,
@@ -13128,11 +13312,11 @@ app.post('/api/db/optimize', async (req, res, next) => {
             // the surrounding queueStorageOperation.
             let gcDeleted = 0;
             try { gcDeleted = gcChunks(); } catch (e) { logger.warn('[Optimize] chunk gc failed:', e?.message || e); }
-            try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn('[Optimize] checkpoint failed:', e?.message || e); }
+            try { runTrackedWalCheckpoint('TRUNCATE', 'optimize-before-vacuum'); } catch (e) { logger.warn('[Optimize] checkpoint failed:', e?.message || e); }
             sqliteDb.exec('VACUUM');
             // VACUUM streams the whole DB through the WAL; without this checkpoint the
             // -wal file stays inflated until the next 5-min background TRUNCATE.
-            try { checkpointWal('TRUNCATE'); } catch (e) { logger.warn('[Optimize] post-VACUUM checkpoint failed:', e?.message || e); }
+            try { runTrackedWalCheckpoint('TRUNCATE', 'optimize-after-vacuum'); } catch (e) { logger.warn('[Optimize] post-VACUUM checkpoint failed:', e?.message || e); }
             const elapsed = Date.now() - t0;
             const postDbSize = statSafe(dbFilePath)?.size ?? 0;
             return {
@@ -13153,6 +13337,53 @@ app.post('/api/db/optimize', async (req, res, next) => {
     }
 });
 
+app.get('/api/db/durability', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        res.json(sqliteDurabilityState());
+    } catch (err) { next(err); }
+});
+
+app.put('/api/db/durability', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    if (sqliteDurabilityManaged) {
+        return res.status(403).json({
+            error: 'SQLite durability is managed by the server administrator',
+            ...sqliteDurabilityState(),
+        });
+    }
+    const nextMode = normalizeSqliteDurabilityMode(req.body?.mode);
+    if (!nextMode) {
+        return res.status(400).json({
+            error: 'mode must be one of: durable, balanced, performance',
+        });
+    }
+    try {
+        await queueStorageMutation(() => {
+            const previousMode = sqliteDurabilityMode;
+            // Persist the operator choice through a FULL commit before applying
+            // a requested downgrade. This also makes every earlier NORMAL-mode
+            // transaction durable before the endpoint acknowledges the change.
+            sqliteDb.pragma('synchronous = FULL');
+            try {
+                kvSet(SQLITE_DURABILITY_CONFIG_KEY, Buffer.from(nextMode, 'utf-8'));
+                sqliteDurabilityMode = nextMode;
+                applySqliteDurabilityMode();
+            } catch (error) {
+                sqliteDurabilityMode = previousMode;
+                applySqliteDurabilityMode();
+                throw error;
+            }
+        });
+        rescheduleSqliteDurabilityCheckpoint();
+        res.json(sqliteDurabilityState());
+    } catch (err) {
+        if (isImportInProgressError(err)) return sendImportBusy(res);
+        next(err);
+    }
+});
+
 app.post('/api/db/wal-checkpoint', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
@@ -13165,17 +13396,19 @@ app.post('/api/db/wal-checkpoint', async (req, res, next) => {
         const result = await queueStorageMutation(async () => {
             await flushPendingDb();
             const t0 = Date.now();
-            checkpointWal('TRUNCATE');
+            const checkpoint = runTrackedWalCheckpoint('TRUNCATE', 'manual-cleanup');
             const elapsed = Date.now() - t0;
             const postWalSize = statSafe(walFilePath)?.size ?? 0;
             return {
-                ok: true,
+                ok: checkpoint.complete,
+                checkpoint,
                 elapsedMs: elapsed,
                 preWalSize,
                 postWalSize,
                 reclaimed: Math.max(0, preWalSize - postWalSize),
             };
         });
+        if (!result.ok) return res.status(503).json(result);
         res.json(result);
     } catch (err) {
         if (isImportInProgressError(err)) return sendImportBusy(res);
@@ -14100,7 +14333,7 @@ app.post('/api/self-update', async (req, res) => {
             try {
             console.log(`[Update] Self-update to v${targetVersion} complete. Restarting...`);
             try { await flushPendingDb(); } catch {}
-            try { checkpointWal('TRUNCATE'); } catch {}
+            try { runTrackedWalCheckpoint('TRUNCATE', 'self-update'); } catch {}
 
             const port = process.env.PORT || 6001;
 
@@ -14356,7 +14589,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     process.on(sig, async () => {
         console.log(`[Server] Received ${sig}, flushing pending data...`);
         try { await flushPendingDb(); } catch (e) { logger.error('[Server] Flush error:', e); }
-        try { checkpointWal('TRUNCATE'); } catch { /* non-fatal */ }
+        try { runTrackedWalCheckpoint('TRUNCATE', 'graceful-shutdown'); } catch { /* non-fatal */ }
         process.exit(0);
     });
 }
@@ -14395,6 +14628,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
     }, Math.min(PROXY_STREAM_GC_INTERVAL_MS, PARTIAL_EXPORT_GC_INTERVAL_MS));
 
     await startServer();
+    startSqliteDurabilityCheckpointScheduler();
 
     chatBackupStore.reconcileChatBackups()
         .then((result) => {
@@ -14405,14 +14639,6 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
             );
         })
         .catch(error => logger.error('[ChatBackups] Startup reconcile failed:', error));
-
-    // Periodically checkpoint WAL to reclaim disk space.
-    // TRUNCATE (vs RESTART) shrinks the -wal file on disk, not just the writer
-    // pointer — required for journal_size_limit to actually take effect.
-    setInterval(() => {
-        try { checkpointWal('TRUNCATE'); }
-        catch { /* non-fatal */ }
-    }, 5 * 60 * 1000); // every 5 minutes
 
     setInterval(() => {
         try { kvCleanupOldDeletions(); }

@@ -4,7 +4,9 @@
     import ShAlert from 'src/lib/UI/GUI/ShAlert.svelte'
     import ShAccordion from 'src/lib/UI/GUI/ShAccordion.svelte'
     import ShLoadingDialog from 'src/lib/UI/GUI/ShLoadingDialog.svelte'
+    import ShSelect from 'src/lib/UI/GUI/ShSelect.svelte'
     import ShSwitch from 'src/lib/UI/GUI/ShSwitch.svelte'
+    import OptionInput from 'src/lib/UI/GUI/OptionInput.svelte'
     import { Tooltip } from 'bits-ui'
     import {
         RefreshCwIcon,
@@ -48,7 +50,7 @@
         backupDisk?: { free: number | null; total: number | null; path?: string; sameAsSaveDir?: boolean }
         sqlite: {
             pageSize: number; pageCount: number; freelistCount: number;
-            reclaimable: number; journalMode: string; autoVacuum: number | string;
+            reclaimable: number; journalMode: string; synchronous: number; autoVacuum: number | string;
         }
         chunks?: { count: number; bytes: number; orphanBytes: number; liveChunked: boolean }
         prefixes: Record<string, PrefixInfo>
@@ -65,6 +67,17 @@
         trashed: { count: number; expiredCount: number; available: boolean }
         orphan: { count: number; totalSize: number; available: boolean }
         etag: string | null
+    }
+    type DurabilityMode = 'durable' | 'balanced' | 'performance'
+    interface DurabilityState {
+        mode: DurabilityMode
+        managed: boolean
+        managedBy: 'environment' | 'hub' | null
+        synchronous: 'FULL' | 'NORMAL'
+        checkpointIntervalMs: number | null
+        maintenanceCheckpointIntervalMs: number
+        powerLossWindowMs: number
+        lastSuccessfulCheckpointAt: number | null
     }
     interface CharBreakdown {
         chaId: string; name: string; image: string; trashed: boolean
@@ -106,6 +119,10 @@
     let optimizeMessage = $state('')
 
     let walCleanupOpen = $state(false)
+    let durability = $state<DurabilityState | null>(null)
+    let durabilityMode = $state<DurabilityMode>('durable')
+    let durabilitySaving = $state(false)
+    let durabilityError = $state<string | null>(null)
 
     // Default off = show only RisuAI internal breakdown (smaller scope, more
     // useful at-a-glance). Toggle on to expand the bar to disk-total scale
@@ -155,6 +172,77 @@
 
     async function loadResourceCacheStats() {
         resourceCacheStats = await getResourceCacheStats()
+    }
+
+    async function loadDurability() {
+        durabilityError = null
+        try {
+            const auth = await forageStorage.createAuth()
+            const res = await fetch('/api/db/durability', { headers: { 'risu-auth': auth } })
+            const json = await res.json().catch(() => ({}))
+            if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+            durability = json as DurabilityState
+            durabilityMode = durability.mode
+        } catch (err) {
+            durabilityError = err instanceof Error ? err.message : String(err)
+        }
+    }
+
+    function durabilityModeLabel(mode: DurabilityMode): string {
+        if (mode === 'balanced') return language.storageDurabilityBalanced
+        if (mode === 'performance') return language.storageDurabilityPerformance
+        return language.storageDurabilityDurable
+    }
+
+    function durabilityModeDescription(mode: DurabilityMode): string {
+        if (mode === 'balanced') return language.storageDurabilityBalancedDesc
+        if (mode === 'performance') return language.storageDurabilityPerformanceDesc
+        return language.storageDurabilityDurableDesc
+    }
+
+    async function changeDurability(event: Event & { currentTarget: HTMLSelectElement }) {
+        if (!durability || durabilitySaving || durability.managed) {
+            durabilityMode = durability?.mode ?? 'durable'
+            return
+        }
+        const previous = durability.mode
+        const next = event.currentTarget.value as DurabilityMode
+        durabilityMode = next
+        if (next !== 'durable') {
+            const confirmed = await alertConfirm(
+                language.storageDurabilityDowngradeConfirm(
+                    durabilityModeLabel(next),
+                    next === 'balanced' ? 1 : 5,
+                ),
+            )
+            if (!confirmed) {
+                durabilityMode = previous
+                return
+            }
+        }
+
+        durabilitySaving = true
+        durabilityError = null
+        try {
+            const auth = await forageStorage.createAuth()
+            const res = await fetch('/api/db/durability', {
+                method: 'PUT',
+                headers: { 'risu-auth': auth, 'content-type': 'application/json' },
+                body: JSON.stringify({ mode: next }),
+            })
+            const json = await res.json().catch(() => ({}))
+            if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+            durability = json as DurabilityState
+            durabilityMode = durability.mode
+            notifySuccess(language.storageDurabilitySaved(durabilityModeLabel(durability.mode)))
+            await loadStats()
+        } catch (err) {
+            durabilityMode = previous
+            durabilityError = err instanceof Error ? err.message : String(err)
+            notifyError(language.storageDurabilitySaveFailed + ': ' + durabilityError)
+        } finally {
+            durabilitySaving = false
+        }
     }
 
     async function clearBrowserCache() {
@@ -417,6 +505,7 @@
 
     $effect(() => {
         void loadStats()
+        void loadDurability()
         if (resourceCacheSupported) void loadResourceCacheStats()
     })
 </script>
@@ -426,6 +515,7 @@
 <div class="flex justify-end mb-3">
     <ShButton variant="outline" size="default" onclick={() => {
         void loadStats()
+        void loadDurability()
         if (resourceCacheSupported) void loadResourceCacheStats()
     }} disabled={loading}>
         <RefreshCwIcon size={16} class={loading ? 'animate-spin' : ''} />
@@ -618,7 +708,57 @@
         {/if}
     </div>
 
-    <!-- ② Manual WAL cleanup ────────────────────────────────────────────── -->
+    <!-- ② SQLite durability ─────────────────────────────────────────────── -->
+    {#if durability}
+        <div class="border border-darkborderc bg-darkbg/40 rounded-md p-4 mb-4">
+            <div class="flex items-center justify-between gap-2 mb-3 flex-wrap">
+                <div class="flex items-center gap-2 text-textcolor">
+                    <ShieldCheckIcon size={16} />
+                    <span class="font-medium">{language.storageDurability}</span>
+                </div>
+                <ShBadge variant={durability.mode === 'durable' ? 'success' : 'warning'}>
+                    {durabilityModeLabel(durability.mode)}
+                </ShBadge>
+            </div>
+            <p class="text-textcolor2 text-sm leading-relaxed mb-3">{language.storageDurabilityDesc}</p>
+
+            <div class="flex items-center justify-between gap-3 flex-wrap">
+                <div class="min-w-0 flex-1">
+                    <div class="text-textcolor text-sm font-medium">{durabilityModeLabel(durability.mode)}</div>
+                    <div class="text-textcolor2 text-xs leading-relaxed mt-0.5">
+                        {durabilityModeDescription(durability.mode)}
+                    </div>
+                </div>
+                {#if durability.managed}
+                    <ShBadge variant="secondary">{language.storageDurabilityManaged}</ShBadge>
+                {:else}
+                    <ShSelect
+                        className="w-full sm:w-52"
+                        bind:value={durabilityMode}
+                        onchange={changeDurability}
+                    >
+                        <OptionInput value="durable">{language.storageDurabilityDurable}</OptionInput>
+                        <OptionInput value="balanced">{language.storageDurabilityBalanced}</OptionInput>
+                        <OptionInput value="performance">{language.storageDurabilityPerformance}</OptionInput>
+                    </ShSelect>
+                {/if}
+            </div>
+
+            {#if durability.mode !== 'durable'}
+                <ShAlert variant="warning" className="mt-3">
+                    {#snippet icon()}<TriangleAlertIcon />{/snippet}
+                    {durabilityModeDescription(durability.mode)}
+                </ShAlert>
+            {/if}
+        </div>
+    {:else if durabilityError}
+        <ShAlert variant="destructive" className="mb-4">
+            {#snippet icon()}<TriangleAlertIcon />{/snippet}
+            {language.storageDurabilityLoadFailed}: {durabilityError}
+        </ShAlert>
+    {/if}
+
+    <!-- ③ Manual WAL cleanup ────────────────────────────────────────────── -->
     <div class="border border-darkborderc bg-darkbg/40 rounded-md p-4 mb-4">
         <div class="flex items-baseline justify-between gap-2 mb-3 flex-wrap">
             <div class="flex items-center gap-2 text-textcolor">
@@ -893,6 +1033,7 @@
     <ShAccordion name={language.storageDebug} variant="card">
         <div class="grid grid-cols-2 gap-x-4 gap-y-1 text-textcolor2 text-sm font-mono">
             <div>journal_mode</div><div class="text-textcolor">{stats.sqlite.journalMode}</div>
+            <div>synchronous</div><div class="text-textcolor">{stats.sqlite.synchronous}</div>
             <div>page_size</div><div class="text-textcolor tabular-nums">{stats.sqlite.pageSize}</div>
             <div>page_count</div><div class="text-textcolor tabular-nums">{stats.sqlite.pageCount.toLocaleString()}</div>
             <div>freelist_count</div><div class="text-textcolor tabular-nums">{stats.sqlite.freelistCount.toLocaleString()}</div>

@@ -1,6 +1,6 @@
 # SQLite NORMAL WAL acknowledges writes before power-loss durability
 
-- Status: Open
+- Status: Fixed
 - Severity: High
 - Lens: D2
 - Area: Area 5 — server KV core and chat rows
@@ -28,3 +28,25 @@ remains an operator option, clearly label its power-loss tradeoff.
 
 Add host-crash/power-loss durability coverage for full writes, chat rows,
 plugin KV, and explicit flush, not merely application-process termination.
+
+## Resolution (2026-07-28)
+
+The authoritative connection now opens with WAL plus `synchronous=FULL`, so
+missing, invalid, and legacy configuration fails safe. Self-hosted operators may
+explicitly choose `balanced` (`NORMAL` plus a verified one-minute `FULL`
+checkpoint) or `performance` (`NORMAL` plus a five-minute checkpoint) from the
+System dashboard; both choices show a concrete power-loss warning. Hub operators
+can lock the same policy through `POCKETRISU_SQLITE_DURABILITY_MODE`, and hub
+tenants cannot override it.
+
+`POST /api/db/flush` now runs a `FULL` checkpoint and reports success only when
+SQLite reports a complete, non-busy result. Scheduled checkpoints are serialized
+with storage mutations, inspect the SQLite busy result, and retry after incomplete
+attempts. Destructive import paths restore the selected synchronous mode rather
+than hard-coding `NORMAL`.
+
+Coverage in `test/compat/sqlite-durability.test.ts` verifies the `FULL` default,
+the explicit durable-flush boundary, persistence across restart, mode restoration
+after a real backup import, and hub administrator enforcement. The existing
+database/chat/plugin atomicity suites continue to exercise the commit paths now
+running under the durable default.
