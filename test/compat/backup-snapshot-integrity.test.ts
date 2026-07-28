@@ -32,6 +32,20 @@ function readKvRows(cwd: string, prefix: string): Array<{ key: string; value: Bu
   }
 }
 
+async function waitForKvRows(
+  cwd: string,
+  prefix: string,
+  expectedCount: number,
+): Promise<Array<{ key: string; value: Buffer }>> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const rows = readKvRows(cwd, prefix)
+    if (rows.length === expectedCount) return rows
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  throw new Error(`Timed out waiting for ${expectedCount} ${prefix} row(s)`)
+}
+
 describe('backup missing chat-row integrity', () => {
   test('full download and server save both reject a missing authoritative chat row', async () => {
     const server = await spawnServer()
@@ -57,7 +71,7 @@ describe('backup missing chat-row integrity', () => {
     })
     expect(writeResponse.status).toBe(200)
 
-    const snapshots = readKvRows(server.cwd, 'database/dbbackup-')
+    const snapshots = await waitForKvRows(server.cwd, 'database/dbbackup-', 1)
     expect(snapshots).toHaveLength(1)
     expect(decodeRisuDat(snapshots[0].value).characters[0].chats[0]).toEqual(
       expect.objectContaining({ id: chatId, _stub: true }),
