@@ -1882,6 +1882,7 @@ describe('plugin publication recovery snapshot scheduling', () => {
             values: { alpha: 'initial' },
             meta: { alpha: { plugin: 'owner-initial' } },
         }))
+        await waitForSnapshotKeys(server, auth)
         await armSnapshotPublicationGate(gateDir)
         expect((await mutateCurrentStorage(server, auth, {
             writes: [
@@ -1928,6 +1929,7 @@ describe('plugin publication recovery snapshot scheduling', () => {
             values: { alpha: 'initial' },
             meta: { alpha: { plugin: 'owner-initial' } },
         }))
+        await waitForSnapshotKeys(server, auth)
         await armSnapshotPublicationGate(gateDir)
         expect((await mutateCurrentStorage(server, auth, {
             writes: [
