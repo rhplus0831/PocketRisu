@@ -10,11 +10,10 @@
     import { tick, untrack } from 'svelte';
     import Chat from "./Chat.svelte";
     import { getAdditionalChatLoadPages, getInitialChatLoadPages } from 'src/ts/chatLoadPages';
-    import { type Chat as ChatData, type Message } from "../../ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import { getCharImage } from "../../ts/characters";
     import { chatProcessStage, doingChat, sendChat } from "../../ts/process/index.svelte";
-    import { ensureCurrentChatReady, setChatBackupReason } from "../../ts/storage/chatStorage";
+    import { ensureChatHydrated, setChatBackupReason } from "../../ts/storage/chatStorage";
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
     import { isExpTranslator, translate } from "../../ts/translator/translator";
@@ -35,6 +34,13 @@ import { isMobile } from 'src/ts/platform'
     import { getInlayAsset } from 'src/ts/process/files/inlays';
     import { quickMenu } from 'src/ts/hotkey';
     import { ChatDraftSession, removeChatDraft } from 'src/ts/storage/chatDraft';
+    import {
+        applyChatInputToTarget,
+        captureChatSendTarget,
+        isChatSendTargetActive,
+        resolveChatSendTarget,
+        type ChatSendTarget,
+    } from 'src/ts/process/chatSendTarget';
 
     import Chats from './Chats.svelte';
     import Button from '../UI/GUI/Button.svelte';
@@ -158,14 +164,20 @@ import { isMobile } from 'src/ts/platform'
         }
     })
 
-    /** Await hydration of active chat. Returns full Chat or null on failure. */
-    async function ensureActiveChatReady(selectedChar = $selectedCharID): Promise<ChatData | null> {
-        const char = DBState.db.characters[selectedChar]
-        if (!char) return null
-        const chat = char.chats[char.chatPage]
-        if (!chat) return null
-        if (!chat._placeholder) return chat
-        return await ensureCurrentChatReady(char.chats, char.chatPage, char.chaId)
+    /** Await hydration of the chat captured when the send began. */
+    async function ensureChatTargetReady(target: ChatSendTarget) {
+        const initialTarget = resolveChatSendTarget(DBState.db, target)
+        if (!initialTarget) return null
+        if (!initialTarget.chat._placeholder) return initialTarget.chat
+
+        await ensureChatHydrated(
+            initialTarget.character.chats,
+            initialTarget.chatIndex,
+            target.chaId,
+        )
+        const hydratedTarget = resolveChatSendTarget(DBState.db, target)
+        if (!hydratedTarget || hydratedTarget.chat._placeholder) return null
+        return hydratedTarget.chat
     }
 
     function scrollToBottom() {
@@ -334,76 +346,90 @@ import { isMobile } from 'src/ts/platform'
     }
 
     async function sendMain(continueResponse:boolean) {
-        let selectedChar = $selectedCharID
         if($doingChat){
             return
         }
 
-        const activeChat = await ensureActiveChatReady(selectedChar)
-        if(!activeChat) return
+        const selectedChar = $selectedCharID
+        const target = captureChatSendTarget(DBState.db, selectedChar)
+        if(!target) return
 
-        let cha = activeChat.message
+        // Composer state is reactive to chat selection. Snapshot the payload
+        // before the first await so a later selection cannot change what is sent.
+        const outgoingComposerInput = messageInput
+        let outgoingInput = outgoingComposerInput
+        const outgoingInputTranslate = messageInputTranslate
+        const outgoingFiles = [...fileInput]
+        let ownsGenerationLock = false
+        let inputAbortController: AbortController | null = null
 
-        if(messageInput.startsWith('/')){
-            const commandProcessed = await processMultiCommand(messageInput)
-            if(commandProcessed !== false){
-                messageInput = ''
-                messageInputTranslate = ''
-                removeChatDraft(draftChaId, draftChatId)
-                return
-            }
-        }
+        try {
+            const activeChat = await ensureChatTargetReady(target)
+            if(!activeChat) return
 
-        if(fileInput.length > 0){
-            for(const file of fileInput){
-                messageInput += `{{inlayed::${file}}}`
-            }
-            fileInput = []
-        }
-
-        if(messageInput === ''){
-            if(cha.length === 0 || cha[cha.length - 1].role !== 'user'){
-                if(DBState.db.useSayNothing){
-                    cha.push({
-                        role: 'user',
-                        data: '*says nothing*',
-                        name: null
-                    })
+            if(outgoingInput.startsWith('/')){
+                const commandProcessed = await processMultiCommand(outgoingInput)
+                if(commandProcessed !== false){
+                    if(isChatSendTargetActive(DBState.db, $selectedCharID, target)){
+                        messageInput = ''
+                        messageInputTranslate = ''
+                    }
+                    removeChatDraft(target.chaId, target.chatId)
+                    return
                 }
             }
-        }
-        else{
-            const char = DBState.db.characters[selectedChar]
-            if(char.type === 'character'){
-                let triggerResult = await runTrigger(char,'input', {chat: activeChat})
-                if(triggerResult){
-                    cha = triggerResult.chat.message
+
+            if(outgoingFiles.length > 0){
+                for(const file of outgoingFiles){
+                    outgoingInput += `{{inlayed::${file}}}`
                 }
+                if(isChatSendTargetActive(DBState.db, $selectedCharID, target)
+                    && fileInput.length === outgoingFiles.length
+                    && fileInput.every((file, index) => file === outgoingFiles[index])){
+                    fileInput = []
+                }
+            }
 
-                cha.push({
-                    role: 'user',
-                    data: await processScript(char,messageInput,'editinput'),
-                    time: Date.now(),
-                    name: null
-                })
+            // Claim the lock before card and editinput hooks. Apart from
+            // preventing duplicate sends, changeChatTo() uses this to keep the
+            // ordinary UI on the target chat while target-bound hooks execute.
+            inputAbortController = new AbortController()
+            abortController = inputAbortController
+            $doingChat = true
+            ownsGenerationLock = true
+
+            const appliedTarget = await applyChatInputToTarget({
+                getDatabase: () => DBState.db,
+                target,
+                input: outgoingInput,
+                signal: inputAbortController.signal,
+                runInputTrigger: (character, chat) => runTrigger(character, 'input', { chat }),
+                processInput: (character, input) => processScript(character, input, 'editinput'),
+            })
+            if(!appliedTarget) return
+
+            if(isChatSendTargetActive(DBState.db, $selectedCharID, target)){
+                if(messageInput === outgoingComposerInput){
+                    messageInput = ''
+                }
+                if(messageInputTranslate === outgoingInputTranslate){
+                    messageInputTranslate = ''
+                }
             }
-            else{
-                cha.push({
-                    role: 'user',
-                    data: messageInput,
-                    time: Date.now(),
-                    name: null
-                })
-            }
+            removeChatDraft(target.chaId, target.chatId)
+
+            await sleep(10)
+            updateInputSizeAll()
+            await sendChatMain(continueResponse, target, true, inputAbortController)
         }
-        messageInput = ''
-        messageInputTranslate = ''
-        removeChatDraft(draftChaId, draftChatId)
-        DBState.db.characters[selectedChar].chats[DBState.db.characters[selectedChar].chatPage].message = cha
-
-        await sleep(10)
-        updateInputSizeAll()
-        await sendChatMain(continueResponse)
+        catch(error){
+            console.error(error)
+            alertError(error)
+        }
+        finally{
+            if(ownsGenerationLock) $doingChat = false
+            if(abortController === inputAbortController) abortController = null
+        }
 
     }
 
@@ -550,15 +576,21 @@ import { isMobile } from 'src/ts/platform'
         DBState.db.characters[$selectedCharID].reloadKeys += 1
     }
 
-    async function sendChatMain(continued:boolean = false) {
+    async function sendChatMain(
+        continued:boolean = false,
+        target?: ChatSendTarget,
+        generationLockHeld = false,
+        existingAbortController?: AbortController,
+    ) {
 
-        messageInput = ''
-        abortController = new AbortController()
+        abortController = existingAbortController ?? new AbortController()
         let generated = false
         try {
             generated = await sendChat(-1, {
                 signal:abortController.signal,
-                continue:continued
+                continue:continued,
+                target,
+                generationLockHeld,
             })
         } catch (error) {
             console.error(error)

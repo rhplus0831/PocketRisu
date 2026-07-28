@@ -2605,6 +2605,11 @@ export function foldChatToMessage(targetMessageIdOrIndex: string | number) {
 }
 
 export function changeChatTo(IdOrIndex: string | number) {
+    // A send is bound to the chat that owned the composer when it began.
+    // Keep ordinary navigation from changing global chat-dependent hook
+    // context while that operation is in flight.
+    if (get(doingChat)) return
+
     let index = -1
     if (typeof IdOrIndex === 'number') {
         index = IdOrIndex

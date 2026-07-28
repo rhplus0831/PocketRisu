@@ -27,6 +27,7 @@ import { resolveChatModelBinding, resolvePresetMaxOutputTokens } from "./request
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
 import { readImage } from "../globalApi.svelte";
+import { resolveChatSendTarget, type ChatSendTarget } from './chatSendTarget';
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -67,6 +68,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     usedContinueTokens?:number,
     preview?:boolean
     previewPrompt?:boolean
+    target?:ChatSendTarget
+    /** The UI acquired doingChat before asynchronous input hooks began. */
+    generationLockHeld?:boolean
 } = {}):Promise<boolean> {
 
     chatProcessStage.set(0)
@@ -175,7 +179,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     let isDoing = get(doingChat)
 
-    if(isDoing){
+    if(isDoing && !arg.generationLockHeld){
         if(chatProcessIndex === -1){
             return false
         }
@@ -199,18 +203,31 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
+    let nowChatroom: character
+    if(arg.target){
+        const resolvedTarget = resolveChatSendTarget(DBState.db, arg.target)
+        if(!resolvedTarget){
+            doingChat.set(false)
+            return false
+        }
+        selectedChar = resolvedTarget.characterIndex
+        selectedChat = resolvedTarget.chatIndex
+        nowChatroom = resolvedTarget.character
+    }
+    else{
+        selectedChar = get(selectedCharID)
+        nowChatroom = DBState.db.characters[selectedChar]
+        selectedChat = nowChatroom.chatPage
+    }
     DBState.db.statics.messages += 1
-    selectedChar = get(selectedCharID)
-    const nowChatroom = DBState.db.characters[selectedChar]
     nowChatroom.lastInteraction = Date.now()
-    selectedChat = nowChatroom.chatPage
     // Block send if chat is still a placeholder (hydration not complete)
-    if (nowChatroom.chats[nowChatroom.chatPage]?._placeholder) {
+    if (nowChatroom.chats[selectedChat]?._placeholder) {
         alertError('Chat is still loading. Please wait a moment.')
         doingChat.set(false)
         return false
     }
-    nowChatroom.chats[nowChatroom.chatPage].message = nowChatroom.chats[nowChatroom.chatPage].message.map((v) => {
+    nowChatroom.chats[selectedChat].message = nowChatroom.chats[selectedChat].message.map((v) => {
         v.chatId = v.chatId ?? v4()
         return v
     })
@@ -1616,7 +1633,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
             signal: abortSignal,
-            usedContinueTokens: resultTokens
+            usedContinueTokens: resultTokens,
+            target: arg.target,
         })
     }
 
@@ -1657,7 +1675,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         
         doingChat.set(false)
         return await sendChat(chatProcessIndex, {
-            signal: abortSignal
+            signal: abortSignal,
+            target: arg.target,
         })
     }
 
