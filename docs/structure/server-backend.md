@@ -348,6 +348,8 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 
 - **`/proxy` and proxy jobs have different trust models.** Authenticated `/proxy` and `/proxy2` accept general HTTP(S) targets, while job/WebSocket streaming validates local/private hosts through `sanitizeTargetUrl()` at `server/node/server.cjs:1848`. Do not reuse the unrestricted proxy path for the local-network feature.
 
+- **Hosted proxy policy lives in `server/node/proxyTarget.cjs`.** With `POCKETRISU_HUB_HOSTING` enabled, general proxy requests use a DNS-pinning undici dispatcher that rejects non-public resolved addresses plus literal redirect targets on every connection, `/hub-proxy` header targets are restricted to the configured HTTPS hub origin, and local proxy-stream job creation/WebSocket upgrades are disabled. Standalone general proxy requests keep global `fetch` and local-network access.
+
 - **`/hub-proxy/*` is not universally guarded by `checkAuth()`.** It checks PocketRisu auth only for the special `X-Node-Server-Auth` flow near `server/node/server.cjs:3436-3465`; changes to its target/header behavior need a deliberate compatibility and security review.
 
 - **Tailscale has no backend implementation.** It is an external reverse-access recommendation using `tailscale serve --bg http://localhost:6001`, documented in `docs/en/remote.md`.

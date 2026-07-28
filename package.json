@@ -80,6 +80,7 @@
     "three": "^0.154.0",
     "tippy.js": "^6.3.7",
     "ua-parser-js": "^2.0.9",
+    "undici": "^7.29.0",
     "uuid": "^9.0.1",
     "wasm-vips": "^0.0.17",
     "wasmoon": "^1.16.0",
