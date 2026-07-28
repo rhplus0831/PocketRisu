@@ -9,6 +9,7 @@ import {
     listInlayExplorerItems,
     postInlayAsset,
     removeInlayAsset,
+    scanInlayReferences,
     setInlayAsset,
     writeInlayImage,
     __resetInlayStorageForTest,
@@ -32,9 +33,14 @@ vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: a
     return el
 })
 
-const { nodeStorageMap, inlayMetaMap } = vi.hoisted(() => ({
+const { nodeStorageMap, inlayMetaMap, serverScanResult } = vi.hoisted(() => ({
     nodeStorageMap: new Map<string, Uint8Array>(),
     inlayMetaMap: new Map<string, any>(),
+    serverScanResult: {
+        scannedAt: 1,
+        totalMessages: 0,
+        refCounts: {} as Record<string, number>,
+    },
 }))
 
 vi.mock('src/ts/storage/nodeStorage', () => {
@@ -48,6 +54,33 @@ vi.mock('src/ts/storage/nodeStorage', () => {
         }
         async removeItem(key: string) {
             nodeStorageMap.delete(key)
+        }
+        async scanInlayReferences() {
+            return {
+                ...serverScanResult,
+                refCounts: { ...serverScanResult.refCounts },
+            }
+        }
+        async deleteUnreferencedInlays(ids: string[], clientProtectedIds: string[] = []) {
+            const protectedIds = new Set(clientProtectedIds)
+            const referencedIds = ids.filter((id) => (
+                protectedIds.has(id) || (serverScanResult.refCounts[id] ?? 0) > 0
+            ))
+            const referenced = new Set(referencedIds)
+            const removedIds = ids.filter((id) => !referenced.has(id))
+            for (const id of removedIds) {
+                nodeStorageMap.delete(`inlay/${id}`)
+                nodeStorageMap.delete(`inlay_info/${id}`)
+                inlayMetaMap.delete(id)
+            }
+            return {
+                success: true,
+                removedIds,
+                referencedIds,
+                scannedAt: serverScanResult.scannedAt,
+                commitOutcome: 'committed',
+                commitOutcomeUnknown: false,
+            }
         }
         async keys(prefix = '') {
             const ks = [...nodeStorageMap.keys()]
@@ -134,6 +167,9 @@ beforeEach(() => {
     vi.clearAllMocks()
     nodeStorageMap.clear()
     inlayMetaMap.clear()
+    serverScanResult.scannedAt = 1
+    serverScanResult.totalMessages = 0
+    serverScanResult.refCounts = {}
     getDatabaseMock.mockReturnValue({ characters: [] })
     __resetInlayStorageForTest()
 })
@@ -401,6 +437,60 @@ describe('listInlayExplorerItems', () => {
 describe('removeInlayAsset', () => {
     test('does not throw when removing a non-existent id', async () => {
         await expect(removeInlayAsset('nope')).resolves.not.toThrow()
+    })
+
+    test('keeps an asset referenced by a loaded but unsaved chat', async () => {
+        getDatabaseMock.mockReturnValue({
+            characters: [{
+                chats: [{ message: [{ role: 'char', data: '{{inlay::kept-local}}' }] }],
+            }],
+        })
+        await setInlayAsset('kept-local', {
+            data: new Blob(['x']),
+            ext: 'png',
+            name: 'kept.png',
+            type: 'image',
+        })
+
+        await expect(removeInlayAsset('kept-local')).resolves.toBe(false)
+        await expect(getInlayAsset('kept-local')).resolves.not.toBeNull()
+    })
+})
+
+describe('scanInlayReferences', () => {
+    test('uses authoritative rows when the client chat is only an empty placeholder', async () => {
+        serverScanResult.scannedAt = 123
+        serverScanResult.totalMessages = 2
+        serverScanResult.refCounts = { 'server-only': 1 }
+        getDatabaseMock.mockReturnValue({
+            characters: [{ chats: [{ _placeholder: true, message: [] }] }],
+        })
+
+        await expect(scanInlayReferences()).resolves.toEqual({
+            scannedAt: 123,
+            totalMessages: 2,
+            refCounts: { 'server-only': 1 },
+        })
+    })
+
+    test('merges loaded swipe and message references not yet stored on the server', async () => {
+        getDatabaseMock.mockReturnValue({
+            characters: [{
+                chats: [{
+                    message: [{
+                        role: 'char',
+                        data: '{{inlay::loaded-message}}',
+                        swipes: ['{{inlayed::loaded-swipe}}'],
+                    }],
+                }],
+            }],
+        })
+
+        const result = await scanInlayReferences()
+        expect(result.refCounts).toMatchObject({
+            'loaded-message': 1,
+            'loaded-swipe': 1,
+        })
     })
 })
 

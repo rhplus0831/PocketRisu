@@ -109,8 +109,8 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
   - `saveInlayedSignature()` stores structured model signature data under the same ID system (`src/ts/process/files/inlays.ts:479`).
   - `getInlayAsset()` returns a base64 data URI; `getInlayAssetBlob()` returns a Blob (`src/ts/process/files/inlays.ts:490`, `src/ts/process/files/inlays.ts:507`).
   - `setInlayAsset()` writes payload, explorer info, and ownership/time metadata sequentially (`src/ts/process/files/inlays.ts:600`).
-  - `removeInlayAsset()` removes all three records (`src/ts/process/files/inlays.ts:609`).
-  - `scanInlayReferences()` counts token references across all in-memory chat messages (`src/ts/process/files/inlays.ts:670`).
+  - `removeInlayAsset()` and `removeInlayAssets()` use one guarded server mutation that preserves IDs referenced by stored or loaded-unsaved chats (`src/ts/process/files/inlays.ts:619`).
+  - `scanInlayReferences()` scans authoritative server chat rows and merges token references from loaded chats so placeholders and unsaved edits are both covered (`src/ts/process/files/inlays.ts:716`).
   - `supportsInlayImage()` checks the current model’s `hasImageInput` flag (`src/ts/process/files/inlays.ts:697`).
   - `src/ts/process/files/tests/inlays.test.ts` and exercises storage round trips, explorer metadata, uploads, resizing, and deletion (`src/ts/process/files/tests/inlays.test.ts:141`, `src/ts/process/files/tests/inlays.test.ts:407`, `src/ts/process/files/tests/inlays.test.ts:497`).
 
@@ -157,7 +157,8 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
   - Raw inlay read/write and sidecar helpers are at `server/node/server.cjs:1182`, `:1242`, and `:1281`.
   - `/api/session` issues the direct-asset cookie (`server/node/server.cjs:3666`).
   - `/api/asset/:hexKey` serves assets and inlays with MIME, ETag, and immutable caching (`server/node/server.cjs:3747`).
-  - `/api/read`, `/api/remove`, `/api/list`, and `/api/write` special-case inlay payloads and sidecars (`server/node/server.cjs:3945`, `:4058`, `:4098`, `:4200`).
+  - `/api/inlays/references` scans authoritative chat rows; `/api/inlays/delete-unreferenced` revalidates under the storage queue before deleting. The compatibility `/api/remove` path applies the same reference guard to inlays (`server/node/server.cjs:7922`).
+  - `/api/read`, `/api/remove`, `/api/list`, and `/api/write` special-case inlay payloads and sidecars (`server/node/server.cjs:7680`, `:7963`, `:8051`, `:10620`).
   - `/api/assets/bulk-read` and `/api/assets/bulk-write` support batched metadata/KV access (`server/node/server.cjs:4573`, `:4645`).
   - `/api/inlays/compress` recompresses eligible filesystem images to WebP and streams progress as SSE (`server/node/server.cjs:6777`).
 
@@ -289,8 +290,8 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
   - `{{inlayed::<id>}}` is an attached reference and gets a `.risu-inlay-image` wrapper.
   - `{{inlayeddata::<id>}}` carries assistant-side multimodal/signature data.
 
-- Chat messages store IDs, never embedded bytes. Deleting an inlay can therefore leave permanent unresolved tokens; use `scanInlayReferences()` before cleanup.
-- `scanInlayReferences()` is advisory: it scans only messages currently present in memory and skips lazy placeholder chat rows. Hydrate or use a server-aware reference scan before destructive cleanup.
+- Chat messages store IDs, never embedded bytes. Gallery deletion therefore revalidates against authoritative chat rows under the storage queue and preserves references from loaded, unsaved chats as an additional keep-set.
+- `scanInlayReferences()` is server-aware and fail-closed in both gallery surfaces: no assets are classified as message-orphans until the authoritative scan succeeds.
 - Signature inlays are not rendered as visible media. They preserve provider/model metadata so a later request can replay the signature alongside the corresponding assistant content.
 - Image inlays are always re-encoded. Lossless mode stores PNG; default mode stores WebP quality 0.85. Original filenames/extensions are informational and do not dictate the encoded image format.
 - `postChatFile()` accepts `mpeg` and `avi`, while `postInlayAsset()` recognizes video only as `webm`, `mp4`, or `mkv` (`src/ts/process/files/multisend.ts:284`, `src/ts/process/files/inlays.ts:72`). Those accepted picker formats can consequently be discarded.

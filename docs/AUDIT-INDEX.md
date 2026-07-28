@@ -1,8 +1,8 @@
 # Audit findings — priority index
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
-`Status` column uses `Open`, `Fixed`, or `Deferred`; 55 findings are currently
-`Open`, 4 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
+`Status` column uses `Open`, `Fixed`, or `Deferred`; 54 findings are currently
+`Open`, 5 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
 as a cross-reference).
@@ -42,7 +42,7 @@ resolution against current code before acting on it.
 | [Patch conflict promotes ETag, enables stale full write](audit/patch-conflict-etag-promotion-enables-stale-full-write.md) | Fixed | High | Whole server database replaced by a stale client image; chat rows created since the client's baseline deleted in the same transaction | Ordinary multi-tab/multi-device use, or any restore/import while another tab is open — every patch-hash 409 escalates to a force-push |
 | [SQLite NORMAL WAL acks before power-loss durability](audit/sqlite-normal-wal-acknowledges-before-power-loss-durability.md) | Fixed | High | All transactions committed since the last WAL checkpoint, including chat rows and full writes already treated as durable | Host crash or power loss — a routine event for the homeserver audience |
 | [Acknowledged patches are not durable](audit/acknowledged-patches-are-not-durable.md) | Deferred | High | Up to 5 s of acknowledged metadata; sharpest case: a whole new chat (row orphaned, later swept) | Any server crash; fatal handlers exit **without flushing**, so any server-side bug converts to loss of acknowledged writes |
-| [Inlay orphan scan classifies referenced inlays as deletable](audit/inlay-orphan-scan-classifies-referenced-inlays-as-deletable.md) | Open | High | Bulk permanent deletion of chat-referenced images (no trash; inlays absent from DB-only snapshots) | The feature invites it: after boot nearly every chat inlay counts as orphaned until its chat is opened; confirming the orphan filter deletes referenced media |
+| [Inlay orphan scan classifies referenced inlays as deletable](audit/inlay-orphan-scan-classifies-referenced-inlays-as-deletable.md) | Fixed | High | Bulk permanent deletion of chat-referenced images (no trash; inlays absent from DB-only snapshots) | The feature invites it: after boot nearly every chat inlay counts as orphaned until its chat is opened; confirming the orphan filter deletes referenced media |
 | [Boot asset GC deletes plugin-owned assets](audit/boot-asset-gc-deletes-plugin-owned-assets.md) | Open | High | Every asset stored via the supported plugin `saveAsset` API, permanently; only recovery is an earlier full backup | Automatic, 5 s after **every** boot, for any plugin persisting asset paths in its storage |
 | [Send-input race replaces another chat's history](audit/send-input-race-replaces-another-chats-history.md) | Open | High | One chat's entire message history overwritten by another's; pre-image may be cooldown-skipped, making it unrecoverable | Switching chats while input triggers/`editinput` scripts run on send; cards can stretch the window arbitrarily |
 | [Reroll failure restores into the current chat](audit/reroll-failure-restores-into-the-current-chat.md) | Open | High | The currently selected chat's entire history overwritten with the rerolled chat's; the rerolled chat stays truncated | Switching chats during generation, then abort or failure — chat switching is unguarded during generation |
@@ -144,8 +144,8 @@ de-fangs multiple findings at once.
   deletion from "recoverable" to "permanent". A single cooldown-exempt
   destructive-pre-image path addresses all five.
 - **DB-only snapshots.** Automatic snapshots never include assets, inlays, or
-  the MCP tool-call cache, so every finding that deletes those bytes
-  (orphan scan, boot GC, inlay replacement, snapshot/GC interplay, MCP
+  the MCP tool-call cache, so every remaining finding that deletes those bytes
+  (boot GC, inlay replacement, snapshot/GC interplay, MCP
   omission) has no automatic safety net.
 - **ETag as authorization (fixed 2026-07-28).** The patch-conflict promotion
   (P1) and the rebase promotion (P2) were the same defect class: adopting a

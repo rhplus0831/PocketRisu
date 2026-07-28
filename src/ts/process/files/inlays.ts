@@ -3,13 +3,16 @@ import { getImageType } from "src/ts/media";
 import { getDatabase } from "../../storage/database.svelte";
 import { getModelInfo, LLMFlags, LLMFormat } from "src/ts/model/modellist";
 import { asBuffer } from "../../util";
-import { NodeStorage } from "../../storage/nodeStorage";
+import {
+    NodeStorage,
+    type InlayDeleteTransport,
+    type InlayReferenceScanTransport,
+} from "../../storage/nodeStorage";
 import {
     type InlayAssetMeta,
     buildInlayMeta,
     getInlayMeta,
     getInlayMetasBatch,
-    removeInlayMeta,
     setInlayMeta,
 } from "./inlayMeta";
 
@@ -160,6 +163,7 @@ export function __resetInlayStorageForTest(): void {
     totalLRUSize = 0
     _nodeInlayStorage = null
     _nodeInlayInfoStorage = null
+    _nodeInlayAdminStorage = null
 }
 
 // ── NodeInlayStorage ──
@@ -332,6 +336,7 @@ function toCoreInlayAsset(asset: any): InlayAsset {
 
 let _nodeInlayStorage: NodeInlayStorage | null = null
 let _nodeInlayInfoStorage: NodeInlayInfoStorage | null = null
+let _nodeInlayAdminStorage: NodeStorage | null = null
 
 function getInlayStorage(): NodeInlayStorage {
     if (!_nodeInlayStorage) _nodeInlayStorage = new NodeInlayStorage()
@@ -341,6 +346,11 @@ function getInlayStorage(): NodeInlayStorage {
 function getInlayInfoStorage(): NodeInlayInfoStorage {
     if (!_nodeInlayInfoStorage) _nodeInlayInfoStorage = new NodeInlayInfoStorage()
     return _nodeInlayInfoStorage
+}
+
+function getInlayAdminStorage(): NodeStorage {
+    if (!_nodeInlayAdminStorage) _nodeInlayAdminStorage = new NodeStorage()
+    return _nodeInlayAdminStorage
 }
 
 export { getInlayMeta } from "./inlayMeta";
@@ -606,26 +616,31 @@ export async function setInlayAsset(id: string, img: InlayAsset) {
     _explorerItemsCache = null // invalidate gallery cache
 }
 
-export async function removeInlayAsset(id: string) {
-    await getInlayStorage().removeItem(id)
-    await getInlayInfoStorage().removeItem(id)
-    await removeInlayMeta(id)
-    _explorerItemsCache = null // invalidate gallery cache
+export type InlayDeleteResult = Pick<InlayDeleteTransport, 'removedIds' | 'referencedIds'>
+
+export async function removeInlayAsset(id: string): Promise<boolean> {
+    const result = await removeInlayAssets([id])
+    return result.removedIds.includes(id)
 }
 
-export async function removeInlayAssets(ids: string[]): Promise<number> {
-    if (!Array.isArray(ids) || ids.length === 0) return 0
-    let removed = 0
-    for (const id of ids) {
-        if (!id) continue
-        try {
-            await removeInlayAsset(id)
-            removed++
-        } catch {
-            // best-effort bulk delete
-        }
+export async function removeInlayAssets(ids: string[]): Promise<InlayDeleteResult> {
+    const requestedIds = [...new Set(ids.filter((id) => typeof id === 'string' && id.length > 0))]
+    if (requestedIds.length === 0) return { removedIds: [], referencedIds: [] }
+
+    // Loaded chats can contain edits that have not reached the save loop yet.
+    // Send that local keep-set in addition to the server's authoritative scan.
+    const localReferences = scanLoadedInlayReferences()
+    const requested = new Set(requestedIds)
+    const clientProtectedIds = Object.keys(localReferences.refCounts).filter((id) => requested.has(id))
+    const result = await getInlayAdminStorage().deleteUnreferencedInlays(
+        requestedIds,
+        clientProtectedIds,
+    )
+    for (const id of result.removedIds) {
+        lruDelete(id)
     }
-    return removed
+    _explorerItemsCache = null
+    return { removedIds: result.removedIds, referencedIds: result.referencedIds }
 }
 
 export async function setInlayMetaFields(
@@ -655,22 +670,24 @@ export async function getInlayInfosBatch(ids: string[]): Promise<Record<string, 
     return await getInlayInfoStorage().getItems<InlayExplorerInfo>(ids)
 }
 
-export type InlayScanResult = {
-    scannedAt: number
-    totalMessages: number
-    refCounts: Record<string, number>
-}
+export type InlayScanResult = InlayReferenceScanTransport
 
 const INLAY_REF_REGEX = /\{\{(?:inlay|inlayed|inlayeddata)::(.+?)\}\}/g
 
-/**
- * Scan all chat messages in the database and count how many times each inlay ID is referenced.
- * This is a synchronous read from the in-memory DB state — no async I/O needed.
- */
-export function scanInlayReferences(): InlayScanResult {
+function addInlayReferencesFromText(text: unknown, refCounts: Record<string, number>): void {
+    if (typeof text !== 'string') return
+    const regex = new RegExp(INLAY_REF_REGEX.source, 'g')
+    let match: RegExpExecArray | null
+    while ((match = regex.exec(text)) !== null) {
+        const id = match[1]
+        refCounts[id] = (refCounts[id] ?? 0) + 1
+    }
+}
+
+function scanLoadedInlayReferences(): InlayScanResult {
     const db = getDatabase()
     const characters = Array.isArray(db?.characters) ? db.characters : []
-    const refCounts: Record<string, number> = {}
+    const refCounts: Record<string, number> = Object.create(null)
     let totalMessages = 0
 
     for (const char of characters) {
@@ -678,20 +695,34 @@ export function scanInlayReferences(): InlayScanResult {
         for (const chat of char.chats) {
             if (!Array.isArray(chat?.message)) continue
             for (const msg of chat.message) {
-                if (typeof msg?.data !== 'string') continue
+                if (!msg || typeof msg !== 'object') continue
                 totalMessages++
-                // Reset regex state and create fresh instance to avoid lastIndex issues
-                const regex = new RegExp(INLAY_REF_REGEX.source, 'g')
-                let m: RegExpExecArray | null
-                while ((m = regex.exec(msg.data)) !== null) {
-                    const id = m[1]
-                    refCounts[id] = (refCounts[id] ?? 0) + 1
+                addInlayReferencesFromText(msg.data, refCounts)
+                if (Array.isArray(msg.swipes)) {
+                    for (const swipe of msg.swipes) {
+                        addInlayReferencesFromText(swipe, refCounts)
+                    }
                 }
             }
         }
     }
 
     return { scannedAt: Date.now(), totalMessages, refCounts }
+}
+
+/**
+ * Scan authoritative server chat rows, then merge references from loaded chats
+ * so unsaved local edits are also retained. Max-count merging avoids double
+ * counting the active chat that normally exists in both sources.
+ */
+export async function scanInlayReferences(): Promise<InlayScanResult> {
+    const server = await getInlayAdminStorage().scanInlayReferences()
+    const loaded = scanLoadedInlayReferences()
+    const refCounts: Record<string, number> = Object.assign(Object.create(null), server.refCounts)
+    for (const [id, count] of Object.entries(loaded.refCounts)) {
+        refCounts[id] = Math.max(refCounts[id] ?? 0, count)
+    }
+    return { ...server, refCounts }
 }
 
 export function supportsInlayImage() {

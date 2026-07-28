@@ -2477,6 +2477,105 @@ function isSafeInlayId(id) {
         id !== '..';
 }
 
+const MAX_INLAY_DELETE_BATCH = 1000;
+const INLAY_REFERENCE_PATTERN = /\{\{(?:inlay|inlayed|inlayeddata)::(.+?)\}\}/g;
+
+function addInlayReferencesFromText(text, refCounts) {
+    if (typeof text !== 'string') return;
+    const regex = new RegExp(INLAY_REFERENCE_PATTERN.source, 'g');
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+        const id = match[1];
+        refCounts.set(id, (refCounts.get(id) ?? 0) + 1);
+    }
+}
+
+function addInlayReferencesFromChat(chat, refCounts) {
+    if (!Array.isArray(chat?.message)) return 0;
+    let totalMessages = 0;
+    for (const message of chat.message) {
+        if (!message || typeof message !== 'object') continue;
+        totalMessages++;
+        addInlayReferencesFromText(message.data, refCounts);
+        if (Array.isArray(message.swipes)) {
+            for (const swipe of message.swipes) {
+                addInlayReferencesFromText(swipe, refCounts);
+            }
+        }
+    }
+    return totalMessages;
+}
+
+/**
+ * Count references from server-authoritative chat rows. This deliberately scans
+ * every physical chat row, including a recently staged row whose stub has not
+ * committed yet. Being conservative can temporarily retain an orphan, while
+ * omitting that row could permanently delete media from a newly created chat.
+ */
+async function scanAuthoritativeInlayReferences() {
+    const refCounts = new Map();
+    let totalMessages = 0;
+
+    for (const key of chatRowStore.listAllChatRowKeys()) {
+        const identity = chatRowStore.parseChatRowKey(key);
+        if (!identity) continue;
+        const chat = await chatRowStore.readChatRow(identity.chaId, identity.chatId);
+        if (!chat) continue;
+        if (isColdStorageChat(chat) && !restoreColdStorageChat(chat)) {
+            throw new Error(`Cannot verify inlay references in cold-storage chat ${key}`);
+        }
+        totalMessages += addInlayReferencesFromChat(chat, refCounts);
+    }
+
+    return {
+        scannedAt: Date.now(),
+        totalMessages,
+        refCounts: Object.fromEntries([...refCounts.entries()].sort(([left], [right]) => (
+            left.localeCompare(right)
+        ))),
+    };
+}
+
+function validateInlayDeleteRequest(body) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+    if (!Array.isArray(body.ids)
+        || body.ids.length === 0
+        || body.ids.length > MAX_INLAY_DELETE_BATCH) return null;
+    const ids = [...new Set(body.ids)];
+    if (ids.length === 0 || ids.some((id) => !isSafeInlayId(id))) return null;
+
+    const clientProtected = body.clientProtectedIds ?? [];
+    if (!Array.isArray(clientProtected)
+        || clientProtected.length > MAX_INLAY_DELETE_BATCH
+        || clientProtected.some((id) => typeof id !== 'string')) return null;
+    const requested = new Set(ids);
+    return {
+        ids,
+        clientProtectedIds: new Set(clientProtected.filter((id) => requested.has(id))),
+    };
+}
+
+async function deleteUnreferencedInlays(ids, clientProtectedIds = new Set()) {
+    const scan = await scanAuthoritativeInlayReferences();
+    const referencedIds = ids.filter((id) => (
+        clientProtectedIds.has(id) || (scan.refCounts[id] ?? 0) > 0
+    ));
+    const referenced = new Set(referencedIds);
+    const removedIds = [];
+
+    for (const id of ids) {
+        if (referenced.has(id)) continue;
+        await deleteInlayFile(id);
+        kvDel(`inlay/${id}`);
+        kvDel(`inlay_thumb/${id}`);
+        kvDel(`inlay_info/${id}`);
+        kvDel(`inlay_meta/${id}`);
+        removedIds.push(id);
+    }
+
+    return { removedIds, referencedIds, scannedAt: scan.scannedAt };
+}
+
 function normalizeInlayExt(ext) {
     if (typeof ext !== 'string') return 'bin';
     const normalized = ext.trim().toLowerCase().replace(/^\.+/, '').replace(/[\/\\\0]/g, '');
@@ -7820,6 +7919,47 @@ app.post('/api/plugin-storage/clear', async (req, res) => {
     });
 });
 
+app.get('/api/inlays/references', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const result = await queueStorageMutation(() => scanAuthoritativeInlayReferences());
+        res.json(result);
+    } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
+        next(error);
+    }
+});
+
+app.post('/api/inlays/delete-unreferenced', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    const request = validateInlayDeleteRequest(req.body);
+    if (!request) {
+        return res.status(400).json({
+            success: false,
+            error: `ids must contain 1-${MAX_INLAY_DELETE_BATCH} safe inlay IDs`,
+            code: 'INVALID_INLAY_DELETE_REQUEST',
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        });
+    }
+    try {
+        const result = await queueStorageMutation(() => deleteUnreferencedInlays(
+            request.ids,
+            request.clientProtectedIds,
+        ));
+        res.json({
+            success: true,
+            ...result,
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+        });
+    } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
+        next(error);
+    }
+});
+
 app.get('/api/remove', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
@@ -7854,14 +7994,48 @@ app.get('/api/remove', async (req, res, next) => {
             }
             if (key.startsWith('inlay/')) {
                 const id = key.slice('inlay/'.length)
-                await deleteInlayFile(id)
-                kvDel(key);
-                kvDel(`inlay_thumb/${id}`);
-                kvDel(`inlay_info/${id}`);
+                if (!isSafeInlayId(id)) {
+                    return res.status(400).json({ error: 'Invalid inlay ID' });
+                }
+                const result = await deleteUnreferencedInlays([id]);
+                if (result.referencedIds.length > 0) {
+                    return res.status(409).json({
+                        success: false,
+                        error: 'The inlay is still referenced by a stored chat message',
+                        code: 'INLAY_REFERENCED',
+                        referencedIds: result.referencedIds,
+                        commitOutcome: 'not-committed',
+                        commitOutcomeUnknown: false,
+                    });
+                }
                 return res.send({ success: true });
             }
             if (key.startsWith('inlay_info/')) {
-                await fs.unlink(getInlaySidecarPath(key.slice('inlay_info/'.length))).catch(() => {});
+                const id = key.slice('inlay_info/'.length);
+                const scan = await scanAuthoritativeInlayReferences();
+                if ((scan.refCounts[id] ?? 0) > 0) {
+                    return res.status(409).json({
+                        success: false,
+                        error: 'The inlay is still referenced by a stored chat message',
+                        code: 'INLAY_REFERENCED',
+                        commitOutcome: 'not-committed',
+                        commitOutcomeUnknown: false,
+                    });
+                }
+                await fs.unlink(getInlaySidecarPath(id)).catch(() => {});
+            }
+            if (key.startsWith('inlay_meta/')) {
+                const id = key.slice('inlay_meta/'.length);
+                const scan = await scanAuthoritativeInlayReferences();
+                if ((scan.refCounts[id] ?? 0) > 0) {
+                    return res.status(409).json({
+                        success: false,
+                        error: 'The inlay is still referenced by a stored chat message',
+                        code: 'INLAY_REFERENCED',
+                        commitOutcome: 'not-committed',
+                        commitOutcomeUnknown: false,
+                    });
+                }
             }
             if (key.startsWith('assets/')) {
                 deleteAssetValue(key);

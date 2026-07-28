@@ -54,6 +54,8 @@
 
   // Scan state
   let scanResult = $state<InlayScanResult | null>(null)
+  let scanning = $state(false)
+  let scanRequest = 0
 
   // Viewer state
   let viewerOpen = $state(false)
@@ -83,7 +85,9 @@
         if (specialFilter === 'meta-missing' && item.hasMeta) return false
         if (specialFilter === 'orphan-character' && !isOrphanCharacter(item)) return false
         if (specialFilter === 'orphan-chat' && !isOrphanChat(item)) return false
-        if (specialFilter === 'orphan-message' && (scanResult?.refCounts[item.id] ?? 0) > 0) return false
+        if (specialFilter === 'orphan-message') {
+          if (!scanResult || (scanResult.refCounts[item.id] ?? 0) > 0) return false
+        }
         return true
       })
   })
@@ -240,14 +244,22 @@
 
   const deleteAsset = async (id: string, name: string) => {
     if (!(await alertConfirm(language.playground.inlayDeleteConfirm.replace('{name}', name)))) return
-    await removeInlayAsset(id)
-    selection.delete(id)
-    allItems = allItems.filter((item) => item.id !== id)
-    if (viewerId === id) {
-      const currentIndex = sortedItems.findIndex((item) => item.id === id)
-      const nextItem = sortedItems[currentIndex + 1] ?? sortedItems[currentIndex - 1] ?? null
-      if (nextItem) openViewer(nextItem.id)
-      else closeViewer()
+    try {
+      const removed = await removeInlayAsset(id)
+      if (!removed) {
+        notifyError(language.playground.inlayDeleteReferenced.replace('{count}', '1'))
+        return
+      }
+      selection.delete(id)
+      allItems = allItems.filter((item) => item.id !== id)
+      if (viewerId === id) {
+        const currentIndex = sortedItems.findIndex((item) => item.id === id)
+        const nextItem = sortedItems[currentIndex + 1] ?? sortedItems[currentIndex - 1] ?? null
+        if (nextItem) openViewer(nextItem.id)
+        else closeViewer()
+      }
+    } catch (error) {
+      notifyError(`${error}`)
     }
   }
 
@@ -255,10 +267,19 @@
     if (selection.size === 0) return
     if (!(await alertConfirm(language.playground.inlayDeleteMultipleConfirm.replace('{count}', selection.size.toString())))) return
     const ids = allItems.filter((item) => selection.has(item.id)).map((item) => item.id)
-    await removeInlayAssets(ids)
-    allItems = allItems.filter((item) => !selection.has(item.id))
-    if (viewerId && selection.has(viewerId)) closeViewer()
-    selection.clear()
+    try {
+      const result = await removeInlayAssets(ids)
+      const removed = new Set(result.removedIds)
+      allItems = allItems.filter((item) => !removed.has(item.id))
+      if (viewerId && removed.has(viewerId)) closeViewer()
+      selection.clear()
+      result.referencedIds.forEach((id) => selection.add(id))
+      if (result.referencedIds.length > 0) {
+        notifyError(language.playground.inlayDeleteReferenced.replace('{count}', result.referencedIds.length.toString()))
+      }
+    } catch (error) {
+      notifyError(`${error}`)
+    }
   }
 
   // --- Effects ---
@@ -278,10 +299,29 @@
     galleryScrollContainer?.scrollTo({ top: 0 })
   })
 
-  // Auto-scan when orphan-message filter is selected
+  const refreshInlayReferenceScan = async (request: number) => {
+    scanResult = null
+    scanning = true
+    try {
+      const result = await scanInlayReferences()
+      if (request === scanRequest && specialFilter === 'orphan-message') scanResult = result
+    } catch (error) {
+      if (request === scanRequest && specialFilter === 'orphan-message') {
+        notifyError(language.playground.inlayScanFailed)
+        specialFilter = 'all'
+      }
+    } finally {
+      if (request === scanRequest) scanning = false
+    }
+  }
+
+  // Scan authoritative rows each time the message-orphan filter is selected.
   $effect(() => {
-    if (specialFilter === 'orphan-message' && !scanResult) {
-      scanResult = scanInlayReferences()
+    if (specialFilter === 'orphan-message') {
+      void refreshInlayReferenceScan(++scanRequest)
+    } else {
+      scanRequest++
+      scanning = false
     }
   })
 
@@ -372,7 +412,9 @@
     <header class="shrink-0 flex flex-col gap-3 bg-bgcolor pb-4">
       <div class="flex flex-wrap gap-3 items-center">
         <span class="text-textcolor2 text-sm">
-          {language.playground.inlayTotalAssets.replace('{count}', filteredItems.length.toString())}
+          {scanning
+            ? language.playground.inlayScanning
+            : language.playground.inlayTotalAssets.replace('{count}', filteredItems.length.toString())}
         </span>
         <div class="flex gap-2 ml-auto">
           {#if hasSelection}

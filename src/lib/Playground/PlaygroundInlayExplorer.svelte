@@ -5,7 +5,7 @@
   import { language } from 'src/lang'
   import SelectInput from "src/lib/UI/GUI/SelectInput.svelte";
   import OptionInput from "src/lib/UI/GUI/OptionInput.svelte";
-  import { alertConfirm } from 'src/ts/alert'
+  import { alertConfirm, notifyError } from 'src/ts/alert'
   import {
     getCharacterChatIndex,
     listInlayExplorerItems,
@@ -29,6 +29,8 @@
   let displayCount = $state(PAGE_SIZE)
   let loading = $state(true)
   let scanResult = $state<InlayScanResult | null>(null)
+  let scanning = $state(false)
+  let scanRequest = 0
   let paging = $state(false)
   let loadMoreSentinel: HTMLDivElement | null = $state(null)
   let selection = $state<Set<string>>(new SvelteSet())
@@ -50,7 +52,9 @@
       if (specialFilter === 'meta-missing' && item.hasMeta) return false
       if (specialFilter === 'orphan-character' && !isOrphanCharacter(item)) return false
       if (specialFilter === 'orphan-chat' && !isOrphanChat(item)) return false
-      if (specialFilter === 'orphan-message' && (scanResult?.refCounts[item.id] ?? 0) > 0) return false
+      if (specialFilter === 'orphan-message') {
+        if (!scanResult || (scanResult.refCounts[item.id] ?? 0) > 0) return false
+      }
 
       return true
     })
@@ -148,9 +152,17 @@
     if (!(await alertConfirm(language.playground.inlayDeleteConfirm.replace('{name}', name)))) {
       return
     }
-    await removeInlayAsset(id)
-    selection.delete(id)
-    allItems = allItems.filter((item) => item.id !== id)
+    try {
+      const removed = await removeInlayAsset(id)
+      if (!removed) {
+        notifyError(language.playground.inlayDeleteReferenced.replace('{count}', '1'))
+        return
+      }
+      selection.delete(id)
+      allItems = allItems.filter((item) => item.id !== id)
+    } catch (error) {
+      notifyError(`${error}`)
+    }
   }
 
   const deleteSelected = async () => {
@@ -160,9 +172,34 @@
     }
 
     const ids = allItems.filter((item) => selection.has(item.id)).map((item) => item.id)
-    await removeInlayAssets(ids)
-    allItems = allItems.filter((item) => !selection.has(item.id))
-    selection.clear()
+    try {
+      const result = await removeInlayAssets(ids)
+      const removed = new Set(result.removedIds)
+      allItems = allItems.filter((item) => !removed.has(item.id))
+      selection.clear()
+      result.referencedIds.forEach((id) => selection.add(id))
+      if (result.referencedIds.length > 0) {
+        notifyError(language.playground.inlayDeleteReferenced.replace('{count}', result.referencedIds.length.toString()))
+      }
+    } catch (error) {
+      notifyError(`${error}`)
+    }
+  }
+
+  const refreshInlayReferenceScan = async (request: number) => {
+    scanResult = null
+    scanning = true
+    try {
+      const result = await scanInlayReferences()
+      if (request === scanRequest && specialFilter === 'orphan-message') scanResult = result
+    } catch (error) {
+      if (request === scanRequest && specialFilter === 'orphan-message') {
+        notifyError(language.playground.inlayScanFailed)
+        specialFilter = 'all'
+      }
+    } finally {
+      if (request === scanRequest) scanning = false
+    }
   }
 
   $effect(() => {
@@ -174,8 +211,11 @@
   })
 
   $effect(() => {
-    if (specialFilter === 'orphan-message' && !scanResult) {
-      scanResult = scanInlayReferences()
+    if (specialFilter === 'orphan-message') {
+      void refreshInlayReferenceScan(++scanRequest)
+    } else {
+      scanRequest++
+      scanning = false
     }
   })
 
@@ -249,7 +289,11 @@
 
 <header class="flex flex-col gap-4 py-6 sticky top-0 bg-bgcolor z-10">
   <div class="flex flex-wrap gap-4 items-center">
-    <span class="text-textcolor2">{language.playground.inlayTotalAssets.replace('{count}', filteredItems.length.toString())}</span>
+    <span class="text-textcolor2">
+      {scanning
+        ? language.playground.inlayScanning
+        : language.playground.inlayTotalAssets.replace('{count}', filteredItems.length.toString())}
+    </span>
     {#if allItems.length > 0}
       <div class="flex gap-2 ml-auto">
         {#if hasSelection}

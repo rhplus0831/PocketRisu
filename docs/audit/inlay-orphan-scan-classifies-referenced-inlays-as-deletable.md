@@ -1,6 +1,6 @@
 # The inlay gallery's orphan scan classifies referenced inlays as deletable
 
-- Status: Open
+- Status: Fixed
 - Severity: High
 - Area: client file management (inlay gallery)
 - Affected code: `src/ts/process/files/inlays.ts:670-695` (`scanInlayReferences` reads only in-memory `chat.message`), `src/ts/storage/chatStorage.ts:20-29` (placeholders have `message: []`), `src/lib/Setting/Pages/InlayImageGallery.svelte:86` (orphan-message filter treats refCount 0 as orphan), `src/lib/Setting/Pages/InlayImageGallery.svelte:241-258` (delete flow), `server/node/server.cjs:4072-4081` (`/api/remove` deletes payload, sidecar, and KV rows without a reference check)
@@ -35,3 +35,18 @@ trash/grace period for gallery deletions.
 Cover with a test that seeds a chat row referencing an inlay, boots a client
 without opening the chat, runs the orphan scan, and asserts the inlay is not
 classified as deletable.
+
+## Resolution
+
+Fixed 2026-07-28. The gallery scan now reads every authoritative server chat
+row and merges that result with loaded client chats so both unopened history
+and unsaved local edits contribute to the keep-set. Gallery deletion uses one
+guarded bulk endpoint that scans again while holding the storage mutation queue;
+IDs referenced by either stored rows or the client's unsaved keep-set are not
+deleted. The compatibility `/api/remove` path applies the same stored-row guard
+to inlay payload and metadata deletion.
+
+Regression coverage imports a chat containing inlay tokens without fetching
+its content, verifies that the server scan finds both current-message and swipe
+references, adds another reference after that scan, and proves the queued delete
+revalidation preserves all referenced IDs while removing only the true orphan.

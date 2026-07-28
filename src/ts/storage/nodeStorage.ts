@@ -61,6 +61,8 @@ import type { BootInternalSnapshot } from "./bootSnapshotRecovery"
 import { comparePluginStorageKeys } from "../plugins/pluginStorageRecord"
 
 export const AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS = 15_000
+/** Full chat-row scans can legitimately traverse years of chat history. */
+export const INLAY_REFERENCE_IO_TIMEOUT_MS = 2 * 60_000
 /** Snapshot ingestion can legitimately stream hundreds of MiB from chunk storage. */
 export const INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS = 10 * 60_000
 /** Save-folder uploads share the same finite end-to-end restore deadline. */
@@ -547,6 +549,54 @@ export interface StorageCapacity {
 export interface StorageEntrySize {
     key: string
     size: number
+}
+
+export interface InlayReferenceScanTransport {
+    scannedAt: number
+    totalMessages: number
+    refCounts: Record<string, number>
+}
+
+export interface InlayDeleteTransport {
+    success: true
+    removedIds: string[]
+    referencedIds: string[]
+    scannedAt: number
+    commitOutcome: 'committed'
+    commitOutcomeUnknown: false
+}
+
+function isInlayReferenceScanTransport(value: unknown): value is InlayReferenceScanTransport {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const result = value as Record<string, unknown>
+    if (!Number.isSafeInteger(result.scannedAt)
+        || (result.scannedAt as number) <= 0
+        || !Number.isSafeInteger(result.totalMessages)
+        || (result.totalMessages as number) < 0
+        || !result.refCounts
+        || typeof result.refCounts !== 'object'
+        || Array.isArray(result.refCounts)) return false
+    return Object.entries(result.refCounts as Record<string, unknown>).every(([id, count]) => (
+        id.length > 0 && Number.isSafeInteger(count) && (count as number) > 0
+    ))
+}
+
+function isInlayDeleteTransport(value: unknown, requestedIds: string[]): value is InlayDeleteTransport {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const result = value as Record<string, unknown>
+    if (result.success !== true
+        || result.commitOutcome !== 'committed'
+        || result.commitOutcomeUnknown !== false
+        || !Number.isSafeInteger(result.scannedAt)
+        || !Array.isArray(result.removedIds)
+        || !Array.isArray(result.referencedIds)) return false
+    const requested = new Set(requestedIds)
+    const removed = result.removedIds as unknown[]
+    const referenced = result.referencedIds as unknown[]
+    if ([...removed, ...referenced].some((id) => typeof id !== 'string' || !requested.has(id))) return false
+    const classified = [...removed, ...referenced] as string[]
+    return new Set(classified).size === requested.size
+        && classified.length === requested.size
 }
 
 // Custom error class for database conflict detection
@@ -3370,6 +3420,60 @@ export class NodeStorage{
             AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
             externalSignal,
         )
+    }
+
+    async scanInlayReferences(
+        externalSignal?: AbortSignal | null,
+    ): Promise<InlayReferenceScanTransport> {
+        return runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const response = await this.requestStorage(
+                'inlay/',
+                'read',
+                false,
+                () => this.authFetch('/api/inlays/references', { signal }),
+                [],
+                signal,
+            )
+            const data: unknown = await awaitWithAbort(response.json(), signal)
+            if (!isInlayReferenceScanTransport(data)) {
+                throw new Error('Invalid inlay reference scan response')
+            }
+            return data
+        }, 'read', INLAY_REFERENCE_IO_TIMEOUT_MS, externalSignal)
+    }
+
+    async deleteUnreferencedInlays(
+        ids: string[],
+        clientProtectedIds: string[] = [],
+        externalSignal?: AbortSignal | null,
+    ): Promise<InlayDeleteTransport> {
+        const requestedIds = [...new Set(ids)]
+        return runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
+            const response = await this.requestStorage(
+                'inlay/',
+                'remove',
+                true,
+                () => this.authFetch('/api/inlays/delete-unreferenced', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ ids: requestedIds, clientProtectedIds }),
+                    signal,
+                }, true, outcome),
+                [],
+                signal,
+                outcome,
+            )
+            const data: unknown = await awaitWithAbort(response.json(), signal)
+            if (!isInlayDeleteTransport(data, requestedIds)) {
+                throw new StorageError('Invalid inlay deletion acknowledgement', {
+                    code: 'COMMIT_OUTCOME_UNKNOWN',
+                    retryable: false,
+                    commitOutcomeUnknown: true,
+                    operation: 'remove',
+                })
+            }
+            return data
+        }, 'remove', INLAY_REFERENCE_IO_TIMEOUT_MS, externalSignal)
     }
 
     private async removeItemAuthoritative(
