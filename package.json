@@ -16,6 +16,7 @@
     "test": "vitest run",
     "test:compat": "vitest run --config vitest.config.compat.ts",
     "test:performance": "node scripts/run-performance-tests.mjs",
+    "test:performance:extreme": "node scripts/run-performance-extreme-tests.mjs",
     "test:server": "vitest run --config vitest.config.server.ts",
     "runserver": "node server/node/server.cjs",
     "hono:build": "vite build --sourcemap && node server/hono/src/utils/postbuild.js"

@@ -37,9 +37,32 @@ vi.mock('../../src/ts/process/modules', () => ({
 }))
 
 const MIB = 1024 * 1024
-const ROW_BYTES = 7 * MIB
-const ROW_COUNT = 8
+const EXTREME_MEMORY_MODE = process.env.POCKETRISU_PERF_EXTREME === '1'
+
+function positiveExtremeInteger(name: string, fallback: number): number {
+  const parsed = Number(process.env[name])
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback
+}
+
+// The opt-in extreme profile keeps each value below the production 128 MiB
+// limit while retaining enough inline Unicode data to drive worker RSS toward
+// 2 GiB. The 448 MiB default stays below V8's maximum string length because
+// inline RisuSave publication must stringify the complete plugin map once.
+// Environment overrides are intended for smoke/debug runs only.
+const ROW_BYTES = EXTREME_MEMORY_MODE
+  ? positiveExtremeInteger('POCKETRISU_EXTREME_ROW_MIB', 28) * MIB
+  : 7 * MIB
+const ROW_COUNT = EXTREME_MEMORY_MODE
+  ? positiveExtremeInteger('POCKETRISU_EXTREME_ROWS', 16)
+  : 8
 const TOTAL_BYTES = ROW_BYTES * ROW_COUNT
+const EXTREME_TARGET_RSS_BYTES = positiveExtremeInteger(
+  'POCKETRISU_EXTREME_TARGET_RSS_MIB',
+  2 * 1024,
+) * MIB
+const EXTREME_MIN_RSS_BYTES = EXTREME_MEMORY_MODE
+  ? Math.max(0, Number(process.env.POCKETRISU_EXTREME_MIN_RSS_MIB ?? 1_536)) * MIB
+  : 0
 const CHUNK_MARKER = Buffer.from('\x00RISUCHUNKED\x00', 'binary')
 const VALUE_PREFIX = 'pluginsave/'
 const MANIFEST_KEY = 'plugin-storage/manifest.json'
@@ -309,7 +332,9 @@ function assertPerRowMemoryShape(
 }
 
 describe('PM2 production plugin-storage transition memory (real client and server)', () => {
-  test('bounds an isolated 56 MiB Unicode transition cycle with PM1 chunks', async () => {
+  test(EXTREME_MEMORY_MODE
+    ? `bounds an isolated ${Math.round(TOTAL_BYTES / MIB)} MiB extreme Unicode transition near 2 GiB RSS`
+    : 'bounds an isolated 56 MiB Unicode transition cycle with PM1 chunks', async () => {
     expect(typeof (globalThis as typeof globalThis & { gc?: () => void }).gc).toBe('function')
     const cacheMode = process.env.POCKETRISU_PERF_RESOURCE_CACHE
     expect(['off', 'on']).toContain(cacheMode)
@@ -319,7 +344,15 @@ describe('PM2 production plugin-storage transition memory (real client and serve
       env: {
         // Keep the layout assertion independent of the production default while
         // exercising the same PM1 file-to-CDC implementation.
-        POCKETRISU_CHUNK_THRESHOLD: String(MIB),
+        POCKETRISU_CHUNK_THRESHOLD: String(Math.max(1, Math.min(MIB, ROW_BYTES / 2))),
+        ...(EXTREME_MEMORY_MODE
+          ? {
+              // The normal aggregate quota is 1 GiB. This opt-in harness needs
+              // headroom for override profiles above 1 GiB, while each individual
+              // value remains within the normal 128 MiB boundary.
+              POCKETRISU_PLUGIN_STORAGE_MAX_BYTES: String(TOTAL_BYTES + 128 * MIB),
+            }
+          : {}),
       },
     })
     servers.push(server)
@@ -530,6 +563,52 @@ describe('PM2 production plugin-storage transition memory (real client and serve
           expect(cacheProbeReads.every(entry => !entry.headers.has('x-cached-hashes'))).toBe(true)
         }
 
+        // Production intentionally refuses to internalize more than 64 MiB.
+        // The extreme profile therefore exercises the large, valid direction:
+        // inline publication -> staged optimized rows. Returning here avoids
+        // turning a safety-boundary refusal into the purpose of this RSS test.
+        if (EXTREME_MEMORY_MODE) {
+          const observedPeakRss = Math.max(
+            externalWholeBaseline.rss,
+            externalSampler.peak.rss,
+            externalFinal.rss,
+          )
+          if (Number.isFinite(EXTREME_MIN_RSS_BYTES) && EXTREME_MIN_RSS_BYTES > 0) {
+            expect(observedPeakRss).toBeGreaterThanOrEqual(EXTREME_MIN_RSS_BYTES)
+          }
+          memoryEvidence[cycleLabel] = {
+            externalize: {
+              wholeBaseline: externalWholeBaseline,
+              stageBaseline: externalStageBaseline,
+              peak: externalSampler.peak,
+              final: externalFinal,
+              checkpoints: externalProgress.map(({ completed, memory }) => ({
+                completed,
+                ...memory,
+              })),
+            },
+          }
+          expect(saveLoopFailure).toBeNull()
+          expect(requestLog.some(entry => entry.path === '/api/plugin-storage/transition'))
+            .toBe(false)
+          console.info('[PM2 extreme memory target]', JSON.stringify({
+            targetRssBytes: EXTREME_TARGET_RSS_BYTES,
+            minimumRssBytes: EXTREME_MIN_RSS_BYTES,
+            observedPeakRss,
+            targetRatio: observedPeakRss / EXTREME_TARGET_RSS_BYTES,
+            rowBytes: ROW_BYTES,
+            rows: ROW_COUNT,
+            totalLogicalBytes: TOTAL_BYTES,
+          }))
+          console.info('[PM2 memory evidence]', JSON.stringify({
+            rowBytes: ROW_BYTES,
+            rows: ROW_COUNT,
+            totalBytes: TOTAL_BYTES,
+            cycles: memoryEvidence,
+          }))
+          return
+        }
+
         const internalProgress: ProgressRecord[] = []
         let internalStageBaseline: MemoryPoint | null = null
         const internalWholeBaseline = await settleGc()
@@ -669,5 +748,5 @@ describe('PM2 production plugin-storage transition memory (real client and serve
     } finally {
       vi.unstubAllGlobals()
     }
-  }, 600_000)
+  }, EXTREME_MEMORY_MODE ? 3_600_000 : 600_000)
 })

@@ -52,6 +52,7 @@ dist.zip
 !/scripts/check-help-keys.mjs
 !/scripts/dedup-assets.sh
 !/scripts/run-performance-tests.mjs
+!/scripts/run-performance-extreme-tests.mjs
 .env
 /server/node/ssl/certificate
 /bin/

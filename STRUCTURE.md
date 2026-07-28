@@ -39,7 +39,7 @@ accepted, and PocketRisu-only state may have no upstream runtime meaning.
 ## Run and verify
 
 Use pnpm 10.34.1 and Node 22.12 or newer; Node 24 is recommended and used by current
-Docker/release builds. The four test commands below are separate suites—there is no
+Docker/release builds. The five test commands below are separate suites—there is no
 aggregate `test:all` command.
 
 | Command | Purpose |
@@ -54,6 +54,7 @@ aggregate `test:all` command.
 | `pnpm test:server` | Node server unit tests with real `better-sqlite3` |
 | `pnpm test:compat` | Real-server storage/interchange integration tests: imports, exports, atomicity, caches, plugin storage |
 | `pnpm test:performance` | Isolated performance suite, run with resource cache disabled and enabled |
+| `pnpm test:performance:extreme` | Opt-in 448 MiB plugin transition stress test targeting roughly 2 GiB peak RSS; performs memory/disk preflight and never runs from the default performance command |
 
 The upstream-backup fixture suite runs only when the ignored local file
 `test/fixtures/upstream/upstream-backup.bin` is supplied. Most `test/compat/` coverage
