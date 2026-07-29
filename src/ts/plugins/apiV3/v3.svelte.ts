@@ -161,6 +161,10 @@ class V3PluginLifecycleScope {
         }
     }
 
+    isCompatibilityDraining() {
+        return this.state === 'draining';
+    }
+
     markTerminated() {
         this.state = 'terminated';
     }
@@ -175,6 +179,7 @@ class V3PluginLifecycleScope {
             return [];
         }
         const controller = new AbortController();
+        const startedAt = Date.now();
         host.beginUnloadStorageAdmission();
         const completion = Promise.allSettled(callbacks.map(callback =>
             Promise.resolve().then(() => host.invokeUnloadCallback(callback, controller.signal)),
@@ -185,6 +190,9 @@ class V3PluginLifecycleScope {
             sleep(timeoutMs).then(() => timeout),
         ]);
         host.endUnloadStorageAdmission();
+
+        const remainingCompatibilityMs = Math.max(0, timeoutMs - (Date.now() - startedAt));
+        await host.drainLegacyUnloadOperations(remainingCompatibilityMs);
 
         if (result === timeout) {
             // Stop callback code from preparing later work. Storage mutations
@@ -2127,10 +2135,17 @@ export const makeRisuaiAPIV3 = (
 
             const callback = pluginChannel.get(pluginName + channelName);
             if(callback){
-                callback(message, {
+                const completion = callback(message, {
                     sender: currentPluginName,
                     channel: channelName
                 });
+                // Ordinary IPC preserves its historical dispatch-only behavior.
+                // During compatibility teardown, return the peer completion so
+                // the sandbox can drain fire-and-forget cancellation/unregister
+                // messages before removing the sender iframe.
+                if (lifecycle.isCompatibilityDraining()) {
+                    return Promise.resolve(completion).then(() => undefined);
+                }
             }
         },
         saveSecretHeader: async (key: string, value: string|string[]) => {

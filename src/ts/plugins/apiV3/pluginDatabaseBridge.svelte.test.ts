@@ -1913,6 +1913,117 @@ describe("V3 guest startup handshake", () => {
         restoreRelay();
     });
 
+    test("legacy compatibility admits only cleanup-shaped DOM mutations", async () => {
+        testState.database.legacyPluginCompatibility = true;
+        const style = document.createElement("style");
+        style.id = "compat-unload-style";
+        style.textContent = ".old-chat { display: none; }";
+        const marker = document.createElement("div");
+        marker.id = "compat-unload-marker";
+        marker.setAttribute("x-plugin-state", "active");
+        const original = document.createElement("button");
+        original.id = "compat-original-button";
+        const replacement = document.createElement("button");
+        replacement.id = "compat-replacement-button";
+        document.body.append(style, marker, original, replacement);
+
+        const plugin = startupPlugin("Compatible DOM Cleanup", `
+            const root = await risuai.getRootDocument();
+            const style = await root.getElementById("compat-unload-style");
+            const marker = await root.getElementById("compat-unload-marker");
+            const original = await root.getElementById("compat-original-button");
+            const replacement = await root.getElementById("compat-replacement-button");
+            await original.remove();
+            await risuai.onUnload(async () => {
+                try {
+                    await style.setInnerHTML("<b>new unload UI</b>");
+                } catch (error) {
+                    globalThis.nonEmptyHtmlRejected = true;
+                }
+                try {
+                    await marker.setAttribute("x-plugin-state", "still-active");
+                } catch (error) {
+                    globalThis.nonEmptyAttributeRejected = true;
+                }
+                await style.setInnerHTML("");
+                await marker.setAttribute("x-plugin-state", "");
+                await replacement.replaceWith(original);
+                globalThis.cleanupDomComplete = true;
+            });
+        `);
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+        await getV3PluginInstance(plugin.name)!.lifetime;
+
+        await expect(teardownV3Plugins()).resolves.toBeUndefined();
+
+        expect(guestWindow.nonEmptyHtmlRejected).toBe(true);
+        expect(guestWindow.nonEmptyAttributeRejected).toBe(true);
+        expect(guestWindow.cleanupDomComplete).toBe(true);
+        expect(style.textContent).toBe("");
+        expect(marker.getAttribute("x-plugin-state")).toBe("");
+        expect(document.getElementById("compat-original-button")).toBe(original);
+        expect(document.getElementById("compat-replacement-button")).toBeNull();
+        restoreRelay();
+    });
+
+    test("legacy compatibility drains fire-and-forget IPC cleanup", async () => {
+        testState.database.legacyPluginCompatibility = true;
+        const receiverStarted = deferred();
+        const releaseReceiver = deferred();
+        const senderName = "Unload IPC Sender";
+        const receiverName = "Unload IPC Receiver";
+        const sender = {
+            ...startupPlugin(senderName, `
+                await risuai.onUnload(() => {
+                    void risuai.postPluginChannelMessage(
+                        ${JSON.stringify(receiverName)},
+                        "cleanup",
+                        { method: "hooks/unregister" }
+                    );
+                });
+            `),
+            allowedIPC: [receiverName],
+        };
+        const receiver = {
+            ...startupPlugin(receiverName, ""),
+            allowedIPC: [senderName],
+        };
+        testState.database.plugins = [sender, receiver];
+        DBState.db = testState.database;
+        pluginChannel.set(`${receiverName}cleanup`, async (message: unknown) => {
+            expect(message).toEqual({ method: "hooks/unregister" });
+            receiverStarted.resolve();
+            await releaseReceiver.promise;
+        });
+
+        const loading = loadV3PluginGeneration([sender]);
+        const iframe = document.body.querySelector("iframe")!;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+        await getV3PluginInstance(sender.name)!.lifetime;
+
+        let teardownSettled = false;
+        const teardown = teardownV3Plugins().finally(() => {
+            teardownSettled = true;
+        });
+        await receiverStarted.promise;
+        await Promise.resolve();
+        expect(teardownSettled).toBe(false);
+
+        releaseReceiver.resolve();
+        await expect(teardown).resolves.toBeUndefined();
+        expect(teardownSettled).toBe(true);
+        expect(iframe.isConnected).toBe(false);
+        restoreRelay();
+    });
+
     test("exposes a non-destructive rewrite helper with a confirmed result", async () => {
         storageMocks.persistent.set(storageKey("maintenance-index"), {
             entries: ["kept"],

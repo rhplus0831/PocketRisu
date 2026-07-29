@@ -95,6 +95,7 @@ const LEGACY_UNLOAD_ROOT_METHODS = new Set([
     'unregisterUIPart',
     'hideContainer',
     'getRootDocument',
+    'postPluginChannelMessage',
     'log',
 ]);
 
@@ -119,6 +120,12 @@ const LEGACY_UNLOAD_INSTANCE_METHODS = new Set([
     'removeChild',
     'removeEventListener',
     'disconnect',
+    // Cleanup-only mutations are argument-restricted below. They restore or
+    // clear UI that the plugin installed before teardown without admitting
+    // new markup, attributes, or registrations during the drain window.
+    'replaceWith',
+    'setAttribute',
+    'setInnerHTML',
 ]);
 
 const LEGACY_UNLOAD_INSTANCE_MUTATION_METHODS = new Set([
@@ -126,6 +133,26 @@ const LEGACY_UNLOAD_INSTANCE_MUTATION_METHODS = new Set([
     'removeItem',
     'clear',
 ]);
+
+const isLegacyUnloadInstanceCallAllowed = (method: string, args: any[]): boolean => {
+    if (!LEGACY_UNLOAD_INSTANCE_METHODS.has(method)) return false;
+    if (method === 'setInnerHTML') {
+        return args.length === 1 && args[0] === '';
+    }
+    if (method === 'setAttribute') {
+        return args.length === 2
+            && typeof args[0] === 'string'
+            && args[0].startsWith('x-')
+            && args[1] === '';
+    }
+    if (method === 'replaceWith') {
+        return args.length === 1
+            && args[0] !== null
+            && typeof args[0] === 'object'
+            && args[0].__classType === 'REMOTE_REQUIRED';
+    }
+    return true;
+};
 
 interface RpcMessage {
     type: MsgType;
@@ -1144,6 +1171,7 @@ export class SandboxHost {
     private unloadStorageAdmission = false;
     private unloadCapabilityToken: string | null = null;
     private readonly unloadStorageMutations = new Set<Promise<void>>();
+    private readonly legacyUnloadOperations = new Set<Promise<void>>();
     private callbackWrapperCache = new Map<string, Function>();
     private readonly terminationCallbackInvocationStack: Array<{
         callback: Function;
@@ -1500,6 +1528,40 @@ export class SandboxHost {
         }
     }
 
+    /** Let already-admitted compatibility cleanup settle within its grace window. */
+    public async drainLegacyUnloadOperations(timeoutMs: number): Promise<boolean> {
+        if (this.legacyUnloadOperations.size === 0) return true;
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return false;
+
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<false>(resolve => {
+            timer = setTimeout(() => resolve(false), timeoutMs);
+        });
+        const drained = (async () => {
+            while (this.legacyUnloadOperations.size > 0) {
+                await Promise.allSettled([...this.legacyUnloadOperations]);
+            }
+            return true as const;
+        })();
+        try {
+            return await Promise.race([drained, timeout]);
+        } finally {
+            if (timer !== undefined) clearTimeout(timer);
+        }
+    }
+
+    private trackUnloadOperation(
+        operations: Set<Promise<void>>,
+        invocation: Promise<unknown>,
+    ): void {
+        let tracked!: Promise<void>;
+        tracked = invocation.then(
+            () => undefined,
+            () => undefined,
+        ).finally(() => operations.delete(tracked));
+        operations.add(tracked);
+    }
+
     public run(container: HTMLElement|HTMLIFrameElement, userCode: string): Promise<void> {
         if (this.started) {
             return Promise.reject(new Error("SandboxHost.run() may only be called once."));
@@ -1694,7 +1756,7 @@ export class SandboxHost {
                         && typeof data.method === 'string'
                         && (data.type === 'CALL_ROOT'
                             ? LEGACY_UNLOAD_ROOT_METHODS.has(data.method)
-                            : LEGACY_UNLOAD_INSTANCE_METHODS.has(data.method));
+                            : isLegacyUnloadInstanceCallAllowed(data.method, args));
                     if (unloadStorageCall
                         && data.method === '_updatePluginStorage'
                         && typeof args[1] === 'function') {
@@ -1730,12 +1792,10 @@ export class SandboxHost {
                         }
                         const invocation = Promise.resolve().then(() => fn(...args));
                         if (UNLOAD_STORAGE_MUTATION_METHODS.has(data.method!)) {
-                            let tracked!: Promise<void>;
-                            tracked = invocation.then(
-                                () => undefined,
-                                () => undefined,
-                            ).finally(() => this.unloadStorageMutations.delete(tracked));
-                            this.unloadStorageMutations.add(tracked);
+                            this.trackUnloadOperation(this.unloadStorageMutations, invocation);
+                        }
+                        if (legacyUnloadCall) {
+                            this.trackUnloadOperation(this.legacyUnloadOperations, invocation);
                         }
                         result = await invocation;
                     } else {
@@ -1750,12 +1810,10 @@ export class SandboxHost {
                         );
                         if (this.compatibilityDraining
                             && LEGACY_UNLOAD_INSTANCE_MUTATION_METHODS.has(data.method!)) {
-                            let tracked!: Promise<void>;
-                            tracked = invocation.then(
-                                () => undefined,
-                                () => undefined,
-                            ).finally(() => this.unloadStorageMutations.delete(tracked));
-                            this.unloadStorageMutations.add(tracked);
+                            this.trackUnloadOperation(this.unloadStorageMutations, invocation);
+                        }
+                        if (legacyUnloadCall) {
+                            this.trackUnloadOperation(this.legacyUnloadOperations, invocation);
                         }
                         result = await invocation;
                     }
@@ -1885,6 +1943,7 @@ export class SandboxHost {
         }
         this.abortControllers.clear();
         this.callbackWrapperCache.clear();
+        this.legacyUnloadOperations.clear();
     }
 
     public terminate() {
