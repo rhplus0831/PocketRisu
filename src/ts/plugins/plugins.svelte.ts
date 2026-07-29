@@ -959,35 +959,134 @@ export const getV2PluginAPIs = () => {
         }
         return value
     }
-    const cloneLegacyStorageJson = <T>(input: T): T => {
-        const value = unwrapGuardedValue(input)
-        const visiting = new Set<object>()
-        const snapshot = (candidate: unknown, path: string): unknown => {
-            if (candidate === null || typeof candidate === 'string' || typeof candidate === 'boolean') {
+    /**
+     * Detach V2/V2.1 inline values at the synchronous call boundary without
+     * narrowing them to optimized storage's JSON-only domain. This mirrors the
+     * structured-clone behavior already used by inline V3 storage while
+     * avoiding arbitrary property reads from caller-controlled objects.
+     *
+     * Accessors remain unsupported because invoking a getter while taking the
+     * pre-queue snapshot could mutate storage outside the transition barrier.
+     * Enumerable data properties are normalized to ordinary mutable snapshot
+     * properties, as the platform structured clone algorithm does.
+     */
+    const cloneLegacyStorageValue = <T>(input: T): T => {
+        const snapshots = new Map<object, unknown>()
+
+        const snapshot = (rawCandidate: unknown, path: string): unknown => {
+            const candidate = unwrapGuardedValue(rawCandidate)
+            if (candidate === null
+                || candidate === undefined
+                || typeof candidate === 'string'
+                || typeof candidate === 'boolean'
+                || typeof candidate === 'number'
+                || typeof candidate === 'bigint') {
                 return candidate
             }
-            if (typeof candidate === 'number') {
-                if (!Number.isFinite(candidate)) {
-                    throw new TypeError(`Legacy plugin storage requires finite JSON numbers at ${path}.`)
-                }
-                return Object.is(candidate, -0) ? 0 : candidate
-            }
             if (typeof candidate !== 'object') {
-                throw new TypeError(`Legacy plugin storage requires JSON data at ${path}.`)
+                throw new TypeError(`Legacy plugin storage requires cloneable data at ${path}.`)
             }
 
             const object = candidate as object
-            if (visiting.has(object)) {
-                throw new TypeError(`Legacy plugin storage does not accept circular data at ${path}.`)
-            }
-            const prototype = Reflect.getPrototypeOf(object)
-            if (prototype !== Object.prototype && prototype !== null && !Array.isArray(object)) {
-                throw new TypeError(`Legacy plugin storage requires plain JSON objects at ${path}.`)
+            const existing = snapshots.get(object)
+            if (existing !== undefined || snapshots.has(object)) return existing
+
+            // Brand checks use built-in operations rather than user-visible
+            // methods, so an own getTime/entries/values override never runs.
+            try {
+                const value = Date.prototype.getTime.call(object)
+                const result = new Date(value)
+                snapshots.set(object, result)
+                return result
+            } catch {
+                // Not a Date.
             }
 
-            visiting.add(object)
-            let result: unknown
-            if (Array.isArray(object)) {
+            try {
+                const iterator = Map.prototype.entries.call(object)
+                const result = new Map<unknown, unknown>()
+                snapshots.set(object, result)
+                for (let next = iterator.next(); !next.done; next = iterator.next()) {
+                    result.set(
+                        snapshot(next.value[0], `${path}.<map key>`),
+                        snapshot(next.value[1], `${path}.<map value>`),
+                    )
+                }
+                return result
+            } catch (error) {
+                if (snapshots.has(object)) throw error
+                // Not a Map.
+            }
+
+            try {
+                const iterator = Set.prototype.values.call(object)
+                const result = new Set<unknown>()
+                snapshots.set(object, result)
+                for (let next = iterator.next(); !next.done; next = iterator.next()) {
+                    result.add(snapshot(next.value, `${path}.<set value>`))
+                }
+                return result
+            } catch (error) {
+                if (snapshots.has(object)) throw error
+                // Not a Set.
+            }
+
+            if (object instanceof ArrayBuffer) {
+                const result = object.slice(0)
+                snapshots.set(object, result)
+                return result
+            }
+
+            if (ArrayBuffer.isView(object)) {
+                const source = object as ArrayBufferView & { length?: number }
+                const clonedBuffer = snapshot(source.buffer, `${path}.buffer`) as ArrayBuffer
+                let result: ArrayBufferView
+                if (source instanceof DataView) {
+                    result = new DataView(clonedBuffer, source.byteOffset, source.byteLength)
+                } else {
+                    const typedArrayConstructors: Record<string, new (
+                        buffer: ArrayBuffer,
+                        byteOffset: number,
+                        length: number,
+                    ) => ArrayBufferView> = {
+                        Buffer: Uint8Array,
+                        Int8Array,
+                        Uint8Array,
+                        Uint8ClampedArray,
+                        Int16Array,
+                        Uint16Array,
+                        Int32Array,
+                        Uint32Array,
+                        Float32Array,
+                        Float64Array,
+                        ...(typeof BigInt64Array === 'undefined' ? {} : { BigInt64Array }),
+                        ...(typeof BigUint64Array === 'undefined' ? {} : { BigUint64Array }),
+                    }
+                    const name = Object.getPrototypeOf(source)?.constructor?.name
+                    const Constructor = typedArrayConstructors[name]
+                    if (!Constructor || !Number.isSafeInteger(source.length)) {
+                        throw new TypeError(`Legacy plugin storage received an unsupported binary view at ${path}.`)
+                    }
+                    result = new Constructor(
+                        clonedBuffer,
+                        source.byteOffset,
+                        source.length!,
+                    )
+                }
+                snapshots.set(object, result)
+                return result
+            }
+
+            if (object instanceof RegExp) {
+                const result = new RegExp(object.source, object.flags)
+                result.lastIndex = object.lastIndex
+                snapshots.set(object, result)
+                return result
+            }
+
+            const isArray = Array.isArray(object)
+            let result: Record<PropertyKey, unknown> | unknown[]
+            if (isArray) {
                 const lengthDescriptor = Reflect.getOwnPropertyDescriptor(object, 'length')
                 const length = lengthDescriptor && "value" in lengthDescriptor
                     ? lengthDescriptor.value
@@ -995,75 +1094,69 @@ export const getV2PluginAPIs = () => {
                 if (!Number.isSafeInteger(length) || length < 0) {
                     throw new TypeError(`Legacy plugin storage received an invalid array at ${path}.`)
                 }
-                const arraySnapshot: unknown[] = []
-                // Shadow any subsequently poisoned Array.prototype.toJSON.
-                Object.defineProperty(arraySnapshot, 'toJSON', {
-                    configurable: false,
-                    enumerable: false,
-                    value: undefined,
-                    writable: false,
-                })
-                for (let index = 0; index < length; index += 1) {
-                    const descriptor = Reflect.getOwnPropertyDescriptor(object, String(index))
-                    if (!descriptor) {
-                        // JSON serialization turns array holes into null.
-                        Object.defineProperty(arraySnapshot, index, {
-                            configurable: true,
-                            enumerable: true,
-                            value: null,
-                            writable: true,
-                        })
-                        continue
-                    }
-                    if (!("value" in descriptor)) {
-                        throw new TypeError(
-                            `Legacy plugin storage does not accept accessors at ${path}[${index}].`,
-                        )
-                    }
-                    if (!descriptor.configurable || !descriptor.enumerable) {
-                        throw new TypeError(
-                            `Legacy plugin storage requires configurable enumerable data at ${path}[${index}].`,
-                        )
-                    }
-                    Object.defineProperty(arraySnapshot, index, {
-                        configurable: true,
-                        enumerable: true,
-                        value: snapshot(descriptor.value, `${path}[${index}]`),
-                        writable: true,
-                    })
-                }
-                result = arraySnapshot
+                result = new Array(length)
             } else {
-                const objectSnapshot = createDatabasePluginStorageRecord<unknown>()
-                for (const key of Reflect.ownKeys(object)) {
-                    if (typeof key !== 'string') {
-                        throw new TypeError(`Legacy plugin storage does not accept symbol keys at ${path}.`)
-                    }
-                    const descriptor = Reflect.getOwnPropertyDescriptor(object, key)
-                    if (!descriptor || !("value" in descriptor)) {
-                        throw new TypeError(`Legacy plugin storage does not accept accessors at ${path}.${key}.`)
-                    }
-                    if (!descriptor.configurable || !descriptor.enumerable) {
-                        throw new TypeError(
-                            `Legacy plugin storage requires configurable enumerable data at ${path}.${key}.`,
-                        )
-                    }
-                    Object.defineProperty(objectSnapshot, key, {
-                        configurable: true,
-                        enumerable: true,
-                        value: snapshot(descriptor.value, `${path}.${key}`),
-                        writable: true,
-                    })
-                }
-                result = objectSnapshot
+                // structuredClone and msgpack both turn custom instances into
+                // ordinary data objects. defineProperty keeps __proto__ inert.
+                result = {}
             }
-            visiting.delete(object)
+            snapshots.set(object, result)
+
+            for (const key of Reflect.ownKeys(object)) {
+                if (key === 'length' && isArray) continue
+                // Structured clone and msgpack omit symbol and hidden fields.
+                if (typeof key !== 'string') continue
+                const descriptor = Reflect.getOwnPropertyDescriptor(object, key)
+                if (!descriptor || !descriptor.enumerable) continue
+                if (!("value" in descriptor)) {
+                    throw new TypeError(`Legacy plugin storage does not accept accessors at ${path}.${key}.`)
+                }
+                Object.defineProperty(result, key, {
+                    configurable: true,
+                    enumerable: true,
+                    value: snapshot(descriptor.value, `${path}.${key}`),
+                    writable: true,
+                })
+            }
             return result
         }
 
-        return snapshot(value, "$") as T
+        return snapshot(input, "$") as T
     }
-    const validateLegacyStorageDescriptor = (descriptor: PropertyDescriptor): unknown => {
+
+    const cloneLegacyStorageRecord = (input: unknown): Record<string, unknown> => {
+        const source = unwrapGuardedValue(input)
+        if (source === null || typeof source !== 'object' || Array.isArray(source)) {
+            throw new TypeError("Legacy plugin storage must be an object.")
+        }
+        const prototype = Reflect.getPrototypeOf(source)
+        if (prototype !== Object.prototype && prototype !== null) {
+            throw new TypeError("Legacy plugin storage must be a plain object.")
+        }
+        const result = createDatabasePluginStorageRecord<unknown>()
+        for (const key of Reflect.ownKeys(source)) {
+            if (typeof key !== 'string') {
+                throw new TypeError("Legacy plugin storage does not accept symbol keys.")
+            }
+            const descriptor = Reflect.getOwnPropertyDescriptor(source, key)
+            if (!descriptor || !("value" in descriptor)) {
+                throw new TypeError(`Legacy plugin storage does not accept an accessor for ${key}.`)
+            }
+            if (!descriptor.enumerable) {
+                throw new TypeError(`Legacy plugin storage requires enumerable data for ${key}.`)
+            }
+            definePluginStorageRecordValue(
+                result,
+                key,
+                cloneLegacyStorageValue(descriptor.value),
+            )
+        }
+        return result
+    }
+    const validateLegacyStorageDescriptor = (
+        descriptor: PropertyDescriptor,
+        storageRecord = false,
+    ): unknown => {
         if (!("value" in descriptor) || descriptor.get || descriptor.set) {
             throw new TypeError("Legacy plugin storage does not accept accessor descriptors.")
         }
@@ -1074,7 +1167,9 @@ export const getV2PluginAPIs = () => {
                 "Legacy plugin storage descriptors must be configurable, enumerable, and writable.",
             )
         }
-        return cloneLegacyStorageJson(descriptor.value)
+        return storageRecord
+            ? cloneLegacyStorageRecord(descriptor.value)
+            : cloneLegacyStorageValue(descriptor.value)
     }
     const guardedStorageProxyByTarget = new WeakMap<object, object>()
     const guardNestedValue = <T>(value: T, storageValue = false): T => {
@@ -1181,7 +1276,11 @@ export const getV2PluginAPIs = () => {
         targetByGuardedProxy.set(guarded, target)
         return guarded as T
     }
-    const readLegacyStorageInput = (source: object, key: string): unknown => {
+    const readLegacyStorageInput = (
+        source: object,
+        key: string,
+        storageRecord = false,
+    ): unknown => {
         const descriptor = Reflect.getOwnPropertyDescriptor(source, key)
         if (!descriptor || !("value" in descriptor)) {
             throw new TypeError(`Legacy plugin storage does not accept an accessor for ${key}.`)
@@ -1191,7 +1290,9 @@ export const getV2PluginAPIs = () => {
                 `Legacy plugin storage requires configurable enumerable data for ${key}.`,
             )
         }
-        return cloneLegacyStorageJson(descriptor.value)
+        return storageRecord
+            ? cloneLegacyStorageRecord(descriptor.value)
+            : cloneLegacyStorageValue(descriptor.value)
     }
     const defineLegacyStorageValue = (
         storage: Record<PropertyKey, unknown>,
@@ -1201,7 +1302,7 @@ export const getV2PluginAPIs = () => {
         setDatabasePluginStorageRecordValue(
             storage as Record<string, unknown>,
             key,
-            cloneLegacyStorageJson(value),
+            cloneLegacyStorageValue(value),
         )
     }
     const replaceLegacyStorageValue = (
@@ -1215,7 +1316,7 @@ export const getV2PluginAPIs = () => {
         // a detached record and replace the map so all keys are real target
         // properties. The live facade below keeps retained handles current.
         const next = copyDatabasePluginStorageRecord(db.pluginCustomStorage)
-        definePluginStorageRecordValue(next, key, cloneLegacyStorageJson(value))
+        definePluginStorageRecordValue(next, key, cloneLegacyStorageValue(value))
         db.pluginCustomStorage = next
         markPluginStorageKeySetChanged()
     }
@@ -1256,7 +1357,7 @@ export const getV2PluginAPIs = () => {
             definePluginStorageRecordValue(
                 snapshot,
                 key,
-                cloneLegacyStorageJson(value),
+                cloneLegacyStorageValue(value),
             )
         }
         return snapshot
@@ -1541,7 +1642,7 @@ export const getV2PluginAPIs = () => {
                     assertSynchronousPluginStorageAccess()
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
                         (target as any)[prop] = prop === 'pluginCustomStorage'
-                            ? cloneLegacyStorageJson(value)
+                            ? cloneLegacyStorageRecord(value)
                             : unwrapGuardedValue(value);
                         if (prop === 'pluginCustomStorage') {
                             markPluginStorageKeySetChanged()
@@ -1599,7 +1700,7 @@ export const getV2PluginAPIs = () => {
                         const defined = Reflect.defineProperty(target, prop, {
                             ...descriptor,
                             value: prop === 'pluginCustomStorage'
-                                ? validateLegacyStorageDescriptor(descriptor)
+                                ? validateLegacyStorageDescriptor(descriptor, true)
                                 : unwrapGuardedValue(descriptor.value),
                         })
                         if (defined && prop === 'pluginCustomStorage') {
@@ -1641,15 +1742,15 @@ export const getV2PluginAPIs = () => {
                 if (!canUseSynchronousPluginStorage()) return null
                 // Svelte's snapshot currently omits an own `__proto__` key.
                 // Read the live proxy with an own-presence check, then return
-                // the same detached JSON value used by legacy writes.
+                // the same detached structured-clone value used by legacy writes.
                 const db = getDatabase();
                 if (!hasPluginStorageRecordValue(db.pluginCustomStorage, key)) return null;
                 const value = db.pluginCustomStorage![key];
                 return value === undefined || value === null
                     ? null
-                    : cloneLegacyStorageJson(value);
+                    : cloneLegacyStorageValue(value);
             },
-            setItem: (key: string, value: string) => {
+            setItem: (key: string, value: unknown) => {
                 if (!canUseSynchronousPluginStorage()) return
                 const db = getDatabase();
                 replaceLegacyStorageValue(db, key, value)
@@ -1698,7 +1799,7 @@ export const getV2PluginAPIs = () => {
                         // replacement itself. A later field may throw, so an
                         // end-of-loop marker cannot keep V3 key()/length()
                         // coherent with this already-visible mutation.
-                        db.pluginCustomStorage = readLegacyStorageInput(newDb, key) as any
+                        db.pluginCustomStorage = readLegacyStorageInput(newDb, key, true) as any
                         markPluginStorageKeySetChanged()
                     } else {
                         (db as any)[key] = newDb[key]
@@ -1729,7 +1830,7 @@ export const getV2PluginAPIs = () => {
                         // The following iteration may await plugin approval,
                         // reject, or interleave with V3 enumeration. Mark this
                         // replacement immediately after it becomes live.
-                        db.pluginCustomStorage = readLegacyStorageInput(newDb, key) as any
+                        db.pluginCustomStorage = readLegacyStorageInput(newDb, key, true) as any
                         markPluginStorageKeySetChanged()
                     } else {
                         (db as any)[key] = newDb[key]

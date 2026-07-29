@@ -5080,6 +5080,96 @@ describe("transitionPluginStorageMode", () => {
         expect(isPluginStorageModeTransitioning()).toBe(false);
     });
 
+    test("V2 storage accepts and detaches the inline structured-clone value domain", () => {
+        class CustomValue {
+            label = "custom";
+        }
+        const cycle: Record<string, unknown> = { label: "cycle" };
+        cycle.self = cycle;
+        const sparse = new Array(3);
+        sparse[1] = "present";
+        const callerOwned = {
+            date: new Date("2026-01-02T03:04:05.000Z"),
+            binary: new Uint8Array([0, 128, 255]),
+            map: new Map([["key", { nested: true }]]),
+            set: new Set(["value"]),
+            nan: Number.NaN,
+            positiveInfinity: Number.POSITIVE_INFINITY,
+            negativeInfinity: Number.NEGATIVE_INFINITY,
+            bigint: 42n,
+            sparse,
+            cycle,
+            custom: new CustomValue(),
+        };
+        const v2Apis = getV2PluginAPIs();
+
+        v2Apis.pluginStorage.setItem("rich", callerOwned);
+
+        const stored = database.pluginCustomStorage.rich;
+        expect(stored).not.toBe(callerOwned);
+        expect(stored.date).toEqual(callerOwned.date);
+        expect(stored.date).not.toBe(callerOwned.date);
+        expect([...stored.binary]).toEqual([0, 128, 255]);
+        expect(stored.binary).not.toBe(callerOwned.binary);
+        expect(stored.map).toEqual(new Map([["key", { nested: true }]]));
+        expect(stored.set).toEqual(new Set(["value"]));
+        expect(stored.nan).toBeNaN();
+        expect(stored.positiveInfinity).toBe(Number.POSITIVE_INFINITY);
+        expect(stored.negativeInfinity).toBe(Number.NEGATIVE_INFINITY);
+        expect(stored.bigint).toBe(42n);
+        expect(stored.sparse).toHaveLength(3);
+        expect(Object.hasOwn(stored.sparse, 0)).toBe(false);
+        expect(Object.hasOwn(stored.sparse, 1)).toBe(true);
+        expect(Object.hasOwn(stored.sparse, 2)).toBe(false);
+        expect(stored.cycle.self).toBe(stored.cycle);
+        expect(stored.custom).toEqual({ label: "custom" });
+        expect(stored.custom).not.toBeInstanceOf(CustomValue);
+
+        callerOwned.binary[0] = 99;
+        callerOwned.map.get("key")!.nested = false;
+        callerOwned.sparse[0] = "late mutation";
+        expect([...stored.binary]).toEqual([0, 128, 255]);
+        expect(stored.map.get("key")).toEqual({ nested: true });
+        expect(Object.hasOwn(stored.sparse, 0)).toBe(false);
+
+        const read = v2Apis.pluginStorage.getItem("rich") as typeof callerOwned;
+        expect(read).not.toBe(stored);
+        expect(read.date).toEqual(new Date("2026-01-02T03:04:05.000Z"));
+        expect([...read.binary]).toEqual([0, 128, 255]);
+        expect(read.map).toEqual(new Map([["key", { nested: true }]]));
+        expect(read.set).toEqual(new Set(["value"]));
+        expect(read.nan).toBeNaN();
+        expect(read.positiveInfinity).toBe(Number.POSITIVE_INFINITY);
+        expect(read.negativeInfinity).toBe(Number.NEGATIVE_INFINITY);
+        expect(read.bigint).toBe(42n);
+        expect(Object.hasOwn(read.sparse, 0)).toBe(false);
+        expect(read.cycle.self).toBe(read.cycle);
+
+        read.binary[1] = 7;
+        read.map.get("key")!.nested = false;
+        expect([...stored.binary]).toEqual([0, 128, 255]);
+        expect(stored.map.get("key")).toEqual({ nested: true });
+    });
+
+    test("V2 reads Date, binary, and non-finite values restored from RisuSave", async () => {
+        const { decodeRisuSave, encodeRisuSaveLegacy } = await import("../storage/risuSave");
+        const restored = await decodeRisuSave(encodeRisuSaveLegacy({
+            pluginCustomStorage: {
+                date: new Date("2024-03-04T05:06:07.000Z"),
+                binary: new Uint8Array([1, 2, 254, 255]),
+                nan: Number.NaN,
+                infinity: Number.POSITIVE_INFINITY,
+            },
+        })) as any;
+        database.pluginCustomStorage = restored.pluginCustomStorage;
+        const storage = getV2PluginAPIs().pluginStorage;
+
+        expect(storage.getItem("date")).toEqual(new Date("2024-03-04T05:06:07.000Z"));
+        expect([...(storage.getItem("binary") as Uint8Array)]).toEqual([1, 2, 254, 255]);
+        expect(storage.getItem("nan")).toBeNaN();
+        expect(storage.getItem("infinity")).toBe(Number.POSITIVE_INFINITY);
+    });
+
     test("legacy storage ingress snapshots caller objects before a held enable write", async () => {
         const v2Apis = getV2PluginAPIs();
         const databaseProxy = v2Apis.getDatabase() as any;
@@ -5125,9 +5215,11 @@ describe("transitionPluginStorageMode", () => {
         expect(() => (v2Apis.pluginStorage.setItem as any)("accessorInput", accessorInput))
             .toThrow("does not accept accessors");
         expect(accessorInvoked).toBe(false);
-        expect(() => {
-            databaseProxy.frozenInput = Object.freeze({ value: "unsafe-alias" });
-        }).toThrow("requires configurable enumerable data");
+        const frozenInput = Object.freeze({ value: "detached-snapshot" });
+        databaseProxy.frozenInput = frozenInput;
+        expect(database.pluginCustomStorage.frozenInput).toEqual(frozenInput);
+        expect(database.pluginCustomStorage.frozenInput).not.toBe(frozenInput);
+        expect(Object.isFrozen(database.pluginCustomStorage.frozenInput)).toBe(false);
 
         let inheritedToJsonInvoked = false;
         const previousToJson = Object.getOwnPropertyDescriptor(Object.prototype, "toJSON");
