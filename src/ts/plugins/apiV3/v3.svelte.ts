@@ -96,6 +96,23 @@ type V3ScriptMode = 'input' | 'output' | 'process' | 'display';
 export const STRICT_PLUGIN_UNLOAD_TIMEOUT_MS = 1_000;
 export const LEGACY_PLUGIN_UNLOAD_TIMEOUT_MS = 5_000;
 
+async function withCombinedAbortSignals<T>(
+    signals: Array<AbortSignal | null | undefined>,
+    operation: (signal?: AbortSignal) => Promise<T>,
+): Promise<T> {
+    const activeSignals = signals.filter((signal): signal is AbortSignal => !!signal);
+    if (activeSignals.length === 0) return operation();
+    if (activeSignals.length === 1) return operation(activeSignals[0]);
+
+    const controller = new AbortController();
+    const stopForwarding = activeSignals.map(signal => forwardAbortSignal(signal, controller));
+    try {
+        return await operation(controller.signal);
+    } finally {
+        for (const stop of stopForwarding) stop();
+    }
+}
+
 class V3PluginLifecycleScope {
     private state: 'initializing' | 'ready' | 'draining' | 'terminating' | 'terminated' = 'initializing';
     private cleanupCallbacks: V3LifecycleCallback[] = [];
@@ -161,6 +178,12 @@ class V3PluginLifecycleScope {
         }
     }
 
+    assertCanFinalizeUnload() {
+        if (this.state === 'terminated') {
+            throw new Error(`Plugin ${this.pluginName} has terminated; finalization API access was rejected.`);
+        }
+    }
+
     isCompatibilityDraining() {
         return this.state === 'draining';
     }
@@ -191,8 +214,8 @@ class V3PluginLifecycleScope {
         ]);
         host.endUnloadStorageAdmission();
 
-        const remainingCompatibilityMs = Math.max(0, timeoutMs - (Date.now() - startedAt));
-        await host.drainLegacyUnloadOperations(remainingCompatibilityMs);
+        const remainingUnloadMs = Math.max(0, timeoutMs - (Date.now() - startedAt));
+        await host.drainUnloadFinalizationOperations(remainingUnloadMs);
 
         if (result === timeout) {
             // Stop callback code from preparing later work. Storage mutations
@@ -1224,7 +1247,12 @@ export const makeRisuaiAPIV3 = (
     return {
 
         //Old APIs from v2.1
-        risuFetch: (url, options) => {
+        risuFetch: async (
+            url: string,
+            options: Record<string, any> = {},
+            _unloadCapabilityOrRequestSignal?: AbortSignal,
+            requestSignal?: AbortSignal,
+        ) => {
             console.error(`[DEPRECATION WARNING] risuFetch is deprecated and will be removed in future versions. Please use nativeFetch instead.`)
             for(const blocked of urlBlacklist){
                 if(url.toLowerCase().includes(blocked)){
@@ -1239,9 +1267,17 @@ export const makeRisuaiAPIV3 = (
                     console.warn(`Request contains potentially sensitive header '${headerName}'. handling of such headers may be changed to only work with nativeFetch.`);
                 }
             }
-            return oldApis.risuFetch(url, options);
+            return withCombinedAbortSignals(
+                [options.abortSignal, _unloadCapabilityOrRequestSignal, requestSignal],
+                signal => oldApis.risuFetch(url, { ...options, abortSignal: signal }),
+            );
         },
-        nativeFetch: (url, options) => {
+        nativeFetch: async (
+            url: string,
+            options: Record<string, any> = {},
+            _unloadCapabilityOrRequestSignal?: AbortSignal,
+            requestSignal?: AbortSignal,
+        ) => {
             for(const blocked of urlBlacklist){
                 if(url.toLowerCase().includes(blocked)){
                     throw new Error(`Requests to ${blocked} are blocked for security reasons.`);
@@ -1255,7 +1291,10 @@ export const makeRisuaiAPIV3 = (
                     console.warn(`Request contains potentially sensitive header '${headerName}'. handling of such headers may be changed to use server-side approch with write-only api access in the future for better security.`);
                 }
             }
-            return oldApis.nativeFetch(url, options);
+            return withCombinedAbortSignals(
+                [options.signal, _unloadCapabilityOrRequestSignal, requestSignal],
+                signal => oldApis.nativeFetch(url, { ...options, signal }),
+            );
         },
         getChar: oldApis.getChar,
         setChar: oldApis.setChar,
@@ -1370,7 +1409,19 @@ export const makeRisuaiAPIV3 = (
         },
         loadPlugins: oldApis.loadPlugins,
         readImage: oldApis.readImage,
-        saveAsset: oldApis.saveAsset,
+        saveAsset: async (
+            data: Uint8Array,
+            _unloadCapabilityOrRequestSignal?: AbortSignal,
+            requestSignal?: AbortSignal,
+        ) => withCombinedAbortSignals(
+            [_unloadCapabilityOrRequestSignal, requestSignal],
+            async signal => {
+                throwIfAborted(signal);
+                const saved = await awaitWithAbort(oldApis.saveAsset(data), signal);
+                throwIfAborted(signal);
+                return saved;
+            },
+        ),
         //Same functionality, but new implementation
         getDatabase: async (
             includeOnly:string[]|'all' = 'all',
@@ -1392,10 +1443,10 @@ export const makeRisuaiAPIV3 = (
         installPlugin: handlePluginInstallViaPlugin,
 
         // --- Color Scheme APIs ---
-        changeColorScheme: (name: string) => {
+        changeColorScheme: (name: string, _unloadSignal?: AbortSignal) => {
             changeColorScheme(name)
         },
-        setColorScheme: (scheme: ColorScheme) => {
+        setColorScheme: (scheme: ColorScheme, _unloadSignal?: AbortSignal) => {
             const requiredKeys = ['bgcolor','darkbg','borderc','selected','draculared','textcolor','textcolor2','darkBorderc','darkbutton','type'] as const
             for (const key of requiredKeys) {
                 if (typeof (scheme as any)[key] !== 'string') {
@@ -1419,7 +1470,7 @@ export const makeRisuaiAPIV3 = (
         },
 
         // --- Text Theme APIs ---
-        changeTextTheme: (name: string) => {
+        changeTextTheme: (name: string, _unloadSignal?: AbortSignal) => {
             if (!['standard','highcontrast'].includes(name)) {
                 throw new Error(`Invalid text theme: ${name}`)
             }
@@ -1434,7 +1485,7 @@ export const makeRisuaiAPIV3 = (
             FontColorItalicBold: string,
             FontColorQuote1: string,
             FontColorQuote2: string
-        }) => {
+        }, _unloadSignal?: AbortSignal) => {
             const requiredKeys = ['FontColorStandard','FontColorBold','FontColorItalic','FontColorItalicBold','FontColorQuote1','FontColorQuote2'] as const
             for (const key of requiredKeys) {
                 if (typeof (theme as any)[key] !== 'string') {
@@ -1468,7 +1519,7 @@ export const makeRisuaiAPIV3 = (
                 }
             }
         },
-        setArgument: async (key:string, value:string) => {
+        setArgument: async (key:string, value:string, _unloadSignal?: AbortSignal) => {
             const db = getDatabase();
             for (const p of db.plugins) {
                 if (p.name === plugin.name) {
@@ -1485,7 +1536,7 @@ export const makeRisuaiAPIV3 = (
             }
             return null;
         },
-        setCharacterToIndex: (index:number, char:any) => {
+        setCharacterToIndex: (index:number, char:any, _unloadSignal?: AbortSignal) => {
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[index];
@@ -1505,7 +1556,12 @@ export const makeRisuaiAPIV3 = (
             }
             return null;
         },
-        setChatToIndex: (characterIndex:number, chatIndex:number, chat:any) => {
+        setChatToIndex: (
+            characterIndex:number,
+            chatIndex:number,
+            chat:any,
+            _unloadSignal?: AbortSignal,
+        ) => {
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[characterIndex];
@@ -1712,15 +1768,22 @@ export const makeRisuaiAPIV3 = (
             options: {
                 id?: string,
                 className?: string,
-            } = {}
+            } = {},
+            unloadSignal?: AbortSignal,
         ) => {
-            lifecycle.assertCanRegister();
             const id = options.id || `${plugin.name}:default`;
 
             if(content === null || content === ''){
+                if (lifecycle.isCompatibilityDraining() || unloadSignal) {
+                    lifecycle.assertCanFinalizeUnload();
+                } else {
+                    lifecycle.assertCanRegister();
+                }
                 removeChatPanel(id);
                 return {id};
             }
+
+            lifecycle.assertCanRegister();
 
             if(typeof content !== 'string'){
                 throw new Error("content must be a string or null");

@@ -1809,7 +1809,7 @@ export const languageKorean = {
     "최적화 저장 값이 JSON과 호환되지 않으면 Date는 ISO 문자열, Map은 항목 배열, Set은 배열, BigInt는 10진수 문자열로 변환하고 undefined, 유한하지 않은 숫자, 배열의 빈 항목은 null로 변환합니다. 함수와 순환 참조는 계속 거부됩니다.",
   legacyPluginCompatibility: "레거시 플러그인 호환성",
   legacyPluginCompatibilityDesc:
-    "레거시 플러그인에 더 긴 종료 시간을 제공하고 onUnload 중 제한된 정리 및 저장소 호출을 허용하며, 종료 단계만 실패한 경우 경고 후 계속합니다. 플러그인 시작 및 데이터베이스 저장 실패는 계속 엄격하게 처리됩니다.",
+    "레거시 플러그인에 더 긴 종료 시간을 제공하고 onUnload 중 상태, UI, 네트워크, 에셋 및 저장소의 제한된 마무리 작업을 허용하며, 종료 단계만 실패한 경우 경고 후 계속합니다. 새 등록, 모델/채팅 작업, 플러그인 교체 및 비어 있지 않은 UI 생성은 계속 차단됩니다.",
   legacyPluginCompatibilityTeardownWarning:
     "하나 이상의 플러그인이 정상적으로 종료되지 않았습니다. 호환성 모드가 해당 플러그인을 종료하고 다시 불러오기를 계속했습니다.",
   optimizePluginMemoryV3Only:

@@ -21,6 +21,9 @@ const ABORTABLE_ROOT_METHODS = new Set([
     'getDatabase',
     'setDatabase',
     'setDatabaseLite',
+    'risuFetch',
+    'nativeFetch',
+    'saveAsset',
     '_getPluginStorage',
     '_getVersionedPluginStorage',
     '_readPluginStorageResult',
@@ -62,9 +65,45 @@ const UNLOAD_STORAGE_MUTATION_METHODS = new Set([
     '_clearPluginStorage',
 ]);
 
+// These calls are bounded finalization work rather than new plugin lifetime
+// work. Strict unload requires the capability signal passed to onUnload;
+// compatibility mode also accepts the unchanged legacy call shape.
+const UNLOAD_FINALIZATION_ROOT_METHODS = new Set([
+    'getDatabase',
+    'setDatabase',
+    'setDatabaseLite',
+    'getArgument',
+    'setArgument',
+    'getArg',
+    'setArg',
+    'getCharacterFromIndex',
+    'setCharacterToIndex',
+    'getChatFromIndex',
+    'setChatToIndex',
+    'getCurrentCharacterIndex',
+    'getCurrentChatIndex',
+    'getCurrentLorebookEntries',
+    'getCharacter',
+    'setCharacter',
+    'getChar',
+    'setChar',
+    'changeColorScheme',
+    'setColorScheme',
+    'getColorScheme',
+    'changeTextTheme',
+    'setCustomTextTheme',
+    'getTextTheme',
+    'setChatPanel',
+    'risuFetch',
+    'nativeFetch',
+    'readImage',
+    'saveAsset',
+]);
+
 // Upstream allowed every API until the iframe was removed. Compatibility mode
 // keeps only the operations commonly needed to flush state and undo UI/hooks.
 const LEGACY_UNLOAD_ROOT_METHODS = new Set([
+    ...UNLOAD_FINALIZATION_ROOT_METHODS,
     '_getPluginStorage',
     '_getVersionedPluginStorage',
     '_readPluginStorageResult',
@@ -98,6 +137,23 @@ const LEGACY_UNLOAD_ROOT_METHODS = new Set([
     'postPluginChannelMessage',
     'log',
 ]);
+
+const isUnloadFinalizationRootCallAllowed = (method: string, args: any[]): boolean => {
+    if (!UNLOAD_FINALIZATION_ROOT_METHODS.has(method)) return false;
+    if (method === 'setChatPanel') {
+        return args[0] === null || args[0] === '';
+    }
+    if (method === 'setDatabase' || method === 'setDatabaseLite') {
+        const database = args[0];
+        return database !== null
+            && typeof database === 'object'
+            && !Array.isArray(database)
+            // A teardown callback may flush state, but it must not recreate or
+            // replace the plugin generation after lifecycle cleanup has begun.
+            && !Object.hasOwn(database, 'plugins');
+    }
+    return true;
+};
 
 const LEGACY_UNLOAD_INSTANCE_METHODS = new Set([
     // Persistent plugin storage returned by getLocalPluginStorage().
@@ -1171,7 +1227,7 @@ export class SandboxHost {
     private unloadStorageAdmission = false;
     private unloadCapabilityToken: string | null = null;
     private readonly unloadStorageMutations = new Set<Promise<void>>();
-    private readonly legacyUnloadOperations = new Set<Promise<void>>();
+    private readonly unloadFinalizationOperations = new Set<Promise<void>>();
     private callbackWrapperCache = new Map<string, Function>();
     private readonly terminationCallbackInvocationStack: Array<{
         callback: Function;
@@ -1528,9 +1584,9 @@ export class SandboxHost {
         }
     }
 
-    /** Let already-admitted compatibility cleanup settle within its grace window. */
-    public async drainLegacyUnloadOperations(timeoutMs: number): Promise<boolean> {
-        if (this.legacyUnloadOperations.size === 0) return true;
+    /** Let already-admitted finalization settle within its unload grace window. */
+    public async drainUnloadFinalizationOperations(timeoutMs: number): Promise<boolean> {
+        if (this.unloadFinalizationOperations.size === 0) return true;
         if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return false;
 
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1538,8 +1594,8 @@ export class SandboxHost {
             timer = setTimeout(() => resolve(false), timeoutMs);
         });
         const drained = (async () => {
-            while (this.legacyUnloadOperations.size > 0) {
-                await Promise.allSettled([...this.legacyUnloadOperations]);
+            while (this.unloadFinalizationOperations.size > 0) {
+                await Promise.allSettled([...this.unloadFinalizationOperations]);
             }
             return true as const;
         })();
@@ -1752,10 +1808,17 @@ export class SandboxHost {
                         && this.unloadStorageAdmission
                         && hasUnloadCapability
                         && UNLOAD_STORAGE_ROOT_METHODS.has(data.method);
+                    const unloadFinalizationCall = data.type === 'CALL_ROOT'
+                        && typeof data.method === 'string'
+                        && this.unloadStorageAdmission
+                        && hasUnloadCapability
+                        && isUnloadFinalizationRootCallAllowed(data.method, args);
                     const legacyUnloadCall = this.compatibilityDraining
                         && typeof data.method === 'string'
                         && (data.type === 'CALL_ROOT'
                             ? LEGACY_UNLOAD_ROOT_METHODS.has(data.method)
+                                && (!UNLOAD_FINALIZATION_ROOT_METHODS.has(data.method)
+                                    || isUnloadFinalizationRootCallAllowed(data.method, args))
                             : isLegacyUnloadInstanceCallAllowed(data.method, args));
                     if (unloadStorageCall
                         && data.method === '_updatePluginStorage'
@@ -1771,9 +1834,12 @@ export class SandboxHost {
                             false,
                         );
                     }
+                    const authorizedUnloadCall = unloadStorageCall || unloadFinalizationCall;
                     if (this.terminated
-                        || (this.terminating && !unloadStorageCall)
-                        || (this.compatibilityDraining && !legacyUnloadCall)) {
+                        || (this.terminating && !authorizedUnloadCall)
+                        || (this.compatibilityDraining
+                            && !legacyUnloadCall
+                            && !authorizedUnloadCall)) {
                         throw new Error("Plugin sandbox is terminating; RPC invocation was rejected.");
                     }
                     let result: any;
@@ -1794,8 +1860,8 @@ export class SandboxHost {
                         if (UNLOAD_STORAGE_MUTATION_METHODS.has(data.method!)) {
                             this.trackUnloadOperation(this.unloadStorageMutations, invocation);
                         }
-                        if (legacyUnloadCall) {
-                            this.trackUnloadOperation(this.legacyUnloadOperations, invocation);
+                        if (legacyUnloadCall || unloadFinalizationCall) {
+                            this.trackUnloadOperation(this.unloadFinalizationOperations, invocation);
                         }
                         result = await invocation;
                     } else {
@@ -1813,7 +1879,7 @@ export class SandboxHost {
                             this.trackUnloadOperation(this.unloadStorageMutations, invocation);
                         }
                         if (legacyUnloadCall) {
-                            this.trackUnloadOperation(this.legacyUnloadOperations, invocation);
+                            this.trackUnloadOperation(this.unloadFinalizationOperations, invocation);
                         }
                         result = await invocation;
                     }
@@ -1943,7 +2009,7 @@ export class SandboxHost {
         }
         this.abortControllers.clear();
         this.callbackWrapperCache.clear();
-        this.legacyUnloadOperations.clear();
+        this.unloadFinalizationOperations.clear();
     }
 
     public terminate() {

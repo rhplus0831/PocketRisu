@@ -14,6 +14,11 @@ const storageMocks = vi.hoisted(() => ({
 }));
 const alertConfirmMock = vi.hoisted(() => vi.fn(async () => true));
 const notifyErrorMock = vi.hoisted(() => vi.fn());
+const unloadFinalizationMocks = vi.hoisted(() => ({
+    fetchNative: vi.fn(async () => ({ status: 204 })),
+    globalFetch: vi.fn(async () => ({ ok: true, status: 204 })),
+    saveAsset: vi.fn(async () => "assets/finalized.png"),
+}));
 const testState = $state({ database: {} as any });
 
 const encodeKey = (value: string) => Buffer.from(value, "utf-8").toString("base64")
@@ -44,17 +49,25 @@ vi.mock("../../storage/database.svelte", () => ({
 
 vi.mock("../../globalApi.svelte", () => ({
     checkCharOrder: vi.fn(),
-    fetchNative: vi.fn(),
+    fetchNative: unloadFinalizationMocks.fetchNative,
     forageStorage: { realStorage: null },
     getFetchLogs: vi.fn(async () => []),
-    globalFetch: vi.fn(),
+    globalFetch: unloadFinalizationMocks.globalFetch,
     readImage: vi.fn(),
     requestImmediateSave: vi.fn(),
-    saveAsset: vi.fn(),
+    saveAsset: unloadFinalizationMocks.saveAsset,
     toGetter: (getter: () => unknown) => ({ get value() { return getter(); } }),
 }));
 
 vi.mock("../../storage/chatStorage", () => ({ chatToStub: (chat: unknown) => chat }));
+
+vi.mock("src/ts/gui/colorscheme", () => ({
+    changeColorScheme: vi.fn((name: string) => {
+        testState.database.colorSchemeName = name;
+    }),
+    updateColorScheme: vi.fn(),
+    updateTextThemeAndCSS: vi.fn(),
+}));
 
 vi.mock("../../storage/persistentKv", () => {
     const writePersistentJson = async (
@@ -504,6 +517,9 @@ beforeEach(async () => {
     storageMocks.revisionOverrides.clear();
     alertConfirmMock.mockClear();
     notifyErrorMock.mockClear();
+    unloadFinalizationMocks.fetchNative.mockClear();
+    unloadFinalizationMocks.globalFetch.mockClear();
+    unloadFinalizationMocks.saveAsset.mockClear();
     pluginV2.providers.clear();
     pluginV2.providerOptions.clear();
     pluginV2.editdisplay.clear();
@@ -1910,6 +1926,124 @@ describe("V3 guest startup handshake", () => {
         )).toBe("durable");
         expect(pluginV2.providers.has("compat-too-late")).toBe(false);
         expect(iframe.isConnected).toBe(false);
+        restoreRelay();
+    });
+
+    test("legacy compatibility restores bounded database, UI, network, and asset finalization", async () => {
+        testState.database.legacyPluginCompatibility = true;
+        const plugin = startupPlugin("Legacy Finalizer", `
+            await risuai.onUnload(async () => {
+                await risuai.setDatabaseLite({ temperature: 73 });
+                await risuai.setArgument("finalized", "yes");
+                await risuai.changeTextTheme("highcontrast");
+                await risuai.setChatPanel(null, { id: "legacy-finalizer-panel" });
+                await risuai.nativeFetch("https://example.com/finalize", { method: "DELETE" });
+                await risuai.risuFetch("https://example.com/legacy-finalize", { method: "POST" });
+                globalThis.savedFinalAsset = await risuai.saveAsset(new Uint8Array([1, 2, 3]));
+                globalThis.legacyFinalizationComplete = true;
+            });
+        `);
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+        await getV3PluginInstance(plugin.name)!.lifetime;
+        chatPanelStore.push({
+            id: "legacy-finalizer-panel",
+            pluginName: "external-fixture",
+            html: "stale",
+        });
+
+        await expect(teardownV3Plugins()).resolves.toBeUndefined();
+
+        expect(guestWindow.legacyFinalizationComplete).toBe(true);
+        expect(guestWindow.savedFinalAsset).toBe("assets/finalized.png");
+        expect(testState.database.temperature).toBe(73);
+        expect(testState.database.textTheme).toBe("highcontrast");
+        expect(testState.database.plugins[0].realArg.finalized).toBe("yes");
+        expect(chatPanelStore.some(panel => panel.id === "legacy-finalizer-panel")).toBe(false);
+        expect(unloadFinalizationMocks.fetchNative).toHaveBeenCalledWith(
+            "https://example.com/finalize",
+            expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
+        expect(unloadFinalizationMocks.globalFetch).toHaveBeenCalledWith(
+            "https://example.com/legacy-finalize",
+            expect.objectContaining({ abortSignal: expect.any(AbortSignal) }),
+        );
+        expect(unloadFinalizationMocks.saveAsset).toHaveBeenCalledOnce();
+        restoreRelay();
+    });
+
+    test("the onUnload signal authorizes finalization without reopening lifecycle work", async () => {
+        testState.database.legacyPluginCompatibility = false;
+        const plugin = startupPlugin("Strict Finalizer", `
+            await risuai.onUnload(async (signal) => {
+                await risuai.setDatabaseLite({ temperature: 91 }, signal);
+                await risuai.setArgument("finalized", "strict", signal);
+                await risuai.changeTextTheme("highcontrast", signal);
+                await risuai.setChatPanel(null, { id: "strict-finalizer-panel" }, signal);
+                await risuai.nativeFetch(
+                    "https://example.com/strict-finalize",
+                    { method: "DELETE" },
+                    signal,
+                );
+                globalThis.savedFinalAsset = await risuai.saveAsset(
+                    new Uint8Array([4, 5, 6]),
+                    signal,
+                );
+                try {
+                    await risuai.setDatabaseLite({ plugins: [] }, signal);
+                } catch (error) {
+                    globalThis.pluginGenerationRejected = true;
+                }
+                try {
+                    await risuai.setChatPanel("<b>late UI</b>", {}, signal);
+                } catch (error) {
+                    globalThis.nonEmptyPanelRejected = true;
+                }
+                try {
+                    await risuai.runLLMModel({ mode: "main", messages: [] }, signal);
+                } catch (error) {
+                    globalThis.modelWorkRejected = true;
+                }
+                globalThis.strictFinalizationComplete = true;
+            });
+        `);
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        await loading;
+        await getV3PluginInstance(plugin.name)!.lifetime;
+        chatPanelStore.push({
+            id: "strict-finalizer-panel",
+            pluginName: "external-fixture",
+            html: "stale",
+        });
+
+        await expect(teardownV3Plugins()).resolves.toBeUndefined();
+
+        expect(guestWindow.strictFinalizationComplete).toBe(true);
+        expect(guestWindow.savedFinalAsset).toBe("assets/finalized.png");
+        expect(guestWindow.pluginGenerationRejected).toBe(true);
+        expect(guestWindow.nonEmptyPanelRejected).toBe(true);
+        expect(guestWindow.modelWorkRejected).toBe(true);
+        expect(testState.database.temperature).toBe(91);
+        expect(testState.database.textTheme).toBe("highcontrast");
+        expect(testState.database.plugins[0].realArg.finalized).toBe("strict");
+        expect(chatPanelStore.some(panel => panel.id === "strict-finalizer-panel")).toBe(false);
+        expect(unloadFinalizationMocks.fetchNative).toHaveBeenCalledWith(
+            "https://example.com/strict-finalize",
+            expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
+        expect(unloadFinalizationMocks.saveAsset).toHaveBeenCalledOnce();
         restoreRelay();
     });
 

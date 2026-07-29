@@ -1543,7 +1543,7 @@ interface RisuaiPluginAPI {
      * await risuai.setCharacter(char);
      * ```
      */
-    setCharacter(character: any): Promise<void>;
+    setCharacter(character: any, unloadSignal?: AbortSignal): Promise<void>;
 
     /**
      * @deprecated Use getCharacter() instead
@@ -1553,7 +1553,7 @@ interface RisuaiPluginAPI {
     /**
      * @deprecated Use setCharacter() instead
      */
-    setChar(character: any): Promise<void>;
+    setChar(character: any, unloadSignal?: AbortSignal): Promise<void>;
 
         /**
      * Gets a character by index
@@ -1567,7 +1567,11 @@ interface RisuaiPluginAPI {
      * @param index - Character index
      * @param character - Character object to save
      */
-    setCharacterToIndex(index: number, character: any): Promise<void>;
+    setCharacterToIndex(
+        index: number,
+        character: any,
+        unloadSignal?: AbortSignal,
+    ): Promise<void>;
 
     /**
      * Gets a chat by index
@@ -1584,7 +1588,12 @@ interface RisuaiPluginAPI {
      * @param chatIndex - Chat index
      * @param chat - Chat object to save
      */
-    setChatToIndex(characterIndex: number, chatIndex: number, chat: any): Promise<void>;
+    setChatToIndex(
+        characterIndex: number,
+        chatIndex: number,
+        chat: any,
+        unloadSignal?: AbortSignal,
+    ): Promise<void>;
 
     /**
      * Gets the current character index
@@ -1647,7 +1656,11 @@ interface RisuaiPluginAPI {
      * @param key - Argument key
      * @param value - Value to set
      */
-    setArgument(key: string, value: string | number): Promise<void>;
+    setArgument(
+        key: string,
+        value: string | number,
+        unloadSignal?: AbortSignal,
+    ): Promise<void>;
 
     /**
      * @deprecated Use getArgument() instead
@@ -1657,7 +1670,7 @@ interface RisuaiPluginAPI {
     /**
      * @deprecated Use setArgument() instead
      */
-    setArg(arg: string, value: string | number): void;
+    setArg(arg: string, value: string | number, unloadSignal?: AbortSignal): void;
 
     // ========== Database APIs ==========
 
@@ -1703,7 +1716,7 @@ interface RisuaiPluginAPI {
      * again. This guarantee applies to calls made through risuai/Risuai.
      * @param db - DatabaseSubset object to save
      */
-    setDatabaseLite(db: DatabaseSubset): Promise<void>;
+    setDatabaseLite(db: DatabaseSubset, unloadSignal?: AbortSignal): Promise<void>;
 
     /**
      * Sets the database (full save with sync)
@@ -1722,7 +1735,7 @@ interface RisuaiPluginAPI {
      * again. This guarantee applies to calls made through risuai/Risuai.
      * @param db - DatabaseSubset object to save
      */
-    setDatabase(db: DatabaseSubset): Promise<void>;
+    setDatabase(db: DatabaseSubset, unloadSignal?: AbortSignal): Promise<void>;
 
     // ========== Color Scheme APIs ==========
 
@@ -1731,13 +1744,13 @@ interface RisuaiPluginAPI {
      * Available presets: 'default', 'dark', 'light', 'cherry', 'galaxy', 'nature', 'realblack', 'monokai-light', 'monokai-black'
      * @param name - Preset color scheme name
      */
-    changeColorScheme(name: string): Promise<void>;
+    changeColorScheme(name: string, unloadSignal?: AbortSignal): Promise<void>;
 
     /**
      * Apply a custom color scheme. Automatically sets colorSchemeName to 'custom'.
      * @param scheme - ColorScheme object with all color values
      */
-    setColorScheme(scheme: ColorScheme): Promise<void>;
+    setColorScheme(scheme: ColorScheme, unloadSignal?: AbortSignal): Promise<void>;
 
     /**
      * Get the current color scheme name and values.
@@ -1751,13 +1764,13 @@ interface RisuaiPluginAPI {
      * Change to a preset text theme.
      * @param name - 'standard' | 'highcontrast'
      */
-    changeTextTheme(name: string): Promise<void>;
+    changeTextTheme(name: string, unloadSignal?: AbortSignal): Promise<void>;
 
     /**
      * Apply a custom text theme. Automatically sets textTheme to 'custom'.
      * @param theme - CustomTextTheme object with all font color values
      */
-    setCustomTextTheme(theme: CustomTextTheme): Promise<void>;
+    setCustomTextTheme(theme: CustomTextTheme, unloadSignal?: AbortSignal): Promise<void>;
 
     /**
      * Get the current text theme name and custom theme values.
@@ -1773,7 +1786,20 @@ interface RisuaiPluginAPI {
      * @param options - Fetch options
      * @returns Response promise
      */
-    nativeFetch(url: string, options?: RequestInit): Promise<Response>;
+    nativeFetch(
+        url: string,
+        options?: RequestInit,
+        unloadSignal?: AbortSignal,
+    ): Promise<Response>;
+
+    /**
+     * @deprecated Use nativeFetch() instead.
+     */
+    risuFetch(
+        url: string,
+        options?: Record<string, any>,
+        unloadSignal?: AbortSignal,
+    ): Promise<any>;
 
     /**
      * Saves a secret header for network requests, for protected Headers (like Authorization) that are stripped by Risuai for security.
@@ -1870,6 +1896,17 @@ interface RisuaiPluginAPI {
      * @param id - UI part ID returned during registration
      */
     unregisterUIPart(id: string): Promise<void>;
+
+    /**
+     * Sets or removes the plugin chat panel. During onUnload, only null or an
+     * empty string is accepted and the callback's signal must be supplied when
+     * legacy compatibility mode is disabled.
+     */
+    setChatPanel(
+        content: string | null,
+        options?: { id?: string; className?: string },
+        unloadSignal?: AbortSignal,
+    ): Promise<{ id: string }>;
 
     // ========== MCP APIs ==========
 
@@ -2152,7 +2189,7 @@ interface RisuaiPluginAPI {
      * @param data - Asset data
      * @returns Saved asset path
      */
-    saveAsset(data: any): Promise<string>;
+    saveAsset(data: any, unloadSignal?: AbortSignal): Promise<string>;
 
     // ========== Plugin Management ==========
 
@@ -2162,7 +2199,15 @@ interface RisuaiPluginAPI {
     loadPlugins(): Promise<void>;
 
     /**
-     * Registers an unload function called when plugin is unloaded
+     * Registers a bounded finalizer called when the plugin is unloaded.
+     *
+     * Pass the supplied signal to final database, argument, character/chat,
+     * theme, chat-panel removal, network, or asset calls. The signal is an
+     * unload capability as well as a cancellation signal; it authorizes only
+     * those finalization APIs. New registrations, plugin-list replacement,
+     * non-empty UI construction, model execution, and chat sends remain closed.
+     * Legacy compatibility mode also accepts the former no-signal call shape
+     * for the supported finalization methods.
      */
     onUnload(func: (signal: AbortSignal) => void | Promise<void>): Promise<void>;
 
