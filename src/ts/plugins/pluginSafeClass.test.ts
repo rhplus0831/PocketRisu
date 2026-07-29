@@ -55,23 +55,70 @@ beforeEach(() => {
 });
 
 describe("SafeLocalPluginStorage write acknowledgement", () => {
-    test("invalid JSON rejects without populating or replacing the cache", async () => {
+    test("values JSON.stringify cannot represent reject without changing the cache", async () => {
         const storage = new SafeLocalPluginStorage();
         const existingKey = `invalid-existing-${keySequence}`;
         const missingKey = `invalid-missing-${keySequence}`;
         await storage.setItem(existingKey, { state: "previous" });
         kv.writePersistentJson.mockClear();
         kv.readPersistentJson.mockClear();
+        const circular: Record<string, unknown> = {};
+        circular.self = circular;
 
-        await expect(storage.setItem(existingKey, { nested: undefined }))
+        await expect(storage.setItem(existingKey, circular))
             .rejects.toThrow(TypeError);
-        await expect(storage.setItem(missingKey, new Map([["lost", true]])))
+        await expect(storage.setItem(missingKey, { unsupported: 1n }))
             .rejects.toThrow(TypeError);
 
         expect(kv.writePersistentJson).not.toHaveBeenCalled();
         await expect(storage.getItem(existingKey)).resolves.toEqual({ state: "previous" });
         await expect(storage.getItem(missingKey)).resolves.toBeNull();
         expect(kv.readPersistentJson).toHaveBeenCalledOnce();
+    });
+
+    test("normalizes legacy values with JSON.stringify semantics", async () => {
+        const storage = new SafeLocalPluginStorage();
+        const key = `legacy-json-${keySequence}`;
+        const toJSON = vi.fn(() => ({ replaced: true }));
+        const getter = vi.fn(() => "from-getter");
+        const accessor = {};
+        Object.defineProperty(accessor, "value", {
+            enumerable: true,
+            get: getter,
+        });
+        const map = new Map([["entry", "historically omitted"]]) as Map<string, string> & {
+            label?: string;
+        };
+        map.label = "enumerable-own-property";
+        const sparse = [1, , undefined, Number.NaN, Number.POSITIVE_INFINITY];
+        const value = {
+            date: new Date("2026-01-02T03:04:05.000Z"),
+            transformed: { original: true, toJSON },
+            accessor,
+            sparse,
+            map,
+            set: new Set(["historically omitted"]),
+            omitted: undefined,
+            omittedFunction: () => "omitted",
+        };
+        const expected = {
+            date: "2026-01-02T03:04:05.000Z",
+            transformed: { replaced: true },
+            accessor: { value: "from-getter" },
+            sparse: [1, null, null, null, null],
+            map: { label: "enumerable-own-property" },
+            set: {},
+        };
+
+        await storage.setItem(key, value);
+
+        expect(toJSON).toHaveBeenCalledOnce();
+        expect(getter).toHaveBeenCalledOnce();
+        expect(kv.writePersistentJson).toHaveBeenCalledWith(
+            `cache/plugin-storage/${key}.json`,
+            expected,
+        );
+        await expect(storage.getItem(key)).resolves.toEqual(expected);
     });
 
     test("snapshots before the first await and publishes only after persistence", async () => {

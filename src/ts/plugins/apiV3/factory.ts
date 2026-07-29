@@ -367,6 +367,7 @@ export function createV3BridgeRequestRegistry(options: {
 interface RemoteRef {
     __type: 'REMOTE_REF';
     id: string;
+    compatJsonStringifySetItem?: boolean;
 }
 
 interface CallbackRef {
@@ -767,6 +768,23 @@ await (async function() {
                     if (prop === 'then') return undefined;
                     if (prop === 'release') {
                         return () => send({ type: 'RELEASE_INSTANCE', id: val.id });
+                    }
+                    if (prop === 'setItem' && val.compatJsonStringifySetItem === true) {
+                        return async (...args) => {
+                            const serialized = JSON.stringify(args[1]);
+                            if (serialized === undefined) {
+                                throw new TypeError(
+                                    'Local plugin storage requires a JSON-representable value.'
+                                );
+                            }
+                            const normalizedArgs = [...args];
+                            normalizedArgs[1] = JSON.parse(serialized);
+                            return sendRequest('CALL_INSTANCE', {
+                                id: val.id,
+                                method: prop,
+                                args: normalizedArgs
+                            });
+                        };
                     }
                     return (...args) => sendRequest('CALL_INSTANCE', {
                         id: val.id,
@@ -1222,7 +1240,13 @@ export class SandboxHost {
 
             const id = this.allocateId('ref_');
             this.instanceRegistry.set(id, val);
-            return { __type: 'REMOTE_REF', id } as RemoteRef;
+            return {
+                __type: 'REMOTE_REF',
+                id,
+                ...(val.__compatJsonStringifySetItem === true
+                    ? { compatJsonStringifySetItem: true }
+                    : {}),
+            } as RemoteRef;
         }
 
         if(val instanceof Response) {

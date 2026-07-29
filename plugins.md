@@ -729,6 +729,11 @@ const deviceId = await Risuai.safeLocalStorage.getItem('device_id');
 
 `getLocalPluginStorage()` returns a `SafeLocalPluginStorage` instance: device-local storage that supports any JSON-serializable value (unlike `safeLocalStorage` which is strings-only), with generic type support:
 
+Values use the compatibility API's historical `JSON.stringify` normalization
+before storage. For example, dates become ISO strings, custom `toJSON` methods
+are honored, and sparse array slots become `null`. Cycles and other values that
+`JSON.stringify` cannot represent reject the write.
+
 ```javascript
 const storage = await Risuai.getLocalPluginStorage();
 

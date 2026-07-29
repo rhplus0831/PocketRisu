@@ -200,6 +200,57 @@ describe("SandboxHost V3 startup lifecycle", () => {
         restoreRelay();
     });
 
+    test("normalizes local plugin storage values before crossing the guest bridge", async () => {
+        const setItem = vi.fn(async () => undefined);
+        const localStorage = {
+            __classType: "REMOTE_REQUIRED" as const,
+            __compatJsonStringifySetItem: true as const,
+            setItem,
+        };
+        const iframe = document.createElement("iframe");
+        document.body.appendChild(iframe);
+        const host = new SandboxHost(startupApi({
+            getLocalPluginStorage: () => localStorage,
+        }));
+        const startup = host.run(iframe, `
+            const storage = await risuai.getLocalPluginStorage();
+            let toJSONCalls = 0;
+            const sparse = new Array(4);
+            sparse[0] = 'first';
+            sparse[2] = undefined;
+            sparse[3] = Number.POSITIVE_INFINITY;
+            const map = new Map([['entry', 'historically omitted']]);
+            map.label = 'enumerable-own-property';
+            await storage.setItem('compatibility-value', {
+                date: new Date('2026-01-02T03:04:05.000Z'),
+                custom: {
+                    original: true,
+                    toJSON() {
+                        toJSONCalls += 1;
+                        return { replaced: true };
+                    },
+                },
+                sparse,
+                map,
+                set: new Set(['historically omitted']),
+            });
+            globalThis.localStorageToJSONCalls = toJSONCalls;
+        `);
+        const restoreRelay = executeGeneratedGuest(iframe);
+
+        await startup;
+        expect(setItem).toHaveBeenCalledWith("compatibility-value", {
+            date: "2026-01-02T03:04:05.000Z",
+            custom: { replaced: true },
+            sparse: ["first", null, null, null],
+            map: { label: "enumerable-own-property" },
+            set: {},
+        });
+        expect((iframe.contentWindow as any).localStorageToJSONCalls).toBe(1);
+        host.terminate();
+        restoreRelay();
+    });
+
     test("runs generation publish/load/GC with signals through the real guest bridge", async () => {
         const backend = generationStorageApi();
         const iframe = document.createElement("iframe");

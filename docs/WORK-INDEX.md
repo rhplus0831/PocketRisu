@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **84** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, and **14** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **83** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, and **15** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -25,7 +25,6 @@ None currently open.
 |---|---|---|---|---|
 | [Remote plain HTTP no longer boots](compatibility/remote-http-deployments-no-longer-boot.md) | compat | Intentional | Existing remote-HTTP deployments cannot reach authentication or storage. | Deterministic after upgrade for non-loopback HTTP unless the operator enables the explicit override. |
 | [Cloudflare Quick Tunnel was removed](compatibility/cloudflare-quick-tunnel-removed.md) | compat | Intentional | Deployments using the bundled tunnel lose remote access and the old API returns 404. | Deterministic after update or container rebuild for Quick Tunnel users. |
-| [Local plugin storage rejects JSON-compatible values](compatibility/local-plugin-storage-strict-json.md) | compat | Open | Plugins can no longer persist values that main accepted through `JSON.stringify`. | Deterministic for ordinary affected values such as `Date`, custom `toJSON` objects, or sparse arrays. |
 | [V2 storage no longer behaves like an ordinary object](compatibility/v2-plugin-storage-object-prototype.md) | compat | Open | Common operations such as `hasOwnProperty`, `instanceof`, and string conversion fail or change result. | Deterministic for legacy plugins using ordinary object/prototype behavior. |
 | [Legacy V3 unload exposes only part of the API](compatibility/v3-onunload-api-allowlist.md) | compat | Open | Formerly valid cleanup, persistence, IPC, fetch, and UI-finalization calls fail. | Every unload for a plugin that uses a method outside the new cleanup allowlist. |
 | [Input hooks cannot call `sendChat`](compatibility/input-hooks-cannot-call-sendchat.md) | compat | Open | The nested call fails and can also abort the user's outer send. | Every invocation of an input hook using the previously supported sequential-send pattern. |
@@ -161,3 +160,4 @@ None currently open.
 | [An unrelated plugin failure poisoned installation](compatibility/unrelated-plugin-failure-poisons-install.md) | A pre-existing V3 startup failure could roll back a healthy plugin import or enable. | Fixed 2026-07-30 with per-plugin startup outcomes and target-aware rollback decisions. |
 | [Raw boot did not pin the plugin generation](compatibility/raw-boot-plugin-generation-not-pinned.md) | Optimized boot reconciliation reported false recovery failures and could not read the selected rows. | Fixed 2026-07-30 by forwarding the decoded database generation through boot reconciliation reads. |
 | [V2 rich storage values were rejected](compatibility/v2-plugin-storage-rich-values.md) | Existing plugin values could fail to read and new writes could prevent provider or hook registration. | Fixed 2026-07-30 with descriptor-safe structured-clone snapshots and persisted rich-value upgrade coverage. |
+| [Local plugin storage rejected JSON-compatible values](compatibility/local-plugin-storage-strict-json.md) | Plugins could no longer persist values that main accepted through `JSON.stringify`. | Fixed 2026-07-30 with compatibility normalization on both sides of the V3 iframe bridge. |

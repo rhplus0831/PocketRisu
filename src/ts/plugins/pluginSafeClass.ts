@@ -19,6 +19,17 @@ function clearPluginStorageCache(): void {
     }
 }
 
+function snapshotLegacyLocalPluginStorageValue(value: unknown): unknown {
+    // SafeLocalPluginStorage historically accepted the values JSON.stringify
+    // can normalize. Keep that compatibility at this API boundary while the
+    // persistence layer itself continues to accept only detached JSON data.
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) {
+        throw new TypeError("Local plugin storage requires a JSON-representable value.");
+    }
+    return snapshotJsonValue(JSON.parse(serialized));
+}
+
 export class SafeLocalStorage {
     getItem(key: string): string | null {
         return localStorage.getItem(`safe_plugin_${key}`);
@@ -63,6 +74,7 @@ export class SafeLocalStorage {
 
 export class SafeLocalPluginStorage {
     __classType = 'REMOTE_REQUIRED' as const;
+    __compatJsonStringifySetItem = true as const;
     __requestAbortMethods = new Set(['getItem', 'setItem', 'removeItem', 'keys', 'clear']);
     // The originating plugin, set when the instance is created via the V3
     // getLocalPluginStorage() API. Used to tag new writes with their origin in
@@ -92,10 +104,11 @@ export class SafeLocalPluginStorage {
     async setItem<T>(key: string, value: T, signal?: AbortSignal): Promise<void> {
         signal?.throwIfAborted();
         const cacheKey = `safe_plugin_${key}`;
-        // Capture and validate synchronously, then publish the detached value
-        // only after persistence succeeds. Rejected writes leave any previous
-        // cache entry authoritative and cannot retain a caller-owned alias.
-        const snapshot = snapshotJsonValue(value);
+        // Apply the compatibility API's historical JSON.stringify coercions
+        // synchronously, then publish the detached value only after persistence
+        // succeeds. Rejected writes leave any previous cache entry authoritative
+        // and cannot retain a caller-owned alias.
+        const snapshot = snapshotLegacyLocalPluginStorageValue(value);
         const storageKey = makeEncodedStorageKey(pluginStoragePrefix, key);
         try {
             if (signal) await writePersistentJson(storageKey, snapshot, signal);

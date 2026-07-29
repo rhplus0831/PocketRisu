@@ -1331,7 +1331,9 @@ interface SafeLocalPluginStorage {
     /**
      * Sets an item in storage
      * @param key - Storage key
-     * @param value - Value to store (any JSON-serializable value)
+     * @param value - Value normalized with JSON.stringify before storage.
+     * Dates and custom toJSON values are supported; values JSON.stringify
+     * cannot represent, such as cycles and BigInt, reject the write.
      * @returns Promise that resolves when item is stored
      */
     setItem<T>(key: string, value: T): Promise<void>;
