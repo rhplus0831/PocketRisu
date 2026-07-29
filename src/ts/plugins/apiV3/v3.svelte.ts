@@ -28,7 +28,10 @@ import {
     updateDatabaseWithPluginStorageSnapshot,
 } from "../pluginSaveStorage";
 import { createPluginDatabaseBridge } from "./pluginDatabaseBridge";
-import { disableEnabledLegacyPluginsForOptimizedMemory } from "../pluginMemoryOptimization";
+import {
+    disableEnabledLegacyPluginsForOptimizedMemory,
+    withPluginLifecycleLock,
+} from "../pluginMemoryOptimization";
 import DOMPurify from 'dompurify';
 import { additionalChatMenu, additionalFloatingActionButtons, additionalHamburgerMenu, additionalSettingsMenu, bodyIntercepterStore, chatPanelStore, DBState, selectedCharID, type MenuDef } from "src/ts/stores.svelte";
 import { v4 } from "uuid";
@@ -2143,10 +2146,49 @@ type V3PluginInstance = {
     host: SandboxHost;
     scope: V3PluginLifecycleScope;
     initialization: Promise<void>;
+    lifetime: Promise<void>;
     teardown?: Promise<void>;
 }
 
 const v3PluginInstances: V3PluginInstance[] = [];
+
+function observeV3PluginLifetime(instance: V3PluginInstance): void {
+    void instance.lifetime.catch(error => {
+        // A normal unload rejects a still-running guest body. The teardown owns
+        // that settlement and must not be reported as a runtime crash.
+        if (instance.teardown || !v3PluginInstances.includes(instance)) return;
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[RisuAI Plugin: ${instance.name}] API V3 plugin stopped.`, error);
+        notifyError(language.pluginRuntimeFailed(instance.name), {
+            description: message,
+            source: "plugin-runtime",
+        });
+
+        void withPluginLifecycleLock(async () => {
+            // A reload may have won the queue while this observer was waiting.
+            if (instance.teardown || !v3PluginInstances.includes(instance)) return;
+
+            let teardownError: unknown;
+            try {
+                await unloadV3PluginInstance(instance);
+            } catch (cleanupError) {
+                teardownError = cleanupError;
+            }
+
+            if (teardownError !== undefined) {
+                console.error(
+                    `[RisuAI Plugin: ${instance.name}] Runtime-failure cleanup also failed.`,
+                    teardownError,
+                );
+            }
+        }).catch(observerError => {
+            console.error(
+                `[RisuAI Plugin: ${instance.name}] Could not handle a runtime failure.`,
+                observerError,
+            );
+        });
+    });
+}
 
 export async function teardownV3Plugins(){
     // unloadV3Plugin removes from the live array synchronously, so iterate a
@@ -2163,9 +2205,9 @@ export async function teardownV3Plugins(){
 }
 
 export async function loadV3PluginGeneration(plugins:RisuPlugin[]){
-    // Promise.all rejects as soon as one guest fails. A generation must not be
-    // reported settled while another guest is still initializing, otherwise a
-    // lifecycle transition could tear down registrations that arrive later.
+    // Wait for every guest's bounded bridge/body-start handshake. The plugin's
+    // top-level lifetime continues independently and is observed above, so a
+    // service loop cannot retain the generation's lifecycle lease.
     const results = await Promise.allSettled(
         plugins.map(plugin => executePluginV3(plugin)),
     );
@@ -2199,12 +2241,17 @@ export async function executePluginV3(plugin:RisuPlugin){
     document.body.appendChild(iframe);
     const scope = new V3PluginLifecycleScope(plugin.name);
     const host = new SandboxHost(makeRisuaiAPIV3(iframe, plugin, scope));
-    const initialization = host.run(iframe, plugin.script);
+    const lifetime = host.run(iframe, plugin.script);
+    // The lifetime may reject before readiness is observed. The lifecycle path
+    // below reports initialization errors; late failures get their own observer.
+    void lifetime.catch(() => undefined);
+    const initialization = host.readiness;
     const instance: V3PluginInstance = {
         name: plugin.name,
         host,
         scope,
         initialization,
+        lifetime,
     };
     v3PluginInstances.push(instance);
     try {
@@ -2212,11 +2259,12 @@ export async function executePluginV3(plugin:RisuPlugin){
         if (!scope.markReady()) {
             throw new Error("Plugin initialization was cancelled during teardown.");
         }
+        observeV3PluginLifetime(instance);
         console.log(`[RisuAI Plugin: ${plugin.name}] Loaded API V3 plugin.`);
     } catch (error) {
-        // A guest can register UI/hooks before a later awaited initialization
-        // step rejects. Run its normal unload path and always terminate the
-        // iframe so a late ready message cannot resurrect this generation.
+        // A guest can establish bridge-owned state before readiness rejects.
+        // Run its normal unload path and always terminate the iframe so a late
+        // ready message cannot resurrect this generation.
         let teardownError: unknown;
         try {
             await unloadV3PluginInstance(instance);

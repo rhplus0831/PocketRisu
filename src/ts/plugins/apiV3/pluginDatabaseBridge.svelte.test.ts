@@ -347,6 +347,7 @@ const {
     customV3ProviderMetaStore,
     getV3PluginInstance,
     loadV3PluginGeneration,
+    loadV3Plugins,
     makeRisuaiAPIV3,
     resetAllPluginPermissions,
     teardownV3Plugins,
@@ -365,6 +366,7 @@ const {
     snapshotV3PluginStorageBatchForTransport,
     validateV3DatabaseMutationForTransport,
 } = await import("./factory");
+const { withPluginLifecycleLock } = await import("../pluginMemoryOptimization");
 const serverUtilsPath = "../../../../server/node/utils.cjs";
 const serverUtils = await import(/* @vite-ignore */ serverUtilsPath) as {
     calculateHash: (value: unknown) => number;
@@ -697,6 +699,7 @@ describe("V3 mode-aware database bridge", () => {
         const restoreRelay = executeGeneratedGuest(iframe);
         try {
             await loading;
+            await getV3PluginInstance(plugin.name)!.lifetime;
             const guest = iframe.contentWindow as any;
             expect(guest.networkSet).toMatchObject({
                 outcome: "unknown",
@@ -1632,119 +1635,109 @@ describe("V3 mode-aware database bridge", () => {
 });
 
 describe("V3 guest startup handshake", () => {
-    test("watchdog cleans a timed-out production instance without harming its peer or reload", async () => {
+    test("long-lived top-level work releases startup and the lifecycle queue", async () => {
         vi.useFakeTimers();
-        const timedOut = startupPlugin("Timed Out Production Startup", `
-            await risuai.addProvider("timed-residue", async () => ({ success: true, content: "bad" }));
+        const longLived = startupPlugin("Long-Lived Production Plugin", `
+            await risuai.addProvider("long-lived-provider", async () => ({ success: true, content: "ok" }));
             await new Promise(() => {});
         `);
         const healthy = startupPlugin("Healthy Production Startup", `
             await risuai.addProvider("healthy-provider", async () => ({ success: true, content: "ok" }));
         `);
-        testState.database.plugins = [timedOut, healthy];
+        testState.database.plugins = [longLived, healthy];
         DBState.db = testState.database;
-        let restoreTimedOutRelay: (() => void) | undefined;
+        let restoreLongLivedRelay: (() => void) | undefined;
         let restoreHealthyRelay: (() => void) | undefined;
-        let restoreReloadRelay: (() => void) | undefined;
 
         try {
             let generationSettled = false;
-            const startedAt = Date.now();
-            const loading = loadV3PluginGeneration([timedOut, healthy]);
-            const loadingOutcome = loading.then(
-                () => null,
-                error => error,
+            const loading = withPluginLifecycleLock(
+                async () => loadV3PluginGeneration([longLived, healthy]),
             ).finally(() => {
                 generationSettled = true;
             });
-            const [timedOutIframe, healthyIframe] = [
+            await vi.waitFor(() => {
+                expect(document.body.querySelectorAll("iframe")).toHaveLength(2);
+            });
+            const [longLivedIframe, healthyIframe] = [
                 ...document.body.querySelectorAll("iframe"),
             ];
-            restoreTimedOutRelay = executeGeneratedGuest(timedOutIframe);
+            restoreLongLivedRelay = executeGeneratedGuest(longLivedIframe);
             restoreHealthyRelay = executeGeneratedGuest(healthyIframe);
-            const healthyInstance = getV3PluginInstance(healthy.name)!;
-            await healthyInstance.initialization;
+            await loading;
 
-            expect(pluginV2.providers.has("timed-residue")).toBe(true);
-            expect(pluginV2.providers.has("healthy-provider")).toBe(true);
-            expect(getV3PluginInstance(timedOut.name)).toBeDefined();
-            expect(getV3PluginInstance(healthy.name)).toBe(healthyInstance);
-            expect(generationSettled).toBe(false);
-            const elapsed = Date.now() - startedAt;
-            expect(elapsed).toBeLessThan(PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS);
-
-            await vi.advanceTimersByTimeAsync(
-                PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS - elapsed - 1,
-            );
-            expect(generationSettled).toBe(false);
-            expect(timedOutIframe.isConnected).toBe(true);
-            expect(pluginV2.providers.has("timed-residue")).toBe(true);
-
-            await vi.advanceTimersByTimeAsync(1);
-            const failure = await loadingOutcome;
-
-            expect(failure).toBeInstanceOf(AggregateError);
-            expect(failure).toMatchObject({
-                message: "One or more V3 plugins failed to initialize.",
-                errors: [expect.objectContaining({
-                    name: "PluginInitializationTimeoutError",
-                    code: "PLUGIN_INITIALIZATION_TIMEOUT",
-                    retryable: false,
-                    commitOutcomeUnknown: false,
-                    operation: "initialization",
-                    message: `Plugin initialization timed out after ${PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS}ms.`,
-                })],
+            expect(generationSettled).toBe(true);
+            await vi.waitFor(() => {
+                expect(pluginV2.providers.has("long-lived-provider")).toBe(true);
+                expect(pluginV2.providers.has("healthy-provider")).toBe(true);
             });
-            expect(notifyErrorMock).toHaveBeenCalledOnce();
-            expect(notifyErrorMock).toHaveBeenCalledWith(
-                `Plugin "${timedOut.name}" failed to start.`,
-                {
-                    description: `Plugin initialization timed out after ${PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS}ms.`,
-                    source: "plugin-startup",
-                },
-            );
+            expect(getV3PluginInstance(longLived.name)).toBeDefined();
+            expect(getV3PluginInstance(healthy.name)).toBeDefined();
 
-            expect(timedOutIframe.isConnected).toBe(false);
-            expect(getV3PluginInstance(timedOut.name)).toBeUndefined();
-            expect(pluginV2.providers.has("timed-residue")).toBe(false);
-            expect(pluginV2.providerOptions.has("timed-residue")).toBe(false);
-            expect(get(customProviderStore)).not.toContain("timed-residue");
-            expect(customV3ProviderMetaStore.some(
-                model => model.id === "pluginmodel:::timed-residue",
-            )).toBe(false);
+            let nextLifecycleOperationRan = false;
+            await withPluginLifecycleLock(async () => {
+                nextLifecycleOperationRan = true;
+            });
+            expect(nextLifecycleOperationRan).toBe(true);
 
+            await vi.advanceTimersByTimeAsync(PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS);
+
+            expect(longLivedIframe.isConnected).toBe(true);
             expect(healthyIframe.isConnected).toBe(true);
-            expect(getV3PluginInstance(healthy.name)).toBe(healthyInstance);
+            expect(getV3PluginInstance(longLived.name)).toBeDefined();
+            expect(getV3PluginInstance(healthy.name)).toBeDefined();
+            expect(pluginV2.providers.has("long-lived-provider")).toBe(true);
             expect(pluginV2.providers.has("healthy-provider")).toBe(true);
-            expect(pluginV2.providerOptions.has("healthy-provider")).toBe(true);
-            expect(get(customProviderStore)).toContain("healthy-provider");
-            expect(customV3ProviderMetaStore.some(
-                model => model.id === "pluginmodel:::healthy-provider",
-            )).toBe(true);
-
-            const reloaded = startupPlugin(timedOut.name, `
-                await risuai.addProvider("reloaded-provider", async () => ({ success: true, content: "recovered" }));
-            `);
-            const reload = loadV3PluginGeneration([reloaded]);
-            const reloadIframe = [...document.body.querySelectorAll("iframe")]
-                .find(iframe => iframe !== healthyIframe)!;
-            restoreReloadRelay = executeGeneratedGuest(reloadIframe);
-            await reload;
-
-            expect(getV3PluginInstance(timedOut.name)).toBeDefined();
-            expect(pluginV2.providers.has("reloaded-provider")).toBe(true);
-            expect(pluginV2.providers.has("timed-residue")).toBe(false);
-            expect(notifyErrorMock).toHaveBeenCalledOnce();
+            expect(notifyErrorMock).not.toHaveBeenCalled();
         } finally {
             vi.useRealTimers();
             await teardownV3Plugins().catch(() => undefined);
-            restoreReloadRelay?.();
             restoreHealthyRelay?.();
-            restoreTimedOutRelay?.();
+            restoreLongLivedRelay?.();
         }
     });
 
-    test("teardown closes registration before awaiting a hanging pre-ready unload callback", async () => {
+    test("hot reload replaces a plugin whose old top-level task is still running", async () => {
+        const oldPlugin = startupPlugin("Hot Reload Service", `
+            await risuai.addProvider("old-hot-provider", async () => ({ success: true, content: "old" }));
+            await new Promise(() => {});
+        `);
+        const replacement = startupPlugin(oldPlugin.name, `
+            await risuai.addProvider("new-hot-provider", async () => ({ success: true, content: "new" }));
+        `);
+        testState.database.plugins = [oldPlugin];
+        DBState.db = testState.database;
+
+        const firstLoad = loadV3PluginGeneration([oldPlugin]);
+        const oldIframe = document.body.querySelector("iframe")!;
+        const restoreOldRelay = executeGeneratedGuest(oldIframe);
+        await firstLoad;
+        await vi.waitFor(() => expect(pluginV2.providers.has("old-hot-provider")).toBe(true));
+
+        const reload = loadV3Plugins([replacement]);
+        await vi.waitFor(() => {
+            const replacementIframe = [...document.body.querySelectorAll("iframe")]
+                .find(iframe => iframe !== oldIframe);
+            expect(replacementIframe).toBeDefined();
+        });
+        const replacementIframe = [...document.body.querySelectorAll("iframe")]
+            .find(iframe => iframe !== oldIframe)!;
+        const restoreReplacementRelay = executeGeneratedGuest(replacementIframe);
+        await reload;
+        await getV3PluginInstance(replacement.name)!.lifetime;
+
+        expect(oldIframe.isConnected).toBe(false);
+        expect(pluginV2.providers.has("old-hot-provider")).toBe(false);
+        expect(pluginV2.providers.has("new-hot-provider")).toBe(true);
+        expect(getV3PluginInstance(replacement.name)).toBeDefined();
+        expect(notifyErrorMock).not.toHaveBeenCalled();
+
+        await teardownV3Plugins();
+        restoreReplacementRelay();
+        restoreOldRelay();
+    });
+
+    test("teardown closes registration while a top-level task is still pending", async () => {
         const startupReadStarted = deferred();
         const releaseStartupRead = deferred();
         const preprocessorCount = getTTSPreprocessors().length;
@@ -1842,12 +1835,12 @@ describe("V3 guest startup handshake", () => {
                 commitOutcomeUnknown: false,
                 operation: "unload",
             }));
-        expect(loadingError).toBeInstanceOf(AggregateError);
+        expect(loadingError).toBeNull();
         expect(pluginV2.providers.has("too-late-provider")).toBe(false);
         expect(get(customProviderStore)).not.toContain("too-late-provider");
         expect(logSpy.mock.calls.some(([message]) =>
             String(message).includes(`[RisuAI Plugin: ${plugin.name}] Loaded API V3 plugin.`),
-        )).toBe(false);
+        )).toBe(true);
         expect(iframe.isConnected).toBe(false);
         restoreRelay();
         errorSpy.mockRestore();
@@ -1879,6 +1872,7 @@ describe("V3 guest startup handshake", () => {
         const guestWindow = iframe.contentWindow as any;
         const restoreRelay = executeGeneratedGuest(iframe);
         await loading;
+        await getV3PluginInstance(plugin.name)!.lifetime;
 
         await expect(teardownV3Plugins()).resolves.toBeUndefined();
 
@@ -1913,6 +1907,7 @@ describe("V3 guest startup handshake", () => {
         const restoreRelay = executeGeneratedGuest(iframe);
 
         await loading;
+        await getV3PluginInstance(plugin.name)!.lifetime;
 
         expect(guestWindow.rewriteResult).toMatchObject({
             committed: true,
@@ -1960,6 +1955,7 @@ describe("V3 guest startup handshake", () => {
         const restoreRelay = executeGeneratedGuest(iframe);
 
         await loading;
+        await getV3PluginInstance(plugin.name)!.lifetime;
 
         expect(guestWindow.composedStorageSurface).toEqual({
             readItem: "function",
@@ -2045,6 +2041,7 @@ describe("V3 guest startup handshake", () => {
         const guestWindow = iframe.contentWindow as any;
         const restoreRelay = executeGeneratedGuest(iframe);
         await loading;
+        await getV3PluginInstance(plugin.name)!.lifetime;
         await vi.waitFor(() => expect(guestWindow.composedMigrationStarted).toBe(true));
         await new Promise(resolve => setTimeout(resolve, 25));
 
@@ -2356,6 +2353,7 @@ describe("V3 guest startup handshake", () => {
         const guestWindow = iframe.contentWindow as any;
         const restoreRelay = executeGeneratedGuest(iframe);
         await loading;
+        await getV3PluginInstance(plugin.name)!.lifetime;
 
         await teardownV3Plugins();
 
@@ -2546,6 +2544,7 @@ describe("V3 guest startup handshake", () => {
         const guestWindow = iframe.contentWindow as any;
         const restoreRelay = executeGeneratedGuest(iframe);
         await loading;
+        await getV3PluginInstance(plugin.name)!.lifetime;
 
         await teardownV3Plugins();
 
@@ -2649,7 +2648,7 @@ describe("V3 guest startup handshake", () => {
         restoreRelay();
     });
 
-    test("keeps a plugin generation pending until delayed storage finishes before registration", async () => {
+    test("slow successful top-level work continues after generation readiness", async () => {
         const readStarted = deferred();
         const releaseRead = deferred();
         const postRegistrationReadStarted = deferred();
@@ -2683,16 +2682,17 @@ describe("V3 guest startup handshake", () => {
         const restoreRelay = executeGeneratedGuest(iframe!);
 
         await readStarted.promise;
-        expect(generationSettled).toBe(false);
+        await loading;
+        expect(generationSettled).toBe(true);
         expect(pluginV2.providers.has("delayed-provider")).toBe(false);
 
         releaseRead.resolve();
         await postRegistrationReadStarted.promise;
         expect(pluginV2.providers.has("delayed-provider")).toBe(true);
-        expect(generationSettled).toBe(false);
+        expect(generationSettled).toBe(true);
 
         releasePostRegistrationRead.resolve();
-        await loading;
+        await getV3PluginInstance(plugin.name)!.lifetime;
 
         expect(pluginV2.providers.has("delayed-provider")).toBe(true);
         expect(getV3PluginInstance(plugin.name)).toBeDefined();
@@ -2700,7 +2700,7 @@ describe("V3 guest startup handshake", () => {
         restoreRelay();
     });
 
-    test("waits for every guest, reports rejection visibly, and never logs the failed guest as loaded", async () => {
+    test("reports a late top-level rejection without holding a healthy peer", async () => {
         const slowReadStarted = deferred();
         const releaseSlowRead = deferred();
         installManifestOwnedStartupKeys("rejected-config", "slow-config");
@@ -2735,25 +2735,28 @@ describe("V3 guest startup handshake", () => {
         const restoreRejectedRelay = executeGeneratedGuest(iframes[0]);
         const restoreSlowRelay = executeGeneratedGuest(iframes[1]);
         await slowReadStarted.promise;
-        await vi.waitFor(() => expect(notifyErrorMock).toHaveBeenCalledOnce());
-        expect(generationSettled).toBe(false);
+        await loading;
+        await vi.waitFor(() => {
+            expect(notifyErrorMock).toHaveBeenCalledOnce();
+            expect(getV3PluginInstance(rejected.name)).toBeUndefined();
+        });
+        expect(generationSettled).toBe(true);
         expect(pluginV2.providers.has("slow-provider")).toBe(false);
         expect(pluginV2.providers.has("rejected-provider")).toBe(false);
-        expect(getV3PluginInstance(rejected.name)).toBeUndefined();
         expect(logSpy.mock.calls.some(([message]) =>
             String(message).includes(`[RisuAI Plugin: ${rejected.name}] Loaded API V3 plugin.`),
-        )).toBe(false);
+        )).toBe(true);
 
         releaseSlowRead.resolve();
-        await expect(loading).rejects.toThrow("One or more V3 plugins failed to initialize.");
+        await getV3PluginInstance(slow.name)!.lifetime;
 
         expect(pluginV2.providers.has("slow-provider")).toBe(true);
         expect(getV3PluginInstance(slow.name)).toBeDefined();
         expect(notifyErrorMock).toHaveBeenCalledWith(
-            `Plugin "${rejected.name}" failed to start.`,
+            `Plugin "${rejected.name}" stopped unexpectedly.`,
             expect.objectContaining({
                 description: "optimized storage unavailable",
-                source: "plugin-startup",
+                source: "plugin-runtime",
             }),
         );
         restoreRejectedRelay();
@@ -2802,7 +2805,8 @@ describe("V3 guest startup handshake", () => {
         const iframe = document.body.querySelector("iframe")!;
         const restoreRelay = executeGeneratedGuest(iframe);
 
-        await expect(loading).rejects.toThrow("One or more V3 plugins failed to initialize.");
+        await loading;
+        await vi.waitFor(() => expect(getV3PluginInstance(plugin.name)).toBeUndefined());
 
         expect(getV3PluginInstance(plugin.name)).toBeUndefined();
         expect(pluginV2.providers.has("residue-provider")).toBe(false);
@@ -2823,6 +2827,13 @@ describe("V3 guest startup handshake", () => {
         expect(disconnectSpy).toHaveBeenCalled();
         expect(removeEventListenerSpy.mock.calls.some(([type]) => type === "click")).toBe(true);
         expect(iframe.isConnected).toBe(false);
+        expect(notifyErrorMock).toHaveBeenCalledWith(
+            `Plugin "${plugin.name}" stopped unexpectedly.`,
+            expect.objectContaining({
+                description: "late startup rejection",
+                source: "plugin-runtime",
+            }),
+        );
         restoreRelay();
         disconnectSpy.mockRestore();
         removeEventListenerSpy.mockRestore();

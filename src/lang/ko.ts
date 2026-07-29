@@ -1826,6 +1826,8 @@ export const languageKorean = {
     "여러 번 다시 불러오기를 시도한 후에도 플러그인 다시 불러오기가 대기 중입니다. 플러그인을 다시 불러오거나 앱을 재시작해 주세요.",
   pluginInitializationFailed: (plugin: string) =>
     `플러그인 "${plugin}"을(를) 시작하지 못했습니다.`,
+  pluginRuntimeFailed: (plugin: string) =>
+    `플러그인 "${plugin}"이(가) 예기치 않게 중지되었습니다.`,
   pluginStorageWriteRejected: (plugin: string) =>
     `플러그인 "${plugin}"이(가) 데이터를 저장하지 못했습니다.`,
   optimizePluginMemoryEnabled: "플러그인 메모리 최적화를 켰습니다.",

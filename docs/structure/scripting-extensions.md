@@ -104,6 +104,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - Strict teardown blocks ordinary RPC but retains a narrow storage authority while `onUnload` drains. Legacy compatibility keeps the broader cleanup-oriented bridge available for up to five seconds before final termination.
   - Remote-required instances are stored in an instance registry and surfaced as proxy references (`src/ts/plugins/apiV3/factory.ts:361`).
   - `run()` applies an iframe sandbox allowing scripts, modals, and downloads, plus a CSP with `connect-src 'none'`, then executes the bridge and plugin source in `srcdoc`. The CSP blocks iframe-originated fetch/XHR/WebSocket connections; it does not make every resource type or download inert (`src/ts/plugins/apiV3/factory.ts:483`, `src/ts/plugins/apiV3/factory.ts:498`, `src/ts/plugins/apiV3/factory.ts:606`).
+  - V3 startup has separate readiness and lifetime phases: `readiness` resolves after the bridge launches the plugin body, while `run()` follows the complete top-level promise. This prevents long-lived service work from retaining bootstrap or the lifecycle queue; late failures are observed and cleaned up in the background.
   - `terminate()` removes the iframe and clears remote/callback state (`src/ts/plugins/apiV3/factory.ts:645`).
 
 - `src/ts/plugins/apiV3/v3.svelte.ts` — `SafeElement` exposes remotely proxied DOM operations; HTML setters use DOMPurify (`src/ts/plugins/apiV3/v3.svelte.ts:59`, `src/ts/plugins/apiV3/v3.svelte.ts:230`).
@@ -120,8 +121,8 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
     - request-body interceptors and MCP registration (`src/ts/plugins/apiV3/v3.svelte.ts:1093`, `src/ts/plugins/apiV3/v3.svelte.ts:1231`);
     - save/local/persistent plugin storage and ownership tracking (`src/ts/plugins/apiV3/v3.svelte.ts:1292`, `src/ts/plugins/apiV3/v3.svelte.ts:1313`);
     - direct LLM invocation, user-message sending, and mutually allowed plugin IPC (`src/ts/plugins/apiV3/v3.svelte.ts:1373`, `src/ts/plugins/apiV3/v3.svelte.ts:1394`, `src/ts/plugins/apiV3/v3.svelte.ts:1442`).
-  - `loadV3Plugins()` unloads all current instances before parallel reload (`src/ts/plugins/apiV3/v3.svelte.ts:1489`).
-  - `executePluginV3()` creates the hidden iframe and starts its `SandboxHost` (`src/ts/plugins/apiV3/v3.svelte.ts:1497`).
+  - `loadV3Plugins()` unloads all current instances before parallel readiness handshakes.
+  - `executePluginV3()` creates the hidden iframe, waits for bounded readiness, then observes its top-level lifetime independently; a late rejection removes the failed instance under the serialized lifecycle lock.
 
 - `src/ts/plugins/apiV3/risuai.d.ts` — Authoritative developer-facing V3 type surface; all plugin-side API and remote-object calls return promises (`src/ts/plugins/apiV3/risuai.d.ts:1`).
   - MCP API declarations begin around `src/ts/plugins/apiV3/risuai.d.ts:98`.

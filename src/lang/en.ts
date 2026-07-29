@@ -1673,6 +1673,7 @@ export const languageEnglish = {
     optimizePluginMemoryLegacyAutoDisabled: (plugins: string) => `Optimized plugin memory was already enabled, so these V2/V2.1 plugins were powered off: ${plugins}`,
     pluginReloadDeferredPending: "A plugin reload is still pending after repeated reload attempts. Try reloading plugins again or restart the app.",
     pluginInitializationFailed: (plugin: string) => `Plugin "${plugin}" failed to start.`,
+    pluginRuntimeFailed: (plugin: string) => `Plugin "${plugin}" stopped unexpectedly.`,
     pluginStorageWriteRejected: (plugin: string) => `Plugin "${plugin}" could not save its data.`,
     optimizePluginMemoryEnabled: "Plugin memory optimization enabled.",
     optimizePluginMemoryDisabled: "Plugin memory optimization disabled.",

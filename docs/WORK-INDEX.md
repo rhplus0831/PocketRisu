@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-29 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **89** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, and **9** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-29 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **88** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, and **10** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -23,7 +23,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [V3 top-level completion blocks startup](compatibility/v3-top-level-startup-barrier.md) | compat | Open | The application remains at Loading Plugins and the lifecycle queue is held. | Every boot or reload with a V3 plugin whose top-level task is long-lived or never settles. |
 | [Remote plain HTTP no longer boots](compatibility/remote-http-deployments-no-longer-boot.md) | compat | Intentional | Existing remote-HTTP deployments cannot reach authentication or storage. | Deterministic after upgrade for non-loopback HTTP unless the operator enables the explicit override. |
 | [Cloudflare Quick Tunnel was removed](compatibility/cloudflare-quick-tunnel-removed.md) | compat | Intentional | Deployments using the bundled tunnel lose remote access and the old API returns 404. | Deterministic after update or container rebuild for Quick Tunnel users. |
 | [Chat saves wait for a full snapshot](compatibility/chat-save-blocked-by-synchronous-snapshot.md) | compat | Open | Chat-save acknowledgement is blocked and can become an ambiguous timeout after the row committed. | The first snapshot-eligible chat save after restart synchronously assembles a full snapshot; large stores commonly expose the delay. |
@@ -161,3 +160,4 @@ None currently open.
 | [Send-input race overwrote another chat](audit/send-input-race-replaces-another-chats-history.md) | Switching chats during input hooks could replace an entire chat history. | Fixed 2026-07-29 by binding the send flow to durable character/chat IDs. |
 | [Reroll failure restored into the current chat](audit/reroll-failure-restores-into-the-current-chat.md) | Switching chats during reroll could corrupt both chat histories. | Fixed 2026-07-29 by resolving settlement against the initiating IDs. |
 | [Rebase promoted the ETag too early](audit/rebase-promotes-etag-before-authoritative-state-is-installed.md) | A failed rebase could authorize a later stale full write and delete newer rows. | Fixed 2026-07-28 by publishing the candidate ETag only after full installation. |
+| [V3 top-level completion blocked startup](compatibility/v3-top-level-startup-barrier.md) | Long-lived plugin work could hold the application at Loading Plugins and retain the lifecycle queue. | Fixed 2026-07-29 by separating bounded readiness from plugin lifetime and observing late failures in the background. |

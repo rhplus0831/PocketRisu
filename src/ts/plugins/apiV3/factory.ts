@@ -235,7 +235,7 @@ export function deserializeV3BridgeError(input: unknown): Error {
 }
 
 type GuestControlMessage = {
-    type: 'READY' | 'ERROR';
+    type: 'READY' | 'COMPLETE' | 'ERROR';
     error?: V3BridgeErrorPayload | string;
     errorStack?: string;
 };
@@ -1037,7 +1037,8 @@ function createGuestRuntimeScript(controlToken: string): string {
     let runnerResolve;
     const runnerPromise = new Promise(resolve => { runnerResolve = resolve; });
     let sourceError;
-    let reported = false;
+    let readyReported = false;
+    let terminalReported = false;
 
     controlPort.start?.();
     hostWindow.postMessage({
@@ -1052,14 +1053,20 @@ function createGuestRuntimeScript(controlToken: string): string {
             ? error.stack
             : undefined,
     });
-    const report = (message) => {
-        if (reported) return;
-        reported = true;
+    const reportReady = () => {
+        if (readyReported || terminalReported) return false;
+        readyReported = true;
+        controlPort.postMessage({ type: 'READY' });
+        return true;
+    };
+    const reportTerminal = (message) => {
+        if (terminalReported) return;
+        terminalReported = true;
         controlPort.postMessage(message);
     };
     const sourceErrorHandler = (event) => {
         sourceError = event.error || new Error(event.message || 'Plugin source failed to parse.');
-        report({ type: 'ERROR', ...errorDetails(sourceError) });
+        reportTerminal({ type: 'ERROR', ...errorDetails(sourceError) });
     };
     window.addEventListener('error', sourceErrorHandler);
 
@@ -1078,10 +1085,23 @@ function createGuestRuntimeScript(controlToken: string): string {
             if (sourceError) throw sourceError;
             const runner = await runnerPromise;
             if (typeof runner !== 'function') throw new Error('Plugin runner is unavailable.');
-            await runner();
-            report({ type: 'READY' });
+            const lifetime = Promise.resolve(runner());
+            const pending = {};
+            const immediateResult = await Promise.race([
+                lifetime.then(
+                    () => ({ status: 'fulfilled' }),
+                    error => ({ status: 'rejected', error }),
+                ),
+                Promise.resolve(pending),
+            ]);
+            if (immediateResult !== pending && immediateResult.status === 'rejected') {
+                throw immediateResult.error;
+            }
+            if (!reportReady()) return;
+            if (immediateResult === pending) await lifetime;
+            reportTerminal({ type: 'COMPLETE' });
         } catch (error) {
-            report({ type: 'ERROR', ...errorDetails(error) });
+            reportTerminal({ type: 'ERROR', ...errorDetails(error) });
         } finally {
             window.removeEventListener('error', sourceErrorHandler);
         }
@@ -1116,10 +1136,14 @@ export class SandboxHost {
     private pendingExecutions = new Map<string, { resolve: Function, reject: Function }>();
     private messageHandler?: (event: MessageEvent) => void;
     private controlPort?: MessagePort;
+    private initialization?: Promise<void>;
     private resolveInitialization?: () => void;
     private rejectInitialization?: (reason: unknown) => void;
     private initializationSettled = false;
     private initializationTimer?: ReturnType<typeof setTimeout>;
+    private resolveCompletion?: () => void;
+    private rejectCompletion?: (reason: unknown) => void;
+    private completionSettled = false;
     private readonly idGeneration = crypto.randomUUID();
     private nextId = 0;
     private started = false;
@@ -1129,6 +1153,12 @@ export class SandboxHost {
 
     constructor(apiFactory: any) {
         this.apiFactory = apiFactory;
+    }
+
+    /** Resolves once the bridge is initialized and the plugin body has started. */
+    public get readiness(): Promise<void> {
+        return this.initialization
+            ?? Promise.reject(new Error("Plugin sandbox has not started."));
     }
 
     private allocateId(prefix: string): string {
@@ -1345,6 +1375,17 @@ export class SandboxHost {
         else reject?.(error);
     }
 
+    private settleCompletion(error?: unknown) {
+        if (this.completionSettled) return;
+        this.completionSettled = true;
+        const resolve = this.resolveCompletion;
+        const reject = this.rejectCompletion;
+        this.resolveCompletion = undefined;
+        this.rejectCompletion = undefined;
+        if (error === undefined) resolve?.();
+        else reject?.(error);
+    }
+
     private invokeTerminationCallback<T>(
         callback: (...args: any[]) => T,
         args: any[],
@@ -1387,9 +1428,9 @@ export class SandboxHost {
                 "AbortError",
             ));
         }
-        this.settleInitialization(
-            new Error("Plugin initialization was cancelled during teardown."),
-        );
+        const cancellation = new Error("Plugin initialization was cancelled during teardown.");
+        this.settleInitialization(cancellation);
+        this.settleCompletion(cancellation);
         // Let an operation that was already admitted finish during the bounded
         // unload grace period. Its rejection/success lets guest code leave the
         // startup await and observe that all later registrations are closed.
@@ -1409,9 +1450,9 @@ export class SandboxHost {
                 "AbortError",
             ));
         }
-        this.settleInitialization(
-            new Error("Plugin initialization was cancelled during teardown."),
-        );
+        const cancellation = new Error("Plugin initialization was cancelled during teardown.");
+        this.settleInitialization(cancellation);
+        this.settleCompletion(cancellation);
     }
 
     /** Permit only plugin-storage calls made by the captured unload callback. */
@@ -1442,18 +1483,34 @@ export class SandboxHost {
         if (this.terminating || this.terminated) {
             return Promise.reject(new Error("Plugin sandbox was terminated before startup."));
         }
+        this.started = true;
         // Retain an explicitly supplied iframe so terminate() can remove it if
         // validation fails. No document content is installed before validation.
         if (container instanceof HTMLIFrameElement) {
             this.iframe = container;
         }
+
+        const initialization = new Promise<void>((resolve, reject) => {
+            this.resolveInitialization = resolve;
+            this.rejectInitialization = reject;
+        });
+        this.initialization = initialization;
+        // Readiness and lifetime have different consumers. Keep either promise
+        // from becoming an unhandled rejection while its owner attaches.
+        void initialization.catch(() => undefined);
+        const completion = new Promise<void>((resolve, reject) => {
+            this.resolveCompletion = resolve;
+            this.rejectCompletion = reject;
+        });
+        void completion.catch(() => undefined);
+
         try {
             validateAsyncFunctionBody(userCode);
         } catch (error) {
-            return Promise.reject(error);
+            this.settleInitialization(error);
+            this.settleCompletion(error);
+            return completion;
         }
-        this.started = true;
-
         if(container instanceof HTMLIFrameElement) {
             this.iframe = container;
         } else {
@@ -1474,10 +1531,6 @@ export class SandboxHost {
 
         this.iframe.setAttribute('csp', this.csp);
 
-        const initialization = new Promise<void>((resolve, reject) => {
-            this.resolveInitialization = resolve;
-            this.rejectInitialization = reject;
-        });
         this.initializationTimer = setTimeout(() => {
             const error = new Error(
                 `Plugin initialization timed out after ${PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS}ms.`,
@@ -1488,6 +1541,7 @@ export class SandboxHost {
             error.commitOutcomeUnknown = false;
             error.operation = "initialization";
             this.settleInitialization(error);
+            this.settleCompletion(error);
             // Close new RPC/registration traffic immediately. The owning V3
             // lifecycle catches the rejection, runs registered cleanup and
             // bounded unload callbacks, then performs final iframe removal.
@@ -1515,16 +1569,25 @@ export class SandboxHost {
                 }
                 this.controlPort = transferredPort;
                 this.controlPort.onmessage = (controlEvent: MessageEvent<GuestControlMessage>) => {
-                    if (this.terminating || this.terminated || this.initializationSettled) return;
+                    if (this.terminating || this.terminated) return;
                     const controlData = controlEvent.data;
                     if (controlData?.type === 'READY') {
                         this.settleInitialization();
+                    } else if (controlData?.type === 'COMPLETE') {
+                        // READY and COMPLETE are ordered on the dedicated port,
+                        // but settling both makes the host robust to a malformed
+                        // or prematurely closed guest runtime.
+                        this.settleInitialization();
+                        this.settleCompletion();
                     } else if (controlData?.type === 'ERROR') {
                         const error = controlData.error === undefined
                             ? new Error("Plugin initialization failed.")
                             : deserializeV3BridgeError(controlData.error);
                         if (controlData.errorStack) error.stack = controlData.errorStack;
-                        this.settleInitialization(error);
+                        if (!this.initializationSettled) {
+                            this.settleInitialization(error);
+                        }
+                        this.settleCompletion(error);
                     }
                 };
                 this.controlPort.start();
@@ -1773,7 +1836,7 @@ export class SandboxHost {
 
         this.iframe.srcdoc = html;
 
-        return initialization;
+        return completion;
     }
 
     private detachRemoteState(abortActiveRequests = true) {

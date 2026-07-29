@@ -157,6 +157,28 @@ beforeEach(() => {
 });
 
 describe("SandboxHost V3 startup lifecycle", () => {
+    test("separates runner readiness from a long-lived top-level promise", async () => {
+        const iframe = document.createElement("iframe");
+        document.body.appendChild(iframe);
+        const host = new SandboxHost(startupApi());
+        let lifetimeSettled = false;
+        const lifetime = host.run(iframe, "await new Promise(() => {});")
+            .then(() => null, error => error)
+            .finally(() => { lifetimeSettled = true; });
+        const restoreRelay = executeGeneratedGuest(iframe);
+
+        await expect(host.readiness).resolves.toBeUndefined();
+        expect(lifetimeSettled).toBe(false);
+        expect(iframe.isConnected).toBe(true);
+
+        host.terminate();
+        await expect(lifetime).resolves.toMatchObject({
+            message: "Plugin initialization was cancelled during teardown.",
+        });
+        expect(iframe.isConnected).toBe(false);
+        restoreRelay();
+    });
+
     test("installs immutable-generation helpers on the public plugin storage API", async () => {
         const iframe = document.createElement("iframe");
         document.body.appendChild(iframe);
