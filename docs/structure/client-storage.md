@@ -127,7 +127,7 @@ Opening a placeholder invokes this flow:
 4. After the fetch, hydration re-finds the chat by ID so an index shift cannot write into the wrong slot (`src/ts/storage/chatStorage.ts:210-220`).
 5. It yields one animation frame, replaces the placeholder, waits one Svelte tick, and clears hydration suppression (`:221-230`).
 
-The server also verifies `x-chat-id` if it falls back to index lookup, returning 409 on an index mismatch (`server/node/server.cjs:5465`). Saving a chat captures an eligible pre-image, writes its row synchronously, returns its content hash for cache seeding, and does not wait for or schedule the database debounce (`server/node/server.cjs:5524`).
+The server also verifies `x-chat-id` if it falls back to index lookup, returning 409 on an index mismatch (`server/node/server.cjs:12530`). Saving a chat captures an eligible pre-image, writes its row synchronously, returns its content hash for cache seeding, and schedules the coalesced automatic snapshot only after acknowledgement; it does not wait for or schedule the database debounce (`server/node/server.cjs:12589`).
 
 ### Verified browser resource cache
 

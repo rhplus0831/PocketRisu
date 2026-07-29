@@ -144,6 +144,8 @@ count and exclusive chunk cost.
   `save/.spool`) and streams the final file through chunk-aware storage.
 - Snapshot failure is non-fatal to the primary save. The cooldown advances only after
   the snapshot row commits.
+- Primary database and chat writes acknowledge their committed mutation before scheduling
+  the coalesced snapshot, so full assembly is outside the response-critical path.
 - Optimized plugin data is folded with `pluginStorageFolded` and the selected
   generation/manifest proof.
 - A plugin-only atomic mutation writes `config/plugin-storage-recovery-dirty` in the same

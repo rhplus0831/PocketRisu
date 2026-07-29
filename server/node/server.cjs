@@ -12590,6 +12590,7 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
     if (!checkActiveSession(req, res)) return;
+    let shouldCreateBackup = false;
     try {
         await queueStorageMutation(async () => {
             const chaId = req.params.chaId;
@@ -12638,10 +12639,13 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                 throw new Error('Stored chat row could not be read');
             }
             const hash = sha256Hex(storedBytes);
-            await createBackupAndRotate();
-
+            // The authoritative row is already durable. Keep full recovery
+            // snapshot assembly outside the response-critical mutation so a
+            // large store cannot turn this acknowledgement into a timeout.
+            shouldCreateBackup = true;
             res.json({ success: true, hash });
         });
+        if (shouldCreateBackup) scheduleBackupAndRotate();
     } catch (error) {
         if (isImportInProgressError(error)) return sendImportBusy(res);
         next(error);
