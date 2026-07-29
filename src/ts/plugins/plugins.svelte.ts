@@ -1250,7 +1250,6 @@ export const getV2PluginAPIs = () => {
             },
             getPrototypeOf(nestedTarget) {
                 assertSynchronousPluginStorageAccess()
-                if (storageValue) return null
                 return Reflect.getPrototypeOf(nestedTarget)
             },
             setPrototypeOf(nestedTarget, prototype) {
@@ -1368,18 +1367,20 @@ export const getV2PluginAPIs = () => {
 
         const facadeToJSON = () => snapshotLegacyStorage()
         legacyStorageFacade = new Proxy(Object.create(null), {
-            get(_target, prop) {
+            get(_target, prop, receiver) {
                 assertSynchronousPluginStorageAccess()
                 const storage = getDatabase().pluginCustomStorage
                 if (hasPluginStorageRecordValue(storage, prop)) {
                     return guardNestedValue(storage![prop as keyof typeof storage], true)
                 }
-                // Svelte snapshot cannot structured-clone a user Proxy. A
-                // null-prototype detached value lets its standard toJSON path
-                // preserve an own `__proto__` without exposing the hook as an
-                // enumerable storage key.
+                // Keep the virtual toJSON hook ahead of inherited lookup so
+                // JSON serialization preserves an own `__proto__` without
+                // exposing the hook as an enumerable storage key.
                 if (prop === "toJSON") return facadeToJSON
-                return undefined
+                // The proxy target stays prototype-free so special storage
+                // keys are inert, but the public V2 facade must retain the
+                // ordinary-object behavior exposed by main and upstream.
+                return Reflect.get(Object.prototype, prop, receiver)
             },
             set(_target, prop, value) {
                 assertSynchronousPluginStorageAccess()
@@ -1402,6 +1403,7 @@ export const getV2PluginAPIs = () => {
             has(_target, prop) {
                 assertSynchronousPluginStorageAccess()
                 return hasPluginStorageRecordValue(getDatabase().pluginCustomStorage, prop)
+                    || Reflect.has(Object.prototype, prop)
             },
             ownKeys() {
                 assertSynchronousPluginStorageAccess()
@@ -1429,7 +1431,7 @@ export const getV2PluginAPIs = () => {
             },
             getPrototypeOf() {
                 assertSynchronousPluginStorageAccess()
-                return null
+                return Object.prototype
             },
             setPrototypeOf() {
                 assertSynchronousPluginStorageAccess()

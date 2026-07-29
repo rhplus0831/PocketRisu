@@ -130,11 +130,17 @@ describe("live plugin storage reads", () => {
         expect(Object.hasOwn(storage, "__proto__")).toBe(true);
         expect(Object.keys(storage)).toEqual(["__proto__"]);
         expect(JSON.parse(JSON.stringify(storage)).__proto__).toEqual({ nested: "assigned" });
+        // Svelte clones ordinary objects with bracket assignment, whose
+        // __proto__ behavior is distinct from the own-safe persistence path.
+        // The V2 facade deliberately matches that ordinary-object result.
+        const ordinary = createDatabasePluginStorageRecord<unknown>();
+        setDatabasePluginStorageRecordValue(ordinary, "__proto__", { nested: "assigned" });
         const snapshot = $state.snapshot(storage);
-        expect(snapshot).not.toBe(storage);
-        expect(Object.keys(snapshot)).toEqual(["__proto__"]);
-        expect(Object.hasOwn(snapshot, "__proto__")).toBe(true);
-        expect(snapshot.__proto__).toEqual({ nested: "assigned" });
+        const ordinarySnapshot = $state.snapshot(ordinary);
+        expect(Object.keys(snapshot)).toEqual(Object.keys(ordinarySnapshot));
+        expect(Object.hasOwn(snapshot, "__proto__"))
+            .toBe(Object.hasOwn(ordinarySnapshot, "__proto__"));
+        expect(Object.getPrototypeOf(snapshot)).toEqual(Object.getPrototypeOf(ordinarySnapshot));
         expect(apis.pluginStorage.keys()).toEqual(["__proto__"]);
         expect(apis.pluginStorage.getItem("__proto__")).toEqual({ nested: "assigned" });
 

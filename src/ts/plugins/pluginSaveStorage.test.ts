@@ -4897,6 +4897,57 @@ describe("transitionPluginStorageMode", () => {
         expect(v2Apis.pluginStorage.getItem("")).toBe("empty-first");
     });
 
+    test("V2 pluginCustomStorage preserves ordinary prototype observations", () => {
+        database.pluginCustomStorage = {
+            alpha: 1,
+            nested: { enabled: true },
+            items: [{ value: "first" }],
+        };
+        const storage = (getV2PluginAPIs().getDatabase() as any).pluginCustomStorage;
+
+        expect(Object.getPrototypeOf(storage)).toBe(Object.prototype);
+        expect(storage).toBeInstanceOf(Object);
+        expect(Object.prototype.isPrototypeOf(storage)).toBe(true);
+        expect(storage.hasOwnProperty("alpha")).toBe(true);
+        expect(storage.hasOwnProperty("missing")).toBe(false);
+        expect("alpha" in storage).toBe(true);
+        expect("toString" in storage).toBe(true);
+        expect("missing" in storage).toBe(false);
+        expect(String(storage)).toBe("[object Object]");
+
+        expect(Object.getPrototypeOf(storage.nested)).toBe(Object.prototype);
+        expect(storage.nested).toBeInstanceOf(Object);
+        expect(Object.getPrototypeOf(storage.items)).toBe(Array.prototype);
+        expect(storage.items).toBeInstanceOf(Array);
+        expect(storage.items).toBeInstanceOf(Object);
+        expect(Object.getPrototypeOf(storage.items[0])).toBe(Object.prototype);
+        expect(storage.items[0]).toBeInstanceOf(Object);
+    });
+
+    test("V2 pluginCustomStorage safely shadows inherited special keys", () => {
+        database.pluginCustomStorage = { alpha: 1 };
+        const storage = (getV2PluginAPIs().getDatabase() as any).pluginCustomStorage;
+
+        storage.hasOwnProperty = "stored-has-own";
+        storage.constructor = "stored-constructor";
+        storage.__proto__ = { stored: "proto-key" };
+
+        expect(storage.hasOwnProperty).toBe("stored-has-own");
+        expect(storage.constructor).toBe("stored-constructor");
+        expect(storage.__proto__).toEqual({ stored: "proto-key" });
+        expect(Object.prototype.hasOwnProperty.call(storage, "hasOwnProperty")).toBe(true);
+        expect(Object.prototype.hasOwnProperty.call(storage, "constructor")).toBe(true);
+        expect(Object.prototype.hasOwnProperty.call(storage, "__proto__")).toBe(true);
+        expect(Object.getPrototypeOf(storage)).toBe(Object.prototype);
+
+        delete storage.hasOwnProperty;
+        delete storage.constructor;
+        delete storage.__proto__;
+        expect(storage.hasOwnProperty("alpha")).toBe(true);
+        expect(storage.constructor).toBe(Object);
+        expect(storage.__proto__).toBe(Object.prototype);
+    });
+
     test("V2 inline mutations invalidate a V3 length/key enumeration snapshot", async () => {
         const v2Apis = getV2PluginAPIs();
         database.pluginCustomStorage = { alpha: 1 };
@@ -5276,7 +5327,7 @@ describe("transitionPluginStorageMode", () => {
         expect(() => Object.setPrototypeOf(storageProxy, {
             toJSON: () => ({ escaped: true }),
         })).toThrow("prototypes cannot be changed");
-        expect(Object.getPrototypeOf(storageProxy)).toBeNull();
+        expect(Object.getPrototypeOf(storageProxy)).toBe(Object.prototype);
         expect(() => Object.preventExtensions(storageProxy))
             .toThrow("must remain extensible");
         expect(Object.isExtensible(storageProxy)).toBe(true);
