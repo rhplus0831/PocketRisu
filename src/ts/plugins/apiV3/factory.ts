@@ -13,8 +13,9 @@ type MsgType =
     | 'EXEC_RESULT'
     | 'CANCEL_REQUEST';
 
-export const PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS = 20_000;
-export const PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS = 30_000;
+// Support older PocketRisu support
+export const PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS = 30 * 60_000;
+export const PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS = 30 * 60_000;
 
 const ABORTABLE_ROOT_METHODS = new Set([
     'getDatabase',

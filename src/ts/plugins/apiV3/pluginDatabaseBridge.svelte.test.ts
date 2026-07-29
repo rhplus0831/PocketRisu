@@ -320,6 +320,7 @@ const {
     getPluginSaveStorageItem,
     getPluginSaveStorageKeys,
     getPluginSaveStorageSnapshot,
+    PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS,
     setPluginSaveStorageItem,
     updateDatabaseWithPluginStorageSnapshot,
     withPluginSaveStorageLock,
@@ -1354,6 +1355,7 @@ describe("V3 mode-aware database bridge", () => {
         const source = iframe.contentWindow!;
         const sent: any[] = [];
         const hostResponses: any[] = [];
+        const requestTimeoutMs = PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS - 1;
         let registry!: ReturnType<typeof createV3BridgeRequestRegistry>;
         vi.spyOn(source, "postMessage").mockImplementation((message: any) => {
             if (message?.type === "RESPONSE") {
@@ -1362,7 +1364,7 @@ describe("V3 mode-aware database bridge", () => {
             }
         });
         registry = createV3BridgeRequestRegistry({
-            requestTimeoutMs: PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS,
+            requestTimeoutMs,
             serializeArgs: args => args,
             collectTransferables: () => [],
             send: message => {
@@ -1403,7 +1405,7 @@ describe("V3 mode-aware database bridge", () => {
             expect(unrelatedSettled).toBe(false);
             expect(transitionSettled).toBe(false);
 
-            await vi.advanceTimersByTimeAsync(PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS);
+            await vi.advanceTimersByTimeAsync(requestTimeoutMs);
             await expect(replacement).resolves.toMatchObject({
                 code: "COMMIT_OUTCOME_UNKNOWN",
                 commitOutcomeUnknown: true,
@@ -1448,7 +1450,7 @@ describe("V3 mode-aware database bridge", () => {
             await readStarted;
             const queuedWrite = setPluginSaveStorageItem("unrelated", { available: true });
 
-            await vi.advanceTimersByTimeAsync(PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS);
+            await vi.advanceTimersByTimeAsync(requestTimeoutMs);
             await expect(snapshot).resolves.toMatchObject({
                 code: "STORAGE_TIMEOUT",
                 commitOutcomeUnknown: false,

@@ -5,10 +5,11 @@ import type {
     PluginSaveStorageVersionedResult,
 } from "../pluginSaveStorage";
 
-export const PLUGIN_STORAGE_UPDATE_TIMEOUT_MS = 10_000;
-// Keep a margin below the bridge's 20-second request deadline so pre-publish
+// Support older PocketRisu support
+export const PLUGIN_STORAGE_UPDATE_TIMEOUT_MS = 30 * 60_000;
+// Keep a margin below the bridge request deadline so pre-publish
 // work normally receives this helper's structured deadline first.
-export const PLUGIN_STORAGE_UPDATE_MAX_TIMEOUT_MS = 15_000;
+export const PLUGIN_STORAGE_UPDATE_MAX_TIMEOUT_MS = 30 * 60_000;
 
 export type PluginStorageUpdateTransform = (
     current: PluginSaveStorageVersionedResult,
