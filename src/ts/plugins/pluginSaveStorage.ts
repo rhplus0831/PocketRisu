@@ -3795,6 +3795,7 @@ async function readBootStorageRows(
     prefix: PluginSaveStoragePrefix,
     listed: string[] | null,
     cached: boolean,
+    pluginStorageGeneration: string | undefined,
     issues: PluginStorageRecoveryIssue[],
     signal?: AbortSignal | null,
 ): Promise<PreparedStorageEntry[]> {
@@ -3816,9 +3817,14 @@ async function readBootStorageRows(
             continue;
         }
         try {
+            const readOptions = {
+                ...(cached ? { cached: true } : {}),
+                ...(pluginStorageGeneration ? { pluginStorageGeneration } : {}),
+                ...(signal ? { signal } : {}),
+            };
             const row = await deps.readPersistentJsonRow(
                 storageKey,
-                cached ? { cached: true, signal } : { signal },
+                readOptions,
             );
             if (row.kind === "missing") {
                 issues.push({ code: "read-failed", encodedKey: storageKey });
@@ -3878,6 +3884,11 @@ export async function reconcilePluginStorageModeForBoot(
         invalidateStorageEnumerationSnapshot();
         const db = deps.getDatabase();
         const target = db.optimizePluginMemory === true;
+        const pluginStorageGeneration = target
+            && typeof db.pluginStorageGeneration === "string"
+            && db.pluginStorageGeneration.length > 0
+            ? db.pluginStorageGeneration
+            : undefined;
         const direction = target ? "externalize" : "internalize";
         const issues: PluginStorageRecoveryIssue[] = [];
         const valueSource = db.pluginCustomStorage ?? createDatabasePluginStorageRecord();
@@ -3905,6 +3916,7 @@ export async function reconcilePluginStorageModeForBoot(
                 PLUGIN_SAVE_PREFIX,
                 listedValueKeys,
                 true,
+                pluginStorageGeneration,
                 issues,
                 signal,
             ),
@@ -3913,6 +3925,7 @@ export async function reconcilePluginStorageModeForBoot(
                 PLUGIN_SAVE_META_PREFIX,
                 listedMetaKeys,
                 false,
+                pluginStorageGeneration,
                 issues,
                 signal,
             ),

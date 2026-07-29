@@ -2771,6 +2771,91 @@ describe("reconcilePluginStorageMode", () => {
 });
 
 describe("boot plugin storage reconciliation recovery", () => {
+    test("pins external row reads to the generation decoded during raw boot", async () => {
+        const generation = "raw-boot-generation";
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "selected");
+        const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "selected");
+        database = {
+            optimizePluginMemory: true,
+            pluginStorageGeneration: generation,
+            pluginCustomStorage: {},
+        };
+        persistent.set(valueKey, { selected: true });
+        persistent.set(metaKey, { plugin: "Selected", updatedAt: 1 });
+        const recordRead = vi.fn();
+        async function readPersistentJsonRow<T>(
+            key: string,
+            options: {
+                cached?: boolean;
+                signal?: AbortSignal | null;
+                pluginStorageGeneration?: string;
+            } = {},
+        ): Promise<{ kind: "missing" } | { kind: "value"; value: T }> {
+            recordRead(key, options);
+            expect(options.pluginStorageGeneration).toBe(generation);
+            return persistent.has(key)
+                ? { kind: "value", value: persistent.get(key) as T }
+                : { kind: "missing" };
+        }
+
+        const result = await reconcilePluginStorageModeForBoot({
+            dependencies: { readPersistentJsonRow },
+        });
+
+        expect(result).toEqual({ direction: "none", values: 0, meta: 0, issues: [] });
+        expect(recordRead).toHaveBeenCalledWith(valueKey, {
+            cached: true,
+            pluginStorageGeneration: generation,
+            signal: expect.any(AbortSignal),
+        });
+        expect(recordRead).toHaveBeenCalledWith(metaKey, {
+            pluginStorageGeneration: generation,
+            signal: expect.any(AbortSignal),
+        });
+    });
+
+    test("does not pin inline-mode recovery to a stale generation field", async () => {
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "leftover");
+        database = {
+            optimizePluginMemory: false,
+            pluginStorageGeneration: "stale-generation",
+            pluginCustomStorage: {},
+        };
+        persistent.set(valueKey, { recovered: true });
+        const recordRead = vi.fn();
+        async function readPersistentJsonRow<T>(
+            key: string,
+            options: {
+                cached?: boolean;
+                signal?: AbortSignal | null;
+                pluginStorageGeneration?: string;
+            } = {},
+        ): Promise<{ kind: "missing" } | { kind: "value"; value: T }> {
+            recordRead(key, options);
+            return persistent.has(key)
+                ? { kind: "value", value: persistent.get(key) as T }
+                : { kind: "missing" };
+        }
+
+        await expect(reconcilePluginStorageModeForBoot({
+            dependencies: {
+                readPersistentJsonRow,
+                persistDatabase: vi.fn(async () => undefined),
+            },
+        })).resolves.toEqual({
+            direction: "internalize",
+            values: 1,
+            meta: 0,
+            issues: [],
+        });
+
+        expect(recordRead).toHaveBeenCalledWith(valueKey, {
+            cached: true,
+            signal: expect.any(AbortSignal),
+        });
+        expect(database.pluginCustomStorage.leftover).toEqual({ recovered: true });
+    });
+
     test("copies an inline value and owner through one acknowledged atomic mutation", async () => {
         database = {
             optimizePluginMemory: true,
