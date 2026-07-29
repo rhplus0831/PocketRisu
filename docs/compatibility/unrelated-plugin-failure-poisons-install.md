@@ -1,6 +1,6 @@
 # An unrelated plugin failure can roll back a healthy installation
 
-- Status: Confirmed regression
+- Status: Fixed 2026-07-30
 - Severity: High
 - Confidence: High
 - Introduced by: strict lifecycle transaction series
@@ -26,9 +26,15 @@ The transaction-level error does not establish that the newly imported plugin
 was at fault. A separate startup notification names the plugin whose V3 startup
 failed, but it is not connected to the rollback decision.
 
-## Recommendation
+## Resolution
 
-Return structured per-plugin lifecycle outcomes. Roll back only when the target
-plugin fails or when a system invariant cannot be established; quarantine or
-report unchanged failures separately. Add an integration test with one
-pre-existing V3 startup-rejecting plugin and one newly imported healthy plugin.
+V3 generation loading now returns structured outcomes attributed by plugin
+name. Plugin import and enable transactions roll back for a target-plugin
+startup failure, teardown or unattributed lifecycle failure, or a persistence
+failure. A startup failure attributed to an unchanged V3 plugin remains
+reported by that plugin's existing startup notification but no longer rolls
+back a healthy target mutation.
+
+Regression coverage verifies a pre-existing rejecting V3 plugin alongside a
+healthy import and enable, preserves target-failure rollback, and exercises
+per-plugin attribution through the real V3 sandbox startup path.

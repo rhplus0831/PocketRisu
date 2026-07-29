@@ -347,6 +347,7 @@ const {
     customV3ProviderMetaStore,
     getV3PluginInstance,
     loadV3PluginGeneration,
+    loadV3PluginGenerationOutcomes,
     loadV3Plugins,
     makeRisuaiAPIV3,
     resetAllPluginPermissions,
@@ -1635,6 +1636,32 @@ describe("V3 mode-aware database bridge", () => {
 });
 
 describe("V3 guest startup handshake", () => {
+    test("attributes generation startup failures to the rejecting plugin", async () => {
+        const rejected = startupPlugin("Rejected generation member", "const broken = ;");
+        const healthy = startupPlugin("Healthy generation member", "");
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+        const loading = loadV3PluginGenerationOutcomes([rejected, healthy]);
+        const healthyIframe = [...document.body.querySelectorAll("iframe")]
+            .find(iframe => (iframe.contentDocument?.querySelectorAll("script").length ?? 0) > 0);
+        expect(healthyIframe).toBeDefined();
+        const restoreHealthyRelay = executeGeneratedGuest(healthyIframe!);
+
+        await expect(loading).resolves.toEqual([
+            expect.objectContaining({
+                pluginName: rejected.name,
+                status: "rejected",
+            }),
+            { pluginName: healthy.name, status: "fulfilled" },
+        ]);
+        expect(getV3PluginInstance(rejected.name)).toBeUndefined();
+        expect(getV3PluginInstance(healthy.name)).toBeDefined();
+
+        await teardownV3Plugins();
+        restoreHealthyRelay();
+        errorSpy.mockRestore();
+    });
+
     test("long-lived top-level work releases startup and the lifecycle queue", async () => {
         vi.useFakeTimers();
         const longLived = startupPlugin("Long-Lived Production Plugin", `

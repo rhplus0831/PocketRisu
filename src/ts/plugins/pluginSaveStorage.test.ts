@@ -1,10 +1,19 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
+type MockV3PluginInitializationOutcome =
+    | { pluginName: string; status: "fulfilled" }
+    | { pluginName: string; status: "rejected"; reason: unknown };
+
 let database: any;
 const persistent = vi.hoisted(() => new Map<string, unknown>());
 const requestImmediateSave = vi.hoisted(() => vi.fn());
 const teardownV3PluginsMock = vi.hoisted(() => vi.fn(async () => undefined));
-const loadV3PluginGenerationMock = vi.hoisted(() => vi.fn(async (..._plugins: any[]) => undefined));
+const loadV3PluginGenerationOutcomesMock = vi.hoisted(() => vi.fn(
+    async (plugins: any[]): Promise<MockV3PluginInitializationOutcome[]> => plugins.map(plugin => ({
+        pluginName: plugin.name,
+        status: "fulfilled" as const,
+    })),
+));
 
 vi.mock("../storage/database.svelte", () => ({
     getDatabase: () => database,
@@ -75,7 +84,7 @@ vi.mock("./pluginSafeClass", () => ({
 vi.mock("./apiV3/v3.svelte", () => ({
     loadV3Plugins: vi.fn(async () => undefined),
     teardownV3Plugins: teardownV3PluginsMock,
-    loadV3PluginGeneration: loadV3PluginGenerationMock,
+    loadV3PluginGenerationOutcomes: loadV3PluginGenerationOutcomesMock,
 }));
 
 vi.mock("./apiV3/transpiler", () => ({
@@ -530,7 +539,9 @@ beforeEach(async () => {
     persistent.clear();
     requestImmediateSave.mockResolvedValue({ status: "committed" });
     teardownV3PluginsMock.mockResolvedValue(undefined);
-    loadV3PluginGenerationMock.mockResolvedValue(undefined);
+    loadV3PluginGenerationOutcomesMock.mockImplementation(async (plugins: any[]) => (
+        plugins.map(plugin => ({ pluginName: plugin.name, status: "fulfilled" as const }))
+    ));
     database = {
         characters: [],
         botPresets: [],
@@ -3631,6 +3642,112 @@ describe("transitionPluginStorageMode", () => {
         );
     });
 
+    test("keeps a healthy import when an already-enabled V3 plugin fails startup", async () => {
+        const brokenPlugin = {
+            name: "Existing broken startup",
+            script: "const broken = ;",
+            arguments: {},
+            realArg: {},
+            version: "3.0" as const,
+            customLink: [],
+            argMeta: {},
+            enabled: true,
+        };
+        database.plugins = [brokenPlugin];
+        loadV3PluginGenerationOutcomesMock.mockImplementation(async (plugins: any[]) => (
+            plugins.map(plugin => plugin.name === brokenPlugin.name
+                ? {
+                    pluginName: plugin.name,
+                    status: "rejected" as const,
+                    reason: new Error("existing startup failed"),
+                }
+                : { pluginName: plugin.name, status: "fulfilled" as const })
+        ));
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+        await importPlugin("//@name Healthy new plugin\n//@api 3.0\n");
+
+        expect(database.plugins.map((plugin: any) => plugin.name)).toEqual([
+            brokenPlugin.name,
+            "Healthy new plugin",
+        ]);
+        expect(requestImmediateSave).toHaveBeenCalledOnce();
+        expect(requestImmediateSave).toHaveBeenCalledWith({ forceFullWrite: true });
+        const { alertError } = vi.mocked(await import("../alert"));
+        expect(alertError).not.toHaveBeenCalled();
+        expect(warnSpy).toHaveBeenCalledWith(
+            "[Plugins] Plugin import continued despite unrelated V3 startup failures:",
+            [brokenPlugin.name],
+        );
+        warnSpy.mockRestore();
+    });
+
+    test("keeps a healthy enable when an already-enabled V3 plugin fails startup", async () => {
+        const plugin = (name: string, enabled: boolean) => ({
+            name,
+            script: "",
+            arguments: {},
+            realArg: {},
+            version: "3.0" as const,
+            customLink: [],
+            argMeta: {},
+            enabled,
+        });
+        const brokenPlugin = plugin("Existing broken enable", true);
+        const healthyPlugin = plugin("Healthy disabled plugin", false);
+        database.plugins = [brokenPlugin, healthyPlugin];
+        loadV3PluginGenerationOutcomesMock.mockImplementation(async (plugins: any[]) => (
+            plugins.map(candidate => candidate.name === brokenPlugin.name
+                ? {
+                    pluginName: candidate.name,
+                    status: "rejected" as const,
+                    reason: new Error("existing startup failed"),
+                }
+                : { pluginName: candidate.name, status: "fulfilled" as const })
+        ));
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+        await expect(setPluginEnabledAndReload(healthyPlugin.name, true))
+            .resolves.toBe("updated");
+
+        expect(database.plugins.find((candidate: any) => candidate.name === healthyPlugin.name).enabled)
+            .toBe(true);
+        expect(requestImmediateSave).toHaveBeenCalledOnce();
+        expect(warnSpy).toHaveBeenCalledWith(
+            "[Plugins] Plugin enable continued despite unrelated V3 startup failures:",
+            [brokenPlugin.name],
+        );
+        warnSpy.mockRestore();
+    });
+
+    test("rolls an enable back when the target V3 plugin fails startup", async () => {
+        const targetPlugin = {
+            name: "Target startup failure",
+            script: "const broken = ;",
+            arguments: {},
+            realArg: {},
+            version: "3.0" as const,
+            customLink: [],
+            argMeta: {},
+            enabled: false,
+        };
+        database.plugins = [targetPlugin];
+        loadV3PluginGenerationOutcomesMock.mockImplementation(async (plugins: any[]) => (
+            plugins.map(plugin => ({
+                pluginName: plugin.name,
+                status: "rejected" as const,
+                reason: new Error("target startup failed"),
+            }))
+        ));
+
+        await expect(setPluginEnabledAndReload(targetPlugin.name, true))
+            .rejects.toThrow("failed and was rolled back");
+
+        expect(database.plugins[0].enabled).toBe(false);
+        expect(requestImmediateSave).toHaveBeenCalledOnce();
+        expect(requestImmediateSave).toHaveBeenCalledWith({ forceFullWrite: true });
+    });
+
     test("durably saves removal before surfacing a rejecting unload", async () => {
         database.plugins = [{
             name: "Remove despite unload error",
@@ -3721,8 +3838,8 @@ describe("transitionPluginStorageMode", () => {
         expect(requestImmediateSave).toHaveBeenCalledTimes(2);
         expect(requestImmediateSave).toHaveBeenNthCalledWith(1, { forceFullWrite: true });
         expect(requestImmediateSave).toHaveBeenNthCalledWith(2, { forceFullWrite: true });
-        expect(loadV3PluginGenerationMock.mock.calls[0]?.[0]).toEqual([]);
-        expect(loadV3PluginGenerationMock.mock.calls.at(-1)?.[0]).toEqual([originalPlugin]);
+        expect(loadV3PluginGenerationOutcomesMock.mock.calls[0]?.[0]).toEqual([]);
+        expect(loadV3PluginGenerationOutcomesMock.mock.calls.at(-1)?.[0]).toEqual([originalPlugin]);
     });
 
     test("restores removal order and provider without duplicating a callback replacement", async () => {
@@ -3776,7 +3893,7 @@ describe("transitionPluginStorageMode", () => {
             plugins: [removedPlugin, retainedPlugin],
             provider: removedPlugin.name,
         });
-        expect(loadV3PluginGenerationMock.mock.calls.at(-1)?.[0])
+        expect(loadV3PluginGenerationOutcomesMock.mock.calls.at(-1)?.[0])
             .toEqual([removedPlugin, retainedPlugin]);
         expect(requestImmediateSave).toHaveBeenNthCalledWith(1, { forceFullWrite: true });
         expect(requestImmediateSave).toHaveBeenNthCalledWith(2, { forceFullWrite: true });

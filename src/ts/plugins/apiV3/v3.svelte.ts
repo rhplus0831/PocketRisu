@@ -2204,16 +2204,32 @@ export async function teardownV3Plugins(){
     }
 }
 
-export async function loadV3PluginGeneration(plugins:RisuPlugin[]){
+export type V3PluginInitializationOutcome =
+    | { pluginName: string; status: "fulfilled" }
+    | { pluginName: string; status: "rejected"; reason: unknown };
+
+export async function loadV3PluginGenerationOutcomes(
+    plugins: RisuPlugin[],
+): Promise<V3PluginInitializationOutcome[]> {
     // Wait for every guest's bounded bridge/body-start handshake. The plugin's
     // top-level lifetime continues independently and is observed above, so a
     // service loop cannot retain the generation's lifecycle lease.
     const results = await Promise.allSettled(
         plugins.map(plugin => executePluginV3(plugin)),
     );
-    const errors = results
-        .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-        .map(result => result.reason);
+    return results.map((result, index) => result.status === "fulfilled"
+        ? { pluginName: plugins[index].name, status: "fulfilled" }
+        : { pluginName: plugins[index].name, status: "rejected", reason: result.reason });
+}
+
+export async function loadV3PluginGeneration(plugins:RisuPlugin[]){
+    const outcomes = await loadV3PluginGenerationOutcomes(plugins);
+    const errors = outcomes
+        .filter((outcome): outcome is Extract<
+            V3PluginInitializationOutcome,
+            { status: "rejected" }
+        > => outcome.status === "rejected")
+        .map(outcome => outcome.reason);
     if (errors.length > 0) {
         throw new AggregateError(errors, "One or more V3 plugins failed to initialize.");
     }

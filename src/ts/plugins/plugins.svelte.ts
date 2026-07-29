@@ -10,7 +10,7 @@ import type { ScriptMode } from "../process/scripts";
 import { checkCodeSafety } from "./pluginSafety";
 import { SafeDocument, SafeIdbFactory, SafeLocalStorage } from "./pluginSafeClass";
 import {
-    loadV3PluginGeneration,
+    loadV3PluginGenerationOutcomes,
     teardownV3Plugins,
 } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
@@ -488,6 +488,7 @@ export async function importPlugin(code:string|null = null, argu:{
                     }
                 },
                 true,
+                pluginData.name,
             )
             console.log(`Imported plugin: ${pluginData.name} (API v${apiVersion})`)
             if (disabledForMemoryOptimization) {
@@ -504,6 +505,12 @@ export async function importPlugin(code:string|null = null, argu:{
 let pluginTranslator = false
 
 type PluginReloadPhase = "teardown" | "loading"
+type PluginLifecycleFailure = {
+    phase: "compatibility-repair" | "v2-teardown" | "v3-teardown" | "v2-load" | "v3-load"
+    error: unknown
+    pluginName?: string
+}
+type PluginLifecycleReport = { failures: PluginLifecycleFailure[] }
 let activePluginReloadPhase: PluginReloadPhase | undefined
 let pluginApiReloadPending = false
 let pluginApiReloadScheduled = false
@@ -576,7 +583,16 @@ async function drainDeferredPluginApiReload(): Promise<void> {
     }
 }
 
-async function loadPluginsUnlocked(_lifecycleLease: PluginLifecycleLease) {
+function pluginLifecycleError(failures: PluginLifecycleFailure[]): AggregateError {
+    return new AggregateError(
+        failures.map(failure => failure.error),
+        "One or more plugin lifecycle phases failed.",
+    )
+}
+
+async function loadPluginsWithReportUnlocked(
+    _lifecycleLease: PluginLifecycleLease,
+): Promise<PluginLifecycleReport> {
     console.log('Loading plugins...')
     const db = getDatabase()
     const legacyPluginCompatibility = db.legacyPluginCompatibility === true
@@ -628,7 +644,7 @@ async function loadPluginsUnlocked(_lifecycleLease: PluginLifecycleLease) {
 
     activePluginReloadPhase = "loading"
     let v2LoadError: unknown
-    let v3LoadError: unknown
+    const v3LoadFailures: PluginLifecycleFailure[] = []
     try {
         const currentDatabase = getDatabase()
         const enabledPlugins = safeStructuredClone(currentDatabase.plugins ?? [])
@@ -643,28 +659,42 @@ async function loadPluginsUnlocked(_lifecycleLease: PluginLifecycleLease) {
         } catch (error) {
             v2LoadError = error
         }
-        try {
-            await loadV3PluginGeneration(enabledPlugins.filter(
-                (plugin: RisuPlugin) => plugin.version === "3.0",
-            ))
-        } catch (error) {
-            v3LoadError = error
+        const v3Outcomes = await loadV3PluginGenerationOutcomes(enabledPlugins.filter(
+            (plugin: RisuPlugin) => plugin.version === "3.0",
+        ))
+        for (const outcome of v3Outcomes) {
+            if (outcome.status === "rejected") {
+                v3LoadFailures.push({
+                    phase: "v3-load",
+                    pluginName: outcome.pluginName,
+                    error: outcome.reason,
+                })
+            }
         }
     } finally {
         activePluginReloadPhase = previousPhase
     }
 
-    const errors = [
-        compatibilityRepairError,
-        v2TeardownError,
-        v3TeardownError,
-        v2LoadError,
-        v3LoadError,
-    ]
-        .filter((error): error is unknown => error !== undefined)
-    if (errors.length > 0) {
-        throw new AggregateError(errors, "One or more plugin lifecycle phases failed.")
+    const failures: PluginLifecycleFailure[] = []
+    if (compatibilityRepairError !== undefined) {
+        failures.push({ phase: "compatibility-repair", error: compatibilityRepairError })
     }
+    if (v2TeardownError !== undefined) {
+        failures.push({ phase: "v2-teardown", error: v2TeardownError })
+    }
+    if (v3TeardownError !== undefined) {
+        failures.push({ phase: "v3-teardown", error: v3TeardownError })
+    }
+    if (v2LoadError !== undefined) {
+        failures.push({ phase: "v2-load", error: v2LoadError })
+    }
+    failures.push(...v3LoadFailures)
+    return { failures }
+}
+
+async function loadPluginsUnlocked(lifecycleLease: PluginLifecycleLease) {
+    const report = await loadPluginsWithReportUnlocked(lifecycleLease)
+    if (report.failures.length > 0) throw pluginLifecycleError(report.failures)
 }
 
 export function loadPlugins(): Promise<void> {
@@ -701,12 +731,35 @@ async function commitPluginListMutation(
     operation: string,
     rollback: () => void,
     rollbackOnReloadFailure: boolean,
+    targetPluginName?: string,
 ): Promise<void> {
+    let lifecycleReport: PluginLifecycleReport = { failures: [] }
     let lifecycleError: unknown
     try {
-        await loadPluginsUnlocked(lifecycleLease)
+        lifecycleReport = await loadPluginsWithReportUnlocked(lifecycleLease)
     } catch (error) {
         lifecycleError = error
+    }
+
+    const actionableFailures = lifecycleReport.failures.filter(failure => !(
+        rollbackOnReloadFailure
+        && targetPluginName !== undefined
+        && failure.phase === "v3-load"
+        && failure.pluginName !== targetPluginName
+    ))
+    const unrelatedFailures = lifecycleReport.failures.filter(
+        failure => !actionableFailures.includes(failure),
+    )
+    if (unrelatedFailures.length > 0) {
+        // V3 startup already emits a plugin-specific error notification. Record
+        // that the requested mutation remains valid despite those failures.
+        console.warn(
+            `[Plugins] ${operation} continued despite unrelated V3 startup failures:`,
+            unrelatedFailures.map(failure => failure.pluginName),
+        )
+    }
+    if (lifecycleError === undefined && actionableFailures.length > 0) {
+        lifecycleError = pluginLifecycleError(actionableFailures)
     }
 
     const rollbackMutation = async (causes: unknown[]): Promise<never> => {
@@ -784,6 +837,7 @@ export function setPluginEnabledAndReload(
             `Plugin ${enabled ? "enable" : "disable"}`,
             () => restorePluginInLiveList(pluginName, originalIndex, originalPlugin),
             enabled,
+            enabled ? pluginName : undefined,
         )
         return "updated"
     })
