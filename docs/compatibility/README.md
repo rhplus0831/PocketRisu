@@ -59,7 +59,7 @@ many users use that path.
 - [Optimized-storage key-length limit](optimized-plugin-storage-key-length-limit.md)
 - [Optimized-mode transition lock-in (fixed 2026-07-30)](optimized-plugin-storage-transition-lock-in.md)
 - [Raw boot does not pin a plugin generation](raw-boot-plugin-generation-not-pinned.md)
-- [Configured optimized-storage limit differs from client limit](plugin-storage-configured-limit-client-mismatch.md)
+- [Configured optimized-storage limit differed from client limit (fixed 2026-07-30)](plugin-storage-configured-limit-client-mismatch.md)
 - [Safe update APIs had a smaller value limit (fixed 2026-07-30)](plugin-storage-batch-size-mismatch.md)
 - [V2 unload could wedge lifecycle (fixed 2026-07-30)](v2-unload-can-wedge-plugin-lifecycle.md)
 - [Unrelated failure can poison an install](unrelated-plugin-failure-poisons-install.md)

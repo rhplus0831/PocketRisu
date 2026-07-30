@@ -126,6 +126,9 @@ function storageWithResponse(next: Response | Error): InstanceType<typeof NodeSt
 
 beforeEach(() => {
     ;(NodeStorage as any).sessionInitialized = true
+    ;(NodeStorage as any).pluginStorageCapabilities = {
+        maxValueBytes: 128 * 1024 * 1024,
+    }
     ;(NodeStorage as any).pluginStorageBatchCapabilities = null
     cache.enabled = true
     cache.sha256OwnedBytes.mockClear()
@@ -719,6 +722,80 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
         })
         expect(fetchMock).toHaveBeenCalledOnce()
         expect(authFetch).not.toHaveBeenCalled()
+    })
+
+    test('rejects a direct first mutation against the authenticated configured limit', async () => {
+        ;(NodeStorage as any).sessionInitialized = false
+        const storage = new NodeStorage()
+        storage.authChecked = true
+        ;(storage as any).cachedJwt = {
+            token: 'cached-token',
+            expiresAt: Date.now() + 300_000,
+        }
+        const fetchMock = vi.fn(async () => response({
+            ok: true,
+            capabilities: {
+                pluginStorage: { maxValueBytes: 8 },
+            },
+        }))
+        vi.stubGlobal('fetch', fetchMock)
+
+        await expect(storage.mutatePluginStorage({
+            operation: 'set',
+            valueKey,
+            valueBytes,
+            owner: 'AA3',
+        })).resolves.toMatchObject({
+            outcome: 'not-committed',
+            code: 'PLUGIN_VALUE_TOO_LARGE',
+            limit: 8,
+            actual: valueBytes.byteLength,
+            commitOutcomeUnknown: false,
+        })
+        expect(fetchMock).toHaveBeenCalledOnce()
+        expect(fetchMock).not.toHaveBeenCalledWith(
+            '/api/plugin-storage/mutate',
+            expect.anything(),
+        )
+    })
+
+    test('replaces the fallback ceiling with a raised authenticated limit', async () => {
+        ;(NodeStorage as any).sessionInitialized = false
+        ;(NodeStorage as any).pluginStorageCapabilities = { maxValueBytes: 8 }
+        const storage = new NodeStorage()
+        storage.authChecked = true
+        ;(storage as any).cachedJwt = {
+            token: 'cached-token',
+            expiresAt: Date.now() + 300_000,
+        }
+        const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+            if (String(input) === '/api/session') {
+                return response({
+                    ok: true,
+                    capabilities: {
+                        pluginStorage: { maxValueBytes: 64 },
+                    },
+                })
+            }
+            if (String(input) === '/api/plugin-storage/mutate') return committedSet()
+            throw new Error(`Unexpected request: ${String(input)}`)
+        })
+        vi.stubGlobal('fetch', fetchMock)
+
+        await expect(storage.mutatePluginStorage({
+            operation: 'set',
+            valueKey,
+            valueBytes,
+            owner: 'AA3',
+        })).resolves.toMatchObject({
+            outcome: 'committed',
+            hash: valueHash,
+        })
+        expect(fetchMock).toHaveBeenCalledTimes(2)
+        expect(fetchMock).toHaveBeenCalledWith(
+            '/api/plugin-storage/mutate',
+            expect.anything(),
+        )
     })
 
     test('uses negotiated framed transport and binds the acknowledgement to metadata hashes', async () => {

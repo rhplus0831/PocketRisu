@@ -23,10 +23,6 @@ import type {
     PluginStorageTransitionTransport,
     PluginStorageViewerPageTransport,
 } from "./nodeStorage";
-import {
-    PLUGIN_VALUE_MAX_BYTES,
-    pluginStorageLimitMessage,
-} from "./pluginStorageLimits";
 import { encodeUtf8Base64Url } from "./base64Url";
 
 export { hasNativeStringWellFormed } from "./unicodeWellFormed";
@@ -101,21 +97,10 @@ export interface PreparedPersistentJson {
     byteLength: number;
 }
 
-export function preparePersistentJson<T>(
-    value: T,
-    options: { pluginValue?: boolean } = {},
-): PreparedPersistentJson {
+export function preparePersistentJson<T>(value: T): PreparedPersistentJson {
     const serialized = stringifyJsonValue(value);
     const bytes = encoder.encode(serialized);
     const byteLength = bytes.byteLength;
-    if (options.pluginValue && byteLength > PLUGIN_VALUE_MAX_BYTES) {
-        throw new StorageError(pluginStorageLimitMessage(byteLength), {
-            status: 413,
-            code: "PLUGIN_VALUE_TOO_LARGE",
-            retryable: false,
-            operation: "write",
-        });
-    }
     return { bytes, byteLength };
 }
 
@@ -136,9 +121,7 @@ export async function writePersistentJson<T>(
     // Snapshot and validate before the first await. Callers may mutate their
     // object after invoking this async method, and storage initialization must
     // not turn that into an unacknowledged change to the bytes being written.
-    const prepared = preparePersistentJson(value, {
-        pluginValue: storageKey.startsWith("pluginsave/"),
-    });
+    const prepared = preparePersistentJson(value);
     await writePreparedPersistentJson(storageKey, prepared, signal);
 }
 
@@ -199,9 +182,10 @@ export async function mutatePersistentPluginStorage<T>(
     throwIfAborted(activeSignal);
     // Preserve the ordinary persistent JSON rule: validation and detachment
     // happen before storage initialization or any queued mutation can run.
+    // The authenticated transport applies its negotiated value-size limit.
     const valueBytes = operation === "set"
         ? (preparedValue
-            ?? preparePersistentJson(valueOrSignal as T, { pluginValue: true })).bytes
+            ?? preparePersistentJson(valueOrSignal as T)).bytes
         : undefined;
     await ensureStorageReady(activeSignal);
     const request = {
@@ -230,7 +214,7 @@ export async function restorePersistentPluginStoragePair<T>(
     signal?: AbortSignal | null,
 ): Promise<PluginStorageMutationResult> {
     throwIfAborted(signal);
-    const valueBytes = preparePersistentJson(value, { pluginValue: true }).bytes;
+    const valueBytes = preparePersistentJson(value).bytes;
     const ownerRecordBytes = ownerRecord === undefined
         ? undefined
         : encoder.encode(stringifyJsonValue(ownerRecord));

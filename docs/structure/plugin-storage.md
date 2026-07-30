@@ -101,7 +101,8 @@ Express + SQLite
   losing special own keys such as `__proto__`.
 - `src/ts/storage/pluginSaveKeyPolicy.ts`, `base64Url.ts`, and
   `unicodeWellFormed.ts` implement canonical reversible keys.
-- `src/ts/storage/pluginStorageLimits.ts` mirrors public size/batch limits.
+- `src/ts/storage/pluginStorageLimits.ts` parses the authenticated server value
+  capability and retains the 128 MiB fallback for older servers.
 - `src/ts/storage/storageError.ts` preserves retryability, dispatch state, and unknown
   commit outcomes across the client boundary.
 - `src/ts/storage/databaseSave.ts` pauses or fences ordinary database saves around an
@@ -152,6 +153,11 @@ through the file-backed chunk writer inside the existing atomic transaction. Thi
 a one-value guarded write reach the same configured per-value limit as ordinary
 `setItem()` without base64 expansion. Older servers use the retained 16 MiB JSON/base64
 batch fallback.
+
+The same authenticated session advertises the generic configured per-value ceiling.
+Client transport preflights use that value before dispatching ordinary, compound, or
+transition row bodies. Servers without the capability retain the historical 128 MiB
+client fallback, while the server remains authoritative for every publication.
 
 ### Immutable generations
 

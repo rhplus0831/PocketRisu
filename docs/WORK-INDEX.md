@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **65** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, **4** are intentional compatibility changes, and **29** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **64** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, **4** are intentional compatibility changes, and **30** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -27,7 +27,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [Configured plugin value limits disagree with the client](compatibility/plugin-storage-configured-limit-client-mismatch.md) | compat | Open | Raising the documented server limit does not expand browser writes. | Requires a non-default server limit and a value crossing the hard-coded 128 MiB client boundary. |
 | [Default exports can exceed import limits](compatibility/backup-export-import-limit-mismatch.md) | compat | Open | A default server-produced backup is refused by a default fresh installation, discovered when restore is needed; the archive itself survives intact. | Requires a store crossing the 2 GiB / 100,000-entry aggregate caps or one 32 MiB+ buffered row; main's default import was unbounded. |
 | [Large RISUSAVE block databases are rejected](compatibility/legacy-risusave-64mib-import-cap.md) | compat | Open | A retained main/upstream save or archive cannot be imported. | Requires the less-common block representation to exceed 64 MiB. |
 | [Large opaque save rows are rejected](compatibility/save-folder-opaque-row-32mib-cap.md) | compat | Open | Valid backups or save folders with legacy opaque rows cannot be restored. | Requires one non-streamed row, such as `remotes/*.local.bin`, to exceed 32 MiB. |
@@ -136,6 +135,7 @@ None currently open.
 
 | Finding | Former harm | Note |
 |---|---|---|
+| [Configured plugin value limits disagreed with the client](compatibility/plugin-storage-configured-limit-client-mismatch.md) | Raising the documented server limit did not expand browser writes, while lowering it caused avoidable rejected uploads. | Fixed 2026-07-30 with an authenticated generic value-limit capability, transport-boundary preflight, a legacy-server fallback, and unequal-limit coverage. |
 | [Safe plugin updates had a smaller value limit](compatibility/plugin-storage-batch-size-mismatch.md) | CAS, rewrite, update, and batch APIs could not modify values accepted by `setItem`. | Fixed 2026-07-30 with negotiated raw-value framing, bounded staging, file-backed atomic publication, legacy fallback, and above-ceiling coverage. |
 | [Install script could delete the only data copy](audit/install-script-can-delete-the-only-data-copy.md) | An overwrite-install failure could erase the entire dataset and all backups. | Fixed 2026-07-27 with same-filesystem staging, rollback, and failure coverage. |
 | [Patch conflict promoted a stale ETag](audit/patch-conflict-etag-promotion-enables-stale-full-write.md) | Ordinary concurrent clients could replace the whole database with stale state. | Fixed 2026-07-28 by treating conflict ETags as provisional and rebasing first. |

@@ -289,6 +289,9 @@ describe('AA3 atomic plugin storage batch', () => {
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toMatchObject({
       capabilities: {
+        pluginStorage: {
+          maxValueBytes: 128 * 1024 * 1024,
+        },
         pluginStorageBatch: {
           transport: 'framed-v1',
           maxOperations: 128,

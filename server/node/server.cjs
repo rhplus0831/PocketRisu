@@ -7807,6 +7807,9 @@ app.post('/api/session', async (req, res) => {
     res.json({
         ok: true,
         capabilities: {
+            pluginStorage: {
+                maxValueBytes: PLUGIN_VALUE_MAX_BYTES,
+            },
             pluginStorageBatch: {
                 transport: 'framed-v1',
                 maxOperations: PLUGIN_STORAGE_BATCH_MAX_OPERATIONS,

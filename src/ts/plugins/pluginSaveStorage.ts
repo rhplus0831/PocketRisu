@@ -827,7 +827,7 @@ function prepareOptimizedPluginStorageValue(
     try {
         return {
             snapshot,
-            prepared: preparePersistentJson(snapshot, { pluginValue: true }),
+            prepared: preparePersistentJson(snapshot),
         };
     } catch (error) {
         if (error instanceof StorageError && error.code === "PLUGIN_VALUE_TOO_LARGE") {
@@ -2061,7 +2061,7 @@ export async function atomicBatchOwnedPluginSaveStorage(
             prepared.push({
                 operation: "set",
                 key: mutation.key,
-                valueBytes: preparePersistentJson(mutation.value, { pluginValue: true }).bytes,
+                valueBytes: preparePersistentJson(mutation.value).bytes,
                 ownedValueBytes: true,
                 owner,
                 ...(Object.prototype.hasOwnProperty.call(mutation, "expectedRevision")
@@ -3577,9 +3577,7 @@ async function applyStagedPluginStorageTransition(
                         retryable: true,
                     });
                 }
-                const prepared = preparePersistentJson(descriptor.value, {
-                    pluginValue: entry.prefix === PLUGIN_SAVE_PREFIX,
-                });
+                const prepared = preparePersistentJson(descriptor.value);
                 if (prepared.byteLength !== entry.size) {
                     throw new StorageError("Plugin storage changed during staging; retry.", {
                         code: "PLUGIN_STORAGE_CHANGED",

@@ -7,6 +7,8 @@ export interface StorageErrorOptions {
     commitOutcomeUnknown?: boolean;
     commitOutcome?: "not-committed" | "committed" | "unknown" | null;
     operation?: string | null;
+    limit?: number;
+    actual?: number;
     cause?: unknown;
 }
 
@@ -22,6 +24,8 @@ export class StorageError extends Error {
     readonly commitOutcomeUnknown: boolean;
     readonly commitOutcome: "not-committed" | "committed" | "unknown" | null;
     readonly operation: string | null;
+    readonly limit?: number;
+    readonly actual?: number;
 
     constructor(message: string, options: StorageErrorOptions = {}) {
         super(message, options.cause === undefined ? undefined : { cause: options.cause });
@@ -33,6 +37,8 @@ export class StorageError extends Error {
         this.commitOutcomeUnknown = options.commitOutcomeUnknown === true;
         this.commitOutcome = options.commitOutcome ?? null;
         this.operation = options.operation ?? null;
+        this.limit = options.limit;
+        this.actual = options.actual;
     }
 }
 

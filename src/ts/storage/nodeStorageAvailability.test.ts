@@ -81,6 +81,9 @@ beforeEach(() => {
     vi.clearAllMocks()
     ;(NodeStorage as any).sessionInitialized = false
     ;(NodeStorage as any).sessionPending = null
+    ;(NodeStorage as any).pluginStorageCapabilities = {
+        maxValueBytes: 128 * 1024 * 1024,
+    }
     cache.enabled = true
     cache.getManifestHashes.mockResolvedValue([])
     cache.getVerifiedManifestSnapshot.mockResolvedValue(null)

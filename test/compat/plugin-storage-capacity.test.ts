@@ -137,6 +137,13 @@ describe('optimized plugin large-value capacity (real server)', () => {
 
   test('enforces per-value and aggregate limits atomically on streaming and legacy writes', async () => {
     const { server, client } = await boot({ value: 8_192, total: 12_000 })
+    const session = await client.fetch('/api/session', { method: 'POST' })
+    expect(session.status).toBe(200)
+    await expect(session.json()).resolves.toMatchObject({
+      capabilities: {
+        pluginStorage: { maxValueBytes: 8_192 },
+      },
+    })
     const seedKey = storageKey('seed')
     const unicodeAtLimit = Buffer.from(JSON.stringify('😀'.repeat(2_047) + 'xx'), 'utf8')
     expect(unicodeAtLimit.byteLength).toBe(8_192)

@@ -60,7 +60,13 @@ import {
     pluginStorageBatchTransportOutcomeUnknown,
 } from "./pluginStorageBatch"
 import type { PluginStorageBatchStreamCapabilities } from "./pluginStorageBatch"
-import { PLUGIN_VALUE_STREAM_THRESHOLD_BYTES } from "./pluginStorageLimits"
+import {
+    DEFAULT_PLUGIN_VALUE_MAX_BYTES,
+    parsePluginStorageCapabilities,
+    pluginStorageLimitMessage,
+    PLUGIN_VALUE_STREAM_THRESHOLD_BYTES,
+    type PluginStorageCapabilities,
+} from "./pluginStorageLimits"
 import type { BootInternalSnapshot } from "./bootSnapshotRecovery"
 import { comparePluginStorageKeys } from "../plugins/pluginStorageRecord"
 
@@ -1272,6 +1278,9 @@ export class NodeStorage{
     authChecked = false
     private cachedJwt: { token: string; expiresAt: number } | null = null
     private static sessionInitialized = false
+    private static pluginStorageCapabilities: PluginStorageCapabilities = {
+        maxValueBytes: DEFAULT_PLUGIN_VALUE_MAX_BYTES,
+    }
     private static pluginStorageBatchCapabilities: PluginStorageBatchStreamCapabilities | null = null
     private static sessionPending: {
         controller: AbortController
@@ -1350,17 +1359,57 @@ export class NodeStorage{
                     // Older servers may return an empty or non-JSON session body.
                 }
                 const capabilities = response && typeof response === 'object'
-                    ? (response as { capabilities?: { pluginStorageBatch?: unknown } })
-                        .capabilities?.pluginStorageBatch
+                    ? (response as {
+                        capabilities?: {
+                            pluginStorage?: unknown
+                            pluginStorageBatch?: unknown
+                        }
+                    }).capabilities
                     : null
                 NodeStorage.pluginStorageBatchCapabilities
-                    = parsePluginStorageBatchStreamCapabilities(capabilities)
+                    = parsePluginStorageBatchStreamCapabilities(
+                        capabilities?.pluginStorageBatch,
+                    )
+                NodeStorage.pluginStorageCapabilities
+                    = parsePluginStorageCapabilities(capabilities?.pluginStorage)
+                    ?? (NodeStorage.pluginStorageBatchCapabilities
+                        ? {
+                            maxValueBytes:
+                                NodeStorage.pluginStorageBatchCapabilities.maxValueBytes,
+                        }
+                        : { maxValueBytes: DEFAULT_PLUGIN_VALUE_MAX_BYTES })
                 NodeStorage.sessionInitialized = true
             }
             // Non-ok (400/401/500): will retry on next checkAuth() call.
         } catch (error) {
             if (signal.aborted) throw error
             // Network error: will retry on next checkAuth() call.
+        }
+    }
+
+    private pluginStorageValueLimitError(
+        actualBytes: number,
+        operation: 'write' | 'transition' | 'batch',
+    ): StorageError {
+        const limitBytes = NodeStorage.pluginStorageCapabilities.maxValueBytes
+        return new StorageError(pluginStorageLimitMessage(actualBytes, limitBytes), {
+            status: 413,
+            code: 'PLUGIN_VALUE_TOO_LARGE',
+            retryable: false,
+            commitOutcomeUnknown: false,
+            commitOutcome: 'not-committed',
+            operation,
+            limit: limitBytes,
+            actual: actualBytes,
+        })
+    }
+
+    private assertPluginStorageValueSize(
+        actualBytes: number,
+        operation: 'write' | 'transition' | 'batch',
+    ): void {
+        if (actualBytes > NodeStorage.pluginStorageCapabilities.maxValueBytes) {
+            throw this.pluginStorageValueLimitError(actualBytes, operation)
         }
     }
 
@@ -1470,6 +1519,7 @@ export class NodeStorage{
         init: RequestInit = {},
         retry = true,
         mutationOutcome?: AuthoritativeStorageOutcomeTracker,
+        beforeDispatch?: () => void,
     ) {
         const execute = async (
             signal: AbortSignal,
@@ -1479,8 +1529,8 @@ export class NodeStorage{
             const headers = new Headers(init.headers)
             headers.set('risu-auth', await this.createAuth(signal))
             headers.set('x-session-id', NodeStorage.sessionId)
-
             throwIfAborted(signal)
+            beforeDispatch?.()
             outcome.markRequestDispatched()
             mutationOutcome?.markRequestDispatched()
             let response: Response
@@ -1511,6 +1561,7 @@ export class NodeStorage{
                     { ...init, signal },
                     false,
                     mutationOutcome,
+                    beforeDispatch,
                 )
             }
 
@@ -1773,7 +1824,18 @@ export class NodeStorage{
                 headers: { 'content-type': 'application/octet-stream' },
                 body: requestBytes as any,
                 signal,
-            }, true, outcome)
+            }, true, outcome, () => {
+                if ('writes' in payload) {
+                    for (const write of payload.writes) {
+                        if (write.storageKey.startsWith('pluginsave/')) {
+                            this.assertPluginStorageValueSize(
+                                write.valueBytes.byteLength,
+                                'write',
+                            )
+                        }
+                    }
+                }
+            })
             const failureResponse = response.clone()
             // Keep the result ambiguous until its acknowledgement body is
             // available; an HTTP status without the transaction payload is not
@@ -1868,7 +1930,15 @@ export class NodeStorage{
                     },
                     body: requestBody,
                     signal,
-                }, mutation, outcome)
+                }, mutation, outcome, () => {
+                    if (body?.targetOptimized) {
+                        for (const row of body.rows) {
+                            if (row.storageKey.startsWith('pluginsave/')) {
+                                this.assertPluginStorageValueSize(row.size, 'transition')
+                            }
+                        }
+                    }
+                })
                 if (mutation) outcome.markRequestDispatched()
                 const result = await awaitWithAbort(response.json(), signal) as any
                 if (response.status === 409) {
@@ -2014,6 +2084,11 @@ export class NodeStorage{
                     },
                     true,
                     outcome,
+                    () => {
+                        if (storageKey.startsWith('pluginsave/')) {
+                            this.assertPluginStorageValueSize(bytes.byteLength, 'transition')
+                        }
+                    },
                 )
                 outcome.markRequestDispatched()
                 const result = await awaitWithAbort(response.json(), signal) as any
@@ -2184,7 +2259,11 @@ export class NodeStorage{
             body: value as any,
             headers,
             signal,
-        }, true, outcome), [409], signal, outcome)
+        }, true, outcome, () => {
+            if (key.startsWith('pluginsave/')) {
+                this.assertPluginStorageValueSize(value.byteLength, 'write')
+            }
+        }), [409], signal, outcome)
         if(da.status === 409){
             const conflict = await this.parseDatabaseConflict(da.clone(), key, etag, signal)
             if (conflict) {
@@ -2224,6 +2303,8 @@ export class NodeStorage{
             status: number | null = null,
             retryAfter: number | null = null,
             commitOutcomeUnknown = outcome === 'unknown',
+            limit?: number,
+            actual?: number,
         ): PluginStorageMutationResult => ({
             outcome,
             operation: request.operation,
@@ -2233,6 +2314,8 @@ export class NodeStorage{
             retryAfter,
             commitOutcomeUnknown,
             ...(retryable === undefined ? {} : { retryable }),
+            ...(limit === undefined ? {} : { limit }),
+            ...(actual === undefined ? {} : { actual }),
         })
         if (request.operation === 'set' && !request.valueBytes) {
             return fallback('not-committed', 'A set mutation requires value bytes.', 'INVALID_REQUEST')
@@ -2291,6 +2374,8 @@ export class NodeStorage{
                     error.status,
                     error.retryAfter,
                     error.commitOutcomeUnknown,
+                    error.limit,
+                    error.actual,
                 )
             }
             return pluginStorageTransportOutcomeUnknown(stableRequest.operation, error)
@@ -2337,7 +2422,14 @@ export class NodeStorage{
                 headers,
                 body: (stableRequest.valueBytes ?? new Uint8Array()) as any,
                 signal,
-            }, true, outcome)
+            }, true, outcome, () => {
+                if (stableRequest.operation === 'set') {
+                    this.assertPluginStorageValueSize(
+                        stableRequest.valueBytes!.byteLength,
+                        'write',
+                    )
+                }
+            })
 
             // Receiving an HTTP response is not enough: keep the mutation
             // outcome ambiguous until the exact acknowledgement is consumed.
@@ -2447,6 +2539,28 @@ export class NodeStorage{
                         : new Uint8Array(operation.valueBytes),
                 }
                 : { ...operation }),
+        }
+        const maxValueBytes = NodeStorage.pluginStorageCapabilities.maxValueBytes
+        const oversizedValue = stableRequest.operations.find(operation => (
+            operation.operation === 'set'
+            && operation.valueBytes.byteLength > maxValueBytes
+        ))
+        if (oversizedValue?.operation === 'set') {
+            return {
+                outcome: 'not-committed',
+                operation: 'batch',
+                code: 'PLUGIN_VALUE_TOO_LARGE',
+                error: pluginStorageLimitMessage(
+                    oversizedValue.valueBytes.byteLength,
+                    maxValueBytes,
+                ),
+                retryable: false,
+                status: 413,
+                retryAfter: null,
+                limit: maxValueBytes,
+                actual: oversizedValue.valueBytes.byteLength,
+                commitOutcomeUnknown: false,
+            }
         }
         let requestBody: BodyInit
         let requestByteLength: number
