@@ -78,6 +78,50 @@ function seedActivePublication(saveDir: string): void {
   }
 }
 
+function orderedValueKey(rawKey: string): string {
+  return `pluginsave/${Buffer.from(rawKey, 'utf-8').toString('base64url')}.json`
+}
+
+function seedOrderedLegacyPublication(saveDir: string): void {
+  const orderedKeys = ['z', 'a'].map(orderedValueKey)
+  const database = new Database(path.join(saveDir, 'risuai.db'))
+  try {
+    database.exec(`CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL, updated_at INTEGER NOT NULL)`)
+    const insert = database.prepare(
+      'INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+    )
+    for (const [index, key] of orderedKeys.entries()) {
+      insert.run(key, Buffer.from(JSON.stringify(index)), 1)
+    }
+    insert.run(MANIFEST_KEY, Buffer.from(JSON.stringify({
+      version: 1,
+      generation: STORAGE_GENERATION,
+      valueKeys: orderedKeys,
+      metaKeys: [],
+    })), 1)
+    insert.run(DATABASE_KEY, Buffer.from(encodeRisuSaveLegacy({
+      characters: [],
+      optimizePluginMemory: true,
+      pluginStorageGeneration: STORAGE_GENERATION,
+      pluginCustomStorage: {},
+    })), 1)
+  } finally {
+    database.close()
+  }
+}
+
+function readManifest(cwd: string): any {
+  const database = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
+  try {
+    const row = database.prepare('SELECT value FROM kv WHERE key = ?').get(MANIFEST_KEY) as {
+      value: Buffer
+    }
+    return JSON.parse(Buffer.from(row.value).toString('utf-8'))
+  } finally {
+    database.close()
+  }
+}
+
 async function boot(
   pluginFailpoint?:
     | 'owner-write'
@@ -197,6 +241,41 @@ async function mutateWithClientOutcome(
 }
 
 describe('atomic optimized plugin value and owner acknowledgement', () => {
+  test('upgrades a legacy manifest and preserves update versus delete-reinsert order', async () => {
+    const { server, client } = await boot(undefined, undefined, seedOrderedLegacyPublication)
+    const write = async (rawKey: string, operation: 'set' | 'remove') => {
+      const key = orderedValueKey(rawKey)
+      const response = await client.fetch('/api/plugin-storage/mutate', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'file-path': Buffer.from(key, 'utf-8').toString('hex'),
+          'x-plugin-storage-operation': operation,
+          'x-plugin-storage-generation': STORAGE_GENERATION,
+          'x-plugin-storage-owner-policy': 'preserve',
+        },
+        body: operation === 'set'
+          ? new Uint8Array(Buffer.from(JSON.stringify(rawKey)))
+          : new Uint8Array(),
+      })
+      expect(response.status).toBe(200)
+    }
+    const zKey = orderedValueKey('z')
+    const aKey = orderedValueKey('a')
+    const bKey = orderedValueKey('b')
+
+    await write('z', 'set')
+    expect(readManifest(server.cwd)).toMatchObject({
+      version: 2,
+      valueKeys: [zKey, aKey],
+    })
+    await write('b', 'set')
+    expect(readManifest(server.cwd).valueKeys).toEqual([zKey, aKey, bKey])
+    await write('z', 'remove')
+    await write('z', 'set')
+    expect(readManifest(server.cwd).valueKeys).toEqual([aKey, bKey, zKey])
+  })
+
   test('generation-bound value-only remove preserves owner bytes and meta manifest membership', async () => {
     const { server, client } = await boot(undefined, undefined, seedActivePublication)
     const response = await client.fetch('/api/plugin-storage/mutate', {
@@ -224,7 +303,7 @@ describe('atomic optimized plugin value and owner acknowledgement', () => {
         value: Buffer
       }
       expect(JSON.parse(Buffer.from(row.value).toString('utf-8'))).toEqual({
-        version: 1,
+        version: 2,
         generation: STORAGE_GENERATION,
         valueKeys: [],
         metaKeys: [OWNER_KEY],

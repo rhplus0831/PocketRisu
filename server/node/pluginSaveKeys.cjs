@@ -6,7 +6,8 @@ const PLUGIN_SAVE_META_PREFIX = policy.metaPrefix;
 const PLUGIN_STORAGE_FOLDED_MARKER = 'pluginStorageFolded';
 const PLUGIN_STORAGE_GENERATION_FIELD = 'pluginStorageGeneration';
 const PLUGIN_STORAGE_MANIFEST_KEY = 'plugin-storage/manifest.json';
-const PLUGIN_STORAGE_MANIFEST_VERSION = 1;
+const PLUGIN_STORAGE_MANIFEST_VERSION = 2;
+const LEGACY_PLUGIN_STORAGE_MANIFEST_VERSION = 1;
 
 function assertArchiveSafePluginSaveStorageKey(storageKey) {
     if (Buffer.byteLength(storageKey, 'utf-8') > BACKUP_ENTRY_NAME_MAX_BYTES) {
@@ -67,7 +68,8 @@ function normalizeManifestKeyList(value, prefix) {
 
 function parsePluginStorageManifest(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)
-        || value.version !== PLUGIN_STORAGE_MANIFEST_VERSION
+        || (value.version !== LEGACY_PLUGIN_STORAGE_MANIFEST_VERSION
+            && value.version !== PLUGIN_STORAGE_MANIFEST_VERSION)
         || typeof value.generation !== 'string' || value.generation.length === 0) {
         return null;
     }
@@ -75,7 +77,7 @@ function parsePluginStorageManifest(value) {
     const metaKeys = normalizeManifestKeyList(value.metaKeys, PLUGIN_SAVE_META_PREFIX);
     if (!valueKeys || !metaKeys) return null;
     return {
-        version: PLUGIN_STORAGE_MANIFEST_VERSION,
+        version: value.version,
         generation: value.generation,
         valueKeys,
         metaKeys,

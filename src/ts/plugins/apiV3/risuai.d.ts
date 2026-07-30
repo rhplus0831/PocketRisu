@@ -1276,18 +1276,24 @@ interface PluginStorage {
     /**
      * Gets a key by index
      * @param index - Key index
-     * @returns Promise resolving to key name or null. Keys use the same stable
-     * order in every storage mode: array-index names numerically, then other
-     * names by UTF-16 code-unit order.
+     * @returns Promise resolving to key name or null. Order matches Object.keys:
+     * array-index names numerically, then other names by insertion order.
      */
     key(index: number): Promise<string | null>;
 
     /**
      * Gets all storage keys
-     * @returns Promise resolving to key names in the stable order documented
-     * by key().
+     * @returns Promise resolving to key names in the legacy Object.keys-compatible
+     * order documented by key().
      */
     keys(): Promise<string[]>;
+
+    /**
+     * Gets all storage keys in deterministic sorted order.
+     * @returns Promise resolving to array-index names numerically followed by
+     * other names in UTF-16 code-unit order.
+     */
+    sortedKeys(): Promise<string[]>;
 
     /**
      * Gets the number of items in storage

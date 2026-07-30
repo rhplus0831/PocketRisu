@@ -17,6 +17,7 @@ import {
     readPluginSaveStorageItemResult,
     getPluginSaveStorageKey,
     getPluginSaveStorageKeys,
+    getPluginSaveStorageSortedKeys,
     getPluginSaveStorageLength,
     getPluginSaveStorageSnapshot,
     removeOwnedPluginSaveStorageItem,
@@ -2134,6 +2135,9 @@ export const makeRisuaiAPIV3 = (
             getPluginSaveStorageKey(index, signal)
         ),
         _keysPluginStorage: (signal?: AbortSignal) => getPluginSaveStorageKeys(signal),
+        _sortedKeysPluginStorage: (signal?: AbortSignal) => (
+            getPluginSaveStorageSortedKeys(signal)
+        ),
         _lengthPluginStorage: (signal?: AbortSignal) => getPluginSaveStorageLength(signal),
         _getSafeLocalStorage: oldApis.safeLocalStorage.getItem,
         _setSafeLocalStorage: (key: string, value: string, signal?: AbortSignal) => {
@@ -2177,6 +2181,7 @@ export const makeRisuaiAPIV3 = (
                     'clear': '_clearPluginStorage',
                     'key': '_keyPluginStorage',
                     'keys': '_keysPluginStorage',
+                    'sortedKeys': '_sortedKeysPluginStorage',
                     'length': '_lengthPluginStorage',
                 },
                 'safeLocalStorage':{

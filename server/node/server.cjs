@@ -4187,7 +4187,13 @@ function writePluginStorageManifest(manifest) {
 
 function pluginStorageManifestEquals(left, right) {
     if (left === null || right === null) return left === right;
-    if (left.generation !== right.generation) return false;
+    if (left.version !== right.version || left.generation !== right.generation) return false;
+    if (left.version === 2) {
+        const sameOrder = (a, b) => a.length === b.length
+            && a.every((key, index) => key === b[index]);
+        return sameOrder(left.valueKeys, right.valueKeys)
+            && sameOrder(left.metaKeys, right.metaKeys);
+    }
     const sameKeys = (a, b) => {
         if (a.length !== b.length) return false;
         const rightKeys = new Set(b);
@@ -9994,7 +10000,6 @@ function authoritativeInlinePluginTransitionRows(liveDb) {
     };
     appendRecord(liveDb?.pluginCustomStorage, PLUGIN_SAVE_PREFIX);
     appendRecord(liveDb?.pluginStorageMeta, PLUGIN_SAVE_META_PREFIX);
-    rows.sort((left, right) => left.storageKey.localeCompare(right.storageKey));
     return rows.map((row, index) => ({ ...row, index }));
 }
 

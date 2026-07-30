@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **76** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, and **22** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **75** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, and **23** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -26,7 +26,6 @@ None currently open.
 | [Remote plain HTTP no longer boots](compatibility/remote-http-deployments-no-longer-boot.md) | compat | Intentional | Existing remote-HTTP deployments cannot reach authentication or storage. | Deterministic after upgrade for non-loopback HTTP unless the operator enables the explicit override. |
 | [Cloudflare Quick Tunnel was removed](compatibility/cloudflare-quick-tunnel-removed.md) | compat | Intentional | Deployments using the bundled tunnel lose remote access and the old API returns 404. | Deterministic after update or container rebuild for Quick Tunnel users. |
 | [Custom hub proxy targets are rejected](compatibility/hub-proxy-custom-targets-rejected.md) | compat | Intentional | Custom hubs and external clients lose their relay route. | Deterministic for any non-official target sent to `/hub-proxy`. |
-| [Plugin storage enumeration order changed](compatibility/plugin-storage-enumeration-order.md) | compat | Open | Cursor, append-order, priority, and first/last conventions can process records differently. | Every affected V3 plugin that relies on main's insertion order for non-index keys. |
 
 ## Tier 2
 
@@ -161,3 +160,4 @@ None currently open.
 | [`loadPlugins()` no longer meant completion](compatibility/plugin-loadplugins-readiness.md) | Plugin callers raced teardown/reload and could not observe lifecycle failure. | Fixed 2026-07-30 by returning the shared deferred drain outside lifecycle callbacks while retaining deadlock-safe acknowledgement inside them. |
 | [V3 database custom-key fallback was removed](compatibility/v3-database-custom-key-fallback.md) | Plugins using the inherited custom-field convention threw before mutation. | Fixed 2026-07-30 by routing unsupported fields through authoritative plugin storage in legacy compatibility mode, with a developer-console-only notice; strict mode still rejects them. |
 | [Plugin permissions could not be reset to Ask](compatibility/permission-editor-cannot-reset-to-ask.md) | Ordinary users could not restore prompt-on-next-use behavior after granting or denying a permission. | Fixed 2026-07-30 by exposing the existing per-plugin reset in the normal permission editor with confirmation, immediate state refresh, and rendered-component coverage. |
+| [Plugin storage enumeration order changed](compatibility/plugin-storage-enumeration-order.md) | Cursor, append-order, priority, and first/last conventions could process records differently. | Fixed 2026-07-30 with legacy `Object.keys()` ordering, authoritative version-2 manifest order, version-1 migration, and a separate `sortedKeys()` API. |

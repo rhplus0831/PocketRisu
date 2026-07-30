@@ -6,10 +6,19 @@ import {
 } from './pluginStorageViewerPage'
 import {
     comparePluginStorageKeys,
+    orderLegacyPluginStorageKeys,
     orderPluginStorageKeys,
 } from './pluginStorageRecord'
 
-describe('plugin storage canonical ordering', () => {
+describe('plugin storage ordering', () => {
+    test('preserves legacy insertion order after numeric array-index keys', () => {
+        expect(orderLegacyPluginStorageKeys([
+            'z', '10', 'a', '01', '2', 'z', '0', '4294967295',
+        ])).toEqual([
+            '0', '2', '10', 'z', 'a', '01', '4294967295',
+        ])
+    })
+
     test('uses array-index order followed by raw UTF-16 code-unit order', () => {
         const composed = '\u00e9'
         const decomposed = 'e\u0301'

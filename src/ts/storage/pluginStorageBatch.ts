@@ -22,7 +22,7 @@ export type PluginStorageBatchOperation =
     };
 
 export interface PluginStorageBatchManifest {
-    version: 1;
+    version: 1 | 2;
     generation: string;
     valueKeys: string[];
     metaKeys: string[];

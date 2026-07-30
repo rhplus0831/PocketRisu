@@ -105,7 +105,7 @@ async function expectPointInTimeExport(initial: Buffer, replacement: Buffer): Pr
   const victimKey = pluginStorageKey('concurrent-export-victim')
   const generation = 'concurrent-export-generation'
   const manifest = {
-    version: 1,
+    version: 2,
     generation,
     valueKeys: [victimKey],
     metaKeys: [],

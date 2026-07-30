@@ -654,11 +654,18 @@ await Risuai.pluginStorage.setItem('last_sync', Date.now().toString());
 
 const preference = await  Risuai.pluginStorage.getItem('user_preference');
 const allKeys = await Risuai.pluginStorage.keys();
+const deterministicKeys = await Risuai.pluginStorage.sortedKeys();
 const count = await Risuai.pluginStorage.length();
 
 await Risuai.pluginStorage.removeItem('last_sync');
 await Risuai.pluginStorage.clear(); // Remove all items
 ```
+
+`keys()` and `key(index)` retain the legacy `Object.keys()` contract: array-index
+names appear numerically first and other names retain insertion order. Use
+`sortedKeys()` when a deterministic UTF-16 key order is required. Plugins should
+store explicit sequence data instead of inferring record age or priority from
+either enumeration order.
 
 Reads can fail and mutations can have an unknown commit outcome. For anything more important than a replaceable preference, follow [Safe V3 plugin-storage mutations](./docs/plugin-storage-mutation-outcomes.md) and the [generation/batch architecture](./docs/structure/plugin-storage.md#immutable-generations); do not turn a failed read into an empty default or blindly replay an ambiguous write.
 

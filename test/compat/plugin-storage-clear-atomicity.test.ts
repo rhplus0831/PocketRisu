@@ -122,7 +122,7 @@ async function expectEmptyPluginSet(client: RisuClient): Promise<void> {
   expect(await readKv(client, UNRELATED_KEY)).toEqual(UNRELATED_VALUE)
   expect(JSON.parse((await readKv(client, MANIFEST_KEY))!.toString('utf-8')))
     .toEqual({
-      version: 1,
+      version: 2,
       generation: STORAGE_GENERATION,
       valueKeys: [],
       metaKeys: [],

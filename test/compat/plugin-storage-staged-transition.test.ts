@@ -24,6 +24,102 @@ function filePathHeader(key: string): string {
 }
 
 describe('staged plugin storage transitions (real server)', () => {
+  test('preserves legacy non-index insertion order across optimization round trips', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const rawKeys = ['z', 'a']
+    const valueKeys = rawKeys.map(key => encodedKey('pluginsave/', key))
+    const values = rawKeys.map(key => Buffer.from(JSON.stringify(key)))
+    expect((await client.importBackup(createSeedBackup({
+      databaseFields: {
+        optimizePluginMemory: false,
+        pluginCustomStorage: { z: 'z', a: 'a' },
+      },
+    }))).ok).toBe(true)
+
+    const externalId = randomUUID()
+    const externalGeneration = randomUUID()
+    const begin = await client.fetch('/api/plugin-storage/transition/stage/begin', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        transitionId: externalId,
+        source: { optimized: false, generation: null, manifest: null },
+        targetOptimized: true,
+        targetGeneration: externalGeneration,
+        rows: valueKeys.map((storageKey, index) => ({
+          storageKey,
+          size: values[index].length,
+        })),
+      }),
+    })
+    expect(begin.status).toBe(200)
+    for (const [index, storageKey] of valueKeys.entries()) {
+      const upload = await client.fetch('/api/plugin-storage/transition/stage/upload', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-plugin-storage-transition': externalId,
+          'x-plugin-storage-key': storageKey,
+        },
+        body: new Uint8Array(values[index]),
+      })
+      expect(upload.status).toBe(200)
+    }
+    const externalFinalize = await client.fetch('/api/plugin-storage/transition/stage/finalize', {
+      method: 'POST',
+      headers: { 'x-plugin-storage-transition': externalId },
+    })
+    expect(externalFinalize.status).toBe(200)
+
+    const manifestResponse = await client.fetch('/api/plugin-storage/manifest', {
+      headers: { 'x-plugin-storage-generation': externalGeneration },
+    })
+    expect(manifestResponse.status).toBe(200)
+    const manifestBody = await manifestResponse.json() as any
+    expect(manifestBody.manifest).toEqual({
+      version: 2,
+      generation: externalGeneration,
+      valueKeys,
+      metaKeys: [],
+    })
+
+    const internalId = randomUUID()
+    const internalGeneration = randomUUID()
+    const internalBegin = await client.fetch('/api/plugin-storage/transition/stage/begin', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        transitionId: internalId,
+        source: {
+          optimized: true,
+          generation: externalGeneration,
+          manifest: manifestBody.manifest,
+        },
+        targetOptimized: false,
+        targetGeneration: internalGeneration,
+        rows: [],
+      }),
+    })
+    expect(internalBegin.status).toBe(200)
+    expect((await internalBegin.json() as any).rows.map((row: any) => row.storageKey))
+      .toEqual(valueKeys)
+    const internalFinalize = await client.fetch('/api/plugin-storage/transition/stage/finalize', {
+      method: 'POST',
+      headers: { 'x-plugin-storage-transition': internalId },
+    })
+    expect(internalFinalize.status).toBe(200)
+
+    const databaseResponse = await client.fetch('/api/read', {
+      headers: { 'file-path': filePathHeader(DATABASE_KEY) },
+    })
+    const database = decodeRisuDat(Buffer.from(await databaseResponse.arrayBuffer()))
+    expect(Object.keys(database.pluginCustomStorage)).toEqual(rawKeys)
+  }, 30_000)
+
   test('keeps uploads invisible, atomically externalizes, then server-streams internalization', async () => {
     const server = await spawnServer({ env: { POCKETRISU_CHUNK_THRESHOLD: '1024' } })
     servers.push(server)
@@ -108,7 +204,7 @@ describe('staged plugin storage transitions (real server)', () => {
           optimized: true,
           generation: externalGeneration,
           manifest: {
-            version: 1,
+            version: 2,
             generation: externalGeneration,
             valueKeys: [valueKey],
             metaKeys: [],
@@ -133,7 +229,7 @@ describe('staged plugin storage transitions (real server)', () => {
       generation: externalGeneration,
       manifestRevision: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
       manifest: {
-        version: 1,
+        version: 2,
         generation: externalGeneration,
         valueKeys: [valueKey],
         metaKeys: [],

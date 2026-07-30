@@ -32,6 +32,11 @@ value and metadata rows in the selected generation. Undeclared physical rows are
 quarantined data and must not appear in live reads, exports, the viewer, or an exact
 restore.
 
+Manifest version 2 also makes its key sequence authoritative. Public V3 `keys()` and
+`key(index)` preserve the legacy `Object.keys()` contract across inline and optimized
+modes; `sortedKeys()` provides the separate canonical UTF-16 order. Version-1 manifests
+are accepted as migration baselines and upgrade on the next optimized publication.
+
 ## Architecture at a glance
 
 ```text

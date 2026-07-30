@@ -32,7 +32,7 @@ const STORAGE_GENERATION = 'aa3-selected-publication'
 const valueKey = (key: string) => `pluginsave/${Buffer.from(key).toString('base64url')}.json`
 const ownerKey = (key: string) => `pluginsave-meta/${Buffer.from(key).toString('base64url')}.json`
 const activeManifest = {
-  version: 1,
+  version: 2,
   generation: STORAGE_GENERATION,
   valueKeys: keys.map(valueKey),
   metaKeys: keys.map(ownerKey),

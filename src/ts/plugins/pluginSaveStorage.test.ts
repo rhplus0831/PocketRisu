@@ -377,7 +377,7 @@ vi.mock("../storage/persistentKv", () => {
                     );
                 }
                 persistent.set("plugin-storage/manifest.json", {
-                    version: 1,
+                    version: 2,
                     generation: stagedPlan.targetGeneration,
                     valueKeys: stagedPlan.rows
                         .map((row: any) => row.storageKey)
@@ -416,6 +416,7 @@ const {
     readPluginSaveStorageItemResult,
     getPluginSaveStorageKey,
     getPluginSaveStorageKeys,
+    getPluginSaveStorageSortedKeys,
     getPluginSaveStorageLength,
     getPluginSaveStorageOwners,
     getPluginSaveStorageViewerPage,
@@ -1477,7 +1478,7 @@ describe("plugin save storage transport", () => {
             updatedAt: 2,
         });
         expect(persistent.get(PLUGIN_STORAGE_MANIFEST_KEY)).toEqual({
-            version: 1,
+            version: 2,
             generation: "viewer-generation",
             valueKeys: [activeValue],
             metaKeys: [],
@@ -1982,6 +1983,9 @@ describe("plugin save storage transport", () => {
 
         expect(Object.getPrototypeOf(database.pluginCustomStorage)).toBe(Object.prototype);
         await expect(getPluginSaveStorageKeys()).resolves.toEqual(
+            SPECIAL_PLUGIN_STORAGE_KEYS,
+        );
+        await expect(getPluginSaveStorageSortedKeys()).resolves.toEqual(
             ORDERED_SPECIAL_PLUGIN_STORAGE_KEYS,
         );
         for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
@@ -2206,27 +2210,32 @@ describe("plugin save storage transport", () => {
         },
     );
 
-    test("uses one stable ECMAScript-aware key order in both modes", async () => {
+    test("uses legacy and explicit sorted key orders in both modes", async () => {
         const insertionOrder = ["beta", "10", "2", "01", "alpha", "4294967295", "0", ""];
-        const expected = ["0", "2", "10", "", "01", "4294967295", "alpha", "beta"];
+        const legacy = ["0", "2", "10", "beta", "01", "alpha", "4294967295", ""];
+        const sorted = ["0", "2", "10", "", "01", "4294967295", "alpha", "beta"];
         for (const key of insertionOrder) {
             await setPluginSaveStorageItem(key, key);
         }
-        await expect(getPluginSaveStorageKeys()).resolves.toEqual(expected);
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(legacy);
+        await expect(getPluginSaveStorageSortedKeys()).resolves.toEqual(sorted);
 
         database.optimizePluginMemory = true;
         database.pluginCustomStorage = {};
-        for (const key of [...insertionOrder].reverse()) {
-            persistent.set(encoded(PLUGIN_SAVE_PREFIX, key), key);
+        const storageKeys = insertionOrder.map(key => encoded(PLUGIN_SAVE_PREFIX, key));
+        for (const [index, key] of storageKeys.entries()) {
+            persistent.set(key, insertionOrder[index]);
         }
-        await expect(getPluginSaveStorageKeys()).resolves.toEqual(expected);
+        installOwnershipManifest("ordered-enumeration-generation", storageKeys, []);
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(legacy);
+        await expect(getPluginSaveStorageSortedKeys()).resolves.toEqual(sorted);
 
-        // Model a list-delta merge that moves an updated row to the end.
-        const movedKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
-        const value = persistent.get(movedKey);
-        persistent.delete(movedKey);
-        persistent.set(movedKey, value);
-        await expect(getPluginSaveStorageKeys()).resolves.toEqual(expected);
+        for (const key of [...storageKeys].reverse()) {
+            const value = persistent.get(key);
+            persistent.delete(key);
+            persistent.set(key, value);
+        }
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(legacy);
     });
 
     test("a stalled write does not block another key and bounds a requested transition", async () => {
@@ -2359,6 +2368,32 @@ describe("plugin save storage transport", () => {
         expect(listPersistentKeys).toHaveBeenCalledTimes(2);
         expect(listPersistentKeys).toHaveBeenCalledWith(PLUGIN_SAVE_PREFIX);
         expect(listPersistentKeys).toHaveBeenCalledWith(PLUGIN_SAVE_META_PREFIX);
+    });
+
+    test("legacy enumeration preserves non-index insertion order while sortedKeys is explicit", async () => {
+        database.pluginCustomStorage = {};
+        for (const key of ["z", "10", "a", "2"]) {
+            database.pluginCustomStorage[key] = key;
+        }
+
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["2", "10", "z", "a"]);
+        await expect(getPluginSaveStorageSortedKeys()).resolves.toEqual(["2", "10", "a", "z"]);
+
+        await setPluginSaveStorageItem("z", "updated");
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["2", "10", "z", "a"]);
+        await removePluginSaveStorageItem("z");
+        await setPluginSaveStorageItem("z", "reinserted");
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["2", "10", "a", "z"]);
+    });
+
+    test("optimized enumeration uses a version-one manifest as its migration baseline", async () => {
+        database.optimizePluginMemory = true;
+        const keys = ["z", "a"].map(key => encoded(PLUGIN_SAVE_PREFIX, key));
+        for (const [index, key] of keys.entries()) persistent.set(key, index);
+        installOwnershipManifest("ordered-generation", keys, []);
+
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["z", "a"]);
+        await expect(getPluginSaveStorageSortedKeys()).resolves.toEqual(["a", "z"]);
     });
 });
 
@@ -2954,7 +2989,7 @@ describe("boot plugin storage reconciliation recovery", () => {
             dependencies: { persistDatabase: vi.fn(async () => undefined) },
         })).resolves.toMatchObject({ issues: [] });
 
-        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["external", "inline"]);
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["inline", "external"]);
     });
 
     test("quarantines an oversized inline key before violating the BR4 archive boundary", async () => {
@@ -3592,7 +3627,7 @@ describe("transitionPluginStorageMode", () => {
         expect(database.pluginStorageGeneration).toEqual(expect.any(String));
         expect(persistent.get(staleKey)).toEqual({ resurrected: false });
         expect(persistent.get(PLUGIN_STORAGE_MANIFEST_KEY)).toEqual({
-            version: 1,
+            version: 2,
             generation: database.pluginStorageGeneration,
             valueKeys: [],
             metaKeys: [],
@@ -3608,7 +3643,7 @@ describe("transitionPluginStorageMode", () => {
         database.pluginCustomStorage = { inlineRecovery: "selected" };
         persistent.set(foreignKey, "foreign-value");
         persistent.set(PLUGIN_STORAGE_MANIFEST_KEY, {
-            version: 1,
+            version: 2,
             generation: "other-generation",
             valueKeys: [foreignKey],
             metaKeys: [],
@@ -3663,7 +3698,7 @@ describe("transitionPluginStorageMode", () => {
 
         expect(database.pluginStorageGeneration).toEqual(expect.any(String));
         expect(persistent.get(PLUGIN_STORAGE_MANIFEST_KEY)).toEqual({
-            version: 1,
+            version: 2,
             generation: database.pluginStorageGeneration,
             valueKeys: [legacyKey],
             metaKeys: [],
@@ -4309,6 +4344,9 @@ describe("transitionPluginStorageMode", () => {
         expect(Object.keys(database.pluginCustomStorage)).toEqual([]);
         expect(database.pluginStorageMeta).toBeUndefined();
         await expect(getPluginSaveStorageKeys()).resolves.toEqual(
+            SPECIAL_PLUGIN_STORAGE_KEYS,
+        );
+        await expect(getPluginSaveStorageSortedKeys()).resolves.toEqual(
             ORDERED_SPECIAL_PLUGIN_STORAGE_KEYS,
         );
         for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
@@ -4333,10 +4371,10 @@ describe("transitionPluginStorageMode", () => {
         expect(Object.getPrototypeOf(database.pluginCustomStorage)).toBe(Object.prototype);
         expect(Object.getPrototypeOf(database.pluginStorageMeta)).toBe(Object.prototype);
         expect(Object.keys(database.pluginCustomStorage)).toEqual(
-            ORDERED_SPECIAL_PLUGIN_STORAGE_KEYS,
+            SPECIAL_PLUGIN_STORAGE_KEYS,
         );
         expect(Object.keys(database.pluginStorageMeta)).toEqual(
-            ORDERED_SPECIAL_PLUGIN_STORAGE_KEYS,
+            SPECIAL_PLUGIN_STORAGE_KEYS,
         );
         for (const [index, key] of SPECIAL_PLUGIN_STORAGE_KEYS.entries()) {
             await expect(getPluginSaveStorageItem(key)).resolves.toEqual({ index });

@@ -1,6 +1,6 @@
 # Plugin storage enumeration order changed
 
-- Status: Confirmed behavioral change
+- Status: Fixed 2026-07-30
 - Severity: Low
 - Confidence: High
 - Introduced by: 9d1cd91d
@@ -28,3 +28,17 @@ different order after upgrade.
 Retain legacy ordering for existing methods with persisted order metadata, or
 introduce a separately named sorted enumeration API. Add migration guidance
 that tells plugins never to infer age from the new order.
+
+## Resolution
+
+V3 `key()` and `keys()` again use the legacy `Object.keys()` contract: array-index
+names numerically, followed by other strings in insertion order. Optimized storage
+manifest version 2 makes that sequence authoritative across mutations, mode
+transitions, backups, and restores; version-1 manifests remain valid migration
+baselines and upgrade on their next publication. Plugins that require the former
+canonical UTF-16 order can call the separately named `sortedKeys()` method.
+
+Historical insertion order that an earlier PocketRisu build already sorted cannot be
+reconstructed. Its current version-1 manifest or inline object order becomes the
+migration baseline, after which updates retain position and delete/reinsert moves a
+non-index key to the end.

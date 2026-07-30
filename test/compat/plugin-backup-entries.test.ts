@@ -395,7 +395,7 @@ describe('external plugin rows in backup archives', () => {
     }
     const storageGeneration = 'node-backup-generation'
     const storageManifest = Buffer.from(JSON.stringify({
-      version: 1,
+      version: 2,
       generation: storageGeneration,
       valueKeys: [...valueRows.keys()],
       metaKeys: [...metaRows.keys()],

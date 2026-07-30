@@ -50,7 +50,7 @@ function encodeDatabase(database: Record<string, unknown>): Buffer {
 }
 
 interface Manifest {
-  version: 1
+  version: 1 | 2
   generation: string
   valueKeys: string[]
   metaKeys: string[]
@@ -385,7 +385,7 @@ describe('staged plugin transition verifier boundaries (real server)', () => {
     expect(readSqliteValue(server, valueKey)).toEqual(value)
     expect(readSqliteValue(server, metaKey)).toEqual(meta)
     expect(JSON.parse(readSqliteValue(server, MANIFEST_KEY)!.toString('utf8'))).toEqual({
-      version: 1,
+      version: 2,
       generation: begun.targetGeneration,
       valueKeys: [valueKey],
       metaKeys: [metaKey],
@@ -1016,7 +1016,7 @@ describe('staged plugin transition verifier boundaries (real server)', () => {
     expect((await finalize(client, external.transitionId)).status).toBe(200)
 
     const externalManifest: Manifest = {
-      version: 1,
+      version: 2,
       generation: external.targetGeneration,
       valueKeys: [valueKey],
       metaKeys: [],

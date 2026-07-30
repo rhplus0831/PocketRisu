@@ -331,7 +331,7 @@ export interface StorageReadOptions {
 }
 
 export interface PluginStorageManifestTransport {
-    version: 1
+    version: 1 | 2
     generation: string
     valueKeys: string[]
     metaKeys: string[]
@@ -2820,7 +2820,7 @@ export class NodeStorage{
             || !manifest
             || Array.isArray(manifest)
             || Object.keys(manifest).length !== 4
-            || manifest.version !== 1
+            || (manifest.version !== 1 && manifest.version !== 2)
             || manifest.generation !== generation
             || !validKeys(manifest.valueKeys, PLUGIN_STORAGE_PREFIXES[0])
             || !validKeys(manifest.metaKeys, PLUGIN_STORAGE_PREFIXES[1])
@@ -2836,7 +2836,7 @@ export class NodeStorage{
             generation,
             manifestRevision: record.manifestRevision,
             manifest: {
-                version: 1,
+                version: manifest.version,
                 generation,
                 valueKeys: [...manifest.valueKeys as string[]],
                 metaKeys: [...manifest.metaKeys as string[]],

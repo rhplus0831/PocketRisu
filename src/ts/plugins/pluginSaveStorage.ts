@@ -63,6 +63,7 @@ import {
     definePluginStorageRecordValue,
     getPluginStorageRecordKeys,
     hasPluginStorageRecordValue,
+    orderLegacyPluginStorageKeys,
     orderPluginStorageKeys,
 } from "./pluginStorageRecord";
 import {
@@ -95,7 +96,7 @@ export { PLUGIN_SAVE_META_PREFIX, PLUGIN_SAVE_PREFIX };
 export const PLUGIN_STORAGE_MANIFEST_KEY = "plugin-storage/manifest.json";
 
 interface PluginStorageManifest {
-    version: 1;
+    version: 1 | 2;
     generation: string;
     valueKeys: string[];
     metaKeys: string[];
@@ -426,13 +427,14 @@ function normalizeManifestKeys(value: unknown, prefix: string): string[] | null 
 function normalizePluginStorageManifest(value: unknown): PluginStorageManifest | null {
     if (!value || typeof value !== "object" || Array.isArray(value)) return null;
     const candidate = value as Partial<PluginStorageManifest>;
-    if (candidate.version !== 1 || typeof candidate.generation !== "string"
+    if ((candidate.version !== 1 && candidate.version !== 2)
+        || typeof candidate.generation !== "string"
         || candidate.generation.length === 0) return null;
     const valueKeys = normalizeManifestKeys(candidate.valueKeys, PLUGIN_SAVE_PREFIX);
     const metaKeys = normalizeManifestKeys(candidate.metaKeys, PLUGIN_SAVE_META_PREFIX);
     if (!valueKeys || !metaKeys) return null;
     return {
-        version: 1,
+        version: candidate.version,
         generation: candidate.generation,
         valueKeys,
         metaKeys,
@@ -445,7 +447,7 @@ function buildPluginStorageManifest(
     metaKeys: Iterable<string>,
 ): PluginStorageManifest {
     return {
-        version: 1,
+        version: 2,
         generation,
         valueKeys: [...new Set(valueKeys)],
         metaKeys: [...new Set(metaKeys)],
@@ -701,7 +703,7 @@ function cloneJsonPluginStorageRecord(
     }
 
     const snapshot = createDatabasePluginStorageRecord<unknown>();
-    for (const key of orderPluginStorageKeys(keys)) {
+    for (const key of orderLegacyPluginStorageKeys(keys)) {
         const descriptor = Reflect.getOwnPropertyDescriptor(source, key)!;
         definePluginStorageRecordValue(snapshot, key, snapshotJsonValue(descriptor.value));
     }
@@ -763,7 +765,7 @@ function cloneInlinePluginStorageRecord(
         validateKey(key);
     }
     const snapshot = createDatabasePluginStorageRecord<unknown>();
-    for (const key of orderPluginStorageKeys(keys)) {
+    for (const key of orderLegacyPluginStorageKeys(keys)) {
         const descriptor = Reflect.getOwnPropertyDescriptor(source, key)!;
         definePluginStorageRecordValue(
             snapshot,
@@ -2305,7 +2307,7 @@ async function getPluginSaveStorageEnumerationSnapshot(
                 db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
             ))
             : await listDecodedStorageKeys(PLUGIN_SAVE_PREFIX, signal);
-        const orderedKeys = orderPluginStorageKeys(keys);
+        const orderedKeys = orderLegacyPluginStorageKeys(keys);
         if (generation === getPluginStorageKeySetGeneration()) {
             storageEnumerationSnapshot = {
                 database: db,
@@ -2519,6 +2521,14 @@ export async function getPluginSaveStorageViewerPage(
 
 export async function getPluginSaveStorageKeys(signal?: AbortSignal | null): Promise<string[]> {
     return getPluginSaveStorageEnumerationSnapshot(true, signal);
+}
+
+export async function getPluginSaveStorageSortedKeys(
+    signal?: AbortSignal | null,
+): Promise<string[]> {
+    return orderPluginStorageKeys(
+        await getPluginSaveStorageEnumerationSnapshot(true, signal),
+    );
 }
 
 export async function getPluginSaveStorageKey(
@@ -2848,7 +2858,7 @@ function measureInlineTransitionEntries(
     for (const key of getPluginStorageRecordKeys(source as Record<string, unknown>)) {
         validateKey(key);
     }
-    return orderPluginStorageKeys(keys).map(key => {
+    return orderLegacyPluginStorageKeys(keys).map(key => {
         throwIfAborted(signal);
         const descriptor = Reflect.getOwnPropertyDescriptor(source, key)!;
         const storageKey = makeArchiveSafePluginSaveStorageKey(prefix, key);

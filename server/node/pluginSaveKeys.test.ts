@@ -5,14 +5,26 @@ const {
     BACKUP_ENTRY_NAME_MAX_BYTES,
     PLUGIN_SAVE_PREFIX,
     PLUGIN_SAVE_META_PREFIX,
+    PLUGIN_STORAGE_MANIFEST_VERSION,
+    createPluginStorageManifest,
     decodePluginSaveStorageKey,
     encodePluginSaveStorageKey,
+    parsePluginStorageManifest,
 } = pluginSaveKeysPkg as {
     BACKUP_ENTRY_NAME_MAX_BYTES: number
     PLUGIN_SAVE_PREFIX: string
     PLUGIN_SAVE_META_PREFIX: string
+    PLUGIN_STORAGE_MANIFEST_VERSION: number
+    createPluginStorageManifest: (
+        generation: string,
+        valueKeys: Iterable<string>,
+        metaKeys: Iterable<string>,
+    ) => { version: number, generation: string, valueKeys: string[], metaKeys: string[] }
     decodePluginSaveStorageKey: (storageKey: string, prefix: string) => string
     encodePluginSaveStorageKey: (rawKey: string, prefix: string) => string
+    parsePluginStorageManifest: (value: unknown) => {
+        version: number, generation: string, valueKeys: string[], metaKeys: string[]
+    } | null
 }
 
 describe('plugin save storage keys', () => {
@@ -56,5 +68,29 @@ describe('plugin save storage keys', () => {
             .not.toThrow()
         expect(() => encodePluginSaveStorageKey(`${maxUtf8Key}a`, PLUGIN_SAVE_META_PREFIX))
             .toThrow('too long for backup archives')
+    })
+
+    it('accepts a version-one order baseline and creates authoritative version-two order', () => {
+        const valueKeys = ['z', 'a'].map(key => encodePluginSaveStorageKey(key, PLUGIN_SAVE_PREFIX))
+        const legacy = parsePluginStorageManifest({
+            version: 1,
+            generation: 'legacy-generation',
+            valueKeys,
+            metaKeys: [],
+        })
+
+        expect(legacy).toEqual({
+            version: 1,
+            generation: 'legacy-generation',
+            valueKeys,
+            metaKeys: [],
+        })
+        expect(PLUGIN_STORAGE_MANIFEST_VERSION).toBe(2)
+        expect(createPluginStorageManifest('ordered-generation', valueKeys, [])).toEqual({
+            version: 2,
+            generation: 'ordered-generation',
+            valueKeys,
+            metaKeys: [],
+        })
     })
 })

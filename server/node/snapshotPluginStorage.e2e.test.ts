@@ -1279,7 +1279,7 @@ describe('plugin publication recovery snapshot scheduling', () => {
 
         await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
         const expectedManifest = {
-            version: 1,
+            version: 2,
             generation,
             valueKeys: [valueRowKey('alpha')],
             metaKeys: [metaRowKey('alpha')],
@@ -1612,7 +1612,7 @@ describe('plugin publication recovery snapshot scheduling', () => {
 
         await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
         const emptyManifest = {
-            version: 1,
+            version: 2,
             generation: db.pluginStorageGeneration,
             valueKeys: [],
             metaKeys: [],
@@ -4227,7 +4227,7 @@ describe('corrupt database boot snapshot recovery', () => {
             auth,
             PLUGIN_STORAGE_MANIFEST_KEY,
         )).toString('utf-8'))).toEqual({
-            version: 1,
+            version: 2,
             generation,
             valueKeys: selectedValueKeys,
             metaKeys: selectedMetaKeys,
@@ -4407,7 +4407,7 @@ describe('corrupt database boot snapshot recovery', () => {
             auth,
             PLUGIN_STORAGE_MANIFEST_KEY,
         )).toString('utf-8'))).toEqual({
-            version: 1,
+            version: 2,
             generation: 'selected-empty-generation',
             valueKeys: [],
             metaKeys: [],
@@ -4568,7 +4568,7 @@ describe('corrupt database boot snapshot recovery', () => {
             auth,
             PLUGIN_STORAGE_MANIFEST_KEY,
         )).toString('utf-8'))).toEqual({
-            version: 1,
+            version: 2,
             generation: 'response-target-generation',
             valueKeys: [targetKey],
             metaKeys: [],

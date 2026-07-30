@@ -99,7 +99,7 @@ function pluginStorageArrayIndex(key: string): number | null {
 }
 
 /**
- * Canonical V3 enumeration order, independent of database/list insertion order.
+ * Explicit deterministic order for callers that do not want insertion order.
  * ECMAScript array-index property names come first numerically; all remaining
  * keys use deterministic UTF-16 code-unit order.
  */
@@ -116,6 +116,23 @@ export function comparePluginStorageKeys(left: string, right: string): number {
 
 export function orderPluginStorageKeys(keys: Iterable<string>): string[] {
     return [...new Set(keys)].sort(comparePluginStorageKeys);
+}
+
+/**
+ * Legacy Object.keys-compatible order. Array-index property names always lead
+ * numerically; all other names retain their first position in the source.
+ */
+export function orderLegacyPluginStorageKeys(keys: Iterable<string>): string[] {
+    const unique = [...new Set(keys)];
+    const indexes: Array<{ key: string; index: number }> = [];
+    const strings: string[] = [];
+    for (const key of unique) {
+        const index = pluginStorageArrayIndex(key);
+        if (index === null) strings.push(key);
+        else indexes.push({ key, index });
+    }
+    indexes.sort((left, right) => left.index - right.index);
+    return [...indexes.map(({ key }) => key), ...strings];
 }
 
 export function copyPluginStorageRecord<T>(

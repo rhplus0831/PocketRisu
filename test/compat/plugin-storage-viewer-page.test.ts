@@ -37,7 +37,7 @@ function seedViewer(
   ))
   const ownedKeys = keys.filter((_key, index) => !options.unknownIndices?.has(index))
   const manifest = {
-    version: 1,
+    version: 2,
     generation: GENERATION,
     valueKeys: keys.map(valueKey),
     metaKeys: ownedKeys.map(ownerKey),
@@ -276,12 +276,12 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
     const entry = initial.entries[0]
     expect(entry.revision).toMatch(/^sha256:[0-9a-f]{64}$/)
 
-    expect((await mutate(client, [entry.key], {
-      version: 1,
-      generation: GENERATION,
-      valueKeys: [valueKey(entry.key)],
-      metaKeys: [ownerKey(entry.key)],
-    }, 'concurrent')).status).toBe(200)
+    expect((await revisionBatch(client, initial.meta.manifestRevision, [{
+      operation: 'set',
+      key: entry.key,
+      value: Buffer.from('{"phase":"concurrent"}').toString('base64'),
+      owner: entry.owner,
+    }])).status).toBe(200)
     const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
     const readPair = () => ({
       value: Buffer.from((sqlite.prepare('SELECT value FROM kv WHERE key = ?')

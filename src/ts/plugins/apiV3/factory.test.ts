@@ -200,6 +200,37 @@ describe("SandboxHost V3 startup lifecycle", () => {
         restoreRelay();
     });
 
+    test("exposes legacy and explicit sorted plugin-storage enumeration", async () => {
+        const iframe = document.createElement("iframe");
+        document.body.appendChild(iframe);
+        const host = new SandboxHost(startupApi({
+            _getAliases: () => ({
+                pluginStorage: {
+                    getItem: "_getPluginStorage",
+                    keys: "_keysPluginStorage",
+                    sortedKeys: "_sortedKeysPluginStorage",
+                },
+            }),
+            _keysPluginStorage: async () => ["z", "a"],
+            _sortedKeysPluginStorage: async () => ["a", "z"],
+        }));
+        const startup = host.run(iframe, `
+            globalThis.enumerationOrders = {
+                legacy: await risuai.pluginStorage.keys(),
+                sorted: await risuai.pluginStorage.sortedKeys(),
+            };
+        `);
+        const restoreRelay = executeGeneratedGuest(iframe);
+
+        await expect(startup).resolves.toBeUndefined();
+        expect((iframe.contentWindow as any).enumerationOrders).toEqual({
+            legacy: ["z", "a"],
+            sorted: ["a", "z"],
+        });
+        host.terminate();
+        restoreRelay();
+    });
+
     test("normalizes local plugin storage values before crossing the guest bridge", async () => {
         const setItem = vi.fn(async () => undefined);
         const localStorage = {

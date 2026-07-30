@@ -828,7 +828,7 @@ describe("V3 mode-aware database bridge", () => {
             temperature: 20,
         });
 
-        expect(await getPluginSaveStorageKeys()).toEqual(["__proto__", "cfg"]);
+        expect(await getPluginSaveStorageKeys()).toEqual(["cfg", "__proto__"]);
         expect(await getPluginSaveStorageItem("cfg"))
             .toEqual({ value: "database-bridge" });
         expect(await getPluginSaveStorageItem("__proto__")).toEqual({ special: true });
@@ -911,7 +911,7 @@ describe("V3 mode-aware database bridge", () => {
     });
 
     test.each([false, true])(
-        "returns canonical detached pluginCustomStorage key order with optimized mode %s",
+        "returns legacy detached pluginCustomStorage key order with optimized mode %s",
         async (optimized) => {
             const insertionOrder = [
                 "beta",
@@ -924,7 +924,7 @@ describe("V3 mode-aware database bridge", () => {
                 "0",
                 "",
             ];
-            const expected = ["0", "2", "10", "", "01", "alpha", "beta", "🔑", "�"];
+            const expected = ["0", "2", "10", "beta", "01", "alpha", "�", "🔑", ""];
             testState.database.optimizePluginMemory = optimized;
             testState.database.pluginCustomStorage = {};
             for (const key of insertionOrder) {
