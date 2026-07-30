@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **71** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, and **27** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **67** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, **4** are intentional compatibility changes, and **27** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -21,17 +21,12 @@ None currently open.
 
 ## Tier 1
 
-| Work item | Source | Status | Impact | Trigger / likelihood |
-|---|---|---|---|---|
-| [Remote plain HTTP no longer boots](compatibility/remote-http-deployments-no-longer-boot.md) | compat | Intentional | Existing remote-HTTP deployments cannot reach authentication or storage. | Deterministic after upgrade for non-loopback HTTP unless the operator enables the explicit override. |
-| [Cloudflare Quick Tunnel was removed](compatibility/cloudflare-quick-tunnel-removed.md) | compat | Intentional | Deployments using the bundled tunnel lose remote access and the old API returns 404. | Deterministic after update or container rebuild for Quick Tunnel users. |
-| [Custom hub proxy targets are rejected](compatibility/hub-proxy-custom-targets-rejected.md) | compat | Intentional | Custom hubs and external clients lose their relay route. | Deterministic for any non-official target sent to `/hub-proxy`. |
+None currently open.
 
 ## Tier 2
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [Generic `HOST` changes the listen address](compatibility/generic-host-env-changes-listen-address.md) | compat | Intentional | The server can bind the wrong interface or fail startup. | Requires an existing process manager or PaaS to set the generic variable for another purpose. |
 | [Optimized storage can lock in its mode](compatibility/optimized-plugin-storage-transition-lock-in.md) | compat | Open | Users cannot turn optimization off after storing otherwise legal data. | Requires a value over 32 MiB or more than 64 MiB aggregate optimized state. |
 | [Safe plugin updates have a smaller value limit](compatibility/plugin-storage-batch-size-mismatch.md) | compat | Open | CAS, rewrite, update, and batch APIs cannot modify values accepted by `setItem`. | Requires an unusually large value, roughly above the 12 MiB encoded request ceiling. |
 | [Configured plugin value limits disagree with the client](compatibility/plugin-storage-configured-limit-client-mismatch.md) | compat | Open | Raising the documented server limit does not expand browser writes. | Requires a non-default server limit and a value crossing the hard-coded 128 MiB client boundary. |
@@ -129,6 +124,15 @@ None currently open.
 | [Compatibility suites are absent from CI](compatibility/compatibility-suites-not-run-in-ci.md) | compat | Open | Build and release workflows provide no regression gate for client, server, or compatibility suites. | Every CI run; the gap is pre-existing rather than a runtime regression. |
 | [Plugin timeout tests are self-referential](compatibility/plugin-timeout-regression-test-is-self-referential.md) | compat | Open | The reported timeout regression can return without a failing test. | Changing the production constant changes the test expectation in lockstep. |
 | [Real upstream fixture tests silently skip](compatibility/real-upstream-backup-fixture-skipped.md) | compat | Open | Synthetic fixtures can miss mistakes in archives emitted by real upstream RisuAI. | Every environment without the ignored local fixture, including CI. |
+
+## Intentional compatibility changes
+
+| Work item | Source | Status | Impact | Trigger / likelihood |
+|---|---|---|---|---|
+| [Remote plain HTTP no longer boots](compatibility/remote-http-deployments-no-longer-boot.md) | compat | Intentional | Existing remote-HTTP deployments cannot reach authentication or storage. | Deterministic after upgrade for non-loopback HTTP unless the operator enables the explicit override. |
+| [Cloudflare Quick Tunnel was removed](compatibility/cloudflare-quick-tunnel-removed.md) | compat | Intentional | Deployments using the bundled tunnel lose remote access and the old API returns 404. | Deterministic after update or container rebuild for Quick Tunnel users. |
+| [Custom hub proxy targets are rejected](compatibility/hub-proxy-custom-targets-rejected.md) | compat | Intentional | Custom hubs and external clients lose their relay route. | Deterministic for any non-official target sent to `/hub-proxy`. |
+| [Generic `HOST` changes the listen address](compatibility/generic-host-env-changes-listen-address.md) | compat | Intentional | The server can bind the wrong interface or fail startup. | Requires an existing process manager or PaaS to set the generic variable for another purpose. |
 
 ## Appendix — Fixed findings
 
