@@ -133,7 +133,7 @@ The subsystem also contains prompt-card types and preset conversion, legacy text
 
 4. Pending attachment IDs are appended as `{{inlayed::id}}` placeholders (`src/lib/ChatScreens/DefaultChatScreen.svelte:349`).
 
-5. For a character chat, the `input` trigger runs first, followed by `processScript(..., 'editinput')`; the processed user message is then pushed into `Chat.message` (`src/lib/ChatScreens/DefaultChatScreen.svelte:368`).
+5. For a character chat, the UI acquires a durable target-bound send transaction, the `input` trigger runs first, followed by `processScript(..., 'editinput')`; the processed user message is then pushed into `Chat.message`. `doingChat` remains reserved for actual model generation, so a V3 input handler may await a sequential child turn while the transaction continues to block duplicate UI sends and navigation (`src/lib/ChatScreens/DefaultChatScreen.svelte`, `src/ts/process/chatSendState.ts`).
 
 6. `sendChatMain()` creates an `AbortController` and calls `sendChat(-1, {signal, continue})` (`src/lib/ChatScreens/DefaultChatScreen.svelte:544`).
 
@@ -310,6 +310,8 @@ Legacy multi-speaker history compatibility remains: character messages may carry
 ## 5. Conventions & gotchas
 
 - `sendChat()` owns acquisition of `doingChat` but does not normally release it on return; the UI/plugin/dev caller must do so. The standard UI releases it at `src/lib/ChatScreens/DefaultChatScreen.svelte:558`.
+
+- The composer-side send transaction and `doingChat` are separate contracts. The transaction spans input triggers, `editinput` handlers, child turns, and the outer generation; `doingChat` covers only a model generation. A `sendChat()` call made while a transaction is active must carry its exact internal transaction token, which prevents unrelated API callers from borrowing the outer send's target.
 
 - The exported `abortChat` writable at `src/ts/process/index.svelte.ts:57` is not the active cancellation mechanism. The UI uses a local `AbortController` at `src/lib/ChatScreens/DefaultChatScreen.svelte:542`.
 

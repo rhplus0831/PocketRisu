@@ -63,6 +63,34 @@ describe('chat send target', () => {
         ])
     })
 
+    test('publishes an input-trigger snapshot before editinput processing', async () => {
+        const db = makeDatabase()
+        const target = captureChatSendTarget(db, 0)!
+
+        await applyChatInputToTarget({
+            getDatabase: () => db,
+            target,
+            input: 'outer message',
+            now: () => 123,
+            runInputTrigger: async (_character, chat) => {
+                const triggeredChat = structuredClone(chat)
+                triggeredChat.message.push({ role: 'char', data: 'trigger message' })
+                return { chat: triggeredChat }
+            },
+            processInput: async (_character, input) => {
+                db.characters[0].chats[0].message.push({ role: 'char', data: 'child turn' })
+                return input
+            },
+        })
+
+        expect(db.characters[0].chats[0].message).toEqual([
+            { role: 'char', data: 'history A' },
+            { role: 'char', data: 'trigger message' },
+            { role: 'char', data: 'child turn' },
+            { role: 'user', data: 'outer message', time: 123, name: null },
+        ])
+    })
+
     test('resolves the target by durable IDs after character and chat reordering', () => {
         const db = makeDatabase()
         const target = captureChatSendTarget(db, 0)!

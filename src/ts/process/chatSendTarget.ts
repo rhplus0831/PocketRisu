@@ -119,7 +119,6 @@ export async function applyChatInputToTarget(options: {
     const initialTarget = resolveChatSendTarget(options.getDatabase(), options.target)
     if (!initialTarget || initialTarget.chat._placeholder) return null
 
-    let triggeredMessages: Message[] | null = null
     let nextMessage: Message | null = null
 
     if (options.input === '') {
@@ -136,7 +135,13 @@ export async function applyChatInputToTarget(options: {
         const triggerResult = await options.runInputTrigger(initialTarget.character, initialTarget.chat)
         if (options.signal?.aborted) return null
         if (Array.isArray(triggerResult?.chat?.message)) {
-            triggeredMessages = triggerResult.chat.message
+            // Input triggers run before editinput handlers. Publish their
+            // cloned chat result to the durable target before a handler can
+            // start a child turn, so that turn builds on the trigger result
+            // and cannot later be overwritten by the outer send.
+            const triggeredTarget = resolveChatSendTarget(options.getDatabase(), options.target)
+            if (!triggeredTarget || triggeredTarget.chat._placeholder) return null
+            triggeredTarget.chat.message = triggerResult.chat.message
         }
 
         const processedInput = await options.processInput(initialTarget.character, options.input)
@@ -159,8 +164,6 @@ export async function applyChatInputToTarget(options: {
     const finalTarget = resolveChatSendTarget(options.getDatabase(), options.target)
     if (!finalTarget || finalTarget.chat._placeholder || options.signal?.aborted) return null
 
-    const messages = triggeredMessages ?? finalTarget.chat.message
-    if (nextMessage) messages.push(nextMessage)
-    finalTarget.chat.message = messages
+    if (nextMessage) finalTarget.chat.message.push(nextMessage)
     return finalTarget
 }

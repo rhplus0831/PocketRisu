@@ -6,6 +6,7 @@ import { language } from "src/lang"
 import { updateTextThemeAndCSS } from "./gui/colorscheme"
 import { defaultHotkeys } from "./defaulthotkeys"
 import { doingChat, previewBody, sendChat } from "./process/index.svelte"
+import { chatOperationActive } from './process/chatSendState'
 
 export function initHotkey(){
     document.addEventListener('keydown', async (ev) => {
@@ -126,7 +127,7 @@ export function initHotkey(){
                     break
                 }
                 case 'previewRequest':{
-                    if(get(doingChat) && get(selectedCharID) !== -1){
+                    if(get(chatOperationActive) && get(selectedCharID) !== -1){
                         return false
                     }
                     alertWait("Loading...")

@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **81** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, and **17** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **80** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, and **18** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -25,7 +25,6 @@ None currently open.
 |---|---|---|---|---|
 | [Remote plain HTTP no longer boots](compatibility/remote-http-deployments-no-longer-boot.md) | compat | Intentional | Existing remote-HTTP deployments cannot reach authentication or storage. | Deterministic after upgrade for non-loopback HTTP unless the operator enables the explicit override. |
 | [Cloudflare Quick Tunnel was removed](compatibility/cloudflare-quick-tunnel-removed.md) | compat | Intentional | Deployments using the bundled tunnel lose remote access and the old API returns 404. | Deterministic after update or container rebuild for Quick Tunnel users. |
-| [Input hooks cannot call `sendChat`](compatibility/input-hooks-cannot-call-sendchat.md) | compat | Open | The nested call fails and can also abort the user's outer send. | Every invocation of an input hook using the previously supported sequential-send pattern. |
 | [V3 hook removal loses callback identity](compatibility/v3-hook-callback-identity.md) | compat | Open | Removal silently fails and duplicate registrations execute handlers or replacers more than once. | Deterministic whenever a V3 plugin removes or re-adds the same callback. |
 | [`loadPlugins()` no longer means completion](compatibility/plugin-loadplugins-readiness.md) | compat | Open | Callers race teardown/reload and cannot observe lifecycle failure. | Every caller that awaits the previous readiness contract. |
 | [Custom hub proxy targets are rejected](compatibility/hub-proxy-custom-targets-rejected.md) | compat | Intentional | Custom hubs and external clients lose their relay route. | Deterministic for any non-official target sent to `/hub-proxy`. |
@@ -161,3 +160,4 @@ None currently open.
 | [Local plugin storage rejected JSON-compatible values](compatibility/local-plugin-storage-strict-json.md) | Plugins could no longer persist values that main accepted through `JSON.stringify`. | Fixed 2026-07-30 with compatibility normalization on both sides of the V3 iframe bridge. |
 | [V2 storage no longer behaved like an ordinary object](compatibility/v2-plugin-storage-object-prototype.md) | Common operations such as `hasOwnProperty`, `instanceof`, and string conversion failed or changed result. | Fixed 2026-07-30 by restoring ordinary prototype observations while retaining safe special-key traps. |
 | [Legacy V3 unload exposed only part of the API](compatibility/v3-onunload-api-allowlist.md) | Plugins could fail to flush database-backed state, notify remote services, save final assets, or restore global UI during disable, removal, or reload. | Fixed 2026-07-30 with a signal-authorized bounded finalization contract plus compatible no-signal legacy calls, while keeping new lifetime work closed. |
+| [Input hooks could not call `sendChat`](compatibility/input-hooks-cannot-call-sendchat.md) | The nested call failed and could also abort the user's outer send. | Fixed 2026-07-30 with a target-bound outer transaction, scoped sequential child turns, and input-hook error isolation. |

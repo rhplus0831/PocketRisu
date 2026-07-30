@@ -28,6 +28,7 @@ import { updateLorebooks } from "./characters";
 import { initMobileGesture } from "./hotkey";
 import { moduleUpdate } from "./process/modules";
 import { doingChat } from "./process/index.svelte";
+import { chatOperationActive } from './process/chatSendState';
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 import { capturePreTrackingPluginStorageChanges } from "./plugins/pluginStorageTracking";
@@ -2608,7 +2609,7 @@ export function changeChatTo(IdOrIndex: string | number) {
     // A send is bound to the chat that owned the composer when it began.
     // Keep ordinary navigation from changing global chat-dependent hook
     // context while that operation is in flight.
-    if (get(doingChat)) return
+    if (get(chatOperationActive)) return
 
     let index = -1
     if (typeof IdOrIndex === 'number') {

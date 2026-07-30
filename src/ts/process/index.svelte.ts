@@ -28,6 +28,11 @@ import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
 import { readImage } from "../globalApi.svelte";
 import { resolveChatSendTarget, type ChatSendTarget } from './chatSendTarget';
+import {
+    doingChat,
+    getActiveChatSendTransaction,
+    type ChatSendTransaction,
+} from './chatSendState';
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -53,7 +58,7 @@ export interface requestTokenPart{
     tokens:number
 }
 
-export const doingChat = writable(false)
+export { doingChat } from './chatSendState'
 export const chatProcessStage = writable(0)
 export const abortChat = writable(false)
 export let requestTokenParts:{[key:string]:requestTokenPart[]} = {}
@@ -69,8 +74,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     preview?:boolean
     previewPrompt?:boolean
     target?:ChatSendTarget
-    /** The UI acquired doingChat before asynchronous input hooks began. */
-    generationLockHeld?:boolean
+    /** Authorizes generation while the matching outer UI send is in input processing. */
+    transaction?:ChatSendTransaction
 } = {}):Promise<boolean> {
 
     chatProcessStage.set(0)
@@ -177,12 +182,20 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
-    let isDoing = get(doingChat)
+    const activeTransaction = getActiveChatSendTransaction()
+    if((activeTransaction && arg.transaction !== activeTransaction)
+        || (!activeTransaction && arg.transaction)){
+        return false
+    }
+    if(activeTransaction && arg.target
+        && (arg.target.chaId !== activeTransaction.target.chaId
+            || arg.target.chatId !== activeTransaction.target.chatId)){
+        return false
+    }
+    const target = arg.target ?? activeTransaction?.target
 
-    if(isDoing && !arg.generationLockHeld){
-        if(chatProcessIndex === -1){
-            return false
-        }
+    if(get(doingChat) && chatProcessIndex === -1){
+        return false
     }
     doingChat.set(true)
 
@@ -204,8 +217,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     let nowChatroom: character
-    if(arg.target){
-        const resolvedTarget = resolveChatSendTarget(DBState.db, arg.target)
+    if(target){
+        const resolvedTarget = resolveChatSendTarget(DBState.db, target)
         if(!resolvedTarget){
             doingChat.set(false)
             return false
@@ -1634,7 +1647,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             continue: true,
             signal: abortSignal,
             usedContinueTokens: resultTokens,
-            target: arg.target,
+            target,
+            transaction: arg.transaction,
         })
     }
 
@@ -1676,7 +1690,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         doingChat.set(false)
         return await sendChat(chatProcessIndex, {
             signal: abortSignal,
-            target: arg.target,
+            target,
+            transaction: arg.transaction,
         })
     }
 

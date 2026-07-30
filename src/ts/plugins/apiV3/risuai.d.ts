@@ -2295,6 +2295,9 @@ interface RisuaiPluginAPI {
     /**
      * Sends a chat message as if it were sent by the user, triggering the normal chat processing flow.
      * @param message - The chat message to send, if string is a blank message, it will trigger the send action without adding a new message.
+     * @remarks When awaited from an input script handler, this runs a sequential
+     * child turn against the outer send's original chat before input processing
+     * resumes. Calls made during active model generation are still rejected.
      */
     sendChat(message: string): Promise<void>;
 

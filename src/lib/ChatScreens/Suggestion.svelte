@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { requestChatData } from "src/ts/process/request/request";
     import { doingChat, type OpenAIChat } from "../../ts/process/index.svelte";
+    import { chatOperationActive } from '../../ts/process/chatSendState';
     import { setDatabase, type character, type Message, type Database } from "../../ts/storage/database.svelte";
 	import { DBState } from 'src/ts/stores.svelte';
     import { selectedCharID } from "../../ts/stores.svelte";
@@ -28,7 +29,7 @@
     let chatPage:number = $state()
 
     const updateSuggestions = () => {
-        if($selectedCharID > -1 && !$doingChat) {
+        if($selectedCharID > -1 && !$chatOperationActive) {
             if(progressChatPage > 0 && progressChatPage != chatPage){
                 progress=false
                 abortController?.abort()
@@ -39,7 +40,7 @@
     }
     
 
-    const unsub = doingChat.subscribe(async (v) => {
+    const unsub = chatOperationActive.subscribe(async (v) => {
         if(v) {
             progress=false
             abortController?.abort()
@@ -125,7 +126,7 @@
             <div class="loadmove mx-2"></div>
             <div>{language.creatingSuggestions}</div>
         </div>        
-    {:else if !$doingChat}
+    {:else if !$chatOperationActive}
         {#if DBState.db.translator !== ''}
             <div class="flex mr-2 mb-2">
                 <button class={"bg-textcolor2 hover:bg-darkbutton font-bold py-2 px-4 rounded-sm " + (toggleTranslate ? 'text-green-500' : 'text-textcolor')}
@@ -193,4 +194,3 @@
         100% { transform: rotate(360deg); }
     }
 </style>
-

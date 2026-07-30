@@ -2,7 +2,7 @@ import { get } from "svelte/store";
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { type character, type customscript, getDatabase, getCurrentCharacter, getCurrentChat } from "../storage/database.svelte";
 import { downloadFile } from "../globalApi.svelte";
-import { alertError, notifySuccess } from "../alert";
+import { alertError, notifyError, notifySuccess } from "../alert";
 import { language } from "src/lang";
 import { selectSingleFile } from "../util";
 import { assetRegex, type CbsConditions, risuChatParser as risuChatParserOrg, type simpleCharacterArgument } from "../parser/parser.svelte";
@@ -11,6 +11,7 @@ import { HypaProcesser } from "./memory/hypamemory";
 import { runLuaEditTrigger } from "./scriptings";
 import { pluginV2 } from "../plugins/plugins.svelte";
 import { runTrigger } from "./triggers";
+import { applyPluginEditHandlers } from './pluginEditHandlers';
 
 const dreg = /{{data}}/g
 const randomness = /\|\|\|/g
@@ -122,12 +123,16 @@ export async function processScriptFull(char:character|simpleCharacterArgument, 
     }
 
     if(pluginV2[mode].size > 0){
-        for(const plugin of pluginV2[mode]){
-            const res = await plugin(data)
-            if(res !== null && res !== undefined){
-                data = res
-            }
-        }
+        data = await applyPluginEditHandlers(pluginV2[mode], data, {
+            isolateErrors: mode === 'editinput',
+            onError: (error) => {
+                console.error('[Plugin editinput hook failed]', error)
+                notifyError('A plugin input hook failed; sending will continue with the last valid input.', {
+                    description: error instanceof Error ? error.message : String(error),
+                    source: 'plugin-runtime',
+                })
+            },
+        })
     }
 
     data = risuChatParser(data, { chatID: chatID, cbsConditions })

@@ -346,7 +346,7 @@ See [Plugin storage](plugin-storage.md) for publication authority, generation/ba
 
 - Direct V3 `runLLMModel()` blocks plugin-backed models by default to avoid provider loops; callers must explicitly set `allowPlugins: true` (`src/ts/plugins/apiV3/v3.svelte.ts:1373`, `src/ts/plugins/apiV3/v3.svelte.ts:1391`).
 
-- V3 `sendChat()` is permission-gated and explicitly refuses execution when the selected main model itself is plugin-backed (`src/ts/plugins/apiV3/v3.svelte.ts:1394`, `src/ts/plugins/apiV3/v3.svelte.ts:1408`).
+- V3 `sendChat()` is permission-gated and explicitly refuses execution when the selected main model itself is plugin-backed. An awaited `input` script handler may run a sequential child turn against the outer send's durable target; unrelated calls during that outer transaction and calls during actual model generation remain blocked (`src/ts/plugins/apiV3/pluginChatSend.ts`, `src/ts/plugins/apiV3/v3.svelte.ts`).
 
 - Plugin IPC requires both sender and receiver to name each other in `//@allowed-ipc` (`src/ts/plugins/apiV3/v3.svelte.ts:1455`, `src/ts/plugins/apiV3/v3.svelte.ts:1460`).
 

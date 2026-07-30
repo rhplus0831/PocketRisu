@@ -12,7 +12,7 @@ import { AppendableBuffer, changeChatTo, checkCharOrder, downloadFile, getFileSr
 import { updateInlayScreen } from "./process/inlayScreen";
 import { parseMarkdownSafe } from "./parser/parser.svelte";
 import { translateHTML } from "./translator/translator";
-import { doingChat } from "./process/index.svelte";
+import { chatOperationActive } from './process/chatSendState';
 import { importCharacter } from "./characterCards";
 import { importCharacterPackage } from "./characterPackage";
 import { PngChunk } from "./pngChunk";
@@ -761,7 +761,7 @@ export function changeChar(index: number, arg:{
     reseter?:()=>any,
 } = {}) {
     const reseter = arg.reseter ?? (() => {})
-    if(get(doingChat)){
+    if(get(chatOperationActive)){
       return
     }
     const char = getDatabase().characters[index]

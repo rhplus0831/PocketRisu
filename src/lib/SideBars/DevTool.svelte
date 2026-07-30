@@ -14,6 +14,7 @@
     import { HardDriveUploadIcon, PlusIcon, TrashIcon } from "@lucide/svelte";
     import { selectSingleFile } from "src/ts/util";
     import { doingChat, previewFormated, previewBody, sendChat, lastActualInputTokens } from "src/ts/process/index.svelte";
+    import { chatOperationActive } from 'src/ts/process/chatSendState';
     import SelectInput from "../UI/GUI/SelectInput.svelte";
     import { applyChatTemplate, chatTemplates } from "src/ts/process/templates/chatTemplate";
     import OptionInput from "../UI/GUI/OptionInput.svelte";
@@ -26,7 +27,7 @@
     let instructCustom = $state('')
 
     const preview = async () => {
-        if($doingChat){
+        if($chatOperationActive){
             return false
         }
         alertWait("Loading...")
@@ -215,7 +216,7 @@
         </button>
     </div>
     <Button className="mt-2" onclick={async () => {
-        if($doingChat){
+        if($chatOperationActive){
             return
         }
         for(let i=0;i<autopilot.length;i++){
@@ -228,7 +229,7 @@
             })
             currentChar.chats[currentChar.chatPage] = currentChat
             db.characters[$selectedCharID] = currentChar
-            if($doingChat){
+            if($chatOperationActive){
                 return
             }
             currentChar.chats[currentChar.chatPage] = currentChat

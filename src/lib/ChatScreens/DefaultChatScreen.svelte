@@ -43,6 +43,12 @@ import { isMobile } from 'src/ts/platform'
         settleChatRerollToTarget,
         type ChatSendTarget,
     } from 'src/ts/process/chatSendTarget';
+    import {
+        beginChatSendTransaction,
+        chatOperationActive,
+        finishChatSendTransaction,
+        type ChatSendTransaction,
+    } from 'src/ts/process/chatSendState';
 
     import Chats from './Chats.svelte';
     import Button from '../UI/GUI/Button.svelte';
@@ -348,7 +354,7 @@ import { isMobile } from 'src/ts/platform'
     }
 
     async function sendMain(continueResponse:boolean) {
-        if($doingChat){
+        if($chatOperationActive){
             return
         }
 
@@ -362,7 +368,7 @@ import { isMobile } from 'src/ts/platform'
         let outgoingInput = outgoingComposerInput
         const outgoingInputTranslate = messageInputTranslate
         const outgoingFiles = [...fileInput]
-        let ownsGenerationLock = false
+        let sendTransaction: ChatSendTransaction | null = null
         let inputAbortController: AbortController | null = null
 
         try {
@@ -392,13 +398,13 @@ import { isMobile } from 'src/ts/platform'
                 }
             }
 
-            // Claim the lock before card and editinput hooks. Apart from
-            // preventing duplicate sends, changeChatTo() uses this to keep the
-            // ordinary UI on the target chat while target-bound hooks execute.
+            // Keep duplicate UI sends and navigation out of the complete input
+            // transaction without claiming the actual generation flag. A V3
+            // input hook may run an authorized sequential child turn here.
+            sendTransaction = beginChatSendTransaction(target)
+            if(!sendTransaction) return
             inputAbortController = new AbortController()
             abortController = inputAbortController
-            $doingChat = true
-            ownsGenerationLock = true
 
             const appliedTarget = await applyChatInputToTarget({
                 getDatabase: () => DBState.db,
@@ -422,14 +428,14 @@ import { isMobile } from 'src/ts/platform'
 
             await sleep(10)
             updateInputSizeAll()
-            await sendChatMain(continueResponse, target, true, inputAbortController)
+            await sendChatMain(continueResponse, target, inputAbortController, sendTransaction)
         }
         catch(error){
             console.error(error)
             alertError(error)
         }
         finally{
-            if(ownsGenerationLock) $doingChat = false
+            if(sendTransaction) finishChatSendTransaction(sendTransaction)
             if(abortController === inputAbortController) abortController = null
         }
 
@@ -482,7 +488,7 @@ import { isMobile } from 'src/ts/platform'
     }
 
     async function reroll() {
-        if($doingChat) return
+        if($chatOperationActive) return
         const target = captureChatSendTarget(DBState.db, $selectedCharID)
         if(!target) return
         const resolvedTarget = resolveChatSendTarget(DBState.db, target)
@@ -529,7 +535,7 @@ import { isMobile } from 'src/ts/platform'
     }
 
     async function unReroll() {
-        if($doingChat) return
+        if($chatOperationActive) return
         const lastMsg = getLastCharMsg()
         if (!lastMsg || !lastMsg.swipes || lastMsg.swipeId === undefined) return
 
@@ -569,8 +575,8 @@ import { isMobile } from 'src/ts/platform'
     async function sendChatMain(
         continued:boolean = false,
         target?: ChatSendTarget,
-        generationLockHeld = false,
         existingAbortController?: AbortController,
+        transaction?: ChatSendTransaction,
     ) {
 
         abortController = existingAbortController ?? new AbortController()
@@ -580,7 +586,7 @@ import { isMobile } from 'src/ts/platform'
                 signal:abortController.signal,
                 continue:continued,
                 target,
-                generationLockHeld,
+                transaction,
             })
         } catch (error) {
             console.error(error)
@@ -1107,7 +1113,7 @@ import { isMobile } from 'src/ts/platform'
                     <Maximize2 size={18} />
                 </button>
 
-                {#if $doingChat || doingChatInputTranslate}
+                {#if $chatOperationActive || doingChatInputTranslate}
                     <button
                             aria-labelledby="cancel"
                             class="order-2 shrink-0 flex justify-center items-center w-9 h-9 rounded-full text-textcolor hover:bg-primary/20 transition-colors" onclick={abortChat}

@@ -48,6 +48,14 @@ import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "s
 import { readPersistentJson, removePersistentKey, writePersistentJson } from "src/ts/storage/persistentKv";
 import { awaitWithAbort, forwardAbortSignal, throwIfAborted } from "src/ts/storage/abort";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
+import {
+    getActiveChatSendTransaction,
+} from 'src/ts/process/chatSendState';
+import {
+    captureChatSendTarget,
+    resolveChatSendTarget,
+} from 'src/ts/process/chatSendTarget';
+import { createPluginChatSendController } from './pluginChatSend';
 import { getModelInfo } from "src/ts/model/modellist";
 import type { ModelModeExtended } from "src/ts/process/request/shared";
 import { requestChatDataMain } from "src/ts/process/request/request";
@@ -1144,6 +1152,29 @@ export const makeRisuaiAPIV3 = (
     };
 
     const oldApis = getV2PluginAPIs();
+    const pluginChatSend = createPluginChatSendController({
+        getPermission: () => getPluginPermission(plugin.name, 'sendChat'),
+        isGenerationActive: () => get(doingChat),
+        getActiveTransaction: getActiveChatSendTransaction,
+        getDefaultTarget: () => {
+            const charId = get(selectedCharID);
+            const char = DBState.db.characters[charId];
+            if(!char) throw new Error('No character selected');
+            const chat = char.chats[char.chatPage];
+            if(!chat) throw new Error('No active chat found');
+            const target = captureChatSendTarget(DBState.db, charId);
+            if(!target) throw new Error('No active chat found');
+            return target;
+        },
+        resolveTarget: (target) => resolveChatSendTarget(DBState.db, target),
+        isPluginModelActive: () => getModelInfo(DBState.db.aiModel).id.startsWith('pluginmodel:::'),
+        runGeneration: (target, transaction) => processSendChat(-1, {
+            target,
+            transaction: transaction ?? undefined,
+        }),
+        // The V3 path does not pass through the UI generation wrapper.
+        releaseGeneration: () => doingChat.set(false),
+    });
     const databaseBridge = createPluginDatabaseBridge({
         allowedDbKeys,
         getLiveDatabase: () => getDatabase() as unknown as Record<string, unknown>,
@@ -1364,8 +1395,11 @@ export const makeRisuaiAPIV3 = (
             // prepends "edit", so preserve the V3 runtime value here.
             const legacyName = name as unknown as Parameters<typeof oldApis.addRisuScriptHandler>[0];
             const guardedFunc = guardPluginCallback(func);
-            oldApis.addRisuScriptHandler(legacyName, guardedFunc);
-            lifecycle.addCleanup(() => oldApis.removeRisuScriptHandler(legacyName, guardedFunc));
+            const registeredFunc = name === 'input'
+                ? pluginChatSend.wrapInputHook(guardedFunc)
+                : guardedFunc;
+            oldApis.addRisuScriptHandler(legacyName, registeredFunc);
+            lifecycle.addCleanup(() => oldApis.removeRisuScriptHandler(legacyName, registeredFunc));
         },
         removeRisuScriptHandler: oldApis.removeRisuScriptHandler,
         addRisuReplacer: async (name:string,func:Function) => {
@@ -2118,54 +2152,7 @@ export const makeRisuaiAPIV3 = (
                 blockPlugins: !options.allowPlugins,
             }, options.mode)
         },
-        sendChat: async (message: string) => {
-            const conf = await getPluginPermission(plugin.name, 'sendChat');
-            if(!conf){
-                return false;
-            }
-
-            if(typeof message !== 'string'){
-                throw new Error("Message must be a string");
-            }
-
-            if(get(doingChat)){
-                throw new Error("A chat is already in progress");
-            }
-
-            if(getModelInfo(DBState.db.aiModel).id.startsWith('pluginmodel:::')){
-                // Executing plugin provider is block because it can be used for loopholes for ipc right now.
-                throw new Error("Sending chat with plugin-based model is currently blocked");
-            }
-
-            const charId = get(selectedCharID);
-            const char = DBState.db.characters[charId];
-            if(!char){
-                throw new Error("No character selected");
-            }
-
-            const chat = char.chats[char.chatPage];
-            if(!chat){
-                throw new Error("No active chat found");
-            }
-
-            if(message){
-                chat.message.push({
-                    role: 'user',
-                    data: message,
-                    time: Date.now(),
-                });
-            }
-
-            try {
-                await processSendChat(-1, {});
-            } finally {
-                // Plugin API path does not pass through the UI unlock logic,
-                // so release doingChat here on both success and failure.
-                doingChat.set(false);
-            }
-
-            return true;
-        },
+        sendChat: pluginChatSend.sendChat,
         addPluginChannelListener: (channelName: string, callback: Function) => {
             lifecycle.assertCanRegister();
             const key = plugin.name + channelName;
