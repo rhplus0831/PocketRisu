@@ -618,6 +618,9 @@ export async function setInlayAsset(id: string, img: InlayAsset) {
 
 export type InlayDeleteResult = Pick<InlayDeleteTransport, 'removedIds' | 'referencedIds'>
 
+// Keep each request within server/node/server.cjs MAX_INLAY_DELETE_BATCH.
+const INLAY_DELETE_BATCH_SIZE = 1000
+
 export async function removeInlayAsset(id: string): Promise<boolean> {
     const result = await removeInlayAssets([id])
     return result.removedIds.includes(id)
@@ -627,20 +630,31 @@ export async function removeInlayAssets(ids: string[]): Promise<InlayDeleteResul
     const requestedIds = [...new Set(ids.filter((id) => typeof id === 'string' && id.length > 0))]
     if (requestedIds.length === 0) return { removedIds: [], referencedIds: [] }
 
-    // Loaded chats can contain edits that have not reached the save loop yet.
-    // Send that local keep-set in addition to the server's authoritative scan.
-    const localReferences = scanLoadedInlayReferences()
-    const requested = new Set(requestedIds)
-    const clientProtectedIds = Object.keys(localReferences.refCounts).filter((id) => requested.has(id))
-    const result = await getInlayAdminStorage().deleteUnreferencedInlays(
-        requestedIds,
-        clientProtectedIds,
-    )
-    for (const id of result.removedIds) {
-        lruDelete(id)
+    const removedIds: string[] = []
+    const referencedIds: string[] = []
+
+    try {
+        for (let offset = 0; offset < requestedIds.length; offset += INLAY_DELETE_BATCH_SIZE) {
+            const batchIds = requestedIds.slice(offset, offset + INLAY_DELETE_BATCH_SIZE)
+            // Loaded chats can contain edits that have not reached the save loop yet.
+            // Refresh that local keep-set for every guarded server mutation.
+            const localReferences = scanLoadedInlayReferences()
+            const clientProtectedIds = batchIds.filter((id) => (localReferences.refCounts[id] ?? 0) > 0)
+            const result = await getInlayAdminStorage().deleteUnreferencedInlays(
+                batchIds,
+                clientProtectedIds,
+            )
+            removedIds.push(...result.removedIds)
+            referencedIds.push(...result.referencedIds)
+            for (const id of result.removedIds) {
+                lruDelete(id)
+            }
+        }
+    } finally {
+        _explorerItemsCache = null
     }
-    _explorerItemsCache = null
-    return { removedIds: result.removedIds, referencedIds: result.referencedIds }
+
+    return { removedIds, referencedIds }
 }
 
 export async function setInlayMetaFields(

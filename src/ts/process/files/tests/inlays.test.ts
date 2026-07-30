@@ -9,6 +9,7 @@ import {
     listInlayExplorerItems,
     postInlayAsset,
     removeInlayAsset,
+    removeInlayAssets,
     scanInlayReferences,
     setInlayAsset,
     writeInlayImage,
@@ -33,7 +34,8 @@ vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: a
     return el
 })
 
-const { nodeStorageMap, inlayMetaMap, serverScanResult } = vi.hoisted(() => ({
+const { deletionRequests, nodeStorageMap, inlayMetaMap, serverScanResult } = vi.hoisted(() => ({
+    deletionRequests: [] as { ids: string[], clientProtectedIds: string[] }[],
     nodeStorageMap: new Map<string, Uint8Array>(),
     inlayMetaMap: new Map<string, any>(),
     serverScanResult: {
@@ -62,6 +64,7 @@ vi.mock('src/ts/storage/nodeStorage', () => {
             }
         }
         async deleteUnreferencedInlays(ids: string[], clientProtectedIds: string[] = []) {
+            deletionRequests.push({ ids: [...ids], clientProtectedIds: [...clientProtectedIds] })
             const protectedIds = new Set(clientProtectedIds)
             const referencedIds = ids.filter((id) => (
                 protectedIds.has(id) || (serverScanResult.refCounts[id] ?? 0) > 0
@@ -165,6 +168,7 @@ function makeImage(w: number, h: number): HTMLImageElement {
 
 beforeEach(() => {
     vi.clearAllMocks()
+    deletionRequests.length = 0
     nodeStorageMap.clear()
     inlayMetaMap.clear()
     serverScanResult.scannedAt = 1
@@ -454,6 +458,42 @@ describe('removeInlayAsset', () => {
 
         await expect(removeInlayAsset('kept-local')).resolves.toBe(false)
         await expect(getInlayAsset('kept-local')).resolves.not.toBeNull()
+    })
+})
+
+describe('removeInlayAssets', () => {
+    test('sends exactly 1,000 selected ids in one request', async () => {
+        const ids = Array.from({ length: 1000 }, (_, index) => `asset-${index}`)
+
+        const result = await removeInlayAssets(ids)
+
+        expect(deletionRequests).toHaveLength(1)
+        expect(deletionRequests[0]).toEqual({ ids, clientProtectedIds: [] })
+        expect(result).toEqual({ removedIds: ids, referencedIds: [] })
+    })
+
+    test('chunks 1,001 selected ids and aggregates guarded results', async () => {
+        const ids = Array.from({ length: 1001 }, (_, index) => `asset-${index}`)
+        serverScanResult.refCounts = { 'asset-0': 1 }
+        getDatabaseMock.mockReturnValue({
+            characters: [{
+                chats: [{
+                    message: [{
+                        role: 'char',
+                        data: '{{inlay::asset-999}} {{inlay::asset-1000}}',
+                    }],
+                }],
+            }],
+        })
+
+        const result = await removeInlayAssets(ids)
+
+        expect(deletionRequests).toEqual([
+            { ids: ids.slice(0, 1000), clientProtectedIds: ['asset-999'] },
+            { ids: ids.slice(1000), clientProtectedIds: ['asset-1000'] },
+        ])
+        expect(result.referencedIds).toEqual(['asset-0', 'asset-999', 'asset-1000'])
+        expect(result.removedIds).toEqual(ids.filter((id) => !result.referencedIds.includes(id)))
     })
 })
 

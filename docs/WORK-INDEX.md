@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **72** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, and **26** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **71** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, and **27** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -32,7 +32,6 @@ None currently open.
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
 | [Generic `HOST` changes the listen address](compatibility/generic-host-env-changes-listen-address.md) | compat | Intentional | The server can bind the wrong interface or fail startup. | Requires an existing process manager or PaaS to set the generic variable for another purpose. |
-| [Bulk inlay deletion exceeds its request limit](compatibility/bulk-inlay-deletion-limit.md) | compat | Open | The UI refuses the entire valid deletion and removes nothing. | Selecting 1,001 or more unreferenced inlays creates an out-of-contract request. |
 | [Optimized storage can lock in its mode](compatibility/optimized-plugin-storage-transition-lock-in.md) | compat | Open | Users cannot turn optimization off after storing otherwise legal data. | Requires a value over 32 MiB or more than 64 MiB aggregate optimized state. |
 | [Safe plugin updates have a smaller value limit](compatibility/plugin-storage-batch-size-mismatch.md) | compat | Open | CAS, rewrite, update, and batch APIs cannot modify values accepted by `setItem`. | Requires an unusually large value, roughly above the 12 MiB encoded request ceiling. |
 | [Configured plugin value limits disagree with the client](compatibility/plugin-storage-configured-limit-client-mismatch.md) | compat | Open | Raising the documented server limit does not expand browser writes. | Requires a non-default server limit and a value crossing the hard-coded 128 MiB client boundary. |
@@ -161,3 +160,4 @@ None currently open.
 | [Plugin storage enumeration order changed](compatibility/plugin-storage-enumeration-order.md) | Cursor, append-order, priority, and first/last conventions could process records differently. | Fixed 2026-07-30 with legacy `Object.keys()` ordering, authoritative version-2 manifest order, version-1 migration, and a separate `sortedKeys()` API. |
 | [Save-folder restores had a fixed deadline](compatibility/save-folder-restore-fixed-deadline.md) | A valid long-running restore could abort or leave the client unable to distinguish rollback from commit. | Fixed 2026-07-30 with activity-reset NDJSON progress, no total deadline, and durable transaction-bound operation-status reconciliation. |
 | [A V2 unload could wedge plugin lifecycle](compatibility/v2-unload-can-wedge-plugin-lifecycle.md) | One never-settling V2 callback could queue every plugin operation forever and leave disable/removal persistence timing-dependent. | Fixed 2026-07-30 with a five-second generation grace, revocable V2 host facades, pre-cleanup durability, and hanging/late-resolution coverage. |
+| [Bulk inlay deletion exceeded its request limit](compatibility/bulk-inlay-deletion-limit.md) | Selecting more than 1,000 valid orphaned inlays made the UI's entire deletion request fail. | Fixed 2026-07-30 by chunking the shared gallery/playground helper into guarded requests of at most 1,000 IDs and aggregating their results. |
