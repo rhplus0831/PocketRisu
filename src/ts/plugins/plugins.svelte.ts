@@ -513,37 +513,44 @@ type PluginLifecycleFailure = {
 type PluginLifecycleReport = { failures: PluginLifecycleFailure[] }
 let activePluginReloadPhase: PluginReloadPhase | undefined
 let pluginApiReloadPending = false
-let pluginApiReloadScheduled = false
 let pluginApiReloadDrainPromise: Promise<void> | undefined
 const MAX_DEFERRED_PLUGIN_RELOAD_ATTEMPTS = 2
 
-function retainDeferredPluginReloadDemand() {
+function retainDeferredPluginReloadDemand(): Promise<void> {
     pluginApiReloadPending = true
-    if (pluginApiReloadScheduled) return
-    pluginApiReloadScheduled = true
-    queueMicrotask(() => {
-        const drainPromise = drainDeferredPluginApiReload()
-        pluginApiReloadDrainPromise = drainPromise
-        void drainPromise.finally(() => {
+    if (pluginApiReloadDrainPromise) return pluginApiReloadDrainPromise
+
+    const drainPromise = Promise.resolve().then(() => drainDeferredPluginApiReload())
+    pluginApiReloadDrainPromise = drainPromise
+    void drainPromise.then(
+        () => {
             if (pluginApiReloadDrainPromise === drainPromise) {
                 pluginApiReloadDrainPromise = undefined
             }
-        })
-    })
+        },
+        () => {
+            if (pluginApiReloadDrainPromise === drainPromise) {
+                pluginApiReloadDrainPromise = undefined
+            }
+        },
+    )
+    return drainPromise
 }
 
 /**
- * Plugin callbacks receive acknowledgement that a reload was requested. The
- * generation itself is deferred so an unload callback can await this API
- * without re-entering and deadlocking the lifecycle operation that invoked it.
+ * Outside plugin lifecycle work, callers share a promise that settles only
+ * after the requested reload generation drains. Lifecycle callbacks receive
+ * acknowledgement instead: awaiting a generation queued behind the active
+ * generation would deadlock the lifecycle operation that invoked the callback.
  */
 export function requestDeferredPluginApiReload(): Promise<void> {
     // Teardown-time demand is covered by the live plugin-list read immediately
     // after every unload callback settles.
-    if (activePluginReloadPhase !== "teardown") {
-        retainDeferredPluginReloadDemand()
-    }
-    return Promise.resolve()
+    if (activePluginReloadPhase === "teardown") return Promise.resolve()
+
+    const drainPromise = retainDeferredPluginReloadDemand()
+    if (activePluginReloadPhase !== undefined) return Promise.resolve()
+    return drainPromise
 }
 
 export async function waitForDeferredPluginApiReloadIdle(): Promise<void> {
@@ -572,13 +579,15 @@ async function drainDeferredPluginApiReload(): Promise<void> {
             }
         }
     } finally {
-        pluginApiReloadScheduled = false
         if (pluginApiReloadPending) {
             console.error(
                 "[Plugins] Deferred plugin reload remains pending after bounded attempts",
                 lastError,
             )
             notifyWarning(language.pluginReloadDeferredPending)
+            throw lastError ?? new Error(
+                "Plugin reload remained pending after bounded lifecycle attempts.",
+            )
         }
     }
 }

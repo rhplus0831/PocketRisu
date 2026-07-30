@@ -449,6 +449,7 @@ const {
     pluginV2,
     removePluginAndReload,
     setPluginEnabledAndReload,
+    waitForDeferredPluginApiReloadIdle,
 } = await import("./plugins.svelte");
 const {
     createPluginStorageRecord,
@@ -4122,6 +4123,81 @@ describe("transitionPluginStorageMode", () => {
 
         expect(acknowledged).toBe(true);
         expect(pluginV2.unload.size).toBe(0);
+    });
+
+    test("lets a loading plugin await a follow-up reload request without deadlocking", async () => {
+        database.plugins = [{
+            name: "Reloading V3 plugin",
+            script: "",
+            arguments: {},
+            realArg: {},
+            version: "3.0",
+            customLink: [],
+            argMeta: {},
+            enabled: true,
+        }];
+        const v2Apis = getV2PluginAPIs();
+        let generations = 0;
+        let acknowledged = false;
+        loadV3PluginGenerationOutcomesMock.mockImplementation(async (plugins: any[]) => {
+            generations += 1;
+            if (generations === 1) {
+                await v2Apis.loadPlugins();
+                acknowledged = true;
+            }
+            return plugins.map(plugin => ({
+                pluginName: plugin.name,
+                status: "fulfilled" as const,
+            }));
+        });
+
+        await loadPlugins();
+        expect(acknowledged).toBe(true);
+        await waitForDeferredPluginApiReloadIdle();
+        expect(generations).toBe(2);
+    });
+
+    test("makes plugin API callers share and await deferred reload completion", async () => {
+        pluginV2.loaded = true;
+        const v2Apis = getV2PluginAPIs();
+        let releaseUnload!: () => void;
+        let markUnloadStarted!: () => void;
+        const unloadBlocked = new Promise<void>(resolve => { releaseUnload = resolve; });
+        const unloadStarted = new Promise<void>(resolve => { markUnloadStarted = resolve; });
+        pluginV2.unload.add(async () => {
+            markUnloadStarted();
+            await unloadBlocked;
+        });
+
+        const firstReload = v2Apis.loadPlugins();
+        const coalescedReload = v2Apis.loadPlugins();
+        let settled = false;
+        void firstReload.then(() => { settled = true; });
+
+        expect(coalescedReload).toBe(firstReload);
+        await unloadStarted;
+        await Promise.resolve();
+        expect(settled).toBe(false);
+
+        releaseUnload();
+        await Promise.all([firstReload, coalescedReload]);
+        expect(settled).toBe(true);
+        expect(pluginV2.unload.size).toBe(0);
+    });
+
+    test("propagates deferred plugin lifecycle failure to plugin API callers", async () => {
+        teardownV3PluginsMock.mockRejectedValue(new Error("deferred teardown failed"));
+        const v2Apis = getV2PluginAPIs();
+
+        await expect(v2Apis.loadPlugins()).rejects.toThrow(
+            "One or more plugin lifecycle phases failed.",
+        );
+
+        expect(teardownV3PluginsMock).toHaveBeenCalledTimes(2);
+        const { notifyWarning } = vi.mocked(await import("../alert"));
+        expect(notifyWarning).toHaveBeenCalledWith(
+            "A plugin reload is still pending after repeated reload attempts. Try reloading plugins again or restart the app.",
+        );
     });
 
     test("durably powers off an invalid enabled V2 record instead of silently skipping it", async () => {

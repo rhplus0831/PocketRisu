@@ -2194,7 +2194,10 @@ interface RisuaiPluginAPI {
     // ========== Plugin Management ==========
 
     /**
-     * Reloads all plugins
+     * Reloads all plugins. Outside an active plugin load/unload callback, the
+     * promise settles after teardown and generation readiness. Lifecycle
+     * callbacks receive acknowledgement instead so awaiting this method cannot
+     * deadlock the generation that invoked them.
      */
     loadPlugins(): Promise<void>;
 

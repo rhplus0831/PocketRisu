@@ -104,7 +104,10 @@ If your plugin relies on any of the above APIs, you will need to modify your cod
 
 `setDatabase()`: A function to set a user database. same as internal `setDatabase`, but with limited access.
 
-`loadPlugins()`: A function to load plugins. same as internal `loadPlugins`.
+`loadPlugins()`: Reloads plugins and, outside an active plugin lifecycle callback,
+settles after teardown and generation readiness. Calls made from a load/unload
+callback acknowledge the request without waiting so the active generation cannot
+deadlock itself.
 
 `readImage()`: A function to read an image asset. same as internal `readImage`.
 
