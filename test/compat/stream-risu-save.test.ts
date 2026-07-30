@@ -1,5 +1,5 @@
-import { afterAll, describe, expect, test } from 'vitest'
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { afterAll, describe, expect, test, vi } from 'vitest'
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import chatRowsPkg from '../../server/node/chatRows.cjs'
@@ -22,7 +22,8 @@ const { streamRisuSaveToFile } = streamRisuSavePkg as {
     pluginStorage?: {
       valueRows: Array<{ key: string; source: string }>
       metaRows: Array<{ key: string; source: string }>
-      readRow: (source: string) => unknown | Promise<unknown>
+      readRow?: (source: string) => unknown | Promise<unknown>
+      rowSource?: (source: string) => { filePath: string; size: number }
     } | null
     shouldAbort?: () => boolean
   }) => Promise<{ filePath: string; size: number }>
@@ -288,6 +289,56 @@ describe('disk-backed streaming Risu save encoding', () => {
     expect(Object.keys(decoded.pluginCustomStorage)).toHaveLength(rowCount)
     const lastKey = `record/${(rowCount - 1).toString().padStart(5, '0')}`
     expect(decoded.pluginCustomStorage[lastKey].body).toHaveLength(4 * 1024 * 1024)
+  })
+
+  test('streams staged JSON row files directly into ordinary and escaped plugin values', async () => {
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'risu-stream-save-row-source-'))
+    tempDirs.push(tempDir)
+    const filePath = path.join(tempDir, 'database-row-source.risudat.tmp')
+    const ordinaryPath = path.join(tempDir, 'ordinary.json')
+    const protoPath = path.join(tempDir, 'proto.json')
+    const ordinaryBytes = Buffer.from(JSON.stringify({
+      body: 'o'.repeat(3 * 1024 * 1024),
+      nested: ['streamed', true, 42],
+    }))
+    const protoBytes = Buffer.from(JSON.stringify({
+      body: 'p'.repeat(2 * 1024 * 1024),
+      exact: '__proto__',
+    }))
+    await writeFile(ordinaryPath, ordinaryBytes)
+    await writeFile(protoPath, protoBytes)
+    const sources = new Map([
+      ['ordinary', { filePath: ordinaryPath, size: ordinaryBytes.length }],
+      ['proto', { filePath: protoPath, size: protoBytes.length }],
+    ])
+    const readRow = vi.fn(() => {
+      throw new Error('file-backed plugin rows must not use readRow')
+    })
+
+    await streamRisuSaveToFile({
+      dbObj: { optimizePluginMemory: true, characters: [], pluginCustomStorage: {} },
+      filePath,
+      readChatRow: async () => null,
+      pluginStorage: {
+        valueRows: [
+          { key: 'large', source: 'ordinary' },
+          { key: '__proto__', source: 'proto' },
+        ],
+        metaRows: [],
+        readRow,
+        rowSource: (source: string) => sources.get(source)!,
+      },
+    })
+
+    expect(readRow).not.toHaveBeenCalled()
+    const decoded = await decodeRisuSave(await readFile(filePath))
+    expect(decoded.pluginCustomStorage.large.nested).toEqual(['streamed', true, 42])
+    expect(decoded.pluginCustomStorage.large.body).toHaveLength(3 * 1024 * 1024)
+    expect(Object.hasOwn(decoded.pluginCustomStorage, '__proto__')).toBe(true)
+    expect(decoded.pluginCustomStorage.__proto__).toEqual({
+      body: 'p'.repeat(2 * 1024 * 1024),
+      exact: '__proto__',
+    })
   })
 
   test('defers multi-megabyte external __proto__ rows and streams their exact escape entries', async () => {

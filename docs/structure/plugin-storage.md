@@ -181,6 +181,12 @@ Production settings use a staged server protocol, not the older direct row-first
 6. A lost acknowledgement is reconciled from the stage receipt and live publication.
    If the outcome remains unknowable, saves are fenced and the UI requires reload.
 
+Reverse transitions accept rows up to the configured optimized-value ceiling and do not
+impose a smaller aggregate transport cap. The server copies SQLite/chunk data and converts
+staged JSON to MessagePack in bounded pages. Inline mode itself still retains the finished
+plugin map in browser memory, so Settings asks for confirmation when the exact preflight is
+larger than 64 MiB total or contains a row larger than 32 MiB.
+
 `transitionPluginStorageMode()` is the production entry point.
 `reconcilePluginStorageModeForBoot()` is the bounded boot-recovery path.
 `reconcilePluginStorageMode()` is dependency-injected test support and rejects ordinary

@@ -1678,6 +1678,8 @@ export const languageEnglish = {
     optimizePluginMemoryEnabled: "Plugin memory optimization enabled.",
     optimizePluginMemoryDisabled: "Plugin memory optimization disabled.",
     optimizePluginMemoryEstimating: "Measuring plugin storage…",
+    optimizePluginMemoryLargeInlineWarning: (total: string, largest: string) =>
+        `Turning optimization off will load ${total} of plugin data into browser memory (largest value: ${largest}). The conversion is streamed on the server and the optimized copy is kept until the final commit, but inline mode must retain all plugin data in browser memory and may become slow or run out of memory. Continue?`,
     optimizePluginMemoryProgress: (completed: number, total: number, completedBytes: string, totalBytes: string) =>
         `Moving plugin storage… ${completed} / ${total} (${completedBytes} / ${totalBytes})`,
     optimizePluginMemoryCancelled: "Plugin storage mode change cancelled.",

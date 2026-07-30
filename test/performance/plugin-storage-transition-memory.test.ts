@@ -563,52 +563,6 @@ describe('PM2 production plugin-storage transition memory (real client and serve
           expect(cacheProbeReads.every(entry => !entry.headers.has('x-cached-hashes'))).toBe(true)
         }
 
-        // Production intentionally refuses to internalize more than 64 MiB.
-        // The extreme profile therefore exercises the large, valid direction:
-        // inline publication -> staged optimized rows. Returning here avoids
-        // turning a safety-boundary refusal into the purpose of this RSS test.
-        if (EXTREME_MEMORY_MODE) {
-          const observedPeakRss = Math.max(
-            externalWholeBaseline.rss,
-            externalSampler.peak.rss,
-            externalFinal.rss,
-          )
-          if (Number.isFinite(EXTREME_MIN_RSS_BYTES) && EXTREME_MIN_RSS_BYTES > 0) {
-            expect(observedPeakRss).toBeGreaterThanOrEqual(EXTREME_MIN_RSS_BYTES)
-          }
-          memoryEvidence[cycleLabel] = {
-            externalize: {
-              wholeBaseline: externalWholeBaseline,
-              stageBaseline: externalStageBaseline,
-              peak: externalSampler.peak,
-              final: externalFinal,
-              checkpoints: externalProgress.map(({ completed, memory }) => ({
-                completed,
-                ...memory,
-              })),
-            },
-          }
-          expect(saveLoopFailure).toBeNull()
-          expect(requestLog.some(entry => entry.path === '/api/plugin-storage/transition'))
-            .toBe(false)
-          console.info('[PM2 extreme memory target]', JSON.stringify({
-            targetRssBytes: EXTREME_TARGET_RSS_BYTES,
-            minimumRssBytes: EXTREME_MIN_RSS_BYTES,
-            observedPeakRss,
-            targetRatio: observedPeakRss / EXTREME_TARGET_RSS_BYTES,
-            rowBytes: ROW_BYTES,
-            rows: ROW_COUNT,
-            totalLogicalBytes: TOTAL_BYTES,
-          }))
-          console.info('[PM2 memory evidence]', JSON.stringify({
-            rowBytes: ROW_BYTES,
-            rows: ROW_COUNT,
-            totalBytes: TOTAL_BYTES,
-            cycles: memoryEvidence,
-          }))
-          return
-        }
-
         const internalProgress: ProgressRecord[] = []
         let internalStageBaseline: MemoryPoint | null = null
         const internalWholeBaseline = await settleGc()
@@ -736,6 +690,28 @@ describe('PM2 production plugin-storage transition memory (real client and serve
             manifestSnapshotRequests: 0,
             prefixListRequests: reexternalizeLists.length,
           },
+        }
+        if (EXTREME_MEMORY_MODE) {
+          const observedPeakRss = Math.max(
+            externalWholeBaseline.rss,
+            externalSampler.peak.rss,
+            externalFinal.rss,
+            internalWholeBaseline.rss,
+            internalSampler.peak.rss,
+            internalFinal.rss,
+          )
+          if (Number.isFinite(EXTREME_MIN_RSS_BYTES) && EXTREME_MIN_RSS_BYTES > 0) {
+            expect(observedPeakRss).toBeGreaterThanOrEqual(EXTREME_MIN_RSS_BYTES)
+          }
+          console.info('[PM2 extreme memory target]', JSON.stringify({
+            targetRssBytes: EXTREME_TARGET_RSS_BYTES,
+            minimumRssBytes: EXTREME_MIN_RSS_BYTES,
+            observedPeakRss,
+            targetRatio: observedPeakRss / EXTREME_TARGET_RSS_BYTES,
+            rowBytes: ROW_BYTES,
+            rows: ROW_COUNT,
+            totalLogicalBytes: TOTAL_BYTES,
+          }))
         }
       expect(saveLoopFailure).toBeNull()
       expect(requestLog.some(entry => entry.path === '/api/plugin-storage/transition')).toBe(false)

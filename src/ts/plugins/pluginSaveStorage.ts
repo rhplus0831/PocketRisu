@@ -112,10 +112,10 @@ interface PluginStorageOwnership {
 
 export const PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS = 30_000;
 export const PLUGIN_STORAGE_BOOT_RECOVERY_TIMEOUT_MS = 30_000;
-export const PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES = 64 * 1024 * 1024;
 export const PLUGIN_STORAGE_INTERNALIZE_MAX_ENTRIES = 100_000;
 export const PLUGIN_STORAGE_INTERNALIZE_DISK_MULTIPLIER = 3;
-export const PLUGIN_STORAGE_TRANSITION_MAX_ROW_BYTES = 32 * 1024 * 1024;
+export const PLUGIN_STORAGE_LARGE_INLINE_WARNING_BYTES = 64 * 1024 * 1024;
+export const PLUGIN_STORAGE_LARGE_INLINE_ROW_WARNING_BYTES = 32 * 1024 * 1024;
 
 type BarrierWaiter = {
     kind: "shared" | "exclusive";
@@ -2699,6 +2699,14 @@ export interface PluginStorageReconcileResult {
     meta: number;
 }
 
+export interface PluginStorageLargeInlineTransitionWarning {
+    direction: "internalize";
+    totalBytes: number;
+    largestRowBytes: number;
+    aggregateWarningBytes: number;
+    rowWarningBytes: number;
+}
+
 export interface PluginStorageBootReconcileResult extends PluginStorageReconcileResult {
     issues: PluginStorageRecoveryIssue[];
 }
@@ -2722,6 +2730,10 @@ export interface PluginStorageReconcileOptions {
     signal?: AbortSignal | null;
     /** Whole-pass boot recovery deadline; individual storage calls remain bounded too. */
     timeoutMs?: number;
+    /** Settings-only confirmation before a large optimized publication is loaded into browser memory. */
+    confirmLargeInlineTransition?: (
+        warning: PluginStorageLargeInlineTransitionWarning,
+    ) => boolean | Promise<boolean>;
     /** Test/bootstrap injection. Normal UI calls use the immediate save path. */
     dependencies?: Partial<ReconcileDependencies>;
 }
@@ -2756,6 +2768,7 @@ interface PluginStorageTransitionPreflight {
     baselineEntries: number;
     baselineBytes: number;
     totalBytes: number;
+    largestRowBytes: number;
     maxBytes: number | null;
     entries: Array<{
         rawKey: string;
@@ -2794,19 +2807,14 @@ function addTransitionBytes(total: number, next: number): number {
 }
 
 function transitionLimitError(
-    kind: "row" | "aggregate" | "entries",
+    kind: "entries",
     actual: number,
     limit: number,
 ): StorageError {
     const units = kind === "entries" ? "entries" : "bytes";
     return new StorageError(
         `Plugin storage has ${actual} ${units}; this transition is limited to ${limit} ${units}.`,
-        {
-            code: kind === "aggregate"
-                ? "PLUGIN_STORAGE_MEMORY_LIMIT"
-                : "PLUGIN_STORAGE_SIZE_LIMIT",
-            operation: "transition",
-        },
+        { code: "PLUGIN_STORAGE_SIZE_LIMIT", operation: "transition" },
     );
 }
 
@@ -2816,9 +2824,6 @@ function validateTransitionRowSize(size: number): void {
             code: "PLUGIN_STORAGE_SIZE_LIMIT",
             operation: "transition",
         });
-    }
-    if (size > PLUGIN_STORAGE_TRANSITION_MAX_ROW_BYTES) {
-        throw transitionLimitError("row", size, PLUGIN_STORAGE_TRANSITION_MAX_ROW_BYTES);
     }
 }
 
@@ -2966,6 +2971,7 @@ async function preflightPluginStorageTransition(
     const inlineBytes: number[] = [];
     let baselineEntries = 0;
     let baselineBytes = 0;
+    let baselineLargestRowBytes = 0;
     const accountInline = (
         entries: Array<{ key: string; size: number }>,
         externalWinners: Set<string>,
@@ -2977,6 +2983,7 @@ async function preflightPluginStorageTransition(
             else {
                 baselineEntries += 1;
                 baselineBytes = addTransitionBytes(baselineBytes, entry.size);
+                baselineLargestRowBytes = Math.max(baselineLargestRowBytes, entry.size);
             }
         }
     };
@@ -3005,12 +3012,21 @@ async function preflightPluginStorageTransition(
         }
         const retainedTotal = retainedBytes.reduce(addTransitionBytes, 0);
         const totalBytes = inlineBytes.reduce(addTransitionBytes, retainedTotal);
+        const largestInlineRow = inlineBytes.reduce(
+            (largest, size) => Math.max(largest, size),
+            0,
+        );
+        const largestRowBytes = retainedBytes.reduce(
+            (largest, size) => Math.max(largest, size),
+            largestInlineRow,
+        );
         return {
             direction: "externalize",
             orderedBytes: inlineBytes,
             baselineEntries: retainedBytes.length,
             baselineBytes: retainedTotal,
             totalBytes,
+            largestRowBytes,
             maxBytes: null,
             entries: [...inlineValues, ...inlineMeta].map(entry => ({
                 rawKey: entry.key,
@@ -3034,22 +3050,14 @@ async function preflightPluginStorageTransition(
     let totalBytes = baselineBytes;
     for (const size of ownedBytes) {
         totalBytes = addTransitionBytes(totalBytes, size);
-        if (totalBytes > PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES) {
-            throw transitionLimitError(
-                "aggregate",
-                totalBytes,
-                PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES,
-            );
-        }
     }
     if (totalBytes > 0) {
         const requiredBytes = totalBytes * PLUGIN_STORAGE_INTERNALIZE_DISK_MULTIPLIER;
         if (!Number.isSafeInteger(requiredBytes)) {
-            throw transitionLimitError(
-                "aggregate",
-                totalBytes,
-                PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES,
-            );
+            throw new StorageError("Plugin storage disk preflight exceeds the safe integer range.", {
+                code: "PLUGIN_STORAGE_SIZE_LIMIT",
+                operation: "transition",
+            });
         }
         const freeBytes = await deps.getPersistentStorageFreeBytes(signal);
         if (freeBytes !== null && freeBytes < requiredBytes) {
@@ -3065,7 +3073,11 @@ async function preflightPluginStorageTransition(
         baselineEntries,
         baselineBytes,
         totalBytes,
-        maxBytes: PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES,
+        largestRowBytes: ownedBytes.reduce(
+            (largest, size) => Math.max(largest, size),
+            baselineLargestRowBytes,
+        ),
+        maxBytes: null,
         entries: ownedEntries,
     };
 }
@@ -3536,7 +3548,7 @@ async function applyStagedPluginStorageTransition(
         total,
         completedBytes: 0,
         totalBytes,
-        maxBytes: target ? null : PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES,
+        maxBytes: null,
     });
 
     // The authoritative baseline above is already durable. Acknowledged rows
@@ -3661,7 +3673,7 @@ async function applyStagedPluginStorageTransition(
                     total,
                     completedBytes,
                     totalBytes,
-                    maxBytes: PLUGIN_STORAGE_INTERNALIZE_MAX_BYTES,
+                    maxBytes: null,
                 });
             }
         }
@@ -4314,6 +4326,26 @@ export async function transitionPluginStorageMode(
                     target,
                     options.signal,
                 );
+                if (!target
+                    && options.confirmLargeInlineTransition
+                    && (preflight.totalBytes > PLUGIN_STORAGE_LARGE_INLINE_WARNING_BYTES
+                        || preflight.largestRowBytes
+                            > PLUGIN_STORAGE_LARGE_INLINE_ROW_WARNING_BYTES)) {
+                    const confirmed = await options.confirmLargeInlineTransition({
+                        direction: "internalize",
+                        totalBytes: preflight.totalBytes,
+                        largestRowBytes: preflight.largestRowBytes,
+                        aggregateWarningBytes: PLUGIN_STORAGE_LARGE_INLINE_WARNING_BYTES,
+                        rowWarningBytes: PLUGIN_STORAGE_LARGE_INLINE_ROW_WARNING_BYTES,
+                    });
+                    throwIfAborted(options.signal);
+                    if (!confirmed) {
+                        throw new DOMException(
+                            "Large plugin storage internalization cancelled.",
+                            "AbortError",
+                        );
+                    }
+                }
                 if (options.dependencies === undefined) {
                     return await applyStagedPluginStorageTransition(
                         deps,

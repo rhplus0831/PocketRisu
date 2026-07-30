@@ -110,6 +110,7 @@ const {
     validateDatabaseShape,
 } = require('./chatRows.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
+const { validateJsonSource } = require('./streamJsonToMsgpack.cjs');
 const {
     readBlockRisuSaveTopLevelFields,
     streamBackupRisuSaveToFile,
@@ -1899,7 +1900,14 @@ const PARTIAL_EXPORT_MAX_ACTIVE_JOBS = 1;
 const PLUGIN_VALUE_SPOOL_FILE_PREFIX = '.plugin-value-';
 const PLUGIN_TRANSITION_STAGE_PREFIX = '.plugin-transition-stage-';
 const PLUGIN_TRANSITION_STAGE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-const PLUGIN_TRANSITION_MAX_ROW_BYTES = 32 * 1024 * 1024;
+// A mode transition must accept every row that optimized storage itself can
+// legally publish. Preserve the historical 32 MiB staging floor when an
+// operator configures a smaller publication quota; the atomic finalize step
+// remains authoritative for that quota.
+const PLUGIN_TRANSITION_MAX_ROW_BYTES = Math.max(
+    32 * 1024 * 1024,
+    PLUGIN_VALUE_MAX_BYTES,
+);
 // POCKETRISU_SPOOL_DIR may relocate temporary database assembly. The default
 // remains on the writable save volume and is independent of server backups.
 const configuredDatabaseSpoolDir = String(process.env.POCKETRISU_SPOOL_DIR ?? '').trim();
@@ -2035,23 +2043,6 @@ function writePluginTransitionStage(stage) {
         fsyncPluginTransitionStageDirectory();
     } catch (error) {
         try { unlinkSync(temporaryPath); } catch {}
-        throw error;
-    }
-}
-
-function writePluginTransitionStageRow(filePath, value) {
-    try {
-        writeFileSync(filePath, value, { flag: 'wx', mode: 0o600 });
-        const fileDescriptor = openSync(filePath, 'r');
-        try {
-            fsyncSync(fileDescriptor);
-        } finally {
-            closeSync(fileDescriptor);
-        }
-        fsyncPluginTransitionStageDirectory();
-    } catch (error) {
-        try { unlinkSync(filePath); } catch {}
-        fsyncPluginTransitionStageDirectory();
         throw error;
     }
 }
@@ -10212,6 +10203,80 @@ async function computeFileSha256(filePath) {
     return hash.digest('hex');
 }
 
+async function spoolPluginTransitionKvRow(storageKey, destinationPath, options = {}) {
+    const expectedSize = kvSize(storageKey);
+    if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) {
+        throw new PluginStorageValidationError(storageKey);
+    }
+    if (expectedSize > PLUGIN_TRANSITION_MAX_ROW_BYTES) {
+        throw new PluginStorageLimitError(
+            'Plugin storage contains a row outside the configured value limit.',
+            {
+                code: 'PLUGIN_STORAGE_SIZE_LIMIT',
+                limit: PLUGIN_TRANSITION_MAX_ROW_BYTES,
+                actual: expectedSize,
+            },
+        );
+    }
+    const result = await kvWriteToFile(storageKey, destinationPath, {
+        shouldAbort: options.shouldAbort,
+    });
+    if (!result || result.size !== expectedSize) {
+        throw new PluginStorageValidationError(storageKey);
+    }
+    await fs.chmod(destinationPath, 0o600);
+    if (options.validateJson !== false) {
+        try {
+            await validateJsonSource({ filePath: destinationPath, size: result.size }, {
+                shouldAbort: options.shouldAbort,
+            });
+        } catch {
+            throw new PluginStorageValidationError(storageKey);
+        }
+    }
+    const sha256 = await computeFileSha256(destinationPath);
+    return { size: result.size, sha256 };
+}
+
+async function writeDurablePluginTransitionStageRow(storageKey, filePath, shouldAbort) {
+    const temporaryPath = `${filePath}.${nodeCrypto.randomUUID()}.tmp`;
+    try {
+        const result = await spoolPluginTransitionKvRow(storageKey, temporaryPath, {
+            shouldAbort,
+            validateJson: true,
+        });
+        const fileDescriptor = openSync(temporaryPath, 'r');
+        try {
+            fsyncSync(fileDescriptor);
+        } finally {
+            closeSync(fileDescriptor);
+        }
+        renameSync(temporaryPath, filePath);
+        fsyncPluginTransitionStageDirectory();
+        return result;
+    } catch (error) {
+        try { unlinkSync(temporaryPath); } catch {}
+        fsyncPluginTransitionStageDirectory();
+        throw error;
+    }
+}
+
+async function pluginTransitionKvRowMatches(storageKey, expected, shouldAbort) {
+    const temporaryPath = path.join(
+        pluginTransitionStageDir,
+        `${PLUGIN_TRANSITION_STAGE_PREFIX}${nodeCrypto.randomUUID()}.verify.tmp`,
+    );
+    try {
+        const actual = await spoolPluginTransitionKvRow(storageKey, temporaryPath, {
+            shouldAbort,
+            validateJson: false,
+        });
+        return actual.size === expected.size && actual.sha256 === expected.sha256;
+    } finally {
+        try { unlinkSync(temporaryPath); } catch {}
+    }
+}
+
 async function assertInternalTransitionBounds(liveDb, sourceKeys) {
     const ownedValueRaw = new Set(sourceKeys.valueKeys.map(
         key => decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_PREFIX),
@@ -10233,12 +10298,12 @@ async function assertInternalTransitionBounds(liveDb, sourceKeys) {
             );
         }
         bytes += size;
-        if (!Number.isSafeInteger(bytes) || bytes > 64 * 1024 * 1024) {
+        if (!Number.isSafeInteger(bytes)) {
             throw new PluginStorageLimitError(
-                'Plugin storage exceeds the 64 MiB internalization limit.',
+                'Plugin storage size exceeds the safe transition range.',
                 {
-                    code: 'PLUGIN_STORAGE_MEMORY_LIMIT',
-                    limit: 64 * 1024 * 1024,
+                    code: 'PLUGIN_STORAGE_SIZE_LIMIT',
+                    limit: Number.MAX_SAFE_INTEGER,
                     actual: bytes,
                 },
             );
@@ -10428,26 +10493,17 @@ app.post('/api/plugin-storage/transition/stage/begin', async (req, res, next) =>
                             throw new Error('Plugin transition begin disconnected');
                         }
                         const index = rows.length;
-                        const value = kvGet(storageKey);
-                        if (!value) throw new PluginStorageValidationError(storageKey);
-                        if (value.length > PLUGIN_TRANSITION_MAX_ROW_BYTES) {
-                            throw new PluginStorageLimitError(
-                                'Plugin storage row exceeds the transition limit.',
-                                {
-                                    code: 'PLUGIN_STORAGE_SIZE_LIMIT',
-                                    limit: PLUGIN_TRANSITION_MAX_ROW_BYTES,
-                                    actual: value.length,
-                                },
-                            );
-                        }
-                        validatePluginStorageRow(storageKey, value);
                         const filePath = pluginTransitionStageRowPath(plan.transitionId, index);
-                        writePluginTransitionStageRow(filePath, value);
+                        const staged = await writeDurablePluginTransitionStageRow(
+                            storageKey,
+                            filePath,
+                            () => req.aborted || res.destroyed,
+                        );
                         rows.push({
                             index,
                             storageKey,
-                            size: value.length,
-                            sha256: sha256Hex(value),
+                            size: staged.size,
+                            sha256: staged.sha256,
                             uploaded: true,
                         });
                     }
@@ -10540,7 +10596,13 @@ app.post('/api/plugin-storage/transition/stage/upload', async (req, res, next) =
             closeSync(fileDescriptor);
         }
         const hash = digest.digest('hex');
-        validatePluginStorageRow(storageKey, readFileSync(temporaryPath));
+        try {
+            await validateJsonSource({ filePath: temporaryPath, size: received }, {
+                shouldAbort: () => req.aborted || res.destroyed,
+            });
+        } catch {
+            throw new PluginStorageValidationError(storageKey);
+        }
         await queueStorageMutation(async () => {
             const current = readPluginTransitionStage(transitionId);
             if (!pluginTransitionStageBelongsToRequest(current, req) || current.state === 'aborted') {
@@ -10591,13 +10653,16 @@ app.get('/api/plugin-storage/transition/stage/row', async (req, res, next) => {
         if (!pluginTransitionStageBelongsToRequest(stage, req)
             || !row?.uploaded
             || stage.state === 'aborted') return res.status(404).end();
-        const value = readFileSync(pluginTransitionStageRowPath(transitionId, row.index));
-        if (value.length !== row.size || sha256Hex(value) !== row.sha256) {
+        const filePath = pluginTransitionStageRowPath(transitionId, row.index);
+        const fileStat = await fs.stat(filePath);
+        if (!fileStat.isFile()
+            || fileStat.size !== row.size
+            || await computeFileSha256(filePath) !== row.sha256) {
             return res.status(409).json({ error: 'Staged transition row failed verification' });
         }
         res.setHeader('content-type', 'application/octet-stream');
-        res.setHeader('content-length', value.length);
-        res.send(value);
+        res.setHeader('content-length', row.size);
+        await pipeline(createReadStream(filePath), res);
     } catch (error) {
         next(error);
     }
@@ -10692,10 +10757,15 @@ app.post('/api/plugin-storage/transition/stage/finalize', async (req, res, next)
                 }
             } else {
                 for (const sourceRow of stage.sourceRowHashes) {
-                    const current = kvGet(sourceRow.storageKey);
-                    if (!current
-                        || current.length !== sourceRow.size
-                        || sha256Hex(current) !== sourceRow.sha256) {
+                    let matches = false;
+                    try {
+                        matches = await pluginTransitionKvRowMatches(
+                            sourceRow.storageKey,
+                            sourceRow,
+                            () => req.aborted || res.destroyed,
+                        );
+                    } catch {}
+                    if (!matches) {
                         return res.status(409).json({ error: 'Plugin row changed during transition' });
                     }
                 }
@@ -10726,13 +10796,12 @@ app.post('/api/plugin-storage/transition/stage/finalize', async (req, res, next)
                             key: decodeValidatedPluginStorageKey(row.storageKey, PLUGIN_SAVE_META_PREFIX),
                             source: row.index,
                         })),
-                    readRow: index => {
+                    rowSource: index => {
                         const row = stage.rows[index];
-                        const value = readFileSync(pluginTransitionStageRowPath(transitionId, index));
-                        if (value.length !== row.size || sha256Hex(value) !== row.sha256) {
-                            throw new Error(`Staged row changed: ${row.storageKey}`);
-                        }
-                        return validatePluginStorageRow(row.storageKey, value);
+                        return {
+                            filePath: pluginTransitionStageRowPath(transitionId, index),
+                            size: row.size,
+                        };
                     },
                 };
             }
@@ -10764,14 +10833,13 @@ app.post('/api/plugin-storage/transition/stage/finalize', async (req, res, next)
                 }
             }
             const recoverySnapshotToken = newPluginRecoverySnapshotToken();
-            if (stage.targetOptimized) {
-                for (const row of stage.rows) {
-                    const filePath = pluginTransitionStageRowPath(transitionId, row.index);
-                    const stat = await fs.stat(filePath);
-                    if (stat.size !== row.size
-                        || await computeFileSha256(filePath) !== row.sha256) {
-                        return res.status(409).json({ error: 'Staged transition row changed' });
-                    }
+            for (const row of stage.rows) {
+                const filePath = pluginTransitionStageRowPath(transitionId, row.index);
+                const stat = await fs.stat(filePath);
+                if (!stat.isFile()
+                    || stat.size !== row.size
+                    || await computeFileSha256(filePath) !== row.sha256) {
+                    return res.status(409).json({ error: 'Staged transition row changed' });
                 }
             }
             withPluginStorageQuotaPlan([...quotaChanges.values()], () => {

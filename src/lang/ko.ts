@@ -1833,6 +1833,8 @@ export const languageKorean = {
   optimizePluginMemoryEnabled: "플러그인 메모리 최적화를 켰습니다.",
   optimizePluginMemoryDisabled: "플러그인 메모리 최적화를 껐습니다.",
   optimizePluginMemoryEstimating: "플러그인 저장소 크기를 계산하는 중…",
+  optimizePluginMemoryLargeInlineWarning: (total: string, largest: string) =>
+    `최적화를 끄면 플러그인 데이터 ${total}(가장 큰 값: ${largest})를 브라우저 메모리에 불러옵니다. 서버 변환은 스트리밍 방식으로 처리되고 최종 커밋 전까지 최적화된 복사본을 유지하지만, 인라인 모드는 모든 플러그인 데이터를 브라우저 메모리에 보관해야 하므로 느려지거나 메모리가 부족해질 수 있습니다. 계속하시겠습니까?`,
   optimizePluginMemoryProgress: (completed: number, total: number, completedBytes: string, totalBytes: string) =>
     `플러그인 저장소 이동 중… ${completed} / ${total} (${completedBytes} / ${totalBytes})`,
   optimizePluginMemoryCancelled: "플러그인 저장 방식 변경을 취소했습니다.",

@@ -21,7 +21,6 @@ const META_PREFIX = 'pluginsave-meta/'
 const CHAT_MIGRATION_KEY = 'migration/chats-externalized'
 const REMOTE_MIGRATION_KEY = 'migration/disable-remote-saving'
 const STAGE_FILE_PREFIX = '.plugin-transition-stage-'
-const MAX_INTERNAL_BYTES = 64 * 1024 * 1024
 const MAX_ENTRIES = 100_000
 
 const servers = new Set<ServerHandle>()
@@ -505,7 +504,7 @@ describe('staged plugin transition verifier boundaries (real server)', () => {
     expect(await readdir(stageDir(server))).toEqual([])
   }, 30_000)
 
-  test('accepts exactly 64 MiB for internalization and rejects 65 MiB', async () => {
+  test('internalizes legal optimized rows above the former row and aggregate inline limits', async () => {
     const exactGeneration = randomUUID()
     const exactManifest: Manifest = {
       version: 1,
@@ -518,7 +517,7 @@ describe('staged plugin transition verifier boundaries (real server)', () => {
         seedSizedOptimizedPublication(
           saveDir,
           exactGeneration,
-          [32 * 1024 * 1024, 32 * 1024 * 1024],
+          [40 * 1024 * 1024, 25 * 1024 * 1024],
         )
       },
     })
@@ -535,7 +534,7 @@ describe('staged plugin transition verifier boundaries (real server)', () => {
       await expect(begun.response.json()).resolves.toMatchObject({
         state: 'ready',
         total: 2,
-        totalBytes: MAX_INTERNAL_BYTES,
+        totalBytes: 65 * 1024 * 1024,
       })
       const files = await readdir(stageDir(exactServer))
       const rowFiles = files.filter(name => name.endsWith('.row'))
@@ -543,45 +542,16 @@ describe('staged plugin transition verifier boundaries (real server)', () => {
       for (const rowFile of rowFiles) {
         expect((await stat(path.join(stageDir(exactServer), rowFile))).mode & 0o777).toBe(0o600)
       }
-      expect((await abort(client, begun.transitionId)).status).toBe(200)
+      expect((await finalize(client, begun.transitionId)).status).toBe(200)
+      const committed = await readPublication(client)
+      expect(committed.database.optimizePluginMemory).toBe(false)
+      expect(committed.database.pluginCustomStorage['large/0']).toHaveLength(40 * 1024 * 1024 - 2)
+      expect(committed.database.pluginCustomStorage['large/1']).toHaveLength(25 * 1024 * 1024 - 2)
+      expect(readSqliteValue(exactServer, exactManifest.valueKeys[0])).toBeNull()
+      expect(readSqliteValue(exactServer, exactManifest.valueKeys[1])).toBeNull()
+      expect(readPluginUsage(exactServer)).toBe(0)
     } finally {
       await disposeServer(exactServer)
-    }
-
-    const oversizedGeneration = randomUUID()
-    const oversizedManifest: Manifest = {
-      version: 1,
-      generation: oversizedGeneration,
-      valueKeys: [0, 1, 2].map(index => encodeStorageKey(VALUE_PREFIX, `large/${index}`)),
-      metaKeys: [],
-    }
-    const oversizedServer = await trackedServer({
-      seedSave: async saveDir => {
-        seedSizedOptimizedPublication(
-          saveDir,
-          oversizedGeneration,
-          [32 * 1024 * 1024, 32 * 1024 * 1024, 1024 * 1024],
-        )
-      },
-    })
-    try {
-      const client = await createClient(oversizedServer.port, oversizedServer.password)
-      const live = await readPublication(client)
-      const begun = await beginTransition(client, {
-        source: sourceOf(live.database, oversizedManifest),
-        targetOptimized: false,
-        rows: [],
-        expectedEtag: live.etag,
-      })
-      expect(begun.response.status).toBe(413)
-      await expect(begun.response.json()).resolves.toMatchObject({
-        code: 'PLUGIN_STORAGE_MEMORY_LIMIT',
-        limit: MAX_INTERNAL_BYTES,
-        actual: 65 * 1024 * 1024,
-      })
-      expect(await readdir(stageDir(oversizedServer))).toEqual([])
-    } finally {
-      await disposeServer(oversizedServer)
     }
   }, 120_000)
 

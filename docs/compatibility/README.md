@@ -57,7 +57,7 @@ many users use that path.
 - [Enumeration order change](plugin-storage-enumeration-order.md)
 - [Ill-formed legacy key compatibility](legacy-plugin-storage-key-compatibility.md)
 - [Optimized-storage key-length limit](optimized-plugin-storage-key-length-limit.md)
-- [Optimized-mode transition lock-in](optimized-plugin-storage-transition-lock-in.md)
+- [Optimized-mode transition lock-in (fixed 2026-07-30)](optimized-plugin-storage-transition-lock-in.md)
 - [Raw boot does not pin a plugin generation](raw-boot-plugin-generation-not-pinned.md)
 - [Configured optimized-storage limit differs from client limit](plugin-storage-configured-limit-client-mismatch.md)
 - [Safe update APIs have a smaller value limit](plugin-storage-batch-size-mismatch.md)

@@ -738,7 +738,6 @@ function isPluginStorageStagedTransitionStatus(
             ))
             || !Number.isSafeInteger(row.size)
             || (row.size as number) <= 0
-            || (row.size as number) > 32 * 1024 * 1024
             || typeof row.uploaded !== 'boolean'
             || !isSha256Hex(row.sha256)) return false
         if (storageKeys.has(row.storageKey as string)) return false

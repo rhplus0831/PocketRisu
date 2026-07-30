@@ -420,6 +420,8 @@ const {
     getPluginSaveStorageLength,
     getPluginSaveStorageOwners,
     getPluginSaveStorageViewerPage,
+    PLUGIN_STORAGE_LARGE_INLINE_ROW_WARNING_BYTES,
+    PLUGIN_STORAGE_LARGE_INLINE_WARNING_BYTES,
     PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_SAVE_PREFIX,
@@ -3368,6 +3370,47 @@ describe("boot plugin storage reconciliation recovery", () => {
 });
 
 describe("transitionPluginStorageMode", () => {
+    test("asks before a large optimized publication is loaded into inline memory", async () => {
+        const firstKey = encoded(PLUGIN_SAVE_PREFIX, "large/first");
+        const secondKey = encoded(PLUGIN_SAVE_PREFIX, "large/second");
+        database.optimizePluginMemory = true;
+        persistent.set(firstKey, { retained: "first" });
+        persistent.set(secondKey, { retained: "second" });
+        installOwnershipManifest("large-source-generation", [firstKey, secondKey], []);
+        const confirmLargeInlineTransition = vi.fn(async () => false);
+        const persistDatabase = vi.fn(async () => undefined);
+        const largeRows = new Map([
+            [firstKey, 40 * 1024 * 1024],
+            [secondKey, 25 * 1024 * 1024],
+        ]);
+
+        await expect(transitionPluginStorageMode(false, {
+            confirmLargeInlineTransition,
+            dependencies: {
+                listPersistentEntriesWithSizes: vi.fn(async (prefix: string) => (
+                    [...largeRows]
+                        .filter(([key]) => key.startsWith(prefix))
+                        .map(([key, size]) => ({ key, size }))
+                )),
+                persistDatabase,
+            },
+        })).rejects.toMatchObject({ name: "AbortError" });
+
+        expect(confirmLargeInlineTransition).toHaveBeenCalledOnce();
+        expect(confirmLargeInlineTransition).toHaveBeenCalledWith({
+            direction: "internalize",
+            totalBytes: 65 * 1024 * 1024,
+            largestRowBytes: 40 * 1024 * 1024,
+            aggregateWarningBytes: PLUGIN_STORAGE_LARGE_INLINE_WARNING_BYTES,
+            rowWarningBytes: PLUGIN_STORAGE_LARGE_INLINE_ROW_WARNING_BYTES,
+        });
+        expect(database.optimizePluginMemory).toBe(true);
+        expect(database.pluginStorageGeneration).toBe("large-source-generation");
+        expect(persistent.get(firstKey)).toEqual({ retained: "first" });
+        expect(persistent.get(secondKey)).toEqual({ retained: "second" });
+        expect(persistDatabase).not.toHaveBeenCalled();
+    });
+
     test("production disable stages rows and publishes without a database envelope", async () => {
         const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
         const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "alpha");

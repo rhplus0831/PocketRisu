@@ -84,6 +84,23 @@
             })
             await transitionPluginStorageMode(enabled, {
                 signal: controller.signal,
+                confirmLargeInlineTransition: async ({ totalBytes, largestRowBytes }) => {
+                    loadingOverlayStore.set({ active: false, text: "", onCancel: null })
+                    const confirmed = await alertConfirm(
+                        language.optimizePluginMemoryLargeInlineWarning(
+                            formatPluginStorageTransitionBytes(totalBytes),
+                            formatPluginStorageTransitionBytes(largestRowBytes),
+                        ),
+                    )
+                    if (confirmed) {
+                        loadingOverlayStore.set({
+                            active: true,
+                            text: language.optimizePluginMemoryEstimating,
+                            onCancel: cancelTransition,
+                        })
+                    }
+                    return confirmed
+                },
                 onStart: ({ completed, total, completedBytes, totalBytes }) => {
                     loadingOverlayStore.set({
                         active: total > 0,

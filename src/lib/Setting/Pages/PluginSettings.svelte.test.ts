@@ -21,6 +21,7 @@ const setPermissionDecision = vi.hoisted(() => vi.fn())
 const confirmReset = vi.hoisted(() => vi.fn())
 const mutationError = vi.hoisted(() => vi.fn())
 const mutationSuccess = vi.hoisted(() => vi.fn())
+const transitionStorageMode = vi.hoisted(() => vi.fn())
 
 vi.mock('src/ts/stores.svelte', () => ({
     DBState: { db: pluginDatabase },
@@ -65,7 +66,7 @@ vi.mock('src/ts/plugins/pluginMemoryOptimization', () => ({
 
 vi.mock('src/ts/plugins/pluginSaveStorage', () => ({
     reconcilePluginStorageModeForBoot: vi.fn(),
-    transitionPluginStorageMode: vi.fn(),
+    transitionPluginStorageMode: transitionStorageMode,
 }))
 
 vi.mock('src/ts/plugins/pluginStorageRecovery', () => ({
@@ -116,7 +117,55 @@ afterEach(() => {
     confirmReset.mockReset()
     mutationError.mockReset()
     mutationSuccess.mockReset()
+    transitionStorageMode.mockReset()
+    pluginDatabase.optimizePluginMemory = false
+    pluginDatabase.autoConvertPluginStorageValues = false
     document.body.replaceChildren()
+})
+
+describe('PluginSettings storage transition', () => {
+    test('confirms before disabling optimization for a large inline publication', async () => {
+        pluginDatabase.optimizePluginMemory = true
+        confirmReset.mockResolvedValue(false)
+        transitionStorageMode.mockImplementationOnce(async (
+            enabled: boolean,
+            options: {
+                confirmLargeInlineTransition: (warning: {
+                    totalBytes: number
+                    largestRowBytes: number
+                }) => Promise<boolean>
+            },
+        ) => {
+            expect(enabled).toBe(false)
+            const confirmed = await options.confirmLargeInlineTransition({
+                totalBytes: 65 * 1024 * 1024,
+                largestRowBytes: 40 * 1024 * 1024,
+            })
+            if (!confirmed) {
+                throw new DOMException('cancelled', 'AbortError')
+            }
+        })
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginSettings, { target })
+        const checkbox = target.querySelector<HTMLInputElement>(
+            'input[alt="Optimize plugin memory usage"]',
+        )
+        expect(checkbox).not.toBeNull()
+
+        checkbox!.checked = false
+        checkbox!.dispatchEvent(new Event('change', { bubbles: true }))
+
+        await waitFor(() => expect(confirmReset).toHaveBeenCalledOnce())
+        expect(confirmReset).toHaveBeenCalledWith(expect.stringContaining(
+            String(65 * 1024 * 1024),
+        ))
+        expect(confirmReset).toHaveBeenCalledWith(expect.stringContaining(
+            String(40 * 1024 * 1024),
+        ))
+
+        await unmount(component)
+    })
 })
 
 describe('PluginSettings permission editor', () => {
