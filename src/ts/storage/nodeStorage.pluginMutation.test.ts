@@ -1459,6 +1459,7 @@ describe('NodeStorage plugin viewer pages', () => {
         keyQuery = '',
         ownerQuery?: string,
         unknownOwner = false,
+        keys?: readonly string[],
     ): string[] {
         const ownerFacets = [{ owner: 'Owner', count: 5_000 }]
         const unknownOwnerCount = 5_000
@@ -1480,7 +1481,7 @@ describe('NodeStorage plugin viewer pages', () => {
         for (let index = 0; index < count; index++) {
             const text = JSON.stringify({ index, body: '한글' })
             const entryRevision = `sha256:${index.toString(16).padStart(64, '0')}`
-            const key = `key-${index.toString().padStart(5, '0')}`
+            const key = keys?.[index] ?? `key-${index.toString().padStart(5, '0')}`
             const owner = index % 2 === 0 ? 'Owner' : null
             const size = new TextEncoder().encode(text).byteLength
             const contentHash = `sha256:${createHash('sha256').update(JSON.stringify([
@@ -1572,6 +1573,24 @@ describe('NodeStorage plugin viewer pages', () => {
         expect(url).toContain('pageSize=50')
         expect(url).toContain('key=key-')
         expect(init.headers['x-plugin-storage-generation']).toBe(generation)
+    })
+
+    test('preserves distinct malformed legacy UTF-16 keys in authoritative pages', async () => {
+        const keys = [
+            ...Array.from({ length: 47 }, (_, index) => `key-${index.toString().padStart(5, '0')}`),
+            '\uD800', '\uD801', '�',
+        ]
+        const storage = storageWithResponse(new Response(
+            `${viewerEvents(keys.length, '', undefined, false, keys).join('\n')}\n`,
+        ))
+
+        const result = await storage.getPluginStorageViewerPage(
+            generation,
+            { page: 2, pageSize: 50 },
+        )
+
+        expect(result.entries.map(entry => entry.key)).toEqual(keys)
+        expect(result.entries.slice(-3).map(entry => entry.key)).toEqual(['\uD800', '\uD801', '�'])
     })
 
     test('an actual abort cancels a pending body read and returns no partial page', async () => {

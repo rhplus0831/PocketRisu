@@ -636,30 +636,27 @@ async function emitStreamingPluginStorageEntry(onEntry, field, key, value) {
     });
 }
 
-async function processPluginMap(source, descriptor, field, onEntry, protoEscape = null) {
+async function processPluginMap(source, descriptor, field, onEntry, escapes = []) {
     const entries = await readMapDescriptors(source, descriptor);
-    let count = 0;
-    let entryIndex = 0;
-    const insertAt = protoEscape === null
-        ? -1
-        : Math.min(protoEscape.index, entries.length);
-    for (let index = 0; index < entries.length + (protoEscape === null ? 0 : 1); index++) {
-        if (index === insertAt) {
+    const sequence = entries.map(entry => ({ kind: 'entry', entry }));
+    for (const escape of [...escapes].sort((left, right) => left.index - right.index)) {
+        sequence.splice(Math.min(escape.index, sequence.length), 0, { kind: 'escape', escape });
+    }
+    for (const item of sequence) {
+        if (item.kind === 'escape') {
             await emitStreamingPluginStorageEntry(
                 onEntry,
                 field,
-                '__proto__',
-                protoEscape.value
+                item.escape.key,
+                item.escape.value
             );
-            count++;
             continue;
         }
-        const entry = entries[entryIndex++];
+        const entry = item.entry;
         const value = await decodeDescriptor(source, entry.descriptor);
         await emitStreamingPluginStorageEntry(onEntry, field, entry.key, value);
-        count++;
     }
-    return count;
+    return sequence.length;
 }
 
 async function collectAssignedChatIds(source, charactersDescriptor, onMissingChatId) {
@@ -1441,9 +1438,12 @@ async function walkRisuSave(input, options = {}) {
         const escapedPluginFields = new Set(
             pluginStorageEscapeEnvelope?.escapes.map(escape => escape.field) ?? []
         );
-        const pluginStorageEscapeByField = new Map(
-            pluginStorageEscapeEnvelope?.escapes.map(escape => [escape.field, escape]) ?? []
-        );
+        const pluginStorageEscapesByField = new Map();
+        for (const escape of pluginStorageEscapeEnvelope?.escapes ?? []) {
+            const entries = pluginStorageEscapesByField.get(escape.field) ?? [];
+            entries.push(escape);
+            pluginStorageEscapesByField.set(escape.field, entries);
+        }
         let externalizePlugins = false;
         let strictPluginStorageActive = false;
         let valueRecordInspection = { present: false, count: 0, decodedRecord: null };
@@ -1513,9 +1513,9 @@ async function walkRisuSave(input, options = {}) {
                         entry.descriptor,
                         entry.key,
                         options.onPluginStorageEntry,
-                        pluginStorageEscapeByField.get(entry.key) ?? null
+                        pluginStorageEscapesByField.get(entry.key) ?? []
                     );
-                    if (pluginStorageEscapeByField.has(entry.key)) {
+                    if (pluginStorageEscapesByField.has(entry.key)) {
                         processedExternalEscapes.add(entry.key);
                     }
                 } else {
@@ -1539,9 +1539,9 @@ async function walkRisuSave(input, options = {}) {
                         entry.descriptor,
                         entry.key,
                         options.onPluginStorageEntry,
-                        pluginStorageEscapeByField.get(entry.key) ?? null
+                        pluginStorageEscapesByField.get(entry.key) ?? []
                     );
-                    if (pluginStorageEscapeByField.has(entry.key)) {
+                    if (pluginStorageEscapesByField.has(entry.key)) {
                         processedExternalEscapes.add(entry.key);
                     }
                 } else {
@@ -1583,26 +1583,34 @@ async function walkRisuSave(input, options = {}) {
                     await emitStreamingPluginStorageEntry(
                         options.onPluginStorageEntry,
                         escape.field,
-                        '__proto__',
+                        escape.key,
                         value
                     );
                     if (escape.field === 'pluginCustomStorage') pluginStats.values++;
                     else pluginStats.meta++;
-                } else {
-                    const current = remainder[escape.field];
+                }
+            }
+            if (!externalizePlugins) {
+                for (const field of ['pluginCustomStorage', 'pluginStorageMeta']) {
+                    const fieldEscapes = pluginStorageEscapeEnvelope.escapes
+                        .filter(escape => escape.field === field)
+                        .sort((left, right) => left.index - right.index);
+                    if (fieldEscapes.length === 0) continue;
+                    const current = remainder[field];
                     const sourceRecord = current && typeof current === 'object' && !Array.isArray(current)
                         ? current
                         : {};
-                    const record = {};
-                    const keys = Object.keys(sourceRecord);
-                    const insertAt = Math.min(escape.index, keys.length);
-                    for (let index = 0; index <= keys.length; index++) {
-                        if (index === insertAt) defineOwn(record, '__proto__', value);
-                        if (index < keys.length) {
-                            defineOwn(record, keys[index], sourceRecord[keys[index]]);
-                        }
+                    const entries = Object.keys(sourceRecord)
+                        .map(key => ({ key, value: sourceRecord[key] }));
+                    for (const escape of fieldEscapes) {
+                        entries.splice(Math.min(escape.index, entries.length), 0, {
+                            key: escape.key,
+                            value: escape.value,
+                        });
                     }
-                    remainder[escape.field] = record;
+                    const record = {};
+                    for (const entry of entries) defineOwn(record, entry.key, entry.value);
+                    remainder[field] = record;
                 }
             }
             if (pluginStorageEscapeEnvelope.originalField.present) {

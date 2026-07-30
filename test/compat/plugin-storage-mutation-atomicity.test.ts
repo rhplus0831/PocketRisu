@@ -10,9 +10,13 @@ import {
   type PluginStorageMutationResult,
 } from '../../src/ts/storage/pluginStorageMutation.js'
 import utilsPkg from '../../server/node/utils.cjs'
+import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
 
 const { encodeRisuSaveLegacy } = utilsPkg as {
   encodeRisuSaveLegacy: (value: unknown) => Uint8Array
+}
+const { encodePluginSaveStorageKey } = pluginSaveKeysPkg as {
+  encodePluginSaveStorageKey: (rawKey: string, prefix: string) => string
 }
 
 const RAW_KEY = 'aa1/atomic-key'
@@ -26,6 +30,9 @@ const DATABASE_KEY = 'database/database.bin'
 const LONG_RAW_KEY = 'v'.repeat(756)
 const LONG_VALUE_KEY = `pluginsave/${Buffer.from(LONG_RAW_KEY, 'utf-8').toString('base64url')}.json`
 const LONG_OWNER_KEY = `pluginsave-meta/${Buffer.from(LONG_RAW_KEY, 'utf-8').toString('base64url')}.json`
+const MALFORMED_RAW_KEY = '\uD800'
+const MALFORMED_VALUE_KEY = encodePluginSaveStorageKey(MALFORMED_RAW_KEY, 'pluginsave/')
+const MALFORMED_OWNER_KEY = encodePluginSaveStorageKey(MALFORMED_RAW_KEY, 'pluginsave-meta/')
 const servers: ServerHandle[] = []
 
 afterAll(async () => {
@@ -66,6 +73,32 @@ function seedActivePublication(saveDir: string): void {
       generation: STORAGE_GENERATION,
       valueKeys: [VALUE_KEY],
       metaKeys: [OWNER_KEY],
+    })), 1)
+    insert.run(DATABASE_KEY, Buffer.from(encodeRisuSaveLegacy({
+      characters: [],
+      optimizePluginMemory: true,
+      pluginStorageGeneration: STORAGE_GENERATION,
+      pluginCustomStorage: {},
+    })), 1)
+  } finally {
+    database.close()
+  }
+}
+
+function seedMalformedKeyPublication(saveDir: string): void {
+  const database = new Database(path.join(saveDir, 'risuai.db'))
+  try {
+    database.exec(`CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL, updated_at INTEGER NOT NULL)`)
+    const insert = database.prepare(
+      'INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+    )
+    insert.run(MALFORMED_VALUE_KEY, OLD_VALUE, 1)
+    insert.run(MALFORMED_OWNER_KEY, OLD_OWNER, 1)
+    insert.run(MANIFEST_KEY, Buffer.from(JSON.stringify({
+      version: 2,
+      generation: STORAGE_GENERATION,
+      valueKeys: [MALFORMED_VALUE_KEY],
+      metaKeys: [MALFORMED_OWNER_KEY],
     })), 1)
     insert.run(DATABASE_KEY, Buffer.from(encodeRisuSaveLegacy({
       characters: [],
@@ -241,6 +274,42 @@ async function mutateWithClientOutcome(
 }
 
 describe('atomic optimized plugin value and owner acknowledgement', () => {
+  test('mutates a tagged historical malformed key without colliding with valid Unicode', async () => {
+    const { server, client } = await boot(undefined, undefined, seedMalformedKeyPublication)
+    expect(MALFORMED_VALUE_KEY).not.toBe(encodePluginSaveStorageKey('�', 'pluginsave/'))
+
+    const nextValue = { generation: 'malformed-key-update' }
+    const response = await client.fetch('/api/plugin-storage/mutate', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': Buffer.from(MALFORMED_VALUE_KEY, 'utf-8').toString('hex'),
+        'x-plugin-storage-operation': 'set',
+        'x-plugin-storage-owner': Buffer.from('Legacy Recovery Plugin').toString('base64url'),
+        'x-plugin-storage-generation': STORAGE_GENERATION,
+      },
+      body: Buffer.from(JSON.stringify(nextValue)),
+    })
+
+    expect(response.status, await response.clone().text()).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      outcome: 'committed',
+      operation: 'set',
+    })
+    const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
+    try {
+      const read = sqlite.prepare('SELECT value FROM kv WHERE key = ?')
+      const value = read.get(MALFORMED_VALUE_KEY) as { value: Buffer }
+      const owner = read.get(MALFORMED_OWNER_KEY) as { value: Buffer }
+      expect(JSON.parse(Buffer.from(value.value).toString('utf-8'))).toEqual(nextValue)
+      expect(JSON.parse(Buffer.from(owner.value).toString('utf-8'))).toMatchObject({
+        plugin: 'Legacy Recovery Plugin',
+      })
+    } finally {
+      sqlite.close()
+    }
+  })
+
   test('upgrades a legacy manifest and preserves update versus delete-reinsert order', async () => {
     const { server, client } = await boot(undefined, undefined, seedOrderedLegacyPublication)
     const write = async (rawKey: string, operation: 'set' | 'remove') => {

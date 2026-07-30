@@ -13,6 +13,7 @@ import { decodeBackup } from './helpers/decode.js'
 import { encodeBackup } from './helpers/encode.js'
 import { decodeRisuDat } from './helpers/normalize.js'
 import utilsPkg from '../../server/node/utils.cjs'
+import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
 
 const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
 const PLUGIN_STORAGE_MANIFEST_KEY = 'plugin-storage/manifest.json'
@@ -21,6 +22,9 @@ const { decodeRisuSave, encodeRisuSaveLegacy } = utilsPkg as {
   decodeRisuSave: (value: Uint8Array) => Promise<any>
   encodeRisuSaveLegacy: (value: unknown) => Uint8Array
 }
+const { encodePluginSaveStorageKey } = pluginSaveKeysPkg as {
+  encodePluginSaveStorageKey: (rawKey: string, prefix: string) => string
+}
 const servers: ServerHandle[] = []
 
 afterAll(async () => {
@@ -28,7 +32,12 @@ afterAll(async () => {
 })
 
 function pluginStorageKey(prefix: 'pluginsave/' | 'pluginsave-meta/', rawKey: string): string {
-  return `${prefix}${Buffer.from(rawKey, 'utf-8').toString('base64url')}.json`
+  // Some boundary tests intentionally construct an oversized legacy physical
+  // row that the canonical writer must reject. Only malformed UTF-16 keys need
+  // the new tagged codec; well-formed rows retain their historical encoding.
+  return rawKey.isWellFormed()
+    ? `${prefix}${Buffer.from(rawKey).toString('base64url')}.json`
+    : encodePluginSaveStorageKey(rawKey, prefix)
 }
 
 function encodeRisuDat(database: Record<string, unknown>): Buffer {
@@ -666,6 +675,24 @@ describe('external plugin rows in backup archives', () => {
       value: pinnedProtoMeta,
       writable: true,
     })
+    for (const [key, value] of [
+      ['\uD800', { kind: 'pinned-high-surrogate-0' }],
+      ['�', { kind: 'pinned-replacement-character' }],
+      ['\uD801', { kind: 'pinned-high-surrogate-1' }],
+    ] as const) {
+      Object.defineProperty(initialValues, key, {
+        configurable: true,
+        enumerable: true,
+        value,
+        writable: true,
+      })
+    }
+    Object.defineProperty(initialMeta, '\uD800', {
+      configurable: true,
+      enumerable: true,
+      value: { plugin: 'Malformed Key Owner', updatedAt: 4 },
+      writable: true,
+    })
     const transition = await sourceClient.fetch('/api/plugin-storage/transition', {
       method: 'POST',
       headers: { 'content-type': 'application/octet-stream' },
@@ -717,6 +744,15 @@ describe('external plugin rows in backup archives', () => {
     expect(fullFolded.pluginCustomStorage.__proto__.negativeZero).toBe(0)
     expect(Object.is(fullFolded.pluginCustomStorage.__proto__.negativeZero, -0)).toBe(false)
     expect(fullFolded.pluginStorageMeta.__proto__.body).toHaveLength(2 * 1024 * 1024)
+    expect(fullFolded.pluginCustomStorage['\uD800']).toEqual({
+      kind: 'pinned-high-surrogate-0',
+    })
+    expect(fullFolded.pluginCustomStorage['�']).toEqual({
+      kind: 'pinned-replacement-character',
+    })
+    expect(fullFolded.pluginCustomStorage['\uD801']).toEqual({
+      kind: 'pinned-high-surrogate-1',
+    })
 
     const jobId = await startPartialExport(sourceClient)
     await waitForPartialExport(sourceClient, jobId, status => status.phase === 'assembling')
@@ -745,10 +781,14 @@ describe('external plugin rows in backup archives', () => {
       'ordinary/first',
       'constructor',
       '__proto__',
+      '\uD800',
+      '�',
+      '\uD801',
     ])
     expect(Object.keys(folded.pluginStorageMeta)).toEqual([
       'ordinary/first',
       '__proto__',
+      '\uD800',
     ])
     expect(Object.hasOwn(folded.pluginCustomStorage, '__proto__')).toBe(true)
     expect(Object.hasOwn(folded.pluginStorageMeta, '__proto__')).toBe(true)
@@ -761,6 +801,10 @@ describe('external plugin rows in backup archives', () => {
     expect(Object.is(folded.pluginCustomStorage.__proto__.negativeZero, -0)).toBe(false)
     expect(folded.pluginStorageMeta.__proto__.plugin).toBe('Pinned Proto Owner')
     expect(folded.pluginStorageMeta.__proto__.body).toHaveLength(2 * 1024 * 1024)
+    expect(folded.pluginCustomStorage['\uD800'].kind).toBe('pinned-high-surrogate-0')
+    expect(folded.pluginCustomStorage['�'].kind).toBe('pinned-replacement-character')
+    expect(folded.pluginCustomStorage['\uD801'].kind).toBe('pinned-high-surrogate-1')
+    expect(folded.pluginStorageMeta['\uD800'].plugin).toBe('Malformed Key Owner')
     expect(folded.__pocketRisuPluginStorageEscapesV1).toMatchObject({
       user: 'reserved-field-collision',
       nested: ['must', 'survive'],
@@ -783,12 +827,32 @@ describe('external plugin rows in backup archives', () => {
       destination.cwd,
       pluginStorageKey('pluginsave-meta/', '__proto__'),
     )!.toString('utf-8'))
+    const restoredMalformed = JSON.parse(readKvValue(
+      destination.cwd,
+      pluginStorageKey('pluginsave/', '\uD800'),
+    )!.toString('utf-8'))
+    const restoredReplacement = JSON.parse(readKvValue(
+      destination.cwd,
+      pluginStorageKey('pluginsave/', '�'),
+    )!.toString('utf-8'))
+    const restoredSecondMalformed = JSON.parse(readKvValue(
+      destination.cwd,
+      pluginStorageKey('pluginsave/', '\uD801'),
+    )!.toString('utf-8'))
+    const restoredMalformedMeta = JSON.parse(readKvValue(
+      destination.cwd,
+      pluginStorageKey('pluginsave-meta/', '\uD800'),
+    )!.toString('utf-8'))
     expect(restoredOrdinary).toEqual({ version: 'pinned', body: 'ordinary-value' })
     expect(restoredProto.kind).toBe('pinned-value-proto')
     expect(restoredProto.body).toHaveLength(3 * 1024 * 1024)
     expect(Object.is(restoredProto.negativeZero, -0)).toBe(false)
     expect(restoredProtoMeta.plugin).toBe('Pinned Proto Owner')
     expect(restoredProtoMeta.body).toHaveLength(2 * 1024 * 1024)
+    expect(restoredMalformed).toEqual({ kind: 'pinned-high-surrogate-0' })
+    expect(restoredReplacement).toEqual({ kind: 'pinned-replacement-character' })
+    expect(restoredSecondMalformed).toEqual({ kind: 'pinned-high-surrogate-1' })
+    expect(restoredMalformedMeta.plugin).toBe('Malformed Key Owner')
     const restoredDatabase = decodeRisuDat(
       readKvValue(destination.cwd, 'database/database.bin')!,
     )

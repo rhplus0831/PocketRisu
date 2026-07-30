@@ -1,5 +1,6 @@
 {
   "backupEntryNameMaxBytes": 1024,
   "valuePrefix": "pluginsave/",
-  "metaPrefix": "pluginsave-meta/"
+  "metaPrefix": "pluginsave-meta/",
+  "illFormedUtf16Tag": "utf16-v1."
 }

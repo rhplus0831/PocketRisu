@@ -8,9 +8,13 @@ import { createClient, type RisuClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { encodeBackup } from './helpers/encode.js'
 import utilsPkg from '../../server/node/utils.cjs'
+import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
 
 const { encodeRisuSaveLegacy } = utilsPkg as {
   encodeRisuSaveLegacy: (value: unknown) => Uint8Array
+}
+const { encodePluginSaveStorageKey } = pluginSaveKeysPkg as {
+  encodePluginSaveStorageKey: (key: string, prefix: string) => string
 }
 
 const servers: ServerHandle[] = []
@@ -19,8 +23,8 @@ afterAll(async () => Promise.allSettled(servers.map(server => server.cleanup()))
 const DATABASE_KEY = 'database/database.bin'
 const MANIFEST_KEY = 'plugin-storage/manifest.json'
 const GENERATION = 'pm3-viewer-generation'
-const valueKey = (key: string) => `pluginsave/${Buffer.from(key).toString('base64url')}.json`
-const ownerKey = (key: string) => `pluginsave-meta/${Buffer.from(key).toString('base64url')}.json`
+const valueKey = (key: string) => encodePluginSaveStorageKey(key, 'pluginsave/')
+const ownerKey = (key: string) => encodePluginSaveStorageKey(key, 'pluginsave-meta/')
 
 function seedViewer(
   saveDir: string,
@@ -223,6 +227,19 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
     ])
     expect(result.entries.map(entry => entry.key)).toContain('e\u0301')
     expect(result.entries.map(entry => entry.key)).toContain('\u00e9')
+  })
+
+  test('malformed legacy UTF-16 keys remain distinct and readable', async () => {
+    const keys = ['\uD800', '�', '\uD801']
+    const server = await spawnServer({
+      seedSave: async saveDir => { seedViewer(saveDir, keys.length, { keys }) },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+
+    const result = await readViewer(await viewer(client))
+    expect(result.entries.map(entry => entry.key)).toEqual(['\uD800', '\uD801', '�'])
+    expect(result.entries.map(entry => JSON.parse(entry.text).index)).toEqual([0, 2, 1])
   })
 
   test('NUL-bearing filter tuples cannot collide in canonical page tokens', async () => {

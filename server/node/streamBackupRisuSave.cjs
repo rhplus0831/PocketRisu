@@ -203,12 +203,12 @@ async function readArrayDescriptors(source, descriptor, label) {
     return descriptors;
 }
 
-function keyPlan(entries, rows, protoIndex = null) {
+function keyPlan(entries, rows, priorEscapes = []) {
     const skeleton = Object.create(null);
     const valueByKey = new Map();
     const baseKeys = entries.map(entry => entry.key);
-    if (protoIndex !== null) {
-        baseKeys.splice(Math.min(protoIndex, baseKeys.length), 0, '__proto__');
+    for (const escape of [...priorEscapes].sort((left, right) => left.index - right.index)) {
+        baseKeys.splice(Math.min(escape.index, baseKeys.length), 0, escape.key);
     }
     for (const key of baseKeys) {
         Object.defineProperty(skeleton, key, {
@@ -219,6 +219,12 @@ function keyPlan(entries, rows, protoIndex = null) {
         });
     }
     for (const entry of entries) valueByKey.set(entry.key, { kind: 'descriptor', ...entry });
+    for (const escape of priorEscapes) {
+        valueByKey.set(escape.key, {
+            kind: 'escaped-descriptor',
+            descriptor: escape.serializedDescriptor,
+        });
+    }
     for (const row of rows) {
         Object.defineProperty(skeleton, row.key, {
             configurable: true,
@@ -236,7 +242,7 @@ async function parseExistingEscapeEnvelope(source, descriptor) {
     if (!values || values.length !== 4) return null;
     const marker = await decodeMetadata(source, values[0], 'plugin escape marker');
     const version = await decodeMetadata(source, values[1], 'plugin escape version');
-    if (marker !== pluginStorageLegacyEscapeMarker || version !== 1) return null;
+    if (marker !== pluginStorageLegacyEscapeMarker || (version !== 1 && version !== 2)) return null;
     const escapeDescriptors = await readArrayDescriptors(
         source,
         values[3],
@@ -244,18 +250,37 @@ async function parseExistingEscapeEnvelope(source, descriptor) {
     );
     if (!escapeDescriptors) return null;
     const escapes = new Map();
+    const seen = new Set();
     for (const entryDescriptor of escapeDescriptors) {
         const entry = await readArrayDescriptors(source, entryDescriptor, 'plugin escape entry');
-        if (!entry || entry.length !== 3) return null;
+        if (!entry || entry.length !== (version === 1 ? 3 : 4)) return null;
         const field = await decodeMetadata(source, entry[0], 'plugin escape field');
         const index = await decodeMetadata(source, entry[1], 'plugin escape index');
+        let key = '__proto__';
+        if (version === 2) {
+            const serializedKey = await decodeMetadata(source, entry[2], 'plugin escape key');
+            if (typeof serializedKey !== 'string') return null;
+            try {
+                key = JSON.parse(serializedKey);
+            } catch {
+                return null;
+            }
+            if (typeof key !== 'string'
+                || JSON.stringify(key) !== serializedKey
+                || (key !== '__proto__' && key.isWellFormed())) return null;
+        }
+        const identity = `${field}\0${key}`;
         if ((field !== 'pluginCustomStorage' && field !== 'pluginStorageMeta')
-            || !Number.isInteger(index) || index < 0 || escapes.has(field)) return null;
-        escapes.set(field, {
+            || !Number.isInteger(index) || index < 0 || seen.has(identity)) return null;
+        seen.add(identity);
+        const fieldEscapes = escapes.get(field) ?? [];
+        fieldEscapes.push({
             field,
             index,
-            serializedDescriptor: entry[2],
+            key,
+            serializedDescriptor: entry[version === 1 ? 2 : 3],
         });
+        escapes.set(field, fieldEscapes);
     }
     return {
         originalDescriptor: values[2],
@@ -1229,24 +1254,29 @@ async function streamBackupRisuSaveToFile({
                         pluginPlans.set(field, { primitiveDescriptor: rootEntry.descriptor });
                         continue;
                     }
-                    const priorEscape = existingEnvelope?.escapes.get(field) ?? null;
-                    const plan = keyPlan(inlineEntries, rows, priorEscape?.index ?? null);
-                    const protoIndex = plan.keys.indexOf('__proto__');
-                    if (protoIndex !== -1) {
-                        const protoValue = plan.valueByKey.get('__proto__');
-                        plan.keys.splice(protoIndex, 1);
+                    const priorEscapes = existingEnvelope?.escapes.get(field) ?? [];
+                    const plan = keyPlan(inlineEntries, rows, priorEscapes);
+                    const retainedKeys = [];
+                    for (const [index, key] of plan.keys.entries()) {
+                        if (key !== '__proto__' && key.isWellFormed()) {
+                            retainedKeys.push(key);
+                            continue;
+                        }
+                        const escapedValue = plan.valueByKey.get(key);
                         outputEscapes.push({
                             field,
-                            index: protoIndex,
-                            value: protoValue?.kind === 'row'
-                                ? { kind: 'row', row: protoValue.row }
-                                : priorEscape
-                                    ? { kind: 'descriptor', descriptor: priorEscape.serializedDescriptor }
-                                    : protoValue?.kind === 'descriptor'
-                                        ? { kind: 'inline', descriptor: protoValue.descriptor }
+                            index,
+                            key,
+                            value: escapedValue?.kind === 'row'
+                                ? { kind: 'row', row: escapedValue.row }
+                                : escapedValue?.kind === 'escaped-descriptor'
+                                    ? { kind: 'descriptor', descriptor: escapedValue.descriptor }
+                                    : escapedValue?.kind === 'descriptor'
+                                        ? { kind: 'inline', descriptor: escapedValue.descriptor }
                                         : null,
                         });
                     }
+                    plan.keys = retainedKeys;
                     pluginPlans.set(field, plan);
                 }
             }
@@ -1303,7 +1333,7 @@ async function streamBackupRisuSaveToFile({
                     && pluginStorage && hasEscapes) {
                     await writer.write(arrayHeader(4));
                     await writer.write(encoded(pluginStorageLegacyEscapeMarker));
-                    await writer.write(encoded(1));
+                    await writer.write(encoded(2));
                     if (existingEnvelope?.originalDescriptor) {
                         await writer.copyDescriptor(source, existingEnvelope.originalDescriptor);
                     } else if (rootByKey.has(pluginStorageLegacyEscapeField)) {
@@ -1318,11 +1348,12 @@ async function streamBackupRisuSaveToFile({
                     await writer.write(arrayHeader(outputEscapes.length));
                     for (const escape of outputEscapes) {
                         if (!escape.value) {
-                            throw new Error('Inline __proto__ plugin value lacks a bounded escape');
+                            throw new Error('Inline plugin value lacks a bounded key escape');
                         }
-                        await writer.write(arrayHeader(3));
+                        await writer.write(arrayHeader(4));
                         await writer.write(encoded(escape.field));
                         await writer.write(encoded(escape.index));
+                        await writer.write(encoded(JSON.stringify(escape.key)));
                         if (escape.value.kind === 'row') {
                             await writeJsonRowAsSerializedEscape(
                                 writer,

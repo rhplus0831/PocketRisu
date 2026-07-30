@@ -12,8 +12,37 @@ vi.mock('./chatStorage', () => ({
 }))
 vi.mock('../globalApi.svelte', () => ({ forageStorage: { realStorage: null } }))
 
-const { diffArrayWithIdGuard, RisuSavePatcher } = await import('./risuSave')
+const {
+    decodeRisuSave,
+    diffArrayWithIdGuard,
+    encodeRisuSaveLegacy,
+    RisuSavePatcher,
+} = await import('./risuSave')
 const { compare } = await import('fast-json-patch')
+
+describe('plugin storage legacy key envelope', () => {
+    test('round-trips multiple malformed UTF-16 keys distinctly and in order', async () => {
+        const rawKeys = ['before', '\uD800', '__proto__', '\uD801', '�', 'after']
+        const pluginCustomStorage: Record<string, unknown> = {}
+        for (const [index, key] of rawKeys.entries()) {
+            Object.defineProperty(pluginCustomStorage, key, {
+                configurable: true,
+                enumerable: true,
+                value: { index },
+                writable: true,
+            })
+        }
+
+        const encoded = encodeRisuSaveLegacy({ characters: [], pluginCustomStorage })
+        const decoded = await decodeRisuSave(encoded)
+
+        expect(encoded[10]).toBe(10)
+        expect(Reflect.ownKeys(decoded.pluginCustomStorage)).toEqual(rawKeys)
+        expect(rawKeys.map(key => decoded.pluginCustomStorage[key])).toEqual(
+            rawKeys.map((_key, index) => ({ index })),
+        )
+    })
+})
 
 // ──────────────────────────────────────────────────────────────────────────
 // diffArrayWithIdGuard — direct tests on the structural-vs-elementwise pivot.

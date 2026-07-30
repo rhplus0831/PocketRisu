@@ -471,20 +471,6 @@ interface AbortSignalRef {
  * self-contained because its compiled source is installed in the guest.
  */
 export function validateV3DatabaseMutationForTransport(input: unknown): void {
-    const assertTransportKey = (value: string): void => {
-        for (let index = 0; index < value.length; index += 1) {
-            const codeUnit = value.charCodeAt(index);
-            if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
-                const trailing = value.charCodeAt(index + 1);
-                if (!(trailing >= 0xDC00 && trailing <= 0xDFFF)) {
-                    throw new Error("Plugin storage keys must be well-formed Unicode.");
-                }
-                index += 1;
-            } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
-                throw new Error("Plugin storage keys must be well-formed Unicode.");
-            }
-        }
-    };
     if (input === null || typeof input !== "object" || Array.isArray(input)) {
         throw new TypeError("V3 database updates require a DatabaseSubset object.");
     }
@@ -513,7 +499,6 @@ export function validateV3DatabaseMutationForTransport(input: unknown): void {
             if (typeof storageKey !== "string") {
                 throw new TypeError("pluginCustomStorage does not accept symbol keys.");
             }
-            assertTransportKey(storageKey);
             const storageDescriptor = Reflect.getOwnPropertyDescriptor(storage, storageKey);
             if (!storageDescriptor || !("value" in storageDescriptor)) {
                 throw new TypeError(
@@ -537,20 +522,6 @@ export function validateV3DatabaseMutationForTransport(input: unknown): void {
  */
 export function snapshotV3PluginStorageBatchForTransport(input: unknown): unknown[] {
     const revisionPattern = /^sha256:[0-9a-f]{64}$/;
-    const assertWellFormed = (value: string): void => {
-        for (let index = 0; index < value.length; index += 1) {
-            const codeUnit = value.charCodeAt(index);
-            if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
-                const trailing = value.charCodeAt(index + 1);
-                if (!(trailing >= 0xDC00 && trailing <= 0xDFFF)) {
-                    throw new TypeError("Plugin storage keys must be well-formed Unicode.");
-                }
-                index += 1;
-            } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
-                throw new TypeError("Plugin storage keys must be well-formed Unicode.");
-            }
-        }
-    };
     const readDataDescriptor = (
         object: object,
         key: PropertyKey,
@@ -665,7 +636,6 @@ export function snapshotV3PluginStorageBatchForTransport(input: unknown): unknow
         if (typeof key !== "string") {
             throw new TypeError(`Plugin storage atomicBatch operation ${index} requires a string key.`);
         }
-        assertWellFormed(key);
         if (seenKeys.has(key)) {
             throw new TypeError(`Plugin storage atomicBatch has duplicate key ${key}.`);
         }

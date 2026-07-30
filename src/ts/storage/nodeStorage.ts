@@ -3012,7 +3012,7 @@ export class NodeStorage{
                 if (!meta || done || !exactKeys(record, [
                     'event', 'key', 'owner', 'text', 'size', 'valueType', 'revision', 'contentHash',
                 ])
-                    || typeof record.key !== 'string' || !record.key.isWellFormed()
+                    || typeof record.key !== 'string'
                     || (record.owner !== null
                         && (typeof record.owner !== 'string'
                             || record.owner.length === 0

@@ -5,6 +5,7 @@ const {
     BACKUP_ENTRY_NAME_MAX_BYTES,
     PLUGIN_SAVE_PREFIX,
     PLUGIN_SAVE_META_PREFIX,
+    PLUGIN_SAVE_ILL_FORMED_UTF16_TAG,
     PLUGIN_STORAGE_MANIFEST_VERSION,
     createPluginStorageManifest,
     decodePluginSaveStorageKey,
@@ -14,6 +15,7 @@ const {
     BACKUP_ENTRY_NAME_MAX_BYTES: number
     PLUGIN_SAVE_PREFIX: string
     PLUGIN_SAVE_META_PREFIX: string
+    PLUGIN_SAVE_ILL_FORMED_UTF16_TAG: string
     PLUGIN_STORAGE_MANIFEST_VERSION: number
     createPluginStorageManifest: (
         generation: string,
@@ -28,11 +30,18 @@ const {
 }
 
 describe('plugin save storage keys', () => {
-    it('rejects lone surrogates before UTF-8 encoding', () => {
-        expect(() => encodePluginSaveStorageKey('\uD800', PLUGIN_SAVE_PREFIX))
-            .toThrow('well-formed Unicode')
-        expect(() => encodePluginSaveStorageKey('\uD801', PLUGIN_SAVE_META_PREFIX))
-            .toThrow('well-formed Unicode')
+    it('losslessly separates historical lone surrogates from valid Unicode', () => {
+        const keys = ['\uD800', '\uD801', '\uDC00', '�'].map(rawKey => (
+            encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_PREFIX)
+        ))
+
+        expect(new Set(keys).size).toBe(keys.length)
+        expect(keys[0]).toContain(`/${PLUGIN_SAVE_ILL_FORMED_UTF16_TAG}`)
+        expect(keys[3]).not.toContain(`/${PLUGIN_SAVE_ILL_FORMED_UTF16_TAG}`)
+        for (let index = 0; index < keys.length; index += 1) {
+            expect(decodePluginSaveStorageKey(keys[index], PLUGIN_SAVE_PREFIX))
+                .toBe(['\uD800', '\uD801', '\uDC00', '�'][index])
+        }
     })
 
     it.each([
@@ -47,6 +56,10 @@ describe('plugin save storage keys', () => {
     it('continues to reject non-canonical encoded forms', () => {
         expect(() => decodePluginSaveStorageKey('pluginsave/_w.json', PLUGIN_SAVE_PREFIX))
             .toThrow('Non-canonical plugin storage key')
+        expect(() => decodePluginSaveStorageKey(
+            `pluginsave/${PLUGIN_SAVE_ILL_FORMED_UTF16_TAG}AGE.json`,
+            PLUGIN_SAVE_PREFIX,
+        )).toThrow('Non-canonical plugin storage key')
     })
 
     it('enforces exact value and metadata archive-name boundaries', () => {

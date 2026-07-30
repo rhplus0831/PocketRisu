@@ -24,12 +24,14 @@ const {
   decodeRisuSave,
   encodeRisuSaveLegacy,
   magicHeader,
+  magicPluginStorageHeader,
   magicStreamCompressedHeader,
 } = utilsPkg as any
 
 const packr = new Packr({ useRecords: false })
 const SPECIAL_PLUGIN_STORAGE_KEYS = [
-  '__proto__', 'constructor', 'prototype', 'toString', 'hasOwnProperty', '',
+  '__proto__', 'constructor', '\uD800', '�', '\uD801',
+  'prototype', 'toString', 'hasOwnProperty', '',
 ] as const
 const tempDirs: string[] = []
 const servers: ServerHandle[] = []
@@ -371,6 +373,32 @@ describe('disk-backed streaming Risu ingest', () => {
     expect(walked.remainder.__pocketRisuPluginStorageEscapesV1).toEqual(validCollision)
     expect(walked.remainder.pluginCustomStorage.safe).toBe('external')
     expect(Object.hasOwn(walked.remainder.pluginCustomStorage, '__proto__')).toBe(false)
+  })
+
+  test('restores a marked v1 __proto__ sidecar written by older PocketRisu builds', async () => {
+    const database: Record<string, unknown> = {
+      characters: [],
+      optimizePluginMemory: false,
+      pluginCustomStorage: { before: 'before', after: 'after' },
+      __pocketRisuPluginStorageEscapesV1: [
+        'PocketRisu.plugin-storage-escapes',
+        1,
+        null,
+        [['pluginCustomStorage', 1, [1, '"legacy-proto"']]],
+      ],
+    }
+    const raw = Buffer.concat([
+      Buffer.from(magicPluginStorageHeader),
+      packr.encode(database),
+    ])
+
+    const walked = await walkRisuSave(raw)
+
+    expect(Object.keys(walked.remainder.pluginCustomStorage)).toEqual([
+      'before', '__proto__', 'after',
+    ])
+    expect(walked.remainder.pluginCustomStorage.__proto__).toBe('legacy-proto')
+    expect(Object.hasOwn(walked.remainder, '__pocketRisuPluginStorageEscapesV1')).toBe(false)
   })
 
   test('rejects a truncated raw spool', async () => {

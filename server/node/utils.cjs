@@ -138,11 +138,12 @@ function createLegacyPluginStorageEnvelope(data, escapes) {
     if (escapes.length === 0) return null;
     return [
         pluginStorageLegacyEscapeMarker,
-        1,
+        2,
         hasReservedField ? serializeLegacyEscapeValue(data[pluginStorageLegacyEscapeField]) : null,
         escapes.map(escape => [
             escape.field,
             escape.index,
+            JSON.stringify(escape.key),
             serializeLegacyEscapeValue(escape.value),
         ]),
     ];
@@ -152,7 +153,7 @@ function parseLegacyPluginStorageEnvelope(value) {
     if (!Array.isArray(value)
         || value.length !== 4
         || value[0] !== pluginStorageLegacyEscapeMarker
-        || value[1] !== 1
+        || (value[1] !== 1 && value[1] !== 2)
         || (value[2] !== null && !Array.isArray(value[2]))
         || !Array.isArray(value[3])
         || (value[2] === null && value[3].length === 0)) {
@@ -166,18 +167,32 @@ function parseLegacyPluginStorageEnvelope(value) {
     const seen = new Set();
     const escapes = [];
     for (const entry of value[3]) {
+        const version = value[1];
         if (!Array.isArray(entry)
-            || entry.length !== 3
+            || entry.length !== (version === 1 ? 3 : 4)
             || (entry[0] !== 'pluginCustomStorage' && entry[0] !== 'pluginStorageMeta')
             || !Number.isInteger(entry[1])
-            || entry[1] < 0
-            || seen.has(entry[0])) {
+            || entry[1] < 0) {
             return null;
         }
-        const parsed = deserializeLegacyEscapeValue(entry[2]);
+        let key = '__proto__';
+        if (version === 2) {
+            if (typeof entry[2] !== 'string') return null;
+            try {
+                key = JSON.parse(entry[2]);
+            } catch {
+                return null;
+            }
+            if (typeof key !== 'string'
+                || JSON.stringify(key) !== entry[2]
+                || (key !== '__proto__' && key.isWellFormed())) return null;
+        }
+        const identity = `${entry[0]}\0${key}`;
+        if (seen.has(identity)) return null;
+        const parsed = deserializeLegacyEscapeValue(entry[version === 1 ? 2 : 3]);
         if (!parsed.valid) return null;
-        seen.add(entry[0]);
-        escapes.push({ field: entry[0], index: entry[1], value: parsed.value });
+        seen.add(identity);
+        escapes.push({ field: entry[0], index: entry[1], key, value: parsed.value });
     }
     return {
         originalField: { present: original.present, value: original.value },
@@ -190,15 +205,22 @@ function prepareLegacyPluginStorageKeys(data) {
     let prepared = data;
     for (const field of ['pluginCustomStorage', 'pluginStorageMeta']) {
         const record = data?.[field];
-        if (!hasOwn(record, '__proto__')) continue;
+        const keys = record && typeof record === 'object' && !Array.isArray(record)
+            ? Object.keys(record)
+            : [];
+        const escapedKeys = keys.filter(key => key === '__proto__' || !key.isWellFormed());
+        if (escapedKeys.length === 0) continue;
         if (prepared === data) prepared = { ...data };
         const recordCopy = copySafeRecord(record);
-        escapes.push({
-            field,
-            index: Object.keys(record).indexOf('__proto__'),
-            value: recordCopy.__proto__,
-        });
-        delete recordCopy.__proto__;
+        for (const key of escapedKeys) {
+            escapes.push({
+                field,
+                index: keys.indexOf(key),
+                key,
+                value: recordCopy[key],
+            });
+            delete recordCopy[key];
+        }
         prepared[field] = recordCopy;
     }
     const envelope = createLegacyPluginStorageEnvelope(data, escapes);
@@ -213,16 +235,22 @@ function restoreLegacyPluginStorageKeys(data) {
     if (!hasOwn(data, pluginStorageLegacyEscapeField)) return data;
     const envelope = parseLegacyPluginStorageEnvelope(data[pluginStorageLegacyEscapeField]);
     if (!envelope) return data;
-    for (const escape of envelope.escapes) {
-        const source = data[escape.field] ?? {};
+    for (const field of ['pluginCustomStorage', 'pluginStorageMeta']) {
+        const fieldEscapes = envelope.escapes
+            .filter(escape => escape.field === field)
+            .sort((left, right) => left.index - right.index);
+        if (fieldEscapes.length === 0) continue;
+        const source = data[field] ?? {};
         const record = {};
-        const keys = Object.keys(source);
-        const insertAt = Math.min(escape.index, keys.length);
-        for (let index = 0; index <= keys.length; index++) {
-            if (index === insertAt) defineOwn(record, '__proto__', escape.value);
-            if (index < keys.length) defineOwn(record, keys[index], source[keys[index]]);
+        const entries = Object.keys(source).map(key => ({ key, value: source[key] }));
+        for (const escape of fieldEscapes) {
+            entries.splice(Math.min(escape.index, entries.length), 0, {
+                key: escape.key,
+                value: escape.value,
+            });
         }
-        data[escape.field] = record;
+        for (const entry of entries) defineOwn(record, entry.key, entry.value);
+        data[field] = record;
     }
     if (envelope.originalField.present) {
         defineOwn(data, pluginStorageLegacyEscapeField, envelope.originalField.value);

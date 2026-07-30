@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **60** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, **4** are intentional compatibility changes, and **34** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **59** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, **4** are intentional compatibility changes, and **35** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -27,7 +27,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [Ill-formed legacy plugin keys poison storage](compatibility/legacy-plugin-storage-key-compatibility.md) | compat | Open | Unrelated V3 mutations and enumeration can fail, leaving old values hard to migrate. | Requires a historical key containing malformed UTF-16. |
 | [Legacy hash-looking assets become unwritable](compatibility/legacy-hash-named-assets-become-unwritable.md) | compat | Open | A readable migrated asset cannot be rewritten or included in partial exports. | Requires a historical 64-lowercase-hex filename whose bytes do not match the name. |
 | [The plugin bridge retains a 30-minute deadline](compatibility/plugin-bridge-residual-30-minute-deadline.md) | compat | Open | Long model/chat/storage calls reject while non-abortable host work may continue. | Requires one legitimate RPC to run longer than 30 minutes. |
 | [Optimized storage limits key length](compatibility/optimized-plugin-storage-key-length-limit.md) | compat | Open | Optimization or later writes reject a key that inline storage accepted. | Requires an unusually long owned key at the 752/753-byte boundary. |
@@ -131,6 +130,7 @@ None currently open.
 
 | Finding | Former harm | Note |
 |---|---|---|
+| [Ill-formed legacy plugin keys poisoned storage](compatibility/legacy-plugin-storage-key-compatibility.md) | One historical lone-surrogate key could block unrelated V3 operations and could not survive optimized storage or backup boundaries losslessly. | Fixed 2026-07-30 with a tagged UTF-16-code-unit row codec, a backward-compatible MessagePack escape envelope, isolated inline operations, and end-to-end mutation/viewer/transition/backup coverage. |
 | [Inline rich values broke enumeration](compatibility/inline-plugin-storage-enumeration-rich-values.md) | One accepted value could poison `keys`, `key`, `length`, versioned reads, or viewer pages. | Fixed 2026-07-30 with value-independent key enumeration, structured-clone viewer/versioned snapshots, rich-value revision tokens, and full API-matrix coverage. |
 | [Large opaque save rows were rejected](compatibility/save-folder-opaque-row-32mib-cap.md) | Valid save folders with a generic or plugin-metadata row above 32 MiB could not be restored. | Fixed 2026-07-30 with namespace-independent protected chunk storage, file-backed opaque publication, streaming plugin-metadata validation/owner indexing, and 32 MiB+1 ZIP/directory restart coverage. |
 | [Large RISUSAVE block databases were rejected](compatibility/legacy-risusave-64mib-import-cap.md) | A retained main/upstream save or archive could not be imported when its block database exceeded 64 MiB. | Fixed 2026-07-30 with bounded disk-backed block conversion, file-spooled REMOTE resolution, streaming database ingestion, and exact 64 MiB + 1 archive/save-folder coverage. |

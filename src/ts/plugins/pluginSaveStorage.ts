@@ -6,12 +6,10 @@ import {
     clearExternalizedPluginStorage,
     clearPersistentPrefix,
     commitPersistentPluginStorageMutation,
-    decodeStorageKeyComponent,
     getPersistentStorageFreeBytes,
     finalizePersistentPluginStorageTransition,
     listPersistentEntriesWithSizes,
     listPersistentKeys,
-    makeEncodedStorageKey,
     mutatePersistentPluginStorage,
     preparePersistentJson,
     readPersistentPluginStorageManifestSnapshot,
@@ -45,6 +43,7 @@ import { sha256OwnedBytes } from "../storage/resourceCache";
 import { safeStructuredClone } from "../polyfill";
 import { Packr } from "msgpackr/index-no-eval";
 import {
+    decodePluginSaveStorageKey,
     makeArchiveSafePluginSaveStorageKey,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_SAVE_PREFIX,
@@ -341,9 +340,7 @@ async function withPluginSaveStorageScopes<T>(
 function normalizePluginStorageKey(key: unknown): string {
     // The inline object backend historically applies ordinary property-key
     // coercion. Do it before routing so optimized mode has identical behavior.
-    const normalized = String(key);
-    assertWellFormedUnicode(normalized);
-    return normalized;
+    return String(key);
 }
 
 /**
@@ -392,9 +389,14 @@ export function withPluginSaveStorageKeySetLock<T>(
 }
 
 function decodeListedStorageKey(fullKey: string, prefix: string): string | null {
-    if (!fullKey.startsWith(prefix) || !fullKey.endsWith(".json")) return null;
-    const encoded = fullKey.slice(prefix.length, -".json".length);
-    return decodeStorageKeyComponent(encoded);
+    try {
+        return decodePluginSaveStorageKey(
+            fullKey,
+            prefix as PluginSaveStoragePrefix,
+        );
+    } catch {
+        return null;
+    }
 }
 
 function normalizeManifestKeys(value: unknown, prefix: string): string[] | null {
@@ -675,7 +677,6 @@ function validatedPluginStorageRecordKeys(
         if (typeof key !== "string") {
             throw new TypeError(`${fieldName} does not accept symbol keys.`);
         }
-        assertWellFormedUnicode(key);
         const descriptor = Reflect.getOwnPropertyDescriptor(source, key);
         if (!descriptor || !("value" in descriptor)) {
             throw new TypeError(`${fieldName} does not accept an accessor for ${key}.`);
@@ -2658,7 +2659,10 @@ export async function getPluginSaveStorageOwners(
         const entries = await Promise.all(ownership.metaKeys.map(async fullKey => {
             const key = decodeListedStorageKey(fullKey, PLUGIN_SAVE_META_PREFIX);
             if (key === null) return null;
-            if (!activeValues.has(makeEncodedStorageKey(PLUGIN_SAVE_PREFIX, key))) return null;
+            if (!activeValues.has(makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_PREFIX,
+                key,
+            ))) return null;
             const record = await readGenerationBoundPluginStorageJson<{ plugin?: string }>(
                 readPersistentJson,
                 fullKey,
@@ -2847,7 +2851,6 @@ function measureInlineTransitionEntries(
         if (typeof key !== "string") {
             throw new TypeError(`${fieldName} does not accept symbol keys.`);
         }
-        assertWellFormedUnicode(key);
         const descriptor = Reflect.getOwnPropertyDescriptor(source, key);
         if (!descriptor || !("value" in descriptor)) {
             throw new TypeError(`${fieldName} does not accept an accessor for ${key}.`);

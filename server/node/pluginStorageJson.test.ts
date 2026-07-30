@@ -5,6 +5,7 @@ const require = createRequire(import.meta.url)
 const {
     PluginStorageValidationError,
     createPluginStorageOwnerScanner,
+    encodeValidatedPluginStorageKey,
     parsePluginStorageJsonBuffer,
     snapshotPluginStorageRecord,
     snapshotPluginStorageJson,
@@ -19,6 +20,7 @@ const {
         push: (bytes: Uint8Array) => void
         finish: () => string | null
     }
+    encodeValidatedPluginStorageKey: (rawKey: string, prefix: string) => string
     parsePluginStorageJsonBuffer: (value: Uint8Array, key?: string) => unknown
     snapshotPluginStorageRecord: (
         value: unknown,
@@ -70,6 +72,26 @@ describe('plugin storage JSON server boundary', () => {
                 nested: ['safe', 0],
                 ['__proto__']: { own: true },
             })
+    })
+
+    it('snapshots distinct malformed UTF-16 keys without poisoning valid rows', () => {
+        const rawKeys = ['\uD800', '\uD801', '�', 'valid']
+        const source = Object.fromEntries(rawKeys.map((key, index) => [key, { index }]))
+
+        const snapshot = snapshotPluginStorageRecord(
+            source,
+            'pluginCustomStorage',
+            'pluginsave/',
+        )
+        const storageKeys = rawKeys.map(key => (
+            encodeValidatedPluginStorageKey(key, 'pluginsave/')
+        ))
+
+        expect(Reflect.ownKeys(snapshot)).toEqual(rawKeys)
+        expect(new Set(storageKeys).size).toBe(rawKeys.length)
+        expect(storageKeys.slice(0, 2).every(key => key.includes('/utf16-v1.'))).toBe(true)
+        expect(validatePluginStorageRow(storageKeys[0], Buffer.from('{"legacy":true}')))
+            .toEqual({ legacy: true })
     })
 
     it.each([

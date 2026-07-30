@@ -943,13 +943,11 @@ describe("V3 mode-aware database bridge", () => {
     );
 
     test.each([false, true])(
-        "rejects malformed Unicode replacement keys before mutating optimized mode %s",
+        "preserves malformed Unicode replacement keys in optimized mode %s",
         async (optimized) => {
             testState.database.optimizePluginMemory = optimized;
             testState.database.pluginCustomStorage = { inlineExisting: { retained: true } };
             storageMocks.persistent.set(storageKey("externalExisting"), { retained: true });
-            const beforePersistent = new Map(storageMocks.persistent);
-            const beforeInline = cloneJson(testState.database.pluginCustomStorage);
             const malformed = {} as Record<string, unknown>;
             Object.defineProperty(malformed, "\uD800", {
                 configurable: true,
@@ -962,11 +960,14 @@ describe("V3 mode-aware database bridge", () => {
             await expect(bridge.setDatabaseLite({
                 pluginCustomStorage: malformed,
                 temperature: 99,
-            })).rejects.toThrow("well-formed Unicode");
+            })).resolves.toBeUndefined();
 
-            expect(testState.database.temperature).toBe(10);
-            expect(testState.database.pluginCustomStorage).toEqual(beforeInline);
-            expect(storageMocks.persistent).toEqual(beforePersistent);
+            const snapshot = await bridge.getDatabase(["pluginCustomStorage", "temperature"]);
+            const snapshotStorage = snapshot.pluginCustomStorage as Record<string, unknown>;
+            expect(snapshot.temperature).toBe(99);
+            expect(Reflect.ownKeys(snapshotStorage)).toEqual(["\uD800"]);
+            expect(snapshotStorage["\uD800"]).toEqual({ invalid: true });
+            expect(snapshotStorage.externalExisting).toBeUndefined();
         },
     );
 
@@ -1113,7 +1114,7 @@ describe("V3 mode-aware database bridge", () => {
         });
         expect(() => validateV3DatabaseMutationForTransport({
             pluginCustomStorage: malformedUnicode,
-        })).toThrow("well-formed Unicode");
+        })).not.toThrow();
     });
 
     test("guest atomicBatch transport snapshots values without invoking user code", () => {
@@ -1167,9 +1168,9 @@ describe("V3 mode-aware database bridge", () => {
         operation[Symbol("hidden")] = true;
         expect(() => snapshotV3PluginStorageBatchForTransport([operation])).toThrow("symbol key");
         expect(() => snapshotV3PluginStorageBatchForTransport(new Array(1))).toThrow("dense");
-        expect(() => snapshotV3PluginStorageBatchForTransport([
+        expect(snapshotV3PluginStorageBatchForTransport([
             { type: "set", key: "\uD800", value: true },
-        ])).toThrow("well-formed Unicode");
+        ])).toEqual([{ type: "set", key: "\uD800", value: true }]);
     });
 
     test("scrubs every Object.prototype-named value and owner hidden by live Svelte state", async () => {

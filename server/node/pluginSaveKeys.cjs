@@ -3,6 +3,7 @@ const policy = require('../../shared/plugin-save-key-policy.json');
 const BACKUP_ENTRY_NAME_MAX_BYTES = policy.backupEntryNameMaxBytes;
 const PLUGIN_SAVE_PREFIX = policy.valuePrefix;
 const PLUGIN_SAVE_META_PREFIX = policy.metaPrefix;
+const PLUGIN_SAVE_ILL_FORMED_UTF16_TAG = policy.illFormedUtf16Tag;
 const PLUGIN_STORAGE_FOLDED_MARKER = 'pluginStorageFolded';
 const PLUGIN_STORAGE_GENERATION_FIELD = 'pluginStorageGeneration';
 const PLUGIN_STORAGE_MANIFEST_KEY = 'plugin-storage/manifest.json';
@@ -22,24 +23,53 @@ function decodePluginSaveStorageKey(storageKey, prefix) {
     if (!storageKey.startsWith(prefix) || !storageKey.endsWith('.json')) {
         throw new Error(`Invalid external plugin storage key: ${storageKey}`);
     }
-    const encoded = storageKey.slice(prefix.length, -'.json'.length);
+    const component = storageKey.slice(prefix.length, -'.json'.length);
+    const taggedUtf16 = component.startsWith(PLUGIN_SAVE_ILL_FORMED_UTF16_TAG);
+    const encoded = taggedUtf16
+        ? component.slice(PLUGIN_SAVE_ILL_FORMED_UTF16_TAG.length)
+        : component;
     if (!/^[A-Za-z0-9_-]*$/.test(encoded)) {
         throw new Error(`Invalid encoded plugin storage key: ${storageKey}`);
     }
-    const decoded = Buffer.from(encoded, 'base64url').toString('utf-8');
-    if (Buffer.from(decoded, 'utf-8').toString('base64url') !== encoded) {
+    const bytes = Buffer.from(encoded, 'base64url');
+    if (bytes.toString('base64url') !== encoded) {
+        throw new Error(`Non-canonical plugin storage key: ${storageKey}`);
+    }
+    if (taggedUtf16) {
+        if (bytes.length === 0 || bytes.length % 2 !== 0) {
+            throw new Error(`Invalid UTF-16 plugin storage key: ${storageKey}`);
+        }
+        let decoded = '';
+        for (let index = 0; index < bytes.length; index += 2) {
+            decoded += String.fromCharCode(bytes.readUInt16BE(index));
+        }
+        if (decoded.isWellFormed()) {
+            throw new Error(`Non-canonical plugin storage key: ${storageKey}`);
+        }
+        return decoded;
+    }
+    const decoded = bytes.toString('utf-8');
+    if (!decoded.isWellFormed()
+        || Buffer.from(decoded, 'utf-8').toString('base64url') !== encoded) {
         throw new Error(`Non-canonical plugin storage key: ${storageKey}`);
     }
     return decoded;
 }
 
 function encodePluginSaveStorageKey(rawKey, prefix) {
-    if (!rawKey.isWellFormed()) {
-        throw new Error(
-            `Plugin storage keys must be well-formed Unicode (no unpaired surrogates): ${JSON.stringify(rawKey)}`
-        );
+    if (typeof rawKey !== 'string') {
+        throw new TypeError('Plugin storage keys must be strings');
     }
-    const encoded = Buffer.from(rawKey, 'utf-8').toString('base64url');
+    let encoded;
+    if (rawKey.isWellFormed()) {
+        encoded = Buffer.from(rawKey, 'utf-8').toString('base64url');
+    } else {
+        const bytes = Buffer.allocUnsafe(rawKey.length * 2);
+        for (let index = 0; index < rawKey.length; index += 1) {
+            bytes.writeUInt16BE(rawKey.charCodeAt(index), index * 2);
+        }
+        encoded = `${PLUGIN_SAVE_ILL_FORMED_UTF16_TAG}${bytes.toString('base64url')}`;
+    }
     const storageKey = `${prefix}${encoded}.json`;
     // Keep generated names subject to the same canonical-form contract as
     // imported backup entries.
@@ -100,6 +130,7 @@ module.exports = {
     BACKUP_ENTRY_NAME_MAX_BYTES,
     PLUGIN_SAVE_PREFIX,
     PLUGIN_SAVE_META_PREFIX,
+    PLUGIN_SAVE_ILL_FORMED_UTF16_TAG,
     PLUGIN_STORAGE_FOLDED_MARKER,
     assertArchiveSafePluginSaveStorageKey,
     PLUGIN_STORAGE_GENERATION_FIELD,

@@ -10,6 +10,7 @@ import {
     getPluginStorageRecordKeys,
     hasPluginStorageRecordValue,
 } from "../plugins/pluginStorageRecord";
+import { isWellFormedUnicode } from "./unicodeWellFormed";
 
 const packr = new Packr({
     useRecords:false
@@ -37,15 +38,19 @@ const pluginStorageLegacyEscapeMarker = "PocketRisu.plugin-storage-escapes";
 type PluginStorageLegacyEscape = {
     field: "pluginCustomStorage" | "pluginStorageMeta";
     index: number;
+    key: string;
     value: unknown;
 };
 
 type SerializedLegacyEscapeValue = [0] | [1, string];
 type PluginStorageLegacyEscapeEnvelope = [
     typeof pluginStorageLegacyEscapeMarker,
-    1,
+    1 | 2,
     SerializedLegacyEscapeValue | null,
-    Array<[PluginStorageLegacyEscape["field"], number, SerializedLegacyEscapeValue]>,
+    Array<
+        | [PluginStorageLegacyEscape["field"], number, SerializedLegacyEscapeValue]
+        | [PluginStorageLegacyEscape["field"], number, string, SerializedLegacyEscapeValue]
+    >,
 ];
 
 function serializeLegacyEscapeValue(value: unknown): SerializedLegacyEscapeValue {
@@ -73,7 +78,7 @@ function parseLegacyPluginStorageEnvelope(value: unknown): {
     if (!Array.isArray(value)
         || value.length !== 4
         || value[0] !== pluginStorageLegacyEscapeMarker
-        || value[1] !== 1
+        || (value[1] !== 1 && value[1] !== 2)
         || (value[2] !== null && !Array.isArray(value[2]))
         || !Array.isArray(value[3])
         || (value[2] === null && value[3].length === 0)) {
@@ -87,18 +92,32 @@ function parseLegacyPluginStorageEnvelope(value: unknown): {
     const seen = new Set<string>();
     const escapes: PluginStorageLegacyEscape[] = [];
     for (const entry of value[3]) {
+        const version = value[1];
         if (!Array.isArray(entry)
-            || entry.length !== 3
+            || entry.length !== (version === 1 ? 3 : 4)
             || (entry[0] !== "pluginCustomStorage" && entry[0] !== "pluginStorageMeta")
             || !Number.isInteger(entry[1])
-            || entry[1] < 0
-            || seen.has(entry[0])) {
+            || entry[1] < 0) {
             return null;
         }
-        const parsed = deserializeLegacyEscapeValue(entry[2]);
+        let key = "__proto__";
+        if (version === 2) {
+            if (typeof entry[2] !== "string") return null;
+            try {
+                key = JSON.parse(entry[2]);
+            } catch {
+                return null;
+            }
+            if (typeof key !== "string"
+                || JSON.stringify(key) !== entry[2]
+                || (key !== "__proto__" && isWellFormedUnicode(key))) return null;
+        }
+        const identity = `${entry[0]}\0${key}`;
+        if (seen.has(identity)) return null;
+        const parsed = deserializeLegacyEscapeValue(entry[version === 1 ? 2 : 3]);
         if (!parsed.valid) return null;
-        seen.add(entry[0]);
-        escapes.push({ field: entry[0], index: entry[1], value: parsed.value });
+        seen.add(identity);
+        escapes.push({ field: entry[0], index: entry[1], key, value: parsed.value });
     }
     return {
         originalField: { present: original.present, value: original.value },
@@ -111,15 +130,22 @@ function prepareLegacyPluginStorageKeys(data: any): { data: any; escaped: boolea
     let prepared = data;
     for (const field of ["pluginCustomStorage", "pluginStorageMeta"] as const) {
         const record = data?.[field] as Record<string, unknown> | undefined;
-        if (!hasPluginStorageRecordValue(record, "__proto__")) continue;
+        const keys = getPluginStorageRecordKeys(record);
+        const escapedKeys = keys.filter(key => (
+            key === "__proto__" || !isWellFormedUnicode(key)
+        ));
+        if (escapedKeys.length === 0) continue;
         if (prepared === data) prepared = { ...data };
         const recordCopy = copyDatabasePluginStorageRecord(record);
-        escapes.push({
-            field,
-            index: getPluginStorageRecordKeys(record).indexOf("__proto__"),
-            value: recordCopy["__proto__"],
-        });
-        delete recordCopy["__proto__"];
+        for (const key of escapedKeys) {
+            escapes.push({
+                field,
+                index: keys.indexOf(key),
+                key,
+                value: recordCopy[key],
+            });
+            delete recordCopy[key];
+        }
         prepared[field] = recordCopy;
     }
     if (escapes.length === 0) return { data, escaped: false };
@@ -127,11 +153,12 @@ function prepareLegacyPluginStorageKeys(data: any): { data: any; escaped: boolea
     const hasReservedField = hasPluginStorageRecordValue(data, pluginStorageLegacyEscapeField);
     const envelope: PluginStorageLegacyEscapeEnvelope = [
         pluginStorageLegacyEscapeMarker,
-        1,
+        2,
         hasReservedField ? serializeLegacyEscapeValue(data[pluginStorageLegacyEscapeField]) : null,
         escapes.map(escape => [
             escape.field,
             escape.index,
+            JSON.stringify(escape.key),
             serializeLegacyEscapeValue(escape.value),
         ]),
     ];
@@ -148,20 +175,25 @@ function restoreLegacyPluginStorageKeys(data: any): any {
     if (!hasPluginStorageRecordValue(data, pluginStorageLegacyEscapeField)) return data;
     const envelope = parseLegacyPluginStorageEnvelope(data[pluginStorageLegacyEscapeField]);
     if (!envelope) return data;
-    for (const escape of envelope.escapes) {
-        const source = data[escape.field] ?? createDatabasePluginStorageRecord();
+    for (const field of ["pluginCustomStorage", "pluginStorageMeta"] as const) {
+        const fieldEscapes = envelope.escapes
+            .filter(escape => escape.field === field)
+            .sort((left, right) => left.index - right.index);
+        if (fieldEscapes.length === 0) continue;
+        const source = data[field] ?? createDatabasePluginStorageRecord();
         const record = createDatabasePluginStorageRecord<unknown>();
-        const keys = getPluginStorageRecordKeys(source);
-        const insertAt = Math.min(escape.index, keys.length);
-        for (let index = 0; index <= keys.length; index++) {
-            if (index === insertAt) {
-                definePluginStorageRecordValue(record, "__proto__", escape.value);
-            }
-            if (index < keys.length) {
-                definePluginStorageRecordValue(record, keys[index], source[keys[index]]);
-            }
+        const entries = getPluginStorageRecordKeys(source)
+            .map(key => ({ key, value: source[key] }));
+        for (const escape of fieldEscapes) {
+            entries.splice(Math.min(escape.index, entries.length), 0, {
+                key: escape.key,
+                value: escape.value,
+            });
         }
-        data[escape.field] = record;
+        for (const entry of entries) {
+            definePluginStorageRecordValue(record, entry.key, entry.value);
+        }
+        data[field] = record;
     }
     if (envelope.originalField.present) {
         definePluginStorageRecordValue(

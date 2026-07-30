@@ -38,7 +38,8 @@ const { decodeRisuSave, encodeRisuSaveLegacy } = utilsPkg as {
 
 const tempDirs: string[] = []
 const SPECIAL_PLUGIN_STORAGE_KEYS = [
-  '__proto__', 'constructor', 'prototype', 'toString', 'hasOwnProperty', '',
+  '__proto__', 'constructor', '\uD800', '�', '\uD801',
+  'prototype', 'toString', 'hasOwnProperty', '',
 ] as const
 
 function specialRecord(prefix: string) {

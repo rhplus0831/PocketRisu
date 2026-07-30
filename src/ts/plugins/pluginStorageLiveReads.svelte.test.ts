@@ -83,6 +83,9 @@ vi.mock("../storage/persistentKv", () => ({
 const { getV2PluginAPIs } = await import("./plugins.svelte");
 const { getOwners } = await import("./pluginStorageMeta");
 const { transitionPluginStorageMode } = await import("./pluginSaveStorage");
+const { makeArchiveSafePluginSaveStorageKey, PLUGIN_SAVE_PREFIX } = await import(
+    "../storage/pluginSaveKeyPolicy"
+);
 
 beforeEach(() => {
     const pluginCustomStorage = createDatabasePluginStorageRecord<unknown>();
@@ -213,7 +216,10 @@ describe("live plugin storage reads", () => {
 
         await transitionPluginStorageMode(true, { dependencies });
         expect(Object.keys(testState.database.pluginCustomStorage)).toEqual([]);
-        expect(persistent.get("pluginsave/__proto__.json"))
+        expect(persistent.get(makeArchiveSafePluginSaveStorageKey(
+            PLUGIN_SAVE_PREFIX,
+            "__proto__",
+        )))
             .toEqual({ nested: "durable" });
 
         await transitionPluginStorageMode(false, { dependencies });

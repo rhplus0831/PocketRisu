@@ -51,7 +51,9 @@ const {
 } = await import('./persistentKv')
 const {
     BACKUP_ENTRY_NAME_MAX_BYTES,
+    decodePluginSaveStorageKey,
     makeArchiveSafePluginSaveStorageKey,
+    PLUGIN_SAVE_ILL_FORMED_UTF16_TAG,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_SAVE_PREFIX,
 } = await import('./pluginSaveKeyPolicy')
@@ -298,6 +300,26 @@ describe('encoded storage keys', () => {
 
     it('encodes a literal replacement character normally', () => {
         expect(makeEncodedStorageKey('pluginsave/', '�')).toBe('pluginsave/77-9.json')
+    })
+
+    it('uses a tagged lossless plugin-row encoding for historical malformed UTF-16', () => {
+        const rawKeys = ['\uD800', '\uD801', '\uDC00', '�']
+        const storageKeys = rawKeys.map(key => (
+            makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_PREFIX, key)
+        ))
+
+        expect(new Set(storageKeys).size).toBe(rawKeys.length)
+        expect(storageKeys[0]).toContain(`/${PLUGIN_SAVE_ILL_FORMED_UTF16_TAG}`)
+        expect(storageKeys[3]).toBe('pluginsave/77-9.json')
+        expect(storageKeys.map(key => decodePluginSaveStorageKey(key, PLUGIN_SAVE_PREFIX)))
+            .toEqual(rawKeys)
+    })
+
+    it('rejects a tagged UTF-16 spelling for a well-formed key', () => {
+        expect(() => decodePluginSaveStorageKey(
+            `pluginsave/${PLUGIN_SAVE_ILL_FORMED_UTF16_TAG}AGE.json`,
+            PLUGIN_SAVE_PREFIX,
+        )).toThrow('Non-canonical plugin storage key')
     })
 
     it('enforces the exact value and metadata archive-name boundaries', () => {
