@@ -1710,7 +1710,9 @@ interface RisuaiPluginAPI {
      * unowned until written through pluginStorage.
      * DatabaseSubset fields and top-level pluginCustomStorage entries must be
      * enumerable string data properties; symbols, accessors, non-enumerable
-     * properties, and unsupported database fields are rejected.
+     * properties are rejected. While PocketRisu's legacy plugin compatibility
+     * mode is enabled, unsupported top-level fields use the upstream-compatible
+     * pluginStorage fallback; strict mode rejects them.
      * The supported iframe API validates descriptors before postMessage can
      * strip or evaluate them; the host validates the structured-cloned result
      * again. This guarantee applies to calls made through risuai/Risuai.
@@ -1729,7 +1731,9 @@ interface RisuaiPluginAPI {
      * unowned until written through pluginStorage.
      * DatabaseSubset fields and top-level pluginCustomStorage entries must be
      * enumerable string data properties; symbols, accessors, non-enumerable
-     * properties, and unsupported database fields are rejected.
+     * properties are rejected. While PocketRisu's legacy plugin compatibility
+     * mode is enabled, unsupported top-level fields use the upstream-compatible
+     * pluginStorage fallback; strict mode rejects them.
      * The supported iframe API validates descriptors before postMessage can
      * strip or evaluate them; the host validates the structured-cloned result
      * again. This guarantee applies to calls made through risuai/Risuai.

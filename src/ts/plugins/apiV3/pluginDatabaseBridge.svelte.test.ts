@@ -14,6 +14,8 @@ const storageMocks = vi.hoisted(() => ({
 }));
 const alertConfirmMock = vi.hoisted(() => vi.fn(async () => true));
 const notifyErrorMock = vi.hoisted(() => vi.fn());
+const notifyWarningMock = vi.hoisted(() => vi.fn());
+const nativeConsoleWarnMock = vi.hoisted(() => vi.fn());
 const unloadFinalizationMocks = vi.hoisted(() => ({
     fetchNative: vi.fn(async () => ({ status: 204 })),
     globalFetch: vi.fn(async () => ({ ok: true, status: 204 })),
@@ -326,7 +328,12 @@ vi.mock("../../alert", () => ({
     alertError: vi.fn(),
     alertNormal: vi.fn(),
     notifyError: notifyErrorMock,
-    notifyWarning: vi.fn(),
+    notifyWarning: notifyWarningMock,
+}));
+
+vi.mock("../../log-capture", () => ({
+    nativeConsoleError: vi.fn(),
+    nativeConsoleWarn: nativeConsoleWarnMock,
 }));
 
 const {
@@ -517,6 +524,8 @@ beforeEach(async () => {
     storageMocks.revisionOverrides.clear();
     alertConfirmMock.mockClear();
     notifyErrorMock.mockClear();
+    notifyWarningMock.mockClear();
+    nativeConsoleWarnMock.mockClear();
     unloadFinalizationMocks.fetchNative.mockClear();
     unloadFinalizationMocks.globalFetch.mockClear();
     unloadFinalizationMocks.saveAsset.mockClear();
@@ -839,6 +848,66 @@ describe("V3 mode-aware database bridge", () => {
         await bridge.setDatabaseLite({ pluginCustomStorage: {} });
         expect(await getPluginSaveStorageKeys()).toEqual([]);
         expect(await getOwners("save")).toEqual({});
+    });
+
+    test.each([false, true])(
+        "restores legacy custom database keys with a console-only notice in optimized mode %s",
+        async (optimized) => {
+            const plugin = startupPlugin(
+                `Legacy database fallback ${optimized ? "optimized" : "inline"}`,
+                "",
+            );
+            testState.database.optimizePluginMemory = optimized;
+            testState.database.legacyPluginCompatibility = true;
+            testState.database.pluginCustomStorage = {};
+            testState.database.plugins = [plugin];
+            DBState.db = testState.database;
+            const api = makeRisuaiAPIV3(
+                document.createElement("iframe"),
+                plugin as any,
+            ) as any;
+
+            await api.setDatabaseLite({
+                pluginCustomStorage: { directReplacement: { source: "database" } },
+                firstLegacyKey: { source: "lite" },
+                temperature: 21,
+            });
+            await api.setDatabase({
+                secondLegacyKey: { source: "full" },
+            });
+
+            expect(await api._getPluginStorage("firstLegacyKey"))
+                .toEqual({ source: "lite" });
+            expect(await api._getPluginStorage("secondLegacyKey"))
+                .toEqual({ source: "full" });
+            expect(await api._getPluginStorage("directReplacement"))
+                .toEqual({ source: "database" });
+            expect(await getOwners("save")).toEqual({
+                firstLegacyKey: plugin.name,
+                secondLegacyKey: plugin.name,
+            });
+            expect(testState.database.temperature).toBe(21);
+            expect(nativeConsoleWarnMock).toHaveBeenCalledOnce();
+            expect(nativeConsoleWarnMock).toHaveBeenCalledWith(
+                expect.stringContaining("used the legacy V3 database custom-key fallback"),
+            );
+            expect(notifyWarningMock).not.toHaveBeenCalled();
+        },
+    );
+
+    test("keeps custom database keys strict when legacy compatibility is disabled", async () => {
+        const plugin = startupPlugin("Strict database keys", "");
+        testState.database.legacyPluginCompatibility = false;
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+        const api = makeRisuaiAPIV3(document.createElement("iframe"), plugin as any) as any;
+
+        await expect(api.setDatabaseLite({ unsupportedKey: true }))
+            .rejects.toThrow("Unsupported V3 database key");
+
+        expect(await api._getPluginStorage("unsupportedKey")).toBeNull();
+        expect(nativeConsoleWarnMock).not.toHaveBeenCalled();
+        expect(notifyWarningMock).not.toHaveBeenCalled();
     });
 
     test.each([false, true])(

@@ -9,7 +9,16 @@ export interface PluginDatabaseBridgeDependencies {
         pluginCustomStorage: Record<string, unknown> | undefined,
         mutateDatabase: (signal?: AbortSignal) => T | Promise<T>,
         signal?: AbortSignal | null,
+        compatibilityWrite?: {
+            values: Record<string, unknown>;
+            owner: string;
+        },
     ) => Promise<T>;
+    customKeyFallback?: {
+        isEnabled: () => boolean;
+        owner: string;
+        warn: () => void;
+    };
     normalizePluginMutation?: (signal?: AbortSignal) => void | Promise<void>;
     applyLite: (database: Record<string, unknown>, signal?: AbortSignal) => void | Promise<void>;
     applyFull: (database: Record<string, unknown>, signal?: AbortSignal) => void | Promise<void>;
@@ -30,12 +39,17 @@ function prepareMutation(
 ): {
     database: Record<string, unknown>;
     pluginCustomStorage: Record<string, unknown> | undefined;
+    compatibilityWrite: {
+        values: Record<string, unknown>;
+        owner: string;
+    } | undefined;
 } {
     if (input === null || typeof input !== "object" || Array.isArray(input)) {
         throw new TypeError("V3 database updates require a DatabaseSubset object.");
     }
 
     const database = {} as Record<string, unknown>;
+    const compatibilityValues = {} as Record<string, unknown>;
     let pluginCustomStorage: Record<string, unknown> | undefined;
     for (const key of Reflect.ownKeys(input)) {
         if (typeof key !== "string") {
@@ -47,9 +61,21 @@ function prepareMutation(
             throw new TypeError(`V3 database updates do not accept an accessor for ${key}.`);
         }
         if (!dependencies.allowedDbKeys.includes(key)) {
-            throw new TypeError(
-                `Unsupported V3 database key ${JSON.stringify(key)}; use pluginStorage for plugin data.`,
+            const fallback = dependencies.customKeyFallback;
+            if (!fallback?.isEnabled()) {
+                throw new TypeError(
+                    `Unsupported V3 database key ${JSON.stringify(key)}; use pluginStorage for plugin data.`,
+                );
+            }
+            if (!descriptor.enumerable) {
+                throw new TypeError(`V3 database updates require an enumerable data property for ${key}.`);
+            }
+            defineOwn(
+                compatibilityValues,
+                key,
+                dependencies.snapshotField(key, descriptor.value),
             );
+            continue;
         }
         if (!descriptor.enumerable) {
             throw new TypeError(`V3 database updates require an enumerable data property for ${key}.`);
@@ -68,7 +94,23 @@ function prepareMutation(
             dependencies.snapshotField(key, descriptor.value),
         );
     }
-    return { database, pluginCustomStorage };
+    const fallback = dependencies.customKeyFallback;
+    const compatibilityWrite = Reflect.ownKeys(compatibilityValues).length > 0 && fallback
+        ? { values: compatibilityValues, owner: fallback.owner }
+        : undefined;
+    return { database, pluginCustomStorage, compatibilityWrite };
+}
+
+function reportCompatibilityWrite(
+    dependencies: PluginDatabaseBridgeDependencies,
+    compatibilityWrite: { values: Record<string, unknown>; owner: string } | undefined,
+): void {
+    if (!compatibilityWrite) return;
+    try {
+        dependencies.customKeyFallback?.warn();
+    } catch {
+        // A developer-console compatibility notice must never change mutation results.
+    }
 }
 
 /**
@@ -79,8 +121,10 @@ function prepareMutation(
  * - replacement preserves owner metadata for retained keys and removes it for
  *   deleted keys; new keys remain unowned until a pluginStorage write;
  * - omitted pluginCustomStorage leaves the authoritative key set unchanged.
+ * - legacy compatibility routes unsupported top-level keys to pluginStorage
+ *   and attributes them to the calling plugin; strict mode rejects them.
  * Input must contain enumerable string data properties only; symbols,
- * accessors, non-enumerable properties, and unsupported keys are rejected.
+ * accessors, and non-enumerable properties are rejected.
  */
 export function createPluginDatabaseBridge(dependencies: PluginDatabaseBridgeDependencies) {
     const getDatabase = async (
@@ -119,7 +163,9 @@ export function createPluginDatabaseBridge(dependencies: PluginDatabaseBridgeDep
                 }
             },
             signal,
+            prepared.compatibilityWrite,
         );
+        reportCompatibilityWrite(dependencies, prepared.compatibilityWrite);
     };
 
     const setDatabase = async (
@@ -139,7 +185,9 @@ export function createPluginDatabaseBridge(dependencies: PluginDatabaseBridgeDep
                 }
             },
             signal,
+            prepared.compatibilityWrite,
         );
+        reportCompatibilityWrite(dependencies, prepared.compatibilityWrite);
     };
 
     return { getDatabase, setDatabaseLite, setDatabase };

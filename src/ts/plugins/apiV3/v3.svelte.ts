@@ -47,6 +47,7 @@ import { hasher } from "src/ts/parser/parser.svelte";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
 import { readPersistentJson, removePersistentKey, writePersistentJson } from "src/ts/storage/persistentKv";
 import { awaitWithAbort, forwardAbortSignal, throwIfAborted } from "src/ts/storage/abort";
+import { nativeConsoleWarn } from "src/ts/log-capture";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
 import {
     getActiveChatSendTransaction,
@@ -104,6 +105,7 @@ type V3ScriptMode = 'input' | 'output' | 'process' | 'display';
 type V3ReplacerFunction = (...args: any[]) => any;
 export const STRICT_PLUGIN_UNLOAD_TIMEOUT_MS = 1_000;
 export const LEGACY_PLUGIN_UNLOAD_TIMEOUT_MS = 5_000;
+const reportedLegacyDatabaseFallbackPlugins = new Set<string>();
 
 async function withCombinedAbortSignals<T>(
     signals: Array<AbortSignal | null | undefined>,
@@ -1196,6 +1198,18 @@ export const makeRisuaiAPIV3 = (
         snapshotField: (key, value) => cloneDatabaseField(key, value),
         getPluginStorageSnapshot: getPluginSaveStorageSnapshot,
         updateWithPluginStorageSnapshot: updateDatabaseWithPluginStorageSnapshot,
+        customKeyFallback: {
+            isEnabled: () => getDatabase().legacyPluginCompatibility === true,
+            owner: plugin.name,
+            warn: () => {
+                if (reportedLegacyDatabaseFallbackPlugins.has(plugin.name)) return;
+                reportedLegacyDatabaseFallbackPlugins.add(plugin.name);
+                nativeConsoleWarn(
+                    `[PocketRisu compatibility] Plugin ${JSON.stringify(plugin.name)} used the legacy V3 database custom-key fallback. `
+                    + "PocketRisu stored the value in pluginStorage; new plugins should use risuai.pluginStorage directly.",
+                );
+            },
+        },
         normalizePluginMutation: (signal) => {
             throwIfAborted(signal);
             const liveDatabase = getDatabase();

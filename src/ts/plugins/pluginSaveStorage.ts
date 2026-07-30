@@ -965,15 +965,32 @@ export async function getPluginSaveStorageSnapshot(
     }, signal);
 }
 
+function createPluginStorageOwnerRecord(
+    owner: string,
+): NonNullable<Database["pluginStorageMeta"]>[string] {
+    return {
+        plugin: owner,
+        updatedAt: Date.now(),
+        revision: crypto.randomUUID(),
+        generation: crypto.randomUUID(),
+    };
+}
+
 /**
  * Apply a V3 database mutation while holding the exclusive pluginStorage barrier.
  * A provided plugin map is an exact replacement; `undefined` leaves the
- * authoritative key set unchanged. Optimized mode never retains inline rows.
+ * authoritative key set unchanged. Legacy database custom keys are merged as
+ * owner-attributed pluginStorage writes in the same publication. Optimized mode
+ * never retains inline rows.
  */
 export async function updateDatabaseWithPluginStorageSnapshot<T>(
     pluginCustomStorage: Record<string, unknown> | undefined,
     mutateDatabase: (signal?: AbortSignal) => T | Promise<T>,
     signal?: AbortSignal | null,
+    compatibilityWrite?: {
+        values: Record<string, unknown>;
+        owner: string;
+    },
 ): Promise<T> {
     throwIfAborted(signal);
     // Snapshot and validate before waiting so caller-owned objects cannot
@@ -981,6 +998,22 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
     const replacement = pluginCustomStorage === undefined
         ? undefined
         : cloneInlinePluginStorageRecord(pluginCustomStorage);
+    const compatibilityValues = compatibilityWrite === undefined
+        ? undefined
+        : cloneInlinePluginStorageRecord(
+            compatibilityWrite.values,
+            "legacy database custom keys",
+        );
+    const compatibilityKeys = compatibilityValues === undefined
+        ? []
+        : getPluginStorageRecordKeys(compatibilityValues);
+    const compatibilityOwner = compatibilityWrite?.owner;
+    if (compatibilityKeys.length > 0) {
+        if (!compatibilityOwner) {
+            throw new TypeError("Legacy database custom-key storage requires a plugin owner.");
+        }
+        assertWellFormedUnicode(compatibilityOwner);
+    }
 
     try {
         return await withPluginSaveStorageLock(async () => {
@@ -1009,6 +1042,19 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
                         const optimizedValue = prepareOptimizedPluginStorageValue(
                             replacement[key],
                             undefined,
+                            db.autoConvertPluginStorageValues === true,
+                        );
+                        definePluginStorageRecordValue(
+                            optimizedReplacement,
+                            key,
+                            optimizedValue.snapshot,
+                        );
+                        preparedValues.set(key, optimizedValue.prepared);
+                    }
+                    for (const key of compatibilityKeys) {
+                        const optimizedValue = prepareOptimizedPluginStorageValue(
+                            compatibilityValues![key],
+                            compatibilityOwner,
                             db.autoConvertPluginStorageValues === true,
                         );
                         definePluginStorageRecordValue(
@@ -1077,9 +1123,25 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
                             retainedMetaKeys.add(existingMetaKey);
                         }
                     }
-                    // A direct database replacement has no plugin-owner context.
-                    // Preserve metadata for retained keys, discard it for deleted
-                    // keys, and leave new keys unowned.
+                    const ownerWrites: { storageKey: string; valueBytes: Uint8Array }[] = [];
+                    for (const key of compatibilityKeys) {
+                        const storageKey = makeArchiveSafePluginSaveStorageKey(
+                            PLUGIN_SAVE_META_PREFIX,
+                            key,
+                        );
+                        const ownerRecord = createPluginStorageOwnerRecord(
+                            compatibilityOwner!,
+                        );
+                        ownerWrites.push({
+                            storageKey,
+                            valueBytes: preparePersistentJson(ownerRecord).bytes,
+                        });
+                        retainedMetaKeys.add(storageKey);
+                    }
+                    // A direct database replacement has no owner context for
+                    // ordinary entries. Preserve metadata for retained keys,
+                    // attribute fallback entries to the calling plugin, discard
+                    // deleted metadata, and leave other new keys unowned.
                     const deletes = [
                         ...ownership.valueKeys.filter(key => !destinationKeys.has(key)),
                         ...ownership.metaKeys.filter(key => !retainedMetaKeys.has(key)),
@@ -1089,13 +1151,51 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
                         prepared.map(entry => ({
                             storageKey: entry.storageKey,
                             valueBytes: entry.valueBytes,
-                        })),
+                        })).concat(ownerWrites),
                         deletes,
                         (values, meta) => {
                             values.clear();
                             for (const key of destinationKeys) values.add(key);
                             meta.clear();
                             for (const key of retainedMetaKeys) meta.add(key);
+                        },
+                        signal,
+                    );
+                } else if (compatibilityKeys.length > 0) {
+                    const writes: { storageKey: string; valueBytes: Uint8Array }[] = [];
+                    const valueKeys: string[] = [];
+                    const metaKeys: string[] = [];
+                    for (const key of compatibilityKeys) {
+                        const optimizedValue = prepareOptimizedPluginStorageValue(
+                            compatibilityValues![key],
+                            compatibilityOwner,
+                            db.autoConvertPluginStorageValues === true,
+                        );
+                        const valueStorageKey = makeArchiveSafePluginSaveStorageKey(
+                            PLUGIN_SAVE_PREFIX,
+                            key,
+                        );
+                        const metaStorageKey = makeArchiveSafePluginSaveStorageKey(
+                            PLUGIN_SAVE_META_PREFIX,
+                            key,
+                        );
+                        const ownerRecord = createPluginStorageOwnerRecord(
+                            compatibilityOwner!,
+                        );
+                        writes.push(
+                            { storageKey: valueStorageKey, valueBytes: optimizedValue.prepared.bytes },
+                            { storageKey: metaStorageKey, valueBytes: preparePersistentJson(ownerRecord).bytes },
+                        );
+                        valueKeys.push(valueStorageKey);
+                        metaKeys.push(metaStorageKey);
+                    }
+                    await commitOptimizedStorageMutation(
+                        db,
+                        writes,
+                        [],
+                        (values, meta) => {
+                            for (const key of valueKeys) values.add(key);
+                            for (const key of metaKeys) meta.add(key);
                         },
                         signal,
                     );
@@ -1107,21 +1207,36 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
                 if (getPluginStorageRecordKeys(previousMeta).length > 0) {
                     delete db.pluginStorageMeta;
                 }
-            } else if (replacement !== undefined) {
+            } else if (replacement !== undefined || compatibilityKeys.length > 0) {
                 throwIfAborted(signal);
-                db.pluginCustomStorage = copyDatabasePluginStorageRecord(replacement);
-                const nextMeta = createDatabasePluginStorageRecord<
-                    NonNullable<Database["pluginStorageMeta"]>[string]
-                >();
-                for (const key of getPluginStorageRecordKeys(replacement)) {
-                    if (
-                        hasPluginStorageRecordValue(previousValues, key)
-                        && hasPluginStorageRecordValue(previousMeta, key)
-                    ) {
-                        definePluginStorageRecordValue(nextMeta, key, previousMeta[key]);
+                const nextValues = replacement === undefined
+                    ? cloneInlinePluginStorageRecord(previousValues)
+                    : copyDatabasePluginStorageRecord(replacement);
+                const nextMeta: NonNullable<Database["pluginStorageMeta"]> = replacement === undefined
+                    ? cloneJsonPluginStorageRecord(previousMeta, "pluginStorageMeta")
+                    : createDatabasePluginStorageRecord<
+                        NonNullable<Database["pluginStorageMeta"]>[string]
+                    >();
+                if (replacement !== undefined) {
+                    for (const key of getPluginStorageRecordKeys(replacement)) {
+                        if (
+                            hasPluginStorageRecordValue(previousValues, key)
+                            && hasPluginStorageRecordValue(previousMeta, key)
+                        ) {
+                            definePluginStorageRecordValue(nextMeta, key, previousMeta[key]);
+                        }
                     }
                 }
-                if (Object.keys(nextMeta).length > 0) {
+                for (const key of compatibilityKeys) {
+                    definePluginStorageRecordValue(nextValues, key, compatibilityValues![key]);
+                    definePluginStorageRecordValue(
+                        nextMeta,
+                        key,
+                        createPluginStorageOwnerRecord(compatibilityOwner!),
+                    );
+                }
+                db.pluginCustomStorage = nextValues;
+                if (getPluginStorageRecordKeys(nextMeta).length > 0) {
                     db.pluginStorageMeta = nextMeta;
                 } else {
                     delete db.pluginStorageMeta;
@@ -1134,7 +1249,9 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
             return result;
         }, signal);
     } finally {
-        if (replacement !== undefined) invalidateStorageEnumerationSnapshot();
+        if (replacement !== undefined || compatibilityKeys.length > 0) {
+            invalidateStorageEnumerationSnapshot();
+        }
     }
 }
 
@@ -1259,12 +1376,7 @@ export async function setOwnedPluginSaveStorageItem<T>(
         await withPluginSaveStorageKeyLock(normalizedKey, async () => {
             throwIfAborted(signal);
             const db = getDatabase();
-            const ownerRecord: NonNullable<Database["pluginStorageMeta"]>[string] = {
-                plugin: owner,
-                updatedAt: Date.now(),
-                revision: crypto.randomUUID(),
-                generation: crypto.randomUUID(),
-            };
+            const ownerRecord = createPluginStorageOwnerRecord(owner);
             if (db.optimizePluginMemory) {
                 const { snapshot, prepared: preparedValue } = prepareOptimizedPluginStorageValue(
                     inlineSnapshot,
