@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **63** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, **4** are intentional compatibility changes, and **31** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **62** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, **4** are intentional compatibility changes, and **32** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -27,7 +27,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [Large RISUSAVE block databases are rejected](compatibility/legacy-risusave-64mib-import-cap.md) | compat | Open | A retained main/upstream save or archive cannot be imported. | Requires the less-common block representation to exceed 64 MiB. |
 | [Large opaque save rows are rejected](compatibility/save-folder-opaque-row-32mib-cap.md) | compat | Open | Valid save folders with remaining non-chunkable opaque rows cannot be restored. | Requires one non-streamed generic or plugin-metadata row to exceed 32 MiB; remote and unsafe-asset rows are now file-backed. |
 | [Inline rich values break enumeration](compatibility/inline-plugin-storage-enumeration-rich-values.md) | compat | Open | One accepted value poisons `keys`, `key`, `length`, versioned reads, or viewer pages. | Requires an inline structured-clone value outside strict JSON, such as `Map`, `BigInt`, or a cycle. |
 | [Ill-formed legacy plugin keys poison storage](compatibility/legacy-plugin-storage-key-compatibility.md) | compat | Open | Unrelated V3 mutations and enumeration can fail, leaving old values hard to migrate. | Requires a historical key containing malformed UTF-16. |
@@ -134,6 +133,7 @@ None currently open.
 
 | Finding | Former harm | Note |
 |---|---|---|
+| [Large RISUSAVE block databases were rejected](compatibility/legacy-risusave-64mib-import-cap.md) | A retained main/upstream save or archive could not be imported when its block database exceeded 64 MiB. | Fixed 2026-07-30 with bounded disk-backed block conversion, file-spooled REMOTE resolution, streaming database ingestion, and exact 64 MiB + 1 archive/save-folder coverage. |
 | [Default exports could exceed import limits](compatibility/backup-export-import-limit-mismatch.md) | A default server-produced backup could be refused by a default fresh installation only when restore was needed. | Fixed 2026-07-30 with an explicit resource-checked large-restore path, disk-backed batched entry metadata, file-backed category streaming/chunking, trusted server-file recovery, and self-round-trip coverage. |
 | [Configured plugin value limits disagreed with the client](compatibility/plugin-storage-configured-limit-client-mismatch.md) | Raising the documented server limit did not expand browser writes, while lowering it caused avoidable rejected uploads. | Fixed 2026-07-30 with an authenticated generic value-limit capability, transport-boundary preflight, a legacy-server fallback, and unequal-limit coverage. |
 | [Safe plugin updates had a smaller value limit](compatibility/plugin-storage-batch-size-mismatch.md) | CAS, rewrite, update, and batch APIs could not modify values accepted by `setItem`. | Fixed 2026-07-30 with negotiated raw-value framing, bounded staging, file-backed atomic publication, legacy fallback, and above-ceiling coverage. |

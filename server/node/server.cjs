@@ -112,11 +112,14 @@ const {
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
 const { validateJsonSource } = require('./streamJsonToMsgpack.cjs');
 const {
+    convertBlockRisuSaveToMessagePack,
     readBlockRisuSaveTopLevelFields,
     streamBackupRisuSaveToFile,
 } = require('./streamBackupRisuSave.cjs');
 const { isChunkableKey } = require('./chunkStore.cjs');
 const {
+    RisuSavePreparationError,
+    configuredMaxDecodedBytes,
     decodeBoundedLegacyRisuSave,
     inspectRisuSaveSource,
     readRisuSaveTopLevelFields,
@@ -5186,6 +5189,84 @@ async function spoolBackupSnapshotRow(snapshot, key, { signal, shouldAbort } = {
     }
 }
 
+function canStreamImportedDatabase(inspection) {
+    return inspection.supported || inspection.format === 'risusave';
+}
+
+/**
+ * Convert block-oriented RISUSAVE databases to the canonical streaming input
+ * on disk, then feed them through the same chat/plugin externalization path as
+ * ordinary MessagePack imports. REMOTE payloads are spooled from the rows that
+ * the enclosing replacement transaction has already staged, so neither the
+ * database nor a large remote character has to be assembled in memory.
+ */
+async function ingestImportedDatabaseStreaming(
+    databaseSource,
+    inspection,
+    { signal = null } = {},
+) {
+    if (inspection.format !== 'risusave') {
+        return ingestDatabaseStreaming(databaseSource, {
+            inspection,
+            shouldAbort: () => signal?.aborted === true,
+            signal,
+        });
+    }
+
+    const convertedPath = path.join(
+        databaseSpoolDir,
+        `${DATABASE_SPOOL_FILE_PREFIX}block-import-${process.pid}-${nodeCrypto.randomUUID()}.tmp`,
+    );
+    const liveReader = { kvSize, kvWriteToFile };
+    let converted = null;
+    try {
+        try {
+            converted = await convertBlockRisuSaveToMessagePack(
+                databaseSource,
+                convertedPath,
+                {
+                    readRemoteRowSize: (name) => kvSize(`remotes/${name}.local.bin`),
+                    readRemoteRowSource: (name) => spoolBackupSnapshotRow(
+                        liveReader,
+                        `remotes/${name}.local.bin`,
+                        {
+                            signal,
+                            shouldAbort: () => signal?.aborted === true,
+                        },
+                    ),
+                    maxDecodedBytes: configuredMaxDecodedBytes(),
+                    shouldAbort: () => signal?.aborted === true,
+                    signal,
+                    throwIfAborted: () => throwIfImportAborted(signal),
+                },
+            );
+        } catch (error) {
+            if (signal?.aborted
+                || error?.risuSavePreparationInvalid === true
+                || error?.risuSavePreparationLimit === true
+                || error?.name === 'AbortError'
+                || error?.syscall
+                || error?.code === 'KV_CHUNK_CORRUPT') {
+                throw error;
+            }
+            throw new RisuSavePreparationError(
+                String(error?.message ?? 'Invalid RisuSave block database'),
+                { cause: error },
+            );
+        }
+        return await ingestDatabaseStreaming(converted, {
+            shouldAbort: () => signal?.aborted === true,
+            signal,
+            maxDecodedBytes: configuredMaxDecodedBytes(),
+        });
+    } finally {
+        await converted?.cleanup?.();
+        // The converter removes incomplete outputs itself. This catches a
+        // process-local failure before it has returned its cleanup handle.
+        await fs.unlink(convertedPath).catch(() => {});
+    }
+}
+
 /**
  * Chat rows are always assembled into database.risudat. Upstream exports also
  * fold external plugin rows into that database; Node-only exports keep them as
@@ -7141,13 +7222,14 @@ async function importBackupFromSource(dataSource, {
         };
         throwIfImportAborted(signal);
         const databaseInspection = await inspectRisuSaveSource(databaseSource);
-        if (databaseInspection.supported) {
-            databaseIngestion = await ingestDatabaseStreaming(databaseSource, {
-                inspection: databaseInspection,
-                shouldAbort: () => signal?.aborted === true,
-                signal,
-            });
-            // Supported legacy/gzip saves cannot contain REMOTE blocks.
+        if (canStreamImportedDatabase(databaseInspection)) {
+            databaseIngestion = await ingestImportedDatabaseStreaming(
+                databaseSource,
+                databaseInspection,
+                { signal },
+            );
+            // Canonical streaming saves have no REMOTE blocks; block saves
+            // have already resolved them into the converted database.
             markRemoteMigrationDone();
         } else {
             assertImportSize(
@@ -13463,7 +13545,7 @@ async function importLegacySaveEntries(
         size: databaseEntry.size,
     };
     const databaseInspection = await inspectRisuSaveSource(databaseSource);
-    const streamDatabase = databaseInspection.supported;
+    const streamDatabase = canStreamImportedDatabase(databaseInspection);
     if (!streamDatabase) {
         assertImportSize(
             databaseEntry.size,
@@ -13550,11 +13632,11 @@ async function importLegacySaveEntries(
         }
 
         if (streamDatabase) {
-            databaseIngestion = await ingestDatabaseStreaming(databaseSource, {
-                inspection: databaseInspection,
-                shouldAbort: () => signal?.aborted === true,
-                signal,
-            });
+            databaseIngestion = await ingestImportedDatabaseStreaming(
+                databaseSource,
+                databaseInspection,
+                { signal },
+            );
             markRemoteMigrationDone();
         } else {
             const decoded = await decodeBoundedLegacyRisuSave(databaseSource, {

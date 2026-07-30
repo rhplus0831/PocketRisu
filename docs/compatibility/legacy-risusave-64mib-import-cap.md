@@ -1,6 +1,6 @@
 # RISUSAVE block databases over 64 MiB are rejected
 
-- Status: Confirmed upgrade/import regression
+- Status: Fixed 2026-07-30
 - Severity: Medium
 - Confidence: High
 - Introduced by: f1931989
@@ -26,3 +26,22 @@ Teach the streaming loader to handle the recognized block format, or document
 the RISU_LEGACY_DATABASE_IMPORT_MAX_BYTES workaround prominently. Add a valid
 64 MiB+1 block-format fixture and compare main, serve, and upstream import
 behavior.
+
+## Resolution
+
+Recognized `RISUSAVE\0` block databases now use the existing bounded block scanner and
+disk-backed JSON-to-MessagePack converter during both backup-archive and save-folder
+replacement. The converted file enters the ordinary streaming database ingestion path,
+so large characters, chats, and plugin values retain the same externalization and atomic
+publication rules as canonical saves.
+
+REMOTE blocks resolve from rows already staged by the enclosing replacement transaction.
+Those rows are copied to private bounded spools rather than materialized in memory, and
+the converter preserves cancellation, the configured decoded-byte ceiling, strict JSON
+validation, cleanup, and the existing `RISU_SAVE_INVALID` response contract. The 64 MiB
+legacy materialization cap remains in force for formats that still lack a streaming path.
+
+Compatibility coverage imports an exact 64 MiB + 1 block database through both a backup
+archive and a retained save folder while setting the legacy fallback cap to 128 bytes.
+The existing REMOTE migration suite verifies successful resolution, missing-row rollback,
+and preservation of the prior publication.

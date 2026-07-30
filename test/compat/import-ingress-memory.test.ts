@@ -18,6 +18,7 @@ const DB_KEY = 'database/database.bin'
 const DB_HEX = Buffer.from(DB_KEY).toString('hex')
 const DEFAULT_IMPORT_LIMIT = 2 * 1024 * 1024 * 1024
 const BUFFERED_ROW_LIMIT = 32 * 1024 * 1024
+const LEGACY_DATABASE_LIMIT = 64 * 1024 * 1024
 
 async function boot(env: Record<string, string> = {}): Promise<{
   server: ServerHandle
@@ -65,6 +66,42 @@ function validJsonBytes(size: number): Buffer {
   const value = Buffer.alloc(size, 0x20)
   value.write('{}', 0, 'utf8')
   return value
+}
+
+function blockDatabaseAtSize(size: number, note: string): Buffer {
+  const magic = Buffer.from('RISUSAVE\0', 'binary')
+  const blockPrefix = (type: number, name: string, bodyLength: number): Buffer => {
+    const nameBytes = Buffer.from(name, 'utf-8')
+    const prefix = Buffer.alloc(3 + nameBytes.length + 4)
+    prefix[0] = type
+    prefix[1] = 0
+    prefix[2] = nameBytes.length
+    nameBytes.copy(prefix, 3)
+    prefix.writeUInt32LE(bodyLength, 3 + nameBytes.length)
+    return prefix
+  }
+  const rootBody = Buffer.from(JSON.stringify({
+    globalNote: note,
+    optimizePluginMemory: false,
+    personas: [],
+  }), 'utf-8')
+  const rootPrefix = blockPrefix(1, 'root', rootBody.length)
+  const configPrefixBytes = 3 + Buffer.byteLength('config') + 4
+  const configBodyLength = size
+    - magic.length
+    - rootPrefix.length
+    - rootBody.length
+    - configPrefixBytes
+  if (configBodyLength < 2) throw new Error('Block database fixture size is too small')
+  const configPrefix = blockPrefix(0, 'config', configBodyLength)
+  const output = Buffer.alloc(size, 0x20)
+  let offset = 0
+  for (const part of [magic, rootPrefix, rootBody, configPrefix]) {
+    part.copy(output, offset)
+    offset += part.length
+  }
+  output.write('{}', offset, 'utf-8')
+  return output
 }
 
 async function executeSaveFolder(client: RisuClient, sourceDir: string): Promise<Response> {
@@ -135,6 +172,30 @@ async function waitForNoImportSpools(server: ServerHandle): Promise<void> {
 }
 
 describe('bounded archive and save-folder ingress (real server)', () => {
+  test('streams a 64 MiB + 1 RISUSAVE block database through archive and save-folder imports', async () => {
+    const blockDatabase = blockDatabaseAtSize(
+      LEGACY_DATABASE_LIMIT + 1,
+      'large-block-database',
+    )
+    expect(blockDatabase.length).toBe(LEGACY_DATABASE_LIMIT + 1)
+    const { server, client } = await boot({
+      RISU_LEGACY_DATABASE_IMPORT_MAX_BYTES: '128',
+      POCKETRISU_CHUNK_THRESHOLD: '4096',
+    })
+
+    const archive = encodeBackup([{ name: 'database.risudat', data: blockDatabase }])
+    expect((await client.importBackup(archive)).ok).toBe(true)
+    await expectNote(client, 'large-block-database')
+
+    const sourceDir = path.join(server.cwd, 'large-block-save-folder')
+    await writeSaveFolderSource(sourceDir, blockDatabase, [])
+    const directoryResponse = await executeSaveFolder(client, sourceDir)
+    expect(directoryResponse.status).toBe(200)
+    await directoryResponse.json()
+    await expectNote(client, 'large-block-database')
+    await waitForNoImportSpools(server)
+  }, 180_000)
+
   test('imports a 52 MiB supported database through archive and ZIP paths', async () => {
     const pluginCustomStorage = Object.fromEntries(Array.from({ length: 13 }, (_, index) => [
       `large-row-${String(index).padStart(2, '0')}`,

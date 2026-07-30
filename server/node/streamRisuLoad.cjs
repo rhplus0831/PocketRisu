@@ -1723,6 +1723,7 @@ module.exports = {
     DEFAULT_STREAM_INGEST_MIN_BYTES,
     RisuSavePreparationError,
     RisuSavePreparationLimitError,
+    configuredMaxDecodedBytes,
     configuredStreamIngestMinBytes,
     decodeBoundedLegacyRisuSave,
     inspectRisuSaveSource,

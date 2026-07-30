@@ -117,6 +117,12 @@ inside the storage queue.
 - JSON and compatibility formats are validated with bounded workers/converters;
 - disconnects abort waiting/staging and clean private files.
 
+Recognized block-oriented `RISUSAVE\0` databases do not use the legacy buffered
+fallback. Import scans their bounded block inventory, resolves REMOTE rows through
+private file spools, converts JSON blocks into a canonical MessagePack spool, and then
+uses ordinary streaming database ingestion. The configured decoded-byte ceiling,
+cancellation, validation, and replacement transaction remain authoritative throughout.
+
 Downloaded-backup restores normally retain conservative 2 GiB and 100,000-entry soft
 admission limits. After the normal destructive-restore confirmations, the browser opts
 into the authenticated large-restore path; trusted server-file restores do so
@@ -271,7 +277,7 @@ Important finite limits include:
 | Variable | Default |
 |---|---:|
 | `RISU_BACKUP_IMPORT_MAX_BYTES` | 2 GiB; zero/invalid falls back to default |
-| `RISU_LEGACY_DATABASE_IMPORT_MAX_BYTES` | 64 MiB |
+| `RISU_LEGACY_DATABASE_IMPORT_MAX_BYTES` | 64 MiB; applies to remaining non-streamable compatibility formats, not recognized block RISUSAVE databases |
 | `RISU_IMPORT_BUFFERED_ENTRY_MAX_BYTES` | 32 MiB |
 | `RISU_BACKUP_IMPORT_MAX_ENTRIES` | 100,000 |
 | `RISU_SAVE_FOLDER_IMPORT_MAX_ENTRIES` | 100,000 |

@@ -883,6 +883,12 @@ function finalizeBlockState(state) {
 }
 
 async function convertBlockRisuSaveToMessagePack(input, filePath, options) {
+    options = { ...options };
+    options.shouldAbort ??= () => false;
+    options.throwIfAborted ??= () => {
+        if (!options.signal?.aborted && !options.shouldAbort()) return;
+        throw abortError(options.signal);
+    };
     options.tempBase = filePath;
     options.nextTempIndex = 0;
     const scratchPath = `${filePath}.values`;
@@ -1354,6 +1360,7 @@ async function streamBackupRisuSaveToFile({
 
 module.exports = {
     PAGE_BYTES,
+    convertBlockRisuSaveToMessagePack,
     readBlockRisuSaveTopLevelFields,
     streamBackupRisuSaveToFile,
 };
