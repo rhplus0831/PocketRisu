@@ -57,8 +57,8 @@ vi.mock('./resourceCache', () => ({
 }))
 
 const {
-    AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
     NodeStorage,
+    authoritativeStoragePayloadTimeoutMs,
 } = await import('./nodeStorage')
 
 const valueKey = 'pluginsave/YWE.json'
@@ -503,7 +503,9 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
             valueBytes,
             owner: 'Plugin',
         })
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(
+            authoritativeStoragePayloadTimeoutMs(valueBytes.byteLength),
+        )
 
         await expect(pending).resolves.toMatchObject({
             outcome: 'not-committed',
@@ -512,6 +514,28 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
             commitOutcomeUnknown: false,
         })
         expect(fetchMock).not.toHaveBeenCalled()
+    })
+
+    test('starts the transport deadline after request hashing completes', async () => {
+        vi.useFakeTimers()
+        const preparationDelay = authoritativeStoragePayloadTimeoutMs(valueBytes.byteLength) + 1
+        cache.sha256OwnedBytes.mockImplementation(() => new Promise(resolve => {
+            setTimeout(() => resolve(valueHash), preparationDelay)
+        }))
+        const storage = storageWithResponse(committedSet())
+
+        const pending = storage.mutatePluginStorage({
+            operation: 'set',
+            valueKey,
+            valueBytes,
+            owner: 'Plugin',
+        })
+        await vi.advanceTimersByTimeAsync(preparationDelay)
+
+        await expect(pending).resolves.toMatchObject({
+            outcome: 'committed',
+            commitOutcomeUnknown: false,
+        })
     })
 
     test('transport loss reports unknown and does not speculate about cache state', async () => {

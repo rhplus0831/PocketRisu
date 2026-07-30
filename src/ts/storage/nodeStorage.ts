@@ -60,7 +60,16 @@ import { PLUGIN_VALUE_STREAM_THRESHOLD_BYTES } from "./pluginStorageLimits"
 import type { BootInternalSnapshot } from "./bootSnapshotRecovery"
 import { comparePluginStorageKeys } from "../plugins/pluginStorageRecord"
 
+/** Short availability bound for authentication and small control requests. */
 export const AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS = 15_000
+/** Bounded metadata may legitimately enumerate large manifests or key sets. */
+export const AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS = 2 * 60_000
+/** Payload work gets fixed setup time plus a conservative minimum transfer rate. */
+export const AUTHORITATIVE_STORAGE_PAYLOAD_BASE_TIMEOUT_MS = 60_000
+export const AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS = 25 * 60_000
+export const AUTHORITATIVE_STORAGE_PAYLOAD_MIN_BYTES_PER_SECOND = 128 * 1024
+/** Long server jobs remain below the 30-minute V3 bridge safety ceiling. */
+export const AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS = AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS
 /** Full chat-row scans can legitimately traverse years of chat history. */
 export const INLAY_REFERENCE_IO_TIMEOUT_MS = 2 * 60_000
 /** Snapshot ingestion can legitimately stream hundreds of MiB from chunk storage. */
@@ -69,6 +78,24 @@ export const INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS = 10 * 60_000
 export const SAVE_FOLDER_IMPORT_TIMEOUT_MS = INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS
 export const INTERNAL_SNAPSHOT_KEY_PATTERN = /^database\/dbbackup-(0|[1-9]\d*)\.bin$/
 type BoundedStorageOperation = 'read' | 'list' | 'write' | 'remove' | 'transition' | 'batch'
+
+/**
+ * Minimal compatibility policy for known-size payloads. A legal 128 MiB
+ * plugin value receives roughly eighteen minutes at the conservative floor,
+ * while small payloads no longer inherit the 15-second control deadline.
+ */
+export function authoritativeStoragePayloadTimeoutMs(byteLength?: number | null): number {
+    if (!Number.isSafeInteger(byteLength) || Number(byteLength) < 0) {
+        return AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS
+    }
+    const transferMs = Math.ceil(
+        Number(byteLength) * 1000 / AUTHORITATIVE_STORAGE_PAYLOAD_MIN_BYTES_PER_SECOND,
+    )
+    return Math.min(
+        AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS,
+        AUTHORITATIVE_STORAGE_PAYLOAD_BASE_TIMEOUT_MS + transferMs,
+    )
+}
 
 /** Internal provenance that cannot be supplied by an HTTP response payload. */
 class LocalAuthoritativeStorageTimeoutError extends StorageError {}
@@ -1332,6 +1359,33 @@ export class NodeStorage{
         )
     }
 
+    /**
+     * Bound response-header acquisition with an explicit operation class.
+     * Callers returning a Response own its subsequent body lifetime; callers
+     * requiring a commit acknowledgement must instead keep body parsing inside
+     * runBoundedAuthoritativeStorageOperation.
+     */
+    private async boundedAuthFetch(
+        input: RequestInfo | URL,
+        init: RequestInit,
+        kind: BoundedStorageOperation,
+        timeoutMs: number,
+    ): Promise<Response> {
+        const mutation = kind === 'write' || kind === 'remove'
+            || kind === 'transition' || kind === 'batch'
+        return runBoundedAuthoritativeStorageOperation(
+            (signal, outcome) => this.authFetch(
+                input,
+                { ...init, signal },
+                true,
+                mutation ? outcome : undefined,
+            ),
+            kind,
+            timeoutMs,
+            init.signal,
+        )
+    }
+
     private async parseStorageFailureResponse(
         response: Response,
         operation: StorageOperation,
@@ -1535,11 +1589,13 @@ export class NodeStorage{
         kind: 'write' | 'transition',
         externalSignal?: AbortSignal | null,
     ): Promise<{ etag?: string }> {
+        // Serialization is local preparation, not transport availability.
+        const requestBytes = encodeRisuSaveLegacy(payload)
         return runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
             const response = await this.authFetch(path, {
                 method: 'POST',
                 headers: { 'content-type': 'application/octet-stream' },
-                body: encodeRisuSaveLegacy(payload) as any,
+                body: requestBytes as any,
                 signal,
             }, true, outcome)
             const failureResponse = response.clone()
@@ -1582,7 +1638,9 @@ export class NodeStorage{
             outcome.markDefinitiveResponse()
             if (typeof result.etag === 'string') this._lastDbEtag = result.etag
             return result
-        }, kind, AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+        }, kind, kind === 'transition'
+            ? AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS
+            : authoritativeStoragePayloadTimeoutMs(requestBytes.byteLength), externalSignal)
     }
 
     async commitPluginStorageMutation(
@@ -1618,6 +1676,12 @@ export class NodeStorage{
         mutation = false,
         allowAbortTombstone = false,
     ): Promise<PluginStorageStagedTransitionStatus | PluginStorageStagedTransitionAbortTombstone> {
+        const requestBody = body ? JSON.stringify(body) : undefined
+        const timeoutMs = mutation
+            ? AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS
+            : (requestBody
+                ? authoritativeStoragePayloadTimeoutMs(new TextEncoder().encode(requestBody).byteLength)
+                : AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS)
         const execute = () => runBoundedAuthoritativeStorageOperation(
             async (signal, outcome) => {
                 const response = await this.authFetch(path, {
@@ -1626,7 +1690,7 @@ export class NodeStorage{
                         'content-type': 'application/json',
                         'x-plugin-storage-transition': transitionId,
                     },
-                    body: body ? JSON.stringify(body) : undefined,
+                    body: requestBody,
                     signal,
                 }, mutation, outcome)
                 if (mutation) outcome.markRequestDispatched()
@@ -1677,7 +1741,7 @@ export class NodeStorage{
                 return result
             },
             mutation ? 'transition' : 'read',
-            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            timeoutMs,
             externalSignal,
         )
         try {
@@ -1810,7 +1874,7 @@ export class NodeStorage{
                 }
                 outcome.markDefinitiveResponse()
                 return result
-            }, 'transition', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+            }, 'transition', authoritativeStoragePayloadTimeoutMs(bytes.byteLength), externalSignal)
         } catch (error) {
             if (!(error instanceof StorageError) || !error.commitOutcomeUnknown) throw error
             let status: PluginStorageStagedTransitionStatus
@@ -1858,7 +1922,7 @@ export class NodeStorage{
             )
             if (!response.ok) throw new Error(`Plugin transition row read failed: ${response.status}`)
             return Buffer.from(await awaitWithAbort(response.arrayBuffer(), signal))
-        }, 'read', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+        }, 'read', AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS, externalSignal)
     }
 
     async getPluginStorageTransitionStatus(
@@ -1918,7 +1982,7 @@ export class NodeStorage{
                 outcome,
             ),
             "write",
-            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            authoritativeStoragePayloadTimeoutMs(value.byteLength),
             externalSignal,
         )
     }
@@ -2009,15 +2073,34 @@ export class NodeStorage{
             }
             : { ...request }
 
+        let expectedValueHash: string | undefined
+        if (stableRequest.operation === 'set') {
+            try {
+                // Hashing is local request preparation and must not consume the
+                // transport availability budget for a legal large value.
+                expectedValueHash = await sha256OwnedBytes(stableRequest.valueBytes!)
+            } catch (error) {
+                return fallback(
+                    'not-committed',
+                    error instanceof Error ? error.message : String(error),
+                    'REQUEST_HASH_UNAVAILABLE',
+                    false,
+                )
+            }
+        }
+
         try {
             return await runBoundedAuthoritativeStorageOperation(
                 (signal, outcome) => this.mutatePluginStorageAuthoritative(
                     stableRequest,
+                    expectedValueHash,
                     signal,
                     outcome,
                 ),
                 stableRequest.operation === 'set' ? 'write' : 'remove',
-                AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+                stableRequest.operation === 'set'
+                    ? authoritativeStoragePayloadTimeoutMs(stableRequest.valueBytes!.byteLength)
+                    : AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS,
                 externalSignal,
             )
         } catch (error) {
@@ -2040,26 +2123,10 @@ export class NodeStorage{
 
     private async mutatePluginStorageAuthoritative(
         stableRequest: PluginStorageMutationRequest,
+        expectedValueHash: string | undefined,
         signal: AbortSignal,
         outcome: AuthoritativeStorageOutcomeTracker,
     ): Promise<PluginStorageMutationResult> {
-        throwIfAborted(signal)
-        let expectedValueHash: string | undefined
-        if (stableRequest.operation === 'set') {
-            try {
-                expectedValueHash = await sha256OwnedBytes(stableRequest.valueBytes!)
-            } catch (error) {
-                return {
-                    outcome: 'not-committed',
-                    operation: stableRequest.operation,
-                    error: error instanceof Error ? error.message : String(error),
-                    code: 'REQUEST_HASH_UNAVAILABLE',
-                    status: null,
-                    retryable: false,
-                    commitOutcomeUnknown: false,
-                }
-            }
-        }
         throwIfAborted(signal)
 
         for (let retryIndex = 0; ; retryIndex++) {
@@ -2179,15 +2246,27 @@ export class NodeStorage{
                 }
                 : { ...operation }),
         }
+        let requestBytes: Uint8Array
+        let requestHash: string
+        try {
+            // Encoding and hashing are local preparation. Start the transport
+            // deadline only once the immutable request is ready to dispatch.
+            requestBytes = encodePluginStorageBatchRequest(stableRequest)
+            requestHash = await sha256OwnedBytes(requestBytes)
+        } catch (error) {
+            return pluginStorageBatchTransportOutcomeUnknown(error)
+        }
         try {
             return await runBoundedAuthoritativeStorageOperation(
                 (signal, outcome) => this.batchPluginStorageAuthoritative(
                     stableRequest,
+                    requestBytes,
+                    requestHash,
                     signal,
                     outcome,
                 ),
                 'batch',
-                AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+                authoritativeStoragePayloadTimeoutMs(requestBytes.byteLength),
                 externalSignal,
             )
         } catch (error) {
@@ -2215,12 +2294,11 @@ export class NodeStorage{
 
     private async batchPluginStorageAuthoritative(
         request: PluginStorageBatchRequest,
+        requestBytes: Uint8Array,
+        requestHash: string,
         signal: AbortSignal,
         outcome: AuthoritativeStorageOutcomeTracker,
     ): Promise<PluginStorageBatchResult> {
-        throwIfAborted(signal)
-        const requestBytes = encodePluginStorageBatchRequest(request)
-        const requestHash = await sha256OwnedBytes(requestBytes)
         throwIfAborted(signal)
 
         for (let retryIndex = 0; ; retryIndex++) {
@@ -2300,7 +2378,7 @@ export class NodeStorage{
                 options.pluginStorageGeneration,
             ),
             'read',
-            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS,
             options.signal,
         )
     }
@@ -2390,7 +2468,7 @@ export class NodeStorage{
         return runBoundedAuthoritativeStorageOperation(
             signal => this.getPluginStorageManifestSnapshotAuthoritative(generation, signal),
             'list',
-            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS,
             externalSignal,
         )
     }
@@ -2415,7 +2493,7 @@ export class NodeStorage{
                 onProgress,
             ),
             'list',
-            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS,
             externalSignal,
         )
     }
@@ -2725,7 +2803,7 @@ export class NodeStorage{
         return runBoundedAuthoritativeStorageOperation(
             signal => this.getPluginStorageManifestStateAuthoritative(generation, signal),
             'list',
-            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS,
             externalSignal,
         )
     }
@@ -2858,7 +2936,7 @@ export class NodeStorage{
                 options.pluginStorageGeneration,
             ),
             "read",
-            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS,
             options.signal,
         )
     }
@@ -2895,7 +2973,7 @@ export class NodeStorage{
                     ? responseEtag
                     : null,
             }
-        }, 'read', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+        }, 'read', AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS, externalSignal)
     }
 
     private async getItemAuthoritative(
@@ -2940,7 +3018,7 @@ export class NodeStorage{
                 options.pluginStorageGeneration,
             ),
             "read",
-            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS,
             options.signal,
         )
     }
@@ -3035,18 +3113,32 @@ export class NodeStorage{
                 }
             }
 
-            const response = await this.authFetch('/api/db/read-cached', {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ cache: { version: 1, hashes: inventory } }),
-            })
-            if (response.status < 200 || response.status >= 300) {
-                throw new Error(`cached database read error: ${response.status}`)
-            }
-            const responseEtag = response.headers.get('x-db-etag')
-            if (!responseEtag) throw new Error('Cached database response is missing its ETag')
-
-            const encodedEnvelope = new Uint8Array(await response.arrayBuffer())
+            const requestBody = JSON.stringify({ cache: { version: 1, hashes: inventory } })
+            const { encodedEnvelope, responseEtag } = await runBoundedAuthoritativeStorageOperation(
+                async (signal) => {
+                    const response = await this.authFetch('/api/db/read-cached', {
+                        method: 'POST',
+                        headers: { 'content-type': 'application/json' },
+                        body: requestBody,
+                        signal,
+                    })
+                    if (response.status < 200 || response.status >= 300) {
+                        throw new Error(`cached database read error: ${response.status}`)
+                    }
+                    const responseEtag = response.headers.get('x-db-etag')
+                    if (!responseEtag) {
+                        throw new Error('Cached database response is missing its ETag')
+                    }
+                    return {
+                        responseEtag,
+                        encodedEnvelope: new Uint8Array(
+                            await awaitWithAbort(response.arrayBuffer(), signal),
+                        ),
+                    }
+                },
+                'read',
+                AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS,
+            )
             const assembled = await decodeAndAssembleCachedDbRead(
                 encodedEnvelope,
                 inventory,
@@ -3092,7 +3184,7 @@ export class NodeStorage{
                 ? responseEtag
                 : null
             return bytes.length === 0 ? null : bytes
-        }, 'read', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+        }, 'read', AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS, externalSignal)
     }
 
     /**
@@ -3166,7 +3258,7 @@ export class NodeStorage{
                 })
             }
             return snapshots
-        }, 'list', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+        }, 'list', AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS, externalSignal)
     }
 
     /**
@@ -3291,7 +3383,7 @@ export class NodeStorage{
         return runBoundedAuthoritativeStorageOperation(
             signal => this.keysAuthoritative(prefix, signal),
             "list",
-            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS,
             externalSignal,
         )
     }
@@ -3314,7 +3406,7 @@ export class NodeStorage{
         return runBoundedAuthoritativeStorageOperation(
             signal => this.listEntriesWithSizesAuthoritative(prefix, signal),
             "list",
-            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS,
             externalSignal,
         )
     }
@@ -3417,7 +3509,7 @@ export class NodeStorage{
                 outcome,
             ),
             "remove",
-            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS,
             externalSignal,
         )
     }
@@ -3501,7 +3593,7 @@ export class NodeStorage{
         return runBoundedAuthoritativeStorageOperation(
             (signal, outcome) => this.clearPluginSaveStorageAuthoritative(signal, outcome),
             'remove',
-            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS,
             externalSignal,
         )
     }
@@ -3631,90 +3723,112 @@ export class NodeStorage{
     }
 
     async patchItem(key: string, patchData: { patch: any[], expectedHash: string }): Promise<PatchItemResult> {
-        const da = await this.authFetch('/api/patch', {
-            method: "POST",
-            body: JSON.stringify(patchData),
-            headers: {
-                'content-type': 'application/json',
-                'file-path': Buffer.from(key, 'utf-8').toString('hex')
-            }
-        })
+        const requestBody = JSON.stringify(patchData)
+        return runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
+            const da = await this.authFetch('/api/patch', {
+                method: "POST",
+                body: requestBody,
+                headers: {
+                    'content-type': 'application/json',
+                    'file-path': Buffer.from(key, 'utf-8').toString('hex')
+                },
+                signal,
+            }, true, outcome)
+            // Header receipt is not the database acknowledgement. Retain the
+            // ambiguous phase until the response body below has been consumed.
+            outcome.markRequestDispatched()
 
-        if (da.status === 409) {
-            const data = await da.json()
-            const rawCurrentEtag = data.currentEtag as unknown
-            const currentEtag = typeof rawCurrentEtag === 'string'
-                && /^[0-9a-f]{32}$/.test(rawCurrentEtag)
-                ? rawCurrentEtag
-                : undefined
-            // Server signals chat-guard rejection via explicit fields. The
-            // error string fallback is kept for forward-compat with deployed
-            // servers that haven't shipped the explicit fields yet.
-            const rejectedByChatGuard = data.chatGuardRejected === true
-                || data.code === 'CHAT_GUARD_REJECTED'
-                || (typeof data.error === 'string' && data.error.includes('chat-internal field ops'))
-            const patchHashConflict = key === 'database/database.bin'
-                && !rejectedByChatGuard
-                && (data.code === 'DATABASE_PATCH_CONFLICT'
-                    || data.error === 'Hash mismatch - data out of sync'
-                    || currentEtag !== undefined)
-            // Never promote an ETag from a rejected mutation. It describes a
-            // server body the client has not fetched and must remain diagnostic
-            // until conflict recovery installs that body and its baselines.
-            return {
-                success: false,
-                conflict: patchHashConflict,
-                currentEtag,
-                chatGuardRejected: rejectedByChatGuard,
+            if (da.status === 409) {
+                const data = await awaitWithAbort(da.json(), signal)
+                const rawCurrentEtag = data.currentEtag as unknown
+                const currentEtag = typeof rawCurrentEtag === 'string'
+                    && /^[0-9a-f]{32}$/.test(rawCurrentEtag)
+                    ? rawCurrentEtag
+                    : undefined
+                // Server signals chat-guard rejection via explicit fields. The
+                // error string fallback is kept for forward-compat with deployed
+                // servers that haven't shipped the explicit fields yet.
+                const rejectedByChatGuard = data.chatGuardRejected === true
+                    || data.code === 'CHAT_GUARD_REJECTED'
+                    || (typeof data.error === 'string' && data.error.includes('chat-internal field ops'))
+                const patchHashConflict = key === 'database/database.bin'
+                    && !rejectedByChatGuard
+                    && (data.code === 'DATABASE_PATCH_CONFLICT'
+                        || data.error === 'Hash mismatch - data out of sync'
+                        || currentEtag !== undefined)
+                // Never promote an ETag from a rejected mutation. It describes a
+                // server body the client has not fetched and must remain diagnostic
+                // until conflict recovery installs that body and its baselines.
+                outcome.markDefinitiveResponse()
+                return {
+                    success: false,
+                    conflict: patchHashConflict,
+                    currentEtag,
+                    chatGuardRejected: rejectedByChatGuard,
+                }
             }
-        }
-        if (da.status < 200 || da.status >= 300) {
-            return { success: false }
-        }
-        const data = await da.json()
-        if (data.error) {
-            return { success: false }
-        }
-        const nextEtag = data.etag as string | undefined
-        if (key === 'database/database.bin' && nextEtag) {
-            this._lastDbEtag = nextEtag
-        }
-        const persistWarning = data.persistWarning as PersistWarning | undefined
-        return { success: true, etag: nextEtag, persistWarning }
+            if (da.status < 200 || da.status >= 300) {
+                const storageError = await this.parseStorageFailureResponse(
+                    da,
+                    'write',
+                    true,
+                    signal,
+                )
+                if (!storageError.commitOutcomeUnknown) outcome.markDefinitiveResponse()
+                if (storageError.commitOutcomeUnknown) throw storageError
+                return { success: false }
+            }
+            const data = await awaitWithAbort(da.json(), signal)
+            if (data.error) {
+                outcome.markDefinitiveResponse()
+                return { success: false }
+            }
+            const nextEtag = data.etag as string | undefined
+            if (key === 'database/database.bin' && nextEtag) {
+                this._lastDbEtag = nextEtag
+            }
+            const persistWarning = data.persistWarning as PersistWarning | undefined
+            outcome.markDefinitiveResponse()
+            return { success: true, etag: nextEtag, persistWarning }
+        }, 'write', AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS)
     }
 
     // ── Bulk asset operations (3-2-B) ──────────────────────────────────────────
     async getItems(keys: string[]): Promise<{key: string, value: Buffer}[]> {
-        const da = await this.authFetch('/api/assets/bulk-read', {
-            method: 'POST',
-            body: JSON.stringify(keys),
-            headers: {
-                'content-type': 'application/json',
-                'accept': 'application/octet-stream'
-            }
-        })
-        if (da.status < 200 || da.status >= 300) throw 'getItems Error'
+        const requestBody = JSON.stringify(keys)
+        return runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const da = await this.authFetch('/api/assets/bulk-read', {
+                method: 'POST',
+                body: requestBody,
+                headers: {
+                    'content-type': 'application/json',
+                    'accept': 'application/octet-stream'
+                },
+                signal,
+            })
+            if (da.status < 200 || da.status >= 300) throw 'getItems Error'
 
-        const ct = da.headers.get('content-type') || ''
-        if (ct.includes('application/octet-stream')) {
-            // Binary protocol: [count(4)] then per entry: [keyLen(4)][key][valLen(4)][value]
-            const buf = Buffer.from(await da.arrayBuffer())
-            let offset = 0
-            const count = buf.readUInt32BE(offset); offset += 4
-            const results: {key: string, value: Buffer}[] = []
-            for (let i = 0; i < count; i++) {
-                const keyLen = buf.readUInt32BE(offset); offset += 4
-                const key = buf.subarray(offset, offset + keyLen).toString('utf-8'); offset += keyLen
-                const valLen = buf.readUInt32BE(offset); offset += 4
-                const value = buf.subarray(offset, offset + valLen) as Buffer; offset += valLen
-                results.push({ key, value })
+            const ct = da.headers.get('content-type') || ''
+            if (ct.includes('application/octet-stream')) {
+                // Binary protocol: [count(4)] then per entry: [keyLen(4)][key][valLen(4)][value]
+                const buf = Buffer.from(await awaitWithAbort(da.arrayBuffer(), signal))
+                let offset = 0
+                const count = buf.readUInt32BE(offset); offset += 4
+                const results: {key: string, value: Buffer}[] = []
+                for (let i = 0; i < count; i++) {
+                    const keyLen = buf.readUInt32BE(offset); offset += 4
+                    const key = buf.subarray(offset, offset + keyLen).toString('utf-8'); offset += keyLen
+                    const valLen = buf.readUInt32BE(offset); offset += 4
+                    const value = buf.subarray(offset, offset + valLen) as Buffer; offset += valLen
+                    results.push({ key, value })
+                }
+                return results
             }
-            return results
-        }
 
-        // Fallback: JSON+base64
-        const results: {key: string, value: string}[] = await da.json()
-        return results.map(r => ({ key: r.key, value: Buffer.from(r.value, 'base64') }))
+            // Fallback: JSON+base64
+            const results: {key: string, value: string}[] = await awaitWithAbort(da.json(), signal)
+            return results.map(r => ({ key: r.key, value: Buffer.from(r.value, 'base64') }))
+        }, 'read', AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS)
     }
 
     async setItems(entries: {key: string, value: Uint8Array}[]) {
@@ -3724,14 +3838,43 @@ export class NodeStorage{
                 key: e.key,
                 value: Buffer.from(e.value).toString('base64')
             }))
-            const da = await this.authFetch('/api/assets/bulk-write', {
-                method: 'POST',
-                body: JSON.stringify(body),
-                headers: {
-                    'content-type': 'application/json'
+            const requestBody = JSON.stringify(body)
+            await runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
+                const da = await this.authFetch('/api/assets/bulk-write', {
+                    method: 'POST',
+                    body: requestBody,
+                    headers: {
+                        'content-type': 'application/json'
+                    },
+                    signal,
+                }, true, outcome)
+                outcome.markRequestDispatched()
+                if (da.status < 200 || da.status >= 300) {
+                    const storageError = await this.parseStorageFailureResponse(
+                        da,
+                        'write',
+                        true,
+                        signal,
+                    )
+                    if (!storageError.commitOutcomeUnknown) outcome.markDefinitiveResponse()
+                    throw storageError
                 }
-            })
-            if (da.status < 200 || da.status >= 300) throw 'setItems Error'
+                const acknowledgement = await awaitWithAbort(da.json(), signal) as unknown
+                if (!acknowledgement || typeof acknowledgement !== 'object'
+                    || (acknowledgement as any).success !== true
+                    || (acknowledgement as any).count !== batch.length) {
+                    throw new StorageError('Bulk asset write returned an invalid acknowledgement.', {
+                        status: da.status,
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcomeUnknown: true,
+                        operation: 'write',
+                    })
+                }
+                outcome.markDefinitiveResponse()
+            }, 'write', authoritativeStoragePayloadTimeoutMs(
+                new TextEncoder().encode(requestBody).byteLength,
+            ))
         }
     }
 
@@ -3834,7 +3977,12 @@ export class NodeStorage{
                 const downloadUrl = `/api/backup/export/jobs/${encodeURIComponent(jobId)}/download`
                 const response = callerSignal
                     ? await this.authFetch(downloadUrl, { signal: callerSignal })
-                    : await this.authFetch(downloadUrl)
+                    : await this.boundedAuthFetch(
+                        downloadUrl,
+                        {},
+                        'read',
+                        AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS,
+                    )
                 if (!response.ok) {
                     throw new Error(`backup export download error: ${response.status}`)
                 }
@@ -3849,30 +3997,40 @@ export class NodeStorage{
         if (opts?.target === 'upstream') params.set('target', 'upstream')
         const query = params.toString()
         const url = `/api/backup/export${query ? `?${query}` : ''}`
-        // Backup preparation can legitimately take longer than ordinary KV
-        // reads. Keep it caller-cancellable without applying the generic 15s
-        // pre-header timeout.
+        // Backup preparation can legitimately take longer than ordinary
+        // metadata work. The returned stream remains caller-owned.
         const da = callerSignal
             ? await this.authFetch(url, { signal: callerSignal })
-            : await this.authFetch(url)
+            : await this.boundedAuthFetch(
+                url,
+                {},
+                'read',
+                AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS,
+            )
         if (da.status < 200 || da.status >= 300) throw `backup export error: ${da.status}`
         return da
     }
 
     async prepareImport(size: number): Promise<void> {
-        const da = await this.authFetch('/api/backup/import/prepare', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ size }),
-        })
-        if (da.status === 409) throw new Error('Another import is already in progress')
-        if (da.status === 413) throw new Error('Backup file is too large')
-        if (da.status === 507) {
-            const body = await da.json().catch(() => ({}))
-            const avail = body.available != null ? ` (available: ${Math.round(body.available / 1024 / 1024)} MB)` : ''
-            throw new Error(`Insufficient disk space${avail}`)
-        }
-        if (da.status < 200 || da.status >= 300) throw new Error(`backup prepare error: ${da.status}`)
+        const requestBody = JSON.stringify({ size })
+        await runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const da = await this.authFetch('/api/backup/import/prepare', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: requestBody,
+                signal,
+            })
+            if (da.status === 409) throw new Error('Another import is already in progress')
+            if (da.status === 413) throw new Error('Backup file is too large')
+            if (da.status === 507) {
+                const body = await awaitWithAbort(da.json(), signal).catch(() => ({}))
+                const avail = body.available != null ? ` (available: ${Math.round(body.available / 1024 / 1024)} MB)` : ''
+                throw new Error(`Insufficient disk space${avail}`)
+            }
+            if (da.status < 200 || da.status >= 300) {
+                throw new Error(`backup prepare error: ${da.status}`)
+            }
+        }, 'read', AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS)
     }
 
     async importBackup(
@@ -4049,13 +4207,18 @@ export class NodeStorage{
     async saveServerBackup(
         onProgress?: (current: number, total: number, bytes: number, totalBytes: number) => void
     ): Promise<{ok: boolean, filename: string, size: number}> {
-        const da = await this.authFetch('/api/backup/server/save', {
-            method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                'x-session-id': NodeStorage.sessionId,
+        const da = await this.boundedAuthFetch(
+            '/api/backup/server/save',
+            {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-session-id': NodeStorage.sessionId,
+                },
             },
-        })
+            'write',
+            AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS,
+        )
         if (da.status < 200 || da.status >= 300) {
             const body = await da.json().catch(() => ({}))
             throw new Error(body.error || `server backup save error: ${da.status}`)
@@ -4089,33 +4252,34 @@ export class NodeStorage{
     }
 
     async listServerBackups(): Promise<{backups: Array<{filename: string, size: number, createdAt: number}>}> {
-        const da = await this.authFetch('/api/backup/server/list')
-        if (da.status < 200 || da.status >= 300) throw new Error(`server backup list error: ${da.status}`)
-        return da.json()
+        return runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const da = await this.authFetch('/api/backup/server/list', { signal })
+            if (da.status < 200 || da.status >= 300) throw new Error(`server backup list error: ${da.status}`)
+            return await awaitWithAbort(da.json(), signal)
+        }, 'list', AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS)
     }
 
     async restoreServerBackup(
         filename: string,
         onProgress?: (bytes: number, totalBytes: number) => void
     ): Promise<{ok: boolean, assetsRestored: number, coldStorageFailed?: number}> {
-        let requestInFlight = false
-        const mutationOutcome: AuthoritativeStorageOutcomeTracker = {
-            markRequestDispatched: () => { requestInFlight = true },
-            markDefinitiveResponse: () => { requestInFlight = false },
-            isRequestInFlight: () => requestInFlight,
-        }
         let da: Response
         try {
-            da = await this.authFetch('/api/backup/server/restore', {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/json',
-                    'x-session-id': NodeStorage.sessionId,
+            da = await this.boundedAuthFetch(
+                '/api/backup/server/restore',
+                {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/json',
+                        'x-session-id': NodeStorage.sessionId,
+                    },
+                    body: JSON.stringify({ filename }),
                 },
-                body: JSON.stringify({ filename }),
-            }, true, mutationOutcome)
+                'write',
+                AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS,
+            )
         } catch (error) {
-            if (mutationOutcome.isRequestInFlight()) {
+            if (error instanceof StorageError && error.commitOutcomeUnknown) {
                 throw backupCommitOutcomeUnknown(
                     'Server backup restore transport failed before a response was received.',
                     error,
@@ -4197,15 +4361,23 @@ export class NodeStorage{
     }
 
     async deleteServerBackup(filename: string): Promise<void> {
-        const da = await this.authFetch(`/api/backup/server/${encodeURIComponent(filename)}`, {
-            method: 'DELETE',
-        })
+        const da = await this.boundedAuthFetch(
+            `/api/backup/server/${encodeURIComponent(filename)}`,
+            { method: 'DELETE' },
+            'remove',
+            AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS,
+        )
         if (da.status === 404) throw new Error('Backup file not found')
         if (da.status < 200 || da.status >= 300) throw new Error(`server backup delete error: ${da.status}`)
     }
 
     async downloadServerBackup(filename: string): Promise<Response> {
-        const da = await this.authFetch(`/api/backup/server/download/${encodeURIComponent(filename)}`)
+        const da = await this.boundedAuthFetch(
+            `/api/backup/server/download/${encodeURIComponent(filename)}`,
+            {},
+            'read',
+            AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS,
+        )
         if (da.status === 404) throw new Error('Backup file not found')
         if (da.status < 200 || da.status >= 300) throw new Error(`server backup download error: ${da.status}`)
         return da
@@ -4214,20 +4386,29 @@ export class NodeStorage{
     // ── Chat backups ──────────────────────────────────────────────────────────
 
     async listChatBackupChats(): Promise<{chats: ChatBackupSummary[]}> {
-        const da = await this.authFetch('/api/chat-backups')
-        if (da.status < 200 || da.status >= 300) throw new Error(`chat backup list error: ${da.status}`)
-        return da.json()
+        return runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const da = await this.authFetch('/api/chat-backups', { signal })
+            if (da.status < 200 || da.status >= 300) {
+                throw new Error(`chat backup list error: ${da.status}`)
+            }
+            return await awaitWithAbort(da.json(), signal)
+        }, 'list', AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS)
     }
 
     async listChatBackupVersions(
         chaId: string,
         chatId: string,
     ): Promise<{versions: ChatBackupVersion[]}> {
-        const da = await this.authFetch(
-            `/api/chat-backups/${encodeURIComponent(chaId)}/${encodeURIComponent(chatId)}`
-        )
-        if (da.status < 200 || da.status >= 300) throw new Error(`chat backup version list error: ${da.status}`)
-        return da.json()
+        return runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const da = await this.authFetch(
+                `/api/chat-backups/${encodeURIComponent(chaId)}/${encodeURIComponent(chatId)}`,
+                { signal },
+            )
+            if (da.status < 200 || da.status >= 300) {
+                throw new Error(`chat backup version list error: ${da.status}`)
+            }
+            return await awaitWithAbort(da.json(), signal)
+        }, 'list', AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS)
     }
 
     async fetchChatBackupVersion(
@@ -4235,26 +4416,46 @@ export class NodeStorage{
         chatId: string,
         versionId: string,
     ): Promise<Chat | null> {
-        const da = await this.authFetch(
-            `/api/chat-backups/${encodeURIComponent(chaId)}/${encodeURIComponent(chatId)}/${encodeURIComponent(versionId)}`
-        )
-        if (da.status === 404) return null
-        if (da.status < 200 || da.status >= 300) throw new Error(`chat backup fetch error: ${da.status}`)
-        const buffer = new Uint8Array(await da.arrayBuffer())
+        const buffer = await runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const da = await this.authFetch(
+                `/api/chat-backups/${encodeURIComponent(chaId)}/${encodeURIComponent(chatId)}/${encodeURIComponent(versionId)}`,
+                { signal },
+            )
+            if (da.status === 404) return null
+            if (da.status < 200 || da.status >= 300) {
+                throw new Error(`chat backup fetch error: ${da.status}`)
+            }
+            return new Uint8Array(await awaitWithAbort(da.arrayBuffer(), signal))
+        }, 'read', AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS)
+        if (!buffer) return null
         return normalizeChat(await decodeRisuSave(buffer))
     }
 
     // ── Chat content (runtime lazy load) ────────────────────────────────────
 
     async fetchChatContent(chaId: string, chatIndex: number, chatId: string): Promise<any | null> {
+        return runBoundedAuthoritativeStorageOperation(
+            signal => this.fetchChatContentAuthoritative(chaId, chatIndex, chatId, signal),
+            'read',
+            AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS,
+        )
+    }
+
+    private async fetchChatContentAuthoritative(
+        chaId: string,
+        chatIndex: number,
+        chatId: string,
+        signal: AbortSignal,
+    ): Promise<any | null> {
         const url = `/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`
         if (!isResourceCacheEnabled()) {
             const da = await this.authFetch(url, {
                 headers: { 'x-chat-id': chatId },
+                signal,
             })
             if (da.status === 404) return null
             if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
-            const buffer = new Uint8Array(await da.arrayBuffer())
+            const buffer = new Uint8Array(await awaitWithAbort(da.arrayBuffer(), signal))
             return normalizeChat(await decodeRisuSave(buffer))
         }
 
@@ -4270,7 +4471,7 @@ export class NodeStorage{
             headers['x-cached-hashes'] = manifestHashes.join(',')
         }
 
-        let da = await this.authFetch(url, { headers })
+        let da = await this.authFetch(url, { headers, signal })
         if (da.status === 404) return null
         if (da.status === 204) {
             try {
@@ -4286,12 +4487,13 @@ export class NodeStorage{
             } catch {
                 da = await this.authFetch(url, {
                     headers: { 'x-chat-id': chatId },
+                    signal,
                 })
                 if (da.status === 404) return null
             }
         }
         if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
-        const buffer = new Uint8Array(await da.arrayBuffer())
+        const buffer = new Uint8Array(await awaitWithAbort(da.arrayBuffer(), signal))
         const chat = normalizeChat(await decodeRisuSave(buffer))
         void storeBytes(resourceKey, buffer).catch(() => {
             // IndexedDB, quota, and Web Crypto anomalies are non-authoritative.
@@ -4302,6 +4504,8 @@ export class NodeStorage{
     async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any, backupReason?: string): Promise<void> {
         const encoded = encodeRisuSaveLegacy(chat)
         const cacheEnabled = isResourceCacheEnabled()
+        // Cache hashing may run concurrently, but it is not part of the
+        // authoritative transport deadline.
         const requestHash = cacheEnabled
             ? sha256Bytes(encoded).catch(() => null)
             : null
@@ -4312,17 +4516,66 @@ export class NodeStorage{
         if (backupReason !== undefined) {
             headers['x-chat-backup-reason'] = backupReason
         }
-        const da = await this.authFetch(`/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`, {
-            method: 'POST',
-            headers,
-            body: encoded,
-        })
-        if (da.status < 200 || da.status >= 300) throw new Error(`saveChatContent error: ${da.status}`)
+        const response = await runBoundedAuthoritativeStorageOperation(
+            async (signal, outcome) => {
+                const da = await this.authFetch(
+                    `/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`,
+                    {
+                        method: 'POST',
+                        headers,
+                        body: encoded,
+                        signal,
+                    },
+                    true,
+                    outcome,
+                )
+                const failureResponse = da.clone()
+                outcome.markRequestDispatched()
+                let payload: unknown
+                try {
+                    payload = await awaitWithAbort(da.json(), signal)
+                } catch (error) {
+                    throw new StorageError('Chat save acknowledgement was lost or malformed.', {
+                        status: da.status,
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcomeUnknown: true,
+                        operation: 'write',
+                        cause: error,
+                    })
+                }
+                if (!da.ok) {
+                    const storageError = await this.parseStorageFailureResponse(
+                        failureResponse,
+                        'write',
+                        true,
+                        signal,
+                    )
+                    if (!storageError.commitOutcomeUnknown) outcome.markDefinitiveResponse()
+                    throw storageError
+                }
+                if (!payload || typeof payload !== 'object'
+                    || (payload as any).success !== true
+                    || ((payload as any).hash !== undefined
+                        && !isSha256Hex((payload as any).hash))) {
+                    throw new StorageError('Chat save returned an invalid acknowledgement.', {
+                        status: da.status,
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcomeUnknown: true,
+                        operation: 'write',
+                    })
+                }
+                outcome.markDefinitiveResponse()
+                return payload as { hash?: string }
+            },
+            'write',
+            authoritativeStoragePayloadTimeoutMs(encoded.byteLength),
+        )
         if (!cacheEnabled || !requestHash) return
 
-        const response = await da.json().catch(() => null)
         const encodedHash = await requestHash
-        if (!encodedHash || response?.hash !== encodedHash) return
+        if (!encodedHash || response.hash !== encodedHash) return
         try {
             await storeBytes(`chat:${chaId}/${chatId}`, encoded)
         } catch {
@@ -4333,16 +4586,20 @@ export class NodeStorage{
     // ── Save-folder migration ─────────────────────────────────────────────────
 
     async scanSaveFolder(folderPath?: string): Promise<{count: number, totalSize: number, hasDatabase: boolean}> {
-        const da = await this.authFetch('/api/migrate/save-folder/scan', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ path: folderPath }),
-        })
-        if (da.status < 200 || da.status >= 300) {
-            const body = await da.json().catch(() => ({}))
-            throw new Error(body.error || `scan error: ${da.status}`)
-        }
-        return da.json()
+        const requestBody = JSON.stringify({ path: folderPath })
+        return runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const da = await this.authFetch('/api/migrate/save-folder/scan', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: requestBody,
+                signal,
+            })
+            if (da.status < 200 || da.status >= 300) {
+                const body = await awaitWithAbort(da.json(), signal).catch(() => ({}))
+                throw new Error(body.error || `scan error: ${da.status}`)
+            }
+            return await awaitWithAbort(da.json(), signal)
+        }, 'list', AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS)
     }
 
     async executeSaveFolderImport(folderPath?: string): Promise<{ok: boolean, imported: number}> {
@@ -4606,25 +4863,67 @@ export class NodeStorage{
     }
 
     async scanCleanup(): Promise<{count: number, totalSize: number}> {
-        const da = await this.authFetch('/api/migrate/save-folder/cleanup/scan', {
-            method: 'POST',
-        })
-        if (da.status < 200 || da.status >= 300) {
-            const body = await da.json().catch(() => ({}))
-            throw new Error(body.error || `cleanup scan error: ${da.status}`)
-        }
-        return da.json()
+        return runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const da = await this.authFetch('/api/migrate/save-folder/cleanup/scan', {
+                method: 'POST',
+                signal,
+            })
+            if (da.status < 200 || da.status >= 300) {
+                const body = await awaitWithAbort(da.json(), signal).catch(() => ({}))
+                throw new Error(body.error || `cleanup scan error: ${da.status}`)
+            }
+            return await awaitWithAbort(da.json(), signal)
+        }, 'list', AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS)
     }
 
     async executeCleanup(): Promise<{ok: boolean, removed: number, freedBytes: number}> {
-        const da = await this.authFetch('/api/migrate/save-folder/cleanup/execute', {
-            method: 'POST',
-        })
-        if (da.status < 200 || da.status >= 300) {
-            const body = await da.json().catch(() => ({}))
-            throw new Error(body.error || `cleanup error: ${da.status}`)
-        }
-        return da.json()
+        return runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
+            const da = await this.authFetch('/api/migrate/save-folder/cleanup/execute', {
+                method: 'POST',
+                signal,
+            }, true, outcome)
+            const failureResponse = da.clone()
+            outcome.markRequestDispatched()
+            let acknowledgement: unknown
+            try {
+                acknowledgement = await awaitWithAbort(da.json(), signal)
+            } catch (error) {
+                throw new StorageError('Cleanup acknowledgement was lost or malformed.', {
+                    status: da.status,
+                    code: 'COMMIT_OUTCOME_UNKNOWN',
+                    retryable: false,
+                    commitOutcomeUnknown: true,
+                    operation: 'remove',
+                    cause: error,
+                })
+            }
+            if (!da.ok) {
+                const storageError = await this.parseStorageFailureResponse(
+                    failureResponse,
+                    'remove',
+                    true,
+                    signal,
+                )
+                if (!storageError.commitOutcomeUnknown) outcome.markDefinitiveResponse()
+                throw storageError
+            }
+            if (!acknowledgement || typeof acknowledgement !== 'object'
+                || (acknowledgement as any).ok !== true
+                || !Number.isSafeInteger((acknowledgement as any).removed)
+                || (acknowledgement as any).removed < 0
+                || !Number.isSafeInteger((acknowledgement as any).freedBytes)
+                || (acknowledgement as any).freedBytes < 0) {
+                throw new StorageError('Cleanup returned an invalid acknowledgement.', {
+                    status: da.status,
+                    code: 'COMMIT_OUTCOME_UNKNOWN',
+                    retryable: false,
+                    commitOutcomeUnknown: true,
+                    operation: 'remove',
+                })
+            }
+            outcome.markDefinitiveResponse()
+            return acknowledgement as {ok: true, removed: number, freedBytes: number}
+        }, 'remove', AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS)
     }
 
 }

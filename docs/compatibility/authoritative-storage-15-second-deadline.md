@@ -1,12 +1,12 @@
 # Authoritative storage still has a 15-second deadline
 
-- Status: Confirmed regression
+- Status: Fixed 2026-07-30
 - Severity: High
 - Confidence: High
 - Introduced by: fa2d0e98
 - Related fix: 832d69bd
 
-## Difference
+## Original difference
 
 main performed NodeStorage network I/O without a general wall-clock deadline.
 serve wraps authoritative operations in runBoundedAuthoritativeStorageOperation
@@ -20,7 +20,7 @@ authFetch wrapper clears its timer when fetch returns response headers. Hashing
 is also inside the bound for optimized mutate/batch paths; staged-transition
 upload computes its expected hash before entering the bounded operation.
 
-## Compatibility impact
+## Original compatibility impact
 
 Slow but valid plugin storage reads, mutations, batches, transitions, asset and
 default storage operations, chat saves, and backup preparation can still fail
@@ -34,15 +34,46 @@ reads and can surface a retryable STORAGE_TIMEOUT after a possible commit.
 This is the closest remaining sibling of the reported 20-second plugin
 regression: the outer plugin RPC now waits, but its storage work does not.
 
-## Reproduction
+## Original reproduction
 
 Delay /api/plugin-storage/mutate acknowledgement for setItem(), a cold-cache
 value read for getItem(), or GET /api/plugin-storage/manifest for keys() by 16
 seconds. main's inline equivalents complete; serve aborts near 15 seconds.
 
-## Recommendation
+## Implemented recommendation
 
-Use operation-aware, progress/idle-based limits and preserve post-dispatch
-unknown-outcome classification. Add a test that stays pending after 20,001 ms
-without importing the production timeout constant, plus throttled large-value
-and delayed-acknowledgement integration cases.
+Replace the universal deadline with a small operation-aware policy while
+retaining a short fallback bound for unclassified control calls. Metadata
+receives two minutes; known-size payloads receive one minute of setup plus
+transfer time at a conservative 128 KiB/s floor, capped at 25 minutes;
+unknown-size payloads and long server jobs receive the 25-minute ceiling.
+Request serialization and hashing happen before the transport timer starts.
+
+Mutations must also be identified explicitly. Once dispatched, chat saves,
+bulk asset writes, cleanup, and other authoritative mutations remain
+commit-outcome unknown until their acknowledgement body is consumed and
+validated.
+
+## Resolution
+
+NodeStorage now applies the operation-aware policy across plugin storage,
+default KV, database, asset, chat, migration, and backup paths. The 15-second
+constant remains as the unclassified auth-fetch fallback; explicitly classified
+requests, including their authentication phase, use the owning operation's
+budget. Legal 128 MiB values receive about 18 minutes rather than 15 seconds,
+while every category still has a finite upper bound below the V3 bridge's
+30-minute ceiling.
+
+The former bare POST callers now use explicit mutation bounds and preserve
+post-dispatch ambiguity through strict acknowledgement parsing, so a timeout
+cannot be mislabeled as a safely retryable read failure after a possible
+commit. Focused coverage keeps a valid write pending after 20,001 ms without
+referencing a production timeout constant, verifies long local hashing does not
+consume the transport budget, and retains stalled/malformed acknowledgement
+classification tests.
+
+This minimal policy intentionally does not make PocketRisu fully unbounded like
+the two original applications. Extremely slow transfers below the throughput
+floor and jobs exceeding 25 minutes can still time out. Those cases remain an
+explicit limitation of the minimal fix and can be revisited with progress- or
+idle-based cancellation if they become practical failures.

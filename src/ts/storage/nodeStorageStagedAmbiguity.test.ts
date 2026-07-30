@@ -53,7 +53,8 @@ vi.mock('./risuSave', () => ({
 }))
 
 const {
-    AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+    AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS,
+    AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS,
     NodeStorage,
 } = await import('./nodeStorage')
 const { StorageError } = await import('./storageError')
@@ -254,8 +255,8 @@ describe('NodeStorage staged finalize ambiguity', () => {
 
         const result = storage.finalizePluginStorageTransition(TRANSITION_ID)
             .catch(error => error)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS)
 
         expectCommitOutcomeUnknown(await result)
         expect(fetchMock).toHaveBeenCalledTimes(2)
@@ -303,7 +304,7 @@ describe('NodeStorage staged finalize ambiguity', () => {
 
         const result = storage.finalizePluginStorageTransition(TRANSITION_ID)
             .catch(error => error)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS)
 
         expectCommitOutcomeUnknown(await result)
         expect(fetchMock).toHaveBeenCalledTimes(2)

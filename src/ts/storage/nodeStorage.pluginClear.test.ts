@@ -37,7 +37,7 @@ vi.mock('./resourceCache', () => ({
     touchResourceCacheManifest: vi.fn(),
 }))
 
-const { AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, NodeStorage } = await import('./nodeStorage')
+const { AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS, NodeStorage } = await import('./nodeStorage')
 const { StorageError } = await import('./storageError')
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -181,7 +181,7 @@ describe('NodeStorage atomic plugin clear outcomes', () => {
         const pending = storage.clearPluginSaveStorage()
             .then(value => value, error => error)
             .finally(() => { settled = true })
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS - 1)
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS - 1)
         await Promise.resolve()
         expect(settled).toBe(false)
         expect(cache.invalidateResourceCachePrefix).not.toHaveBeenCalled()

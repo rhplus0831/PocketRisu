@@ -56,10 +56,18 @@ vi.mock('./risuSave', () => ({
 }))
 
 const {
+    AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS,
     AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+    AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS,
     NodeStorage,
+    authoritativeStoragePayloadTimeoutMs,
 } = await import('./nodeStorage')
 const { StorageError } = await import('./storageError')
+const { encodeRisuSaveLegacy } = await import('./risuSave')
+
+const SMALL_PLUGIN_WRITE_TIMEOUT_MS = authoritativeStoragePayloadTimeoutMs(
+    new TextEncoder().encode('{"value":1}').byteLength,
+)
 
 function readyStorage(): InstanceType<typeof NodeStorage> {
     const storage = new NodeStorage()
@@ -81,6 +89,7 @@ beforeEach(() => {
     cache.sha256OwnedBytes.mockResolvedValue('a'.repeat(64))
     cache.storeBytes.mockResolvedValue(undefined)
     cache.storeOwnedBytesWithKnownHash.mockResolvedValue(undefined)
+    vi.mocked(encodeRisuSaveLegacy).mockReturnValue(new Uint8Array([1, 2, 3]))
 })
 
 afterEach(() => {
@@ -89,6 +98,15 @@ afterEach(() => {
 })
 
 describe('NodeStorage availability bounds', () => {
+    it('assigns legal large payloads a bounded transfer budget', () => {
+        const timeoutMs = authoritativeStoragePayloadTimeoutMs(128 * 1024 * 1024)
+
+        expect(timeoutMs).toBeGreaterThan(20_001)
+        expect(timeoutMs).toBeLessThanOrEqual(AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS)
+        expect(authoritativeStoragePayloadTimeoutMs(undefined))
+            .toBe(AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS)
+    })
+
     it('polls a partial export job past the generic 15 second read bound', async () => {
         vi.useFakeTimers()
         const startedAt = Date.now()
@@ -136,7 +154,7 @@ describe('NodeStorage availability bounds', () => {
         expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/download'))).toBe(true)
     })
 
-    it('keeps the ordinary availability bound for a full export without a caller signal', async () => {
+    it('bounds a stalled full export at the long-job ceiling', async () => {
         vi.useFakeTimers()
         let requestSignal: AbortSignal | undefined
         vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
@@ -146,7 +164,7 @@ describe('NodeStorage availability bounds', () => {
         const storage = readyStorage()
 
         const exported = storage.exportBackup().catch(error => error)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS)
 
         await expect(exported).resolves.toMatchObject({
             code: 'STORAGE_TIMEOUT',
@@ -194,7 +212,7 @@ describe('NodeStorage availability bounds', () => {
 
         const exported = storage.exportBackup({ scope: 'partial' }).catch(error => error)
         await vi.waitFor(() => expect(downloadSignal).toBeDefined())
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS)
 
         await expect(exported).resolves.toMatchObject({
             code: 'STORAGE_TIMEOUT',
@@ -507,6 +525,37 @@ describe('NodeStorage availability bounds', () => {
         expect(cache.storeOwnedBytesWithKnownHash).toHaveBeenCalledTimes(2)
     })
 
+    it('keeps a valid storage write pending beyond 20,001ms', async () => {
+        vi.useFakeTimers()
+        let requestSignal: AbortSignal | undefined
+        vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+            requestSignal = init?.signal ?? undefined
+            return new Promise<Response>(resolve => {
+                setTimeout(() => resolve(new Response(JSON.stringify({
+                    hash: 'a'.repeat(64),
+                }), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                })), 20_002)
+            })
+        }))
+        const storage = readyStorage()
+        let settled = false
+
+        const pending = storage.setItem(
+            'pluginsave/alpha.json',
+            new TextEncoder().encode('{"value":1}'),
+        ).finally(() => { settled = true })
+        await vi.advanceTimersByTimeAsync(20_001)
+
+        expect(settled).toBe(false)
+        expect(requestSignal?.aborted).toBe(false)
+
+        await vi.advanceTimersByTimeAsync(1)
+        await expect(pending).resolves.toBeUndefined()
+        expect(requestSignal?.aborted).toBe(false)
+    })
+
     it('aborts a stalled write and reports an unknown commit outcome', async () => {
         vi.useFakeTimers()
         let requestSignal: AbortSignal | undefined
@@ -520,7 +569,7 @@ describe('NodeStorage availability bounds', () => {
             'pluginsave/alpha.json',
             new TextEncoder().encode('{"value":1}'),
         ).catch(error => error)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(SMALL_PLUGIN_WRITE_TIMEOUT_MS)
         const error = await result
 
         expect(error).toBeInstanceOf(StorageError)
@@ -530,6 +579,87 @@ describe('NodeStorage availability bounds', () => {
             operation: 'write',
         })
         expect(requestSignal?.aborted).toBe(true)
+    })
+
+    it('classifies a timed-out chat save as commit-outcome unknown', async () => {
+        vi.useFakeTimers()
+        cache.enabled = false
+        const encoded = new Uint8Array([1, 2, 3])
+        vi.mocked(encodeRisuSaveLegacy).mockReturnValue(encoded)
+        let requestSignal: AbortSignal | undefined
+        vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+            requestSignal = init?.signal ?? undefined
+            return new Promise<Response>(() => undefined)
+        }))
+        const storage = readyStorage()
+
+        const result = storage.saveChatContent('character', 0, 'chat', {})
+            .catch(error => error)
+        await vi.advanceTimersByTimeAsync(
+            authoritativeStoragePayloadTimeoutMs(encoded.byteLength),
+        )
+
+        await expect(result).resolves.toMatchObject({
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            commitOutcomeUnknown: true,
+            retryable: false,
+            operation: 'write',
+        })
+        expect(requestSignal?.aborted).toBe(true)
+    })
+
+    it('accepts the original PocketRisu chat-save acknowledgement without a hash', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+            success: true,
+        }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+        })))
+        const storage = readyStorage()
+
+        await expect(storage.saveChatContent('character', 0, 'chat', {}))
+            .resolves.toBeUndefined()
+        expect(cache.storeBytes).not.toHaveBeenCalled()
+    })
+
+    it('classifies a timed-out bulk asset write as commit-outcome unknown', async () => {
+        vi.useFakeTimers()
+        const value = new Uint8Array([1, 2, 3])
+        const requestBody = JSON.stringify([{
+            key: 'assets/example',
+            value: Buffer.from(value).toString('base64'),
+        }])
+        vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => undefined)))
+        const storage = readyStorage()
+
+        const result = storage.setItems([{ key: 'assets/example', value }])
+            .catch(error => error)
+        await vi.advanceTimersByTimeAsync(authoritativeStoragePayloadTimeoutMs(
+            new TextEncoder().encode(requestBody).byteLength,
+        ))
+
+        await expect(result).resolves.toMatchObject({
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            commitOutcomeUnknown: true,
+            retryable: false,
+            operation: 'write',
+        })
+    })
+
+    it('classifies a timed-out cleanup as commit-outcome unknown', async () => {
+        vi.useFakeTimers()
+        vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => undefined)))
+        const storage = readyStorage()
+
+        const result = storage.executeCleanup().catch(error => error)
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS)
+
+        await expect(result).resolves.toMatchObject({
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            commitOutcomeUnknown: true,
+            retryable: false,
+            operation: 'remove',
+        })
     })
 
     it('reports a safe timeout when authentication stalls before dispatch and then recovers', async () => {
@@ -550,7 +680,7 @@ describe('NodeStorage availability bounds', () => {
             'pluginsave/alpha.json',
             new TextEncoder().encode('{"value":1}'),
         ).catch(error => error)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(SMALL_PLUGIN_WRITE_TIMEOUT_MS)
         const error = await result
 
         expect(error).toBeInstanceOf(StorageError)
@@ -599,7 +729,7 @@ describe('NodeStorage availability bounds', () => {
             'pluginsave/alpha.json',
             new TextEncoder().encode('{"value":1}'),
         ).catch(error => error)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(SMALL_PLUGIN_WRITE_TIMEOUT_MS)
         await expect(result).resolves.toMatchObject({
             code: 'STORAGE_TIMEOUT',
             commitOutcomeUnknown: false,
@@ -644,7 +774,7 @@ describe('NodeStorage availability bounds', () => {
             'pluginsave/alpha.json',
             new TextEncoder().encode('{"value":1}'),
         ).catch(error => error)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(SMALL_PLUGIN_WRITE_TIMEOUT_MS)
         await expect(result).resolves.toMatchObject({
             code: 'STORAGE_TIMEOUT',
             commitOutcomeUnknown: false,
@@ -681,7 +811,7 @@ describe('NodeStorage availability bounds', () => {
             'pluginsave/alpha.json',
             new TextEncoder().encode('{"value":1}'),
         ).catch(error => error)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(SMALL_PLUGIN_WRITE_TIMEOUT_MS)
         const error = await result
 
         expect(error).toBeInstanceOf(StorageError)
@@ -727,7 +857,7 @@ describe('NodeStorage availability bounds', () => {
         const storage = readyStorage()
 
         const pending = storage.finalizePluginStorageTransition(transitionId)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS)
         const result = await pending
 
         expect(result.state).toBe('committed')
@@ -767,7 +897,7 @@ describe('NodeStorage availability bounds', () => {
 
         const pending = storage.finalizePluginStorageTransition(transitionId)
             .catch(error => error)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS)
         const error = await pending
 
         expect(error).toBeInstanceOf(StorageError)
@@ -791,7 +921,7 @@ describe('NodeStorage availability bounds', () => {
             'pluginsave/alpha.json',
             new TextEncoder().encode('{"value":1}'),
         ).catch(error => error)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(SMALL_PLUGIN_WRITE_TIMEOUT_MS)
         const error = await result
 
         expect(error).toBeInstanceOf(StorageError)
@@ -829,7 +959,7 @@ describe('NodeStorage availability bounds', () => {
             'pluginsave/alpha.json',
             new TextEncoder().encode('{"value":1}'),
         ).catch(error => error)
-        await vi.advanceTimersByTimeAsync(AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(SMALL_PLUGIN_WRITE_TIMEOUT_MS)
         const error = await result
 
         expect(error).toBeInstanceOf(StorageError)
