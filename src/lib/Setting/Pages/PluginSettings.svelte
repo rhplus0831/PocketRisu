@@ -25,6 +25,7 @@
     import {
         getPluginPermissionDecisions,
         pluginPermissionDescs,
+        resetPluginPermission,
         setPluginPermissionDecision,
         type PluginPermissionDecision,
         type PluginPermissionDesc,
@@ -58,6 +59,7 @@
     let permissionEditorLoading = $state(false)
     let permissionDecisions = $state<Partial<Record<PluginPermissionDesc, PluginPermissionDecision>>>({})
     let permissionSaving = $state<PluginPermissionDesc[]>([])
+    let permissionResetting = $state(false)
     let permissionLoadVersion = 0
     const optimizePluginMemoryEligible = $derived(
         canOptimizePluginMemory(DBState.db.plugins),
@@ -209,7 +211,7 @@
         permission: PluginPermissionDesc,
         decision: Exclude<PluginPermissionDecision, "ask">,
     ) {
-        if (permissionSaving.includes(permission)) return
+        if (permissionResetting || permissionSaving.includes(permission)) return
         permissionSaving.push(permission)
         try {
             await setPluginPermissionDecision(pluginName, permission, decision)
@@ -220,6 +222,29 @@
             notifyError(error)
         } finally {
             permissionSaving = permissionSaving.filter((item) => item !== permission)
+        }
+    }
+
+    async function resetPermissionsToAsk(pluginName: string, displayName: string) {
+        if (permissionEditorLoading || permissionResetting || permissionSaving.length > 0) return
+        permissionResetting = true
+        try {
+            const confirmed = await alertConfirm(
+                language.resetPluginPermissionConfirm.replace("{}", displayName),
+            )
+            if (!confirmed) return
+
+            await resetPluginPermission(pluginName)
+            if (permissionEditorPlugin === pluginName) {
+                permissionDecisions = Object.fromEntries(
+                    pluginPermissionDescs.map((permission) => [permission, "ask"] as const),
+                )
+            }
+            notifySuccess(language.resetPluginPermissionDone.replace("{}", displayName))
+        } catch (error) {
+            notifyError(error)
+        } finally {
+            permissionResetting = false
         }
     }
 </script>
@@ -473,8 +498,24 @@
         </div>
         {#if permissionEditorPlugin === plugin.name}
             <div class="mt-3 rounded-md border border-darkborderc bg-darkbg/60 p-3">
-                <div class="font-medium">
-                    {language.pluginPermissionsFor.replace("{}", plugin.displayName ?? plugin.name)}
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                    <div class="font-medium">
+                        {language.pluginPermissionsFor.replace("{}", plugin.displayName ?? plugin.name)}
+                    </div>
+                    <ShButton
+                        size="xs"
+                        variant="outline"
+                        disabled={permissionEditorLoading || permissionResetting || permissionSaving.length > 0}
+                        onclick={async (e) => {
+                            e.stopPropagation()
+                            await resetPermissionsToAsk(
+                                plugin.name,
+                                plugin.displayName ?? plugin.name,
+                            )
+                        }}
+                    >
+                        {language.resetPluginPermission}
+                    </ShButton>
                 </div>
                 <p class="mt-1 text-xs text-textcolor2">{language.pluginPermissionEditorHint}</p>
 
@@ -507,7 +548,7 @@
                                         size="xs"
                                         variant={decision === "granted" ? "success" : "outline"}
                                         aria-pressed={decision === "granted"}
-                                        disabled={permissionSaving.includes(permission)}
+                                        disabled={permissionResetting || permissionSaving.includes(permission)}
                                         onclick={async (e) => {
                                             e.stopPropagation()
                                             await updatePermission(plugin.name, permission, "granted")
@@ -519,7 +560,7 @@
                                         size="xs"
                                         variant={decision === "revoked" ? "destructive" : "outline"}
                                         aria-pressed={decision === "revoked"}
-                                        disabled={permissionSaving.includes(permission)}
+                                        disabled={permissionResetting || permissionSaving.includes(permission)}
                                         onclick={async (e) => {
                                             e.stopPropagation()
                                             await updatePermission(plugin.name, permission, "revoked")

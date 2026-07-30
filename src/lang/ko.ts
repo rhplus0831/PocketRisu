@@ -1780,14 +1780,14 @@ export const languageKorean = {
     "플러그인 {} 이(가) Provider 접근 권한을 요청합니다. 무단 API 호출이 발생할 수 있습니다. 허용하시겠습니까?",
   sendChatConsent:
     "플러그인 {} 이(가) 사용자 대신 채팅 메시지를 전송할 권한을 요청합니다. AI 응답이 트리거됩니다. 허용하시겠습니까?",
-  resetPluginPermission: "권한 응답 초기화",
+  resetPluginPermission: "모두 요청 시 확인으로 초기화",
   resetPluginPermissionConfirm:
     '플러그인 "{}"의 저장된 권한 응답(허용/거부 이력)을 모두 삭제하시겠습니까?\n\n다음에 플러그인이 권한을 요청할 때 다시 묻게 됩니다.',
   resetPluginPermissionDone: '"{}"의 권한 응답을 초기화했습니다',
   managePluginPermissions: "플러그인 권한 관리",
   pluginPermissionsFor: '"{}" 권한',
   pluginPermissionEditorHint:
-    "변경 사항은 즉시 저장됩니다. 철회된 권한은 여기에서 허용할 때까지 차단됩니다.",
+    "변경 사항은 즉시 저장됩니다. 모두 요청 시 확인으로 초기화하면 저장된 선택을 지우고 플러그인이 다시 묻습니다.",
   pluginPermissionFetchLogs: "요청 로그 읽기",
   pluginPermissionDatabase: "전체 데이터베이스 접근",
   pluginPermissionMainDom: "메인 페이지 접근",
