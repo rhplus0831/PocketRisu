@@ -31,12 +31,25 @@ const {
 interface AssetStore {
     assetDir: string
     migrationMarkerPath: string
+    legacyHashIdentityMarkerPath: string
+    legacyHashMarkerDir: string
     ensureAssetDir: () => void
     isSafeAssetName: (name: unknown) => boolean
+    isHashShapedAssetName: (name: unknown) => boolean
     assetPathFor: (name: string) => string
+    legacyHashMarkerPathFor: (name: string) => string
+    isLegacyHashAsset: (name: string) => boolean
+    markLegacyHashAsset: (name: string) => boolean
+    clearLegacyHashAsset: (name: string) => boolean
+    reconcileLegacyHashAssetIdentity: (
+        options?: { discover?: boolean },
+    ) => { marked: number; cleared: number }
     writeAssetFile: (name: string, buffer: Buffer) => void
     writeAssetFileIfChanged: (name: string, buffer: Buffer) => boolean
     readAssetFile: (name: string) => Buffer | null
+    verifyStoredAssetHash: (
+        name: string,
+    ) => { claimed: string | null; actual: string | null; ok: boolean } | null
     assetFileExists: (name: string) => boolean
     assetFileSize: (name: string) => number | null
     assetFileMtimeMs: (name: string) => number | null
@@ -137,6 +150,65 @@ describe('asset hash verification', () => {
                 ok: true,
             })
         }
+    })
+})
+
+describe('legacy hash-shaped asset identity', () => {
+    it('discovers mismatched legacy files once and persists their identity', () => {
+        const store = makeStore()
+        const legacyName = `${'0'.repeat(64)}.png`
+        const legacyValue = Buffer.from('historical bytes')
+        const validValue = Buffer.from('content-addressed bytes')
+        const validName = `${createHash('sha256').update(validValue).digest('hex')}.webp`
+        store.writeAssetFile(legacyName, legacyValue)
+        store.writeAssetFile(validName, validValue)
+
+        expect(store.isLegacyHashAsset(legacyName)).toBe(false)
+        expect(store.reconcileLegacyHashAssetIdentity({ discover: true })).toEqual({
+            marked: 1,
+            cleared: 0,
+        })
+        expect(store.isLegacyHashAsset(legacyName)).toBe(true)
+        expect(store.isLegacyHashAsset(validName)).toBe(false)
+        expect(fs.readFileSync(store.legacyHashIdentityMarkerPath, 'utf-8')).not.toBe('')
+        expect(store.listAssetFiles().map(entry => entry.name).sort()).toEqual([
+            legacyName,
+            validName,
+        ].sort())
+
+        const reopened = createAssetStore({ assetDir: store.assetDir }) as AssetStore
+        expect(reopened.isLegacyHashAsset(legacyName)).toBe(true)
+        expect(reopened.verifyStoredAssetHash(legacyName)).toMatchObject({ ok: false })
+    })
+
+    it('prunes stale markers without discovering later filesystem corruption', () => {
+        const store = makeStore()
+        const validValue = Buffer.from('canonical bytes')
+        const validName = `${createHash('sha256').update(validValue).digest('hex')}.png`
+        const corruptValue = Buffer.from('corrupt bytes')
+        const corruptName = `${createHash('sha256').update(Buffer.from('expected')).digest('hex')}.png`
+        store.writeAssetFile(validName, validValue)
+        store.writeAssetFile(corruptName, corruptValue)
+        store.markLegacyHashAsset(validName)
+
+        expect(store.reconcileLegacyHashAssetIdentity()).toEqual({ marked: 0, cleared: 1 })
+        expect(store.isLegacyHashAsset(validName)).toBe(false)
+        expect(store.isLegacyHashAsset(corruptName)).toBe(false)
+    })
+
+    it('removes identity markers with asset deletion and bulk clearing', () => {
+        const store = makeStore()
+        const first = `${'1'.repeat(64)}.png`
+        const second = `${'2'.repeat(64)}.png`
+        store.writeAssetFile(first, Buffer.from('first'))
+        store.writeAssetFile(second, Buffer.from('second'))
+        store.markLegacyHashAsset(first)
+        store.markLegacyHashAsset(second)
+
+        expect(store.deleteAssetFile(first)).toBe(true)
+        expect(store.isLegacyHashAsset(first)).toBe(false)
+        expect(store.clearAssetFiles()).toBe(1)
+        expect(fs.existsSync(store.legacyHashMarkerDir)).toBe(false)
     })
 })
 

@@ -49,10 +49,15 @@ const { buildListResponse } = require('./listDelta.cjs');
 const {
     assetDir,
     migrationMarkerPath: assetMigrationMarker,
+    legacyHashIdentityMarkerPath,
     createAssetStore,
     ensureAssetDir,
     isSafeAssetName,
     assetPathFor,
+    isLegacyHashAsset,
+    markLegacyHashAsset,
+    clearLegacyHashAsset,
+    reconcileLegacyHashAssetIdentity,
     writeAssetFile,
     writeAssetFileIfChanged,
     readAssetFile,
@@ -3188,16 +3193,28 @@ function readAssetValue(key, reader = { kvGet }) {
     return reader.kvGet(key);
 }
 
+function verifyAssetHashForWrite(key, value) {
+    const verification = verifyAssetHash(key, value);
+    const name = assetNameForKey(key);
+    const legacyHashMismatch = !verification.ok
+        && name !== null
+        && isLegacyHashAsset(name);
+    return { ...verification, legacyHashMismatch };
+}
+
 function writeAssetValue(key, value, options = {}) {
-    const { skipIfUnchanged = false } = options;
+    const { skipIfUnchanged = false, legacyHashMismatch = false } = options;
     const name = assetNameForKey(key);
     if (name !== null && isSafeAssetName(name)) {
+        if (legacyHashMismatch) markLegacyHashAsset(name);
         let wrote = true;
         if (skipIfUnchanged) {
             wrote = writeAssetFileIfChanged(name, value);
         } else {
             writeAssetFile(name, value);
         }
+        const verification = verifyAssetHash(key, value);
+        if (verification.ok) clearLegacyHashAsset(name);
         // A crash between the file rename and this delete is harmless: reads
         // prefer the file, and the startup migration removes the duplicate.
         kvDel(key);
@@ -3229,6 +3246,7 @@ function listAssetEntriesWithSizes(reader = { kvListWithSizes, kvGetUpdatedAt })
             size: file.size,
             mtimeMs: file.mtimeMs,
             source: 'fs',
+            legacyHash: isLegacyHashAsset(file.name),
         });
     }
     for (const row of reader.kvListWithSizes('assets/')) {
@@ -3240,6 +3258,7 @@ function listAssetEntriesWithSizes(reader = { kvListWithSizes, kvGetUpdatedAt })
                     ? reader.kvGetUpdatedAt(row.key)
                     : null,
                 source: 'kv',
+                legacyHash: false,
             });
         }
     }
@@ -3256,11 +3275,11 @@ async function prepareAssetImportStage() {
     const store = createAssetStore({ assetDir: assetImportStagingDir });
     store.ensureAssetDir();
     writeFileSync(store.migrationMarkerPath, new Date().toISOString(), 'utf-8');
+    store.reconcileLegacyHashAssetIdentity({ discover: true });
     return { store };
 }
 
-function warnImportedAssetHashMismatch(key, value, source) {
-    const verification = verifyAssetHash(key, value);
+function warnImportedAssetHashVerification(key, verification, source) {
     if (!verification.ok) {
         logger.warn(
             `[AssetFS] ${source} hash mismatch for ${key}: `
@@ -3269,10 +3288,17 @@ function warnImportedAssetHashMismatch(key, value, source) {
     }
 }
 
+function warnImportedAssetHashMismatch(key, value, source) {
+    const verification = verifyAssetHash(key, value);
+    warnImportedAssetHashVerification(key, verification, source);
+    return verification;
+}
+
 function writeImportedAsset(assetStage, key, value, source, writeKv = kvSet) {
-    warnImportedAssetHashMismatch(key, value, source);
+    const verification = warnImportedAssetHashMismatch(key, value, source);
     const name = assetNameForKey(key);
     if (name !== null && isSafeAssetName(name)) {
+        if (!verification.ok) assetStage.store.markLegacyHashAsset(name);
         assetStage.store.writeAssetFile(name, value);
         kvClearDeletion(key);
         return 'fs';
@@ -3295,6 +3321,9 @@ async function writeImportedAssetFromFile(
             maxBytes,
             signal,
         });
+        const verification = assetStage.store.verifyStoredAssetHash(name);
+        warnImportedAssetHashVerification(key, verification, label || 'Legacy import');
+        if (!verification.ok) assetStage.store.markLegacyHashAsset(name);
         kvClearDeletion(key);
         return 'fs';
     }
@@ -3408,40 +3437,51 @@ async function importColdStorageFromFile(
 
 function migrateAssetsToFilesystem() {
     ensureAssetDir();
-    if (existsSync(assetMigrationMarker)) return;
-
-    const keys = kvList('assets/');
-    if (keys.length > 0) {
-        console.log(`[AssetFS] Migrating ${keys.length} asset row(s) to ${assetDir}...`);
+    let migratedRows = false;
+    if (!existsSync(assetMigrationMarker)) {
+        const keys = kvList('assets/');
+        if (keys.length > 0) {
+            console.log(`[AssetFS] Migrating ${keys.length} asset row(s) to ${assetDir}...`);
+        }
+        const result = migrateAssetRowsToFilesystem({
+            keys,
+            getValue: (key) => {
+                const value = kvGet(key);
+                if (value !== null) {
+                    warnImportedAssetHashMismatch(key, value, 'Startup migration');
+                }
+                return value;
+            },
+            deleteValue: (key) => {
+                kvDel(key);
+                kvClearDeletion(key);
+            },
+            store: {
+                isSafeAssetName,
+                writeAssetFileIfChanged,
+            },
+            onProgress: ({ index, total, migrated }) => {
+                if (migrated % 100 === 0 || index === total - 1) {
+                    console.log(`[AssetFS] Migrating... ${index + 1}/${total}`);
+                }
+            },
+        });
+        writeFileSync(assetMigrationMarker, new Date().toISOString(), 'utf-8');
+        migratedRows = result.migrated > 0;
+        if (keys.length > 0) {
+            console.log(
+                `[AssetFS] Migration complete. ${result.migrated} moved, `
+                + `${result.skippedUnsafe} unsafe name(s) kept in SQLite.`
+            );
+        }
     }
-    const result = migrateAssetRowsToFilesystem({
-        keys,
-        getValue: (key) => {
-            const value = kvGet(key);
-            if (value !== null) {
-                warnImportedAssetHashMismatch(key, value, 'Startup migration');
-            }
-            return value;
-        },
-        deleteValue: (key) => {
-            kvDel(key);
-            kvClearDeletion(key);
-        },
-        store: {
-            isSafeAssetName,
-            writeAssetFileIfChanged,
-        },
-        onProgress: ({ index, total, migrated }) => {
-            if (migrated % 100 === 0 || index === total - 1) {
-                console.log(`[AssetFS] Migrating... ${index + 1}/${total}`);
-            }
-        },
-    });
-    writeFileSync(assetMigrationMarker, new Date().toISOString(), 'utf-8');
-    if (keys.length > 0) {
-        console.log(
-            `[AssetFS] Migration complete. ${result.migrated} moved, `
-            + `${result.skippedUnsafe} unsafe name(s) kept in SQLite.`
+
+    const discoverLegacyIdentity = migratedRows || !existsSync(legacyHashIdentityMarkerPath);
+    const identity = reconcileLegacyHashAssetIdentity({ discover: discoverLegacyIdentity });
+    if (identity.marked > 0 || identity.cleared > 0) {
+        logger.info(
+            `[AssetFS] Legacy hash identity reconciliation: ${identity.marked} marked, `
+            + `${identity.cleared} stale marker(s) cleared.`,
         );
     }
 }
@@ -6397,6 +6437,7 @@ function listPartialBackupAssetEntries(database, reader) {
             sortKey: entry.key,
             size: entry.size,
             source: entry.source,
+            legacyHash: entry.legacyHash,
         });
     }
     entries.sort((a, b) => a.sortKey.localeCompare(b.sortKey));
@@ -6525,7 +6566,7 @@ async function copyPartialExportAsset(job, entry, destination) {
         output = null;
         const digest = hash.digest('hex');
         const verification = sourceName.match(/^([0-9a-f]{64})\.[A-Za-z0-9]{1,10}$/);
-        if (verification && verification[1] !== digest) {
+        if (verification && verification[1] !== digest && !entry.legacyHash) {
             throw new Error(`Partial export asset hash mismatch: ${entry.key}`);
         }
         return {
@@ -11651,9 +11692,11 @@ app.post('/api/write', async (req, res, next) => {
                 }
             }
             const assetVerification = key.startsWith('assets/')
-                ? verifyAssetHash(key, fileContent)
+                ? verifyAssetHashForWrite(key, fileContent)
                 : null;
-            if (assetVerification && !assetVerification.ok) {
+            if (assetVerification
+                && !assetVerification.ok
+                && !assetVerification.legacyHashMismatch) {
                 res.status(400).json({
                     error: 'asset content does not match its SHA-256 name',
                     key,
@@ -11823,6 +11866,7 @@ app.post('/api/write', async (req, res, next) => {
             } else if (key.startsWith('assets/')) {
                 writeAssetValue(key, fileContent, {
                     skipIfUnchanged: assetVerification.claimed !== null,
+                    legacyHashMismatch: assetVerification.legacyHashMismatch,
                 });
             } else {
                 kvSet(key, fileContent);
@@ -12219,12 +12263,14 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
         const decodedEntries = entries.map(({ key, value }) => {
             const buffer = Buffer.from(value, 'base64');
             const verification = typeof key === 'string' && key.startsWith('assets/')
-                ? verifyAssetHash(key, buffer)
+                ? verifyAssetHashForWrite(key, buffer)
                 : null;
             return { key, buffer, verification };
         });
         const mismatches = decodedEntries
-            .filter((entry) => entry.verification && !entry.verification.ok)
+            .filter((entry) => entry.verification
+                && !entry.verification.ok
+                && !entry.verification.legacyHashMismatch)
             .map((entry) => ({
                 key: entry.key,
                 expected: entry.verification.claimed,
@@ -12279,6 +12325,7 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
                         if (typeof key === 'string' && key.startsWith('assets/')) {
                             writeAssetValue(key, buffer, {
                                 skipIfUnchanged: verification.claimed !== null,
+                                legacyHashMismatch: verification.legacyHashMismatch,
                             });
                         } else {
                             kvSet(key, buffer);

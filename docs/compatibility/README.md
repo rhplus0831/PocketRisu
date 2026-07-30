@@ -70,7 +70,7 @@ many users use that path.
 ## Persistence, assets, and server API reports
 
 - [Asset filename migration is not portable](asset-filename-migration-not-portable.md)
-- [Legacy hash-looking assets become unwritable](legacy-hash-named-assets-become-unwritable.md)
+- [Legacy hash-looking assets became unwritable (fixed 2026-07-31)](legacy-hash-named-assets-become-unwritable.md)
 - [Whole-chat patches partially commit rows](whole-chat-patch-partially-commits-rows.md)
 - [Bulk asset writes partially commit files](bulk-asset-write-partially-commits-files.md)
 - [Bulk inlay deletion exceeded its request limit (fixed 2026-07-30)](bulk-inlay-deletion-limit.md)

@@ -5,7 +5,7 @@
 
 ## 1. Purpose & overview
 
-This subsystem handles language translation, speech synthesis, image generation, notification audio, and chat-embedded media. Translation supports remote services, an auxiliary LLM, and browser-local Bergamot models; TTS supports browser speech plus several hosted/self-hosted providers and plugin hooks. Inlays give images, audio, video, and model signatures stable IDs outside chat records. On Node, safe content-addressed ordinary assets and current inlay payloads live as files; unsafe/legacy asset names and ownership metadata remain in SQLite, while inlay display metadata is mirrored in filesystem sidecars.
+This subsystem handles language translation, speech synthesis, image generation, notification audio, and chat-embedded media. Translation supports remote services, an auxiliary LLM, and browser-local Bergamot models; TTS supports browser speech plus several hosted/self-hosted providers and plugin hooks. Inlays give images, audio, video, and model signatures stable IDs outside chat records. On Node, safe-named ordinary assets and current inlay payloads live as files; historical hash-shaped mismatches have explicit filesystem identity markers, unsafe asset names and ownership metadata remain in SQLite, and inlay display metadata is mirrored in filesystem sidecars.
 
 ## 2. Key files
 
@@ -299,7 +299,7 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 - Upload extension matching is lowercase and case-sensitive; callers should normalize extensions before expanding format support.
 - `compressImage()` can route GIF through canvas recompression, which collapses animated input to a rasterized frame.
 - Current inlay payloads are filesystem files, despite the client-facing `NodeStorage` KV abstraction. Explorer info is mirrored in sidecars; ownership/time metadata remains in SQLite.
-- Safe `assets/<content-hash>.<ext>` values are also filesystem-backed. Unsafe or legacy names retain the SQLite fallback, so code must use the storage helpers instead of assuming one physical backend for every asset key.
+- Safe-named `assets/*` values are filesystem-backed. Historical `assets/<content-hash>.<ext>` mismatches are tracked by private legacy-identity markers, while unsafe names retain the SQLite fallback, so code must use the storage helpers instead of assuming one physical backend for every asset key.
 - The server still reads and migrates legacy SQLite `inlay/<id>` JSON records (`server/node/server.cjs:1352-1433`). Preserve this fallback when changing storage format.
 - Direct asset URLs use one-year `immutable` caching (`server/node/server.cjs:3755-3762`). Reusing and overwriting an explicit inlay ID can leave a browser with a stale cached URL; new content normally needs a new ID.
 - Inlay IDs are validated against separators and traversal components before filesystem access (`server/node/server.cjs:1111-1139`).

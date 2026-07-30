@@ -271,6 +271,157 @@ describe('asset round-trip', () => {
 })
 
 describe('asset upload hash verification', () => {
+  test('startup migration records legacy identity before removing the main-compatible row', async () => {
+    const legacyName = `${'0'.repeat(64)}.png`
+    const legacyKey = `assets/${legacyName}`
+    const legacyValue = Buffer.from('main-compatible arbitrary asset bytes')
+    const databaseValue = decodeBackup(createSeedBackup({ characterCount: 1 }))
+      .find(entry => entry.name === 'database.risudat')!.data
+    const srv = await spawnServer({
+      seedSave: async (saveDir) => {
+        const database = new Database(path.join(saveDir, 'risuai.db'))
+        try {
+          database.exec(`
+            CREATE TABLE kv (
+              key TEXT PRIMARY KEY,
+              value BLOB NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+          `)
+          const insert = database.prepare(
+            'INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+          )
+          insert.run('database/database.bin', databaseValue, Date.now())
+          insert.run(legacyKey, legacyValue, Date.now())
+        } finally {
+          database.close()
+        }
+      },
+    })
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+
+    expect(readKvValue(srv.cwd, legacyKey)).toBeNull()
+    expect(await readFile(path.join(srv.cwd, 'save', 'assets', legacyName)))
+      .toEqual(legacyValue)
+    expect(await readFile(path.join(
+      srv.cwd,
+      'save',
+      'assets',
+      '.legacy-hash-assets',
+      legacyName,
+    ), 'utf-8')).toBe('legacy-hash-asset-v1\n')
+
+    const replacement = Buffer.from('rewritten after startup migration')
+    const rewrite = await client.fetch('/api/write', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': Buffer.from(legacyKey, 'utf-8').toString('hex'),
+      },
+      body: new Uint8Array(replacement),
+    })
+    expect(rewrite.status).toBe(200)
+    expect(await readFile(path.join(srv.cwd, 'save', 'assets', legacyName)))
+      .toEqual(replacement)
+  })
+
+  test('legacy hash-shaped imports remain readable and writable without weakening new assets', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    let client = await createClient(srv.port, srv.password)
+    const legacyName = `${'0'.repeat(64)}.png`
+    const legacyKey = `assets/${legacyName}`
+    const importedLegacy = Buffer.from('historical custom-id bytes')
+    const canonicalValue = Buffer.from('eventually canonical bytes')
+    const canonicalName = hashAssetName(canonicalValue, 'webp')
+    const canonicalKey = `assets/${canonicalName}`
+    const importedCanonicalLegacy = Buffer.from('older bytes under a reusable custom id')
+    const seed = Buffer.concat([
+      createSeedBackup({ characterCount: 1 }),
+      encodeBackup([
+        { name: legacyName, data: importedLegacy },
+        { name: canonicalName, data: importedCanonicalLegacy },
+      ]),
+    ])
+    expect((await client.importBackup(seed)).ok).toBe(true)
+
+    const readLegacy = await client.fetch('/api/read', {
+      headers: { 'file-path': Buffer.from(legacyKey, 'utf-8').toString('hex') },
+    })
+    expect(readLegacy.status).toBe(200)
+    expect(Buffer.from(await readLegacy.arrayBuffer())).toEqual(importedLegacy)
+
+    const singleReplacement = Buffer.from('single-write replacement')
+    const singleWrite = await client.fetch('/api/write', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': Buffer.from(legacyKey, 'utf-8').toString('hex'),
+      },
+      body: new Uint8Array(singleReplacement),
+    })
+    expect(singleWrite.status).toBe(200)
+    expect(await readFile(path.join(srv.cwd, 'save', 'assets', legacyName)))
+      .toEqual(singleReplacement)
+
+    const bulkReplacement = Buffer.from('bulk-write replacement')
+    const ordinaryValue = Buffer.from('ordinary batch value')
+    const bulkWrite = await client.fetch('/api/assets/bulk-write', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify([
+        { key: legacyKey, value: bulkReplacement.toString('base64') },
+        { key: 'assets/ordinary.png', value: ordinaryValue.toString('base64') },
+      ]),
+    })
+    expect(bulkWrite.status).toBe(200)
+    expect(await bulkWrite.json()).toEqual({ success: true, count: 2 })
+    expect(await readFile(path.join(srv.cwd, 'save', 'assets', legacyName)))
+      .toEqual(bulkReplacement)
+    expect(await readFile(path.join(srv.cwd, 'save', 'assets', 'ordinary.png')))
+      .toEqual(ordinaryValue)
+
+    await srv.restart()
+    client = await createClient(srv.port, srv.password)
+    const postRestartReplacement = Buffer.from('post-restart replacement')
+    const postRestartWrite = await client.fetch('/api/write', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': Buffer.from(legacyKey, 'utf-8').toString('hex'),
+      },
+      body: new Uint8Array(postRestartReplacement),
+    })
+    expect(postRestartWrite.status).toBe(200)
+
+    const canonicalWrite = await client.fetch('/api/write', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': Buffer.from(canonicalKey, 'utf-8').toString('hex'),
+      },
+      body: new Uint8Array(canonicalValue),
+    })
+    expect(canonicalWrite.status).toBe(200)
+    await expectMissing(path.join(
+      srv.cwd,
+      'save',
+      'assets',
+      '.legacy-hash-assets',
+      canonicalName,
+    ))
+    const rejectedAfterCanonicalization = await client.fetch('/api/write', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': Buffer.from(canonicalKey, 'utf-8').toString('hex'),
+      },
+      body: new Uint8Array(Buffer.from('new mismatch')),
+    })
+    expect(rejectedAfterCanonicalization.status).toBe(400)
+  })
+
   test('/api/write rejects mismatches and preserves the inode on an idempotent matching write', async () => {
     const srv = await spawnServer()
     servers.push(srv)

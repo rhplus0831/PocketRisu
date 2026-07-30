@@ -903,6 +903,31 @@ describe('external plugin rows in backup archives', () => {
     await waitForNoPartialExportSpools(source.cwd)
   })
 
+  test('partial export preserves a rewritten legacy hash-shaped profile asset', async () => {
+    const source = await spawnServer()
+    servers.push(source)
+    const client = await createClient(source.port, source.password)
+    const legacyName = `${'0'.repeat(64)}.png`
+    const legacyKey = `assets/${legacyName}`
+    const importedBytes = Buffer.from('historical profile bytes')
+    const rewrittenBytes = Buffer.from('rewritten profile bytes')
+    const seedEntries = decodeBackup(createSeedBackup({ characterCount: 1 }))
+    const databaseEntry = seedEntries.find(entry => entry.name === 'database.risudat')!
+    const database = decodeRisuDat(databaseEntry.data)
+    ;(database.characters as Array<Record<string, unknown>>)[0].image = legacyKey
+    databaseEntry.data = encodeRisuDat(database)
+    seedEntries.push({ name: legacyName, data: importedBytes })
+    expect((await client.importBackup(encodeBackup(seedEntries))).ok).toBe(true)
+    await writeKv(client, legacyKey, rewrittenBytes)
+
+    const jobId = await startPartialExport(client)
+    const archive = entriesByName(await downloadPartialExport(client, jobId))
+    expect(archive.get(legacyName)).toEqual(rewrittenBytes)
+    const folded = decodeRisuDat(archive.get('database.risudat')!)
+    expect((folded.characters as Array<Record<string, unknown>>)[0].image).toBe(legacyKey)
+    await waitForNoPartialExportSpools(source.cwd)
+  })
+
   test('partial export creation returns promptly while real preparation exceeds 15 seconds', async () => {
     const source = await spawnServer({
       env: { POCKETRISU_TEST_PARTIAL_EXPORT_DELAY_MS: '15250' },

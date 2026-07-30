@@ -6,6 +6,9 @@ const { createHash, randomUUID } = require('crypto');
 
 const ASSET_MIGRATION_MARKER = '.migrated_to_fs';
 const ASSET_TEMP_PREFIX = '.tmp-';
+const LEGACY_HASH_IDENTITY_MARKER = '.legacy_hash_identity_v1';
+const LEGACY_HASH_MARKER_DIR = '.legacy-hash-assets';
+const LEGACY_HASH_MARKER_VALUE = 'legacy-hash-asset-v1\n';
 const SAFE_ASSET_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const HASH_NAME_RE = /^assets\/([0-9a-f]{64})\.[A-Za-z0-9]{1,10}$/;
 
@@ -80,6 +83,8 @@ function createAssetStore(options = {}) {
     const assetDir = path.resolve(options.assetDir || path.join(process.cwd(), 'save', 'assets'));
     const fsOps = options.fs || fs;
     const resolvedAssetDir = assetDir + path.sep;
+    const legacyHashMarkerDir = path.join(assetDir, LEGACY_HASH_MARKER_DIR);
+    const legacyHashIdentityMarkerPath = path.join(assetDir, LEGACY_HASH_IDENTITY_MARKER);
 
     function ensureAssetDir() {
         fsOps.mkdirSync(assetDir, { recursive: true });
@@ -101,6 +106,84 @@ function createAssetStore(options = {}) {
             throw new Error(`Path escapes asset directory: ${filePath}`);
         }
         return filePath;
+    }
+
+    function isHashShapedAssetName(name) {
+        return typeof name === 'string' && HASH_NAME_RE.test(`assets/${name}`);
+    }
+
+    function legacyHashMarkerPathFor(name) {
+        if (!isSafeAssetName(name) || !isHashShapedAssetName(name)) {
+            throw new Error(`Invalid legacy hash asset name: ${name}`);
+        }
+        return path.join(legacyHashMarkerDir, name);
+    }
+
+    function fsyncDirectory(directory) {
+        try {
+            const dirFd = fsOps.openSync(directory, 'r');
+            try { fsOps.fsyncSync(dirFd); } finally { fsOps.closeSync(dirFd); }
+        } catch {
+            // Directory fsync is unavailable on some platforms.
+        }
+    }
+
+    function writeMarkerFile(filePath, value) {
+        const directory = path.dirname(filePath);
+        fsOps.mkdirSync(directory, { recursive: true });
+        const tempPath = path.join(directory, `${ASSET_TEMP_PREFIX}${randomUUID()}`);
+        let fd;
+        try {
+            fd = fsOps.openSync(tempPath, 'wx', 0o600);
+            const data = Buffer.from(value, 'utf-8');
+            let offset = 0;
+            while (offset < data.length) {
+                offset += fsOps.writeSync(fd, data, offset, data.length - offset);
+            }
+            fsOps.fsyncSync(fd);
+            fsOps.closeSync(fd);
+            fd = undefined;
+            fsOps.renameSync(tempPath, filePath);
+            fsyncDirectory(directory);
+        } finally {
+            if (fd !== undefined) {
+                try { fsOps.closeSync(fd); } catch {}
+            }
+            try { fsOps.unlinkSync(tempPath); } catch {}
+        }
+    }
+
+    function isLegacyHashAsset(name) {
+        if (!isHashShapedAssetName(name)) return false;
+        try {
+            const markerPath = legacyHashMarkerPathFor(name);
+            const stat = fsOps.lstatSync(markerPath);
+            return stat.isFile()
+                && stat.size === Buffer.byteLength(LEGACY_HASH_MARKER_VALUE, 'utf-8')
+                && fsOps.readFileSync(markerPath, 'utf-8') === LEGACY_HASH_MARKER_VALUE;
+        } catch (error) {
+            if (error?.code === 'ENOENT') return false;
+            throw error;
+        }
+    }
+
+    function markLegacyHashAsset(name) {
+        const markerPath = legacyHashMarkerPathFor(name);
+        if (isLegacyHashAsset(name)) return false;
+        writeMarkerFile(markerPath, LEGACY_HASH_MARKER_VALUE);
+        return true;
+    }
+
+    function clearLegacyHashAsset(name) {
+        if (!isHashShapedAssetName(name)) return false;
+        try {
+            fsOps.unlinkSync(legacyHashMarkerPathFor(name));
+            fsyncDirectory(legacyHashMarkerDir);
+            return true;
+        } catch (error) {
+            if (error?.code === 'ENOENT') return false;
+            throw error;
+        }
     }
 
     function fileStat(name) {
@@ -144,12 +227,7 @@ function createAssetStore(options = {}) {
             tempPath = undefined;
 
             // Persist the directory-entry swap where the platform supports it.
-            try {
-                const dirFd = fsOps.openSync(assetDir, 'r');
-                try { fsOps.fsyncSync(dirFd); } finally { fsOps.closeSync(dirFd); }
-            } catch {
-                // Directory fsync is unavailable on some platforms.
-            }
+            fsyncDirectory(assetDir);
         } finally {
             if (fd !== undefined) {
                 try { fsOps.closeSync(fd); } catch {}
@@ -182,6 +260,67 @@ function createAssetStore(options = {}) {
         }
     }
 
+    function verifyStoredAssetHash(name) {
+        const key = `assets/${name}`;
+        const match = key.match(HASH_NAME_RE);
+        if (!match) return { claimed: null, actual: null, ok: true };
+        if (!fileStat(name)) return null;
+        const hash = createHash('sha256');
+        const buffer = Buffer.allocUnsafe(256 * 1024);
+        const fd = fsOps.openSync(assetPathFor(name), 'r');
+        try {
+            let offset = 0;
+            while (true) {
+                const bytesRead = fsOps.readSync(fd, buffer, 0, buffer.length, offset);
+                if (bytesRead === 0) break;
+                hash.update(buffer.subarray(0, bytesRead));
+                offset += bytesRead;
+            }
+        } finally {
+            fsOps.closeSync(fd);
+        }
+        const actual = hash.digest('hex');
+        return { claimed: match[1], actual, ok: match[1] === actual };
+    }
+
+    function reconcileLegacyHashAssetIdentity({ discover = false } = {}) {
+        ensureAssetDir();
+        let marked = 0;
+        let cleared = 0;
+        const files = new Map(listAssetFiles().map((entry) => [entry.name, entry]));
+
+        if (discover) {
+            for (const name of files.keys()) {
+                if (!isHashShapedAssetName(name)) continue;
+                const verification = verifyStoredAssetHash(name);
+                if (verification && !verification.ok) {
+                    if (markLegacyHashAsset(name)) marked++;
+                } else if (clearLegacyHashAsset(name)) {
+                    cleared++;
+                }
+            }
+        }
+
+        try {
+            for (const entry of fsOps.readdirSync(legacyHashMarkerDir, { withFileTypes: true })) {
+                if (!entry.isFile() || entry.name.startsWith(ASSET_TEMP_PREFIX)) continue;
+                const verification = files.has(entry.name)
+                    ? verifyStoredAssetHash(entry.name)
+                    : null;
+                if (!verification || verification.ok || !isLegacyHashAsset(entry.name)) {
+                    if (clearLegacyHashAsset(entry.name)) cleared++;
+                }
+            }
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+
+        if (discover) {
+            writeMarkerFile(legacyHashIdentityMarkerPath, new Date().toISOString());
+        }
+        return { marked, cleared };
+    }
+
     function assetFileExists(name) {
         return fileStat(name) !== null;
     }
@@ -196,13 +335,15 @@ function createAssetStore(options = {}) {
 
     function deleteAssetFile(name) {
         if (!isSafeAssetName(name)) return false;
+        let removed = false;
         try {
             fsOps.unlinkSync(assetPathFor(name));
-            return true;
+            removed = true;
         } catch (error) {
-            if (error?.code === 'ENOENT') return false;
-            throw error;
+            if (error?.code !== 'ENOENT') throw error;
         }
+        clearLegacyHashAsset(name);
+        return removed;
     }
 
     function listAssetFiles() {
@@ -235,7 +376,9 @@ function createAssetStore(options = {}) {
         ensureAssetDir();
         let removed = 0;
         for (const entry of fsOps.readdirSync(assetDir, { withFileTypes: true })) {
-            if (entry.name === ASSET_MIGRATION_MARKER) continue;
+            if (entry.name === ASSET_MIGRATION_MARKER
+                || entry.name === LEGACY_HASH_IDENTITY_MARKER
+                || entry.name === LEGACY_HASH_MARKER_DIR) continue;
             if (!entry.isFile() && !entry.isSymbolicLink()) continue;
             try {
                 fsOps.unlinkSync(path.join(assetDir, entry.name));
@@ -244,6 +387,7 @@ function createAssetStore(options = {}) {
                 if (error?.code !== 'ENOENT') throw error;
             }
         }
+        fsOps.rmSync(legacyHashMarkerDir, { recursive: true, force: true });
         return removed;
     }
 
@@ -259,12 +403,21 @@ function createAssetStore(options = {}) {
     return {
         assetDir,
         migrationMarkerPath: path.join(assetDir, ASSET_MIGRATION_MARKER),
+        legacyHashIdentityMarkerPath,
+        legacyHashMarkerDir,
         ensureAssetDir,
         isSafeAssetName,
+        isHashShapedAssetName,
         assetPathFor,
+        legacyHashMarkerPathFor,
+        isLegacyHashAsset,
+        markLegacyHashAsset,
+        clearLegacyHashAsset,
+        reconcileLegacyHashAssetIdentity,
         writeAssetFile,
         writeAssetFileIfChanged,
         readAssetFile,
+        verifyStoredAssetHash,
         assetFileExists,
         assetFileSize,
         assetFileMtimeMs,
@@ -312,6 +465,9 @@ const defaultStore = createAssetStore();
 module.exports = {
     ASSET_MIGRATION_MARKER,
     ASSET_TEMP_PREFIX,
+    LEGACY_HASH_IDENTITY_MARKER,
+    LEGACY_HASH_MARKER_DIR,
+    LEGACY_HASH_MARKER_VALUE,
     SAFE_ASSET_NAME_RE,
     HASH_NAME_RE,
     createAssetStore,
