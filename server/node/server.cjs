@@ -2345,6 +2345,161 @@ const BACKUP_NDJSON_HEARTBEAT_MS = Math.max(
     100,
     Number(process.env.BACKUP_NDJSON_HEARTBEAT_MS ?? '5000') || 5000,
 );
+const REPLACEMENT_OPERATION_ID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const REPLACEMENT_OPERATION_RETENTION_MS = Math.max(
+    60_000,
+    Number(process.env.POCKETRISU_REPLACEMENT_OPERATION_RETENTION_MS ?? 24 * 60 * 60 * 1000)
+        || 24 * 60 * 60 * 1000,
+);
+
+const insertReplacementOperation = sqliteDb.prepare(`
+    INSERT INTO replacement_operations (
+        operation_id, kind, state, result_json, error_json, created_at, updated_at
+    ) VALUES (?, ?, 'running', NULL, NULL, ?, ?)
+`);
+const updateReplacementOperation = sqliteDb.prepare(`
+    UPDATE replacement_operations
+    SET state = ?, result_json = ?, error_json = ?, updated_at = ?
+    WHERE operation_id = ?
+`);
+const readReplacementOperation = sqliteDb.prepare(`
+    SELECT operation_id, kind, state, result_json, error_json, created_at, updated_at
+    FROM replacement_operations
+    WHERE operation_id = ?
+`);
+const deleteExpiredReplacementOperations = sqliteDb.prepare(`
+    DELETE FROM replacement_operations
+    WHERE state != 'running' AND updated_at < ?
+`);
+
+// A running record is committed before destructive work begins. Every actual
+// publication writes `committed` inside its data transaction, so a process
+// restart can safely classify any leftover running record as not committed.
+sqliteDb.prepare(`
+    UPDATE replacement_operations
+    SET state = 'not-committed',
+        error_json = ?,
+        updated_at = ?
+    WHERE state = 'running'
+`).run(JSON.stringify({
+    message: 'The server restarted before the replacement committed.',
+    code: 'REPLACEMENT_INTERRUPTED',
+    retryable: true,
+}), Date.now());
+deleteExpiredReplacementOperations.run(Date.now() - REPLACEMENT_OPERATION_RETENTION_MS);
+
+function replacementOperationId(req) {
+    const value = req.headers['x-risu-replacement-id'];
+    return typeof value === 'string' && REPLACEMENT_OPERATION_ID_REGEX.test(value)
+        ? value
+        : null;
+}
+
+function registerReplacementOperation(req, kind) {
+    const operationId = replacementOperationId(req);
+    if (!operationId) {
+        const error = new Error('A canonical replacement operation ID is required');
+        error.code = 'INVALID_REPLACEMENT_OPERATION_ID';
+        error.statusCode = 400;
+        throw error;
+    }
+    const now = Date.now();
+    deleteExpiredReplacementOperations.run(now - REPLACEMENT_OPERATION_RETENTION_MS);
+    try {
+        insertReplacementOperation.run(operationId, kind, now, now);
+    } catch (error) {
+        if (error?.code === 'SQLITE_CONSTRAINT_PRIMARYKEY'
+            || error?.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+            const conflict = new Error('Replacement operation ID already exists');
+            conflict.code = 'REPLACEMENT_OPERATION_EXISTS';
+            conflict.statusCode = 409;
+            throw conflict;
+        }
+        throw error;
+    }
+    return operationId;
+}
+
+function setReplacementOperationOutcome(operationId, state, { result = null, error = null } = {}) {
+    if (!operationId) return;
+    updateReplacementOperation.run(
+        state,
+        result === null ? null : JSON.stringify(result),
+        error === null ? null : JSON.stringify(error),
+        Date.now(),
+        operationId,
+    );
+}
+
+function replacementErrorRecord(error, fallbackCode) {
+    const annotated = authoritativeImportErrorPayload(error, fallbackCode);
+    return annotated ?? {
+        message: String(error?.message ?? 'Replacement failed'),
+        code: String(error?.code ?? fallbackCode),
+        retryable: false,
+    };
+}
+
+function finalizeReplacementOperationError(operationId, error, fallbackCode) {
+    if (!operationId) return;
+    const existing = readReplacementOperation.get(operationId);
+    if (!existing || existing.state === 'committed') return;
+    const annotated = authoritativeImportErrorPayload(error, fallbackCode);
+    const state = annotated?.commitOutcome === 'unknown'
+        ? 'unknown'
+        : annotated?.commitOutcome === 'committed'
+            ? 'committed'
+            : 'not-committed';
+    setReplacementOperationOutcome(operationId, state, {
+        error: replacementErrorRecord(error, fallbackCode),
+    });
+}
+
+function parseReplacementOperationRow(row) {
+    if (!row) return null;
+    let result = null;
+    let error = null;
+    try { result = row.result_json === null ? null : JSON.parse(row.result_json); } catch {}
+    try { error = row.error_json === null ? null : JSON.parse(row.error_json); } catch {}
+    return {
+        operationId: row.operation_id,
+        kind: row.kind,
+        state: row.state,
+        result,
+        error,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+    };
+}
+
+function beginReplacementNdjson(res) {
+    res.setHeader('content-type', 'application/x-ndjson');
+    res.setHeader('cache-control', 'no-cache, no-transform');
+    res.setHeader('x-accel-buffering', 'no');
+    res.flushHeaders();
+    res.write('{"type":"heartbeat"}\n');
+    return setInterval(() => {
+        if (!res.writableEnded && !res.destroyed) res.write('{"type":"heartbeat"}\n');
+    }, BACKUP_NDJSON_HEARTBEAT_MS);
+}
+
+function sendReplacementProgress(res, phase) {
+    if (!res.writableEnded && !res.destroyed) {
+        res.write(`${JSON.stringify({ type: 'progress', phase })}\n`);
+    }
+}
+
+function sendReplacementDone(res, operationId, result) {
+    if (res.writableEnded || res.destroyed) return;
+    res.write(`${JSON.stringify({
+        type: 'done',
+        operationId,
+        commitOutcome: 'committed',
+        commitOutcomeUnknown: false,
+        ...result,
+    })}\n`);
+    res.end();
+}
 
 function importDiskSpaceError(required, available) {
     const error = new ImportIngressError('Insufficient disk space for import staging', {
@@ -12723,7 +12878,11 @@ function clearExistingData() {
     clearEntities();
 }
 
-async function importLegacySaveEntries(sources, missingDatabaseMessage, { signal = null } = {}) {
+async function importLegacySaveEntries(
+    sources,
+    missingDatabaseMessage,
+    { signal = null, operationId = null } = {},
+) {
     throwIfImportAborted(signal);
     recoverPendingImportSwap('Save-folder import preparation');
     if (sources.length === 0) return { imported: 0 };
@@ -12872,6 +13031,9 @@ async function importLegacySaveEntries(sources, missingDatabaseMessage, { signal
                 retryable: true,
             });
         }
+        setReplacementOperationOutcome(operationId, 'committed', {
+            result: { ok: true, imported: sources.length },
+        });
         sqliteDb.exec('COMMIT');
         transactionCommitted = true;
 
@@ -13041,7 +13203,7 @@ async function importHexFilesFromDir(dirPath, options = {}) {
     }
 }
 
-function sendSaveFolderImportFailure(res, error, diagnostic) {
+function sendSaveFolderImportFailure(res, error, diagnostic, { ndjson = false } = {}) {
     const annotated = authoritativeImportErrorPayload(
         error,
         'SAVE_FOLDER_IMPORT_FAILED',
@@ -13052,21 +13214,43 @@ function sendSaveFolderImportFailure(res, error, diagnostic) {
     // replacement whose publication could not be recovered conclusively.
     const preserveLegacyValidation = annotated === null
         || annotated.commitOutcome === 'not-committed';
-    if (preserveLegacyValidation && diagnostic && !res.headersSent) {
+    if (!ndjson && preserveLegacyValidation && diagnostic && !res.headersSent) {
         res.status(400).json(diagnostic);
         return true;
     }
-    if (preserveLegacyValidation
+    if (!ndjson
+        && preserveLegacyValidation
         && error?.risuSavePreparationInvalid === true
         && !res.headersSent) {
         res.status(400).json({ error: error.message });
         return true;
     }
     return sendImportIngressError(res, error, {
+        ndjson,
         fallbackCode: 'SAVE_FOLDER_IMPORT_FAILED',
         includeAnnotatedOutcome: true,
     });
 }
+
+app.get('/api/replacement-operations/:operationId', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const operationId = req.params.operationId;
+        if (!REPLACEMENT_OPERATION_ID_REGEX.test(operationId)) {
+            return res.status(400).json({ error: 'Invalid replacement operation ID' });
+        }
+        const operation = parseReplacementOperationRow(
+            readReplacementOperation.get(operationId),
+        );
+        if (!operation) {
+            return res.status(404).json({ error: 'Replacement operation not found' });
+        }
+        res.setHeader('cache-control', 'no-store');
+        res.json(operation);
+    } catch (error) {
+        next(error);
+    }
+});
 
 app.post('/api/migrate/save-folder/scan', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
@@ -13097,16 +13281,10 @@ app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
     const abortTracker = createImportAbortTracker(req, res);
     let ownsImportSlot = false;
     let releaseImportBarrier = null;
+    let operationId = null;
+    let heartbeatTimer = null;
+    const wantsNdjson = String(req.headers.accept ?? '').includes('application/x-ndjson');
     try {
-        if (importInProgress) {
-            res.status(409).json({ error: 'Another import is already in progress' });
-            return;
-        }
-        importInProgress = true;
-        ownsImportSlot = true;
-        releaseImportBarrier = await importBarrier.acquire(abortTracker.signal);
-        throwIfImportAborted(abortTracker.signal);
-
         const folderPath = req.body?.path || savePath;
         const resolved = path.resolve(folderPath);
         try {
@@ -13119,19 +13297,62 @@ app.post('/api/migrate/save-folder/execute', async (req, res, next) => {
             res.status(400).json({ error: 'Cannot access directory' });
             return;
         }
+        if (importInProgress) {
+            res.status(409).json({ error: 'Another import is already in progress' });
+            return;
+        }
+        importInProgress = true;
+        ownsImportSlot = true;
+        if (wantsNdjson) {
+            operationId = registerReplacementOperation(req, 'save-folder-directory');
+            heartbeatTimer = beginReplacementNdjson(res);
+            sendReplacementProgress(res, 'queued');
+        }
+        releaseImportBarrier = await importBarrier.acquire(abortTracker.signal);
+        throwIfImportAborted(abortTracker.signal);
+        if (wantsNdjson) sendReplacementProgress(res, 'staging');
+
         const result = await importHexFilesFromDir(resolved, {
             signal: abortTracker.signal,
+            operationId,
         });
-        res.json({ ok: true, imported: result.imported });
+        if (operationId
+            && readReplacementOperation.get(operationId)?.state === 'running') {
+            setReplacementOperationOutcome(operationId, 'committed', {
+                result: { ok: true, imported: result.imported },
+            });
+        }
+        if (wantsNdjson) {
+            sendReplacementDone(res, operationId, { ok: true, imported: result.imported });
+        } else {
+            res.json({ ok: true, imported: result.imported });
+        }
     } catch (error) {
+        finalizeReplacementOperationError(
+            operationId,
+            error,
+            'SAVE_FOLDER_IMPORT_FAILED',
+        );
         const diagnostic = logPluginStorageValidationFailure(
             '[PluginStorage] Rejected invalid save-folder row',
             error
         );
-        if (!sendSaveFolderImportFailure(res, error, diagnostic)) {
+        if (!sendSaveFolderImportFailure(res, error, diagnostic, { ndjson: wantsNdjson })) {
+            if (wantsNdjson && res.headersSent) {
+                if (!res.writableEnded && !res.destroyed) {
+                    res.write(`${JSON.stringify(importNdjsonErrorEvent(
+                        error,
+                        diagnostic,
+                        'SAVE_FOLDER_IMPORT_FAILED',
+                    ))}\n`);
+                    res.end();
+                }
+                return;
+            }
             res.status(400).json(diagnostic ?? { error: error.message || 'Import failed' });
         }
     } finally {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
         abortTracker.cleanup();
         releaseImportBarrier?.();
         if (ownsImportSlot) importInProgress = false;
@@ -13146,22 +13367,11 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
     let releaseImportBarrier = null;
     let prevRequestTimeout;
     let stageDir = null;
+    let operationId = null;
+    let heartbeatTimer = null;
+    const wantsNdjson = String(req.headers.accept ?? '').includes('application/x-ndjson');
 
     try {
-        if (importInProgress) {
-            res.status(409).json({ error: 'Another import is already in progress' });
-            return;
-        }
-        importInProgress = true;
-        ownsImportSlot = true;
-        releaseImportBarrier = await importBarrier.acquire(abortTracker.signal);
-        throwIfImportAborted(abortTracker.signal);
-
-        req.socket.setTimeout(0);
-        req.socket.setKeepAlive(true);
-        prevRequestTimeout = req.socket.server?.requestTimeout;
-        if (req.socket.server) req.socket.server.requestTimeout = 0;
-
         const contentType = String(req.headers['content-type'] ?? '');
         if (contentType
             && !contentType.includes('application/zip')
@@ -13174,8 +13384,27 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
             assertImportSize(contentLength, BACKUP_IMPORT_MAX_BYTES, 'Save-folder ZIP');
             await assertImportDiskSpace(contentLength);
         }
+        if (importInProgress) {
+            res.status(409).json({ error: 'Another import is already in progress' });
+            return;
+        }
+        importInProgress = true;
+        ownsImportSlot = true;
+        if (wantsNdjson) {
+            operationId = registerReplacementOperation(req, 'save-folder-zip');
+            heartbeatTimer = beginReplacementNdjson(res);
+            sendReplacementProgress(res, 'queued');
+        }
+        releaseImportBarrier = await importBarrier.acquire(abortTracker.signal);
+        throwIfImportAborted(abortTracker.signal);
+
+        req.socket.setTimeout(0);
+        req.socket.setKeepAlive(true);
+        prevRequestTimeout = req.socket.server?.requestTimeout;
+        if (req.socket.server) req.socket.server.requestTimeout = 0;
 
         stageDir = createSaveFolderImportStage();
+        if (wantsNdjson) sendReplacementProgress(res, 'uploading');
         const zipPath = path.join(stageDir, 'upload.zip');
         const zipSpool = await spoolAsyncIterable(req, zipPath, {
             maxBytes: BACKUP_IMPORT_MAX_BYTES,
@@ -13183,6 +13412,7 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
             signal: abortTracker.signal,
         });
         await assertImportDiskSpace(zipSpool.size);
+        if (wantsNdjson) sendReplacementProgress(res, 'inspecting');
         const inventory = await inspectZipFile(zipSpool.filePath, {
             acceptEntry: (entryPath) => {
                 const basename = path.posix.basename(entryPath.replaceAll('\\', '/'));
@@ -13203,6 +13433,7 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
             );
         }
         await assertImportDiskSpace(inventory.expandedBytes);
+        if (wantsNdjson) sendReplacementProgress(res, 'extracting');
         const sources = await extractZipEntries(
             inventory,
             path.join(stageDir, 'rows'),
@@ -13212,22 +13443,49 @@ app.post('/api/migrate/save-folder/upload', async (req, res, next) => {
         const result = await importLegacySaveEntries(
             sources,
             'Data does not contain database/database.bin',
-            { signal: abortTracker.signal },
+            { signal: abortTracker.signal, operationId },
         );
+        if (operationId
+            && readReplacementOperation.get(operationId)?.state === 'running') {
+            setReplacementOperationOutcome(operationId, 'committed', {
+                result: { ok: true, imported: result.imported },
+            });
+        }
         await fs.rm(stageDir, { recursive: true, force: true });
         stageDir = null;
-        res.json({ ok: true, imported: result.imported });
+        if (wantsNdjson) {
+            sendReplacementDone(res, operationId, { ok: true, imported: result.imported });
+        } else {
+            res.json({ ok: true, imported: result.imported });
+        }
     } catch (error) {
+        finalizeReplacementOperationError(
+            operationId,
+            error,
+            'SAVE_FOLDER_IMPORT_FAILED',
+        );
         const diagnostic = logPluginStorageValidationFailure(
             '[PluginStorage] Rejected invalid uploaded save-folder row',
             error
         );
-        if (!sendSaveFolderImportFailure(res, error, diagnostic)) {
+        if (!sendSaveFolderImportFailure(res, error, diagnostic, { ndjson: wantsNdjson })) {
+            if (wantsNdjson && res.headersSent) {
+                if (!res.writableEnded && !res.destroyed) {
+                    res.write(`${JSON.stringify(importNdjsonErrorEvent(
+                        error,
+                        diagnostic,
+                        'SAVE_FOLDER_IMPORT_FAILED',
+                    ))}\n`);
+                    res.end();
+                }
+                return;
+            }
             if (!res.headersSent) {
                 res.status(400).json(diagnostic ?? { error: error.message || 'Import failed' });
             }
         }
     } finally {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
         abortTracker.cleanup();
         if (stageDir) await fs.rm(stageDir, { recursive: true, force: true }).catch(() => {});
         releaseImportBarrier?.();
@@ -13994,6 +14252,9 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
     let restorePublicationStarted = false;
     let closed = false;
     let releaseImportBarrier = null;
+    let operationId = null;
+    let heartbeatTimer = null;
+    const wantsNdjson = String(req.headers.accept ?? '').includes('application/x-ndjson');
     const restoreAbortController = new AbortController();
     const restoreSocket = req.socket;
     const abortRestoreOnDisconnect = () => {
@@ -14034,6 +14295,11 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                 commitOutcomeUnknown: false,
             });
         }
+        if (wantsNdjson) {
+            operationId = registerReplacementOperation(req, 'internal-snapshot');
+            heartbeatTimer = beginReplacementNdjson(res);
+            sendReplacementProgress(res, 'queued');
+        }
         // Acquire before entering the storage queue: acquire() drains that same
         // queue, so holding a slot while waiting for it would deadlock.
         // The disconnect signal must participate in this wait. Otherwise an
@@ -14041,6 +14307,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
         // that holder releases, retaining its request lifecycle unnecessarily.
         releaseImportBarrier = await importBarrier.acquire(restoreAbortController.signal);
         throwIfRestoreAborted();
+        if (wantsNdjson) sendReplacementProgress(res, 'spooling');
         let snapshotFound = true;
         let committedPublication = null;
         {
@@ -14072,6 +14339,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                 };
                 const inspection = await inspectRisuSaveSource(source);
                 throwIfRestoreAborted();
+                if (wantsNdjson) sendReplacementProgress(res, 'publishing');
                 let restoreTransactionOpen = false;
                 try {
                     // Keep the live monolith, external plugin rows, ownership
@@ -14154,6 +14422,9 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                         throw new Error('Injected snapshot restore failure before commit');
                     }
                     throwIfRestoreAborted();
+                    setReplacementOperationOutcome(operationId, 'committed', {
+                        result: { ok: true, key },
+                    });
                     sqliteDb.exec('COMMIT');
                     restoreTransactionOpen = false;
                     restoreCommitted = true;
@@ -14172,6 +14443,15 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
         }
         if (!snapshotFound) {
             if (closed) return;
+            if (wantsNdjson) {
+                const error = new Error('Snapshot not found');
+                error.code = 'SNAPSHOT_NOT_FOUND';
+                error.statusCode = 404;
+                error.retryable = false;
+                error.commitOutcome = 'not-committed';
+                error.commitOutcomeUnknown = false;
+                throw error;
+            }
             return res.status(404).json({
                 error: 'Snapshot not found',
                 retryable: false,
@@ -14195,13 +14475,52 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             res.destroy();
             return;
         }
-        res.json({
-            ok: true,
-            key,
-            commitOutcome: 'committed',
-            commitOutcomeUnknown: false,
-        });
+        if (wantsNdjson) {
+            sendReplacementDone(res, operationId, { ok: true, key });
+        } else {
+            res.json({
+                ok: true,
+                key,
+                commitOutcome: 'committed',
+                commitOutcomeUnknown: false,
+            });
+        }
     } catch (err) {
+        const diagnostic = pluginStorageValidationDiagnostic(err);
+        if (err && typeof err === 'object') {
+            if (restoreCommitted) {
+                err.commitOutcome = 'committed';
+                err.commitOutcomeUnknown = false;
+                err.retryable = false;
+            } else if (err.commitOutcome !== 'unknown') {
+                err.commitOutcome = 'not-committed';
+                err.commitOutcomeUnknown = false;
+            }
+        }
+        finalizeReplacementOperationError(
+            operationId,
+            err,
+            'SNAPSHOT_RESTORE_NOT_COMMITTED',
+        );
+        if (wantsNdjson && res.headersSent && !closed) {
+            if (!res.writableEnded && !res.destroyed) {
+                res.write(`${JSON.stringify(importNdjsonErrorEvent(
+                    err,
+                    diagnostic ? {
+                        ...diagnostic,
+                        status: 400,
+                        retryable: false,
+                        commitOutcome: 'not-committed',
+                        commitOutcomeUnknown: false,
+                    } : null,
+                    restoreCommitted
+                        ? 'SNAPSHOT_RESTORE_COMMIT_FAILED'
+                        : 'SNAPSHOT_RESTORE_NOT_COMMITTED',
+                ))}\n`);
+                res.end();
+            }
+            return;
+        }
         if (restoreCommitted) {
             logger.error('[Snapshot Restore] Commit succeeded but acknowledgement failed:', err);
             if (closed) return;
@@ -14224,7 +14543,6 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                 : '[Snapshot Restore] Client disconnected before publication; partial spool was discarded');
             return;
         }
-        const diagnostic = pluginStorageValidationDiagnostic(err);
         if (diagnostic) return res.status(400).json({
             ...diagnostic,
             retryable: false,
@@ -14273,6 +14591,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
             commitOutcomeUnknown: false,
         });
     } finally {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
         releaseImportBarrier?.();
         req.off('aborted', abortRestoreOnDisconnect);
         restoreSocket?.off('close', abortRestoreOnDisconnect);

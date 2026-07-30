@@ -72,10 +72,11 @@ export const AUTHORITATIVE_STORAGE_PAYLOAD_MIN_BYTES_PER_SECOND = 128 * 1024
 export const AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS = AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS
 /** Full chat-row scans can legitimately traverse years of chat history. */
 export const INLAY_REFERENCE_IO_TIMEOUT_MS = 2 * 60_000
-/** Snapshot ingestion can legitimately stream hundreds of MiB from chunk storage. */
-export const INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS = 10 * 60_000
-/** Save-folder uploads share the same finite end-to-end restore deadline. */
-export const SAVE_FOLDER_IMPORT_TIMEOUT_MS = INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS
+/** Abort a replacement only after both transport and server activity go silent. */
+export const REPLACEMENT_ACTIVITY_TIMEOUT_MS = 2 * 60_000
+/** Bound status reconciliation after a replacement transport is lost. */
+export const REPLACEMENT_RECONCILE_TIMEOUT_MS = 2 * 60_000
+export const REPLACEMENT_RECONCILE_POLL_MS = 250
 export const INTERNAL_SNAPSHOT_KEY_PATTERN = /^database\/dbbackup-(0|[1-9]\d*)\.bin$/
 type BoundedStorageOperation = 'read' | 'list' | 'write' | 'remove' | 'transition' | 'batch'
 
@@ -132,6 +133,51 @@ type BackupNdjsonEvent = BackupNdjsonHeartbeatEvent
     | BackupNdjsonDoneEvent
     | BackupNdjsonErrorEvent
 
+type ReplacementOperationKind =
+    | 'save-folder-directory'
+    | 'save-folder-zip'
+    | 'internal-snapshot'
+
+interface ReplacementHeartbeatEvent {
+    type: 'heartbeat'
+}
+
+interface ReplacementProgressEvent {
+    type: 'progress'
+    phase: string
+}
+
+interface ReplacementDoneEvent {
+    type: 'done'
+    operationId: string
+    ok: true
+    commitOutcome: 'committed'
+    commitOutcomeUnknown: false
+    imported?: number
+    key?: string
+}
+
+type ReplacementNdjsonEvent = ReplacementHeartbeatEvent
+    | ReplacementProgressEvent
+    | ReplacementDoneEvent
+    | BackupNdjsonErrorEvent
+
+interface ReplacementOperationStatus {
+    operationId: string
+    kind: ReplacementOperationKind
+    state: 'running' | 'committed' | 'not-committed' | 'unknown'
+    result: Record<string, unknown> | null
+    error: Record<string, unknown> | null
+    createdAt: number
+    updatedAt: number
+}
+
+interface ReplacementActivityController {
+    signal: AbortSignal
+    touch: () => void
+    stop: () => void
+}
+
 function hasExactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
     const allowedKeys = new Set(allowed)
     return Object.keys(value).length === allowed.length
@@ -140,6 +186,194 @@ function hasExactKeys(value: Record<string, unknown>, allowed: readonly string[]
 
 function isNonnegativeSafeInteger(value: unknown): value is number {
     return Number.isSafeInteger(value) && Number(value) >= 0
+}
+
+function createReplacementActivityController(
+    externalSignal?: AbortSignal | null,
+): ReplacementActivityController {
+    const controller = new AbortController()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const stopForwarding = forwardAbortSignal(externalSignal, controller)
+    const touch = () => {
+        if (controller.signal.aborted) return
+        if (timer) clearTimeout(timer)
+        timer = setTimeout(() => {
+            controller.abort(new DOMException(
+                'Replacement operation became idle.',
+                'TimeoutError',
+            ))
+        }, REPLACEMENT_ACTIVITY_TIMEOUT_MS)
+    }
+    touch()
+    return {
+        signal: controller.signal,
+        touch,
+        stop: () => {
+            if (timer) clearTimeout(timer)
+            stopForwarding()
+        },
+    }
+}
+
+function replacementProtocolUnknown(message: string, cause?: unknown): StorageError {
+    return new StorageError(message, {
+        code: 'COMMIT_OUTCOME_UNKNOWN',
+        retryable: false,
+        commitOutcome: 'unknown',
+        commitOutcomeUnknown: true,
+        operation: 'transition',
+        cause,
+    })
+}
+
+function parseReplacementNdjsonLine(
+    line: string,
+    source: string,
+    operationId: string,
+    kind: ReplacementOperationKind,
+): ReplacementNdjsonEvent {
+    if (line.length === 0) {
+        throw replacementProtocolUnknown(`${source} returned a blank NDJSON record.`)
+    }
+    let parsed: unknown
+    try {
+        parsed = JSON.parse(line)
+    } catch (error) {
+        throw replacementProtocolUnknown(`${source} returned malformed NDJSON.`, error)
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw replacementProtocolUnknown(`${source} returned a malformed NDJSON event.`)
+    }
+    const event = parsed as Record<string, unknown>
+    if (event.type === 'heartbeat') {
+        if (!hasExactKeys(event, ['type'])) {
+            throw replacementProtocolUnknown(`${source} returned a malformed heartbeat event.`)
+        }
+        return event as unknown as ReplacementHeartbeatEvent
+    }
+    if (event.type === 'progress') {
+        if (!hasExactKeys(event, ['type', 'phase'])
+            || typeof event.phase !== 'string'
+            || event.phase.length === 0) {
+            throw replacementProtocolUnknown(`${source} returned a malformed progress event.`)
+        }
+        return event as unknown as ReplacementProgressEvent
+    }
+    if (event.type === 'error') {
+        const failure = backupNdjsonStorageError(event, source)
+        if (!failure) {
+            throw replacementProtocolUnknown(`${source} returned a malformed error event.`)
+        }
+        return event as unknown as BackupNdjsonErrorEvent
+    }
+    if (event.type !== 'done') {
+        throw replacementProtocolUnknown(`${source} returned an unknown NDJSON event.`)
+    }
+
+    const resultKey = kind === 'internal-snapshot' ? 'key' : 'imported'
+    const expectedKeys = [
+        'type', 'operationId', 'ok', 'commitOutcome',
+        'commitOutcomeUnknown', resultKey,
+    ]
+    const validResult = resultKey === 'key'
+        ? typeof event.key === 'string' && parseInternalSnapshotKey(event.key) !== null
+        : isNonnegativeSafeInteger(event.imported)
+    if (!hasExactKeys(event, expectedKeys)
+        || event.operationId !== operationId
+        || event.ok !== true
+        || event.commitOutcome !== 'committed'
+        || event.commitOutcomeUnknown !== false
+        || !validResult) {
+        throw replacementProtocolUnknown(`${source} returned an invalid commit acknowledgement.`)
+    }
+    return event as unknown as ReplacementDoneEvent
+}
+
+function parseReplacementOperationStatus(
+    value: unknown,
+    operationId: string,
+    kind: ReplacementOperationKind,
+): ReplacementOperationStatus {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw replacementProtocolUnknown('Replacement operation status was malformed.')
+    }
+    const status = value as Record<string, unknown>
+    const validState = status.state === 'running'
+        || status.state === 'committed'
+        || status.state === 'not-committed'
+        || status.state === 'unknown'
+    if (!hasExactKeys(status, [
+        'operationId', 'kind', 'state', 'result', 'error', 'createdAt', 'updatedAt',
+    ])
+        || status.operationId !== operationId
+        || status.kind !== kind
+        || !validState
+        || !(status.result === null
+            || (typeof status.result === 'object' && !Array.isArray(status.result)))
+        || !(status.error === null
+            || (typeof status.error === 'object' && !Array.isArray(status.error)))
+        || !isNonnegativeSafeInteger(status.createdAt)
+        || !isNonnegativeSafeInteger(status.updatedAt)) {
+        throw replacementProtocolUnknown('Replacement operation status was malformed.')
+    }
+    return status as unknown as ReplacementOperationStatus
+}
+
+async function consumeReplacementNdjson(
+    response: Response,
+    source: string,
+    operationId: string,
+    kind: ReplacementOperationKind,
+    activity: ReplacementActivityController,
+): Promise<ReplacementDoneEvent> {
+    if (!response.body) {
+        throw replacementProtocolUnknown(
+            `${source} response ended before a terminal outcome was received.`,
+        )
+    }
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let result: ReplacementDoneEvent | null = null
+    let terminalError: StorageError | null = null
+    let terminalSeen = false
+
+    const consumeLine = (line: string) => {
+        const event = parseReplacementNdjsonLine(line, source, operationId, kind)
+        if (event.type === 'error') {
+            terminalError = backupNdjsonStorageError(event, source)
+            terminalSeen = true
+            return
+        }
+        if (terminalSeen) {
+            throw replacementProtocolUnknown(
+                `${source} returned an event after its terminal outcome.`,
+            )
+        }
+        if (event.type === 'done') {
+            result = event
+            terminalSeen = true
+        }
+    }
+
+    while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        activity.touch()
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+        for (const line of lines) consumeLine(line)
+    }
+    buffer += decoder.decode()
+    if (buffer) consumeLine(buffer)
+    if (terminalError) throw terminalError
+    if (!result) {
+        throw replacementProtocolUnknown(
+            `${source} response ended before a terminal outcome was received.`,
+        )
+    }
+    return result
 }
 
 function backupCommitOutcomeUnknown(message: string, cause?: unknown): StorageError {
@@ -654,26 +888,6 @@ interface StorageFailurePayload {
     commitOutcomeUnknown?: unknown
 }
 
-interface InternalSnapshotRestoreAcknowledgement {
-    ok: true
-    key: string
-    commitOutcome: 'committed'
-    commitOutcomeUnknown: false
-}
-
-function isExactInternalSnapshotRestoreAcknowledgement(
-    value: unknown,
-    key: string,
-): value is InternalSnapshotRestoreAcknowledgement {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-    const result = value as Record<string, unknown>
-    return Object.keys(result).sort().join(',') === 'commitOutcome,commitOutcomeUnknown,key,ok'
-        && result.ok === true
-        && result.key === key
-        && result.commitOutcome === 'committed'
-        && result.commitOutcomeUnknown === false
-}
-
 const PLUGIN_STORAGE_PREFIXES = ['pluginsave/', 'pluginsave-meta/'] as const
 const PLUGIN_STORAGE_MAX_RETRIES = 2
 const PLUGIN_STORAGE_DEFAULT_RETRY_SECONDS = 0.25
@@ -803,22 +1017,6 @@ function parseStrictSaveFolderJson(text: string): unknown {
     return value
 }
 
-interface SaveFolderImportAcknowledgement {
-    ok: true
-    imported: number
-}
-
-function isExactSaveFolderImportAcknowledgement(
-    value: unknown,
-): value is SaveFolderImportAcknowledgement {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
-    const result = value as Record<string, unknown>
-    return Object.keys(result).sort().join(',') === 'imported,ok'
-        && result.ok === true
-        && Number.isSafeInteger(result.imported)
-        && Number(result.imported) >= 0
-}
-
 function saveFolderImportStorageError(
     value: unknown,
     status: number,
@@ -941,46 +1139,6 @@ function saveFolderImportPreDispatchError(
             cause: error,
         },
     )
-}
-
-function normalizeSaveFolderImportOperationError(
-    error: unknown,
-    source: 'Save-folder import' | 'Save-folder ZIP import',
-): unknown {
-    // The bounded-operation tracker only emits STORAGE_TIMEOUT while no
-    // mutation request is in flight. Save-folder replacement is intentionally
-    // non-retryable even at that predispatch boundary: callers must require a
-    // fresh user action rather than automatically replaying the import.
-    if (error instanceof LocalAuthoritativeStorageTimeoutError
-        && error.code === 'STORAGE_TIMEOUT'
-        && !error.commitOutcomeUnknown) {
-        return new StorageError(`${source} timed out before mutation dispatch`, {
-            code: 'SAVE_FOLDER_IMPORT_TIMEOUT',
-            retryable: false,
-            commitOutcome: 'not-committed',
-            commitOutcomeUnknown: false,
-            operation: 'write',
-            cause: error,
-        })
-    }
-    // The generic authoritative-operation wrapper records the ambiguity bit,
-    // but older call sites can omit the corresponding textual outcome. Keep
-    // the save-folder boundary exact for fetch rejection and total timeout.
-    if (error instanceof StorageError
-        && error.commitOutcomeUnknown
-        && error.commitOutcome !== 'unknown') {
-        return new StorageError(error.message, {
-            status: error.status,
-            code: 'COMMIT_OUTCOME_UNKNOWN',
-            retryAfter: error.retryAfter,
-            retryable: false,
-            commitOutcome: 'unknown',
-            commitOutcomeUnknown: true,
-            operation: 'write',
-            cause: error,
-        })
-    }
-    return error
 }
 
 // Warning the server attaches to /api/patch responses when the most recent
@@ -3261,6 +3419,156 @@ export class NodeStorage{
         }, 'list', AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS, externalSignal)
     }
 
+    private async readReplacementOperationStatus(
+        operationId: string,
+        kind: ReplacementOperationKind,
+    ): Promise<ReplacementOperationStatus | null> {
+        return runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const response = await this.authFetch(
+                `/api/replacement-operations/${encodeURIComponent(operationId)}`,
+                { signal },
+            )
+            if (response.status === 404) return null
+            if (!response.ok) {
+                throw await this.parseStorageFailureResponse(response, 'read', false, signal)
+            }
+            const value = await awaitWithAbort(response.json(), signal)
+            return parseReplacementOperationStatus(value, operationId, kind)
+        }, 'read', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS)
+    }
+
+    private replacementResultFromStatus(
+        status: ReplacementOperationStatus,
+        expectedSnapshotKey?: string,
+    ): {ok: true, imported: number} | {ok: true, key: string} {
+        const result = status.result
+        if (status.kind === 'internal-snapshot') {
+            if (!result
+                || !hasExactKeys(result, ['ok', 'key'])
+                || result.ok !== true
+                || result.key !== expectedSnapshotKey) {
+                throw replacementProtocolUnknown(
+                    'Committed snapshot restore status contained an invalid result.',
+                )
+            }
+            return { ok: true, key: result.key as string }
+        }
+        if (!result
+            || !hasExactKeys(result, ['ok', 'imported'])
+            || result.ok !== true
+            || !isNonnegativeSafeInteger(result.imported)) {
+            throw replacementProtocolUnknown(
+                'Committed save-folder status contained an invalid result.',
+            )
+        }
+        return { ok: true, imported: result.imported as number }
+    }
+
+    private replacementStatusError(
+        status: ReplacementOperationStatus,
+        source: string,
+    ): StorageError {
+        const record = status.error
+        const message = typeof record?.message === 'string'
+            ? record.message
+            : typeof record?.error === 'string'
+                ? record.error
+                : `${source} did not commit.`
+        const code = typeof record?.code === 'string'
+            ? record.code
+            : status.state === 'unknown'
+                ? 'COMMIT_OUTCOME_UNKNOWN'
+                : 'REPLACEMENT_NOT_COMMITTED'
+        const unknown = status.state === 'unknown'
+        return new StorageError(message, {
+            code,
+            retryable: !unknown && record?.retryable === true,
+            commitOutcome: unknown ? 'unknown' : 'not-committed',
+            commitOutcomeUnknown: unknown,
+            operation: 'transition',
+        })
+    }
+
+    private async reconcileReplacementOperation(
+        operationId: string,
+        kind: ReplacementOperationKind,
+        source: string,
+        expectedSnapshotKey?: string,
+    ): Promise<{ok: true, imported: number} | {ok: true, key: string}> {
+        const deadline = Date.now() + REPLACEMENT_RECONCILE_TIMEOUT_MS
+        let missingReads = 0
+        let failedReads = 0
+        while (Date.now() <= deadline) {
+            let status: ReplacementOperationStatus | null
+            try {
+                status = await this.readReplacementOperationStatus(operationId, kind)
+                failedReads = 0
+            } catch (error) {
+                failedReads += 1
+                if (failedReads >= 3) {
+                    throw replacementProtocolUnknown(
+                        `${source} status could not be read after the transport ended.`,
+                        error,
+                    )
+                }
+                await new Promise<void>(resolve => setTimeout(resolve, REPLACEMENT_RECONCILE_POLL_MS))
+                continue
+            }
+            if (!status) {
+                missingReads += 1
+                // Registration happens before the mutation barrier. Repeated
+                // absence therefore proves this POST never reached destructive
+                // work rather than leaving an ambiguous mutation to replay.
+                if (missingReads >= 3) {
+                    throw new StorageError(`${source} was not dispatched.`, {
+                        code: 'REPLACEMENT_NOT_DISPATCHED',
+                        retryable: false,
+                        commitOutcome: 'not-committed',
+                        commitOutcomeUnknown: false,
+                        operation: 'transition',
+                    })
+                }
+            } else if (status.state === 'committed') {
+                return this.replacementResultFromStatus(status, expectedSnapshotKey)
+            } else if (status.state === 'not-committed' || status.state === 'unknown') {
+                throw this.replacementStatusError(status, source)
+            } else {
+                missingReads = 0
+            }
+            await new Promise<void>(resolve => setTimeout(resolve, REPLACEMENT_RECONCILE_POLL_MS))
+        }
+        throw replacementProtocolUnknown(
+            `${source} status did not reach a terminal outcome after the transport ended.`,
+        )
+    }
+
+    private async resolveReplacementTransportFailure(
+        operationId: string,
+        kind: ReplacementOperationKind,
+        source: string,
+        error: unknown,
+        expectedSnapshotKey?: string,
+    ): Promise<{ok: true, imported: number} | {ok: true, key: string}> {
+        if (error instanceof StorageError
+            && (!error.commitOutcomeUnknown || error.commitOutcome === 'committed')) {
+            throw error
+        }
+        try {
+            return await this.reconcileReplacementOperation(
+                operationId,
+                kind,
+                source,
+                expectedSnapshotKey,
+            )
+        } catch (statusError) {
+            if (statusError instanceof StorageError) throw statusError
+            throw replacementProtocolUnknown(
+                `${source} transport failed and its status could not be reconciled.`,
+                statusError ?? error,
+            )
+        }
+    }
+
     /**
      * Publish one internal snapshot through the server's exclusive restore
      * transaction. Boot recovery and Settings deliberately share this exact
@@ -3275,109 +3583,102 @@ export class NodeStorage{
         if (parseInternalSnapshotKey(key) === null) {
             throw new TypeError('Invalid internal snapshot key')
         }
-        return runBoundedAuthoritativeStorageOperation<'committed'>(async (signal, outcome) => {
-            // Retrying an expired-auth response would replay the restore POST.
-            // Authentication is completed before dispatch, so one attempt is
-            // the only safe mutation policy.
-            const response = await this.authFetch('/api/db/snapshots/restore', {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ key }),
-                signal,
-            }, false, outcome)
-
-            // The active-session middleware rejects 423 before the restore
-            // route can run. Classify it from headers immediately: its optional
-            // diagnostic body may be delayed or truncated by a proxy, but that
-            // cannot make a mutation which never entered the route ambiguous.
-            if (response.status === 423) {
-                outcome.markDefinitiveResponse()
-                try {
-                    void response.body?.cancel().catch(() => undefined)
-                } catch {
-                    // Body disposal is best-effort and never changes the known
-                    // not-committed outcome.
-                }
-                throw new StorageError('Session deactivated', {
-                    status: 423,
-                    code: 'HTTP_423',
-                    retryable: false,
-                    commitOutcomeUnknown: false,
-                    operation: 'transition',
-                })
-            }
-            // authFetch knows only that an HTTP response started. Keep the
-            // restore ambiguous until its complete, strict JSON envelope has
-            // been consumed. A proxy-generated 2xx, a mismatched echo, or a
-            // truncated body after COMMIT cannot become an acknowledgement.
-            outcome.markRequestDispatched()
-            let payload: unknown
-            try {
-                const body = await awaitWithAbort(response.text(), signal)
-                payload = JSON.parse(body)
-            } catch (error) {
-                throw new StorageError('Snapshot restore acknowledgement was truncated or malformed', {
-                    status: response.status,
-                    code: 'COMMIT_OUTCOME_UNKNOWN',
-                    retryable: false,
-                    commitOutcomeUnknown: true,
-                    operation: 'transition',
-                    cause: error,
-                })
-            }
-
-            if (!response.ok) {
-                const failure = payload && typeof payload === 'object' && !Array.isArray(payload)
-                    ? payload as StorageFailurePayload
-                    : null
-                const explicitlyNotCommitted = failure?.commitOutcome === 'not-committed'
-                    && failure?.commitOutcomeUnknown === false
-                // Authentication/session/key rejection happens before the
-                // mutation transaction. Server 5xx is definitive only when its
-                // rollback envelope says so exactly.
-                const rejectedBeforeMutation = response.status === 400
-                    || response.status === 401
-                    || response.status === 403
-                    || response.status === 404
-                    || response.status === 423
-                const definitive = explicitlyNotCommitted || rejectedBeforeMutation
-                if (definitive) outcome.markDefinitiveResponse()
-                throw new StorageError(
-                    payloadMessage(failure) ?? `Snapshot restore failed with HTTP ${response.status}`,
-                    {
-                        status: response.status,
-                        code: typeof failure?.code === 'string'
-                            ? failure.code
-                            : (definitive ? `HTTP_${response.status}` : 'COMMIT_OUTCOME_UNKNOWN'),
-                        retryAfter: parseRetryAfterSeconds(failure?.retryAfter),
-                        retryable: definitive && failure?.retryable === true,
-                        commitOutcomeUnknown: !definitive,
-                        commitOutcome: explicitlyNotCommitted
-                            ? 'not-committed'
-                            : (!definitive ? 'unknown' : null),
-                        operation: 'transition',
-                    },
-                )
-            }
-
-            if (response.status !== 200
-                || !isExactInternalSnapshotRestoreAcknowledgement(payload, key)) {
-                throw new StorageError('Snapshot restore returned an invalid commit acknowledgement', {
-                    status: response.status,
-                    code: 'COMMIT_OUTCOME_UNKNOWN',
-                    retryable: false,
-                    commitOutcomeUnknown: true,
-                    operation: 'transition',
-                })
-            }
-            outcome.markDefinitiveResponse()
+        const operationId = uuidv4()
+        const activity = createReplacementActivityController(externalSignal)
+        let dispatched = false
+        const dispatchTracker: AuthoritativeStorageOutcomeTracker = {
+            markRequestDispatched: () => { dispatched = true },
+            // Header receipt does not settle a streamed replacement.
+            markDefinitiveResponse: () => undefined,
+            isRequestInFlight: () => dispatched,
+        }
+        const publishCommittedState = () => {
             this._lastDbEtag = null
             void listCacheDelete([''])
             for (const group of DB_CACHE_GROUPS) {
                 void invalidateResourceCacheManifest(`db:${group}`)
             }
+        }
+        try {
+            // Authentication completes before the only mutation dispatch and
+            // auth retry stays disabled. Heartbeats and phase events refresh
+            // the idle deadline while slow valid server work continues.
+            const response = await this.authFetch('/api/db/snapshots/restore', {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'accept': 'application/x-ndjson',
+                    'x-risu-replacement-id': operationId,
+                },
+                body: JSON.stringify({ key }),
+                signal: activity.signal,
+            }, false, dispatchTracker)
+            activity.touch()
+
+            if (response.status === 423) {
+                try { void response.body?.cancel().catch(() => undefined) } catch {}
+                throw new StorageError('Session deactivated', {
+                    status: 423,
+                    code: 'HTTP_423',
+                    retryable: false,
+                    commitOutcome: 'not-committed',
+                    commitOutcomeUnknown: false,
+                    operation: 'transition',
+                })
+            }
+            if (!response.ok) {
+                throw await this.parseStorageFailureResponse(
+                    response,
+                    'transition',
+                    true,
+                    activity.signal,
+                )
+            }
+            const result = await consumeReplacementNdjson(
+                response,
+                'Snapshot restore',
+                operationId,
+                'internal-snapshot',
+                activity,
+            )
+            if (result.key !== key) {
+                throw replacementProtocolUnknown(
+                    'Snapshot restore returned the wrong snapshot key.',
+                )
+            }
+            publishCommittedState()
             return 'committed'
-        }, 'transition', INTERNAL_SNAPSHOT_RESTORE_TIMEOUT_MS, externalSignal)
+        } catch (error) {
+            if (!dispatched) {
+                throw new StorageError(
+                    getThrownMessage(error, 'Snapshot restore failed before dispatch.'),
+                    {
+                        code: 'SNAPSHOT_RESTORE_NOT_DISPATCHED',
+                        retryable: false,
+                        commitOutcome: 'not-committed',
+                        commitOutcomeUnknown: false,
+                        operation: 'transition',
+                        cause: error,
+                    },
+                )
+            }
+            const reconciled = await this.resolveReplacementTransportFailure(
+                operationId,
+                'internal-snapshot',
+                'Snapshot restore',
+                error,
+                key,
+            )
+            if (!('key' in reconciled) || reconciled.key !== key) {
+                throw replacementProtocolUnknown(
+                    'Snapshot restore reconciliation returned the wrong result.',
+                )
+            }
+            publishCommittedState()
+            return 'committed'
+        } finally {
+            activity.stop()
+        }
     }
     async keys(prefix: string = '', externalSignal?: AbortSignal | null):Promise<string[]>{
         return runBoundedAuthoritativeStorageOperation(
@@ -4603,79 +4904,63 @@ export class NodeStorage{
     }
 
     async executeSaveFolderImport(folderPath?: string): Promise<{ok: boolean, imported: number}> {
+        const operationId = uuidv4()
+        const activity = createReplacementActivityController()
+        let dispatched = false
+        const dispatchTracker: AuthoritativeStorageOutcomeTracker = {
+            markRequestDispatched: () => { dispatched = true },
+            markDefinitiveResponse: () => undefined,
+            isRequestInFlight: () => dispatched,
+        }
         try {
-            return await runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
-                // A save-folder import replaces authoritative state. Authentication
-                // must finish before its single POST; never replay the mutation on
-                // an expired-token response or after any committed/unknown result.
-                let response: Response
-                try {
-                    response = await this.authFetch('/api/migrate/save-folder/execute', {
-                        method: 'POST',
-                        headers: { 'content-type': 'application/json' },
-                        body: JSON.stringify({ path: folderPath }),
-                        signal,
-                    }, false, outcome)
-                } catch (error) {
-                    // authFetch marks the shared tracker immediately before the
-                    // mutation fetch. Authentication/token failures happen before
-                    // that boundary and are therefore definitively not committed;
-                    // a fetch failure after the mark remains unknown in the outer
-                    // bounded write operation.
-                    if (!outcome.isRequestInFlight()) {
-                        throw saveFolderImportPreDispatchError(
-                            error,
-                            'SAVE_FOLDER_IMPORT_AUTH_FAILED',
-                        )
-                    }
-                    throw error
-                }
-
-                // Header receipt alone cannot acknowledge the replacement. Keep
-                // the request in flight through strict, complete body parsing.
-                outcome.markRequestDispatched()
-                let payload: unknown
-                try {
-                    payload = parseStrictSaveFolderJson(
-                        await awaitWithAbort(response.text(), signal),
-                    )
-                } catch (error) {
-                    throw new StorageError('Save-folder import response was truncated or malformed', {
-                        status: response.status,
-                        code: 'COMMIT_OUTCOME_UNKNOWN',
-                        retryable: false,
-                        commitOutcome: 'unknown',
-                        commitOutcomeUnknown: true,
-                        operation: 'write',
-                        cause: error,
-                    })
-                }
-
-                if (!response.ok) {
-                    const failure = saveFolderImportStorageError(
-                        payload,
-                        response.status,
-                        `Save-folder import failed with HTTP ${response.status}`,
-                    )
-                    if (failure.authoritative) outcome.markDefinitiveResponse()
-                    throw failure.error
-                }
-                if (response.status !== 200
-                    || !isExactSaveFolderImportAcknowledgement(payload)) {
-                    throw new StorageError('Save-folder import returned an invalid commit acknowledgement', {
-                        status: response.status,
-                        code: 'COMMIT_OUTCOME_UNKNOWN',
-                        retryable: false,
-                        commitOutcome: 'unknown',
-                        commitOutcomeUnknown: true,
-                        operation: 'write',
-                    })
-                }
-                outcome.markDefinitiveResponse()
-                return payload
-            }, 'write', SAVE_FOLDER_IMPORT_TIMEOUT_MS)
+            const response = await this.authFetch('/api/migrate/save-folder/execute', {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'accept': 'application/x-ndjson',
+                    'x-risu-replacement-id': operationId,
+                },
+                body: JSON.stringify({ path: folderPath }),
+                signal: activity.signal,
+            }, false, dispatchTracker)
+            activity.touch()
+            if (!response.ok) {
+                throw await this.parseStorageFailureResponse(
+                    response,
+                    'write',
+                    true,
+                    activity.signal,
+                )
+            }
+            const result = await consumeReplacementNdjson(
+                response,
+                'Save-folder import',
+                operationId,
+                'save-folder-directory',
+                activity,
+            )
+            return { ok: true, imported: result.imported! }
         } catch (error) {
-            throw normalizeSaveFolderImportOperationError(error, 'Save-folder import')
+            if (!dispatched) {
+                throw saveFolderImportPreDispatchError(
+                    error,
+                    'SAVE_FOLDER_IMPORT_AUTH_FAILED',
+                )
+            }
+            const reconciled = await this.resolveReplacementTransportFailure(
+                operationId,
+                'save-folder-directory',
+                'Save-folder import',
+                error,
+            )
+            if (!('imported' in reconciled)) {
+                throw replacementProtocolUnknown(
+                    'Save-folder import reconciliation returned the wrong result.',
+                )
+            }
+            return reconciled
+        } finally {
+            activity.stop()
         }
     }
 
@@ -4683,55 +4968,66 @@ export class NodeStorage{
         file: Blob,
         onProgress?: (loaded: number, total: number) => void
     ): Promise<{ok: boolean, imported: number}> {
-        const startedAt = Date.now()
+        const operationId = uuidv4()
+        const activity = createReplacementActivityController()
         try {
-            return await runBoundedAuthoritativeStorageOperation(
-                (signal, outcome) => this.uploadSaveFolderZipAuthoritative(
-                    file,
-                    onProgress,
-                    signal,
-                    outcome,
-                    startedAt,
-                ),
-                'write',
-                SAVE_FOLDER_IMPORT_TIMEOUT_MS,
+            return await this.uploadSaveFolderZipAuthoritative(
+                file,
+                onProgress,
+                activity,
+                operationId,
             )
         } catch (error) {
-            throw normalizeSaveFolderImportOperationError(error, 'Save-folder ZIP import')
+            const reconciled = await this.resolveReplacementTransportFailure(
+                operationId,
+                'save-folder-zip',
+                'Save-folder ZIP import',
+                error,
+            )
+            if (!('imported' in reconciled)) {
+                throw replacementProtocolUnknown(
+                    'Save-folder ZIP reconciliation returned the wrong result.',
+                )
+            }
+            return reconciled
+        } finally {
+            activity.stop()
         }
     }
 
     private async uploadSaveFolderZipAuthoritative(
         file: Blob,
         onProgress: ((loaded: number, total: number) => void) | undefined,
-        signal: AbortSignal,
-        outcome: AuthoritativeStorageOutcomeTracker,
-        startedAt: number,
+        activity: ReplacementActivityController,
+        operationId: string,
     ): Promise<{ok: boolean, imported: number}> {
         let authHeader: string
         try {
-            // Authentication is completed before the one allowed mutation
-            // dispatch. Its failure is therefore definitively not committed.
-            authHeader = await this.createAuth(signal)
+            authHeader = await this.createAuth(activity.signal)
         } catch (error) {
             throw saveFolderImportPreDispatchError(error, 'SAVE_FOLDER_IMPORT_AUTH_FAILED')
         }
+        activity.touch()
 
         return await new Promise((resolve, reject) => {
             let xhr: XMLHttpRequest
             let settled = false
             let dispatched = false
             let onSignalAbort: () => void = () => undefined
+            let parsedIndex = 0
+            let leftover = ''
+            let result: ReplacementDoneEvent | null = null
+            let serverError: StorageError | null = null
+            let protocolError: StorageError | null = null
+            let terminalSeen = false
             try {
                 xhr = new XMLHttpRequest()
                 xhr.open('POST', '/api/migrate/save-folder/upload')
-                xhr.timeout = Math.max(
-                    1,
-                    SAVE_FOLDER_IMPORT_TIMEOUT_MS - (Date.now() - startedAt),
-                )
                 xhr.setRequestHeader('content-type', 'application/zip')
                 xhr.setRequestHeader('risu-auth', authHeader)
                 xhr.setRequestHeader('x-session-id', NodeStorage.sessionId)
+                xhr.setRequestHeader('accept', 'application/x-ndjson')
+                xhr.setRequestHeader('x-risu-replacement-id', operationId)
             } catch (error) {
                 reject(saveFolderImportPreDispatchError(
                     error,
@@ -4741,16 +5037,14 @@ export class NodeStorage{
             }
 
             const cleanup = () => {
-                signal.removeEventListener('abort', onSignalAbort)
+                activity.signal.removeEventListener('abort', onSignalAbort)
                 xhr.upload.onprogress = null
+                xhr.upload.onload = null
                 xhr.onerror = null
                 xhr.onabort = null
                 xhr.ontimeout = null
                 xhr.onload = null
-                try { xhr.timeout = 0 } catch {
-                    // Some test/browser implementations expose a readonly
-                    // timeout after completion; handler cleanup is sufficient.
-                }
+                xhr.onprogress = null
             }
             const resolveOnce = (value: {ok: boolean, imported: number}) => {
                 if (settled) return
@@ -4758,7 +5052,7 @@ export class NodeStorage{
                 cleanup()
                 resolve(value)
             }
-            const rejectOnce = (error: StorageError) => {
+            const rejectOnce = (error: unknown) => {
                 if (settled) return
                 settled = true
                 cleanup()
@@ -4774,62 +5068,136 @@ export class NodeStorage{
             })
             const rejectUnknown = (message: string) => rejectOnce(unknownError(message))
 
+            const consumeLine = (line: string) => {
+                let event: ReplacementNdjsonEvent
+                try {
+                    event = parseReplacementNdjsonLine(
+                        line,
+                        'Save-folder ZIP import',
+                        operationId,
+                        'save-folder-zip',
+                    )
+                } catch (error) {
+                    protocolError ??= error instanceof StorageError
+                        ? error
+                        : replacementProtocolUnknown(
+                            'Save-folder ZIP import returned malformed NDJSON.',
+                            error,
+                        )
+                    return
+                }
+                if (event.type === 'error') {
+                    serverError = backupNdjsonStorageError(event, 'Save-folder ZIP import')
+                    terminalSeen = true
+                    return
+                }
+                if (terminalSeen) {
+                    protocolError ??= replacementProtocolUnknown(
+                        'Save-folder ZIP import returned an event after its terminal outcome.',
+                    )
+                    return
+                }
+                if (event.type === 'done') {
+                    result = event
+                    terminalSeen = true
+                }
+            }
+            const drainNdjson = (flush = false) => {
+                const text = xhr.responseText
+                if (text.length > parsedIndex) {
+                    leftover += text.slice(parsedIndex)
+                    parsedIndex = text.length
+                }
+                const lines = leftover.split('\n')
+                leftover = lines.pop() ?? ''
+                for (const line of lines) consumeLine(line)
+                if (flush && leftover) {
+                    consumeLine(leftover)
+                    leftover = ''
+                }
+            }
+            const settleStream = (fallbackMessage: string, cleanCompletion = true) => {
+                if (settled) return
+                try {
+                    drainNdjson(true)
+                } catch (error) {
+                    protocolError ??= replacementProtocolUnknown(
+                        'Save-folder ZIP response could not be parsed.',
+                        error,
+                    )
+                }
+                if (serverError) rejectOnce(serverError)
+                else if (protocolError) rejectOnce(protocolError)
+                else if (cleanCompletion && result) {
+                    resolveOnce({ ok: true, imported: result.imported! })
+                } else rejectUnknown(fallbackMessage)
+            }
+
             xhr.upload.onprogress = (event) => {
+                activity.touch()
                 if (event.lengthComputable) {
                     onProgress?.(event.loaded, event.total)
                 }
             }
-            xhr.onerror = () => rejectUnknown('Save-folder ZIP upload response was lost')
+            xhr.upload.onload = () => activity.touch()
+            xhr.onprogress = () => {
+                activity.touch()
+                drainNdjson()
+            }
+            xhr.onerror = () => settleStream(
+                'Save-folder ZIP upload response was lost',
+                false,
+            )
             xhr.onabort = () => {
                 if (dispatched) {
-                    rejectUnknown('Save-folder ZIP upload was aborted after dispatch')
+                    settleStream('Save-folder ZIP upload was aborted after dispatch', false)
                 } else {
                     rejectOnce(saveFolderImportPreDispatchError(
-                        signal.reason ?? new DOMException('Save-folder ZIP upload aborted', 'AbortError'),
+                        activity.signal.reason
+                            ?? new DOMException('Save-folder ZIP upload aborted', 'AbortError'),
                         'SAVE_FOLDER_IMPORT_NOT_DISPATCHED',
                     ))
                 }
             }
-            xhr.ontimeout = () => rejectUnknown('Save-folder ZIP upload timed out after dispatch')
+            xhr.ontimeout = () => settleStream(
+                'Save-folder ZIP upload timed out after dispatch',
+                false,
+            )
             xhr.onload = () => {
                 // XHR status 0 means no authoritative HTTP response exists.
                 // Ignore even an exact-looking cached/proxy body: after send()
                 // the replacement outcome must remain unknown.
                 if (xhr.status === 0) {
-                    rejectUnknown('Save-folder ZIP upload response was lost')
-                    return
-                }
-                let payload: unknown
-                try {
-                    payload = parseStrictSaveFolderJson(xhr.responseText)
-                } catch {
-                    rejectUnknown('Save-folder ZIP import response was truncated or malformed')
+                    settleStream('Save-folder ZIP upload response was lost', false)
                     return
                 }
                 if (xhr.status < 200 || xhr.status >= 300) {
+                    let payload: unknown
+                    try {
+                        payload = parseStrictSaveFolderJson(xhr.responseText)
+                    } catch {
+                        rejectUnknown('Save-folder ZIP import response was truncated or malformed')
+                        return
+                    }
                     const failure = saveFolderImportStorageError(
                         payload,
                         xhr.status,
                         `Save-folder ZIP import failed with HTTP ${xhr.status}`,
                     )
-                    if (failure.authoritative) outcome.markDefinitiveResponse()
                     rejectOnce(failure.error)
                     return
                 }
-                if (xhr.status !== 200
-                    || !isExactSaveFolderImportAcknowledgement(payload)) {
-                    rejectUnknown('Save-folder ZIP import returned an invalid commit acknowledgement')
-                    return
-                }
-                outcome.markDefinitiveResponse()
-                resolveOnce(payload)
+                settleStream(
+                    'Save-folder ZIP response ended before a terminal outcome was received.',
+                )
             }
 
             onSignalAbort = () => {
                 const failure = dispatched
                     ? unknownError('Save-folder ZIP upload timed out after dispatch')
                     : saveFolderImportPreDispatchError(
-                        signal.reason ?? new DOMException('Save-folder ZIP upload timed out', 'TimeoutError'),
+                        activity.signal.reason
+                            ?? new DOMException('Save-folder ZIP upload timed out', 'TimeoutError'),
                         'SAVE_FOLDER_IMPORT_NOT_DISPATCHED',
                     )
                 try { xhr.abort() } catch {
@@ -4838,8 +5206,8 @@ export class NodeStorage{
                 }
                 rejectOnce(failure)
             }
-            signal.addEventListener('abort', onSignalAbort, { once: true })
-            if (signal.aborted) {
+            activity.signal.addEventListener('abort', onSignalAbort, { once: true })
+            if (activity.signal.aborted) {
                 onSignalAbort()
                 return
             }
@@ -4851,7 +5219,7 @@ export class NodeStorage{
                 xhr.send(file)
                 if (!settled) {
                     dispatched = true
-                    outcome.markRequestDispatched()
+                    activity.touch()
                 }
             } catch (error) {
                 rejectOnce(saveFolderImportPreDispatchError(

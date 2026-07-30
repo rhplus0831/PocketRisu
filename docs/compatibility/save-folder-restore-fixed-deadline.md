@@ -1,6 +1,6 @@
 # Save-folder and snapshot restores gained a fixed 10-minute deadline
 
-- Status: Confirmed regression
+- Status: Fixed 2026-07-30
 - Severity: Medium
 - Confidence: High
 
@@ -24,8 +24,23 @@ can exceed the relevant limit. The import routes are designed to observe
 disconnect and roll back pre-commit work, but a timeout racing publication
 still leaves the client unable to distinguish rollback from a completed commit.
 
-## Recommendation
+## Resolution
 
-Use progress/idle timeouts and a configurable overall policy scaled to declared
-bytes/entries. Expose a job status endpoint so reconnecting clients can resolve
-the outcome. Test slow but progressing directory, ZIP, and snapshot restores.
+The client no longer applies a total wall-clock deadline. Save-folder and snapshot
+replacements opt into a strict NDJSON activity stream and use a two-minute inactivity
+watchdog that is refreshed by upload progress, server heartbeats, phase events, and
+terminal events. A progressing operation can therefore run for longer than ten minutes,
+while a silent or disconnected operation still stops waiting after a finite interval.
+
+Every replacement carries a UUID and has a durable status row outside the logical KV
+database being replaced. The server writes `committed` and the exact result in the same
+SQLite transaction that publishes the replacement. A client that loses the terminal
+response polls the authenticated status endpoint and can distinguish a committed restore
+from one that did not commit without replaying the destructive request. Stale `running`
+rows become `not-committed` after a server restart, and retained outcomes are pruned after
+the configured retention interval.
+
+Legacy callers that do not negotiate the stream keep the existing JSON response. Tests
+cover directory and ZIP work that remains active beyond eleven minutes, strict streamed
+outcomes, lost acknowledgements, idle disconnects, and committed snapshot reconciliation
+across server restart.

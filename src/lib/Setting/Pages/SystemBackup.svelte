@@ -141,8 +141,8 @@
         alertWait(language.serverBackupRestoring)
         await runInternalSnapshotRestoreUi(snap.key, {
             // NodeStorage owns authentication, the active-writer session fence,
-            // the long restore timeout, strict acknowledgement parsing, and the
-            // no-retry mutation rule. Boot recovery uses the same method.
+            // activity monitoring, durable outcome reconciliation, strict event
+            // parsing, and the no-retry mutation rule. Boot recovery uses the same method.
             restore: (key, signal) => forageStorage.restoreInternalSnapshot(key, signal),
             onCommitted: () => notifySuccess('Loaded backup'),
             onDefinitiveFailure: (error) => {

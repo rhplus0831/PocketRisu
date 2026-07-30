@@ -36,7 +36,7 @@ vi.mock('./resourceCache', () => ({
 import {
     ConflictError,
     NodeStorage,
-    SAVE_FOLDER_IMPORT_TIMEOUT_MS,
+    REPLACEMENT_ACTIVITY_TIMEOUT_MS,
 } from './nodeStorage'
 import { StorageError } from './storageError'
 
@@ -952,396 +952,286 @@ describe('NodeStorage plugin error contract', () => {
         expect(fetchMock).toHaveBeenCalledOnce()
     })
 
-    test.each([
-        ['committed', false, 'SAVE_FOLDER_IMPORT_POST_COMMIT_CLEANUP_FAILED'],
-        ['not-committed', false, 'SAVE_FOLDER_IMPORT_NOT_COMMITTED'],
-        ['unknown', true, 'SAVE_FOLDER_IMPORT_OUTCOME_UNKNOWN'],
-    ] as const)(
-        'preserves a save-folder direct-import %s outcome without replaying the POST',
-        async (commitOutcome, commitOutcomeUnknown, code) => {
-            fetchMock.mockResolvedValueOnce(jsonResponse({
-                error: `direct import ${commitOutcome}`,
-                code,
-                retryable: commitOutcome === 'not-committed',
-                commitOutcome,
-                commitOutcomeUnknown,
-            }, 500))
-
-            const failure = await readyStorage().executeSaveFolderImport('/source')
-                .then(() => null, error => error)
-
-            expect(fetchMock).toHaveBeenCalledOnce()
-            expect(failure).toBeInstanceOf(StorageError)
-            expect(failure).toMatchObject({
-                message: `direct import ${commitOutcome}`,
-                status: 500,
-                code,
-                retryable: commitOutcome === 'not-committed',
-                commitOutcome,
-                commitOutcomeUnknown,
-                operation: 'write',
+    test('accepts an exact activity-streamed directory replacement', async () => {
+        fetchMock.mockImplementationOnce(async (_input, init) => {
+            const headers = new Headers(init?.headers)
+            const operationId = headers.get('x-risu-replacement-id')
+            expect(headers.get('accept')).toBe('application/x-ndjson')
+            expect(operationId).toMatch(/^[0-9a-f-]{36}$/)
+            return new Response([
+                '{"type":"heartbeat"}',
+                '{"type":"progress","phase":"publishing"}',
+                JSON.stringify({
+                    type: 'done',
+                    operationId,
+                    ok: true,
+                    imported: 7,
+                    commitOutcome: 'committed',
+                    commitOutcomeUnknown: false,
+                }),
+                '',
+            ].join('\n'), {
+                status: 200,
+                headers: { 'content-type': 'application/x-ndjson' },
             })
-        },
-    )
+        })
+
+        await expect(readyStorage().executeSaveFolderImport('/source')).resolves.toEqual({
+            ok: true,
+            imported: 7,
+        })
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    test('allows a progressing directory replacement to run beyond ten minutes', async () => {
+        vi.useFakeTimers()
+        fetchMock.mockImplementationOnce(async (_input, init) => {
+            const operationId = new Headers(init?.headers).get('x-risu-replacement-id')
+            const encoder = new TextEncoder()
+            let minute = 0
+            return new Response(new ReadableStream<Uint8Array>({
+                start(controller) {
+                    const tick = () => {
+                        if (minute >= 11) {
+                            controller.enqueue(encoder.encode(JSON.stringify({
+                                type: 'done',
+                                operationId,
+                                ok: true,
+                                imported: 3,
+                                commitOutcome: 'committed',
+                                commitOutcomeUnknown: false,
+                            }) + '\n'))
+                            controller.close()
+                            return
+                        }
+                        controller.enqueue(encoder.encode('{"type":"heartbeat"}\n'))
+                        minute += 1
+                        setTimeout(tick, 60_000)
+                    }
+                    tick()
+                },
+            }), {
+                status: 200,
+                headers: { 'content-type': 'application/x-ndjson' },
+            })
+        })
+
+        const storage = readyStorage()
+        vi.spyOn(storage, 'createAuth').mockResolvedValue('test-token')
+        const pending = storage.executeSaveFolderImport('/source')
+        await vi.advanceTimersByTimeAsync(11 * 60_000)
+
+        await expect(pending).resolves.toEqual({ ok: true, imported: 3 })
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
 
     test.each([
         ['committed', false],
         ['not-committed', true],
     ] as const)(
-        'preserves an authoritative direct %s envelope whose server code is STORAGE_TIMEOUT',
+        'preserves a streamed directory %s error outcome',
         async (commitOutcome, retryable) => {
-            fetchMock.mockResolvedValueOnce(jsonResponse({
-                error: `server direct ${commitOutcome} timeout`,
-                code: 'STORAGE_TIMEOUT',
-                retryable,
-                commitOutcome,
-                commitOutcomeUnknown: false,
-            }, 500))
+            fetchMock.mockImplementationOnce(async (_input, init) => {
+                const operationId = new Headers(init?.headers).get('x-risu-replacement-id')
+                expect(operationId).toBeTruthy()
+                return new Response([
+                    '{"type":"heartbeat"}',
+                    JSON.stringify({
+                        type: 'error',
+                        message: `directory ${commitOutcome}`,
+                        code: `DIRECTORY_${commitOutcome.toUpperCase()}`,
+                        retryable,
+                        commitOutcome,
+                        commitOutcomeUnknown: false,
+                        status: 500,
+                    }),
+                    '',
+                ].join('\n'), {
+                    status: 200,
+                    headers: { 'content-type': 'application/x-ndjson' },
+                })
+            })
 
             const failure = await readyStorage().executeSaveFolderImport('/source')
                 .then(() => null, error => error)
 
-            expect(fetchMock).toHaveBeenCalledOnce()
             expect(failure).toBeInstanceOf(StorageError)
             expect(failure).toMatchObject({
-                message: `server direct ${commitOutcome} timeout`,
-                status: 500,
-                code: 'STORAGE_TIMEOUT',
+                message: `directory ${commitOutcome}`,
                 retryable,
                 commitOutcome,
                 commitOutcomeUnknown: false,
-                operation: 'write',
             })
-            expect((failure as Error).cause).toBeUndefined()
+            expect(fetchMock).toHaveBeenCalledOnce()
         },
     )
 
-    test('turns the historical plain save-folder validation response into StorageError', async () => {
-        fetchMock.mockResolvedValueOnce(jsonResponse({
-            error: 'Referenced REMOTE block missing is missing',
-        }, 400))
+    test('reconciles a lost directory acknowledgement as committed', async () => {
+        let operationId = ''
+        fetchMock
+            .mockImplementationOnce(async (_input, init) => {
+                operationId = new Headers(init?.headers).get('x-risu-replacement-id')!
+                throw new TypeError('response socket lost')
+            })
+            .mockImplementationOnce(async (input) => {
+                expect(String(input)).toContain(operationId)
+                return jsonResponse({
+                    operationId,
+                    kind: 'save-folder-directory',
+                    state: 'committed',
+                    result: { ok: true, imported: 9 },
+                    error: null,
+                    createdAt: 1,
+                    updatedAt: 2,
+                })
+            })
 
-        const failure = await readyStorage().executeSaveFolderImport('/source')
-            .then(() => null, error => error)
-
-        expect(fetchMock).toHaveBeenCalledOnce()
-        expect(failure).toBeInstanceOf(StorageError)
-        expect(failure).toMatchObject({
-            message: 'Referenced REMOTE block missing is missing',
-            status: 400,
-            code: 'HTTP_400',
-            retryable: false,
-            commitOutcome: 'not-committed',
-            commitOutcomeUnknown: false,
-            operation: 'write',
+        await expect(readyStorage().executeSaveFolderImport('/source')).resolves.toEqual({
+            ok: true,
+            imported: 9,
         })
+        expect(fetchMock).toHaveBeenCalledTimes(2)
     })
 
-    test('does not replay a direct save-folder import after its response is lost', async () => {
-        fetchMock.mockRejectedValueOnce(new Error('socket closed after upload'))
-
-        const failure = await readyStorage().executeSaveFolderImport('/source')
-            .then(() => null, error => error)
-
-        expect(fetchMock).toHaveBeenCalledOnce()
-        expect(failure).toBeInstanceOf(StorageError)
-        expect(failure).toMatchObject({
-            message: 'socket closed after upload',
-            code: 'COMMIT_OUTCOME_UNKNOWN',
-            retryable: false,
-            commitOutcome: 'unknown',
-            commitOutcomeUnknown: true,
-            operation: 'write',
-        })
-        expect((failure as Error).cause).toBeInstanceOf(StorageError)
-        expect((failure as Error).cause).toMatchObject({
-            code: 'COMMIT_OUTCOME_UNKNOWN',
-            commitOutcomeUnknown: true,
-            operation: 'write',
-        })
-    })
-
-    test.each(['checkAuth', 'createAuth'] as const)(
-        'classifies direct-import %s failure before dispatch as not committed',
-        async (failurePoint) => {
-            const storage = readyStorage()
-            const cause = new DOMException(`${failurePoint} unavailable`, 'NotSupportedError')
-            vi.spyOn(storage as any, failurePoint).mockRejectedValueOnce(cause)
-
-            const failure = await storage.executeSaveFolderImport('/source')
-                .then(() => null, error => error)
-
-            expect(fetchMock).not.toHaveBeenCalled()
-            expect(failure).toBeInstanceOf(StorageError)
-            expect(failure).toMatchObject({
-                message: `${failurePoint} unavailable`,
-                status: null,
-                code: 'SAVE_FOLDER_IMPORT_AUTH_FAILED',
-                retryable: false,
-                commitOutcome: 'not-committed',
-                commitOutcomeUnknown: false,
-                operation: 'write',
-            })
-            expect((failure as Error).cause).toBe(cause)
-        },
-    )
-
-    test.each(['checkAuth', 'createAuth'] as const)(
-        'bounds a never-resolving direct-import %s phase as not committed',
-        async (failurePoint) => {
-            vi.useFakeTimers()
-            const storage = readyStorage()
-            vi.spyOn(storage as any, failurePoint)
-                .mockReturnValueOnce(new Promise(() => undefined))
-
-            const pending = storage.executeSaveFolderImport('/source')
-                .then(() => null, error => error)
-            await vi.advanceTimersByTimeAsync(SAVE_FOLDER_IMPORT_TIMEOUT_MS)
-            const failure = await pending
-
-            expect(fetchMock).not.toHaveBeenCalled()
-            expect(failure).toBeInstanceOf(StorageError)
-            expect(failure).toMatchObject({
-                message: 'Save-folder import timed out before mutation dispatch',
-                status: null,
-                code: 'SAVE_FOLDER_IMPORT_TIMEOUT',
-                retryable: false,
-                commitOutcome: 'not-committed',
-                commitOutcomeUnknown: false,
-                operation: 'write',
-            })
-            expect((failure as Error).cause).toBeInstanceOf(StorageError)
-            expect((failure as Error).cause).toMatchObject({
-                code: 'STORAGE_TIMEOUT',
-                retryable: true,
-                commitOutcomeUnknown: false,
-                operation: 'write',
-            })
-            expect(vi.getTimerCount()).toBe(0)
-
-            await vi.advanceTimersByTimeAsync(SAVE_FOLDER_IMPORT_TIMEOUT_MS)
-            expect(fetchMock).not.toHaveBeenCalled()
-        },
-    )
-
-    test('keeps a deadline immediately before direct dispatch not committed with no late request', async () => {
+    test('turns an idle directory stream into a definitive status result', async () => {
         vi.useFakeTimers()
-        const storage = readyStorage()
-        vi.spyOn(storage as any, 'createAuth').mockImplementationOnce(() => (
-            new Promise(resolve => {
-                setTimeout(() => resolve('late-token'), SAVE_FOLDER_IMPORT_TIMEOUT_MS + 1)
+        let operationId = ''
+        fetchMock
+            .mockImplementationOnce(async (_input, init) => {
+                operationId = new Headers(init?.headers).get('x-risu-replacement-id')!
+                return await new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener('abort', () => {
+                        reject(new DOMException('idle', 'AbortError'))
+                    }, { once: true })
+                })
             })
-        ))
+            .mockImplementationOnce(async () => jsonResponse({
+                operationId,
+                kind: 'save-folder-directory',
+                state: 'not-committed',
+                result: null,
+                error: {
+                    message: 'Directory replacement rolled back after disconnect.',
+                    code: 'REPLACEMENT_INTERRUPTED',
+                    retryable: true,
+                },
+                createdAt: 1,
+                updatedAt: 2,
+            }))
 
+        const storage = readyStorage()
+        vi.spyOn(storage, 'createAuth').mockResolvedValue('test-token')
         const pending = storage.executeSaveFolderImport('/source')
             .then(() => null, error => error)
-        await vi.advanceTimersByTimeAsync(SAVE_FOLDER_IMPORT_TIMEOUT_MS)
+        await vi.advanceTimersByTimeAsync(1)
+        expect(fetchMock).toHaveBeenCalledOnce()
+        await vi.advanceTimersByTimeAsync(REPLACEMENT_ACTIVITY_TIMEOUT_MS)
         const failure = await pending
 
-        expect(fetchMock).not.toHaveBeenCalled()
         expect(failure).toMatchObject({
-            code: 'SAVE_FOLDER_IMPORT_TIMEOUT',
-            retryable: false,
+            message: 'Directory replacement rolled back after disconnect.',
+            code: 'REPLACEMENT_INTERRUPTED',
             commitOutcome: 'not-committed',
             commitOutcomeUnknown: false,
-            operation: 'write',
         })
-        expect((failure as Error).cause).toBeInstanceOf(StorageError)
-
-        await vi.advanceTimersByTimeAsync(1)
-        expect(fetchMock).not.toHaveBeenCalled()
-        expect(vi.getTimerCount()).toBe(0)
+        expect(fetchMock).toHaveBeenCalledTimes(2)
     })
 
-    test('keeps a deadline immediately after direct dispatch unknown without replay', async () => {
+    test('keeps ZIP upload and response activity alive beyond ten minutes', async () => {
         vi.useFakeTimers()
-        const storage = readyStorage()
-        vi.spyOn(storage as any, 'createAuth').mockImplementationOnce(() => (
-            new Promise(resolve => {
-                setTimeout(() => resolve('on-time-token'), SAVE_FOLDER_IMPORT_TIMEOUT_MS - 1)
-            })
-        ))
-        fetchMock.mockImplementationOnce(() => new Promise(() => undefined))
-
-        const pending = storage.executeSaveFolderImport('/source')
-            .then(() => null, error => error)
-        await vi.advanceTimersByTimeAsync(SAVE_FOLDER_IMPORT_TIMEOUT_MS - 1)
-        expect(fetchMock).toHaveBeenCalledOnce()
-        await vi.advanceTimersByTimeAsync(1)
-        const failure = await pending
-
-        expect(failure).toBeInstanceOf(StorageError)
-        expect(failure).toMatchObject({
-            status: null,
-            code: 'COMMIT_OUTCOME_UNKNOWN',
-            retryable: false,
-            commitOutcome: 'unknown',
-            commitOutcomeUnknown: true,
-            operation: 'write',
-        })
-        expect((failure as Error).cause).toBeInstanceOf(StorageError)
-        expect((failure as Error).cause).toMatchObject({
-            code: 'COMMIT_OUTCOME_UNKNOWN',
-            commitOutcomeUnknown: true,
-            operation: 'write',
-        })
-        expect(vi.getTimerCount()).toBe(0)
-
-        await vi.advanceTimersByTimeAsync(SAVE_FOLDER_IMPORT_TIMEOUT_MS)
-        expect(fetchMock).toHaveBeenCalledOnce()
-    })
-
-    test('preserves a committed ZIP-import error and reports lost transport as unknown', async () => {
-        let requests = 0
-        class FakeXmlHttpRequest {
-            status = 500
-            responseText = JSON.stringify({
-                error: 'ZIP import committed; cleanup failed',
-                code: 'SAVE_FOLDER_IMPORT_POST_COMMIT_CLEANUP_FAILED',
-                retryable: false,
-                commitOutcome: 'committed',
-                commitOutcomeUnknown: false,
-            })
+        class ProgressingXmlHttpRequest {
+            status = 200
+            responseText = ''
             upload: Record<string, any> = {}
+            onprogress: (() => void) | null = null
+            onerror: (() => void) | null = null
+            onabort: (() => void) | null = null
+            ontimeout: (() => void) | null = null
+            onload: (() => void) | null = null
+            private headers = new Map<string, string>()
+            open() {}
+            setRequestHeader(name: string, value: string) {
+                this.headers.set(name.toLowerCase(), value)
+            }
+            send() {
+                let minute = 0
+                const tick = () => {
+                    if (minute >= 11) {
+                        this.responseText = [
+                            '{"type":"heartbeat"}',
+                            JSON.stringify({
+                                type: 'done',
+                                operationId: this.headers.get('x-risu-replacement-id'),
+                                ok: true,
+                                imported: 4,
+                                commitOutcome: 'committed',
+                                commitOutcomeUnknown: false,
+                            }),
+                            '',
+                        ].join('\n')
+                        this.onprogress?.()
+                        this.onload?.()
+                        return
+                    }
+                    this.upload.onprogress?.({
+                        lengthComputable: true,
+                        loaded: minute + 1,
+                        total: 12,
+                    })
+                    minute += 1
+                    setTimeout(tick, 60_000)
+                }
+                tick()
+            }
+            abort() {
+                this.onabort?.()
+            }
+        }
+        vi.stubGlobal('XMLHttpRequest', ProgressingXmlHttpRequest)
+
+        const pending = readyStorage().uploadSaveFolderZip(new Blob(['archive']))
+        await vi.advanceTimersByTimeAsync(11 * 60_000)
+
+        await expect(pending).resolves.toEqual({ ok: true, imported: 4 })
+        expect(fetchMock).not.toHaveBeenCalled()
+    })
+
+    test('reconciles a lost ZIP acknowledgement as committed', async () => {
+        let operationId = ''
+        class LostXmlHttpRequest {
+            status = 0
+            responseText = ''
+            upload: Record<string, any> = {}
+            onprogress: (() => void) | null = null
             onerror: (() => void) | null = null
             onabort: (() => void) | null = null
             ontimeout: (() => void) | null = null
             onload: (() => void) | null = null
             open() {}
-            setRequestHeader() {}
-            send() {
-                requests++
-                this.onload?.()
+            setRequestHeader(name: string, value: string) {
+                if (name.toLowerCase() === 'x-risu-replacement-id') operationId = value
             }
-        }
-        vi.stubGlobal('XMLHttpRequest', FakeXmlHttpRequest)
-
-        const committed = await readyStorage().uploadSaveFolderZip(new Blob(['archive']))
-            .then(() => null, error => error)
-        expect(requests).toBe(1)
-        expect(committed).toBeInstanceOf(StorageError)
-        expect(committed).toMatchObject({
-            message: 'ZIP import committed; cleanup failed',
-            status: 500,
-            code: 'SAVE_FOLDER_IMPORT_POST_COMMIT_CLEANUP_FAILED',
-            retryable: false,
-            commitOutcome: 'committed',
-            commitOutcomeUnknown: false,
-            operation: 'write',
-        })
-
-        class LostXmlHttpRequest extends FakeXmlHttpRequest {
-            status = 0
             send() {
-                requests++
                 this.onerror?.()
             }
         }
         vi.stubGlobal('XMLHttpRequest', LostXmlHttpRequest)
-        const unknown = await readyStorage().uploadSaveFolderZip(new Blob(['archive']))
-            .then(() => null, error => error)
-        expect(requests).toBe(2)
-        expect(unknown).toBeInstanceOf(StorageError)
-        expect(unknown).toMatchObject({
-            code: 'COMMIT_OUTCOME_UNKNOWN',
-            retryable: false,
-            commitOutcome: 'unknown',
-            commitOutcomeUnknown: true,
-            operation: 'write',
+        fetchMock.mockImplementationOnce(async () => jsonResponse({
+            operationId,
+            kind: 'save-folder-zip',
+            state: 'committed',
+            result: { ok: true, imported: 12 },
+            error: null,
+            createdAt: 1,
+            updatedAt: 2,
+        }))
+
+        await expect(readyStorage().uploadSaveFolderZip(new Blob(['archive']))).resolves.toEqual({
+            ok: true,
+            imported: 12,
         })
+        expect(fetchMock).toHaveBeenCalledOnce()
     })
-
-    test.each([
-        ['committed', false],
-        ['not-committed', true],
-    ] as const)(
-        'preserves an authoritative ZIP %s envelope whose server code is STORAGE_TIMEOUT',
-        async (commitOutcome, retryable) => {
-            let requests = 0
-            class AuthoritativeTimeoutXmlHttpRequest {
-                status = 500
-                responseText = JSON.stringify({
-                    error: `server ZIP ${commitOutcome} timeout`,
-                    code: 'STORAGE_TIMEOUT',
-                    retryable,
-                    commitOutcome,
-                    commitOutcomeUnknown: false,
-                })
-                upload: Record<string, any> = {}
-                onerror: (() => void) | null = null
-                onabort: (() => void) | null = null
-                ontimeout: (() => void) | null = null
-                onload: (() => void) | null = null
-                open() {}
-                setRequestHeader() {}
-                send() {
-                    requests++
-                    this.onload?.()
-                }
-            }
-            vi.stubGlobal('XMLHttpRequest', AuthoritativeTimeoutXmlHttpRequest)
-
-            const failure = await readyStorage().uploadSaveFolderZip(new Blob(['archive']))
-                .then(() => null, error => error)
-
-            expect(requests).toBe(1)
-            expect(failure).toBeInstanceOf(StorageError)
-            expect(failure).toMatchObject({
-                message: `server ZIP ${commitOutcome} timeout`,
-                status: 500,
-                code: 'STORAGE_TIMEOUT',
-                retryable,
-                commitOutcome,
-                commitOutcomeUnknown: false,
-                operation: 'write',
-            })
-            expect((failure as Error).cause).toBeUndefined()
-        },
-    )
-
-    test.each(['committed', 'not-committed'] as const)(
-        'ignores exact-looking %s ZIP body when XHR status is zero',
-        async (commitOutcome) => {
-            let requests = 0
-            class StatusZeroXmlHttpRequest {
-                status = 0
-                responseText = JSON.stringify({
-                    error: `forged ${commitOutcome} outcome`,
-                    code: 'FORGED_OUTCOME',
-                    retryable: commitOutcome === 'not-committed',
-                    commitOutcome,
-                    commitOutcomeUnknown: false,
-                })
-                upload: Record<string, any> = {}
-                onerror: (() => void) | null = null
-                onabort: (() => void) | null = null
-                ontimeout: (() => void) | null = null
-                onload: (() => void) | null = null
-                open() {}
-                setRequestHeader() {}
-                send() {
-                    requests++
-                    this.onload?.()
-                }
-            }
-            vi.stubGlobal('XMLHttpRequest', StatusZeroXmlHttpRequest)
-
-            const failure = await readyStorage().uploadSaveFolderZip(new Blob(['archive']))
-                .then(() => null, error => error)
-
-            expect(requests).toBe(1)
-            expect(failure).toBeInstanceOf(StorageError)
-            expect(failure).toMatchObject({
-                message: 'Save-folder ZIP upload response was lost',
-                status: null,
-                code: 'COMMIT_OUTCOME_UNKNOWN',
-                retryable: false,
-                commitOutcome: 'unknown',
-                commitOutcomeUnknown: true,
-                operation: 'write',
-            })
-        },
-    )
 
     test('wraps ZIP-import authentication failure as definitively not committed', async () => {
         const storage = readyStorage()
@@ -1351,201 +1241,14 @@ describe('NodeStorage plugin error contract', () => {
         const failure = await storage.uploadSaveFolderZip(new Blob(['archive']))
             .then(() => null, error => error)
 
-        expect(failure).toBeInstanceOf(StorageError)
         expect(failure).toMatchObject({
             message: 'auth signing unavailable',
             code: 'SAVE_FOLDER_IMPORT_AUTH_FAILED',
-            retryable: false,
             commitOutcome: 'not-committed',
             commitOutcomeUnknown: false,
-            operation: 'write',
         })
+        expect(fetchMock).not.toHaveBeenCalled()
     })
-
-    test('bounds ZIP-import authentication and classifies its timeout as not committed', async () => {
-        vi.useFakeTimers()
-        const storage = readyStorage()
-        vi.spyOn(storage as any, 'createAuth').mockReturnValueOnce(new Promise(() => undefined))
-        const xhrConstructor = vi.fn()
-        vi.stubGlobal('XMLHttpRequest', xhrConstructor)
-
-        const pending = storage.uploadSaveFolderZip(new Blob(['archive']))
-            .then(() => null, error => error)
-        await vi.advanceTimersByTimeAsync(SAVE_FOLDER_IMPORT_TIMEOUT_MS)
-        const failure = await pending
-
-        expect(xhrConstructor).not.toHaveBeenCalled()
-        expect(failure).toBeInstanceOf(StorageError)
-        expect(failure).toMatchObject({
-            message: 'Save-folder ZIP import timed out before mutation dispatch',
-            code: 'SAVE_FOLDER_IMPORT_TIMEOUT',
-            retryable: false,
-            commitOutcome: 'not-committed',
-            commitOutcomeUnknown: false,
-            operation: 'write',
-        })
-    })
-
-    test('bounds a dispatched ZIP import with no callbacks and cleans up its XHR', async () => {
-        vi.useFakeTimers()
-        let instance: SilentXmlHttpRequest | null = null
-        class SilentXmlHttpRequest {
-            status = 0
-            responseText = ''
-            upload: Record<string, any> = {}
-            onerror: (() => void) | null = null
-            onabort: (() => void) | null = null
-            ontimeout: (() => void) | null = null
-            onload: (() => void) | null = null
-            timeoutAssignments: number[] = []
-            abortCalls = 0
-            sendCalls = 0
-            private timeoutValue = 0
-            constructor() {
-                instance = this
-            }
-            get timeout() {
-                return this.timeoutValue
-            }
-            set timeout(value: number) {
-                this.timeoutValue = value
-                this.timeoutAssignments.push(value)
-            }
-            open() {}
-            setRequestHeader() {}
-            send() {
-                this.sendCalls++
-            }
-            abort() {
-                this.abortCalls++
-            }
-        }
-        vi.stubGlobal('XMLHttpRequest', SilentXmlHttpRequest)
-
-        const pending = readyStorage().uploadSaveFolderZip(new Blob(['archive']))
-            .then(() => null, error => error)
-        await vi.advanceTimersByTimeAsync(SAVE_FOLDER_IMPORT_TIMEOUT_MS)
-        const failure = await pending
-
-        expect(failure).toBeInstanceOf(StorageError)
-        expect(failure).toMatchObject({
-            code: 'COMMIT_OUTCOME_UNKNOWN',
-            retryable: false,
-            commitOutcome: 'unknown',
-            commitOutcomeUnknown: true,
-            operation: 'write',
-        })
-        expect(instance).not.toBeNull()
-        expect(instance!.sendCalls).toBe(1)
-        expect(instance!.abortCalls).toBe(1)
-        expect(instance!.timeoutAssignments).toEqual([
-            SAVE_FOLDER_IMPORT_TIMEOUT_MS,
-            0,
-        ])
-        expect(instance!.upload.onprogress).toBeNull()
-        expect(instance!.onerror).toBeNull()
-        expect(instance!.onabort).toBeNull()
-        expect(instance!.ontimeout).toBeNull()
-        expect(instance!.onload).toBeNull()
-
-        await vi.advanceTimersByTimeAsync(SAVE_FOLDER_IMPORT_TIMEOUT_MS)
-        expect(instance!.sendCalls).toBe(1)
-        expect(instance!.abortCalls).toBe(1)
-    })
-
-    test.each([
-        [
-            'extra field',
-            '{"error":"forged committed result","code":"FORGED","retryable":false,"commitOutcome":"committed","commitOutcomeUnknown":false,"extra":true}',
-        ],
-        [
-            'missing field',
-            '{"error":"forged committed result","code":"FORGED","commitOutcome":"committed","commitOutcomeUnknown":false}',
-        ],
-        [
-            'wrong field type',
-            '{"error":"forged committed result","code":"FORGED","retryable":"false","commitOutcome":"committed","commitOutcomeUnknown":false}',
-        ],
-        [
-            'duplicate top-level field',
-            '{"error":"first","error":"forged committed result","code":"FORGED","retryable":false,"commitOutcome":"committed","commitOutcomeUnknown":false}',
-        ],
-    ])(
-        'treats a direct save-folder response with a %s as outcome unknown',
-        async (_caseName, rawBody) => {
-            fetchMock.mockResolvedValueOnce(new Response(rawBody, {
-                status: 500,
-                headers: { 'content-type': 'application/json' },
-            }))
-
-            const failure = await readyStorage().executeSaveFolderImport('/source')
-                .then(() => null, error => error)
-
-            expect(fetchMock).toHaveBeenCalledOnce()
-            expect(failure).toBeInstanceOf(StorageError)
-            expect(failure).toMatchObject({
-                status: 500,
-                code: 'COMMIT_OUTCOME_UNKNOWN',
-                retryable: false,
-                commitOutcome: 'unknown',
-                commitOutcomeUnknown: true,
-                operation: 'write',
-            })
-        },
-    )
-
-    test.each([
-        [
-            'failure envelope with an extra field',
-            500,
-            '{"error":"forged rollback","code":"FORGED","retryable":true,"commitOutcome":"not-committed","commitOutcomeUnknown":false,"extra":true}',
-        ],
-        [
-            'success envelope with an extra field',
-            200,
-            '{"ok":true,"imported":1,"extra":true}',
-        ],
-        [
-            'success envelope with a duplicate field',
-            200,
-            '{"ok":false,"ok":true,"imported":1}',
-        ],
-    ])(
-        'treats a ZIP save-folder %s as outcome unknown',
-        async (_caseName, status, responseText) => {
-            let requests = 0
-            class MalformedXmlHttpRequest {
-                status = status
-                responseText = responseText
-                upload: Record<string, any> = {}
-                onerror: (() => void) | null = null
-                onabort: (() => void) | null = null
-                ontimeout: (() => void) | null = null
-                onload: (() => void) | null = null
-                open() {}
-                setRequestHeader() {}
-                send() {
-                    requests++
-                    this.onload?.()
-                }
-            }
-            vi.stubGlobal('XMLHttpRequest', MalformedXmlHttpRequest)
-
-            const failure = await readyStorage().uploadSaveFolderZip(new Blob(['archive']))
-                .then(() => null, error => error)
-
-            expect(requests).toBe(1)
-            expect(failure).toBeInstanceOf(StorageError)
-            expect(failure).toMatchObject({
-                status,
-                code: 'COMMIT_OUTCOME_UNKNOWN',
-                retryable: false,
-                commitOutcome: 'unknown',
-                commitOutcomeUnknown: true,
-                operation: 'write',
-            })
-        },
-    )
 
     test.each(['constructor', 'open', 'header', 'send'] as const)(
         'wraps synchronous XHR %s failure as not dispatched and never replays',

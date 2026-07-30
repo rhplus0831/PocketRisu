@@ -16,6 +16,7 @@ import path from 'node:path'
 import { zipSync } from 'fflate'
 import { Packr } from 'msgpackr'
 import Database from 'better-sqlite3'
+import { randomUUID } from 'node:crypto'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { createSeedBackup } from './helpers/seed.js'
@@ -261,6 +262,42 @@ describe('chunking lifecycle (real server, low threshold)', () => {
     expect(s.chunks.count).toBeGreaterThan(1)
   })
 
+  test('save-folder ZIP activity stream publishes a durable committed outcome', async () => {
+    const { client } = await boot({ BACKUP_NDJSON_HEARTBEAT_MS: '100' })
+    const operationId = randomUUID()
+    const response = await client.fetch('/api/migrate/save-folder/upload', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/zip',
+        'accept': 'application/x-ndjson',
+        'x-risu-replacement-id': operationId,
+      },
+      body: new Uint8Array(saveFolderZip(bigDbBlob('activity-stream'))),
+    })
+    expect(response.status).toBe(200)
+    expect(response.headers.get('content-type')).toContain('application/x-ndjson')
+    const events = (await response.text()).trim().split('\n').map(line => JSON.parse(line))
+    expect(events.some(event => event.type === 'heartbeat')).toBe(true)
+    expect(events.some(event => event.type === 'progress')).toBe(true)
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      operationId,
+      ok: true,
+      commitOutcome: 'committed',
+      commitOutcomeUnknown: false,
+    })
+
+    const statusResponse = await client.fetch(`/api/replacement-operations/${operationId}`)
+    expect(statusResponse.status).toBe(200)
+    await expect(statusResponse.json()).resolves.toMatchObject({
+      operationId,
+      kind: 'save-folder-zip',
+      state: 'committed',
+      result: { ok: true },
+      error: null,
+    })
+  })
+
   test('save-folder directory import externalizes and chunks chat rows (importHexFilesFromDir)', async () => {
     const { client, srv } = await boot()
     const dir = path.join(srv.cwd, 'migrate-src')
@@ -301,6 +338,50 @@ describe('chunking lifecycle (real server, low threshold)', () => {
     const restored = dbBlobFromExport(await client.exportBackup())
     expect(restored.includes(Buffer.from('AAA'))).toBe(true)
     expect((await getStats(client)).chunks.liveChunked).toBe(false)
+  })
+
+  test('snapshot commit remains queryable after acknowledgement loss and restart', async () => {
+    const { client, srv } = await boot({
+      POCKETRISU_BACKUP_INTERVAL_MS: '0',
+      POCKETRISU_TEST_SNAPSHOT_RESTORE_FAILPOINT: 'response',
+      BACKUP_NDJSON_HEARTBEAT_MS: '100',
+    })
+    await uploadZip(client, bigDbBlob('status-before'))
+    await uploadZip(client, bigDbBlob('status-after'))
+    const snapshots = (await (await client.fetch('/api/db/snapshots')).json()).snapshots
+    expect(snapshots.length).toBeGreaterThan(0)
+
+    const operationId = randomUUID()
+    const response = await client.fetch('/api/db/snapshots/restore', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'accept': 'application/x-ndjson',
+        'x-risu-replacement-id': operationId,
+      },
+      body: JSON.stringify({ key: snapshots[0].key }),
+    })
+    expect(response.status).toBe(200)
+    await expect(response.text()).rejects.toThrow()
+
+    const statusBeforeRestart = await client.fetch(`/api/replacement-operations/${operationId}`)
+    await expect(statusBeforeRestart.json()).resolves.toMatchObject({
+      operationId,
+      kind: 'internal-snapshot',
+      state: 'committed',
+      result: { ok: true, key: snapshots[0].key },
+      error: null,
+    })
+
+    await srv.restart({ POCKETRISU_TEST_SNAPSHOT_RESTORE_FAILPOINT: '' })
+    const restarted = await createClient(srv.port, srv.password)
+    const statusAfterRestart = await restarted.fetch(`/api/replacement-operations/${operationId}`)
+    await expect(statusAfterRestart.json()).resolves.toMatchObject({
+      operationId,
+      kind: 'internal-snapshot',
+      state: 'committed',
+      result: { ok: true, key: snapshots[0].key },
+    })
   })
 
   test('optimize reclaims orphan chunks left by re-imports', async () => {

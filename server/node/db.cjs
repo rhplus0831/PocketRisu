@@ -64,7 +64,25 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS plugin_storage_owners (
     storage_key TEXT PRIMARY KEY,
     owner       TEXT NOT NULL
+  );
+
+  -- Destructive replacement outcomes are operational metadata, not user data.
+  -- Keeping them outside the KV table means a save-folder or snapshot replacement can
+  -- publish its terminal outcome in the same SQLite transaction without that
+  -- record being folded into backups or cleared by the replacement itself.
+  CREATE TABLE IF NOT EXISTS replacement_operations (
+    operation_id TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL,
+    state        TEXT NOT NULL CHECK (state IN ('running', 'committed', 'not-committed', 'unknown')),
+    result_json  TEXT,
+    error_json   TEXT,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
   )
+`);
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_replacement_operations_updated_at
+    ON replacement_operations(updated_at)
 `);
 db.prepare(`INSERT OR IGNORE INTO sync_meta (id, list_epoch) VALUES (1, ?)`).run(crypto.randomUUID());
 db.prepare(`INSERT OR IGNORE INTO plugin_storage_usage (id, bytes) VALUES (1, 0)`).run();

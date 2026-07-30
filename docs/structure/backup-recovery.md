@@ -134,6 +134,11 @@ Publication coordinates:
 The journal phase is persisted before cleanup so startup can distinguish a committed
 replacement from one that must restore its old directories.
 
+Current clients negotiate a strict NDJSON activity stream for directory and ZIP
+replacement. Upload progress, server heartbeats, and phase events refresh a two-minute
+browser inactivity watchdog; there is no total wall-clock deadline. Legacy clients that
+do not request the stream retain the JSON response contract.
+
 ## Automatic snapshots
 
 Automatic snapshots assemble a self-contained database recovery row under
@@ -179,8 +184,17 @@ use a bounded legacy decoder.
 
 The restore transaction replaces the live stub graph, external chat rows, migration
 markers, and the provably owned plugin publication together. Cancellation while queued or
-before commit removes/rolls back the operation. A lost acknowledgement after dispatch is
-reported as unknown and must not be replayed.
+before commit removes/rolls back the operation. Snapshot restore uses the same strict
+activity stream and inactivity watchdog as save-folder replacement.
+
+Every streamed save-folder or snapshot replacement carries a client-generated UUID. Its
+status is stored in SQLite's `replacement_operations` table, outside the logical KV data
+being replaced. The server records `committed` and the exact result inside the same
+transaction as publication; a response lost after commit is therefore reconciled through
+`GET /api/replacement-operations/:operationId` without replaying the request. Pre-commit
+failures become `not-committed`; `running` rows left by process exit are classified as
+`not-committed` on restart because publication and the committed marker share a
+transaction. An unavailable or contradictory status remains unknown and stops fallback.
 
 Client ownership lives in:
 
@@ -217,9 +231,10 @@ semantics.
 
 Backup import streams use a strict NDJSON terminal event. Missing or malformed terminal
 events, truncation, status-zero completion, and transport loss after dispatch become
-`COMMIT_OUTCOME_UNKNOWN`. Save-folder and snapshot replacement use exact acknowledgement
-schemas and one destructive dispatch. Authentication retry is not allowed once doing so
-could duplicate a committed replacement.
+`COMMIT_OUTCOME_UNKNOWN`. Save-folder and snapshot replacement use strict NDJSON events,
+one destructive dispatch, and durable status reconciliation before reporting an unknown
+outcome. Authentication retry is not allowed once doing so could duplicate a committed
+replacement.
 
 ## Limits, spools, and operator configuration
 

@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **74** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, and **24** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-30 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **73** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, and **25** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -32,7 +32,6 @@ None currently open.
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
 | [Generic `HOST` changes the listen address](compatibility/generic-host-env-changes-listen-address.md) | compat | Intentional | The server can bind the wrong interface or fail startup. | Requires an existing process manager or PaaS to set the generic variable for another purpose. |
-| [Save-folder restores have a fixed deadline](compatibility/save-folder-restore-fixed-deadline.md) | compat | Open | A valid restore aborts or leaves the client unable to distinguish rollback from commit. | Requires a large archive, slow disk/link, many entries, or queued work to exceed ten minutes. |
 | [A V2 unload can wedge plugin lifecycle](compatibility/v2-unload-can-wedge-plugin-lifecycle.md) | compat | Open | Unrelated plugin operations queue forever and persistence becomes timing-dependent. | Requires a third-party V2 unload callback that never settles. |
 | [Bulk inlay deletion exceeds its request limit](compatibility/bulk-inlay-deletion-limit.md) | compat | Open | The UI refuses the entire valid deletion and removes nothing. | Selecting 1,001 or more unreferenced inlays creates an out-of-contract request. |
 | [Optimized storage can lock in its mode](compatibility/optimized-plugin-storage-transition-lock-in.md) | compat | Open | Users cannot turn optimization off after storing otherwise legal data. | Requires a value over 32 MiB or more than 64 MiB aggregate optimized state. |
@@ -161,3 +160,4 @@ None currently open.
 | [V3 database custom-key fallback was removed](compatibility/v3-database-custom-key-fallback.md) | Plugins using the inherited custom-field convention threw before mutation. | Fixed 2026-07-30 by routing unsupported fields through authoritative plugin storage in legacy compatibility mode, with a developer-console-only notice; strict mode still rejects them. |
 | [Plugin permissions could not be reset to Ask](compatibility/permission-editor-cannot-reset-to-ask.md) | Ordinary users could not restore prompt-on-next-use behavior after granting or denying a permission. | Fixed 2026-07-30 by exposing the existing per-plugin reset in the normal permission editor with confirmation, immediate state refresh, and rendered-component coverage. |
 | [Plugin storage enumeration order changed](compatibility/plugin-storage-enumeration-order.md) | Cursor, append-order, priority, and first/last conventions could process records differently. | Fixed 2026-07-30 with legacy `Object.keys()` ordering, authoritative version-2 manifest order, version-1 migration, and a separate `sortedKeys()` API. |
+| [Save-folder restores had a fixed deadline](compatibility/save-folder-restore-fixed-deadline.md) | A valid long-running restore could abort or leave the client unable to distinguish rollback from commit. | Fixed 2026-07-30 with activity-reset NDJSON progress, no total deadline, and durable transaction-bound operation-status reconciliation. |

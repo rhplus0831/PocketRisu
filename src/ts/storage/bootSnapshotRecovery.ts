@@ -25,8 +25,7 @@ export interface BootSnapshotRecoveryOptions<T> {
 
 /**
  * Ask the authoritative server to validate and publish each internal snapshot
- * through its
- * bounded atomic restore boundary. The browser must not fetch/decompress a
+ * through its atomic restore boundary. The browser must not fetch/decompress a
  * folded candidate first: doing so would duplicate the repository in memory
  * and bypass the server's decoded-size and disk-headroom limits. Discovery is
  * metadata-only, and folded candidate bodies never cross the browser boundary.

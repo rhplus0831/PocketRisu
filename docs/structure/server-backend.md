@@ -101,6 +101,7 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `RISU_RESTORE_MAX_DECODED_BYTES` | Maximum decoded streaming restore size; default 4 GiB. |
 | `RISU_RESTORE_DISK_HEADROOM_BYTES` | Additional free-space requirement for restore spools; default 256 MiB. |
 | `RISU_RESTORE_MAX_LEGACY_BYTES` | Maximum in-memory compatibility restore; default 64 MiB. |
+| `POCKETRISU_REPLACEMENT_OPERATION_RETENTION_MS` | Retention for durable save-folder/snapshot replacement outcomes; default 24 hours. |
 | `RISU_STREAM_INGEST_MIN_BYTES` | Minimum supported `database.risudat` size for disk-backed ingest; default 32 MiB. Set to `1` to force the path for compatibility tests. |
 | `BACKUP_NDJSON_HEARTBEAT_MS` | Backup-import keepalive interval, default 5 seconds and clamped to at least 100 ms at `server/node/server.cjs:1037`. |
 | `RISU_UPDATE_CHECK` | Disables update checks when exactly `false` at `server/node/server.cjs:1067`. |
@@ -248,9 +249,12 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
   the SQLite transaction with fsynced filesystem swaps through the durable journal.
 - Automatic snapshots use the configured database spool, fold the selected plugin
   generation, preserve already-missing chats as bare stubs, and publish non-fatally into
-  chunk-aware KV storage. Snapshot restore is bounded, cancellable, and atomic.
+  chunk-aware KV storage. Snapshot restore is bounded by decoded-size and disk-headroom
+  limits, cancellable before commit, and atomic; its client wait is activity-based rather
+  than a fixed total deadline.
 - Destructive routes distinguish committed, not-committed, and unknown outcomes. An
-  unknown result is reconciled by reload/readback and is never replayed automatically.
+  interrupted save-folder/snapshot response first consults the durable replacement status;
+  any still-unknown result is reconciled by reload/readback and never replayed automatically.
 - Per-chat pre-image history is a separate filesystem recovery mechanism and is not
   embedded in portable/server archives.
 
@@ -277,7 +281,7 @@ outcome contracts are canonical in [Backup and recovery](backup-recovery.md).
 | Lazy chats | `GET/POST /api/chat-content/:chaId/:chatIndex` reads/writes individual chat rows, negotiates cached hashes, and captures eligible pre-images before overwrite. Routes: `server/node/server.cjs:5465` and `:5524`. | `NodeStorage.fetchChatContent()` and `saveChatContent()` at `src/ts/storage/nodeStorage.ts:924`. |
 | Save-folder migration | `POST /api/migrate/save-folder/scan`, `/execute`, `/upload`, `/cleanup/scan`, and `/cleanup/execute`. Routes begin at `server/node/server.cjs:5805`. | `NodeStorage` migration methods. |
 | Storage dashboard | `GET /api/db/stats`, `/characters`, `/modules`, and `/durability`; `PUT /api/db/durability`; `POST /api/db/optimize`; `POST /api/db/wal-checkpoint`. Durability defaults to `FULL`; explicit flush always verifies a `FULL` checkpoint. | `SystemDashboard.svelte`. |
-| DB snapshots | `GET/PUT /api/db/snapshots/limits`, metadata-only `GET`, `DELETE`, and bounded atomic/cancellable `POST /api/db/snapshots/restore`. | Bootstrap recovery, `SystemBackup.svelte`, and `snapshotRestoreUi.ts`. |
+| DB snapshots and replacement status | `GET/PUT /api/db/snapshots/limits`, metadata-only `GET`, `DELETE`, bounded atomic/cancellable `POST /api/db/snapshots/restore`, and authenticated `GET /api/replacement-operations/:operationId` reconciliation. | Bootstrap recovery, save-folder restore, `SystemBackup.svelte`, and `snapshotRestoreUi.ts`. |
 | Inlay maintenance | Cookie-authenticated `POST /api/inlays/compress`, streamed as SSE. Route: `server/node/server.cjs:6777`. | `src/lib/Setting/Pages/Advanced/InlayCompressButton.svelte`. |
 | Public/update | Unauthenticated `GET /api/public-stats` and `GET /api/update-check`; authenticated `POST /api/self-update`. Routes begin at `server/node/server.cjs:6870`. | `src/ts/publicStats.ts` and `src/ts/update.ts`. |
 
@@ -344,6 +348,8 @@ outcome contracts are canonical in [Backup and recovery](backup-recovery.md).
 - Duplicate character IDs are a row-key collision, not harmless metadata. Ingest repairs duplicate `chaId` values before externalizing rows and copies any referenced pre-existing stub rows into the new namespace; direct full writes reject duplicates at the boundary (`server/node/chatRows.cjs:94-146`, `:373-423`; `server/node/server.cjs:4298-4308`).
 
 - Imports own the write connection exclusively. Every destructive import (backup import, file-server restore, save-folder execute/upload, snapshot restore) holds `importBarrier` across its whole window, and the barrier claims its hold before draining the storage queue. The server has one writable `better-sqlite3` connection, so any statement issued while an import's raw transaction is open silently joins it — and would be discarded by its `ROLLBACK`. Never `acquire()` the barrier from inside a queued storage operation (the drain would deadlock), and never mutate the database outside `queueStorageMutation()`. Coverage: `server/node/importBarrier.test.ts` and `test/compat/import-mutation-barrier.test.ts`.
+
+- Replacement outcome rows are deliberately outside KV so importing a new logical database cannot erase them. Register before dispatch, write `committed` in the same SQLite transaction as replacement publication, and expose only the authenticated status route. Startup may classify a leftover `running` row as `not-committed` precisely because a committed publication cannot exist without its transactional status update.
 
 - Chat backups are pre-images, not post-save snapshots. `captureChatPreImage()` must stay immediately before the chat-row write inside the shared storage queue. Capture failures are logged and swallowed so recovery history cannot make the primary save fail. The newest version for each chat is protected during global budget eviction, but the 45-second cooldown means not every intermediate streaming/edit state is retained.
 
