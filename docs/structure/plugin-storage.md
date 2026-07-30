@@ -22,8 +22,9 @@ prefix keys and must not treat `clear()` as a per-plugin operation.
 | Inline | `Database.pluginCustomStorage` and `Database.pluginStorageMeta` inside `database/database.bin` | The database object |
 | Optimized | `pluginsave/<encoded>.json` and `pluginsave-meta/<encoded>.json` | Matching `Database.pluginStorageGeneration` plus `plugin-storage/manifest.json` |
 
-Inline basic get/set preserves legacy structured-clone values. Optimized storage and
-the versioned/compound APIs require detached, strict JSON values. Optional automatic
+Inline basic get/set preserves legacy structured-clone values. Versioned reads can
+surface those legacy rows for guarded migration or removal, but optimized storage and
+versioned/compound replacement values require detached, strict JSON. Optional automatic
 conversion can normalize legacy values before a mode change; conversion is a visible
 compatibility operation, not merely an implementation detail.
 

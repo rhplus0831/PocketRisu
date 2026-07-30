@@ -53,7 +53,7 @@ many users use that path.
 - [V2 caller-alias detachment](v2-plugin-storage-live-aliases.md)
 - [V2 object-prototype change](v2-plugin-storage-object-prototype.md)
 - [Local plugin storage strict JSON](local-plugin-storage-strict-json.md)
-- [Inline rich values break enumeration](inline-plugin-storage-enumeration-rich-values.md)
+- [Inline rich values broke enumeration (fixed 2026-07-30)](inline-plugin-storage-enumeration-rich-values.md)
 - [Enumeration order change](plugin-storage-enumeration-order.md)
 - [Ill-formed legacy key compatibility](legacy-plugin-storage-key-compatibility.md)
 - [Optimized-storage key-length limit](optimized-plugin-storage-key-length-limit.md)

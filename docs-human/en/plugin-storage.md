@@ -70,10 +70,12 @@ A `missing` read uses an absence CAS (`expectedRevision: null`). If another
 row already exists—or appears before the write—the host returns a conflict
 instead of overwriting it. Passing a `failed` read is a no-op.
 
-Guarded/versioned values must be strict detached JSON in both inline and
-optimized modes. The legacy basic inline `getItem()`/`setItem()` path can
-retain structured-clone-compatible values, but code intended to survive mode
-changes should use JSON-safe data consistently.
+Guarded/versioned replacement values must be strict detached JSON in both inline
+and optimized modes. A versioned read can expose a legacy structured-clone value
+from inline storage so the plugin can guardedly remove it or transform it into
+JSON. The legacy basic inline `getItem()`/`setItem()` path can retain such rich
+values, but code intended to survive mode changes should use JSON-safe data
+consistently.
 
 On current servers, optimized guarded writes negotiate a streamed framed
 transport and accept one value up to the same configured per-value limit as

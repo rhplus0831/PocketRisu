@@ -2040,10 +2040,69 @@ describe("plugin save storage transport", () => {
         expect(Object.hasOwn(storedSparse!, 0)).toBe(false);
         const storedCycle = await getPluginSaveStorageItem<any>("legacy-7");
         expect(storedCycle.self).toBe(storedCycle);
+
+        const expectedKeys = values.map((_, index) => `legacy-${index}`);
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(expectedKeys);
+        await expect(getPluginSaveStorageSortedKeys()).resolves.toEqual(expectedKeys);
+        await expect(getPluginSaveStorageLength()).resolves.toBe(expectedKeys.length);
+        for (const [index, key] of expectedKeys.entries()) {
+            await expect(getPluginSaveStorageKey(index)).resolves.toBe(key);
+        }
+        await expect(getPluginSaveStorageKey(expectedKeys.length)).resolves.toBeNull();
+
+        const versioned = await Promise.all(expectedKeys.map(key => (
+            getPluginSaveStorageItemWithRevision(key)
+        )));
+        for (const result of versioned) {
+            expect(result).toMatchObject({
+                status: "value",
+                revision: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+            });
+        }
+        expect(versioned[0]).toMatchObject({ status: "value", value: undefined });
+        expect((versioned[1] as any).value).toEqual(
+            new Date("2026-01-02T03:04:05.000Z"),
+        );
+        expect((versioned[2] as any).value).toEqual(new Map([["key", "value"]]));
+        expect((versioned[3] as any).value).toEqual(new Set(["value"]));
+        expect((versioned[4] as any).value.nested).toBeNaN();
+        expect((versioned[5] as any).value).toEqual({ nested: 1n });
+        expect(Object.hasOwn((versioned[6] as any).value, 0)).toBe(false);
+        expect((versioned[7] as any).value.self).toBe((versioned[7] as any).value);
+
+        const viewer = await getPluginSaveStorageViewerPage({ page: 0 });
+        expect(viewer.entries.map(entry => entry.key)).toEqual(expectedKeys);
+        expect(viewer.entries).toEqual(expect.arrayContaining(expectedKeys.map(key => (
+            expect.objectContaining({
+                key,
+                revision: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+            })
+        ))));
+
+        const mapRead = await readPluginSaveStorageItemResult("legacy-2");
+        expect(mapRead).toMatchObject({
+            status: "value",
+            value: new Map([["key", "value"]]),
+        });
+        await expect(setOwnedPluginSaveStorageItemFromRead(
+            mapRead,
+            { migrated: true },
+            "Compatibility Test",
+        )).resolves.toMatchObject({ status: "committed" });
+        expect(database.pluginCustomStorage["legacy-2"]).toEqual({ migrated: true });
+
+        const cycleRevision = (versioned[7] as any).revision as string;
+        await expect(atomicBatchOwnedPluginSaveStorage([{
+            type: "remove",
+            key: "legacy-7",
+            expectedRevision: cycleRevision,
+        }], "Compatibility Test")).resolves.toMatchObject({ committed: true });
+        expect(database.pluginCustomStorage).not.toHaveProperty("legacy-7");
+
         const { preparePersistentJson } = vi.mocked(
             await import("../storage/persistentKv"),
         );
-        expect(preparePersistentJson).not.toHaveBeenCalled();
+        expect(preparePersistentJson).toHaveBeenCalledOnce();
         expect(persistent.size).toBe(0);
     });
 

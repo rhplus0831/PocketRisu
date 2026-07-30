@@ -1166,7 +1166,11 @@ interface PluginStorage {
      */
     getItem(key: string): Promise<any | null>;
 
-    /** Reads a value without conflating stored JSON null with a missing key. */
+    /**
+     * Reads a value without conflating stored JSON null with a missing key.
+     * Existing inline structured-clone values are returned for guarded
+     * migration; replacement values remain strict JSON.
+     */
     getWithRevision<T = any>(key: string, unloadSignal?: AbortSignal): Promise<PluginStorageVersionedValue<T>>;
 
     /**
@@ -1235,8 +1239,9 @@ interface PluginStorage {
      * JSON values. Unsupported optimized values reject with StorageError code
      * `PLUGIN_STORAGE_VALUE_UNSUPPORTED`; oversized values use
      * `PLUGIN_VALUE_TOO_LARGE`. The user can opt into conservative automatic
-     * conversion for ordinary setItem writes; compound/versioned APIs remain
-     * strictly JSON-only.
+     * conversion for ordinary setItem writes; compound/versioned replacement
+     * values remain strictly JSON-only, although versioned reads can expose a
+     * legacy inline rich value for migration or guarded removal.
      * @returns Promise that resolves when item is stored
      */
     setItem(key: string, value: any): Promise<void>;

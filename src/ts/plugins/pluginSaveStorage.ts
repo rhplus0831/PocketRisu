@@ -43,6 +43,7 @@ import { StorageError } from "../storage/storageError";
 import { abortReason, awaitWithAbort, throwIfAborted } from "../storage/abort";
 import { sha256OwnedBytes } from "../storage/resourceCache";
 import { safeStructuredClone } from "../polyfill";
+import { Packr } from "msgpackr/index-no-eval";
 import {
     makeArchiveSafePluginSaveStorageKey,
     PLUGIN_SAVE_META_PREFIX,
@@ -654,18 +655,10 @@ async function commitOptimizedStorageMutation(
     }
 }
 
-function cloneJsonPluginStorageRecord<T>(
-    source: Record<string, T>,
-    fieldName?: string,
-): Record<string, T>;
-function cloneJsonPluginStorageRecord(
-    source: unknown,
-    fieldName?: string,
-): Record<string, unknown>;
-function cloneJsonPluginStorageRecord(
+function validatedPluginStorageRecordKeys(
     source: unknown,
     fieldName = "pluginCustomStorage",
-): Record<string, unknown> {
+): string[] {
     if (source === null || typeof source !== "object" || Array.isArray(source)) {
         throw new TypeError(`${fieldName} must be a JSON object.`);
     }
@@ -701,10 +694,25 @@ function cloneJsonPluginStorageRecord(
     for (const key of getPluginStorageRecordKeys(source as Record<string, unknown>)) {
         validateKey(key);
     }
+    return orderLegacyPluginStorageKeys(keys);
+}
 
+function cloneJsonPluginStorageRecord<T>(
+    source: Record<string, T>,
+    fieldName?: string,
+): Record<string, T>;
+function cloneJsonPluginStorageRecord(
+    source: unknown,
+    fieldName?: string,
+): Record<string, unknown>;
+function cloneJsonPluginStorageRecord(
+    source: unknown,
+    fieldName = "pluginCustomStorage",
+): Record<string, unknown> {
+    const keys = validatedPluginStorageRecordKeys(source, fieldName);
     const snapshot = createDatabasePluginStorageRecord<unknown>();
-    for (const key of orderLegacyPluginStorageKeys(keys)) {
-        const descriptor = Reflect.getOwnPropertyDescriptor(source, key)!;
+    for (const key of keys) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(source as object, key)!;
         definePluginStorageRecordValue(snapshot, key, snapshotJsonValue(descriptor.value));
     }
     return snapshot;
@@ -732,41 +740,10 @@ function cloneInlinePluginStorageRecord(
     source: unknown,
     fieldName = "pluginCustomStorage",
 ): Record<string, unknown> {
-    if (source === null || typeof source !== "object" || Array.isArray(source)) {
-        throw new TypeError(`${fieldName} must be a JSON object.`);
-    }
-    const prototype = Reflect.getPrototypeOf(source);
-    if (prototype !== Object.prototype && prototype !== null) {
-        throw new TypeError(`${fieldName} must be a plain JSON object.`);
-    }
-
-    const keys: string[] = [];
-    const seen = new Set<PropertyKey>();
-    const validateKey = (key: PropertyKey) => {
-        if (seen.has(key)) return;
-        seen.add(key);
-        if (typeof key !== "string") {
-            throw new TypeError(`${fieldName} does not accept symbol keys.`);
-        }
-        assertWellFormedUnicode(key);
-        const descriptor = Reflect.getOwnPropertyDescriptor(source, key);
-        if (!descriptor || !("value" in descriptor)) {
-            throw new TypeError(`${fieldName} does not accept an accessor for ${key}.`);
-        }
-        if (!descriptor.enumerable) {
-            throw new TypeError(
-                `${fieldName} requires an enumerable data property for ${key}.`,
-            );
-        }
-        keys.push(key);
-    };
-    for (const key of Reflect.ownKeys(source)) validateKey(key);
-    for (const key of getPluginStorageRecordKeys(source as Record<string, unknown>)) {
-        validateKey(key);
-    }
+    const keys = validatedPluginStorageRecordKeys(source, fieldName);
     const snapshot = createDatabasePluginStorageRecord<unknown>();
-    for (const key of orderLegacyPluginStorageKeys(keys)) {
-        const descriptor = Reflect.getOwnPropertyDescriptor(source, key)!;
+    for (const key of keys) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(source as object, key)!;
         definePluginStorageRecordValue(
             snapshot,
             key,
@@ -1708,6 +1685,10 @@ export async function rewriteOwnedPluginSaveStorageItem(
 }
 
 const pluginStorageBatchEncoder = new TextEncoder();
+const inlinePluginStorageRevisionPackr = new Packr({
+    structuredClone: true,
+    useRecords: false,
+});
 
 function describePluginStorageFailure(
     error: unknown,
@@ -1848,7 +1829,22 @@ async function inlinePluginStorageRevision(
     owner: unknown,
     ownerRowPresent: boolean,
 ): Promise<string> {
-    const valueBytes = pluginStorageBatchEncoder.encode(stringifyJsonValue(value));
+    let valueBytes: Uint8Array;
+    let revisionDomain = "pocketrisu-plugin-storage-v1";
+    try {
+        valueBytes = pluginStorageBatchEncoder.encode(stringifyJsonValue(value));
+    } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+        // Inline basic storage intentionally retains the historical structured-
+        // clone value domain. Versioned migration reads, viewer maintenance,
+        // and guarded removal still need an opaque CAS token for those rows.
+        // MessagePack's structured-clone mode preserves cycles and rich types;
+        // copy its reusable encoder output before any later encode can run.
+        valueBytes = new Uint8Array(inlinePluginStorageRevisionPackr.encode(
+            safeStructuredClone(value),
+        ));
+        revisionDomain = "pocketrisu-plugin-storage-structured-clone-v1";
+    }
     const incarnation = isCanonicalInlinePluginStorageOwner(owner)
         ? owner.revision
         : ownerRowPresent
@@ -1857,7 +1853,7 @@ async function inlinePluginStorageRevision(
             ))}`
             : "legacy:unowned";
     const prefix = pluginStorageBatchEncoder.encode(
-        `pocketrisu-plugin-storage-v1\0${incarnation}\0`,
+        `${revisionDomain}\0${incarnation}\0`,
     );
     const input = new Uint8Array(prefix.byteLength + valueBytes.byteLength);
     input.set(prefix, 0);
@@ -1889,7 +1885,9 @@ export async function getPluginSaveStorageItemWithRevision(
         if (!hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) {
             return { status: "missing", value: null, revision: null, generation: null };
         }
-        const value = snapshotJsonValue(db.pluginCustomStorage[normalizedKey]);
+        // Versioned writes remain strict JSON, but accepting a legacy rich
+        // value on read lets plugins migrate or guardedly remove that row.
+        const value = safeStructuredClone(db.pluginCustomStorage[normalizedKey]);
         const ownerRowPresent = hasPluginStorageRecordValue(db.pluginStorageMeta, normalizedKey);
         const owner = ownerRowPresent ? db.pluginStorageMeta?.[normalizedKey] : undefined;
         return {
@@ -2303,9 +2301,9 @@ async function getPluginSaveStorageEnumerationSnapshot(
         }
         const generation = getPluginStorageKeySetGeneration();
         const keys = !db.optimizePluginMemory
-            ? getPluginStorageRecordKeys(cloneJsonPluginStorageRecord(
+            ? validatedPluginStorageRecordKeys(
                 db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
-            ))
+            )
             : await listDecodedStorageKeys(PLUGIN_SAVE_PREFIX, signal);
         const orderedKeys = orderLegacyPluginStorageKeys(keys);
         if (generation === getPluginStorageKeySetGeneration()) {
@@ -2444,7 +2442,7 @@ export async function getPluginSaveStorageViewerPage(
             const ownerRowPresent = hasPluginStorageRecordValue(meta, key);
             return {
                 key,
-                value: snapshotJsonValue(values[key]),
+                value: safeStructuredClone(values[key]),
                 ownerRowPresent,
                 ownerRecord: ownerRowPresent ? snapshotJsonValue(meta[key]) : undefined,
             };
