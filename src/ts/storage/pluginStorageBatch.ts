@@ -2,8 +2,25 @@ import { StorageError } from "./storageError";
 
 export const PLUGIN_STORAGE_BATCH_MAX_OPERATIONS = 128;
 export const PLUGIN_STORAGE_BATCH_MAX_BODY_BYTES = 16 * 1024 * 1024;
+export const PLUGIN_STORAGE_BATCH_STREAM_MAGIC = "PRISUB01";
+export const PLUGIN_STORAGE_BATCH_STREAM_PREFIX_BYTES = 12;
 export const PLUGIN_STORAGE_REVISION_PATTERN = /^sha256:[0-9a-f]{64}$/;
 export const PLUGIN_STORAGE_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const PLUGIN_STORAGE_HASH_PATTERN = /^[0-9a-f]{64}$/;
+
+export interface PluginStorageBatchStreamCapabilities {
+    transport: "framed-v1";
+    maxOperations: number;
+    maxMetadataBytes: number;
+    maxValueBytes: number;
+    maxPayloadBytes: number;
+}
+
+export interface PreparedPluginStorageBatchStream {
+    body: Blob;
+    metadataBytes: Uint8Array;
+    byteLength: number;
+}
 
 export type PluginStorageBatchOperation =
     | {
@@ -66,7 +83,7 @@ export type PluginStorageBatchResult =
         code: string;
         error: string;
         retryable: boolean;
-        status: number;
+        status: number | null;
         retryAfter: number | null;
         limit?: number;
         actual?: number;
@@ -88,6 +105,177 @@ export interface PluginStorageVersionedState {
     valueBytes: Uint8Array | null;
     revision: string | null;
     generation: string | null;
+}
+
+export class PluginStorageBatchPreparationError extends RangeError {
+    readonly code: string;
+    readonly limit?: number;
+    readonly actual?: number;
+
+    constructor(message: string, options: {
+        code: string;
+        limit?: number;
+        actual?: number;
+    }) {
+        super(message);
+        this.name = "PluginStorageBatchPreparationError";
+        this.code = options.code;
+        this.limit = options.limit;
+        this.actual = options.actual;
+    }
+}
+
+export function parsePluginStorageBatchStreamCapabilities(
+    value: unknown,
+): PluginStorageBatchStreamCapabilities | null {
+    if (!isRecord(value)
+        || value.transport !== "framed-v1"
+        || !Number.isSafeInteger(value.maxOperations)
+        || Number(value.maxOperations) < 1
+        || Number(value.maxOperations) > PLUGIN_STORAGE_BATCH_MAX_OPERATIONS
+        || !Number.isSafeInteger(value.maxMetadataBytes)
+        || Number(value.maxMetadataBytes) < 1
+        || !Number.isSafeInteger(value.maxValueBytes)
+        || Number(value.maxValueBytes) < 1
+        || !Number.isSafeInteger(value.maxPayloadBytes)
+        || Number(value.maxPayloadBytes) < Number(value.maxValueBytes)) {
+        return null;
+    }
+    return {
+        transport: "framed-v1",
+        maxOperations: Number(value.maxOperations),
+        maxMetadataBytes: Number(value.maxMetadataBytes),
+        maxValueBytes: Number(value.maxValueBytes),
+        maxPayloadBytes: Number(value.maxPayloadBytes),
+    };
+}
+
+/**
+ * Frame a batch as bounded JSON metadata followed by raw value bytes. The
+ * metadata binds each value by length and SHA-256, so hashing the metadata is
+ * also a request-bound acknowledgement token without base64-expanding or
+ * concatenating the complete payload in browser memory.
+ */
+export function preparePluginStorageBatchStream(
+    request: PluginStorageBatchRequest,
+    valueHashes: readonly (string | null)[],
+    capabilities: PluginStorageBatchStreamCapabilities,
+): PreparedPluginStorageBatchStream {
+    if (request.operations.length < 1
+        || request.operations.length > capabilities.maxOperations) {
+        throw new PluginStorageBatchPreparationError(
+            `Plugin storage atomicBatch requires 1-${capabilities.maxOperations} operations.`,
+            {
+                code: "INVALID_PLUGIN_STORAGE_BATCH",
+                limit: capabilities.maxOperations,
+                actual: request.operations.length,
+            },
+        );
+    }
+    if (valueHashes.length !== request.operations.length) {
+        throw new TypeError("Plugin storage batch value hashes do not match the operations.");
+    }
+    const hasManifest = request.expectedManifest !== undefined;
+    const hasManifestRevision = request.expectedManifestRevision !== undefined;
+    if (hasManifest === hasManifestRevision) {
+        throw new TypeError("Plugin storage batch requires exactly one manifest CAS.");
+    }
+    if (hasManifestRevision && (typeof request.expectedManifestRevision !== "string"
+        || !PLUGIN_STORAGE_REVISION_PATTERN.test(request.expectedManifestRevision))) {
+        throw new TypeError("Plugin storage batch manifest revision is invalid.");
+    }
+
+    let payloadBytes = 0;
+    const operations = request.operations.map((operation, index) => {
+        if (operation.operation === "remove") {
+            if (valueHashes[index] !== null) {
+                throw new TypeError(`Plugin storage remove operation ${index} has a value hash.`);
+            }
+            return {
+                operation: operation.operation,
+                key: operation.key,
+                ...(Object.prototype.hasOwnProperty.call(operation, "expectedRevision")
+                    ? { expectedRevision: operation.expectedRevision }
+                    : {}),
+            };
+        }
+        const valueLength = operation.valueBytes.byteLength;
+        if (valueLength < 1 || valueLength > capabilities.maxValueBytes) {
+            throw new PluginStorageBatchPreparationError(
+                `Plugin value is ${valueLength} bytes; the streamed batch per-value limit is ${capabilities.maxValueBytes} bytes.`,
+                {
+                    code: "PLUGIN_VALUE_TOO_LARGE",
+                    limit: capabilities.maxValueBytes,
+                    actual: valueLength,
+                },
+            );
+        }
+        const valueHash = valueHashes[index];
+        if (typeof valueHash !== "string" || !PLUGIN_STORAGE_HASH_PATTERN.test(valueHash)) {
+            throw new TypeError(`Plugin storage set operation ${index} has an invalid value hash.`);
+        }
+        payloadBytes += valueLength;
+        if (!Number.isSafeInteger(payloadBytes) || payloadBytes > capabilities.maxPayloadBytes) {
+            throw new PluginStorageBatchPreparationError(
+                `Plugin storage batch values use ${payloadBytes} bytes; the streamed batch payload limit is ${capabilities.maxPayloadBytes} bytes.`,
+                {
+                    code: "PLUGIN_STORAGE_BATCH_TOO_LARGE",
+                    limit: capabilities.maxPayloadBytes,
+                    actual: payloadBytes,
+                },
+            );
+        }
+        return {
+            operation: operation.operation,
+            key: operation.key,
+            owner: operation.owner,
+            valueLength,
+            valueHash,
+            ...(Object.prototype.hasOwnProperty.call(operation, "expectedRevision")
+                ? { expectedRevision: operation.expectedRevision }
+                : {}),
+        };
+    });
+    const metadata = {
+        version: 3,
+        generation: request.generation,
+        ...(hasManifest
+            ? { expectedManifest: request.expectedManifest }
+            : { expectedManifestRevision: request.expectedManifestRevision }),
+        operations,
+    };
+    const metadataBytes = new TextEncoder().encode(JSON.stringify(metadata));
+    if (metadataBytes.byteLength > capabilities.maxMetadataBytes) {
+        throw new PluginStorageBatchPreparationError(
+            `Plugin storage batch metadata is ${metadataBytes.byteLength} bytes; the limit is ${capabilities.maxMetadataBytes} bytes.`,
+            {
+                code: "PLUGIN_STORAGE_BATCH_METADATA_TOO_LARGE",
+                limit: capabilities.maxMetadataBytes,
+                actual: metadataBytes.byteLength,
+            },
+        );
+    }
+
+    const prefix = new Uint8Array(PLUGIN_STORAGE_BATCH_STREAM_PREFIX_BYTES);
+    prefix.set(new TextEncoder().encode(PLUGIN_STORAGE_BATCH_STREAM_MAGIC), 0);
+    new DataView(prefix.buffer).setUint32(PLUGIN_STORAGE_BATCH_STREAM_MAGIC.length, metadataBytes.byteLength);
+    const parts: BlobPart[] = [prefix, metadataBytes];
+    for (const operation of request.operations) {
+        if (operation.operation === "set") {
+            // BodyInit accepts Uint8Array in every supported browser. TS's
+            // BlobPart declaration is narrower because Uint8Array may be
+            // parameterized with ArrayBufferLike rather than ArrayBuffer.
+            parts.push(operation.valueBytes as unknown as BlobPart);
+        }
+    }
+    const byteLength = PLUGIN_STORAGE_BATCH_STREAM_PREFIX_BYTES
+        + metadataBytes.byteLength
+        + payloadBytes;
+    return {
+        body: new Blob(parts, { type: "application/x-pocketrisu-plugin-storage-batch" }),
+        metadataBytes,
+        byteLength,
+    };
 }
 
 export function encodePluginStorageBatchRequest(request: PluginStorageBatchRequest): Uint8Array {
@@ -242,7 +430,9 @@ export function classifyPluginStorageBatchAcknowledgement(
         && body.success === false
         && body.outcome === "not-committed"
         && (body.code === "PLUGIN_VALUE_TOO_LARGE"
-            || body.code === "PLUGIN_STORAGE_TOTAL_TOO_LARGE")
+            || body.code === "PLUGIN_STORAGE_TOTAL_TOO_LARGE"
+            || body.code === "PLUGIN_STORAGE_BATCH_TOO_LARGE"
+            || body.code === "PLUGIN_STORAGE_BATCH_METADATA_TOO_LARGE")
         && body.retryable === false
         && typeof body.error === "string"
         && Number.isSafeInteger(body.limit)
@@ -283,6 +473,28 @@ export function classifyPluginStorageBatchAcknowledgement(
             code: expected.code,
             error: body.error,
             retryable: expected.retryable,
+            status,
+            retryAfter,
+            commitOutcomeUnknown: false,
+        };
+    }
+
+    if (status === 503
+        && hasOnlyKeys(body, [
+            "success", "outcome", "operation", "error", "code", "retryable",
+        ])
+        && body.success === false
+        && body.outcome === "not-committed"
+        && body.code === "PLUGIN_STORAGE_SPOOL_UNAVAILABLE"
+        && body.retryable === true
+        && typeof body.error === "string"
+        && body.error.length > 0) {
+        return {
+            outcome: "not-committed",
+            operation: "batch",
+            code: body.code,
+            error: body.error,
+            retryable: true,
             status,
             retryAfter,
             commitOutcomeUnknown: false,

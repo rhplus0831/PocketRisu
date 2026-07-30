@@ -740,6 +740,13 @@ function hitPluginStorageMutationFailpoint(boundary) {
 
 const PLUGIN_STORAGE_BATCH_MAX_OPERATIONS = 128;
 const PLUGIN_STORAGE_BATCH_MAX_BODY_BYTES = 16 * 1024 * 1024;
+const PLUGIN_STORAGE_BATCH_STREAM_MAGIC = Buffer.from('PRISUB01', 'ascii');
+const PLUGIN_STORAGE_BATCH_STREAM_PREFIX_BYTES = 12;
+const PLUGIN_STORAGE_BATCH_STREAM_MAX_METADATA_BYTES = 1024 * 1024;
+const PLUGIN_STORAGE_BATCH_STREAM_MAX_PAYLOAD_BYTES = Math.max(
+    PLUGIN_VALUE_MAX_BYTES,
+    PLUGIN_STORAGE_MAX_BYTES,
+);
 const PLUGIN_STORAGE_REVISION_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const PLUGIN_STORAGE_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const pluginStorageBatchFailpoint = process.env.NODE_ENV === 'test'
@@ -830,8 +837,7 @@ function isCanonicalPluginStorageOwnerRecord(owner, bytes) {
  * owner incarnation makes a same-value remove/recreate distinguishable while
  * still giving historical rows (without revision metadata) a stable token.
  */
-function pluginStorageRevision(valueBytes, ownerBytes) {
-    if (!valueBytes) return null;
+function pluginStorageRevisionDigest(ownerBytes) {
     const owner = parsePluginStorageOwnerRecord(ownerBytes);
     const incarnation = isCanonicalPluginStorageOwnerRecord(owner, ownerBytes)
         ? owner.revision
@@ -840,7 +846,19 @@ function pluginStorageRevision(valueBytes, ownerBytes) {
     digest.update('pocketrisu-plugin-storage-v1\0', 'utf-8');
     digest.update(incarnation, 'utf-8');
     digest.update('\0', 'utf-8');
+    return digest;
+}
+
+function pluginStorageRevision(valueBytes, ownerBytes) {
+    if (!valueBytes) return null;
+    const digest = pluginStorageRevisionDigest(ownerBytes);
     digest.update(valueBytes);
+    return `sha256:${digest.digest('hex')}`;
+}
+
+async function pluginStorageRevisionFromFile(filePath, ownerBytes) {
+    const digest = pluginStorageRevisionDigest(ownerBytes);
+    for await (const chunk of createReadStream(filePath)) digest.update(chunk);
     return `sha256:${digest.digest('hex')}`;
 }
 
@@ -1781,12 +1799,15 @@ app.use((req, res, next) => {
     // pre-buffered by the generic octet-stream parser.
     const isStreamingPluginMutation = req.path === '/api/plugin-storage/mutate'
         && req.headers['x-plugin-storage-stream'] === '1';
+    const isStreamingPluginBatch = req.path === '/api/plugin-storage/batch'
+        && req.headers['x-plugin-storage-batch-stream'] === '1';
     const isStreamingPluginTransitionUpload
         = req.path === '/api/plugin-storage/transition/stage/upload';
     if (
         req.path === '/api/backup/import'
         || req.path === '/api/migrate/save-folder/upload'
         || isStreamingPluginMutation
+        || isStreamingPluginBatch
         || isStreamingPluginTransitionUpload
     ) return next();
     const isPluginStorageBatch = req.path === '/api/plugin-storage/batch';
@@ -1898,6 +1919,7 @@ const PARTIAL_EXPORT_MAX_CANCELLATION_TOMBSTONES = 256;
 // reservation instead of letting concurrent jobs all spend the same bytes.
 const PARTIAL_EXPORT_MAX_ACTIVE_JOBS = 1;
 const PLUGIN_VALUE_SPOOL_FILE_PREFIX = '.plugin-value-';
+const PLUGIN_BATCH_VALUE_SPOOL_FILE_PREFIX = '.plugin-batch-value-';
 const PLUGIN_TRANSITION_STAGE_PREFIX = '.plugin-transition-stage-';
 const PLUGIN_TRANSITION_STAGE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // A mode transition must accept every row that optimized storage itself can
@@ -1982,6 +2004,7 @@ if (databaseSpoolReady) {
                 entry.name.startsWith(DATABASE_SPOOL_FILE_PREFIX)
                 || entry.name.startsWith(BACKUP_IMPORT_SPOOL_FILE_PREFIX)
                 || entry.name.startsWith(PLUGIN_VALUE_SPOOL_FILE_PREFIX)
+                || entry.name.startsWith(PLUGIN_BATCH_VALUE_SPOOL_FILE_PREFIX)
             )) continue;
             try {
                 unlinkSync(path.join(databaseSpoolDir, entry.name));
@@ -7781,7 +7804,18 @@ app.post('/api/session', async (req, res) => {
     saveSessions()
     const maxAge = 7 * 24 * 60 * 60 // seconds
     res.setHeader('Set-Cookie', `risu-session=${token}; HttpOnly; SameSite=Strict; Max-Age=${maxAge}; Path=/`)
-    res.json({ ok: true })
+    res.json({
+        ok: true,
+        capabilities: {
+            pluginStorageBatch: {
+                transport: 'framed-v1',
+                maxOperations: PLUGIN_STORAGE_BATCH_MAX_OPERATIONS,
+                maxMetadataBytes: PLUGIN_STORAGE_BATCH_STREAM_MAX_METADATA_BYTES,
+                maxValueBytes: PLUGIN_VALUE_MAX_BYTES,
+                maxPayloadBytes: PLUGIN_STORAGE_BATCH_STREAM_MAX_PAYLOAD_BYTES,
+            },
+        },
+    })
 })
 
 // ── Direct asset serving (F-1) ─────────────────────────────────────────────
@@ -8976,6 +9010,351 @@ app.get('/api/plugin-storage/manifest', async (req, res, next) => {
     }
 });
 
+function parsePluginStorageBatchEnvelope(body, { streamed = false } = {}) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).length !== 4
+        || Object.keys(body).some(key => ![
+            'version', 'generation', 'expectedManifest',
+            'expectedManifestRevision', 'operations',
+        ].includes(key))
+        || (streamed ? body.version !== 3 : (body.version !== 1 && body.version !== 2))
+        || typeof body.generation !== 'string'
+        || body.generation.length === 0
+        || !Array.isArray(body.operations)
+        || body.operations.length < 1
+        || body.operations.length > PLUGIN_STORAGE_BATCH_MAX_OPERATIONS) {
+        throw new Error(`Plugin storage batch requires 1-${PLUGIN_STORAGE_BATCH_MAX_OPERATIONS} operations.`);
+    }
+
+    let expectedManifest;
+    let expectedManifestRevision;
+    if (body.version === 1 || (body.version === 3 && body.expectedManifest !== undefined)) {
+        if (!body.expectedManifest || body.expectedManifestRevision !== undefined
+            || typeof body.expectedManifest !== 'object'
+            || Array.isArray(body.expectedManifest)
+            || Object.keys(body.expectedManifest).length !== 4
+            || Object.keys(body.expectedManifest).some(key => ![
+                'version', 'generation', 'valueKeys', 'metaKeys',
+            ].includes(key))) {
+            throw new Error('Plugin storage batch requires an exact expectedManifest.');
+        }
+        expectedManifest = normalizePluginStorageManifestRequest(
+            body.expectedManifest,
+            'expectedManifest',
+        );
+        if (expectedManifest.generation !== body.generation
+            || expectedManifest.valueKeys.length !== body.expectedManifest.valueKeys.length
+            || expectedManifest.metaKeys.length !== body.expectedManifest.metaKeys.length) {
+            throw new Error('Plugin storage batch expectedManifest is not canonical.');
+        }
+    } else {
+        if (body.expectedManifest !== undefined
+            || typeof body.expectedManifestRevision !== 'string'
+            || !PLUGIN_STORAGE_REVISION_PATTERN.test(body.expectedManifestRevision)) {
+            throw new Error('Plugin storage batch requires an exact manifest revision.');
+        }
+        expectedManifestRevision = body.expectedManifestRevision;
+    }
+
+    const seen = new Set();
+    const operations = body.operations.map((input, index) => {
+        if (!input || typeof input !== 'object' || Array.isArray(input)) {
+            throw new Error(`Plugin storage batch operation ${index} must be an object.`);
+        }
+        const allowed = streamed
+            ? new Set([
+                'operation', 'key', 'valueLength', 'valueHash',
+                'owner', 'expectedRevision',
+            ])
+            : new Set(['operation', 'key', 'value', 'owner', 'expectedRevision']);
+        if (Object.keys(input).some(key => !allowed.has(key))) {
+            throw new Error(`Plugin storage batch operation ${index} has unsupported fields.`);
+        }
+        if (input.operation !== 'set' && input.operation !== 'remove') {
+            throw new Error(`Plugin storage batch operation ${index} must be set or remove.`);
+        }
+        if (typeof input.key !== 'string') {
+            throw new Error(`Plugin storage batch operation ${index} requires a string key.`);
+        }
+        const valueKey = encodePluginSaveStorageKey(input.key, PLUGIN_SAVE_PREFIX);
+        const ownerKey = encodePluginSaveStorageKey(input.key, PLUGIN_SAVE_META_PREFIX);
+        if (seen.has(valueKey)) throw new Error(`Duplicate plugin storage key at operation ${index}.`);
+        seen.add(valueKey);
+
+        const hasExpectedRevision = Object.prototype.hasOwnProperty.call(input, 'expectedRevision');
+        if (hasExpectedRevision
+            && input.expectedRevision !== null
+            && (typeof input.expectedRevision !== 'string'
+                || !PLUGIN_STORAGE_REVISION_PATTERN.test(input.expectedRevision))) {
+            throw new Error(`Plugin storage operation ${index} has an invalid expectedRevision.`);
+        }
+
+        if (input.operation === 'remove') {
+            if (Object.keys(input).some(key => ![
+                'operation', 'key', 'expectedRevision',
+            ].includes(key))) {
+                throw new Error(`Remove operation ${index} cannot include value or owner data.`);
+            }
+            return {
+                operation: 'remove',
+                rawKey: input.key,
+                valueKey,
+                ownerKey,
+                hasExpectedRevision,
+                expectedRevision: input.expectedRevision,
+            };
+        }
+
+        let valueBytes = null;
+        let valueSize;
+        let valueHash;
+        if (streamed) {
+            if (!Number.isSafeInteger(input.valueLength) || input.valueLength < 1) {
+                throw new Error(`Set operation ${index} requires a positive valueLength.`);
+            }
+            if (input.valueLength > PLUGIN_VALUE_MAX_BYTES) {
+                throw new PluginStorageLimitError(
+                    `Plugin value is ${input.valueLength} bytes; the per-value limit is ${PLUGIN_VALUE_MAX_BYTES} bytes. Split the value into smaller records.`,
+                    {
+                        code: 'PLUGIN_VALUE_TOO_LARGE',
+                        limit: PLUGIN_VALUE_MAX_BYTES,
+                        actual: input.valueLength,
+                    },
+                );
+            }
+            if (typeof input.valueHash !== 'string' || !/^[0-9a-f]{64}$/.test(input.valueHash)) {
+                throw new Error(`Set operation ${index} requires a SHA-256 valueHash.`);
+            }
+            valueSize = input.valueLength;
+            valueHash = input.valueHash;
+        } else {
+            if (typeof input.value !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(input.value)) {
+                throw new Error(`Set operation ${index} requires canonical base64 value bytes.`);
+            }
+            valueBytes = Buffer.from(input.value, 'base64');
+            if (valueBytes.length === 0 || valueBytes.toString('base64') !== input.value) {
+                throw new Error(`Set operation ${index} requires canonical non-empty value bytes.`);
+            }
+            const valueText = valueBytes.toString('utf-8');
+            if (!Buffer.from(valueText, 'utf-8').equals(valueBytes)) {
+                throw new Error(`Set operation ${index} value must be valid UTF-8 JSON.`);
+            }
+            validatePluginStorageRow(valueKey, valueBytes);
+            valueSize = valueBytes.length;
+            valueHash = sha256Hex(valueBytes);
+        }
+        if (typeof input.owner !== 'string' || !input.owner.isWellFormed()) {
+            throw new Error(`Set operation ${index} requires a well-formed owner string.`);
+        }
+        return {
+            operation: 'set',
+            rawKey: input.key,
+            valueKey,
+            ownerKey,
+            valueBytes,
+            valueFilePath: null,
+            valueSize,
+            valueHash,
+            owner: input.owner,
+            hasExpectedRevision,
+            expectedRevision: input.expectedRevision,
+        };
+    });
+
+    return {
+        requestedGeneration: body.generation,
+        expectedManifest,
+        expectedManifestRevision,
+        operations,
+    };
+}
+
+function createPluginStorageBatchRequestReader(req) {
+    const iterator = req[Symbol.asyncIterator]();
+    let current = Buffer.alloc(0);
+    let offset = 0;
+    let ended = false;
+
+    async function nextSlice(maxBytes) {
+        while (offset >= current.length) {
+            if (ended) return null;
+            const result = await iterator.next();
+            if (result.done) {
+                ended = true;
+                return null;
+            }
+            current = Buffer.isBuffer(result.value)
+                ? result.value
+                : Buffer.from(result.value);
+            offset = 0;
+            if (current.length === 0) continue;
+        }
+        const length = Math.min(maxBytes, current.length - offset);
+        const slice = current.subarray(offset, offset + length);
+        offset += length;
+        return slice;
+    }
+
+    return {
+        async readBuffer(length) {
+            const result = Buffer.allocUnsafe(length);
+            let written = 0;
+            while (written < length) {
+                const slice = await nextSlice(length - written);
+                if (!slice) throw new Error('Streamed plugin storage batch was truncated.');
+                slice.copy(result, written);
+                written += slice.length;
+            }
+            return result;
+        },
+        async writeFile(length, filePath, digest) {
+            const handle = await fs.open(filePath, 'wx', 0o600);
+            let written = 0;
+            try {
+                while (written < length) {
+                    const slice = await nextSlice(length - written);
+                    if (!slice) throw new Error('Streamed plugin storage batch value was truncated.');
+                    let sliceOffset = 0;
+                    while (sliceOffset < slice.length) {
+                        const result = await handle.write(
+                            slice,
+                            sliceOffset,
+                            slice.length - sliceOffset,
+                            written + sliceOffset,
+                        );
+                        if (result.bytesWritten <= 0) {
+                            throw new Error('Streamed plugin storage batch value could not be staged.');
+                        }
+                        sliceOffset += result.bytesWritten;
+                    }
+                    digest.update(slice);
+                    written += slice.length;
+                }
+            } finally {
+                await handle.close();
+            }
+        },
+        async assertEnd() {
+            if (await nextSlice(1)) {
+                throw new Error('Streamed plugin storage batch contains trailing bytes.');
+            }
+        },
+    };
+}
+
+async function receiveStreamedPluginStorageBatch(req, res) {
+    if (!databaseSpoolReady) {
+        const error = new Error('The server upload spool is unavailable; check the save volume permissions.');
+        error.code = 'PLUGIN_STORAGE_SPOOL_UNAVAILABLE';
+        error.status = 503;
+        error.retryable = true;
+        throw error;
+    }
+    const declaredText = Array.isArray(req.headers['x-plugin-storage-batch-length'])
+        ? req.headers['x-plugin-storage-batch-length'][0]
+        : req.headers['x-plugin-storage-batch-length'];
+    const declaredLength = typeof declaredText === 'string' ? Number(declaredText) : NaN;
+    const contentLength = Number(req.headers['content-length']);
+    const maximumLength = PLUGIN_STORAGE_BATCH_STREAM_PREFIX_BYTES
+        + PLUGIN_STORAGE_BATCH_STREAM_MAX_METADATA_BYTES
+        + PLUGIN_STORAGE_BATCH_STREAM_MAX_PAYLOAD_BYTES;
+    if (!Number.isSafeInteger(declaredLength) || declaredLength <= 0
+        || declaredLength > maximumLength
+        || (Number.isSafeInteger(contentLength) && contentLength !== declaredLength)) {
+        const error = new Error('Streamed plugin storage batch requires an exact bounded length.');
+        error.code = 'PLUGIN_STORAGE_BATCH_TOO_LARGE';
+        error.status = declaredLength > maximumLength ? 413 : 400;
+        error.limit = maximumLength;
+        error.actual = declaredLength;
+        throw error;
+    }
+
+    const stagedPaths = [];
+    try {
+        const reader = createPluginStorageBatchRequestReader(req);
+        const prefix = await reader.readBuffer(PLUGIN_STORAGE_BATCH_STREAM_PREFIX_BYTES);
+        if (!prefix.subarray(0, PLUGIN_STORAGE_BATCH_STREAM_MAGIC.length)
+            .equals(PLUGIN_STORAGE_BATCH_STREAM_MAGIC)) {
+            throw new Error('Streamed plugin storage batch has an invalid magic header.');
+        }
+        const metadataLength = prefix.readUInt32BE(PLUGIN_STORAGE_BATCH_STREAM_MAGIC.length);
+        if (metadataLength < 1 || metadataLength > PLUGIN_STORAGE_BATCH_STREAM_MAX_METADATA_BYTES) {
+            const error = new Error('Streamed plugin storage batch metadata exceeds its limit.');
+            error.code = 'PLUGIN_STORAGE_BATCH_METADATA_TOO_LARGE';
+            error.status = 413;
+            error.limit = PLUGIN_STORAGE_BATCH_STREAM_MAX_METADATA_BYTES;
+            error.actual = metadataLength;
+            throw error;
+        }
+        const metadataBytes = await reader.readBuffer(metadataLength);
+        const metadataText = metadataBytes.toString('utf-8');
+        if (!Buffer.from(metadataText, 'utf-8').equals(metadataBytes)) {
+            throw new Error('Streamed plugin storage batch metadata must be UTF-8 JSON.');
+        }
+        const body = JSON.parse(metadataText);
+        if (!Buffer.from(JSON.stringify(body), 'utf-8').equals(metadataBytes)) {
+            throw new Error('Streamed plugin storage batch metadata must use canonical JSON framing.');
+        }
+        const parsed = parsePluginStorageBatchEnvelope(body, { streamed: true });
+        const payloadBytes = parsed.operations.reduce(
+            (total, operation) => total + (operation.operation === 'set' ? operation.valueSize : 0),
+            0,
+        );
+        if (!Number.isSafeInteger(payloadBytes)
+            || payloadBytes > PLUGIN_STORAGE_BATCH_STREAM_MAX_PAYLOAD_BYTES) {
+            const error = new Error('Streamed plugin storage batch values exceed the payload limit.');
+            error.code = 'PLUGIN_STORAGE_BATCH_TOO_LARGE';
+            error.status = 413;
+            error.limit = PLUGIN_STORAGE_BATCH_STREAM_MAX_PAYLOAD_BYTES;
+            error.actual = payloadBytes;
+            throw error;
+        }
+        const expectedLength = PLUGIN_STORAGE_BATCH_STREAM_PREFIX_BYTES
+            + metadataLength
+            + payloadBytes;
+        if (expectedLength !== declaredLength) {
+            throw new Error('Streamed plugin storage batch length does not match its metadata.');
+        }
+
+        for (let index = 0; index < parsed.operations.length; index++) {
+            const operation = parsed.operations[index];
+            if (operation.operation !== 'set') continue;
+            const valueFilePath = path.join(
+                databaseSpoolDir,
+                `${PLUGIN_BATCH_VALUE_SPOOL_FILE_PREFIX}${nodeCrypto.randomUUID()}.${index}.upload`,
+            );
+            stagedPaths.push(valueFilePath);
+            const digest = nodeCrypto.createHash('sha256');
+            await reader.writeFile(operation.valueSize, valueFilePath, digest);
+            if (digest.digest('hex') !== operation.valueHash) {
+                throw new Error(`Streamed plugin storage batch value ${index} failed its hash check.`);
+            }
+            try {
+                await validateJsonSource({
+                    filePath: valueFilePath,
+                    size: operation.valueSize,
+                }, {
+                    shouldAbort: () => req.aborted || res.destroyed,
+                });
+            } catch {
+                throw new PluginStorageValidationError(operation.valueKey);
+            }
+            operation.valueFilePath = valueFilePath;
+        }
+        await reader.assertEnd();
+        return {
+            ...parsed,
+            requestHash: sha256Hex(metadataBytes),
+            stagedPaths,
+        };
+    } catch (error) {
+        for (const filePath of stagedPaths) {
+            try { unlinkSync(filePath); } catch {}
+        }
+        throw error;
+    }
+}
+
 /**
  * Atomically mutate a bounded set of optimized plugin values. Every CAS is
  * checked before the first write, and every value plus owner sidecar is
@@ -8994,139 +9373,79 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
         retryable: false,
     });
 
-    let body;
     let operations;
     let requestHash;
     let requestedGeneration;
     let expectedManifest;
     let expectedManifestRevision;
+    let stagedPaths = [];
     try {
-        if (!Buffer.isBuffer(req.body)) throw new Error('A JSON batch body is required.');
-        if (req.body.length > PLUGIN_STORAGE_BATCH_MAX_BODY_BYTES) {
-            return reject(413, 'Plugin storage batch body exceeds the 16 MiB limit.');
+        const streamHeader = Array.isArray(req.headers['x-plugin-storage-batch-stream'])
+            ? req.headers['x-plugin-storage-batch-stream'][0]
+            : req.headers['x-plugin-storage-batch-stream'];
+        if (streamHeader !== undefined && streamHeader !== '1') {
+            throw new Error('x-plugin-storage-batch-stream must be 1 when present.');
         }
-        requestHash = sha256Hex(req.body);
-        const text = req.body.toString('utf-8');
-        if (!Buffer.from(text, 'utf-8').equals(req.body)) {
-            throw new Error('Plugin storage batch must be valid UTF-8 JSON.');
-        }
-        body = JSON.parse(text);
-        if (!body || typeof body !== 'object' || Array.isArray(body)
-            || Object.keys(body).length !== 4
-            || Object.keys(body).some(key => ![
-                'version', 'generation', 'expectedManifest',
-                'expectedManifestRevision', 'operations',
-            ].includes(key))
-            || (body.version !== 1 && body.version !== 2)
-            || typeof body.generation !== 'string'
-            || body.generation.length === 0
-            || !Array.isArray(body.operations)
-            || body.operations.length < 1
-            || body.operations.length > PLUGIN_STORAGE_BATCH_MAX_OPERATIONS) {
-            throw new Error(`Plugin storage batch requires 1-${PLUGIN_STORAGE_BATCH_MAX_OPERATIONS} operations.`);
-        }
-        requestedGeneration = body.generation;
-        if (body.version === 1) {
-            if (!body.expectedManifest || body.expectedManifestRevision !== undefined
-                || typeof body.expectedManifest !== 'object'
-                || Array.isArray(body.expectedManifest)
-                || Object.keys(body.expectedManifest).length !== 4
-                || Object.keys(body.expectedManifest).some(key => ![
-                    'version', 'generation', 'valueKeys', 'metaKeys',
-                ].includes(key))) {
-                throw new Error('Plugin storage batch requires an exact expectedManifest.');
-            }
-            expectedManifest = normalizePluginStorageManifestRequest(
-                body.expectedManifest,
-                'expectedManifest',
-            );
-            if (expectedManifest.generation !== requestedGeneration
-                || expectedManifest.valueKeys.length !== body.expectedManifest.valueKeys.length
-                || expectedManifest.metaKeys.length !== body.expectedManifest.metaKeys.length) {
-                throw new Error('Plugin storage batch expectedManifest is not canonical.');
-            }
+        let parsed;
+        if (streamHeader === '1') {
+            parsed = await receiveStreamedPluginStorageBatch(req, res);
+            stagedPaths = parsed.stagedPaths;
         } else {
-            if (body.expectedManifest !== undefined
-                || typeof body.expectedManifestRevision !== 'string'
-                || !PLUGIN_STORAGE_REVISION_PATTERN.test(body.expectedManifestRevision)) {
-                throw new Error('Plugin storage batch requires an exact manifest revision.');
+            if (!Buffer.isBuffer(req.body)) throw new Error('A JSON batch body is required.');
+            if (req.body.length > PLUGIN_STORAGE_BATCH_MAX_BODY_BYTES) {
+                return reject(413, 'Plugin storage batch body exceeds the 16 MiB limit.');
             }
-            expectedManifestRevision = body.expectedManifestRevision;
+            requestHash = sha256Hex(req.body);
+            const text = req.body.toString('utf-8');
+            if (!Buffer.from(text, 'utf-8').equals(req.body)) {
+                throw new Error('Plugin storage batch must be valid UTF-8 JSON.');
+            }
+            parsed = parsePluginStorageBatchEnvelope(JSON.parse(text));
         }
-
-        const seen = new Set();
-        operations = body.operations.map((input, index) => {
-            if (!input || typeof input !== 'object' || Array.isArray(input)) {
-                throw new Error(`Plugin storage batch operation ${index} must be an object.`);
-            }
-            const allowed = new Set(['operation', 'key', 'value', 'owner', 'expectedRevision']);
-            if (Object.keys(input).some(key => !allowed.has(key))) {
-                throw new Error(`Plugin storage batch operation ${index} has unsupported fields.`);
-            }
-            if (input.operation !== 'set' && input.operation !== 'remove') {
-                throw new Error(`Plugin storage batch operation ${index} must be set or remove.`);
-            }
-            if (typeof input.key !== 'string') {
-                throw new Error(`Plugin storage batch operation ${index} requires a string key.`);
-            }
-            const valueKey = encodePluginSaveStorageKey(input.key, PLUGIN_SAVE_PREFIX);
-            const ownerKey = encodePluginSaveStorageKey(input.key, PLUGIN_SAVE_META_PREFIX);
-            if (seen.has(valueKey)) throw new Error(`Duplicate plugin storage key at operation ${index}.`);
-            seen.add(valueKey);
-
-            const hasExpectedRevision = Object.prototype.hasOwnProperty.call(input, 'expectedRevision');
-            if (hasExpectedRevision
-                && input.expectedRevision !== null
-                && (typeof input.expectedRevision !== 'string'
-                    || !PLUGIN_STORAGE_REVISION_PATTERN.test(input.expectedRevision))) {
-                throw new Error(`Plugin storage operation ${index} has an invalid expectedRevision.`);
-            }
-
-            if (input.operation === 'remove') {
-                if (Object.prototype.hasOwnProperty.call(input, 'value')
-                    || Object.prototype.hasOwnProperty.call(input, 'owner')) {
-                    throw new Error(`Remove operation ${index} cannot include value or owner.`);
-                }
-                return {
-                    operation: 'remove',
-                    rawKey: input.key,
-                    valueKey,
-                    ownerKey,
-                    hasExpectedRevision,
-                    expectedRevision: input.expectedRevision,
-                };
-            }
-
-            if (typeof input.value !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(input.value)) {
-                throw new Error(`Set operation ${index} requires canonical base64 value bytes.`);
-            }
-            const valueBytes = Buffer.from(input.value, 'base64');
-            if (valueBytes.length === 0 || valueBytes.toString('base64') !== input.value) {
-                throw new Error(`Set operation ${index} requires canonical non-empty value bytes.`);
-            }
-            const valueText = valueBytes.toString('utf-8');
-            if (!Buffer.from(valueText, 'utf-8').equals(valueBytes)) {
-                throw new Error(`Set operation ${index} value must be valid UTF-8 JSON.`);
-            }
-            validatePluginStorageRow(valueKey, valueBytes);
-            if (typeof input.owner !== 'string' || !input.owner.isWellFormed()) {
-                throw new Error(`Set operation ${index} requires a well-formed owner string.`);
-            }
-            return {
-                operation: 'set',
-                rawKey: input.key,
-                valueKey,
-                ownerKey,
-                valueBytes,
-                valueHash: sha256Hex(valueBytes),
-                owner: input.owner,
-                hasExpectedRevision,
-                expectedRevision: input.expectedRevision,
-            };
-        });
+        operations = parsed.operations;
+        requestHash = parsed.requestHash ?? requestHash;
+        requestedGeneration = parsed.requestedGeneration;
+        expectedManifest = parsed.expectedManifest;
+        expectedManifestRevision = parsed.expectedManifestRevision;
     } catch (error) {
-        return reject(400, error instanceof Error ? error.message : String(error));
+        if (error instanceof PluginStorageLimitError) {
+            return sendPluginStorageMutationLimitError(res, 'batch', error);
+        }
+        if (error?.status === 503 && error?.code === 'PLUGIN_STORAGE_SPOOL_UNAVAILABLE') {
+            return res.status(503).json({
+                success: false,
+                outcome: 'not-committed',
+                operation: 'batch',
+                error: error.message,
+                code: error.code,
+                retryable: true,
+            });
+        }
+        if (error?.status === 413) {
+            return res.status(413).json({
+                success: false,
+                outcome: 'not-committed',
+                operation: 'batch',
+                error: error instanceof Error ? error.message : String(error),
+                code: error.code ?? 'INVALID_PLUGIN_STORAGE_BATCH',
+                limit: error.limit,
+                actual: error.actual,
+                retryable: false,
+            });
+        }
+        return reject(error?.status ?? 400, error instanceof Error ? error.message : String(error));
     }
+
+    let cleanedStage = false;
+    const cleanupStage = () => {
+        if (cleanedStage) return;
+        cleanedStage = true;
+        for (const filePath of stagedPaths) {
+            try { unlinkSync(filePath); } catch {}
+        }
+    };
+    res.once('finish', cleanupStage);
+    res.once('close', cleanupStage);
 
     class PluginStorageRevisionConflict extends Error {
         constructor(conflicts) {
@@ -9207,10 +9526,32 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                     };
                 };
                 const recoverySnapshotToken = newPluginRecoverySnapshotToken();
+                generation = nodeCrypto.randomUUID();
+                const updatedAt = Date.now();
+                for (const operation of operations) {
+                    if (operation.operation !== 'set') continue;
+                    operation.committedOwnerBytes = operation.owner
+                        ? Buffer.from(JSON.stringify({
+                            plugin: operation.owner,
+                            updatedAt,
+                            revision: nodeCrypto.randomUUID(),
+                            generation,
+                        }), 'utf-8')
+                        : null;
+                    operation.committedRevision = operation.valueFilePath
+                        ? await pluginStorageRevisionFromFile(
+                            operation.valueFilePath,
+                            operation.committedOwnerBytes,
+                        )
+                        : pluginStorageRevision(
+                            operation.valueBytes,
+                            operation.committedOwnerBytes,
+                        );
+                }
                 hitPluginStorageBatchFailpoint('before-transaction');
                 withPluginStorageQuotaPlan(operations.map(operation => ({
                     key: operation.valueKey,
-                    size: operation.operation === 'set' ? operation.valueBytes.length : null,
+                    size: operation.operation === 'set' ? operation.valueSize : null,
                 })), () => {
                     const conflicts = [];
                     for (const operation of operations) {
@@ -9226,23 +9567,18 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                     }
                     if (conflicts.length > 0) throw new PluginStorageRevisionConflict(conflicts);
 
-                    generation = nodeCrypto.randomUUID();
-                    const updatedAt = Date.now();
                     for (let index = 0; index < operations.length; index++) {
                         const operation = operations[index];
                         if (operation.operation === 'set') {
-                            kvSet(operation.valueKey, operation.valueBytes);
+                            if (operation.valueFilePath) {
+                                kvSetFromFile(operation.valueKey, operation.valueFilePath);
+                            } else {
+                                kvSet(operation.valueKey, operation.valueBytes);
+                            }
                             hitPluginStorageBatchFailpoint(`after-value:${index}`);
                             if (operation.owner) {
-                                operation.committedOwnerBytes = Buffer.from(JSON.stringify({
-                                    plugin: operation.owner,
-                                    updatedAt,
-                                    revision: nodeCrypto.randomUUID(),
-                                    generation,
-                                }), 'utf-8');
                                 kvSet(operation.ownerKey, operation.committedOwnerBytes);
                             } else {
-                                operation.committedOwnerBytes = null;
                                 kvDel(operation.ownerKey);
                             }
                             hitPluginStorageBatchFailpoint(`after-owner:${index}`);
@@ -9261,10 +9597,7 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                     committedRevisions = operations.map(operation => ({
                         key: operation.rawKey,
                         revision: operation.operation === 'set'
-                            ? pluginStorageRevision(
-                                operation.valueBytes,
-                                operation.committedOwnerBytes,
-                            )
+                            ? operation.committedRevision
                             : null,
                         valueHash: operation.operation === 'set'
                             ? operation.valueHash
@@ -9311,6 +9644,16 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                 hitPluginStorageBatchFailpoint('verification-read');
                 for (let index = 0; index < operations.length; index++) {
                     const operation = operations[index];
+                    if (operation.operation === 'set' && operation.valueFilePath) {
+                        const storedOwner = kvGet(operation.ownerKey);
+                        const ownerMatches = operation.committedOwnerBytes
+                            ? storedOwner?.equals(operation.committedOwnerBytes) === true
+                            : storedOwner === null;
+                        if (kvSize(operation.valueKey) !== operation.valueSize || !ownerMatches) {
+                            throw new Error('Committed streamed plugin storage batch failed verification.');
+                        }
+                        continue;
+                    }
                     const current = readPluginStorageState(operation.valueKey, operation.ownerKey);
                     if (current.revision !== committedRevisions[index].revision) {
                         throw new Error('Committed plugin storage batch failed verification.');

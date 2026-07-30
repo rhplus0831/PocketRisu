@@ -3,6 +3,10 @@ import { describe, expect, test } from "vitest";
 import {
     classifyPluginStorageBatchAcknowledgement,
     encodePluginStorageBatchRequest,
+    parsePluginStorageBatchStreamCapabilities,
+    preparePluginStorageBatchStream,
+    PLUGIN_STORAGE_BATCH_STREAM_MAGIC,
+    PLUGIN_STORAGE_BATCH_STREAM_PREFIX_BYTES,
 } from "./pluginStorageBatch";
 
 const request = {
@@ -51,6 +55,77 @@ function ack(overrides: Record<string, unknown> = {}) {
 }
 
 describe("plugin storage batch acknowledgement", () => {
+    test("frames a value above the legacy ceiling as raw bytes with bounded metadata", async () => {
+        const largeValue = new Uint8Array(13 * 1024 * 1024);
+        largeValue[0] = 0x22;
+        largeValue[largeValue.length - 1] = 0x22;
+        const valueHash = createHash("sha256").update(largeValue).digest("hex");
+        const capabilities = parsePluginStorageBatchStreamCapabilities({
+            transport: "framed-v1",
+            maxOperations: 128,
+            maxMetadataBytes: 1024 * 1024,
+            maxValueBytes: 128 * 1024 * 1024,
+            maxPayloadBytes: 1024 * 1024 * 1024,
+        });
+        expect(capabilities).not.toBeNull();
+        const prepared = preparePluginStorageBatchStream({
+            generation: "selected-generation",
+            expectedManifestRevision: `sha256:${"c".repeat(64)}`,
+            operations: [{
+                operation: "set",
+                key: "large",
+                owner: "AA3",
+                valueBytes: largeValue,
+            }],
+        }, [valueHash], capabilities!);
+
+        expect(prepared.metadataBytes.byteLength).toBeLessThan(1024);
+        expect(prepared.byteLength).toBe(
+            PLUGIN_STORAGE_BATCH_STREAM_PREFIX_BYTES
+            + prepared.metadataBytes.byteLength
+            + largeValue.byteLength,
+        );
+        expect(prepared.body.size).toBe(prepared.byteLength);
+        const prefix = Buffer.from(await prepared.body
+            .slice(0, PLUGIN_STORAGE_BATCH_STREAM_PREFIX_BYTES)
+            .arrayBuffer());
+        expect(prefix.subarray(0, 8).toString("ascii")).toBe(PLUGIN_STORAGE_BATCH_STREAM_MAGIC);
+        expect(prefix.readUInt32BE(8)).toBe(prepared.metadataBytes.byteLength);
+        const metadata = JSON.parse(new TextDecoder().decode(prepared.metadataBytes));
+        expect(metadata.operations[0]).toMatchObject({
+            key: "large",
+            valueLength: largeValue.byteLength,
+            valueHash,
+        });
+        expect(Buffer.from(await prepared.body.slice(-1).arrayBuffer())).toEqual(Buffer.from('"'));
+    });
+
+    test("enforces negotiated streamed value and payload limits before dispatch", () => {
+        const capabilities = {
+            transport: "framed-v1" as const,
+            maxOperations: 2,
+            maxMetadataBytes: 4096,
+            maxValueBytes: 8,
+            maxPayloadBytes: 12,
+        };
+        const operation = (key: string, size: number) => ({
+            operation: "set" as const,
+            key,
+            owner: "AA3",
+            valueBytes: new Uint8Array(size),
+        });
+        expect(() => preparePluginStorageBatchStream({
+            generation: "selected-generation",
+            expectedManifestRevision: `sha256:${"c".repeat(64)}`,
+            operations: [operation("large", 9)],
+        }, ["a".repeat(64)], capabilities)).toThrow(/per-value limit/);
+        expect(() => preparePluginStorageBatchStream({
+            generation: "selected-generation",
+            expectedManifestRevision: `sha256:${"c".repeat(64)}`,
+            operations: [operation("a", 7), operation("b", 6)],
+        }, ["a".repeat(64), "b".repeat(64)], capabilities)).toThrow(/payload limit/);
+    });
+
     test("encodes a compact manifest CAS without repository-cardinality payload", () => {
         const operations = Array.from({ length: 128 }, (_, index) => ({
             operation: "set" as const,

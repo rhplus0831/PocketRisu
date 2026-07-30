@@ -125,6 +125,8 @@ function storageWithResponse(next: Response | Error): InstanceType<typeof NodeSt
 }
 
 beforeEach(() => {
+    ;(NodeStorage as any).sessionInitialized = true
+    ;(NodeStorage as any).pluginStorageBatchCapabilities = null
     cache.enabled = true
     cache.sha256OwnedBytes.mockClear()
     cache.sha256OwnedBytes.mockImplementation(async (bytes: Uint8Array) => (
@@ -681,6 +683,108 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
                 : { key: operation.key, revision: null, valueHash: null }),
         })
     }
+
+    test('negotiates framed limits before a direct first batch call', async () => {
+        ;(NodeStorage as any).sessionInitialized = false
+        const storage = new NodeStorage()
+        storage.authChecked = true
+        ;(storage as any).cachedJwt = {
+            token: 'cached-token',
+            expiresAt: Date.now() + 300_000,
+        }
+        const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+            expect(String(input)).toBe('/api/session')
+            return response({
+                ok: true,
+                capabilities: {
+                    pluginStorageBatch: {
+                        transport: 'framed-v1',
+                        maxOperations: 128,
+                        maxMetadataBytes: 4096,
+                        maxValueBytes: 8,
+                        maxPayloadBytes: 8,
+                    },
+                },
+            })
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        const authFetch = vi.fn()
+        ;(storage as any).authFetch = authFetch
+
+        await expect(storage.batchPluginStorage(batchRequest)).resolves.toMatchObject({
+            outcome: 'not-committed',
+            code: 'PLUGIN_VALUE_TOO_LARGE',
+            limit: 8,
+            commitOutcomeUnknown: false,
+        })
+        expect(fetchMock).toHaveBeenCalledOnce()
+        expect(authFetch).not.toHaveBeenCalled()
+    })
+
+    test('uses negotiated framed transport and binds the acknowledgement to metadata hashes', async () => {
+        ;(NodeStorage as any).pluginStorageBatchCapabilities = {
+            transport: 'framed-v1',
+            maxOperations: 128,
+            maxMetadataBytes: 1024 * 1024,
+            maxValueBytes: 128 * 1024 * 1024,
+            maxPayloadBytes: 1024 * 1024 * 1024,
+        }
+        const storage = new NodeStorage()
+        ;(storage as any).authFetch = vi.fn(async (
+            _input: RequestInfo | URL,
+            init: RequestInit,
+        ) => {
+            const framed = NodeBuffer.from(await (init.body as Blob).arrayBuffer())
+            expect(framed.subarray(0, 8).toString('ascii')).toBe('PRISUB01')
+            const metadataLength = framed.readUInt32BE(8)
+            const metadataBytes = framed.subarray(12, 12 + metadataLength)
+            const metadata = JSON.parse(metadataBytes.toString('utf8')) as {
+                version: number
+                operations: Array<{
+                    operation: 'set' | 'remove'
+                    key: string
+                    valueLength?: number
+                    valueHash?: string
+                }>
+            }
+            expect(metadata.version).toBe(3)
+            expect(metadata.operations[0]).toMatchObject({
+                operation: 'set',
+                valueLength: batchRequest.operations[0].valueBytes.byteLength,
+                valueHash,
+            })
+            expect(framed.subarray(12 + metadataLength)).toEqual(NodeBuffer.from(
+                batchRequest.operations[0].valueBytes,
+            ))
+            const requestHash = createHash('sha256').update(metadataBytes).digest('hex')
+            return response({
+                success: true,
+                outcome: 'committed',
+                operation: 'batch',
+                verification: 'verified',
+                requestHash,
+                generation: '123e4567-e89b-42d3-a456-426614174000',
+                revisions: metadata.operations.map(operation => operation.operation === 'set'
+                    ? {
+                        key: operation.key,
+                        revision: `sha256:${'a'.repeat(64)}`,
+                        valueHash: operation.valueHash,
+                    }
+                    : { key: operation.key, revision: null, valueHash: null }),
+            })
+        })
+
+        await expect(storage.batchPluginStorage(batchRequest)).resolves.toMatchObject({
+            outcome: 'committed',
+            revisions: [{ valueHash }, { valueHash: null }],
+        })
+        const init = (storage as any).authFetch.mock.calls[0][1] as RequestInit
+        expect(init.headers).toMatchObject({
+            'content-type': 'application/x-pocketrisu-plugin-storage-batch',
+            'x-plugin-storage-batch-stream': '1',
+        })
+        expect(cache.sha256OwnedBytes).toHaveBeenCalledTimes(2)
+    })
 
     test('publishes cache only after an exact request-bound committed acknowledgement', async () => {
         const storage = new NodeStorage()

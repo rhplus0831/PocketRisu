@@ -75,6 +75,13 @@ optimized modes. The legacy basic inline `getItem()`/`setItem()` path can
 retain structured-clone-compatible values, but code intended to survive mode
 changes should use JSON-safe data consistently.
 
+On current servers, optimized guarded writes negotiate a streamed framed
+transport and accept one value up to the same configured per-value limit as
+`setItem()`. The host validates lengths, hashes, and JSON before attempting the
+atomic publication. An older server that does not advertise framed batches uses
+the legacy JSON transport and may reject batches whose encoded request exceeds
+16 MiB; split records when supporting that older server generation.
+
 For a single-key update, `updateItem()` uses the host's fair migration barrier,
 performs an initial versioned read plus a final pre-publication re-read, and
 does not run its callback when the initial read rejects. The callback receives

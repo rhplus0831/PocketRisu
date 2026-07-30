@@ -1,6 +1,6 @@
 # Safe plugin-storage update APIs cannot handle values accepted by setItem
 
-- Status: Confirmed internal contract mismatch
+- Status: Fixed 2026-07-30
 - Severity: Medium
 - Confidence: High
 
@@ -29,3 +29,23 @@ Use streamed binary request framing or derive every mutation limit from the
 same negotiated capability. Report operation-specific limits before encoding
 and test one value across setItem, getItem, rewriteItem, updateItem, and
 atomicBatch at the shared boundary.
+
+## Resolution
+
+The authenticated session now advertises the server's framed-batch operation,
+metadata, per-value, and aggregate payload limits. New clients use a `framed-v1`
+request consisting of bounded canonical JSON metadata followed by raw JSON value
+bytes. Each value is bound into the request by its byte length and SHA-256 digest,
+so the acknowledgement remains request-specific without base64 expansion.
+
+The server streams every value into a private spool, verifies its declared length
+and digest, validates JSON from the staged file, and only then enters the storage
+mutation queue. Revision and manifest CAS checks still precede one SQLite
+transaction; large values publish through the existing file-backed chunk writer.
+Failed ingress, conflicts, transaction rollbacks, and lost connections clean the
+private stage without exposing a live prefix. Servers that do not advertise the
+framing capability retain the legacy 16 MiB JSON/base64 fallback.
+
+Coverage includes a real 13 MiB value (above the old effective ceiling), negotiated
+capabilities, malformed hash rejection, staged revision conflicts, transaction
+rollback, spool cleanup, legacy framing, and client acknowledgement binding.

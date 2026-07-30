@@ -60,7 +60,7 @@ many users use that path.
 - [Optimized-mode transition lock-in (fixed 2026-07-30)](optimized-plugin-storage-transition-lock-in.md)
 - [Raw boot does not pin a plugin generation](raw-boot-plugin-generation-not-pinned.md)
 - [Configured optimized-storage limit differs from client limit](plugin-storage-configured-limit-client-mismatch.md)
-- [Safe update APIs have a smaller value limit](plugin-storage-batch-size-mismatch.md)
+- [Safe update APIs had a smaller value limit (fixed 2026-07-30)](plugin-storage-batch-size-mismatch.md)
 - [V2 unload could wedge lifecycle (fixed 2026-07-30)](v2-unload-can-wedge-plugin-lifecycle.md)
 - [Unrelated failure can poison an install](unrelated-plugin-failure-poisons-install.md)
 - [Permission editor cannot reset to Ask](permission-editor-cannot-reset-to-ask.md)

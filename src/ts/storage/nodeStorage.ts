@@ -53,9 +53,13 @@ import type {
 import {
     classifyPluginStorageBatchAcknowledgement,
     encodePluginStorageBatchRequest,
+    parsePluginStorageBatchStreamCapabilities,
+    preparePluginStorageBatchStream,
+    PluginStorageBatchPreparationError,
     PLUGIN_STORAGE_UUID_PATTERN,
     pluginStorageBatchTransportOutcomeUnknown,
 } from "./pluginStorageBatch"
+import type { PluginStorageBatchStreamCapabilities } from "./pluginStorageBatch"
 import { PLUGIN_VALUE_STREAM_THRESHOLD_BYTES } from "./pluginStorageLimits"
 import type { BootInternalSnapshot } from "./bootSnapshotRecovery"
 import { comparePluginStorageKeys } from "../plugins/pluginStorageRecord"
@@ -1268,6 +1272,7 @@ export class NodeStorage{
     authChecked = false
     private cachedJwt: { token: string; expiresAt: number } | null = null
     private static sessionInitialized = false
+    private static pluginStorageBatchCapabilities: PluginStorageBatchStreamCapabilities | null = null
     private static sessionPending: {
         controller: AbortController
         promise: Promise<void>
@@ -1334,8 +1339,22 @@ export class NodeStorage{
                 },
                 signal,
             })
-            await awaitWithAbort(res.arrayBuffer(), signal)
+            const responseBytes = await awaitWithAbort(res.arrayBuffer(), signal)
             if (res.ok) {
+                let response: unknown = null
+                try {
+                    response = responseBytes.byteLength > 0
+                        ? JSON.parse(new TextDecoder().decode(responseBytes))
+                        : null
+                } catch {
+                    // Older servers may return an empty or non-JSON session body.
+                }
+                const capabilities = response && typeof response === 'object'
+                    ? (response as { capabilities?: { pluginStorageBatch?: unknown } })
+                        .capabilities?.pluginStorageBatch
+                    : null
+                NodeStorage.pluginStorageBatchCapabilities
+                    = parsePluginStorageBatchStreamCapabilities(capabilities)
                 NodeStorage.sessionInitialized = true
             }
             // Non-ok (400/401/500): will retry on next checkAuth() call.
@@ -2380,6 +2399,32 @@ export class NodeStorage{
         request: PluginStorageBatchRequest,
         externalSignal?: AbortSignal | null,
     ): Promise<PluginStorageBatchResult> {
+        if (!NodeStorage.sessionInitialized) {
+            try {
+                // Batch framing is negotiated by /api/session. Ordinary app
+                // boot already initializes it, but a direct first storage call
+                // must not silently fall back to the legacy 16 MiB encoder.
+                await runBoundedAuthoritativeStorageOperation(
+                    signal => this.checkAuth(signal),
+                    'read',
+                    AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+                    externalSignal,
+                )
+            } catch (error) {
+                return {
+                    outcome: 'not-committed',
+                    operation: 'batch',
+                    code: error instanceof StorageError
+                        ? error.code ?? 'STORAGE_AUTH_UNAVAILABLE'
+                        : 'STORAGE_AUTH_UNAVAILABLE',
+                    error: error instanceof Error ? error.message : String(error),
+                    retryable: true,
+                    status: error instanceof StorageError ? error.status : null,
+                    retryAfter: error instanceof StorageError ? error.retryAfter : null,
+                    commitOutcomeUnknown: false,
+                }
+            }
+        }
         const stableRequest: PluginStorageBatchRequest = {
             generation: request.generation,
             ...(request.expectedManifest
@@ -2403,27 +2448,66 @@ export class NodeStorage{
                 }
                 : { ...operation }),
         }
-        let requestBytes: Uint8Array
+        let requestBody: BodyInit
+        let requestByteLength: number
         let requestHash: string
+        let streamed = false
         try {
-            // Encoding and hashing are local preparation. Start the transport
-            // deadline only once the immutable request is ready to dispatch.
-            requestBytes = encodePluginStorageBatchRequest(stableRequest)
-            requestHash = await sha256OwnedBytes(requestBytes)
+            const capabilities = NodeStorage.pluginStorageBatchCapabilities
+            if (capabilities) {
+                const valueHashes: Array<string | null> = []
+                for (const operation of stableRequest.operations) {
+                    valueHashes.push(operation.operation === 'set'
+                        ? await sha256OwnedBytes(operation.valueBytes)
+                        : null)
+                }
+                const prepared = preparePluginStorageBatchStream(
+                    stableRequest,
+                    valueHashes,
+                    capabilities,
+                )
+                requestBody = prepared.body
+                requestByteLength = prepared.byteLength
+                requestHash = await sha256OwnedBytes(prepared.metadataBytes)
+                streamed = true
+            } else {
+                // Compatibility fallback for servers that predate session
+                // capability negotiation and framed batch uploads.
+                const requestBytes = encodePluginStorageBatchRequest(stableRequest)
+                requestBody = requestBytes as any
+                requestByteLength = requestBytes.byteLength
+                requestHash = await sha256OwnedBytes(requestBytes)
+            }
         } catch (error) {
-            return pluginStorageBatchTransportOutcomeUnknown(error)
+            return {
+                outcome: 'not-committed',
+                operation: 'batch',
+                code: error instanceof PluginStorageBatchPreparationError
+                    ? error.code
+                    : 'INVALID_PLUGIN_STORAGE_BATCH',
+                error: error instanceof Error ? error.message : String(error),
+                retryable: false,
+                status: null,
+                retryAfter: null,
+                ...(error instanceof PluginStorageBatchPreparationError
+                    ? { limit: error.limit, actual: error.actual }
+                    : {}),
+                commitOutcomeUnknown: false,
+            }
         }
         try {
             return await runBoundedAuthoritativeStorageOperation(
                 (signal, outcome) => this.batchPluginStorageAuthoritative(
                     stableRequest,
-                    requestBytes,
+                    requestBody,
+                    requestByteLength,
                     requestHash,
+                    streamed,
                     signal,
                     outcome,
                 ),
                 'batch',
-                authoritativeStoragePayloadTimeoutMs(requestBytes.byteLength),
+                authoritativeStoragePayloadTimeoutMs(requestByteLength),
                 externalSignal,
             )
         } catch (error) {
@@ -2451,8 +2535,10 @@ export class NodeStorage{
 
     private async batchPluginStorageAuthoritative(
         request: PluginStorageBatchRequest,
-        requestBytes: Uint8Array,
+        requestBody: BodyInit,
+        requestByteLength: number,
         requestHash: string,
+        streamed: boolean,
         signal: AbortSignal,
         outcome: AuthoritativeStorageOutcomeTracker,
     ): Promise<PluginStorageBatchResult> {
@@ -2461,8 +2547,14 @@ export class NodeStorage{
         for (let retryIndex = 0; ; retryIndex++) {
             const response = await this.authFetch('/api/plugin-storage/batch', {
                 method: 'POST',
-                headers: { 'content-type': 'application/octet-stream' },
-                body: requestBytes as any,
+                headers: streamed
+                    ? {
+                        'content-type': 'application/x-pocketrisu-plugin-storage-batch',
+                        'x-plugin-storage-batch-stream': '1',
+                        'x-plugin-storage-batch-length': String(requestByteLength),
+                    }
+                    : { 'content-type': 'application/octet-stream' },
+                body: requestBody,
                 signal,
             }, true, outcome)
 

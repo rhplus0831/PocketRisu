@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from 'vitest'
 import Database from 'better-sqlite3'
 import path from 'node:path'
 import { existsSync } from 'node:fs'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, writeFile } from 'node:fs/promises'
 import { gzipSync } from 'node:zlib'
 import { createHash } from 'node:crypto'
 import { Packr } from 'msgpackr'
@@ -115,6 +115,58 @@ function compactEnvelope(
   }))
 }
 
+function framedCompactEnvelope(
+  operations: Array<
+    | {
+        operation: 'set'
+        key: string
+        owner: string
+        valueBytes: Uint8Array
+        expectedRevision?: string | null
+      }
+    | { operation: 'remove'; key: string; expectedRevision?: string | null }
+  >,
+  expectedManifestRevision: string,
+  valueHashOverride?: string,
+): Uint8Array {
+  const metadata = Buffer.from(JSON.stringify({
+    version: 3,
+    generation: STORAGE_GENERATION,
+    expectedManifestRevision,
+    operations: operations.map(operation => operation.operation === 'set'
+      ? {
+          operation: operation.operation,
+          key: operation.key,
+          owner: operation.owner,
+          valueLength: operation.valueBytes.byteLength,
+          valueHash: valueHashOverride
+            ?? createHash('sha256').update(operation.valueBytes).digest('hex'),
+          ...(Object.prototype.hasOwnProperty.call(operation, 'expectedRevision')
+            ? { expectedRevision: operation.expectedRevision }
+            : {}),
+        }
+      : {
+          operation: operation.operation,
+          key: operation.key,
+          ...(Object.prototype.hasOwnProperty.call(operation, 'expectedRevision')
+            ? { expectedRevision: operation.expectedRevision }
+            : {}),
+        }),
+  }), 'utf8')
+  const prefix = Buffer.alloc(12)
+  prefix.write('PRISUB01', 0, 'ascii')
+  prefix.writeUInt32BE(metadata.byteLength, 8)
+  return new Uint8Array(Buffer.concat([
+    prefix,
+    metadata,
+    ...operations
+      .filter((operation): operation is Extract<typeof operation, { operation: 'set' }> => (
+        operation.operation === 'set'
+      ))
+      .map(operation => Buffer.from(operation.valueBytes)),
+  ]))
+}
+
 function batchBody(expectedRevision?: string | null): Uint8Array {
   return envelope(keys.map(key => ({
       operation: 'set',
@@ -175,6 +227,18 @@ async function mutate(client: RisuClient, body = batchBody()): Promise<Response>
   })
 }
 
+async function mutateFramed(client: RisuClient, body: Uint8Array): Promise<Response> {
+  return client.fetch('/api/plugin-storage/batch', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-pocketrisu-plugin-storage-batch',
+      'x-plugin-storage-batch-stream': '1',
+      'x-plugin-storage-batch-length': String(body.byteLength),
+    },
+    body,
+  })
+}
+
 async function readState(client: RisuClient, key: string): Promise<any> {
   const response = await client.fetch('/api/plugin-storage/state', {
     headers: {
@@ -216,6 +280,133 @@ function readGeneration(cwd: string): 'old' | 'new' | 'torn' {
 }
 
 describe('AA3 atomic plugin storage batch', () => {
+  test('session negotiation advertises framed limits from server configuration', async () => {
+    const { client } = await boot()
+    const response = await client.fetch('/api/session', {
+      method: 'POST',
+      headers: { 'x-session-id': 'batch-capability-test' },
+    })
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      capabilities: {
+        pluginStorageBatch: {
+          transport: 'framed-v1',
+          maxOperations: 128,
+          maxMetadataBytes: 1024 * 1024,
+          maxValueBytes: 128 * 1024 * 1024,
+          maxPayloadBytes: 1024 * 1024 * 1024,
+        },
+      },
+    })
+  })
+
+  test('streams and atomically commits a value above the legacy encoded ceiling', async () => {
+    const { server, client } = await boot()
+    const manifest = await readManifest(client, 'state')
+    const key = 'aa3/large-streamed'
+    const value = Buffer.from(JSON.stringify('x'.repeat(13 * 1024 * 1024 - 2)), 'utf8')
+    expect(value.byteLength).toBe(13 * 1024 * 1024)
+    const framed = framedCompactEnvelope([{
+      operation: 'set',
+      key,
+      owner: 'AA3',
+      valueBytes: value,
+      expectedRevision: null,
+    }], manifest.manifestRevision)
+
+    const response = await mutateFramed(client, framed)
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      outcome: 'committed',
+      operation: 'batch',
+      revisions: [{
+        key,
+        revision: expect.stringMatching(REVISION_PATTERN),
+        valueHash: createHash('sha256').update(value).digest('hex'),
+      }],
+    })
+    const read = await readState(client, key)
+    expect(read.missing).toBe(false)
+    expect(createHash('sha256').update(Buffer.from(read.value, 'base64')).digest('hex'))
+      .toBe(createHash('sha256').update(value).digest('hex'))
+    const spool = await readdir(path.join(server.cwd, 'save', '.spool'))
+    expect(spool.filter(name => name.startsWith('.plugin-batch-value-'))).toEqual([])
+  }, 90_000)
+
+  test('rejects a corrupt framed value before publication and removes its stage', async () => {
+    const { server, client } = await boot()
+    const manifest = await readManifest(client, 'state')
+    const key = 'aa3/corrupt-streamed'
+    const value = Buffer.from('{"valid":true}', 'utf8')
+    const framed = framedCompactEnvelope([{
+      operation: 'set',
+      key,
+      owner: 'AA3',
+      valueBytes: value,
+      expectedRevision: null,
+    }], manifest.manifestRevision, '0'.repeat(64))
+
+    const response = await mutateFramed(client, framed)
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toMatchObject({
+      outcome: 'not-committed',
+      code: 'INVALID_PLUGIN_STORAGE_BATCH',
+    })
+    await expect(readState(client, key)).resolves.toMatchObject({ missing: true })
+    const spool = await readdir(path.join(server.cwd, 'save', '.spool'))
+    expect(spool.filter(name => name.startsWith('.plugin-batch-value-'))).toEqual([])
+  })
+
+  test('checks streamed revisions after staging and leaves no committed prefix or spool', async () => {
+    const { server, client } = await boot()
+    const manifest = await readManifest(client, 'state')
+    const key = keys[0]
+    const before = readPhysicalPair(server.cwd, key)
+    const value = Buffer.from(JSON.stringify({ generation: 'must-not-commit', key }), 'utf8')
+    const framed = framedCompactEnvelope([{
+      operation: 'set',
+      key,
+      owner: 'AA3',
+      valueBytes: value,
+      expectedRevision: `sha256:${'0'.repeat(64)}`,
+    }], manifest.manifestRevision)
+
+    const response = await mutateFramed(client, framed)
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toMatchObject({
+      outcome: 'not-committed',
+      code: 'PLUGIN_STORAGE_REVISION_CONFLICT',
+    })
+    expect(readPhysicalPair(server.cwd, key)).toEqual(before)
+    const spool = await readdir(path.join(server.cwd, 'save', '.spool'))
+    expect(spool.filter(name => name.startsWith('.plugin-batch-value-'))).toEqual([])
+  })
+
+  test('rolls a staged file write back with its owner and manifest', async () => {
+    const { server, client } = await boot('after-value:0')
+    const manifest = await readManifest(client, 'state')
+    const key = keys[0]
+    const before = readPhysicalPair(server.cwd, key)
+    const state = await readState(client, key)
+    const framed = framedCompactEnvelope([{
+      operation: 'set',
+      key,
+      owner: 'AA3',
+      valueBytes: Buffer.from(JSON.stringify({ generation: 'must-roll-back', key }), 'utf8'),
+      expectedRevision: state.revision,
+    }], manifest.manifestRevision)
+
+    const response = await mutateFramed(client, framed)
+    expect(response.status).toBe(500)
+    await expect(response.json()).resolves.toMatchObject({
+      outcome: 'not-committed',
+      code: 'PLUGIN_STORAGE_BATCH_ROLLED_BACK',
+    })
+    expect(readPhysicalPair(server.cwd, key)).toEqual(before)
+    const spool = await readdir(path.join(server.cwd, 'save', '.spool'))
+    expect(spool.filter(name => name.startsWith('.plugin-batch-value-'))).toEqual([])
+  })
+
   test('staged status cannot consume a tentative matching import publication', async () => {
     const server = await spawnServer({
       seedSave: async saveDir => {

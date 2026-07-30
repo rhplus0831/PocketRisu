@@ -144,6 +144,15 @@ An outcome of `unknown` means the request may already have committed. Never repl
 blindly. Re-read authoritative state, or reload when a generation/transition outcome
 cannot be proven.
 
+Optimized compound writes negotiate their transport through `/api/session`. Current
+clients use `framed-v1`: bounded canonical metadata names the CAS and binds each set
+value by length and SHA-256, followed by the raw JSON bytes. The server streams values
+to private spool files, validates them before queue admission, and publishes large rows
+through the file-backed chunk writer inside the existing atomic transaction. This lets
+a one-value guarded write reach the same configured per-value limit as ordinary
+`setItem()` without base64 expansion. Older servers use the retained 16 MiB JSON/base64
+batch fallback.
+
 ### Immutable generations
 
 Generation helpers publish a prepared immutable key set and one manifest pointer. They
