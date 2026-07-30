@@ -299,59 +299,97 @@ describe('bounded archive and save-folder ingress (real server)', () => {
   }, 120_000)
 
   const boundedRows = [
-    { label: 'generic', key: 'generic/large-row.bin', json: false },
+    {
+      label: 'generic',
+      key: 'generic/large-row.bin',
+      kind: 'generic',
+      owner: null,
+    },
     {
       label: 'plugin metadata',
       key: `pluginsave-meta/${Buffer.from('large-meta').toString('base64url')}.json`,
-      json: true,
+      kind: 'metadata',
+      owner: 'Large Metadata Owner',
     },
   ] as const
 
   for (const route of ['ZIP', 'directory'] as const) {
     for (const row of boundedRows) {
-      test(`${route} ${row.label} row accepts exactly 32 MiB and rejects +1`, async () => {
-        const exactValue = row.json
-          ? validJsonBytes(BUFFERED_ROW_LIMIT)
-          : Buffer.alloc(BUFFERED_ROW_LIMIT, 0x41)
-        const exactDatabase = databaseEntry(createSeedBackup({
-          databaseFields: { globalNote: `${route}-${row.label}-exact` },
+      test(`${route} ${row.label} row streams above the former 32 MiB limit`, async () => {
+        const metadataPrefix = '{"plugin":"Large Metadata Owner","updatedAt":1}'
+        const value = row.kind === 'metadata'
+          ? Buffer.concat([
+              Buffer.from(metadataPrefix),
+              Buffer.alloc(
+                BUFFERED_ROW_LIMIT + 1 - Buffer.byteLength(metadataPrefix),
+                0x20,
+              ),
+            ])
+          : Buffer.alloc(BUFFERED_ROW_LIMIT + 1, 0x41)
+        const database = databaseEntry(createSeedBackup({
+          databaseFields: { globalNote: `${route}-${row.label}-streamed` },
         }))
-        const rejectedDatabase = databaseEntry(createSeedBackup({
-          databaseFields: { globalNote: 'must-not-publish' },
-        }))
-        const { server, client } = await boot()
-        let rejected: Response
+        const { server, client } = await boot({ POCKETRISU_CHUNK_THRESHOLD: '4096' })
+        let response: Response
 
         if (route === 'ZIP') {
-          const accepted = await uploadSaveFolder(
+          response = await uploadSaveFolder(
             client,
-            saveFolderZipWithRows(exactDatabase, [{ key: row.key, value: exactValue }]),
-          )
-          expect(accepted.status).toBe(200)
-          await accepted.json()
-          rejected = await uploadSaveFolder(
-            client,
-            saveFolderZipWithRows(rejectedDatabase, [{
-              key: row.key,
-              value: Buffer.concat([exactValue, Buffer.from([0x20])]),
-            }]),
+            saveFolderZipWithRows(database, [{ key: row.key, value }]),
           )
         } else {
-          const sourceDir = path.join(server.cwd, `bounded-${row.label.replaceAll(' ', '-')}`)
-          const rowPath = path.join(sourceDir, Buffer.from(row.key).toString('hex'))
-          await mkdir(sourceDir, { recursive: true })
-          await writeFile(path.join(sourceDir, DB_HEX), exactDatabase)
-          await writeFile(rowPath, exactValue)
-          const accepted = await executeSaveFolder(client, sourceDir)
-          expect(accepted.status).toBe(200)
-          await accepted.json()
-          await writeFile(path.join(sourceDir, DB_HEX), rejectedDatabase)
-          await writeFile(rowPath, Buffer.concat([exactValue, Buffer.from([0x20])]))
-          rejected = await executeSaveFolder(client, sourceDir)
+          const sourceDir = path.join(server.cwd, `streamed-${row.label.replaceAll(' ', '-')}`)
+          await writeSaveFolderSource(sourceDir, database, [{ key: row.key, value }])
+          response = await executeSaveFolder(client, sourceDir)
         }
 
-        await expectStructuredNotCommitted(rejected)
-        await expectNote(client, `${route}-${row.label}-exact`)
+        expect(response.status).toBe(200)
+        await response.json()
+        await expectNote(client, `${route}-${row.label}-streamed`)
+
+        const read = await client.fetch('/api/read', {
+          headers: { 'file-path': Buffer.from(row.key).toString('hex') },
+        })
+        expect(read.status).toBe(200)
+        expect(Buffer.from(await read.arrayBuffer()).equals(value)).toBe(true)
+
+        const physical = new Database(path.join(server.cwd, 'save', 'risuai.db'), {
+          readonly: true,
+        })
+        try {
+          expect((physical.prepare('SELECT LENGTH(value) AS size FROM kv WHERE key = ?')
+            .get(row.key) as { size: number }).size).toBeLessThan(value.length)
+          expect((physical.prepare(
+            'SELECT COUNT(*) AS count FROM manifest_chunks WHERE manifest_key = ?',
+          ).get(row.key) as { count: number }).count).toBeGreaterThan(0)
+          if (row.owner) {
+            expect((physical.prepare(
+              'SELECT owner FROM plugin_storage_owners WHERE storage_key = ?',
+            ).get(row.key) as { owner: string } | undefined)?.owner).toBe(row.owner)
+          }
+        } finally {
+          physical.close()
+        }
+
+        await server.restart({ POCKETRISU_CHUNK_THRESHOLD: '4096' })
+        const restarted = await createClient(server.port, server.password)
+        const reread = await restarted.fetch('/api/read', {
+          headers: { 'file-path': Buffer.from(row.key).toString('hex') },
+        })
+        expect(reread.status).toBe(200)
+        expect(Buffer.from(await reread.arrayBuffer()).equals(value)).toBe(true)
+        if (row.owner) {
+          const afterRestart = new Database(path.join(server.cwd, 'save', 'risuai.db'), {
+            readonly: true,
+          })
+          try {
+            expect((afterRestart.prepare(
+              'SELECT owner FROM plugin_storage_owners WHERE storage_key = ?',
+            ).get(row.key) as { owner: string } | undefined)?.owner).toBe(row.owner)
+          } finally {
+            afterRestart.close()
+          }
+        }
         await waitForNoImportSpools(server)
       }, 120_000)
     }

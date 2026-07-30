@@ -66,17 +66,12 @@ function normalizeThreshold(value) {
 }
 
 function isChunkableKey(key) {
-    return typeof key === 'string'
-        && (key === 'database/database.bin'
-            || key.startsWith('database/dbbackup-')
-            || key.startsWith('chats/')
-            || key.startsWith('pluginsave/')
-            // These namespaces can arrive as file-backed backup entries.  They
-            // must remain stream-writable so restoring a historical oversized
-            // row never requires one monolithic SQLite BLOB binding.
-            || key.startsWith('assets/')
-            || key.startsWith('coldstorage/')
-            || key.startsWith('remotes/'));
+    // Chunking is a physical representation detail, not a namespace contract.
+    // Every logical KV reader/delete/size/copy path is chunk-aware, and legacy
+    // save folders may contain valid application or plugin-defined namespaces
+    // that this server cannot predict. Keeping an allowlist here would make a
+    // value writable through the generic API but unrestorable from disk.
+    return typeof key === 'string';
 }
 
 function isChunked(value) {

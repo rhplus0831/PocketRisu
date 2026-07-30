@@ -4,7 +4,8 @@ const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
-const { createChunkStore, createSnapshotReader, isChunkableKey } = require('./chunkStore.cjs');
+const { createChunkStore, createSnapshotReader } = require('./chunkStore.cjs');
+const { createPluginStorageOwnerScanner } = require('./pluginStorageJson.cjs');
 const {
     PLUGIN_VALUE_MAX_BYTES,
     PLUGIN_STORAGE_MAX_BYTES,
@@ -113,11 +114,7 @@ function migrateFromSaveDir() {
 
     console.log(`[DB] Migrating ${hexFiles.length} file(s) from /save/ to SQLite...`);
 
-    const insert = db.prepare(
-        `INSERT OR IGNORE INTO kv (key, value, updated_at) VALUES (?, ?, ?)`
-    );
     const exists = db.prepare(`SELECT 1 FROM kv WHERE key = ?`);
-    const now = Date.now();
 
     const run = db.transaction(() => {
         for (let i = 0; i < hexFiles.length; i++) {
@@ -129,11 +126,9 @@ function migrateFromSaveDir() {
             // particular, chunkStore.putValue() uses INSERT OR REPLACE, so a
             // stale legacy file must be skipped before entering that path.
             if (exists.get(key)) continue;
-            const value = fs.readFileSync(path.join(savePath, hexFiles[i]));
-            // Route every chunk-capable namespace through the same size gate so
-            // oversized legacy values cannot hit SQLite's BLOB bind limit.
-            if (isChunkableKey(key)) chunkStore.putValue(key, value);
-            else insert.run(key, value, now);
+            // Every namespace uses the file-backed chunk gate. Unknown legacy
+            // keys are just as entitled to a bounded migration as built-ins.
+            chunkStore.putValueFromFile(key, path.join(savePath, hexFiles[i]));
             stmtRemoveDeletion.run(key);
         }
     });
@@ -144,8 +139,9 @@ function migrateFromSaveDir() {
     console.log(`[DB] To free disk space, remove migrated files via Settings > Clean Up Save Folder.`);
 }
 
-// Chunk-aware store for large database, snapshot, and chat values. Assets remain
-// one raw row each. Built before migrateFromSaveDir so legacy values can chunk.
+// Chunk-aware store for every logical KV namespace. Small values remain raw
+// SQLite rows; large values use protected manifests. Built before
+// migrateFromSaveDir so legacy values can stream into the same representation.
 const DB_BLOB_KEY = 'database/database.bin';
 const chunkThreshold = process.env.POCKETRISU_CHUNK_THRESHOLD
     ? Number(process.env.POCKETRISU_CHUNK_THRESHOLD)
@@ -175,9 +171,8 @@ function parseKvSetFailpoint(raw) {
 const kvSetFailpoint = parseKvSetFailpoint(process.env.POCKETRISU_TEST_FAILPOINT);
 
 // ─── KV operations ────────────────────────────────────────────────────────────
-// Chunk-capable writes route through chunkStore; reads/deletes/sizes/copies are
-// chunk-aware for every key. The statements below serve direct-row writes/lists.
-const stmtKvSet    = db.prepare(`INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)`);
+// All writes route through chunkStore; reads/deletes/sizes/copies are likewise
+// chunk-aware for every key. Values below the threshold still use direct rows.
 const stmtKvList   = db.prepare(`SELECT key FROM kv`);
 const stmtKvPrefix = db.prepare(`SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\'`);
 const stmtKvDelPrefix = db.prepare(`DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'`);
@@ -231,11 +226,62 @@ function pluginStorageOwnerFromBytes(key, value) {
     }
 }
 
+function normalizedPluginStorageOwner(owner) {
+    return typeof owner === 'string'
+        && owner.length > 0
+        && owner.isWellFormed()
+        ? owner
+        : null;
+}
+
+function setPluginStorageOwnerIndex(key, owner) {
+    if (!key.startsWith(PLUGIN_STORAGE_META_PREFIX)) return;
+    const normalized = normalizedPluginStorageOwner(owner);
+    if (normalized === null) stmtDeletePluginStorageOwner.run(key);
+    else stmtSetPluginStorageOwner.run(key, normalized);
+}
+
+function pluginStorageOwnerFromFile(filePath) {
+    const scanner = createPluginStorageOwnerScanner();
+    const fd = fs.openSync(filePath, 'r');
+    const page = Buffer.allocUnsafe(64 * 1024);
+    try {
+        let offset = 0;
+        while (true) {
+            const bytesRead = fs.readSync(fd, page, 0, page.length, offset);
+            if (bytesRead === 0) break;
+            scanner.push(page.subarray(0, bytesRead));
+            offset += bytesRead;
+        }
+        return scanner.finish();
+    } catch {
+        return null;
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
+function pluginStorageOwnerFromReader(reader, key) {
+    const scanner = createPluginStorageOwnerScanner();
+    try {
+        const size = reader.kvSize(key);
+        if (!Number.isSafeInteger(size) || size < 0) return null;
+        for (let offset = 0; offset < size; offset += 64 * 1024) {
+            scanner.push(reader.kvReadRange(
+                key,
+                offset,
+                Math.min(64 * 1024, size - offset),
+            ));
+        }
+        return scanner.finish();
+    } catch {
+        return null;
+    }
+}
+
 function updatePluginStorageOwnerIndex(key, value) {
     if (!key.startsWith(PLUGIN_STORAGE_META_PREFIX)) return;
-    const owner = pluginStorageOwnerFromBytes(key, value);
-    if (owner === null) stmtDeletePluginStorageOwner.run(key);
-    else stmtSetPluginStorageOwner.run(key, owner);
+    setPluginStorageOwnerIndex(key, pluginStorageOwnerFromBytes(key, value));
 }
 
 function getPluginStorageUsage() {
@@ -318,29 +364,34 @@ function consumePluginStorageQuotaPlan(key, nextSize) {
 }
 
 const runKvSet = db.transaction((key, value) => {
+    if (typeof key !== 'string') throw new TypeError('KV key must be a string');
     const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
     const quotaPlanned = consumePluginStorageQuotaPlan(key, value.length);
     if (!quotaPlanned) assertPluginWriteWithinLimits(key, value.length, previousSize);
-    if (isChunkableKey(key)) chunkStore.putValue(key, value);
-    else stmtKvSet.run(key, value, Date.now());
+    chunkStore.putValue(key, value);
     if (!quotaPlanned) updatePluginStorageUsageForWrite(key, value.length, previousSize);
     updatePluginStorageOwnerIndex(key, value);
     stmtRemoveDeletion.run(key);
 });
 
-const runKvSetFromFile = db.transaction((key, filePath, size) => {
+const runKvSetFromFile = db.transaction((
+    key,
+    filePath,
+    size,
+    ownerProvided,
+    providedOwner,
+) => {
+    if (typeof key !== 'string') throw new TypeError('KV key must be a string');
     const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
     const quotaPlanned = consumePluginStorageQuotaPlan(key, size);
     if (!quotaPlanned) assertPluginWriteWithinLimits(key, size, previousSize);
-    let ownerBytes = null;
-    if (isChunkableKey(key)) chunkStore.putValueFromFile(key, filePath);
-    else {
-        ownerBytes = fs.readFileSync(filePath);
-        stmtKvSet.run(key, ownerBytes, Date.now());
-    }
+    chunkStore.putValueFromFile(key, filePath);
     if (!quotaPlanned) updatePluginStorageUsageForWrite(key, size, previousSize);
     if (key.startsWith(PLUGIN_STORAGE_META_PREFIX)) {
-        updatePluginStorageOwnerIndex(key, ownerBytes ?? fs.readFileSync(filePath));
+        setPluginStorageOwnerIndex(
+            key,
+            ownerProvided ? providedOwner : pluginStorageOwnerFromFile(filePath),
+        );
     }
     stmtRemoveDeletion.run(key);
 });
@@ -403,10 +454,20 @@ function kvSet(key, value) {
     runKvSet(key, value);
 }
 
-function kvSetFromFile(key, filePath) {
+function kvSetFromFile(key, filePath, options = {}) {
     checkKvSetFailpoint(key);
     const size = fs.statSync(filePath).size;
-    runKvSetFromFile(key, filePath, size);
+    const ownerProvided = Object.prototype.hasOwnProperty.call(
+        options,
+        'pluginStorageOwner',
+    );
+    runKvSetFromFile(
+        key,
+        filePath,
+        size,
+        ownerProvided,
+        ownerProvided ? options.pluginStorageOwner : null,
+    );
 }
 
 function kvDel(key) {
@@ -581,20 +642,30 @@ function reconcilePluginStorageUsage() {
 
 function reconcilePluginStorageOwners() {
     // A better-sqlite3 connection cannot write while one of its own iterators
-    // is active. Use a short-lived read connection so boot can rebuild the
+    // is active. Use short-lived read connections so boot can rebuild the
     // derived index without retaining every owner body in an `.all()` array.
-    const ownerSource = new Database(dbPath, { readonly: true });
-    const rows = ownerSource.prepare(
-        `SELECT key, value FROM kv WHERE key LIKE 'pluginsave-meta/%'`,
+    const ownerKeys = new Database(dbPath, { readonly: true });
+    const ownerValues = new Database(dbPath, { readonly: true });
+    ownerValues.exec('BEGIN');
+    const rows = ownerKeys.prepare(
+        `SELECT key FROM kv WHERE key LIKE 'pluginsave-meta/%'`,
     );
+    const reader = createSnapshotReader(ownerValues);
     const reconcile = db.transaction(() => {
         db.prepare('DELETE FROM plugin_storage_owners').run();
-        for (const row of rows.iterate()) updatePluginStorageOwnerIndex(row.key, row.value);
+        for (const row of rows.iterate()) {
+            setPluginStorageOwnerIndex(
+                row.key,
+                pluginStorageOwnerFromReader(reader, row.key),
+            );
+        }
     });
     try {
         reconcile();
     } finally {
-        ownerSource.close();
+        try { ownerValues.exec('ROLLBACK'); } catch {}
+        ownerValues.close();
+        ownerKeys.close();
     }
 }
 

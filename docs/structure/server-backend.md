@@ -7,7 +7,7 @@
 
 The server backend turns the built Svelte SPA into a self-hosted PocketRisu instance. The production implementation is the Express executable in `server/node/server.cjs`: it serves `dist/`, authenticates and fences writers, persists the PocketRisu-internal stubs-only RisuSave database plus external chat/plugin rows, proxies model traffic, manages filesystem stores, and exposes maintenance and recovery protocols. Self-contained migration archives are assembled only at explicit export boundaries.
 
-Persistent application data is primarily stored in SQLite through a binary-compatible key/value abstraction. `database/database.bin` contains character/settings data plus chat stubs; full bodies live in `chats/<chaId>/<chatId>` rows. Optimized plugin authority is a generation-bound publication: `Database.pluginStorageGeneration`, `plugin-storage/manifest.json`, and exact `pluginsave/` plus `pluginsave-meta/` rows. The live database, automatic snapshots, chats, and plugin values can use protected content-defined chunks. Safe ordinary assets, inlays, server-created archives, private pins/stages, and per-chat pre-image history are filesystem-backed; unsafe asset names remain KV rows. Destructive imports use an exclusive barrier plus a filesystem/SQLite commit journal. See [Plugin storage](plugin-storage.md) and [Backup and recovery](backup-recovery.md) for the cross-cutting protocols.
+Persistent application data is primarily stored in SQLite through a binary-compatible key/value abstraction. `database/database.bin` contains character/settings data plus chat stubs; full bodies live in `chats/<chaId>/<chatId>` rows. Optimized plugin authority is a generation-bound publication: `Database.pluginStorageGeneration`, `plugin-storage/manifest.json`, and exact `pluginsave/` plus `pluginsave-meta/` rows. Every logical KV namespace can use protected content-defined chunks; namespace does not determine physical representation. Safe ordinary assets, inlays, server-created archives, private pins/stages, and per-chat pre-image history are filesystem-backed; unsafe asset names remain KV rows. Destructive imports use an exclusive barrier plus a filesystem/SQLite commit journal. See [Plugin storage](plugin-storage.md) and [Backup and recovery](backup-recovery.md) for the cross-cutting protocols.
 
 ## 2. Key files
 
@@ -78,7 +78,7 @@ The server reads configuration directly from `process.env`; it does not load `.e
 |---|---|
 | `PORT` | HTTP/HTTPS port; default `6001`. |
 | `HOST` | Optional bind address passed to `server.listen()`; unset preserves the historical all-interfaces bind. Use `127.0.0.1` behind a local reverse proxy. |
-| `POCKETRISU_CHUNK_THRESHOLD` | Lowers the chunk threshold for live DB, snapshot, chat, and plugin-value rows. The effective maximum/default is 16 MiB. |
+| `POCKETRISU_CHUNK_THRESHOLD` | Lowers the protected-chunk threshold for every logical KV namespace. The effective maximum/default is 16 MiB. |
 | `POCKETRISU_BACKUP_INTERVAL_MS` | Minimum interval between automatic DB snapshots; default five minutes. |
 | `POCKETRISU_ASSET_GC_GRACE_MS` | Minimum time an ordinary asset must remain unreferenced across independent server sweeps before deletion; default seven days. |
 | `POCKETRISU_ASSET_GC_START_DELAY_MS` | Delay before the first server-owned asset sweep; default 30 seconds. |
@@ -186,10 +186,11 @@ Important KV namespaces include:
 - `migration/chats-externalized`: idempotence marker for the chat-row boot migration.
 - `migration-backup/pre-chat-externalization-<timestamp>.bin`: manifest-safe copy of the pre-migration monolith for downgrade recovery.
 
-`kvSet()` routes `database/database.bin`, `database/dbbackup-*`, `chats/*`, and
-`pluginsave/*` through the chunk store. Values at or below the effective threshold remain
-ordinary KV rows. Larger values publish a marker only with a protected, complete manifest;
-readers verify chunk hashes, sequence/count, logical size, and whole-value SHA-256.
+`kvSet()` and `kvSetFromFile()` route every string key through the chunk store. Values at
+or below the effective threshold remain ordinary KV rows. Larger values publish a marker
+only with a protected, complete manifest; readers verify chunk hashes, sequence/count,
+logical size, and whole-value SHA-256. This namespace-independent rule ensures that an
+extension-defined row accepted by the generic API remains restorable from a save folder.
 
 Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB, approximately 16 KiB average, and SHA-256 content hashes at `server/node/chunkStore.cjs:18`. Values larger than 16 MiB are represented in `kv.value` by `CHUNK_MARKER`; reads concatenate manifest chunks through the bound store created at `server/node/chunkStore.cjs:114`.
 

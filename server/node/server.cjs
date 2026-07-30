@@ -116,7 +116,6 @@ const {
     readBlockRisuSaveTopLevelFields,
     streamBackupRisuSaveToFile,
 } = require('./streamBackupRisuSave.cjs');
-const { isChunkableKey } = require('./chunkStore.cjs');
 const {
     RisuSavePreparationError,
     configuredMaxDecodedBytes,
@@ -182,6 +181,7 @@ const { createBackupImportIndex } = require('./backupImportIndex.cjs');
 const {
     PluginStorageValidationError,
     assertPluginStorageRow,
+    createPluginStorageOwnerScanner,
     decodeValidatedPluginStorageKey,
     encodeValidatedPluginStorageKey,
     isPluginStorageValidationError,
@@ -3287,7 +3287,7 @@ async function writeImportedAssetFromFile(
     source,
     signal,
     label,
-    { maxBytes = BACKUP_IMPORT_MAX_BYTES, bufferedEntryMaxBytes = IMPORT_BUFFERED_ENTRY_MAX_BYTES } = {},
+    { maxBytes = BACKUP_IMPORT_MAX_BYTES } = {},
 ) {
     const name = assetNameForKey(key);
     if (name !== null && isSafeAssetName(name)) {
@@ -3298,18 +3298,7 @@ async function writeImportedAssetFromFile(
         kvClearDeletion(key);
         return 'fs';
     }
-    if (isChunkableKey(key)) {
-        kvSetFromFile(key, source.filePath);
-    } else {
-        const value = await readFileToBufferBounded(source.filePath, {
-            size: source.size,
-            maxBytes: Math.min(bufferedEntryMaxBytes, maxBytes),
-            label: `${label} unsafe asset ${key}`,
-            code: 'IMPORT_BUFFERED_ENTRY_LIMIT',
-            signal,
-        });
-        kvSet(key, value);
-    }
+    kvSetFromFile(key, source.filePath);
     logger.warn(`[AssetFS] ${label} retained unsafe asset key ${key} in SQLite`);
     return 'kv';
 }
@@ -3318,7 +3307,6 @@ async function validateAndImportPluginValueFile(
     key,
     source,
     signal,
-    label,
     { maxBytes = BACKUP_IMPORT_MAX_BYTES } = {},
 ) {
     decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_PREFIX);
@@ -3336,32 +3324,32 @@ async function validateAndImportPluginValueFile(
         throw error;
     }
     throwIfImportAborted(signal);
-    if (!isChunkableKey(key)) {
-        throw new Error(`${label} plugin value is not eligible for file-backed storage`);
-    }
     kvSetFromFile(key, source.filePath);
 }
 
-async function importBoundedOpaqueRow(
+async function validateAndImportPluginMetadataFile(
     key,
     source,
     signal,
-    label,
-    code = 'IMPORT_BUFFERED_ENTRY_LIMIT',
-    { maxBytes = BACKUP_IMPORT_MAX_BYTES, bufferedEntryMaxBytes = IMPORT_BUFFERED_ENTRY_MAX_BYTES } = {},
+    { maxBytes = BACKUP_IMPORT_MAX_BYTES } = {},
 ) {
-    if (isChunkableKey(key)) {
-        kvSetFromFile(key, source.filePath);
-        return;
-    }
-    const value = await readFileToBufferBounded(source.filePath, {
+    decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_META_PREFIX);
+    const ownerScanner = createPluginStorageOwnerScanner();
+    await validateJsonFileStreaming(source.filePath, {
         size: source.size,
-        maxBytes: Math.min(bufferedEntryMaxBytes, maxBytes),
-        label,
-        code,
+        maxBytes,
         signal,
+        onPage: (page) => ownerScanner.push(page),
     });
-    kvSet(key, value);
+    throwIfImportAborted(signal);
+    kvSetFromFile(key, source.filePath, {
+        pluginStorageOwner: ownerScanner.finish(),
+    });
+}
+
+async function importOpaqueRowFromFile(key, source, signal) {
+    throwIfImportAborted(signal);
+    kvSetFromFile(key, source.filePath);
 }
 
 async function importColdStorageFromFile(
@@ -6988,14 +6976,13 @@ async function importBackupFromSource(dataSource, {
                     source,
                     signal,
                     'Backup import',
-                    { maxBytes, bufferedEntryMaxBytes },
+                    { maxBytes },
                 );
             } else if (storageKey.startsWith(PLUGIN_SAVE_PREFIX)) {
                 await validateAndImportPluginValueFile(
                     storageKey,
                     source,
                     signal,
-                    'Backup import',
                     { maxBytes },
                 );
             } else if (storageKey.startsWith('coldstorage/')) {
@@ -7006,19 +6993,20 @@ async function importBackupFromSource(dataSource, {
                     `Backup entry ${name}`,
                     { maxBytes, bufferedEntryMaxBytes },
                 );
-            } else if (storageKey.startsWith(PLUGIN_SAVE_META_PREFIX)
-                || storageKey === PLUGIN_STORAGE_MANIFEST_KEY) {
-                const data = await readBuffered();
-                validatePluginStorageRow(storageKey, data);
-                kvSet(storageKey, data);
-            } else {
-                await importBoundedOpaqueRow(
+            } else if (storageKey.startsWith(PLUGIN_SAVE_META_PREFIX)) {
+                await validateAndImportPluginMetadataFile(
                     storageKey,
                     source,
                     signal,
-                    `Backup row ${storageKey}`,
-                    'IMPORT_BUFFERED_ENTRY_LIMIT',
-                    { maxBytes, bufferedEntryMaxBytes },
+                    { maxBytes },
+                );
+            } else if (storageKey === PLUGIN_STORAGE_MANIFEST_KEY) {
+                await importOpaqueRowFromFile(storageKey, source, signal);
+            } else {
+                await importOpaqueRowFromFile(
+                    storageKey,
+                    source,
+                    signal,
                 );
             }
             assetsRestored += 1;
@@ -13584,17 +13572,7 @@ async function importLegacySaveEntries(
                     key,
                     source,
                     signal,
-                    'Save-folder import',
                 );
-                continue;
-            }
-            // Only namespaces implemented by chunkStore may stay file-backed
-            // above the row-local materialization cap.
-            if (key.startsWith('database/dbbackup-') || key.startsWith('chats/')) {
-                if (!isChunkableKey(key)) {
-                    throw new Error(`Save-folder row is not eligible for file-backed storage: ${key}`);
-                }
-                kvSetFromFile(key, source.filePath);
                 continue;
             }
             if (key.startsWith(PLUGIN_SAVE_PREFIX)) {
@@ -13602,31 +13580,22 @@ async function importLegacySaveEntries(
                     key,
                     source,
                     signal,
-                    'Save-folder import',
                 );
                 continue;
             }
-            if (key.startsWith(PLUGIN_SAVE_META_PREFIX)
-                || key === PLUGIN_STORAGE_MANIFEST_KEY) {
-                const value = await readFileToBufferBounded(source.filePath, {
-                    size: source.size,
-                    maxBytes: Math.min(
-                        IMPORT_BUFFERED_ENTRY_MAX_BYTES,
-                        BACKUP_IMPORT_MAX_BYTES,
-                        PLUGIN_VALUE_MAX_BYTES,
-                    ),
-                    label: `Save-folder plugin row ${key}`,
-                    code: 'IMPORT_BUFFERED_ENTRY_LIMIT',
-                    signal,
-                });
-                validatePluginStorageRow(key, value);
-                kvSet(key, value);
-            } else {
-                await importBoundedOpaqueRow(
+            if (key.startsWith(PLUGIN_SAVE_META_PREFIX)) {
+                await validateAndImportPluginMetadataFile(
                     key,
                     source,
                     signal,
-                    `Save-folder row ${key}`,
+                );
+            } else if (key === PLUGIN_STORAGE_MANIFEST_KEY) {
+                await importOpaqueRowFromFile(key, source, signal);
+            } else {
+                await importOpaqueRowFromFile(
+                    key,
+                    source,
+                    signal,
                 );
             }
         }

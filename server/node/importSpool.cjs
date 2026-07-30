@@ -294,6 +294,7 @@ async function validateJsonFileStreaming(filePath, {
     signal,
     shouldAbort,
     maxDepth = 1024,
+    onPage,
 } = {}) {
     const fileHandle = await fs.open(filePath, 'r');
     const stack = [];
@@ -657,7 +658,9 @@ async function validateJsonFileStreaming(filePath, {
             if (read.bytesRead <= 0) {
                 throw importFormatError('Plugin storage row is truncated', 'TRUNCATED_IMPORT_SOURCE');
             }
-            processBytes(page.subarray(0, read.bytesRead));
+            const bytes = page.subarray(0, read.bytesRead);
+            processBytes(bytes);
+            onPage?.(bytes);
             offset += read.bytesRead;
             await yieldToEventLoop();
         }

@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 const require = createRequire(import.meta.url)
 const {
     PluginStorageValidationError,
+    createPluginStorageOwnerScanner,
     parsePluginStorageJsonBuffer,
     snapshotPluginStorageRecord,
     snapshotPluginStorageJson,
@@ -13,6 +14,10 @@ const {
     PluginStorageValidationError: new (encodedKey: string) => Error & {
         code: string
         encodedKey: string
+    }
+    createPluginStorageOwnerScanner: (options?: { maxCaptureBytes?: number }) => {
+        push: (bytes: Uint8Array) => void
+        finish: () => string | null
     }
     parsePluginStorageJsonBuffer: (value: Uint8Array, key?: string) => unknown
     snapshotPluginStorageRecord: (
@@ -28,6 +33,29 @@ const {
 const encoded = (key: string) => `pluginsave/${Buffer.from(key).toString('base64url')}.json`
 
 describe('plugin storage JSON server boundary', () => {
+    it('extracts the last top-level plugin owner across bounded pages', () => {
+        const body = Buffer.from(
+            '{"nested":{"plugin":"nested-must-not-win"},'
+            + '"plugin":"초기 owner","array":[{"plugin":"also-nested"}],'
+            + '"pl\\u0075gin":"최종 owner 🔑"}',
+        )
+        const scanner = createPluginStorageOwnerScanner()
+        for (let offset = 0; offset < body.length; offset += 3) {
+            scanner.push(body.subarray(offset, offset + 3))
+        }
+        expect(scanner.finish()).toBe('최종 owner 🔑')
+    })
+
+    it('omits invalid or implausibly large best-effort owner names', () => {
+        const nonString = createPluginStorageOwnerScanner()
+        nonString.push(Buffer.from('{"plugin":"first","plugin":42}'))
+        expect(nonString.finish()).toBeNull()
+
+        const oversized = createPluginStorageOwnerScanner({ maxCaptureBytes: 4 })
+        oversized.push(Buffer.from('{"plugin":"12345"}'))
+        expect(oversized.finish()).toBeNull()
+    })
+
     it('accepts and detaches the same strict JSON value set as the client', () => {
         const source = { nested: ['safe', -0], ['__proto__']: { own: true } }
         const json = stringifyPluginStorageJson(source)

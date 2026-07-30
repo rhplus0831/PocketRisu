@@ -7,6 +7,7 @@ const {
 } = require('./pluginSaveKeys.cjs');
 
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
+const PLUGIN_STORAGE_OWNER_CAPTURE_MAX_BYTES = 64 * 1024;
 
 class PluginStorageValidationError extends Error {
     constructor(encodedKey) {
@@ -15,6 +16,170 @@ class PluginStorageValidationError extends Error {
         this.code = 'INVALID_PLUGIN_STORAGE_ROW';
         this.encodedKey = encodedKey;
     }
+}
+
+function decodedCapturedJsonString(bytes) {
+    if (!Array.isArray(bytes)) return null;
+    try {
+        return JSON.parse(Buffer.concat([
+            Buffer.from('"', 'utf-8'),
+            Buffer.from(bytes),
+            Buffer.from('"', 'utf-8'),
+        ]).toString('utf-8'));
+    } catch {
+        return null;
+    }
+}
+
+function normalizedPluginStorageOwner(value) {
+    return typeof value === 'string'
+        && value.length > 0
+        && value.isWellFormed()
+        ? value
+        : null;
+}
+
+/**
+ * Extract the last top-level `plugin` string from an already-validated JSON
+ * row without retaining the row body. Plugin ownership is a best-effort
+ * derived index, so an implausibly large owner name is deliberately omitted
+ * while the authoritative metadata bytes remain untouched.
+ */
+function createPluginStorageOwnerScanner({
+    maxCaptureBytes = PLUGIN_STORAGE_OWNER_CAPTURE_MAX_BYTES,
+} = {}) {
+    let started = false;
+    let rootObject = false;
+    let rootComplete = false;
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let stringRole = null;
+    let captured = null;
+    let captureOverflow = false;
+    let expectingKey = false;
+    let pendingKey = null;
+    let awaitingValue = false;
+    let owner = null;
+
+    const beginString = (role) => {
+        inString = true;
+        escape = false;
+        stringRole = role;
+        captured = role === 'key' || role === 'owner' ? [] : null;
+        captureOverflow = false;
+    };
+    const appendCaptured = (byte) => {
+        if (captured === null || captureOverflow) return;
+        if (captured.length >= maxCaptureBytes) {
+            captured = null;
+            captureOverflow = true;
+            return;
+        }
+        captured.push(byte);
+    };
+    const finishString = () => {
+        const decoded = captureOverflow ? null : decodedCapturedJsonString(captured);
+        if (stringRole === 'key') {
+            pendingKey = decoded;
+            expectingKey = false;
+        } else if (stringRole === 'owner') {
+            owner = normalizedPluginStorageOwner(decoded);
+            awaitingValue = false;
+        } else if (rootObject && depth === 1 && awaitingValue) {
+            awaitingValue = false;
+        }
+        inString = false;
+        escape = false;
+        stringRole = null;
+        captured = null;
+        captureOverflow = false;
+    };
+    const consumeNonStringValue = () => {
+        if (!rootObject || depth !== 1 || !awaitingValue) return;
+        if (pendingKey === 'plugin') owner = null;
+        awaitingValue = false;
+    };
+
+    return {
+        push(buffer) {
+            for (const byte of buffer) {
+                if (rootComplete) continue;
+                if (inString) {
+                    if (escape) {
+                        appendCaptured(byte);
+                        escape = false;
+                        continue;
+                    }
+                    if (byte === 0x5c) {
+                        appendCaptured(byte);
+                        escape = true;
+                        continue;
+                    }
+                    if (byte === 0x22) {
+                        finishString();
+                        continue;
+                    }
+                    appendCaptured(byte);
+                    continue;
+                }
+
+                if (byte === 0x20 || byte === 0x09 || byte === 0x0d || byte === 0x0a) {
+                    continue;
+                }
+                if (!started) {
+                    started = true;
+                    if (byte === 0x7b) {
+                        rootObject = true;
+                        depth = 1;
+                        expectingKey = true;
+                    } else {
+                        rootComplete = true;
+                    }
+                    continue;
+                }
+                if (!rootObject) continue;
+
+                if (byte === 0x22) {
+                    if (depth === 1 && expectingKey) beginString('key');
+                    else if (depth === 1 && awaitingValue && pendingKey === 'plugin') {
+                        beginString('owner');
+                    } else beginString('other');
+                    continue;
+                }
+                if (byte === 0x3a && depth === 1 && pendingKey !== null) {
+                    awaitingValue = true;
+                    continue;
+                }
+                if (byte === 0x7b || byte === 0x5b) {
+                    consumeNonStringValue();
+                    depth++;
+                    continue;
+                }
+                if (byte === 0x7d || byte === 0x5d) {
+                    if (depth === 1 && byte === 0x7d) {
+                        consumeNonStringValue();
+                        depth = 0;
+                        rootComplete = true;
+                    } else if (depth > 1) {
+                        depth--;
+                    }
+                    continue;
+                }
+                if (byte === 0x2c && depth === 1) {
+                    consumeNonStringValue();
+                    pendingKey = null;
+                    expectingKey = true;
+                    continue;
+                }
+                consumeNonStringValue();
+            }
+        },
+        finish() {
+            if (!rootObject || !rootComplete || inString || depth !== 0) return null;
+            return owner;
+        },
+    };
 }
 
 function isPluginStorageValidationError(error) {
@@ -299,6 +464,7 @@ function serializePluginStorageRow(storageKey, value) {
 
 module.exports = {
     PluginStorageValidationError,
+    createPluginStorageOwnerScanner,
     assertPluginStorageJsonBuffer,
     assertPluginStorageRow,
     decodeValidatedPluginStorageKey,

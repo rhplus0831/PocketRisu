@@ -138,9 +138,11 @@ Compatibility clients that drive the HTTP protocol directly opt in by sending
 authenticated and active-session-only; the upload is independently revalidated and does
 not trust client-supplied entry metrics.
 
-Raw inlays and plain cold-storage JSON use file-backed streaming stages. Large unsafe
-asset and remote compatibility rows use chunked file ingestion. Compatibility-only
-metadata formats that still require materialization remain subject to the buffered-entry
+Raw inlays and plain cold-storage JSON use file-backed streaming stages. Every logical
+KV namespace can use protected chunk ingestion, including unsafe assets, remotes,
+arbitrary extension-defined rows, and streaming-validated plugin metadata. Remaining
+compatibility transformations that genuinely materialize a body—such as legacy wrapped
+inlay records or already-gzipped cold-storage JSON—remain subject to the buffered-entry
 limit unless the user has explicitly selected large restore.
 
 Directory and ZIP save-folder imports copy regular, non-symlink files into a stage before

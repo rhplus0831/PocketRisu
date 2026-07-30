@@ -133,7 +133,7 @@ describe('cdcSplit — content-defined chunking (pure)', () => {
 describe('createChunkStore — chunk-aware kv (injected :memory: db)', () => {
     const T = { threshold: 1024 } // small threshold so test buffers exercise chunking
 
-    it('B0: chunk gate includes live DB, snapshots, chat rows, and plugin values only', () => {
+    it('B0: chunk gate accepts every logical string key', () => {
         expect(isChunkableKey('database/database.bin')).toBe(true)
         expect(isChunkableKey('database/dbbackup-123.bin')).toBe(true)
         expect(isChunkableKey('chats/character/chat')).toBe(true)
@@ -141,9 +141,10 @@ describe('createChunkStore — chunk-aware kv (injected :memory: db)', () => {
         expect(isChunkableKey('assets/large.bin')).toBe(true)
         expect(isChunkableKey('coldstorage/character')).toBe(true)
         expect(isChunkableKey('remotes/large.local.bin')).toBe(true)
-        expect(isChunkableKey('pluginsave-meta/dmVjdG9y.json')).toBe(false)
-        expect(isChunkableKey('database/other.bin')).toBe(false)
-        expect(isChunkableKey('chats')).toBe(false)
+        expect(isChunkableKey('pluginsave-meta/dmVjdG9y.json')).toBe(true)
+        expect(isChunkableKey('database/other.bin')).toBe(true)
+        expect(isChunkableKey('generic/extension-defined.bin')).toBe(true)
+        expect(isChunkableKey('chats')).toBe(true)
         expect(isChunkableKey(null as unknown as string)).toBe(false)
     })
 

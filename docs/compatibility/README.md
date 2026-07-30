@@ -78,7 +78,7 @@ many users use that path.
 ## Backup and interchange reports
 
 - [RISUSAVE block databases over 64 MiB were rejected (fixed 2026-07-30)](legacy-risusave-64mib-import-cap.md)
-- [Large buffered backup/save-folder rows are rejected](save-folder-opaque-row-32mib-cap.md)
+- [Large buffered backup/save-folder rows were rejected (fixed 2026-07-30)](save-folder-opaque-row-32mib-cap.md)
 - [Save-folder restore had a fixed deadline (fixed 2026-07-30)](save-folder-restore-fixed-deadline.md)
 - [Upstream export can emit a PocketRisu-only version byte](upstream-export-plugin-proto-header.md)
 
