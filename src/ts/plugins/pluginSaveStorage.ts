@@ -4293,9 +4293,10 @@ export async function transitionPluginStorageMode(
             );
         }
 
-        // Earlier plugin reloads, including every awaited V2 unload callback,
-        // have now drained. Keep the synchronous legacy guard active from this
-        // point until reconciliation and its durable save have completed.
+        // Earlier plugin reloads, including each V2 unload grace period, have
+        // now drained. Retired generations cannot publish late writes. Keep the
+        // synchronous legacy guard active until reconciliation and its durable
+        // save have completed.
         const finishTransition = beginPluginStorageModeTransition();
         try {
             return await withPluginSaveStorageLock(async () => {

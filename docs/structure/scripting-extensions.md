@@ -77,6 +77,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - `getV2PluginAPIs()` exposes model registration, script/replacer registration, limited database access, safe globals/storage/document wrappers, and asset operations (`src/ts/plugins/plugins.svelte.ts:508`).
   - `addProvider()` registers a provider callback and optional tokenizer metadata (`src/ts/plugins/plugins.svelte.ts:530`).
   - `loadV2Plugin()` unloads prior hooks and executes transformed source through `new Function`; V2.0 execution additionally requires `allowV2Plugin` (`src/ts/plugins/plugins.svelte.ts:813`, `src/ts/plugins/plugins.svelte.ts:885`, `src/ts/plugins/plugins.svelte.ts:899`).
+  - V2 teardown starts all unload callbacks within one five-second generation grace, revokes captured host facades when the grace closes, and releases the global lifecycle queue even if a callback never settles. Disable/removal records are durably committed before cleanup and reconciled again before the next generation loads.
 
 - `src/ts/plugins/pluginSafety.ts` — `checkCodeSafety()` parses V2.1 source with Acorn, rewrites sensitive globals, and caches the transformed result by source hash/checker version (`src/ts/plugins/pluginSafety.ts:59`).
   - It rejects direct `eval`, `new Function`, `sessionStorage`, and `cookieStore` (`src/ts/plugins/pluginSafety.ts:21`).

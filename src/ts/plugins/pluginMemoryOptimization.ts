@@ -21,7 +21,8 @@ function invokePluginLifecycleOperation<T>(
 /**
  * Serialize plugin load/unload work with storage-mode transitions. A transition
  * must not snapshot inline V2 storage until every earlier unload callback has
- * completed, while later reloads must not start until reconciliation finishes.
+ * completed or its bounded generation grace has expired, while later reloads
+ * must not start until reconciliation finishes.
  */
 export function withPluginLifecycleLock<T>(
     operation: (lease: PluginLifecycleLease) => Promise<T>,

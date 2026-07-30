@@ -487,8 +487,10 @@ export async function importPlugin(code:string|null = null, argu:{
                         if (hotReloadIndex !== -1) hotReloading.splice(hotReloadIndex, 1)
                     }
                 },
-                true,
-                pluginData.name,
+                {
+                    rollbackOnReloadFailure: true,
+                    targetPluginName: pluginData.name,
+                },
             )
             console.log(`Imported plugin: ${pluginData.name} (API v${apiVersion})`)
             if (disabledForMemoryOptimization) {
@@ -601,6 +603,7 @@ function pluginLifecycleError(failures: PluginLifecycleFailure[]): AggregateErro
 
 async function loadPluginsWithReportUnlocked(
     _lifecycleLease: PluginLifecycleLease,
+    afterTeardown?: () => void,
 ): Promise<PluginLifecycleReport> {
     console.log('Loading plugins...')
     const db = getDatabase()
@@ -655,6 +658,7 @@ async function loadPluginsWithReportUnlocked(
     let v2LoadError: unknown
     const v3LoadFailures: PluginLifecycleFailure[] = []
     try {
+        afterTeardown?.()
         const currentDatabase = getDatabase()
         const enabledPlugins = safeStructuredClone(currentDatabase.plugins ?? [])
             .filter((plugin: RisuPlugin) => (
@@ -739,39 +743,17 @@ async function commitPluginListMutation(
     lifecycleLease: PluginLifecycleLease,
     operation: string,
     rollback: () => void,
-    rollbackOnReloadFailure: boolean,
-    targetPluginName?: string,
+    options: {
+        rollbackOnReloadFailure: boolean
+        targetPluginName?: string
+        persistBeforeLifecycle?: boolean
+        reapplyAfterTeardown?: () => void
+    },
 ): Promise<void> {
-    let lifecycleReport: PluginLifecycleReport = { failures: [] }
-    let lifecycleError: unknown
-    try {
-        lifecycleReport = await loadPluginsWithReportUnlocked(lifecycleLease)
-    } catch (error) {
-        lifecycleError = error
-    }
-
-    const actionableFailures = lifecycleReport.failures.filter(failure => !(
-        rollbackOnReloadFailure
-        && targetPluginName !== undefined
-        && failure.phase === "v3-load"
-        && failure.pluginName !== targetPluginName
-    ))
-    const unrelatedFailures = lifecycleReport.failures.filter(
-        failure => !actionableFailures.includes(failure),
-    )
-    if (unrelatedFailures.length > 0) {
-        // V3 startup already emits a plugin-specific error notification. Record
-        // that the requested mutation remains valid despite those failures.
-        console.warn(
-            `[Plugins] ${operation} continued despite unrelated V3 startup failures:`,
-            unrelatedFailures.map(failure => failure.pluginName),
-        )
-    }
-    if (lifecycleError === undefined && actionableFailures.length > 0) {
-        lifecycleError = pluginLifecycleError(actionableFailures)
-    }
-
-    const rollbackMutation = async (causes: unknown[]): Promise<never> => {
+    const rollbackMutation = async (
+        causes: unknown[],
+        reloadAfterRollback: boolean,
+    ): Promise<never> => {
         const errors = [...causes]
         let rollbackSaveCommitted = false
         try {
@@ -780,10 +762,12 @@ async function commitPluginListMutation(
         } catch (error) {
             errors.push(error)
         }
-        try {
-            await loadPluginsUnlocked(lifecycleLease)
-        } catch (error) {
-            errors.push(error)
+        if (reloadAfterRollback) {
+            try {
+                await loadPluginsUnlocked(lifecycleLease)
+            } catch (error) {
+                errors.push(error)
+            }
         }
         try {
             requireCommittedDatabaseSave(
@@ -802,8 +786,53 @@ async function commitPluginListMutation(
         )
     }
 
-    if (lifecycleError && rollbackOnReloadFailure) {
-        return rollbackMutation([lifecycleError])
+    if (options.persistBeforeLifecycle) {
+        try {
+            requireCommittedDatabaseSave(
+                await requestImmediateSave({ forceFullWrite: true }),
+                operation,
+            )
+        } catch (saveError) {
+            // No plugin code has run yet, so the existing runtime generation
+            // still matches the restored list and must not be torn down.
+            return rollbackMutation([saveError], false)
+        }
+    }
+
+    let lifecycleReport: PluginLifecycleReport = { failures: [] }
+    let lifecycleError: unknown
+    try {
+        lifecycleReport = await loadPluginsWithReportUnlocked(
+            lifecycleLease,
+            options.reapplyAfterTeardown,
+        )
+    } catch (error) {
+        lifecycleError = error
+    }
+
+    const actionableFailures = lifecycleReport.failures.filter(failure => !(
+        options.rollbackOnReloadFailure
+        && options.targetPluginName !== undefined
+        && failure.phase === "v3-load"
+        && failure.pluginName !== options.targetPluginName
+    ))
+    const unrelatedFailures = lifecycleReport.failures.filter(
+        failure => !actionableFailures.includes(failure),
+    )
+    if (unrelatedFailures.length > 0) {
+        // V3 startup already emits a plugin-specific error notification. Record
+        // that the requested mutation remains valid despite those failures.
+        console.warn(
+            `[Plugins] ${operation} continued despite unrelated V3 startup failures:`,
+            unrelatedFailures.map(failure => failure.pluginName),
+        )
+    }
+    if (lifecycleError === undefined && actionableFailures.length > 0) {
+        lifecycleError = pluginLifecycleError(actionableFailures)
+    }
+
+    if (lifecycleError && options.rollbackOnReloadFailure) {
+        return rollbackMutation([lifecycleError], true)
     }
 
     try {
@@ -812,8 +841,15 @@ async function commitPluginListMutation(
             operation,
         )
     } catch (saveError) {
+        if (options.persistBeforeLifecycle) {
+            throw new AggregateError(
+                lifecycleError ? [lifecycleError, saveError] : [saveError],
+                `${operation} was durably committed, but plugin cleanup state was not durably saved.`,
+            )
+        }
         return rollbackMutation(
             lifecycleError ? [lifecycleError, saveError] : [saveError],
+            true,
         )
     }
 
@@ -845,8 +881,34 @@ export function setPluginEnabledAndReload(
             lifecycleLease,
             `Plugin ${enabled ? "enable" : "disable"}`,
             () => restorePluginInLiveList(pluginName, originalIndex, originalPlugin),
-            enabled,
-            enabled ? pluginName : undefined,
+            {
+                rollbackOnReloadFailure: enabled,
+                targetPluginName: enabled ? pluginName : undefined,
+                persistBeforeLifecycle: !enabled,
+                reapplyAfterTeardown: enabled ? undefined : () => {
+                    const liveDatabase = getDatabase()
+                    const livePlugin = liveDatabase.plugins?.find(
+                        candidate => candidate.name === pluginName,
+                    )
+                    if (livePlugin) {
+                        livePlugin.enabled = false
+                        liveDatabase.plugins = (liveDatabase.plugins ?? []).filter(
+                            candidate => candidate.name !== pluginName
+                                || candidate === livePlugin,
+                        )
+                    } else {
+                        const disabledPlugin = safeStructuredClone(originalPlugin)
+                        disabledPlugin.enabled = false
+                        const insertionIndex = Math.min(
+                            Math.max(originalIndex, 0),
+                            liveDatabase.plugins?.length ?? 0,
+                        )
+                        liveDatabase.plugins ??= []
+                        liveDatabase.plugins.splice(insertionIndex, 0, disabledPlugin)
+                    }
+                    setDatabaseLite(liveDatabase)
+                },
+            },
         )
         return "updated"
     })
@@ -870,7 +932,19 @@ export function removePluginAndReload(pluginName: string): Promise<boolean> {
                 restorePluginInLiveList(pluginName, index, removedPlugin)
                 getDatabase().currentPluginProvider = previousProvider
             },
-            false,
+            {
+                rollbackOnReloadFailure: false,
+                persistBeforeLifecycle: true,
+                reapplyAfterTeardown: () => {
+                    const liveDatabase = getDatabase()
+                    liveDatabase.plugins = (liveDatabase.plugins ?? [])
+                        .filter(plugin => plugin.name !== pluginName)
+                    if (liveDatabase.currentPluginProvider === pluginName) {
+                        liveDatabase.currentPluginProvider = ""
+                    }
+                    setDatabaseLite(liveDatabase)
+                },
+            },
         )
         return true
     })
@@ -950,12 +1024,153 @@ export const allowedDbKeys = [
     'characterOrder'
 ]
 
-export const getV2PluginAPIs = () => {
+export const V2_PLUGIN_UNLOAD_GRACE_MS = 5_000
+
+type V2PluginApiGeneration = {
+    readonly id: symbol
+    active: boolean
+}
+
+let activeV2PluginApiGeneration: V2PluginApiGeneration | undefined
+
+function assertV2PluginApiGenerationActive(
+    generation: V2PluginApiGeneration | undefined,
+): void {
+    if (generation && !generation.active) {
+        throw new Error("This V2 plugin generation has already been unloaded.")
+    }
+}
+
+/**
+ * Keep every host object reached through a loaded V2 generation revocable.
+ * Functions are wrapped at property-read time, so callbacks that retain a
+ * method cannot regain access by waiting until a newer generation is live.
+ */
+function createV2PluginApiGenerationFacade<T extends object>(
+    source: T,
+    generation: V2PluginApiGeneration,
+): T {
+    const facadeBySource = new WeakMap<object, object>()
+    const sourceByFacade = new WeakMap<object, object>()
+
+    const unwrap = <V>(value: V): V => {
+        if ((typeof value === "object" && value !== null) || typeof value === "function") {
+            return (sourceByFacade.get(value as object) ?? value) as V
+        }
+        return value
+    }
+
+    const wrap = <V>(value: V): V => {
+        if ((typeof value !== "object" || value === null) && typeof value !== "function") {
+            return value
+        }
+        const target = value as object
+        const cached = facadeBySource.get(target)
+        if (cached) return cached as V
+
+        const facade = new Proxy(target, {
+            apply(callable, thisArg, args) {
+                assertV2PluginApiGenerationActive(generation)
+                const result = Reflect.apply(
+                    callable as (...args: unknown[]) => unknown,
+                    unwrap(thisArg),
+                    args.map(unwrap),
+                )
+                // Function.prototype.bind/valueOf can otherwise reveal a raw
+                // host method that outlives this generation.
+                return typeof result === "function" ? wrap(result) : result
+            },
+            construct(callable, args, newTarget) {
+                assertV2PluginApiGenerationActive(generation)
+                return wrap(Reflect.construct(
+                    callable as new (...args: unknown[]) => object,
+                    args.map(unwrap),
+                    unwrap(newTarget),
+                ))
+            },
+            get(nestedTarget, prop, receiver) {
+                assertV2PluginApiGenerationActive(generation)
+                const descriptor = Reflect.getOwnPropertyDescriptor(nestedTarget, prop)
+                if (descriptor
+                    && !descriptor.configurable
+                    && "value" in descriptor
+                    && !descriptor.writable) {
+                    // Proxy invariants require the exact value for intrinsic
+                    // non-configurable callable metadata.
+                    return descriptor.value
+                }
+                return wrap(Reflect.get(nestedTarget, prop, receiver))
+            },
+            set(nestedTarget, prop, nestedValue, receiver) {
+                assertV2PluginApiGenerationActive(generation)
+                return Reflect.set(nestedTarget, prop, nestedValue, receiver)
+            },
+            deleteProperty(nestedTarget, prop) {
+                assertV2PluginApiGenerationActive(generation)
+                return Reflect.deleteProperty(nestedTarget, prop)
+            },
+            defineProperty(nestedTarget, prop, descriptor) {
+                assertV2PluginApiGenerationActive(generation)
+                return Reflect.defineProperty(
+                    nestedTarget,
+                    prop,
+                    descriptor,
+                )
+            },
+            getOwnPropertyDescriptor(nestedTarget, prop) {
+                assertV2PluginApiGenerationActive(generation)
+                const descriptor = Reflect.getOwnPropertyDescriptor(nestedTarget, prop)
+                if (!descriptor || !("value" in descriptor) || !descriptor.configurable) {
+                    return descriptor
+                }
+                return { ...descriptor, value: wrap(descriptor.value) }
+            },
+            getPrototypeOf(nestedTarget) {
+                assertV2PluginApiGenerationActive(generation)
+                return Reflect.getPrototypeOf(nestedTarget)
+            },
+            setPrototypeOf(nestedTarget, prototype) {
+                assertV2PluginApiGenerationActive(generation)
+                return Reflect.setPrototypeOf(nestedTarget, prototype)
+            },
+            has(nestedTarget, prop) {
+                assertV2PluginApiGenerationActive(generation)
+                return Reflect.has(nestedTarget, prop)
+            },
+            ownKeys(nestedTarget) {
+                assertV2PluginApiGenerationActive(generation)
+                return Reflect.ownKeys(nestedTarget)
+            },
+            isExtensible(nestedTarget) {
+                assertV2PluginApiGenerationActive(generation)
+                return Reflect.isExtensible(nestedTarget)
+            },
+            preventExtensions(_nestedTarget) {
+                assertV2PluginApiGenerationActive(generation)
+                // Keeping source properties configurable prevents Object.freeze
+                // from forcing raw host functions through Proxy invariants.
+                return false
+            },
+        })
+        facadeBySource.set(target, facade)
+        sourceByFacade.set(facade, target)
+        return facade as V
+    }
+
+    return wrap(source)
+}
+
+export const getV2PluginAPIs = (generation?: V2PluginApiGeneration) => {
+    const assertGenerationAccess = () => {
+        assertV2PluginApiGenerationActive(generation)
+    }
     const canUseSynchronousPluginStorage = () => {
+        if (generation && !generation.active) return false
         const db = getDatabase()
         return db.optimizePluginMemory !== true && !isPluginStorageModeTransitioning()
     }
     const assertSynchronousPluginStorageAccess = () => {
+        assertGenerationAccess()
         if (!canUseSynchronousPluginStorage()) {
             throw new Error("Legacy plugin database access is unavailable during a storage mode transition.")
         }
@@ -1458,7 +1673,7 @@ export const getV2PluginAPIs = () => {
         return legacyStorageFacade
     }
 
-    return {
+    const pluginApis = {
         risuFetch: globalFetch,
         nativeFetch: fetchNative,
         getArg: (arg: string) => {
@@ -1554,7 +1769,10 @@ export const getV2PluginAPIs = () => {
             //compatibility layer with old unsafe APIs
 
             //from PBV2
-            safeGlobal.showDirectoryPicker = window.showDirectoryPicker
+            safeGlobal.showDirectoryPicker = (...args: Parameters<typeof window.showDirectoryPicker>) => {
+                assertGenerationAccess()
+                return window.showDirectoryPicker(...args)
+            }
 
             safeGlobal.DBState = {
                 db: toGetter(
@@ -1562,27 +1780,43 @@ export const getV2PluginAPIs = () => {
                 )
             }
             safeGlobal.setInterval = (...args: any[]) => {
+                assertGenerationAccess()
                 //@ts-expect-error spreading any[] into setInterval params causes type mismatch with TimerHandler signature
                 return globalThis.setInterval(...args);
             }
             safeGlobal.setTimeout = (...args: any[]) => {
+                assertGenerationAccess()
                 //@ts-expect-error spreading any[] into setTimeout params causes type mismatch with TimerHandler signature
                 return globalThis.setTimeout(...args);
             }
             safeGlobal.clearInterval = (...args: any[]) => {
+                assertGenerationAccess()
                 //@ts-expect-error spreading any[] into clearInterval - first arg should be number | undefined
                 return globalThis.clearInterval(...args);
             }
             safeGlobal.clearTimeout = (...args: any[]) => {
+                assertGenerationAccess()
                 //@ts-expect-error spreading any[] into clearTimeout - first arg should be number | undefined
                 return globalThis.clearTimeout(...args);
             }
-            safeGlobal.alert = globalThis.alert;
-            safeGlobal.confirm = globalThis.confirm;
-            safeGlobal.prompt = globalThis.prompt;
+            safeGlobal.alert = (...args: Parameters<typeof globalThis.alert>) => {
+                assertGenerationAccess()
+                return globalThis.alert(...args)
+            };
+            safeGlobal.confirm = (...args: Parameters<typeof globalThis.confirm>) => {
+                assertGenerationAccess()
+                return globalThis.confirm(...args)
+            };
+            safeGlobal.prompt = (...args: Parameters<typeof globalThis.prompt>) => {
+                assertGenerationAccess()
+                return globalThis.prompt(...args)
+            };
             safeGlobal.innerWidth = window.innerWidth;
             safeGlobal.innerHeight = window.innerHeight;
-            safeGlobal.getComputedStyle = window.getComputedStyle
+            safeGlobal.getComputedStyle = (...args: Parameters<typeof window.getComputedStyle>) => {
+                assertGenerationAccess()
+                return window.getComputedStyle(...args)
+            }
             safeGlobal.navigator = window.navigator;
             safeGlobal.localStorage = globalThis.__pluginApis__.safeLocalStorage;
             safeGlobal.indexedDB = globalThis.__pluginApis__.safeIdbFactory;
@@ -1599,10 +1833,12 @@ export const getV2PluginAPIs = () => {
             safeGlobal.Function = globalThis.__pluginApis__.SafeFunction;
             safeGlobal.document = globalThis.__pluginApis__.safeDocument;
             safeGlobal.addEventListener = (...args: any[]) => {
+                assertGenerationAccess()
                 //@ts-expect-error spreading any[] into addEventListener - expects (type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions)
                 window.addEventListener(...args);
             }
             safeGlobal.removeEventListener = (...args: any[]) => {
+                assertGenerationAccess()
                 //@ts-expect-error spreading any[] into removeEventListener - expects (type: string, listener: EventListenerOrEventListenerObject, options?: boolean | EventListenerOptions)
                 window.removeEventListener(...args);
             }
@@ -1885,29 +2121,64 @@ export const getV2PluginAPIs = () => {
         },
 
     }
+    return generation
+        ? createV2PluginApiGenerationFacade(pluginApis, generation)
+        : pluginApis
 }
 
 export async function teardownV2Plugins(): Promise<void> {
     const callbacks = [...pluginV2.unload]
-    const errors: unknown[] = []
+    const retiringGeneration = activeV2PluginApiGeneration
+    const callbackErrors: Array<unknown | undefined> = new Array(callbacks.length)
+    const callbackSettled = new Array(callbacks.length).fill(false)
+    let graceExpired = false
 
     // Detach the dying generation from host event registries before invoking
-    // third-party cleanup, while retaining its captured storage facade so its
-    // awaited final inline writes can still complete.
+    // third-party cleanup. Its captured host facade remains usable only for the
+    // bounded grace period so awaited final inline writes can still complete.
     clearPluginV2RuntimeRegistries()
     try {
-        for (const unload of callbacks) {
+        const settlements = callbacks.map(async (unload, index) => {
             try {
                 await unload()
             } catch (error) {
-                errors.push(error)
+                if (graceExpired) {
+                    console.warn("[Plugins] A V2 unload callback failed after its generation retired.", error)
+                } else {
+                    callbackErrors[index] = error
+                }
+            } finally {
+                callbackSettled[index] = true
+            }
+        })
+
+        if (settlements.length > 0) {
+            let timeout: ReturnType<typeof setTimeout> | undefined
+            const drained = Promise.all(settlements).then(() => "drained" as const)
+            const deadline = new Promise<"timeout">((resolve) => {
+                timeout = setTimeout(() => resolve("timeout"), V2_PLUGIN_UNLOAD_GRACE_MS)
+            })
+            const result = await Promise.race([drained, deadline])
+            if (timeout !== undefined) clearTimeout(timeout)
+            if (result === "timeout") {
+                graceExpired = true
+                const pendingCount = callbackSettled.filter(settled => !settled).length
+                callbackErrors.push(new Error(
+                    `${pendingCount} V2 unload callback${pendingCount === 1 ? "" : "s"} `
+                    + `exceeded the ${V2_PLUGIN_UNLOAD_GRACE_MS} ms grace period.`,
+                ))
             }
         }
     } finally {
+        if (retiringGeneration) retiringGeneration.active = false
+        if (activeV2PluginApiGeneration === retiringGeneration) {
+            activeV2PluginApiGeneration = undefined
+        }
         // Cleanup callbacks may register residue through captured APIs.
         clearPluginV2RuntimeRegistries()
     }
 
+    const errors = callbackErrors.filter(error => error !== undefined)
     if (errors.length > 0) {
         throw new AggregateError(errors, "One or more V2 unload callbacks failed.")
     }
@@ -1920,7 +2191,13 @@ export async function loadV2PluginGeneration(plugins: RisuPlugin[]) {
     plugins = plugins.filter(canLoadLegacyPlugin)
     pluginV2.loaded = plugins.length > 0
 
-    globalThis.__pluginApis__ = getV2PluginAPIs()
+    if (activeV2PluginApiGeneration) activeV2PluginApiGeneration.active = false
+    const generation: V2PluginApiGeneration = {
+        id: Symbol("v2-plugin-api-generation"),
+        active: true,
+    }
+    activeV2PluginApiGeneration = generation
+    globalThis.__pluginApis__ = getV2PluginAPIs(generation)
 
     for (const plugin of plugins) {
         let data = ''

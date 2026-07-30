@@ -447,9 +447,11 @@ const {
     importPlugin,
     loadPlugins,
     loadV2Plugin,
+    loadV2PluginGeneration,
     pluginV2,
     removePluginAndReload,
     setPluginEnabledAndReload,
+    V2_PLUGIN_UNLOAD_GRACE_MS,
     waitForDeferredPluginApiReloadIdle,
 } = await import("./plugins.svelte");
 const {
@@ -539,9 +541,9 @@ function makeInvalidRecord(
 beforeEach(async () => {
     vi.clearAllMocks();
     persistent.clear();
-    requestImmediateSave.mockResolvedValue({ status: "committed" });
-    teardownV3PluginsMock.mockResolvedValue(undefined);
-    loadV3PluginGenerationOutcomesMock.mockImplementation(async (plugins: any[]) => (
+    requestImmediateSave.mockReset().mockResolvedValue({ status: "committed" });
+    teardownV3PluginsMock.mockReset().mockResolvedValue(undefined);
+    loadV3PluginGenerationOutcomesMock.mockReset().mockImplementation(async (plugins: any[]) => (
         plugins.map(plugin => ({ pluginName: plugin.name, status: "fulfilled" as const }))
     ));
     database = {
@@ -3720,9 +3722,14 @@ describe("transitionPluginStorageMode", () => {
             enabled: true,
         }];
         pluginV2.loaded = true;
-        pluginV2.unload.add(async () => { throw new Error("unload failed"); });
+        const events: string[] = [];
+        pluginV2.unload.add(async () => {
+            events.push("unload");
+            throw new Error("unload failed");
+        });
         let persistedEnabled: boolean | undefined;
         requestImmediateSave.mockImplementationOnce(async () => {
+            events.push("save");
             persistedEnabled = database.plugins[0].enabled;
             return { status: "committed" };
         });
@@ -3734,7 +3741,8 @@ describe("transitionPluginStorageMode", () => {
 
         expect(database.plugins[0].enabled).toBe(false);
         expect(persistedEnabled).toBe(false);
-        expect(requestImmediateSave).toHaveBeenCalledOnce();
+        expect(events).toEqual(["save", "unload"]);
+        expect(requestImmediateSave).toHaveBeenCalledTimes(2);
         expect(requestImmediateSave).toHaveBeenCalledWith({ forceFullWrite: true });
     });
 
@@ -3881,9 +3889,14 @@ describe("transitionPluginStorageMode", () => {
             enabled: true,
         }];
         pluginV2.loaded = true;
-        pluginV2.unload.add(async () => { throw new Error("unload failed"); });
+        const events: string[] = [];
+        pluginV2.unload.add(async () => {
+            events.push("unload");
+            throw new Error("unload failed");
+        });
         let persistedPluginNames: string[] | undefined;
         requestImmediateSave.mockImplementationOnce(async () => {
+            events.push("save");
             persistedPluginNames = database.plugins.map((plugin: any) => plugin.name);
             return { status: "committed" };
         });
@@ -3893,8 +3906,89 @@ describe("transitionPluginStorageMode", () => {
 
         expect(database.plugins).toEqual([]);
         expect(persistedPluginNames).toEqual([]);
-        expect(requestImmediateSave).toHaveBeenCalledOnce();
+        expect(events).toEqual(["save", "unload"]);
+        expect(requestImmediateSave).toHaveBeenCalledTimes(2);
         expect(requestImmediateSave).toHaveBeenCalledWith({ forceFullWrite: true });
+    });
+
+    test("keeps a precommitted disable when cleanup mutates the list and its save fails", async () => {
+        const originalPlugin = {
+            name: "Precommitted disable",
+            script: "original script",
+            arguments: {},
+            realArg: {},
+            version: "2.1" as const,
+            customLink: [],
+            argMeta: {},
+            enabled: true,
+        };
+        database.plugins = [structuredClone(originalPlugin)];
+        pluginV2.unload.add(() => {
+            database.plugins = [
+                {
+                    ...structuredClone(database.plugins[0]),
+                    script: "cleanup replacement",
+                    enabled: true,
+                },
+                structuredClone(originalPlugin),
+            ];
+        });
+        let preCleanupSnapshot: any[] | undefined;
+        requestImmediateSave
+            .mockImplementationOnce(async () => {
+                preCleanupSnapshot = structuredClone(database.plugins);
+                return { status: "committed" };
+            })
+            .mockRejectedValueOnce(new Error("cleanup save failed"));
+
+        await expect(setPluginEnabledAndReload(originalPlugin.name, false))
+            .rejects.toThrow("durably committed, but plugin cleanup state was not durably saved");
+
+        expect(preCleanupSnapshot).toEqual([{ ...originalPlugin, enabled: false }]);
+        expect(database.plugins).toEqual([{
+            ...originalPlugin,
+            script: "cleanup replacement",
+            enabled: false,
+        }]);
+        expect(requestImmediateSave).toHaveBeenCalledTimes(2);
+    });
+
+    test("keeps a precommitted removal when cleanup tries to restore the target", async () => {
+        const removedPlugin = {
+            name: "Precommitted removal",
+            script: "",
+            arguments: {},
+            realArg: {},
+            version: "2.1" as const,
+            customLink: [],
+            argMeta: {},
+            enabled: true,
+        };
+        const retainedPlugin = { ...removedPlugin, name: "Retained plugin" };
+        database.plugins = [structuredClone(removedPlugin), structuredClone(retainedPlugin)];
+        database.currentPluginProvider = removedPlugin.name;
+        pluginV2.unload.add(() => {
+            database.plugins.push(structuredClone(removedPlugin));
+            database.currentPluginProvider = removedPlugin.name;
+        });
+        let preCleanupSnapshot: { names: string[]; provider: string } | undefined;
+        requestImmediateSave
+            .mockImplementationOnce(async () => {
+                preCleanupSnapshot = {
+                    names: database.plugins.map((plugin: any) => plugin.name),
+                    provider: database.currentPluginProvider,
+                };
+                return { status: "committed" };
+            })
+            .mockRejectedValueOnce(new Error("cleanup save failed"));
+
+        await expect(removePluginAndReload(removedPlugin.name))
+            .rejects.toThrow("durably committed, but plugin cleanup state was not durably saved");
+
+        expect(preCleanupSnapshot).toEqual({ names: [retainedPlugin.name], provider: "" });
+        expect(database.plugins).toEqual([retainedPlugin]);
+        expect(database.currentPluginProvider).toBe("");
+        expect(requestImmediateSave).toHaveBeenCalledTimes(2);
     });
 
     test.each([
@@ -3925,7 +4019,7 @@ describe("transitionPluginStorageMode", () => {
         expect(requestImmediateSave).toHaveBeenNthCalledWith(2, { forceFullWrite: true });
     });
 
-    test("restores a disabled plugin through the live list after teardown replaces it", async () => {
+    test("restores a disabled plugin without teardown when its pre-cleanup save fails", async () => {
         const originalPlugin = {
             name: "Live-list power rollback",
             script: "original script",
@@ -3937,12 +4031,6 @@ describe("transitionPluginStorageMode", () => {
             enabled: true,
         };
         database.plugins = [structuredClone(originalPlugin)];
-        teardownV3PluginsMock.mockImplementationOnce(async () => {
-            const replacement = structuredClone(database.plugins);
-            replacement[0].script = "callback replacement";
-            replacement[0].arguments = { callback: "string" };
-            database.plugins = replacement;
-        });
         let persistedRollback: any[] | undefined;
         requestImmediateSave
             .mockRejectedValueOnce(new Error("exact save rejected"))
@@ -3959,11 +4047,11 @@ describe("transitionPluginStorageMode", () => {
         expect(requestImmediateSave).toHaveBeenCalledTimes(2);
         expect(requestImmediateSave).toHaveBeenNthCalledWith(1, { forceFullWrite: true });
         expect(requestImmediateSave).toHaveBeenNthCalledWith(2, { forceFullWrite: true });
-        expect(loadV3PluginGenerationOutcomesMock.mock.calls[0]?.[0]).toEqual([]);
-        expect(loadV3PluginGenerationOutcomesMock.mock.calls.at(-1)?.[0]).toEqual([originalPlugin]);
+        expect(teardownV3PluginsMock).not.toHaveBeenCalled();
+        expect(loadV3PluginGenerationOutcomesMock).not.toHaveBeenCalled();
     });
 
-    test("restores removal order and provider without duplicating a callback replacement", async () => {
+    test("restores removal order and provider without teardown when its pre-cleanup save fails", async () => {
         const removedPlugin = {
             name: "Live-list removal rollback",
             script: "original removed script",
@@ -3984,14 +4072,6 @@ describe("transitionPluginStorageMode", () => {
             structuredClone(retainedPlugin),
         ];
         database.currentPluginProvider = removedPlugin.name;
-        teardownV3PluginsMock.mockImplementationOnce(async () => {
-            database.plugins = [
-                structuredClone(database.plugins[0]),
-                { ...structuredClone(removedPlugin), script: "callback update" },
-                { ...structuredClone(removedPlugin), script: "callback duplicate" },
-            ];
-            database.currentPluginProvider = "callback provider";
-        });
         let persistedRollback: any;
         requestImmediateSave
             .mockResolvedValueOnce({ status: "displaced" })
@@ -4014,8 +4094,8 @@ describe("transitionPluginStorageMode", () => {
             plugins: [removedPlugin, retainedPlugin],
             provider: removedPlugin.name,
         });
-        expect(loadV3PluginGenerationOutcomesMock.mock.calls.at(-1)?.[0])
-            .toEqual([removedPlugin, retainedPlugin]);
+        expect(teardownV3PluginsMock).not.toHaveBeenCalled();
+        expect(loadV3PluginGenerationOutcomesMock).not.toHaveBeenCalled();
         expect(requestImmediateSave).toHaveBeenNthCalledWith(1, { forceFullWrite: true });
         expect(requestImmediateSave).toHaveBeenNthCalledWith(2, { forceFullWrite: true });
     });
@@ -4073,13 +4153,13 @@ describe("transitionPluginStorageMode", () => {
             argMeta: {},
             enabled: false,
         }];
-        pluginV2.loaded = true;
-        const v2Apis = getV2PluginAPIs();
+        await loadV2PluginGeneration([]);
+        const v2Apis = (globalThis as any).__pluginApis__;
         let releaseUnload!: () => void;
         let markUnloadStarted!: () => void;
         const unloadBlocked = new Promise<void>(resolve => { releaseUnload = resolve; });
         const unloadStarted = new Promise<void>(resolve => { markUnloadStarted = resolve; });
-        pluginV2.unload.add(async () => {
+        v2Apis.onUnload(async () => {
             markUnloadStarted();
             await unloadBlocked;
             v2Apis.pluginStorage.setItem("unload-final", "included");
@@ -4102,6 +4182,122 @@ describe("transitionPluginStorageMode", () => {
         expect(persistent.get(encoded(PLUGIN_SAVE_PREFIX, "unload-final")))
             .toBe("included");
         expect(database.pluginCustomStorage).toEqual({});
+    });
+
+    test("bounds a hanging V2 unload and releases unrelated lifecycle work", async () => {
+        vi.useFakeTimers();
+        try {
+            database.plugins = [{
+                name: "Hanging legacy unload",
+                script: "",
+                arguments: {},
+                realArg: {},
+                version: "2.1",
+                customLink: [],
+                argMeta: {},
+                enabled: true,
+            }];
+            await loadV2PluginGeneration([]);
+            const v2Apis = (globalThis as any).__pluginApis__;
+            let markUnloadStarted!: () => void;
+            const unloadStarted = new Promise<void>(resolve => { markUnloadStarted = resolve; });
+            const neverSettles = new Promise<void>(() => undefined);
+            v2Apis.onUnload(async () => {
+                markUnloadStarted();
+                await neverSettles;
+            });
+            v2Apis.onUnload(() => {
+                v2Apis.pluginStorage.setItem("independent-unload", "completed");
+            });
+            const persistedEnabledStates: boolean[] = [];
+            requestImmediateSave.mockImplementation(async () => {
+                persistedEnabledStates.push(database.plugins[0]?.enabled ?? false);
+                return { status: "committed" };
+            });
+
+            const disableResult = setPluginEnabledAndReload(
+                "Hanging legacy unload",
+                false,
+            ).then(() => null, error => error);
+            await unloadStarted;
+            expect(persistedEnabledStates).toEqual([false]);
+
+            let queuedReloadSettled = false;
+            const queuedReload = loadPlugins().then(() => { queuedReloadSettled = true; });
+            await Promise.resolve();
+            expect(queuedReloadSettled).toBe(false);
+
+            await vi.advanceTimersByTimeAsync(V2_PLUGIN_UNLOAD_GRACE_MS);
+            const disableError = await disableResult;
+            await queuedReload;
+
+            expect(disableError).toBeInstanceOf(AggregateError);
+            expect(disableError.message).toContain(
+                "durably committed, but plugin teardown or reload failed",
+            );
+            expect(queuedReloadSettled).toBe(true);
+            expect(database.plugins[0].enabled).toBe(false);
+            expect(database.pluginCustomStorage["independent-unload"]).toBe("completed");
+            expect(persistedEnabledStates).toEqual([false, false]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    test("revokes a V2 generation before a timed-out unload resolves late", async () => {
+        vi.useFakeTimers();
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+        try {
+            database.plugins = [{
+                name: "Late legacy unload",
+                script: "",
+                arguments: {},
+                realArg: {},
+                version: "2.1",
+                customLink: [],
+                argMeta: {},
+                enabled: true,
+            }];
+            await loadV2PluginGeneration([]);
+            const v2Apis = (globalThis as any).__pluginApis__;
+            const retainedStorage = v2Apis.pluginStorage;
+            const retainedBoundSetItem = retainedStorage.setItem.bind(retainedStorage);
+            let releaseUnload!: () => void;
+            let markUnloadStarted!: () => void;
+            const unloadBlocked = new Promise<void>(resolve => { releaseUnload = resolve; });
+            const unloadStarted = new Promise<void>(resolve => { markUnloadStarted = resolve; });
+            v2Apis.onUnload(async () => {
+                markUnloadStarted();
+                await unloadBlocked;
+                retainedStorage.setItem("late-unload-write", "must-not-land");
+            });
+
+            const disableResult = setPluginEnabledAndReload(
+                "Late legacy unload",
+                false,
+            ).then(() => null, error => error);
+            await unloadStarted;
+            await vi.advanceTimersByTimeAsync(V2_PLUGIN_UNLOAD_GRACE_MS);
+            await disableResult;
+
+            releaseUnload();
+            for (let index = 0; index < 20 && warnSpy.mock.calls.length === 0; index += 1) {
+                await Promise.resolve();
+            }
+
+            expect(database.pluginCustomStorage).not.toHaveProperty("late-unload-write");
+            expect(() => retainedStorage.setItem("another-late-write", true))
+                .toThrow("already been unloaded");
+            expect(() => retainedBoundSetItem("bound-late-write", true))
+                .toThrow("already been unloaded");
+            expect(warnSpy).toHaveBeenCalledWith(
+                "[Plugins] A V2 unload callback failed after its generation retired.",
+                expect.objectContaining({ message: "This V2 plugin generation has already been unloaded." }),
+            );
+        } finally {
+            warnSpy.mockRestore();
+            vi.useRealTimers();
+        }
     });
 
     test("drains every V2 unload callback and releases a queued transition after errors", async () => {
