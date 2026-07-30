@@ -239,13 +239,11 @@ describe('bounded archive and save-folder ingress (real server)', () => {
 
   const boundedRows = [
     { label: 'generic', key: 'generic/large-row.bin', json: false },
-    { label: 'remote', key: 'remotes/large.local.bin', json: false },
     {
       label: 'plugin metadata',
       key: `pluginsave-meta/${Buffer.from('large-meta').toString('base64url')}.json`,
       json: true,
     },
-    { label: 'unsafe asset', key: 'assets/.unsafe-large-row', json: false },
   ] as const
 
   for (const route of ['ZIP', 'directory'] as const) {
@@ -297,6 +295,131 @@ describe('bounded archive and save-folder ingress (real server)', () => {
       }, 120_000)
     }
   }
+
+  for (const route of ['ZIP', 'directory'] as const) {
+    for (const row of [
+      { label: 'remote', key: 'remotes/large.local.bin' },
+      { label: 'unsafe asset', key: 'assets/.unsafe-large-row' },
+    ] as const) {
+      test(`${route} ${row.label} row streams above the former 32 MiB limit`, async () => {
+        const value = Buffer.alloc(BUFFERED_ROW_LIMIT + 1, 0x52)
+        const database = databaseEntry(createSeedBackup({
+          databaseFields: { globalNote: `${route}-${row.label}-streamed` },
+        }))
+        const { server, client } = await boot({ POCKETRISU_CHUNK_THRESHOLD: '4096' })
+
+        let response: Response
+        if (route === 'ZIP') {
+          response = await uploadSaveFolder(
+            client,
+            saveFolderZipWithRows(database, [{ key: row.key, value }]),
+          )
+        } else {
+          const sourceDir = path.join(server.cwd, `streamed-${row.label.replaceAll(' ', '-')}`)
+          await writeSaveFolderSource(sourceDir, database, [{ key: row.key, value }])
+          response = await executeSaveFolder(client, sourceDir)
+        }
+
+        expect(response.status).toBe(200)
+        await response.json()
+        await expectNote(client, `${route}-${row.label}-streamed`)
+        await waitForNoImportSpools(server)
+      }, 120_000)
+    }
+  }
+
+  test('backup import streams large raw inlays and cold-storage JSON', async () => {
+    const database = databaseEntry(createSeedBackup({
+      databaseFields: { globalNote: 'large-streamed-backup-categories' },
+    }))
+    const inlay = Buffer.alloc(BUFFERED_ROW_LIMIT + 1, 0x49)
+    const cold = validJsonBytes(BUFFERED_ROW_LIMIT + 1)
+    const unsafeAsset = Buffer.alloc(BUFFERED_ROW_LIMIT + 1, 0x55)
+    const archive = encodeBackup([
+      { name: 'database.risudat', data: database },
+      { name: 'inlay/large-inlay.bin', data: inlay },
+      { name: 'coldstorage/large-character.json', data: cold },
+      { name: '.unsafe-large-asset', data: unsafeAsset },
+    ])
+    const { server, client } = await boot({ POCKETRISU_CHUNK_THRESHOLD: '4096' })
+
+    expect((await client.importBackup(archive)).ok).toBe(true)
+    await expectNote(client, 'large-streamed-backup-categories')
+    expect((await stat(path.join(server.cwd, 'save', 'inlays', 'large-inlay.bin'))).size)
+      .toBe(inlay.length)
+    const coldResponse = await client.fetch('/api/read', {
+      headers: { 'file-path': Buffer.from('coldstorage/large-character').toString('hex') },
+    })
+    expect(coldResponse.status).toBe(200)
+    expect(Buffer.from(await coldResponse.arrayBuffer()).subarray(0, 2)).toEqual(
+      Buffer.from([0x1f, 0x8b]),
+    )
+    const unsafeResponse = await client.fetch('/api/read', {
+      headers: { 'file-path': Buffer.from('assets/.unsafe-large-asset').toString('hex') },
+    })
+    expect(unsafeResponse.status).toBe(200)
+    expect((await unsafeResponse.arrayBuffer()).byteLength).toBe(unsafeAsset.length)
+
+    const reexported = await client.exportBackup()
+    expect(decodeBackup(reexported).find(entry => entry.name === '.unsafe-large-asset')?.data.length)
+      .toBe(unsafeAsset.length)
+    expect((await client.importBackup(reexported)).ok).toBe(true)
+    await expectNote(client, 'large-streamed-backup-categories')
+    await waitForNoImportSpools(server)
+  }, 120_000)
+
+  test('explicit large restore bypasses soft byte and entry-count caps atomically', async () => {
+    const softByteCap = 1024 * 1024
+    const archive = encodeBackup([
+      ...decodeBackup(paddedBackupAt(softByteCap + 1, 'large-restore-confirmed')),
+      { name: 'second-small-asset', data: Buffer.from('ok') },
+    ])
+    const { client } = await boot({
+      RISU_BACKUP_IMPORT_MAX_BYTES: String(softByteCap),
+      RISU_BACKUP_IMPORT_MAX_ENTRIES: '2',
+    })
+
+    const ordinaryPrepare = await client.fetch('/api/backup/import/prepare', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ size: archive.length }),
+    })
+    await expectStructuredNotCommitted(ordinaryPrepare)
+
+    const confirmedPrepare = await client.fetch('/api/backup/import/prepare', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ size: archive.length, allowLargeRestore: true }),
+    })
+    expect(confirmedPrepare.status).toBe(200)
+
+    const restored = await client.fetch('/api/backup/import', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-risu-backup',
+        'x-risu-large-restore': '1',
+      },
+      body: new Uint8Array(archive),
+    })
+    expect(restored.status).toBe(200)
+    expect(await restored.json()).toMatchObject({ ok: true })
+    await expectNote(client, 'large-restore-confirmed')
+
+    const serverProduced = await client.exportBackup()
+    expect(serverProduced.length).toBeGreaterThan(softByteCap)
+    expect(decodeBackup(serverProduced).length).toBeGreaterThan(2)
+    const roundTrip = await client.fetch('/api/backup/import', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-risu-backup',
+        'x-risu-large-restore': '1',
+      },
+      body: new Uint8Array(serverProduced),
+    })
+    expect(roundTrip.status).toBe(200)
+    expect(await roundTrip.json()).toMatchObject({ ok: true })
+    await expectNote(client, 'large-restore-confirmed')
+  }, 120_000)
 
   test('archive cap accepts exact bytes, rejects +1, and default cap is finite', async () => {
     const cap = 1024 * 1024

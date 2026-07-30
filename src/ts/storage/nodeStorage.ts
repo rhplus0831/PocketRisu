@@ -4517,8 +4517,11 @@ export class NodeStorage{
         return da
     }
 
-    async prepareImport(size: number): Promise<void> {
-        const requestBody = JSON.stringify({ size })
+    async prepareImport(size: number, allowLargeRestore = false): Promise<void> {
+        const requestBody = JSON.stringify({
+            size,
+            ...(allowLargeRestore ? { allowLargeRestore: true } : {}),
+        })
         await runBoundedAuthoritativeStorageOperation(async (signal) => {
             const da = await this.authFetch('/api/backup/import/prepare', {
                 method: 'POST',
@@ -4541,9 +4544,11 @@ export class NodeStorage{
 
     async importBackup(
         file: Blob,
-        onProgress?: (loaded: number, total: number) => void
+        onProgress?: (loaded: number, total: number) => void,
+        options: { allowLargeRestore?: boolean } = {},
     ): Promise<{ok: boolean, assetsRestored: number, coldStorageFailed?: number}> {
-        await this.prepareImport(file.size)
+        const allowLargeRestore = options.allowLargeRestore === true
+        await this.prepareImport(file.size, allowLargeRestore)
         const authHeader = await this.createAuth()
 
         return await new Promise((resolve, reject) => {
@@ -4552,6 +4557,7 @@ export class NodeStorage{
             xhr.setRequestHeader('content-type', 'application/x-risu-backup')
             xhr.setRequestHeader('risu-auth', authHeader)
             xhr.setRequestHeader('x-session-id', NodeStorage.sessionId)
+            if (allowLargeRestore) xhr.setRequestHeader('x-risu-large-restore', '1')
             // Opt into NDJSON streaming so the server keeps the response socket
             // alive during long post-upload work — prevents reverse-proxy 502s.
             xhr.setRequestHeader('accept', 'application/x-ndjson')

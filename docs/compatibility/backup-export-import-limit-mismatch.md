@@ -1,6 +1,6 @@
 # Default imports can reject backups produced by the same server
 
-- Status: Confirmed self-round-trip regression
+- Status: Fixed 2026-07-30
 - Severity: High
 - Confidence: High
 - Introduced by: f1931989
@@ -35,3 +35,19 @@ preflight must match total, count, and per-category admission unless the
 importer streams those raw categories. Preserve a documented unlimited sentinel
 if safe. Test aggregate 2 GiB+1 and 100,001-entry plans without allocating their
 full payloads, plus a 32 MiB+1 inlay/cold row round trip.
+
+## Resolution
+
+The destructive-restore UI now explicitly selects a resource-checked large-restore
+admission path, and trusted server-file restores use the same path automatically.
+Ordinary API callers retain the conservative 2 GiB and 100,000-entry soft limits.
+Large restores use disk headroom admission and safely representable technical ceilings;
+they no longer interpret the ordinary soft limits as an inability to restore.
+
+Archive entry names and order-independent inlay metadata are tracked in a private,
+disk-backed SQLite index with bounded transaction batches instead of heap-wide sets and
+maps. Publication remains one destructive SQLite/filesystem transaction. Current raw
+inlays and cold-storage JSON stream through file-backed stages, and oversized asset and
+remote compatibility rows use chunked file ingestion. Coverage exercises soft-limit
+override, server-produced self-round-trip, disk-backed duplicate detection, and rows
+above the former 32 MiB buffered boundary.

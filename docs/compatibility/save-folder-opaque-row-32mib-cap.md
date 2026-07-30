@@ -1,6 +1,6 @@
 # Buffered backup/save-folder imports reject large opaque rows
 
-- Status: Confirmed import regression
+- Status: Partially fixed 2026-07-30; non-chunkable save-folder rows remain
 - Severity: Medium
 - Confidence: High
 - Introduced by: f1931989
@@ -12,19 +12,20 @@ chat rows, and eligible plugin-value rows, but falls back to
 importBoundedOpaqueRow() for other valid namespaces. That path defaults to 32
 MiB per entry. main did not have this per-entry limit.
 
-One concrete historical namespace is remotes/<id>.local.bin, used by split
-remote-character saves. The same bounded helper affects ordinary backup import,
-not only save folders.
+The concrete historical `remotes/<id>.local.bin` case and unsafe asset rows now use
+chunked file ingestion, and confirmed downloaded-backup restores have a separate
+large-restore admission path. Arbitrary non-chunkable save-folder namespaces and plugin
+metadata still fall back to the bounded helper.
 
 ## Compatibility impact
 
-A valid backup, save folder, or ZIP containing a remote row of 32 MiB+1 is
-rejected even when total bytes and entry count are below their configured
-limits. The error already reports row, configured limit, and actual size.
+A valid save folder or ZIP containing a remaining non-chunkable row of 32 MiB+1 is
+rejected even when total bytes and entry count are below their configured limits. The
+error already reports row, configured limit, and actual size.
 
 ## Recommendation
 
-Stream known legacy namespaces or spool opaque rows to the save volume instead
-of buffering them. Until then, document the existing
-RISU_IMPORT_BUFFERED_ENTRY_MAX_BYTES mitigation. Add a valid database plus a 32
-MiB+1 remotes row fixture to ordinary backup and save-folder tests.
+Define a file-backed representation for arbitrary opaque namespaces or reject them at
+the write boundary before they can become accepted live state. Until then, document the
+existing `RISU_IMPORT_BUFFERED_ENTRY_MAX_BYTES` mitigation. Remote and unsafe-asset
+fixtures above 32 MiB now cover the chunked ZIP/directory path.

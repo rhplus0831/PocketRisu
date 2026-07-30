@@ -205,9 +205,13 @@ export class AutoStorage{
         return this.realStorage.exportBackup(opts, signal)
     }
 
-    async importBackup(file: Blob, onProgress?: (loaded: number, total: number) => void) {
+    async importBackup(
+        file: Blob,
+        onProgress?: (loaded: number, total: number) => void,
+        options: { allowLargeRestore?: boolean } = {},
+    ) {
         await this.Init()
-        return this.realStorage.importBackup(file, onProgress)
+        return this.realStorage.importBackup(file, onProgress, options)
     }
 
     async patchItem(key: string, patchData: { patch: any[], expectedHash: string }): Promise<PatchItemResult> {

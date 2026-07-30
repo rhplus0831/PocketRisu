@@ -39,7 +39,7 @@ many users use that path.
 - [V3 top-level completion blocks application startup](v3-top-level-startup-barrier.md)
 - [Chat-row migration breaks direct rollback to main](chat-row-migration-breaks-main-rollback.md)
 - [Asset externalization breaks direct rollback to main](asset-externalization-breaks-main-rollback.md)
-- [Default export/import limits do not round-trip](backup-export-import-limit-mismatch.md)
+- [Default export/import limits did not round-trip (fixed 2026-07-30)](backup-export-import-limit-mismatch.md)
 
 ## Plugin and storage reports
 

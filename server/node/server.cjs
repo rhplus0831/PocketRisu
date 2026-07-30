@@ -175,6 +175,7 @@ const {
     backupEntrySize,
     preflightBackupEntries,
 } = require('./backupEntryFormat.cjs');
+const { createBackupImportIndex } = require('./backupImportIndex.cjs');
 const {
     PluginStorageValidationError,
     assertPluginStorageRow,
@@ -2324,6 +2325,11 @@ const IMPORT_JOURNAL_PATH = path.join(savePath, 'import_journal.json')
 const IMPORT_JOURNAL_MARKER_KEY = 'import_journal/marker'
 const hexRegex = /^[0-9a-fA-F]+$/;
 const DEFAULT_BACKUP_IMPORT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+// Large restore is an explicit, authenticated recovery action.  Keep ordinary
+// API callers behind the conservative soft limits while allowing the UI (after
+// its destructive-restore confirmations) and trusted server backups to use all
+// safely representable space that the disk preflight can admit.
+const DEFAULT_LARGE_RESTORE_MAX_BYTES = Math.floor(Number.MAX_SAFE_INTEGER / 2);
 const DEFAULT_LEGACY_DATABASE_IMPORT_MAX_BYTES = 64 * 1024 * 1024;
 const BACKUP_IMPORT_MAX_BYTES = finiteByteLimit(
     process.env.RISU_BACKUP_IMPORT_MAX_BYTES,
@@ -2343,6 +2349,15 @@ const BACKUP_IMPORT_MAX_ENTRIES = finiteByteLimit(
     process.env.RISU_BACKUP_IMPORT_MAX_ENTRIES,
     100_000,
     { max: 1_000_000 },
+);
+const LARGE_RESTORE_MAX_BYTES = finiteByteLimit(
+    process.env.RISU_LARGE_RESTORE_MAX_BYTES,
+    DEFAULT_LARGE_RESTORE_MAX_BYTES,
+    { max: DEFAULT_LARGE_RESTORE_MAX_BYTES },
+);
+const LARGE_RESTORE_MAX_ENTRIES = finiteByteLimit(
+    process.env.RISU_LARGE_RESTORE_MAX_ENTRIES,
+    Number.MAX_SAFE_INTEGER,
 );
 const IMPORT_BUFFERED_ENTRY_MAX_BYTES = finiteByteLimit(
     process.env.RISU_IMPORT_BUFFERED_ENTRY_MAX_BYTES,
@@ -2619,6 +2634,28 @@ function importContentLength(req, label) {
         throw importFormatError(`${label} has an invalid Content-Length`, 'INVALID_IMPORT_SIZE');
     }
     return value;
+}
+
+function requestConfirmsLargeRestore(req) {
+    return req.headers['x-risu-large-restore'] === '1';
+}
+
+function backupImportLimits({ allowLargeRestore = false } = {}) {
+    return allowLargeRestore
+        ? {
+            maxBytes: LARGE_RESTORE_MAX_BYTES,
+            maxEntries: LARGE_RESTORE_MAX_ENTRIES,
+            // Remaining compatibility-only buffered rows are admitted under
+            // the explicit recovery ceiling.  Current exported assets, raw
+            // inlays, cold storage, plugin values, and remote rows all use
+            // file-backed paths below and do not allocate this amount.
+            bufferedEntryMaxBytes: LARGE_RESTORE_MAX_BYTES,
+        }
+        : {
+            maxBytes: BACKUP_IMPORT_MAX_BYTES,
+            maxEntries: BACKUP_IMPORT_MAX_ENTRIES,
+            bufferedEntryMaxBytes: IMPORT_BUFFERED_ENTRY_MAX_BYTES,
+        };
 }
 
 async function assertImportDiskSpace(sourceBytes, targetPath = databaseSpoolDir) {
@@ -3241,35 +3278,52 @@ function writeImportedAsset(assetStage, key, value, source, writeKv = kvSet) {
     return 'kv';
 }
 
-async function writeImportedAssetFromFile(assetStage, key, source, signal, label) {
+async function writeImportedAssetFromFile(
+    assetStage,
+    key,
+    source,
+    signal,
+    label,
+    { maxBytes = BACKUP_IMPORT_MAX_BYTES, bufferedEntryMaxBytes = IMPORT_BUFFERED_ENTRY_MAX_BYTES } = {},
+) {
     const name = assetNameForKey(key);
     if (name !== null && isSafeAssetName(name)) {
         await copyFileToSpool(source.filePath, assetStage.store.assetPathFor(name), {
-            maxBytes: BACKUP_IMPORT_MAX_BYTES,
+            maxBytes,
             signal,
         });
         kvClearDeletion(key);
         return 'fs';
     }
-    const value = await readFileToBufferBounded(source.filePath, {
-        size: source.size,
-        maxBytes: Math.min(IMPORT_BUFFERED_ENTRY_MAX_BYTES, BACKUP_IMPORT_MAX_BYTES),
-        label: `${label} unsafe asset ${key}`,
-        code: 'IMPORT_BUFFERED_ENTRY_LIMIT',
-        signal,
-    });
-    kvSet(key, value);
+    if (isChunkableKey(key)) {
+        kvSetFromFile(key, source.filePath);
+    } else {
+        const value = await readFileToBufferBounded(source.filePath, {
+            size: source.size,
+            maxBytes: Math.min(bufferedEntryMaxBytes, maxBytes),
+            label: `${label} unsafe asset ${key}`,
+            code: 'IMPORT_BUFFERED_ENTRY_LIMIT',
+            signal,
+        });
+        kvSet(key, value);
+    }
     logger.warn(`[AssetFS] ${label} retained unsafe asset key ${key} in SQLite`);
     return 'kv';
 }
 
-async function validateAndImportPluginValueFile(key, source, signal, label) {
+async function validateAndImportPluginValueFile(
+    key,
+    source,
+    signal,
+    label,
+    { maxBytes = BACKUP_IMPORT_MAX_BYTES } = {},
+) {
     decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_PREFIX);
-    const maxBytes = Math.min(BACKUP_IMPORT_MAX_BYTES, PLUGIN_VALUE_MAX_BYTES);
+    const valueMaxBytes = Math.min(maxBytes, PLUGIN_VALUE_MAX_BYTES);
     try {
         await validateJsonFileStreaming(source.filePath, {
             size: source.size,
-            maxBytes,
+            maxBytes: valueMaxBytes,
             signal,
         });
     } catch (error) {
@@ -3285,15 +3339,80 @@ async function validateAndImportPluginValueFile(key, source, signal, label) {
     kvSetFromFile(key, source.filePath);
 }
 
-async function importBoundedOpaqueRow(key, source, signal, label, code = 'IMPORT_BUFFERED_ENTRY_LIMIT') {
+async function importBoundedOpaqueRow(
+    key,
+    source,
+    signal,
+    label,
+    code = 'IMPORT_BUFFERED_ENTRY_LIMIT',
+    { maxBytes = BACKUP_IMPORT_MAX_BYTES, bufferedEntryMaxBytes = IMPORT_BUFFERED_ENTRY_MAX_BYTES } = {},
+) {
+    if (isChunkableKey(key)) {
+        kvSetFromFile(key, source.filePath);
+        return;
+    }
     const value = await readFileToBufferBounded(source.filePath, {
         size: source.size,
-        maxBytes: Math.min(IMPORT_BUFFERED_ENTRY_MAX_BYTES, BACKUP_IMPORT_MAX_BYTES),
+        maxBytes: Math.min(bufferedEntryMaxBytes, maxBytes),
         label,
         code,
         signal,
     });
     kvSet(key, value);
+}
+
+async function importColdStorageFromFile(
+    storageKey,
+    source,
+    signal,
+    label,
+    { maxBytes, bufferedEntryMaxBytes },
+) {
+    const handle = await fs.open(source.filePath, 'r');
+    let gzip = false;
+    try {
+        const header = Buffer.alloc(2);
+        const { bytesRead } = await handle.read(header, 0, 2, 0);
+        gzip = bytesRead === 2 && header[0] === 0x1f && header[1] === 0x8b;
+    } finally {
+        await handle.close();
+    }
+
+    // Historical third-party archives sometimes put already-compressed bytes
+    // in a .json entry. Preserve that compatibility path; current PocketRisu
+    // exports are plain JSON and take the fully streaming path below.
+    if (gzip) {
+        const data = await readFileToBufferBounded(source.filePath, {
+            size: source.size,
+            maxBytes: Math.min(bufferedEntryMaxBytes, maxBytes),
+            label,
+            code: 'IMPORT_BUFFERED_ENTRY_LIMIT',
+            signal,
+        });
+        const storageValue = encodeColdStorageCanonicalBuffer(
+            parseColdStorageJsonBuffer(data, label, { allowPlainJson: true }).coldData,
+        );
+        kvSet(storageKey, storageValue);
+        return;
+    }
+
+    await validateJsonFileStreaming(source.filePath, {
+        size: source.size,
+        maxBytes,
+        signal,
+    });
+    const compressedPath = `${source.filePath}.cold.gz`;
+    try {
+        await pipeline(
+            createReadStream(source.filePath, { highWaterMark: IMPORT_IO_PAGE_BYTES }),
+            zlib.createGzip({ chunkSize: IMPORT_IO_PAGE_BYTES }),
+            createWriteStream(compressedPath, { flags: 'wx', mode: 0o600 }),
+            signal ? { signal } : {},
+        );
+        kvSetFromFile(storageKey, compressedPath);
+    } finally {
+        await fs.unlink(compressedPath).catch(() => {});
+    }
 }
 
 function migrateAssetsToFilesystem() {
@@ -6616,11 +6735,19 @@ function resolveBackupStorageKey(name) {
 // Accepts any async iterable of Buffer chunks (HTTP request body, file stream, etc.)
 async function importBackupFromSource(dataSource, {
     maxBytes = BACKUP_IMPORT_MAX_BYTES,
+    maxEntries = BACKUP_IMPORT_MAX_ENTRIES,
+    bufferedEntryMaxBytes = IMPORT_BUFFERED_ENTRY_MAX_BYTES,
     totalBytes = 0,
     onProgress = null,
     signal = null,
 } = {}) {
     maxBytes = finiteByteLimit(maxBytes, BACKUP_IMPORT_MAX_BYTES);
+    maxEntries = finiteByteLimit(maxEntries, BACKUP_IMPORT_MAX_ENTRIES);
+    bufferedEntryMaxBytes = finiteByteLimit(
+        bufferedEntryMaxBytes,
+        IMPORT_BUFFERED_ENTRY_MAX_BYTES,
+        { max: maxBytes },
+    );
     if (totalBytes > 0) assertImportSize(totalBytes, maxBytes, 'Backup archive');
     throwIfImportAborted(signal);
     recoverPendingImportSwap('Backup import preparation');
@@ -6630,14 +6757,10 @@ async function importBackupFromSource(dataSource, {
     let activeEntryWriteFinished = null;
     let databaseIngestion = null;
     let backupEntryStageDir = null;
+    let entryIndex = null;
     let backupEntryIndex = 0;
     let assetsRestored = 0;
     let bytesReceived = 0;
-    const seenEntryNames = new Set();
-    const importedInlayIds = new Set();
-    const importedSidecarIds = new Set();
-    const explicitSidecarMap = new Map();
-    const legacyInlayInfoMap = new Map();
     const existingInlayKeys = (await listInlayFiles()).map((entry) => `inlay/${entry.id}`);
     const existingAssetKeys = listAssetEntriesWithSizes()
         .filter((entry) => entry.source === 'fs')
@@ -6676,6 +6799,15 @@ async function importBackupFromSource(dataSource, {
         };
         writeFileSync(stagingSidecarPath(id), JSON.stringify(sidecar));
     }
+    async function writeStagingInlayFileFromSource(id, ext, source, info) {
+        const normalizedExt = normalizeInlayExt(ext);
+        await copyFileToSpool(
+            source.filePath,
+            stagingInlayFilePath(id, normalizedExt),
+            { maxBytes, signal },
+        );
+        writeStagingSidecarSync(id, { ...(info || {}), ext: normalizedExt });
+    }
     function writeStagingSidecarSync(id, info) {
         const sidecar = {
             ext: normalizeInlayExt(info?.ext),
@@ -6692,52 +6824,59 @@ async function importBackupFromSource(dataSource, {
         const inlaySidecar = parseInlaySidecarBackupName(name);
         const readBuffered = () => readFileToBufferBounded(source.filePath, {
             size: source.size,
-            maxBytes: IMPORT_BUFFERED_ENTRY_MAX_BYTES,
+            maxBytes: Math.min(bufferedEntryMaxBytes, maxBytes),
             label: `Backup entry ${name}`,
             code: 'IMPORT_BUFFERED_ENTRY_LIMIT',
             signal,
         });
 
         if (inlayRaw) {
-            const data = await readBuffered();
-            importedInlayIds.add(inlayRaw.id);
+            const before = entryIndex.getInlay(inlayRaw.id);
+            entryIndex.markInlayImported(inlayRaw.id);
             if (inlayRaw.ext) {
-                writeStagingInlayFileSync(inlayRaw.id, inlayRaw.ext, data, legacyInlayInfoMap.get(inlayRaw.id) || { ext: inlayRaw.ext, name: inlayRaw.id, type: 'image' });
-            } else if (data.length > 0 && data[0] === 0x7b) {
-                const parsed = JSON.parse(data.toString('utf-8'));
-                const type = typeof parsed?.type === 'string' ? parsed.type : 'image';
-                const ext = normalizeInlayExt(parsed?.ext);
-                const buffer = type === 'signature'
-                    ? Buffer.from(typeof parsed?.data === 'string' ? parsed.data : '', 'utf-8')
-                    : decodeDataUri(parsed?.data).buffer;
-                writeStagingInlayFileSync(inlayRaw.id, ext, buffer, legacyInlayInfoMap.get(inlayRaw.id) || {
-                    ext,
-                    name: typeof parsed?.name === 'string' ? parsed.name : inlayRaw.id,
-                    type,
-                    height: typeof parsed?.height === 'number' ? parsed.height : undefined,
-                    width: typeof parsed?.width === 'number' ? parsed.width : undefined,
-                });
+                await writeStagingInlayFileFromSource(
+                    inlayRaw.id,
+                    inlayRaw.ext,
+                    source,
+                    before?.legacy || { ext: inlayRaw.ext, name: inlayRaw.id, type: 'image' },
+                );
             } else {
-                writeStagingInlayFileSync(inlayRaw.id, 'bin', data, legacyInlayInfoMap.get(inlayRaw.id) || {
-                    ext: 'bin',
-                    name: inlayRaw.id,
-                    type: 'image',
-                });
+                const data = await readBuffered();
+                if (data.length > 0 && data[0] === 0x7b) {
+                    const parsed = JSON.parse(data.toString('utf-8'));
+                    const type = typeof parsed?.type === 'string' ? parsed.type : 'image';
+                    const ext = normalizeInlayExt(parsed?.ext);
+                    const buffer = type === 'signature'
+                        ? Buffer.from(typeof parsed?.data === 'string' ? parsed.data : '', 'utf-8')
+                        : decodeDataUri(parsed?.data).buffer;
+                    writeStagingInlayFileSync(inlayRaw.id, ext, buffer, before?.legacy || {
+                        ext,
+                        name: typeof parsed?.name === 'string' ? parsed.name : inlayRaw.id,
+                        type,
+                        height: typeof parsed?.height === 'number' ? parsed.height : undefined,
+                        width: typeof parsed?.width === 'number' ? parsed.width : undefined,
+                    });
+                } else {
+                    writeStagingInlayFileSync(inlayRaw.id, 'bin', data, before?.legacy || {
+                        ext: 'bin',
+                        name: inlayRaw.id,
+                        type: 'image',
+                    });
+                }
             }
-            if (explicitSidecarMap.has(inlayRaw.id)) {
-                writeStagingSidecarSync(inlayRaw.id, explicitSidecarMap.get(inlayRaw.id));
-            } else if (!importedSidecarIds.has(inlayRaw.id)) {
-                const legacyInfo = legacyInlayInfoMap.get(inlayRaw.id);
-                if (legacyInfo) writeStagingSidecarSync(inlayRaw.id, legacyInfo);
+            const after = entryIndex.getInlay(inlayRaw.id);
+            if (after?.explicit) {
+                writeStagingSidecarSync(inlayRaw.id, after.explicit);
+            } else if (!after?.sidecar && after?.legacy) {
+                writeStagingSidecarSync(inlayRaw.id, after.legacy);
             }
             kvClearDeletion(`inlay/${inlayRaw.id}`);
             assetsRestored += 1;
         } else if (inlaySidecar) {
             const data = await readBuffered();
             const parsed = JSON.parse(data.toString('utf-8'));
-            explicitSidecarMap.set(inlaySidecar.id, parsed);
+            entryIndex.markInlaySidecar(inlaySidecar.id, parsed);
             writeStagingSidecarSync(inlaySidecar.id, parsed);
-            importedSidecarIds.add(inlaySidecar.id);
         } else if (name.startsWith('inlay_info/')) {
             const data = await readBuffered();
             const id = name.slice('inlay_info/'.length);
@@ -6745,15 +6884,17 @@ async function importBackupFromSource(dataSource, {
                 throw new Error(`Invalid legacy inlay info entry name: ${name}`);
             }
             const parsed = JSON.parse(data.toString('utf-8'));
-            legacyInlayInfoMap.set(id, {
+            const info = {
                 ext: normalizeInlayExt(parsed?.ext),
                 name: typeof parsed?.name === 'string' ? parsed.name : id,
                 type: typeof parsed?.type === 'string' ? parsed.type : 'image',
                 height: typeof parsed?.height === 'number' ? parsed.height : undefined,
                 width: typeof parsed?.width === 'number' ? parsed.width : undefined,
-            });
-            if (importedInlayIds.has(id) && !importedSidecarIds.has(id)) {
-                writeStagingSidecarSync(id, legacyInlayInfoMap.get(id));
+            };
+            entryIndex.setLegacyInlayInfo(id, info);
+            const state = entryIndex.getInlay(id);
+            if (state?.imported && !state.sidecar) {
+                writeStagingSidecarSync(id, info);
             }
         } else if (name.startsWith('inlay_thumb/')) {
             // Skip deprecated thumbnail entries from legacy backups.
@@ -6766,6 +6907,7 @@ async function importBackupFromSource(dataSource, {
                     source,
                     signal,
                     'Backup import',
+                    { maxBytes, bufferedEntryMaxBytes },
                 );
             } else if (storageKey.startsWith(PLUGIN_SAVE_PREFIX)) {
                 await validateAndImportPluginValueFile(
@@ -6773,14 +6915,16 @@ async function importBackupFromSource(dataSource, {
                     source,
                     signal,
                     'Backup import',
+                    { maxBytes },
                 );
             } else if (storageKey.startsWith('coldstorage/')) {
-                const data = await readBuffered();
-                const storageValue = encodeColdStorageCanonicalBuffer(
-                    parseColdStorageJsonBuffer(data, name, { allowPlainJson: true }).coldData
+                await importColdStorageFromFile(
+                    storageKey,
+                    source,
+                    signal,
+                    `Backup entry ${name}`,
+                    { maxBytes, bufferedEntryMaxBytes },
                 );
-                validatePluginStorageRow(storageKey, storageValue);
-                kvSet(storageKey, storageValue);
             } else if (storageKey.startsWith(PLUGIN_SAVE_META_PREFIX)
                 || storageKey === PLUGIN_STORAGE_MANIFEST_KEY) {
                 const data = await readBuffered();
@@ -6792,6 +6936,8 @@ async function importBackupFromSource(dataSource, {
                     source,
                     signal,
                     `Backup row ${storageKey}`,
+                    'IMPORT_BUFFERED_ENTRY_LIMIT',
+                    { maxBytes, bufferedEntryMaxBytes },
                 );
             }
             assetsRestored += 1;
@@ -6808,6 +6954,7 @@ async function importBackupFromSource(dataSource, {
         `${BACKUP_ENTRY_STAGE_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}`,
     );
     await fs.mkdir(backupEntryStageDir, { recursive: false, mode: 0o700 });
+    entryIndex = createBackupImportIndex(path.join(backupEntryStageDir, 'index.sqlite'));
 
     sqliteDb.pragma('synchronous = OFF');
 
@@ -6901,15 +7048,14 @@ async function importBackupFromSource(dataSource, {
                         assertImportSize(dataLength, maxBytes, `Backup entry ${name}`);
                         buffer = buffer.subarray(headerLength);
 
-                        if (seenEntryNames.has(name)) {
+                        if (!entryIndex.addEntry(name)) {
                             throw importFormatError(`Duplicate backup entry: ${name}`, 'DUPLICATE_BACKUP_ENTRY');
                         }
-                        seenEntryNames.add(name);
-                        if (seenEntryNames.size > BACKUP_IMPORT_MAX_ENTRIES) {
+                        if (entryIndex.count > maxEntries) {
                             throw importSizeError(
                                 'Backup entry count',
-                                BACKUP_IMPORT_MAX_ENTRIES,
-                                seenEntryNames.size,
+                                maxEntries,
+                                entryIndex.count,
                                 'IMPORT_ENTRY_COUNT_LIMIT',
                             );
                         }
@@ -7036,10 +7182,8 @@ async function importBackupFromSource(dataSource, {
                 retryable: true,
             });
         }
-        for (const [id, info] of legacyInlayInfoMap.entries()) {
-            if (importedInlayIds.has(id) && !importedSidecarIds.has(id)) {
-                writeStagingSidecarSync(id, info);
-            }
+        for (const { id, info } of entryIndex.legacyInlaysMissingSidecars()) {
+            writeStagingSidecarSync(id, info);
         }
         writeFileSync(
             path.join(stagingDir, path.basename(inlayMigrationMarker)),
@@ -7163,6 +7307,9 @@ async function importBackupFromSource(dataSource, {
         }
         if (databaseSpool) {
             await fs.unlink(databaseSpool.filePath).catch(() => {});
+        }
+        try { entryIndex?.destroy(); } catch (error) {
+            logger.warn('[Backup Import] Failed to remove entry index:', error);
         }
         if (backupEntryStageDir) {
             await fs.rm(backupEntryStageDir, { recursive: true, force: true }).catch(() => {});
@@ -12403,7 +12550,10 @@ app.post('/api/backup/import/prepare', async (req, res, next) => {
         if (!Number.isSafeInteger(size) || size < 0) {
             throw importFormatError('Backup has an invalid byte length', 'INVALID_IMPORT_SIZE');
         }
-        assertImportSize(size, BACKUP_IMPORT_MAX_BYTES, 'Backup archive');
+        const limits = backupImportLimits({
+            allowLargeRestore: req.body?.allowLargeRestore === true,
+        });
+        assertImportSize(size, limits.maxBytes, 'Backup archive');
 
         if (size > 0) {
             await assertImportDiskSpace(size);
@@ -12426,6 +12576,9 @@ app.post('/api/backup/import', async (req, res, next) => {
     let heartbeatTimer = null;
     let uploadSpool = null;
     let uploadStream = null;
+    const limits = backupImportLimits({
+        allowLargeRestore: requestConfirmsLargeRestore(req),
+    });
 
     try {
         if (importInProgress) {
@@ -12456,7 +12609,7 @@ app.post('/api/backup/import', async (req, res, next) => {
 
         const contentLength = importContentLength(req, 'Backup archive');
         if (contentLength !== null) {
-            assertImportSize(contentLength, BACKUP_IMPORT_MAX_BYTES, 'Backup archive');
+            assertImportSize(contentLength, limits.maxBytes, 'Backup archive');
             await assertImportDiskSpace(contentLength);
         }
 
@@ -12465,7 +12618,7 @@ app.post('/api/backup/import', async (req, res, next) => {
             `${BACKUP_IMPORT_SPOOL_FILE_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}.tmp`,
         );
         uploadSpool = await spoolAsyncIterable(req, uploadPath, {
-            maxBytes: BACKUP_IMPORT_MAX_BYTES,
+            maxBytes: limits.maxBytes,
             expectedBytes: contentLength,
             signal: abortTracker.signal,
         });
@@ -12495,7 +12648,7 @@ app.post('/api/backup/import', async (req, res, next) => {
             let lastProgressWrite = 0;
             const totalBytes = uploadSpool.size;
             const result = await importBackupFromSource(uploadStream, {
-                maxBytes: BACKUP_IMPORT_MAX_BYTES,
+                ...limits,
                 totalBytes,
                 signal: abortTracker.signal,
                 onProgress: (received, total) => {
@@ -12518,7 +12671,7 @@ app.post('/api/backup/import', async (req, res, next) => {
             res.end();
         } else {
             const result = await importBackupFromSource(uploadStream, {
-                maxBytes: BACKUP_IMPORT_MAX_BYTES,
+                ...limits,
                 totalBytes: uploadSpool.size,
                 signal: abortTracker.signal,
             });
@@ -12819,7 +12972,8 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
             return;
         }
 
-        assertImportSize(fileStat.size, BACKUP_IMPORT_MAX_BYTES, 'Server backup');
+        const limits = backupImportLimits({ allowLargeRestore: true });
+        assertImportSize(fileStat.size, limits.maxBytes, 'Server backup');
 
         await assertImportDiskSpace(fileStat.size);
 
@@ -12836,7 +12990,7 @@ app.post('/api/backup/server/restore', async (req, res, next) => {
         const { createReadStream } = require('fs');
         restoreStream = createReadStream(filePath, { highWaterMark: IMPORT_IO_PAGE_BYTES });
         const result = await importBackupFromSource(restoreStream, {
-            maxBytes: BACKUP_IMPORT_MAX_BYTES,
+            ...limits,
             totalBytes: fileStat.size,
             signal: abortTracker.signal,
             onProgress: (received, total) => {

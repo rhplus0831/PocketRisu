@@ -114,6 +114,44 @@ describe('NodeStorage plugin error contract', () => {
         vi.unstubAllGlobals()
     })
 
+    test('sends explicit large-restore admission on prepare and upload', async () => {
+        fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }))
+        const requestHeaders = new Map<string, string>()
+
+        class FakeXmlHttpRequest {
+            status = 200
+            responseText = ''
+            upload: Record<string, any> = {}
+            onprogress: (() => void) | null = null
+            onload: (() => void) | null = null
+            open() {}
+            setRequestHeader(name: string, value: string) {
+                requestHeaders.set(name.toLowerCase(), value)
+            }
+            send() {
+                this.upload.onload?.()
+                this.responseText = '{"type":"done","ok":true,"assetsRestored":0}\n'
+                this.onprogress?.()
+                this.onload?.()
+            }
+        }
+        vi.stubGlobal('XMLHttpRequest', FakeXmlHttpRequest)
+
+        await expect(readyStorage().importBackup(
+            new Blob(['archive']),
+            undefined,
+            { allowLargeRestore: true },
+        )).resolves.toMatchObject({ ok: true })
+
+        const prepare = fetchMock.mock.calls[0]
+        expect(prepare[0]).toBe('/api/backup/import/prepare')
+        expect(JSON.parse(String((prepare[1] as RequestInit).body))).toEqual({
+            size: 7,
+            allowLargeRestore: true,
+        })
+        expect(requestHeaders.get('x-risu-large-restore')).toBe('1')
+    })
+
     test('preserves the exact structured late upload error even after a done event', async () => {
         fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }))
 

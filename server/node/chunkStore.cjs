@@ -70,7 +70,13 @@ function isChunkableKey(key) {
         && (key === 'database/database.bin'
             || key.startsWith('database/dbbackup-')
             || key.startsWith('chats/')
-            || key.startsWith('pluginsave/'));
+            || key.startsWith('pluginsave/')
+            // These namespaces can arrive as file-backed backup entries.  They
+            // must remain stream-writable so restoring a historical oversized
+            // row never requires one monolithic SQLite BLOB binding.
+            || key.startsWith('assets/')
+            || key.startsWith('coldstorage/')
+            || key.startsWith('remotes/'));
 }
 
 function isChunked(value) {

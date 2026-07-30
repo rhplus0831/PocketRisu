@@ -117,6 +117,26 @@ inside the storage queue.
 - JSON and compatibility formats are validated with bounded workers/converters;
 - disconnects abort waiting/staging and clean private files.
 
+Downloaded-backup restores normally retain conservative 2 GiB and 100,000-entry soft
+admission limits. After the normal destructive-restore confirmations, the browser opts
+into the authenticated large-restore path; trusted server-file restores do so
+automatically. Large restore still performs disk-headroom admission, but uses technical
+safe-integer ceilings rather than the ordinary soft limits. Its entry names and inlay
+ordering state live in a private SQLite index committed in bounded batches, so archive
+cardinality does not create a heap-wide `Set` or `Map`. This is one logical restore:
+batches never publish a partial live database.
+
+Compatibility clients that drive the HTTP protocol directly opt in by sending
+`allowLargeRestore: true` to `/api/backup/import/prepare` and
+`x-risu-large-restore: 1` on the matching archive upload. Both routes remain
+authenticated and active-session-only; the upload is independently revalidated and does
+not trust client-supplied entry metrics.
+
+Raw inlays and plain cold-storage JSON use file-backed streaming stages. Large unsafe
+asset and remote compatibility rows use chunked file ingestion. Compatibility-only
+metadata formats that still require materialization remain subject to the buffered-entry
+limit unless the user has explicitly selected large restore.
+
 Directory and ZIP save-folder imports copy regular, non-symlink files into a stage before
 entering the replacement transaction. They reject missing live databases, duplicate
 entries, excessive entry counts/expanded bytes, unsupported links, and invalid names.
@@ -255,12 +275,15 @@ Important finite limits include:
 | `RISU_IMPORT_BUFFERED_ENTRY_MAX_BYTES` | 32 MiB |
 | `RISU_BACKUP_IMPORT_MAX_ENTRIES` | 100,000 |
 | `RISU_SAVE_FOLDER_IMPORT_MAX_ENTRIES` | 100,000 |
+| `RISU_LARGE_RESTORE_MAX_BYTES` | Largest safe value compatible with 2× disk-headroom arithmetic |
+| `RISU_LARGE_RESTORE_MAX_ENTRIES` | Largest safe integer |
 | `RISU_RESTORE_MAX_DECODED_BYTES` | 4 GiB |
 | `RISU_RESTORE_DISK_HEADROOM_BYTES` | 256 MiB |
 | `RISU_RESTORE_MAX_LEGACY_BYTES` | 64 MiB |
 
-Entry-count values are capped at one million. Limits are admission and safety controls;
-raising them increases memory, disk, and recovery risk.
+Ordinary entry-count values are capped at one million. Large-restore ceilings are
+separate recovery controls; disk-backed metadata keeps memory bounded, but raising or
+overriding byte limits still increases disk, CPU, and recovery time.
 
 Docker Compose persists `/app/save` only. Default chat history under
 `/app/save/chat-backups` survives container replacement, but default server archives

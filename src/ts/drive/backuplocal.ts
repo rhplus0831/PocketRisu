@@ -198,7 +198,7 @@ export function LoadLocalBackup(){
                 replace: () => forageStorage.importBackup(file, (loaded, total) => {
                     const progress = total > 0 ? ((loaded / total) * 100).toFixed(2) : '0.00'
                     alertWait(`Loading local Backup... (${progress}%)`)
-                }),
+                }, { allowLargeRestore: true }),
                 onCommitted: async (result) => {
                     if (result.coldStorageFailed && result.coldStorageFailed > 0) {
                         alertError(`Warning: ${result.coldStorageFailed} character(s) could not be restored from cold storage. The imported save may be incomplete. The app will now reload.`)

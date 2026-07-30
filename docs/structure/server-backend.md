@@ -98,6 +98,8 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `RISU_SAVE_FOLDER_IMPORT_MAX_ENTRIES` | Save-folder/ZIP entry cap; default 100,000, maximum 1,000,000. |
 | `RISU_BACKUP_IMPORT_MAX_ENTRIES` | Backup archive entry cap; default 100,000, maximum 1,000,000. |
 | `RISU_IMPORT_BUFFERED_ENTRY_MAX_BYTES` | Per buffered archive entry cap; default 32 MiB and capped by the overall limit. |
+| `RISU_LARGE_RESTORE_MAX_BYTES` | Explicit large-restore technical byte ceiling; defaults to the largest value compatible with 2× disk-headroom arithmetic. |
+| `RISU_LARGE_RESTORE_MAX_ENTRIES` | Explicit large-restore technical entry ceiling; defaults to the largest safe integer. |
 | `RISU_RESTORE_MAX_DECODED_BYTES` | Maximum decoded streaming restore size; default 4 GiB. |
 | `RISU_RESTORE_DISK_HEADROOM_BYTES` | Additional free-space requirement for restore spools; default 256 MiB. |
 | `RISU_RESTORE_MAX_LEGACY_BYTES` | Maximum in-memory compatibility restore; default 64 MiB. |
