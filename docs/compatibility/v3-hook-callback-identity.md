@@ -1,6 +1,6 @@
 # V3 hook removal no longer preserves callback identity
 
-- Status: Confirmed regression
+- Status: Fixed 2026-07-30
 - Severity: Medium
 - Confidence: High
 - Introduced by: 99253152
@@ -30,8 +30,15 @@ Add the same afterRequest replacer twice, then remove it using the original
 function. main leaves the Set empty. serve leaves two wrappers and transforms
 the next response twice.
 
-## Recommendation
+## Resolution
 
-Maintain a lifecycle- and mode-scoped mapping from the original callback to one
-guarded callback, and resolve both add and remove through it. Test duplicate
-registration, explicit removal, and actual handler/replacer execution.
+`makeRisuaiAPIV3()` now maintains lifecycle- and mode-scoped mappings from each
+original bridge callback to one guarded callback. Script-handler and replacer
+add/remove operations resolve through those mappings, restoring `Set`
+deduplication and identity-based removal while keeping input-hook send scope
+separate from the other script modes.
+
+The V3 guest bridge regression test registers the same callback twice, verifies
+that each registry executes it once, removes display and input modes
+independently, and confirms explicit replacer removal. The full client suite and
+Svelte/TypeScript diagnostics passed after the change.

@@ -101,6 +101,7 @@ export const pluginChannel = new Map<string, Function>();
 
 type V3LifecycleCallback = (signal?: AbortSignal) => void | Promise<void>;
 type V3ScriptMode = 'input' | 'output' | 'process' | 'display';
+type V3ReplacerFunction = (...args: any[]) => any;
 export const STRICT_PLUGIN_UNLOAD_TIMEOUT_MS = 1_000;
 export const LEGACY_PLUGIN_UNLOAD_TIMEOUT_MS = 5_000;
 
@@ -1151,6 +1152,20 @@ export const makeRisuaiAPIV3 = (
         }) as T;
     };
 
+    // The iframe bridge already gives each guest function a stable host-side
+    // callback. Keep the additional lifecycle guard stable within each hook
+    // registry too, so Set.add() can deduplicate it and Set.delete() can find it.
+    // These maps belong to this lifecycle/API instance and deliberately keep
+    // different modes separate: an input hook has an additional sendChat scope.
+    const scriptHandlerCallbacks = new Map<
+        V3ScriptMode,
+        WeakMap<EditFunction, EditFunction>
+    >();
+    const replacerCallbacks = new Map<
+        string,
+        WeakMap<V3ReplacerFunction, V3ReplacerFunction>
+    >();
+
     const oldApis = getV2PluginAPIs();
     const pluginChatSend = createPluginChatSendController({
         getPermission: () => getPluginPermission(plugin.name, 'sendChat'),
@@ -1394,15 +1409,31 @@ export const makeRisuaiAPIV3 = (
             // calls that mode "editdisplay"; the legacy implementation itself
             // prepends "edit", so preserve the V3 runtime value here.
             const legacyName = name as unknown as Parameters<typeof oldApis.addRisuScriptHandler>[0];
-            const guardedFunc = guardPluginCallback(func);
-            const registeredFunc = name === 'input'
-                ? pluginChatSend.wrapInputHook(guardedFunc)
-                : guardedFunc;
+            let callbacksForMode = scriptHandlerCallbacks.get(name);
+            if (!callbacksForMode) {
+                callbacksForMode = new WeakMap();
+                scriptHandlerCallbacks.set(name, callbacksForMode);
+            }
+            let registeredFunc = callbacksForMode.get(func);
+            const isNewRegistration = !registeredFunc;
+            if (!registeredFunc) {
+                const guardedFunc = guardPluginCallback(func);
+                registeredFunc = name === 'input'
+                    ? pluginChatSend.wrapInputHook(guardedFunc)
+                    : guardedFunc;
+            }
             oldApis.addRisuScriptHandler(legacyName, registeredFunc);
-            lifecycle.addCleanup(() => oldApis.removeRisuScriptHandler(legacyName, registeredFunc));
+            if (isNewRegistration) {
+                callbacksForMode.set(func, registeredFunc);
+                lifecycle.addCleanup(() => oldApis.removeRisuScriptHandler(legacyName, registeredFunc));
+            }
         },
-        removeRisuScriptHandler: oldApis.removeRisuScriptHandler,
-        addRisuReplacer: async (name:string,func:Function) => {
+        removeRisuScriptHandler: (name: V3ScriptMode, func: EditFunction) => {
+            const legacyName = name as unknown as Parameters<typeof oldApis.removeRisuScriptHandler>[0];
+            const registeredFunc = scriptHandlerCallbacks.get(name)?.get(func) ?? func;
+            oldApis.removeRisuScriptHandler(legacyName, registeredFunc);
+        },
+        addRisuReplacer: async (name: string, func: V3ReplacerFunction) => {
             lifecycle.assertCanRegister();
             //permission check for replacer
             const conf = await getPluginPermission(plugin.name, 'replacer', 'periodically');
@@ -1410,11 +1441,24 @@ export const makeRisuaiAPIV3 = (
                 return;
             }
             lifecycle.assertCanRegister();
-            const guardedFunc = guardPluginCallback(func as (...args: any[]) => any);
-            oldApis.addRisuReplacer(name, guardedFunc as any);
-            lifecycle.addCleanup(() => oldApis.removeRisuReplacer(name, guardedFunc as any));
+            let callbacksForMode = replacerCallbacks.get(name);
+            if (!callbacksForMode) {
+                callbacksForMode = new WeakMap();
+                replacerCallbacks.set(name, callbacksForMode);
+            }
+            let registeredFunc = callbacksForMode.get(func);
+            const isNewRegistration = !registeredFunc;
+            if (!registeredFunc) registeredFunc = guardPluginCallback(func);
+            oldApis.addRisuReplacer(name, registeredFunc as any);
+            if (isNewRegistration) {
+                callbacksForMode.set(func, registeredFunc);
+                lifecycle.addCleanup(() => oldApis.removeRisuReplacer(name, registeredFunc as any));
+            }
         },
-        removeRisuReplacer: oldApis.removeRisuReplacer,
+        removeRisuReplacer: (name: string, func: V3ReplacerFunction) => {
+            const registeredFunc = replacerCallbacks.get(name)?.get(func) ?? func;
+            oldApis.removeRisuReplacer(name, registeredFunc as any);
+        },
         setDatabaseLite: async (database: unknown, signal?: AbortSignal) => {
             await runPluginStorageWriter(async () => {
                 const conf = await getPluginPermission(

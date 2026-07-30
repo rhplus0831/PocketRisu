@@ -523,7 +523,11 @@ beforeEach(async () => {
     pluginV2.providers.clear();
     pluginV2.providerOptions.clear();
     pluginV2.editdisplay.clear();
+    pluginV2.editinput.clear();
+    pluginV2.editoutput.clear();
+    pluginV2.editprocess.clear();
     pluginV2.replacerbeforeRequest.clear();
+    pluginV2.replacerafterRequest.clear();
     customProviderStore.set([]);
     customV3ProviderMetaStore.splice(0);
     pluginChannel.clear();
@@ -1652,6 +1656,70 @@ describe("V3 mode-aware database bridge", () => {
 });
 
 describe("V3 guest startup handshake", () => {
+    test("preserves callback identity across duplicate hook registration and removal", async () => {
+        const plugin = startupPlugin("Stable Hook Identity", `
+            globalThis.scriptCalls = 0;
+            globalThis.replacerCalls = 0;
+            globalThis.sharedScriptHook = async (content) => {
+                globalThis.scriptCalls += 1;
+                return content + ":script";
+            };
+            globalThis.responseReplacer = async (content) => {
+                globalThis.replacerCalls += 1;
+                return content + ":replacer";
+            };
+            await risuai.addRisuScriptHandler("display", globalThis.sharedScriptHook);
+            await risuai.addRisuScriptHandler("display", globalThis.sharedScriptHook);
+            await risuai.addRisuScriptHandler("input", globalThis.sharedScriptHook);
+            await risuai.addRisuScriptHandler("input", globalThis.sharedScriptHook);
+            await risuai.addRisuReplacer("afterRequest", globalThis.responseReplacer);
+            await risuai.addRisuReplacer("afterRequest", globalThis.responseReplacer);
+            await new Promise(() => {});
+        `);
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const restoreRelay = executeGeneratedGuest(iframe);
+
+        try {
+            await loading;
+            await vi.waitFor(() => {
+                expect(pluginV2.editdisplay.size).toBe(1);
+                expect(pluginV2.editinput.size).toBe(1);
+                expect(pluginV2.replacerafterRequest.size).toBe(1);
+            });
+
+            const displayHook = [...pluginV2.editdisplay][0];
+            const inputHook = [...pluginV2.editinput][0];
+            const responseReplacer = [...pluginV2.replacerafterRequest][0];
+            await expect(displayHook("display")).resolves.toBe("display:script");
+            await expect(inputHook("input")).resolves.toBe("input:script");
+            await expect(responseReplacer("response", "model")).resolves.toBe("response:replacer");
+            expect((iframe.contentWindow as any).scriptCalls).toBe(2);
+            expect((iframe.contentWindow as any).replacerCalls).toBe(1);
+
+            const instance = getV3PluginInstance(plugin.name)!;
+            await instance.host.executeInIframe(`
+                await risuai.removeRisuScriptHandler("display", globalThis.sharedScriptHook);
+            `);
+            expect(pluginV2.editdisplay.size).toBe(0);
+            expect(pluginV2.editinput.size).toBe(1);
+            expect(pluginV2.replacerafterRequest.size).toBe(1);
+
+            await instance.host.executeInIframe(`
+                await risuai.removeRisuScriptHandler("input", globalThis.sharedScriptHook);
+                await risuai.removeRisuReplacer("afterRequest", globalThis.responseReplacer);
+            `);
+            expect(pluginV2.editinput.size).toBe(0);
+            expect(pluginV2.replacerafterRequest.size).toBe(0);
+        } finally {
+            await teardownV3Plugins().catch(() => undefined);
+            restoreRelay();
+        }
+    });
+
     test("attributes generation startup failures to the rejecting plugin", async () => {
         const rejected = startupPlugin("Rejected generation member", "const broken = ;");
         const healthy = startupPlugin("Healthy generation member", "");
