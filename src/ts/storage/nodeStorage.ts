@@ -601,8 +601,34 @@ export async function runBoundedAuthoritativeStorageOperation<T>(
 }
 
 export type BootDatabaseReadResult =
-    | { kind: 'bytes', bytes: Buffer | null }
+    | { kind: 'missing' }
+    | { kind: 'bytes', bytes: Buffer }
     | { kind: 'decoded', database: Record<string, any> }
+
+export type DatabaseCreateIfAbsentResult =
+    | { kind: 'created', etag: string | null }
+    | { kind: 'already-present' }
+
+interface DatabaseStorageCapabilities {
+    rawBootRead: boolean
+    atomicCreate: boolean
+}
+
+const LEGACY_DATABASE_STORAGE_CAPABILITIES: DatabaseStorageCapabilities = {
+    rawBootRead: false,
+    atomicCreate: false,
+}
+
+function parseDatabaseStorageCapabilities(value: unknown): DatabaseStorageCapabilities {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return { ...LEGACY_DATABASE_STORAGE_CAPABILITIES }
+    }
+    const candidate = value as Record<string, unknown>
+    return {
+        rawBootRead: candidate.rawBootRead === true,
+        atomicCreate: candidate.atomicCreate === true,
+    }
+}
 
 export interface StorageReadOptions {
     pluginStorageGeneration?: string
@@ -1290,6 +1316,9 @@ export class NodeStorage{
         maxValueBytes: DEFAULT_PLUGIN_VALUE_MAX_BYTES,
     }
     private static pluginStorageBatchCapabilities: PluginStorageBatchStreamCapabilities | null = null
+    private static databaseStorageCapabilities: DatabaseStorageCapabilities = {
+        ...LEGACY_DATABASE_STORAGE_CAPABILITIES,
+    }
     private static sessionPending: {
         controller: AbortController
         promise: Promise<void>
@@ -1371,6 +1400,7 @@ export class NodeStorage{
                         capabilities?: {
                             pluginStorage?: unknown
                             pluginStorageBatch?: unknown
+                            database?: unknown
                         }
                     }).capabilities
                     : null
@@ -1386,6 +1416,8 @@ export class NodeStorage{
                                 NodeStorage.pluginStorageBatchCapabilities.maxValueBytes,
                         }
                         : { maxValueBytes: DEFAULT_PLUGIN_VALUE_MAX_BYTES })
+                NodeStorage.databaseStorageCapabilities
+                    = parseDatabaseStorageCapabilities(capabilities?.database)
                 NodeStorage.sessionInitialized = true
             }
             // Non-ok (400/401/500): will retry on next checkAuth() call.
@@ -2244,6 +2276,100 @@ export class NodeStorage{
             authoritativeStoragePayloadTimeoutMs(value.byteLength),
             externalSignal,
         )
+    }
+
+    async createDatabaseIfAbsent(
+        value: Uint8Array,
+        externalSignal?: AbortSignal | null,
+    ): Promise<DatabaseCreateIfAbsentResult> {
+        await runBoundedAuthoritativeStorageOperation(
+            signal => this.checkAuth(signal),
+            'read',
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+
+        if (!NodeStorage.databaseStorageCapabilities.atomicCreate) {
+            // A legacy server cannot make creation atomic. Re-read through its
+            // authenticated, universally supported contract immediately before
+            // writing so an existing database is never replaced merely because
+            // a newer route was unavailable.
+            const current = await this.readLegacyDatabaseForBoot(externalSignal)
+            if (current.kind !== 'missing') return { kind: 'already-present' }
+            await this.setItem('database/database.bin', value, undefined, externalSignal)
+            return { kind: 'created', etag: this._lastDbEtag }
+        }
+
+        return runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
+            const response = await this.requestStorage(
+                'database/database.bin',
+                'write',
+                true,
+                () => this.authFetch('/api/db/create-if-absent', {
+                    method: 'POST',
+                    signal,
+                }, true, outcome),
+                [409],
+                signal,
+                outcome,
+            )
+
+            let data: unknown
+            try {
+                data = await awaitWithAbort(response.json(), signal)
+            } catch (error) {
+                throw new StorageError(
+                    'Database creation returned an unreadable acknowledgement.',
+                    {
+                        status: response.status,
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcome: 'unknown',
+                        commitOutcomeUnknown: true,
+                        operation: 'write',
+                        cause: error,
+                    },
+                )
+            }
+
+            const acknowledgement = data && typeof data === 'object' && !Array.isArray(data)
+                ? data as Record<string, unknown>
+                : null
+            if (response.status === 409
+                && acknowledgement?.code === 'DATABASE_ALREADY_EXISTS'
+                && acknowledgement.commitOutcome === 'not-committed'
+                && acknowledgement.commitOutcomeUnknown === false) {
+                return { kind: 'already-present' }
+            }
+            const etag = acknowledgement?.etag
+            if (response.status === 201
+                && acknowledgement?.success === true
+                && acknowledgement.created === true
+                && acknowledgement.commitOutcome === 'committed'
+                && acknowledgement.commitOutcomeUnknown === false
+                && typeof etag === 'string'
+                && /^[0-9a-f]{32}$/.test(etag)) {
+                this._lastDbEtag = etag
+                return { kind: 'created', etag }
+            }
+
+            if (!response.ok) {
+                throw await this.parseStorageFailureResponse(
+                    response.clone(),
+                    'write',
+                    true,
+                    signal,
+                )
+            }
+            throw new StorageError('Database creation acknowledgement was malformed.', {
+                status: response.status,
+                code: 'COMMIT_OUTCOME_UNKNOWN',
+                retryable: false,
+                commitOutcome: 'unknown',
+                commitOutcomeUnknown: true,
+                operation: 'write',
+            })
+        }, 'write', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
     }
 
     private async setItemAuthoritative(
@@ -3525,8 +3651,16 @@ export class NodeStorage{
     }
 
     async readDatabaseForBoot(): Promise<BootDatabaseReadResult> {
+        await runBoundedAuthoritativeStorageOperation(
+            signal => this.checkAuth(signal),
+            'read',
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+        )
+        if (!NodeStorage.databaseStorageCapabilities.rawBootRead) {
+            return this.readLegacyDatabaseForBoot()
+        }
         if (!isResourceCacheEnabled()) {
-            return { kind: 'bytes', bytes: await this.readRawDatabaseForBoot() }
+            return this.readRawDatabaseForBoot()
         }
 
         try {
@@ -3590,13 +3724,13 @@ export class NodeStorage{
             // database.bin on the server. A corrupt live monolith must still
             // reach bootstrap so it can select an internal snapshot and route
             // that snapshot through the server's atomic restore transaction.
-            return { kind: 'bytes', bytes: await this.readRawDatabaseForBoot() }
+            return this.readRawDatabaseForBoot()
         }
     }
 
     private async readRawDatabaseForBoot(
         externalSignal?: AbortSignal | null,
-    ): Promise<Buffer | null> {
+    ): Promise<BootDatabaseReadResult> {
         return runBoundedAuthoritativeStorageOperation(async (signal) => {
             const response = await this.requestStorage(
                 'database/database.bin',
@@ -3606,19 +3740,101 @@ export class NodeStorage{
                     method: 'GET',
                     signal,
                 }),
-                [404],
+                [],
                 signal,
             )
-            if (response.status === 404) {
+            if (response.status === 204) {
                 this._lastDbEtag = null
-                return null
+                return { kind: 'missing' }
             }
             const bytes = Buffer.from(await awaitWithAbort(response.arrayBuffer(), signal))
+            if (bytes.length === 0) {
+                throw new StorageError(
+                    'The raw boot route returned an ambiguous empty response.',
+                    {
+                        status: response.status,
+                        code: 'AMBIGUOUS_DATABASE_BOOT_READ',
+                        retryable: false,
+                        commitOutcomeUnknown: false,
+                        operation: 'read',
+                    },
+                )
+            }
             const responseEtag = response.headers.get('x-db-etag')
             this._lastDbEtag = responseEtag && /^[0-9a-f]{32}$/.test(responseEtag)
                 ? responseEtag
                 : null
-            return bytes.length === 0 ? null : bytes
+            return { kind: 'bytes', bytes }
+        }, 'read', AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS, externalSignal)
+    }
+
+    private async readLegacyDatabaseForBoot(
+        externalSignal?: AbortSignal | null,
+    ): Promise<BootDatabaseReadResult> {
+        return runBoundedAuthoritativeStorageOperation(async (signal) => {
+            const response = await this.requestStorage(
+                'database/database.bin',
+                'read',
+                false,
+                () => this.authFetch('/api/read', {
+                    method: 'GET',
+                    headers: {
+                        'file-path': Buffer.from('database/database.bin', 'utf-8').toString('hex'),
+                    },
+                    signal,
+                }),
+                [],
+                signal,
+            )
+            const bytes = Buffer.from(await awaitWithAbort(response.arrayBuffer(), signal))
+            const responseEtag = response.headers.get('x-db-etag')
+            if (bytes.length > 0) {
+                this._lastDbEtag = responseEtag && /^[0-9a-f]{32}$/.test(responseEtag)
+                    ? responseEtag
+                    : null
+                return { kind: 'bytes', bytes }
+            }
+
+            // Legacy /api/read represents both a missing key and a zero-byte
+            // existing value as an empty 200 response. Consult an uncached,
+            // authoritative key list before allowing fresh initialization.
+            const listResponse = await this.requestStorage(
+                'database/',
+                'list',
+                false,
+                () => this.authFetch('/api/list', {
+                    method: 'GET',
+                    headers: { 'key-prefix': 'database/' },
+                    signal,
+                }),
+                [],
+                signal,
+            )
+            const listData: unknown = await awaitWithAbort(listResponse.json(), signal)
+            const content = listData && typeof listData === 'object' && !Array.isArray(listData)
+                ? (listData as { content?: unknown }).content
+                : null
+            if (!Array.isArray(content) || !content.every(key => typeof key === 'string')) {
+                throw new StorageError('Legacy database existence check was malformed.', {
+                    code: 'AMBIGUOUS_DATABASE_BOOT_READ',
+                    retryable: false,
+                    commitOutcomeUnknown: false,
+                    operation: 'list',
+                })
+            }
+            if (content.includes('database/database.bin')) {
+                throw new StorageError(
+                    'The server reported an existing database with an empty body; refusing to replace it.',
+                    {
+                        code: 'AMBIGUOUS_DATABASE_BOOT_READ',
+                        retryable: false,
+                        commitOutcomeUnknown: false,
+                        operation: 'read',
+                    },
+                )
+            }
+            this._lastDbEtag = null
+            return { kind: 'missing' }
         }, 'read', AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS, externalSignal)
     }
 

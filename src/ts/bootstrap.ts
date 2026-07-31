@@ -139,20 +139,28 @@ export async function loadData() {
                 await forageStorage.Init()
 
                 LoadingStatusState.text = "Loading Local Save File..."
-                const databaseRead = await forageStorage.readDatabaseForBoot()
-                let gotStorage: Uint8Array | null = databaseRead.kind === 'bytes'
-                    ? databaseRead.bytes as unknown as Uint8Array
-                    : null
+                let databaseRead = await forageStorage.readDatabaseForBoot()
                 LoadingStatusState.text = "Decoding Local Save File..."
-                if (databaseRead.kind === 'bytes' && checkNullish(gotStorage)) {
-                    createdFreshDatabase = true
-                    gotStorage = encodeRisuSaveLegacy({})
-                    await forageStorage.setItem('database/database.bin', gotStorage)
+                if (databaseRead.kind === 'missing') {
+                    const freshBytes = encodeRisuSaveLegacy({})
+                    const creation = await forageStorage.createDatabaseIfAbsent(freshBytes)
+                    if (creation.kind === 'created') {
+                        createdFreshDatabase = true
+                        databaseRead = { kind: 'bytes', bytes: Buffer.from(freshBytes) }
+                    } else {
+                        // Another authenticated writer won first initialization.
+                        // Install its authoritative bytes instead of the losing
+                        // client's seed so both tabs converge on the same state.
+                        databaseRead = await forageStorage.readDatabaseForBoot()
+                        if (databaseRead.kind === 'missing') {
+                            throw new Error('Database creation conflicted but no database is readable')
+                        }
+                    }
                 }
                 try {
                     const decoded = databaseRead.kind === 'decoded'
                         ? databaseRead.database
-                        : await decodeRisuSave(gotStorage)
+                        : await decodeRisuSave(databaseRead.bytes)
                     setPatchSyncBaseline(decoded)
                     console.log(decoded)
                     setDatabase(decoded)

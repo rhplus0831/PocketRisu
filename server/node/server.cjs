@@ -8586,6 +8586,10 @@ app.post('/api/session', async (req, res) => {
                 maxValueBytes: PLUGIN_VALUE_MAX_BYTES,
                 maxPayloadBytes: PLUGIN_STORAGE_BATCH_STREAM_MAX_PAYLOAD_BYTES,
             },
+            database: {
+                rawBootRead: true,
+                atomicCreate: true,
+            },
         },
     })
 })
@@ -8993,11 +8997,84 @@ app.get('/api/db/read-raw-for-boot', async (req, res, next) => {
         await flushPendingDb();
         await importBarrier.waitUntilIdle();
         const raw = kvGet('database/database.bin');
-        if (raw === null) return res.status(404).json({ error: 'Database not found' });
+        // A missing endpoint is also a 404. Use an explicit successful empty
+        // response so newer clients never confuse version skew with a fresh
+        // installation and overwrite an older server's database.
+        if (raw === null) return res.status(204).end();
         res.setHeader('x-db-etag', computeBufferEtag(raw));
         res.setHeader('Content-Type', 'application/octet-stream');
         res.send(raw);
     } catch (error) {
+        next(error);
+    }
+});
+
+// Fresh initialization must never use the generic replacement endpoint. The
+// queue linearizes this check with every other storage mutation, and the
+// transaction makes creation a single create-only publication.
+app.post('/api/db/create-if-absent', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    let shouldCreateBackup = false;
+    try {
+        const result = await queueStorageMutation(async () => {
+            await flushPendingDb();
+            const existing = kvGet('database/database.bin');
+            if (existing !== null) {
+                return {
+                    created: false,
+                    currentEtag: computeBufferEtag(existing),
+                };
+            }
+
+            const database = {};
+            const encoded = Buffer.from(encodeRisuSaveLegacy(database));
+            const created = sqliteDb.transaction(() => {
+                // Keep the condition inside the transaction as defense in depth
+                // if this route is ever reused outside queueStorageMutation().
+                if (kvGet('database/database.bin') !== null) return false;
+                kvSet('database/database.bin', encoded);
+                return true;
+            })();
+            if (!created) {
+                const committed = kvGet('database/database.bin');
+                return {
+                    created: false,
+                    currentEtag: committed === null ? null : computeBufferEtag(committed),
+                };
+            }
+
+            invalidateDbCache();
+            replaceDbCacheValue(DB_HEX_KEY, database);
+            dbEtag = computeBufferEtag(encoded);
+            seedDbCacheEtag(DB_HEX_KEY, dbEtag);
+            rememberSessionPluginStorageState(req, database);
+            shouldCreateBackup = true;
+            return { created: true, etag: dbEtag };
+        });
+
+        if (!result.created) {
+            return res.status(409).json({
+                success: false,
+                created: false,
+                error: 'Database already exists',
+                code: 'DATABASE_ALREADY_EXISTS',
+                currentEtag: result.currentEtag,
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            });
+        }
+        res.status(201).json({
+            success: true,
+            created: true,
+            etag: result.etag,
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+        });
+        if (shouldCreateBackup) scheduleBackupAndRotate();
+    } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
         next(error);
     }
 });

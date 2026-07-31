@@ -199,10 +199,14 @@ async function writeRealKey(
     if (!response.ok) throw new Error(`Write failed (${response.status}): ${await response.text()}`)
 }
 
-function readyStorage(): InstanceType<typeof NodeStorage> {
+function readyStorage(databaseCapabilities = {
+    rawBootRead: true,
+    atomicCreate: true,
+}): InstanceType<typeof NodeStorage> {
     const storage = new NodeStorage()
     storage.authChecked = true
     ;(NodeStorage as any).sessionInitialized = true
+    ;(NodeStorage as any).databaseStorageCapabilities = databaseCapabilities
     vi.spyOn(storage, 'createAuth').mockResolvedValue('test-token')
     return storage
 }
@@ -277,6 +281,10 @@ beforeEach(() => {
     vi.clearAllMocks()
     ;(NodeStorage as any).sessionInitialized = false
     ;(NodeStorage as any).sessionPending = null
+    ;(NodeStorage as any).databaseStorageCapabilities = {
+        rawBootRead: false,
+        atomicCreate: false,
+    }
     cache.enabled = false
 })
 
@@ -365,6 +373,233 @@ describe('NodeStorage boot snapshot recovery', () => {
         expect(result).toEqual({ kind: 'bytes', bytes: Buffer.from(corrupt) })
         expect(storage._lastDbEtag).toBe('b'.repeat(32))
         expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    it('negotiates the raw boot route before selecting it', async () => {
+        const corrupt = new Uint8Array([0xde, 0xad, 0xbe, 0xef])
+        const requests: string[] = []
+        const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+            const requestPath = String(input)
+            requests.push(requestPath)
+            if (requestPath === '/api/session') {
+                return new Response(JSON.stringify({
+                    ok: true,
+                    capabilities: {
+                        database: { rawBootRead: true, atomicCreate: true },
+                    },
+                }), { status: 200, headers: { 'content-type': 'application/json' } })
+            }
+            if (requestPath === '/api/db/read-raw-for-boot') {
+                return new Response(corrupt, {
+                    status: 200,
+                    headers: { 'x-db-etag': 'c'.repeat(32) },
+                })
+            }
+            throw new Error(`Unexpected request: ${requestPath}`)
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = new NodeStorage()
+        storage.authChecked = true
+        vi.spyOn(storage, 'createAuth').mockResolvedValue('test-token')
+
+        await expect(storage.readDatabaseForBoot()).resolves.toEqual({
+            kind: 'bytes',
+            bytes: Buffer.from(corrupt),
+        })
+        expect(requests).toEqual(['/api/session', '/api/db/read-raw-for-boot'])
+    })
+
+    it('uses legacy read when the session body does not advertise database routes', async () => {
+        const existing = Buffer.from('older-server-database')
+        const requests: string[] = []
+        vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+            const requestPath = String(input)
+            requests.push(requestPath)
+            if (requestPath === '/api/session') return new Response(null, { status: 200 })
+            if (requestPath === '/api/read') return new Response(existing, { status: 200 })
+            throw new Error(`Unexpected request: ${requestPath}`)
+        }))
+        const storage = new NodeStorage()
+        storage.authChecked = true
+        vi.spyOn(storage, 'createAuth').mockResolvedValue('test-token')
+
+        await expect(storage.readDatabaseForBoot()).resolves.toEqual({
+            kind: 'bytes',
+            bytes: existing,
+        })
+        expect(requests).toEqual(['/api/session', '/api/read'])
+        expect(requests).not.toContain('/api/db/read-raw-for-boot')
+    })
+
+    it('preserves an older database when the server has neither session nor raw boot routes', async () => {
+        const existing = Buffer.from('main-shaped-existing-database')
+        const requests: string[] = []
+        vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+            const requestPath = String(input)
+            requests.push(requestPath)
+            if (requestPath === '/api/session') {
+                return new Response('Cannot POST /api/session', { status: 404 })
+            }
+            if (requestPath === '/api/read') return new Response(existing, { status: 200 })
+            throw new Error(`Unexpected request: ${requestPath}`)
+        }))
+        const storage = new NodeStorage()
+        storage.authChecked = true
+        vi.spyOn(storage, 'createAuth').mockResolvedValue('test-token')
+
+        await expect(storage.readDatabaseForBoot()).resolves.toEqual({
+            kind: 'bytes',
+            bytes: existing,
+        })
+        expect(requests).toEqual(['/api/session', '/api/session', '/api/read'])
+        expect(requests).not.toContain('/api/db/read-raw-for-boot')
+        expect(requests).not.toContain('/api/write')
+    })
+
+    it('fails closed when an advertised raw boot route returns 404', async () => {
+        const fetchMock = vi.fn(async () => new Response('Cannot GET route', { status: 404 }))
+        vi.stubGlobal('fetch', fetchMock)
+
+        await expect(readyStorage().readDatabaseForBoot()).rejects.toMatchObject({
+            status: 404,
+            operation: 'read',
+        } satisfies Partial<InstanceType<typeof StorageError>>)
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    it('accepts only the explicit 204 raw response as a missing database', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })))
+        const storage = readyStorage()
+        storage._lastDbEtag = 'stale'
+
+        await expect(storage.readDatabaseForBoot()).resolves.toEqual({ kind: 'missing' })
+        expect(storage._lastDbEtag).toBeNull()
+    })
+
+    it('fails closed on an ambiguous zero-byte raw success', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 200 })))
+
+        await expect(readyStorage().readDatabaseForBoot()).rejects.toMatchObject({
+            code: 'AMBIGUOUS_DATABASE_BOOT_READ',
+            operation: 'read',
+        } satisfies Partial<InstanceType<typeof StorageError>>)
+    })
+
+    it('refuses an empty legacy read when the authoritative list still contains the database', async () => {
+        const requests: string[] = []
+        vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+            const requestPath = String(input)
+            requests.push(requestPath)
+            if (requestPath === '/api/read') return new Response(null, { status: 200 })
+            if (requestPath === '/api/list') {
+                return new Response(JSON.stringify({
+                    success: true,
+                    content: ['database/database.bin'],
+                }), { status: 200, headers: { 'content-type': 'application/json' } })
+            }
+            throw new Error(`Unexpected request: ${requestPath}`)
+        }))
+
+        await expect(readyStorage({
+            rawBootRead: false,
+            atomicCreate: false,
+        }).readDatabaseForBoot()).rejects.toMatchObject({
+            code: 'AMBIGUOUS_DATABASE_BOOT_READ',
+            operation: 'read',
+        } satisfies Partial<InstanceType<typeof StorageError>>)
+        expect(requests).toEqual(['/api/read', '/api/list'])
+    })
+
+    it('fails closed when a legacy absence check returns a malformed list', async () => {
+        vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+            if (String(input) === '/api/read') return new Response(null, { status: 200 })
+            if (String(input) === '/api/list') {
+                return new Response(JSON.stringify({ success: true, content: 'not-an-array' }), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            throw new Error(`Unexpected request: ${String(input)}`)
+        }))
+
+        await expect(readyStorage({
+            rawBootRead: false,
+            atomicCreate: false,
+        }).readDatabaseForBoot()).rejects.toMatchObject({
+            code: 'AMBIGUOUS_DATABASE_BOOT_READ',
+            operation: 'list',
+        } satisfies Partial<InstanceType<typeof StorageError>>)
+    })
+
+    it('creates on a legacy server only after read and list both prove absence', async () => {
+        const requests: string[] = []
+        vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+            const requestPath = String(input)
+            requests.push(requestPath)
+            if (requestPath === '/api/read') return new Response(null, { status: 200 })
+            if (requestPath === '/api/list') {
+                return new Response(JSON.stringify({ success: true, content: [] }), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            if (requestPath === '/api/write') {
+                return new Response(JSON.stringify({ success: true }), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            throw new Error(`Unexpected request: ${requestPath}`)
+        }))
+        const storage = readyStorage({
+            rawBootRead: false,
+            atomicCreate: false,
+        })
+
+        await expect(storage.createDatabaseIfAbsent(new Uint8Array([1, 2, 3])))
+            .resolves.toEqual({ kind: 'created', etag: null })
+        expect(requests).toEqual(['/api/read', '/api/list', '/api/write'])
+        expect(requests).not.toContain('/api/db/read-raw-for-boot')
+    })
+
+    it('uses the atomic create route and retains its ETag', async () => {
+        const etag = 'd'.repeat(32)
+        const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            expect(String(input)).toBe('/api/db/create-if-absent')
+            expect(init?.method).toBe('POST')
+            return new Response(JSON.stringify({
+                success: true,
+                created: true,
+                etag,
+                commitOutcome: 'committed',
+                commitOutcomeUnknown: false,
+            }), { status: 201, headers: { 'content-type': 'application/json' } })
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+
+        await expect(storage.createDatabaseIfAbsent(new Uint8Array([1, 2, 3])))
+            .resolves.toEqual({ kind: 'created', etag })
+        expect(storage._lastDbEtag).toBe(etag)
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    it('reports an atomic create race without accepting the competing ETag', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+            success: false,
+            created: false,
+            error: 'Database already exists',
+            code: 'DATABASE_ALREADY_EXISTS',
+            currentEtag: 'e'.repeat(32),
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        }), { status: 409, headers: { 'content-type': 'application/json' } })))
+        const storage = readyStorage()
+
+        await expect(storage.createDatabaseIfAbsent(new Uint8Array([1, 2, 3])))
+            .resolves.toEqual({ kind: 'already-present' })
+        expect(storage._lastDbEtag).toBeNull()
     })
 
     it('accepts only the complete committed restore acknowledgement', async () => {

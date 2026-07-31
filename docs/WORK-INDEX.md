@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **38** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is an intentional documented limitation, **1** is deferred for future work, and **55** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **37** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is an intentional documented limitation, **1** is deferred for future work, and **56** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -35,7 +35,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [A boot-route 404 can overwrite the server database](compatibility/boot-raw-read-404-overwrites-older-server-database.md) | compat | Open | A valid older-server database is replaced by an empty database, losing the entire dataset. | Requires an accidental mixed frontend/backend deployment, stale frontend during rollback, or similar version mismatch. |
 | [The legacy migration marker can outlive the WAL commit](audit/legacy-kv-migration-marker-can-outlive-the-wal-commit.md) | audit | Open | The whole database is hidden and an empty/incomplete database is served; legacy sources remain for manual recovery. | Requires power loss in the narrow transaction-to-marker ordering window. |
 
 ## Tier 5
@@ -118,6 +117,7 @@ None currently open.
 
 | Finding | Former harm | Note |
 |---|---|---|
+| [A boot-route 404 could overwrite the server database](compatibility/boot-raw-read-404-overwrites-older-server-database.md) | A mixed-version frontend could classify an unsupported boot route as a missing database and replace the entire valid dataset with an empty save. | Fixed 2026-07-31 with session capability negotiation, legacy read/list proof of absence, explicit 204 raw absence, fail-closed ambiguous responses, an atomic create-if-absent endpoint, winner reread, and mixed-version plus concurrent real-server coverage. |
 | [Chat-version cap collapsed to 100](audit/chat-version-cap-collapses-from-125-to-100.md) | Recovery copies only; the oldest 20% of the advertised history disappeared at the 125-version boundary. | Fixed 2026-07-31 with a direct 125-version cap, crash-safe partial-bundle rewriting, exact 125/126 byte-read coverage, and configurable rollover, idempotence, and injected-withdrawal regressions. |
 | [Global chat budget evicted newer bundles first](audit/global-chat-budget-evicts-newer-bundles-before-older-loose-versions.md) | A small byte-cap overage could destroy 25 newer chat recovery versions even though removing one older loose version would have sufficed. | Fixed 2026-07-31 with one globally age-ordered set of indivisible eviction units, newest-member bundle aging, per-chat newest protection, and an exact cross-chat small-overage regression. |
 | [`update.sh` wiped custom backup roots](audit/update-script-wipes-custom-in-tree-backup-roots.md) | Every source update erased all recovery archives under a permitted custom in-tree root such as `data/backups`, while the surviving live database silently recreated the directory empty. | Fixed 2026-07-31 by normalizing both updater-visible recovery markers into exact top-level keep entries, failing closed for managed-code targets, and covering full temporary source updates for default, custom server, and custom chat backup roots. |

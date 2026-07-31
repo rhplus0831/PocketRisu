@@ -176,8 +176,12 @@ describe("raw boot optimized plugin reconciliation", () => {
 
             const storage = new NodeStorage();
             storage.authChecked = true;
-            (NodeStorage as any).sessionInitialized = true;
+            (NodeStorage as any).sessionInitialized = false;
             (NodeStorage as any).sessionPending = null;
+            (NodeStorage as any).databaseStorageCapabilities = {
+                rawBootRead: false,
+                atomicCreate: false,
+            };
             vi.spyOn(storage, "createAuth").mockResolvedValue(token);
             bootState.storage = storage;
 
@@ -192,6 +196,10 @@ describe("raw boot optimized plugin reconciliation", () => {
                 values: 0,
                 meta: 0,
                 issues: [],
+            });
+            expect(requests).toContainEqual({
+                path: "/api/session",
+                generation: null,
             });
             expect(requests).toContainEqual({
                 path: "/api/db/read-raw-for-boot",

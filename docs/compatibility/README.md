@@ -33,7 +33,7 @@ many users use that path.
 
 ## Highest-priority findings
 
-- [New client 404 can overwrite an older server database](boot-raw-read-404-overwrites-older-server-database.md)
+- [New client 404 could overwrite an older server database (fixed 2026-07-31)](boot-raw-read-404-overwrites-older-server-database.md)
 - [Authoritative storage still stops at 15 seconds](authoritative-storage-15-second-deadline.md)
 - [Chat saves wait for a full snapshot after committing](chat-save-blocked-by-synchronous-snapshot.md)
 - [V3 top-level completion blocks application startup](v3-top-level-startup-barrier.md)

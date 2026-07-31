@@ -1,7 +1,8 @@
 import { StorageError } from "./storageError"
 
 export type BootSnapshotDatabaseRead =
-    | { kind: "bytes"; bytes: Uint8Array | null }
+    | { kind: "missing" }
+    | { kind: "bytes"; bytes: Uint8Array }
     | { kind: "decoded"; database: unknown }
 
 export interface BootInternalSnapshot {
@@ -49,8 +50,10 @@ export async function recoverDatabaseFromInternalSnapshots<T>({
             // Install only the committed stripped publication read back from
             // the server, never the folded ingest-only snapshot object.
             const restoredRead = await storage.readDatabaseForBoot()
+            if (restoredRead.kind === "missing") {
+                throw new Error("Restored database is missing")
+            }
             if (restoredRead.kind === "bytes") {
-                if (!restoredRead.bytes) throw new Error("Restored database is missing")
                 return await decode(restoredRead.bytes)
             }
             return restoredRead.database as T
