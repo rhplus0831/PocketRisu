@@ -65,7 +65,7 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 
 1. `pnpm runserver` invokes `node server/node/server.cjs` from the repository root.
 2. CommonJS evaluation loads `db.cjs` and `logs.cjs` near `server/node/server.cjs:36`. Those modules synchronously create/open their SQLite files before route registration.
-3. `db.cjs` creates `save/`, opens `save/risuai.db`, enables WAL with the power-loss-durable `synchronous=FULL` default, and applies performance and lock pragmas near `server/node/db.cjs:23`. It creates the `kv`, deletion-journal, and epoch tables, initializes the chunk store, then attempts legacy save-folder migration. `server.cjs` may apply only an explicit persisted or administrator-managed downgrade after this safe startup boundary.
+3. `db.cjs` creates `save/`, opens `save/risuai.db`, enables WAL with the power-loss-durable `synchronous=FULL` default, and applies performance and lock pragmas near `server/node/db.cjs:23`. It creates the `kv`, deletion-journal, epoch, and operational migration-state tables, initializes the chunk store, then attempts legacy save-folder migration. Legacy values and their `storage_migrations` completion row commit together; `.migrated_to_sqlite` is an atomically published rollback/UI compatibility marker that startup reconciles against that state. `server.cjs` may apply only an explicit persisted or administrator-managed downgrade after this safe startup boundary.
 4. `server.cjs` installs fatal logging handlers before the rest of its initialization at `server/node/server.cjs:117`. It then creates `save/`, creates/sweeps the database-assembly spool, resolves the independent chat-history root, migrates legacy history from the configured server-backup directory, reads or creates the password/JWT/instance files, loads persisted direct-asset sessions, initializes the server-backup directory, and registers middleware and routes.
 5. `startServer()` resolves interrupted filesystem swaps, then read-only preflights the live database before any migration or epoch write. A valid database gets the epoch bump plus asset, inlay, chat, plugin-stage, and legacy `REMOTE` migrations. A corrupt database skips those mutations and listens in authenticated snapshot-recovery mode so the original bytes remain recoverable. The chat migration first writes `migration-backup/pre-chat-externalization-<timestamp>.bin`, then records `migration/chats-externalized`.
 6. TLS is enabled only when both `server/node/ssl/certificate/server.key` and `server.crt` can be read; otherwise it starts plain HTTP.
@@ -143,7 +143,7 @@ The server reads configuration directly from `process.env`; it does not load `.e
 │   ├── __backup_path                  # updater-visible backup path marker
 │   ├── __chat_backup_path             # updater-visible chat-history path marker
 │   ├── import_journal.json             # present only across import publication/recovery
-│   └── .migrated_to_sqlite             # legacy hex-file migration marker
+│   └── .migrated_to_sqlite             # legacy hex-file rollback/UI compatibility marker
 ├── backups/
 │   └── risu-backup-<timestamp>.bin     # default server-side backup destination
 └── server/node/ssl/certificate/

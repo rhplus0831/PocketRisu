@@ -44,6 +44,8 @@ const { kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList,
         kvGetListEpoch, kvBumpListEpoch,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, createKvSnapshot,
         withPluginStorageQuotaPlan,
+        isLegacyHexMigrationComplete, markLegacyHexMigrationComplete,
+        publishLegacyHexMigrationMarker,
         db: sqliteDb } = require('./db.cjs');
 const { buildListResponse } = require('./listDelta.cjs');
 const {
@@ -14234,8 +14236,6 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 });
 
 // ── Save-folder migration endpoints ──────────────────────────────────────────
-const migrationMarkerPath = path.join(savePath, '.migrated_to_sqlite');
-
 function decodeCanonicalHexStorageKey(filename) {
     if (typeof filename !== 'string'
         || filename.length === 0
@@ -14446,6 +14446,10 @@ async function importLegacySaveEntries(
                 retryable: true,
             });
         }
+        // Bind the legacy-file migration completion signal to the same SQLite
+        // commit as every imported row. The filesystem marker published after
+        // commit is retained only for rollback and UI compatibility.
+        markLegacyHexMigrationComplete(sources.length);
         setReplacementOperationOutcome(operationId, 'committed', {
             result: { ok: true, imported: sources.length },
         });
@@ -14468,7 +14472,7 @@ async function importLegacySaveEntries(
             failure.code = 'SAVE_FOLDER_IMPORT_MIGRATION_MARKER_FAILED';
             throw failure;
         }
-        writeFileSync(migrationMarkerPath, new Date().toISOString(), 'utf-8');
+        publishLegacyHexMigrationMarker();
     } catch (error) {
         if (!transactionCommitted) {
             let rollbackSucceeded = !error?.restoreError;
@@ -14915,7 +14919,7 @@ app.post('/api/migrate/save-folder/cleanup/scan', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
     try {
-        if (!existsSync(migrationMarkerPath)) {
+        if (!isLegacyHexMigrationComplete()) {
             res.status(400).json({ error: 'Migration has not been completed yet' });
             return;
         }
@@ -14930,7 +14934,7 @@ app.post('/api/migrate/save-folder/cleanup/execute', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
     try {
-        if (!existsSync(migrationMarkerPath)) {
+        if (!isLegacyHexMigrationComplete()) {
             res.status(400).json({ error: 'Migration has not been completed yet' });
             return;
         }

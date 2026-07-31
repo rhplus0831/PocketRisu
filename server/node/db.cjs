@@ -79,7 +79,17 @@ db.exec(`
     error_json   TEXT,
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL
-  )
+  );
+
+  -- One-time storage migration state is operational metadata. Keeping the
+  -- commit record outside kv binds it to the SQLite file without exposing it
+  -- through backups or deleting it during a logical database replacement.
+  CREATE TABLE IF NOT EXISTS storage_migrations (
+    migration_id TEXT    PRIMARY KEY,
+    version      INTEGER NOT NULL CHECK (version >= 1),
+    completed_at INTEGER NOT NULL,
+    source_count INTEGER NOT NULL CHECK (source_count >= 0)
+  );
 `);
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_replacement_operations_updated_at
@@ -96,10 +106,98 @@ db.prepare(`INSERT OR IGNORE INTO plugin_storage_usage (id, bytes) VALUES (1, 0)
 // ─── Migration: /save/ hex files → kv table ──────────────────────────────────
 const savePath = path.join(process.cwd(), 'save');
 const migrationMarker = path.join(process.cwd(), 'save', '.migrated_to_sqlite');
+const LEGACY_HEX_MIGRATION_ID = 'legacy-hex-files-to-sqlite';
+const LEGACY_HEX_MIGRATION_VERSION = 1;
+const stmtGetStorageMigration = db.prepare(`
+  SELECT version, completed_at, source_count
+  FROM storage_migrations
+  WHERE migration_id = ?
+`);
+const stmtSetStorageMigration = db.prepare(`
+  INSERT INTO storage_migrations (migration_id, version, completed_at, source_count)
+  VALUES (?, ?, ?, ?)
+  ON CONFLICT(migration_id) DO UPDATE SET
+    version = excluded.version,
+    completed_at = excluded.completed_at,
+    source_count = excluded.source_count
+  WHERE storage_migrations.version <= excluded.version
+`);
+
+function isLegacyHexMigrationComplete() {
+    const state = stmtGetStorageMigration.get(LEGACY_HEX_MIGRATION_ID);
+    return Number(state?.version ?? 0) >= LEGACY_HEX_MIGRATION_VERSION;
+}
+
+function markLegacyHexMigrationComplete(sourceCount = 0) {
+    const normalizedCount = Number.isSafeInteger(sourceCount) && sourceCount >= 0
+        ? sourceCount
+        : 0;
+    stmtSetStorageMigration.run(
+        LEGACY_HEX_MIGRATION_ID,
+        LEGACY_HEX_MIGRATION_VERSION,
+        Date.now(),
+        normalizedCount,
+    );
+}
+
+function fsyncDirectory(directory) {
+    let fd;
+    try {
+        fd = fs.openSync(directory, 'r');
+        fs.fsyncSync(fd);
+    } catch (error) {
+        // Directory fsync is unavailable on some supported filesystems. The
+        // transactional SQLite completion row remains the authority there.
+        if (!['EACCES', 'EINVAL', 'EISDIR', 'ENOTSUP', 'EPERM'].includes(error?.code)) {
+            throw error;
+        }
+    } finally {
+        if (fd !== undefined) fs.closeSync(fd);
+    }
+}
+
+function publishLegacyHexMigrationMarker() {
+    const temporaryMarker = `${migrationMarker}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    const bytes = Buffer.from(new Date().toISOString(), 'utf-8');
+    let fd;
+    try {
+        fd = fs.openSync(temporaryMarker, 'wx', 0o600);
+        let offset = 0;
+        while (offset < bytes.length) {
+            const written = fs.writeSync(fd, bytes, offset, bytes.length - offset);
+            if (written <= 0) throw new Error('Legacy migration marker write made no progress');
+            offset += written;
+        }
+        fs.fsyncSync(fd);
+        fs.closeSync(fd);
+        fd = undefined;
+        fs.renameSync(temporaryMarker, migrationMarker);
+        fsyncDirectory(savePath);
+    } finally {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch {}
+        }
+        try { fs.rmSync(temporaryMarker, { force: true }); } catch {}
+    }
+}
+
+function ensureLegacyHexMigrationMarker() {
+    if (fs.existsSync(migrationMarker)) return;
+    try {
+        publishLegacyHexMigrationMarker();
+    } catch (error) {
+        // The marker is a rollback/UI compatibility artifact. The completion
+        // row committed with the migrated values is the source of truth.
+        console.warn('[DB] Could not publish legacy migration marker:', error?.message || error);
+    }
+}
 
 function migrateFromSaveDir() {
     if (!fs.existsSync(savePath)) return;
-    if (fs.existsSync(migrationMarker)) return;
+    if (isLegacyHexMigrationComplete()) {
+        ensureLegacyHexMigrationMarker();
+        return;
+    }
 
     const hexRegex = /^[0-9a-fA-F]+$/;
     let files;
@@ -110,11 +208,35 @@ function migrateFromSaveDir() {
     }
 
     const hexFiles = files.filter(f => hexRegex.test(f));
-    if (hexFiles.length === 0) return;
-
-    console.log(`[DB] Migrating ${hexFiles.length} file(s) from /save/ to SQLite...`);
+    const markerExists = fs.existsSync(migrationMarker);
+    if (hexFiles.length === 0) {
+        // Older versions and completed save-folder imports have only the
+        // filesystem marker. Adopt it when no preserved sources can be checked;
+        // future migrations will commit both state and data atomically.
+        if (markerExists) {
+            db.transaction(() => markLegacyHexMigrationComplete(0))();
+        }
+        return;
+    }
 
     const exists = db.prepare(`SELECT 1 FROM kv WHERE key = ?`);
+    const databaseHexName = Buffer.from(DB_BLOB_KEY, 'utf-8').toString('hex');
+    const hasLegacyDatabase = hexFiles.some(file => file.toLowerCase() === databaseHexName);
+
+    // A legacy marker without transactional state may predate the durable
+    // migration protocol. The old import was one SQLite transaction, so the
+    // authoritative database row proves that transaction committed. Adopt it
+    // without resurrecting individual keys deliberately deleted since then.
+    if (markerExists && (!hasLegacyDatabase || exists.get(DB_BLOB_KEY))) {
+        db.transaction(() => markLegacyHexMigrationComplete(hexFiles.length))();
+        console.log('[DB] Verified legacy migration marker against SQLite state.');
+        return;
+    }
+
+    if (markerExists) {
+        console.warn('[DB] Legacy migration marker has no matching SQLite database; recovering preserved files.');
+    }
+    console.log(`[DB] Migrating ${hexFiles.length} file(s) from /save/ to SQLite...`);
 
     const run = db.transaction(() => {
         for (let i = 0; i < hexFiles.length; i++) {
@@ -131,10 +253,14 @@ function migrateFromSaveDir() {
             chunkStore.putValueFromFile(key, path.join(savePath, hexFiles[i]));
             stmtRemoveDeletion.run(key);
         }
+        // This is the authoritative completion signal. A crash can expose
+        // neither the migrated values nor this row, or both, but never a marker
+        // that suppresses a rolled-back migration.
+        markLegacyHexMigrationComplete(hexFiles.length);
     });
     run();
 
-    fs.writeFileSync(migrationMarker, new Date().toISOString(), 'utf-8');
+    ensureLegacyHexMigrationMarker();
     console.log(`[DB] Migration complete. ${hexFiles.length} files preserved in /save/.`);
     console.log(`[DB] To free disk space, remove migrated files via Settings > Clean Up Save Folder.`);
 }
@@ -731,4 +857,7 @@ module.exports = {
     getPluginStorageUsage,
     reconcilePluginStorageUsage,
     withPluginStorageQuotaPlan,
+    isLegacyHexMigrationComplete,
+    markLegacyHexMigrationComplete,
+    publishLegacyHexMigrationMarker,
 };

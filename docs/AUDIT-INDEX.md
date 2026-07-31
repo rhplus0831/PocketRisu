@@ -2,7 +2,7 @@
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
 `Status` column uses `Open`, `Fixed`, `Deferred`, or `Intentional documented limitation`;
-36 findings are currently `Open`, 22 are `Fixed`, 1 is `Deferred`, and 1 is an
+35 findings are currently `Open`, 23 are `Fixed`, 1 is `Deferred`, and 1 is an
 `Intentional documented limitation`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
@@ -76,7 +76,7 @@ resolution against current code before acting on it.
 | [RISUP export deletes auto-suggest prefix and clean policy](audit/risup-export-deletes-auto-suggest-prefix-and-clean-policy.md) | Fixed | Medium | Two configured preset fields, deleted from the **live** in-memory preset and omitted from the archive | Deterministic on every `.risup` export — the export path mutates the live preset |
 | [Unmigrated KV inlays omitted from backups](audit/unmigrated-kv-inlays-are-omitted-from-backups.md) | Open | Medium | KV-fallback inlays absent from every archive; a restore then deletes the live copy | Requires a skipped/failed entry in the one-time migration; the loss lands on any later restore |
 | [Interrupted inlay migration discards the source row](audit/interrupted-inlay-migration-discards-the-source-row.md) | Open | Medium | One inlay: the valid KV source deleted in favor of a torn file | Crash inside the one-time migration window, then next-boot resume |
-| [Legacy KV migration marker can outlive the WAL commit](audit/legacy-kv-migration-marker-can-outlive-the-wal-commit.md) | Open | Medium | Whole database hidden (empty DB served); hex sources survive on disk for manual recovery | Power loss during the legacy hex-to-SQLite migration |
+| [Legacy KV migration marker can outlive the WAL commit](audit/legacy-kv-migration-marker-can-outlive-the-wal-commit.md) | Fixed | Medium | Whole database hidden (empty DB served); hex sources survive on disk for manual recovery | Power loss during the legacy hex-to-SQLite migration |
 | [Boot asset GC races concurrent publication](audit/boot-asset-gc-races-concurrent-publication.md) | Fixed | Medium | Single assets uploaded from another tab/device, deleted mid-publication | Boot plus concurrent activity on another device; bounded window |
 | [External dedup can strand or overwrite a live asset](audit/external-dedup-can-strand-or-overwrite-a-live-asset.md) | Open | Medium | Canonical asset path left absent after a crash; a race can replace a live inode | Running `scripts/dedup-assets.sh` against live servers (it claims to be safe); directly relevant to the multi-instance hardlink-dedup plan |
 | [Preferred jdupes merges cross-instance ownership](audit/preferred-jdupes-merges-cross-instance-ownership.md) | Open | Medium | Assets unreadable/unexportable for one instance after ownership collapses onto another's inode | Root cron dedup across per-user instances |

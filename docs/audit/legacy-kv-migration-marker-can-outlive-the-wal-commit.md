@@ -1,6 +1,6 @@
 # The legacy KV migration marker can outlive the WAL commit
 
-- Status: Open
+- Status: Fixed 2026-07-31
 - Severity: Medium
 - Lens: D5
 - Area: Area 5 — server KV core and chat rows
@@ -25,3 +25,26 @@ before atomically publishing and fsyncing the marker and its parent. Verify the
 marker against migrated state on boot and retry from preserved sources on drift.
 
 Add power-loss ordering coverage for the transaction/marker boundary.
+
+## Resolution (2026-07-31)
+
+Legacy migration completion now lives in the SQLite-only `storage_migrations`
+table and is committed in the same transaction as every imported raw or
+chunked value. The `.migrated_to_sqlite` file remains for rollback and UI
+compatibility, but it is published through a synced temporary file, atomic
+rename, and parent-directory sync; cleanup authorization now consults the
+transactional completion row instead of marker existence.
+
+Boot also reconciles markers written by older versions. When the preserved
+legacy database file exists but SQLite lacks its authoritative database row,
+the server treats the marker as drift and reimports the preserved files. When
+the database row proves the old all-or-nothing transaction committed, the
+server adopts the marker without resurrecting individual keys intentionally
+deleted since migration. Explicit directory and ZIP imports record the same
+completion state before their SQLite commit.
+
+`test/compat/legacy-kv-migration-durability.test.ts` constructs both sides of
+the transaction/marker crash boundary, verifies stale-marker recovery, marker
+repair, preserved sources, and one-shot migration semantics. The direct-import
+regression in `test/compat/import-ingress-memory.test.ts` verifies committed
+state and cleanup authorization even when post-commit marker publication fails.

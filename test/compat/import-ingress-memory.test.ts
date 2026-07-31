@@ -965,6 +965,9 @@ describe('bounded archive and save-folder ingress (real server)', () => {
       POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT: 'migration-marker',
     })
     const failingClient = await createClient(server.port, server.password)
+    // Startup repairs a missing compatibility marker from transactional state;
+    // remove it again so this request exercises publication failure itself.
+    await rm(migrationMarker, { force: true })
     const response = await executeSaveFolder(failingClient, sourceDir)
     expect(response.status).toBe(500)
     await expect(response.json()).resolves.toEqual({
@@ -977,11 +980,27 @@ describe('bounded archive and save-folder ingress (real server)', () => {
     await expectNote(failingClient, 'committed-marker-failure')
     expect(await readFile(path.join(server.cwd, 'save', assetKey))).toEqual(candidateAsset)
     await expect(stat(migrationMarker)).rejects.toMatchObject({ code: 'ENOENT' })
+    const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
+    try {
+      expect(sqlite.prepare(`
+        SELECT version, source_count
+        FROM storage_migrations
+        WHERE migration_id = 'legacy-hex-files-to-sqlite'
+      `).get()).toEqual({ version: 1, source_count: 2 })
+    } finally {
+      sqlite.close()
+    }
+    const cleanupScan = await failingClient.fetch('/api/migrate/save-folder/cleanup/scan', {
+      method: 'POST',
+    })
+    expect(cleanupScan.status).toBe(200)
+    await expect(cleanupScan.json()).resolves.toEqual({ count: 0, totalSize: 0 })
 
     await server.restart({ POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT: '' })
     const restarted = await createClient(server.port, server.password)
     await expectNote(restarted, 'committed-marker-failure')
     expect(await readFile(path.join(server.cwd, 'save', assetKey))).toEqual(candidateAsset)
+    expect((await stat(migrationMarker)).isFile()).toBe(true)
     expect(await readdir(path.join(server.cwd, 'save'))).not.toContain('import_journal.json')
     await waitForNoImportSpools(server)
   }, 60_000)
