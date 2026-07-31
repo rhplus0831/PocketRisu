@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **48** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is deferred for future work, and **46** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **47** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is deferred for future work, and **47** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -31,7 +31,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [Backups omit drafts and imports delete them](audit/backups-omit-drafts-and-imports-delete-them.md) | audit | Open | All persistent unsent composer drafts are deleted. | Every full backup restore/import clears the namespace while no backup contains it. |
 | [Young-chat deletion has no pre-image](audit/chat-deletion-has-no-preimage-history.md) | audit | Open | An accidentally deleted young chat has no recovery copy. | Create and save a chat once, then use the normal delete flow before a snapshot captures it. |
 | [RISUP export mutates the live preset](audit/risup-export-deletes-auto-suggest-prefix-and-clean-policy.md) | audit | Open | Two live auto-suggest policy fields are deleted and also omitted from the archive. | Deterministic on every `.risup` export of an affected configured preset. |
 | [Legacy storage getters treat falsey values as missing](audit/legacy-storage-getters-conflate-valid-values-with-missing.md) | audit | Open | A plugin can reset persisted configuration or lock itself against later saves. | Every affected V2 plugin read of a stored empty string, zero, or false sentinel. |
@@ -123,6 +122,7 @@ None currently open.
 
 | Finding | Former harm | Note |
 |---|---|---|
+| [Backups omitted drafts and imports deleted them](audit/backups-omit-drafts-and-imports-delete-them.md) | Every full backup restore/import permanently deleted all persistent unsent composer drafts. | Fixed 2026-07-31 with pinned graph-referenced draft entries in Node full/server/partial archives, post-normalization exact-key restoration, stale/orphan filtering, upstream omission, and archive/save-folder round-trip coverage. |
 | [Plugin updates discarded configured arguments](audit/plugin-updates-discard-configured-arguments.md) | Ordinary updates and confirmed duplicate imports reset persisted API keys, endpoints, models, prompts, and enablement. | Fixed 2026-07-31 by merging live values for retained argument names, defaulting only new arguments, preserving compatible enablement, confirming removals outside the lifecycle lock, rechecking before commit, and covering update/import schema changes plus durability. |
 | [Inactive character and chat writes were not scheduled](audit/non-selected-character-and-chat-writes-have-no-save-scheduler.md) | Acknowledged edits to non-selected characters, inactive chat rows, and per-chat module metadata could revert on refresh. | Fixed 2026-07-31 with startup-safe character/chat dirty bridges, target-aware V3 index and database replacement diffs, MCP and backup/package-import wiring, placeholder-safe row selection, complete stub metadata tracking, and inactive-target persistence coverage. |
 | [HTML chat import reused the authoritative row ID](audit/html-chat-import-reuses-the-authoritative-row-id.md) | Importing an HTML export into its source character created two visible chats backed by one row, so edits could disappear or replace the other chat after reload. | Fixed 2026-07-31 with shared fresh-ID import normalization, client row-before-stub duplicate rejection, server patch/full-write integrity guards for full and cold chats, and HTML import/edit/save/reload plus atomic rejection coverage. |

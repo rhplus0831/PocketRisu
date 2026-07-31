@@ -74,6 +74,12 @@ partial archives emit only referenced canonical rows and fail with
 `BACKUP_MISSING_MCP_TOOL_CALL_ROW` when a marker's payload is absent. Upstream-target
 exports omit this PocketRisu-only namespace.
 
+Node-only downloads, server-file archives, and partial archives also select
+composer rows under `drafts/` from the pinned SQLite view. Export selection is
+limited to exact character/chat identities backed by the selected chat-row graph,
+so drafts left behind by a deleted chat are not published. Upstream-target exports
+omit this PocketRisu-only namespace.
+
 Server archives publish through a private temporary file and a no-overwrite final link;
 name collisions are probed rather than overwritten. Download responses remain
 uncompressed at Express level so archive framing and keepalives are not buffered by
@@ -154,6 +160,13 @@ limit unless the user has explicitly selected large restore.
 Directory and ZIP save-folder imports copy regular, non-symlink files into a stage before
 entering the replacement transaction. They reject missing live databases, duplicate
 entries, excessive entry counts/expanded bytes, unsupported links, and invalid names.
+
+Composer-draft archive and save-folder rows remain in private staging until database
+ingestion has assigned missing chat IDs and normalized duplicate character IDs. The
+transaction first clears the prior `drafts/` namespace, then restores only entries whose
+exact `drafts/<chaId>/<chatId>` key occurs in the normalized imported graph. Legacy or
+upstream archives without draft entries therefore replace stale drafts without allowing
+cross-dataset ID reuse to attach unrelated text.
 
 Publication coordinates:
 

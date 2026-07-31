@@ -110,6 +110,7 @@ const {
 const {
     createChatRowStore,
     chatRowKey,
+    parseChatRowKey,
     hasChatPayloads,
     findDuplicateChaIds,
     findDuplicateChatIds,
@@ -1948,6 +1949,7 @@ const BACKUP_ENTRY_STAGE_PREFIX = '.backup-entry-stage-';
 const PARTIAL_EXPORT_JOB_PREFIX = '.partial-export-';
 const FULL_EXPORT_PIN_PREFIX = '.full-export-';
 const SERVER_BACKUP_TEMP_PREFIX = '.risu-backup-save-';
+const DRAFT_PREFIX = 'drafts/';
 const configuredPartialExportJobTtlMs = Number(
     process.env.NODE_ENV === 'test'
         ? process.env.POCKETRISU_TEST_PARTIAL_EXPORT_TTL_MS
@@ -5762,6 +5764,63 @@ function listMcpToolCallBackupEntries(reader, kind = 'kv-source') {
         }));
 }
 
+function draftStorageKey(chaId, chatId) {
+    return `${DRAFT_PREFIX}${chaId}/${chatId}`;
+}
+
+function referencedDraftStorageKeys(database) {
+    const keys = new Set();
+    for (const character of database?.characters ?? []) {
+        if (typeof character?.chaId !== 'string' || character.chaId.length === 0
+            || !Array.isArray(character.chats)) continue;
+        for (const chat of character.chats) {
+            if (typeof chat?.id !== 'string' || chat.id.length === 0) continue;
+            keys.add(draftStorageKey(character.chaId, chat.id));
+        }
+    }
+    return keys;
+}
+
+function referencedDraftStorageKeysFromChatRows(reader) {
+    const keys = new Set();
+    for (const entry of reader.kvListWithSizes('chats/')) {
+        const parsed = parseChatRowKey(entry.key);
+        if (!parsed?.chaId || !parsed.chatId) continue;
+        keys.add(draftStorageKey(parsed.chaId, parsed.chatId));
+    }
+    return keys;
+}
+
+function listDraftBackupEntries(
+    reader,
+    { database = null, kind = 'kv-source' } = {},
+) {
+    const referenced = database
+        ? referencedDraftStorageKeys(database)
+        : referencedDraftStorageKeysFromChatRows(reader);
+    return reader.kvListWithSizes(DRAFT_PREFIX)
+        .filter((entry) => referenced.has(entry.key))
+        .map((entry) => ({
+            kind,
+            key: entry.key,
+            backupName: entry.key,
+            sortKey: entry.key,
+            size: entry.size,
+        }));
+}
+
+async function restoreImportedDraftEntries(entries, database, { signal = null } = {}) {
+    const referenced = referencedDraftStorageKeys(database);
+    let restored = 0;
+    for (const entry of entries) {
+        throwIfImportAborted(signal);
+        if (!referenced.has(entry.key)) continue;
+        await importOpaqueRowFromFile(entry.key, entry, signal);
+        restored++;
+    }
+    return restored;
+}
+
 function mcpToolCallSnapshotStorage(reader) {
     const rows = listMcpToolCallBackupEntries(reader).map((entry) => ({
         key: parseMcpToolCallStorageKey(entry.key).suffix,
@@ -6620,6 +6679,7 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
                     size: entry.size,
                 }))),
                 ...(target === 'upstream' ? [] : listMcpToolCallBackupEntries(snapshot)),
+                ...(target === 'upstream' ? [] : listDraftBackupEntries(snapshot)),
             ];
             // Admission is deliberately conservative: reserve every physical
             // plugin candidate before decoding the tiny ownership metadata
@@ -6986,7 +7046,8 @@ async function pinPartialExportState(job) {
             const database = { ...strippedDb, account: undefined };
             const selected = listPartialBackupAssetEntries(database, snapshot);
             const mcpToolCalls = listMcpToolCallBackupEntries(snapshot, 'kv');
-            const selectedEntries = [...selected.entries, ...mcpToolCalls]
+            const drafts = listDraftBackupEntries(snapshot, { database, kind: 'kv' });
+            const selectedEntries = [...selected.entries, ...mcpToolCalls, ...drafts]
                 .sort((left, right) => left.sortKey.localeCompare(right.sortKey));
             preflightBackupEntries([
                 { backupName: 'database.risudat', size: raw.length },
@@ -7225,6 +7286,13 @@ function resolveBackupStorageKey(name) {
         return name;
     }
 
+    if (name.startsWith(DRAFT_PREFIX)) {
+        if (name.length === DRAFT_PREFIX.length || name.includes('\0')) {
+            throw new Error(`Invalid composer draft entry name: ${name}`);
+        }
+        return name;
+    }
+
     if (
         name.startsWith(PLUGIN_SAVE_PREFIX) ||
         name.startsWith(PLUGIN_SAVE_META_PREFIX)
@@ -7281,6 +7349,7 @@ async function importBackupFromSource(dataSource, {
     let backupEntryStageDir = null;
     let entryIndex = null;
     let backupEntryIndex = 0;
+    const deferredDraftEntries = [];
     let assetsRestored = 0;
     let bytesReceived = 0;
     const existingInlayKeys = (await listInlayFiles()).map((entry) => `inlay/${entry.id}`);
@@ -7455,6 +7524,9 @@ async function importBackupFromSource(dataSource, {
                 );
             } else if (storageKey === PLUGIN_STORAGE_MANIFEST_KEY) {
                 await importOpaqueRowFromFile(storageKey, source, signal);
+            } else if (storageKey.startsWith(DRAFT_PREFIX)) {
+                deferredDraftEntries.push({ key: storageKey, ...source });
+                return { retainSource: true };
             } else {
                 await importOpaqueRowFromFile(
                     storageKey,
@@ -7507,9 +7579,9 @@ async function importBackupFromSource(dataSource, {
         kvDelPrefix(PLUGIN_SAVE_PREFIX);
         kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
         kvDel(PLUGIN_STORAGE_MANIFEST_KEY);
-        // Composer drafts are session/device-local and not carried in the backup;
-        // wipe stale ones so an old snapshot's chats don't resurrect later drafts.
-        kvDelPrefix('drafts/');
+        // Drafts are graph-owned backup rows. Clear the prior dataset now, then
+        // restore only entries whose character/chat IDs survive normalization.
+        kvDelPrefix(DRAFT_PREFIX);
         // Same reasoning as clearExistingData (save-folder import path): wipe stale
         // remote payloads from the prior user before this backup's contents land.
         // .bin backups never carry REMOTE blocks today, so the migration won't
@@ -7639,11 +7711,13 @@ async function importBackupFromSource(dataSource, {
                         if (currentEntry.name === 'database.risudat') {
                             hasDatabase = true;
                         } else {
-                            await importStagedEntry(currentEntry.name, {
+                            const importResult = await importStagedEntry(currentEntry.name, {
                                 filePath: currentEntry.filePath,
                                 size: currentEntry.size,
                             });
-                            await fs.unlink(currentEntry.filePath).catch(() => {});
+                            if (!importResult?.retainSource) {
+                                await fs.unlink(currentEntry.filePath).catch(() => {});
+                            }
                         }
                         currentEntry = null;
                     }
@@ -7694,6 +7768,11 @@ async function importBackupFromSource(dataSource, {
             });
             markRemoteMigrationDone();
         }
+        await restoreImportedDraftEntries(
+            deferredDraftEntries,
+            databaseIngestion?.strippedDb,
+            { signal },
+        );
         // Deterministically hold the hardest reader race in compatibility
         // tests: the candidate database is visible inside SQLite's uncommitted
         // replacement transaction, but the import has not published it.
@@ -13125,9 +13204,10 @@ app.get('/api/backup/export', async (req, res, next) => {
     const shouldAbort = () => abortTracker.signal.aborted || res.destroyed;
     try {
         // ?target=upstream excludes NodeOnly-only slashed namespaces: plugin
-        // rows plus inlay/, inlay_sidecar/, and inlay_meta/. Upstream RisuAI's
-        // import treats those names as paths under assets/ and fails with
-        // ENOENT. Plugin rows are folded inline; inlay images remain lossy.
+        // rows plus drafts/, inlay/, inlay_sidecar/, and inlay_meta/. Upstream
+        // RisuAI's import treats those names as paths under assets/ and fails
+        // with ENOENT. Plugin rows are folded inline; drafts and inlays remain
+        // intentionally lossy on this migration-only target.
         const target = req.query.target === 'upstream' ? 'upstream' : 'nodeonly';
         pinnedState = await pinFullBackupState({
             target,
@@ -14099,8 +14179,9 @@ function clearExistingData() {
     kvDel(PLUGIN_STORAGE_MANIFEST_KEY);
     kvDelPrefix(MCP_TOOL_CALL_CACHE_PREFIX);
     for (const key of chatRowStore.listAllChatRowKeys()) kvDel(key);
-    // Composer drafts aren't part of a save folder; clear stale ones on import.
-    kvDelPrefix('drafts/');
+    // Draft rows belong to the imported chat graph. Matching rows from a legacy
+    // save folder are restored only after the database has normalized its IDs.
+    kvDelPrefix(DRAFT_PREFIX);
     // Drop the previous user's remote payloads. The new save folder usually
     // brings its own remotes/<id>.local.bin files (INSERT OR REPLACE), but if
     // the imported character ids reuse names from the prior user without
@@ -14155,6 +14236,7 @@ async function importLegacySaveEntries(
     const assetStage = await prepareAssetImportStage();
     let assetSwap = null;
     let databaseIngestion = null;
+    const deferredDraftEntries = [];
     let journal = null;
     let transactionCommitted = false;
 
@@ -14167,6 +14249,10 @@ async function importLegacySaveEntries(
             const { key } = source;
             if (key === DB_BLOB_KEY && streamDatabase) continue;
             if (key === DB_BLOB_KEY) continue;
+            if (key.startsWith(DRAFT_PREFIX)) {
+                deferredDraftEntries.push(source);
+                continue;
+            }
             if (key.startsWith('assets/')) {
                 await writeImportedAssetFromFile(
                     assetStage,
@@ -14223,6 +14309,12 @@ async function importLegacySaveEntries(
             });
             markRemoteMigrationDone();
         }
+
+        await restoreImportedDraftEntries(
+            deferredDraftEntries,
+            databaseIngestion?.strippedDb,
+            { signal },
+        );
 
         throwIfImportAborted(signal);
         fsyncDirectoryTree(assetImportStagingDir);
@@ -14880,6 +14972,7 @@ async function estimateServerBackupSize(reader = null) {
     const sizeReader = reader || { kvListWithSizes };
     for (const it of sizeReader.kvListWithSizes(PLUGIN_SAVE_PREFIX)) total += it.size;
     for (const it of sizeReader.kvListWithSizes(PLUGIN_SAVE_META_PREFIX)) total += it.size;
+    for (const it of listDraftBackupEntries(sizeReader)) total += it.size;
     for (const it of listAssetEntriesWithSizes(sizeReader)) total += it.size;
     for (const it of sizeReader.kvListWithSizes('inlay_meta/')) total += it.size;
     for (const e of reader
