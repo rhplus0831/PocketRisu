@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **54** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, and **41** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **53** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, and **42** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -31,7 +31,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [Recovery copies omit MCP tool-call payloads](audit/recovery-copies-omit-mcp-tool-call-payloads.md) | audit | Open | Remembered tool arguments and responses referenced by chats are permanently lost. | Every fresh-instance migration from a portable backup for users with remembered MCP tool calls. |
 | [Live startup state can misclassify a new chat](audit/live-startup-state-can-classify-a-new-chat-as-durable.md) | audit | Open | A newly created chat is committed as a stub without a row and loses all messages on refresh. | Deterministic when normal boot repair or synchronous V2 startup code creates the affected chat. |
 | [HTML chat import reuses the row ID](audit/html-chat-import-reuses-the-authoritative-row-id.md) | audit | Open | New work in an imported duplicate chat silently disappears after save and reload. | Importing an HTML export back into its source character creates the duplicate ID every time. |
 | [Inactive character and chat writes are not scheduled](audit/non-selected-character-and-chat-writes-have-no-save-scheduler.md) | audit | Open | Acknowledged character, chat, and module edits revert on refresh. | Normal arbitrary-target V3 or MCP writes to non-selected records lack a dirty bridge. |
@@ -123,6 +122,7 @@ None currently open.
 
 | Finding | Former harm | Note |
 |---|---|---|
+| [Recovery copies omitted MCP tool-call payloads](audit/recovery-copies-omit-mcp-tool-call-payloads.md) | Fresh-instance restores kept opaque chat markers but permanently lost remembered tool arguments and responses. | Fixed 2026-07-31 with point-in-time reference-aware Node/server/partial archive entries, a bounded folded snapshot envelope, strict namespace replacement and key validation, and fresh-server plus snapshot round-trip coverage. |
 | [Inlay replacement unlinked before publish](audit/inlay-replacement-unlinks-before-publish.md) | A failed overwrite could destroy an image, while compression converted publication failures into successful skips. | Fixed 2026-07-31 with staged and fsynced payload/sidecar files, ordered atomic renames, post-commit old-extension cleanup, startup temp cleanup, terminal compression errors, and injected-failure plus `SIGKILL` restart coverage. |
 | [The storage viewer required `String.isWellFormed`](compatibility/plugin-storage-viewer-requires-string-iswellformed.md) | Optimized or owner-filtered viewer pages threw instead of rendering in browsers missing the method. | Fixed 2026-07-31 by routing viewer filters and streamed owner/error validation through the existing portable Unicode helper, with optimized and inline fallback coverage. |
 | [Optimized storage limited key length](compatibility/optimized-plugin-storage-key-length-limit.md) | Optimization or later writes rejected a logical key that inline storage accepted. | Fixed 2026-07-31 with fixed-size domain-separated physical identifiers, exact manifest-v3 logical mappings, atomic mutation/removal, and transition/viewer/backup coverage while preserving existing short names. |

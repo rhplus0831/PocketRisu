@@ -35,6 +35,11 @@ const {
     snapshotPluginStorageJson,
     snapshotPluginStorageRecord,
 } = require('./pluginStorageJson.cjs');
+const {
+    MCP_TOOL_CALL_SNAPSHOT_FIELD,
+    MCP_TOOL_CALL_SNAPSHOT_MARKER,
+    parseMcpToolCallSnapshotKey,
+} = require('./mcpToolCallRecovery.cjs');
 
 const DEFAULT_STREAM_INGEST_MIN_BYTES = 32 * 1024 * 1024;
 const CURSOR_CACHE_BYTES = 64 * 1024;
@@ -657,6 +662,20 @@ async function processPluginMap(source, descriptor, field, onEntry, escapes = []
         await emitStreamingPluginStorageEntry(onEntry, field, entry.key, value);
     }
     return sequence.length;
+}
+
+async function processMcpToolCallMap(source, descriptor, onEntry) {
+    if (await descriptorCollectionKind(source, descriptor) !== 'map') {
+        throw new TypeError('Folded MCP tool-call payloads must be a map');
+    }
+    const entries = await readMapDescriptors(source, descriptor);
+    for (const entry of entries) {
+        const parsed = parseMcpToolCallSnapshotKey(entry.key);
+        if (!parsed) throw new TypeError(`Invalid folded MCP tool-call key: ${entry.key}`);
+        const value = normalizeJSON(await decodeDescriptor(source, entry.descriptor));
+        await onEntry({ key: parsed.storageKey, callId: parsed.callId, value });
+    }
+    return entries.length;
 }
 
 async function collectAssignedChatIds(source, charactersDescriptor, onMissingChatId) {
@@ -1365,6 +1384,10 @@ async function walkRisuSave(input, options = {}) {
         && typeof options.onPluginStorageEntry !== 'function') {
         throw new TypeError('onPluginStorageEntry is required when plugin storage is externalized');
     }
+    if (options.externalizeMcpToolCalls
+        && typeof options.onMcpToolCallEntry !== 'function') {
+        throw new TypeError('onMcpToolCallEntry is required when MCP tool calls are externalized');
+    }
     const inspection = options.inspection ?? await inspectRisuSaveSource(input);
     if (!inspection.supported) {
         throw new Error('Risu save format is not supported by the streaming loader');
@@ -1375,6 +1398,8 @@ async function walkRisuSave(input, options = {}) {
         onChat: guardStreamingCallback(options.onChat),
         onPluginStorageEntry: guardStreamingCallback(options.onPluginStorageEntry),
         onPluginStorageFolded: guardStreamingCallback(options.onPluginStorageFolded),
+        onMcpToolCallEntry: guardStreamingCallback(options.onMcpToolCallEntry),
+        onMcpToolCallsFolded: guardStreamingCallback(options.onMcpToolCallsFolded),
         retainCharacterChats: guardStreamingCallback(options.retainCharacterChats, true),
     };
 
@@ -1427,6 +1452,19 @@ async function walkRisuSave(input, options = {}) {
         const pluginStorageFolded = foldedMarkerEntry
             ? normalizeJSON(await decodeDescriptor(source, foldedMarkerEntry.descriptor)) === true
             : false;
+        const mcpFoldedMarkerEntry = byKey.get(MCP_TOOL_CALL_SNAPSHOT_MARKER);
+        const mcpToolCallsFolded = mcpFoldedMarkerEntry
+            ? normalizeJSON(await decodeDescriptor(source, mcpFoldedMarkerEntry.descriptor)) === true
+            : false;
+        const externalizeMcpToolCalls = options.externalizeMcpToolCalls && mcpToolCallsFolded;
+        if (externalizeMcpToolCalls) {
+            if (typeof options.onMcpToolCallsFolded !== 'function') {
+                throw new TypeError(
+                    'onMcpToolCallsFolded is required for a folded MCP tool-call snapshot'
+                );
+            }
+            await options.onMcpToolCallsFolded();
+        }
         const pluginStorageEscapeEntry = inspection.pluginStorageEscapes
             ? byKey.get(pluginStorageLegacyEscapeField)
             : null;
@@ -1490,10 +1528,21 @@ async function walkRisuSave(input, options = {}) {
 
         const remainder = {};
         const pluginStats = { changed: externalizePlugins, values: 0, meta: 0 };
+        const mcpToolCallStats = { changed: externalizeMcpToolCalls, entries: 0 };
         const processedExternalEscapes = new Set();
         for (const entry of rootEntries) {
             if (entry.key === PLUGIN_STORAGE_FOLDED_MARKER) {
                 continue;
+            } else if (externalizeMcpToolCalls
+                && entry.key === MCP_TOOL_CALL_SNAPSHOT_MARKER) {
+                continue;
+            } else if (externalizeMcpToolCalls
+                && entry.key === MCP_TOOL_CALL_SNAPSHOT_FIELD) {
+                mcpToolCallStats.entries = await processMcpToolCallMap(
+                    source,
+                    entry.descriptor,
+                    options.onMcpToolCallEntry,
+                );
             } else if (entry.key === pluginStorageLegacyEscapeField
                 && pluginStorageEscapeEnvelope !== null) {
                 continue;
@@ -1629,6 +1678,7 @@ async function walkRisuSave(input, options = {}) {
         return {
             remainder,
             pluginStats,
+            mcpToolCallStats,
             format: inspection.format,
             messagePackBytes: source.size - rootStart,
         };

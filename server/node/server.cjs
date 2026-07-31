@@ -115,6 +115,13 @@ const {
     validateDatabaseShape,
 } = require('./chatRows.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
+const {
+    MCP_TOOL_CALL_CACHE_PREFIX,
+    mcpToolCallStorageKey,
+    parseMcpToolCallSnapshotKey,
+    parseMcpToolCallStorageKey,
+    scanMcpToolCallIdsFromFile,
+} = require('./mcpToolCallRecovery.cjs');
 const { validateJsonSource } = require('./streamJsonToMsgpack.cjs');
 const {
     convertBlockRisuSaveToMessagePack,
@@ -1142,6 +1149,7 @@ async function createBackupAndRotate() {
         const strippedDb = dbCache[DB_HEX_KEY] || await loadStrippedDatabase(raw, 'snapshot');
         backupDbSpool = await spoolSelfContainedBackupDatabase(strippedDb, {
             foldPluginStorage: true,
+            foldMcpToolCalls: true,
             markPluginStorageFolded: true,
             onMissingChatRow: (chaId, chatId) => {
                 warnAndPreserveMissingChatRow('Snapshot', chaId, chatId);
@@ -1531,6 +1539,15 @@ async function ingestDatabaseStreaming(source, {
                     streamedPluginMetaKeys,
                 ),
             ));
+        },
+        onMcpToolCallsFolded: () => {
+            kvDelPrefix(MCP_TOOL_CALL_CACHE_PREFIX);
+        },
+        onMcpToolCallEntry: ({ key, callId, value }) => {
+            if (!parseMcpToolCallStorageKey(key)) {
+                throw new TypeError(`Invalid remembered MCP tool-call key: ${key}`);
+            }
+            kvSet(key, serializeMcpToolCallPayload(key, callId, value));
         },
         restoreColdStorageCharacters: (dbObj) => {
             const coldRestoreResult = restoreColdStorageCharactersInDb(dbObj);
@@ -5428,9 +5445,10 @@ async function spoolSelfContainedBackupDatabase(
     strippedDb,
     {
         foldPluginStorage = false,
+        foldMcpToolCalls = false,
         markPluginStorageFolded = false,
         shouldAbort = () => false,
-        reader = { kvGet, kvList },
+        reader = { kvGet, kvList, kvListWithSizes },
         onMissingChatRow,
     } = {}
 ) {
@@ -5442,6 +5460,9 @@ async function spoolSelfContainedBackupDatabase(
     const pluginStorage = foldPluginStorage
         ? resolveOwnedPluginStorageRows(strippedDb, reader)
         : null;
+    const mcpToolCalls = foldMcpToolCalls
+        ? mcpToolCallSnapshotStorage(reader)
+        : null;
 
     try {
         return await streamRisuSaveToFile({
@@ -5452,6 +5473,7 @@ async function spoolSelfContainedBackupDatabase(
                 return value === null ? null : decodeRisuSave(value);
             },
             pluginStorage,
+            mcpToolCalls,
             markPluginStorageFolded,
             shouldAbort,
             onMissingChatRow,
@@ -5707,6 +5729,84 @@ async function listPluginBackupEntries(
         });
     }
     return rows;
+}
+
+function listMcpToolCallBackupEntries(reader, kind = 'kv-source') {
+    return reader.kvListWithSizes(MCP_TOOL_CALL_CACHE_PREFIX)
+        .filter((entry) => parseMcpToolCallStorageKey(entry.key) !== null)
+        .map((entry) => ({
+            kind,
+            key: entry.key,
+            backupName: entry.key,
+            sortKey: entry.key,
+            size: entry.size,
+            mcpToolCall: true,
+        }));
+}
+
+function mcpToolCallSnapshotStorage(reader) {
+    const rows = listMcpToolCallBackupEntries(reader).map((entry) => ({
+        key: parseMcpToolCallStorageKey(entry.key).suffix,
+        source: entry.key,
+    }));
+    return {
+        rows,
+        readRow: (storageKey) => {
+            const value = reader.kvGet(storageKey);
+            if (!value) throw new Error(`Remembered MCP tool-call row is unavailable: ${storageKey}`);
+            try {
+                return JSON.parse(value.toString('utf8'));
+            } catch (cause) {
+                throw new Error(`Remembered MCP tool-call row is invalid: ${storageKey}`, { cause });
+            }
+        },
+    };
+}
+
+function serializeMcpToolCallPayload(storageKey, callId, value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+        || !value.call || typeof value.call !== 'object' || Array.isArray(value.call)
+        || value.call.id !== callId
+        || typeof value.call.name !== 'string'
+        || !Array.isArray(value.response)) {
+        throw new TypeError(`Invalid remembered MCP tool-call payload: ${storageKey}`);
+    }
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) {
+        throw new TypeError(`Invalid remembered MCP tool-call payload: ${storageKey}`);
+    }
+    return Buffer.from(serialized, 'utf8');
+}
+
+function missingMcpToolCallBackupRowError(callId) {
+    const error = new Error(`Backup cannot resolve remembered MCP tool call ${callId}`);
+    error.code = 'BACKUP_MISSING_MCP_TOOL_CALL_ROW';
+    error.statusCode = 500;
+    return error;
+}
+
+async function selectReferencedMcpToolCallEntries(entries, databaseSpool, shouldAbort) {
+    const candidates = new Map(
+        entries.filter((entry) => entry.mcpToolCall === true)
+            .map((entry) => [entry.key, entry]),
+    );
+    if (candidates.size === 0) {
+        const referenced = await scanMcpToolCallIdsFromFile(databaseSpool.filePath, { shouldAbort });
+        if (referenced.size > 0) {
+            throw missingMcpToolCallBackupRowError(referenced.values().next().value);
+        }
+        return entries;
+    }
+    const referenced = await scanMcpToolCallIdsFromFile(databaseSpool.filePath, { shouldAbort });
+    const selectedKeys = new Set();
+    for (const callId of referenced) {
+        const storageKey = mcpToolCallStorageKey(callId);
+        if (!storageKey || !candidates.has(storageKey)) {
+            throw missingMcpToolCallBackupRowError(callId);
+        }
+        selectedKeys.add(storageKey);
+    }
+    return entries.filter((entry) => entry.mcpToolCall !== true || selectedKeys.has(entry.key));
 }
 
 // Full downloads and server-side saves can each retain a SQLite WAL snapshot,
@@ -6501,6 +6601,7 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
                     sortKey: entry.key,
                     size: entry.size,
                 }))),
+                ...(target === 'upstream' ? [] : listMcpToolCallBackupEntries(snapshot)),
             ];
             // Admission is deliberately conservative: reserve every physical
             // plugin candidate before decoding the tiny ownership metadata
@@ -6866,9 +6967,12 @@ async function pinPartialExportState(job) {
             const strippedDb = await loadStrippedDatabase(raw, 'Partial Backup');
             const database = { ...strippedDb, account: undefined };
             const selected = listPartialBackupAssetEntries(database, snapshot);
+            const mcpToolCalls = listMcpToolCallBackupEntries(snapshot, 'kv');
+            const selectedEntries = [...selected.entries, ...mcpToolCalls]
+                .sort((left, right) => left.sortKey.localeCompare(right.sortKey));
             preflightBackupEntries([
                 { backupName: 'database.risudat', size: raw.length },
-                ...selected.entries,
+                ...selectedEntries,
             ]);
             const assemblyBytes = [
                 ...snapshot.kvListWithSizes('chats/'),
@@ -6878,12 +6982,12 @@ async function pinPartialExportState(job) {
                 (sum, entry) => sum + entry.size + Buffer.byteLength(entry.key, 'utf-8'),
                 raw.length,
             );
-            const selectedAssetBytes = selected.entries.reduce(
+            const selectedEntryBytes = selectedEntries.reduce(
                 (sum, entry) => sum + entry.size,
                 0,
             );
             const requiredBytes = (
-                (assemblyBytes + selectedAssetBytes) * BACKUP_DISK_HEADROOM
+                (assemblyBytes + selectedEntryBytes) * BACKUP_DISK_HEADROOM
                 + 16 * 1024 * 1024
             );
             if (!Number.isSafeInteger(requiredBytes)) {
@@ -6910,11 +7014,11 @@ async function pinPartialExportState(job) {
             }
             job.missingAssets = selected.missing;
             job.progress.phase = 'pinning-assets';
-            job.progress.total = selected.entries.length + 2;
+            job.progress.total = selectedEntries.length + 2;
 
             const pinnedEntries = [];
             let pinIndex = 0;
-            for (const entry of selected.entries) {
+            for (const entry of selectedEntries) {
                 throwIfPartialExportCancelled(job);
                 if (entry.source === 'fs') {
                     const destination = path.join(job.pinDir, `${String(pinIndex).padStart(8, '0')}.asset`);
@@ -6938,9 +7042,31 @@ async function pinPartialExportState(job) {
 }
 
 async function writePartialExportArchive(job, database, entries) {
+    job.progress.phase = 'folding-database';
+    job.databaseSpool = await spoolSelfContainedBackupDatabase(database, {
+        foldPluginStorage: true,
+        shouldAbort: () => job.abortController.signal.aborted,
+        reader: job.snapshot,
+        onMissingChatRow: (chaId, chatId) => {
+            warnAndPreserveMissingChatRow('Partial Backup Export', chaId, chatId);
+        },
+    });
+    throwIfPartialExportCancelled(job);
+    const selectedEntries = await selectReferencedMcpToolCallEntries(
+        entries,
+        job.databaseSpool,
+        () => job.abortController.signal.aborted,
+    );
+    preflightBackupEntries([
+        ...selectedEntries,
+        { backupName: 'database.risudat', size: job.databaseSpool.size },
+    ]);
+    job.progress.total = selectedEntries.length + 2;
+    job.progress.current = selectedEntries.length;
+
     const output = createWriteStream(job.archiveTempPath, { flags: 'wx', mode: 0o600 });
     try {
-        for (const entry of entries) {
+        for (const entry of selectedEntries) {
             throwIfPartialExportCancelled(job);
             if (!await writeWithBackpressure(
                 output,
@@ -6966,20 +7092,6 @@ async function writePartialExportArchive(job, database, entries) {
             }
         }
 
-        job.progress.phase = 'folding-database';
-        job.databaseSpool = await spoolSelfContainedBackupDatabase(database, {
-            foldPluginStorage: true,
-            shouldAbort: () => job.abortController.signal.aborted,
-            reader: job.snapshot,
-            onMissingChatRow: (chaId, chatId) => {
-                warnAndPreserveMissingChatRow('Partial Backup Export', chaId, chatId);
-            },
-        });
-        throwIfPartialExportCancelled(job);
-        preflightBackupEntries([{
-            backupName: 'database.risudat',
-            size: job.databaseSpool.size,
-        }]);
         job.progress.current++;
         if (!await writeWithBackpressure(
             output,
@@ -7086,6 +7198,13 @@ function resolveBackupStorageKey(name) {
 
     if (name === PLUGIN_STORAGE_MANIFEST_KEY) {
         return PLUGIN_STORAGE_MANIFEST_KEY;
+    }
+
+    if (name.startsWith(MCP_TOOL_CALL_CACHE_PREFIX)) {
+        if (!parseMcpToolCallStorageKey(name)) {
+            throw new Error(`Invalid remembered MCP tool-call entry name: ${name}`);
+        }
+        return name;
     }
 
     if (
@@ -7360,6 +7479,7 @@ async function importBackupFromSource(dataSource, {
         kvDelPrefix('inlay_meta/');
         kvDelPrefix('inlay_info/');
         kvDelPrefix('coldstorage/');
+        kvDelPrefix(MCP_TOOL_CALL_CACHE_PREFIX);
         // Chat rows are per-database payloads and are never carried as backup
         // entries; imported database.risudat recreates them before commit.
         for (const key of chatRowStore.listAllChatRowKeys()) kvDel(key);
@@ -12972,7 +13092,13 @@ app.get('/api/backup/export', async (req, res, next) => {
             signal: abortTracker.signal,
         });
         throwIfBackupExportAborted(abortTracker.signal);
-        const namespacedEntries = pinnedState.entries;
+        const namespacedEntries = target === 'upstream'
+            ? pinnedState.entries
+            : await selectReferencedMcpToolCallEntries(
+                pinnedState.entries,
+                backupDbSpool,
+                shouldAbort,
+            );
         const dbSize = backupDbSpool?.size ?? 0;
         preflightBackupEntries([
             ...namespacedEntries,
@@ -13233,7 +13359,11 @@ app.post('/api/backup/server/save', async (req, res, next) => {
         });
         throwIfBackupExportAborted(abortTracker.signal);
 
-        const namespacedEntries = pinnedState.entries;
+        const namespacedEntries = await selectReferencedMcpToolCallEntries(
+            pinnedState.entries,
+            backupDbSpool,
+            shouldAbort,
+        );
         preflightBackupEntries([
             ...namespacedEntries,
             ...(backupDbSpool
@@ -13915,6 +14045,7 @@ function clearExistingData() {
     kvDelPrefix(PLUGIN_SAVE_PREFIX);
     kvDelPrefix(PLUGIN_SAVE_META_PREFIX);
     kvDel(PLUGIN_STORAGE_MANIFEST_KEY);
+    kvDelPrefix(MCP_TOOL_CALL_CACHE_PREFIX);
     for (const key of chatRowStore.listAllChatRowKeys()) kvDel(key);
     // Composer drafts aren't part of a save folder; clear stale ones on import.
     kvDelPrefix('drafts/');

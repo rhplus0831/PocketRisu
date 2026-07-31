@@ -32,6 +32,7 @@ The exported application graph spans:
 
 - the stubs-only `database/database.bin` row;
 - full `chats/*` rows;
+- remembered MCP payload rows under `cache/mcp-tool-calls/` when referenced by exported chats;
 - the selected optimized [plugin storage](plugin-storage.md) generation and manifest;
 - `assets/*`, cold-storage, remote, draft, and metadata namespaces as applicable;
 - safe ordinary assets under `save/assets/`;
@@ -67,6 +68,11 @@ Full download and server-file export share a strict point-in-time protocol:
 Missing referenced chat rows fail full and server-file exports with
 `BACKUP_MISSING_CHAT_ROW`. This fail-closed policy is different from partial jobs and
 automatic snapshots, which exist to retain a recovery point from already-damaged state.
+Complete remembered-tool markers are also resolved against the pinned
+`cache/mcp-tool-calls/` namespace. Node-only downloads, server-file archives, and
+partial archives emit only referenced canonical rows and fail with
+`BACKUP_MISSING_MCP_TOOL_CALL_ROW` when a marker's payload is absent. Upstream-target
+exports omit this PocketRisu-only namespace.
 
 Server archives publish through a private temporary file and a no-overwrite final link;
 name collisions are probed rather than overwritten. Download responses remain
@@ -181,6 +187,9 @@ count and exclusive chunk cost.
   the coalesced snapshot, so full assembly is outside the response-critical path.
 - Optimized plugin data is folded with `pluginStorageFolded` and the selected
   generation/manifest proof.
+- Referenced remembered MCP calls are folded into a versioned private map. Restore
+  replaces the dedicated cache prefix atomically and removes the private envelope before
+  publishing the live database.
 - A plugin-only atomic mutation writes `config/plugin-storage-recovery-dirty` in the same
   transaction and schedules a coalesced snapshot. Publication compare-clears only the
   token it captured, so a newer mutation remains pending.

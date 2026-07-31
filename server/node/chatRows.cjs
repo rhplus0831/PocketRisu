@@ -536,8 +536,11 @@ function createChatRowStore(options) {
                 availableDiskBytes: opts.availableDiskBytes,
                 onDecodedChunk: opts.onDecodedChunk,
                 externalizePluginStorage: typeof opts.onPluginStorageEntry === 'function',
+                externalizeMcpToolCalls: typeof opts.onMcpToolCallEntry === 'function',
                 onPluginStorageEntry: opts.onPluginStorageEntry,
                 onPluginStorageFolded: opts.onPluginStorageFolded,
+                onMcpToolCallEntry: opts.onMcpToolCallEntry,
+                onMcpToolCallsFolded: opts.onMcpToolCallsFolded,
                 retainCharacterChats: (character) => Boolean(
                     opts.restoreColdStorageCharacters && character?.coldstorage
                 ),
@@ -658,6 +661,7 @@ function createChatRowStore(options) {
             return {
                 strippedDb: dbObj,
                 pluginStats: walked.pluginStats,
+                mcpToolCallStats: walked.mcpToolCallStats,
                 stats: {
                     ...(restoreResult || {}),
                     chats: streamedChats + restoredChats,

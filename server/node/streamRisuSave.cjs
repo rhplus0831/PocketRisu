@@ -11,6 +11,13 @@ const {
 const { mergeChatStubWithFullChat } = require('./chatRows.cjs');
 const { PLUGIN_STORAGE_FOLDED_MARKER } = require('./pluginSaveKeys.cjs');
 const {
+    MCP_TOOL_CALL_SNAPSHOT_FIELD,
+    MCP_TOOL_CALL_SNAPSHOT_MARKER,
+    collectMcpToolCallIds,
+    mcpToolCallStorageKey,
+    parseMcpToolCallStorageKey,
+} = require('./mcpToolCallRecovery.cjs');
+const {
     streamJsonFileToMessagePack,
     validateJsonSource,
 } = require('./streamJsonToMsgpack.cjs');
@@ -220,10 +227,14 @@ async function streamRisuSaveToFile({
     filePath,
     readChatRow,
     pluginStorage = null,
+    mcpToolCalls = null,
     foldChatRows = true,
     markPluginStorageFolded = false,
     shouldAbort = () => false,
     onMissingChatRow = throwMissingChatRow,
+    onMissingMcpToolCallRow = (callId) => {
+        throw new Error(`Missing remembered MCP tool-call row: ${callId}`);
+    },
 }) {
     if (!dbObj || typeof dbObj !== 'object' || Array.isArray(dbObj)) {
         throw new TypeError('Streaming Risu save root must be an object');
@@ -258,6 +269,21 @@ async function streamRisuSaveToFile({
         || hasEscapedPluginKey(dbObj.pluginStorageMeta)
         ? buildPluginMapPlan(dbObj.pluginStorageMeta, metaRows, readPluginRow, pluginRowSource)
         : null;
+    const mcpRows = mcpToolCalls?.rows ?? [];
+    if (mcpRows.length > 0
+        && typeof mcpToolCalls?.readRow !== 'function'
+        && typeof mcpToolCalls?.rowSource !== 'function') {
+        throw new TypeError('mcpToolCalls requires readRow or rowSource when rows are present');
+    }
+    const mcpPlan = mcpToolCalls === null
+        ? null
+        : buildPluginMapPlan(
+            {},
+            mcpRows,
+            mcpToolCalls.readRow,
+            mcpToolCalls.rowSource,
+        );
+    const referencedMcpToolCallIds = new Set();
 
     function extractPluginKeyEscapePlans(plan, field) {
         if (!plan) return [];
@@ -296,6 +322,8 @@ async function streamRisuSaveToFile({
 
     const topKeys = Object.keys(dbObj).filter(key =>
         key !== PLUGIN_STORAGE_FOLDED_MARKER
+        && key !== MCP_TOOL_CALL_SNAPSHOT_FIELD
+        && key !== MCP_TOOL_CALL_SNAPSHOT_MARKER
         && (!hasPluginStorageEscapes || key !== pluginStorageLegacyEscapeField)
     );
     const characters = dbObj.characters;
@@ -313,6 +341,10 @@ async function streamRisuSaveToFile({
     }
     if (hasPluginStorageEscapes) {
         topKeys.push(pluginStorageLegacyEscapeField);
+    }
+    if (mcpPlan) {
+        topKeys.push(MCP_TOOL_CALL_SNAPSHOT_FIELD);
+        topKeys.push(MCP_TOOL_CALL_SNAPSHOT_MARKER);
     }
 
     let outputHandle = null;
@@ -352,6 +384,25 @@ async function streamRisuSaveToFile({
             } else {
                 await writeValue(plan.base[key]);
             }
+        }
+    }
+
+    async function writeMcpToolCallMap() {
+        const selected = [];
+        for (const callId of referencedMcpToolCallIds) {
+            const storageKey = mcpToolCallStorageKey(callId);
+            const parsed = storageKey ? parseMcpToolCallStorageKey(storageKey) : null;
+            if (!parsed || !mcpPlan.rowByKey.has(parsed.suffix)) {
+                await onMissingMcpToolCallRow(callId);
+                continue;
+            }
+            selected.push(parsed.suffix);
+        }
+        selected.sort((left, right) => left.localeCompare(right));
+        await output.write(mapHeader(selected.length));
+        for (const key of selected) {
+            await writeValue(key);
+            await writePluginRow(mcpPlan, mcpPlan.rowByKey.get(key));
         }
     }
 
@@ -419,8 +470,11 @@ async function streamRisuSaveToFile({
             if (chat && chat._stub === true && chat.id) {
                 const fullChat = await readChatRow(char.chaId, chat.id);
                 if (fullChat == null) await onMissingChatRow(char.chaId, chat.id);
-                await writeValue(mergeChatStubWithFullChat(chat, fullChat));
+                const merged = mergeChatStubWithFullChat(chat, fullChat);
+                collectMcpToolCallIds(merged, referencedMcpToolCallIds);
+                await writeValue(merged);
             } else {
+                collectMcpToolCallIds(chat, referencedMcpToolCallIds);
                 await writeValue(chat);
             }
         }
@@ -434,6 +488,9 @@ async function streamRisuSaveToFile({
             && char.chats.some(chat => chat && chat._stub === true && chat.id)
         );
         if (!hasRowBackedChat) {
+            for (const chat of char?.chats ?? []) {
+                collectMcpToolCallIds(chat, referencedMcpToolCallIds);
+            }
             await writeValue(char);
             return;
         }
@@ -465,6 +522,10 @@ async function streamRisuSaveToFile({
             } else if (key === 'pluginStorageMeta' && metaPlan) {
                 await writePluginMap(metaPlan);
             } else if (key === PLUGIN_STORAGE_FOLDED_MARKER) {
+                await writeValue(true);
+            } else if (key === MCP_TOOL_CALL_SNAPSHOT_FIELD && mcpPlan) {
+                await writeMcpToolCallMap();
+            } else if (key === MCP_TOOL_CALL_SNAPSHOT_MARKER && mcpPlan) {
                 await writeValue(true);
             } else if (key === pluginStorageLegacyEscapeField
                 && hasPluginStorageEscapes) {
