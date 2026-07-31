@@ -635,7 +635,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     } as const
 
     function applyPromptBlockRole(chats:OpenAIChat[], role?: 'user'|'bot'|'system'){
-        console.log("Applying ", chats, role)
         if(!role){
             return
         }

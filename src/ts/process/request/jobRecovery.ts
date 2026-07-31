@@ -448,11 +448,6 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
     }
     if (job.status !== 'done') return
     const result = await readJobResult(job)
-    // A job recovered at boot never reached the live path's log flush (the tab
-    // died mid-request), so record it here. The request body is absent by
-    // design — the server never persists it, since it carries the provider
-    // credential — so the entry holds the response and the outcome only.
-    recordJobRecoveryLog(job, result)
     let mutated = false
     if (result.ok === true) {
         if (existingIdx === -1) {
@@ -480,6 +475,12 @@ export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
         if (existingIdx === -1) mutated = insertJobError(loc, job, result.error)
     }
     if (needsSave(mutated, existingIdx) && !(await persistRecoveredChat(loc, job))) return
+    // A job recovered at boot never reached the live path's log flush (the tab
+    // died mid-request). Record it only after serve's external chat row has
+    // committed: a failed save deliberately leaves the job unclaimed for a
+    // later retry, and logging before that retry point would double-count the
+    // same provider request in usage statistics.
+    recordJobRecoveryLog(job, result)
     await claimJob(job.id)
 }
 

@@ -17422,6 +17422,8 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
         console.log(`[Server] Received ${sig}, flushing pending data...`);
         try { await flushPendingDb(); } catch (e) { logger.error('[Server] Flush error:', e); }
         try { runTrackedWalCheckpoint('TRUNCATE', 'graceful-shutdown'); } catch { /* non-fatal */ }
+        try { modelJobs.close(); } catch (e) { logger.error('[ModelJobs] Close error:', e); }
+        try { requestLogs.close(); } catch (e) { logger.error('[RequestLogs] Close error:', e); }
         process.exit(0);
     });
 }

@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
     notifyInfo: vi.fn(),
     ensureChatHydrated: vi.fn(),
     saveChatToServer: vi.fn(async () => {}),
+    recordRequestLog: vi.fn(),
 }))
 
 vi.mock('src/ts/globalApi.svelte', () => ({
@@ -29,6 +30,9 @@ vi.mock('src/ts/storage/chatStorage', () => ({
 vi.mock('src/ts/alert', () => ({
     notifyError: mocks.notifyError,
     notifyInfo: mocks.notifyInfo,
+}))
+vi.mock('src/ts/requestLog', () => ({
+    recordRequestLog: mocks.recordRequestLog,
 }))
 
 // Fresh module instances per test: recoverModelJobs is once-guarded, and the
@@ -157,6 +161,7 @@ beforeEach(() => {
     mocks.ensureChatHydrated.mockReset()
     mocks.saveChatToServer.mockReset()
     mocks.saveChatToServer.mockResolvedValue(undefined)
+    mocks.recordRequestLog.mockReset()
 })
 
 afterEach(() => {
@@ -460,6 +465,7 @@ describe('recovered chat is persisted', () => {
         const { claims } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
 
         await recovery.recoverTerminalJob(makeJob() as any) // save fails, no claim
+        expect(mocks.recordRequestLog).not.toHaveBeenCalled()
         await recovery.recoverTerminalJob(makeJob() as any) // tab return: same job again
 
         expect(chat.message).toHaveLength(1) // matched on generationId → fill, no duplicate
@@ -468,6 +474,7 @@ describe('recovered chat is persisted', () => {
         // text the first pass failed to save would be claimed away.
         expect(mocks.saveChatToServer).toHaveBeenCalledTimes(2)
         expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+        expect(mocks.recordRequestLog).toHaveBeenCalledTimes(1)
     })
 })
 

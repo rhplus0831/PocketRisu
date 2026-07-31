@@ -671,7 +671,8 @@ import ShButton from "../UI/GUI/ShButton.svelte";
     }}>{language.convertToModule}</Button>
 
     <Button onclick={async () => {
-        removeChar($selectedCharID, DBState.db.characters[$selectedCharID].name)
+        const char = DBState.db.characters[$selectedCharID]
+        await removeChar(char.chaId, char.name)
     }} className="mt-2" size="md">{language.removeCharacter}</Button>
 
     {#if DBState.db.characters[$selectedCharID].type === 'character'}
