@@ -124,6 +124,33 @@ afterEach(() => {
 })
 
 describe('PluginSettings storage transition', () => {
+    test('keeps automatic value conversion available in the compatibility area', async () => {
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginSettings, { target })
+        const compatibilityCheckbox = target.querySelector<HTMLInputElement>(
+            'input[alt="Legacy plugin compatibility"]',
+        )
+        const conversionCheckbox = target.querySelector<HTMLInputElement>(
+            'input[alt="Automatically convert compatible plugin values"]',
+        )
+
+        expect(pluginDatabase.optimizePluginMemory).toBe(false)
+        expect(compatibilityCheckbox).not.toBeNull()
+        expect(conversionCheckbox).not.toBeNull()
+        expect(conversionCheckbox!.disabled).toBe(false)
+        expect(conversionCheckbox!.closest('div.my-4')).toBe(
+            compatibilityCheckbox!.closest('div.my-4'),
+        )
+
+        conversionCheckbox!.checked = true
+        conversionCheckbox!.dispatchEvent(new Event('change', { bubbles: true }))
+
+        expect(pluginDatabase.autoConvertPluginStorageValues).toBe(true)
+
+        await unmount(component)
+    })
+
     test('confirms before disabling optimization for a large inline publication', async () => {
         pluginDatabase.optimizePluginMemory = true
         confirmReset.mockResolvedValue(false)
