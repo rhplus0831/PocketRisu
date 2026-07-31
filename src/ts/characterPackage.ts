@@ -2,7 +2,7 @@ import * as fflate from 'fflate'
 import { v4 } from 'uuid'
 import { alertConfirm, alertError, alertStore, alertWait, notifySuccess } from './alert'
 import { exportCharacterCard, importCharacterProcess } from './characterCards'
-import { LocalWriter, readImage, VirtualWriter } from './globalApi.svelte'
+import { LocalWriter, markCharacterDirty, markChatDirty, readImage, VirtualWriter } from './globalApi.svelte'
 import { language } from 'src/lang'
 import { type character, getDatabase, setDatabase, saveImage, normalizeChat } from './storage/database.svelte'
 import type { Chat } from './storage/database.svelte'
@@ -15,6 +15,7 @@ import { getInlayAsset, setInlayAsset, getInlayInfosBatch, type InlayAsset } fro
 import { getInlayMeta, setInlayMeta, type InlayAssetMeta } from './process/files/inlayMeta'
 import { PngChunk } from './pngChunk'
 import { reencodeImage } from './process/files/inlays'
+import { collectImportedChatDirtyTargets } from './storage/dirtyTargetDiff'
 
 // ── Types ──
 
@@ -264,15 +265,15 @@ function importChatsToCharacter(
     personaIdMap: Record<string, string>,
     progress: ProgressFn,
     mode: 'replace' | 'append' = 'replace'
-): void {
-    if (!manifest.chats) return
+): Chat[] | null {
+    if (!manifest.chats) return null
 
     progress(language.characterPackageProgressImportChats)
     const chatsBytes = unzipped[manifest.chats.file]
-    if (!chatsBytes) return
+    if (!chatsBytes) return null
 
     const chatsJson = JSON.parse(new TextDecoder().decode(chatsBytes))
-    if (chatsJson.type !== 'risuAllChats' || chatsJson.ver !== 2 || !Array.isArray(chatsJson.data)) return
+    if (chatsJson.type !== 'risuAllChats' || chatsJson.ver !== 2 || !Array.isArray(chatsJson.data)) return null
 
     const importedChats: Chat[] = chatsJson.data
 
@@ -313,6 +314,13 @@ function importChatsToCharacter(
         }
         targetChar.chatPage = 0
     }
+    return importedChats
+}
+
+function markImportedChatsDirty(targetChar: character, importedChats: Chat[] | null): void {
+    const targets = collectImportedChatDirtyTargets(targetChar.chaId, importedChats)
+    for (const chaId of targets.characters) markCharacterDirty(chaId)
+    for (const [chaId, chatId] of targets.chats) markChatDirty(chaId, chatId)
 }
 
 async function importInlays(
@@ -681,7 +689,12 @@ export async function importCharacterPackage(): Promise<void> {
             const newChar = db.characters[newCharIndex] as character
 
             const personaIdMap = await importPersonas(manifest, unzipped, importProgress)
-            importChatsToCharacter(manifest, unzipped, newChar, personaIdMap, importProgress)
+            const importedChats = importChatsToCharacter(manifest, unzipped, newChar, personaIdMap, importProgress)
+            // A new character can be imported while the home screen or another
+            // character is selected. Name both its block and every new full row
+            // explicitly instead of relying on selected-character reactivity.
+            markCharacterDirty(newChar.chaId)
+            markImportedChatsDirty(newChar, importedChats)
             await importInlays(manifest, unzipped, newChar.chaId, importCurrentStep, importTotalSteps, progressLabel)
 
             setDatabase(db)
@@ -746,7 +759,15 @@ export async function importPackageToCharacter(charIndex: number): Promise<void>
         }
 
         const personaIdMap = await importPersonas(manifest, unzipped, importProgress)
-        importChatsToCharacter(manifest, unzipped, targetChar, personaIdMap, importProgress, 'append')
+        const importedChats = importChatsToCharacter(
+            manifest,
+            unzipped,
+            targetChar,
+            personaIdMap,
+            importProgress,
+            'append',
+        )
+        markImportedChatsDirty(targetChar, importedChats)
         await importInlays(manifest, unzipped, targetChar.chaId, importCurrentStep, importTotalSteps, progressLabel)
 
         setDatabase(db)

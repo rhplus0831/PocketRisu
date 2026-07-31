@@ -1,8 +1,8 @@
 # Audit findings — priority index
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
-`Status` column uses `Open`, `Fixed`, or `Deferred`; 46 findings are currently
-`Open`, 13 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
+`Status` column uses `Open`, `Fixed`, or `Deferred`; 45 findings are currently
+`Open`, 14 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
 as a cross-reference).
@@ -59,7 +59,7 @@ resolution against current code before acting on it.
 | [Reroll discards the only copy within pre-image cooldown](audit/reroll-discards-the-only-copy-within-preimage-cooldown.md) | Open | High | The discarded response and its entire swipe history | Normal reroll timing (recent save already consumed the capture cooldown) plus tab close, crash, or failed completion before generation ends |
 | [Card triggers can bulk-delete history without consent](audit/card-triggers-can-bulk-delete-history-without-consent.md) | Open | Medium | The entire message array, wiped and persisted; cooldown can skip the pre-image, making it permanent | Requires a malicious or buggy imported card — but importing shared cards is routine and no consent gate covers bulk chat mutation |
 | [Chat deletion has no pre-image history](audit/chat-deletion-has-no-preimage-history.md) | Open | Medium | A young chat (created, saved once, deleted) leaves no recovery copy anywhere | Accidental deletion of a recently created chat — the exact case the chat-version feature exists to undo |
-| [Non-selected character and chat writes have no save scheduler](audit/non-selected-character-and-chat-writes-have-no-save-scheduler.md) | Open | High | Acknowledged edits to non-selected characters and inactive chats silently reverted on refresh | V3 arbitrary-index setters, Risu-access MCP mutations, background writes; no dirty bridge exists for these targets |
+| [Non-selected character and chat writes have no save scheduler](audit/non-selected-character-and-chat-writes-have-no-save-scheduler.md) | Fixed | High | Acknowledged edits to non-selected characters and inactive chats silently reverted on refresh | V3 arbitrary-index setters, Risu-access MCP mutations, background writes; no dirty bridge exists for these targets |
 | [Plugin updates discard configured arguments](audit/plugin-updates-discard-configured-arguments.md) | Open | Medium | API keys, endpoints, models, large prompts, and enablement — reset and immediately persisted | The ordinary plugin Update button; every update |
 | [Partial block decode becomes authoritative](audit/partial-block-decode-becomes-authoritative.md) | Open | Medium | Blocks still intact on disk are permanently discarded once the partial decode is cached and re-encoded | Requires one corrupted block first; the response then amplifies corruption instead of failing over to recovery copies |
 | [Rebase promotes ETag before authoritative state installs](audit/rebase-promotes-etag-before-authoritative-state-is-installed.md) | Fixed | Medium | Another client's characters and stubs replaced, their rows deleted, via a stale forced write | Mid-rebase failure (fetch/decode/install), then a forced full write; plugin-memory reconciliation is a production caller of forced writes |

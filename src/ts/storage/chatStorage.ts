@@ -1,4 +1,4 @@
-import { forageStorage, markCharacterDirty } from "../globalApi.svelte"
+import { forageStorage, markCharacterDirty, markChatDirty } from "../globalApi.svelte"
 import { type Chat, type ChatStub, type ChatOrStub, getDatabase, isChatStub } from "./database.svelte"
 import { language } from "../../lang"
 import { safeStructuredClone } from "../polyfill"
@@ -182,6 +182,7 @@ export function importChatBackup(targetChaId: string, backup: Chat): Chat {
     // Imports usually target a character that isn't selected, which the
     // reactive dirty tracker never watches — mark it dirty by hand.
     markCharacterDirty(targetChaId)
+    markChatDirty(targetChaId, restored.id ?? '')
     return restored
 }
 

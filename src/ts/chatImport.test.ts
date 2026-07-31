@@ -10,6 +10,7 @@ import {
 vi.mock('./globalApi.svelte', () => ({
     forageStorage: { realStorage: {} },
     markCharacterDirty: vi.fn(),
+    markChatDirty: vi.fn(),
 }))
 vi.mock('./storage/database.svelte', () => ({
     getDatabase: () => ({ characters: [] }),

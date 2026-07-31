@@ -4,8 +4,10 @@ import {
     getDatabase,
     normalizeChat,
     setDatabase as setDatabaseState,
+    type Database,
 } from "src/ts/storage/database.svelte";
 import { cloneDatabaseField } from "src/ts/storage/databaseClone";
+import { collectDirtySaveTargets } from "src/ts/storage/dirtyTargetDiff";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
 import { recordOwner, removeOwner, clearOwners } from "../pluginStorageMeta";
 import {
@@ -39,7 +41,7 @@ import { v4 } from "uuid";
 import { sleep } from "src/ts/util";
 import { alertConfirm, alertError, alertNormal, notifyError, notifyWarning } from "src/ts/alert";
 import { language } from "src/lang";
-import { checkCharOrder, forageStorage, getFetchLogs } from "src/ts/globalApi.svelte";
+import { checkCharOrder, forageStorage, getFetchLogs, markCharacterDirty, markChatDirty } from "src/ts/globalApi.svelte";
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
 import { get } from "svelte/store";
 import { registerMCPModule, registeredCustomPluginMCPs, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
@@ -79,6 +81,19 @@ import {
     type AfterTTSResult,
     type TTSHookFn,
 } from "src/ts/process/ttsHooks";
+
+function snapshotCharactersForDirtyTracking(value: unknown): Database['characters'] {
+    return cloneDatabaseField('characters', value) as Database['characters'];
+}
+
+function scheduleCharacterDirtyTargets(
+    before: Database['characters'],
+    after: Database['characters'],
+): void {
+    const targets = collectDirtySaveTargets(before, after);
+    for (const chaId of targets.characters) markCharacterDirty(chaId);
+    for (const [chaId, chatId] of targets.chats) markChatDirty(chaId, chatId);
+}
 
 /*
     V3 API for RisuAI Plugins
@@ -1227,15 +1242,24 @@ export const makeRisuaiAPIV3 = (
         },
         applyLite: (mutation, signal) => {
             const db = getDatabase();
+            const previousCharacters = Object.hasOwn(mutation, 'characters')
+                ? snapshotCharactersForDirtyTracking(db.characters)
+                : null;
             for (const key of Object.keys(mutation)) {
                 throwIfAborted(signal);
                 (db as any)[key] = mutation[key];
             }
             throwIfAborted(signal);
             DBState.db = db;
+            if (previousCharacters) {
+                scheduleCharacterDirtyTargets(previousCharacters, db.characters);
+            }
         },
         applyFull: async (mutation, signal) => {
             const db = getDatabase();
+            const previousCharacters = Object.hasOwn(mutation, 'characters')
+                ? snapshotCharactersForDirtyTracking(db.characters)
+                : null;
             const preparedEntries: [string, unknown][] = [];
             for (const key of Object.keys(mutation)) {
                 throwIfAborted(signal);
@@ -1255,6 +1279,9 @@ export const makeRisuaiAPIV3 = (
             }
             throwIfAborted(signal);
             setDatabaseState(db);
+            if (previousCharacters) {
+                scheduleCharacterDirtyTargets(previousCharacters, getDatabase().characters);
+            }
         },
     });
     const pluginStorageUpdates = new PluginStorageUpdateCoordinator({
@@ -1635,7 +1662,13 @@ export const makeRisuaiAPIV3 = (
             const charIds = Object.keys(db.characters);
             const charId = charIds[index];
             if(charId){
+                const previousCharacters = snapshotCharactersForDirtyTracking([
+                    db.characters[charId],
+                ]);
                 DBState.db.characters[charId] = char
+                scheduleCharacterDirtyTargets(previousCharacters, [
+                    DBState.db.characters[charId],
+                ]);
             }
         },
         getChatFromIndex: (characterIndex:number, chatIndex:number) => {
@@ -1660,9 +1693,18 @@ export const makeRisuaiAPIV3 = (
             const charIds = Object.keys(db.characters);
             const charId = charIds[characterIndex];
             if(charId){
-                const chats = db.characters[charId].chats;
+                const owner = db.characters[charId];
+                const chats = owner.chats;
                 if(chats && chats[chatIndex]){
+                    const previousCharacters = snapshotCharactersForDirtyTracking([{
+                        chaId: owner.chaId,
+                        chats: [chats[chatIndex]],
+                    }]);
                     DBState.db.characters[charId].chats[chatIndex] = normalizeChat(chat)
+                    scheduleCharacterDirtyTargets(previousCharacters, [{
+                        chaId: owner.chaId,
+                        chats: [DBState.db.characters[charId].chats[chatIndex]],
+                    }] as Database['characters']);
                 }
             }
         },

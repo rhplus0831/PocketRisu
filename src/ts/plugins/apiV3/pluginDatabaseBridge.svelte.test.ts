@@ -16,6 +16,10 @@ const alertConfirmMock = vi.hoisted(() => vi.fn(async () => true));
 const notifyErrorMock = vi.hoisted(() => vi.fn());
 const notifyWarningMock = vi.hoisted(() => vi.fn());
 const nativeConsoleWarnMock = vi.hoisted(() => vi.fn());
+const dirtyTargetMocks = vi.hoisted(() => ({
+    markCharacterDirty: vi.fn(),
+    markChatDirty: vi.fn(),
+}));
 const unloadFinalizationMocks = vi.hoisted(() => ({
     fetchNative: vi.fn(async () => ({ status: 204 })),
     globalFetch: vi.fn(async () => ({ ok: true, status: 204 })),
@@ -56,6 +60,8 @@ vi.mock("../../globalApi.svelte", () => ({
     forageStorage: { realStorage: null },
     getFetchLogs: vi.fn(async () => []),
     globalFetch: unloadFinalizationMocks.globalFetch,
+    markCharacterDirty: dirtyTargetMocks.markCharacterDirty,
+    markChatDirty: dirtyTargetMocks.markChatDirty,
     readImage: vi.fn(),
     requestImmediateSave: vi.fn(),
     saveAsset: unloadFinalizationMocks.saveAsset,
@@ -524,6 +530,8 @@ beforeEach(async () => {
     notifyErrorMock.mockClear();
     notifyWarningMock.mockClear();
     nativeConsoleWarnMock.mockClear();
+    dirtyTargetMocks.markCharacterDirty.mockClear();
+    dirtyTargetMocks.markChatDirty.mockClear();
     unloadFinalizationMocks.fetchNative.mockClear();
     unloadFinalizationMocks.globalFetch.mockClear();
     unloadFinalizationMocks.saveAsset.mockClear();
@@ -564,6 +572,110 @@ beforeEach(async () => {
 });
 
 describe("V3 mode-aware database bridge", () => {
+    test("schedules a non-selected character replacement without changing index API behavior", () => {
+        const plugin = startupPlugin("Targeted character setter", "");
+        testState.database.characters = [
+            { chaId: "char-a", name: "A", chats: [] },
+            { chaId: "char-b", name: "B", chats: [] },
+        ];
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+        const api = makeRisuaiAPIV3(document.createElement("iframe"), plugin as any) as any;
+
+        const result = api.setCharacterToIndex(1, {
+            chaId: "char-b",
+            name: "B updated",
+            chats: [],
+        });
+
+        expect(result).toBeUndefined();
+        expect(testState.database.characters[1].name).toBe("B updated");
+        expect(dirtyTargetMocks.markCharacterDirty).toHaveBeenCalledWith("char-b");
+        expect(dirtyTargetMocks.markChatDirty).not.toHaveBeenCalled();
+    });
+
+    test("schedules an inactive full chat row and its changed stub metadata", () => {
+        const plugin = startupPlugin("Targeted chat setter", "");
+        testState.database.characters = [{
+            chaId: "char-a",
+            name: "A",
+            chats: [{
+                id: "chat-a",
+                name: "Old",
+                note: "",
+                localLore: [],
+                message: [{ role: "user", data: "before" }],
+            }],
+        }];
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+        const api = makeRisuaiAPIV3(document.createElement("iframe"), plugin as any) as any;
+
+        api.setChatToIndex(0, 0, {
+            id: "chat-a",
+            name: "After",
+            note: "",
+            localLore: [],
+            modules: ["module-a"],
+            message: [{ role: "user", data: "after" }],
+        });
+
+        expect(dirtyTargetMocks.markCharacterDirty).toHaveBeenCalledWith("char-a");
+        expect(dirtyTargetMocks.markChatDirty).toHaveBeenCalledWith("char-a", "chat-a");
+    });
+
+    test("never schedules a lazy placeholder as an authoritative chat row", () => {
+        const plugin = startupPlugin("Placeholder-safe chat setter", "");
+        testState.database.characters = [{
+            chaId: "char-a",
+            name: "A",
+            chats: [{
+                id: "chat-a",
+                name: "Old",
+                note: "",
+                localLore: [],
+                message: [],
+                _placeholder: true,
+            }],
+        }];
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+        const api = makeRisuaiAPIV3(document.createElement("iframe"), plugin as any) as any;
+
+        api.setChatToIndex(0, 0, {
+            ...testState.database.characters[0].chats[0],
+            modules: ["module-a"],
+        });
+
+        expect(dirtyTargetMocks.markCharacterDirty).toHaveBeenCalledWith("char-a");
+        expect(dirtyTargetMocks.markChatDirty).not.toHaveBeenCalled();
+    });
+
+    test("whole-database character replacement schedules only changed targets", async () => {
+        const plugin = startupPlugin("Targeted database setter", "");
+        testState.database.characters = [{
+            chaId: "char-a",
+            name: "A",
+            chats: [{
+                id: "chat-a",
+                name: "Chat",
+                note: "",
+                localLore: [],
+                message: [{ role: "user", data: "before" }],
+            }],
+        }];
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+        const api = makeRisuaiAPIV3(document.createElement("iframe"), plugin as any) as any;
+        const replacement = cloneJson(testState.database.characters);
+        replacement[0].chats[0].message[0].data = "after";
+
+        await api.setDatabaseLite({ characters: replacement });
+
+        expect(dirtyTargetMocks.markCharacterDirty).not.toHaveBeenCalled();
+        expect(dirtyTargetMocks.markChatDirty).toHaveBeenCalledWith("char-a", "chat-a");
+    });
+
     test("normalizes a plugin-list mutation before the setter resolves", async () => {
         const normalizePluginMutation = vi.fn(() => {
             for (const plugin of testState.database.plugins) {

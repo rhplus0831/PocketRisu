@@ -45,6 +45,7 @@ import {
     DatabaseSaveCoordinator,
     type DatabaseSaveOutcome,
 } from "./storage/databaseSave"
+import { DirtyTargetBridge } from "./storage/dirtyTargetBridge"
 
 export const forageStorage = new AutoStorage()
 
@@ -273,7 +274,7 @@ let requestImmediateSaveImpl: ((options?: {
     status: 'failed',
     error: new Error('Database save loop is not initialized'),
 })
-let markCharacterDirtyImpl: ((chaId: string) => void) = () => {}
+const dirtyTargetBridge = new DirtyTargetBridge()
 let patchSyncBaseline: Database | null = null
 
 // Surfaces server-side persist failures (Stage 1 visibility — see issues.md).
@@ -387,7 +388,14 @@ export function requestImmediateSave(options?: {
 // mutates a non-selected character (e.g. chat backup import from settings)
 // must mark it dirty explicitly or the change never persists.
 export function markCharacterDirty(chaId: string) {
-    markCharacterDirtyImpl(chaId)
+    dirtyTargetBridge.markCharacter(chaId)
+}
+
+// Full chat bodies live in their own authoritative rows. Arbitrary-target
+// writers must name the row explicitly because the reactive effect watches
+// only the active chat.
+export function markChatDirty(chaId: string, chatId: string) {
+    dirtyTargetBridge.markChat(chaId, chatId)
 }
 
 export function setPatchSyncBaseline(data: Database | null) {
@@ -640,6 +648,7 @@ export async function saveDb() {
                     name: c.name,
                     lastDate: c.lastDate,
                     folderId: c.folderId,
+                    modules: c.modules,
                 })))
                 if (changeTracker.character[0] !== DBState.db.characters[selIdState]?.chaId) {
                     changeTracker.character.unshift(DBState.db.characters[selIdState]?.chaId)
@@ -1096,11 +1105,24 @@ export async function saveDb() {
         })
     }
 
-    markCharacterDirtyImpl = (chaId) => {
-        if (!chaId) return
-        changeTracker.character = [chaId, ...changeTracker.character.filter(id => id !== chaId)]
-        changed = true
-    }
+    // Publish the bridges only after encoder, patcher, and reactive tracking
+    // are ready. Calls made during plugin/bootstrap work remain queued above
+    // and are drained into the first ordinary save.
+    dirtyTargetBridge.activate({
+        character: (chaId) => {
+            changeTracker.character = [chaId, ...changeTracker.character.filter(id => id !== chaId)]
+            changed = true
+        },
+        chat: (chaId, chatId) => {
+            changeTracker.chat = [
+                [chaId, chatId],
+                ...changeTracker.chat.filter(([queuedChaId, queuedChatId]) => (
+                    queuedChaId !== chaId || queuedChatId !== chatId
+                )),
+            ]
+            changed = true
+        },
+    })
 
     let savetrys = 0
     while (true) {

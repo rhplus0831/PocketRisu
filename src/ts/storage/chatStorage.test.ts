@@ -4,9 +4,10 @@ import { beforeEach, describe, test, expect, vi } from 'vitest'
 // unrelated $effect chains that fail in a stripped-down test environment.
 // Mirror the production isChatStub semantics including the hybrid guard so
 // the chat-data-loss tests below exercise the real intent.
-const { mockSaveChatContent, mockMarkCharacterDirty, mockDbState } = vi.hoisted(() => ({
+const { mockSaveChatContent, mockMarkCharacterDirty, mockMarkChatDirty, mockDbState } = vi.hoisted(() => ({
     mockSaveChatContent: vi.fn(),
     mockMarkCharacterDirty: vi.fn(),
+    mockMarkChatDirty: vi.fn(),
     mockDbState: { characters: [] as any[] },
 }))
 
@@ -17,6 +18,7 @@ vi.mock('../globalApi.svelte', () => ({
         },
     },
     markCharacterDirty: mockMarkCharacterDirty,
+    markChatDirty: mockMarkChatDirty,
 }))
 vi.mock('./database.svelte', () => ({
     getDatabase: () => mockDbState,
@@ -43,6 +45,7 @@ type ChatStub = any
 beforeEach(() => {
     mockSaveChatContent.mockReset()
     mockMarkCharacterDirty.mockReset()
+    mockMarkChatDirty.mockReset()
     mockDbState.characters = []
 })
 
@@ -177,11 +180,13 @@ describe('chat backup import transformation', () => {
         // Without the explicit dirty mark, imports into non-selected
         // characters never persist — see markCharacterDirty in globalApi.
         expect(mockMarkCharacterDirty).toHaveBeenCalledWith('char-t')
+        expect(mockMarkChatDirty).toHaveBeenCalledWith('char-t', restored.id)
     })
 
     test('import throws when the target character is missing', () => {
         expect(() => importChatBackup('missing', blankChat())).toThrow()
         expect(mockMarkCharacterDirty).not.toHaveBeenCalled()
+        expect(mockMarkChatDirty).not.toHaveBeenCalled()
     })
 })
 

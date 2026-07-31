@@ -3,6 +3,7 @@ import { alertConfirm } from 'src/ts/alert'
 import { type character, type loreBook } from 'src/ts/storage/database.svelte'
 import { DBState } from 'src/ts/stores.svelte'
 import { pickHashRand } from 'src/ts/util'
+import { markCharacterDirty } from 'src/ts/globalApi.svelte'
 import { type MCPTool, MCPToolHandler, type RPCToolCallContent } from '../mcplib'
 import { getCharacter } from './utils'
 
@@ -527,6 +528,7 @@ export class CharacterHandler extends MCPToolHandler {
         const realField = fieldRemap[field as keyof typeof fieldRemap]
         // @ts-ignore
         char[realField] = value
+        markCharacterDirty(char.chaId)
       } else {
         return [
           {
@@ -592,6 +594,7 @@ export class CharacterHandler extends MCPToolHandler {
         mode: 'normal',
       }
       char.globalLore.push(newEntry)
+      markCharacterDirty(char.chaId)
       return [
         {
           type: 'text',
@@ -617,6 +620,7 @@ export class CharacterHandler extends MCPToolHandler {
         entry.key = ''
       }
     }
+    markCharacterDirty(char.chaId)
 
     return [
       {
@@ -664,6 +668,7 @@ export class CharacterHandler extends MCPToolHandler {
     }
 
     char.globalLore.splice(entryIndex, 1)
+    markCharacterDirty(char.chaId)
 
     return [
       {
@@ -754,6 +759,7 @@ export class CharacterHandler extends MCPToolHandler {
       }
 
       char.customscript.push(newScript)
+      markCharacterDirty(char.chaId)
       return [
         {
           type: 'text',
@@ -770,6 +776,7 @@ export class CharacterHandler extends MCPToolHandler {
     if (type !== undefined) script.type = type
     if (flag !== undefined) script.flag = flag
     if (ableFlag !== undefined) script.ableFlag = ableFlag
+    markCharacterDirty(char.chaId)
 
     return [
       {
@@ -805,6 +812,7 @@ export class CharacterHandler extends MCPToolHandler {
 
     if (!char.customscript) {
       char.customscript = []
+      markCharacterDirty(char.chaId)
     }
 
     const scriptIndex = char.customscript.findIndex((script) => {
@@ -821,6 +829,7 @@ export class CharacterHandler extends MCPToolHandler {
     }
 
     char.customscript.splice(scriptIndex, 1)
+    markCharacterDirty(char.chaId)
 
     return [
       {
@@ -880,6 +889,7 @@ export class CharacterHandler extends MCPToolHandler {
 
     if (!char.additionalAssets) {
       char.additionalAssets = []
+      markCharacterDirty(char.chaId)
     }
 
     const assetIndex = char.additionalAssets.findIndex((asset) => {
@@ -896,6 +906,7 @@ export class CharacterHandler extends MCPToolHandler {
     }
 
     char.additionalAssets.splice(assetIndex, 1)
+    markCharacterDirty(char.chaId)
 
     return [
       {
@@ -955,6 +966,7 @@ export class CharacterHandler extends MCPToolHandler {
     const firstTrigger = char.triggerscript?.[0]
     if (firstTrigger?.effect?.[0]?.type === 'triggerlua') {
       firstTrigger.effect[0].code = code
+      markCharacterDirty(char.chaId)
       return [
         {
           type: 'text',
