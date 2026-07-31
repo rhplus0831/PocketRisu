@@ -65,7 +65,7 @@ many users use that path.
 - [Unrelated failure can poison an install](unrelated-plugin-failure-poisons-install.md)
 - [Permission editor cannot reset to Ask](permission-editor-cannot-reset-to-ask.md)
 - [Input hooks cannot call sendChat](input-hooks-cannot-call-sendchat.md)
-- [Viewer requires String.isWellFormed](plugin-storage-viewer-requires-string-iswellformed.md)
+- [Viewer requires String.isWellFormed (fixed 2026-07-31)](plugin-storage-viewer-requires-string-iswellformed.md)
 
 ## Persistence, assets, and server API reports
 

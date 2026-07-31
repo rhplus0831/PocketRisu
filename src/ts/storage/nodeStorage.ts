@@ -76,6 +76,7 @@ import {
     pluginSaveStorageKeyMappingComponent,
     type PluginSaveStoragePrefix,
 } from "./pluginSaveKeyPolicy"
+import { isWellFormedUnicode } from "./unicodeWellFormed"
 
 /** Short availability bound for authentication and small control requests. */
 export const AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS = 15_000
@@ -2897,7 +2898,7 @@ export class NodeStorage{
             throw new RangeError('Plugin storage viewer page size must be between 1 and 50')
         }
         if ((options.ownerQuery !== undefined && options.unknownOwner)
-            || (options.ownerQuery !== undefined && !options.ownerQuery.isWellFormed())) {
+            || (options.ownerQuery !== undefined && !isWellFormedUnicode(options.ownerQuery))) {
             throw new TypeError('Plugin storage viewer owner filter is invalid')
         }
         const query = new URLSearchParams({
@@ -2961,7 +2962,7 @@ export class NodeStorage{
                         return exactKeys(candidate, ['owner', 'count'])
                             && typeof candidate.owner === 'string'
                             && candidate.owner.length > 0
-                            && candidate.owner.isWellFormed()
+                            && isWellFormedUnicode(candidate.owner)
                             && Number.isSafeInteger(candidate.count)
                             && (candidate.count as number) > 0
                             && (index === 0
@@ -3030,7 +3031,7 @@ export class NodeStorage{
                     || (record.owner !== null
                         && (typeof record.owner !== 'string'
                             || record.owner.length === 0
-                            || !record.owner.isWellFormed()))
+                            || !isWellFormedUnicode(record.owner)))
                     || typeof record.text !== 'string'
                     || !Number.isSafeInteger(record.size) || (record.size as number) < 0
                     || textEncoder.encode(record.text as string).byteLength !== record.size
@@ -3092,7 +3093,7 @@ export class NodeStorage{
                 && exactKeys(record, ['event', 'message'])
                 && typeof record.message === 'string'
                 && record.message.length > 0
-                && record.message.isWellFormed()) {
+                && isWellFormedUnicode(record.message)) {
                 throw new StorageError(record.message, {
                     code: 'STORAGE_RESPONSE_ERROR', operation: 'list', retryable: true,
                 })

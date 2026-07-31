@@ -31,7 +31,10 @@ import {
     snapshotJsonValue,
     stringifyJsonValue,
 } from "../storage/jsonValue";
-import { assertWellFormedUnicode } from "../storage/unicodeWellFormed";
+import {
+    assertWellFormedUnicode,
+    isWellFormedUnicode,
+} from "../storage/unicodeWellFormed";
 import {
     beginDatabaseSavePause,
     blockDatabaseSavesUntilReload,
@@ -2558,7 +2561,7 @@ export async function getPluginSaveStorageViewerPage(
     }
     if ((options.ownerQuery !== undefined && options.unknownOwner)
         || (options.ownerQuery !== undefined
-            && (!options.ownerQuery || !options.ownerQuery.isWellFormed()))) {
+            && (!options.ownerQuery || !isWellFormedUnicode(options.ownerQuery)))) {
         throw new TypeError("Plugin storage viewer owner filter is invalid.");
     }
     return withPluginSaveStorageScope("viewer", async () => {

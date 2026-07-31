@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { Buffer as BrowserBuffer } from 'buffer'
 import { Buffer as NodeBuffer } from 'node:buffer'
 import { createHash } from 'node:crypto'
@@ -55,6 +55,14 @@ vi.mock('./resourceCache', () => ({
     storeOwnedBytesWithKnownHash: cache.storeOwnedBytesWithKnownHash,
     touchResourceCacheManifest: vi.fn(async () => undefined),
 }))
+
+// Load the browser transport as an older WebView would: without the modern
+// String prototype method, so the viewer must use the portable Unicode helper.
+const nativeIsWellFormedDescriptor = Object.getOwnPropertyDescriptor(
+    String.prototype,
+    'isWellFormed',
+)
+Reflect.deleteProperty(String.prototype, 'isWellFormed')
 
 const {
     NodeStorage,
@@ -149,6 +157,16 @@ afterEach(() => {
     vi.useRealTimers()
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
+})
+
+afterAll(() => {
+    if (nativeIsWellFormedDescriptor) {
+        Object.defineProperty(
+            String.prototype,
+            'isWellFormed',
+            nativeIsWellFormedDescriptor,
+        )
+    }
 })
 
 describe('NodeStorage atomic plugin mutation cache publication', () => {
@@ -1576,6 +1594,24 @@ describe('NodeStorage plugin viewer pages', () => {
         }))
         return lines
     }
+
+    test('validates viewer filters and rows without native String.isWellFormed', async () => {
+        expect(String.prototype.isWellFormed).toBeUndefined()
+
+        const storage = storageWithResponse(new Response(`${viewerEvents().join('\n')}\n`))
+        await expect(storage.getPluginStorageViewerPage(
+            generation,
+            { page: 2, pageSize: 50 },
+        )).resolves.toMatchObject({
+            total: 10_000,
+            ownerFacets: [{ owner: 'Owner', count: 5_000 }],
+        })
+
+        await expect(storage.getPluginStorageViewerPage(
+            generation,
+            { page: 2, pageSize: 50, ownerQuery: '\uD800' },
+        )).rejects.toThrow('Plugin storage viewer owner filter is invalid')
+    })
 
     test('streams one bounded 10k-key page from one request with fragmented UTF-8', async () => {
         const bytes = new TextEncoder().encode(`${viewerEvents(50, 'key-').join('\n')}\n`)

@@ -1876,11 +1876,28 @@ describe("plugin save storage transport", () => {
             alpha: { plugin: "Owner A", updatedAt: 1 },
         };
 
-        const owned = await getPluginSaveStorageViewerPage({
-            page: 1,
-            pageSize: 1,
-            ownerQuery: "Owner A",
-        });
+        const nativeIsWellFormedDescriptor = Object.getOwnPropertyDescriptor(
+            String.prototype,
+            "isWellFormed",
+        );
+        Reflect.deleteProperty(String.prototype, "isWellFormed");
+        const owned = await (async () => {
+            try {
+                return await getPluginSaveStorageViewerPage({
+                    page: 1,
+                    pageSize: 1,
+                    ownerQuery: "Owner A",
+                });
+            } finally {
+                if (nativeIsWellFormedDescriptor) {
+                    Object.defineProperty(
+                        String.prototype,
+                        "isWellFormed",
+                        nativeIsWellFormedDescriptor,
+                    );
+                }
+            }
+        })();
         expect(owned.entries.map(entry => entry.key)).toEqual(["alpha"]);
         const versionedAlpha = await getPluginSaveStorageItemWithRevision("alpha");
         expect(owned.entries[0].revision).toBe(versionedAlpha.revision);

@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **56** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, and **39** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **55** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, and **40** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -25,9 +25,7 @@ None currently open.
 
 ## Tier 2
 
-| Work item | Source | Status | Impact | Trigger / likelihood |
-|---|---|---|---|---|
-| [The storage viewer requires `String.isWellFormed`](compatibility/plugin-storage-viewer-requires-string-iswellformed.md) | compat | Open | Optimized or owner-filtered viewer pages throw instead of rendering. | Limited to Firefox 114–118 and older embedded WebViews missing the method. |
+None currently open.
 
 ## Tier 3
 
@@ -126,6 +124,7 @@ None currently open.
 
 | Finding | Former harm | Note |
 |---|---|---|
+| [The storage viewer required `String.isWellFormed`](compatibility/plugin-storage-viewer-requires-string-iswellformed.md) | Optimized or owner-filtered viewer pages threw instead of rendering in browsers missing the method. | Fixed 2026-07-31 by routing viewer filters and streamed owner/error validation through the existing portable Unicode helper, with optimized and inline fallback coverage. |
 | [Optimized storage limited key length](compatibility/optimized-plugin-storage-key-length-limit.md) | Optimization or later writes rejected a logical key that inline storage accepted. | Fixed 2026-07-31 with fixed-size domain-separated physical identifiers, exact manifest-v3 logical mappings, atomic mutation/removal, and transition/viewer/backup coverage while preserving existing short names. |
 | [The plugin bridge retained a 30-minute deadline](compatibility/plugin-bridge-residual-30-minute-deadline.md) | Long model/chat/storage calls rejected while non-abortable host work could continue. | Fixed 2026-07-31 by restoring unbounded live RPC/initialization waits, cancelling on guest/host lifecycle loss, propagating cancellation through model/chat work, and making storage-update deadlines explicit-only. |
 | [Plugin timeout tests were self-referential](compatibility/plugin-timeout-regression-test-is-self-referential.md) | The timeout regression could return without a failing test. | Fixed 2026-07-31 with independent former-boundary assertions for RPCs, initialization, storage outcomes, page disappearance, and model/chat cancellation. |
