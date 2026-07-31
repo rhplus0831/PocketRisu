@@ -49,6 +49,8 @@ describe('Voyage contextual embedding providers', () => {
     expect(mocks.globalFetch).toHaveBeenCalledWith(
       'https://api.voyageai.com/v1/contextualizedembeddings',
       {
+        logCategory: 'embedding',
+        logSource: 'memory',
         headers: {
           Authorization: 'Bearer voyage-key',
           'Content-Type': 'application/json',

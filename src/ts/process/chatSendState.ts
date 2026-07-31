@@ -1,12 +1,16 @@
 import { derived, get, writable } from 'svelte/store'
 import type { ChatSendTarget } from './chatSendTarget'
+import { doingChat } from './generationState'
 
 export interface ChatSendTransaction {
     readonly id: number
     readonly target: ChatSendTarget
 }
 
-export const doingChat = writable(false)
+// Compatibility export only: generationState owns the sole generation flag.
+// The transaction below is an origin-binding reservation for the input-hook
+// phase, not a second generation lifecycle.
+export { doingChat }
 
 const activeChatSendTransaction = writable<ChatSendTransaction | null>(null)
 let nextChatSendTransactionId = 1

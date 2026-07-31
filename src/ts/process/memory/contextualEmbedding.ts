@@ -60,6 +60,8 @@ class VoyageContextProvider implements ContextualEmbeddingProvider {
     let groupOffset = 0;
     for (const batch of batches) {
       const response = await globalFetch(VOYAGE_API_URL, {
+        logCategory: 'embedding',
+        logSource: 'memory',
         headers: {
           "Authorization": "Bearer " + apiKey,
           "Content-Type": "application/json"
@@ -91,6 +93,8 @@ class VoyageContextProvider implements ContextualEmbeddingProvider {
   async embedQueries(queries: string[]): Promise<VectorArray[]> {
     const apiKey = this.getApiKey();
     const response = await globalFetch(VOYAGE_API_URL, {
+      logCategory: 'embedding',
+      logSource: 'memory',
       headers: {
         "Authorization": "Bearer " + apiKey,
         "Content-Type": "application/json"

@@ -17,7 +17,7 @@
     import { alertClear, alertConfirm, alertConfirmMulti, alertInput, alertRequestData, alertWait, notifyInfo, notifySuccess, type AlertAction } from "../../ts/alert"
     import { ParseMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
     import { getLLMCache, setLLMCache } from "../../ts/translator/translator"
-    import { getCurrentCharacter, getCurrentChat, setCurrentChat, type MessageGenerationInfo } from "../../ts/storage/database.svelte"
+    import { getCurrentCharacter, getCurrentChat, setCurrentChat, type MessageGenerationInfo, type StreamingDisplayOptimizationMode } from "../../ts/storage/database.svelte"
     import { setChatBackupReason } from "../../ts/storage/chatStorage"
     import { selectedCharID } from "../../ts/stores.svelte"
     import { HideIconStore, ReloadGUIPointer, selIdState } from "../../ts/stores.svelte"
@@ -55,6 +55,9 @@
         totalPages?: number;
         isComment?: boolean;
         disabled?: boolean | 'allBefore';
+        isOptimizedStreamingMessage?: boolean;
+        streamingOptimizationMode?: StreamingDisplayOptimizationMode;
+        rawStreamingText?: string;
     }
 
     let {
@@ -79,6 +82,9 @@
         totalPages = 1,
         isComment = false,
         disabled = false,
+        isOptimizedStreamingMessage = false,
+        streamingOptimizationMode = 'off',
+        rawStreamingText = message,
     }: Props = $props();
 
     let msgDisplay = $state('')
@@ -91,6 +97,16 @@
         if (character?.chaId && chat?.id) {
             setChatBackupReason(character.chaId, chat.id, reason)
         }
+    }
+
+    export function updateStreamingDisplay(state: {
+        isOptimizedStreamingMessage: boolean
+        streamingOptimizationMode: StreamingDisplayOptimizationMode
+        rawStreamingText: string
+    }){
+        isOptimizedStreamingMessage = state.isOptimizedStreamingMessage
+        streamingOptimizationMode = state.streamingOptimizationMode
+        rawStreamingText = state.rawStreamingText
     }
 
     async function rm(){
@@ -196,16 +212,25 @@
 
 
     let blankMessage = $derived((message === '{{none}}' || message === '{{blank}}' || message === '') && idx === -1 && !altGreeting || isComment)
+    let displayMessage = $derived(isOptimizedStreamingMessage ? rawStreamingText : message)
+    let renderRawStreaming = $derived(isOptimizedStreamingMessage && streamingOptimizationMode === 'strong')
+
+    function updateDisplayedMessage(){
+        if(renderRawStreaming){
+            return
+        }
+        displaya(displayMessage)
+    }
 
     $effect.pre(() => {
-        displaya(message)
+        updateDisplayedMessage()
     });
 
     const unsubscribers:Unsubscriber[] = []
 
     onMount(()=>{
         unsubscribers.push(ReloadGUIPointer.subscribe((v) => {
-            displaya(message)
+            updateDisplayedMessage()
         }))
     })
 
@@ -423,7 +448,7 @@
             class:prose-invert={$ColorSchemeTypeStore === 'dark'}
             bind:this={bodyRoot}
             onclick={() => {
-            if(DBState.db.clickToEdit && idx > -1){
+            if(DBState.db.clickToEdit && idx > -1 && !isOptimizedStreamingMessage){
                 editMode = true
             }
         }}
@@ -444,9 +469,11 @@
                     role={role ?? null}
                     bind:translated={translated}
                     bind:translating={translating}
-                    bind:retranslate={retranslate} />
+                    bind:retranslate={retranslate}
+                    {renderRawStreaming}
+                    {rawStreamingText} />
             {/key}
-            {#if idx >= 0 && !editMode && partialEditEnabled && (DBState.db.enableBlockPartialEdit || DBState.db.enableDragPartialEdit)}
+            {#if idx >= 0 && !editMode && !isOptimizedStreamingMessage && partialEditEnabled && (DBState.db.enableBlockPartialEdit || DBState.db.enableDragPartialEdit)}
                 <PartialEditController
                     messageData={message}
                     chatIndex={idx}
@@ -518,6 +545,9 @@
 {#snippet majorIconButtonsBody(showNames:boolean)}
     {#if !blankMessage}
     <button class="flex items-center hover:text-primary transition-colors button-icon-copy" onclick={async ()=>{
+        const copyText = renderRawStreaming
+            ? risuChatParser(rawStreamingText, {chara: name, chatID: idx, rmVar: true, visualize: true, cbsConditions: getCbsCondition()})
+            : msgDisplay
         if(window.navigator.clipboard.write){
             try {
                 alertWait(language.loading)
@@ -525,7 +555,7 @@
 
                 const parser = new DOMParser()
                 const doc = parser.parseFromString(
-                    await ParseMarkdown(msgDisplay, getCurrentCharacter(), 'normal', idx, getCbsCondition())
+                    await ParseMarkdown(copyText, getCurrentCharacter(), 'normal', idx, getCbsCondition())
                 , 'text/html')
                 
                 doc.querySelectorAll('mark').forEach((el) => {
@@ -722,7 +752,7 @@
 
                 await window.navigator.clipboard.write([
                     new ClipboardItem({
-                        'text/plain': new Blob([msgDisplay], {type: 'text/plain'}),
+                        'text/plain': new Blob([copyText], {type: 'text/plain'}),
                         'text/html': new Blob([html], {type: 'text/html'})
                     })
                 ])
@@ -731,12 +761,12 @@
             }
             catch (e) {
                 alertClear()
-                window.navigator.clipboard.writeText(msgDisplay).then(() => {
+                window.navigator.clipboard.writeText(copyText).then(() => {
                     setStatusMessage(language.copied)
                 })
             }
         }
-        window.navigator.clipboard.writeText(msgDisplay).then(() => {
+        window.navigator.clipboard.writeText(copyText).then(() => {
             setStatusMessage(language.copied)
         })
     }}>
@@ -749,7 +779,7 @@
 {#if idx > -1}
     {#if DBState.db.characters[selIdState.selId].ttsMode !== 'none' && (DBState.db.characters[selIdState.selId].ttsMode)}
         <button class="flex items-center hover:text-primary transition-colors button-icon-tts" onclick={()=>{
-            return sayTTS(null, message)
+            return sayTTS(null, isOptimizedStreamingMessage ? rawStreamingText : message)
         }}>
             <Volume2Icon size={20}/>
             {#if showNames}
@@ -768,7 +798,7 @@
 {/snippet}
 
 {#snippet translationButton(showNames = false)}
-    {#if DBState.db.translator !== '' && !blankMessage}
+    {#if DBState.db.translator !== '' && !blankMessage && !isOptimizedStreamingMessage}
         <button class={"flex items-center cursor-pointer hover:text-primary transition-colors button-icon-translate " + (translated ? 'text-blue-400':'')} class:translating={translating} onclick={async () => {
             translated = !translated
         }}>
@@ -778,7 +808,7 @@
             {/if}
         </button>
     {/if}
-    {#if idx > -1}
+    {#if idx > -1 && !isOptimizedStreamingMessage}
         <button class={"flex items-center hover:text-primary transition-colors button-icon-edit "+(editMode?'text-blue-400':'')} onclick={() => {
             if(!editMode){
                 editMode = true

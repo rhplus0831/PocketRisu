@@ -45,12 +45,14 @@ import { checkCharOrder, forageStorage, getFetchLogs, markCharacterDirty, markCh
 import { changeColorScheme, updateColorScheme, updateTextThemeAndCSS, type ColorScheme } from "src/ts/gui/colorscheme";
 import { get } from "svelte/store";
 import { registerMCPModule, registeredCustomPluginMCPs, unregisterMCPModule } from "src/ts/process/mcp/pluginmcp";
+import { getInlayAsset } from "src/ts/process/files/inlays";
 import { getLLMCache, searchLLMCache } from "src/ts/translator/translator";
 import { hasher } from "src/ts/parser/parser.svelte";
 import { LLMFlags, LLMFormat, LLMProvider, LLMTokenizer, type LLMModel } from "src/ts/model/types";
 import { readPersistentJson, removePersistentKey, writePersistentJson } from "src/ts/storage/persistentKv";
 import { awaitWithAbort, forwardAbortSignal, throwIfAborted } from "src/ts/storage/abort";
 import { nativeConsoleWarn } from "src/ts/log-capture";
+import { endAllGenerations } from "src/ts/process/generationState";
 import { sendChat as processSendChat, doingChat } from "src/ts/process/index.svelte";
 import {
     getActiveChatSendTransaction,
@@ -1217,7 +1219,7 @@ export const makeRisuaiAPIV3 = (
             signal,
         }),
         // The V3 path does not pass through the UI generation wrapper.
-        releaseGeneration: () => doingChat.set(false),
+        releaseGeneration: () => endAllGenerations(),
     });
     const databaseBridge = createPluginDatabaseBridge({
         allowedDbKeys,
@@ -1397,7 +1399,7 @@ export const makeRisuaiAPIV3 = (
         },
         getChar: oldApis.getChar,
         setChar: oldApis.setChar,
-        addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string }>, options?: PluginV3ProviderOptions) => {
+        addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string | ReadableStream<string> }>, options?: PluginV3ProviderOptions) => {
             lifecycle.assertCanRegister();
             console.warn(`[WARN] addProvider is a powerful API that can potentially be unsafe if used incorrectly. addProvider's functionality might be limited or changed in future updates to ensure security. please use other APIs if possible.`);
             let provs = get(customProviderStore)
@@ -1540,6 +1542,9 @@ export const makeRisuaiAPIV3 = (
         },
         loadPlugins: oldApis.loadPlugins,
         readImage: oldApis.readImage,
+        readInlay: async (id: string) => {
+            return await getInlayAsset(id);
+        },
         saveAsset: async (
             data: Uint8Array,
             _unloadCapabilityOrRequestSignal?: AbortSignal,
@@ -2009,19 +2014,22 @@ export const makeRisuaiAPIV3 = (
             lifecycle.addUnload(callback);
         },
         getFetchLogs: async () => {
-            const unsafeFetchLog = getFetchLogs()
             const conf = await getPluginPermission(plugin.name, 'fetchLogs');
             if(!conf){
                 return null;
             }
+            // Reads the server request log; the shape returned to plugins is
+            // unchanged from when this came from the in-memory fetch log.
+            const unsafeFetchLog = await getFetchLogs()
             return unsafeFetchLog.map(log => {
 
                 const url = new URL(log.url);
                 return {
                     url: url.origin + url.pathname,
-                    body: log.body,
+                    body: log.requestBody ?? '',
                     status: log.status,
-                    response: log.response,
+                    response: log.responseBody,
+                    timestamp: log.timestamp,
                 }
             })
         },

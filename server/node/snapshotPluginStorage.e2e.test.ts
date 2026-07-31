@@ -3971,6 +3971,26 @@ describe('corrupt database boot snapshot recovery', () => {
         const displaced = await authenticate(server)
         const active = await authenticate(server)
 
+        // A boot only registers; it no longer steals the writer lock. Model a
+        // real gesture on the fresh session so the gesture-gated state machine
+        // transfers ownership before asserting that the old session is fenced.
+        const prefixOnly = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: {
+                ...active,
+                'content-type': 'application/json',
+                'x-user-active': '1',
+            },
+            body: JSON.stringify({ key: `${snapshotKey}/suffix` }),
+        })
+        expect(prefixOnly.status).toBe(400)
+        await expect(prefixOnly.json()).resolves.toEqual({
+            error: 'Invalid snapshot key',
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        })
+
         const locked = await fetch(`${server.origin}/api/db/snapshots/restore`, {
             method: 'POST',
             headers: { ...displaced, 'content-type': 'application/json' },
@@ -3984,19 +4004,6 @@ describe('corrupt database boot snapshot recovery', () => {
         expect(unchanged.status).toBe(200)
         expect(Buffer.from(await unchanged.arrayBuffer()).toString('utf-8'))
             .toBe('corrupt-live-database')
-
-        const prefixOnly = await fetch(`${server.origin}/api/db/snapshots/restore`, {
-            method: 'POST',
-            headers: { ...active, 'content-type': 'application/json' },
-            body: JSON.stringify({ key: `${snapshotKey}/suffix` }),
-        })
-        expect(prefixOnly.status).toBe(400)
-        await expect(prefixOnly.json()).resolves.toEqual({
-            error: 'Invalid snapshot key',
-            retryable: false,
-            commitOutcome: 'not-committed',
-            commitOutcomeUnknown: false,
-        })
 
         const restored = await fetch(`${server.origin}/api/db/snapshots/restore`, {
             method: 'POST',

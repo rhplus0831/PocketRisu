@@ -89,6 +89,7 @@ const {
     addLogBatch, queryLogs, clearLogs, countLogs,
     logger, installProcessHandlers, expressErrorMiddleware,
 } = require('./logs.cjs');
+const { createRequestLogs } = require('./request-logs.cjs');
 const { applyPatchAtomic } = require('./atomicJsonPatch.cjs');
 const { createGenerationMemo } = require('./generationMemo.cjs');
 const {
@@ -3903,9 +3904,10 @@ async function checkDiskSpace(requiredBytes, targetPath = path.join(process.cwd(
 
 // ── Active writer session (single-writer lock) ────────────────────────────────
 // Mirrors the BroadcastChannel-based tab lock on the server side so that the
-// same protection extends across devices. The last client to call /api/session
-// becomes the active writer; older sessions receive 423 on write attempts.
-let activeSessionId = null // string | null
+// same protection extends across devices. Page loads register without stealing
+// the lock; a recent user gesture allows a freshly booted session to take over.
+const { createSessionLock } = require('./session-lock.cjs');
+const sessionLock = createSessionLock();
 const pluginStorageReadStateBySession = new Map();
 
 function rememberSessionPluginStorageState(req, dbObj) {
@@ -3926,9 +3928,15 @@ function sessionPluginStorageReadState(req) {
 
 function checkActiveSession(req, res) {
     const clientSessionId = req.headers['x-session-id']
-    if (!clientSessionId) return true  // client without session support
-    if (!activeSessionId) return true  // no session registered yet
-    if (clientSessionId === activeSessionId) return true
+    const userActive = req.headers['x-user-active'] === '1'
+    const result = sessionLock.checkWrite(
+        typeof clientSessionId === 'string' ? clientSessionId : '',
+        userActive,
+    )
+    if (result.tookOver) {
+        console.log('[Session] Write lock taken over by a freshly-booted session')
+    }
+    if (result.ok) return true
     res.status(423).json({ error: 'Session deactivated' })
     return false
 }
@@ -4537,10 +4545,17 @@ function parseInlaySidecarBackupName(name) {
     return { id };
 }
 
+// Upstream backups can use flat coldstorage_<uuid>.json entry names. Restrict
+// that compatibility form to UUIDs so similarly named assets remain assets.
+const COLD_STORAGE_FLAT_NAME_RE = /^coldstorage_([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:\.json)?$/;
+
 function normalizeColdStorageStorageKey(nameOrKey) {
     let key = nameOrKey;
     if (key.startsWith('coldstorage/')) {
         key = key.slice('coldstorage/'.length);
+    } else {
+        const flat = COLD_STORAGE_FLAT_NAME_RE.exec(key);
+        if (flat) key = flat[1];
     }
     if (key.endsWith('.json')) {
         key = key.slice(0, -'.json'.length);
@@ -7784,7 +7799,7 @@ function resolveBackupStorageKey(name) {
 
     // Upstream backups transport cold storage as coldstorage/<uuid>.json.
     // Normalize back to the runtime KV key: coldstorage/<uuid>.
-    if (name.startsWith('coldstorage/')) {
+    if (name.startsWith('coldstorage/') || COLD_STORAGE_FLAT_NAME_RE.test(name)) {
         return normalizeColdStorageStorageKey(name);
     }
 
@@ -8958,6 +8973,12 @@ app.delete('/proxy-stream-jobs/:jobId', async (req, res) => {
     res.send({ success: true });
 });
 
+// Durable model-preset relay. Provider bytes are streamed to the client and
+// journaled so an interrupted tab can resume or recover the response.
+const { createModelJobs } = require('./model-jobs.cjs');
+const modelJobs = createModelJobs({ saveDir: savePath, logger });
+modelJobs.registerRoutes(app, { auth: checkProxyAuth });
+
 // app.get('/api/password', async(req, res)=> {
 //     if(password === ''){
 //         res.send({status: 'unset'})
@@ -9008,15 +9029,22 @@ app.post('/api/token/refresh', async (req, res) => {
     res.json({ token: createServerJwt() })
 })
 
+// Side-effect-free state check used when a tab returns to the foreground.
+app.get('/api/session/lock-status', async (req, res) => {
+    if (!await checkAuth(req, res)) return
+    const id = req.headers['x-session-id']
+    res.json({ state: sessionLock.peek(typeof id === 'string' ? id : '') })
+})
+
 // ── Session cookie issuance (F-0) ──────────────────────────────────────────
 // Called once after JWT auth succeeds. Issues a long-lived cookie so that
 // <img src="/api/asset/..."> requests can be authenticated without JS.
 app.post('/api/session', async (req, res) => {
     if (!await checkAuth(req, res)) return
     const clientSessionId = req.headers['x-session-id']
-    if (clientSessionId) {
-        activeSessionId = clientSessionId
-        console.log('[Session] Active writer session updated')
+    if (typeof clientSessionId === 'string') {
+        sessionLock.register(clientSessionId)
+        console.log('[Session] Session boot registered')
     }
     const token = nodeCrypto.randomBytes(32).toString('hex')
     const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000
@@ -12846,6 +12874,11 @@ app.post('/api/plugin-storage/transition', async (req, res, next) => {
     }
 });
 
+// Provider request history and token-usage statistics use their own rotated DB;
+// this deliberately coexists with logs.cjs system logging and redaction.
+const requestLogs = createRequestLogs({ saveDir: savePath });
+requestLogs.registerRoutes(app, { auth: checkAuth, activeSession: checkActiveSession });
+
 app.post('/api/write', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
@@ -14861,6 +14894,8 @@ function clearExistingData() {
     // stitch in stale cross-user data. Wiping here ensures only payloads
     // that arrived in this import survive.
     kvDelPrefix('remotes/');
+    // Cold-storage rows belong to the previous user's chat graph too.
+    kvDelPrefix('coldstorage/');
     // Clear remote-block migration marker — newly imported database.bin may
     // contain REMOTE blocks (it usually does, since save-folder imports
     // preserve upstream's split-character format) and we want the migration

@@ -1,4 +1,5 @@
 import { changeFullscreen, checkNullish } from "./util"
+import { installDynamicViewportHeight } from "./viewportHeight"
 import { v4 as uuidv4 } from 'uuid';
 import { get } from "svelte/store";
 import { setDatabase, defaultSdDataFunc, getDatabase, changeToThemePreset, type Chat, type Database } from "./storage/database.svelte";
@@ -27,6 +28,7 @@ import {
     checkCharOrder
 } from "./globalApi.svelte";
 import { registerModelDynamic } from "./model/modellist";
+import { initModelJobRecovery } from "./process/request/jobRecovery";
 import { convertStubsToPlaceholders } from "./storage/chatStorage";
 import { isChatStub, purgeUnsupportedGroupChats } from "./storage/database.svelte";
 import { allowInsecureContext } from "./platform";
@@ -351,6 +353,11 @@ export async function loadData() {
             updateTextThemeAndCSS()
             updateAnimationSpeed()
             updateHeightMode()
+            // Only when no explicit heightMode override is active — an explicit
+            // vh/dvh/svh/... choice must keep sizing exactly as configured.
+            if (!db.heightMode || db.heightMode === 'normal') {
+                installDynamicViewportHeight()
+            }
             updateErrorHandling()
             updateGuisize()
             if (!db.didFirstSetup) {
@@ -391,6 +398,11 @@ export async function loadData() {
             }, 5_000)
             checkRisuUpdate()
             fetchPublicStats()
+            // Server-side model-job recovery (jobRecovery.ts): slot journaled
+            // responses from disconnected generations back into their chats.
+            // Installs the return triggers (visibility / online) and runs the
+            // first pass. Fire-and-forget — never throws, no-op without jobs.
+            initModelJobRecovery()
             if (import.meta.env.VITE_RISU_TOS === 'TRUE') {
                 alertTOS().then((a) => {
                     if (a === false) {

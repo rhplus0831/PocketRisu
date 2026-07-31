@@ -62,6 +62,7 @@ For migration from an existing RisuAI installation, see the [migration guide](do
 - **Multiple AI providers**: OpenAI, Claude, Gemini, DeepInfra, OpenRouter, Ollama, and more
 - **Multi-device access**: Run one server, access from PC, tablet, and smartphone through a web browser
 - **Unified server-owned storage**: Characters, chats, and settings live in SQLite; content-addressed assets, inlays, and backup archives use managed server directories (no external cloud dependency)
+- **Server-side generation**: The server keeps generating even if your screen locks or the connection drops — reconnect and the completed response is restored automatically
 - **Easy server-side backup**: The server handles backup and restore directly; local `.bin` backup export and import also supported
 - **Powerful dashboard**: Disk usage (per character / per module), reclaimable snapshot space, SQLite optimization, and more — all in one screen
 - **Lorebook & long-term memory**: World info / memory book, HypaMemoryV3, and other context retention features

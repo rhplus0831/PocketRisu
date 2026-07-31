@@ -369,8 +369,12 @@ export function createV3BridgeRequestRegistry(options: {
         const request = data?.reqId ? pendingRequests.get(data.reqId) : undefined;
         if (!request) return false;
         pendingRequests.delete(data.reqId);
-        if (data.error) request.reject(options.deserializeError(data.error));
-        else request.resolve(options.deserializeResult(data.result));
+        try {
+            if (data.error) request.reject(options.deserializeError(data.error));
+            else request.resolve(options.deserializeResult(data.result));
+        } catch (error) {
+            request.reject(error);
+        }
         return true;
     };
 
@@ -831,6 +835,118 @@ await (async function() {
         return transferables;
     }
 
+    function replaceStreamsWithPorts(obj) {
+        const ports = [];
+        const cleanups = [];
+        if (!obj || typeof obj !== 'object') return { result: obj, ports, cleanups };
+
+        function replace(val) {
+            if (!(val instanceof ReadableStream)) return val;
+
+            const ch = new MessageChannel();
+            ports.push(ch.port2);
+
+            const reader = val.getReader();
+            let credits = 0;
+            let reading = false;
+            let finished = false;
+
+            function finish() {
+                finished = true;
+                ch.port1.onmessage = null;
+                ch.port1.close();
+            }
+
+            cleanups.push(() => {
+                reader.cancel().catch(() => {});
+                finish();
+            });
+
+            async function pump() {
+                if (reading || finished) return;
+                reading = true;
+                try {
+                    while (credits > 0 && !finished) {
+                        credits--;
+                        const { done, value } = await reader.read();
+                        if (finished) return;
+                        if (done) { ch.port1.postMessage({ done: true }); finish(); return; }
+                        ch.port1.postMessage({ done: false, value });
+                    }
+                } catch (e) {
+                    try { ch.port1.postMessage({ done: true, error: e.message }); } catch(_) {}
+                    finish();
+                } finally {
+                    reading = false;
+                }
+            }
+
+            ch.port1.onmessage = (e) => {
+                if (e.data?.cancel) {
+                    reader.cancel();
+                    finish();
+                } else if (e.data?.pull) {
+                    credits++;
+                    pump();
+                }
+            };
+
+            return { __type: 'STREAM_PORT', portIndex: ports.length - 1 };
+        }
+
+        if (obj instanceof ReadableStream) return { result: replace(obj), ports, cleanups };
+        if (obj.constructor === Object) {
+            const out = {};
+            for (const k of Object.keys(obj)) out[k] = replace(obj[k]);
+            return { result: out, ports, cleanups };
+        }
+
+        return { result: obj, ports, cleanups };
+    }
+
+    function reconstructStreamsFromPorts(obj, ports) {
+        if (!obj || typeof obj !== 'object') return obj;
+
+        function reconstruct(val) {
+            if (!val || val.__type !== 'STREAM_PORT' || typeof val.portIndex !== 'number') return val;
+
+            const port = ports[val.portIndex];
+            if (!port) throw new Error('Stream port at index ' + val.portIndex + ' not received');
+
+            return new ReadableStream({
+                start(controller) {
+                    port.onmessage = (e) => {
+                        if (e.data.done) {
+                            if (e.data.error) controller.error(new Error(e.data.error));
+                            else controller.close();
+                            port.onmessage = null;
+                            port.close();
+                        } else {
+                            controller.enqueue(e.data.value);
+                        }
+                    };
+                },
+                pull() {
+                    port.postMessage({ pull: true });
+                },
+                cancel() {
+                    port.postMessage({ cancel: true });
+                    port.onmessage = null;
+                    port.close();
+                }
+            });
+        }
+
+        if (obj.__type === 'STREAM_PORT') return reconstruct(obj);
+        if (obj.constructor === Object) {
+            const out = {};
+            for (const k of Object.keys(obj)) out[k] = reconstruct(obj[k]);
+            return out;
+        }
+
+        return obj;
+    }
+
     function send(payload, transferables = []) {
         window.parent.postMessage(payload, '*', transferables);
     }
@@ -907,7 +1023,20 @@ await (async function() {
 
 
         if (data.type === 'RESPONSE' && data.reqId) {
-            requestRegistry.handleResponse(data);
+            try {
+                requestRegistry.handleResponse({
+                    ...data,
+                    result: data.error
+                        ? data.result
+                        : reconstructStreamsFromPorts(data.result, event.ports),
+                });
+            } catch (error) {
+                requestRegistry.handleResponse({
+                    ...data,
+                    result: undefined,
+                    error: serializeBridgeError(error),
+                });
+            }
         }
 
         else if (data.type === 'EXECUTE_CODE' && data.reqId) {
@@ -933,6 +1062,15 @@ await (async function() {
             const fn = callbackRegistry.get(data.id);
             const response = { type: 'CALLBACK_RETURN', reqId: data.reqId };
             const usedAbortIds = [];
+            let transferables = [];
+            let streamCleanups = [];
+
+            const rollbackStreams = () => {
+                for (const cleanup of streamCleanups) {
+                    try { cleanup(); } catch(_) {}
+                }
+                streamCleanups = [];
+            };
 
             try {
                 if (!fn) throw new Error("Callback not found or released");
@@ -951,15 +1089,31 @@ await (async function() {
                 });
                 const result = await fn(...deserializedArgs);
                 response.result = result;
+                const { result: streamResult, ports: streamPorts, cleanups } = replaceStreamsWithPorts(response.result);
+                response.result = streamResult;
+                streamCleanups = cleanups;
+                transferables = collectTransferables(response, streamPorts);
             } catch (e) {
+                rollbackStreams();
+                delete response.result;
                 response.error = serializeBridgeError(e);
             }
             // Clean up abort controllers after callback completes
             for (const id of usedAbortIds) {
                 abortControllers.delete(id);
             }
-            const transferables = collectTransferables(response);
-            send(response, transferables);
+            try {
+                send(response, transferables);
+            } catch (e) {
+                rollbackStreams();
+                try {
+                    send({
+                        type: 'CALLBACK_RETURN',
+                        reqId: data.reqId,
+                        error: 'Failed to post message to parent: ' + ((e && e.message) || String(e || "Unknown error"))
+                    });
+                } catch(_) {}
+            }
         }
     });
 
@@ -1173,6 +1327,24 @@ export class SandboxHost {
     private terminating = false;
     private terminated = false;
 
+    // Teardown hooks for streams bridged over MessagePort. MessagePort has no
+    // 'close' event in stable browsers, so without these the other side of an
+    // active stream would wait forever once the iframe is gone.
+    private activeStreamCleanups = new Set<() => void>();
+    private replaceStreamsWithPorts!: (obj: any) => {
+        result: any;
+        ports: MessagePort[];
+        cleanups: (() => void)[];
+    };
+    private reconstructStreamsFromPorts!: (obj: any, ports: readonly MessagePort[]) => any;
+
+    private closeActiveStreams() {
+        for (const cleanup of [...this.activeStreamCleanups]) {
+            try { cleanup(); } catch(_) {}
+        }
+        this.activeStreamCleanups.clear();
+    }
+
     constructor(apiFactory: any) {
         this.apiFactory = apiFactory;
     }
@@ -1212,7 +1384,6 @@ export class SandboxHost {
         if (obj instanceof ArrayBuffer ||
             obj instanceof MessagePort ||
             (typeof ImageBitmap !== 'undefined' && obj instanceof ImageBitmap) ||
-            obj instanceof ReadableStream ||
             obj instanceof WritableStream ||
             obj instanceof TransformStream ||
             (typeof OffscreenCanvas !== 'undefined' && obj instanceof OffscreenCanvas)) {
@@ -1267,8 +1438,7 @@ export class SandboxHost {
         }
 
         if(
-            val instanceof ReadableStream
-            || val instanceof WritableStream
+            val instanceof WritableStream
             || val instanceof TransformStream
         ) {
             return {
@@ -1569,6 +1739,137 @@ export class SandboxHost {
             this.settleCompletion(error);
             return completion;
         }
+        this.replaceStreamsWithPorts = (obj: any): { result: any, ports: MessagePort[], cleanups: (() => void)[] } => {
+        const ports: MessagePort[] = [];
+        const cleanups: (() => void)[] = [];
+        if (!obj || typeof obj !== 'object') return { result: obj, ports, cleanups };
+
+        const replace = (val: any): any => {
+            if (!(val instanceof ReadableStream)) return val;
+
+            const ch = new MessageChannel();
+            ports.push(ch.port2);
+
+            const reader = val.getReader();
+            let credits = 0;
+            let reading = false;
+            let finished = false;
+
+            const finish = () => {
+                finished = true;
+                ch.port1.onmessage = null;
+                ch.port1.close();
+                this.activeStreamCleanups.delete(cleanup);
+            };
+
+            const cleanup = () => {
+                reader.cancel().catch(() => {});
+                finish();
+            };
+            this.activeStreamCleanups.add(cleanup);
+            cleanups.push(cleanup);
+
+            const pump = async () => {
+                if (reading || finished) return;
+                reading = true;
+                try {
+                    while (credits > 0 && !finished) {
+                        credits--;
+                        const { done, value } = await reader.read();
+                        if (finished) return;
+                        if (done) { ch.port1.postMessage({ done: true }); finish(); return; }
+                        ch.port1.postMessage({ done: false, value });
+                    }
+                } catch (e: any) {
+                    try { ch.port1.postMessage({ done: true, error: e.message }); } catch(_) {}
+                    finish();
+                } finally {
+                    reading = false;
+                }
+            };
+
+            ch.port1.onmessage = (e: MessageEvent) => {
+                if (e.data?.cancel) {
+                    reader.cancel();
+                    finish();
+                } else if (e.data?.pull) {
+                    credits++;
+                    pump();
+                }
+            };
+
+            return { __type: 'STREAM_PORT', portIndex: ports.length - 1 };
+        };
+
+        if (obj instanceof ReadableStream) return { result: replace(obj), ports, cleanups };
+        if (obj.constructor === Object) {
+            const out: any = {};
+            for (const k of Object.keys(obj)) out[k] = replace(obj[k]);
+            return { result: out, ports, cleanups };
+        }
+
+        return { result: obj, ports, cleanups };
+        };
+
+        this.reconstructStreamsFromPorts = (obj: any, ports: readonly MessagePort[]): any => {
+        if (!obj || typeof obj !== 'object') return obj;
+
+        const reconstruct = (val: any): any => {
+            if (val?.__type !== 'STREAM_PORT' || typeof val.portIndex !== 'number') return val;
+
+            const port = ports[val.portIndex];
+            if (!port) throw new Error(`Stream port at index ${val.portIndex} not received`);
+
+            const cleanups = this.activeStreamCleanups;
+            let cleanup: (() => void) | null = null;
+            const unregister = () => {
+                if (cleanup) {
+                    cleanups.delete(cleanup);
+                    cleanup = null;
+                }
+            };
+
+            return new ReadableStream({
+                start(controller) {
+                    port.onmessage = (e: MessageEvent) => {
+                        if (e.data.done) {
+                            if (e.data.error) controller.error(new Error(e.data.error));
+                            else controller.close();
+                            port.onmessage = null;
+                            port.close();
+                            unregister();
+                        } else {
+                            controller.enqueue(e.data.value);
+                        }
+                    };
+                    cleanup = () => {
+                        controller.error(new Error('Sandbox terminated'));
+                        port.onmessage = null;
+                        port.close();
+                    };
+                    cleanups.add(cleanup);
+                },
+                pull() {
+                    port.postMessage({ pull: true });
+                },
+                cancel() {
+                    port.postMessage({ cancel: true });
+                    port.onmessage = null;
+                    port.close();
+                    unregister();
+                }
+            });
+        };
+
+        if (obj.__type === 'STREAM_PORT') return reconstruct(obj);
+        if (obj.constructor === Object) {
+            const out: any = {};
+            for (const k of Object.keys(obj)) out[k] = reconstruct(obj[k]);
+            return out;
+        }
+
+        return obj;
+        };
         if(container instanceof HTMLIFrameElement) {
             this.iframe = container;
         } else {
@@ -1665,7 +1966,13 @@ export class SandboxHost {
                 const req = this.pendingCallbacks.get(data.reqId!);
                 if (req) {
                     if (data.error) req.reject(deserializeV3BridgeError(data.error));
-                    else req.resolve(data.result);
+                    else {
+                        try {
+                            req.resolve(this.reconstructStreamsFromPorts(data.result, event.ports));
+                        } catch (e) {
+                            req.reject(e);
+                        }
+                    }
                     this.pendingCallbacks.delete(data.reqId!);
                 }
                 return;
@@ -1697,6 +2004,15 @@ export class SandboxHost {
                 if (data.type === 'CALL_ROOT' && data.method === '_updatePluginStorage') {
                     this.activePluginStorageUpdateControllers.add(requestController);
                 }
+                let transferables: Transferable[] = [];
+                let streamCleanups: (() => void)[] = [];
+
+                const rollbackStreams = () => {
+                    for (const cleanup of streamCleanups) {
+                        try { cleanup(); } catch(_) {}
+                    }
+                    streamCleanups = [];
+                };
                 try {
                     const args = this.deserializeArgs(data.args || [], usedAbortIds);
                     const hasUnloadCapability = args.some(arg =>
@@ -1784,31 +2100,15 @@ export class SandboxHost {
                     }
 
 
-                    // WebKit on iOS fails when Response.body (ReadableStream)
-                    // is transferred through postMessage. Pre-read into an
-                    // ArrayBuffer (preserves binary data) and send that instead.
-                    const isWebKit = /Safari/.test(navigator.userAgent) && !/Chrome|Chromium/.test(navigator.userAgent);
-                    if (isWebKit && result instanceof Response && result.body) {
-                        try {
-                            const buf = await result.arrayBuffer();
-                            response.result = {
-                                __type: 'CALLBACK_STREAMS',
-                                __specialType: 'Response',
-                                value: buf,
-                                init: {
-                                    status: result.status,
-                                    statusText: result.statusText,
-                                    headers: Array.from(result.headers.entries())
-                                }
-                            };
-                        } catch (_) {
-                            response.result = this.serialize(result);
-                        }
-                    } else {
-                        response.result = this.serialize(result);
-                    }
+                    response.result = this.serialize(result);
+                    const { result: streamResult, ports: streamPorts, cleanups } = this.replaceStreamsWithPorts(response.result);
+                    response.result = streamResult;
+                    streamCleanups = cleanups;
+                    transferables = this.collectTransferables(response, streamPorts);
 
                 } catch (err: any) {
+                    rollbackStreams();
+                    delete response.result;
                     response.error = serializeV3BridgeError(err);
                 } finally {
                     if (data.reqId
@@ -1823,12 +2123,12 @@ export class SandboxHost {
                 // request. Do not emit a stale response after abort cleanup.
                 if (this.terminated
                     || this.cancelledRequestControllers.has(requestController)) return;
-                const transferables = this.collectTransferables(response);
                 console.log("Original request:", data);
                 console.log('Original response:', response, transferables);
                 try {
                     this.iframe.contentWindow?.postMessage(response, '*', transferables);
                 } catch (error) {
+                    rollbackStreams();
                     // Reactive $state proxies reject structured cloning. When
                     // nothing needs to be transferred, a plain deep copy of the
                     // response is equivalent — retry with that before failing.
@@ -1897,6 +2197,7 @@ export class SandboxHost {
         for (const controller of this.abortControllers.values()) {
             controller.abort();
         }
+        this.closeActiveStreams();
         this.instanceRegistry.clear();
         this.pendingCallbacks.clear();
         this.pendingExecutions.clear();

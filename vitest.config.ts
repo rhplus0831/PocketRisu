@@ -24,8 +24,9 @@ export default defineConfig({
     environment: 'happy-dom',
     include: ['src/**/*.test.ts'],
     setupFiles: ['vitest.setup.ts'],
-    // compat suite has its own node-environment config (vitest.config.compat.ts);
-    // exclude here so `pnpm test` doesn't pick them up under the wrong environment.
-    exclude: ['node_modules/**', 'test/compat/**'],
+    // compat/server suites have their own node-environment configs
+    // (vitest.config.compat.ts / vitest.config.server.ts); exclude here so
+    // `pnpm test` doesn't pick them up under the wrong environment.
+    exclude: ['node_modules/**', 'test/compat/**', 'server/node/**'],
   },
 })

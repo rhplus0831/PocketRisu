@@ -3,7 +3,7 @@
     import TextInput from "../UI/GUI/TextInput.svelte";
     import NumberInput from "../UI/GUI/NumberInput.svelte";
     import Button from "../UI/GUI/Button.svelte";
-    import { getRequestLog, previewChatGuardToast, previewPersistFailureToast } from "src/ts/globalApi.svelte";
+    import { previewChatGuardToast, previewPersistFailureToast } from "src/ts/globalApi.svelte";
     import { alertMd, alertWait } from "src/ts/alert";
     import Accordion from "../UI/Accordion.svelte";
     import { getCharToken, getChatToken } from "src/ts/tokenizer";
@@ -15,6 +15,7 @@
     import { selectSingleFile } from "src/ts/util";
     import { doingChat, previewFormated, previewBody, sendChat, lastActualInputTokens } from "src/ts/process/index.svelte";
     import { chatOperationActive } from 'src/ts/process/chatSendState';
+    import { endAllGenerations } from "src/ts/process/generationState";
     import SelectInput from "../UI/GUI/SelectInput.svelte";
     import { applyChatTemplate, chatTemplates } from "src/ts/process/templates/chatTemplate";
     import OptionInput from "../UI/GUI/OptionInput.svelte";
@@ -47,7 +48,7 @@
         if(previewJoin === 'prompt'){
             md += '### Prompt\n'
             md += '```json\n' + JSON.stringify(JSON.parse(previewBody), null, 2).replaceAll('```', '\\`\\`\\`') + '\n```\n'
-            $doingChat = false
+            endAllGenerations()
             alertMd(md)
             return
         }
@@ -78,7 +79,7 @@
 
             md += '### Instruction\n'
             md += '```\n' + instructed.replaceAll('```', '\\`\\`\\`') + '\n```\n'
-            $doingChat = false
+            endAllGenerations()
             alertMd(md)
             return
         }
@@ -102,7 +103,7 @@
 
             md += '```\n' + formated[i].content.replaceAll('```', '\\`\\`\\`') + '\n```\n'
         }
-        $doingChat = false
+        endAllGenerations()
         alertMd(md)
     }
     
@@ -234,12 +235,12 @@
             }
             currentChar.chats[currentChar.chatPage] = currentChat
             db.characters[$selectedCharID] = currentChar
-            doingChat.set(false)
+            endAllGenerations()
             await sendChat(i);
             currentChar = db.characters[$selectedCharID]
             currentChat = currentChar.chats[currentChar.chatPage]
         }
-        doingChat.set(false)
+        endAllGenerations()
     }}>Run</Button>
 </Accordion>
 
@@ -315,10 +316,6 @@
     `.trim()
     alertMd(html)
 }}>Preview Module</Button>
-
-<Button className="mt-2" onclick={() => {
-    alertMd(getRequestLog())
-}}>Request Log</Button>
 
 <Accordion styled name={"Toast Preview (Save Guards)"}>
     <Button className="mt-2" onclick={() => previewChatGuardToast('client')}>Chat guard — client (PATCH refused)</Button>

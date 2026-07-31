@@ -978,6 +978,23 @@ function isInlayDeleteTransport(value: unknown, requestedIds: string[]): value i
         && classified.length === requested.size
 }
 
+// ── User-gesture recency for the write lock ─────────────────────────────────
+// The server moves the single-writer lock only on writes that follow a real
+// user gesture (x-user-active header). The app also writes automatically —
+// boot housekeeping, the flush-on-hide keepalive — and those must never move
+// the lock: a phone tab going to background fires a flush, and without this
+// distinction it silently stole the lock from the device actually in use.
+const USER_GESTURE_WINDOW_MS = 15_000
+let lastUserGestureAt = 0
+if (typeof window !== 'undefined') {
+    const markGesture = () => { lastUserGestureAt = Date.now() }
+    window.addEventListener('pointerdown', markGesture, { capture: true, passive: true })
+    window.addEventListener('keydown', markGesture, { capture: true, passive: true })
+}
+function isUserActive(): boolean {
+    return Date.now() - lastUserGestureAt < USER_GESTURE_WINDOW_MS
+}
+
 // Custom error class for database conflict detection
 export class ConflictError extends StorageError {
     currentEtag: string
@@ -1376,9 +1393,22 @@ async function listCacheDelete(prefixes: readonly string[]): Promise<void> {
 export class NodeStorage{
     private static readonly BULK_WRITE_CLIENT_BATCH = 20
 
-    // Unique per page load — used for cross-device single-writer lock
-    private static sessionId: string =
-        crypto?.randomUUID?.() ?? (Date.now().toString(36) + Math.random().toString(36).slice(2))
+    // Cross-device single-writer lock identity. Persisted in sessionStorage so
+    // a reload or an OS tab restore of the SAME tab keeps the same identity —
+    // a phone tab resurrected in the background must not look like a new
+    // device (which used to silently steal the write lock from a PC
+    // mid-session). Still per-tab: a genuinely new tab gets a new id, and
+    // same-device multi-tab is handled by the BroadcastChannel lock.
+    private static sessionId: string = (() => {
+        const KEY = 'risu-writer-session-id'
+        const minted = crypto?.randomUUID?.() ?? (Date.now().toString(36) + Math.random().toString(36).slice(2))
+        try {
+            const stored = sessionStorage.getItem(KEY)
+            if (stored) return stored
+            sessionStorage.setItem(KEY, minted)
+        } catch { /* storage unavailable (rare privacy modes) — per-load id */ }
+        return minted
+    })()
 
     _lastDbEtag: string | null = null
     authChecked = false
@@ -1641,6 +1671,7 @@ export class NodeStorage{
             const headers = new Headers(init.headers)
             headers.set('risu-auth', await this.createAuth(signal))
             headers.set('x-session-id', NodeStorage.sessionId)
+            if (isUserActive()) headers.set('x-user-active', '1')
             throwIfAborted(signal)
             beforeDispatch?.()
             outcome.markRequestDispatched()
@@ -1659,7 +1690,6 @@ export class NodeStorage{
             }
             outcome.markDefinitiveResponse()
             mutationOutcome?.markDefinitiveResponse()
-
             if (response.status === 423) {
                 window.dispatchEvent(new CustomEvent('risu-session-deactivated'))
             }
@@ -4670,6 +4700,20 @@ export class NodeStorage{
         this._lastDbEtag = etag
     }
 
+    /** Writer-lock state of THIS session (side-effect free; reload-on-return
+     *  check). 'stale' = another device wrote after this page booted — our
+     *  in-memory copy is outdated and must reload before writing again. */
+    async getWriterLockState(): Promise<'free' | 'active' | 'fresh' | 'stale' | 'unknown'> {
+        try {
+            const res = await this.authFetch('/api/session/lock-status')
+            if (!res.ok) return 'unknown'
+            const data = await res.json()
+            return data?.state ?? 'unknown'
+        } catch {
+            return 'unknown'
+        }
+    }
+
     async patchItem(key: string, patchData: { patch: any[], expectedHash: string }): Promise<PatchItemResult> {
         const requestBody = JSON.stringify(patchData)
         return runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
@@ -5007,6 +5051,7 @@ export class NodeStorage{
             xhr.setRequestHeader('risu-auth', authHeader)
             xhr.setRequestHeader('x-session-id', NodeStorage.sessionId)
             if (allowLargeRestore) xhr.setRequestHeader('x-risu-large-restore', '1')
+            if (isUserActive()) xhr.setRequestHeader('x-user-active', '1')
             // Opt into NDJSON streaming so the server keeps the response socket
             // alive during long post-upload work — prevents reverse-proxy 502s.
             xhr.setRequestHeader('accept', 'application/x-ndjson')
@@ -5686,6 +5731,7 @@ export class NodeStorage{
                 xhr.setRequestHeader('content-type', 'application/zip')
                 xhr.setRequestHeader('risu-auth', authHeader)
                 xhr.setRequestHeader('x-session-id', NodeStorage.sessionId)
+                if (isUserActive()) xhr.setRequestHeader('x-user-active', '1')
                 xhr.setRequestHeader('accept', 'application/x-ndjson')
                 xhr.setRequestHeader('x-risu-replacement-id', operationId)
             } catch (error) {
@@ -5792,7 +5838,6 @@ export class NodeStorage{
                     resolveOnce({ ok: true, imported: result.imported! })
                 } else rejectUnknown(fallbackMessage)
             }
-
             xhr.upload.onprogress = (event) => {
                 activity.touch()
                 if (event.lengthComputable) {
