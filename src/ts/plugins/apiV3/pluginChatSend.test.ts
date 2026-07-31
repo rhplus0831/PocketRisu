@@ -132,4 +132,40 @@ describe('V3 plugin child chat sends', () => {
         await expect(inputHook('outer')).rejects.toThrow('already in progress')
         expect(db.characters[0].chats[0].message).toHaveLength(1)
     })
+
+    test('forwards bridge cancellation through permission and generation cleanup', async () => {
+        const db = makeDatabase()
+        const target = captureChatSendTarget(db, 0)!
+        const requestController = new AbortController()
+        let permissionSignal: AbortSignal | undefined
+        let generationSignal: AbortSignal | undefined
+        const releaseGeneration = vi.fn()
+        const cancellation = new DOMException('Plugin sandbox terminated', 'AbortError')
+        const controller = createPluginChatSendController({
+            getPermission: async signal => {
+                permissionSignal = signal
+                return true
+            },
+            isGenerationActive: () => false,
+            getActiveTransaction: () => null,
+            getDefaultTarget: () => target,
+            resolveTarget: candidate => resolveChatSendTarget(db, candidate),
+            isPluginModelActive: () => false,
+            runGeneration: async (_candidate, _transaction, signal) => {
+                generationSignal = signal
+                return new Promise<never>((_resolve, reject) => {
+                    signal!.addEventListener('abort', () => reject(signal!.reason), { once: true })
+                })
+            },
+            releaseGeneration,
+        })
+
+        const sending = controller.sendChat('pending', requestController.signal)
+        await vi.waitFor(() => expect(generationSignal).toBe(requestController.signal))
+        requestController.abort(cancellation)
+
+        await expect(sending).rejects.toBe(cancellation)
+        expect(permissionSignal).toBe(requestController.signal)
+        expect(releaseGeneration).toHaveBeenCalledOnce()
+    })
 })

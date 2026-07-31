@@ -1,11 +1,12 @@
 import type { Chat } from '../../storage/database.svelte'
+import { throwIfAborted } from '../../storage/abort'
 import type { ChatSendTarget } from '../../process/chatSendTarget'
 import type { ChatSendTransaction } from '../../process/chatSendState'
 
 type InputHook = (content: string) => string | null | undefined | Promise<string | null | undefined>
 
 export interface PluginChatSendDependencies {
-    getPermission: () => Promise<boolean>
+    getPermission: (signal?: AbortSignal) => Promise<boolean>
     isGenerationActive: () => boolean
     getActiveTransaction: () => ChatSendTransaction | null
     getDefaultTarget: () => ChatSendTarget
@@ -14,6 +15,7 @@ export interface PluginChatSendDependencies {
     runGeneration: (
         target: ChatSendTarget,
         transaction: ChatSendTransaction | null,
+        signal?: AbortSignal,
     ) => Promise<unknown>
     releaseGeneration: () => void
     now?: () => number
@@ -21,7 +23,7 @@ export interface PluginChatSendDependencies {
 
 export interface PluginChatSendController {
     wrapInputHook: <T extends InputHook>(hook: T) => T
-    sendChat: (message: string) => Promise<boolean>
+    sendChat: (message: string, signal?: AbortSignal) => Promise<boolean>
 }
 
 /**
@@ -45,8 +47,10 @@ export function createPluginChatSendController(
         }) as T
     }
 
-    async function sendChat(message: string): Promise<boolean> {
-        if (!await dependencies.getPermission()) return false
+    async function sendChat(message: string, signal?: AbortSignal): Promise<boolean> {
+        throwIfAborted(signal)
+        if (!await dependencies.getPermission(signal)) return false
+        throwIfAborted(signal)
 
         if (typeof message !== 'string') {
             throw new Error('Message must be a string')
@@ -78,7 +82,7 @@ export function createPluginChatSendController(
         }
 
         try {
-            await dependencies.runGeneration(target, transaction)
+            await dependencies.runGeneration(target, transaction, signal)
         } finally {
             dependencies.releaseGeneration()
         }

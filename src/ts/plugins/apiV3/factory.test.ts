@@ -647,6 +647,35 @@ describe("SandboxHost V3 startup lifecycle", () => {
         restoreRelay();
     });
 
+    test("guest pagehide cancels host work without an elapsed-time deadline", async () => {
+        const callStarted = deferred();
+        let receivedSignal: AbortSignal | undefined;
+        const iframe = document.createElement("iframe");
+        document.body.appendChild(iframe);
+        const host = new SandboxHost(startupApi({
+            getDatabase: (_includeOnly: unknown, signal: AbortSignal) =>
+                new Promise<never>((_resolve, reject) => {
+                    receivedSignal = signal;
+                    callStarted.resolve();
+                    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+                }),
+        }));
+        const completion = host.run(iframe, "await risuai.getDatabase();");
+        const restoreRelay = executeGeneratedGuest(iframe);
+
+        try {
+            await host.readiness;
+            await callStarted.promise;
+            iframe.contentWindow!.dispatchEvent(new Event("pagehide"));
+
+            await vi.waitFor(() => expect(receivedSignal?.aborted).toBe(true));
+            await expect(completion).rejects.toThrow("page was unloaded");
+        } finally {
+            host.terminate();
+            restoreRelay();
+        }
+    });
+
     test("termination aborts host AbortControllers created for guest calls", async () => {
         const callStarted = deferred();
         let receivedSignal: AbortSignal | undefined;

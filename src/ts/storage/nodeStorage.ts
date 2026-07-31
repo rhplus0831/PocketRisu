@@ -78,7 +78,7 @@ export const AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS = 2 * 60_000
 export const AUTHORITATIVE_STORAGE_PAYLOAD_BASE_TIMEOUT_MS = 60_000
 export const AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS = 25 * 60_000
 export const AUTHORITATIVE_STORAGE_PAYLOAD_MIN_BYTES_PER_SECOND = 128 * 1024
-/** Long server jobs remain below the 30-minute V3 bridge safety ceiling. */
+/** Long server jobs retain an operation-specific transport ceiling. */
 export const AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS = AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS
 /** Full chat-row scans can legitimately traverse years of chat history. */
 export const INLAY_REFERENCE_IO_TIMEOUT_MS = 2 * 60_000

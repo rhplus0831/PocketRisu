@@ -43,7 +43,7 @@ many users use that path.
 
 ## Plugin and storage reports
 
-- [Residual 30-minute bridge deadline](plugin-bridge-residual-30-minute-deadline.md)
+- [Residual 30-minute bridge deadline (fixed 2026-07-31)](plugin-bridge-residual-30-minute-deadline.md)
 - [V3 hook callback identity](v3-hook-callback-identity.md)
 - [V3 unload API allowlist](v3-onunload-api-allowlist.md)
 - [loadPlugins readiness contract](plugin-loadplugins-readiness.md)
@@ -93,7 +93,7 @@ many users use that path.
 
 - [Compatibility suites are absent from CI](compatibility-suites-not-run-in-ci.md)
 - [Real upstream fixture tests silently skip](real-upstream-backup-fixture-skipped.md)
-- [Plugin timeout test is self-referential](plugin-timeout-regression-test-is-self-referential.md)
+- [Plugin timeout test was self-referential (fixed 2026-07-31)](plugin-timeout-regression-test-is-self-referential.md)
 
 ## Verification
 

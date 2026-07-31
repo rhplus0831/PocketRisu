@@ -13,10 +13,6 @@ type MsgType =
     | 'EXEC_RESULT'
     | 'CANCEL_REQUEST';
 
-// Support older PocketRisu support
-export const PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS = 30 * 60_000;
-export const PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS = 30 * 60_000;
-
 const ABORTABLE_ROOT_METHODS = new Set([
     'getDatabase',
     'setDatabase',
@@ -43,6 +39,8 @@ const ABORTABLE_ROOT_METHODS = new Set([
     '_setSafeLocalStorage',
     '_removeSafeLocalStorage',
     '_clearSafeLocalStorage',
+    'runLLMModel',
+    'sendChat',
 ]);
 
 const UNLOAD_STORAGE_ROOT_METHODS = new Set([
@@ -332,7 +330,6 @@ function validateAsyncFunctionBody(source: string): void {
 
 /** Self-contained because its source is also installed in the iframe guest. */
 export function createV3BridgeRequestRegistry(options: {
-    requestTimeoutMs: number;
     serializeArgs: (args: any[]) => any[];
     collectTransferables: (message: any) => Transferable[];
     send: (message: any, transferables?: Transferable[]) => void;
@@ -344,63 +341,16 @@ export function createV3BridgeRequestRegistry(options: {
     const pendingRequests = new Map<string, {
         resolve: (value: unknown) => void;
         reject: (error: unknown) => void;
-        timer: ReturnType<typeof setTimeout>;
     }>();
-    const rootMutations: Record<string, "write" | "remove" | "batch"> = {
-        _atomicBatchPluginStorage: 'batch',
-        _setPluginStorageFromRead: 'batch',
-        _rewritePluginStorage: 'batch',
-        _updatePluginStorage: 'write',
-        _setPluginStorage: 'write',
-        _setPluginStorageWithOutcome: 'write',
-        _removePluginStorage: 'remove',
-        _removePluginStorageWithOutcome: 'remove',
-        _removePluginStorageConfirmed: 'remove',
-        _clearPluginStorage: 'remove',
-        setDatabase: 'write',
-        setDatabaseLite: 'write',
-        _setSafeLocalStorage: 'write',
-        _removeSafeLocalStorage: 'remove',
-        _clearSafeLocalStorage: 'remove',
-    };
-    const instanceMutations: Record<string, "write" | "remove"> = {
-        setItem: 'write',
-        removeItem: 'remove',
-        clear: 'remove',
-    };
-
-    const mutationOperation = (type: string, method: string | undefined) => (
-        type === 'CALL_ROOT'
-            ? rootMutations[method ?? '']
-            : type === 'CALL_INSTANCE'
-                ? instanceMutations[method ?? '']
-                : undefined
-    );
 
     const sendRequest = (type: string, payload: any) => new Promise((resolve, reject) => {
         // A generation-unique prefix prevents a late response from an older
         // registry instance from matching a new request. The monotonic suffix
-        // cannot collide within this registry, including after timeouts.
+        // cannot collide within this registry. Requests deliberately remain
+        // pending until the host responds or the guest lifecycle cancels them,
+        // matching the upstream V3 bridge contract.
         const reqId = `${requestGeneration}:${requestSequence++}`;
-        const timer = setTimeout(() => {
-            if (!pendingRequests.delete(reqId)) return;
-            try {
-                options.send({ type: 'CANCEL_REQUEST', reqId });
-            } catch {
-                // Cancellation is advisory; the local request is already bounded.
-            }
-            const operation = mutationOperation(type, payload.method);
-            const error = new Error(
-                'Plugin bridge request timed out after ' + options.requestTimeoutMs + 'ms.',
-            ) as Error & Record<string, unknown>;
-            error.name = 'StorageError';
-            error.code = operation ? 'COMMIT_OUTCOME_UNKNOWN' : 'STORAGE_TIMEOUT';
-            error.retryable = !operation;
-            error.commitOutcomeUnknown = !!operation;
-            error.operation = operation || null;
-            reject(error);
-        }, options.requestTimeoutMs);
-        pendingRequests.set(reqId, { resolve, reject, timer });
+        pendingRequests.set(reqId, { resolve, reject });
 
         try {
             const args = payload.args
@@ -410,7 +360,6 @@ export function createV3BridgeRequestRegistry(options: {
             const transferables = options.collectTransferables(message);
             options.send(message, transferables);
         } catch (error) {
-            clearTimeout(timer);
             pendingRequests.delete(reqId);
             reject(error);
         }
@@ -420,7 +369,6 @@ export function createV3BridgeRequestRegistry(options: {
         const request = data?.reqId ? pendingRequests.get(data.reqId) : undefined;
         if (!request) return false;
         pendingRequests.delete(data.reqId);
-        clearTimeout(request.timer);
         if (data.error) request.reject(options.deserializeError(data.error));
         else request.resolve(options.deserializeResult(data.result));
         return true;
@@ -428,7 +376,6 @@ export function createV3BridgeRequestRegistry(options: {
 
     const cancelAll = (reason = new Error('Plugin bridge terminated.')) => {
         for (const [reqId, request] of pendingRequests) {
-            clearTimeout(request.timer);
             request.reject(reason);
             try {
                 options.send({ type: 'CANCEL_REQUEST', reqId });
@@ -734,7 +681,6 @@ export function installV3PluginStorageHelpers(pluginStorage: Record<string, any>
 
 const GUEST_BRIDGE_SCRIPT = `
 await (async function() {
-    const requestTimeoutMs = ${PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS};
     const callbackRegistry = new Map();
     const callbackIdByFunction = new WeakMap();
     const proxyRefRegistry = new Map();
@@ -890,13 +836,18 @@ await (async function() {
     }
 
     const requestRegistry = createRequestRegistry({
-        requestTimeoutMs,
         serializeArgs: (args) => args.map(serializeArg),
         collectTransferables,
         send,
         deserializeError: deserializeBridgeError,
         deserializeResult,
     });
+    // A disappearing guest should cancel by lifecycle, not by guessing from
+    // elapsed time. Normal host teardown also aborts its active controllers;
+    // pagehide covers guest-side navigation or detachment that happens first.
+    window.addEventListener('pagehide', () => {
+        requestRegistry.cancelAll(new Error('Plugin bridge page was unloaded.'));
+    }, { once: true });
 
     function sendRequest(type, payload) {
         if (type === 'CALL_ROOT'
@@ -1212,7 +1163,6 @@ export class SandboxHost {
     private resolveInitialization?: () => void;
     private rejectInitialization?: (reason: unknown) => void;
     private initializationSettled = false;
-    private initializationTimer?: ReturnType<typeof setTimeout>;
     private resolveCompletion?: () => void;
     private rejectCompletion?: (reason: unknown) => void;
     private completionSettled = false;
@@ -1441,10 +1391,6 @@ export class SandboxHost {
     private settleInitialization(error?: unknown) {
         if (this.initializationSettled) return;
         this.initializationSettled = true;
-        if (this.initializationTimer !== undefined) {
-            clearTimeout(this.initializationTimer);
-            this.initializationTimer = undefined;
-        }
         const resolve = this.resolveInitialization;
         const reject = this.rejectInitialization;
         this.resolveInitialization = undefined;
@@ -1642,23 +1588,6 @@ export class SandboxHost {
         this.iframe.sandbox.add('allow-downloads')
 
         this.iframe.setAttribute('csp', this.csp);
-
-        this.initializationTimer = setTimeout(() => {
-            const error = new Error(
-                `Plugin initialization timed out after ${PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS}ms.`,
-            ) as Error & Record<string, unknown>;
-            error.name = "PluginInitializationTimeoutError";
-            error.code = "PLUGIN_INITIALIZATION_TIMEOUT";
-            error.retryable = false;
-            error.commitOutcomeUnknown = false;
-            error.operation = "initialization";
-            this.settleInitialization(error);
-            this.settleCompletion(error);
-            // Close new RPC/registration traffic immediately. The owning V3
-            // lifecycle catches the rejection, runs registered cleanup and
-            // bounded unload callbacks, then performs final iframe removal.
-            this.beginTermination();
-        }, PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS);
 
         const messageHandler = async (event: MessageEvent) => {
             // sandboxed srcdoc without allow-same-origin has an opaque origin,

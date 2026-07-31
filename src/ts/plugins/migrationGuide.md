@@ -714,8 +714,9 @@ Do not implement a migration as `getItem()` followed later by `setItem()`, and
 do not use `Promise.race()` as a watchdog. A losing promise keeps running, so
 it can overwrite a newer value after the timeout was reported.
 
-Use `pluginStorage.updateItem()` for one-row transforms. Its timeout is one
-total deadline covering mutex admission, both reads, the transform, and the
+Use `pluginStorage.updateItem()` for one-row transforms. By default it waits
+until completion or lifecycle cancellation. An explicit `timeoutMs` applies
+one total deadline covering mutex admission, both reads, the transform, and the
 atomic CAS publish. The callback receives that same `AbortSignal`. PocketRisu
 re-reads the row revision immediately before publish; if another plugin
 instance or session changed it, the method returns a conflict without writing.
@@ -724,9 +725,9 @@ rejects with `commitOutcomeUnknown: true`: the server may have committed even
 though its acknowledgement was lost. Re-read the row before deciding whether
 to retry; never blindly replay that transform. PocketRisu stops lending the
 caller's cancellation signal to an admitted CAS and drains its authoritative
-outcome during plugin teardown. The deadline prevents any new CAS submission
-after expiry; it cannot retroactively cancel a request already admitted by the
-server.
+outcome during plugin teardown. An explicit deadline prevents any new CAS
+submission after expiry; it cannot retroactively cancel a request already
+admitted by the server.
 
 ```javascript
 const result = await risuai.pluginStorage.updateItem(

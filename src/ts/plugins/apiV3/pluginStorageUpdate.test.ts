@@ -13,6 +13,48 @@ function deferred<T = void>() {
 }
 
 describe("PluginStorageUpdateCoordinator", () => {
+    test("has no default elapsed-time deadline", async () => {
+        vi.useFakeTimers();
+        try {
+            const transformStarted = deferred();
+            const releaseTransform = deferred();
+            let transformSignal: AbortSignal | undefined;
+            const atomicSet = vi.fn(async () => ({
+                committed: true as const,
+                generation: "published",
+                revisions: [{ key: "settings", revision: revision("b") }],
+            }));
+            const coordinator = new PluginStorageUpdateCoordinator({
+                read: vi.fn(async () => ({
+                    status: "value" as const,
+                    value: { schema: 1 },
+                    revision: revision("a"),
+                    generation: null,
+                })),
+                atomicSet,
+            });
+            let settled = false;
+            const update = coordinator.updateItem("settings", async (current, signal) => {
+                transformSignal = signal;
+                transformStarted.resolve();
+                await releaseTransform.promise;
+                return { ...(current.value as object), schema: 2 };
+            }, undefined).finally(() => { settled = true; });
+            await transformStarted.promise;
+
+            await vi.advanceTimersByTimeAsync(30 * 60_000 + 1);
+            expect(settled).toBe(false);
+            expect(transformSignal?.aborted).toBe(false);
+            expect(atomicSet).not.toHaveBeenCalled();
+
+            releaseTransform.resolve();
+            await expect(update).resolves.toMatchObject({ committed: true });
+            expect(atomicSet).toHaveBeenCalledOnce();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     test("returns the newer revision without publishing a stale transform", async () => {
         let state = {
             status: "value" as const,

@@ -5,10 +5,6 @@ import type {
     PluginSaveStorageVersionedResult,
 } from "../pluginSaveStorage";
 
-// Support older PocketRisu support
-export const PLUGIN_STORAGE_UPDATE_TIMEOUT_MS = 30 * 60_000;
-// Keep a margin below the bridge request deadline so pre-publish
-// work normally receives this helper's structured deadline first.
 export const PLUGIN_STORAGE_UPDATE_MAX_TIMEOUT_MS = 30 * 60_000;
 
 export type PluginStorageUpdateTransform = (
@@ -178,10 +174,10 @@ export class PluginStorageUpdateCoordinator {
         if (optionKeys.some(option => option !== "timeoutMs")) {
             throw new TypeError("pluginStorage.updateItem options contain an unsupported field.");
         }
-        const timeoutMs = options?.timeoutMs ?? PLUGIN_STORAGE_UPDATE_TIMEOUT_MS;
-        if (!Number.isInteger(timeoutMs)
+        const timeoutMs = options?.timeoutMs;
+        if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs)
             || timeoutMs < 1
-            || timeoutMs > PLUGIN_STORAGE_UPDATE_MAX_TIMEOUT_MS) {
+            || timeoutMs > PLUGIN_STORAGE_UPDATE_MAX_TIMEOUT_MS)) {
             throw new RangeError(
                 `pluginStorage.updateItem timeoutMs must be an integer from 1-${PLUGIN_STORAGE_UPDATE_MAX_TIMEOUT_MS}.`,
             );
@@ -189,17 +185,19 @@ export class PluginStorageUpdateCoordinator {
 
         const controller = new AbortController();
         const stopForwarding = signals.map(signal => forwardAbortSignal(signal, controller));
-        const timer = setTimeout(() => {
-            controller.abort(new StorageError(
-                `Plugin storage update timed out after ${timeoutMs}ms.`,
-                {
-                    code: "STORAGE_TIMEOUT",
-                    operation: "update",
-                    retryable: true,
-                    commitOutcomeUnknown: false,
-                },
-            ));
-        }, timeoutMs);
+        const timer = timeoutMs === undefined
+            ? undefined
+            : setTimeout(() => {
+                controller.abort(new StorageError(
+                    `Plugin storage update timed out after ${timeoutMs}ms.`,
+                    {
+                        code: "STORAGE_TIMEOUT",
+                        operation: "update",
+                        retryable: true,
+                        commitOutcomeUnknown: false,
+                    },
+                ));
+            }, timeoutMs);
 
         try {
             const signal = controller.signal;
@@ -276,7 +274,7 @@ export class PluginStorageUpdateCoordinator {
                 }
             }
         } finally {
-            clearTimeout(timer);
+            if (timer !== undefined) clearTimeout(timer);
             for (const stop of stopForwarding) stop();
         }
     }

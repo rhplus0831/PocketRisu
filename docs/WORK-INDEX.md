@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **58** items are assigned to tiers, **2** are other open issues, **3** are coverage gaps, **4** are intentional compatibility changes, and **36** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **57** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, and **38** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -27,7 +27,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [The plugin bridge retains a 30-minute deadline](compatibility/plugin-bridge-residual-30-minute-deadline.md) | compat | Open | Long model/chat/storage calls reject while non-abortable host work may continue. | Requires one legitimate RPC to run longer than 30 minutes. |
 | [Optimized storage limits key length](compatibility/optimized-plugin-storage-key-length-limit.md) | compat | Open | Optimization or later writes reject a key that inline storage accepted. | Requires an unusually long owned key at the 752/753-byte boundary. |
 | [The storage viewer requires `String.isWellFormed`](compatibility/plugin-storage-viewer-requires-string-iswellformed.md) | compat | Open | Optimized or owner-filtered viewer pages throw instead of rendering. | Limited to Firefox 114–118 and older embedded WebViews missing the method. |
 
@@ -113,7 +112,6 @@ None currently open.
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
 | [Compatibility suites are absent from CI](compatibility/compatibility-suites-not-run-in-ci.md) | compat | Open | Build and release workflows provide no regression gate for client, server, or compatibility suites. | Every CI run; the gap is pre-existing rather than a runtime regression. |
-| [Plugin timeout tests are self-referential](compatibility/plugin-timeout-regression-test-is-self-referential.md) | compat | Open | The reported timeout regression can return without a failing test. | Changing the production constant changes the test expectation in lockstep. |
 | [Real upstream fixture tests silently skip](compatibility/real-upstream-backup-fixture-skipped.md) | compat | Open | Synthetic fixtures can miss mistakes in archives emitted by real upstream RisuAI. | Every environment without the ignored local fixture, including CI. |
 
 ## Intentional compatibility changes
@@ -129,6 +127,8 @@ None currently open.
 
 | Finding | Former harm | Note |
 |---|---|---|
+| [The plugin bridge retained a 30-minute deadline](compatibility/plugin-bridge-residual-30-minute-deadline.md) | Long model/chat/storage calls rejected while non-abortable host work could continue. | Fixed 2026-07-31 by restoring unbounded live RPC/initialization waits, cancelling on guest/host lifecycle loss, propagating cancellation through model/chat work, and making storage-update deadlines explicit-only. |
+| [Plugin timeout tests were self-referential](compatibility/plugin-timeout-regression-test-is-self-referential.md) | The timeout regression could return without a failing test. | Fixed 2026-07-31 with independent former-boundary assertions for RPCs, initialization, storage outcomes, page disappearance, and model/chat cancellation. |
 | [Legacy hash-looking assets became unwritable](compatibility/legacy-hash-named-assets-become-unwritable.md) | A readable migrated asset could not be rewritten or included in partial exports. | Fixed 2026-07-31 with durable per-asset legacy identity, one-time backfill for already-migrated files, strict canonicalization, and migration/read/rewrite/bulk/partial/full-export coverage. |
 | [Ill-formed legacy plugin keys poisoned storage](compatibility/legacy-plugin-storage-key-compatibility.md) | One historical lone-surrogate key could block unrelated V3 operations and could not survive optimized storage or backup boundaries losslessly. | Fixed 2026-07-30 with a tagged UTF-16-code-unit row codec, a backward-compatible MessagePack escape envelope, isolated inline operations, and end-to-end mutation/viewer/transition/backup coverage. |
 | [Inline rich values broke enumeration](compatibility/inline-plugin-storage-enumeration-rich-values.md) | One accepted value could poison `keys`, `key`, `length`, versioned reads, or viewer pages. | Fixed 2026-07-30 with value-independent key enumeration, structured-clone viewer/versioned snapshots, rich-value revision tokens, and full API-matrix coverage. |

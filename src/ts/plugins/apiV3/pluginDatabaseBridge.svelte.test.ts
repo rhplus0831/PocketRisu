@@ -34,6 +34,7 @@ const decodeKey = (value: string) => Buffer.from(
 ).toString("utf-8");
 const cloneJson = <T>(value: T): T => JSON.parse(JSON.stringify(value));
 const manifestKey = "plugin-storage/manifest.json";
+const FORMER_BRIDGE_DEADLINE_MS = 30 * 60_000;
 
 vi.mock("../../storage/database.svelte", () => ({
     changeToPreset: vi.fn(),
@@ -340,7 +341,6 @@ const {
     getPluginSaveStorageItem,
     getPluginSaveStorageKeys,
     getPluginSaveStorageSnapshot,
-    PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS,
     setPluginSaveStorageItem,
     updateDatabaseWithPluginStorageSnapshot,
     withPluginSaveStorageLock,
@@ -379,8 +379,6 @@ const { get } = await import("svelte/store");
 const { registeredCustomPluginMCPs } = await import("../../process/mcp/pluginmcp");
 const { getTTSPostprocessors, getTTSPreprocessors } = await import("../../process/ttsHooks");
 const {
-    PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS,
-    PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS,
     SandboxHost,
     createV3BridgeRequestRegistry,
     deserializeV3BridgeError,
@@ -623,6 +621,31 @@ describe("V3 mode-aware database bridge", () => {
             await api._removePluginStorage(42);
             expect(await api._getPluginStorage("42")).toBeNull();
             expect(await api._keysPluginStorage()).toEqual([]);
+        },
+    );
+
+    test.each(["runLLMModel", "sendChat"] as const)(
+        "forwards the bridge-owned signal through %s",
+        async method => {
+            const plugin = startupPlugin("Cancelled Model Work", "");
+            testState.database.plugins = [plugin];
+            const api = makeRisuaiAPIV3(
+                document.createElement("iframe"),
+                plugin as any,
+            ) as any;
+            const controller = new AbortController();
+            const cancellation = new DOMException("Bridge lifecycle ended", "AbortError");
+            controller.abort(cancellation);
+
+            const operation = method === "runLLMModel"
+                ? api.runLLMModel(
+                    { mode: "main", messages: [] },
+                    undefined,
+                    controller.signal,
+                )
+                : api.sendChat("hello", undefined, controller.signal);
+
+            await expect(operation).rejects.toBe(cancellation);
         },
     );
 
@@ -1449,7 +1472,6 @@ describe("V3 mode-aware database bridge", () => {
         const source = iframe.contentWindow!;
         const sent: any[] = [];
         const hostResponses: any[] = [];
-        const requestTimeoutMs = PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS - 1;
         let registry!: ReturnType<typeof createV3BridgeRequestRegistry>;
         vi.spyOn(source, "postMessage").mockImplementation((message: any) => {
             if (message?.type === "RESPONSE") {
@@ -1458,7 +1480,6 @@ describe("V3 mode-aware database bridge", () => {
             }
         });
         registry = createV3BridgeRequestRegistry({
-            requestTimeoutMs,
             serializeArgs: args => args,
             collectTransferables: () => [],
             send: message => {
@@ -1473,7 +1494,6 @@ describe("V3 mode-aware database bridge", () => {
             deserializeResult: value => value,
         });
 
-        vi.useFakeTimers();
         try {
             const replacement = registry.sendRequest("CALL_ROOT", {
                 method: "setDatabaseLite",
@@ -1499,12 +1519,9 @@ describe("V3 mode-aware database bridge", () => {
             expect(unrelatedSettled).toBe(false);
             expect(transitionSettled).toBe(false);
 
-            await vi.advanceTimersByTimeAsync(requestTimeoutMs);
-            await expect(replacement).resolves.toMatchObject({
-                code: "COMMIT_OUTCOME_UNKNOWN",
-                commitOutcomeUnknown: true,
-                operation: "write",
-            });
+            const replacementCancellation = new Error("Plugin bridge terminated.");
+            registry.cancelAll(replacementCancellation);
+            await expect(replacement).resolves.toBe(replacementCancellation);
             await expect(unrelated).resolves.toEqual({ source: "existing" });
             await expect(transitionBarrier).resolves.toBeUndefined();
 
@@ -1522,7 +1539,7 @@ describe("V3 mode-aware database bridge", () => {
             })).toBe(false);
 
             releaseWrite();
-            await vi.advanceTimersByTimeAsync(0);
+            await Promise.resolve();
             expect(storageMocks.persistent.has(storageKey("replacement"))).toBe(false);
             expect(hostResponses).toEqual([]);
 
@@ -1544,12 +1561,9 @@ describe("V3 mode-aware database bridge", () => {
             await readStarted;
             const queuedWrite = setPluginSaveStorageItem("unrelated", { available: true });
 
-            await vi.advanceTimersByTimeAsync(requestTimeoutMs);
-            await expect(snapshot).resolves.toMatchObject({
-                code: "STORAGE_TIMEOUT",
-                commitOutcomeUnknown: false,
-                retryable: true,
-            });
+            const readCancellation = new Error("Plugin bridge terminated.");
+            registry.cancelAll(readCancellation);
+            await expect(snapshot).resolves.toBe(readCancellation);
             await expect(queuedWrite).resolves.toBeUndefined();
             expect(storageMocks.persistent.get(storageKey("unrelated")))
                 .toEqual({ available: true });
@@ -1563,14 +1577,13 @@ describe("V3 mode-aware database bridge", () => {
                 result: { pluginCustomStorage: { late: true } },
             })).toBe(false);
             releaseRead();
-            await vi.advanceTimersByTimeAsync(0);
+            await Promise.resolve();
             expect(hostResponses).toEqual([]);
         } finally {
             storageMocks.writeGate = null;
             storageMocks.readGate = null;
             host.terminate();
             await startup;
-            vi.useRealTimers();
         }
     });
 
@@ -1861,7 +1874,7 @@ describe("V3 guest startup handshake", () => {
             });
             expect(nextLifecycleOperationRan).toBe(true);
 
-            await vi.advanceTimersByTimeAsync(PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS);
+            await vi.advanceTimersByTimeAsync(FORMER_BRIDGE_DEADLINE_MS + 1);
 
             expect(longLivedIframe.isConnected).toBe(true);
             expect(healthyIframe.isConnected).toBe(true);

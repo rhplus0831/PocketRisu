@@ -1151,7 +1151,10 @@ type PluginStorageUpdateTransform = (
 ) => any | Promise<any>;
 
 interface PluginStorageUpdateOptions {
-    /** One total deadline for mutex admission, reads, transform, and CAS. */
+    /**
+     * Optional total deadline for mutex admission, reads, transform, and CAS.
+     * Omit it to wait until completion or lifecycle/explicit cancellation.
+     */
     timeoutMs?: number;
 }
 

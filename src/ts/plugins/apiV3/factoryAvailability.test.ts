@@ -1,16 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-    PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS,
-    PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS,
     SandboxHost,
     createV3BridgeRequestRegistry,
     deserializeV3BridgeError,
 } from './factory'
 
+const FORMER_BRIDGE_DEADLINE_MS = 30 * 60_000
+
 function createRegistry(overrides: Partial<Parameters<typeof createV3BridgeRequestRegistry>[0]> = {}) {
     const send = vi.fn()
     const registry = createV3BridgeRequestRegistry({
-        requestTimeoutMs: PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS,
         serializeArgs: args => args,
         collectTransferables: () => [],
         send,
@@ -28,46 +27,49 @@ afterEach(() => {
 })
 
 describe('V3 bridge request availability', () => {
-    it('uses generation-unique monotonic IDs and rejects stale timeout responses', async () => {
+    it('keeps root and instance requests pending beyond the former deadline', async () => {
         vi.useFakeTimers()
-        const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0)
         const { registry, send } = createRegistry()
 
-        const first = registry.sendRequest('CALL_ROOT', {
+        const root = registry.sendRequest('CALL_ROOT', {
             method: '_getPluginStorage',
             args: ['first'],
-        }).catch(error => error)
-        const firstId = send.mock.calls[0][0].reqId
-        await vi.advanceTimersByTimeAsync(PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS)
-        await expect(first).resolves.toMatchObject({ code: 'STORAGE_TIMEOUT' })
-
-        const second = registry.sendRequest('CALL_ROOT', {
-            method: '_getPluginStorage',
+        })
+        const instance = registry.sendRequest('CALL_INSTANCE', {
+            id: 'remote-ref',
+            method: 'getItem',
             args: ['second'],
         })
-        const secondRequest = send.mock.calls.find(
-            ([message]) => message.type === 'CALL_ROOT' && message.args?.[0] === 'second',
-        )?.[0]
-        expect(secondRequest.reqId).not.toBe(firstId)
+        const [rootRequest, instanceRequest] = send.mock.calls.map(([message]) => message)
+        expect(instanceRequest.reqId).not.toBe(rootRequest.reqId)
+
+        await vi.advanceTimersByTimeAsync(FORMER_BRIDGE_DEADLINE_MS + 1)
+        expect(registry.pendingCount()).toBe(2)
+        expect(send.mock.calls.some(([message]) => message.type === 'CANCEL_REQUEST')).toBe(false)
+
         expect(registry.handleResponse({
             type: 'RESPONSE',
-            reqId: firstId,
+            reqId: rootRequest.reqId,
+            result: 'late-root',
+        })).toBe(true)
+        expect(registry.pendingCount()).toBe(1)
+        expect(registry.handleResponse({
+            type: 'RESPONSE',
+            reqId: instanceRequest.reqId,
+            result: 'late-instance',
+        })).toBe(true)
+        await expect(root).resolves.toBe('late-root')
+        await expect(instance).resolves.toBe('late-instance')
+        expect(registry.handleResponse({
+            type: 'RESPONSE',
+            reqId: rootRequest.reqId,
             result: 'stale',
         })).toBe(false)
-        expect(registry.pendingCount()).toBe(1)
-
-        expect(registry.handleResponse({
-            type: 'RESPONSE',
-            reqId: secondRequest.reqId,
-            result: 'current',
-        })).toBe(true)
-        await expect(second).resolves.toBe('current')
-        randomSpy.mockRestore()
     })
 
-    it('cancels a timed-out safe-local mutation and ignores a late response', async () => {
-        vi.useFakeTimers()
+    it('cancels pending work only when its lifecycle ends', async () => {
         const { registry, send } = createRegistry()
+        const cancellation = new Error('Plugin bridge terminated.')
 
         const result = registry.sendRequest('CALL_ROOT', {
             method: '_setSafeLocalStorage',
@@ -75,15 +77,8 @@ describe('V3 bridge request availability', () => {
         }).catch(error => error)
         expect(registry.pendingCount()).toBe(1)
 
-        await vi.advanceTimersByTimeAsync(PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS)
-        const error = await result
-        expect(error).toMatchObject({
-            name: 'StorageError',
-            code: 'COMMIT_OUTCOME_UNKNOWN',
-            retryable: false,
-            commitOutcomeUnknown: true,
-            operation: 'write',
-        })
+        registry.cancelAll(cancellation)
+        await expect(result).resolves.toBe(cancellation)
         expect(registry.pendingCount()).toBe(0)
 
         const request = send.mock.calls[0][0]
@@ -98,7 +93,7 @@ describe('V3 bridge request availability', () => {
         })).toBe(false)
     })
 
-    it('classifies remote SafeLocalStorage mutations as unknown after timeout', async () => {
+    it('preserves a structured storage deadline instead of replacing it', async () => {
         vi.useFakeTimers()
         const { registry, send } = createRegistry()
 
@@ -107,19 +102,35 @@ describe('V3 bridge request availability', () => {
             method: 'removeItem',
             args: ['key'],
         }).catch(error => error)
-        await vi.advanceTimersByTimeAsync(PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS)
+        const request = send.mock.calls[0][0]
+
+        await vi.advanceTimersByTimeAsync(FORMER_BRIDGE_DEADLINE_MS + 1)
+        expect(registry.pendingCount()).toBe(1)
+        expect(send).toHaveBeenCalledOnce()
+
+        registry.handleResponse({
+            type: 'RESPONSE',
+            reqId: request.reqId,
+            error: {
+                __type: 'ERROR',
+                name: 'StorageError',
+                message: 'Plugin storage update timed out.',
+                code: 'STORAGE_TIMEOUT',
+                retryable: true,
+                commitOutcomeUnknown: false,
+                operation: 'update',
+            },
+        })
 
         await expect(result).resolves.toMatchObject({
-            code: 'COMMIT_OUTCOME_UNKNOWN',
-            commitOutcomeUnknown: true,
-            operation: 'remove',
+            code: 'STORAGE_TIMEOUT',
+            commitOutcomeUnknown: false,
+            operation: 'update',
         })
-        expect(send.mock.calls.at(-1)?.[0]?.type).toBe('CANCEL_REQUEST')
         expect(registry.pendingCount()).toBe(0)
     })
 
     it('cleans up immediately when argument serialization throws', async () => {
-        vi.useFakeTimers()
         const serializationError = new DOMException('not cloneable', 'DataCloneError')
         const { registry, send } = createRegistry({
             serializeArgs: () => { throw serializationError },
@@ -131,13 +142,9 @@ describe('V3 bridge request availability', () => {
         })).rejects.toBe(serializationError)
         expect(registry.pendingCount()).toBe(0)
         expect(send).not.toHaveBeenCalled()
-
-        await vi.advanceTimersByTimeAsync(PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS)
-        expect(send).not.toHaveBeenCalled()
     })
 
     it('cleans up immediately when postMessage throws', async () => {
-        vi.useFakeTimers()
         const postMessageError = new DOMException('detached frame', 'InvalidStateError')
         const throwingSend = vi.fn(() => { throw postMessageError })
         const { registry } = createRegistry({
@@ -149,9 +156,6 @@ describe('V3 bridge request availability', () => {
             args: ['key'],
         })).rejects.toBe(postMessageError)
         expect(registry.pendingCount()).toBe(0)
-        expect(throwingSend).toHaveBeenCalledOnce()
-
-        await vi.advanceTimersByTimeAsync(PLUGIN_BRIDGE_REQUEST_TIMEOUT_MS)
         expect(throwingSend).toHaveBeenCalledOnce()
     })
 
@@ -210,6 +214,49 @@ describe('V3 bridge request availability', () => {
         await startup
     })
 
+    it.each([
+        { method: 'runLLMModel', args: [{ mode: 'main', messages: [] }] },
+        { method: 'sendChat', args: ['hello'] },
+    ])('injects lifecycle cancellation into $method', async ({ method, args }) => {
+        vi.stubGlobal('ImageBitmap', class ImageBitmap {})
+        let requestSignal: AbortSignal | undefined
+        const api = {
+            [method]: vi.fn((...receivedArgs: unknown[]) => {
+                requestSignal = receivedArgs.at(-1) as AbortSignal
+                return new Promise<never>((_resolve, reject) => {
+                    requestSignal!.addEventListener(
+                        'abort',
+                        () => reject(requestSignal!.reason),
+                        { once: true },
+                    )
+                })
+            }),
+        }
+        const iframe = document.createElement('iframe')
+        document.body.appendChild(iframe)
+        const host = new SandboxHost(api)
+        const startup = host.run(iframe, '').catch(() => undefined)
+        const source = iframe.contentWindow!
+        const reqId = `${method}-request`
+
+        window.dispatchEvent(new MessageEvent('message', {
+            source,
+            origin: 'null',
+            data: { type: 'CALL_ROOT', reqId, method, args },
+        }))
+        await vi.waitFor(() => expect(requestSignal).toBeInstanceOf(AbortSignal))
+
+        window.dispatchEvent(new MessageEvent('message', {
+            source,
+            origin: 'null',
+            data: { type: 'CANCEL_REQUEST', reqId },
+        }))
+        expect(requestSignal?.aborted).toBe(true)
+
+        host.terminate()
+        await startup
+    })
+
     it('appends cancellation after the optional getDatabase argument', async () => {
         vi.stubGlobal('ImageBitmap', class ImageBitmap {})
         let receivedIncludeOnly: unknown = 'not-called'
@@ -252,7 +299,7 @@ describe('V3 bridge request availability', () => {
         await startup
     })
 
-    it('terminates and rejects a guest whose initialization never settles', async () => {
+    it('keeps slow initialization alive until explicit teardown', async () => {
         vi.useFakeTimers()
         const iframe = document.createElement('iframe')
         document.body.appendChild(iframe)
@@ -262,20 +309,12 @@ describe('V3 bridge request availability', () => {
             .then(() => null, error => error)
             .finally(() => { settled = true })
 
-        await vi.advanceTimersByTimeAsync(PLUGIN_BRIDGE_INITIALIZATION_TIMEOUT_MS - 1)
+        await vi.advanceTimersByTimeAsync(FORMER_BRIDGE_DEADLINE_MS + 1)
         expect(settled).toBe(false)
         expect(iframe.isConnected).toBe(true)
 
-        await vi.advanceTimersByTimeAsync(1)
-        await expect(startup).resolves.toMatchObject({
-            name: 'PluginInitializationTimeoutError',
-            code: 'PLUGIN_INITIALIZATION_TIMEOUT',
-            retryable: false,
-            commitOutcomeUnknown: false,
-            operation: 'initialization',
-        })
-        expect(iframe.isConnected).toBe(true)
         host.terminate()
+        await expect(startup).resolves.toBeInstanceOf(Error)
         expect(iframe.isConnected).toBe(false)
     })
 })

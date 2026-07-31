@@ -1171,7 +1171,7 @@ export const makeRisuaiAPIV3 = (
 
     const oldApis = getV2PluginAPIs();
     const pluginChatSend = createPluginChatSendController({
-        getPermission: () => getPluginPermission(plugin.name, 'sendChat'),
+        getPermission: (signal) => getPluginPermission(plugin.name, 'sendChat', false, signal),
         isGenerationActive: () => get(doingChat),
         getActiveTransaction: getActiveChatSendTransaction,
         getDefaultTarget: () => {
@@ -1186,9 +1186,10 @@ export const makeRisuaiAPIV3 = (
         },
         resolveTarget: (target) => resolveChatSendTarget(DBState.db, target),
         isPluginModelActive: () => getModelInfo(DBState.db.aiModel).id.startsWith('pluginmodel:::'),
-        runGeneration: (target, transaction) => processSendChat(-1, {
+        runGeneration: (target, transaction, signal) => processSendChat(-1, {
             target,
             transaction: transaction ?? undefined,
+            signal,
         }),
         // The V3 path does not pass through the UI generation wrapper.
         releaseGeneration: () => doingChat.set(false),
@@ -2199,23 +2200,35 @@ export const makeRisuaiAPIV3 = (
             messages: OpenAIChat[]
             staticModel?: string
             allowPlugins?: boolean
-        }) => {
-            return requestChatDataMain({
-                formated: options.messages,
-                bias: {},
-                staticModel: options.staticModel,
+        }, callerOrRequestSignal?: AbortSignal, requestSignal?: AbortSignal) =>
+            withCombinedAbortSignals(
+                [callerOrRequestSignal, requestSignal],
+                async signal => {
+                    throwIfAborted(signal)
+                    return requestChatDataMain({
+                        formated: options.messages,
+                        bias: {},
+                        staticModel: options.staticModel,
 
-                // Calls into plugin-provided models are blocked by default to
-                // guard against accidental IPC loops between provider plugins.
-                // Plugin authors who need to reach the user's plugin-supplied
-                // main or auxiliary model (e.g. a TTS preprocessor that
-                // rewrites text with the configured otherAx model) can opt in
-                // explicitly with `allowPlugins: true`, accepting responsibility
-                // for avoiding provider-to-provider call loops.
-                blockPlugins: !options.allowPlugins,
-            }, options.mode)
-        },
-        sendChat: pluginChatSend.sendChat,
+                        // Calls into plugin-provided models are blocked by default to
+                        // guard against accidental IPC loops between provider plugins.
+                        // Plugin authors who need to reach the user's plugin-supplied
+                        // main or auxiliary model (e.g. a TTS preprocessor that
+                        // rewrites text with the configured otherAx model) can opt in
+                        // explicitly with `allowPlugins: true`, accepting responsibility
+                        // for avoiding provider-to-provider call loops.
+                        blockPlugins: !options.allowPlugins,
+                    }, options.mode, signal ?? null)
+                },
+            ),
+        sendChat: (
+            message: string,
+            callerOrRequestSignal?: AbortSignal,
+            requestSignal?: AbortSignal,
+        ) => withCombinedAbortSignals(
+            [callerOrRequestSignal, requestSignal],
+            signal => pluginChatSend.sendChat(message, signal),
+        ),
         addPluginChannelListener: (channelName: string, callback: Function) => {
             lifecycle.assertCanRegister();
             const key = plugin.name + channelName;
