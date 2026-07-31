@@ -35,12 +35,13 @@ vi.mock("../storage/persistentKv", () => ({
 
 vi.mock("./pluginStorageMeta", () => ownership);
 
-const { SafeLocalPluginStorage } = await import("./pluginSafeClass");
+const { SafeLocalPluginStorage, SafeLocalStorage } = await import("./pluginSafeClass");
 
 let keySequence = 0;
 
 beforeEach(() => {
     keySequence += 1;
+    localStorage.clear();
     kv.readPersistentJson.mockReset();
     kv.readPersistentJson.mockResolvedValue(null);
     kv.writePersistentJson.mockReset();
@@ -52,6 +53,22 @@ beforeEach(() => {
     ownership.recordOwner.mockClear();
     ownership.removeOwner.mockClear();
     ownership.clearOwners.mockClear();
+});
+
+describe("SafeLocalStorage legacy reads", () => {
+    test("preserves an empty value and empty key while missing entries remain null", () => {
+        const storage = new SafeLocalStorage();
+
+        storage.setItem("", "");
+
+        expect(storage.getItem("")).toBe("");
+        expect(storage.getItem("missing")).toBeNull();
+        expect(storage.keys()).toEqual([""]);
+        expect(storage.length).toBe(1);
+        expect(storage.key(0)).toBe("");
+        expect(storage.key(1)).toBeNull();
+        expect(storage.key(-1)).toBeNull();
+    });
 });
 
 describe("SafeLocalPluginStorage write acknowledgement", () => {

@@ -1,8 +1,8 @@
 # Audit findings — priority index
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
-`Status` column uses `Open`, `Fixed`, or `Deferred`; 41 findings are currently
-`Open`, 18 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
+`Status` column uses `Open`, `Fixed`, or `Deferred`; 40 findings are currently
+`Open`, 19 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
 as a cross-reference).
@@ -84,7 +84,7 @@ resolution against current code before acting on it.
 | [Inlay filename mapping is not injective](audit/inlay-filename-mapping-is-not-injective.md) | Open | Medium | An unrelated payload overwritten or unlinked via `<id>.meta.json` aliasing or prefix fallback | Requires dotted inlay IDs; destructive helpers act on ambiguous matches |
 | [Bulk write commits a partial filesystem prefix](audit/bulk-write-commits-a-partial-filesystem-prefix.md) | Open | Medium | Earlier files irreversibly replaced on mid-batch failure; the committed prefix is unknowable to callers | No current production caller; the exposed endpoint contract remains non-atomic |
 | [Character package remaps chat IDs without remapping inlay metadata](audit/character-package-remaps-chat-ids-without-remapping-inlay-metadata.md) | Open | Medium | Imported media misclassified as orphaned, making gallery deletion (see P1 orphan scan) more likely | Every character-package import that carries inlays |
-| [Legacy storage getters conflate valid values with missing](audit/legacy-storage-getters-conflate-valid-values-with-missing.md) | Open | Medium | A legacy plugin resets its configuration after reading stored `''`/`0`/`false` as absent | Any V2 plugin persisting falsey sentinels |
+| [Legacy storage getters conflate valid values with missing](audit/legacy-storage-getters-conflate-valid-values-with-missing.md) | Fixed | Medium | A legacy plugin resets its configuration after reading stored `''`/`0`/`false` as absent | Any V2 plugin persisting falsey sentinels |
 | [Full-write ETag does not cover chat rows](audit/full-write-etag-does-not-cover-chat-rows.md) | Open | Low | A newer chat row overwritten with no pre-image captured | Headerless legacy/external compatibility callers only; current clients unaffected |
 | [Whole-chat patches half-apply external rows](audit/whole-chat-patches-half-apply-external-rows.md) | Open | Low | Mixed old/new rows after a failed multi-chat patch; overwritten rows lack pre-images | Compatibility-shaped payload-bearing patches only |
 | [Non-canonical hex path splits the patch cache](audit/noncanonical-hex-path-splits-the-patch-cache.md) | Open | Low | An acknowledged edit overwritten by the parallel-cased cache's later flush | Mixed-case hex from a non-official caller only |

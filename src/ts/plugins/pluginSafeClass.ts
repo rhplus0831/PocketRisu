@@ -45,7 +45,7 @@ export class SafeLocalStorage {
         const keys: string[] = [];
         for (let i = 0; i < localStorage.length; i++) {
             const key = localStorage.key(i);
-            if (key && key.startsWith('safe_plugin_')) {
+            if (key !== null && key.startsWith('safe_plugin_')) {
                 keys.push(key.substring('safe_plugin_'.length));
             }
         }
@@ -54,7 +54,7 @@ export class SafeLocalStorage {
 
     key(index: number): string | null {
         const safeKeys = this.keys();
-        return safeKeys[index] || null;
+        return Object.hasOwn(safeKeys, index) ? safeKeys[index] : null;
     }
 
     clear(): void {

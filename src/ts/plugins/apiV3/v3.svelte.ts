@@ -2182,7 +2182,7 @@ export const makeRisuaiAPIV3 = (
             getPluginSaveStorageSortedKeys(signal)
         ),
         _lengthPluginStorage: (signal?: AbortSignal) => getPluginSaveStorageLength(signal),
-        _getSafeLocalStorage: oldApis.safeLocalStorage.getItem,
+        _getSafeLocalStorage: (key: string) => oldApis.safeLocalStorage.getItem(key),
         _setSafeLocalStorage: (key: string, value: string, signal?: AbortSignal) => {
             signal?.throwIfAborted()
             oldApis.safeLocalStorage.setItem(key, value)
@@ -2198,8 +2198,8 @@ export const makeRisuaiAPIV3 = (
             oldApis.safeLocalStorage.clear()
             clearOwners('local', signal)
         },
-        _keySafeLocalStorage: oldApis.safeLocalStorage.key,
-        _keysSafeLocalStorage: oldApis.safeLocalStorage.keys,
+        _keySafeLocalStorage: (index: number) => oldApis.safeLocalStorage.key(index),
+        _keysSafeLocalStorage: () => oldApis.safeLocalStorage.keys(),
         searchTranslationCache: async (partialKey: string) => {
             return searchLLMCache(partialKey)
         },

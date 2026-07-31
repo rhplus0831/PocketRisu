@@ -5639,6 +5639,26 @@ describe("transitionPluginStorageMode", () => {
         expect(v2Apis.pluginStorage.getItem("")).toBe("empty-first");
     });
 
+    test("V2 pluginStorage preserves falsey values while missing entries remain null", () => {
+        const storage = getV2PluginAPIs().pluginStorage;
+        const values = [
+            ["false", false],
+            ["zero", 0],
+            ["empty", ""],
+            ["nullable", null],
+        ] as const;
+
+        for (const [key, value] of values) storage.setItem(key, value);
+
+        expect(storage.getItem("false")).toBe(false);
+        expect(storage.getItem("zero")).toBe(0);
+        expect(storage.getItem("empty")).toBe("");
+        expect(storage.getItem("nullable")).toBeNull();
+        expect(storage.getItem("missing")).toBeNull();
+        expect(Object.hasOwn(database.pluginCustomStorage, "nullable")).toBe(true);
+        expect(Object.hasOwn(database.pluginCustomStorage, "missing")).toBe(false);
+    });
+
     test("V2 pluginCustomStorage preserves ordinary prototype observations", () => {
         database.pluginCustomStorage = {
             alpha: 1,

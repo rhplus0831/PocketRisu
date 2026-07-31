@@ -1,10 +1,10 @@
 # Legacy storage getters conflate valid values with missing entries
 
-- Status: Open
+- Status: Fixed
 - Severity: Medium
 - Lens: L4
 - Area: Area 2 — client/plugin boundary
-- Affected code: `src/ts/plugins/plugins.svelte.ts:735`, `src/ts/plugins/plugins.svelte.ts:739`, `src/ts/plugins/plugins.svelte.ts:741`, `src/ts/plugins/plugins.svelte.ts:755`, `src/ts/plugins/plugins.svelte.ts:759`, `src/ts/plugins/pluginSafeClass.ts:30`, `src/ts/plugins/apiV3/v3.svelte.ts:1343`, `src/ts/plugins/apiV3/v3.svelte.ts:1356`
+- Affected code: `src/ts/plugins/plugins.svelte.ts:2047`, `src/ts/plugins/plugins.svelte.ts:2075`, `src/ts/plugins/pluginSafeClass.ts:33`, `src/ts/plugins/pluginSafeClass.ts:55`, `src/ts/plugins/apiV3/v3.svelte.ts:2177`, `src/ts/plugins/apiV3/v3.svelte.ts:2185`
 
 ## Risk
 
@@ -24,3 +24,14 @@ truthiness. Keep the V2 and V3 facades behaviorally aligned.
 
 Add parity tests for false, zero, empty string, null, missing values, and the
 empty-string key.
+
+## Resolution
+
+Fixed 2026-07-31. The V2 save-backed facade uses exact own-presence reads and
+nullish indexed-key fallback, while the shared V2/V3 `SafeLocalStorage.key()`
+now tests exact array-index presence instead of value truthiness. V3 exports
+the local-storage methods through bound wrappers so `key()` retains its class
+receiver. Focused
+regressions cover false, zero, empty string, stored null, missing entries, and
+empty-string indexed keys through the synchronous V2 surface, shared local
+wrapper, and generated V3 guest bridge.

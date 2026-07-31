@@ -231,6 +231,72 @@ describe("SandboxHost V3 startup lifecycle", () => {
         restoreRelay();
     });
 
+    test("preserves falsey storage values and empty indexed keys across the guest bridge", async () => {
+        const values = new Map<string, unknown>([
+            ["false", false],
+            ["zero", 0],
+            ["empty", ""],
+            ["nullable", null],
+        ]);
+        const iframe = document.createElement("iframe");
+        document.body.appendChild(iframe);
+        const host = new SandboxHost(startupApi({
+            _getAliases: () => ({
+                pluginStorage: {
+                    getItem: "_getPluginStorage",
+                    key: "_keyPluginStorage",
+                },
+                safeLocalStorage: {
+                    getItem: "_getSafeLocalStorage",
+                    key: "_keySafeLocalStorage",
+                },
+            }),
+            _getPluginStorage: async (key: string) => (
+                values.has(key) ? values.get(key) : null
+            ),
+            _keyPluginStorage: async (index: number) => index === 0 ? "" : null,
+            _getSafeLocalStorage: async (key: string) => key === "empty" ? "" : null,
+            _keySafeLocalStorage: async (index: number) => index === 0 ? "" : null,
+        }));
+        const startup = host.run(iframe, `
+            globalThis.falseyStorageReads = [
+                await risuai.pluginStorage.getItem('false'),
+                await risuai.pluginStorage.getItem('zero'),
+                await risuai.pluginStorage.getItem('empty'),
+                await risuai.pluginStorage.getItem('nullable'),
+                await risuai.pluginStorage.getItem('missing'),
+                await risuai.safeLocalStorage.getItem('empty'),
+                await risuai.safeLocalStorage.getItem('missing'),
+            ];
+            globalThis.emptyIndexedStorageKeys = [
+                await risuai.pluginStorage.key(0),
+                await risuai.pluginStorage.key(1),
+                await risuai.safeLocalStorage.key(0),
+                await risuai.safeLocalStorage.key(1),
+            ];
+        `);
+        const restoreRelay = executeGeneratedGuest(iframe);
+
+        await expect(startup).resolves.toBeUndefined();
+        expect((iframe.contentWindow as any).falseyStorageReads).toEqual([
+            false,
+            0,
+            "",
+            null,
+            null,
+            "",
+            null,
+        ]);
+        expect((iframe.contentWindow as any).emptyIndexedStorageKeys).toEqual([
+            "",
+            null,
+            "",
+            null,
+        ]);
+        host.terminate();
+        restoreRelay();
+    });
+
     test("normalizes local plugin storage values before crossing the guest bridge", async () => {
         const setItem = vi.fn(async () => undefined);
         const localStorage = {
