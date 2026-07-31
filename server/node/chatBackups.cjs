@@ -907,51 +907,74 @@ function createChatBackupStore(options) {
         );
         if (totalBytes <= maxBytes) return { removed: 0, totalBytes, maxBytes };
 
-        const bundles = [];
-        const loose = [];
-        const newestByDir = new Map();
+        const evictable = [];
         for (const { chatDir } of chatDirs) {
             const scan = scanChatDirectory(chatDir);
             const allVersions = [
                 ...scan.loose,
                 ...scan.bundles.flatMap(bundle => bundle.entries),
             ].sort(compareVersionsOldest);
-            newestByDir.set(chatDir, allVersions.at(-1)?.versionId ?? null);
+            const newestId = allVersions.at(-1)?.versionId ?? null;
 
             for (const bundle of scan.bundles) {
-                bundles.push({
+                if (bundle.entries.some(entry => entry.versionId === newestId)) continue;
+                const age = bundle.entries.reduce((newest, entry) => (
+                    newest === null || compareVersionsOldest(newest, entry) < 0
+                        ? entry
+                        : newest
+                ), null) ?? { ts: 0, seq: 0, versionId: '' };
+                evictable.push({
+                    type: 'bundle',
                     chatDir,
                     bundle,
-                    ageTs: bundle.entries[bundle.entries.length - 1]?.ts ?? 0,
+                    age,
+                    versionCount: bundle.entries.length,
+                    name: bundle.bundleFile,
                 });
             }
-            for (const entry of scan.loose) loose.push({ chatDir, entry });
+            for (const entry of scan.loose) {
+                if (entry.versionId === newestId) continue;
+                evictable.push({
+                    type: 'loose',
+                    chatDir,
+                    entry,
+                    age: entry,
+                    versionCount: 1,
+                    name: entry.filename,
+                });
+            }
         }
 
-        bundles.sort((a, b) => a.ageTs - b.ageTs
-            || a.bundle.bundleFile.localeCompare(b.bundle.bundleFile));
-        loose.sort((a, b) => compareVersionsOldest(a.entry, b.entry)
-            || a.chatDir.localeCompare(b.chatDir));
+        // A solid bundle is one indivisible eviction unit. Treat its newest
+        // member as the unit's age so a bundle containing newer recovery points
+        // cannot jump ahead of an older loose version in another chat. If ages
+        // tie, prefer the unit that discards fewer versions.
+        evictable.sort((a, b) => compareVersionsOldest(a.age, b.age)
+            || a.versionCount - b.versionCount
+            || a.chatDir.localeCompare(b.chatDir)
+            || a.name.localeCompare(b.name));
 
         let removed = 0;
-        for (const item of bundles) {
+        for (const item of evictable) {
             if (totalBytes <= maxBytes) break;
-            const newestId = newestByDir.get(item.chatDir);
-            if (item.bundle.entries.some(entry => entry.versionId === newestId)) continue;
-            try { fs.unlinkSync(path.join(item.chatDir, item.bundle.bundleFile)); } catch {}
-            try { fs.unlinkSync(path.join(item.chatDir, item.bundle.metaFile)); } catch {}
+            let deleted = false;
+            if (item.type === 'bundle') {
+                try {
+                    fs.unlinkSync(path.join(item.chatDir, item.bundle.bundleFile));
+                    deleted = true;
+                } catch {}
+                try {
+                    fs.unlinkSync(path.join(item.chatDir, item.bundle.metaFile));
+                    deleted = true;
+                } catch {}
+            } else {
+                try {
+                    fs.unlinkSync(path.join(item.chatDir, item.entry.filename));
+                    deleted = true;
+                } catch {}
+            }
             totalBytes = treeBytes(root);
-            removed++;
-        }
-
-        for (const item of loose) {
-            if (totalBytes <= maxBytes) break;
-            if (item.entry.versionId === newestByDir.get(item.chatDir)) continue;
-            try {
-                fs.unlinkSync(path.join(item.chatDir, item.entry.filename));
-                totalBytes = treeBytes(root);
-                removed++;
-            } catch {}
+            if (deleted) removed++;
         }
         return { removed, totalBytes, maxBytes };
     }

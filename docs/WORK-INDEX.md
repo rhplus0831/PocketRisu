@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **41** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is deferred for future work, and **53** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **40** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is deferred for future work, and **54** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -31,7 +31,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [Global chat budget evicts newer bundles first](audit/global-chat-budget-evicts-newer-bundles-before-older-loose-versions.md) | audit | Open | Recovery copies only; live data survives — 25 newer versions can be destroyed unnecessarily. | A normal global byte-cap overage with an older loose version in another chat. |
 | [Snapshots reference assets GC can delete](audit/snapshots-reference-assets-the-gc-can-delete.md) | audit | Open | Recovery copies only; live data survives — restored snapshots contain dangling asset references. | Replace an asset, allow ordinary GC to run, then restore the older retained snapshot. |
 | [Chat-version cap collapses to 100](audit/chat-version-cap-collapses-from-125-to-100.md) | audit | Open | Recovery copies only; live data survives — the oldest 20% of advertised history is dropped. | Deterministic when a chat reaches its 125th retained version. |
 
@@ -116,6 +115,7 @@ None currently open.
 
 | Finding | Former harm | Note |
 |---|---|---|
+| [Global chat budget evicted newer bundles first](audit/global-chat-budget-evicts-newer-bundles-before-older-loose-versions.md) | A small byte-cap overage could destroy 25 newer chat recovery versions even though removing one older loose version would have sufficed. | Fixed 2026-07-31 with one globally age-ordered set of indivisible eviction units, newest-member bundle aging, per-chat newest protection, and an exact cross-chat small-overage regression. |
 | [`update.sh` wiped custom backup roots](audit/update-script-wipes-custom-in-tree-backup-roots.md) | Every source update erased all recovery archives under a permitted custom in-tree root such as `data/backups`, while the surviving live database silently recreated the directory empty. | Fixed 2026-07-31 by normalizing both updater-visible recovery markers into exact top-level keep entries, failing closed for managed-code targets, and covering full temporary source updates for default, custom server, and custom chat backup roots. |
 | [Docker server backups were ephemeral](audit/docker-server-backups-are-ephemeral.md) | Every server-side `.bin` recovery archive disappeared on a normal image update or container recreation, while the live save volume survived and hid the loss. | Fixed 2026-07-31 by mounting a stable named volume at `/app/backups`, documenting the pre-recreation copy migration and custom-path caveat in every install guide, and locking both Docker persistence mounts and explicit volume names with compatibility coverage. |
 | [Denied V3 database writes reported success](compatibility/v3-database-setter-permission.md) | A plugin could discard an unsaved retry buffer after a denied write resolved even though no state was committed. | Fixed 2026-07-31 by rejecting both setters with the RPC-stable `PluginPermissionError` / `PLUGIN_PERMISSION_DENIED` contract while retaining the permission boundary, with ask, grant, persisted-denial, write-only, and real guest-bridge coverage. |

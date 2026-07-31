@@ -835,7 +835,7 @@ describe('chat backup reconcile and reads', () => {
         )?.equals(raws[25])).toBe(true)
     })
 
-    it('evicts oldest bundles before loose versions and preserves every chat newest', async () => {
+    it('evicts every eligible unit when necessary and preserves each chat newest', async () => {
         const harness = makeHarness({
             now: 100,
             versionsPerBundle: 3,
@@ -881,6 +881,56 @@ describe('chat backup reconcile and reads', () => {
             'chat-b',
             'v-250-0-b',
         )).not.toBeNull()
+    })
+
+    it('evicts one older loose version before a newer cross-chat bundle', async () => {
+        const harness = makeHarness({
+            versionsPerBundle: 3,
+            maxBytes: 100 * 1024 * 1024,
+        })
+        for (const timestamp of [200, 201, 202, 300]) {
+            harness.setNow(timestamp)
+            harness.setRow('char-a', 'chat-a', rawChat(timestamp))
+            await harness.store.captureChatPreImage({
+                chaId: 'char-a',
+                chatId: 'chat-a',
+                reason: 'a',
+            })
+        }
+        for (const timestamp of [100, 150]) {
+            harness.setNow(timestamp)
+            harness.setRow('char-b', 'chat-b', rawChat(timestamp))
+            await harness.store.captureChatPreImage({
+                chaId: 'char-b',
+                chatId: 'chat-b',
+                reason: 'b',
+            })
+        }
+
+        const before = await harness.store.reconcileChatBackups()
+        const olderLoosePath = path.join(
+            chatDir(harness.root, 'char-b', 'chat-b'),
+            'v-100-0-b.bin.gz',
+        )
+        expect(fs.existsSync(olderLoosePath)).toBe(true)
+        harness.setMaxBytes(before.totalBytes - fs.statSync(olderLoosePath).size)
+
+        const result = await harness.store.reconcileChatBackups()
+
+        expect(result.budgetItemsRemoved).toBe(1)
+        expect(result.totalBytes).toBe(result.maxBytes)
+        expect(harness.store.readChatBackup('char-b', 'chat-b', 'v-100-0-b')).toBeNull()
+        expect(harness.store.readChatBackup('char-b', 'chat-b', 'v-150-0-b')).not.toBeNull()
+        for (const timestamp of [200, 201, 202, 300]) {
+            expect(harness.store.readChatBackup(
+                'char-a',
+                'chat-a',
+                `v-${timestamp}-0-a`,
+            )).not.toBeNull()
+        }
+        expect(harness.store.listChatBackups('char-a', 'chat-a').filter(
+            version => version.storage === 'bundle',
+        )).toHaveLength(3)
     })
 })
 
