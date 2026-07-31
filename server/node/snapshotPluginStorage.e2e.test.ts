@@ -434,9 +434,18 @@ function encodeRisuSaveBlock(
     value: unknown,
     compressed = false,
 ): Buffer {
-    const nameBytes = Buffer.from(name, 'utf-8')
     const json = Buffer.from(JSON.stringify(value), 'utf-8')
     const body = compressed ? gzipSync(json) : json
+    return encodeRawRisuSaveBlock(type, name, body, compressed)
+}
+
+function encodeRawRisuSaveBlock(
+    type: number,
+    name: string,
+    body: Buffer,
+    compressed = false,
+): Buffer {
+    const nameBytes = Buffer.from(name, 'utf-8')
     const header = Buffer.alloc(3 + nameBytes.length + 4)
     header[0] = type
     header[1] = compressed ? 1 : 0
@@ -3756,6 +3765,67 @@ describe('corrupt database boot snapshot recovery', () => {
         expect(await decodeRisuSave(
             await readKey(server, auth, 'database/database.bin'),
         )).toMatchObject({ recoveredFrom: 'older-block-snapshot' })
+    }, 30_000)
+
+    it('does not publish a partial block decode and restores a valid snapshot instead', async () => {
+        const cwd = makeWorkDir()
+        const snapshotKey = `database/dbbackup-${Math.floor((Date.now() + 60_000) / 100)}.bin`
+        const corruptLive = Buffer.concat([
+            Buffer.from('RISUSAVE\0', 'binary'),
+            encodeRisuSaveBlock(1, 'root', {
+                partialMarker: 'must-not-become-live',
+                __directory: ['character'],
+            }),
+            encodeRawRisuSaveBlock(2, 'character', Buffer.from('{"chaId":', 'utf-8')),
+        ])
+        const validSnapshot = Buffer.from(encodeRisuSaveLegacy({
+            characters: [],
+            recoveredFrom: 'valid-snapshot',
+        }))
+        const raw = openFixtureDatabase(cwd)
+        const insert = raw.prepare(
+            'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+        )
+        raw.transaction(() => {
+            const now = Date.now()
+            insert.run('database/database.bin', corruptLive, now)
+            insert.run(snapshotKey, validSnapshot, now + 1)
+        })()
+        raw.close()
+        const before = readExactKvState(cwd)
+
+        let server = await startServer(cwd)
+        let auth = await authenticate(server)
+        expect(server.logs()).toContain('starting in snapshot-recovery mode')
+        expect(readExactKvState(cwd)).toEqual(before)
+        const rawLive = await fetch(`${server.origin}/api/db/read-raw-for-boot`, {
+            headers: auth,
+        })
+        expect(rawLive.status).toBe(200)
+        expect(Buffer.from(await rawLive.arrayBuffer())).toEqual(corruptLive)
+
+        const restored = await fetch(`${server.origin}/api/db/snapshots/restore`, {
+            method: 'POST',
+            headers: { ...auth, 'content-type': 'application/json' },
+            body: JSON.stringify({ key: snapshotKey }),
+        })
+        expect(restored.status).toBe(200)
+        await expect(restored.json()).resolves.toMatchObject({
+            ok: true,
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+        })
+        expect(await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )).toMatchObject({ recoveredFrom: 'valid-snapshot' })
+
+        await stopServer(server)
+        server = await startServer(cwd)
+        auth = await authenticate(server)
+        expect(server.logs()).not.toContain('starting in snapshot-recovery mode')
+        expect(await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )).toMatchObject({ recoveredFrom: 'valid-snapshot' })
     }, 30_000)
 
     it('session-fences restore, rejects prefix-only keys, and echoes the exact committed key', async () => {

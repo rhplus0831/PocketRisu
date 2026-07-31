@@ -11,7 +11,7 @@ import { alertConfirm, alertError, alertMd, alertSelect, alertTOS, waitAlert, no
 import { hasher } from "./parser/parser.svelte";
 import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
-import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEncoder, RisuSavePatcher, type toSaveType } from "./storage/risuSave";
+import { decodeAuthoritativeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEncoder, RisuSavePatcher, type toSaveType } from "./storage/risuSave";
 import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat, convertStubsToPlaceholders } from "./storage/chatStorage";
 import {
     buildKnownChatIdsByCharacter,
@@ -738,7 +738,7 @@ export async function saveDb() {
             throw new Error('Conflict recovery could not read the authoritative database')
         }
 
-        const latestDb = await decodeRisuSave(candidate.data) as Database
+        const latestDb = await decodeAuthoritativeRisuSave(candidate.data) as Database
         // The patch baseline is the body paired with candidate.etag, not the
         // merged local result. The retry can therefore submit the tracked local
         // changes as a real patch against the authoritative server state.
@@ -1031,7 +1031,7 @@ export async function saveDb() {
             // Re-init patcher from the data we just wrote so both sides
             // share the same baseline (including setDatabase defaults).
             if (supportsPatchSync) {
-                const decodedDb = await decodeRisuSave(dbData)
+                const decodedDb = await decodeAuthoritativeRisuSave(dbData)
                 await patcher.init(decodedDb)
             }
         }
@@ -2309,7 +2309,7 @@ export async function loadInternalBackup() {
 
     const data = await forageStorage.getItem(selectedBackup)
 
-    const backupDecoded = await decodeRisuSave(Buffer.from(data) as unknown as Uint8Array)
+    const backupDecoded = await decodeAuthoritativeRisuSave(Buffer.from(data) as unknown as Uint8Array)
     setDatabase(backupDecoded)
 
     notifySuccess('Loaded backup')

@@ -1,7 +1,7 @@
 import { changeFullscreen, checkNullish } from "./util"
 import { v4 as uuidv4 } from 'uuid';
 import { get } from "svelte/store";
-import { setDatabase, defaultSdDataFunc, getDatabase, changeToThemePreset, type Chat } from "./storage/database.svelte";
+import { setDatabase, defaultSdDataFunc, getDatabase, changeToThemePreset, type Chat, type Database } from "./storage/database.svelte";
 import { chatDraftKey, sweepOrphanDrafts } from "./storage/chatDraft";
 import { checkRisuUpdate } from "./update";
 import { fetchPublicStats } from "./publicStats";
@@ -10,7 +10,7 @@ import { loadPlugins } from "./plugins/plugins.svelte";
 import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertConfirmMulti, alertInput, notifyWarning } from "./alert";
 import { characterURLImport } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
-import { decodeRisuSave, encodeRisuSaveLegacy, RisuSaveEncoder } from "./storage/risuSave";
+import { decodeAuthoritativeRisuSave, encodeRisuSaveLegacy, RisuSaveEncoder } from "./storage/risuSave";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { applyEarlyLanguage, changeLanguage, language } from "src/lang";
@@ -60,7 +60,7 @@ async function persistBootPluginStorageReconcile(): Promise<void> {
         data,
         forageStorage.getDbEtag() ?? undefined,
     );
-    setPatchSyncBaseline(await decodeRisuSave(data));
+    setPatchSyncBaseline(await decodeAuthoritativeRisuSave(data));
 }
 
 function renderInsecureContextFatalError() {
@@ -158,9 +158,9 @@ export async function loadData() {
                     }
                 }
                 try {
-                    const decoded = databaseRead.kind === 'decoded'
-                        ? databaseRead.database
-                        : await decodeRisuSave(databaseRead.bytes)
+                    const decoded: Database = databaseRead.kind === 'decoded'
+                        ? databaseRead.database as Database
+                        : await decodeAuthoritativeRisuSave(databaseRead.bytes)
                     setPatchSyncBaseline(decoded)
                     console.log(decoded)
                     setDatabase(decoded)
@@ -168,7 +168,7 @@ export async function loadData() {
                     console.error(error)
                     const restoredDecoded = await recoverDatabaseFromInternalSnapshots({
                         storage: forageStorage,
-                        decode: decodeRisuSave,
+                        decode: decodeAuthoritativeRisuSave,
                         onStatus: (status) => { LoadingStatusState.text = status },
                     })
                     if (!restoredDecoded) {

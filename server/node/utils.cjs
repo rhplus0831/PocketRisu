@@ -406,6 +406,11 @@ async function checkCompressionStreams() {
 function checkHeader(data) {
     let header = 'raw';
 
+    if (data.length >= magicRisuSaveHeader.length
+        && magicRisuSaveHeader.every((byte, index) => data[index] === byte)) {
+        return 'risusave';
+    }
+
     if (data.length < magicHeader.length) {
         return false;
     }
@@ -499,6 +504,7 @@ class RisuSaveDecoder {
             resolveRemote = null,
             maxRemoteDepth = 32,
             strictBlockJson = false,
+            requireCompleteBlockSet = false,
             signal = null,
             maxDecodedBytes = Number.MAX_SAFE_INTEGER,
             onCompressedBlockDecode = null,
@@ -507,6 +513,9 @@ class RisuSaveDecoder {
         let offset = magicRisuSaveHeader.length;
         let db = {};
         let decodedBytes = 0;
+        const loadedBlockNames = new Set();
+        const directory = new Set();
+        let rootBlocks = 0;
 
         while (offset < data.length) {
             try {
@@ -514,7 +523,11 @@ class RisuSaveDecoder {
                     throw structuralRisuSaveError(`Truncated RisuSave block header at byte ${offset}`);
                 }
                 const type = data[offset];
-                const compression = data[offset + 1] === 1;
+                const compressionFlag = data[offset + 1];
+                if (compressionFlag !== 0 && compressionFlag !== 1) {
+                    throw structuralRisuSaveError(`Invalid RisuSave block compression flag at byte ${offset + 1}`);
+                }
+                const compression = compressionFlag === 1;
                 offset += 2;
 
                 const nameLength = data[offset];
@@ -522,7 +535,8 @@ class RisuSaveDecoder {
                 if (offset + nameLength + 4 > data.length) {
                     throw structuralRisuSaveError(`Truncated RisuSave block name at byte ${offset}`);
                 }
-                const name = new TextDecoder().decode(data.subarray(offset, offset + nameLength));
+                const name = new TextDecoder('utf-8', { fatal: requireCompleteBlockSet })
+                    .decode(data.subarray(offset, offset + nameLength));
                 offset += nameLength;
 
                 const newArrayBuf = new ArrayBuffer(4);
@@ -556,9 +570,12 @@ class RisuSaveDecoder {
                     name,
                     type,
                     compression,
-                    content: new TextDecoder().decode(blockData),
+                    content: new TextDecoder('utf-8', {
+                        fatal: strictBlockJson && isKnownJsonRisuSaveType(type),
+                    }).decode(blockData),
                     remoteChain: [],
                 });
+                loadedBlockNames.add(name);
             } catch (error) {
                 if (error?.risuSaveStructuralInvalid || error?.code === 'RISU_STREAM_ABORTED') {
                     throw error;
@@ -586,9 +603,29 @@ class RisuSaveDecoder {
                 switch (this.blocks[key].type) {
                     case RisuSaveType.ROOT: {
                         const rootData = JSON.parse(this.blocks[key].content);
+                        if (requireCompleteBlockSet
+                            && (!rootData || typeof rootData !== 'object' || Array.isArray(rootData))) {
+                            throw structuralRisuSaveError(
+                                `Invalid RisuSave root block ${this.blocks[key].name}`,
+                            );
+                        }
+                        rootBlocks++;
                         for (const rootKey in rootData) {
                             if (!db[rootKey] && !rootKey.startsWith('__')) {
                                 db[rootKey] = rootData[rootKey];
+                            }
+                            if (rootKey === '__directory') {
+                                const rootDirectory = rootData[rootKey];
+                                if (!Array.isArray(rootDirectory)
+                                    || rootDirectory.some(name => typeof name !== 'string')) {
+                                    if (requireCompleteBlockSet) {
+                                        throw structuralRisuSaveError(
+                                            `Invalid RisuSave directory in root block ${this.blocks[key].name}`,
+                                        );
+                                    }
+                                    continue;
+                                }
+                                for (const name of rootDirectory) directory.add(name);
                             }
                         }
                         break;
@@ -633,7 +670,14 @@ class RisuSaveDecoder {
                         // (`remotes/<name>.local.bin`). Without a resolver
                         // callback we have to skip — the historical behavior
                         // that drops characters saved by upstream RisuAI.
-                        if (!resolveRemote) break;
+                        if (!resolveRemote) {
+                            if (requireCompleteBlockSet) {
+                                throw structuralRisuSaveError(
+                                    `Cannot resolve REMOTE block ${this.blocks[key].name}`,
+                                );
+                            }
+                            break;
+                        }
                         const remoteInfo = JSON.parse(this.blocks[key].content);
                         if (!remoteInfo || typeof remoteInfo.name !== 'string'
                             || remoteInfo.name.length === 0
@@ -680,9 +724,12 @@ class RisuSaveDecoder {
                             name: remoteInfo.name,
                             type: remoteInfo.type,
                             compression: false,
-                            content: new TextDecoder().decode(resolved),
+                            content: new TextDecoder('utf-8', {
+                                fatal: strictBlockJson && isKnownJsonRisuSaveType(remoteInfo.type),
+                            }).decode(resolved),
                             remoteChain: nextChain,
                         });
+                        loadedBlockNames.add(remoteInfo.name);
                         break;
                     }
                     default: {
@@ -713,6 +760,17 @@ class RisuSaveDecoder {
                 if (this.blocks[key].type === RisuSaveType.ROOT) {
                     throw new Error('Failed to decode root block, cannot proceed with decoding RisuSave data');
                 }
+            }
+        }
+        if (requireCompleteBlockSet) {
+            if (rootBlocks === 0) {
+                throw structuralRisuSaveError('RisuSave data has no root block');
+            }
+            const missingBlocks = [...directory].filter(name => !loadedBlockNames.has(name));
+            if (missingBlocks.length > 0) {
+                throw structuralRisuSaveError(
+                    `RisuSave directory references missing block${missingBlocks.length === 1 ? '' : 's'}: ${missingBlocks.join(', ')}`,
+                );
             }
         }
         if(!Array.isArray(db.characters)){
@@ -764,6 +822,14 @@ async function decodeRisuSave(data, options = {}) {
     // risusave) and the catch-fallback paths all guarantee id-populated presets.
     const result = await _decodeRisuSaveInternal(data, options);
     return ensureBotPresetIds(result);
+}
+
+async function decodeAuthoritativeRisuSave(data, options = {}) {
+    return decodeRisuSave(data, {
+        ...options,
+        strictBlockJson: true,
+        requireCompleteBlockSet: true,
+    });
 }
 
 async function _decodeRisuSaveInternal(data, options = {}) {
@@ -1000,6 +1066,7 @@ module.exports = {
 
     // Functions
     decodeRisuSave,
+    decodeAuthoritativeRisuSave,
     encodeRisuSaveLegacy,
     calculateHash,
     normalizeJSON,

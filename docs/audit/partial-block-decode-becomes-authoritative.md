@@ -1,9 +1,11 @@
 # A corrupted save block is silently skipped and the partial database becomes authoritative
 
-- Status: Open
+- Status: Fixed (2026-07-31)
 - Severity: Medium
 - Area: save-format decoding (server and client)
-- Affected code: `server/node/utils.cjs:247-286` (block parser: bare `catch { continue; }`, no length validation), `server/node/utils.cjs:292-386` (per-block errors logged and skipped; defaults manufactured), `src/ts/storage/risuSave.ts:429-470` (client decoder mirrors the skip), `src/ts/storage/database.svelte.ts` (`setDatabase` fills missing collections)
+- Resolution code: `server/node/utils.cjs`, `server/node/server.cjs`,
+  `server/node/streamRisuLoad.cjs`, `server/node/streamBackupRisuSave.cjs`,
+  `src/ts/storage/risuSave.ts`, and `src/ts/bootstrap.ts`
 
 ## Risk
 
@@ -24,3 +26,26 @@ Validate block headers and declared lengths against the remaining buffer,
 require every directory entry to resolve, and make a required-block parse
 failure abort the decode so boot falls back to snapshots/backups. Never cache
 or re-encode a partial decode as authoritative.
+
+## Resolution
+
+Authoritative browser and server database decodes now use a strict block
+integrity contract. It validates framing, compression flags, UTF-8 and JSON
+for known block types, requires a root object, resolves REMOTE payloads, and,
+when a historical `__directory` is present, requires every declared block to
+be available. A failure is propagated as `RISU_SAVE_INVALID`; it is not routed
+through legacy format fallbacks and the partial object is never cached or
+re-encoded.
+
+Server boot therefore preserves the corrupt live bytes and enters the existing
+authenticated snapshot-recovery mode. Browser boot likewise invokes internal
+snapshot recovery instead of installing the partial result. Bounded restores
+and the disk-backed large-block transformer enforce the same completeness
+rule before publication.
+
+Compatibility decoding remains deliberately permissive for legacy chat rows
+and explicit salvage callers. Historical block saves without `__directory`
+remain valid, and complete unknown future block types remain ignorable. Added
+coverage proves partial JSON, truncated framing, unresolved directory entries,
+and missing roots fail authoritatively while a valid snapshot can be restored
+without changing the corrupt source bytes first.

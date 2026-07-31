@@ -662,6 +662,27 @@ describe('disk-backed streaming Risu ingest', () => {
       commitOutcomeUnknown: false,
     })
 
+    const missingDirectoryBlock = Buffer.concat([
+      Buffer.from('RISUSAVE\0', 'binary'),
+      encodeRisuSaveBlock(1, 'root', {
+        marker: 'directory-survives-direct-compat',
+        __directory: ['missing-character'],
+      }),
+    ])
+    await expect(decodeRisuSave(missingDirectoryBlock)).resolves.toMatchObject({
+      marker: 'directory-survives-direct-compat',
+      characters: [],
+    })
+    await expect(decodeBoundedLegacyRisuSave(missingDirectoryBlock, {
+      maxLegacyBytes: 1024 * 1024,
+      maxDecodedBytes: 1024 * 1024,
+    })).rejects.toMatchObject({
+      code: 'RISU_SAVE_INVALID',
+      status: 400,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+
     const remoteSource = Buffer.concat([
       Buffer.from('RISUSAVE\0', 'binary'),
       encodeRisuSaveBlock(1, 'root', { marker: 'remote-source' }),

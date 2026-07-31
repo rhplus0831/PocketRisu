@@ -2,7 +2,7 @@
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
 `Status` column uses `Open`, `Fixed`, `Deferred`, or `Intentional documented limitation`;
-35 findings are currently `Open`, 23 are `Fixed`, 1 is `Deferred`, and 1 is an
+34 findings are currently `Open`, 24 are `Fixed`, 1 is `Deferred`, and 1 is an
 `Intentional documented limitation`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
@@ -62,7 +62,7 @@ resolution against current code before acting on it.
 | [Chat deletion has no pre-image history](audit/chat-deletion-has-no-preimage-history.md) | Fixed | Medium | A young chat (created, saved once, deleted) leaves no recovery copy anywhere | Accidental deletion of a recently created chat — the exact case the chat-version feature exists to undo |
 | [Non-selected character and chat writes have no save scheduler](audit/non-selected-character-and-chat-writes-have-no-save-scheduler.md) | Fixed | High | Acknowledged edits to non-selected characters and inactive chats silently reverted on refresh | V3 arbitrary-index setters, Risu-access MCP mutations, background writes; no dirty bridge exists for these targets |
 | [Plugin updates discard configured arguments](audit/plugin-updates-discard-configured-arguments.md) | Fixed | Medium | API keys, endpoints, models, large prompts, and enablement — reset and immediately persisted | The ordinary plugin Update button; every update |
-| [Partial block decode becomes authoritative](audit/partial-block-decode-becomes-authoritative.md) | Open | Medium | Blocks still intact on disk are permanently discarded once the partial decode is cached and re-encoded | Requires one corrupted block first; the response then amplifies corruption instead of failing over to recovery copies |
+| [Partial block decode becomes authoritative](audit/partial-block-decode-becomes-authoritative.md) | Fixed | Medium | Blocks still intact on disk are permanently discarded once the partial decode is cached and re-encoded | Requires one corrupted block first; the response then amplifies corruption instead of failing over to recovery copies |
 | [Rebase promotes ETag before authoritative state installs](audit/rebase-promotes-etag-before-authoritative-state-is-installed.md) | Fixed | Medium | Another client's characters and stubs replaced, their rows deleted, via a stale forced write | Mid-rebase failure (fetch/decode/install), then a forced full write; plugin-memory reconciliation is a production caller of forced writes |
 | [Save loop idles after five failures](audit/save-loop-idles-after-five-failures.md) | Open | Medium | All queued unsaved edits if the tab closes after the loop goes idle | Five consecutive save failures (a network outage) with no new edit afterwards; nothing restarts the loop on reconnect |
 | [Pre-tracking baseline capture omits six save domains](audit/pre-tracking-baseline-capture-still-omits-six-save-domains.md) | Open | Medium | Boot-time mutations (ID repairs, migrations, URL module imports) absorbed as the clean baseline and left memory-only | Every boot that mutates an untracked domain; bot presets and modules are sharpest because unrelated saves don't rescue them |

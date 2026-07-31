@@ -1358,6 +1358,7 @@ async function decodeBoundedLegacyRisuSave(input, options = {}) {
         return await decodeRisuSave(raw, {
             resolveRemote: boundedRemoteResolver,
             strictBlockJson: inspection.format === 'risusave',
+            requireCompleteBlockSet: inspection.format === 'risusave',
             signal: options.signal,
             maxDecodedBytes: strictBlockDecodedBytes ?? maxLegacyBytes,
             onCompressedBlockDecode: options.onCompressedBlockDecode,

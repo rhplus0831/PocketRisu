@@ -83,7 +83,10 @@ async function runTransform(
 ) {
   const directory = await mkdtemp(path.join(tmpdir(), 'block-backup-diff-'))
   dirs.push(directory)
-  const inputBytes = encodeBlocks(blocks)
+  const authoritativeBlocks = blocks.some(block => block.type === RisuSaveType.ROOT)
+    ? blocks
+    : [{ type: RisuSaveType.ROOT, name: 'root', json: '{}' }, ...blocks]
+  const inputBytes = encodeBlocks(authoritativeBlocks)
   const inputPath = path.join(directory, 'database.bin')
   const outputPath = path.join(directory, 'database.risudat')
   await writeFile(inputPath, inputBytes)
@@ -319,6 +322,11 @@ describe('block RisuSave backup transformer differential', () => {
   test.each([
     { name: 'config', type: RisuSaveType.CONFIG, json: '{' },
     { name: 'chat', type: RisuSaveType.CHAT, json: 'NaN' },
+    {
+      name: 'missing-directory-entry',
+      type: RisuSaveType.ROOT,
+      json: JSON.stringify({ __directory: ['missing-character'] }),
+    },
     {
       name: 'unknown-remote',
       type: RisuSaveType.REMOTE,

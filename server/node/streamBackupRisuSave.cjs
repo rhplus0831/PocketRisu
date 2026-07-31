@@ -801,6 +801,9 @@ async function reduceBlockRisuSave(input, options, adapter) {
     const decodedState = { bytes: 0, limit: options.maxDecodedBytes };
     const expanded = await expandRemoteBlocks(rawBlocks, options, decodedState);
     const state = new Map();
+    const loadedBlockNames = new Set(expanded.blocks.map(block => block.name));
+    const directory = new Set();
+    let rootBlocks = 0;
     try {
         for (const block of expanded.blocks) {
             if (block.type === RisuSaveType.REMOTE) continue;
@@ -814,6 +817,20 @@ async function reduceBlockRisuSave(input, options, adapter) {
                     continue;
                 }
                 if (block.type === RisuSaveType.ROOT) {
+                    const rootFields = await readJsonObjectFields(
+                        source,
+                        ['__directory'],
+                        { signal: options.signal, shouldAbort: options.shouldAbort },
+                    );
+                    rootBlocks++;
+                    if (Object.hasOwn(rootFields, '__directory')) {
+                        const rootDirectory = rootFields.__directory;
+                        if (!Array.isArray(rootDirectory)
+                            || rootDirectory.some(name => typeof name !== 'string')) {
+                            throw new Error(`Invalid RisuSave directory in root block ${block.name}`);
+                        }
+                        for (const name of rootDirectory) directory.add(name);
+                    }
                     const entries = await adapter.rootEntries(source);
                     for (const [key, record] of entries) setRootStateValue(state, key, record);
                 } else if (block.type === RisuSaveType.ROOT_COMPONENT) {
@@ -845,6 +862,13 @@ async function reduceBlockRisuSave(input, options, adapter) {
             } finally {
                 await source.cleanup?.();
             }
+        }
+        if (rootBlocks === 0) throw new Error('RisuSave data has no root block');
+        const missingBlocks = [...directory].filter(name => !loadedBlockNames.has(name));
+        if (missingBlocks.length > 0) {
+            throw new Error(
+                `RisuSave directory references missing block${missingBlocks.length === 1 ? '' : 's'}: ${missingBlocks.join(', ')}`,
+            );
         }
         return state;
     } finally {

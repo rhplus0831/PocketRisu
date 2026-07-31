@@ -93,6 +93,7 @@ const { applyPatchAtomic } = require('./atomicJsonPatch.cjs');
 const { createGenerationMemo } = require('./generationMemo.cjs');
 const {
     decodeRisuSave,
+    decodeAuthoritativeRisuSave,
     encodeRisuSaveLegacy,
     calculateHash,
     normalizeJSON,
@@ -1329,6 +1330,16 @@ function markRemoteMigrationDone() {
     kvSet(REMOTE_MIGRATION_MARKER_KEY, REMOTE_MIGRATION_MARKER_VALUE);
 }
 
+async function decodeAuthoritativeDatabase(raw, options = {}) {
+    return decodeAuthoritativeRisuSave(raw, {
+        resolveRemote: async (name) => {
+            const value = kvGet(`remotes/${name}.local.bin`);
+            return value || null;
+        },
+        ...options,
+    });
+}
+
 /**
  * Convert any leftover REMOTE blocks in database.bin into inline raw blocks.
  * Safe to call repeatedly: idempotent via KV marker.
@@ -1357,12 +1368,7 @@ async function migrateRemoteBlocksIfNeeded() {
     const backupKey = `migration-backup/pre-remote-fix-${Date.now()}.bin`;
     kvCopyValue('database/database.bin', backupKey);
 
-    const dbObj = await decodeRisuSave(raw, {
-        resolveRemote: async (name) => {
-            const value = kvGet(`remotes/${name}.local.bin`);
-            return value || null;
-        },
-    });
+    const dbObj = await decodeAuthoritativeDatabase(raw);
 
     const reEncoded = encodeRisuSaveLegacy(dbObj, 'compression');
 
@@ -1401,12 +1407,7 @@ async function migrateRemoteBlocksIfNeeded() {
  * same strict validation used by ingest.
  */
 async function preflightBootDatabase(raw) {
-    const decoded = await decodeRisuSave(raw, {
-        resolveRemote: async (name) => {
-            const value = kvGet(`remotes/${name}.local.bin`);
-            return value || null;
-        },
-    });
+    const decoded = await decodeAuthoritativeDatabase(raw);
     const normalized = normalizeJSON(decoded);
     validateDatabaseShape(normalized);
     snapshotOptimizedPluginStorageFields(decoded);
@@ -1429,7 +1430,7 @@ async function ingestDatabase(raw, {
         }
     }
     const decoded = Buffer.isBuffer(source) || source instanceof Uint8Array
-        ? await decodeRisuSave(source)
+        ? await decodeAuthoritativeDatabase(source)
         : source;
     const dbObj = normalizeJSON(decoded);
     validateDatabaseShape(dbObj);
@@ -1570,7 +1571,7 @@ async function loadStrippedDatabase(raw, source) {
         logger.warn(`[${source}] Large supported database.bin found; externalizing through the streaming ingest path`);
         return (await ingestDatabaseStreaming(raw, { inspection })).strippedDb;
     }
-    const rawDecoded = await decodeRisuSave(raw);
+    const rawDecoded = await decodeAuthoritativeDatabase(raw);
     const decoded = normalizeJSON(rawDecoded);
     validateDatabaseShape(decoded);
     const strictPluginStorage = snapshotOptimizedPluginStorageFields(rawDecoded);
@@ -5022,7 +5023,7 @@ async function readLivePluginStoragePublication() {
     let dbObj = dbCache[DB_HEX_KEY] || null;
     if (!dbObj) {
         const rawDatabase = kvGet('database/database.bin');
-        dbObj = rawDatabase ? await decodeRisuSave(rawDatabase) : null;
+        dbObj = rawDatabase ? await decodeAuthoritativeDatabase(rawDatabase) : null;
     }
     return {
         dbObj,
@@ -5725,7 +5726,9 @@ async function listPluginBackupEntries(
     if (!dbObj) {
         const rawDatabase = reader.kvGet('database/database.bin');
         if (!rawDatabase) return [];
-        dbObj = await decodeRisuSave(rawDatabase);
+        dbObj = await decodeAuthoritativeRisuSave(rawDatabase, {
+            resolveRemote: async (name) => reader.kvGet(`remotes/${name}.local.bin`) || null,
+        });
     }
     const owned = resolveOwnedPluginStorageKeys(dbObj, reader);
     const sizes = new Map([
@@ -9566,7 +9569,9 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
         if (isClosed()) return;
 
         const rawDatabase = snapshot.kvGet('database/database.bin');
-        const dbObj = rawDatabase ? await decodeRisuSave(rawDatabase) : null;
+        const dbObj = rawDatabase ? await decodeAuthoritativeRisuSave(rawDatabase, {
+            resolveRemote: async (name) => snapshot.kvGet(`remotes/${name}.local.bin`) || null,
+        }) : null;
         const generation = pluginStorageGeneration(dbObj);
         const manifestState = readPluginStorageManifestState(snapshot.kvGet);
         metrics.manifestParses = 1;
@@ -11102,7 +11107,7 @@ async function handlePluginStorageManifestMutation(req, res, next) {
             await flushPendingDb();
             const rawDatabase = kvGet('database/database.bin');
             if (!rawDatabase) return res.status(409).json({ error: 'Database not found' });
-            const liveDb = await decodeRisuSave(rawDatabase);
+            const liveDb = await decodeAuthoritativeDatabase(rawDatabase);
             const generation = typeof plan?.generation === 'string' && plan.generation.length > 0
                 ? plan.generation
                 : null;
@@ -11270,7 +11275,7 @@ async function refreshPluginTransitionStageState(stage) {
     if (!stage || stage.state === 'committed' || stage.state === 'aborted') return stage;
     const rawDatabase = kvGet('database/database.bin');
     if (!rawDatabase) return stage;
-    const dbObj = await decodeRisuSave(rawDatabase);
+    const dbObj = await decodeAuthoritativeDatabase(rawDatabase);
     const manifest = readPluginStorageManifestState().manifest;
     if (
         (dbObj?.optimizePluginMemory === true) === stage.targetOptimized
@@ -11703,7 +11708,7 @@ app.post('/api/plugin-storage/transition/stage/begin', async (req, res, next) =>
                     error: 'Another plugin storage transition is already active',
                 });
             }
-            const liveDb = await decodeRisuSave(rawDatabase);
+            const liveDb = await decodeAuthoritativeDatabase(rawDatabase);
             const manifestState = readPluginStorageManifestState();
             try {
                 assertPluginStorageSource(plan.source, liveDb, manifestState);
@@ -12025,7 +12030,7 @@ app.post('/api/plugin-storage/transition/stage/finalize', async (req, res, next)
             await flushPendingDb();
             const rawDatabase = kvGet('database/database.bin');
             if (!rawDatabase) return res.status(409).json({ error: 'Database not found' });
-            const liveDb = await decodeRisuSave(rawDatabase);
+            const liveDb = await decodeAuthoritativeDatabase(rawDatabase);
             const manifestState = readPluginStorageManifestState();
             try {
                 assertPluginStorageSource(stage.source, liveDb, manifestState);
@@ -12190,12 +12195,12 @@ app.post('/api/plugin-storage/transition', async (req, res, next) => {
             return res.status(400).json({ error: 'Invalid plugin storage transition envelope' });
         }
         const targetDatabaseBytes = Buffer.from(plan.database);
-        const targetDb = await decodeRisuSave(targetDatabaseBytes);
+        const targetDb = await decodeAuthoritativeDatabase(targetDatabaseBytes);
         await queueStorageMutation(async () => {
             await flushPendingDb();
             const rawDatabase = kvGet('database/database.bin');
             if (!rawDatabase) return res.status(409).json({ error: 'Database not found' });
-            const liveDb = await decodeRisuSave(rawDatabase);
+            const liveDb = await decodeAuthoritativeDatabase(rawDatabase);
             const manifestState = readPluginStorageManifestState();
             try {
                 assertPluginStorageSource(plan.source, liveDb, manifestState);
@@ -12470,7 +12475,7 @@ app.post('/api/write', async (req, res, next) => {
                     // decode the prior live row solely for targeted cleanup;
                     // optimize's grace-window sweep handles cache-cold writes.
                     const previousStrippedDb = dbCache[filePath] || dbCache[DB_HEX_KEY] || null;
-                    const incomingDb = await decodeRisuSave(fileContent);
+                    const incomingDb = await decodeAuthoritativeDatabase(fileContent);
 
                     // Mirror the patch-persist guard:
                     // a malformed full-write payload could carry chats with
@@ -12589,7 +12594,7 @@ app.post('/api/write', async (req, res, next) => {
                 dbEtag = computeBufferEtag(persistedDatabaseContent);
                 rememberSessionPluginStorageState(
                     req,
-                    await decodeRisuSave(persistedDatabaseContent),
+                    await decodeAuthoritativeDatabase(persistedDatabaseContent),
                 );
                 shouldCreateBackup = true;
             } else if (Object.hasOwn(dbCache, filePath) || saveTimers[filePath]) {
@@ -15285,7 +15290,7 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
             res.json({ characters: [], orphan: { count: 0, totalSize: 0 }, chatBytesNote: 'estimate' });
             return;
         }
-        const dbObj = await decodeRisuSave(raw);
+        const dbObj = await decodeAuthoritativeDatabase(raw);
 
         const assetSize = new Map();
         for (const it of listAssetEntriesWithSizes()) {
@@ -15377,7 +15382,7 @@ app.get('/api/db/stats/modules', async (req, res, next) => {
             res.json({ modules: [] });
             return;
         }
-        const dbObj = await decodeRisuSave(raw);
+        const dbObj = await decodeAuthoritativeDatabase(raw);
         const list = Array.isArray(dbObj.modules) ? dbObj.modules : [];
 
         const assetSize = new Map();
