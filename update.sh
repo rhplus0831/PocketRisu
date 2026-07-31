@@ -9,6 +9,52 @@ info()  { printf '\033[1;34m[INFO]\033[0m  %s\n' "$*"; }
 warn()  { printf '\033[1;33m[WARN]\033[0m  %s\n' "$*"; }
 error() { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*"; exit 1; }
 
+# Return the top-level app entry containing a marker-declared recovery path.
+# Paths outside the app root need no protection. Refuse managed app roots so a
+# stale or hand-edited marker cannot preserve old executable files over a new
+# release. Node is already a requirement for source installations and gives us
+# portable path normalization without relying on platform-specific realpath
+# flags.
+custom_data_keep_entry() {
+    local marker_path="$1"
+    local label="$2"
+    [ -f "$marker_path" ] || return 0
+
+    node - "$SCRIPT_DIR" "$marker_path" "$label" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+
+const [root, markerPath, label] = process.argv.slice(2);
+let raw;
+try {
+    raw = fs.readFileSync(markerPath, 'utf8').trim();
+} catch {
+    process.exit(0);
+}
+if (!raw) process.exit(0);
+
+let relative;
+try {
+    relative = path.relative(root, path.resolve(root, raw));
+} catch {
+    process.exit(0);
+}
+if (relative.startsWith('..') || path.isAbsolute(relative)) process.exit(0);
+if (!relative) {
+    process.stderr.write(`[ERROR] ${label} points at the PocketRisu app root. Move it to a separate folder before updating.\n`);
+    process.exit(1);
+}
+
+const top = relative.split(path.sep)[0];
+const managedRoots = new Set(['server', 'dist', 'scripts', 'bin', 'node_modules', '.update-tmp']);
+if (managedRoots.has(top)) {
+    process.stderr.write(`[ERROR] ${label} is inside PocketRisu app files (${relative}). Move it to a separate folder such as data/backups before updating.\n`);
+    process.exit(1);
+}
+process.stdout.write(top);
+NODE
+}
+
 # ── Check current version ─────────────────────────────────────────────────────
 
 CURRENT=""
@@ -82,8 +128,36 @@ EXTRACTED_DIR=$(find "$TMP_DIR" -maxdepth 1 -type d \
 
 info "Updating files..."
 
-# Remove old app files but keep save/ and backups/
-find "$SCRIPT_DIR" -mindepth 1 -maxdepth 1 ! -name 'save' ! -name 'backups' ! -name '.installed-version' -exec rm -rf {} +
+# Remove old app files but keep the default data roots and any custom in-tree
+# recovery roots recorded by the server for dependency-free updaters.
+KEEP_ENTRIES=('save' 'backups' '.installed-version')
+for marker_name in '__backup_path' '__chat_backup_path'; do
+    case "$marker_name" in
+        '__backup_path') label='Server-backup directory' ;;
+        '__chat_backup_path') label='Chat-backup directory' ;;
+    esac
+    custom_keep=$(custom_data_keep_entry "$SCRIPT_DIR/save/$marker_name" "$label")
+    if [ -n "$custom_keep" ]; then
+        info "Preserving $label: $custom_keep/"
+        KEEP_ENTRIES+=("$custom_keep")
+    fi
+done
+
+shopt -s nullglob
+for entry_path in "$SCRIPT_DIR"/* "$SCRIPT_DIR"/.[!.]* "$SCRIPT_DIR"/..?*; do
+    entry_name=${entry_path##*/}
+    preserve_entry=0
+    for keep_entry in "${KEEP_ENTRIES[@]}"; do
+        if [ "$entry_name" = "$keep_entry" ]; then
+            preserve_entry=1
+            break
+        fi
+    done
+    if [ "$preserve_entry" -eq 0 ]; then
+        rm -rf -- "$entry_path"
+    fi
+done
+shopt -u nullglob
 
 # Move new files in
 mv "$EXTRACTED_DIR"/* "$EXTRACTED_DIR"/.[!.]* "$SCRIPT_DIR/" 2>/dev/null || true

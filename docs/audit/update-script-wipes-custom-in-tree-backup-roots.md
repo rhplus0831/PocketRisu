@@ -1,9 +1,11 @@
 # update.sh deletes custom in-tree backup directories the server permits
 
-- Status: Open
+- Status: Fixed
 - Severity: Medium
 - Area: deployment scripts
-- Affected code: `update.sh:86` (deletion sweep spares only `save`, `backups`, `.installed-version`), `server/node/server.cjs:907` (`MANAGED_BACKUP_PATH_ROOTS` denylist omits arbitrary dirs like `data`), `server/node/server.cjs:911-930` (`save/__backup_path` marker written for the portable updater only)
+- Formerly affected code: historical replacement sweep in `update.sh`; fixed by
+  marker-aware keep-list construction and covered by
+  `server/node/updateScript.test.ts`
 
 ## Risk
 
@@ -21,3 +23,18 @@ Make `update.sh` honor `save/__backup_path` (and `save/__chat_backup_path`)
 before the sweep, or refuse in-tree custom recovery paths for source
 deployments. A scripted test: configure `data/backups`, run the update
 replacement step, assert the archives survive.
+
+## Resolution
+
+Fixed 2026-07-31. The source updater now reads and path-normalizes both recovery
+markers before deleting old application files. It preserves the exact top-level
+directory containing each custom in-tree server-backup or chat-history root,
+ignores paths outside the installation, and refuses app-root or managed-code
+targets before the deletion sweep begins.
+
+`server/node/updateScript.test.ts` performs complete updates against temporary
+installations using a local release archive. It verifies that `save/`, default
+backups, custom server archives, and custom chat versions survive while stale
+application files are replaced, including a custom root with shell-pattern
+characters. A second case proves a managed-root marker aborts without deleting
+the old installation.

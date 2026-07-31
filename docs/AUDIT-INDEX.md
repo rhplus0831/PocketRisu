@@ -1,8 +1,8 @@
 # Audit findings — priority index
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
-`Status` column uses `Open`, `Fixed`, or `Deferred`; 39 findings are currently
-`Open`, 20 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
+`Status` column uses `Open`, `Fixed`, or `Deferred`; 38 findings are currently
+`Open`, 21 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
 as a cross-reference).
@@ -98,7 +98,7 @@ that make P1–P3 incidents recoverable.
 | Finding | Status | Doc sev. | What could be lost | Trigger / likelihood |
 |---|---|---|---|---|
 | [Docker server backups are ephemeral](audit/docker-server-backups-are-ephemeral.md) | Fixed | Medium | Every server-side `.bin` backup | Every image update or container recreation with the shipped Compose file — discovered exactly when a backup is needed |
-| [update.sh wipes custom in-tree backup roots](audit/update-script-wipes-custom-in-tree-backup-roots.md) | Open | Medium | All recovery archives under a custom in-tree root (e.g. `data/backups`) | Every `update.sh` run once such a path is configured; the server permits the configuration |
+| [update.sh wipes custom in-tree backup roots](audit/update-script-wipes-custom-in-tree-backup-roots.md) | Fixed | Medium | All recovery archives under a custom in-tree root (e.g. `data/backups`) | Every `update.sh` run once such a path is configured; the server permits the configuration |
 | [Best-effort path markers let updaters delete recovery directories](audit/best-effort-path-markers-let-updaters-delete-recovery-directories.md) | Open | Medium | All archives under a custom root, classified as update debris | Marker write/read failure (swallowed silently) plus an updater run |
 | [Wall-clock rollback disables chat pre-image capture](audit/wall-clock-rollback-disables-chat-preimage-capture.md) | Open | Medium | Pre-image capture silently off — possibly for years — while authoritative overwrites continue | A bad RTC or large backward NTP correction; the state persists across restarts |
 | [Changing the chat-backup root hides all existing version history](audit/changing-chat-backup-root-hides-all-existing-version-history.md) | Open | Medium | All prior version history invisible; an operator may then clean the old volume, deleting the only pre-images | Changing the chat-backup root override |
