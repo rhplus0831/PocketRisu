@@ -38,7 +38,7 @@ many users use that path.
 - [Chat saves wait for a full snapshot after committing](chat-save-blocked-by-synchronous-snapshot.md)
 - [V3 top-level completion blocks application startup](v3-top-level-startup-barrier.md)
 - [Chat-row migration breaks direct rollback to main (fixed 2026-07-31)](chat-row-migration-breaks-main-rollback.md)
-- [Asset externalization breaks direct rollback to main](asset-externalization-breaks-main-rollback.md)
+- [Asset externalization breaks direct rollback to main (fixed 2026-07-31)](asset-externalization-breaks-main-rollback.md)
 - [Default export/import limits did not round-trip (fixed 2026-07-30)](backup-export-import-limit-mismatch.md)
 
 ## Plugin and storage reports
