@@ -23,6 +23,8 @@ export interface ServerHandle {
   cwd: string
   /** Restart the same save directory on a fresh port. */
   restart: (env?: Record<string, string>) => Promise<void>
+  /** Abruptly kill the active process without deleting its save directory. */
+  crash: () => Promise<void>
   /** Kill the server and clean up the temp directory. */
   cleanup: () => Promise<void>
 }
@@ -154,6 +156,23 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Server
   handle.restart = async (env = {}) => {
     await stop()
     await launch(env)
+  }
+  handle.crash = async () => {
+    const active = child
+    if (!active || exited) return
+    active.kill('SIGKILL')
+    await new Promise<void>(resolve => {
+      if (active.exitCode !== null) {
+        resolve()
+        return
+      }
+      active.once('exit', () => resolve())
+    })
+    if (child === active) {
+      child = null
+      handle.pid = 0
+      exited = true
+    }
   }
   handle.cleanup = async () => {
     await stop()

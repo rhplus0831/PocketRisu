@@ -2342,6 +2342,17 @@ if (existsSync(instanceIdPath)) {
 const authCodePath = path.join(process.cwd(), 'save', '__authcode')
 const inlayDir = path.join(savePath, 'inlays')
 const inlayMigrationMarker = path.join(inlayDir, '.migrated_to_fs')
+const INLAY_TEMP_PREFIX = '.inlay-publish-'
+const INLAY_TEMP_NAME_PATTERN = /^\.inlay-publish-\d+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-(?:payload|sidecar)$/i
+const inlayPublishFailpoint = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_INLAY_PUBLISH_FAILPOINT ?? '').trim()
+    : ''
+const inlayPublishTestGateDir = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_INLAY_PUBLISH_GATE_DIR ?? '').trim() || null
+    : null
+const inlayPublishTestGateStage = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_INLAY_PUBLISH_GATE_STAGE ?? '').trim()
+    : ''
 const IMPORT_JOURNAL_PATH = path.join(savePath, 'import_journal.json')
 const IMPORT_JOURNAL_MARKER_KEY = 'import_journal/marker'
 const hexRegex = /^[0-9a-fA-F]+$/;
@@ -2905,6 +2916,113 @@ function ensureInlayDirSync() {
     }
 }
 
+async function fsyncInlayDirectory() {
+    let directoryHandle;
+    try {
+        directoryHandle = await fs.open(inlayDir, 'r');
+        await directoryHandle.sync();
+    } catch {
+        // Some platforms do not allow directory handles to be opened or synced.
+        // The staged file itself is still synced before every atomic rename.
+    } finally {
+        await directoryHandle?.close().catch(() => {});
+    }
+}
+
+function fsyncInlayDirectorySync() {
+    let directoryDescriptor;
+    try {
+        directoryDescriptor = openSync(inlayDir, 'r');
+        fsyncSync(directoryDescriptor);
+    } catch {
+        // Directory fsync is unavailable on some platforms.
+    } finally {
+        if (directoryDescriptor !== undefined) {
+            try { closeSync(directoryDescriptor); } catch {}
+        }
+    }
+}
+
+function newInlayTempPath(label) {
+    const tempPath = path.join(
+        inlayDir,
+        `${INLAY_TEMP_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}-${label}`,
+    );
+    assertInsideInlayDir(tempPath);
+    return tempPath;
+}
+
+function isInlayTemporaryFileName(name) {
+    return typeof name === 'string' && INLAY_TEMP_NAME_PATTERN.test(name);
+}
+
+async function writeDurableInlayTempFile(filePath, value) {
+    let handle;
+    try {
+        handle = await fs.open(filePath, 'wx', 0o600);
+        await handle.writeFile(value);
+        await handle.sync();
+    } finally {
+        await handle?.close().catch(() => {});
+    }
+}
+
+function writeDurableInlayTempFileSync(filePath, value) {
+    let descriptor;
+    try {
+        descriptor = openSync(filePath, 'wx', 0o600);
+        writeFileSync(descriptor, value);
+        fsyncSync(descriptor);
+    } finally {
+        if (descriptor !== undefined) {
+            try { closeSync(descriptor); } catch {}
+        }
+    }
+}
+
+async function reachInlayPublishTestBoundary(stage, id) {
+    if (inlayPublishFailpoint === stage) {
+        throw new Error(`Injected inlay publication failure at ${stage}`);
+    }
+    if (!inlayPublishTestGateDir || inlayPublishTestGateStage !== stage) return;
+    const holdPath = path.join(inlayPublishTestGateDir, 'hold');
+    if (!existsSync(holdPath)) return;
+    await fs.mkdir(inlayPublishTestGateDir, { recursive: true });
+    await fs.writeFile(
+        path.join(inlayPublishTestGateDir, 'entered'),
+        JSON.stringify({ stage, id }),
+        'utf-8',
+    );
+    const releasePath = path.join(inlayPublishTestGateDir, 'release');
+    while (existsSync(holdPath) && !existsSync(releasePath)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+}
+
+function inlaySidecarValue(id, info) {
+    return Buffer.from(JSON.stringify({
+        ext: normalizeInlayExt(info?.ext),
+        name: typeof info?.name === 'string' ? info.name : id,
+        type: typeof info?.type === 'string' ? info.type : 'image',
+        height: typeof info?.height === 'number' ? info.height : undefined,
+        width: typeof info?.width === 'number' ? info.width : undefined,
+    }));
+}
+
+async function reconcileInterruptedInlayPublications() {
+    await ensureInlayDir();
+    const entries = await fs.readdir(inlayDir, { withFileTypes: true });
+    let removedTemporaryFile = false;
+    for (const entry of entries) {
+        if (!entry.isFile() || !isInlayTemporaryFileName(entry.name)) continue;
+        await fs.unlink(path.join(inlayDir, entry.name)).catch((error) => {
+            if (error?.code !== 'ENOENT') throw error;
+        });
+        removedTemporaryFile = true;
+    }
+    if (removedTemporaryFile) await fsyncInlayDirectory();
+}
+
 function getMimeFromExt(ext, buffer) {
     return ASSET_EXT_MIME[normalizeInlayExt(ext)] || detectMime(buffer);
 }
@@ -3005,49 +3123,153 @@ async function readInlayFile(id) {
 
 async function writeInlaySidecar(id, info) {
     await ensureInlayDir();
-    const sidecar = {
-        ext: normalizeInlayExt(info?.ext),
-        name: typeof info?.name === 'string' ? info.name : id,
-        type: typeof info?.type === 'string' ? info.type : 'image',
-        height: typeof info?.height === 'number' ? info.height : undefined,
-        width: typeof info?.width === 'number' ? info.width : undefined,
-    };
-    await fs.writeFile(getInlaySidecarPath(id), JSON.stringify(sidecar));
+    const temporaryPath = newInlayTempPath('sidecar');
+    try {
+        await writeDurableInlayTempFile(temporaryPath, inlaySidecarValue(id, info));
+        await fs.rename(temporaryPath, getInlaySidecarPath(id));
+        await fsyncInlayDirectory();
+    } finally {
+        await fs.unlink(temporaryPath).catch(() => {});
+    }
 }
 
 function writeInlaySidecarSync(id, info) {
     ensureInlayDirSync();
-    const sidecar = {
-        ext: normalizeInlayExt(info?.ext),
-        name: typeof info?.name === 'string' ? info.name : id,
-        type: typeof info?.type === 'string' ? info.type : 'image',
-        height: typeof info?.height === 'number' ? info.height : undefined,
-        width: typeof info?.width === 'number' ? info.width : undefined,
-    };
-    writeFileSync(getInlaySidecarPath(id), JSON.stringify(sidecar));
+    const temporaryPath = newInlayTempPath('sidecar');
+    try {
+        writeDurableInlayTempFileSync(temporaryPath, inlaySidecarValue(id, info));
+        renameSync(temporaryPath, getInlaySidecarPath(id));
+        fsyncInlayDirectorySync();
+    } finally {
+        try { unlinkSync(temporaryPath); } catch {}
+    }
 }
 
 async function writeInlayFile(id, ext, buffer, info = null) {
     await ensureInlayDir();
-    await deleteInlayRawFile(id);
     const normalizedExt = normalizeInlayExt(ext);
-    await fs.writeFile(getInlayFilePath(id, normalizedExt), Buffer.from(buffer));
-    await writeInlaySidecar(id, {
+    const destinationPath = getInlayFilePath(id, normalizedExt);
+    const sidecarPath = getInlaySidecarPath(id);
+    const previousPath = await resolveInlayFilePath(id);
+    const payloadTemporaryPath = newInlayTempPath('payload');
+    const sidecarTemporaryPath = newInlayTempPath('sidecar');
+    const sidecarValue = inlaySidecarValue(id, {
         ...(info || {}),
         ext: normalizedExt,
     });
+    let payloadPublished = false;
+    let sidecarPublished = false;
+    try {
+        // Stage and sync both files before changing any reader-visible path.
+        // ENOSPC and encoding/write failures therefore leave the old inlay
+        // completely untouched.
+        await writeDurableInlayTempFile(payloadTemporaryPath, Buffer.from(buffer));
+        await writeDurableInlayTempFile(sidecarTemporaryPath, sidecarValue);
+        await reachInlayPublishTestBoundary('before-payload-publish', id);
+
+        // Publish the payload first while the prior sidecar and prior-extension
+        // payload remain authoritative. The sidecar rename below is the commit
+        // point for extension-changing replacements.
+        await fs.rename(payloadTemporaryPath, destinationPath);
+        payloadPublished = true;
+        await fsyncInlayDirectory();
+        await reachInlayPublishTestBoundary('after-payload-publish', id);
+
+        await fs.rename(sidecarTemporaryPath, sidecarPath);
+        sidecarPublished = true;
+        await fsyncInlayDirectory();
+
+        // Only a committed sidecar can make the prior extension obsolete.
+        // Failures here retain an extra recoverable copy rather than removing
+        // the only valid one.
+        if (previousPath && previousPath !== destinationPath) {
+            try {
+                await fs.unlink(previousPath);
+                await fsyncInlayDirectory();
+            } catch (error) {
+                if (error?.code !== 'ENOENT') {
+                    logger.warn(`[InlayFS] Failed to remove obsolete payload for ${id}:`, error?.message || error);
+                }
+            }
+        }
+    } catch (error) {
+        // If an extension-changing replacement did not reach its sidecar commit
+        // point, roll back its newly visible orphan. The prior sidecar-selected
+        // source remains untouched. Same-extension rename is already atomic and
+        // therefore still leaves one complete payload.
+        if (payloadPublished && !sidecarPublished && previousPath !== destinationPath) {
+            try {
+                await fs.unlink(destinationPath);
+                await fsyncInlayDirectory();
+            } catch (rollbackError) {
+                if (rollbackError?.code !== 'ENOENT') {
+                    logger.warn(
+                        `[InlayFS] Failed to roll back unpublished payload for ${id}:`,
+                        rollbackError?.message || rollbackError,
+                    );
+                }
+            }
+        }
+        throw error;
+    } finally {
+        await fs.unlink(payloadTemporaryPath).catch(() => {});
+        await fs.unlink(sidecarTemporaryPath).catch(() => {});
+    }
     kvClearDeletion(`inlay/${id}`);
 }
 
 function writeInlayFileSync(id, ext, buffer, info = null) {
     ensureInlayDirSync();
-    deleteInlayRawFileSync(id);
     const normalizedExt = normalizeInlayExt(ext);
-    writeFileSync(getInlayFilePath(id, normalizedExt), Buffer.from(buffer));
-    writeInlaySidecarSync(id, {
+    const destinationPath = getInlayFilePath(id, normalizedExt);
+    const sidecarPath = getInlaySidecarPath(id);
+    const previousPath = resolveInlayFilePathSync(id);
+    const payloadTemporaryPath = newInlayTempPath('payload');
+    const sidecarTemporaryPath = newInlayTempPath('sidecar');
+    const sidecarValue = inlaySidecarValue(id, {
         ...(info || {}),
         ext: normalizedExt,
     });
+    let payloadPublished = false;
+    let sidecarPublished = false;
+    try {
+        writeDurableInlayTempFileSync(payloadTemporaryPath, Buffer.from(buffer));
+        writeDurableInlayTempFileSync(sidecarTemporaryPath, sidecarValue);
+        renameSync(payloadTemporaryPath, destinationPath);
+        payloadPublished = true;
+        fsyncInlayDirectorySync();
+        renameSync(sidecarTemporaryPath, sidecarPath);
+        sidecarPublished = true;
+        fsyncInlayDirectorySync();
+        if (previousPath && previousPath !== destinationPath) {
+            try {
+                unlinkSync(previousPath);
+                fsyncInlayDirectorySync();
+            } catch (error) {
+                if (error?.code !== 'ENOENT') {
+                    logger.warn(`[InlayFS] Failed to remove obsolete payload for ${id}:`, error?.message || error);
+                }
+            }
+        }
+    } catch (error) {
+        if (payloadPublished && !sidecarPublished && previousPath !== destinationPath) {
+            try {
+                unlinkSync(destinationPath);
+                fsyncInlayDirectorySync();
+            } catch (rollbackError) {
+                if (rollbackError?.code !== 'ENOENT') {
+                    logger.warn(
+                        `[InlayFS] Failed to roll back unpublished payload for ${id}:`,
+                        rollbackError?.message || rollbackError,
+                    );
+                }
+            }
+        }
+        throw error;
+    } finally {
+        try { unlinkSync(payloadTemporaryPath); } catch {}
+        try { unlinkSync(sidecarTemporaryPath); } catch {}
+    }
     kvClearDeletion(`inlay/${id}`);
 }
 
@@ -3088,6 +3310,7 @@ async function listInlayFiles() {
         .filter((entry) => (
             entry.isFile() &&
             entry.name !== '.migrated_to_fs' &&
+            !isInlayTemporaryFileName(entry.name) &&
             !entry.name.endsWith('.meta.json')
         ))
         .map((entry) => {
@@ -3144,7 +3367,7 @@ async function readInlayAssetPayload(id) {
 }
 
 async function migrateInlaysToFilesystem() {
-    await ensureInlayDir();
+    await reconcileInterruptedInlayPublications();
     if (existsSync(inlayMigrationMarker)) return;
 
     const keys = kvList('inlay/');
@@ -15609,12 +15832,22 @@ app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
                         }
                         const sidecar = await readInlaySidecar(entry.id);
                         const info = sidecar || {};
-                        await writeInlayFile(
-                            entry.id,
-                            'webp',
-                            webpBuf,
-                            { ...info, ext: 'webp' },
-                        );
+                        try {
+                            await writeInlayFile(
+                                entry.id,
+                                'webp',
+                                webpBuf,
+                                { ...info, ext: 'webp' },
+                            );
+                        } catch (cause) {
+                            const publicationError = new Error(
+                                `Failed to publish compressed inlay ${entry.id}: ${cause?.message || cause}`,
+                                { cause },
+                            );
+                            publicationError.code = 'INLAY_PUBLICATION_FAILED';
+                            publicationError.inlayId = entry.id;
+                            throw publicationError;
+                        }
                         kvDel(`inlay_thumb/${entry.id}`);
                         return true;
                     });
@@ -15636,6 +15869,16 @@ app.post('/api/inlays/compress', sessionAuthMiddleware, async (req, res) => {
                     send({
                         type: 'error',
                         message: 'An import started; compression stopped. Retry after it completes.',
+                    });
+                    res.end();
+                    return;
+                }
+                if (entryError?.code === 'INLAY_PUBLICATION_FAILED') {
+                    send({
+                        type: 'error',
+                        code: entryError.code,
+                        id: entryError.inlayId,
+                        message: entryError.message,
                     });
                     res.end();
                     return;

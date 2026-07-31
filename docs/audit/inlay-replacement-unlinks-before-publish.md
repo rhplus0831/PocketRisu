@@ -1,9 +1,9 @@
 # Inlay replacement unlinks the only copy before publishing the new one
 
-- Status: Open
+- Status: Fixed
 - Severity: High
 - Area: server file stores (inlays)
-- Affected code: `server/node/server.cjs:1281-1309` (`writeInlayFile` deletes first, writes directly to the final name, no fsync), `server/node/server.cjs:4244-4262` (`/api/write` inlay path), `server/node/server.cjs:6818-6861` (bulk compression; per-entry failures counted as `skipped`)
+- Affected code: historical `writeInlayFile` delete-first publication and bulk-compression skip handling in `server/node/server.cjs`; fixed in the atomic inlay publication helpers and `/api/inlays/compress`
 
 ## Risk
 
@@ -37,3 +37,28 @@ publication failure as an error (with the source preserved), not a skip.
 Cover with fault-injection: force the post-unlink write to fail and assert the
 original payload still exists; kill mid-overwrite and assert one valid version
 survives restart.
+
+## Resolution
+
+Fixed 2026-07-31. Inlay payloads and sidecars are now written to exclusive
+temporary files and fsynced before any reader-visible path changes. The payload
+is atomically renamed first while the prior sidecar and prior-extension payload
+remain authoritative; the atomic sidecar rename is the extension-changing
+commit point. The directory is fsynced after publication, and the exact prior
+payload is removed only after that commit. Same-extension replacement uses the
+atomic payload rename, so readers see either the complete old bytes or the
+complete new bytes. Sidecar-only writes use the same staged, fsynced rename
+pattern, temporary files are excluded from inlay enumeration, and startup
+removes temporary files left by an interrupted process.
+
+Bulk compression now distinguishes publication failures from ordinary
+non-beneficial or unconvertible images. A publication failure terminates the
+stream with `INLAY_PUBLICATION_FAILED` instead of incrementing `skipped` and
+reporting `done`; an extension-changing failure before the sidecar commit rolls
+back the unpublished destination while retaining the original source.
+
+`test/compat/inlay-publication-atomicity.test.ts` covers an injected staged-write
+failure, compression failure reporting with byte-exact source preservation, and
+a real `SIGKILL` after payload publication but before the sidecar commit followed
+by restart. Existing inlay-reference and pinned full-export race coverage also
+passes with the new protocol.
