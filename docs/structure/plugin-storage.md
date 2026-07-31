@@ -224,7 +224,10 @@ larger than 64 MiB total or contains a row larger than 32 MiB.
 uses the ETag-fenced `/api/plugin-storage/reconcile-boot` endpoint: the server validates
 manifest-owned rows one at a time, copies recoverable inline leftovers, and atomically
 clears those inline copies only after validation succeeds. The response contains counts
-and encoded-key-only diagnostics, never plugin values. Older servers and inline mode use
+and encoded-key-only diagnostics, never plugin values. The queued fence rederives both
+the raw boot-row ETag and the canonical legacy-encoded database-view ETag from the same
+selected bytes, accepts only the representation supplied by the preceding boot read, and
+preserves that accepted token for later ordinary saves. Older servers and inline mode use
 the retained client `reconcilePluginStorageModeForBoot()` compatibility path.
 `reconcilePluginStorageMode()` is dependency-injected test support and rejects ordinary
 production use.

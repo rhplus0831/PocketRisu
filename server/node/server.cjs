@@ -1576,6 +1576,17 @@ async function ingestDatabaseStreaming(source, {
     return result;
 }
 
+function normalizeDecodedDatabaseForRead(rawDecoded) {
+    const decoded = normalizeJSON(rawDecoded);
+    validateDatabaseShape(decoded);
+    const strictPluginStorage = snapshotOptimizedPluginStorageFields(rawDecoded);
+    if (strictPluginStorage) {
+        decoded.pluginCustomStorage = strictPluginStorage.values;
+        if (strictPluginStorage.hasMeta) decoded.pluginStorageMeta = strictPluginStorage.meta;
+    }
+    return decoded;
+}
+
 async function loadStrippedDatabase(raw, source) {
     const inspection = await inspectRisuSaveSource(raw);
     if (kvGet(CHAT_EXTERNALIZATION_MARKER_KEY) === null
@@ -1584,13 +1595,7 @@ async function loadStrippedDatabase(raw, source) {
         return (await ingestDatabaseStreaming(raw, { inspection })).strippedDb;
     }
     const rawDecoded = await decodeAuthoritativeDatabase(raw);
-    const decoded = normalizeJSON(rawDecoded);
-    validateDatabaseShape(decoded);
-    const strictPluginStorage = snapshotOptimizedPluginStorageFields(rawDecoded);
-    if (strictPluginStorage) {
-        decoded.pluginCustomStorage = strictPluginStorage.values;
-        if (strictPluginStorage.hasMeta) decoded.pluginStorageMeta = strictPluginStorage.meta;
-    }
+    const decoded = normalizeDecodedDatabaseForRead(rawDecoded);
     const hasChats = hasChatPayloads(decoded);
     const hasPluginStorage = hasExternalizablePluginStorage(decoded);
     if (!hasChats && !hasPluginStorage) return decoded;
@@ -5289,26 +5294,39 @@ async function reconcileOptimizedPluginStorageForBoot(req, expectedEtag) {
             error.pluginStorageBootStatus = 409;
             throw error;
         }
-        // Hash the bytes selected inside this queued operation instead of
-        // trusting a process-local cache. This keeps the fence authoritative
-        // even after an out-of-process repair changes the SQLite row.
-        const currentEtag = computeBufferEtag(rawDatabase);
-        dbEtag = currentEtag;
-        if (expectedEtag !== currentEtag) {
+        // Derive both accepted boot tokens from the bytes selected inside this
+        // queued operation. Cache-off boot receives the raw-row token, while
+        // cache-enabled boot receives the legacy-encoded normalized-view token.
+        // Accepting either equivalent representation preserves the fence while
+        // still detecting an out-of-process change to the selected database.
+        const rawEtag = computeBufferEtag(rawDatabase);
+        const liveDb = await decodeAuthoritativeDatabase(rawDatabase);
+        const canonicalEtag = expectedEtag === rawEtag
+            ? null
+            : prepareDatabaseReadPayload(
+                normalizeDecodedDatabaseForRead(liveDb),
+            ).etag;
+        if (expectedEtag !== rawEtag && expectedEtag !== canonicalEtag) {
+            // Raw boot reloads do not populate the process-local cache token;
+            // leave it aligned with the current raw row until that reload or a
+            // cached read establishes its own equivalent representation.
+            dbEtag = rawEtag;
             const error = new Error('Database changed before plugin storage reconciliation');
             error.pluginStorageBootStatus = 409;
-            error.currentEtag = currentEtag;
+            error.currentEtag = rawEtag;
             throw error;
         }
+        // Subsequent ordinary saves must use the same representation that the
+        // active client proved, rather than switching token domains mid-boot.
+        dbEtag = expectedEtag;
 
-        const liveDb = await decodeAuthoritativeDatabase(rawDatabase);
         if (liveDb?.optimizePluginMemory !== true) {
             return {
                 direction: 'none',
                 values: 0,
                 meta: 0,
                 issues: [],
-                etag: currentEtag,
+                etag: expectedEtag,
                 databaseChanged: false,
                 storageChanged: false,
             };
@@ -5447,7 +5465,7 @@ async function reconcileOptimizedPluginStorageForBoot(req, expectedEtag) {
 
         const inlineTotal = inlineValues.entries.length + inlineMeta.entries.length;
         let cleanup = {
-            etag: currentEtag,
+            etag: expectedEtag,
             databaseChanged: false,
         };
         if (inlineTotal > 0 && issues.length === 0) {

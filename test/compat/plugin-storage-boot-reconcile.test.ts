@@ -36,6 +36,21 @@ interface Seed {
   rows: Array<{ key: string, value: Buffer }>
   valueKeys: string[]
   metaKeys?: string[]
+  databaseEncoding?: 'legacy' | 'block'
+}
+
+function encodeBlockDatabase(database: Record<string, unknown>): Buffer {
+  const name = Buffer.from('root', 'utf8')
+  const payload = Buffer.from(JSON.stringify(database), 'utf8')
+  const length = Buffer.allocUnsafe(4)
+  length.writeUInt32LE(payload.length)
+  return Buffer.concat([
+    Buffer.from('RISUSAVE\0', 'binary'),
+    Buffer.from([1, 0, name.length]),
+    name,
+    length,
+    payload,
+  ])
 }
 
 function seedOptimizedPublication(saveDir: string, seed: Seed): void {
@@ -55,13 +70,23 @@ function seedOptimizedPublication(saveDir: string, seed: Seed): void {
     'INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
   )
   const now = Date.now()
+  const database = {
+    characters: [],
+    optimizePluginMemory: true,
+    pluginStorageGeneration: seed.generation,
+    pluginCustomStorage: {},
+  }
+  const databaseBytes = seed.databaseEncoding === 'block'
+    ? encodeBlockDatabase({
+        ...database,
+        botPresets: [{ id: 'boot-reconcile-preset' }],
+        modules: [],
+        plugins: [],
+        personas: [],
+      })
+    : encodeDatabase(database)
   sqlite.transaction(() => {
-    insert.run(DATABASE_KEY, encodeDatabase({
-      characters: [],
-      optimizePluginMemory: true,
-      pluginStorageGeneration: seed.generation,
-      pluginCustomStorage: {},
-    }), now)
+    insert.run(DATABASE_KEY, databaseBytes, now)
     insert.run(CHAT_MIGRATION_KEY, Buffer.from('done'), now)
     insert.run(REMOTE_MIGRATION_KEY, Buffer.from('done'), now)
     insert.run(MANIFEST_KEY, Buffer.from(JSON.stringify({
@@ -109,6 +134,39 @@ async function rawDatabase(client: RisuClient): Promise<{
   }
 }
 
+async function rawDatabaseEtag(client: RisuClient): Promise<string> {
+  const response = await client.fetch('/api/db/read-raw-for-boot')
+  expect(response.status).toBe(200)
+  const etag = response.headers.get('x-db-etag')
+  expect(etag).toMatch(/^[0-9a-f]{32}$/)
+  await response.arrayBuffer()
+  return etag!
+}
+
+async function cachedDatabaseEtag(client: RisuClient): Promise<string> {
+  const response = await client.fetch('/api/db/read-cached', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      cache: {
+        version: 1,
+        hashes: {
+          root: [],
+          characters: [],
+          botPresets: [],
+          modules: [],
+          personas: [],
+        },
+      },
+    }),
+  })
+  expect(response.status).toBe(200)
+  const etag = response.headers.get('x-db-etag')
+  expect(etag).toMatch(/^[0-9a-f]{32}$/)
+  await response.arrayBuffer()
+  return etag!
+}
+
 async function reconcile(client: RisuClient, etag: string): Promise<{
   response: Response
   text: string
@@ -145,6 +203,103 @@ function readSqliteJson(server: ServerHandle, key: string): unknown {
 }
 
 describe('server-side optimized plugin storage boot reconciliation', () => {
+  test('accepts the cached-view ETag for a block-format database', async () => {
+    const generation = '00000000-0000-4000-8000-000000000001'
+    const valueKey = encodeStorageKey(VALUE_PREFIX, 'block-format')
+    const server = await trackedServer({
+      generation,
+      valueKeys: [valueKey],
+      rows: [{ key: valueKey, value: Buffer.from(JSON.stringify({ valid: true })) }],
+      databaseEncoding: 'block',
+    })
+    try {
+      const client = await createClient(server.port, server.password)
+      const cachedEtag = await cachedDatabaseEtag(client)
+      const rawEtag = await rawDatabaseEtag(client)
+      expect(cachedEtag).not.toBe(rawEtag)
+
+      const result = await reconcile(client, cachedEtag)
+
+      expect(result.response.status).toBe(200)
+      expect(result.body).toMatchObject({
+        success: true,
+        direction: 'none',
+        values: 0,
+        meta: 0,
+        issues: [],
+        etag: cachedEtag,
+        databaseChanged: false,
+        storageChanged: false,
+      })
+
+      const write = await client.fetch('/api/write', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'file-path': Buffer.from(DATABASE_KEY).toString('hex'),
+          'x-if-match': cachedEtag,
+        },
+        body: encodeDatabase({
+          characters: [],
+          botPresets: [{ id: 'boot-reconcile-preset' }],
+          modules: [],
+          plugins: [],
+          personas: [],
+          optimizePluginMemory: true,
+          pluginStorageGeneration: generation,
+          pluginCustomStorage: {},
+          savedAfterReconcile: true,
+        }),
+      })
+      expect(write.status).toBe(200)
+    } finally {
+      await disposeServer(server)
+    }
+  }, 30_000)
+
+  test('rejects a stale cached-view ETag after a real database change', async () => {
+    const generation = '00000000-0000-4000-8000-000000000002'
+    const valueKey = encodeStorageKey(VALUE_PREFIX, 'stale-cache-view')
+    const storedValue = { remains: 'unchanged' }
+    const server = await trackedServer({
+      generation,
+      valueKeys: [valueKey],
+      rows: [{ key: valueKey, value: Buffer.from(JSON.stringify(storedValue)) }],
+      databaseEncoding: 'block',
+    })
+    try {
+      const client = await createClient(server.port, server.password)
+      const staleEtag = await cachedDatabaseEtag(client)
+      replaceDatabase(server, {
+        characters: [],
+        botPresets: [{ id: 'boot-reconcile-preset' }],
+        modules: [],
+        plugins: [],
+        personas: [],
+        optimizePluginMemory: true,
+        pluginStorageGeneration: generation,
+        pluginCustomStorage: {},
+        changedAfterBootRead: true,
+      })
+      const current = await rawDatabase(client)
+
+      const result = await reconcile(client, staleEtag)
+
+      expect(result.response.status).toBe(409)
+      expect(result.body).toMatchObject({
+        success: false,
+        commitOutcome: 'not-committed',
+        commitOutcomeUnknown: false,
+        code: 'PLUGIN_STORAGE_BOOT_CONFLICT',
+        currentEtag: current.etag,
+        retryable: true,
+      })
+      expect(readSqliteJson(server, valueKey)).toEqual(storedValue)
+    } finally {
+      await disposeServer(server)
+    }
+  }, 30_000)
+
   test('validates a clean publication without returning value bodies', async () => {
     const generation = '11111111-1111-4111-8111-111111111111'
     const valueKey = encodeStorageKey(VALUE_PREFIX, 'large/clean')
