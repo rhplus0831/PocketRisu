@@ -211,8 +211,12 @@ staged JSON to MessagePack in bounded pages. Inline mode itself still retains th
 plugin map in browser memory, so Settings asks for confirmation when the exact preflight is
 larger than 64 MiB total or contains a row larger than 32 MiB.
 
-`transitionPluginStorageMode()` is the production entry point.
-`reconcilePluginStorageModeForBoot()` is the bounded boot-recovery path.
+`transitionPluginStorageMode()` is the production entry point. Optimized-mode startup
+uses the ETag-fenced `/api/plugin-storage/reconcile-boot` endpoint: the server validates
+manifest-owned rows one at a time, copies recoverable inline leftovers, and atomically
+clears those inline copies only after validation succeeds. The response contains counts
+and encoded-key-only diagnostics, never plugin values. Older servers and inline mode use
+the retained client `reconcilePluginStorageModeForBoot()` compatibility path.
 `reconcilePluginStorageMode()` is dependency-injected test support and rejects ordinary
 production use.
 
@@ -220,7 +224,10 @@ production use.
 
 Boot reconciliation isolates corrupt or unavailable rows, records encoded-key-only
 diagnostics, and prefers a recoverable copy/quarantine over destructive guessing. A
-suspect source is not allowed to become an empty authoritative publication.
+suspect source is not allowed to become an empty authoritative publication. In optimized
+mode, external row bodies stay on the server during this scan; the browser receives only
+the committed result envelope and rereads `database.bin` if inline recovery copies were
+removed. Inline mode still materializes the complete map in browser memory by design.
 
 The viewer obtains a generation-pinned, deterministic server snapshot. Paging, filters,
 owner facets, and value reads belong to the same publication. Edits and deletes are

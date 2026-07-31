@@ -63,6 +63,18 @@ async function persistBootPluginStorageReconcile(): Promise<void> {
     setPatchSyncBaseline(await decodeAuthoritativeRisuSave(data));
 }
 
+async function reloadAuthoritativeDatabaseDuringBoot(): Promise<void> {
+    const databaseRead = await forageStorage.readDatabaseForBoot()
+    if (databaseRead.kind === 'missing') {
+        throw new Error('The authoritative database disappeared during boot reconciliation')
+    }
+    const decoded: Database = databaseRead.kind === 'decoded'
+        ? databaseRead.database as Database
+        : await decodeAuthoritativeRisuSave(databaseRead.bytes)
+    setPatchSyncBaseline(decoded)
+    setDatabase(decoded)
+}
+
 function renderInsecureContextFatalError() {
     const overlay = document.createElement('div')
     overlay.id = 'pocketrisu-insecure-context-error'
@@ -179,23 +191,55 @@ export async function loadData() {
                 }
 
                 LoadingStatusState.text = "Reconciling Plugin Storage..."
-                const databaseForPluginCompatibility = getDatabase()
-                const autoDisabledLegacyPlugins = disableEnabledLegacyPluginsForOptimizedMemory(
-                    databaseForPluginCompatibility.plugins,
-                    databaseForPluginCompatibility.optimizePluginMemory,
-                )
-                if (autoDisabledLegacyPlugins.length > 0) {
-                    notifyWarning(language.optimizePluginMemoryLegacyAutoDisabled(
-                        autoDisabledLegacyPlugins.join(", "),
-                    ))
-                }
                 const pluginStorageDirection = getDatabase().optimizePluginMemory === true
                     ? "externalize"
                     : "internalize"
                 let pluginStorageReconcileResult
                 try {
-                    pluginStorageReconcileResult = await reconcilePluginStorageModeForBoot()
-                } catch {
+                    const serverResult = getDatabase().optimizePluginMemory === true
+                        ? await forageStorage.reconcileOptimizedPluginStorageForBoot()
+                        : null
+                    if (serverResult) {
+                        pluginStorageReconcileResult = {
+                            direction: serverResult.direction,
+                            values: serverResult.values,
+                            meta: serverResult.meta,
+                            issues: serverResult.issues,
+                        }
+                        setPluginStorageRecoveryState(
+                            serverResult.issues.length > 0
+                                ? { direction: "externalize", issues: serverResult.issues }
+                                : null,
+                        )
+                        if (serverResult.databaseChanged) {
+                            // The server atomically removed recovered inline
+                            // copies. Install the database paired with its new
+                            // ETag before any client defaults or plugin work can
+                            // become a stale local mutation.
+                            await reloadAuthoritativeDatabaseDuringBoot()
+                        }
+                    } else {
+                        // Older servers and inline mode retain the compatibility
+                        // recovery path. Inline mode necessarily materializes the
+                        // completed plugin map in browser memory.
+                        pluginStorageReconcileResult = await reconcilePluginStorageModeForBoot()
+                    }
+                } catch (error) {
+                    if (getDatabase().optimizePluginMemory === true) {
+                        // A server mutation may have committed even when its
+                        // acknowledgement was lost. Re-read before continuing;
+                        // never let the later save loop inherit a stale ETag or
+                        // stale inline copy after an ambiguous outcome.
+                        try {
+                            await reloadAuthoritativeDatabaseDuringBoot()
+                        } catch (reloadError) {
+                            console.error(
+                                "[Plugin storage] Could not refresh authoritative state after reconciliation",
+                                reloadError,
+                            )
+                            throw error
+                        }
+                    }
                     // This is the final boot availability boundary. Known
                     // list/read/write/parse failures are isolated per row by
                     // reconcilePluginStorageModeForBoot; an unexpected failure
@@ -218,6 +262,17 @@ export async function loadData() {
                     })
                     console.error("[Plugin storage] Boot reconciliation entered recovery mode")
                 }
+
+                const databaseForPluginCompatibility = getDatabase()
+                const autoDisabledLegacyPlugins = disableEnabledLegacyPluginsForOptimizedMemory(
+                    databaseForPluginCompatibility.plugins,
+                    databaseForPluginCompatibility.optimizePluginMemory,
+                )
+                if (autoDisabledLegacyPlugins.length > 0) {
+                    notifyWarning(language.optimizePluginMemoryLegacyAutoDisabled(
+                        autoDisabledLegacyPlugins.join(", "),
+                    ))
+                }
                 if (pluginStorageReconcileResult.issues.length > 0) {
                     notifyWarning(
                         language.pluginStorageRecoveryBootWarning(
@@ -228,7 +283,6 @@ export async function loadData() {
                 }
                 if (
                     autoDisabledLegacyPlugins.length > 0
-                    && pluginStorageReconcileResult.direction === "none"
                     && pluginStorageReconcileResult.issues.length === 0
                 ) {
                     await persistBootPluginStorageReconcile()

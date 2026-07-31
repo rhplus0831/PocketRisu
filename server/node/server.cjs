@@ -5033,6 +5033,420 @@ async function readLivePluginStoragePublication() {
     };
 }
 
+function pluginStorageBootRecoveryIssue(code, encodedKey) {
+    return { code, encodedKey };
+}
+
+function collectOptimizedBootInlineEntries(dbObj, field, prefix, issues) {
+    const source = dbObj?.[field] ?? {};
+    if (source === null || typeof source !== 'object' || Array.isArray(source)) {
+        issues.push(pluginStorageBootRecoveryIssue('unsupported-json', prefix));
+        return { entries: [], storageKeys: new Set(), valid: false };
+    }
+    const prototype = Reflect.getPrototypeOf(source);
+    if (prototype !== Object.prototype && prototype !== null) {
+        issues.push(pluginStorageBootRecoveryIssue('unsupported-json', prefix));
+        return { entries: [], storageKeys: new Set(), valid: false };
+    }
+
+    const entries = [];
+    const storageKeys = new Set();
+    for (const rawKey of Reflect.ownKeys(source)) {
+        if (typeof rawKey !== 'string') {
+            issues.push(pluginStorageBootRecoveryIssue('unsupported-json', prefix));
+            continue;
+        }
+        let storageKey;
+        try {
+            storageKey = encodePluginSaveStorageKey(rawKey, prefix);
+        } catch {
+            issues.push(pluginStorageBootRecoveryIssue('invalid-encoded-key', prefix));
+            continue;
+        }
+        storageKeys.add(storageKey);
+        const descriptor = Reflect.getOwnPropertyDescriptor(source, rawKey);
+        if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) {
+            issues.push(pluginStorageBootRecoveryIssue('unsupported-json', storageKey));
+            continue;
+        }
+        try {
+            const canonical = serializePluginStorageRow(storageKey, descriptor.value);
+            entries.push({
+                rawKey,
+                storageKey,
+                value: descriptor.value,
+                canonicalHash: sha256Hex(canonical),
+            });
+        } catch {
+            issues.push(pluginStorageBootRecoveryIssue('unsupported-json', storageKey));
+        }
+    }
+    return { entries, storageKeys, valid: true };
+}
+
+function decodeOptimizedBootStorageKey(storageKey, prefix, manifest) {
+    const rawKey = isHashedPluginSaveStorageKey(storageKey, prefix)
+        ? manifest
+            ? decodeManifestPluginSaveStorageKey(manifest, storageKey, prefix)
+            : null
+        : decodePluginSaveStorageKey(storageKey, prefix);
+    if (rawKey === null || encodePluginSaveStorageKey(rawKey, prefix) !== storageKey) {
+        throw new TypeError('Plugin storage key is not canonical');
+    }
+    return rawKey;
+}
+
+async function inspectOptimizedBootExternalRows({
+    prefix,
+    listed,
+    inlineStorageKeys,
+    generation,
+    manifest,
+    issues,
+}) {
+    // Only duplicate hashes survive an iteration. Clean optimized databases
+    // normally have no inline keys, so the retained map stays empty even when
+    // the publication contains many large rows.
+    const duplicateHashes = new Map();
+    const ownedKeys = generation && manifest?.generation === generation
+        ? new Set(prefix === PLUGIN_SAVE_META_PREFIX ? manifest.metaKeys : manifest.valueKeys)
+        : null;
+    for (const storageKey of listed) {
+        const duplicateHash = (() => {
+            try {
+                decodeOptimizedBootStorageKey(storageKey, prefix, manifest);
+            } catch {
+                issues.push(pluginStorageBootRecoveryIssue('invalid-encoded-key', storageKey));
+                return null;
+            }
+            if (generation && (!ownedKeys || !ownedKeys.has(storageKey))) {
+                // Generation-bound browser reads deliberately make undeclared
+                // physical rows look absent. Preserve that recovery diagnostic
+                // without transferring or parsing the quarantined body.
+                issues.push(pluginStorageBootRecoveryIssue('read-failed', storageKey));
+                return null;
+            }
+            let bytes;
+            try {
+                bytes = kvGet(storageKey);
+            } catch {
+                issues.push(pluginStorageBootRecoveryIssue('read-failed', storageKey));
+                return null;
+            }
+            if (!bytes) {
+                issues.push(pluginStorageBootRecoveryIssue('read-failed', storageKey));
+                return null;
+            }
+            let parsed;
+            try {
+                parsed = JSON.parse(bytes.toString('utf-8'));
+            } catch {
+                issues.push(pluginStorageBootRecoveryIssue('invalid-json', storageKey));
+                return null;
+            }
+            try {
+                const canonical = serializePluginStorageRow(storageKey, parsed);
+                return inlineStorageKeys.has(storageKey) ? sha256Hex(canonical) : null;
+            } catch {
+                issues.push(pluginStorageBootRecoveryIssue('unsupported-json', storageKey));
+                return null;
+            }
+        })();
+        if (duplicateHash) duplicateHashes.set(storageKey, duplicateHash);
+        // The row Buffer, decoded string, parsed value and canonical bytes are
+        // all out of scope here. Yield so V8 can reclaim them before the next
+        // potentially large record is read.
+        await new Promise(resolve => setImmediate(resolve));
+    }
+    return duplicateHashes;
+}
+
+function nextOptimizedBootRecoveryManifest(manifest, generation, entries) {
+    if (!generation) return null;
+    if (!manifest || manifest.generation !== generation) {
+        throw new Error('The selected plugin storage generation has no matching manifest');
+    }
+    const valueKeys = new Set(manifest.valueKeys);
+    const metaKeys = new Set(manifest.metaKeys);
+    for (const entry of entries) {
+        if (entry.storageKey.startsWith(PLUGIN_SAVE_META_PREFIX)) {
+            metaKeys.add(entry.storageKey);
+        } else {
+            valueKeys.add(entry.storageKey);
+        }
+    }
+    return createPluginStorageManifest(
+        generation,
+        valueKeys,
+        metaKeys,
+        mergePluginStorageKeyMappings(
+            manifest,
+            entries.map(entry => entry.rawKey),
+            valueKeys,
+            metaKeys,
+        ),
+    );
+}
+
+function publishOptimizedBootRecoveryRows(entries, generation, manifest) {
+    const prepared = entries.map(entry => ({
+        ...entry,
+        bytes: serializePluginStorageRow(entry.storageKey, entry.value),
+    }));
+    const nextManifest = nextOptimizedBootRecoveryManifest(manifest, generation, prepared);
+    const recoverySnapshotToken = newPluginRecoverySnapshotToken();
+    withPluginStorageQuotaPlan(
+        prepared
+            .filter(entry => entry.storageKey.startsWith(PLUGIN_SAVE_PREFIX))
+            .map(entry => ({ key: entry.storageKey, size: entry.bytes.length })),
+        () => {
+            for (const entry of prepared) kvSet(entry.storageKey, entry.bytes);
+            if (nextManifest) writePluginStorageManifest(nextManifest);
+            markPluginRecoverySnapshotDirty(recoverySnapshotToken);
+        },
+    );
+    return nextManifest ?? manifest;
+}
+
+async function persistOptimizedBootInlineCleanup(req, liveDb) {
+    if (!databaseSpoolReady) {
+        throw new Error('The database spool is unavailable');
+    }
+    const targetDb = {
+        ...liveDb,
+        pluginCustomStorage: {},
+    };
+    delete targetDb.pluginStorageMeta;
+    const spoolPath = path.join(
+        databaseSpoolDir,
+        `${DATABASE_SPOOL_FILE_PREFIX}plugin-boot-${process.pid}-${nodeCrypto.randomUUID()}.tmp`,
+    );
+    let spool = null;
+    try {
+        spool = await streamRisuSaveToFile({
+            dbObj: targetDb,
+            filePath: spoolPath,
+            readChatRow: async () => null,
+            foldChatRows: false,
+        });
+        const resultEtag = await computeFileEtag(spool.filePath);
+        const recoverySnapshotToken = newPluginRecoverySnapshotToken();
+        sqliteDb.transaction(() => {
+            kvSetFromFile('database/database.bin', spool.filePath);
+            markPluginRecoverySnapshotDirty(recoverySnapshotToken);
+        })();
+        invalidateDbCache();
+        dbEtag = resultEtag;
+        rememberSessionPluginStorageState(req, targetDb);
+        return { etag: resultEtag, databaseChanged: true };
+    } finally {
+        if (spool) await fs.unlink(spool.filePath).catch(() => {});
+        else await fs.unlink(spoolPath).catch(() => {});
+    }
+}
+
+/**
+ * Reconcile only the optimized-mode boot case. External row bodies are parsed
+ * and released one at a time on the server; none are returned to the browser.
+ * Inline mode retains the legacy client recovery path because its final state
+ * necessarily contains the complete plugin map in browser memory.
+ */
+async function reconcileOptimizedPluginStorageForBoot(req, expectedEtag) {
+    let copiedRows = false;
+    const result = await queueStorageMutation(async () => {
+        await flushPendingDb();
+        const rawDatabase = kvGet('database/database.bin');
+        if (!rawDatabase) {
+            const error = new Error('Database not found');
+            error.pluginStorageBootStatus = 409;
+            throw error;
+        }
+        // Hash the bytes selected inside this queued operation instead of
+        // trusting a process-local cache. This keeps the fence authoritative
+        // even after an out-of-process repair changes the SQLite row.
+        const currentEtag = computeBufferEtag(rawDatabase);
+        dbEtag = currentEtag;
+        if (expectedEtag !== currentEtag) {
+            const error = new Error('Database changed before plugin storage reconciliation');
+            error.pluginStorageBootStatus = 409;
+            error.currentEtag = currentEtag;
+            throw error;
+        }
+
+        const liveDb = await decodeAuthoritativeDatabase(rawDatabase);
+        if (liveDb?.optimizePluginMemory !== true) {
+            return {
+                direction: 'none',
+                values: 0,
+                meta: 0,
+                issues: [],
+                etag: currentEtag,
+                databaseChanged: false,
+                storageChanged: false,
+            };
+        }
+
+        const issues = [];
+        const inlineValues = collectOptimizedBootInlineEntries(
+            liveDb,
+            'pluginCustomStorage',
+            PLUGIN_SAVE_PREFIX,
+            issues,
+        );
+        const inlineMeta = collectOptimizedBootInlineEntries(
+            liveDb,
+            'pluginStorageMeta',
+            PLUGIN_SAVE_META_PREFIX,
+            issues,
+        );
+        let listedValues;
+        let listedMeta;
+        try {
+            listedValues = kvList(PLUGIN_SAVE_PREFIX);
+        } catch {
+            listedValues = null;
+            issues.push(pluginStorageBootRecoveryIssue('list-failed', PLUGIN_SAVE_PREFIX));
+        }
+        try {
+            listedMeta = kvList(PLUGIN_SAVE_META_PREFIX);
+        } catch {
+            listedMeta = null;
+            issues.push(pluginStorageBootRecoveryIssue('list-failed', PLUGIN_SAVE_META_PREFIX));
+        }
+
+        const generation = pluginStorageGeneration(liveDb);
+        let manifest = null;
+        if (generation) {
+            const rawManifest = kvGet(PLUGIN_STORAGE_MANIFEST_KEY);
+            if (rawManifest) {
+                try {
+                    const parsed = JSON.parse(rawManifest.toString('utf-8'));
+                    const normalized = parsePluginStorageManifest(parsed);
+                    if (normalized?.generation === generation) manifest = normalized;
+                } catch {
+                    issues.push(pluginStorageBootRecoveryIssue(
+                        'invalid-json',
+                        PLUGIN_STORAGE_MANIFEST_KEY,
+                    ));
+                }
+            }
+        }
+
+        const externalValues = await inspectOptimizedBootExternalRows({
+            prefix: PLUGIN_SAVE_PREFIX,
+            listed: listedValues ?? [],
+            inlineStorageKeys: inlineValues.storageKeys,
+            generation,
+            manifest,
+            issues,
+        });
+        const externalMeta = await inspectOptimizedBootExternalRows({
+            prefix: PLUGIN_SAVE_META_PREFIX,
+            listed: listedMeta ?? [],
+            inlineStorageKeys: inlineMeta.storageKeys,
+            generation,
+            manifest,
+            issues,
+        });
+
+        for (const [inline, external] of [
+            [inlineValues, externalValues],
+            [inlineMeta, externalMeta],
+        ]) {
+            for (const entry of inline.entries) {
+                const duplicate = external.get(entry.storageKey);
+                if (duplicate && duplicate !== entry.canonicalHash) {
+                    issues.push(pluginStorageBootRecoveryIssue(
+                        'conflicting-copies',
+                        entry.storageKey,
+                    ));
+                }
+            }
+        }
+
+        let valueCopies = 0;
+        let metaCopies = 0;
+        const listedValueSet = listedValues === null ? null : new Set(listedValues);
+        const listedMetaSet = listedMeta === null ? null : new Set(listedMeta);
+        const inlineMetaByRawKey = new Map(
+            inlineMeta.entries.map(entry => [entry.rawKey, entry]),
+        );
+        const pairedMetaKeys = new Set();
+        let currentManifest = manifest;
+
+        if (listedValueSet) {
+            for (const entry of inlineValues.entries) {
+                if (listedValueSet.has(entry.storageKey)) continue;
+                const metaEntry = inlineMetaByRawKey.get(entry.rawKey);
+                if (metaEntry && listedMetaSet?.has(metaEntry.storageKey)) {
+                    const external = externalMeta.get(metaEntry.storageKey);
+                    if (!external || external !== metaEntry.canonicalHash) continue;
+                }
+                if (metaEntry) pairedMetaKeys.add(metaEntry.storageKey);
+                try {
+                    currentManifest = publishOptimizedBootRecoveryRows(
+                        [entry, ...(metaEntry ? [metaEntry] : [])],
+                        generation,
+                        currentManifest,
+                    );
+                    copiedRows = true;
+                    valueCopies += 1;
+                    if (metaEntry && !listedMetaSet?.has(metaEntry.storageKey)) metaCopies += 1;
+                } catch {
+                    issues.push(pluginStorageBootRecoveryIssue('write-failed', entry.storageKey));
+                }
+            }
+        }
+
+        if (listedMetaSet) {
+            for (const entry of inlineMeta.entries) {
+                if (pairedMetaKeys.has(entry.storageKey) || listedMetaSet.has(entry.storageKey)) {
+                    continue;
+                }
+                try {
+                    currentManifest = publishOptimizedBootRecoveryRows(
+                        [entry],
+                        generation,
+                        currentManifest,
+                    );
+                    copiedRows = true;
+                    metaCopies += 1;
+                } catch {
+                    issues.push(pluginStorageBootRecoveryIssue('write-failed', entry.storageKey));
+                }
+            }
+        }
+
+        const inlineTotal = inlineValues.entries.length + inlineMeta.entries.length;
+        let cleanup = {
+            etag: currentEtag,
+            databaseChanged: false,
+        };
+        if (inlineTotal > 0 && issues.length === 0) {
+            try {
+                cleanup = await persistOptimizedBootInlineCleanup(req, liveDb);
+            } catch {
+                issues.push(pluginStorageBootRecoveryIssue(
+                    'persist-failed',
+                    'database/database.bin',
+                ));
+            }
+        }
+
+        return {
+            direction: inlineTotal > 0 || issues.length > 0 ? 'externalize' : 'none',
+            values: valueCopies,
+            meta: metaCopies,
+            issues,
+            etag: cleanup.etag,
+            databaseChanged: cleanup.databaseChanged,
+            storageChanged: copiedRows,
+        };
+    });
+    if (copiedRows || result.databaseChanged) schedulePluginRecoverySnapshot();
+    return result;
+}
+
 function pluginStorageNamespaceConflict(message) {
     const error = new Error(message);
     error.pluginStorageNamespaceConflict = true;
@@ -8630,6 +9044,7 @@ app.post('/api/session', async (req, res) => {
             database: {
                 rawBootRead: true,
                 atomicCreate: true,
+                optimizedPluginStorageBootReconcile: true,
             },
         },
     })
@@ -9913,6 +10328,55 @@ app.get('/api/plugin-storage/manifest', async (req, res, next) => {
                 success: false,
                 error: error.message,
                 code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
+            });
+        }
+        next(error);
+    }
+});
+
+app.post('/api/plugin-storage/reconcile-boot', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    const expectedEtag = req.headers['x-if-match'];
+    if (typeof expectedEtag !== 'string' || !/^[0-9a-f]{32}$/.test(expectedEtag)) {
+        return res.status(400).json({
+            success: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+            code: 'INVALID_DATABASE_ETAG',
+            error: 'Optimized plugin storage boot reconciliation requires a database ETag.',
+            retryable: false,
+        });
+    }
+    try {
+        const result = await reconcileOptimizedPluginStorageForBoot(req, expectedEtag);
+        return res.json({
+            success: true,
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+            ...result,
+        });
+    } catch (error) {
+        if (error?.pluginStorageBootStatus === 409) {
+            return res.status(409).json({
+                success: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+                code: 'PLUGIN_STORAGE_BOOT_CONFLICT',
+                error: error.message,
+                currentEtag: error.currentEtag ?? null,
+                retryable: true,
+            });
+        }
+        if (isImportInProgressError(error)) {
+            res.setHeader('Retry-After', '5');
+            return res.status(503).json({
+                success: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+                code: 'IMPORT_IN_PROGRESS',
+                error: 'An import is in progress; retry reconciliation after it completes.',
+                retryable: true,
             });
         }
         next(error);

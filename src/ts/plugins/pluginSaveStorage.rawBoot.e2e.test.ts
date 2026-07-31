@@ -79,7 +79,6 @@ const DATABASE_BYTES = new Uint8Array(encodeRisuSaveLegacy({
 const DECODED_DATABASE = await decodeRisuSave(DATABASE_BYTES);
 
 const { NodeStorage } = await import("../storage/nodeStorage");
-const { reconcilePluginStorageModeForBoot } = await import("./pluginSaveStorage");
 
 function seedOptimizedPublication(saveDir: string): void {
     const sqlite = new Database(path.join(saveDir, "risuai.db"));
@@ -156,7 +155,7 @@ afterEach(() => {
 });
 
 describe("raw boot optimized plugin reconciliation", () => {
-    test("pins row reads to the generation decoded from cache-off boot bytes", async () => {
+    test("reconciles on the server without downloading optimized row bodies", async () => {
         const server = await spawnServer({
             seedSave: async saveDir => seedOptimizedPublication(saveDir),
             env: { POCKETRISU_BACKUP_INTERVAL_MS: "3600000" },
@@ -191,11 +190,14 @@ describe("raw boot optimized plugin reconciliation", () => {
             expect(new Uint8Array(databaseRead.bytes!)).toEqual(DATABASE_BYTES);
             bootState.database = structuredClone(DECODED_DATABASE);
 
-            await expect(reconcilePluginStorageModeForBoot()).resolves.toEqual({
+            await expect(storage.reconcileOptimizedPluginStorageForBoot()).resolves.toMatchObject({
+                success: true,
                 direction: "none",
                 values: 0,
                 meta: 0,
                 issues: [],
+                databaseChanged: false,
+                storageChanged: false,
             });
             expect(requests).toContainEqual({
                 path: "/api/session",
@@ -206,6 +208,10 @@ describe("raw boot optimized plugin reconciliation", () => {
                 generation: null,
             });
             expect(requests).toContainEqual({
+                path: "/api/plugin-storage/reconcile-boot",
+                generation: null,
+            });
+            expect(requests).not.toContainEqual({
                 path: "/api/read",
                 generation: GENERATION,
             });

@@ -602,6 +602,83 @@ describe('NodeStorage boot snapshot recovery', () => {
         expect(storage._lastDbEtag).toBeNull()
     })
 
+    it('accepts only the exact optimized plugin boot reconciliation acknowledgement', async () => {
+        const expectedEtag = 'a'.repeat(32)
+        const resultEtag = 'b'.repeat(32)
+        const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            expect(String(input)).toBe('/api/plugin-storage/reconcile-boot')
+            expect(init?.method).toBe('POST')
+            expect(new Headers(init?.headers).get('x-if-match')).toBe(expectedEtag)
+            return new Response(JSON.stringify({
+                success: true,
+                commitOutcome: 'committed',
+                commitOutcomeUnknown: false,
+                direction: 'externalize',
+                values: 1,
+                meta: 0,
+                issues: [],
+                etag: resultEtag,
+                databaseChanged: true,
+                storageChanged: true,
+            }), { status: 200, headers: { 'content-type': 'application/json' } })
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage({
+            rawBootRead: true,
+            atomicCreate: true,
+            optimizedPluginStorageBootReconcile: true,
+        } as any)
+        storage._lastDbEtag = expectedEtag
+
+        await expect(storage.reconcileOptimizedPluginStorageForBoot()).resolves.toMatchObject({
+            direction: 'externalize',
+            values: 1,
+            etag: resultEtag,
+            databaseChanged: true,
+        })
+        expect(storage._lastDbEtag).toBe(resultEtag)
+        expect(resourceCache.invalidateResourceCachePrefix).toHaveBeenCalledTimes(2)
+    })
+
+    it('keeps a malformed optimized plugin boot acknowledgement commit-unknown', async () => {
+        const expectedEtag = 'c'.repeat(32)
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+            success: true,
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+            direction: 'none',
+            values: 0,
+            meta: 0,
+            issues: [],
+            etag: 'd'.repeat(32),
+            databaseChanged: false,
+            storageChanged: false,
+            unexpected: true,
+        }), { status: 200, headers: { 'content-type': 'application/json' } })))
+        const storage = readyStorage({
+            rawBootRead: true,
+            atomicCreate: true,
+            optimizedPluginStorageBootReconcile: true,
+        } as any)
+        storage._lastDbEtag = expectedEtag
+
+        await expect(storage.reconcileOptimizedPluginStorageForBoot()).rejects.toMatchObject({
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            commitOutcomeUnknown: true,
+            operation: 'transition',
+        } satisfies Partial<InstanceType<typeof StorageError>>)
+        expect(storage._lastDbEtag).toBe(expectedEtag)
+    })
+
+    it('does not call the boot reconciliation route on an older server', async () => {
+        const fetchMock = vi.fn()
+        vi.stubGlobal('fetch', fetchMock)
+
+        await expect(readyStorage().reconcileOptimizedPluginStorageForBoot())
+            .resolves.toBeNull()
+        expect(fetchMock).not.toHaveBeenCalled()
+    })
+
     it('accepts only the complete committed restore acknowledgement', async () => {
         const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
             expect(String(input)).toBe('/api/db/snapshots/restore')

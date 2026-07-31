@@ -77,7 +77,14 @@ Structural/versioned migrations that need broader context live separately in `bo
 3. If the authoritative read reports no database, encode an empty legacy save and call `createDatabaseIfAbsent()`. Current servers linearize the create-only transaction through `/api/db/create-if-absent`; if another writer wins, bootstrap rereads and installs that writer's authoritative database. Legacy servers receive a final read/list proof before the compatibility `/api/write`. Only the winning creator applies fresh-install UI defaults (`:142-169`).
 4. Decode full bytes or accept the already decoded/verified segmented result, capture an untouched patch baseline, and only then call `setDatabase()` (`:151-157`). Capturing first matters because `setDatabase()` adds client defaults that should subsequently be synchronized to the server.
 5. On decode failure, request metadata-only snapshot candidates and submit them newest-first to the server's bounded atomic restore route. The wait has no total wall-clock deadline: strict NDJSON activity refreshes a two-minute inactivity watchdog, and a lost response is reconciled through the durable operation-status route. Try an older candidate only after a definitive not-committed result; a committed or unknown result stops fallback. Folded snapshot/chat/plugin bodies never enter browser memory.
-6. Reconcile optimized plugin storage before plugin loading through `reconcilePluginStorageModeForBoot()`. It isolates bad rows and surfaces recovery/copy-only diagnostics rather than treating an unavailable source as empty. Publication and mode-switch semantics are owned by [Plugin storage](plugin-storage.md).
+6. Reconcile plugin storage before plugin loading. Current servers handle optimized mode
+   through an ETag-fenced server endpoint that scans row bodies one at a time and returns
+   only counts plus encoded-key diagnostics; optimized plugin values therefore do not
+   cross the boot-reconciliation boundary into browser memory. If the server removes
+   recovered inline copies, bootstrap rereads the paired authoritative database/ETag
+   before continuing. Older servers and inline mode retain the client compatibility
+   path. Publication and mode-switch semantics are owned by
+   [Plugin storage](plugin-storage.md).
 7. Load plugins, run `checkNewFormat()`, and normalize character/module/persona data (`:216-230`, `:433-608`).
 8. Convert on-wire `ChatStub` objects into runtime-safe placeholder `Chat` objects (`:232-239`).
 9. Apply UI state, optionally offer the one-time resource-cache enable prompt, run the backup reminder, mark the app loaded, assign IDs, then start `saveDb()` (`:241-279`). Module updates follow and stale remote-cache cleanup is deferred five seconds. Ordinary asset garbage collection is server-owned and never runs from the client boot path.

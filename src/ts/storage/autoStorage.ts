@@ -57,6 +57,12 @@ export class AutoStorage{
         await this.Init()
         return await this.realStorage.readDatabaseForBoot()
     }
+    async reconcileOptimizedPluginStorageForBoot(signal?: AbortSignal | null) {
+        await this.Init()
+        return signal
+            ? await this.realStorage.reconcileOptimizedPluginStorageForBoot(signal)
+            : await this.realStorage.reconcileOptimizedPluginStorageForBoot()
+    }
     async createDatabaseIfAbsent(value: Uint8Array, signal?: AbortSignal | null) {
         await this.Init()
         return signal

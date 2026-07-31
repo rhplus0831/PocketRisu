@@ -68,6 +68,7 @@ import {
     type PluginStorageCapabilities,
 } from "./pluginStorageLimits"
 import type { BootInternalSnapshot } from "./bootSnapshotRecovery"
+import type { PluginStorageRecoveryIssue } from "../plugins/pluginStorageRecovery"
 import { comparePluginStorageKeys } from "../plugins/pluginStorageRecord"
 import {
     decodePluginSaveStorageKey,
@@ -612,11 +613,13 @@ export type DatabaseCreateIfAbsentResult =
 interface DatabaseStorageCapabilities {
     rawBootRead: boolean
     atomicCreate: boolean
+    optimizedPluginStorageBootReconcile: boolean
 }
 
 const LEGACY_DATABASE_STORAGE_CAPABILITIES: DatabaseStorageCapabilities = {
     rawBootRead: false,
     atomicCreate: false,
+    optimizedPluginStorageBootReconcile: false,
 }
 
 function parseDatabaseStorageCapabilities(value: unknown): DatabaseStorageCapabilities {
@@ -627,6 +630,8 @@ function parseDatabaseStorageCapabilities(value: unknown): DatabaseStorageCapabi
     return {
         rawBootRead: candidate.rawBootRead === true,
         atomicCreate: candidate.atomicCreate === true,
+        optimizedPluginStorageBootReconcile:
+            candidate.optimizedPluginStorageBootReconcile === true,
     }
 }
 
@@ -655,6 +660,73 @@ export interface PluginStorageManifestSnapshotTransport {
 export interface PluginStorageManifestStateTransport {
     generation: string
     manifestRevision: string
+}
+
+export interface OptimizedPluginStorageBootReconcileTransport {
+    success: true
+    commitOutcome: 'committed'
+    commitOutcomeUnknown: false
+    direction: 'externalize' | 'none'
+    values: number
+    meta: number
+    issues: PluginStorageRecoveryIssue[]
+    etag: string
+    databaseChanged: boolean
+    storageChanged: boolean
+}
+
+const PLUGIN_STORAGE_BOOT_ISSUE_CODES = new Set([
+    'invalid-encoded-key',
+    'invalid-json',
+    'unsupported-json',
+    'conflicting-copies',
+    'read-failed',
+    'list-failed',
+    'write-failed',
+    'remove-failed',
+    'persist-failed',
+])
+
+function isOptimizedPluginStorageBootReconcileTransport(
+    value: unknown,
+): value is OptimizedPluginStorageBootReconcileTransport {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const result = value as Record<string, unknown>
+    const allowed = new Set([
+        'success',
+        'commitOutcome',
+        'commitOutcomeUnknown',
+        'direction',
+        'values',
+        'meta',
+        'issues',
+        'etag',
+        'databaseChanged',
+        'storageChanged',
+    ])
+    if (Object.keys(result).some(key => !allowed.has(key))
+        || result.success !== true
+        || result.commitOutcome !== 'committed'
+        || result.commitOutcomeUnknown !== false
+        || (result.direction !== 'externalize' && result.direction !== 'none')
+        || !Number.isSafeInteger(result.values)
+        || (result.values as number) < 0
+        || !Number.isSafeInteger(result.meta)
+        || (result.meta as number) < 0
+        || !Array.isArray(result.issues)
+        || typeof result.etag !== 'string'
+        || !/^[0-9a-f]{32}$/.test(result.etag)
+        || typeof result.databaseChanged !== 'boolean'
+        || typeof result.storageChanged !== 'boolean') return false
+    return result.issues.every(issue => {
+        if (!issue || typeof issue !== 'object' || Array.isArray(issue)) return false
+        const record = issue as Record<string, unknown>
+        return Object.keys(record).length === 2
+            && typeof record.code === 'string'
+            && PLUGIN_STORAGE_BOOT_ISSUE_CODES.has(record.code)
+            && typeof record.encodedKey === 'string'
+            && record.encodedKey.length > 0
+    })
 }
 
 export interface PluginStorageViewerEntryTransport {
@@ -2370,6 +2442,88 @@ export class NodeStorage{
                 operation: 'write',
             })
         }, 'write', AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS, externalSignal)
+    }
+
+    async reconcileOptimizedPluginStorageForBoot(
+        externalSignal?: AbortSignal | null,
+    ): Promise<OptimizedPluginStorageBootReconcileTransport | null> {
+        await runBoundedAuthoritativeStorageOperation(
+            signal => this.checkAuth(signal),
+            'read',
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+        if (!NodeStorage.databaseStorageCapabilities.optimizedPluginStorageBootReconcile) {
+            return null
+        }
+        const expectedEtag = this._lastDbEtag
+        if (!expectedEtag || !/^[0-9a-f]{32}$/.test(expectedEtag)) {
+            throw new StorageError(
+                'Optimized plugin storage reconciliation requires an authoritative database ETag.',
+                {
+                    code: 'AMBIGUOUS_DATABASE_BOOT_READ',
+                    retryable: false,
+                    commitOutcomeUnknown: false,
+                    operation: 'transition',
+                },
+            )
+        }
+
+        return runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
+            const response = await this.requestStorage(
+                'plugin-storage/reconcile-boot',
+                'transition',
+                true,
+                () => this.authFetch('/api/plugin-storage/reconcile-boot', {
+                    method: 'POST',
+                    headers: { 'x-if-match': expectedEtag },
+                    signal,
+                }, true, outcome),
+                [],
+                signal,
+                outcome,
+            )
+            // Response headers do not prove that the mutation acknowledgement
+            // body arrived intact. Keep the operation ambiguous until the exact
+            // bounded envelope below has been consumed and validated.
+            outcome.markRequestDispatched()
+            let payload: unknown
+            try {
+                payload = await awaitWithAbort(response.json(), signal)
+            } catch (error) {
+                throw new StorageError(
+                    'Optimized plugin storage reconciliation returned an unreadable acknowledgement.',
+                    {
+                        status: response.status,
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcomeUnknown: true,
+                        operation: 'transition',
+                        cause: error,
+                    },
+                )
+            }
+            if (!isOptimizedPluginStorageBootReconcileTransport(payload)) {
+                throw new StorageError(
+                    'Optimized plugin storage reconciliation returned an invalid acknowledgement.',
+                    {
+                        status: response.status,
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcomeUnknown: true,
+                        operation: 'transition',
+                    },
+                )
+            }
+            outcome.markDefinitiveResponse()
+            this._lastDbEtag = payload.etag
+            if (payload.storageChanged) {
+                void listCacheDelete(['', ...PLUGIN_STORAGE_PREFIXES])
+                void invalidateResourceCachePrefix(`kv:${PLUGIN_STORAGE_PREFIXES[0]}`)
+                void invalidateResourceCachePrefix(`kv:${PLUGIN_STORAGE_PREFIXES[1]}`)
+            }
+            return payload
+        }, 'transition', AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS, externalSignal)
     }
 
     private async setItemAuthoritative(
