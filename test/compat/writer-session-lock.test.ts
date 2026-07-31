@@ -19,13 +19,19 @@ async function registerSession(client: RisuClient, sessionId: string): Promise<v
   await response.text()
 }
 
-function writeKey(client: RisuClient, sessionId: string, value: Buffer): Promise<Response> {
+function writeKey(
+  client: RisuClient,
+  sessionId: string,
+  value: Buffer,
+  userActive = false,
+): Promise<Response> {
   return client.fetch('/api/write', {
     method: 'POST',
     headers: {
       'content-type': 'application/octet-stream',
       'file-path': KEY_HEX,
       'x-session-id': sessionId,
+      ...(userActive ? { 'x-user-active': '1' } : {}),
     },
     body: new Uint8Array(value),
   })
@@ -58,7 +64,12 @@ describe('active writer session lock', () => {
     expect((await writeKey(displacedClient, displacedSessionId, Buffer.from('{"version":1}'))).status).toBe(200)
 
     await registerSession(activeClient, activeSessionId)
-    expect((await writeKey(activeClient, activeSessionId, Buffer.from('{"version":2}'))).status).toBe(200)
+    expect((await writeKey(
+      activeClient,
+      activeSessionId,
+      Buffer.from('{"version":2}'),
+      true,
+    )).status).toBe(200)
 
     const displacedRemove = await removeKey(displacedClient, displacedSessionId)
     expect(displacedRemove.status).toBe(423)
