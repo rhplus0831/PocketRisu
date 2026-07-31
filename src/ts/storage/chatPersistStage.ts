@@ -1,5 +1,6 @@
 import type { Chat, Database } from './database.svelte'
 import type { toSaveType } from './risuSave'
+import isEqual from 'lodash/isEqual'
 
 export type ChatPersistId = [chaId: string, chatId: string]
 export type ChatCheckpointTracker = Map<string, number>
@@ -10,6 +11,80 @@ export const CHECKPOINT_INTERVAL_MS = 20_000
 
 export function chatPersistKey(chaId: string, chatId: string): string {
     return `${chaId}|${chatId}`
+}
+
+/**
+ * Build the durable-chat discovery baseline from the database that was read
+ * from the server, never from startup-mutated live state.
+ */
+export function buildKnownChatIdsByCharacter(
+    persistedBaseline: Pick<Database, 'characters'> | null | undefined,
+): Map<string, Set<string>> {
+    return new Map(
+        (persistedBaseline?.characters ?? [])
+            .filter(character => !!character?.chaId)
+            .map(character => [
+                character.chaId,
+                new Set(
+                    (character.chats ?? [])
+                        .map(chat => chat?.id)
+                        .filter((chatId): chatId is string => !!chatId),
+                ),
+            ]),
+    )
+}
+
+/**
+ * Startup runs migrations and synchronous legacy plugins before saveDb can
+ * install its reactive effects. Queue every full chat that is new or changed
+ * relative to the persisted baseline so its authoritative row is written
+ * before the encoder is allowed to publish its stub.
+ *
+ * Placeholders are deliberately excluded: they contain no authoritative chat
+ * body and must continue to rely on their already-persisted row.
+ */
+export function capturePreTrackingFullChatChanges(
+    changeTracker: Pick<toSaveType, 'chat'>,
+    current: Pick<Database, 'characters'>,
+    persistedBaseline: Pick<Database, 'characters'> | null | undefined,
+): boolean {
+    if (!persistedBaseline) return false
+
+    const baselineCharacters = new Map(
+        (persistedBaseline.characters ?? [])
+            .filter(character => !!character?.chaId)
+            .map(character => [character.chaId, character]),
+    )
+    const queued = new Set(
+        changeTracker.chat.map(([chaId, chatId]) => chatPersistKey(chaId, chatId)),
+    )
+    let changed = false
+
+    for (const character of current.characters ?? []) {
+        const chaId = character?.chaId
+        if (!chaId) continue
+        const baselineChats = new Map(
+            (baselineCharacters.get(chaId)?.chats ?? [])
+                .filter(chat => !!chat?.id)
+                .map(chat => [chat.id as string, chat]),
+        )
+
+        for (const chat of character.chats ?? []) {
+            const chatId = chat?.id
+            if (!chatId || chat._placeholder || !Array.isArray(chat.message)) continue
+
+            const baselineChat = baselineChats.get(chatId)
+            if (baselineChat && isEqual(chat, baselineChat)) continue
+
+            const key = chatPersistKey(chaId, chatId)
+            if (queued.has(key)) continue
+            queued.add(key)
+            changeTracker.chat.unshift([chaId, chatId])
+            changed = true
+        }
+    }
+
+    return changed
 }
 
 export function collectChatsToPersist(

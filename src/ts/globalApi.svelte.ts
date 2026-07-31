@@ -13,7 +13,11 @@ import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { decodeRisuSave, encodeRisuSaveLegacy, findDangerousChatOps, RisuSaveEncoder, RisuSavePatcher, type toSaveType } from "./storage/risuSave";
 import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classifyChat, convertStubsToPlaceholders } from "./storage/chatStorage";
-import { prepareChatPersistStage } from "./storage/chatPersistStage";
+import {
+    buildKnownChatIdsByCharacter,
+    capturePreTrackingFullChatChanges,
+    prepareChatPersistStage,
+} from "./storage/chatPersistStage";
 import { AutoStorage } from "./storage/autoStorage";
 import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
 import { withAssetSaveRetry } from "./storage/assetSaveRetry";
@@ -396,14 +400,11 @@ export async function saveDb() {
     const sessionID = v4()
     const saveCoordinator = new DatabaseSaveCoordinator()
     let doingChatState = get(doingChat)
-    const knownChatIdsByCharacter = new Map<string, Set<string>>(
-        (getDatabase()?.characters ?? [])
-            .filter(character => character?.chaId)
-            .map(character => [
-                character.chaId,
-                new Set((character.chats ?? []).map(chat => chat?.id).filter(Boolean)),
-            ])
-    )
+    // Bootstrap can mutate live state before save tracking starts. The server-
+    // read baseline is the only valid proof that a chat id already has a row.
+    const initialSaveBaseline = patchSyncBaseline
+        ?? cloneDatabaseState(getDatabase())
+    const knownChatIdsByCharacter = buildKnownChatIdsByCharacter(initialSaveBaseline)
     const generationChatCheckpoints = new Map<string, number>()
     let channel: BroadcastChannel
     if (window.BroadcastChannel) {
@@ -438,12 +439,6 @@ export async function saveDb() {
         plugins: false,
         pluginCustomStorage: false
     }
-
-    // Bootstrap loads plugins before starting saveDb(). Keep the server-read
-    // baseline so inline plugin writes made during plugin initialization are
-    // not mistaken for the save tracker's initial clean state.
-    const initialSaveBaseline = patchSyncBaseline
-        ?? cloneDatabaseState(getDatabase())
 
     let encoder = new RisuSaveEncoder()
     await encoder.init(getDatabase(), {
@@ -693,6 +688,18 @@ export async function saveDb() {
             saveTimeoutExecute()
         })
     })
+
+    // The general character effect clears its initial queues while establishing
+    // a clean reactive baseline. Reconcile startup-created/replaced full chats
+    // only after that initialization so their row writes cannot be discarded.
+    await tick()
+    if (capturePreTrackingFullChatChanges(
+        changeTracker,
+        getDatabase(),
+        initialSaveBaseline,
+    )) {
+        changed = true
+    }
 
     function requeueChatChanges(chats: [string, string][]) {
         const chatSeen = new Set<string>()

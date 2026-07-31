@@ -2,8 +2,10 @@ import { describe, expect, test, vi } from 'vitest'
 import type { Chat, Database } from './database.svelte'
 import type { toSaveType } from './risuSave'
 import {
+    buildKnownChatIdsByCharacter,
     CHECKPOINT_INTERVAL_MS,
     ChatRowPersistError,
+    capturePreTrackingFullChatChanges,
     chatPersistKey,
     runChatPersistStage,
 } from './chatPersistStage'
@@ -27,6 +29,34 @@ function makeDatabase(chat = makeChat()): Database {
     } as unknown as Database
 }
 
+function makeDatabaseWithChats(chats: Chat[]): Database {
+    return {
+        characters: [{
+            chaId: 'char-1',
+            chats,
+        }],
+    } as unknown as Database
+}
+
+function makeStub(id: string): Chat {
+    return {
+        id,
+        name: `Stub ${id}`,
+        _stub: true,
+    } as unknown as Chat
+}
+
+function makePlaceholder(id: string): Chat {
+    return {
+        id,
+        name: `Placeholder ${id}`,
+        note: '',
+        localLore: [],
+        message: [],
+        _placeholder: true,
+    }
+}
+
 function makeTrackedChanges(overrides: Partial<toSaveType> = {}): toSaveType {
     return {
         character: [],
@@ -45,6 +75,129 @@ function clone<T>(value: T): T {
 }
 
 describe('chat persistence stage', () => {
+    test('persists a synchronous startup-created chat before an unrelated save publishes its stub', async () => {
+        const persisted = makeDatabaseWithChats([makeStub('chat-existing')])
+        const startupChat = makeChat('chat-startup')
+        const live = makeDatabaseWithChats([
+            makePlaceholder('chat-existing'),
+            startupChat,
+        ])
+        const tracker = makeTrackedChanges({ root: true })
+        const knownChatIdsByCharacter = buildKnownChatIdsByCharacter(persisted)
+        const rowStore = new Map<string, Chat>([[
+            chatPersistKey('char-1', 'chat-existing'),
+            makeChat('chat-existing'),
+        ]])
+        const order: string[] = []
+
+        expect(capturePreTrackingFullChatChanges(tracker, live, persisted)).toBe(true)
+        expect(tracker.chat).toEqual([['char-1', 'chat-startup']])
+        expect(knownChatIdsByCharacter.get('char-1')).toEqual(new Set(['chat-existing']))
+
+        await runChatPersistStage({
+            db: live,
+            toSave: tracker,
+            doingChat: false,
+            knownChatIdsByCharacter,
+            generationCheckpoints: new Map(),
+            requeueChats: vi.fn(),
+            saveChat: async (chaId, _chatIndex, chatId, chat) => {
+                order.push(`row:${chatId}`)
+                rowStore.set(chatPersistKey(chaId, chatId), clone(chat))
+            },
+            commitStubDatabase: async () => {
+                order.push('stub-db')
+                expect(rowStore.has(chatPersistKey('char-1', 'chat-startup'))).toBe(true)
+                expect(knownChatIdsByCharacter.get('char-1')?.has('chat-startup')).toBe(false)
+                return { committed: true, result: undefined }
+            },
+        })
+
+        expect(order).toEqual(['row:chat-startup', 'stub-db'])
+        expect(knownChatIdsByCharacter.get('char-1')).toEqual(
+            new Set(['chat-existing', 'chat-startup']),
+        )
+        for (const chat of live.characters[0].chats) {
+            expect(
+                rowStore.has(chatPersistKey('char-1', chat.id ?? '')),
+                `${chat.id} stub must resolve after reload`,
+            ).toBe(true)
+        }
+    })
+
+    test('persists a startup chat whose id was repaired before promoting the repaired id', async () => {
+        const persisted = makeDatabaseWithChats([makeStub('chat-duplicate')])
+        const repairedChat = makeChat('chat-repaired')
+        const live = makeDatabaseWithChats([repairedChat])
+        const tracker = makeTrackedChanges({ root: true })
+        const knownChatIdsByCharacter = buildKnownChatIdsByCharacter(persisted)
+        const rowStore = new Map<string, Chat>()
+
+        expect(capturePreTrackingFullChatChanges(tracker, live, persisted)).toBe(true)
+        expect(tracker.chat).toEqual([['char-1', 'chat-repaired']])
+
+        await runChatPersistStage({
+            db: live,
+            toSave: tracker,
+            doingChat: false,
+            knownChatIdsByCharacter,
+            generationCheckpoints: new Map(),
+            requeueChats: vi.fn(),
+            saveChat: async (chaId, _chatIndex, chatId, chat) => {
+                rowStore.set(chatPersistKey(chaId, chatId), clone(chat))
+            },
+            commitStubDatabase: async () => {
+                expect(rowStore.has(chatPersistKey('char-1', 'chat-repaired'))).toBe(true)
+                expect(knownChatIdsByCharacter.get('char-1')?.has('chat-repaired')).toBe(false)
+                return { committed: true, result: undefined }
+            },
+        })
+
+        expect(knownChatIdsByCharacter.get('char-1')?.has('chat-repaired')).toBe(true)
+        expect(rowStore.get(chatPersistKey('char-1', 'chat-repaired'))?.message)
+            .toEqual(repairedChat.message)
+    })
+
+    test('persists a full startup replacement even when its id was already durable', async () => {
+        const persisted = makeDatabaseWithChats([makeStub('chat-existing')])
+        const replacement = makeChat('chat-existing')
+        replacement.message = [{ role: 'user', data: 'replaced during plugin startup' }]
+        const live = makeDatabaseWithChats([replacement])
+        const tracker = makeTrackedChanges({ root: true })
+        const knownChatIdsByCharacter = buildKnownChatIdsByCharacter(persisted)
+        const saveChat = vi.fn(async () => {})
+
+        expect(capturePreTrackingFullChatChanges(tracker, live, persisted)).toBe(true)
+        expect(tracker.chat).toEqual([['char-1', 'chat-existing']])
+
+        await runChatPersistStage({
+            db: live,
+            toSave: tracker,
+            doingChat: false,
+            knownChatIdsByCharacter,
+            generationCheckpoints: new Map(),
+            requeueChats: vi.fn(),
+            saveChat,
+            commitStubDatabase: async () => ({ committed: true, result: undefined }),
+        })
+
+        expect(saveChat).toHaveBeenCalledWith(
+            'char-1',
+            0,
+            'chat-existing',
+            replacement,
+        )
+    })
+
+    test('does not treat an ordinary persisted placeholder as a new chat body', () => {
+        const persisted = makeDatabaseWithChats([makeStub('chat-existing')])
+        const live = makeDatabaseWithChats([makePlaceholder('chat-existing')])
+        const tracker = makeTrackedChanges()
+
+        expect(capturePreTrackingFullChatChanges(tracker, live, persisted)).toBe(false)
+        expect(tracker.chat).toEqual([])
+    })
+
     test('checkpoints every new chat row before committing crash-resolvable stubs', async () => {
         const db = makeDatabase()
         const knownChatIdsByCharacter = new Map<string, Set<string>>()
