@@ -465,6 +465,7 @@ const {
     pluginV2,
     removePluginAndReload,
     setPluginEnabledAndReload,
+    updatePlugin,
     V2_PLUGIN_UNLOAD_GRACE_MS,
     waitForDeferredPluginApiReloadIdle,
 } = await import("./plugins.svelte");
@@ -3934,6 +3935,210 @@ describe("transitionPluginStorageMode", () => {
         });
         await expect(getPluginSaveStorageItem("legacy")).resolves.toEqual({
             compatible: true,
+        });
+    });
+
+    describe("plugin import update preservation", () => {
+        const pluginSource = (
+            name: string,
+            argumentLines: string[],
+            options: {
+                api?: "2.1" | "3.0"
+                extraHeaders?: string[]
+            } = {},
+        ) => [
+            `//@name ${name}`,
+            `//@api ${options.api ?? "3.0"}`,
+            ...(options.extraHeaders ?? []),
+            ...argumentLines.map(argument => `//@arg ${argument}`),
+            "",
+        ].join("\n");
+
+        const configuredPlugin = (
+            name: string,
+            argumentsMap: Record<string, "int" | "string">,
+            realArg: Record<string, number | string>,
+            enabled: boolean,
+            version: 2 | "2.1" | "3.0" = "3.0",
+        ) => ({
+            name,
+            script: "// installed source",
+            arguments: argumentsMap,
+            realArg,
+            version,
+            customLink: [],
+            argMeta: {},
+            enabled,
+        });
+
+        test("ordinary updates preserve configured values and a disabled state", async () => {
+            const name = "Configured remote update";
+            const installed = {
+                ...configuredPlugin(
+                    name,
+                    { api_key: "string", retries: "int" },
+                    { api_key: "secret-key", retries: 7 },
+                    false,
+                ),
+                updateURL: "https://plugins.example/update.js",
+                versionOfPlugin: "1.0.0",
+            };
+            database.plugins = [installed];
+            const updatedSource = pluginSource(name, [
+                "api_key string",
+                "retries int",
+            ], {
+                extraHeaders: [
+                    "//@version 2.0.0",
+                    `//@update-url ${installed.updateURL}`,
+                ],
+            });
+            const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => ({
+                status: 200,
+                text: async () => updatedSource,
+            } as Response));
+
+            try {
+                await expect(updatePlugin(installed)).resolves.toBe(true);
+                expect(fetchMock).toHaveBeenCalledWith(installed.updateURL);
+            } finally {
+                fetchMock.mockRestore();
+            }
+
+            expect(database.plugins[0]).toMatchObject({
+                name,
+                realArg: { api_key: "secret-key", retries: 7 },
+                enabled: false,
+                versionOfPlugin: "2.0.0",
+            });
+            expect(requestImmediateSave).toHaveBeenCalledOnce();
+            const { alertConfirm } = vi.mocked(await import("../alert"));
+            expect(alertConfirm).not.toHaveBeenCalled();
+        });
+
+        test("updates initialize only newly declared arguments", async () => {
+            const name = "Added argument update";
+            database.plugins = [configuredPlugin(
+                name,
+                { endpoint: "string" },
+                { endpoint: "https://private.example" },
+                true,
+            )];
+
+            await importPlugin(pluginSource(name, [
+                "endpoint string",
+                "model string",
+                "retries int",
+            ]), {
+                isUpdate: true,
+                originalPluginName: name,
+            });
+
+            expect(database.plugins[0].realArg).toEqual({
+                endpoint: "https://private.example",
+                model: "",
+                retries: 0,
+            });
+            expect(database.plugins[0].enabled).toBe(true);
+        });
+
+        test("removed arguments require confirmation before their values are dropped", async () => {
+            const name = "Removed argument update";
+            const installed = configuredPlugin(
+                name,
+                { api_key: "string", endpoint: "string" },
+                { api_key: "secret-key", endpoint: "https://private.example" },
+                true,
+            );
+            database.plugins = [structuredClone(installed)];
+            const updateSource = pluginSource(name, ["api_key string"]);
+            const { alertConfirm } = vi.mocked(await import("../alert"));
+
+            await importPlugin(updateSource, {
+                isUpdate: true,
+                originalPluginName: name,
+            });
+
+            expect(database.plugins).toEqual([installed]);
+            expect(requestImmediateSave).not.toHaveBeenCalled();
+            expect(alertConfirm).toHaveBeenCalledOnce();
+            expect(alertConfirm).toHaveBeenLastCalledWith(expect.stringContaining('"endpoint"'));
+            expect(alertConfirm.mock.calls[0][0]).not.toContain("https://private.example");
+
+            alertConfirm.mockResolvedValueOnce(true);
+            await importPlugin(updateSource, {
+                isUpdate: true,
+                originalPluginName: name,
+            });
+
+            expect(database.plugins[0].realArg).toEqual({ api_key: "secret-key" });
+            expect(requestImmediateSave).toHaveBeenCalledOnce();
+        });
+
+        test("renamed arguments are confirmed as removals and start with new defaults", async () => {
+            const name = "Renamed argument update";
+            database.plugins = [configuredPlugin(
+                name,
+                { old_token: "string" },
+                { old_token: "old-secret" },
+                true,
+            )];
+            const { alertConfirm } = vi.mocked(await import("../alert"));
+            alertConfirm.mockResolvedValueOnce(true);
+
+            await importPlugin(pluginSource(name, ["new_token string"]), {
+                isUpdate: true,
+                originalPluginName: name,
+            });
+
+            expect(alertConfirm).toHaveBeenCalledWith(expect.stringContaining('"old_token"'));
+            expect(database.plugins[0].realArg).toEqual({ new_token: "" });
+        });
+
+        test("confirmed duplicate imports preserve configured values and enablement", async () => {
+            const name = "Confirmed duplicate import";
+            database.plugins = [configuredPlugin(
+                name,
+                { prompt: "string" },
+                { prompt: "large configured prompt" },
+                false,
+            )];
+            const { alertConfirm } = vi.mocked(await import("../alert"));
+            alertConfirm.mockResolvedValueOnce(true);
+
+            await importPlugin(pluginSource(name, ["prompt string"]));
+
+            expect(alertConfirm).toHaveBeenCalledOnce();
+            expect(database.plugins[0].realArg).toEqual({
+                prompt: "large configured prompt",
+            });
+            expect(database.plugins[0].enabled).toBe(false);
+            expect(requestImmediateSave).toHaveBeenCalledOnce();
+        });
+
+        test("compatibility-gated updates preserve values but force legacy plugins off", async () => {
+            const name = "Compatibility-gated update";
+            database.optimizePluginMemory = true;
+            database.plugins = [configuredPlugin(
+                name,
+                { endpoint: "string" },
+                { endpoint: "https://private.example" },
+                true,
+                "2.1",
+            )];
+
+            await importPlugin(pluginSource(name, ["endpoint string"], { api: "2.1" }), {
+                isUpdate: true,
+                originalPluginName: name,
+            });
+
+            expect(database.plugins[0].realArg).toEqual({
+                endpoint: "https://private.example",
+            });
+            expect(database.plugins[0].enabled).toBe(false);
+            const { notifyWarning } = vi.mocked(await import("../alert"));
+            expect(notifyWarning).toHaveBeenCalledOnce();
+            expect(requestImmediateSave).toHaveBeenCalledOnce();
         });
     });
 

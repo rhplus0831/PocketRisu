@@ -57,6 +57,39 @@ interface ProviderPluginCustomLink {
 
 export type RisuPlugin = ProviderPlugin
 
+function getRemovedPluginArgumentNames(
+    existingPlugin: RisuPlugin | undefined,
+    replacementPlugin: RisuPlugin,
+): string[] {
+    if (!existingPlugin) return []
+
+    const replacementArguments = new Set(Object.keys(replacementPlugin.arguments ?? {}))
+    return Object.keys(existingPlugin.arguments ?? {})
+        .filter(argumentName => !replacementArguments.has(argumentName))
+        .sort()
+}
+
+function preservePluginArgumentValues(
+    existingPlugin: RisuPlugin | undefined,
+    replacementPlugin: RisuPlugin,
+): void {
+    if (!existingPlugin) return
+
+    const existingValues = existingPlugin.realArg ?? {}
+    for (const argumentName of Object.keys(replacementPlugin.arguments ?? {})) {
+        if (Object.prototype.hasOwnProperty.call(existingValues, argumentName)) {
+            replacementPlugin.realArg[argumentName] = existingValues[argumentName]
+        }
+    }
+}
+
+function pluginArgumentRemovalConfirmation(argumentNames: string[]): string {
+    return language.pluginUpdateRemovesArgumentsConfirm.replace(
+        "{}",
+        argumentNames.map(argumentName => JSON.stringify(argumentName)).join(", "),
+    )
+}
+
 export async function createBlankPlugin(){
     await importPlugin(
 `
@@ -433,70 +466,96 @@ export async function importPlugin(code:string|null = null, argu:{
             }
         }
 
-        await withPluginLifecycleLock(async (lifecycleLease) => {
-            // The confirmation await may have overlapped a mode transition.
-            // Re-read the live database only after earlier lifecycle work has
-            // drained, then commit and reload as one serialized operation.
-            const commitDatabase = getDatabase()
-            commitDatabase.plugins ??= []
-            const commitPluginIndex = commitDatabase.plugins.findIndex(
-                (plugin: RisuPlugin) => plugin.name === pluginData.name,
-            )
-            disabledForMemoryOptimization = shouldDisableImportedPlugin(
-                apiInternalVersion,
-                commitDatabase.optimizePluginMemory,
-            )
-            pluginData.enabled = !disabledForMemoryOptimization
-            const previousPlugin = commitPluginIndex === -1
-                ? undefined
-                : safeStructuredClone(commitDatabase.plugins[commitPluginIndex])
-            let mutationApplied = false
+        const confirmedRemovedArguments = new Set<string>()
+        while (true) {
+            const mutationResult = await withPluginLifecycleLock(async (lifecycleLease) => {
+                // Any confirmation await may have overlapped another plugin-list
+                // mutation or a storage-mode transition. Re-read authoritative
+                // state under the lifecycle lock before deciding what is removed.
+                const commitDatabase = getDatabase()
+                commitDatabase.plugins ??= []
+                const commitPluginIndex = commitDatabase.plugins.findIndex(
+                    (plugin: RisuPlugin) => plugin.name === pluginData.name,
+                )
+                disabledForMemoryOptimization = shouldDisableImportedPlugin(
+                    apiInternalVersion,
+                    commitDatabase.optimizePluginMemory,
+                )
+                const previousPlugin = commitPluginIndex === -1
+                    ? undefined
+                    : safeStructuredClone(commitDatabase.plugins[commitPluginIndex])
+                const unconfirmedRemovedArguments = getRemovedPluginArgumentNames(
+                    previousPlugin,
+                    pluginData,
+                ).filter(argumentName => !confirmedRemovedArguments.has(argumentName))
+                if (unconfirmedRemovedArguments.length > 0) {
+                    return { unconfirmedRemovedArguments }
+                }
 
-            if(commitPluginIndex !== -1){
-                commitDatabase.plugins[commitPluginIndex] = pluginData;
-                mutationApplied = true
-            }
-            else if(!isUpdate || argu.isHotReload){
-                commitDatabase.plugins.push(pluginData)
-                mutationApplied = true
-            }
+                preservePluginArgumentValues(previousPlugin, pluginData)
+                pluginData.enabled = disabledForMemoryOptimization
+                    ? false
+                    : previousPlugin === undefined
+                        ? true
+                        : previousPlugin.enabled === true
+                let mutationApplied = false
 
-            const wasHotReloading = hotReloading.includes(pluginData.name)
-            if(argu.isHotReload && !hotReloading.includes(pluginData.name)){
-                hotReloading.push(pluginData.name)
-            }
+                if(commitPluginIndex !== -1){
+                    commitDatabase.plugins[commitPluginIndex] = pluginData;
+                    mutationApplied = true
+                }
+                else if(!isUpdate || argu.isHotReload){
+                    commitDatabase.plugins.push(pluginData)
+                    mutationApplied = true
+                }
 
-            setDatabaseLite(commitDatabase)
-            await commitPluginListMutation(
-                lifecycleLease,
-                "Plugin import",
-                () => {
-                    if (mutationApplied) {
-                        if (previousPlugin === undefined) {
-                            removePluginFromLiveList(pluginData.name)
-                        } else {
-                            restorePluginInLiveList(
-                                pluginData.name,
-                                commitPluginIndex,
-                                previousPlugin,
-                            )
+                const wasHotReloading = hotReloading.includes(pluginData.name)
+                if(argu.isHotReload && !hotReloading.includes(pluginData.name)){
+                    hotReloading.push(pluginData.name)
+                }
+
+                setDatabaseLite(commitDatabase)
+                await commitPluginListMutation(
+                    lifecycleLease,
+                    "Plugin import",
+                    () => {
+                        if (mutationApplied) {
+                            if (previousPlugin === undefined) {
+                                removePluginFromLiveList(pluginData.name)
+                            } else {
+                                restorePluginInLiveList(
+                                    pluginData.name,
+                                    commitPluginIndex,
+                                    previousPlugin,
+                                )
+                            }
                         }
-                    }
-                    if (!wasHotReloading) {
-                        const hotReloadIndex = hotReloading.indexOf(pluginData.name)
-                        if (hotReloadIndex !== -1) hotReloading.splice(hotReloadIndex, 1)
-                    }
-                },
-                {
-                    rollbackOnReloadFailure: true,
-                    targetPluginName: pluginData.name,
-                },
-            )
-            console.log(`Imported plugin: ${pluginData.name} (API v${apiVersion})`)
-            if (disabledForMemoryOptimization) {
-                notifyWarning(language.optimizePluginMemoryImportDisabled)
+                        if (!wasHotReloading) {
+                            const hotReloadIndex = hotReloading.indexOf(pluginData.name)
+                            if (hotReloadIndex !== -1) hotReloading.splice(hotReloadIndex, 1)
+                        }
+                    },
+                    {
+                        rollbackOnReloadFailure: true,
+                        targetPluginName: pluginData.name,
+                    },
+                )
+                console.log(`Imported plugin: ${pluginData.name} (API v${apiVersion})`)
+                if (disabledForMemoryOptimization) {
+                    notifyWarning(language.optimizePluginMemoryImportDisabled)
+                }
+                return { unconfirmedRemovedArguments: [] }
+            })
+
+            if (mutationResult.unconfirmedRemovedArguments.length === 0) break
+            const confirmed = await alertConfirm(pluginArgumentRemovalConfirmation(
+                mutationResult.unconfirmedRemovedArguments,
+            ))
+            if (!confirmed) return
+            for (const argumentName of mutationResult.unconfirmedRemovedArguments) {
+                confirmedRemovedArguments.add(argumentName)
             }
-        })
+        }
 
     } catch (error) {
         console.error(error)
