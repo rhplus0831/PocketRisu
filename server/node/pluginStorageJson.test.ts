@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 const require = createRequire(import.meta.url)
 const {
     PluginStorageValidationError,
+    convertCompatiblePluginStorageJson,
     createPluginStorageOwnerScanner,
     encodeValidatedPluginStorageKey,
     parsePluginStorageJsonBuffer,
@@ -16,6 +17,7 @@ const {
         code: string
         encodedKey: string
     }
+    convertCompatiblePluginStorageJson: (value: unknown) => unknown
     createPluginStorageOwnerScanner: (options?: { maxCaptureBytes?: number }) => {
         push: (bytes: Uint8Array) => void
         finish: () => string | null
@@ -138,6 +140,31 @@ describe('plugin storage JSON server boundary', () => {
         { nested: Number.POSITIVE_INFINITY },
     ])('rejects unsupported values instead of lossy JSON coercion', value => {
         expect(() => stringifyPluginStorageJson(value)).toThrow(TypeError)
+    })
+
+    it('converts the documented rich-value subset on the server', () => {
+        const sparse = new Array(3)
+        sparse[1] = Number.NaN
+        expect(convertCompatiblePluginStorageJson({
+            date: new Date('2026-01-02T03:04:05.000Z'),
+            map: new Map([[1n, new Set(['a', 'b'])]]),
+            bigint: -42n,
+            missing: undefined,
+            sparse,
+        })).toEqual({
+            date: '2026-01-02T03:04:05.000Z',
+            map: [['1', ['a', 'b']]],
+            bigint: '-42',
+            missing: null,
+            sparse: [null, null, null],
+        })
+    })
+
+    it('keeps functions and circular references outside automatic conversion', () => {
+        const cycle: Record<string, unknown> = {}
+        cycle.self = cycle
+        expect(() => convertCompatiblePluginStorageJson(() => undefined)).toThrow(TypeError)
+        expect(() => convertCompatiblePluginStorageJson(cycle)).toThrow(TypeError)
     })
 
     it('returns no row validation for unrelated generic KV namespaces', () => {

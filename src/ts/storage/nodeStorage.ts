@@ -61,6 +61,14 @@ import {
 } from "./pluginStorageBatch"
 import type { PluginStorageBatchStreamCapabilities } from "./pluginStorageBatch"
 import {
+    isPluginStorageBulkTransitionResult,
+    parsePluginStorageTransitionStreamCapabilities,
+    preparePluginStorageBulkTransition,
+    type PluginStorageBulkTransitionRequest,
+    type PluginStorageBulkTransitionResult,
+    type PluginStorageTransitionStreamCapabilities,
+} from "./pluginStorageTransitionBulk"
+import {
     DEFAULT_PLUGIN_VALUE_MAX_BYTES,
     parsePluginStorageCapabilities,
     pluginStorageLimitMessage,
@@ -1418,6 +1426,8 @@ export class NodeStorage{
         maxValueBytes: DEFAULT_PLUGIN_VALUE_MAX_BYTES,
     }
     private static pluginStorageBatchCapabilities: PluginStorageBatchStreamCapabilities | null = null
+    private static pluginStorageTransitionCapabilities:
+        PluginStorageTransitionStreamCapabilities | null = null
     private static databaseStorageCapabilities: DatabaseStorageCapabilities = {
         ...LEGACY_DATABASE_STORAGE_CAPABILITIES,
     }
@@ -1502,6 +1512,7 @@ export class NodeStorage{
                         capabilities?: {
                             pluginStorage?: unknown
                             pluginStorageBatch?: unknown
+                            pluginStorageTransition?: unknown
                             database?: unknown
                         }
                     }).capabilities
@@ -1509,6 +1520,10 @@ export class NodeStorage{
                 NodeStorage.pluginStorageBatchCapabilities
                     = parsePluginStorageBatchStreamCapabilities(
                         capabilities?.pluginStorageBatch,
+                    )
+                NodeStorage.pluginStorageTransitionCapabilities
+                    = parsePluginStorageTransitionStreamCapabilities(
+                        capabilities?.pluginStorageTransition,
                     )
                 NodeStorage.pluginStorageCapabilities
                     = parsePluginStorageCapabilities(capabilities?.pluginStorage)
@@ -2045,6 +2060,150 @@ export class NodeStorage{
             'transition',
             signal,
         )
+    }
+
+    async getPluginStorageTransitionStreamCapabilities(
+        signal?: AbortSignal | null,
+    ): Promise<PluginStorageTransitionStreamCapabilities | null> {
+        await this.initSession(signal)
+        return NodeStorage.pluginStorageTransitionCapabilities
+    }
+
+    async commitBulkPluginStorageTransition(
+        request: PluginStorageBulkTransitionRequest,
+        externalSignal?: AbortSignal | null,
+    ): Promise<PluginStorageBulkTransitionResult> {
+        await this.initSession(externalSignal)
+        const capabilities = NodeStorage.pluginStorageTransitionCapabilities
+        if (!capabilities) {
+            throw new StorageError('The server does not support consolidated plugin transitions.', {
+                code: 'PLUGIN_STORAGE_TRANSITION_UNSUPPORTED',
+                operation: 'transition',
+                retryable: false,
+                commitOutcomeUnknown: false,
+                commitOutcome: 'not-committed',
+            })
+        }
+        const prepared = await preparePluginStorageBulkTransition(request, capabilities)
+        const execute = () => runBoundedAuthoritativeStorageOperation(
+            async (signal, outcome) => {
+                const response = await this.authFetch('/api/plugin-storage/transition/bulk', {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/x-pocketrisu-plugin-storage-transition',
+                        'x-plugin-storage-transition': request.transitionId,
+                        'x-plugin-storage-transition-length': String(prepared.byteLength),
+                    },
+                    body: prepared.body,
+                    signal,
+                }, true, outcome)
+                outcome.markRequestDispatched()
+                let body: unknown = null
+                try {
+                    body = await awaitWithAbort(response.json(), signal)
+                } catch (error) {
+                    if (signal.aborted) throw error
+                }
+                if (!response.ok) {
+                    const record = body && typeof body === 'object'
+                        ? body as Record<string, unknown>
+                        : null
+                    const definitive = response.status < 500
+                        || (record?.outcome === 'not-committed')
+                    if (definitive) outcome.markDefinitiveResponse()
+                    throw new StorageError(
+                        typeof record?.error === 'string'
+                            ? record.error
+                            : 'Bulk plugin storage transition failed.',
+                        {
+                            status: response.status,
+                            code: typeof record?.code === 'string'
+                                ? record.code
+                                : (definitive
+                                    ? 'PLUGIN_STORAGE_TRANSITION_FAILED'
+                                    : 'COMMIT_OUTCOME_UNKNOWN'),
+                            retryable: definitive && record?.retryable === true,
+                            commitOutcomeUnknown: !definitive,
+                            commitOutcome: definitive ? 'not-committed' : 'unknown',
+                            operation: 'transition',
+                            limit: typeof record?.limit === 'number' ? record.limit : undefined,
+                            actual: typeof record?.actual === 'number' ? record.actual : undefined,
+                        },
+                    )
+                }
+                if (!isPluginStorageBulkTransitionResult(
+                    body,
+                    request.transitionId,
+                    request.targetGeneration,
+                )) {
+                    throw new StorageError('Invalid bulk plugin transition acknowledgement.', {
+                        status: response.status,
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcomeUnknown: true,
+                        commitOutcome: 'unknown',
+                        operation: 'transition',
+                    })
+                }
+                outcome.markDefinitiveResponse()
+                this._lastDbEtag = body.etag
+                return body
+            },
+            'transition',
+            authoritativeStoragePayloadTimeoutMs(prepared.byteLength),
+            externalSignal,
+        )
+        try {
+            return await execute()
+        } catch (error) {
+            if (!(error instanceof StorageError) || !error.commitOutcomeUnknown) throw error
+            let status: PluginStorageStagedTransitionStatus
+            try {
+                status = await this.getPluginStorageTransitionStatus(request.transitionId)
+                if (status.state === 'ready') {
+                    status = await this.finalizePluginStorageTransition(request.transitionId)
+                }
+            } catch (statusError) {
+                throw new StorageError(
+                    'Bulk plugin storage transition outcome could not be resolved; reload is required.',
+                    {
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcomeUnknown: true,
+                        commitOutcome: 'unknown',
+                        operation: 'transition',
+                        cause: new AggregateError(
+                            [error, statusError],
+                            'Bulk transition and status reconciliation both failed',
+                        ),
+                    },
+                )
+            }
+            if (status.state !== 'committed'
+                || status.targetGeneration !== request.targetGeneration
+                || typeof status.etag !== 'string') {
+                throw new StorageError('Bulk plugin storage transition was not committed.', {
+                    code: 'PLUGIN_STORAGE_TRANSITION_NOT_COMMITTED',
+                    retryable: true,
+                    commitOutcomeUnknown: false,
+                    commitOutcome: 'not-committed',
+                    operation: 'transition',
+                    cause: error,
+                })
+            }
+            this._lastDbEtag = status.etag
+            return {
+                success: true,
+                transitionId: status.transitionId,
+                state: 'committed',
+                direction: status.direction,
+                targetGeneration: status.targetGeneration,
+                values: status.rows.filter(row => row.storageKey.startsWith('pluginsave/')).length,
+                meta: status.rows.filter(row => row.storageKey.startsWith('pluginsave-meta/')).length,
+                totalBytes: status.totalBytes,
+                etag: status.etag,
+            }
+        }
     }
 
     private async stagedPluginStorageControl(

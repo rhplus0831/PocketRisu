@@ -278,9 +278,8 @@ function assertBoundedMemory(
 ): void {
   // Heap/RSS include Svelte, Vite and SQLite/native state, so their relative
   // ceilings intentionally leave more headroom. Happy DOM can defer reclaiming
-  // completed Fetch request bodies under host contention; the sampler permits
-  // at most two bounded-store generations for that adapter artifact, while the
-  // forced-GC per-row checkpoints below enforce the production one-row shape.
+  // completed Fetch request bodies under host contention. The bulk transition
+  // intentionally holds one request body containing the complete inline map.
   const retainedHeap = direction === 'internalize'
     ? Math.max(baseline.heapUsed, final.heapUsed)
     : baseline.heapUsed
@@ -302,8 +301,13 @@ function assertBoundedMemory(
     : 5 * ROW_BYTES + 24 * MIB
   expect(delta(peak.arrayBuffers, baseline.arrayBuffers))
     .toBeLessThanOrEqual(sampledArrayBufferLimit)
+  const finalArrayBufferLimit = direction === 'internalize'
+    // Inline mode necessarily retains the completed database response and its
+    // decoded plugin map after the single authoritative refresh.
+    ? 3 * TOTAL_BYTES + 3 * ROW_BYTES + 16 * MIB
+    : 3 * ROW_BYTES + 8 * MIB
   expect(delta(final.arrayBuffers, baseline.arrayBuffers)).toBeLessThanOrEqual(
-    3 * ROW_BYTES + 8 * MIB,
+    finalArrayBufferLimit,
   )
   expect(delta(peak.heapUsed, retainedHeap)).toBeLessThanOrEqual(
     5 * ROW_BYTES + 48 * MIB,
@@ -313,22 +317,18 @@ function assertBoundedMemory(
   )
 }
 
-function assertPerRowMemoryShape(
-  direction: 'externalize' | 'internalize',
+function assertBulkCompletionMemoryShape(
   baseline: MemoryPoint,
   progress: readonly ProgressRecord[],
 ): void {
+  expect(progress).toHaveLength(1)
   const checkpointArrayBufferDelta = Math.max(
     0,
     ...progress.map(entry => delta(entry.memory.arrayBuffers, baseline.arrayBuffers)),
   )
-  expect(checkpointArrayBufferDelta).toBeLessThanOrEqual(3 * ROW_BYTES + 8 * MIB)
-  if (direction === 'externalize') {
-    // Seven source rows remain after the first acknowledgement. At least four
-    // rows' worth of heap must become collectible before the eighth finishes.
-    expect(progress[0].memory.heapUsed - progress.at(-1)!.memory.heapUsed)
-      .toBeGreaterThanOrEqual(4 * ROW_BYTES)
-  }
+  expect(checkpointArrayBufferDelta).toBeLessThanOrEqual(
+    3 * TOTAL_BYTES + 3 * ROW_BYTES + 16 * MIB,
+  )
 }
 
 describe('PM2 production plugin-storage transition memory (real client and server)', () => {
@@ -512,13 +512,11 @@ describe('PM2 production plugin-storage transition memory (real client and serve
           values: ROW_COUNT,
           meta: 0,
         })
-        expect(externalProgress).toHaveLength(ROW_COUNT)
-        externalProgress.forEach((progress, index) => {
-          expect(progress.completed).toBe(index + 1)
-          expect(progress.completedBytes).toBe((index + 1) * ROW_BYTES)
-          expect(progress.liveKeys).toEqual(rawKeys.slice(index + 1))
-          expect(progress.optimized).toBe(false)
-        })
+        expect(externalProgress).toHaveLength(1)
+        expect(externalProgress[0].completed).toBe(ROW_COUNT)
+        expect(externalProgress[0].completedBytes).toBe(TOTAL_BYTES)
+        expect(externalProgress[0].liveKeys).toEqual([])
+        expect(externalProgress[0].optimized).toBe(true)
         expect(getDatabase().optimizePluginMemory).toBe(true)
         expect(Object.keys(getDatabase().pluginCustomStorage)).toEqual([])
         expect(externalStageBaseline).not.toBeNull()
@@ -529,14 +527,14 @@ describe('PM2 production plugin-storage transition memory (real client and serve
           externalSampler.peak,
           externalFinal,
         )
-        assertPerRowMemoryShape('externalize', externalStageBaseline!, externalProgress)
+        assertBulkCompletionMemoryShape(externalStageBaseline!, externalProgress)
 
         const externalRequests = requestLog.slice(externalStartLog)
         expect(externalRequests.filter(entry => (
-          entry.path === '/api/plugin-storage/transition/stage/upload'
-        ))).toHaveLength(ROW_COUNT)
+          entry.path === '/api/plugin-storage/transition/bulk'
+        ))).toHaveLength(1)
         expect(externalRequests.some(entry => (
-          entry.path === '/api/plugin-storage/transition'
+          entry.path.startsWith('/api/plugin-storage/transition/stage/')
         ))).toBe(false)
         inspectExternalChunkLayout(server, storageKeys)
 
@@ -590,13 +588,11 @@ describe('PM2 production plugin-storage transition memory (real client and serve
           values: ROW_COUNT,
           meta: 0,
         })
-        expect(internalProgress).toHaveLength(ROW_COUNT)
-        internalProgress.forEach((progress, index) => {
-          expect(progress.completed).toBe(index + 1)
-          expect(progress.completedBytes).toBe((index + 1) * ROW_BYTES)
-          expect(progress.liveKeys).toEqual([])
-          expect(progress.optimized).toBe(true)
-        })
+        expect(internalProgress).toHaveLength(1)
+        expect(internalProgress[0].completed).toBe(ROW_COUNT)
+        expect(internalProgress[0].completedBytes).toBe(TOTAL_BYTES)
+        expect(internalProgress[0].liveKeys).toEqual(rawKeys)
+        expect(internalProgress[0].optimized).toBe(false)
         expect(getDatabase().optimizePluginMemory).toBe(false)
         expect(Object.keys(getDatabase().pluginCustomStorage).sort()).toEqual(rawKeys)
         for (const rawKey of rawKeys) {
@@ -611,7 +607,7 @@ describe('PM2 production plugin-storage transition memory (real client and serve
           internalSampler.peak,
           internalFinal,
         )
-        assertPerRowMemoryShape('internalize', internalStageBaseline!, internalProgress)
+        assertBulkCompletionMemoryShape(internalStageBaseline!, internalProgress)
 
         const internalRequests = requestLog.slice(internalStartLog)
         const manifestSnapshots = internalRequests.filter(entry => (
@@ -629,10 +625,10 @@ describe('PM2 production plugin-storage transition memory (real client and serve
           )
         ))).toEqual([])
         expect(internalRequests.filter(entry => (
-          entry.path === '/api/plugin-storage/transition/stage/row'
-        ))).toHaveLength(ROW_COUNT)
+          entry.path === '/api/plugin-storage/transition/bulk'
+        ))).toHaveLength(1)
         expect(internalRequests.some(entry => (
-          entry.path === '/api/plugin-storage/transition'
+          entry.path.startsWith('/api/plugin-storage/transition/stage/')
         ))).toBe(false)
         const pluginReads = internalRequests.filter(entry => {
           if (entry.path !== '/api/read') return false
@@ -714,7 +710,9 @@ describe('PM2 production plugin-storage transition memory (real client and serve
           }))
         }
       expect(saveLoopFailure).toBeNull()
-      expect(requestLog.some(entry => entry.path === '/api/plugin-storage/transition')).toBe(false)
+      expect(requestLog.filter(entry => (
+        entry.path === '/api/plugin-storage/transition/bulk'
+      ))).toHaveLength(3)
       console.info('[PM2 memory evidence]', JSON.stringify({
         rowBytes: ROW_BYTES,
         rows: ROW_COUNT,

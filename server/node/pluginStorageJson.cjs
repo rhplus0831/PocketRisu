@@ -297,6 +297,140 @@ function stringifyPluginStorageJson(value) {
     return serialized;
 }
 
+const dateGetTime = Date.prototype.getTime;
+const dateToISOString = Date.prototype.toISOString;
+const mapForEach = Map.prototype.forEach;
+const setForEach = Set.prototype.forEach;
+const bigintToString = BigInt.prototype.toString;
+
+function assertNoConvertedTypeProperties(value, type) {
+    if (Reflect.ownKeys(value).length > 0) {
+        throw new TypeError(`Automatic plugin storage conversion does not accept custom ${type} properties`);
+    }
+}
+
+/**
+ * Server counterpart of the client compatibility converter. This operates on
+ * the lossless bulk-transition transport before strict JSON serialization, so
+ * the server owns migration policy instead of trusting a client-normalized row.
+ */
+function convertCompatiblePluginStorageJson(input) {
+    const visiting = new Set();
+    const convert = (value) => {
+        if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+            return value;
+        }
+        if (typeof value === 'number') {
+            if (!Number.isFinite(value)) return null;
+            return Object.is(value, -0) ? 0 : value;
+        }
+        if (typeof value === 'bigint') return Reflect.apply(bigintToString, value, []);
+        if (value === undefined) return null;
+        if (typeof value !== 'object' || visiting.has(value)) {
+            throw new TypeError('Automatic plugin storage conversion cannot represent this value');
+        }
+
+        visiting.add(value);
+        try {
+            if (Array.isArray(value)) {
+                const result = new Array(value.length);
+                for (const key of Reflect.ownKeys(value)) {
+                    if (key === 'length') continue;
+                    if (typeof key !== 'string') {
+                        throw new TypeError('Automatic plugin storage conversion rejects symbol array keys');
+                    }
+                    const index = Number(key);
+                    if (!Number.isInteger(index)
+                        || index < 0
+                        || index >= value.length
+                        || String(index) !== key) {
+                        throw new TypeError('Automatic plugin storage conversion rejects extra array properties');
+                    }
+                }
+                for (let index = 0; index < value.length; index += 1) {
+                    const descriptor = Reflect.getOwnPropertyDescriptor(value, String(index));
+                    if (!descriptor) {
+                        result[index] = null;
+                    } else if (!('value' in descriptor) || !descriptor.enumerable) {
+                        throw new TypeError('Automatic plugin storage conversion requires enumerable array data');
+                    } else {
+                        result[index] = convert(descriptor.value);
+                    }
+                }
+                return result;
+            }
+
+            let dateValue = false;
+            let dateTime = Number.NaN;
+            try {
+                dateTime = Reflect.apply(dateGetTime, value, []);
+                dateValue = true;
+            } catch {}
+            if (dateValue) {
+                assertNoConvertedTypeProperties(value, 'Date');
+                if (!Number.isFinite(dateTime)) {
+                    throw new TypeError('Automatic plugin storage conversion rejects invalid dates');
+                }
+                return Reflect.apply(dateToISOString, value, []);
+            }
+
+            let mapEntries = [];
+            try {
+                Reflect.apply(mapForEach, value, [
+                    (entryValue, entryKey) => mapEntries.push([entryKey, entryValue]),
+                ]);
+            } catch {
+                mapEntries = null;
+            }
+            if (mapEntries !== null) {
+                assertNoConvertedTypeProperties(value, 'Map');
+                return mapEntries.map(([entryKey, entryValue]) => [
+                    convert(entryKey),
+                    convert(entryValue),
+                ]);
+            }
+
+            let setEntries = [];
+            try {
+                Reflect.apply(setForEach, value, [
+                    (entryValue) => setEntries.push(entryValue),
+                ]);
+            } catch {
+                setEntries = null;
+            }
+            if (setEntries !== null) {
+                assertNoConvertedTypeProperties(value, 'Set');
+                return setEntries.map(entry => convert(entry));
+            }
+
+            const prototype = Reflect.getPrototypeOf(value);
+            if (prototype !== Object.prototype && prototype !== null) {
+                throw new TypeError('Automatic plugin storage conversion requires plain objects');
+            }
+            const result = Object.create(null);
+            for (const key of Reflect.ownKeys(value)) {
+                if (typeof key !== 'string') {
+                    throw new TypeError('Automatic plugin storage conversion rejects symbol object keys');
+                }
+                const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+                if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) {
+                    throw new TypeError('Automatic plugin storage conversion requires enumerable data');
+                }
+                Object.defineProperty(result, key, {
+                    configurable: true,
+                    enumerable: true,
+                    value: convert(descriptor.value),
+                    writable: true,
+                });
+            }
+            return result;
+        } finally {
+            visiting.delete(value);
+        }
+    };
+    return snapshotPluginStorageJson(convert(input));
+}
+
 function encodeValidatedPluginStorageKey(rawKey, prefix) {
     try {
         return encodePluginSaveStorageKey(rawKey, prefix);
@@ -470,6 +604,7 @@ function serializePluginStorageRow(storageKey, value) {
 module.exports = {
     PluginStorageValidationError,
     createPluginStorageOwnerScanner,
+    convertCompatiblePluginStorageJson,
     assertPluginStorageJsonBuffer,
     assertPluginStorageRow,
     decodeValidatedPluginStorageKey,

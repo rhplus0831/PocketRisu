@@ -1681,7 +1681,7 @@ export const languageEnglish = {
     optimizePluginMemory: "Optimize plugin memory usage",
     optimizePluginMemoryDesc: "Store plugin save data as on-demand server entries instead of keeping it inside database.bin and client memory.",
     autoConvertPluginStorageValues: "Automatically convert compatible plugin values",
-    autoConvertPluginStorageValuesDesc: "When an optimized write is not JSON-compatible, convert Date to an ISO string, Map to entry arrays, Set to an array, BigInt to a decimal string, and undefined, non-finite numbers, or array holes to null. Functions and circular references are still rejected.",
+    autoConvertPluginStorageValuesDesc: "When an optimized write or storage-mode migration is not JSON-compatible, convert Date to an ISO string, Map to entry arrays, Set to an array, BigInt to a decimal string, and undefined, non-finite numbers, or array holes to null. Functions and circular references are still rejected.",
     legacyPluginCompatibility: "Legacy plugin compatibility",
     legacyPluginCompatibilityDesc: "Preserve the upstream V3 custom database-key fallback, give legacy plugins more time to unload, permit bounded state, UI, network, asset, and storage finalization during onUnload, and treat teardown-only failures as warnings. The database fallback reports only to the browser developer console. New registrations, model/chat work, plugin replacement, and non-empty UI construction remain blocked.",
     legacyPluginCompatibilityTeardownWarning: "One or more plugins did not unload cleanly. Compatibility mode terminated them and continued the plugin reload.",

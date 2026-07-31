@@ -92,7 +92,7 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
 
 - `src/ts/plugins/pluginMemoryOptimization.ts` — Encodes the compatibility gate for `optimizePluginMemory`: enabled V2/V2.1 plugins block the mode, imports of those versions are disabled while it is active, and attempts to enable them are refused. V3 plugins remain compatible because their save API is asynchronous.
 
-- `src/ts/plugins/pluginSaveStorage.ts` — Routes save-backed values between inline database maps and externally published `pluginsave/` rows. It owns the manifest/generation authority model, optimistic revisions, batch coordination, staged mode transitions, and boot reconciliation.
+- `src/ts/plugins/pluginSaveStorage.ts` — Routes save-backed values between inline database maps and externally published `pluginsave/` rows. It owns the manifest/generation authority model, optimistic revisions, batch coordination, capability-negotiated bulk mode transitions, and boot reconciliation.
 - `src/ts/storage/pluginStorageMutation.ts` and `pluginStorageBatch.ts` — Encode compare-and-set and all-or-nothing multi-key requests for the server authority.
 - `src/ts/plugins/pluginStorageRecovery.ts` — Publishes reconciliation/recovery state to settings and maintenance UI.
 

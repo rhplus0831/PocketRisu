@@ -203,7 +203,7 @@ not-committed, or unknown outcomes. See
   `pluginStorageGeneration`, `plugin-storage/manifest.json`, value rows, and owner rows
   move together. Prefix rows absent from the matching manifest are quarantined physical
   data, not current state.
-- Use the dedicated versioned mutation, batch, generation, and staged-transition APIs
+- Use the dedicated versioned mutation, batch, generation, and capability-negotiated transition APIs
   for optimized rows and publication controls. Generic KV writes never mutate those
   roots. Ordinary database patches may update the inline value/owner maps only after
   the server proves that the live authoritative mode is inline.

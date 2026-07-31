@@ -213,7 +213,9 @@ vi.mock("../storage/persistentKv", () => {
             for (const key of mutation.deletes) persistent.delete(key);
             persistent.set("plugin-storage/manifest.json", mutation.nextManifest);
         }),
+        commitPersistentPluginStorageBulkTransition: vi.fn(),
         commitPersistentPluginStorageTransition: vi.fn(),
+        getPersistentPluginStorageTransitionStreamCapabilities: vi.fn(async () => null),
         beginPersistentPluginStorageTransition: vi.fn(async (plan: any) => {
             stagedPlan = plan;
             stagedRows.clear();
@@ -590,6 +592,8 @@ beforeEach(async () => {
         removePersistentKey,
         setPreparedPersistentPluginStoragePreservingOwner,
         writePersistentJson,
+        getPersistentPluginStorageTransitionStreamCapabilities,
+        commitPersistentPluginStorageBulkTransition,
         commitPersistentPluginStorageTransition,
     } = vi.mocked(await import("../storage/persistentKv"));
     listPersistentKeys.mockImplementation(async (prefix: string) =>
@@ -691,6 +695,8 @@ beforeEach(async () => {
     ) => {
         persistent.set(key, value);
     });
+    getPersistentPluginStorageTransitionStreamCapabilities.mockResolvedValue(null);
+    commitPersistentPluginStorageBulkTransition.mockReset();
     commitPersistentPluginStorageTransition.mockResolvedValue({ etag: "test-etag" });
 });
 
@@ -3735,6 +3741,58 @@ describe("transitionPluginStorageMode", () => {
         expect(database.optimizePluginMemory).toBe(false);
         expect(database.pluginCustomStorage.compatible).toEqual({ retained: true });
         expect(database.pluginCustomStorage.unsupported).toBeInstanceOf(Map);
+    });
+
+    test("production enable sends rich inline values once for server-side conversion", async () => {
+        database.optimizePluginMemory = false;
+        database.autoConvertPluginStorageValues = true;
+        database.pluginCustomStorage = {
+            rich: new Map([["createdAt", new Date("2026-08-01T00:00:00.000Z")]]),
+        };
+        const {
+            beginPersistentPluginStorageTransition,
+            commitPersistentPluginStorageBulkTransition,
+            getPersistentPluginStorageTransitionStreamCapabilities,
+            listPersistentEntriesWithSizes,
+            uploadPersistentPluginStorageTransitionRow,
+        } = vi.mocked(await import("../storage/persistentKv"));
+        getPersistentPluginStorageTransitionStreamCapabilities.mockResolvedValueOnce({
+            transport: "framed-v1",
+            maxEntries: 100_000,
+            maxMetadataBytes: 64 * 1024 * 1024,
+            maxValueBytes: 128 * 1024 * 1024,
+            maxPayloadBytes: 1024 * 1024 * 1024,
+        });
+        commitPersistentPluginStorageBulkTransition.mockImplementationOnce(async request => ({
+            success: true,
+            transitionId: request.transitionId,
+            state: "committed",
+            direction: "externalize",
+            targetGeneration: request.targetGeneration,
+            values: 1,
+            meta: 0,
+            totalBytes: 42,
+            etag: "bulk-etag",
+        }));
+
+        await expect(transitionPluginStorageMode(true)).resolves.toEqual({
+            direction: "externalize",
+            values: 1,
+            meta: 0,
+        });
+
+        expect(commitPersistentPluginStorageBulkTransition).toHaveBeenCalledOnce();
+        const request = commitPersistentPluginStorageBulkTransition.mock.calls[0][0];
+        expect(request.autoConvert).toBe(true);
+        expect(request.rows).toHaveLength(1);
+        expect(request.rows[0].value).toBeInstanceOf(Map);
+        expect((request.rows[0].value as Map<string, unknown>).get("createdAt"))
+            .toBeInstanceOf(Date);
+        expect(listPersistentEntriesWithSizes).not.toHaveBeenCalled();
+        expect(beginPersistentPluginStorageTransition).not.toHaveBeenCalled();
+        expect(uploadPersistentPluginStorageTransitionRow).not.toHaveBeenCalled();
+        expect(database.optimizePluginMemory).toBe(true);
+        expect(database.pluginCustomStorage).toEqual({});
     });
 
     test("production enable does not misreport a network TypeError as incompatible data", async () => {

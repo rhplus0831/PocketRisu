@@ -18,6 +18,7 @@ import type {
     PluginStorageBatchResult,
     PluginStorageVersionedState,
 } from "./pluginStorageBatch"
+import type { PluginStorageBulkTransitionRequest } from "./pluginStorageTransitionBulk"
 
 export class AutoStorage{
     isAccount:boolean = false
@@ -296,6 +297,19 @@ export class AutoStorage{
     ) {
         await this.Init()
         return await this.realStorage.finalizePluginStorageTransition(transitionId, signal)
+    }
+
+    async getPluginStorageTransitionStreamCapabilities(signal?: AbortSignal | null) {
+        await this.Init()
+        return await this.realStorage.getPluginStorageTransitionStreamCapabilities(signal)
+    }
+
+    async commitBulkPluginStorageTransition(
+        request: PluginStorageBulkTransitionRequest,
+        signal?: AbortSignal | null,
+    ) {
+        await this.Init()
+        return await this.realStorage.commitBulkPluginStorageTransition(request, signal)
     }
 
     async abortPluginStorageTransition(

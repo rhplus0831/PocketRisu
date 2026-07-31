@@ -194,16 +194,25 @@ Revisions are concurrency tokens, not sortable timestamps.
 
 ## Mode transitions
 
-Production settings use a staged server protocol, not the older direct row-first loop:
+Production settings negotiate a bulk server protocol. On current servers, the client sends
+one framed request containing transition metadata and the complete inline plugin snapshot;
+the server validates and, when enabled, converts compatible rich values while writing an
+unpublished private stage. The client does not JSON-validate individual values first.
+Servers that do not advertise the bulk capability retain the earlier staged row protocol.
 
-1. Preflight validates every key/value, row counts, configured limits, and disk headroom.
-2. The server creates a private stage under `save/.plugin-transition-staging/`.
-3. The client/server stream rows into or out of the stage without publishing them live.
-4. Ordinary database saves pause while the final database object is prepared.
-5. Finalize publishes the fresh generation, exact manifest, rows, mode, quota state, and
+1. The client validates record shape and transport limits, then sends one framed bulk request.
+2. The server validates keys and values, applies configured compatible-value conversion,
+   checks row counts, configured limits, source identity, and disk headroom, and writes a
+   private stage under `save/.plugin-transition-staging/`.
+3. Ordinary database saves pause while the request and final database object are prepared.
+4. The server publishes the fresh generation, exact manifest, rows, mode, quota state, and
    recovery token atomically.
-6. A lost acknowledgement is reconciled from the stage receipt and live publication.
+5. A lost acknowledgement is reconciled from the stage receipt and live publication.
    If the outcome remains unknowable, saves are fenced and the UI requires reload.
+
+Externalization therefore uses one migration request instead of one upload request per row.
+Internalization is also one migration request; after commit the client performs one
+authoritative `database.bin` refresh rather than reading every optimized row separately.
 
 Reverse transitions accept rows up to the configured optimized-value ceiling and do not
 impose a smaller aggregate transport cap. The server copies SQLite/chunk data and converts
