@@ -16,7 +16,7 @@ import { zipSync } from 'fflate'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { createClient } from './helpers/client.js'
 import { createSeedBackup } from './helpers/seed.js'
-import { normalizeBackup, fingerprintAssets } from './helpers/normalize.js'
+import { decodeRisuDat, normalizeBackup, fingerprintAssets } from './helpers/normalize.js'
 import { encodeBackup } from './helpers/encode.js'
 import { decodeBackup } from './helpers/decode.js'
 
@@ -42,6 +42,21 @@ function readKvValue(cwd: string, key: string): Buffer | null {
 
 async function expectMissing(filePath: string): Promise<void> {
   await expect(readFile(filePath)).rejects.toMatchObject({ code: 'ENOENT' })
+}
+
+function mainV181AcceptsBackupEntryName(name: string): boolean {
+  if (name === 'database.risudat') return true
+  if (name.includes('\0')) return false
+  if (name.startsWith('coldstorage/')) {
+    const suffix = name.slice('coldstorage/'.length).replace(/\.json$/, '')
+    return suffix.length > 0 && !suffix.includes('/')
+  }
+  if (name.startsWith('inlay/')) return name.slice('inlay/'.length).length > 0
+  if (name.startsWith('inlay_sidecar/')) return name.slice('inlay_sidecar/'.length).length > 0
+  if (name.startsWith('inlay_meta/')) return name.slice('inlay_meta/'.length).length > 0
+  if (name.startsWith('inlay_info/')) return name.slice('inlay_info/'.length).length > 0
+  if (name.startsWith('inlay_thumb/')) return name.slice('inlay_thumb/'.length).length > 0
+  return name === path.basename(name)
 }
 
 // ─── Smoke ──────────────────────────────────────────────────────────────────
@@ -563,6 +578,112 @@ describe('upstream-compatible backup export', () => {
 })
 
 // ─── Content-type compatibility ────────────────────────────────────────────
+
+describe('PocketRisu main rollback export', () => {
+  test('folds a main-shaped save through serve and back into the main v1.8.1 import contract', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const seed = Buffer.concat([
+      createSeedBackup({
+        characterCount: 2,
+        chatsPerCharacter: 2,
+        messagesPerChat: 3,
+        includeAssets: true,
+        databaseFields: {
+          optimizePluginMemory: true,
+          pluginCustomStorage: { 'main-compatible-key': { enabled: true } },
+          pluginStorageMeta: {
+            'main-compatible-key': { plugin: 'Rollback fixture', updatedAt: 1 },
+          },
+        },
+      }),
+      encodeBackup([
+        { name: 'inlay/main-rollback.png', data: Buffer.from('main-inlay-bytes') },
+        {
+          name: 'inlay_sidecar/main-rollback',
+          data: Buffer.from(JSON.stringify({
+            ext: 'png',
+            name: 'main-rollback.png',
+            type: 'image',
+          })),
+        },
+        {
+          name: 'inlay_meta/main-rollback',
+          data: Buffer.from(JSON.stringify({
+            createdAt: 1,
+            updatedAt: 2,
+            charId: 'test-char-0',
+            chatId: 'chat-0-0',
+          })),
+        },
+      ]),
+    ])
+    const expected = normalizeBackup(seed)
+    expect((await client.importBackup(seed)).ok).toBe(true)
+
+    // Serve has really migrated the main-shaped monolith before the rollback
+    // export is exercised; this is not merely a monolith-to-monolith test.
+    const liveDatabaseBeforeBytes = readKvValue(srv.cwd, 'database/database.bin')!
+    const liveBefore = decodeRisuDat(liveDatabaseBeforeBytes) as any
+    expect(liveBefore.characters[0].chats[0]).toMatchObject({
+      id: 'chat-0-0',
+      _stub: true,
+    })
+    expect(liveBefore.characters[0].chats[0].message).toBeUndefined()
+    const firstChatRow = readKvValue(srv.cwd, 'chats/test-char-0/chat-0-0')
+    expect(firstChatRow).not.toBeNull()
+
+    const response = await client.fetch('/api/backup/export?target=main')
+    expect(response.status).toBe(200)
+    expect(response.headers.get('content-disposition')).toContain('-main.bin')
+    expect(response.headers.get('x-risu-backup-target')).toBe('main')
+    expect(response.headers.get('x-risu-backup-omitted'))
+      .toBe('drafts,remembered-mcp-tool-calls')
+    const rollback = Buffer.from(await response.arrayBuffer())
+    const entries = decodeBackup(rollback)
+    expect(entries.every(entry => mainV181AcceptsBackupEntryName(entry.name))).toBe(true)
+    expect(entries.some(entry => entry.name.startsWith('pluginsave/'))).toBe(false)
+    expect(entries.some(entry => entry.name.startsWith('pluginsave-meta/'))).toBe(false)
+    expect(entries.some(entry => entry.name === 'plugin-storage/manifest.json')).toBe(false)
+    expect(entries.some(entry => entry.name.startsWith('drafts/'))).toBe(false)
+    expect(entries.some(entry => entry.name.startsWith('cache/mcp-tool-calls/'))).toBe(false)
+    expect(entries.map(entry => entry.name)).toEqual(expect.arrayContaining([
+      'database.risudat',
+      Buffer.from('test-asset-0').toString('hex'),
+      Buffer.from('test-asset-1').toString('hex'),
+      'inlay/main-rollback.png',
+      'inlay_sidecar/main-rollback',
+      'inlay_meta/main-rollback',
+    ]))
+    const entriesByName = new Map(entries.map(entry => [entry.name, entry.data]))
+    expect(entriesByName.get(Buffer.from('test-asset-0').toString('hex')))
+      .toEqual(Buffer.from('fake-png-data-0'))
+    expect(entriesByName.get('inlay/main-rollback.png'))
+      .toEqual(Buffer.from('main-inlay-bytes'))
+
+    const restored = normalizeBackup(rollback)
+    expect(restored.normalized.characters).toEqual(expected.normalized.characters)
+    for (const character of (restored.raw.characters as any[])) {
+      for (const chat of character.chats) {
+        expect(chat._stub).toBeUndefined()
+        expect(chat.message).toHaveLength(3)
+      }
+    }
+    expect(restored.raw.pluginCustomStorage).toEqual({
+      'main-compatible-key': { enabled: true },
+    })
+    expect(restored.raw.pluginStorageMeta).toEqual({
+      'main-compatible-key': { plugin: 'Rollback fixture', updatedAt: 1 },
+    })
+
+    // Export is non-destructive: serve remains on its row-backed layout.
+    expect(readKvValue(srv.cwd, 'database/database.bin')).toEqual(liveDatabaseBeforeBytes)
+    const liveAfter = decodeRisuDat(readKvValue(srv.cwd, 'database/database.bin')!) as any
+    expect(liveAfter.characters[0].chats[0]._stub).toBe(true)
+    expect(readKvValue(srv.cwd, 'chats/test-char-0/chat-0-0')).toEqual(firstChatRow)
+  }, 30_000)
+})
 
 describe('content-type compatibility', () => {
   test('import works with application/octet-stream', async () => {

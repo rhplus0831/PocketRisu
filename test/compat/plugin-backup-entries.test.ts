@@ -487,6 +487,21 @@ describe('external plugin rows in backup archives', () => {
     expect(upstreamDatabase.pluginCustomStorage['foreign-row']).toBeUndefined()
     expect(upstreamDatabase.pluginStorageGeneration).toBe(storageGeneration)
 
+    const mainResponse = await sourceClient.fetch('/api/backup/export?target=main')
+    expect(mainResponse.status).toBe(200)
+    expect(mainResponse.headers.get('content-disposition')).toContain('-main.bin')
+    const mainBackup = Buffer.from(await mainResponse.arrayBuffer())
+    const mainEntries = decodeBackup(mainBackup)
+    expect(mainEntries.some(entry => entry.name.startsWith('pluginsave/'))).toBe(false)
+    expect(mainEntries.some(entry => entry.name.startsWith('pluginsave-meta/'))).toBe(false)
+    expect(mainEntries.some(entry => entry.name === PLUGIN_STORAGE_MANIFEST_KEY)).toBe(false)
+    const mainDatabaseEntry = mainEntries.find(entry => entry.name === 'database.risudat')!
+    expect(mainDatabaseEntry.data[10]).toBe(7)
+    const mainDatabase = decodeRisuDat(mainDatabaseEntry.data)
+    expect(mainDatabase.pluginCustomStorage).toEqual(upstreamDatabase.pluginCustomStorage)
+    expect(mainDatabase.pluginStorageMeta).toEqual(upstreamDatabase.pluginStorageMeta)
+    expect(mainDatabase.pluginStorageGeneration).toBe(storageGeneration)
+
     const upstreamDestination = await spawnServer()
     servers.push(upstreamDestination)
     const upstreamDestinationClient = await createClient(
@@ -752,6 +767,14 @@ describe('external plugin rows in backup archives', () => {
     })
     expect(fullFolded.pluginCustomStorage['\uD801']).toEqual({
       kind: 'pinned-high-surrogate-1',
+    })
+
+    const mainResponse = await sourceClient.fetch('/api/backup/export?target=main')
+    expect(mainResponse.status).toBe(409)
+    expect(mainResponse.headers.get('content-disposition')).toBeNull()
+    expect(mainResponse.headers.get('x-risu-backup-target')).toBeNull()
+    await expect(mainResponse.json()).resolves.toMatchObject({
+      code: 'BACKUP_MAIN_UNSUPPORTED_PLUGIN_KEYS',
     })
 
     const jobId = await startPartialExport(sourceClient)

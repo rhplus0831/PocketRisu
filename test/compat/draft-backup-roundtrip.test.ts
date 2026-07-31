@@ -109,6 +109,11 @@ describe('composer draft backup recovery', () => {
     const upstreamNames = entryNames(Buffer.from(await upstreamResponse.arrayBuffer()))
     expect(upstreamNames.some(name => name.startsWith('drafts/'))).toBe(false)
 
+    const mainResponse = await sourceClient.fetch('/api/backup/export?target=main')
+    expect(mainResponse.status).toBe(200)
+    const mainNames = entryNames(Buffer.from(await mainResponse.arrayBuffer()))
+    expect(mainNames.some(name => name.startsWith('drafts/'))).toBe(false)
+
     const destination = await spawnServer()
     servers.push(destination)
     const destinationClient = await createClient(destination.port, destination.password)

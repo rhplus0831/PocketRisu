@@ -110,6 +110,35 @@ describe('NodeStorage availability bounds', () => {
             .toBe(AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS)
     })
 
+    it('requests the dedicated main-compatible export target', async () => {
+        const fetchMock = vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), {
+            status: 200,
+        }))
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+
+        await expect(storage.exportBackup({ target: 'main' })).resolves.toBeInstanceOf(Response)
+
+        expect(fetchMock).toHaveBeenCalledWith(
+            '/api/backup/export?target=main',
+            expect.objectContaining({ headers: expect.any(Headers) }),
+        )
+    })
+
+    it('surfaces a main-target compatibility rejection from the server', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+            error: 'plugin keys are not representable by main',
+        }), {
+            status: 409,
+            headers: { 'content-type': 'application/json' },
+        })))
+        const storage = readyStorage()
+
+        await expect(storage.exportBackup({ target: 'main' })).rejects.toThrow(
+            'plugin keys are not representable by main',
+        )
+    })
+
     it('polls a partial export job past the generic 15 second read bound', async () => {
         vi.useFakeTimers()
         const startedAt = Date.now()

@@ -118,6 +118,18 @@ export async function SaveLocalBackupForUpstream(){
     }
 }
 
+export async function SaveLocalBackupForMain(){
+    try {
+        alertWait("Preparing a main-compatible rollback export...")
+        const response = await forageStorage.exportBackup({ target: 'main' })
+        await streamBackupToDisk(response, `risu-backup-${Date.now()}-main.bin`)
+        notifySuccess('Success')
+    } catch (error) {
+        console.error(error)
+        alertError(error instanceof Error ? error.message : 'Failed')
+    }
+}
+
 /**
  * Saves a partial local backup with only critical assets.
  * 

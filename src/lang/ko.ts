@@ -1014,6 +1014,9 @@ export const languageKorean = {
   translationResponseSize: "번역 응답 크기",
   webdeeplwarn: "이 옵션은 웹에서는 제대로 작동하지 않을 수 있습니다.",
   saveBackupLocal: "로컬 백업 저장",
+  saveBackupForMain: "PocketRisu main 롤백용 내보내기",
+  saveBackupForMainConfirm:
+    "PocketRisu main 브랜치로 돌아가기 위한 비파괴적 롤백 아카이브를 만듭니다. 전체 채팅, 내장형 플러그인 값, 일반 에셋, 인레이, 콜드 스토리지가 포함됩니다. main이 해당 네임스페이스를 가져올 수 없어 전송하지 않은 작성 중 초안과 기억된 MCP 도구 호출 페이로드는 제외됩니다.\n\n새 main 데이터 디렉터리에 이 아카이브를 복원하세요. 복원된 데이터를 확인할 때까지 기존 serve 데이터 디렉터리와 일반 PocketRisu 백업을 보관하세요.\n\n계속하시겠습니까?",
   saveBackupForUpstream: "원본 리스용 백업 내보내기",
   saveBackupForUpstreamConfirm:
     "이 백업은 원본 RisuAI(웹·Tauri)로 데이터를 옮기기 위한 용도입니다. 인레이 이미지는 entry 이름 형식이 원본 RisuAI 임포트와 호환되지 않아 제외됩니다. 그 외 데이터(데이터베이스, 캐릭터 에셋, 콜드 스토리지)는 포함됩니다.\n\n포켓리스 사이의 데이터 이동에는 일반 로컬 백업을 사용하세요.\n\n계속하시겠습니까?",

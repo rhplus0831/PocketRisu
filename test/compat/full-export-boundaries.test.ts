@@ -81,9 +81,9 @@ function missingChatBlockDatabase(compression: boolean): Buffer {
 
 async function expectArchiveExportRejected(
   client: RisuClient,
-  target: 'nodeonly' | 'upstream',
+  target: 'nodeonly' | 'upstream' | 'main',
 ): Promise<void> {
-  const query = target === 'upstream' ? '?target=upstream' : ''
+  const query = target === 'nodeonly' ? '' : `?target=${target}`
   const response = await client.fetch(`/api/backup/export${query}`)
   expect(response.status).toBe(500)
   expect(response.headers.get('content-disposition')).toBeNull()
@@ -105,9 +105,9 @@ describe('full export corruption boundaries', () => {
         missingChatBlockDatabase(compression),
       )
 
-      for (const target of ['nodeonly', 'upstream'] as const) {
+      for (const target of ['nodeonly', 'upstream', 'main'] as const) {
         const response = await client.fetch(
-          `/api/backup/export${target === 'upstream' ? '?target=upstream' : ''}`,
+          `/api/backup/export${target === 'nodeonly' ? '' : `?target=${target}`}`,
         )
         expect(response.status).toBe(500)
         expect(response.headers.get('content-disposition')).toBeNull()
@@ -120,6 +120,19 @@ describe('full export corruption boundaries', () => {
     },
     30_000,
   )
+
+  test('rejects an unknown export target instead of silently creating a Node-only archive', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+
+    const response = await client.fetch('/api/backup/export?target=legacy-main')
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toMatchObject({
+      code: 'BACKUP_EXPORT_TARGET_INVALID',
+    })
+  })
 
   const publicationCorruptions = [
     {
@@ -193,6 +206,7 @@ describe('full export corruption boundaries', () => {
 
       await expectArchiveExportRejected(client, 'nodeonly')
       await expectArchiveExportRejected(client, 'upstream')
+      await expectArchiveExportRejected(client, 'main')
 
       const backupsDir = path.join(server.cwd, 'backups')
       const before = (await readdir(backupsDir)).sort()

@@ -98,6 +98,7 @@ const {
     calculateHash,
     normalizeJSON,
     hasRemoteBlocks,
+    magicHeader,
     magicRisuSaveHeader,
     parseCachedHashesHeader,
     sha256Hex,
@@ -5631,9 +5632,10 @@ async function ingestImportedDatabaseStreaming(
 }
 
 /**
- * Chat rows are always assembled into database.risudat. Upstream exports also
- * fold external plugin rows into that database; Node-only exports keep them as
- * independent archive entries so large plugin stores are never monolithized.
+ * Chat rows are always assembled into database.risudat. Migration targets
+ * (upstream and main rollback) also fold external plugin rows into that
+ * database; Node-only exports keep them as independent archive entries so
+ * large plugin stores are never monolithized.
  */
 async function buildSelfContainedBackupDatabase({
     foldPluginStorage = true,
@@ -5716,6 +5718,35 @@ async function buildSelfContainedBackupDatabase({
     } finally {
         if (ownsSnapshot) snapshot?.close();
     }
+}
+
+async function requireMainCompatibleBackupDatabase(databaseSpool) {
+    if (!databaseSpool?.filePath || databaseSpool.size < magicHeader.length) {
+        const error = new Error('The main-compatible database export is incomplete');
+        error.code = 'BACKUP_MAIN_DATABASE_INCOMPLETE';
+        error.statusCode = 500;
+        throw error;
+    }
+
+    const handle = await fs.open(databaseSpool.filePath, 'r');
+    try {
+        const header = Buffer.alloc(magicHeader.length);
+        const { bytesRead } = await handle.read(header, 0, header.length, 0);
+        if (bytesRead === header.length && header.equals(Buffer.from(magicHeader))) return;
+    } finally {
+        await handle.close();
+    }
+
+    // PocketRisu's escape envelope uses save headers that the rollback branch
+    // predates. Never label that output as main-compatible: the older decoder
+    // would reject the complete archive even though all chat rows were folded.
+    const error = new Error(
+        'Cannot export for main because plugin storage contains keys that its save format cannot represent. '
+        + 'Rename or remove __proto__ and ill-formed Unicode plugin keys, then retry.',
+    );
+    error.code = 'BACKUP_MAIN_UNSUPPORTED_PLUGIN_KEYS';
+    error.statusCode = 409;
+    throw error;
 }
 
 async function listPluginBackupEntries(
@@ -6101,6 +6132,8 @@ async function planFullBackupFilesystemEntries(snapshot, target) {
             });
         }
     }
+    // Original upstream cannot import PocketRisu's slash-named inlay entries.
+    // The PocketRisu main rollback target can, so retain them there.
     if (target === 'upstream') return entries;
 
     for (const inlay of await listInlayFiles()) {
@@ -6693,22 +6726,25 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
                 throw fullBackupDatabaseUnavailableError(cause);
             }
             const filesystemEntries = await planFullBackupFilesystemEntries(snapshot, target);
+            const includeInlays = target !== 'upstream';
+            const includeServeOnlyRows = target === 'nodeonly';
+            const foldPluginStorage = target !== 'nodeonly';
             const baseSnapshotEntries = [
                 ...planFullBackupColdStorageEntries(snapshot),
-                ...(target === 'upstream' ? [] : snapshot.kvListWithSizes('inlay_meta/').map((entry) => ({
+                ...(includeInlays ? snapshot.kvListWithSizes('inlay_meta/').map((entry) => ({
                     kind: 'kv-source',
                     key: entry.key,
                     backupName: entry.key,
                     sortKey: entry.key,
                     size: entry.size,
-                }))),
-                ...(target === 'upstream' ? [] : listMcpToolCallBackupEntries(snapshot)),
-                ...(target === 'upstream' ? [] : listDraftBackupEntries(snapshot)),
+                })) : []),
+                ...(includeServeOnlyRows ? listMcpToolCallBackupEntries(snapshot) : []),
+                ...(includeServeOnlyRows ? listDraftBackupEntries(snapshot) : []),
             ];
             // Admission is deliberately conservative: reserve every physical
             // plugin candidate before decoding the tiny ownership metadata
             // from the pinned database file. Only owned rows are published.
-            const pluginCandidates = target === 'upstream' ? [] : [
+            const pluginCandidates = foldPluginStorage ? [] : [
                 ...snapshot.kvListWithSizes(PLUGIN_SAVE_PREFIX),
                 ...snapshot.kvListWithSizes(PLUGIN_SAVE_META_PREFIX),
                 ...snapshot.kvListWithSizes(PLUGIN_STORAGE_MANIFEST_KEY),
@@ -6746,8 +6782,8 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
             }
             const assemblyRows = [
                 ...snapshot.kvListWithSizes('chats/'),
-                ...(target === 'upstream' ? snapshot.kvListWithSizes(PLUGIN_SAVE_PREFIX) : []),
-                ...(target === 'upstream' ? snapshot.kvListWithSizes(PLUGIN_SAVE_META_PREFIX) : []),
+                ...(foldPluginStorage ? snapshot.kvListWithSizes(PLUGIN_SAVE_PREFIX) : []),
+                ...(foldPluginStorage ? snapshot.kvListWithSizes(PLUGIN_SAVE_META_PREFIX) : []),
                 // REMOTE rows are not archive entries. They are private source
                 // spools used while rebuilding database.risudat, so reserve
                 // every physical candidate conservatively before resolving
@@ -6814,9 +6850,9 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
             const databaseSource = { filePath: databaseSourcePath, size: databaseSize };
             const snapshotEntries = [
                 ...baseSnapshotEntries,
-                ...(target === 'upstream'
-                    ? []
-                    : await listPluginBackupEntries(snapshot, databaseState)),
+                ...(includeServeOnlyRows
+                    ? await listPluginBackupEntries(snapshot, databaseState)
+                    : []),
             ];
             const plannedEntries = [...filesystemEntries, ...snapshotEntries]
                 .sort((a, b) => a.sortKey.localeCompare(b.sortKey));
@@ -13313,12 +13349,23 @@ app.get('/api/backup/export', async (req, res, next) => {
     let pinnedState = null;
     const shouldAbort = () => abortTracker.signal.aborted || res.destroyed;
     try {
-        // ?target=upstream excludes NodeOnly-only slashed namespaces: plugin
-        // rows plus drafts/, inlay/, inlay_sidecar/, and inlay_meta/. Upstream
-        // RisuAI's import treats those names as paths under assets/ and fails
-        // with ENOENT. Plugin rows are folded inline; drafts and inlays remain
-        // intentionally lossy on this migration-only target.
-        const target = req.query.target === 'upstream' ? 'upstream' : 'nodeonly';
+        const requestedTarget = req.query.target;
+        if (requestedTarget !== undefined
+            && requestedTarget !== 'nodeonly'
+            && requestedTarget !== 'upstream'
+            && requestedTarget !== 'main') {
+            res.status(400).json({
+                error: 'Unsupported backup export target',
+                code: 'BACKUP_EXPORT_TARGET_INVALID',
+            });
+            return;
+        }
+        // upstream excludes slash-named PocketRisu namespaces its importer
+        // rejects. main is a separate downgrade contract: it folds optimized
+        // plugin rows and omits serve-only drafts/MCP rows, while retaining the
+        // inlay namespaces that the PocketRisu main importer understands.
+        const target = requestedTarget ?? 'nodeonly';
+        const foldPluginStorage = target !== 'nodeonly';
         pinnedState = await pinFullBackupState({
             target,
             signal: abortTracker.signal,
@@ -13326,21 +13373,24 @@ app.get('/api/backup/export', async (req, res, next) => {
         await waitAtFullExportAfterPinTestGate(abortTracker.signal);
         throwIfBackupExportAborted(abortTracker.signal);
         backupDbSpool = await buildSelfContainedBackupDatabase({
-            foldPluginStorage: target === 'upstream',
+            foldPluginStorage,
             shouldAbort,
             snapshot: pinnedState.snapshot,
             databaseSource: pinnedState.databaseSource,
             databaseState: pinnedState.databaseState,
             signal: abortTracker.signal,
         });
+        if (target === 'main') {
+            await requireMainCompatibleBackupDatabase(backupDbSpool);
+        }
         throwIfBackupExportAborted(abortTracker.signal);
-        const namespacedEntries = target === 'upstream'
-            ? pinnedState.entries
-            : await selectReferencedMcpToolCallEntries(
+        const namespacedEntries = target === 'nodeonly'
+            ? await selectReferencedMcpToolCallEntries(
                 pinnedState.entries,
                 backupDbSpool,
                 shouldAbort,
-            );
+            )
+            : pinnedState.entries;
         const dbSize = backupDbSpool?.size ?? 0;
         preflightBackupEntries([
             ...namespacedEntries,
@@ -13350,11 +13400,15 @@ app.get('/api/backup/export', async (req, res, next) => {
             return sum + backupEntrySize(entry.backupName, entry.size);
         }, 0) + (dbSize ? backupEntrySize('database.risudat', dbSize) : 0);
 
-        const filenameSuffix = target === 'upstream' ? '-upstream' : '';
+        const filenameSuffix = target === 'nodeonly' ? '' : `-${target}`;
         res.setHeader('content-type', 'application/octet-stream');
         res.setHeader('content-disposition', `attachment; filename="risu-backup-${Date.now()}${filenameSuffix}.bin"`);
         res.setHeader('content-length', totalBytes);
         res.setHeader('x-risu-backup-assets', namespacedEntries.length);
+        res.setHeader('x-risu-backup-target', target);
+        if (target === 'main') {
+            res.setHeader('x-risu-backup-omitted', 'drafts,remembered-mcp-tool-calls');
+        }
 
         for (const entry of namespacedEntries) {
             throwIfBackupExportAborted(abortTracker.signal);

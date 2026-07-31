@@ -8,6 +8,7 @@
     import { alertConfirm } from "src/ts/alert";
     import {
         LoadLocalBackup,
+        SaveLocalBackupForMain,
         SaveLocalBackupForUpstream,
         SavePartialLocalBackup,
         ImportFromSaveZip,
@@ -35,7 +36,16 @@
         {/snippet}
     </ShAlert>
 
-    <!-- Migration: upstream RisuAI ↔ NodeOnly ─────────────────────────── -->
+    <!-- Rollback and upstream migration exports ─────────────────────────── -->
+    <Button
+        onclick={async () => {
+            if (await alertConfirm(language.saveBackupForMainConfirm)) {
+                SaveLocalBackupForMain();
+            }
+        }} className="mt-2">
+        {language.saveBackupForMain}
+    </Button>
+
     <Button
         onclick={async () => {
             if (await alertConfirm(language.saveBackupForUpstreamConfirm)) {

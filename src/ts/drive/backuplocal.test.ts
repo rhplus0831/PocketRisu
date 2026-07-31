@@ -56,7 +56,12 @@ vi.mock('streamsaver', () => ({
     createWriteStream: mocks.createWriteStream,
 }))
 
-const { ImportFromSaveZip, SavePartialLocalBackup, runSaveFolderZipImport } = await import('./backuplocal')
+const {
+    ImportFromSaveZip,
+    SaveLocalBackupForMain,
+    SavePartialLocalBackup,
+    runSaveFolderZipImport,
+} = await import('./backuplocal')
 
 function backupResponse(missingAssets = 0) {
     const bytes = new Uint8Array([1, 2, 3, 4])
@@ -422,5 +427,30 @@ describe('SavePartialLocalBackup', () => {
         expect(writable.locked).toBe(false)
         expect(mocks.notifySuccess).toHaveBeenCalledWith('Success')
         expect(mocks.alertError).not.toHaveBeenCalled()
+    })
+})
+
+describe('SaveLocalBackupForMain', () => {
+    test('downloads only through the dedicated main target', async () => {
+        await SaveLocalBackupForMain()
+
+        expect(mocks.exportBackup).toHaveBeenCalledWith({ target: 'main' })
+        expect(mocks.downloadFile).toHaveBeenCalledWith(
+            'server-partial.bin',
+            new Uint8Array([1, 2, 3, 4]),
+        )
+        expect(mocks.notifySuccess).toHaveBeenCalledWith('Success')
+    })
+
+    test('shows the server compatibility reason instead of claiming success', async () => {
+        const failure = new Error('main cannot represent this plugin key')
+        mocks.exportBackup.mockRejectedValueOnce(failure)
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+        await SaveLocalBackupForMain()
+
+        expect(mocks.alertError).toHaveBeenCalledWith(failure.message)
+        expect(mocks.notifySuccess).not.toHaveBeenCalled()
+        consoleError.mockRestore()
     })
 })

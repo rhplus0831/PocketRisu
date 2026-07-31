@@ -15,6 +15,7 @@ These mechanisms are intentionally different:
 | Mechanism | Scope and policy |
 |---|---|
 | Downloaded full backup | Node self-contained archive; requires valid live DB and every referenced chat |
+| Main-target downgrade export | Non-destructive migration archive for the PocketRisu `main` rollback target; folds chats and plugin storage while retaining main-readable assets and inlays |
 | Upstream-target export | Migration archive; folds/filters PocketRisu state and intentionally omits inlays |
 | Server-file backup | Same strict full-state cut, published atomically into the configured backup directory |
 | Partial export job | Selected characters/personas/modules and referenced identity assets; recovery-oriented missing-chat policy |
@@ -92,6 +93,29 @@ and omits `inlay/`, `inlay_sidecar/`, and `inlay_meta/`; existing inlay referenc
 therefore become unresolved. Use the normal Node export for PocketRisu restore. Import
 accepts supported unencrypted upstream `.bin` data, not encrypted risuai.xyz account
 backups.
+
+### PocketRisu main-target downgrade
+
+`target=main` is the supported non-destructive path for rolling a `serve` installation
+back to the audited PocketRisu `main` storage contract. It uses the same pinned full-state
+cut as an ordinary full export, requires every referenced chat row, folds chat bodies and
+the selected optimized plugin publication into `database.risudat`, and emits the legacy
+version-7 database header accepted by `main`. Ordinary assets, cold storage, inlay
+payloads, inlay sidecars, and inlay metadata remain archive entries because `main`
+understands those names.
+
+The target omits `drafts/` and `cache/mcp-tool-calls/`: the rollback import contract has
+no archive-entry readers for composer drafts or remembered MCP payloads. It also omits
+external plugin rows and their manifest after folding them inline. A plugin key such as
+`__proto__` or ill-formed Unicode that requires PocketRisu's newer escape-aware save
+header makes the export fail before archive headers are published; it is never mislabeled
+as main-compatible.
+
+The UI exposes this operation under **Data Migration → Export for PocketRisu Main
+Rollback** and warns about the two omitted namespaces. Restore the result into a fresh
+`main` data directory and retain both the original `serve` directory and a normal full
+PocketRisu backup until verification completes. Directly booting `main` against the
+row-backed `serve` directory remains unsupported.
 
 ## Partial export jobs
 

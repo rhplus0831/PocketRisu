@@ -158,11 +158,12 @@ Drafts deliberately do not modify `Chat`, so typing does not re-upload a chat bo
 
 ### Backup and destructive recovery
 
-- Full, upstream-target, and server-file exports stream from server-owned point-in-time sources. Full/server exports require a valid live database and every referenced chat.
+- Full, upstream-target, main-target, and server-file exports stream from server-owned point-in-time sources. Every full-state target requires a valid live database and every referenced chat.
 - Normal Node full/server exports and partial jobs carry only composer drafts whose exact character/chat identity exists in the pinned graph. Upstream-target exports omit drafts, and destructive imports restore draft rows only after imported IDs are normalized.
 - `SavePartialLocalBackup()` creates, polls, downloads, and deletes a cancellable server export job. The server pins selected state and identity assets, folds plugin/chat rows, reports missing assets, and can preserve an already-missing chat as a bare stub. Browser placeholders are not hydrated for this flow.
 - `LoadLocalBackup()`, server-backup restore, save-folder replacement, and snapshot restore distinguish committed, not-committed, and unknown outcomes. Save-folder and snapshot waits are activity-based and reconcile lost acknowledgements against transaction-bound operation status. Ambiguous destructive requests are never replayed; the UI warns and reloads to reconcile authoritative state.
 - `target=upstream` is a lossy migration export: it omits composer drafts plus inlay payload, sidecar, and metadata namespaces. Use the normal Node export for PocketRisu recovery.
+- `target=main` is the non-destructive downgrade export for the audited PocketRisu main branch. It folds chat and optimized plugin rows, retains main-readable assets/inlays, omits unsupported draft and remembered-MCP rows, and rejects newer escape-aware plugin save headers before download.
 - Per-chat pre-image import remains separate: it decodes one history version, assigns a fresh chat ID, and saves it as a new chat instead of overwriting current row identity.
 
 See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snapshot, limit, cancellation, and outcome contracts.

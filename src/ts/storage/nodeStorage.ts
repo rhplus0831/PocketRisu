@@ -4674,7 +4674,7 @@ export class NodeStorage{
 
     async exportBackup(
         opts?: {
-            target?: 'upstream'
+            target?: 'upstream' | 'main'
             scope?: 'partial'
             signal?: AbortSignal | null
             onPreparationProgress?: (progress: {
@@ -4788,7 +4788,7 @@ export class NodeStorage{
         }
 
         const params = new URLSearchParams()
-        if (opts?.target === 'upstream') params.set('target', 'upstream')
+        if (opts?.target) params.set('target', opts.target)
         const query = params.toString()
         const url = `/api/backup/export${query ? `?${query}` : ''}`
         // Backup preparation can legitimately take longer than ordinary
@@ -4801,7 +4801,14 @@ export class NodeStorage{
                 'read',
                 AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS,
             )
-        if (da.status < 200 || da.status >= 300) throw `backup export error: ${da.status}`
+        if (da.status < 200 || da.status >= 300) {
+            const detail = await da.json().catch(() => null) as { error?: unknown } | null
+            throw new Error(
+                typeof detail?.error === 'string'
+                    ? detail.error
+                    : `backup export error: ${da.status}`,
+            )
+        }
         return da
     }
 

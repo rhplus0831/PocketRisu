@@ -195,7 +195,7 @@ export class AutoStorage{
 
     async exportBackup(
         opts?: {
-            target?: 'upstream'
+            target?: 'upstream' | 'main'
             scope?: 'partial'
             signal?: AbortSignal | null
             onPreparationProgress?: (progress: {

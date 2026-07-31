@@ -190,6 +190,11 @@ describe('remembered MCP tool-call recovery', () => {
     ).arrayBuffer()))
     expect(upstream.some(entry => entry.name.startsWith(MCP_PREFIX))).toBe(false)
 
+    const mainResponse = await sourceClient.fetch('/api/backup/export?target=main')
+    expect(mainResponse.status).toBe(200)
+    const main = decodeBackup(Buffer.from(await mainResponse.arrayBuffer()))
+    expect(main.some(entry => entry.name.startsWith(MCP_PREFIX))).toBe(false)
+
     await writeKv(
       destinationClient,
       mcpStorageKey(staleId),
