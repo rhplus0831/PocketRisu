@@ -275,21 +275,23 @@ Gemini cache identity is `chat ID + task + preset ID`; entries also record model
 
 The Risu formats apply to `botPreset`, not `ModelPreset`.
 
-`downloadPreset()` at `database.svelte.ts:2846`:
+`downloadPreset()` at `database.svelte.ts:2882`:
 
-- first snapshots the active global prompt/model fields through `saveCurrentPreset()`;
-- clones the selected `botPreset`;
-- blanks API keys, proxy keys, forced URLs, and WebUI URLs (`database.svelte.ts:2851`);
-- for the binary path, MessagePack-encodes the preset, encrypts it with the `"risupreset"` context, wraps it in `{presetVersion: 2, type: "preset"}`, compresses it, then RPack-encodes it (`database.svelte.ts:2861`);
-- despite the API argument being named `"risupreset"`, the current exporter writes a `.risup` filename (`database.svelte.ts:2873`).
+- for the active preset, builds a non-mutating snapshot of the live global
+  prompt/model fields through the same pure builder used by
+  `saveCurrentPreset()`;
+- for an inactive preset, clones the selected stored `botPreset` directly;
+- blanks API keys, proxy keys, forced URLs, and WebUI URLs (`database.svelte.ts:2889`);
+- for the binary path, MessagePack-encodes the preset, encrypts it with the `"risupreset"` context, wraps it in `{presetVersion: 2, type: "preset"}`, compresses it, then RPack-encodes it (`database.svelte.ts:2900`);
+- despite the API argument being named `"risupreset"`, the current exporter writes a `.risup` filename (`database.svelte.ts:2912`).
 
-`importPreset()` accepts JSON, legacy `.risupreset`, and `.risup` (`database.svelte.ts:2895`):
+`importPreset()` accepts JSON, legacy `.risupreset`, and `.risup` (`database.svelte.ts:2933`):
 
-- `.risup` is first unwrapped with `decodeRPack`; `.risupreset` is treated as the older raw compressed envelope (`database.svelte.ts:2906`);
-- binary envelopes with preset versions 0 or 2 and type `"preset"` are decrypted and merged onto `presetTemplate` (`database.svelte.ts:2911`);
+- `.risup` is first unwrapped with `decodeRPack`; `.risupreset` is treated as the older raw compressed envelope (`database.svelte.ts:2947`);
+- binary envelopes with preset versions 0 or 2 and type `"preset"` are decrypted and merged onto `presetTemplate` (`database.svelte.ts:2952`);
 - JSON also merges onto `presetTemplate`;
-- NovelAI parameter files and SillyTavern prompt layouts have separate conversion branches (`database.svelte.ts:2922`, `database.svelte.ts:2947`);
-- every imported ordinary preset receives a fresh stable ID before being appended (`database.svelte.ts:3052`).
+- NovelAI parameter files and SillyTavern prompt layouts have separate conversion branches (`database.svelte.ts:2960`, `database.svelte.ts:2985`);
+- every imported ordinary preset receives a fresh stable ID before being appended (`database.svelte.ts:3090`).
 
 Model profiles instead use plain `.profile.json` fragments (`modelProfileBrowser.svelte:241`, `ModelPresetBasicInfo.svelte:105`). Fragment export normally omits a preset's direct credentials, but the flexible profile/base-provider fields are not scrubbed recursively; inspect hand-edited or imported fragments before sharing. There is no dedicated standalone `ModelPreset` import/export format; model presets and direct credentials persist as part of the PocketRisu database/backup.
 
@@ -377,9 +379,9 @@ Model profiles instead use plain `.profile.json` fragments (`modelProfileBrowser
 - To change per-chat model selection, inspect `src/ts/process/request/modelPresetBinding.ts:42` and `src/lib/SideBars/ModelBind.svelte`.
 - To change how prompt-preset parameters override a model preset, inspect `src/ts/process/request/modelPresetBinding.ts:191`.
 - To change prompt text/template defaults, inspect `src/ts/storage/defaultPrompts.ts:3` and the upstream-compatible `presetTemplate` at `src/ts/storage/database.svelte.ts:2230`.
-- To add a field to the upstream-compatible prompt preset, update `botPreset` at `src/ts/storage/database.svelte.ts:1723`, `presetTemplate` at `:2230`, `saveCurrentPreset()` at `:2406`, and `setPreset()` at `:2531`.
+- To add a field to the upstream-compatible prompt preset, update `botPreset` at `src/ts/storage/database.svelte.ts:1753`, `presetTemplate` at `:2260`, `createCurrentBotPresetSnapshot()` at `:2436`, and `setPreset()` at `:2567`.
 - To change active prompt-preset compatibility behavior, inspect the stable-ID helpers at `src/ts/storage/database.svelte.ts:2339`.
-- To change `.risup`/`.risupreset` encoding, redaction, or import compatibility, inspect `src/ts/storage/database.svelte.ts:2846` and `:2895`.
+- To change `.risup`/`.risupreset` encoding, redaction, or import compatibility, inspect `src/ts/storage/database.svelte.ts:2882` and `:2933`.
 - To change saved-key selection priority, inspect `src/ts/process/request/modelPresetBinding.ts:264`.
 - To implement real API-key rotation, add explicit pool/list state and retry policy; current CRUD at `src/ts/preset/apiKeyPool.ts:17` and credential resolution at `src/ts/process/request/modelPresetBinding.ts:278` select only one key.
 - To change generic request merge precedence, inspect `src/ts/preset/adapter/buildRequest.ts:15`.

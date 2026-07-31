@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **46** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is deferred for future work, and **48** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **45** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is deferred for future work, and **49** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -31,7 +31,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [RISUP export mutates the live preset](audit/risup-export-deletes-auto-suggest-prefix-and-clean-policy.md) | audit | Open | Two live auto-suggest policy fields are deleted and also omitted from the archive. | Deterministic on every `.risup` export of an affected configured preset. |
 | [Legacy storage getters treat falsey values as missing](audit/legacy-storage-getters-conflate-valid-values-with-missing.md) | audit | Open | A plugin can reset persisted configuration or lock itself against later saves. | Every affected V2 plugin read of a stored empty string, zero, or false sentinel. |
 | [Denied V3 database writes report success](compatibility/v3-database-setter-permission.md) | compat | Open | A plugin can discard an unsaved retry buffer even though no state was committed. | Permission denial deterministically resolves `Promise<void>` as if the write succeeded. |
 | [Docker server backups are ephemeral](audit/docker-server-backups-are-ephemeral.md) | audit | Open | Recovery copies only; live data survives — every server-side `.bin` backup is removed. | Normal image update or container recreation with the shipped Compose layout. |
@@ -121,6 +120,7 @@ None currently open.
 
 | Finding | Former harm | Note |
 |---|---|---|
+| [RISUP export mutated the live preset](audit/risup-export-deletes-auto-suggest-prefix-and-clean-policy.md) | Two live auto-suggest policy fields were deleted and also omitted from the archive. | Fixed 2026-07-31 with a shared pure preset snapshot, non-mutating active and inactive exports, complete auto-suggest field capture, and field-exhaustive binary round-trip coverage. |
 | [Young-chat deletion had no pre-image](audit/chat-deletion-has-no-preimage-history.md) | A chat created, saved once, and accidentally deleted before a full snapshot could have no recovery copy anywhere. | Fixed 2026-07-31 with forced cooldown-exempt pre-images before structural row deletion, fail-closed database publication, cache-backed full-write/transition coverage, and byte-exact first-save deletion plus rollback tests. |
 | [Backups omitted drafts and imports deleted them](audit/backups-omit-drafts-and-imports-delete-them.md) | Every full backup restore/import permanently deleted all persistent unsent composer drafts. | Fixed 2026-07-31 with pinned graph-referenced draft entries in Node full/server/partial archives, post-normalization exact-key restoration, stale/orphan filtering, upstream omission, and archive/save-folder round-trip coverage. |
 | [Plugin updates discarded configured arguments](audit/plugin-updates-discard-configured-arguments.md) | Ordinary updates and confirmed duplicate imports reset persisted API keys, endpoints, models, prompts, and enablement. | Fixed 2026-07-31 by merging live values for retained argument names, defaulting only new arguments, preserving compatible enablement, confirming removals outside the lifecycle lock, rechecking before commit, and covering update/import schema changes plus durability. |

@@ -2433,16 +2433,10 @@ export function withStableActivePreset(fn: () => void): void {
     }
 }
 
-export function saveCurrentPreset(){
-    let db = getDatabase()
-    let pres = db.botPresets
-
-    if(db.botPresetsId === -1){
-        return
-    }
-    const savedPreset:botPreset =  {
-        id: pres[db.botPresetsId]?.id || uuidv4(),
-        name: pres[db.botPresetsId].name,
+function createCurrentBotPresetSnapshot(db: Database, currentPreset: botPreset): botPreset {
+    return {
+        id: currentPreset?.id || uuidv4(),
+        name: currentPreset.name,
         apiType: db.apiType,
         openAIKey: db.openAIKey,
         localNetworkMode: db.localNetworkMode,
@@ -2476,6 +2470,8 @@ export function saveCurrentPreset(){
         NAIappendName: db.NAIappendName ?? false,
         localStopStrings: db.localStopStrings,
         autoSuggestPrompt: db.autoSuggestPrompt,
+        autoSuggestPrefix: db.autoSuggestPrefix,
+        autoSuggestClean: db.autoSuggestClean,
         customProxyRequestModel: db.customProxyRequestModel,
         reverseProxyOobaArgs: safeStructuredClone(db.reverseProxyOobaArgs) ?? null,
         top_p: db.top_p ?? 1,
@@ -2505,7 +2501,7 @@ export function saveCurrentPreset(){
         customFlags: safeStructuredClone(db.customFlags),
         enableCustomFlags: db.enableCustomFlags,
         regex: db.presetRegex,
-        image: pres?.[db.botPresetsId]?.image ?? '',
+        image: currentPreset?.image ?? '',
         reasonEffort: db.reasoningEffort ?? 0,
         thinkingTokens: db.thinkingTokens ?? null,
         thinkingType: db.thinkingType ?? 'budget',
@@ -2519,6 +2515,16 @@ export function saveCurrentPreset(){
         verbosity: db.verbosity ?? 1,
         dynamicOutput: db.dynamicOutput ?? null
     }
+}
+
+export function saveCurrentPreset(){
+    let db = getDatabase()
+    let pres = db.botPresets
+
+    if(db.botPresetsId === -1){
+        return
+    }
+    const savedPreset = createCurrentBotPresetSnapshot(db, pres[db.botPresetsId])
     
     if(!Array.isArray(pres)){
         pres = []
@@ -2874,9 +2880,11 @@ import { defaultHotkeys, type Hotkey } from '../defaulthotkeys';
 import type { OpenAIChat } from '../process/index.svelte';
 
 export async function downloadPreset(id:number, type:'json'|'risupreset'|'return' = 'json'){
-    saveCurrentPreset()
     let db = getDatabase()
-    let pres = safeStructuredClone(db.botPresets[id])
+    const selectedPreset = id === db.botPresetsId
+        ? createCurrentBotPresetSnapshot(db, db.botPresets[id])
+        : db.botPresets[id]
+    let pres = safeStructuredClone(selectedPreset)
     console.log(pres)
     pres.openAIKey = ''
     pres.forceReplaceUrl = ''

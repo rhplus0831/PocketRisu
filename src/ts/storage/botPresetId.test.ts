@@ -31,14 +31,21 @@ vi.mock('../../lang', () => ({
     changeLanguage: () => {},
 }))
 
+vi.mock('../rpack/rpack_js', () => ({
+    encodeRPack: async (data: Uint8Array) => data,
+    decodeRPack: async (data: Uint8Array) => data,
+}))
+
 const databaseModule = await import('./database.svelte')
 const storesModule = await import('../stores.svelte')
 const {
     createBotPresetTemplate,
+    downloadPreset,
     getActiveBotPreset,
     getActiveBotPresetId,
     getBotPresetById,
     getBotPresetIndexById,
+    importPreset,
     setDatabase,
     setActiveBotPresetById,
     withStableActivePreset,
@@ -90,6 +97,84 @@ describe('database defaults', () => {
         setDatabase(DBState.db)
 
         expect(DBState.db.legacyPluginCompatibility).toBe(false)
+    })
+})
+
+describe('prompt preset export', () => {
+    test('exports the active live settings without mutating the stored preset', async () => {
+        setDatabase(DBState.db)
+        Object.assign(DBState.db.botPresets[1], {
+            autoSuggestPrompt: 'Stored prompt',
+            autoSuggestPrefix: 'Stored prefix',
+            autoSuggestClean: true,
+        })
+        Object.assign(DBState.db, {
+            autoSuggestPrompt: 'Live prompt',
+            autoSuggestPrefix: 'Live prefix',
+            autoSuggestClean: false,
+        })
+        const presetsBeforeExport = structuredClone(DBState.db.botPresets)
+
+        const exported = await downloadPreset(1, 'return')
+
+        expect(DBState.db.botPresets).toEqual(presetsBeforeExport)
+        expect(exported?.data).toMatchObject({
+            autoSuggestPrompt: 'Live prompt',
+            autoSuggestPrefix: 'Live prefix',
+            autoSuggestClean: false,
+        })
+    })
+
+    test('exports an inactive preset without rewriting the active preset', async () => {
+        setDatabase(DBState.db)
+        Object.assign(DBState.db.botPresets[0], {
+            autoSuggestPrompt: 'Inactive prompt',
+            autoSuggestPrefix: 'Inactive prefix',
+            autoSuggestClean: false,
+        })
+        Object.assign(DBState.db, {
+            autoSuggestPrompt: 'Active live prompt',
+            autoSuggestPrefix: 'Active live prefix',
+            autoSuggestClean: true,
+        })
+        const presetsBeforeExport = structuredClone(DBState.db.botPresets)
+
+        const exported = await downloadPreset(0, 'return')
+
+        expect(DBState.db.botPresets).toEqual(presetsBeforeExport)
+        expect(exported?.data).toMatchObject({
+            autoSuggestPrompt: 'Inactive prompt',
+            autoSuggestPrefix: 'Inactive prefix',
+            autoSuggestClean: false,
+        })
+    })
+
+    test('round-trips every exported active-preset field through RISUP import', async () => {
+        setDatabase(DBState.db)
+        Object.assign(DBState.db, {
+            autoSuggestPrompt: 'Round-trip prompt',
+            autoSuggestPrefix: 'Round-trip prefix',
+            autoSuggestClean: false,
+        })
+        const exported = await downloadPreset(1, 'return')
+        expect(exported?.buf).toBeTruthy()
+
+        DBState.db = {
+            botPresets: [makePreset('destination', 'Destination')],
+            botPresetsId: 0,
+        }
+        setDatabase(DBState.db)
+        await importPreset({
+            name: 'round-trip.risup',
+            data: exported!.buf!,
+        })
+
+        const imported = DBState.db.botPresets.at(-1)
+        expect(imported?.id).not.toBe(exported!.data.id)
+        for (const [key, value] of Object.entries(exported!.data)) {
+            if (key === 'id') continue
+            expect(imported?.[key]).toEqual(value)
+        }
     })
 })
 

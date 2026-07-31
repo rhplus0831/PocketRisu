@@ -1,8 +1,8 @@
 # Audit findings — priority index
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
-`Status` column uses `Open`, `Fixed`, or `Deferred`; 42 findings are currently
-`Open`, 17 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
+`Status` column uses `Open`, `Fixed`, or `Deferred`; 41 findings are currently
+`Open`, 18 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
 as a cross-reference).
@@ -72,7 +72,7 @@ resolution against current code before acting on it.
 | Finding | Status | Doc sev. | What could be lost | Trigger / likelihood |
 |---|---|---|---|---|
 | [Backups omit drafts and imports delete them](audit/backups-omit-drafts-and-imports-delete-them.md) | Fixed | Medium | Every unsent composer draft | Every backup restore/import cleared the `drafts/` prefix; no backup path included it |
-| [RISUP export deletes auto-suggest prefix and clean policy](audit/risup-export-deletes-auto-suggest-prefix-and-clean-policy.md) | Open | Medium | Two configured preset fields, deleted from the **live** in-memory preset and omitted from the archive | Deterministic on every `.risup` export — the export path mutates the live preset |
+| [RISUP export deletes auto-suggest prefix and clean policy](audit/risup-export-deletes-auto-suggest-prefix-and-clean-policy.md) | Fixed | Medium | Two configured preset fields, deleted from the **live** in-memory preset and omitted from the archive | Deterministic on every `.risup` export — the export path mutates the live preset |
 | [Unmigrated KV inlays omitted from backups](audit/unmigrated-kv-inlays-are-omitted-from-backups.md) | Open | Medium | KV-fallback inlays absent from every archive; a restore then deletes the live copy | Requires a skipped/failed entry in the one-time migration; the loss lands on any later restore |
 | [Interrupted inlay migration discards the source row](audit/interrupted-inlay-migration-discards-the-source-row.md) | Open | Medium | One inlay: the valid KV source deleted in favor of a torn file | Crash inside the one-time migration window, then next-boot resume |
 | [Legacy KV migration marker can outlive the WAL commit](audit/legacy-kv-migration-marker-can-outlive-the-wal-commit.md) | Open | Medium | Whole database hidden (empty DB served); hex sources survive on disk for manual recovery | Power loss during the legacy hex-to-SQLite migration |
