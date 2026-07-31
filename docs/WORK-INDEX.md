@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **50** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, and **45** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **49** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is deferred for future work, and **45** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -31,7 +31,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [Pre-tracking capture omits six save domains](audit/pre-tracking-baseline-capture-still-omits-six-save-domains.md) | audit | Open | Boot migrations, repairs, imports, and defaults can remain memory-only and vanish. | Affected bootstrap mutations are absorbed as the clean baseline on an ordinary boot. |
 | [Plugin updates discard configured arguments](audit/plugin-updates-discard-configured-arguments.md) | audit | Open | API keys, endpoints, models, prompts, and enablement are reset and persisted. | Every ordinary update or confirmed duplicate import of an affected plugin. |
 | [Backups omit drafts and imports delete them](audit/backups-omit-drafts-and-imports-delete-them.md) | audit | Open | All persistent unsent composer drafts are deleted. | Every full backup restore/import clears the namespace while no backup contains it. |
 | [Young-chat deletion has no pre-image](audit/chat-deletion-has-no-preimage-history.md) | audit | Open | An accidentally deleted young chat has no recovery copy. | Create and save a chat once, then use the normal delete flow before a snapshot captures it. |
@@ -114,6 +113,12 @@ None currently open.
 | [Cloudflare Quick Tunnel was removed](compatibility/cloudflare-quick-tunnel-removed.md) | compat | Intentional | Deployments using the bundled tunnel lose remote access and the old API returns 404. | Deterministic after update or container rebuild for Quick Tunnel users. |
 | [Custom hub proxy targets are rejected](compatibility/hub-proxy-custom-targets-rejected.md) | compat | Intentional | Custom hubs and external clients lose their relay route. | Deterministic for any non-official target sent to `/hub-proxy`. |
 | [Generic `HOST` changes the listen address](compatibility/generic-host-env-changes-listen-address.md) | compat | Intentional | The server can bind the wrong interface or fail startup. | Requires an existing process manager or PaaS to set the generic variable for another purpose. |
+
+## Deferred work
+
+| Work item | Source | Status | Impact | Trigger / likelihood |
+|---|---|---|---|---|
+| [Pre-tracking capture omits six save domains](audit/pre-tracking-baseline-capture-still-omits-six-save-domains.md) | audit | Deferred | Boot migrations, repairs, imports, and defaults can remain memory-only and vanish. | Affected bootstrap mutations are absorbed as the clean baseline on an ordinary boot. |
 
 ## Appendix — Fixed findings
 
