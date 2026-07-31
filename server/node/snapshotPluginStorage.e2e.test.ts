@@ -909,7 +909,135 @@ describe('atomic plugin storage publication', () => {
             .toEqual(originalDb)
     }, 30_000)
 
-    it('rejects plugin publication patches before cache mutation, flush, and restart', async () => {
+    it('preserves inline plugin storage patch behavior while guarding publication controls', async () => {
+        const cwd = makeWorkDir()
+        let server = await startServer(cwd)
+        let auth = await authenticate(server)
+        const modeGeneration = crypto.randomUUID()
+        const initialDb = {
+            characters: [],
+            optimizePluginMemory: false,
+            pluginStorageGeneration: modeGeneration,
+            pluginCustomStorage: {
+                alpha: 'old-value',
+                removeMe: 'old-value',
+            },
+            pluginStorageMeta: {
+                alpha: {
+                    plugin: 'Inline owner',
+                    updatedAt: 1,
+                },
+            },
+        }
+        await writeKey(
+            server,
+            auth,
+            'database/database.bin',
+            encodeRisuSaveLegacy(initialDb),
+        )
+
+        const alphaRevision = crypto.randomUUID()
+        const alphaGeneration = crypto.randomUUID()
+        const betaRevision = crypto.randomUUID()
+        const betaGeneration = crypto.randomUUID()
+        const storedInitialDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        expect(storedInitialDb).toEqual(initialDb)
+        const expectedHash = calculateHash(normalizeJSON(storedInitialDb)).toString(16)
+        const patchResponse = await patchDatabaseResponse(server, auth, expectedHash, [
+            { op: 'replace', path: '/pluginCustomStorage/alpha', value: 'new-value' },
+            { op: 'add', path: '/pluginCustomStorage/beta', value: { enabled: true } },
+            { op: 'remove', path: '/pluginCustomStorage/removeMe' },
+            { op: 'replace', path: '/pluginStorageMeta/alpha/updatedAt', value: 2 },
+            { op: 'add', path: '/pluginStorageMeta/alpha/revision', value: alphaRevision },
+            { op: 'add', path: '/pluginStorageMeta/alpha/generation', value: alphaGeneration },
+            {
+                op: 'add',
+                path: '/pluginStorageMeta/beta',
+                value: {
+                    plugin: 'Inline owner',
+                    updatedAt: 3,
+                    revision: betaRevision,
+                    generation: betaGeneration,
+                },
+            },
+        ])
+        expect(patchResponse.status).toBe(200)
+        await expect(patchResponse.json()).resolves.toMatchObject({
+            success: true,
+            appliedOperations: 7,
+            etag: expect.any(String),
+        })
+
+        await flushDatabase(server, auth)
+        const expectedDb = {
+            ...storedInitialDb,
+            pluginCustomStorage: {
+                alpha: 'new-value',
+                beta: { enabled: true },
+            },
+            pluginStorageMeta: {
+                alpha: {
+                    plugin: 'Inline owner',
+                    updatedAt: 2,
+                    revision: alphaRevision,
+                    generation: alphaGeneration,
+                },
+                beta: {
+                    plugin: 'Inline owner',
+                    updatedAt: 3,
+                    revision: betaRevision,
+                    generation: betaGeneration,
+                },
+            },
+        }
+        const assertInlineState = async () => {
+            expect(await decodeRisuSave(await readKey(
+                server,
+                auth,
+                'database/database.bin',
+            ))).toEqual(expectedDb)
+            expect((await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).length).toBe(0)
+            const physicalKeys = readExactKvState(cwd).map((entry) => entry.key)
+            expect(physicalKeys).not.toContain(valueRowKey('alpha'))
+            expect(physicalKeys).not.toContain(metaRowKey('alpha'))
+        }
+        await assertInlineState()
+
+        const inlineExpectedHash = calculateHash(normalizeJSON(expectedDb)).toString(16)
+        const controlAttacks = [
+            [{ op: 'replace', path: '/optimizePluginMemory', value: true }],
+            [{ op: 'replace', path: '/pluginStorageGeneration', value: crypto.randomUUID() }],
+            [{ op: 'add', path: '/pluginStorageFolded', value: true }],
+            [
+                { op: 'replace', path: '/pluginCustomStorage/alpha', value: 'forged' },
+                { op: 'replace', path: '/optimizePluginMemory', value: true },
+            ],
+            [{ op: 'replace', path: '', value: { ...expectedDb, username: 'forged' } }],
+        ]
+        for (const patch of controlAttacks) {
+            const response = await patchDatabaseResponse(
+                server,
+                auth,
+                inlineExpectedHash,
+                patch,
+            )
+            expect(response.status).toBe(409)
+            expect(await response.json()).toMatchObject({
+                code: 'PLUGIN_STORAGE_PUBLICATION_GUARD',
+            })
+        }
+        await flushDatabase(server, auth)
+        await assertInlineState()
+
+        await stopServer(server)
+        server = await startServer(cwd)
+        auth = await authenticate(server)
+        await assertInlineState()
+    }, 30_000)
+
+    it('rejects optimized plugin publication patches before cache mutation, flush, and restart', async () => {
         const cwd = makeWorkDir()
         let server = await startServer(cwd)
         let auth = await authenticate(server)

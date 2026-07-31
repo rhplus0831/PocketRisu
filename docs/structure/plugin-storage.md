@@ -182,8 +182,12 @@ no longer selected or pinned.
 - Server mutations enter the storage queue and publish values, owner records, the exact
   manifest, the selected generation, quota state, and recovery-dirty token in one SQLite
   transaction.
-- Generic `/api/write`, `/api/remove`, and JSON Patch paths must not mutate manifest-owned
-  rows or the database publication roots.
+- Generic `/api/write` and `/api/remove` paths must not mutate manifest-owned rows, and
+  JSON Patch must not change optimized rows or publication controls. To preserve the
+  original inline save behavior, database patches may update `pluginCustomStorage` and
+  `pluginStorageMeta` only after the server proves that the live authoritative mode is
+  inline. Those accepted patches retain the ordinary delayed database-patch durability
+  window.
 
 Owner records contain plugin identity, update time, opaque revision, and generation.
 Revisions are concurrency tokens, not sortable timestamps.

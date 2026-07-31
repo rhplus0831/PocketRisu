@@ -12683,28 +12683,62 @@ app.post('/api/db/flush', sessionAuthMiddleware, async (req, res, next) => {
 });
 
 // ─── Patch sync endpoint ──────────────────────────────────────────────────────
-function patchTouchesPluginStoragePublication(patch) {
+const INLINE_PLUGIN_STORAGE_PATCH_ROOTS = [
+    'pluginCustomStorage',
+    'pluginStorageMeta',
+];
+const PLUGIN_STORAGE_CONTROL_PATCH_ROOTS = [
+    'optimizePluginMemory',
+    PLUGIN_STORAGE_GENERATION_FIELD,
+    PLUGIN_STORAGE_FOLDED_MARKER,
+];
+
+function pluginStoragePatchPointerKind(pointer) {
+    // Preserve the existing whole-document guard. The slash form is retained
+    // for compatibility with the original predicate even though RFC 6901 uses
+    // the empty string for the document root.
+    if (pointer === '' || pointer === '/') return 'document';
+    if (typeof pointer !== 'string') return null;
+    if (INLINE_PLUGIN_STORAGE_PATCH_ROOTS.some((root) => (
+        pointer === `/${root}` || pointer.startsWith(`/${root}/`)
+    ))) return 'inline-record';
+    if (PLUGIN_STORAGE_CONTROL_PATCH_ROOTS.some((root) => (
+        pointer === `/${root}` || pointer.startsWith(`/${root}/`)
+    ))) return 'control';
+    return null;
+}
+
+function patchReferencesPluginStoragePointerKinds(patch, kinds) {
     if (!Array.isArray(patch)) return false;
-    const protectedRoots = [
-        'pluginCustomStorage',
-        'pluginStorageMeta',
-        'optimizePluginMemory',
-        PLUGIN_STORAGE_GENERATION_FIELD,
-        PLUGIN_STORAGE_FOLDED_MARKER,
-    ];
-    const touchesProtectedPointer = (pointer) => {
-        if (pointer === '' || pointer === '/') return true;
-        if (typeof pointer !== 'string') return false;
-        return protectedRoots.some((root) => (
-            pointer === `/${root}` || pointer.startsWith(`/${root}/`)
-        ));
-    };
     return patch.some((operation) => (
         operation && typeof operation === 'object' && (
-            touchesProtectedPointer(operation.path)
-            || touchesProtectedPointer(operation.from)
+            kinds.has(pluginStoragePatchPointerKind(operation.path))
+            || kinds.has(pluginStoragePatchPointerKind(operation.from))
         )
     ));
+}
+
+function patchTouchesPluginStoragePublication(patch) {
+    return patchReferencesPluginStoragePointerKinds(
+        patch,
+        new Set(['document', 'inline-record', 'control']),
+    );
+}
+
+function patchTouchesPluginStoragePublicationControl(patch) {
+    return patchReferencesPluginStoragePointerKinds(
+        patch,
+        new Set(['document', 'control']),
+    );
+}
+
+function publicationAllowsInlinePluginStoragePatch(publication) {
+    // A completed optimized -> inline transition retains a fresh generation as
+    // its mode epoch, so generation presence alone does not imply external rows.
+    return Boolean(publication.dbObj)
+        && publication.dbObj.optimizePluginMemory !== true
+        && publication.dbObj[PLUGIN_STORAGE_FOLDED_MARKER] !== true
+        && publication.manifestState.present === false;
 }
 
 app.post('/api/patch', async (req, res, next) => {
@@ -12733,16 +12767,28 @@ app.post('/api/patch', async (req, res, next) => {
         await queueStorageMutation(async () => {
             const decodedKey = Buffer.from(filePath, 'hex').toString('utf-8');
 
-            // Publication-sensitive patches must never reach dbCache or the
-            // eager externalization helper below. Mode transitions, generation
-            // rotation, inline/external map changes, and direct row patches all
-            // publish through the CAS-backed plugin storage endpoints instead.
+            // Manifest rows, optimized rows, mode controls, and whole-document
+            // replacements must never reach dbCache or the eager externalizer.
+            // Inline value/owner maps are different: database.bin is their sole
+            // authority, so retain the original PocketRisu patch behavior only
+            // after proving the live server publication is currently inline.
+            let rejectPluginStoragePatch = decodedKey === PLUGIN_STORAGE_MANIFEST_KEY
+                || Boolean(canonicalPluginStorageRowPrefix(decodedKey));
             if (
-                decodedKey === PLUGIN_STORAGE_MANIFEST_KEY
-                || canonicalPluginStorageRowPrefix(decodedKey)
-                || (decodedKey === 'database/database.bin'
-                    && patchTouchesPluginStoragePublication(patch))
+                !rejectPluginStoragePatch
+                && decodedKey === 'database/database.bin'
+                && patchTouchesPluginStoragePublication(patch)
             ) {
+                if (patchTouchesPluginStoragePublicationControl(patch)) {
+                    rejectPluginStoragePatch = true;
+                } else {
+                    const livePublication = await readLivePluginStoragePublication();
+                    rejectPluginStoragePatch = !publicationAllowsInlinePluginStoragePatch(
+                        livePublication,
+                    );
+                }
+            }
+            if (rejectPluginStoragePatch) {
                 return res.status(409).json({
                     error: 'Patch rejected: plugin storage publication must be changed atomically',
                     code: 'PLUGIN_STORAGE_PUBLICATION_GUARD',
