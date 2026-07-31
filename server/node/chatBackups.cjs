@@ -580,13 +580,19 @@ function createChatBackupStore(options) {
         reconcileTimer.unref?.();
     }
 
-    async function captureChatPreImage({ chaId, chatId, reason } = {}) {
+    async function captureChatPreImage({
+        chaId,
+        chatId,
+        reason,
+        force = false,
+        required = false,
+    } = {}) {
         try {
             const existing = readChatRowRaw(chaId, chatId);
             if (existing === null || existing === undefined) return 'skipped-no-row';
             const raw = Buffer.from(existing);
 
-            if (raw.length < 4096) {
+            if (!force && raw.length < 4096) {
                 try {
                     const decoded = await decodeChat(raw);
                     if (decoded?.message?.[0]?.data?.startsWith(COLD_STORAGE_HEADER)) {
@@ -608,7 +614,7 @@ function createChatBackupStore(options) {
                 newest = newestTimestampOnDisk(chatDir);
                 newestByChatDir.set(chatDir, newest);
             }
-            if (newest !== null && currentTime - newest < Math.max(0, cooldownMs)) {
+            if (!force && newest !== null && currentTime - newest < Math.max(0, cooldownMs)) {
                 return 'skipped-cooldown';
             }
 
@@ -622,6 +628,7 @@ function createChatBackupStore(options) {
             return 'captured';
         } catch (error) {
             log('error', '[ChatBackups] Pre-image capture failed:', error);
+            if (required) throw error;
             return 'error';
         }
     }

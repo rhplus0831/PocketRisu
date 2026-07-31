@@ -233,6 +233,12 @@ function referencedChatRowKeys(dbObj) {
     return keys;
 }
 
+function removedChatRowKeys(oldStrippedDb, newStrippedDb) {
+    const oldKeys = referencedChatRowKeys(oldStrippedDb);
+    const newKeys = referencedChatRowKeys(newStrippedDb);
+    return [...oldKeys].filter(key => !newKeys.has(key));
+}
+
 function createChatExternalizer(chaId, onPayload, makeId = nodeCrypto.randomUUID) {
     const seenChatIds = new Set();
     return function externalizeChat(chat) {
@@ -382,9 +388,7 @@ function createChatRowStore(options) {
     }
 
     function deleteRemovedChatRows(oldStrippedDb, newStrippedDb) {
-        const oldKeys = referencedChatRowKeys(oldStrippedDb);
-        const newKeys = referencedChatRowKeys(newStrippedDb);
-        const removedKeys = [...oldKeys].filter(key => !newKeys.has(key));
+        const removedKeys = removedChatRowKeys(oldStrippedDb, newStrippedDb);
         if (removedKeys.length === 0) return 0;
 
         db.transaction(() => {
@@ -724,6 +728,7 @@ function createChatRowStore(options) {
         hasChatPayloads,
         referencedChatRowKeys,
         extractPayloadChats: extractAndWritePayloadChats,
+        removedChatRowKeys,
         deleteRemovedChatRows,
         sweepOrphanChatRows,
         splitFullDb,
@@ -747,6 +752,7 @@ module.exports = {
     mergeChatStubWithFullChat,
     hasChatPayloads,
     referencedChatRowKeys,
+    removedChatRowKeys,
     extractPayloadChats,
     splitFullDb,
     assignMissingChatId,

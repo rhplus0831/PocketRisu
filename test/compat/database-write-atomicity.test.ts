@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import path from 'node:path'
 import { createRequire } from 'node:module'
+import { writeFile } from 'node:fs/promises'
 import Database from 'better-sqlite3'
 import { Packr } from 'msgpackr'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
@@ -116,14 +117,19 @@ function makeExternalizedSeed(): {
   return { strippedDb, rows }
 }
 
-async function bootSeeded(failpoint?: string): Promise<{
+async function bootSeeded(failpoint?: string, blockChatBackupRoot = false): Promise<{
   client: RisuClient
   server: ServerHandle
   strippedDb: Record<string, any>
 }> {
   const seed = makeExternalizedSeed()
   const server = await spawnServer({
-    env: failpoint ? { POCKETRISU_TEST_FAILPOINT: failpoint } : undefined,
+    env: {
+      ...(failpoint ? { POCKETRISU_TEST_FAILPOINT: failpoint } : {}),
+      ...(blockChatBackupRoot
+        ? { POCKETRISU_CHAT_BACKUP_DIR: 'save/chat-backups-blocked' }
+        : {}),
+    },
     seedSave: async (saveDir) => {
       const database = new Database(path.join(saveDir, 'risuai.db'))
       try {
@@ -140,6 +146,9 @@ async function bootSeeded(failpoint?: string): Promise<{
         for (const [key, value] of seed.rows) insert.run(key, value, Date.now())
       } finally {
         database.close()
+      }
+      if (blockChatBackupRoot) {
+        await writeFile(path.join(saveDir, 'chat-backups-blocked'), 'not a directory')
       }
     },
   })
@@ -367,6 +376,143 @@ describe('atomic database writes with external rows', () => {
     const storedDb = decodeRisuDat(readKv(server.cwd, DB_KEY)!) as Record<string, any>
     expect(storedDb.characters[0].chats.map((chat: any) => chat.id)).not.toContain(removedChat.id)
     expect(readKv(server.cwd, removedKey)).toBeNull()
+  })
+
+  test('deleting a chat after its first save creates a restorable forced pre-image', async () => {
+    const { client, server, strippedDb } = await bootSeeded()
+    const chaId = strippedDb.characters[0].chaId as string
+    const chatId = 'young-chat-first-save'
+    const chat = {
+      id: chatId,
+      name: 'Young chat',
+      message: [{ role: 'user', data: 'only durable copy' }],
+      note: '',
+      localLore: [],
+    }
+    const rawChat = encodeRisuDat(chat)
+
+    const chatSave = await client.fetch(`/api/chat-content/${encodeURIComponent(chaId)}/2`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-chat-id': chatId,
+      },
+      body: new Uint8Array(rawChat),
+    })
+    expect(chatSave.status).toBe(200)
+
+    const withYoungChat = structuredClone(strippedDb)
+    const youngStub = { id: chatId, name: chat.name, _stub: true }
+    withYoungChat.characters[0].chats.push(youngStub)
+    const addStub = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_PATH_HEX,
+      },
+      body: JSON.stringify({
+        expectedHash: calculateHash(normalizeJSON(strippedDb)).toString(16),
+        patch: [{ op: 'add', path: '/characters/0/chats/2', value: youngStub }],
+      }),
+    })
+    expect(addStub.status).toBe(200)
+    expect((await flushDatabase(client)).status).toBe(200)
+
+    const beforeDelete = await client.fetch(
+      `/api/chat-backups/${encodeURIComponent(chaId)}/${encodeURIComponent(chatId)}`,
+    )
+    expect(beforeDelete.status).toBe(200)
+    await expect(beforeDelete.json()).resolves.toEqual({ versions: [] })
+
+    const removeStub = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_PATH_HEX,
+      },
+      body: JSON.stringify({
+        expectedHash: calculateHash(normalizeJSON(withYoungChat)).toString(16),
+        patch: [{ op: 'remove', path: '/characters/0/chats/2' }],
+      }),
+    })
+    expect(removeStub.status).toBe(200)
+    expect((await flushDatabase(client)).status).toBe(200)
+    expect(readKv(server.cwd, chatRowKey(chaId, chatId))).toBeNull()
+
+    const historyResponse = await client.fetch(
+      `/api/chat-backups/${encodeURIComponent(chaId)}/${encodeURIComponent(chatId)}`,
+    )
+    expect(historyResponse.status).toBe(200)
+    const history = await historyResponse.json() as {
+      versions: Array<{ versionId: string; reason: string }>
+    }
+    expect(history.versions).toHaveLength(1)
+    expect(history.versions[0].reason).toBe('delete-chat')
+
+    const versionResponse = await client.fetch(
+      `/api/chat-backups/${encodeURIComponent(chaId)}/${encodeURIComponent(chatId)}/${history.versions[0].versionId}`,
+    )
+    expect(versionResponse.status).toBe(200)
+    expect(Buffer.from(await versionResponse.arrayBuffer())).toEqual(rawChat)
+  })
+
+  test('full-write fallback captures removed chat rows before committing deletion', async () => {
+    const { client, server, strippedDb } = await bootSeeded()
+    const removedChat = strippedDb.characters[0].chats[1]
+    const chaId = strippedDb.characters[0].chaId as string
+    const removedKey = chatRowKey(chaId, removedChat.id)
+    const removedRaw = readKv(server.cwd, removedKey)
+    const warmCache = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_PATH_HEX,
+      },
+      body: JSON.stringify({
+        expectedHash: calculateHash(normalizeJSON(strippedDb)).toString(16),
+        patch: [{
+          op: 'test',
+          path: '/characters/0/chaId',
+          value: chaId,
+        }],
+      }),
+    })
+    expect(warmCache.status).toBe(200)
+    const incoming = makeFullDatabase('new', false)
+    incoming.characters[0].chats.splice(1, 1)
+
+    const response = await writeFullDatabase(client, incoming)
+
+    expect(response.status).toBe(200)
+    expect(readKv(server.cwd, removedKey)).toBeNull()
+    const historyResponse = await client.fetch(
+      `/api/chat-backups/${encodeURIComponent(chaId)}/${encodeURIComponent(removedChat.id)}`,
+    )
+    const history = await historyResponse.json() as {
+      versions: Array<{ versionId: string; reason: string }>
+    }
+    expect(history.versions).toHaveLength(1)
+    expect(history.versions[0].reason).toBe('delete-chat')
+    const versionResponse = await client.fetch(
+      `/api/chat-backups/${encodeURIComponent(chaId)}/${encodeURIComponent(removedChat.id)}/${history.versions[0].versionId}`,
+    )
+    expect(Buffer.from(await versionResponse.arrayBuffer())).toEqual(removedRaw)
+  })
+
+  test('failed deletion pre-image leaves database.bin and the chat row unchanged', async () => {
+    const { client, server, strippedDb } = await bootSeeded(undefined, true)
+    const removedChat = strippedDb.characters[0].chats[1]
+    const removedKey = chatRowKey(strippedDb.characters[0].chaId, removedChat.id)
+    const databaseBefore = readKv(server.cwd, DB_KEY)
+    const chatBefore = readKv(server.cwd, removedKey)
+
+    const patchResponse = await removeSecondChat(client, strippedDb)
+    expect(patchResponse.status).toBe(200)
+
+    const flushResponse = await flushDatabase(client)
+    expect(flushResponse.status).toBe(500)
+    expect(readKv(server.cwd, DB_KEY)).toEqual(databaseBefore)
+    expect(readKv(server.cwd, removedKey)).toEqual(chatBefore)
   })
 
   test('failed patch flush leaves database.bin and the pending chat row unchanged', async () => {

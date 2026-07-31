@@ -1,8 +1,8 @@
 # Audit findings — priority index
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
-`Status` column uses `Open`, `Fixed`, or `Deferred`; 43 findings are currently
-`Open`, 16 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
+`Status` column uses `Open`, `Fixed`, or `Deferred`; 42 findings are currently
+`Open`, 17 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
 as a cross-reference).
@@ -58,7 +58,7 @@ resolution against current code before acting on it.
 | [Inlay replacement unlinks before publish](audit/inlay-replacement-unlinks-before-publish.md) | Fixed | High | Each affected image destroyed (old payload unlinked before the new one is written); bulk compression converts ENOSPC into mass loss reported as success | Crash/power loss during an inlay overwrite; running compression on a nearly full disk — exactly when users run it |
 | [Reroll discards the only copy within pre-image cooldown](audit/reroll-discards-the-only-copy-within-preimage-cooldown.md) | Open | High | The discarded response and its entire swipe history | Normal reroll timing (recent save already consumed the capture cooldown) plus tab close, crash, or failed completion before generation ends |
 | [Card triggers can bulk-delete history without consent](audit/card-triggers-can-bulk-delete-history-without-consent.md) | Open | Medium | The entire message array, wiped and persisted; cooldown can skip the pre-image, making it permanent | Requires a malicious or buggy imported card — but importing shared cards is routine and no consent gate covers bulk chat mutation |
-| [Chat deletion has no pre-image history](audit/chat-deletion-has-no-preimage-history.md) | Open | Medium | A young chat (created, saved once, deleted) leaves no recovery copy anywhere | Accidental deletion of a recently created chat — the exact case the chat-version feature exists to undo |
+| [Chat deletion has no pre-image history](audit/chat-deletion-has-no-preimage-history.md) | Fixed | Medium | A young chat (created, saved once, deleted) leaves no recovery copy anywhere | Accidental deletion of a recently created chat — the exact case the chat-version feature exists to undo |
 | [Non-selected character and chat writes have no save scheduler](audit/non-selected-character-and-chat-writes-have-no-save-scheduler.md) | Fixed | High | Acknowledged edits to non-selected characters and inactive chats silently reverted on refresh | V3 arbitrary-index setters, Risu-access MCP mutations, background writes; no dirty bridge exists for these targets |
 | [Plugin updates discard configured arguments](audit/plugin-updates-discard-configured-arguments.md) | Fixed | Medium | API keys, endpoints, models, large prompts, and enablement — reset and immediately persisted | The ordinary plugin Update button; every update |
 | [Partial block decode becomes authoritative](audit/partial-block-decode-becomes-authoritative.md) | Open | Medium | Blocks still intact on disk are permanently discarded once the partial decode is cached and re-encoded | Requires one corrupted block first; the response then amplifies corruption instead of failing over to recovery copies |
@@ -138,12 +138,12 @@ is small.
 Several defect families recur across tiers; fixing the shared mechanism
 de-fangs multiple findings at once.
 
-- **Reason-blind pre-image cooldown.** `captureChatPreImage()` skips capture
-  inside the cooldown regardless of destructive intent. This still upgrades
-  the remaining reroll finding, card-trigger wipes, and young-chat deletion
-  from "recoverable" to "permanent". A cooldown-exempt destructive-pre-image
-  path addresses all three remaining findings; the send-input and reroll-target
-  races were fixed by binding their operations to durable character/chat IDs.
+- **Reason-blind pre-image cooldown.** Ordinary in-row mutations still skip
+  capture inside the cooldown regardless of destructive intent, which can make
+  the remaining reroll and card-trigger findings permanent. Structural chat
+  deletion is now separate: it forces a cooldown-exempt pre-image and aborts
+  database publication if capture fails. The send-input and reroll-target races
+  were fixed by binding their operations to durable character/chat IDs.
 - **DB-only snapshots.** Automatic snapshots still do not include assets or
   inlays. Referenced MCP tool-call payloads are now folded into the snapshot,
   but snapshot/GC asset interplay and version-history inlay ownership remain

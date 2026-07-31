@@ -1729,12 +1729,30 @@ function duplicateChatIdSample(duplicates) {
 }
 
 function trackPendingChatRowDeletions(oldStrippedDb, newStrippedDb) {
-    const oldKeys = chatRowStore.referencedChatRowKeys(oldStrippedDb);
+    const removedKeys = chatRowStore.removedChatRowKeys(oldStrippedDb, newStrippedDb);
     const newKeys = chatRowStore.referencedChatRowKeys(newStrippedDb);
-    for (const key of oldKeys) {
-        if (!newKeys.has(key)) pendingChatRowDeletions.add(key);
-    }
+    for (const key of removedKeys) pendingChatRowDeletions.add(key);
     for (const key of newKeys) pendingChatRowDeletions.delete(key);
+}
+
+async function captureChatDeletionPreImages(chatRowKeys) {
+    for (const key of chatRowKeys) {
+        const identity = chatRowStore.parseChatRowKey(key);
+        if (!identity) {
+            throw new Error(`Could not decode pending chat-row deletion key: ${key}`);
+        }
+        const result = await chatBackupStore.captureChatPreImage({
+            ...identity,
+            reason: 'delete-chat',
+            force: true,
+            required: true,
+        });
+        if (result !== 'captured' && result !== 'skipped-no-row') {
+            throw new Error(
+                `Required chat deletion pre-image was not captured for ${identity.chaId}/${identity.chatId}: ${result}`
+            );
+        }
+    }
 }
 
 /**
@@ -1782,6 +1800,7 @@ async function persistDbCache(filePath, decodedKey) {
     const chatRowsToDelete = decodedKey === 'database/database.bin'
         ? [...pendingChatRowDeletions].filter(key => !referencedChatRows.has(key))
         : [];
+    await captureChatDeletionPreImages(chatRowsToDelete);
     try {
         // Must stay synchronous: better-sqlite3 commits when this callback returns.
         sqliteDb.transaction(() => {
@@ -12188,6 +12207,9 @@ app.post('/api/plugin-storage/transition', async (req, res, next) => {
             }
 
             const recoverySnapshotToken = newPluginRecoverySnapshotToken();
+            await captureChatDeletionPreImages(
+                chatRowStore.removedChatRowKeys(liveDb, pluginExternalization.strippedDb)
+            );
             withPluginStorageQuotaPlan([...quotaChanges.values()], () => {
                 for (const row of pluginExternalization.rows) {
                     kvSet(row.storageKey, row.value);
@@ -12435,6 +12457,10 @@ app.post('/api/write', async (req, res, next) => {
                     if (chatRows.length > 0 || pluginExternalization.changed) {
                         persistedDatabaseContent = Buffer.from(encodeRisuSaveLegacy(strippedDb));
                     }
+                    const chatRowsToDelete = previousStrippedDb
+                        ? chatRowStore.removedChatRowKeys(previousStrippedDb, strippedDb)
+                        : [];
+                    await captureChatDeletionPreImages(chatRowsToDelete);
 
                     // Must stay synchronous: every external row and the stub graph
                     // commit or roll back together with database.bin.

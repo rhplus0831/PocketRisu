@@ -20,7 +20,7 @@ These mechanisms are intentionally different:
 | Partial export job | Selected characters/personas/modules and referenced identity assets; recovery-oriented missing-chat policy |
 | Automatic snapshot | DB recovery point stored under `database/dbbackup-*`; preserves a bare missing-chat stub with warning |
 | Save-folder import | Destructive replacement from a staged directory or ZIP |
-| Per-chat history | Best-effort pre-images for one chat row; not part of `.bin` backup archives |
+| Per-chat history | Best-effort overwrite pre-images plus required structural-deletion pre-images for one chat row; not part of `.bin` backup archives |
 | Migration safety copy | One-purpose pre-migration material retained for downgrade/emergency recovery |
 
 Do not describe any one of these as “the backup.” Their data coverage, failure policy,

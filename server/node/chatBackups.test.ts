@@ -20,6 +20,8 @@ interface ChatBackupStore {
         chaId: string
         chatId: string
         reason?: string
+        force?: boolean
+        required?: boolean
     }) => Promise<string>
     reconcileChatBackups: () => Promise<{
         staleTempsRemoved: number
@@ -464,6 +466,36 @@ describe('chat backup capture', () => {
         expect(harness.store.listChatBackups('char', 'chat')).toHaveLength(2)
     })
 
+    it('forces a deletion pre-image through cooldown and cold-storage filtering', async () => {
+        const harness = makeHarness({ cooldownMs: 45_000 })
+        const first = rawChat(1)
+        const coldStub = Buffer.from(encodeRisuSaveLegacy({
+            id: 'cold',
+            message: [{ data: `${COLD_STORAGE_HEADER}coldstorage/key` }],
+        }))
+        harness.setRow('char', 'chat', first)
+
+        expect(await harness.store.captureChatPreImage({
+            chaId: 'char',
+            chatId: 'chat',
+        })).toBe('captured')
+        harness.setRow('char', 'chat', coldStub)
+        harness.advance(1)
+
+        expect(await harness.store.captureChatPreImage({
+            chaId: 'char',
+            chatId: 'chat',
+            reason: 'delete-chat',
+            force: true,
+            required: true,
+        })).toBe('captured')
+        const versions = harness.store.listChatBackups('char', 'chat')
+        expect(versions).toHaveLength(2)
+        expect(versions[0].reason).toBe('delete-chat')
+        expect(harness.store.readChatBackup('char', 'chat', versions[0].versionId)?.equals(coldStub))
+            .toBe(true)
+    })
+
     it('seeds cooldown from disk after a store restart', async () => {
         const harness = makeHarness({ now: 5_000, cooldownMs: 45_000 })
         harness.setRow('char', 'chat', rawChat(1))
@@ -563,6 +595,27 @@ describe('chat backup capture', () => {
             chatId: 'chat',
         })).resolves.toBe('error')
         expect(logger.error).toHaveBeenCalled()
+    })
+
+    it('rejects capture failures when the caller requires a recovery copy', async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-chat-backups-required-'))
+        tempRoots.push(root)
+        const store = createChatBackupStore({
+            getChatBackupsRoot: () => path.join(root, 'chat-backups'),
+            readChatRowRaw: () => {
+                throw new Error('required row read failed')
+            },
+            logger: { error: vi.fn(), warn: vi.fn() },
+            autoReconcile: false,
+        }) as ChatBackupStore
+        stores.push(store)
+
+        await expect(store.captureChatPreImage({
+            chaId: 'char',
+            chatId: 'chat',
+            force: true,
+            required: true,
+        })).rejects.toThrow('required row read failed')
     })
 })
 
