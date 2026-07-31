@@ -2,5 +2,7 @@
   "backupEntryNameMaxBytes": 1024,
   "valuePrefix": "pluginsave/",
   "metaPrefix": "pluginsave-meta/",
-  "illFormedUtf16Tag": "utf16-v1."
+  "illFormedUtf16Tag": "utf16-v1.",
+  "hashedKeyTag": "sha256-v1.",
+  "hashedKeyDomain": "pocketrisu-plugin-storage-key-v1"
 }

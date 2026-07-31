@@ -960,6 +960,10 @@ interface SafeMutationObserver {
  * Plugin-specific storage that syncs with save files
  *
  * **All methods return Promises** due to iframe message passing.
+ * Logical keys are preserved exactly. Long keys use a fixed-size internal
+ * identifier when optimized or archived, so the archive filename limit is
+ * not a plugin-facing key-length limit; normal request and memory limits still
+ * apply.
  *
  * @example
  * ```typescript

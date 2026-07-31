@@ -35,8 +35,11 @@ restore.
 
 Manifest version 2 also makes its key sequence authoritative. Public V3 `keys()` and
 `key(index)` preserve the legacy `Object.keys()` contract across inline and optimized
-modes; `sortedKeys()` provides the separate canonical UTF-16 order. Version-1 manifests
-are accepted as migration baselines and upgrade on the next optimized publication.
+modes; `sortedKeys()` provides the separate canonical UTF-16 order. Manifest version 3
+adds exact logical-key mappings for fixed-size hashed physical names when a reversible
+name would exceed the archive entry-name limit. Versions 1 and 2 remain valid migration
+baselines; ordinary short keys retain their existing names and do not force a manifest
+upgrade.
 
 ## Architecture at a glance
 
@@ -101,7 +104,8 @@ Express + SQLite
 - `src/ts/storage/jsonValue.ts` snapshots, validates, and converts JSON values without
   losing special own keys such as `__proto__`.
 - `src/ts/storage/pluginSaveKeyPolicy.ts`, `base64Url.ts`, and
-  `unicodeWellFormed.ts` implement canonical reversible keys.
+  `unicodeWellFormed.ts` implement canonical reversible keys plus the versioned,
+  fixed-size hash mapping used only for over-limit physical names.
 - `src/ts/storage/pluginStorageLimits.ts` parses the authenticated server value
   capability and retains the 128 MiB fallback for older servers.
 - `src/ts/storage/storageError.ts` preserves retryability, dispatch state, and unknown

@@ -322,7 +322,7 @@ describe('encoded storage keys', () => {
         )).toThrow('Non-canonical plugin storage key')
     })
 
-    it('enforces the exact value and metadata archive-name boundaries', () => {
+    it('keeps boundary names stable and hashes the first over-limit identifier', () => {
         const maxValueName = makeArchiveSafePluginSaveStorageKey(
             PLUGIN_SAVE_PREFIX,
             'v'.repeat(756),
@@ -334,14 +334,14 @@ describe('encoded storage keys', () => {
 
         expect(new TextEncoder().encode(maxValueName)).toHaveLength(BACKUP_ENTRY_NAME_MAX_BYTES)
         expect(new TextEncoder().encode(maxMetaName)).toHaveLength(BACKUP_ENTRY_NAME_MAX_BYTES)
-        expect(() => makeArchiveSafePluginSaveStorageKey(
+        expect(makeArchiveSafePluginSaveStorageKey(
             PLUGIN_SAVE_PREFIX,
             'v'.repeat(757),
-        )).toThrow('too long for backup archives')
-        expect(() => makeArchiveSafePluginSaveStorageKey(
+        )).toMatch(/^pluginsave\/sha256-v1\.[0-9a-f]{64}\.json$/)
+        expect(makeArchiveSafePluginSaveStorageKey(
             PLUGIN_SAVE_META_PREFIX,
             'm'.repeat(753),
-        )).toThrow('too long for backup archives')
+        )).toMatch(/^pluginsave-meta\/sha256-v1\.[0-9a-f]{64}\.json$/)
     })
 
     it('measures multibyte identifiers by encoded UTF-8 bytes, not string length', () => {
@@ -354,9 +354,9 @@ describe('encoded storage keys', () => {
 
         const oversizedUtf8Key = `${maxUtf8Key}a` // 377 code units, 753 UTF-8 bytes
         expect(oversizedUtf8Key).toHaveLength(377)
-        expect(() => makeArchiveSafePluginSaveStorageKey(
+        expect(makeArchiveSafePluginSaveStorageKey(
             PLUGIN_SAVE_META_PREFIX,
             oversizedUtf8Key,
-        )).toThrow('too long for backup archives')
+        )).toMatch(/^pluginsave-meta\/sha256-v1\./)
     })
 })

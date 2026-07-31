@@ -174,7 +174,12 @@ const {
     createPluginStorageManifest,
     parsePluginStorageManifest,
     decodePluginSaveStorageKey,
+    decodeManifestPluginSaveStorageKey,
     encodePluginSaveStorageKey,
+    isHashedPluginSaveStorageKey,
+    mergePluginStorageKeyMappings,
+    pluginSaveStorageKeyMappingComponent,
+    pluginStorageManifestMappingMap,
 } = require('./pluginSaveKeys.cjs');
 const {
     assertBackupEntryNameWithinLimit,
@@ -1470,6 +1475,7 @@ async function ingestDatabaseStreaming(source, {
 } = {}) {
     const streamedPluginValueKeys = new Set();
     const streamedPluginMetaKeys = new Set();
+    const streamedPluginRawKeys = new Set();
     let foldedPluginStorage = false;
     const result = await chatRowStore.ingestStreamingDatabase(source, {
         inspection: inspection ?? await inspectRisuSaveSource(source),
@@ -1504,6 +1510,7 @@ async function ingestDatabaseStreaming(source, {
             (prefix === PLUGIN_SAVE_META_PREFIX
                 ? streamedPluginMetaKeys
                 : streamedPluginValueKeys).add(storageKey);
+            streamedPluginRawKeys.add(key);
         },
         onPluginStorageComplete: ({ dbObj, pluginStats }) => {
             if (!foldedPluginStorage && !pluginStats?.changed) return;
@@ -1517,6 +1524,12 @@ async function ingestDatabaseStreaming(source, {
                 generation,
                 streamedPluginValueKeys,
                 streamedPluginMetaKeys,
+                mergePluginStorageKeyMappings(
+                    null,
+                    streamedPluginRawKeys,
+                    streamedPluginValueKeys,
+                    streamedPluginMetaKeys,
+                ),
             ));
         },
         restoreColdStorageCharacters: (dbObj) => {
@@ -3338,7 +3351,11 @@ async function validateAndImportPluginValueFile(
     signal,
     { maxBytes = BACKUP_IMPORT_MAX_BYTES } = {},
 ) {
-    decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_PREFIX);
+    if (isHashedPluginSaveStorageKey(key, PLUGIN_SAVE_PREFIX)) {
+        assertArchiveSafePluginSaveStorageKey(key);
+    } else {
+        decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_PREFIX);
+    }
     const valueMaxBytes = Math.min(maxBytes, PLUGIN_VALUE_MAX_BYTES);
     try {
         await validateJsonFileStreaming(source.filePath, {
@@ -3362,7 +3379,11 @@ async function validateAndImportPluginMetadataFile(
     signal,
     { maxBytes = BACKUP_IMPORT_MAX_BYTES } = {},
 ) {
-    decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_META_PREFIX);
+    if (isHashedPluginSaveStorageKey(key, PLUGIN_SAVE_META_PREFIX)) {
+        assertArchiveSafePluginSaveStorageKey(key);
+    } else {
+        decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_META_PREFIX);
+    }
     const ownerScanner = createPluginStorageOwnerScanner();
     await validateJsonFileStreaming(source.filePath, {
         size: source.size,
@@ -4485,6 +4506,15 @@ function preparePluginStorageExternalization(dbObj) {
             generation,
             activeValueKeys,
             activeMetaKeys,
+            mergePluginStorageKeyMappings(
+                null,
+                [
+                    ...valueEntries.map(([rawKey]) => rawKey),
+                    ...metaEntries.map(([rawKey]) => rawKey),
+                ],
+                activeValueKeys,
+                activeMetaKeys,
+            ),
         ),
     };
 }
@@ -4507,11 +4537,17 @@ function writePluginStorageManifest(manifest) {
 function pluginStorageManifestEquals(left, right) {
     if (left === null || right === null) return left === right;
     if (left.version !== right.version || left.generation !== right.generation) return false;
-    if (left.version === 2) {
+    if (left.version === 2 || left.version === 3) {
         const sameOrder = (a, b) => a.length === b.length
             && a.every((key, index) => key === b[index]);
         return sameOrder(left.valueKeys, right.valueKeys)
-            && sameOrder(left.metaKeys, right.metaKeys);
+            && sameOrder(left.metaKeys, right.metaKeys)
+            && (left.version !== 3 || (
+                sameOrder(
+                    left.keyMappings.map(entry => JSON.stringify(entry)),
+                    right.keyMappings.map(entry => JSON.stringify(entry)),
+                )
+            ));
     }
     const sameKeys = (a, b) => {
         if (a.length !== b.length) return false;
@@ -4570,7 +4606,9 @@ function readStrictPluginStorageOwnershipManifest(readValue = kvGet) {
     // reads. Destructive replacement needs a stronger ownership proof: a
     // duplicate declaration is ambiguous input, not permission to delete.
     if (manifest.valueKeys.length !== parsed.valueKeys.length
-        || manifest.metaKeys.length !== parsed.metaKeys.length) {
+        || manifest.metaKeys.length !== parsed.metaKeys.length
+        || (manifest.version === 3
+            && manifest.keyMappings.length !== parsed.keyMappings.length)) {
         throw new TypeError('The live plugin storage manifest contains duplicate entries');
     }
 
@@ -4687,7 +4725,11 @@ function canonicalPluginStorageRowPrefix(storageKey) {
             : null;
     if (!prefix) return null;
     try {
-        decodePluginSaveStorageKey(storageKey, prefix);
+        if (isHashedPluginSaveStorageKey(storageKey, prefix)) {
+            assertArchiveSafePluginSaveStorageKey(storageKey);
+        } else {
+            decodePluginSaveStorageKey(storageKey, prefix);
+        }
         return prefix;
     } catch {
         return null;
@@ -4951,6 +4993,7 @@ function resolveOwnedPluginStorageKeys(dbObj, reader = { kvGet, kvList }) {
         return {
             valueKeys: ownership.valueKeys,
             metaKeys: ownership.metaKeys,
+            manifest: ownership.manifest,
         };
     }
 
@@ -4963,6 +5006,7 @@ function resolveOwnedPluginStorageKeys(dbObj, reader = { kvGet, kvList }) {
     return {
         valueKeys: reader.kvList(PLUGIN_SAVE_PREFIX),
         metaKeys: reader.kvList(PLUGIN_SAVE_META_PREFIX),
+        manifest: null,
     };
 }
 
@@ -5026,15 +5070,19 @@ function readPluginStorageManifest(readValue = kvGet) {
 }
 
 function resolveOwnedPluginStorageRows(dbObj, reader) {
-    const { valueKeys, metaKeys } = resolveOwnedPluginStorageKeys(dbObj, reader);
+    const { valueKeys, metaKeys, manifest } = resolveOwnedPluginStorageKeys(dbObj, reader);
 
     return {
         valueRows: valueKeys.map((storageKey) => ({
-            key: decodeValidatedPluginStorageKey(storageKey, PLUGIN_SAVE_PREFIX),
+            key: manifest
+                ? decodeManifestPluginSaveStorageKey(manifest, storageKey, PLUGIN_SAVE_PREFIX)
+                : decodeValidatedPluginStorageKey(storageKey, PLUGIN_SAVE_PREFIX),
             source: storageKey,
         })),
         metaRows: metaKeys.map((storageKey) => ({
-            key: decodeValidatedPluginStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX),
+            key: manifest
+                ? decodeManifestPluginSaveStorageKey(manifest, storageKey, PLUGIN_SAVE_META_PREFIX)
+                : decodeValidatedPluginStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX),
             source: storageKey,
         })),
         readRow: (storageKey) => parsePluginSaveJson(storageKey, reader.kvGet),
@@ -6824,7 +6872,11 @@ function resolveBackupStorageKey(name) {
         const prefix = name.startsWith(PLUGIN_SAVE_PREFIX)
             ? PLUGIN_SAVE_PREFIX
             : PLUGIN_SAVE_META_PREFIX;
-        decodeValidatedPluginStorageKey(name, prefix);
+        if (isHashedPluginSaveStorageKey(name, prefix)) {
+            assertArchiveSafePluginSaveStorageKey(name);
+        } else {
+            decodeValidatedPluginStorageKey(name, prefix);
+        }
         return name;
     }
 
@@ -8779,8 +8831,12 @@ app.get('/api/plugin-storage/state', async (req, res, next) => {
 
     try {
         const valueKey = Buffer.from(filePath, 'hex').toString('utf-8');
-        const rawKey = decodePluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX);
-        const ownerKey = encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX);
+        if (isHashedPluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX)) {
+            assertArchiveSafePluginSaveStorageKey(valueKey);
+        } else {
+            decodePluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX);
+        }
+        const ownerKey = `${PLUGIN_SAVE_META_PREFIX}${valueKey.slice(PLUGIN_SAVE_PREFIX.length)}`;
         const state = await queueStorageReadAfterImports(async () => {
             const publication = await readLivePluginStoragePublication();
             const { dbObj, generation, manifestState } = publication;
@@ -8822,6 +8878,15 @@ app.get('/api/plugin-storage/state', async (req, res, next) => {
                 if (!activeManifest) {
                     throw pluginStorageNamespaceConflict(
                         'The selected plugin storage generation has no matching manifest',
+                    );
+                }
+                if (isHashedPluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX)
+                    && (activeManifest.valueKeys.includes(valueKey)
+                        || activeManifest.metaKeys.includes(ownerKey))) {
+                    decodeManifestPluginSaveStorageKey(
+                        activeManifest,
+                        valueKey,
+                        PLUGIN_SAVE_PREFIX,
                     );
                 }
                 const valueBytes = activeManifest.valueKeys.includes(valueKey)
@@ -8993,7 +9058,11 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
             .filter((storageKey) => physicalValues.has(storageKey))
             .map((storageKey) => ({
                 storageKey,
-                key: decodePluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX),
+                key: decodeManifestPluginSaveStorageKey(
+                    activeManifest,
+                    storageKey,
+                    PLUGIN_SAVE_PREFIX,
+                ),
             }))
             .filter(({ key }) => !normalizedQuery || key.toLowerCase().includes(normalizedQuery))
             .sort((left, right) => comparePluginStorageRecordKeys(left.key, right.key));
@@ -9293,9 +9362,10 @@ function parsePluginStorageBatchEnvelope(body, { streamed = false } = {}) {
         if (!body.expectedManifest || body.expectedManifestRevision !== undefined
             || typeof body.expectedManifest !== 'object'
             || Array.isArray(body.expectedManifest)
-            || Object.keys(body.expectedManifest).length !== 4
+            || Object.keys(body.expectedManifest).length
+                !== (body.expectedManifest.version === 3 ? 5 : 4)
             || Object.keys(body.expectedManifest).some(key => ![
-                'version', 'generation', 'valueKeys', 'metaKeys',
+                'version', 'generation', 'valueKeys', 'metaKeys', 'keyMappings',
             ].includes(key))) {
             throw new Error('Plugin storage batch requires an exact expectedManifest.');
         }
@@ -9305,7 +9375,10 @@ function parsePluginStorageBatchEnvelope(body, { streamed = false } = {}) {
         );
         if (expectedManifest.generation !== body.generation
             || expectedManifest.valueKeys.length !== body.expectedManifest.valueKeys.length
-            || expectedManifest.metaKeys.length !== body.expectedManifest.metaKeys.length) {
+            || expectedManifest.metaKeys.length !== body.expectedManifest.metaKeys.length
+            || (expectedManifest.version === 3
+                && expectedManifest.keyMappings.length
+                    !== body.expectedManifest.keyMappings.length)) {
             throw new Error('Plugin storage batch expectedManifest is not canonical.');
         }
     } else {
@@ -9767,6 +9840,12 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                     requestedGeneration,
                     nextValueKeys,
                     nextMetaKeys,
+                    mergePluginStorageKeyMappings(
+                        activeManifest,
+                        operations.map(operation => operation.rawKey),
+                        nextValueKeys,
+                        nextMetaKeys,
+                    ),
                 );
                 const readActiveState = (operation) => {
                     const valueBytes = activeValueKeys.has(operation.valueKey)
@@ -10073,7 +10152,10 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
     let valueSize = 0;
     try {
         valueKey = Buffer.from(filePath, 'hex').toString('utf-8');
-        const rawKey = decodePluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX);
+        const hashedValueKey = isHashedPluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX);
+        const rawKey = hashedValueKey
+            ? null
+            : decodePluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX);
         const unrestrictedOwnerKey = `${PLUGIN_SAVE_META_PREFIX}${valueKey.slice(PLUGIN_SAVE_PREFIX.length)}`;
 
         if (operation === 'set') {
@@ -10093,7 +10175,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                     || !/^[A-Za-z0-9_-]+$/.test(ownerRecordHeader)) {
                     throw new Error('An exact owner record is required.');
                 }
-                ownerKey = encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX);
+                ownerKey = unrestrictedOwnerKey;
                 ownerRecordBytes = Buffer.from(ownerRecordHeader, 'base64url');
                 if (ownerRecordBytes.toString('base64url') !== ownerRecordHeader) {
                     throw new Error('Plugin owner record must use canonical base64url encoding.');
@@ -10108,9 +10190,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 if (ownerRecordHeader !== undefined) {
                     throw new Error('Unexpected plugin owner record.');
                 }
-                ownerKey = owner
-                    ? encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX)
-                    : unrestrictedOwnerKey;
+                ownerKey = unrestrictedOwnerKey;
             }
             if (!streamingSet) {
                 if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
@@ -10250,6 +10330,23 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
             }
             const nextValueKeys = new Set(activeManifest?.valueKeys ?? []);
             const nextMetaKeys = new Set(activeManifest?.metaKeys ?? []);
+            if (isHashedPluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX)) {
+                if (!activeManifest) {
+                    return res.status(409).json({
+                        success: false,
+                        outcome: 'not-committed',
+                        operation,
+                        error: 'A hashed plugin storage key requires an active mapped manifest.',
+                        code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
+                        retryable: true,
+                    });
+                }
+                decodeManifestPluginSaveStorageKey(
+                    activeManifest,
+                    valueKey,
+                    PLUGIN_SAVE_PREFIX,
+                );
+            }
             if (activeManifest) {
                 if (operation === 'set') nextValueKeys.add(valueKey);
                 else nextValueKeys.delete(valueKey);
@@ -10265,6 +10362,12 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                     liveGeneration,
                     nextValueKeys,
                     nextMetaKeys,
+                    mergePluginStorageKeyMappings(
+                        activeManifest,
+                        [],
+                        nextValueKeys,
+                        nextMetaKeys,
+                    ),
                 )
                 : null;
             const preservedOwner = ownerPolicy === 'preserve' ? kvGet(ownerKey) : null;
@@ -10505,7 +10608,11 @@ async function handlePluginStorageManifestMutation(req, res, next) {
                         ? PLUGIN_SAVE_PREFIX
                         : null;
                 if (!prefix) throw new TypeError(`Invalid plugin storage key: ${storageKey}`);
-                decodePluginSaveStorageKey(storageKey, prefix);
+                const mappingManifest = nextManifest.valueKeys.includes(storageKey)
+                    || nextManifest.metaKeys.includes(storageKey)
+                    ? nextManifest
+                    : expectedManifest;
+                decodeManifestPluginSaveStorageKey(mappingManifest, storageKey, prefix);
                 if (seen.has(storageKey)) throw new TypeError(`Duplicate plugin storage mutation: ${storageKey}`);
                 seen.add(storageKey);
                 return prefix === PLUGIN_SAVE_META_PREFIX ? nextMetaKeys : nextValueKeys;
@@ -10529,6 +10636,7 @@ async function handlePluginStorageManifestMutation(req, res, next) {
                 generation,
                 nextValueKeys,
                 nextMetaKeys,
+                nextManifest.version === 3 ? nextManifest.keyMappings : [],
             );
             if (!pluginStorageManifestEquals(derivedManifest, nextManifest)) {
                 return res.status(400).json({
@@ -10585,6 +10693,7 @@ function pluginTransitionStageResponse(stage) {
         targetGeneration: stage.targetGeneration,
         rows: stage.rows.map(row => ({
             storageKey: row.storageKey,
+            rawKey: row.rawKey,
             size: row.size,
             sha256: row.sha256 ?? null,
             uploaded: row.uploaded === true,
@@ -10606,6 +10715,16 @@ function pluginTransitionDesiredManifest(stage) {
         stage.rows
             .filter(row => row.storageKey.startsWith(PLUGIN_SAVE_META_PREFIX))
             .map(row => row.storageKey),
+        mergePluginStorageKeyMappings(
+            null,
+            stage.rows.map(row => row.rawKey),
+            stage.rows
+                .filter(row => row.storageKey.startsWith(PLUGIN_SAVE_PREFIX))
+                .map(row => row.storageKey),
+            stage.rows
+                .filter(row => row.storageKey.startsWith(PLUGIN_SAVE_META_PREFIX))
+                .map(row => row.storageKey),
+        ),
     );
 }
 
@@ -10672,14 +10791,31 @@ function normalizedPluginTransitionRows(rows) {
             throw new TypeError('Invalid plugin transition row descriptor');
         }
         const rowKeys = Object.keys(row).sort();
-        if (rowKeys.length !== 2
-            || rowKeys[0] !== 'size'
-            || rowKeys[1] !== 'storageKey') {
-            throw new TypeError('Transition row descriptors accept only storageKey and size');
+        const hasRawKey = Object.hasOwn(row, 'rawKey');
+        if ((hasRawKey
+            && (rowKeys.length !== 3
+                || rowKeys[0] !== 'rawKey'
+                || rowKeys[1] !== 'size'
+                || rowKeys[2] !== 'storageKey'))
+            || (!hasRawKey
+                && (rowKeys.length !== 2
+                    || rowKeys[0] !== 'size'
+                    || rowKeys[1] !== 'storageKey'))) {
+            throw new TypeError('Transition row descriptors require rawKey, storageKey, and size');
         }
         const storageKey = row.storageKey;
         const prefix = canonicalPluginStorageRowPrefix(storageKey);
-        if (!prefix || seen.has(storageKey)) {
+        let rawKey = row.rawKey;
+        if (prefix && !hasRawKey) {
+            try {
+                rawKey = decodePluginSaveStorageKey(storageKey, prefix);
+            } catch {
+                rawKey = null;
+            }
+        }
+        if (!prefix || typeof rawKey !== 'string'
+            || encodePluginSaveStorageKey(rawKey, prefix) !== storageKey
+            || seen.has(storageKey)) {
             throw new TypeError('Plugin transition row keys must be unique and canonical');
         }
         seen.add(storageKey);
@@ -10698,7 +10834,7 @@ function normalizedPluginTransitionRows(rows) {
         if (!Number.isSafeInteger(total)) {
             throw new TypeError('Plugin transition size exceeds the safe integer range');
         }
-        return { index, storageKey, size, sha256: null, uploaded: false };
+        return { index, storageKey, rawKey, size, sha256: null, uploaded: false };
     });
 }
 
@@ -10736,6 +10872,7 @@ function authoritativeInlinePluginTransitionRows(liveDb) {
             seen.add(storageKey);
             rows.push({
                 storageKey,
+                rawKey,
                 size: value.length,
                 sha256: sha256Hex(value),
                 uploaded: false,
@@ -10771,7 +10908,7 @@ function assertDeclaredTransitionRowsMatch(declaredRows, authoritativeRows) {
     const declaredByKey = new Map(declared.map(row => [row.storageKey, row]));
     for (const row of authoritativeRows) {
         const candidate = declaredByKey.get(row.storageKey);
-        if (!candidate || candidate.size !== row.size) {
+        if (!candidate || candidate.size !== row.size || candidate.rawKey !== row.rawKey) {
             throw mismatch();
         }
     }
@@ -10883,10 +11020,14 @@ async function pluginTransitionKvRowMatches(storageKey, expected, shouldAbort) {
 
 async function assertInternalTransitionBounds(liveDb, sourceKeys) {
     const ownedValueRaw = new Set(sourceKeys.valueKeys.map(
-        key => decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_PREFIX),
+        key => sourceKeys.manifest
+            ? decodeManifestPluginSaveStorageKey(sourceKeys.manifest, key, PLUGIN_SAVE_PREFIX)
+            : decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_PREFIX),
     ));
     const ownedMetaRaw = new Set(sourceKeys.metaKeys.map(
-        key => decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_META_PREFIX),
+        key => sourceKeys.manifest
+            ? decodeManifestPluginSaveStorageKey(sourceKeys.manifest, key, PLUGIN_SAVE_META_PREFIX)
+            : decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_META_PREFIX),
     ));
     let entries = sourceKeys.valueKeys.length + sourceKeys.metaKeys.length;
     let bytes = 0;
@@ -10984,12 +11125,8 @@ app.post('/api/plugin-storage/transition/stage/begin', async (req, res, next) =>
             && sourceKeys[1] === 'manifest'
             && sourceKeys[2] === 'optimized';
         const manifest = plan?.source?.manifest;
-        const manifestShapeValid = manifest === null || (
-            manifest
-            && typeof manifest === 'object'
-            && !Array.isArray(manifest)
-            && Object.keys(manifest).sort().join(',') === 'generation,metaKeys,valueKeys,version'
-        );
+        const manifestShapeValid = manifest === null
+            || parsePluginStorageManifest(manifest) !== null;
         if (plan?.version !== 2
             || !PLUGIN_STORAGE_UUID_PATTERN.test(plan.transitionId)
             || !PLUGIN_STORAGE_UUID_PATTERN.test(plan.targetGeneration)
@@ -11097,6 +11234,16 @@ app.post('/api/plugin-storage/transition/stage/begin', async (req, res, next) =>
                             throw new Error('Plugin transition begin disconnected');
                         }
                         const index = rows.length;
+                        const prefix = storageKey.startsWith(PLUGIN_SAVE_META_PREFIX)
+                            ? PLUGIN_SAVE_META_PREFIX
+                            : PLUGIN_SAVE_PREFIX;
+                        const rawKey = sourceKeys.manifest
+                            ? decodeManifestPluginSaveStorageKey(
+                                sourceKeys.manifest,
+                                storageKey,
+                                prefix,
+                            )
+                            : decodeValidatedPluginStorageKey(storageKey, prefix);
                         const filePath = pluginTransitionStageRowPath(plan.transitionId, index);
                         const staged = await writeDurablePluginTransitionStageRow(
                             storageKey,
@@ -11106,6 +11253,7 @@ app.post('/api/plugin-storage/transition/stage/begin', async (req, res, next) =>
                         rows.push({
                             index,
                             storageKey,
+                            rawKey,
                             size: staged.size,
                             sha256: staged.sha256,
                             uploaded: true,
@@ -11391,13 +11539,13 @@ app.post('/api/plugin-storage/transition/stage/finalize', async (req, res, next)
                     valueRows: stage.rows
                         .filter(row => row.storageKey.startsWith(PLUGIN_SAVE_PREFIX))
                         .map(row => ({
-                            key: decodeValidatedPluginStorageKey(row.storageKey, PLUGIN_SAVE_PREFIX),
+                            key: row.rawKey,
                             source: row.index,
                         })),
                     metaRows: stage.rows
                         .filter(row => row.storageKey.startsWith(PLUGIN_SAVE_META_PREFIX))
                         .map(row => ({
-                            key: decodeValidatedPluginStorageKey(row.storageKey, PLUGIN_SAVE_META_PREFIX),
+                            key: row.rawKey,
                             source: row.index,
                         })),
                     rowSource: index => {

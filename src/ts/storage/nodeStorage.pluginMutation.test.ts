@@ -60,6 +60,10 @@ const {
     NodeStorage,
     authoritativeStoragePayloadTimeoutMs,
 } = await import('./nodeStorage')
+const {
+    makeArchiveSafePluginSaveStorageKey,
+    PLUGIN_SAVE_PREFIX,
+} = await import('./pluginSaveKeyPolicy')
 
 const valueKey = 'pluginsave/YWE.json'
 const valueBytes = new TextEncoder().encode('{"generation":"new"}')
@@ -1421,6 +1425,48 @@ describe('NodeStorage plugin manifest snapshots', () => {
             manifestRevision: 'D'.repeat(64),
         }))
         await expect(malformed.getPluginStorageManifestState(generation)).rejects.toMatchObject({
+            code: 'STORAGE_RESPONSE_ERROR',
+        })
+    })
+
+    test('accepts exact mapped manifests and rejects unreferenced mappings', async () => {
+        const rawKey = 'mapped-key-'.repeat(300)
+        const mappedValueKey = makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_PREFIX, rawKey)
+        const component = mappedValueKey.slice(PLUGIN_SAVE_PREFIX.length)
+        const mappedManifest = {
+            version: 3,
+            generation,
+            valueKeys: [mappedValueKey],
+            metaKeys: [],
+            keyMappings: [[component, rawKey]],
+        }
+        const valid = storageWithResponse(response({
+            success: true,
+            generation,
+            manifestRevision,
+            manifest: mappedManifest,
+            valueKeys: [mappedValueKey],
+            metaKeys: [],
+        }))
+        await expect(valid.getPluginStorageManifestSnapshot(generation)).resolves.toMatchObject({
+            manifest: mappedManifest,
+        })
+
+        const invalid = storageWithResponse(response({
+            success: true,
+            generation,
+            manifestRevision,
+            manifest: {
+                ...mappedManifest,
+                keyMappings: [
+                    [component, rawKey],
+                    [`sha256-v1.${'0'.repeat(64)}.json`, 'unreferenced'],
+                ],
+            },
+            valueKeys: [mappedValueKey],
+            metaKeys: [],
+        }))
+        await expect(invalid.getPluginStorageManifestSnapshot(generation)).rejects.toMatchObject({
             code: 'STORAGE_RESPONSE_ERROR',
         })
     })

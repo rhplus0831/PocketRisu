@@ -4,6 +4,7 @@ const {
     PLUGIN_SAVE_META_PREFIX,
     decodePluginSaveStorageKey,
     encodePluginSaveStorageKey,
+    isHashedPluginSaveStorageKey,
 } = require('./pluginSaveKeys.cjs');
 
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
@@ -434,7 +435,9 @@ function pluginStoragePrefixForKey(storageKey) {
 function validatePluginStorageRow(storageKey, value) {
     const prefix = pluginStoragePrefixForKey(storageKey);
     if (prefix === null) return null;
-    decodeValidatedPluginStorageKey(storageKey, prefix);
+    if (!isHashedPluginSaveStorageKey(storageKey, prefix)) {
+        decodeValidatedPluginStorageKey(storageKey, prefix);
+    }
     try {
         return parsePluginStorageJsonBuffer(value, storageKey);
     } catch {
@@ -445,7 +448,9 @@ function validatePluginStorageRow(storageKey, value) {
 function assertPluginStorageRow(storageKey, value) {
     const prefix = pluginStoragePrefixForKey(storageKey);
     if (prefix === null) return false;
-    decodeValidatedPluginStorageKey(storageKey, prefix);
+    if (!isHashedPluginSaveStorageKey(storageKey, prefix)) {
+        decodeValidatedPluginStorageKey(storageKey, prefix);
+    }
     try {
         assertPluginStorageJsonBuffer(value);
     } catch {

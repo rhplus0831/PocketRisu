@@ -131,6 +131,14 @@ vi.mock("../storage/persistentKv", () => {
                     ?? new TextEncoder().encode(JSON.stringify(persistent.get(storageKey)));
                 return {
                     storageKey,
+                    rawKey: stagedPlan.rows.find(
+                        (row: any) => row.storageKey === storageKey,
+                    )?.rawKey ?? decode(storageKey.slice(
+                        storageKey.startsWith("pluginsave-meta/")
+                            ? "pluginsave-meta/".length
+                            : "pluginsave/".length,
+                        -".json".length,
+                    )),
                     size: bytes.byteLength,
                     sha256: [...new Uint8Array(await crypto.subtle.digest(
                         "SHA-256",
@@ -1542,18 +1550,32 @@ describe("plugin save storage transport", () => {
         });
     });
 
-    test("owned writes reject the metadata boundary before writing either row", async () => {
+    test("owned writes route over-limit logical keys through the mapped batch protocol", async () => {
         database.optimizePluginMemory = true;
-        const { writePersistentJson } = await import("../storage/persistentKv");
+        installOwnershipManifest("long-key-generation", [], []);
+        const { batchPersistentPluginStorage, writePersistentJson } = await import(
+            "../storage/persistentKv"
+        );
+        const rawKey = "k".repeat(753);
 
         await expect(setOwnedPluginSaveStorageItem(
-            "k".repeat(753),
+            rawKey,
             { value: 1 },
             "Boundary Plugin",
-        )).rejects.toThrow("too long for backup archives");
+        )).resolves.toBeUndefined();
 
+        expect(batchPersistentPluginStorage).toHaveBeenCalledWith(
+            expect.objectContaining({
+                generation: "long-key-generation",
+                operations: [expect.objectContaining({
+                    operation: "set",
+                    key: rawKey,
+                    owner: "Boundary Plugin",
+                })],
+            }),
+            undefined,
+        );
         expect(writePersistentJson).not.toHaveBeenCalled();
-        expect(persistent.size).toBe(0);
     });
 
     test("owned writes accept the maximum metadata-safe raw ASCII identifier", async () => {
@@ -1648,29 +1670,43 @@ describe("plugin save storage transport", () => {
         expect(removePersistentKey).not.toHaveBeenCalled();
     });
 
-    test("rejects an oversized optimized value replacement before any mutation", async () => {
+    test("publishes an over-limit replacement with a verified fixed-name mapping", async () => {
         database.optimizePluginMemory = true;
+        database.pluginStorageGeneration = "long-replacement-generation";
         database.pluginCustomStorage = {};
         const retainedValueKey = encoded(PLUGIN_SAVE_PREFIX, "retained");
         const retainedMetaKey = encoded(PLUGIN_SAVE_META_PREFIX, "retained");
         persistent.set(retainedValueKey, { source: "retained" });
         persistent.set(retainedMetaKey, { plugin: "Owner", updatedAt: 1 });
-        const before = new Map(persistent);
+        installOwnershipManifest(
+            "long-replacement-generation",
+            [retainedValueKey],
+            [retainedMetaKey],
+        );
         const mutateDatabase = vi.fn();
         const { writePersistentJson, removePersistentKey } = await import(
             "../storage/persistentKv"
         );
 
+        const rawKey = "x".repeat(757);
         await expect(updateDatabaseWithPluginStorageSnapshot(
-            { ["x".repeat(757)]: { source: "oversized" } },
+            { [rawKey]: { source: "mapped" } },
             mutateDatabase,
-        )).rejects.toThrow("too long for backup archives");
+        )).resolves.toBeUndefined();
 
-        expect(persistent).toEqual(before);
+        const storageKey = makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_PREFIX, rawKey);
+        expect(storageKey).toContain("/sha256-v1.");
+        expect(persistent.get(storageKey)).toEqual({ source: "mapped" });
+        expect(persistent.get(PLUGIN_STORAGE_MANIFEST_KEY)).toMatchObject({
+            version: 3,
+            generation: "long-replacement-generation",
+            valueKeys: [storageKey],
+            keyMappings: [[storageKey.slice(PLUGIN_SAVE_PREFIX.length), rawKey]],
+        });
         expect(database.pluginCustomStorage).toEqual({});
         expect(writePersistentJson).not.toHaveBeenCalled();
         expect(removePersistentKey).not.toHaveBeenCalled();
-        expect(mutateDatabase).not.toHaveBeenCalled();
+        expect(mutateDatabase).toHaveBeenCalledOnce();
     });
 
     test("inline reads return a structured-cloneable copy, not the reactive proxy", async () => {
@@ -3077,14 +3113,21 @@ describe("boot plugin storage reconciliation recovery", () => {
         await expect(getPluginSaveStorageKeys()).resolves.toEqual(["inline", "external"]);
     });
 
-    test("quarantines an oversized inline key before violating the BR4 archive boundary", async () => {
+    test("recovers an over-limit inline key through its fixed physical name", async () => {
         const oversizedKey = "v".repeat(757);
         const originalValues = { [oversizedKey]: { retained: true } };
         database = {
             optimizePluginMemory: true,
+            pluginStorageGeneration: "long-boot-generation",
             pluginCustomStorage: originalValues,
             plugins: [],
         };
+        persistent.set(PLUGIN_STORAGE_MANIFEST_KEY, {
+            version: 2,
+            generation: "long-boot-generation",
+            valueKeys: [],
+            metaKeys: [],
+        });
         const writePersistentJson = vi.fn();
         const persistDatabase = vi.fn();
 
@@ -3092,13 +3135,56 @@ describe("boot plugin storage reconciliation recovery", () => {
             dependencies: { writePersistentJson, persistDatabase },
         });
 
-        expect(result.issues).toEqual([{
-            code: "invalid-encoded-key",
-            encodedKey: PLUGIN_SAVE_PREFIX,
-        }]);
-        expect(database.pluginCustomStorage).toBe(originalValues);
+        expect(result.issues).toEqual([]);
+        const storageKey = makeArchiveSafePluginSaveStorageKey(
+            PLUGIN_SAVE_PREFIX,
+            oversizedKey,
+        );
+        expect(storageKey).toContain("/sha256-v1.");
+        expect(persistent.get(storageKey)).toEqual({ retained: true });
+        expect(persistent.get(PLUGIN_STORAGE_MANIFEST_KEY)).toMatchObject({
+            version: 3,
+            generation: "long-boot-generation",
+            valueKeys: [storageKey],
+            keyMappings: [[storageKey.slice(PLUGIN_SAVE_PREFIX.length), oversizedKey]],
+        });
+        expect(database.pluginCustomStorage).toEqual({});
         expect(writePersistentJson).not.toHaveBeenCalled();
-        expect(persistDatabase).not.toHaveBeenCalled();
+        expect(persistDatabase).toHaveBeenCalledOnce();
+    });
+
+    test("boot recovery resolves a mapped optimized row back to its exact logical key", async () => {
+        const oversizedKey = "reverse".repeat(500);
+        const storageKey = makeArchiveSafePluginSaveStorageKey(
+            PLUGIN_SAVE_PREFIX,
+            oversizedKey,
+        );
+        database = {
+            optimizePluginMemory: false,
+            pluginStorageGeneration: "long-reverse-generation",
+            pluginCustomStorage: {},
+            plugins: [],
+        };
+        persistent.set(storageKey, { restored: true });
+        persistent.set(PLUGIN_STORAGE_MANIFEST_KEY, {
+            version: 3,
+            generation: "long-reverse-generation",
+            valueKeys: [storageKey],
+            metaKeys: [],
+            keyMappings: [[storageKey.slice(PLUGIN_SAVE_PREFIX.length), oversizedKey]],
+        });
+        const persistDatabase = vi.fn(async () => undefined);
+
+        await expect(reconcilePluginStorageModeForBoot({
+            dependencies: { persistDatabase },
+        })).resolves.toMatchObject({
+            direction: "internalize",
+            values: 1,
+            issues: [],
+        });
+        expect(database.pluginCustomStorage[oversizedKey]).toEqual({ restored: true });
+        expect(persistent.has(storageKey)).toBe(false);
+        expect(persistDatabase).toHaveBeenCalledOnce();
     });
 
     test("isolates zero-length and malformed JSON rows while good rows reach plugins and UI", async () => {
@@ -3720,7 +3806,7 @@ describe("transitionPluginStorageMode", () => {
         const begin = beginPersistentPluginStorageTransition.mock.calls.at(-1)![0];
         expect(begin).not.toHaveProperty("database");
         expect(begin.rows).toHaveLength(3);
-        expect(begin.rows.every(row => Object.keys(row).sort().join(",") === "size,storageKey"))
+        expect(begin.rows.every(row => Object.keys(row).sort().join(",") === "rawKey,size,storageKey"))
             .toBe(true);
         const uploads = uploadPersistentPluginStorageTransitionRow.mock.calls.slice(-3);
         expect(uploads).toHaveLength(3);

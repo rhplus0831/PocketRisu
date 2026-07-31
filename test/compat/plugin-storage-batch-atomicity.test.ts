@@ -10,6 +10,7 @@ import { createClient, type RisuClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { encodeBackup } from './helpers/encode.js'
 import utilsPkg from '../../server/node/utils.cjs'
+import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
 
 const { encodeRisuSaveLegacy, decodeRisuSave, magicCompressedHeader } = utilsPkg as {
   encodeRisuSaveLegacy: (value: unknown) => Uint8Array
@@ -17,6 +18,15 @@ const { encodeRisuSaveLegacy, decodeRisuSave, magicCompressedHeader } = utilsPkg
   magicCompressedHeader: Uint8Array
 }
 const packr = new Packr({ useRecords: false })
+const {
+  encodePluginSaveStorageKey,
+  PLUGIN_SAVE_PREFIX,
+  PLUGIN_SAVE_META_PREFIX,
+} = pluginSaveKeysPkg as {
+  encodePluginSaveStorageKey: (rawKey: string, prefix: string) => string
+  PLUGIN_SAVE_PREFIX: string
+  PLUGIN_SAVE_META_PREFIX: string
+}
 
 const servers: ServerHandle[] = []
 afterAll(async () => Promise.allSettled(servers.map(server => server.cleanup())))
@@ -29,8 +39,8 @@ const DATABASE_KEY = 'database/database.bin'
 const MANIFEST_KEY = 'plugin-storage/manifest.json'
 const RECOVERY_DIRTY_KEY = 'config/plugin-storage-recovery-dirty'
 const STORAGE_GENERATION = 'aa3-selected-publication'
-const valueKey = (key: string) => `pluginsave/${Buffer.from(key).toString('base64url')}.json`
-const ownerKey = (key: string) => `pluginsave-meta/${Buffer.from(key).toString('base64url')}.json`
+const valueKey = (key: string) => encodePluginSaveStorageKey(key, PLUGIN_SAVE_PREFIX)
+const ownerKey = (key: string) => encodePluginSaveStorageKey(key, PLUGIN_SAVE_META_PREFIX)
 const activeManifest = {
   version: 2,
   generation: STORAGE_GENERATION,
@@ -280,6 +290,86 @@ function readGeneration(cwd: string): 'old' | 'new' | 'torn' {
 }
 
 describe('AA3 atomic plugin storage batch', () => {
+  test('maps over-limit logical keys to fixed physical names and removes the mapping atomically', async () => {
+    const { server, client } = await boot()
+    const key = `aa3/${'long-key-'.repeat(600)}`
+    const value = Buffer.from(JSON.stringify({ survives: true }))
+    const before = await readManifest(client, 'state')
+    const setResponse = await mutateFramed(client, framedCompactEnvelope([{
+      operation: 'set',
+      key,
+      owner: 'AA3 long-key owner',
+      valueBytes: value,
+      expectedRevision: null,
+    }], before.manifestRevision))
+    expect(setResponse.status).toBe(200)
+    const setBody = await setResponse.json() as any
+    expect(setBody.revisions).toMatchObject([{ key, revision: expect.stringMatching(REVISION_PATTERN) }])
+
+    const physicalValueKey = valueKey(key)
+    const physicalOwnerKey = ownerKey(key)
+    expect(Buffer.byteLength(physicalValueKey)).toBeLessThan(128)
+    expect(Buffer.byteLength(physicalOwnerKey)).toBeLessThan(128)
+    expect(physicalValueKey).toContain('/sha256-v1.')
+    const snapshot = await readManifest(client)
+    expect(snapshot.manifest).toMatchObject({
+      version: 3,
+      valueKeys: expect.arrayContaining([physicalValueKey]),
+      metaKeys: expect.arrayContaining([physicalOwnerKey]),
+      keyMappings: [[physicalValueKey.slice(PLUGIN_SAVE_PREFIX.length), key]],
+    })
+    await expect(readState(client, key)).resolves.toMatchObject({
+      missing: false,
+      revision: setBody.revisions[0].revision,
+    })
+
+    const viewerResponse = await client.fetch('/api/plugin-storage/viewer-page?page=0&pageSize=50', {
+      headers: {
+        accept: 'application/x-ndjson',
+        'x-plugin-storage-generation': STORAGE_GENERATION,
+      },
+    })
+    expect(viewerResponse.status).toBe(200)
+    const viewerEvents = (await viewerResponse.text()).trim().split('\n').map(line => JSON.parse(line))
+    expect(viewerEvents).toContainEqual(expect.objectContaining({
+      event: 'entry',
+      key,
+      owner: 'AA3 long-key owner',
+    }))
+
+    const backup = await client.exportBackup()
+    const destination = await spawnServer()
+    servers.push(destination)
+    const destinationClient = await createClient(destination.port, destination.password)
+    expect((await destinationClient.importBackup(backup)).ok).toBe(true)
+    await expect(readState(destinationClient, key)).resolves.toMatchObject({ missing: false })
+    const restoredManifest = await readManifest(destinationClient)
+    expect(restoredManifest.manifest).toMatchObject({
+      version: 3,
+      valueKeys: expect.arrayContaining([physicalValueKey]),
+      metaKeys: expect.arrayContaining([physicalOwnerKey]),
+      keyMappings: [[physicalValueKey.slice(PLUGIN_SAVE_PREFIX.length), key]],
+    })
+
+    const removeResponse = await mutateFramed(client, framedCompactEnvelope([{
+      operation: 'remove',
+      key,
+      expectedRevision: setBody.revisions[0].revision,
+    }], snapshot.manifestRevision))
+    expect(removeResponse.status).toBe(200)
+    await expect(readState(client, key)).resolves.toMatchObject({ missing: true })
+    const after = await readManifest(client)
+    expect(after.manifest.valueKeys).not.toContain(physicalValueKey)
+    expect(after.manifest.metaKeys).not.toContain(physicalOwnerKey)
+    expect(after.manifest.keyMappings ?? []).toEqual([])
+
+    const db = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
+    const count = db.prepare('SELECT COUNT(*) AS count FROM kv WHERE key IN (?, ?)')
+      .get(physicalValueKey, physicalOwnerKey) as { count: number }
+    db.close()
+    expect(count.count).toBe(0)
+  })
+
   test('session negotiation advertises framed limits from server configuration', async () => {
     const { client } = await boot()
     const response = await client.fetch('/api/session', {

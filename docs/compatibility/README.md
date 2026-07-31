@@ -56,7 +56,7 @@ many users use that path.
 - [Inline rich values broke enumeration (fixed 2026-07-30)](inline-plugin-storage-enumeration-rich-values.md)
 - [Enumeration order change](plugin-storage-enumeration-order.md)
 - [Ill-formed legacy key compatibility (fixed 2026-07-30)](legacy-plugin-storage-key-compatibility.md)
-- [Optimized-storage key-length limit](optimized-plugin-storage-key-length-limit.md)
+- [Optimized-storage key-length limit (fixed 2026-07-31)](optimized-plugin-storage-key-length-limit.md)
 - [Optimized-mode transition lock-in (fixed 2026-07-30)](optimized-plugin-storage-transition-lock-in.md)
 - [Raw boot does not pin a plugin generation](raw-boot-plugin-generation-not-pinned.md)
 - [Configured optimized-storage limit differed from client limit (fixed 2026-07-30)](plugin-storage-configured-limit-client-mismatch.md)

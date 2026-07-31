@@ -312,6 +312,7 @@ describe('NodeStorage availability bounds', () => {
             targetGeneration,
             rows: [{
                 storageKey: 'pluginsave/YQ.json',
+                rawKey: 'a',
                 size: 3,
                 sha256: 'a'.repeat(64),
                 uploaded: true,
@@ -336,7 +337,7 @@ describe('NodeStorage availability bounds', () => {
             source: { optimized: false, generation: null, manifest: null },
             targetOptimized: true,
             targetGeneration,
-            rows: [{ storageKey: 'pluginsave/YQ.json', size: 3 }],
+            rows: [{ storageKey: 'pluginsave/YQ.json', rawKey: 'a', size: 3 }],
         }
 
         await storage.beginPluginStorageTransition(plan)

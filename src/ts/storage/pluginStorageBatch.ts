@@ -39,10 +39,11 @@ export type PluginStorageBatchOperation =
     };
 
 export interface PluginStorageBatchManifest {
-    version: 1 | 2;
+    version: 1 | 2 | 3;
     generation: string;
     valueKeys: string[];
     metaKeys: string[];
+    keyMappings?: [string, string][];
 }
 
 export interface PluginStorageBatchRequest {

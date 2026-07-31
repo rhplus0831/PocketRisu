@@ -6,6 +6,11 @@ import { createClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { createSeedBackup } from './helpers/seed.js'
 import { decodeRisuDat } from './helpers/normalize.js'
+import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
+
+const { encodePluginSaveStorageKey } = pluginSaveKeysPkg as {
+  encodePluginSaveStorageKey: (rawKey: string, prefix: string) => string
+}
 
 const servers: ServerHandle[] = []
 const DATABASE_KEY = 'database/database.bin'
@@ -16,7 +21,7 @@ afterAll(async () => {
 })
 
 function encodedKey(prefix: 'pluginsave/' | 'pluginsave-meta/', rawKey: string): string {
-  return `${prefix}${Buffer.from(rawKey, 'utf8').toString('base64url')}.json`
+  return encodePluginSaveStorageKey(rawKey, prefix)
 }
 
 function filePathHeader(key: string): string {
@@ -50,6 +55,7 @@ describe('staged plugin storage transitions (real server)', () => {
         targetOptimized: true,
         targetGeneration: externalGeneration,
         rows: valueKeys.map((storageKey, index) => ({
+          rawKey: rawKeys[index],
           storageKey,
           size: values[index].length,
         })),
@@ -124,14 +130,18 @@ describe('staged plugin storage transitions (real server)', () => {
     const server = await spawnServer({ env: { POCKETRISU_CHUNK_THRESHOLD: '1024' } })
     servers.push(server)
     const client = await createClient(server.port, server.password)
-    const rawKey = '한글/row'
+    const rawKey = `한글/${'long-key-'.repeat(600)}`
     const valueKey = encodedKey('pluginsave/', rawKey)
+    const ownerKey = encodedKey('pluginsave-meta/', rawKey)
     const inlineValue = { payload: 'x'.repeat(4_000) }
+    const inlineOwner = { plugin: 'Long transition owner', updatedAt: 1 }
     const value = Buffer.from(JSON.stringify(inlineValue), 'utf8')
+    const owner = Buffer.from(JSON.stringify(inlineOwner), 'utf8')
     expect((await client.importBackup(createSeedBackup({
       databaseFields: {
         optimizePluginMemory: false,
         pluginCustomStorage: { [rawKey]: inlineValue },
+        pluginStorageMeta: { [rawKey]: inlineOwner },
       },
     }))).ok).toBe(true)
     const externalId = randomUUID()
@@ -142,7 +152,10 @@ describe('staged plugin storage transitions (real server)', () => {
       source: { optimized: false, generation: null, manifest: null },
       targetOptimized: true,
       targetGeneration: externalGeneration,
-      rows: [{ storageKey: valueKey, size: value.length }],
+      rows: [
+        { rawKey, storageKey: valueKey, size: value.length },
+        { rawKey, storageKey: ownerKey, size: owner.length },
+      ],
     }
     const begin = await client.fetch('/api/plugin-storage/transition/stage/begin', {
       method: 'POST',
@@ -162,10 +175,22 @@ describe('staged plugin storage transitions (real server)', () => {
       body: new Uint8Array(value),
     })
     expect(upload.status).toBe(200)
-    expect((await upload.json() as any).state).toBe('ready')
+    expect((await upload.json() as any).state).toBe('uploading')
+    const ownerUpload = await client.fetch('/api/plugin-storage/transition/stage/upload', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-plugin-storage-transition': externalId,
+        'x-plugin-storage-key': ownerKey,
+      },
+      body: new Uint8Array(owner),
+    })
+    expect(ownerUpload.status).toBe(200)
+    expect((await ownerUpload.json() as any).state).toBe('ready')
 
     const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
     expect(sqlite.prepare('SELECT 1 FROM kv WHERE key = ?').get(valueKey)).toBeUndefined()
+    expect(sqlite.prepare('SELECT 1 FROM kv WHERE key = ?').get(ownerKey)).toBeUndefined()
     expect(sqlite.prepare('SELECT 1 FROM kv WHERE key = ?').get(MANIFEST_KEY)).toBeUndefined()
     sqlite.close()
     const inventoryBefore = await client.fetch('/api/storage/list-sizes', {
@@ -192,6 +217,21 @@ describe('staged plugin storage transitions (real server)', () => {
     })
     expect(Buffer.from(await valueRead.arrayBuffer())).toEqual(value)
 
+    const mappedManifest = {
+      version: 3,
+      generation: externalGeneration,
+      valueKeys: [valueKey],
+      metaKeys: [ownerKey],
+      keyMappings: [[valueKey.slice('pluginsave/'.length), rawKey]],
+    }
+    const mappedManifestResponse = await client.fetch('/api/plugin-storage/manifest', {
+      headers: { 'x-plugin-storage-generation': externalGeneration },
+    })
+    expect(mappedManifestResponse.status).toBe(200)
+    await expect(mappedManifestResponse.json()).resolves.toMatchObject({
+      manifest: mappedManifest,
+    })
+
     const internalId = randomUUID()
     const internalGeneration = randomUUID()
     const internalBegin = await client.fetch('/api/plugin-storage/transition/stage/begin', {
@@ -203,12 +243,7 @@ describe('staged plugin storage transitions (real server)', () => {
         source: {
           optimized: true,
           generation: externalGeneration,
-          manifest: {
-            version: 2,
-            generation: externalGeneration,
-            valueKeys: [valueKey],
-            metaKeys: [],
-          },
+          manifest: mappedManifest,
         },
         targetOptimized: false,
         targetGeneration: internalGeneration,
@@ -218,7 +253,7 @@ describe('staged plugin storage transitions (real server)', () => {
     expect(internalBegin.status).toBe(200)
     const internalState = await internalBegin.json() as any
     expect(internalState.state).toBe('ready')
-    expect(internalState.rows).toHaveLength(1)
+    expect(internalState.rows).toHaveLength(2)
     const ownershipSnapshot = await client.fetch('/api/plugin-storage/manifest', {
       headers: { 'x-plugin-storage-generation': externalGeneration },
     })
@@ -229,13 +264,10 @@ describe('staged plugin storage transitions (real server)', () => {
       generation: externalGeneration,
       manifestRevision: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
       manifest: {
-        version: 2,
-        generation: externalGeneration,
-        valueKeys: [valueKey],
-        metaKeys: [],
+        ...mappedManifest,
       },
       valueKeys: [valueKey],
-      metaKeys: [],
+      metaKeys: [ownerKey],
     })
     const stagedRead = await client.fetch('/api/plugin-storage/transition/stage/row', {
       headers: {
@@ -280,9 +312,11 @@ describe('staged plugin storage transitions (real server)', () => {
     expect(database.optimizePluginMemory).toBe(false)
     expect(database.pluginStorageGeneration).toBe(internalGeneration)
     expect(database.pluginCustomStorage[rawKey]).toEqual({ payload: 'x'.repeat(4_000) })
+    expect(database.pluginStorageMeta[rawKey]).toEqual(inlineOwner)
 
     const finalSqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
     expect(finalSqlite.prepare('SELECT 1 FROM kv WHERE key = ?').get(valueKey)).toBeUndefined()
+    expect(finalSqlite.prepare('SELECT 1 FROM kv WHERE key = ?').get(ownerKey)).toBeUndefined()
     expect(finalSqlite.prepare('SELECT 1 FROM kv WHERE key = ?').get(MANIFEST_KEY)).toBeUndefined()
     expect(finalSqlite.prepare('SELECT 1 FROM kv WHERE key = ?')
       .get('config/plugin-storage-recovery-dirty')).toBeDefined()
@@ -311,7 +345,7 @@ describe('staged plugin storage transitions (real server)', () => {
         source: { optimized: false, generation: null, manifest: null },
         targetOptimized: true,
         targetGeneration: randomUUID(),
-        rows: [{ storageKey: valueKey, size: value.length }],
+        rows: [{ rawKey: 'cancelled', storageKey: valueKey, size: value.length }],
       }),
     })
     expect(begin.status).toBe(200)
@@ -369,7 +403,7 @@ describe('staged plugin storage transitions (real server)', () => {
         source: { optimized: false, generation: null, manifest: null },
         targetOptimized: true,
         targetGeneration,
-        rows: [{ storageKey: valueKey, size: value.length }],
+        rows: [{ rawKey: 'atomic', storageKey: valueKey, size: value.length }],
       }),
     })
     const beginBody = await beginResponse.text()

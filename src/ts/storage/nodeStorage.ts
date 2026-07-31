@@ -69,6 +69,13 @@ import {
 } from "./pluginStorageLimits"
 import type { BootInternalSnapshot } from "./bootSnapshotRecovery"
 import { comparePluginStorageKeys } from "../plugins/pluginStorageRecord"
+import {
+    decodePluginSaveStorageKey,
+    isHashedPluginSaveStorageKey,
+    makeArchiveSafePluginSaveStorageKey,
+    pluginSaveStorageKeyMappingComponent,
+    type PluginSaveStoragePrefix,
+} from "./pluginSaveKeyPolicy"
 
 /** Short availability bound for authentication and small control requests. */
 export const AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS = 15_000
@@ -602,10 +609,11 @@ export interface StorageReadOptions {
 }
 
 export interface PluginStorageManifestTransport {
-    version: 1 | 2
+    version: 1 | 2 | 3
     generation: string
     valueKeys: string[]
     metaKeys: string[]
+    keyMappings?: [string, string][]
 }
 
 export interface PluginStorageManifestSnapshotTransport {
@@ -679,7 +687,7 @@ export interface PluginStorageStagedTransitionBegin {
     source: PluginStorageTransitionTransport['source']
     targetOptimized: boolean
     targetGeneration: string
-    rows: { storageKey: string, size: number }[]
+    rows: { storageKey: string, rawKey: string, size: number }[]
     expectedEtag?: string
 }
 
@@ -691,6 +699,7 @@ export interface PluginStorageStagedTransitionStatus {
     targetGeneration: string
     rows: {
         storageKey: string
+        rawKey: string
         size: number
         sha256: string
         uploaded: boolean
@@ -742,10 +751,11 @@ function isPluginStorageStagedTransitionStatus(
     for (const rowValue of result.rows) {
         if (!rowValue || typeof rowValue !== 'object' || Array.isArray(rowValue)) return false
         const row = rowValue as Record<string, unknown>
-        if (Object.keys(row).sort().join(',') !== 'sha256,size,storageKey,uploaded'
+        if (Object.keys(row).sort().join(',') !== 'rawKey,sha256,size,storageKey,uploaded'
             || !PLUGIN_STORAGE_PREFIXES.some(prefix => (
-                isCanonicalPluginStorageKey(row.storageKey, prefix)
+                isCanonicalPluginStorageKey(row.storageKey, prefix, row.rawKey)
             ))
+            || typeof row.rawKey !== 'string'
             || !Number.isSafeInteger(row.size)
             || (row.size as number) <= 0
             || typeof row.uploaded !== 'boolean'
@@ -920,25 +930,22 @@ function parseInternalSnapshotKey(value: unknown): number | null {
         : null
 }
 
-function isCanonicalPluginStorageKey(value: unknown, prefix: string): value is string {
+function isCanonicalPluginStorageKey(
+    value: unknown,
+    prefix: string,
+    rawKey?: unknown,
+): value is string {
     if (typeof value !== 'string'
         || !value.startsWith(prefix)
         || !value.endsWith('.json')) return false
-    const encoded = value.slice(prefix.length, -'.json'.length)
-    if (!/^[A-Za-z0-9_-]*$/.test(encoded)) return false
     try {
-        const padded = encoded
-            .replace(/-/g, '+')
-            .replace(/_/g, '/')
-            .padEnd(Math.ceil(encoded.length / 4) * 4, '=')
-        const bytes = Buffer.from(padded, 'base64')
-        const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
-        const canonical = Buffer.from(decoded, 'utf-8')
-            .toString('base64')
-            .replace(/\+/g, '-')
-            .replace(/\//g, '_')
-            .replace(/=+$/g, '')
-        return canonical === encoded
+        const typedPrefix = prefix as PluginSaveStoragePrefix
+        if (isHashedPluginSaveStorageKey(value, typedPrefix)) {
+            return typeof rawKey === 'string'
+                && makeArchiveSafePluginSaveStorageKey(typedPrefix, rawKey) === value
+        }
+        decodePluginSaveStorageKey(value, typedPrefix)
+        return true
     } catch {
         return false
     }
@@ -2525,6 +2532,13 @@ export class NodeStorage{
                         ...request.expectedManifest,
                         valueKeys: [...request.expectedManifest.valueKeys],
                         metaKeys: [...request.expectedManifest.metaKeys],
+                        ...(request.expectedManifest.version === 3
+                            ? {
+                                keyMappings: request.expectedManifest.keyMappings?.map(
+                                    entry => [...entry] as [string, string],
+                                ) ?? [],
+                            }
+                            : {}),
                     },
                 }
                 : {}),
@@ -3242,11 +3256,63 @@ export class NodeStorage{
         const allowed = new Set([
             'success', 'generation', 'manifestRevision', 'manifest', 'valueKeys', 'metaKeys',
         ])
+        const mappingEntries = manifest?.version === 3 && Array.isArray(manifest.keyMappings)
+            ? manifest.keyMappings
+            : []
+        const mappingMap = new Map<string, string>()
+        const validMappings = mappingEntries.every(entry => {
+            if (!Array.isArray(entry) || entry.length !== 2
+                || typeof entry[0] !== 'string' || typeof entry[1] !== 'string'
+                || mappingMap.has(entry[0])) return false
+            const storageKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_STORAGE_PREFIXES[0] as PluginSaveStoragePrefix,
+                entry[1],
+            )
+            if (pluginSaveStorageKeyMappingComponent(
+                storageKey,
+                PLUGIN_STORAGE_PREFIXES[0] as PluginSaveStoragePrefix,
+            ) !== entry[0]) return false
+            mappingMap.set(entry[0], entry[1])
+            return true
+        })
+        const mappedRawKey = (key: unknown, prefix: string) => typeof key === 'string'
+            ? mappingMap.get(pluginSaveStorageKeyMappingComponent(
+                key,
+                prefix as PluginSaveStoragePrefix,
+            ) ?? '')
+            : undefined
         const validKeys = (value: unknown, prefix: string): value is string[] => (
             Array.isArray(value)
-            && value.every(key => isCanonicalPluginStorageKey(key, prefix))
+            && value.every(key => isCanonicalPluginStorageKey(
+                key,
+                prefix,
+                mappedRawKey(key, prefix),
+            ))
             && new Set(value).size === value.length
         )
+        const declaredMappedComponents = new Set<string>()
+        if (Array.isArray(manifest?.valueKeys)) {
+            for (const key of manifest.valueKeys) {
+                if (typeof key !== 'string') continue
+                const component = pluginSaveStorageKeyMappingComponent(
+                    key,
+                    PLUGIN_STORAGE_PREFIXES[0] as PluginSaveStoragePrefix,
+                )
+                if (component) declaredMappedComponents.add(component)
+            }
+        }
+        if (Array.isArray(manifest?.metaKeys)) {
+            for (const key of manifest.metaKeys) {
+                if (typeof key !== 'string') continue
+                const component = pluginSaveStorageKeyMappingComponent(
+                    key,
+                    PLUGIN_STORAGE_PREFIXES[1] as PluginSaveStoragePrefix,
+                )
+                if (component) declaredMappedComponents.add(component)
+            }
+        }
+        const exactMappingCoverage = declaredMappedComponents.size === mappingMap.size
+            && [...mappingMap.keys()].every(component => declaredMappedComponents.has(component))
         const manifestValueKeys = Array.isArray(manifest?.valueKeys)
             ? new Set(manifest.valueKeys as string[])
             : null
@@ -3260,8 +3326,10 @@ export class NodeStorage{
             || !/^sha256:[0-9a-f]{64}$/.test(record.manifestRevision)
             || !manifest
             || Array.isArray(manifest)
-            || Object.keys(manifest).length !== 4
-            || (manifest.version !== 1 && manifest.version !== 2)
+            || Object.keys(manifest).length !== (manifest.version === 3 ? 5 : 4)
+            || (manifest.version !== 1 && manifest.version !== 2 && manifest.version !== 3)
+            || !validMappings
+            || !exactMappingCoverage
             || manifest.generation !== generation
             || !validKeys(manifest.valueKeys, PLUGIN_STORAGE_PREFIXES[0])
             || !validKeys(manifest.metaKeys, PLUGIN_STORAGE_PREFIXES[1])
@@ -3281,6 +3349,9 @@ export class NodeStorage{
                 generation,
                 valueKeys: [...manifest.valueKeys as string[]],
                 metaKeys: [...manifest.metaKeys as string[]],
+                ...(manifest.version === 3
+                    ? { keyMappings: mappingEntries.map(entry => [...entry] as [string, string]) }
+                    : {}),
             },
             valueKeys: [...record.valueKeys as string[]],
             metaKeys: [...record.metaKeys as string[]],

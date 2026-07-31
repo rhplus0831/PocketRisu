@@ -44,7 +44,9 @@ import { safeStructuredClone } from "../polyfill";
 import { Packr } from "msgpackr/index-no-eval";
 import {
     decodePluginSaveStorageKey,
+    isHashedPluginSaveStorageKey,
     makeArchiveSafePluginSaveStorageKey,
+    pluginSaveStorageKeyMappingComponent,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_SAVE_PREFIX,
     type PluginSaveStoragePrefix,
@@ -96,10 +98,11 @@ export { PLUGIN_SAVE_META_PREFIX, PLUGIN_SAVE_PREFIX };
 export const PLUGIN_STORAGE_MANIFEST_KEY = "plugin-storage/manifest.json";
 
 interface PluginStorageManifest {
-    version: 1 | 2;
+    version: 1 | 2 | 3;
     generation: string;
     valueKeys: string[];
     metaKeys: string[];
+    keyMappings?: [string, string][];
 }
 
 interface PluginStorageOwnership {
@@ -388,18 +391,57 @@ export function withPluginSaveStorageKeySetLock<T>(
     );
 }
 
-function decodeListedStorageKey(fullKey: string, prefix: string): string | null {
+function pluginStorageManifestMappingMap(
+    manifest?: PluginStorageManifest | null,
+): Map<string, string> {
+    return new Map(manifest?.version === 3 ? manifest.keyMappings ?? [] : []);
+}
+
+function decodeListedStorageKey(
+    fullKey: string,
+    prefix: string,
+    manifest?: PluginStorageManifest | null,
+): string | null {
     try {
+        const component = pluginSaveStorageKeyMappingComponent(
+            fullKey,
+            prefix as PluginSaveStoragePrefix,
+        );
         return decodePluginSaveStorageKey(
             fullKey,
             prefix as PluginSaveStoragePrefix,
+            component === null
+                ? undefined
+                : pluginStorageManifestMappingMap(manifest).get(component),
         );
     } catch {
         return null;
     }
 }
 
-function normalizeManifestKeys(value: unknown, prefix: string): string[] | null {
+function normalizeManifestMappings(value: unknown): [string, string][] | null {
+    if (!Array.isArray(value)) return null;
+    const mappings: [string, string][] = [];
+    const seen = new Set<string>();
+    for (const entry of value) {
+        if (!Array.isArray(entry) || entry.length !== 2
+            || typeof entry[0] !== "string" || typeof entry[1] !== "string"
+            || seen.has(entry[0])) return null;
+        const storageKey = makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_PREFIX, entry[1]);
+        if (pluginSaveStorageKeyMappingComponent(storageKey, PLUGIN_SAVE_PREFIX) !== entry[0]) {
+            return null;
+        }
+        seen.add(entry[0]);
+        mappings.push([entry[0], entry[1]]);
+    }
+    return mappings;
+}
+
+function normalizeManifestKeys(
+    value: unknown,
+    prefix: string,
+    manifest: PluginStorageManifest,
+): string[] | null {
     if (!Array.isArray(value)) return null;
     const keys: string[] = [];
     const seen = new Set<string>();
@@ -408,7 +450,7 @@ function normalizeManifestKeys(value: unknown, prefix: string): string[] | null 
             return null;
         }
         try {
-            const decoded = decodeListedStorageKey(item, prefix);
+            const decoded = decodeListedStorageKey(item, prefix, manifest);
             if (
                 decoded === null
                 || makeArchiveSafePluginSaveStorageKey(
@@ -430,17 +472,49 @@ function normalizeManifestKeys(value: unknown, prefix: string): string[] | null 
 function normalizePluginStorageManifest(value: unknown): PluginStorageManifest | null {
     if (!value || typeof value !== "object" || Array.isArray(value)) return null;
     const candidate = value as Partial<PluginStorageManifest>;
-    if ((candidate.version !== 1 && candidate.version !== 2)
+    if ((candidate.version !== 1 && candidate.version !== 2 && candidate.version !== 3)
         || typeof candidate.generation !== "string"
         || candidate.generation.length === 0) return null;
-    const valueKeys = normalizeManifestKeys(candidate.valueKeys, PLUGIN_SAVE_PREFIX);
-    const metaKeys = normalizeManifestKeys(candidate.metaKeys, PLUGIN_SAVE_META_PREFIX);
+    const keyMappings = candidate.version === 3
+        ? normalizeManifestMappings(candidate.keyMappings)
+        : [];
+    if (!keyMappings) return null;
+    const partialManifest: PluginStorageManifest = {
+        version: candidate.version,
+        generation: candidate.generation,
+        valueKeys: [],
+        metaKeys: [],
+        ...(candidate.version === 3 ? { keyMappings } : {}),
+    };
+    const valueKeys = normalizeManifestKeys(
+        candidate.valueKeys,
+        PLUGIN_SAVE_PREFIX,
+        partialManifest,
+    );
+    const metaKeys = normalizeManifestKeys(
+        candidate.metaKeys,
+        PLUGIN_SAVE_META_PREFIX,
+        partialManifest,
+    );
     if (!valueKeys || !metaKeys) return null;
+    const declaredComponents = new Set<string>();
+    for (const [keys, prefix] of [
+        [valueKeys, PLUGIN_SAVE_PREFIX],
+        [metaKeys, PLUGIN_SAVE_META_PREFIX],
+    ] as const) {
+        for (const key of keys) {
+            const component = pluginSaveStorageKeyMappingComponent(key, prefix);
+            if (component !== null) declaredComponents.add(component);
+        }
+    }
+    if (declaredComponents.size !== keyMappings.length
+        || keyMappings.some(([component]) => !declaredComponents.has(component))) return null;
     return {
         version: candidate.version,
         generation: candidate.generation,
         valueKeys,
         metaKeys,
+        ...(candidate.version === 3 ? { keyMappings } : {}),
     };
 }
 
@@ -448,13 +522,49 @@ function buildPluginStorageManifest(
     generation: string,
     valueKeys: Iterable<string>,
     metaKeys: Iterable<string>,
+    keyMappings: Iterable<[string, string]> = [],
 ): PluginStorageManifest {
-    return {
-        version: 2,
+    const mappings = [...keyMappings].map(([component, rawKey]) => [component, rawKey] as [string, string]);
+    const manifest: PluginStorageManifest = {
+        version: mappings.length > 0 ? 3 : 2,
         generation,
         valueKeys: [...new Set(valueKeys)],
         metaKeys: [...new Set(metaKeys)],
+        ...(mappings.length > 0 ? { keyMappings: mappings } : {}),
     };
+    const normalized = normalizePluginStorageManifest(manifest);
+    if (!normalized) throw new TypeError("Plugin storage manifest key mappings are invalid.");
+    return normalized;
+}
+
+function mergedPluginStorageKeyMappings(
+    manifest: PluginStorageManifest | null | undefined,
+    rawKeys: Iterable<string>,
+    valueKeys: Iterable<string>,
+    metaKeys: Iterable<string>,
+): [string, string][] {
+    const mappings = pluginStorageManifestMappingMap(manifest);
+    for (const rawKey of rawKeys) {
+        const storageKey = makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_PREFIX, rawKey);
+        const component = pluginSaveStorageKeyMappingComponent(storageKey, PLUGIN_SAVE_PREFIX);
+        if (component === null) continue;
+        const existing = mappings.get(component);
+        if (existing !== undefined && existing !== rawKey) {
+            throw new TypeError("Plugin storage key hash collision.");
+        }
+        mappings.set(component, rawKey);
+    }
+    const declared = new Set<string>();
+    for (const [keys, prefix] of [
+        [valueKeys, PLUGIN_SAVE_PREFIX],
+        [metaKeys, PLUGIN_SAVE_META_PREFIX],
+    ] as const) {
+        for (const key of keys) {
+            const component = pluginSaveStorageKeyMappingComponent(key, prefix);
+            if (component !== null) declared.add(component);
+        }
+    }
+    return [...mappings].filter(([component]) => declared.has(component));
 }
 
 async function resolvePluginStorageOwnership(
@@ -486,12 +596,14 @@ async function resolvePluginStorageOwnership(
         && db.pluginStorageGeneration.length > 0
         ? db.pluginStorageGeneration
         : null;
-    const physicalValues = new Set(listedValueKeys.filter(
-        key => decodeListedStorageKey(key, PLUGIN_SAVE_PREFIX) !== null,
-    ));
-    const physicalMeta = new Set(listedMetaKeys.filter(
-        key => decodeListedStorageKey(key, PLUGIN_SAVE_META_PREFIX) !== null,
-    ));
+    const physicalValues = new Set(listedValueKeys.filter(key => (
+        isHashedPluginSaveStorageKey(key, PLUGIN_SAVE_PREFIX)
+        || decodeListedStorageKey(key, PLUGIN_SAVE_PREFIX) !== null
+    )));
+    const physicalMeta = new Set(listedMetaKeys.filter(key => (
+        isHashedPluginSaveStorageKey(key, PLUGIN_SAVE_META_PREFIX)
+        || decodeListedStorageKey(key, PLUGIN_SAVE_META_PREFIX) !== null
+    )));
 
     if (generation && manifest?.generation === generation) {
         const valueKeys = manifest.valueKeys.filter(key => physicalValues.has(key));
@@ -562,6 +674,13 @@ function clonePluginStorageOwnership(ownership: PluginStorageOwnership): PluginS
             ...ownership.manifest,
             valueKeys: [...ownership.manifest.valueKeys],
             metaKeys: [...ownership.manifest.metaKeys],
+            ...(ownership.manifest.version === 3
+                ? {
+                    keyMappings: ownership.manifest.keyMappings?.map(
+                        ([component, rawKey]) => [component, rawKey] as [string, string],
+                    ),
+                }
+                : {}),
         } : null,
         valueKeys: [...ownership.valueKeys],
         metaKeys: [...ownership.metaKeys],
@@ -620,6 +739,7 @@ async function commitOptimizedStorageMutation(
     deletes: string[],
     mutate: (valueKeys: Set<string>, metaKeys: Set<string>) => void,
     signal?: AbortSignal | null,
+    logicalKeys: Iterable<string> = [],
 ): Promise<void> {
     const generation = db.pluginStorageGeneration;
     for (let attempt = 0; ; attempt++) {
@@ -636,11 +756,22 @@ async function commitOptimizedStorageMutation(
         const valueKeys = new Set(ownership.manifest.valueKeys);
         const metaKeys = new Set(ownership.manifest.metaKeys);
         mutate(valueKeys, metaKeys);
+        const keyMappings = mergedPluginStorageKeyMappings(
+            ownership.manifest,
+            logicalKeys,
+            valueKeys,
+            metaKeys,
+        );
         try {
             await commitPersistentPluginStorageMutation({
                 generation,
                 expectedManifest: ownership.manifest,
-                nextManifest: buildPluginStorageManifest(generation, valueKeys, metaKeys),
+                nextManifest: buildPluginStorageManifest(
+                    generation,
+                    valueKeys,
+                    metaKeys,
+                    keyMappings,
+                ),
                 writes,
                 deletes,
             }, signal);
@@ -654,6 +785,37 @@ async function commitOptimizedStorageMutation(
             ) continue;
             throw error;
         }
+    }
+}
+
+async function commitHashedOwnedPluginStorageMutation(
+    db: Database,
+    operation: PersistentPluginStorageBatchOperation,
+    signal?: AbortSignal | null,
+): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+        const generation = db.pluginStorageGeneration;
+        if (!generation) {
+            throw new Error(
+                "Optimized plugin storage is not reconciled; reload to complete its atomic adoption.",
+            );
+        }
+        const manifestState = await readPersistentPluginStorageManifestState(generation, signal);
+        const result = await batchPersistentPluginStorage({
+            generation,
+            expectedManifestRevision: manifestState.manifestRevision,
+            operations: [operation],
+        }, signal);
+        if (result.outcome === "committed") return;
+        if (result.code === "PLUGIN_STORAGE_GENERATION_CONFLICT" && attempt < 2) continue;
+        throw new StorageError(result.error ?? "Plugin storage mutation failed.", {
+            status: result.status,
+            code: result.code,
+            retryAfter: result.retryAfter,
+            retryable: result.retryable,
+            commitOutcomeUnknown: false,
+            operation: "batch",
+        });
     }
 }
 
@@ -870,7 +1032,7 @@ async function readExternalizedPluginStorageUnlocked(
 
     for (const storageKey of ownership.valueKeys) {
         throwIfAborted(signal);
-        const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
+        const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX, ownership.manifest);
         if (key === null) continue;
         definePluginStorageRecordValue(
             values,
@@ -886,7 +1048,7 @@ async function readExternalizedPluginStorageUnlocked(
     }
     for (const storageKey of ownership.metaKeys) {
         throwIfAborted(signal);
-        const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
+        const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX, ownership.manifest);
         if (key === null) continue;
         definePluginStorageRecordValue(meta, key, await readGenerationBoundPluginStorageJson(
             readPersistentJson,
@@ -911,7 +1073,7 @@ async function listDecodedStorageKeys(
     const keys: string[] = [];
     for (const storageKey of storageKeys) {
         throwIfAborted(signal);
-        const decoded = decodeListedStorageKey(storageKey, prefix);
+        const decoded = decodeListedStorageKey(storageKey, prefix, ownership.manifest);
         if (decoded !== null) keys.push(decoded);
     }
     return keys;
@@ -1087,6 +1249,7 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
                         const rawKey = decodeListedStorageKey(
                             existingMetaKey,
                             PLUGIN_SAVE_META_PREFIX,
+                            ownership.manifest,
                         );
                         if (rawKey === null
                             || !hasPluginStorageRecordValue(optimizedReplacement, rawKey)) continue;
@@ -1140,6 +1303,7 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
                             for (const key of retainedMetaKeys) meta.add(key);
                         },
                         signal,
+                        [...prepared.map(entry => entry.key), ...compatibilityKeys],
                     );
                 } else if (compatibilityKeys.length > 0) {
                     const writes: { storageKey: string; valueBytes: Uint8Array }[] = [];
@@ -1178,6 +1342,7 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
                             for (const key of metaKeys) meta.add(key);
                         },
                         signal,
+                        compatibilityKeys,
                     );
                 }
                 throwIfAborted(signal);
@@ -1318,7 +1483,8 @@ export async function setPluginSaveStorageItem<T>(
                 PLUGIN_SAVE_PREFIX,
                 normalizedKey,
             );
-            if (db.pluginStorageGeneration) {
+            if (db.pluginStorageGeneration
+                && !isHashedPluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX)) {
                 await setPreparedPersistentPluginStoragePreservingOwner(
                     storageKey,
                     prepared,
@@ -1333,6 +1499,7 @@ export async function setPluginSaveStorageItem<T>(
                 [],
                 values => values.add(storageKey),
                 signal,
+                [normalizedKey],
             );
         }, signal);
     } finally {
@@ -1369,20 +1536,33 @@ export async function setOwnedPluginSaveStorageItem<T>(
                 );
                 // The server derives this row, but preflight its stricter archive
                 // boundary before dispatching either side of the transaction.
-                makeArchiveSafePluginSaveStorageKey(
+                const metaStorageKey = makeArchiveSafePluginSaveStorageKey(
                     PLUGIN_SAVE_META_PREFIX,
                     normalizedKey,
                 );
                 if (db.pluginStorageGeneration) {
-                    await mutatePersistentPluginStorage(
-                        valueStorageKey,
-                        "set",
-                        snapshot,
-                        owner,
-                        signal,
-                        db.pluginStorageGeneration,
-                        preparedValue,
-                    );
+                    if (
+                        isHashedPluginSaveStorageKey(valueStorageKey, PLUGIN_SAVE_PREFIX)
+                        || isHashedPluginSaveStorageKey(metaStorageKey, PLUGIN_SAVE_META_PREFIX)
+                    ) {
+                        await commitHashedOwnedPluginStorageMutation(db, {
+                            operation: "set",
+                            key: normalizedKey,
+                            valueBytes: preparedValue.bytes,
+                            ownedValueBytes: true,
+                            owner,
+                        }, signal);
+                    } else {
+                        await mutatePersistentPluginStorage(
+                            valueStorageKey,
+                            "set",
+                            snapshot,
+                            owner,
+                            signal,
+                            db.pluginStorageGeneration,
+                            preparedValue,
+                        );
+                    }
                 } else {
                     await mutatePersistentPluginStorage(
                         valueStorageKey,
@@ -1452,7 +1632,8 @@ export async function removePluginSaveStorageItem(
                 PLUGIN_SAVE_PREFIX,
                 normalizedKey,
             );
-            if (db.pluginStorageGeneration) {
+            if (db.pluginStorageGeneration
+                && !isHashedPluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX)) {
                 await removePersistentPluginStoragePreservingOwner(
                     storageKey,
                     signal,
@@ -1488,13 +1669,27 @@ export async function removeOwnedPluginSaveStorageItem(
                     PLUGIN_SAVE_PREFIX,
                     normalizedKey,
                 );
+                const metaStorageKey = makeArchiveSafePluginSaveStorageKey(
+                    PLUGIN_SAVE_META_PREFIX,
+                    normalizedKey,
+                );
                 if (db.pluginStorageGeneration) {
-                    await mutatePersistentPluginStorage(
-                        valueStorageKey,
-                        "remove",
-                        signal,
-                        db.pluginStorageGeneration,
-                    );
+                    if (
+                        isHashedPluginSaveStorageKey(valueStorageKey, PLUGIN_SAVE_PREFIX)
+                        || isHashedPluginSaveStorageKey(metaStorageKey, PLUGIN_SAVE_META_PREFIX)
+                    ) {
+                        await commitHashedOwnedPluginStorageMutation(db, {
+                            operation: "remove",
+                            key: normalizedKey,
+                        }, signal);
+                    } else {
+                        await mutatePersistentPluginStorage(
+                            valueStorageKey,
+                            "remove",
+                            signal,
+                            db.pluginStorageGeneration,
+                        );
+                    }
                 } else {
                     await mutatePersistentPluginStorage(
                         valueStorageKey,
@@ -2580,6 +2775,7 @@ export async function setPluginSaveStorageOwner(
             [],
             (_values, meta) => meta.add(storageKey),
             signal,
+            [normalizedKey],
         );
     }, signal);
 }
@@ -2657,7 +2853,11 @@ export async function getPluginSaveStorageOwners(
         const ownership = await readCachedCurrentOwnership(db, signal);
         const activeValues = new Set(ownership.valueKeys);
         const entries = await Promise.all(ownership.metaKeys.map(async fullKey => {
-            const key = decodeListedStorageKey(fullKey, PLUGIN_SAVE_META_PREFIX);
+            const key = decodeListedStorageKey(
+                fullKey,
+                PLUGIN_SAVE_META_PREFIX,
+                ownership.manifest,
+            );
             if (key === null) return null;
             if (!activeValues.has(makeArchiveSafePluginSaveStorageKey(
                 PLUGIN_SAVE_PREFIX,
@@ -2714,6 +2914,7 @@ export interface PluginStorageBootReconcileResult extends PluginStorageReconcile
 }
 
 interface ReconcileDependencies {
+    commitPersistentPluginStorageMutation: typeof commitPersistentPluginStorageMutation;
     getDatabase: () => Database;
     getPersistentStorageFreeBytes: typeof getPersistentStorageFreeBytes;
     listPersistentEntriesWithSizes: typeof listPersistentEntriesWithSizes;
@@ -2750,6 +2951,9 @@ function resolveReconcileDependencies(
     overrides: Partial<ReconcileDependencies> = {},
 ): ReconcileDependencies {
     return {
+        commitPersistentPluginStorageMutation: (request, signal) => (
+            commitPersistentPluginStorageMutation(request, signal)
+        ),
         getDatabase,
         getPersistentStorageFreeBytes,
         listPersistentEntriesWithSizes,
@@ -2929,7 +3133,11 @@ async function preflightPluginStorageTransition(
     const ownedBytes: number[] = [];
     const ownedEntries: PluginStorageTransitionPreflight["entries"] = [];
     for (const storageKey of ownedValueKeys) {
-        const rawKey = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
+        const rawKey = decodeListedStorageKey(
+            storageKey,
+            PLUGIN_SAVE_PREFIX,
+            ownership.manifest,
+        );
         const size = valueSizeByKey.get(storageKey);
         if (rawKey === null || size === undefined) {
             throw new StorageError("Plugin storage changed during size inventory; retry.", {
@@ -2949,7 +3157,11 @@ async function preflightPluginStorageTransition(
         });
     }
     for (const storageKey of ownedMetaKeys) {
-        const rawKey = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
+        const rawKey = decodeListedStorageKey(
+            storageKey,
+            PLUGIN_SAVE_META_PREFIX,
+            ownership.manifest,
+        );
         const size = metaSizeByKey.get(storageKey);
         if (rawKey === null || size === undefined) {
             throw new StorageError("Plugin storage changed during size inventory; retry.", {
@@ -3205,7 +3417,11 @@ async function preparePluginStorageReconciliation(
         for (const storageKey of activeValueKeys) {
             if (
                 overwrittenValueKeys.has(storageKey)
-                || decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX) === null
+                || decodeListedStorageKey(
+                    storageKey,
+                    PLUGIN_SAVE_PREFIX,
+                    ownership.manifest,
+                ) === null
             ) continue;
             const value = snapshotJsonValue(
                 await readGenerationBoundPluginStorageJson(
@@ -3216,13 +3432,21 @@ async function preparePluginStorageReconciliation(
                     options.signal,
                 ),
             );
-            const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX)!;
+            const key = decodeListedStorageKey(
+                storageKey,
+                PLUGIN_SAVE_PREFIX,
+                ownership.manifest,
+            )!;
             definePluginStorageRecordValue(values, key, value);
         }
         for (const storageKey of activeMetaKeys) {
             if (
                 overwrittenMetaKeys.has(storageKey)
-                || decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX) === null
+                || decodeListedStorageKey(
+                    storageKey,
+                    PLUGIN_SAVE_META_PREFIX,
+                    ownership.manifest,
+                ) === null
             ) continue;
             const record = snapshotJsonValue(await readGenerationBoundPluginStorageJson(
                 deps.readPersistentJson,
@@ -3231,7 +3455,11 @@ async function preparePluginStorageReconciliation(
                 false,
                 options.signal,
             ));
-            const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX)!;
+            const key = decodeListedStorageKey(
+                storageKey,
+                PLUGIN_SAVE_META_PREFIX,
+                ownership.manifest,
+            )!;
             definePluginStorageRecordValue(
                 meta,
                 key,
@@ -3304,7 +3532,7 @@ async function preparePluginStorageReconciliation(
 
     let completed = 0;
     for (const storageKey of valueStorageKeys) {
-        const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX);
+        const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_PREFIX, ownership.manifest);
         if (key === null) continue;
         const value = snapshotJsonValue(
             await readGenerationBoundPluginStorageJson(
@@ -3327,7 +3555,7 @@ async function preparePluginStorageReconciliation(
         });
     }
     for (const storageKey of metaStorageKeys) {
-        const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX);
+        const key = decodeListedStorageKey(storageKey, PLUGIN_SAVE_META_PREFIX, ownership.manifest);
         if (key === null) continue;
         const record = snapshotJsonValue(await readGenerationBoundPluginStorageJson(
             deps.readPersistentJson,
@@ -3397,6 +3625,15 @@ async function applyPluginStorageReconciliation(
                 prepared.generation,
                 prepared.activeValueKeys,
                 prepared.activeMetaKeys,
+                mergedPluginStorageKeyMappings(
+                    null,
+                    [
+                        ...prepared.valueEntries.map(entry => entry.key),
+                        ...prepared.metaEntries.map(entry => entry.key),
+                    ],
+                    prepared.activeValueKeys,
+                    prepared.activeMetaKeys,
+                ),
             ),
         );
         // Replace the now-empty Svelte records instead of retaining proxy
@@ -3519,6 +3756,7 @@ async function applyStagedPluginStorageTransition(
         rows: target
             ? preflight.entries.map(entry => ({
                 storageKey: entry.storageKey,
+                rawKey: entry.rawKey,
                 size: entry.size,
             }))
             : [],
@@ -3631,8 +3869,11 @@ async function applyStagedPluginStorageTransition(
                 const prefix = row.storageKey.startsWith(PLUGIN_SAVE_META_PREFIX)
                     ? PLUGIN_SAVE_META_PREFIX
                     : PLUGIN_SAVE_PREFIX;
-                const rawKey = decodeListedStorageKey(row.storageKey, prefix);
-                if (rawKey === null) {
+                const rawKey = typeof row.rawKey === "string"
+                    ? row.rawKey
+                    : decodeListedStorageKey(row.storageKey, prefix);
+                if (rawKey === null
+                    || makeArchiveSafePluginSaveStorageKey(prefix, rawKey) !== row.storageKey) {
                     throw new StorageError("The staged transition returned an invalid key.", {
                         code: "PLUGIN_STORAGE_CHANGED",
                         operation: "transition",
@@ -3929,6 +4170,7 @@ async function readBootStorageRows(
     listed: string[] | null,
     cached: boolean,
     pluginStorageGeneration: string | undefined,
+    manifest: PluginStorageManifest | null,
     issues: PluginStorageRecoveryIssue[],
     signal?: AbortSignal | null,
 ): Promise<PreparedStorageEntry[]> {
@@ -3938,7 +4180,7 @@ async function readBootStorageRows(
         throwIfAborted(signal);
         let key: string | null = null;
         try {
-            key = decodeListedStorageKey(storageKey, prefix);
+            key = decodeListedStorageKey(storageKey, prefix, manifest);
             if (
                 key === null
                 || makeArchiveSafePluginSaveStorageKey(prefix, key) !== storageKey
@@ -4017,11 +4259,11 @@ export async function reconcilePluginStorageModeForBoot(
         invalidateStorageEnumerationSnapshot();
         const db = deps.getDatabase();
         const target = db.optimizePluginMemory === true;
-        const pluginStorageGeneration = target
-            && typeof db.pluginStorageGeneration === "string"
+        const selectedGeneration = typeof db.pluginStorageGeneration === "string"
             && db.pluginStorageGeneration.length > 0
             ? db.pluginStorageGeneration
             : undefined;
+        const pluginStorageGeneration = target ? selectedGeneration : undefined;
         const direction = target ? "externalize" : "internalize";
         const issues: PluginStorageRecoveryIssue[] = [];
         const valueSource = db.pluginCustomStorage ?? createDatabasePluginStorageRecord();
@@ -4043,6 +4285,26 @@ export async function reconcilePluginStorageModeForBoot(
             listBootStorageKeys(deps, PLUGIN_SAVE_PREFIX, issues, signal),
             listBootStorageKeys(deps, PLUGIN_SAVE_META_PREFIX, issues, signal),
         ]);
+        let recoveryManifest: PluginStorageManifest | null = null;
+        if (selectedGeneration) {
+            try {
+                const rawManifest = await deps.readPersistentJson<unknown>(
+                    PLUGIN_STORAGE_MANIFEST_KEY,
+                    { signal },
+                );
+                const normalized = normalizePluginStorageManifest(rawManifest);
+                if (normalized?.generation === selectedGeneration) {
+                    recoveryManifest = normalized;
+                }
+            } catch (error) {
+                throwIfAborted(signal);
+                issues.push(bootRecoveryIssue(
+                    error,
+                    PLUGIN_STORAGE_MANIFEST_KEY,
+                    "read-failed",
+                ));
+            }
+        }
         const [externalValueEntries, externalMetaEntries] = await Promise.all([
             readBootStorageRows(
                 deps,
@@ -4050,6 +4312,7 @@ export async function reconcilePluginStorageModeForBoot(
                 listedValueKeys,
                 true,
                 pluginStorageGeneration,
+                recoveryManifest,
                 issues,
                 signal,
             ),
@@ -4059,6 +4322,7 @@ export async function reconcilePluginStorageModeForBoot(
                 listedMetaKeys,
                 false,
                 pluginStorageGeneration,
+                recoveryManifest,
                 issues,
                 signal,
             ),
@@ -4104,6 +4368,62 @@ export async function reconcilePluginStorageModeForBoot(
                 : new Set(listedMetaKeys);
             const inlineMetaByKey = new Map(metaEntries.map(entry => [entry.key, entry]));
             const pairedMetaKeys = new Set<string>();
+            let currentRecoveryManifest = recoveryManifest;
+
+            const restorePair = async (
+                entry: PreparedStorageEntry,
+                metaEntry: PreparedStorageEntry | undefined,
+            ): Promise<void> => {
+                const mapped = isHashedPluginSaveStorageKey(
+                    entry.storageKey,
+                    PLUGIN_SAVE_PREFIX,
+                ) || (metaEntry !== undefined && isHashedPluginSaveStorageKey(
+                    metaEntry.storageKey,
+                    PLUGIN_SAVE_META_PREFIX,
+                ));
+                if (!mapped) {
+                    await deps.restorePersistentPluginStoragePair(
+                        entry.storageKey,
+                        entry.value,
+                        metaEntry?.value,
+                        signal,
+                    );
+                    return;
+                }
+                if (!pluginStorageGeneration
+                    || !currentRecoveryManifest
+                    || currentRecoveryManifest.generation !== pluginStorageGeneration) {
+                    throw new Error(
+                        "Mapped plugin storage recovery requires the selected manifest.",
+                    );
+                }
+                const valueKeys = new Set(currentRecoveryManifest.valueKeys);
+                const metaKeys = new Set(currentRecoveryManifest.metaKeys);
+                valueKeys.add(entry.storageKey);
+                if (metaEntry) metaKeys.add(metaEntry.storageKey);
+                const nextManifest = buildPluginStorageManifest(
+                    pluginStorageGeneration,
+                    valueKeys,
+                    metaKeys,
+                    mergedPluginStorageKeyMappings(
+                        currentRecoveryManifest,
+                        [entry.key],
+                        valueKeys,
+                        metaKeys,
+                    ),
+                );
+                await deps.commitPersistentPluginStorageMutation({
+                    generation: pluginStorageGeneration,
+                    expectedManifest: currentRecoveryManifest,
+                    nextManifest,
+                    writes: [entry, ...(metaEntry ? [metaEntry] : [])].map(row => ({
+                        storageKey: row.storageKey,
+                        valueBytes: preparePersistentJson(row.value).bytes,
+                    })),
+                    deletes: [],
+                }, signal);
+                currentRecoveryManifest = nextManifest;
+            };
 
             if (listedValueSet !== null) {
                 for (const entry of valueEntries) {
@@ -4121,12 +4441,7 @@ export async function reconcilePluginStorageModeForBoot(
                     }
                     if (metaEntry) pairedMetaKeys.add(metaEntry.storageKey);
                     try {
-                        await deps.restorePersistentPluginStoragePair(
-                            entry.storageKey,
-                            entry.value,
-                            metaEntry?.value,
-                            signal,
-                        );
+                        await restorePair(entry, metaEntry);
                         valueCopies += 1;
                         completed += 1;
                         if (metaEntry) {
@@ -4149,7 +4464,45 @@ export async function reconcilePluginStorageModeForBoot(
                     if (pairedMetaKeys.has(entry.storageKey)
                         || listedMetaSet.has(entry.storageKey)) continue;
                     try {
-                        await deps.writePersistentJson(entry.storageKey, entry.value, signal);
+                        if (isHashedPluginSaveStorageKey(
+                            entry.storageKey,
+                            PLUGIN_SAVE_META_PREFIX,
+                        )) {
+                            if (!pluginStorageGeneration
+                                || !currentRecoveryManifest
+                                || currentRecoveryManifest.generation !== pluginStorageGeneration) {
+                                throw new Error(
+                                    "Mapped plugin storage recovery requires the selected manifest.",
+                                );
+                            }
+                            const valueKeys = new Set(currentRecoveryManifest.valueKeys);
+                            const metaKeys = new Set(currentRecoveryManifest.metaKeys);
+                            metaKeys.add(entry.storageKey);
+                            const nextManifest = buildPluginStorageManifest(
+                                pluginStorageGeneration,
+                                valueKeys,
+                                metaKeys,
+                                mergedPluginStorageKeyMappings(
+                                    currentRecoveryManifest,
+                                    [entry.key],
+                                    valueKeys,
+                                    metaKeys,
+                                ),
+                            );
+                            await deps.commitPersistentPluginStorageMutation({
+                                generation: pluginStorageGeneration,
+                                expectedManifest: currentRecoveryManifest,
+                                nextManifest,
+                                writes: [{
+                                    storageKey: entry.storageKey,
+                                    valueBytes: preparePersistentJson(entry.value).bytes,
+                                }],
+                                deletes: [],
+                            }, signal);
+                            currentRecoveryManifest = nextManifest;
+                        } else {
+                            await deps.writePersistentJson(entry.storageKey, entry.value, signal);
+                        }
                         metaCopies += 1;
                         options.onProgress?.({ direction, completed: ++completed, total });
                     } catch (error) {

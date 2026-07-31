@@ -10,6 +10,7 @@ const {
     createPluginStorageManifest,
     decodePluginSaveStorageKey,
     encodePluginSaveStorageKey,
+    mergePluginStorageKeyMappings,
     parsePluginStorageManifest,
 } = pluginSaveKeysPkg as {
     BACKUP_ENTRY_NAME_MAX_BYTES: number
@@ -21,11 +22,32 @@ const {
         generation: string,
         valueKeys: Iterable<string>,
         metaKeys: Iterable<string>,
-    ) => { version: number, generation: string, valueKeys: string[], metaKeys: string[] }
-    decodePluginSaveStorageKey: (storageKey: string, prefix: string) => string
+        keyMappings?: Iterable<[string, string]>,
+    ) => {
+        version: number,
+        generation: string,
+        valueKeys: string[],
+        metaKeys: string[],
+        keyMappings?: [string, string][],
+    }
+    decodePluginSaveStorageKey: (
+        storageKey: string,
+        prefix: string,
+        mappedRawKey?: string,
+    ) => string
     encodePluginSaveStorageKey: (rawKey: string, prefix: string) => string
+    mergePluginStorageKeyMappings: (
+        manifest: unknown,
+        rawKeys: Iterable<string>,
+        valueKeys?: Iterable<string>,
+        metaKeys?: Iterable<string>,
+    ) => [string, string][]
     parsePluginStorageManifest: (value: unknown) => {
-        version: number, generation: string, valueKeys: string[], metaKeys: string[]
+        version: number,
+        generation: string,
+        valueKeys: string[],
+        metaKeys: string[],
+        keyMappings?: [string, string][],
     } | null
 }
 
@@ -62,16 +84,22 @@ describe('plugin save storage keys', () => {
         )).toThrow('Non-canonical plugin storage key')
     })
 
-    it('enforces exact value and metadata archive-name boundaries', () => {
+    it('keeps boundary names stable and hashes the first over-limit identifier', () => {
         const maxValueName = encodePluginSaveStorageKey('v'.repeat(756), PLUGIN_SAVE_PREFIX)
         const maxMetaName = encodePluginSaveStorageKey('m'.repeat(752), PLUGIN_SAVE_META_PREFIX)
 
         expect(Buffer.byteLength(maxValueName, 'utf-8')).toBe(BACKUP_ENTRY_NAME_MAX_BYTES)
         expect(Buffer.byteLength(maxMetaName, 'utf-8')).toBe(BACKUP_ENTRY_NAME_MAX_BYTES)
-        expect(() => encodePluginSaveStorageKey('v'.repeat(757), PLUGIN_SAVE_PREFIX))
-            .toThrow('too long for backup archives')
-        expect(() => encodePluginSaveStorageKey('m'.repeat(753), PLUGIN_SAVE_META_PREFIX))
-            .toThrow('too long for backup archives')
+        const oversizedValue = 'v'.repeat(757)
+        const oversizedMeta = 'm'.repeat(753)
+        const valueName = encodePluginSaveStorageKey(oversizedValue, PLUGIN_SAVE_PREFIX)
+        const metaName = encodePluginSaveStorageKey(oversizedMeta, PLUGIN_SAVE_META_PREFIX)
+        expect(valueName).toMatch(/^pluginsave\/sha256-v1\.[0-9a-f]{64}\.json$/)
+        expect(metaName).toMatch(/^pluginsave-meta\/sha256-v1\.[0-9a-f]{64}\.json$/)
+        expect(decodePluginSaveStorageKey(valueName, PLUGIN_SAVE_PREFIX, oversizedValue))
+            .toBe(oversizedValue)
+        expect(() => decodePluginSaveStorageKey(valueName, PLUGIN_SAVE_PREFIX))
+            .toThrow('unmapped hashed plugin storage key')
     })
 
     it('uses encoded UTF-8 bytes for non-ASCII raw keys', () => {
@@ -79,8 +107,8 @@ describe('plugin save storage keys', () => {
         expect(Buffer.byteLength(maxUtf8Key, 'utf-8')).toBe(752)
         expect(() => encodePluginSaveStorageKey(maxUtf8Key, PLUGIN_SAVE_META_PREFIX))
             .not.toThrow()
-        expect(() => encodePluginSaveStorageKey(`${maxUtf8Key}a`, PLUGIN_SAVE_META_PREFIX))
-            .toThrow('too long for backup archives')
+        expect(encodePluginSaveStorageKey(`${maxUtf8Key}a`, PLUGIN_SAVE_META_PREFIX))
+            .toMatch(/^pluginsave-meta\/sha256-v1\./)
     })
 
     it('accepts a version-one order baseline and creates authoritative version-two order', () => {
@@ -98,12 +126,53 @@ describe('plugin save storage keys', () => {
             valueKeys,
             metaKeys: [],
         })
-        expect(PLUGIN_STORAGE_MANIFEST_VERSION).toBe(2)
+        expect(PLUGIN_STORAGE_MANIFEST_VERSION).toBe(3)
         expect(createPluginStorageManifest('ordered-generation', valueKeys, [])).toEqual({
             version: 2,
             generation: 'ordered-generation',
             valueKeys,
             metaKeys: [],
         })
+
+        const rawKey = 'x'.repeat(2000)
+        const hashedKey = encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_PREFIX)
+        expect(createPluginStorageManifest(
+            'mapped-generation',
+            [hashedKey],
+            [],
+            mergePluginStorageKeyMappings(null, [rawKey], [hashedKey], []),
+        )).toEqual({
+            version: 3,
+            generation: 'mapped-generation',
+            valueKeys: [hashedKey],
+            metaKeys: [],
+            keyMappings: [[hashedKey.slice(PLUGIN_SAVE_PREFIX.length), rawKey]],
+        })
+    })
+
+    it('rejects missing, extra, forged, and duplicate hash mappings', () => {
+        const rawKey = 'mapped'.repeat(500)
+        const valueKey = encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_PREFIX)
+        const component = valueKey.slice(PLUGIN_SAVE_PREFIX.length)
+        const base = {
+            version: 3,
+            generation: 'strict-mapping-generation',
+            valueKeys: [valueKey],
+            metaKeys: [],
+        }
+
+        expect(parsePluginStorageManifest(base)).toBeNull()
+        expect(parsePluginStorageManifest({
+            ...base,
+            keyMappings: [[component, rawKey], ['sha256-v1.'.concat('0'.repeat(64), '.json'), 'extra']],
+        })).toBeNull()
+        expect(parsePluginStorageManifest({
+            ...base,
+            keyMappings: [[component, `${rawKey}forged`]],
+        })).toBeNull()
+        expect(parsePluginStorageManifest({
+            ...base,
+            keyMappings: [[component, rawKey], [component, rawKey]],
+        })).toBeNull()
     })
 })
