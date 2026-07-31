@@ -133,9 +133,33 @@ Open `http://localhost:6001` in your browser.
 docker compose pull && docker compose up -d
 ```
 
+If you installed PocketRisu before the Compose file included the persistent
+backup volume, migrate the existing server backups **before** the first
+container recreation:
+
+```bash
+mkdir -p pocketrisu-backups-migration
+docker compose stop risuai
+docker cp risuai-nodeonly:/app/backups/. ./pocketrisu-backups-migration/
+curl -fL https://raw.githubusercontent.com/PocketRisu/PocketRisu/main/docker-compose.yml -o docker-compose.yml
+docker compose pull
+docker compose up -d
+docker cp ./pocketrisu-backups-migration/. risuai-nodeonly:/app/backups/
+```
+
+Verify the backups in **System → Backups** before removing the temporary
+`pocketrisu-backups-migration` directory. If you maintain a customized Compose
+file, add the `risuai-backups:/app/backups` mount and its top-level volume
+declaration manually instead of replacing your file.
+
 ### Data Location
 
-All data (chats, characters, etc.) is stored in the Docker volume `risuai-save`. Data is preserved across updates.
+Chats, characters, automatic snapshots, and chat history are stored in the
+Docker volume `risuai-save`. Full `.bin` backups created with **Server backup**
+are stored in `risuai-backups`. Both volumes survive image updates and container
+recreation. Do not run `docker compose down -v` unless you intend to delete
+both volumes. A custom server-backup path is persistent only when you mount it
+from the host or another volume.
 
 
 ---

@@ -133,9 +133,31 @@ docker compose up -d
 docker compose pull && docker compose up -d
 ```
 
+영구 백업 볼륨이 Compose 파일에 추가되기 전에 PocketRisu를 설치했다면, 처음
+컨테이너를 재생성하기 **전에** 기존 서버 백업을 마이그레이션하세요.
+
+```bash
+mkdir -p pocketrisu-backups-migration
+docker compose stop risuai
+docker cp risuai-nodeonly:/app/backups/. ./pocketrisu-backups-migration/
+curl -fL https://raw.githubusercontent.com/PocketRisu/PocketRisu/main/docker-compose.yml -o docker-compose.yml
+docker compose pull
+docker compose up -d
+docker cp ./pocketrisu-backups-migration/. risuai-nodeonly:/app/backups/
+```
+
+임시 `pocketrisu-backups-migration` 디렉터리를 삭제하기 전에 **시스템 → 백업**에서
+백업이 보이는지 확인하세요. Compose 파일을 직접 수정해 사용 중이라면 파일을
+교체하지 말고 `risuai-backups:/app/backups` 마운트와 최상위 볼륨 선언을 직접
+추가하세요.
+
 ### 데이터 위치
 
-채팅·캐릭터 등 모든 데이터는 Docker 볼륨(`risuai-save`)에 저장됩니다. 업데이트해도 데이터는 유지됩니다.
+채팅, 캐릭터, 자동 스냅샷 및 채팅 기록은 Docker 볼륨 `risuai-save`에 저장됩니다.
+**서버 백업**으로 만든 전체 `.bin` 백업은 `risuai-backups`에 저장됩니다. 두 볼륨은
+이미지 업데이트와 컨테이너 재생성 후에도 유지됩니다. 두 볼륨을 삭제하려는 경우가
+아니라면 `docker compose down -v`를 실행하지 마세요. 사용자 지정 서버 백업 경로는
+호스트 경로나 별도 볼륨으로 마운트한 경우에만 영구 보존됩니다.
 
 
 ---

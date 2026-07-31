@@ -315,10 +315,11 @@ Ordinary entry-count values are capped at one million. Large-restore ceilings ar
 separate recovery controls; disk-backed metadata keeps memory bounded, but raising or
 overriding byte limits still increases disk, CPU, and recovery time.
 
-Docker Compose persists `/app/save` only. Default chat history under
-`/app/save/chat-backups` survives container replacement, but default server archives
-under `/app/backups` do not unless that path is mounted or reconfigured under the save
-volume.
+Docker Compose persists `/app/save` and `/app/backups` in separate explicitly named
+volumes. Default chat history under `/app/save/chat-backups` and default server archives
+under `/app/backups` therefore survive container replacement. Operators who configure a
+different server-backup path must mount that path themselves; changing the application
+setting does not create a Docker persistence boundary.
 
 ## Change map
 

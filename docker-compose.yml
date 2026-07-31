@@ -13,6 +13,7 @@ services:
       - 6001:6001
     volumes:
       - risuai-save:/app/save
+      - risuai-backups:/app/backups
 
 volumes:
   risuai-save:
@@ -20,3 +21,7 @@ volumes:
     # Without this, the new project name 'pocketrisu' would prefix the volume as
     # 'pocketrisu_risuai-save', creating an empty save folder for existing users.
     name: risuai-nodeonly_risuai-save
+  risuai-backups:
+    # Server-created .bin archives live outside save/ by design. Keep their
+    # volume name stable across Compose project-name or directory changes too.
+    name: risuai-nodeonly_risuai-backups

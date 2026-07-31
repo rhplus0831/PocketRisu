@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **43** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is deferred for future work, and **51** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **42** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is deferred for future work, and **52** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -31,7 +31,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [Docker server backups are ephemeral](audit/docker-server-backups-are-ephemeral.md) | audit | Open | Recovery copies only; live data survives — every server-side `.bin` backup is removed. | Normal image update or container recreation with the shipped Compose layout. |
 | [`update.sh` wipes custom backup roots](audit/update-script-wipes-custom-in-tree-backup-roots.md) | audit | Open | Recovery copies only; live data survives — all archives in the configured in-tree root are erased. | Every source update once a permitted custom root such as `data/backups` is configured. |
 | [Global chat budget evicts newer bundles first](audit/global-chat-budget-evicts-newer-bundles-before-older-loose-versions.md) | audit | Open | Recovery copies only; live data survives — 25 newer versions can be destroyed unnecessarily. | A normal global byte-cap overage with an older loose version in another chat. |
 | [Snapshots reference assets GC can delete](audit/snapshots-reference-assets-the-gc-can-delete.md) | audit | Open | Recovery copies only; live data survives — restored snapshots contain dangling asset references. | Replace an asset, allow ordinary GC to run, then restore the older retained snapshot. |
@@ -118,6 +117,7 @@ None currently open.
 
 | Finding | Former harm | Note |
 |---|---|---|
+| [Docker server backups were ephemeral](audit/docker-server-backups-are-ephemeral.md) | Every server-side `.bin` recovery archive disappeared on a normal image update or container recreation, while the live save volume survived and hid the loss. | Fixed 2026-07-31 by mounting a stable named volume at `/app/backups`, documenting the pre-recreation copy migration and custom-path caveat in every install guide, and locking both Docker persistence mounts and explicit volume names with compatibility coverage. |
 | [Denied V3 database writes reported success](compatibility/v3-database-setter-permission.md) | A plugin could discard an unsaved retry buffer after a denied write resolved even though no state was committed. | Fixed 2026-07-31 by rejecting both setters with the RPC-stable `PluginPermissionError` / `PLUGIN_PERMISSION_DENIED` contract while retaining the permission boundary, with ask, grant, persisted-denial, write-only, and real guest-bridge coverage. |
 | [Legacy storage getters conflated valid values with missing](audit/legacy-storage-getters-conflate-valid-values-with-missing.md) | A plugin could reset persisted configuration or fail to enumerate a valid empty-string key after falsey reads were reported as missing. | Fixed 2026-07-31 with exact own-presence and indexed-key checks, bound V3 local-storage wrappers, and false, zero, empty string, null, missing, and empty-key parity coverage across V2 and V3-facing storage facades. |
 | [RISUP export mutated the live preset](audit/risup-export-deletes-auto-suggest-prefix-and-clean-policy.md) | Two live auto-suggest policy fields were deleted and also omitted from the archive. | Fixed 2026-07-31 with a shared pure preset snapshot, non-mutating active and inactive exports, complete auto-suggest field capture, and field-exhaustive binary round-trip coverage. |

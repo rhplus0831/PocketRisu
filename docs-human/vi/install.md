@@ -135,9 +135,33 @@ Mở `http://localhost:6001` trong trình duyệt.
 docker compose pull && docker compose up -d
 ```
 
+Nếu bạn đã cài PocketRisu trước khi tệp Compose có volume sao lưu bền vững, hãy
+di chuyển các bản sao lưu máy chủ hiện có **trước** lần tạo lại container đầu
+tiên:
+
+```bash
+mkdir -p pocketrisu-backups-migration
+docker compose stop risuai
+docker cp risuai-nodeonly:/app/backups/. ./pocketrisu-backups-migration/
+curl -fL https://raw.githubusercontent.com/PocketRisu/PocketRisu/main/docker-compose.yml -o docker-compose.yml
+docker compose pull
+docker compose up -d
+docker cp ./pocketrisu-backups-migration/. risuai-nodeonly:/app/backups/
+```
+
+Hãy kiểm tra các bản sao lưu trong **Hệ thống → Sao lưu** trước khi xóa thư mục
+tạm `pocketrisu-backups-migration`. Nếu bạn dùng tệp Compose tùy chỉnh, đừng
+thay thế tệp đó; hãy tự thêm mount `risuai-backups:/app/backups` và khai báo
+volume cấp cao nhất.
+
 ### Vị trí dữ liệu
 
-Tất cả dữ liệu (cuộc trò chuyện, nhân vật, v.v.) được lưu trong Docker volume `risuai-save`. Dữ liệu được bảo toàn khi cập nhật.
+Cuộc trò chuyện, nhân vật, snapshot tự động và lịch sử trò chuyện được lưu trong
+Docker volume `risuai-save`. Các bản sao lưu `.bin` đầy đủ được tạo bằng
+**Sao lưu máy chủ** được lưu trong `risuai-backups`. Cả hai volume đều được giữ
+lại khi cập nhật image hoặc tạo lại container. Không chạy
+`docker compose down -v` trừ khi bạn muốn xóa cả hai volume. Đường dẫn sao lưu
+máy chủ tùy chỉnh chỉ bền vững khi được mount từ máy chủ hoặc một volume khác.
 
 
 ---

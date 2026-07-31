@@ -135,9 +135,30 @@ docker compose up -d
 docker compose pull && docker compose up -d
 ```
 
+如果您在 Compose 文件加入持久化备份卷之前安装了 PocketRisu，请在第一次重新创建
+容器**之前**迁移现有的服务器备份：
+
+```bash
+mkdir -p pocketrisu-backups-migration
+docker compose stop risuai
+docker cp risuai-nodeonly:/app/backups/. ./pocketrisu-backups-migration/
+curl -fL https://raw.githubusercontent.com/PocketRisu/PocketRisu/main/docker-compose.yml -o docker-compose.yml
+docker compose pull
+docker compose up -d
+docker cp ./pocketrisu-backups-migration/. risuai-nodeonly:/app/backups/
+```
+
+删除临时 `pocketrisu-backups-migration` 目录之前，请在**系统 → 备份**中确认备份
+可见。如果您维护了自定义 Compose 文件，请不要替换该文件，而应手动添加
+`risuai-backups:/app/backups` 挂载和顶层卷声明。
+
 ### 数据位置
 
-所有数据(聊天、角色等)存储在 Docker 卷 `risuai-save` 中。更新时数据保留。
+聊天、角色、自动快照和聊天历史记录存储在 Docker 卷 `risuai-save` 中。通过
+**服务器备份**创建的完整 `.bin` 备份存储在 `risuai-backups` 中。映像更新和容器
+重新创建后，这两个卷都会保留。除非您确实要删除这两个卷，否则不要运行
+`docker compose down -v`。自定义服务器备份路径只有在从主机或其他卷挂载时才会
+持久保留。
 
 
 ---

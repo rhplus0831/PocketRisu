@@ -135,9 +135,34 @@ Abre `http://localhost:6001` en tu navegador.
 docker compose pull && docker compose up -d
 ```
 
+Si instalaste PocketRisu antes de que el archivo Compose incluyera el volumen
+persistente de copias de seguridad, migra las copias existentes **antes** de
+recrear el contenedor por primera vez:
+
+```bash
+mkdir -p pocketrisu-backups-migration
+docker compose stop risuai
+docker cp risuai-nodeonly:/app/backups/. ./pocketrisu-backups-migration/
+curl -fL https://raw.githubusercontent.com/PocketRisu/PocketRisu/main/docker-compose.yml -o docker-compose.yml
+docker compose pull
+docker compose up -d
+docker cp ./pocketrisu-backups-migration/. risuai-nodeonly:/app/backups/
+```
+
+Comprueba las copias en **Sistema → Copias de seguridad** antes de eliminar el
+directorio temporal `pocketrisu-backups-migration`. Si mantienes un archivo
+Compose personalizado, no lo reemplaces: añade manualmente el montaje
+`risuai-backups:/app/backups` y la declaración del volumen de nivel superior.
+
 ### Ubicación de los datos
 
-Todos los datos (chats, personajes, etc.) se almacenan en el volumen de Docker `risuai-save`. Los datos se conservan al actualizar.
+Los chats, personajes, instantáneas automáticas y el historial de chats se
+guardan en el volumen Docker `risuai-save`. Las copias completas `.bin` creadas
+con **Copia de seguridad del servidor** se guardan en `risuai-backups`. Ambos
+volúmenes sobreviven a las actualizaciones de imagen y a la recreación del
+contenedor. No ejecutes `docker compose down -v` salvo que quieras eliminar
+ambos volúmenes. Una ruta personalizada de copias del servidor solo es
+persistente si la montas desde el host u otro volumen.
 
 
 ---
