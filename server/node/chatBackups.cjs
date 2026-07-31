@@ -370,6 +370,17 @@ function createChatBackupStore(options) {
 
     const bundleSize = Math.max(1, Math.floor(versionsPerBundle));
     const bundleLimit = Math.max(0, Math.floor(maxBundlesPerChat));
+    const defaultVersionLimit = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        // Keep the configured solid bundles plus one active loose batch.
+        bundleSize * (bundleLimit + 1),
+    );
+    const versionLimit = clampInteger(
+        config.maxVersionsPerChat,
+        defaultVersionLimit,
+        1,
+        Number.MAX_SAFE_INTEGER,
+    );
     const newestByChatDir = new Map();
     let tempCounter = 0;
     let reconcileTimer = null;
@@ -791,6 +802,7 @@ function createChatBackupStore(options) {
     function bundleLooseVersions(chatDir) {
         let count = 0;
         while (true) {
+            if (scanChatDirectory(chatDir).bundles.length >= bundleLimit) break;
             const loose = looseGzipEntries(chatDir);
             if (loose.length < bundleSize) break;
             const selected = loose.slice(0, bundleSize);
@@ -803,6 +815,124 @@ function createChatBackupStore(options) {
             }
         }
         return count;
+    }
+
+    function materializeRetainedBundleEntries(chatDir, bundle, removedVersionIds) {
+        const uncompressed = zlib.gunzipSync(
+            fs.readFileSync(path.join(chatDir, bundle.bundleFile)),
+        );
+        const retainedIds = [];
+
+        for (const entry of bundle.entries) {
+            if (removedVersionIds.has(entry.versionId)) continue;
+            const end = entry.offset + entry.size;
+            if (!Number.isSafeInteger(end) || end > uncompressed.length) {
+                throw new Error(`Bundle ${bundle.bundleFile} has an invalid entry range`);
+            }
+            const raw = Buffer.from(uncompressed.subarray(entry.offset, end));
+            const rawPath = path.join(chatDir, `${entry.versionId}.bin`);
+            const gzipPath = `${rawPath}.gz`;
+
+            if (fs.existsSync(rawPath) && !fs.readFileSync(rawPath).equals(raw)) {
+                throw new Error(`Loose version conflicts with ${bundle.bundleFile}: ${entry.versionId}`);
+            }
+            if (fs.existsSync(gzipPath)) {
+                let looseRaw;
+                try {
+                    looseRaw = zlib.gunzipSync(fs.readFileSync(gzipPath));
+                } catch {
+                    throw new Error(`Loose version is corrupt for ${entry.versionId}`);
+                }
+                if (!looseRaw.equals(raw)) {
+                    throw new Error(`Loose version conflicts with ${bundle.bundleFile}: ${entry.versionId}`);
+                }
+            } else if (!fs.existsSync(rawPath)) {
+                writeFileAtomic(gzipPath, zlib.gzipSync(raw));
+            }
+            retainedIds.push(entry.versionId);
+        }
+
+        // Retained entries are durable as loose versions before the old solid
+        // bundle is withdrawn. A crash before this point leaves the old bundle
+        // authoritative; a crash after it leaves the loose copies authoritative.
+        fs.unlinkSync(path.join(chatDir, bundle.metaFile));
+        try { fs.unlinkSync(path.join(chatDir, bundle.bundleFile)); } catch {}
+
+        if (retainedIds.length === 0) return { bundleRemoved: 1, bundleRewritten: 0 };
+
+        const retainedSet = new Set(retainedIds);
+        const retained = looseGzipEntries(chatDir)
+            .filter(entry => retainedSet.has(entry.versionId));
+        if (retained.length !== retainedIds.length) {
+            // Raw loose files can exist after a previously interrupted gzip.
+            // Leaving them loose is safe and the next reconciliation will gzip
+            // and bundle them again.
+            return { bundleRemoved: 1, bundleRewritten: 0 };
+        }
+        try {
+            createBundle(chatDir, retained);
+            return { bundleRemoved: 0, bundleRewritten: 1 };
+        } catch (error) {
+            log('warn', `[ChatBackups] Failed to rebuild trimmed bundle ${bundle.bundleFile}:`, error);
+            return { bundleRemoved: 1, bundleRewritten: 0 };
+        }
+    }
+
+    function removeVersionEverywhere(chatDir, versionId) {
+        const scan = scanChatDirectory(chatDir);
+        let bundleRemoved = 0;
+        let bundleRewritten = 0;
+
+        for (const bundle of scan.bundles) {
+            if (!bundle.entries.some(entry => entry.versionId === versionId)) continue;
+            const result = materializeRetainedBundleEntries(
+                chatDir,
+                bundle,
+                new Set([versionId]),
+            );
+            bundleRemoved += result.bundleRemoved;
+            bundleRewritten += result.bundleRewritten;
+        }
+
+        for (const suffix of ['.bin', '.bin.gz']) {
+            try { fs.unlinkSync(path.join(chatDir, `${versionId}${suffix}`)); } catch {}
+        }
+        return { bundleRemoved, bundleRewritten };
+    }
+
+    function enforceChatVersionLimit(chatDir) {
+        let versionsRemoved = 0;
+        let bundlesRemoved = 0;
+        let bundlesRewritten = 0;
+
+        while (true) {
+            const scan = scanChatDirectory(chatDir);
+            const byId = new Map();
+            for (const bundle of scan.bundles) {
+                for (const entry of bundle.entries) byId.set(entry.versionId, entry);
+            }
+            for (const entry of scan.loose) byId.set(entry.versionId, entry);
+            const versions = [...byId.values()].sort(compareVersionsOldest);
+            if (versions.length <= versionLimit) break;
+
+            const oldest = versions[0];
+            try {
+                const result = removeVersionEverywhere(chatDir, oldest.versionId);
+                const remaining = scanChatDirectory(chatDir);
+                const stillPresent = remaining.loose.some(entry => entry.versionId === oldest.versionId)
+                    || remaining.bundles.some(bundle => (
+                        bundle.entries.some(entry => entry.versionId === oldest.versionId)
+                    ));
+                if (stillPresent) throw new Error(`Could not remove ${oldest.versionId}`);
+                versionsRemoved++;
+                bundlesRemoved += result.bundleRemoved;
+                bundlesRewritten += result.bundleRewritten;
+            } catch (error) {
+                log('warn', `[ChatBackups] Failed to enforce version limit in ${chatDir}:`, error);
+                break;
+            }
+        }
+        return { versionsRemoved, bundlesRemoved, bundlesRewritten };
     }
 
     function removeBundledLooseDuplicates(chatDir) {
@@ -865,24 +995,6 @@ function createChatBackupStore(options) {
                 log('warn', `[ChatBackups] Failed to remove bundled duplicate ${loosePath}:`, error);
             }
         }
-    }
-
-    function rotateChatBundles(chatDir) {
-        const bundles = scanChatDirectory(chatDir).bundles
-            .map(bundle => ({
-                ...bundle,
-                firstTs: bundle.entries[0]?.ts ?? 0,
-                lastTs: bundle.entries[bundle.entries.length - 1]?.ts ?? 0,
-            }))
-            .sort((a, b) => a.firstTs - b.firstTs || a.lastTs - b.lastTs);
-        let removed = 0;
-        while (bundles.length > bundleLimit) {
-            const oldest = bundles.shift();
-            try { fs.unlinkSync(path.join(chatDir, oldest.bundleFile)); } catch {}
-            try { fs.unlinkSync(path.join(chatDir, oldest.metaFile)); } catch {}
-            removed++;
-        }
-        return removed;
     }
 
     function treeBytes(directory) {
@@ -1001,6 +1113,7 @@ function createChatBackupStore(options) {
             gzipped: 0,
             bundlesCreated: 0,
             bundlesRotated: 0,
+            versionsTrimmed: 0,
             budgetItemsRemoved: 0,
             totalBytes: 0,
             maxBytes: 0,
@@ -1014,7 +1127,11 @@ function createChatBackupStore(options) {
             // before threshold checks so the next pass always finishes the work.
             removeBundledLooseDuplicates(chatDir);
             stats.bundlesCreated += bundleLooseVersions(chatDir);
-            stats.bundlesRotated += rotateChatBundles(chatDir);
+            const retention = enforceChatVersionLimit(chatDir);
+            stats.versionsTrimmed += retention.versionsRemoved;
+            stats.bundlesRotated += retention.bundlesRemoved;
+            // Trimming can retire a one-entry bundle and free a bundle slot.
+            stats.bundlesCreated += bundleLooseVersions(chatDir);
         }
         const budget = enforceGlobalBudget(root, chatDirs);
         stats.budgetItemsRemoved = budget.removed;

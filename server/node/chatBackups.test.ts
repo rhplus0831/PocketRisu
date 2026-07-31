@@ -28,6 +28,7 @@ interface ChatBackupStore {
         gzipped: number
         bundlesCreated: number
         bundlesRotated: number
+        versionsTrimmed: number
         budgetItemsRemoved: number
         totalBytes: number
         maxBytes: number
@@ -180,6 +181,7 @@ function makeHarness(options: {
     cooldownMs?: number
     versionsPerBundle?: number
     maxBundlesPerChat?: number
+    maxVersionsPerChat?: number
     decodeChat?: (raw: Buffer) => Promise<any>
     maxBytes?: number
 } = {}) {
@@ -203,6 +205,7 @@ function makeHarness(options: {
         cooldownMs: options.cooldownMs ?? 0,
         versionsPerBundle: options.versionsPerBundle ?? 25,
         maxBundlesPerChat: options.maxBundlesPerChat ?? 4,
+        maxVersionsPerChat: options.maxVersionsPerChat,
         getByteBudget: () => maxBytes,
         byteBudgetMin: 1,
         autoReconcile: false,
@@ -802,7 +805,7 @@ describe('chat backup reconcile and reads', () => {
         }
     })
 
-    it('rotates the oldest bundle when a fifth 25-version archive is created', async () => {
+    it('retains exactly 125 versions and then evicts only the single oldest version', async () => {
         const harness = makeHarness({ now: 20_000 })
         const raws: Buffer[] = []
         for (let index = 0; index < 125; index++) {
@@ -817,22 +820,150 @@ describe('chat backup reconcile and reads', () => {
             harness.advance()
         }
 
-        const result = await harness.store.reconcileChatBackups()
-        expect(result.bundlesCreated).toBe(5)
-        expect(result.bundlesRotated).toBe(1)
+        const boundary = await harness.store.reconcileChatBackups()
+        expect(boundary.versionsTrimmed).toBe(0)
+        expect(harness.store.listChatBackups('char', 'chat')).toHaveLength(125)
+        for (let index = 0; index < raws.length; index++) {
+            expect(harness.store.readChatBackup(
+                'char',
+                'chat',
+                `v-${20_000 + index}-0-save`,
+            )?.equals(raws[index])).toBe(true)
+        }
+
+        const newest = rawChat(125)
+        harness.setRow('char', 'chat', newest)
+        await harness.store.captureChatPreImage({
+            chaId: 'char',
+            chatId: 'chat',
+            reason: 'save',
+        })
+
+        const overflow = await harness.store.reconcileChatBackups()
+        expect(overflow.versionsTrimmed).toBe(1)
         const versions = harness.store.listChatBackups('char', 'chat')
-        expect(versions).toHaveLength(100)
-        expect(versions.every(version => version.storage === 'bundle')).toBe(true)
-        expect(harness.store.readChatBackup(
-            'char',
-            'chat',
-            'v-20000-0-save',
-        )).toBeNull()
-        expect(harness.store.readChatBackup(
-            'char',
-            'chat',
-            'v-20025-0-save',
-        )?.equals(raws[25])).toBe(true)
+        expect(versions).toHaveLength(125)
+        expect(versions[0].versionId).toBe('v-20125-0-save')
+        expect(versions.at(-1)?.versionId).toBe('v-20001-0-save')
+        expect(harness.store.readChatBackup('char', 'chat', 'v-20000-0-save')).toBeNull()
+        expect(harness.store.readChatBackup('char', 'chat', 'v-20001-0-save')
+            ?.equals(raws[1])).toBe(true)
+        expect(harness.store.readChatBackup('char', 'chat', 'v-20125-0-save')
+            ?.equals(newest)).toBe(true)
+    })
+
+    it('enforces a configurable exact cap and remains idempotent after trimming a bundle', async () => {
+        const harness = makeHarness({
+            now: 30_000,
+            versionsPerBundle: 2,
+            maxBundlesPerChat: 2,
+        })
+        const raws: Buffer[] = []
+        for (let index = 0; index < 7; index++) {
+            const raw = rawChat(200 + index)
+            raws.push(raw)
+            harness.setRow('char', 'chat', raw)
+            await harness.store.captureChatPreImage({
+                chaId: 'char',
+                chatId: 'chat',
+                reason: 'small',
+            })
+            harness.advance()
+        }
+
+        const first = await harness.store.reconcileChatBackups()
+        expect(first.versionsTrimmed).toBe(1)
+        const versions = harness.store.listChatBackups('char', 'chat')
+        expect(versions.map(version => version.versionId)).toEqual(
+            Array.from({ length: 6 }, (_, index) => `v-${30_006 - index}-0-small`),
+        )
+        expect(harness.store.readChatBackup('char', 'chat', 'v-30000-0-small')).toBeNull()
+        for (let index = 1; index < raws.length; index++) {
+            expect(harness.store.readChatBackup(
+                'char',
+                'chat',
+                `v-${30_000 + index}-0-small`,
+            )?.equals(raws[index])).toBe(true)
+        }
+
+        const newest = rawChat(207)
+        harness.setRow('char', 'chat', newest)
+        await harness.store.captureChatPreImage({
+            chaId: 'char',
+            chatId: 'chat',
+            reason: 'small',
+        })
+        const next = await harness.store.reconcileChatBackups()
+        expect(next.versionsTrimmed).toBe(1)
+        expect(harness.store.listChatBackups('char', 'chat').map(version => version.versionId))
+            .toEqual(Array.from(
+                { length: 6 },
+                (_, index) => `v-${30_007 - index}-0-small`,
+            ))
+        expect(harness.store.readChatBackup('char', 'chat', 'v-30001-0-small')).toBeNull()
+        expect(harness.store.readChatBackup('char', 'chat', 'v-30007-0-small')
+            ?.equals(newest)).toBe(true)
+
+        const tree = path.join(harness.root, 'chat-backups')
+        const snapshot = recursiveSnapshot(tree)
+        const idempotent = await harness.store.reconcileChatBackups()
+        expect(idempotent.versionsTrimmed).toBe(0)
+        expect(recursiveSnapshot(tree)).toEqual(snapshot)
+    })
+
+    it('keeps every retained version recoverable when bundle withdrawal fails', async () => {
+        const harness = makeHarness({
+            now: 40_000,
+            versionsPerBundle: 2,
+            maxBundlesPerChat: 1,
+        })
+        const raws: Buffer[] = []
+        for (let index = 0; index < 5; index++) {
+            const raw = rawChat(300 + index)
+            raws.push(raw)
+            harness.setRow('char', 'chat', raw)
+            await harness.store.captureChatPreImage({
+                chaId: 'char',
+                chatId: 'chat',
+                reason: 'failure',
+            })
+            harness.advance()
+        }
+
+        const unlinkSync = fs.unlinkSync.bind(fs)
+        let rejectedWithdrawal = false
+        const unlinkSpy = vi.spyOn(fs, 'unlinkSync').mockImplementation((filename) => {
+            if (!rejectedWithdrawal && String(filename).endsWith('.meta.json')) {
+                rejectedWithdrawal = true
+                throw Object.assign(new Error('injected withdrawal failure'), { code: 'EIO' })
+            }
+            return unlinkSync(filename)
+        })
+        const failed = await harness.store.reconcileChatBackups()
+            .finally(() => unlinkSpy.mockRestore())
+
+        expect(rejectedWithdrawal).toBe(true)
+        expect(failed.versionsTrimmed).toBe(0)
+        expect(harness.store.listChatBackups('char', 'chat')).toHaveLength(5)
+        for (let index = 0; index < raws.length; index++) {
+            expect(harness.store.readChatBackup(
+                'char',
+                'chat',
+                `v-${40_000 + index}-0-failure`,
+            )?.equals(raws[index])).toBe(true)
+        }
+
+        const retried = await harness.store.reconcileChatBackups()
+        expect(retried.versionsTrimmed).toBe(1)
+        expect(harness.store.listChatBackups('char', 'chat')).toHaveLength(4)
+        expect(harness.store.readChatBackup('char', 'chat', 'v-40000-0-failure')).toBeNull()
+        for (let index = 1; index < raws.length; index++) {
+            expect(harness.store.readChatBackup(
+                'char',
+                'chat',
+                `v-${40_000 + index}-0-failure`,
+            )?.equals(raws[index])).toBe(true)
+        }
     })
 
     it('evicts every eligible unit when necessary and preserves each chat newest', async () => {
