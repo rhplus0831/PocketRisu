@@ -370,6 +370,7 @@ const {
     DBState,
 } = await import("../../stores.svelte");
 const {
+    PLUGIN_PERMISSION_DENIED_CODE,
     customV3ProviderMetaStore,
     getV3PluginInstance,
     loadV3PluginGeneration,
@@ -1783,11 +1784,74 @@ describe("V3 mode-aware database bridge", () => {
         releaseDialog(true);
         await Promise.resolve();
         expect(testState.database.temperature).toBe(10);
+    });
 
+    test.each([
+        {
+            method: "setDatabaseLite",
+            mutation: { temperature: 88 },
+            readValue: () => testState.database.temperature,
+            initialValue: 10,
+        },
+        {
+            method: "setDatabase",
+            mutation: { theme: "denied" },
+            readValue: () => testState.database.theme,
+            initialValue: "default",
+        },
+    ])("$method rejects an asked and persisted database denial", async ({
+        method,
+        mutation,
+        readValue,
+        initialValue,
+    }) => {
+        const plugin = startupPlugin(`Denied ${method}`, "// write-only plugin");
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
         alertConfirmMock.mockResolvedValueOnce(false);
-        await api.setDatabaseLite({ temperature: 88 });
-        expect(alertConfirmMock).toHaveBeenCalledTimes(2);
-        expect(testState.database.temperature).toBe(10);
+        const api = makeRisuaiAPIV3(document.createElement("iframe"), plugin as any) as any;
+        const expectedError = {
+            name: "PluginPermissionError",
+            code: PLUGIN_PERMISSION_DENIED_CODE,
+            message: `Plugin "${plugin.name}" was denied the "db" permission.`,
+        };
+
+        await expect(api[method](mutation)).rejects.toMatchObject(expectedError);
+        expect(readValue()).toBe(initialValue);
+
+        await expect(api[method](mutation)).rejects.toMatchObject(expectedError);
+        expect(readValue()).toBe(initialValue);
+        expect(alertConfirmMock).toHaveBeenCalledOnce();
+    });
+
+    test.each([
+        {
+            method: "setDatabaseLite",
+            mutation: { temperature: 88 },
+            readValue: () => testState.database.temperature,
+            expectedValue: 88,
+        },
+        {
+            method: "setDatabase",
+            mutation: { theme: "granted" },
+            readValue: () => testState.database.theme,
+            expectedValue: "granted",
+        },
+    ])("$method applies a write-only mutation after permission is granted", async ({
+        method,
+        mutation,
+        readValue,
+        expectedValue,
+    }) => {
+        const plugin = startupPlugin(`Granted ${method}`, "// write-only plugin");
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+        alertConfirmMock.mockResolvedValueOnce(true);
+        const api = makeRisuaiAPIV3(document.createElement("iframe"), plugin as any) as any;
+
+        await expect(api[method](mutation)).resolves.toBeUndefined();
+        expect(readValue()).toBe(expectedValue);
+        expect(alertConfirmMock).toHaveBeenCalledOnce();
     });
 
     test("actual full V3 setter preserves plugin-install filtering", async () => {
@@ -1851,6 +1915,59 @@ describe("V3 mode-aware database bridge", () => {
 });
 
 describe("V3 guest startup handshake", () => {
+    test("carries denied database setter errors through the guest RPC", async () => {
+        const plugin = startupPlugin("Denied Database Guest", `
+            globalThis.databasePermissionErrors = [];
+            for (const [method, mutation] of [
+                ["setDatabaseLite", { temperature: 88 }],
+                ["setDatabase", { theme: "denied" }],
+            ]) {
+                try {
+                    await risuai[method](mutation);
+                    globalThis.databasePermissionErrors.push({ method, resolved: true });
+                } catch (error) {
+                    globalThis.databasePermissionErrors.push({
+                        method,
+                        name: error.name,
+                        code: error.code,
+                        message: error.message,
+                    });
+                }
+            }
+        `);
+        testState.database.plugins = [plugin];
+        DBState.db = testState.database;
+        alertConfirmMock.mockResolvedValueOnce(false);
+
+        const loading = loadV3PluginGeneration([plugin]);
+        const iframe = document.body.querySelector("iframe")!;
+        const guestWindow = iframe.contentWindow as any;
+        const restoreRelay = executeGeneratedGuest(iframe);
+        try {
+            await loading;
+            await getV3PluginInstance(plugin.name)!.lifetime;
+
+            expect(Array.from(guestWindow.databasePermissionErrors)).toEqual([
+                expect.objectContaining({
+                    method: "setDatabaseLite",
+                    name: "PluginPermissionError",
+                    code: PLUGIN_PERMISSION_DENIED_CODE,
+                }),
+                expect.objectContaining({
+                    method: "setDatabase",
+                    name: "PluginPermissionError",
+                    code: PLUGIN_PERMISSION_DENIED_CODE,
+                }),
+            ]);
+            expect(alertConfirmMock).toHaveBeenCalledOnce();
+            expect(testState.database.temperature).toBe(10);
+            expect(testState.database.theme).toBe("default");
+        } finally {
+            await teardownV3Plugins();
+            restoreRelay();
+        }
+    });
+
     test("preserves callback identity across duplicate hook registration and removal", async () => {
         const plugin = startupPlugin("Stable Hook Identity", `
             globalThis.scriptCalls = 0;

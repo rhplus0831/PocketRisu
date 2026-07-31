@@ -1,6 +1,6 @@
 # V3 database writes can silently succeed after permission denial
 
-- Status: Intentional security correction with a silent-result compatibility defect
+- Status: Fixed 2026-07-31
 - Severity: Medium
 - Confidence: High
 - Introduced by: d9c9817f
@@ -27,3 +27,15 @@ discard a retry buffer, or continue from state that was never committed.
 Keep the permission boundary but reject with a stable permission-denied error
 or return an explicit mutation result. Test ask, grant, persisted denial, and a
 plugin that only writes.
+
+## Resolution
+
+PocketRisu retains the database permission boundary and now rejects both
+setDatabase() and setDatabaseLite() with `PluginPermissionError` and the stable
+`PLUGIN_PERMISSION_DENIED` code when the user denies access. The V3 iframe
+bridge preserves the error name and code, while successful calls retain their
+existing `Promise<void>` contract.
+
+Coverage exercises ask, grant, persisted denial, and write-only use for both
+setters, plus the real guest RPC path to verify that sandboxed plugins receive
+the stable error and that denied calls do not mutate database state.

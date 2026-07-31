@@ -1459,6 +1459,12 @@ interface ProviderOptions {
 // Risuai Global API
 // ============================================================================
 
+/** Stable error returned when a user denies a plugin permission request. */
+interface PluginPermissionError extends Error {
+    name: 'PluginPermissionError';
+    code: 'PLUGIN_PERMISSION_DENIED';
+}
+
 /**
  * Risuai Plugin API v3.0
  *
@@ -1735,6 +1741,7 @@ interface RisuaiPluginAPI {
      * strip or evaluate them; the host validates the structured-cloned result
      * again. This guarantee applies to calls made through risuai/Risuai.
      * @param db - DatabaseSubset object to save
+     * @throws {PluginPermissionError} If the user has denied database permission.
      */
     setDatabaseLite(db: DatabaseSubset, unloadSignal?: AbortSignal): Promise<void>;
 
@@ -1756,6 +1763,7 @@ interface RisuaiPluginAPI {
      * strip or evaluate them; the host validates the structured-cloned result
      * again. This guarantee applies to calls made through risuai/Risuai.
      * @param db - DatabaseSubset object to save
+     * @throws {PluginPermissionError} If the user has denied database permission.
      */
     setDatabase(db: DatabaseSubset, unloadSignal?: AbortSignal): Promise<void>;
 

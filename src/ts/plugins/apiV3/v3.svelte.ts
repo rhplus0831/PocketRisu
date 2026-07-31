@@ -822,6 +822,16 @@ const unloadV3Plugin = async (pluginName: string) => {
 export type PluginPermissionDesc = 'fetchLogs'|'db'|'mainDom'|'replacer'|'provider'|'sendChat';
 export type PluginPermissionDecision = 'granted'|'revoked'|'ask';
 export const pluginPermissionDescs: readonly PluginPermissionDesc[] = ['fetchLogs', 'db', 'mainDom', 'replacer', 'provider', 'sendChat'];
+export const PLUGIN_PERMISSION_DENIED_CODE = 'PLUGIN_PERMISSION_DENIED';
+
+export class PluginPermissionError extends Error {
+    readonly code = PLUGIN_PERMISSION_DENIED_CODE;
+
+    constructor(pluginName: string, permissionDesc: PluginPermissionDesc) {
+        super(`Plugin "${pluginName}" was denied the "${permissionDesc}" permission.`);
+        this.name = 'PluginPermissionError';
+    }
+}
 
 // Plugin names are free text (the //@name directive), so `${name}_${desc}` keys
 // can collide — both across permissions and with a legacy name-only entry that
@@ -1510,7 +1520,7 @@ export const makeRisuaiAPIV3 = (
                     'periodically',
                     signal,
                 );
-                if (!conf) return;
+                if (!conf) throw new PluginPermissionError(plugin.name, 'db');
                 throwIfAborted(signal);
                 await databaseBridge.setDatabaseLite(database, signal);
             }, signal);
@@ -1523,7 +1533,7 @@ export const makeRisuaiAPIV3 = (
                     'periodically',
                     signal,
                 );
-                if (!conf) return;
+                if (!conf) throw new PluginPermissionError(plugin.name, 'db');
                 throwIfAborted(signal);
                 await databaseBridge.setDatabase(database, signal);
             }, signal);

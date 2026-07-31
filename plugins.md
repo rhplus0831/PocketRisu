@@ -787,6 +787,9 @@ await Risuai.setDatabaseLite(db);
 ```
 
 `getDatabase()` returns `null` if the user has not granted database access consent.
+`setDatabase()` and `setDatabaseLite()` reject with a `PluginPermissionError`
+whose stable `code` is `PLUGIN_PERMISSION_DENIED` when consent is denied; no
+database state is changed.
 
 Database updates merge only the fields you provide; omitted fields remain
 unchanged. `pluginCustomStorage` is the exception at the key level: when the

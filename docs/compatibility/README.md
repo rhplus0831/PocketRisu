@@ -47,7 +47,7 @@ many users use that path.
 - [V3 hook callback identity](v3-hook-callback-identity.md)
 - [V3 unload API allowlist](v3-onunload-api-allowlist.md)
 - [loadPlugins readiness contract](plugin-loadplugins-readiness.md)
-- [Silent V3 database permission denial](v3-database-setter-permission.md)
+- [Silent V3 database permission denial (fixed 2026-07-31)](v3-database-setter-permission.md)
 - [Removed V3 custom-key fallback](v3-database-custom-key-fallback.md)
 - [V2 rich-value rejection](v2-plugin-storage-rich-values.md)
 - [V2 caller-alias detachment](v2-plugin-storage-live-aliases.md)
