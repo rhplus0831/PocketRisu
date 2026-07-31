@@ -1,8 +1,8 @@
 # Audit findings — priority index
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
-`Status` column uses `Open`, `Fixed`, or `Deferred`; 47 findings are currently
-`Open`, 12 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
+`Status` column uses `Open`, `Fixed`, or `Deferred`; 46 findings are currently
+`Open`, 13 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
 as a cross-reference).
@@ -53,7 +53,7 @@ resolution against current code before acting on it.
 |---|---|---|---|---|
 | [Chat-row stage not bound to committed stub snapshot](audit/chat-row-stage-is-not-bound-to-the-committed-stub-snapshot.md) | Open | High | A whole chat: stub committed without its row (404 placeholder), or a durable row orphaned and swept after the grace period | Chat created during a slow row POST; client loss after a partial commit |
 | [Live startup state can classify a new chat as durable](audit/live-startup-state-can-classify-a-new-chat-as-durable.md) | Fixed | High | A whole chat created at startup commits as a stub with no row; refresh loses its messages | Synchronous V2/V2.1 plugin startup writes; bootstrap chat-ID repair is an organic non-plugin trigger |
-| [HTML chat import reuses the authoritative row ID](audit/html-chat-import-reuses-the-authoritative-row-id.md) | Open | High | New work in the imported duplicate chat silently vanishes after save and reload (two chats share one row) | Importing an exported HTML chat back into its source character |
+| [HTML chat import reuses the authoritative row ID](audit/html-chat-import-reuses-the-authoritative-row-id.md) | Fixed | High | New work in the imported duplicate chat silently vanishes after save and reload (two chats share one row) | Importing an exported HTML chat back into its source character |
 | [Recovery copies omit MCP tool-call payloads](audit/recovery-copies-omit-mcp-tool-call-payloads.md) | Fixed | High | Every remembered tool call's arguments and responses, permanently, once the original database is gone; request history silently degrades | Any portable-backup migration to a fresh instance for MCP users — the primary purpose of portable backups; masked on same-instance restores |
 | [Inlay replacement unlinks before publish](audit/inlay-replacement-unlinks-before-publish.md) | Fixed | High | Each affected image destroyed (old payload unlinked before the new one is written); bulk compression converts ENOSPC into mass loss reported as success | Crash/power loss during an inlay overwrite; running compression on a nearly full disk — exactly when users run it |
 | [Reroll discards the only copy within pre-image cooldown](audit/reroll-discards-the-only-copy-within-preimage-cooldown.md) | Open | High | The discarded response and its entire swipe history | Normal reroll timing (recent save already consumed the capture cooldown) plus tab close, crash, or failed completion before generation ends |

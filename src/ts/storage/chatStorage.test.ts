@@ -32,6 +32,7 @@ const {
     classifyChat,
     consumeChatBackupReason,
     importChatBackup,
+    prepareChatForImport,
     saveChatToServer,
     setChatBackupReason,
     transformChatBackupForImport,
@@ -97,6 +98,38 @@ describe('pending chat backup reasons', () => {
 })
 
 describe('chat backup import transformation', () => {
+    test('shared import preparation clones content, strips cold markers, and assigns a fresh id', () => {
+        const original = blankChat({
+            id: 'source-id',
+            message: [{ role: 'user', data: 'portable content' }] as any,
+            _stub: true,
+            _placeholder: true,
+        } as any)
+
+        const imported = prepareChatForImport(original, () => 'fresh-id')
+
+        expect(imported).not.toBe(original)
+        expect(imported.message).not.toBe(original.message)
+        expect(imported.message).toEqual(original.message)
+        expect(imported.id).toBe('fresh-id')
+        expect(imported).not.toHaveProperty('_stub')
+        expect(imported).not.toHaveProperty('_placeholder')
+        expect(original.id).toBe('source-id')
+        expect(original).toHaveProperty('_stub', true)
+    })
+
+    test('shared import preparation restores required full-chat fields', () => {
+        const imported = prepareChatForImport({ id: 'source-id' } as any, () => 'fresh-id')
+
+        expect(imported).toMatchObject({
+            id: 'fresh-id',
+            message: [],
+            note: '',
+            name: '',
+            localLore: [],
+        })
+    })
+
     test('clones into a full chat with a fresh id and restored-name suffix', () => {
         const original = blankChat({
             id: 'original-chat-id',

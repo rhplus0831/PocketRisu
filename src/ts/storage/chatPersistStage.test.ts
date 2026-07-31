@@ -7,6 +7,8 @@ import {
     ChatRowPersistError,
     capturePreTrackingFullChatChanges,
     chatPersistKey,
+    DuplicateChatIdError,
+    findDuplicateChatIdsByCharacter,
     runChatPersistStage,
 } from './chatPersistStage'
 
@@ -75,6 +77,55 @@ function clone<T>(value: T): T {
 }
 
 describe('chat persistence stage', () => {
+    test('detects duplicate ids only within the same character', () => {
+        const db = {
+            characters: [
+                { chaId: 'char-a', chats: [makeChat('same'), makeStub('same')] },
+                { chaId: 'char-b', chats: [makeChat('same')] },
+            ],
+        } as unknown as Database
+
+        expect(findDuplicateChatIdsByCharacter(db)).toEqual([{
+            chaId: 'char-a',
+            chatId: 'same',
+            firstIndex: 0,
+            duplicateIndex: 1,
+        }])
+    })
+
+    test.each<[string, Chat[]]>([
+        ['full chats', [makeChat('duplicate'), makeChat('duplicate')]],
+        ['cold stubs', [makeStub('duplicate'), makeStub('duplicate')]],
+    ])('rejects duplicate %s before writing a row or committing stubs', async (_label, chats) => {
+        const saveChat = vi.fn(async () => {})
+        const commitStubDatabase = vi.fn(async () => ({ committed: true, result: undefined }))
+
+        const attempt = runChatPersistStage({
+            db: makeDatabaseWithChats(chats),
+            toSave: makeTrackedChanges({ character: ['char-1'] }),
+            doingChat: false,
+            knownChatIdsByCharacter: new Map(),
+            generationCheckpoints: new Map(),
+            requeueChats: vi.fn(),
+            saveChat,
+            commitStubDatabase,
+        })
+
+        await expect(attempt).rejects.toEqual(
+            expect.objectContaining<Partial<DuplicateChatIdError>>({
+                name: 'DuplicateChatIdError',
+                duplicates: [{
+                    chaId: 'char-1',
+                    chatId: 'duplicate',
+                    firstIndex: 0,
+                    duplicateIndex: 1,
+                }],
+            }),
+        )
+        expect(saveChat).not.toHaveBeenCalled()
+        expect(commitStubDatabase).not.toHaveBeenCalled()
+    })
+
     test('persists a synchronous startup-created chat before an unrelated save publishes its stub', async () => {
         const persisted = makeDatabaseWithChats([makeStub('chat-existing')])
         const startupChat = makeChat('chat-startup')

@@ -37,6 +37,13 @@ interface ChatRowStore {
         makeId?: () => string,
     ) => { reassignedDuplicateChaIds: number }
     findDuplicateChaIds: (dbObj: any) => string[]
+    findDuplicateChatIds: (dbObj: any) => Array<{
+        chaId: string | null
+        characterIndex: number
+        chatId: string
+        firstIndex: number
+        duplicateIndex: number
+    }>
     normalizeOrphanFolderIds: (dbObj: any) => boolean
     ingestFullDatabase: (
         raw: Buffer | object,
@@ -82,6 +89,7 @@ const {
     hasChatPayloads,
     splitFullDb,
     findDuplicateChaIds,
+    findDuplicateChatIds,
 } = chatRowsPkg as {
     createChatRowStore: (options: any) => ChatRowStore
     chatRowKey: (chaId: string, chatId: string) => string
@@ -91,6 +99,7 @@ const {
     hasChatPayloads: (dbObj: any) => boolean
     splitFullDb: ChatRowStore['splitFullDb']
     findDuplicateChaIds: ChatRowStore['findDuplicateChaIds']
+    findDuplicateChatIds: ChatRowStore['findDuplicateChatIds']
 }
 const { createChunkStore, isChunkableKey } = chunkStorePkg as {
     createChunkStore: (db: any, opts?: { threshold?: number }) => {
@@ -414,6 +423,33 @@ describe('splitFullDb and assembleFullDb', () => {
             chatEntries.map(entry => entry.chatId),
         )
         expect(input.characters[0].chats[1].id).toBe('duplicate')
+    })
+
+    it('detects duplicate full and stub chat ids within a character', () => {
+        const input = {
+            characters: [
+                {
+                    chaId: 'char-a',
+                    chats: [
+                        { id: 'duplicate', name: 'Full', message: [] },
+                        { id: 'duplicate', name: 'Stub', _stub: true },
+                        { id: '', name: 'Missing', _stub: true },
+                    ],
+                },
+                {
+                    chaId: 'char-b',
+                    chats: [{ id: 'duplicate', name: 'Allowed elsewhere', _stub: true }],
+                },
+            ],
+        }
+
+        expect(findDuplicateChatIds(input)).toEqual([{
+            chaId: 'char-a',
+            characterIndex: 0,
+            chatId: 'duplicate',
+            firstIndex: 0,
+            duplicateIndex: 1,
+        }])
     })
 
     it('passes through bare stubs and assigns ids to missing payload chats', () => {

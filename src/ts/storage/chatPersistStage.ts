@@ -5,12 +5,41 @@ import isEqual from 'lodash/isEqual'
 export type ChatPersistId = [chaId: string, chatId: string]
 export type ChatCheckpointTracker = Map<string, number>
 
+export interface DuplicateChatId {
+    chaId: string
+    chatId: string
+    firstIndex: number
+    duplicateIndex: number
+}
+
 // The server throttles chat pre-image backups to 45s per chat, so 20s client
 // checkpoints improve crash durability without creating a backup per fragment.
 export const CHECKPOINT_INTERVAL_MS = 20_000
 
 export function chatPersistKey(chaId: string, chatId: string): string {
     return `${chaId}|${chatId}`
+}
+
+export function findDuplicateChatIdsByCharacter(
+    db: Pick<Database, 'characters'>,
+): DuplicateChatId[] {
+    const duplicates: DuplicateChatId[] = []
+    for (const character of db.characters ?? []) {
+        const chaId = character?.chaId
+        if (!chaId) continue
+        const firstIndexById = new Map<string, number>()
+        for (let index = 0; index < (character.chats?.length ?? 0); index++) {
+            const chatId = character.chats[index]?.id
+            if (!chatId) continue
+            const firstIndex = firstIndexById.get(chatId)
+            if (firstIndex === undefined) {
+                firstIndexById.set(chatId, index)
+                continue
+            }
+            duplicates.push({ chaId, chatId, firstIndex, duplicateIndex: index })
+        }
+    }
+    return duplicates
 }
 
 /**
@@ -177,6 +206,13 @@ export class ChatRowPersistError extends Error {
     }
 }
 
+export class DuplicateChatIdError extends Error {
+    constructor(public readonly duplicates: DuplicateChatId[]) {
+        super(`Refusing to persist ${duplicates.length} duplicate chat id${duplicates.length === 1 ? '' : 's'}`)
+        this.name = 'DuplicateChatIdError'
+    }
+}
+
 export interface StubCommitResult<T> {
     committed: boolean
     result: T
@@ -211,6 +247,11 @@ export interface PreparedChatPersistStage {
 export async function prepareChatPersistStage(
     options: ChatRowPersistStageOptions,
 ): Promise<PreparedChatPersistStage> {
+    const duplicateChatIds = findDuplicateChatIdsByCharacter(options.db)
+    if (duplicateChatIds.length > 0) {
+        throw new DuplicateChatIdError(duplicateChatIds)
+    }
+
     const chatsToPersist = collectChatsToPersist(
         options.db,
         options.toSave,

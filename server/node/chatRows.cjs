@@ -155,6 +155,34 @@ function findDuplicateChaIds(dbObj) {
     return duplicates;
 }
 
+function findDuplicateChatIds(dbObj) {
+    const duplicates = [];
+    if (!Array.isArray(dbObj?.characters)) return duplicates;
+
+    for (let characterIndex = 0; characterIndex < dbObj.characters.length; characterIndex++) {
+        const character = dbObj.characters[characterIndex];
+        if (!Array.isArray(character?.chats)) continue;
+        const firstIndexById = new Map();
+        for (let chatIndex = 0; chatIndex < character.chats.length; chatIndex++) {
+            const chatId = character.chats[chatIndex]?.id;
+            if (typeof chatId !== 'string' || chatId.length === 0) continue;
+            const firstIndex = firstIndexById.get(chatId);
+            if (firstIndex === undefined) {
+                firstIndexById.set(chatId, chatIndex);
+                continue;
+            }
+            duplicates.push({
+                chaId: character.chaId ?? null,
+                characterIndex,
+                chatId,
+                firstIndex,
+                duplicateIndex: chatIndex,
+            });
+        }
+    }
+    return duplicates;
+}
+
 function dedupeCharacterIds(dbObj, makeId = nodeCrypto.randomUUID, state = {}) {
     const usedChaIds = state.usedChaIds ?? new Set();
     const seenCharacters = state.seenCharacters ?? new WeakSet();
@@ -703,6 +731,7 @@ function createChatRowStore(options) {
         assignMissingChatIds,
         dedupeCharacterIds,
         findDuplicateChaIds,
+        findDuplicateChatIds,
         normalizeOrphanFolderIds,
         ingestFullDatabase,
         ingestStreamingDatabase,
@@ -724,6 +753,7 @@ module.exports = {
     assignMissingChatIds,
     dedupeCharacterIds,
     findDuplicateChaIds,
+    findDuplicateChatIds,
     createChatExternalizer,
     normalizeOrphanFolderIds,
 };

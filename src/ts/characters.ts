@@ -1,6 +1,6 @@
 import { get, writable } from "svelte/store";
 import { saveImage, setDatabase, type character, type Chat, defaultSdDataFunc, type loreBook, getDatabase, getCharacterByIndex, setCharacterByIndex, getCurrentChat, loadTogglesFromChat, normalizeChat, newChatModelDefaults } from "./storage/database.svelte";
-import { ensureChatHydrated } from "./storage/chatStorage";
+import { ensureChatHydrated, prepareChatForImport } from "./storage/chatStorage";
 import { alertAddCharacter, alertConfirm, alertError, alertSelect, alertStore, alertWait, notifySuccess, notifyInfo } from "./alert";
 import { loadingOverlayStore, chatDeselected } from "./stores.svelte";
 import { language } from "../lang";
@@ -16,6 +16,7 @@ import { chatOperationActive } from './process/chatSendState';
 import { importCharacter } from "./characterCards";
 import { importCharacterPackage } from "./characterPackage";
 import { PngChunk } from "./pngChunk";
+import { encodeChatHtmlPayload, parseChatHtmlExport } from "./chatImport";
 
 export function createNewCharacter() {
     let db = getDatabase()
@@ -274,9 +275,7 @@ export async function exportChat(page:number){
                             </div>
                             ${chatContentHTML}
                         </div>
-                        <div class="idat">${
-                            JSON.stringify(chat).replace(/</g, '&lt;').replace(/>/g, '&gt;')
-                        }</div>
+                        <div class="idat">${encodeChatHtmlPayload(chat)}</div>
                     </body>
             `
 
@@ -422,9 +421,8 @@ export async function importChat(){
                     if(chat.folderId && folderIdMap[chat.folderId]){
                         chat.folderId = folderIdMap[chat.folderId]
                     }
-                    chat.id = v4()
                 })
-                db.characters[selectedID].chats.unshift(...chats.map(c => normalizeChat(c)))
+                db.characters[selectedID].chats.unshift(...chats.map(c => prepareChatForImport(c)))
                 notifySuccess(language.successImport)
                 return
             }
@@ -432,14 +430,11 @@ export async function importChat(){
                 const chats = json.data
                 if(Array.isArray(chats) && chats.length > 0){
                     db.characters[selectedID].chats.unshift(...(chats.map((v) => {
-                        if(!v.id){
-                            v.id = uuidv4()
-                        }
                         if(!v.localLore){
                             v.localLore = []
                         }
                         v.fmIndex ??= -1
-                        return normalizeChat(v)
+                        return prepareChatForImport(v)
                     })))
                     notifySuccess(language.successImport)
                     return
@@ -452,8 +447,7 @@ export async function importChat(){
                 const das:Chat = json.data
                 if(!(checkNullish(das.message) || checkNullish(das.note) || checkNullish(das.name) || checkNullish(das.localLore))){
                     das.fmIndex ??= -1
-                    das.id = v4()
-                    db.characters[selectedID].chats.unshift(normalizeChat(das))
+                    db.characters[selectedID].chats.unshift(prepareChatForImport(das))
                     notifySuccess(language.successImport)
                     return
                 }
@@ -468,11 +462,9 @@ export async function importChat(){
             }
         }
         else if(dat.name.endsWith('html')){
-            const doc = new DOMParser().parseFromString(Buffer.from(dat.data).toString('utf-8'), 'text/html')
-            const chat = doc.querySelector('.idat').textContent
-            const json = JSON.parse(chat)
-            if(json.message && json.note && json.name && json.localLore){
-                db.characters[selectedID].chats.unshift(normalizeChat(json))
+            const importedChat = parseChatHtmlExport(Buffer.from(dat.data).toString('utf-8'))
+            if(importedChat){
+                db.characters[selectedID].chats.unshift(importedChat)
                 notifySuccess(language.successImport)
             }
             else{

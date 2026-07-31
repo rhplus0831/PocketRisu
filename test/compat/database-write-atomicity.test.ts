@@ -281,6 +281,24 @@ describe('atomic database writes with external rows', () => {
     )).toEqual(Buffer.from(JSON.stringify({ plugin: 'old plugin', updatedAt: 1 })))
   })
 
+  test('full write rejects duplicate cold-chat ids without changing authoritative state', async () => {
+    const { client, server, strippedDb } = await bootSeeded()
+    const before = snapshotExternalRows(server.cwd)
+    const malformed = structuredClone(strippedDb)
+    malformed.characters[0].chats.splice(1, 0, {
+      ...malformed.characters[0].chats[0],
+      name: 'Duplicate row identity',
+    })
+
+    const response = await writeFullDatabase(client, malformed)
+
+    expect(response.status).toBe(500)
+    await expect(response.json()).resolves.toMatchObject({
+      error: 'Write aborted: chat data integrity check failed',
+    })
+    expect(snapshotExternalRows(server.cwd)).toEqual(before)
+  })
+
   test('patch hash mismatch returns a stable database-conflict envelope', async () => {
     const { client } = await bootSeeded()
 
@@ -302,6 +320,34 @@ describe('atomic database writes with external rows', () => {
       code: 'DATABASE_PATCH_CONFLICT',
       currentEtag: expect.stringMatching(/^[0-9a-f]{32}$/),
     })
+  })
+
+  test('patch rejects a duplicate cold-chat id before updating the cache', async () => {
+    const { client, server, strippedDb } = await bootSeeded()
+    const before = snapshotExternalRows(server.cwd)
+    const duplicate = {
+      ...strippedDb.characters[0].chats[0],
+      name: 'Duplicate row identity',
+    }
+
+    const response = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_PATH_HEX,
+      },
+      body: JSON.stringify({
+        expectedHash: calculateHash(normalizeJSON(strippedDb)).toString(16),
+        patch: [{ op: 'add', path: '/characters/0/chats/1', value: duplicate }],
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toMatchObject({
+      code: 'DUPLICATE_CHAT_IDS',
+      currentEtag: expect.stringMatching(/^[0-9a-f]{32}$/),
+    })
+    expect(snapshotExternalRows(server.cwd)).toEqual(before)
   })
 
   test('patch removal keeps its row until database.bin and deletion commit together', async () => {

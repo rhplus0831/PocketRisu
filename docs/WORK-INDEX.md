@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **52** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, and **43** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **51** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, and **44** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -31,7 +31,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [HTML chat import reuses the row ID](audit/html-chat-import-reuses-the-authoritative-row-id.md) | audit | Open | New work in an imported duplicate chat silently disappears after save and reload. | Importing an HTML export back into its source character creates the duplicate ID every time. |
 | [Inactive character and chat writes are not scheduled](audit/non-selected-character-and-chat-writes-have-no-save-scheduler.md) | audit | Open | Acknowledged character, chat, and module edits revert on refresh. | Normal arbitrary-target V3 or MCP writes to non-selected records lack a dirty bridge. |
 | [Pre-tracking capture omits six save domains](audit/pre-tracking-baseline-capture-still-omits-six-save-domains.md) | audit | Open | Boot migrations, repairs, imports, and defaults can remain memory-only and vanish. | Affected bootstrap mutations are absorbed as the clean baseline on an ordinary boot. |
 | [Plugin updates discard configured arguments](audit/plugin-updates-discard-configured-arguments.md) | audit | Open | API keys, endpoints, models, prompts, and enablement are reset and persisted. | Every ordinary update or confirmed duplicate import of an affected plugin. |
@@ -121,6 +120,7 @@ None currently open.
 
 | Finding | Former harm | Note |
 |---|---|---|
+| [HTML chat import reused the authoritative row ID](audit/html-chat-import-reuses-the-authoritative-row-id.md) | Importing an HTML export into its source character created two visible chats backed by one row, so edits could disappear or replace the other chat after reload. | Fixed 2026-07-31 with shared fresh-ID import normalization, client row-before-stub duplicate rejection, server patch/full-write integrity guards for full and cold chats, and HTML import/edit/save/reload plus atomic rejection coverage. |
 | [Live startup state could misclassify a new chat](audit/live-startup-state-can-classify-a-new-chat-as-durable.md) | A startup-created or reidentified chat could be committed as a stub without an authoritative row, losing all of its messages on refresh. | Fixed 2026-07-31 by deriving known chat IDs from the persisted baseline and reconciling startup full chats after reactive tracking initializes, with row-before-stub, ID-repair, replacement, and reload-resolvability coverage. |
 | [Recovery copies omitted MCP tool-call payloads](audit/recovery-copies-omit-mcp-tool-call-payloads.md) | Fresh-instance restores kept opaque chat markers but permanently lost remembered tool arguments and responses. | Fixed 2026-07-31 with point-in-time reference-aware Node/server/partial archive entries, a bounded folded snapshot envelope, strict namespace replacement and key validation, and fresh-server plus snapshot round-trip coverage. |
 | [Inlay replacement unlinked before publish](audit/inlay-replacement-unlinks-before-publish.md) | A failed overwrite could destroy an image, while compression converted publication failures into successful skips. | Fixed 2026-07-31 with staged and fsynced payload/sidecar files, ordered atomic renames, post-commit old-extension cleanup, startup temp cleanup, terminal compression errors, and injected-failure plus `SIGKILL` restart coverage. |

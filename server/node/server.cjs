@@ -112,6 +112,7 @@ const {
     chatRowKey,
     hasChatPayloads,
     findDuplicateChaIds,
+    findDuplicateChatIds,
     validateDatabaseShape,
 } = require('./chatRows.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
@@ -1719,6 +1720,13 @@ function findStubFlagLossChats(dbObj) {
     return losses;
 }
 
+function duplicateChatIdSample(duplicates) {
+    return duplicates.slice(0, 3).map(duplicate => {
+        const characterLabel = duplicate.chaId ?? `character[${duplicate.characterIndex}]`;
+        return `${characterLabel}/${duplicate.chatId}`;
+    }).join(', ');
+}
+
 function trackPendingChatRowDeletions(oldStrippedDb, newStrippedDb) {
     const oldKeys = chatRowStore.referencedChatRowKeys(oldStrippedDb);
     const newKeys = chatRowStore.referencedChatRowKeys(newStrippedDb);
@@ -1747,6 +1755,16 @@ async function persistDbCache(filePath, decodedKey) {
                 + `would silently strip messages on disk. sample=[${sample}]`
             );
             recordPersistFailure(err, 'persistDbCache:stub-flag-loss');
+            invalidateDbCache();
+            throw err;
+        }
+        const duplicateChatIds = findDuplicateChatIds(cachedDb);
+        if (duplicateChatIds.length > 0) {
+            const err = new Error(
+                `persist aborted: ${duplicateChatIds.length} duplicate chat id(s) — `
+                + `would alias authoritative rows. sample=[${duplicateChatIdSample(duplicateChatIds)}]`
+            );
+            recordPersistFailure(err, 'persistDbCache:duplicate-chat-ids');
             invalidateDbCache();
             throw err;
         }
@@ -12037,7 +12055,11 @@ app.post('/api/plugin-storage/transition', async (req, res, next) => {
                 return res.status(400).json({ error: 'Invalid inline plugin storage records' });
             }
             const losses = findStubFlagLossChats(targetDb);
-            if (losses.length > 0 || findDuplicateChaIds(targetDb).length > 0) {
+            if (
+                losses.length > 0
+                || findDuplicateChaIds(targetDb).length > 0
+                || findDuplicateChatIds(targetDb).length > 0
+            ) {
                 return res.status(400).json({ error: 'Plugin storage transition failed database integrity checks' });
             }
 
@@ -12305,6 +12327,18 @@ app.post('/api/write', async (req, res, next) => {
                         return;
                     }
 
+                    const duplicateChatIds = findDuplicateChatIds(incomingDb);
+                    if (duplicateChatIds.length > 0) {
+                        const err = new Error(
+                            `write aborted: ${duplicateChatIds.length} duplicate chat id(s) — `
+                            + `would alias authoritative rows. sample=[${duplicateChatIdSample(duplicateChatIds)}]`
+                        );
+                        recordPersistFailure(err, '/api/write:duplicate-chat-ids');
+                        logger.error(`[Write] ${err.message}`);
+                        res.status(500).json({ error: 'Write aborted: chat data integrity check failed' });
+                        return;
+                    }
+
                     const splitDatabase = chatRowStore.splitFullDb(incomingDb);
                     const chatRows = splitDatabase.chatEntries.map(entry => ({
                         ...entry,
@@ -12560,6 +12594,24 @@ app.post('/api/patch', async (req, res, next) => {
             const result = applyPatchAtomic(cachedDb, patch);
             const snapshot = result.newDocument;
             if (decodedKey === 'database/database.bin') {
+                const duplicateChatIds = findDuplicateChatIds(snapshot);
+                if (duplicateChatIds.length > 0) {
+                    logger.warn(
+                        `[Patch] Rejected ${duplicateChatIds.length} duplicate chat id(s): `
+                        + duplicateChatIdSample(duplicateChatIds)
+                    );
+                    let currentEtag;
+                    try {
+                        currentEtag = getDbCacheEtag(filePath);
+                        dbEtag = currentEtag;
+                    } catch {}
+                    res.status(409).send({
+                        error: 'Patch rejected: duplicate chat ids would alias authoritative rows',
+                        code: 'DUPLICATE_CHAT_IDS',
+                        currentEtag,
+                    });
+                    return;
+                }
                 // Keep dbCache and the ETag on the same optimized stub shape
                 // that the debounced persist will write.
                 const externalized = externalizePluginStorageIfNeeded(snapshot);

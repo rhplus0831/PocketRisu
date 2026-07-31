@@ -1,7 +1,7 @@
 import { changeFullscreen, checkNullish } from "./util"
 import { v4 as uuidv4 } from 'uuid';
 import { get } from "svelte/store";
-import { setDatabase, defaultSdDataFunc, getDatabase, changeToThemePreset } from "./storage/database.svelte";
+import { setDatabase, defaultSdDataFunc, getDatabase, changeToThemePreset, type Chat } from "./storage/database.svelte";
 import { chatDraftKey, sweepOrphanDrafts } from "./storage/chatDraft";
 import { checkRisuUpdate } from "./update";
 import { fetchPublicStats } from "./publicStats";
@@ -721,27 +721,36 @@ function assignIds() {
     if (!DBState?.db?.characters) {
         return
     }
-    const assignedIds = new Set<string>()
+    const assignedCharacterIds = new Set<string>()
     for (let i = 0; i < DBState.db.characters.length; i++) {
         const cha = DBState.db.characters[i]
         if (!cha.chaId) {
             cha.chaId = uuidv4()
         }
-        if (assignedIds.has(cha.chaId)) {
+        if (assignedCharacterIds.has(cha.chaId)) {
             console.warn(`Duplicate chaId found: ${cha.chaId}. Assigning new ID.`);
             cha.chaId = uuidv4();
         }
-        assignedIds.add(cha.chaId)
+        assignedCharacterIds.add(cha.chaId)
+        const assignedChatIds = new Set<string>()
         for (let i2 = 0; i2 < cha.chats.length; i2++) {
             const chat = cha.chats[i2]
             if (!chat.id) {
                 chat.id = uuidv4()
             }
-            if (assignedIds.has(chat.id)) {
-                console.warn(`Duplicate chat ID found: ${chat.id}. Assigning new ID.`);
-                chat.id = uuidv4();
+            if (assignedChatIds.has(chat.id)) {
+                if (chat._placeholder || (chat as Chat & { _stub?: boolean })._stub) {
+                    // A cold chat body still lives under the old id. Renaming
+                    // only its stub would create a dangling row reference, so
+                    // leave the collision visible for the save integrity guard
+                    // to reject instead of silently publishing corruption.
+                    console.error(`Duplicate cold chat ID found: ${chat.id}. Persistence will be blocked.`)
+                    continue
+                }
+                console.warn(`Duplicate full chat ID found: ${chat.id}. Assigning new ID.`)
+                chat.id = uuidv4()
             }
-            assignedIds.add(chat.id)
+            assignedChatIds.add(chat.id)
         }
     }
 }

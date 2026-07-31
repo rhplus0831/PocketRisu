@@ -134,19 +134,38 @@ export async function saveChatToServer(chaId: string, chatIndex: number, chatId:
 
 // ── Backup import ───────────────────────────────────────────────────────────
 
-export function transformChatBackupForImport(backup: Chat, restoredAt = Date.now()): Chat {
-    const restored = safeStructuredClone(backup) as Chat & {
+/**
+ * Clone a transported chat into a new local identity.
+ *
+ * Chat ids address authoritative rows, so every import must allocate a fresh
+ * id even when the source came from this installation. Wire/runtime markers
+ * are deliberately removed: an imported chat owns the payload carried by the
+ * import and must never hydrate through the source row.
+ */
+export function prepareChatForImport(
+    source: Partial<Chat>,
+    makeId: () => string = v4,
+): Chat {
+    const imported = safeStructuredClone(source) as Chat & {
         _stub?: boolean
         _placeholder?: boolean
     }
-    delete restored._stub
-    delete restored._placeholder
-    if (!Array.isArray(restored.message)) restored.message = []
+    delete imported._stub
+    delete imported._placeholder
+    if (!Array.isArray(imported.message)) imported.message = []
+    if (typeof imported.note !== 'string') imported.note = ''
+    if (typeof imported.name !== 'string') imported.name = ''
+    if (!Array.isArray(imported.localLore)) imported.localLore = []
+    imported.id = makeId()
+    return imported
+}
+
+export function transformChatBackupForImport(backup: Chat, restoredAt = Date.now()): Chat {
+    const restored = prepareChatForImport(backup)
 
     const originalName = typeof restored.name === 'string' && restored.name.trim()
         ? restored.name
         : language.chatBackupUntitledChat
-    restored.id = v4()
     restored.name = `${originalName} ${language.chatBackupRestoredSuffix(
         new Date(restoredAt).toLocaleString()
     )}`
