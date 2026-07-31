@@ -1,6 +1,6 @@
 # Unified work-priority index
 
-Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **40** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is deferred for future work, and **54** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **39** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is an intentional documented limitation, **1** is deferred for future work, and **54** fixed findings appear in the appendix. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
 
 ## Priority rules
 
@@ -31,7 +31,6 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [Snapshots reference assets GC can delete](audit/snapshots-reference-assets-the-gc-can-delete.md) | audit | Open | Recovery copies only; live data survives — restored snapshots contain dangling asset references. | Replace an asset, allow ordinary GC to run, then restore the older retained snapshot. |
 | [Chat-version cap collapses to 100](audit/chat-version-cap-collapses-from-125-to-100.md) | audit | Open | Recovery copies only; live data survives — the oldest 20% of advertised history is dropped. | Deterministic when a chat reaches its 125th retained version. |
 
 ## Tier 4
@@ -104,6 +103,12 @@ None currently open.
 | [Cloudflare Quick Tunnel was removed](compatibility/cloudflare-quick-tunnel-removed.md) | compat | Intentional | Deployments using the bundled tunnel lose remote access and the old API returns 404. | Deterministic after update or container rebuild for Quick Tunnel users. |
 | [Custom hub proxy targets are rejected](compatibility/hub-proxy-custom-targets-rejected.md) | compat | Intentional | Custom hubs and external clients lose their relay route. | Deterministic for any non-official target sent to `/hub-proxy`. |
 | [Generic `HOST` changes the listen address](compatibility/generic-host-env-changes-listen-address.md) | compat | Intentional | The server can bind the wrong interface or fail startup. | Requires an existing process manager or PaaS to set the generic variable for another purpose. |
+
+## Intentional documented limitations
+
+| Work item | Source | Status | Impact | Trigger / likelihood |
+|---|---|---|---|---|
+| [DB-only snapshots do not preserve assets](audit/snapshots-reference-assets-the-gc-can-delete.md) | audit | Intentional documented limitation | Restoring a snapshot can leave dangling references to assets that are no longer present; the live state before restore is unaffected. | Automatic snapshots are explicitly scoped to database recovery and exclude character assets and inlays; use a full server/local backup when media recovery is required. |
 
 ## Deferred work
 

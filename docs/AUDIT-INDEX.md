@@ -1,8 +1,9 @@
 # Audit findings — priority index
 
 Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
-`Status` column uses `Open`, `Fixed`, or `Deferred`; 37 findings are currently
-`Open`, 22 are `Fixed`, and 1 is `Deferred`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
+`Status` column uses `Open`, `Fixed`, `Deferred`, or `Intentional documented limitation`;
+36 findings are currently `Open`, 22 are `Fixed`, 1 is `Deferred`, and 1 is an
+`Intentional documented limitation`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this
 index re-ranks them by the criteria below, so a finding's tier here can differ
 from its own severity label (the tier is the priority signal; the label is kept
 as a cross-reference).
@@ -103,7 +104,6 @@ that make P1–P3 incidents recoverable.
 | [Wall-clock rollback disables chat pre-image capture](audit/wall-clock-rollback-disables-chat-preimage-capture.md) | Open | Medium | Pre-image capture silently off — possibly for years — while authoritative overwrites continue | A bad RTC or large backward NTP correction; the state persists across restarts |
 | [Changing the chat-backup root hides all existing version history](audit/changing-chat-backup-root-hides-all-existing-version-history.md) | Open | Medium | All prior version history invisible; an operator may then clean the old volume, deleting the only pre-images | Changing the chat-backup root override |
 | [Chat-version backups do not keep referenced inlays live](audit/chat-version-backups-do-not-keep-referenced-inlays-live.md) | Open | Medium | Inlay bytes referenced only by retained versions deleted; restoring the version yields dangling media | Delete a live chat, clean apparent orphans, later restore the version |
-| [Snapshots reference assets the GC can delete](audit/snapshots-reference-assets-the-gc-can-delete.md) | Open | Medium | Snapshot restores arrive with dangling asset references | Replace an asset, boot GC runs, restore an older snapshot |
 | [Direct flush callers bypass automatic-snapshot serialization](audit/direct-flush-callers-bypass-automatic-snapshot-serialization.md) | Open | Medium | A mixed/bare-stub recovery point published as a valid snapshot | Graceful shutdown or self-update restart racing concurrent mutations |
 | [Global chat budget evicts newer bundles before older loose versions](audit/global-chat-budget-evicts-newer-bundles-before-older-loose-versions.md) | Fixed | Medium | 25 newer recovery points destroyed where one older loose file would have sufficed | A global byte-cap overage across chats |
 | [Chat-version cap collapses from 125 to 100](audit/chat-version-cap-collapses-from-125-to-100.md) | Open | Medium | The oldest 20% of the advertised recovery depth, dropped at once | Reaching the 125th version; the current regression test codifies the loss |
@@ -133,6 +133,12 @@ is small.
 |---|---|---|---|---|
 | [Callback bridge skips stream transfer and remote-class serialization](audit/callback-bridge-skips-stream-transfer-and-remote-class-serialization.md) | Open | Medium | Host promise hangs forever with no error; already-produced (paid) model output stranded; mutation observers receive stripped, non-functional objects | V3 plugin callbacks returning nested streams or remote-class wrappers |
 
+## Intentional documented limitations
+
+| Finding | Status | Original doc sev. | Documented limitation | User-facing contract |
+|---|---|---|---|---|
+| [DB-only snapshots do not preserve assets](audit/snapshots-reference-assets-the-gc-can-delete.md) | Intentional documented limitation | Medium | Restoring an older database snapshot can leave dangling references when an excluded asset is no longer present. | The Backups UI labels these snapshots “DB only,” explicitly excludes character assets and inlays, and directs asset-complete recovery to full backups. |
+
 ## Cross-cutting amplifiers
 
 Several defect families recur across tiers; fixing the shared mechanism
@@ -144,10 +150,10 @@ de-fangs multiple findings at once.
   deletion is now separate: it forces a cooldown-exempt pre-image and aborts
   database publication if capture fails. The send-input and reroll-target races
   were fixed by binding their operations to durable character/chat IDs.
-- **DB-only snapshots.** Automatic snapshots still do not include assets or
-  inlays. Referenced MCP tool-call payloads are now folded into the snapshot,
-  but snapshot/GC asset interplay and version-history inlay ownership remain
-  without that automatic safety net.
+- **DB-only snapshots.** Automatic snapshots intentionally do not include assets
+  or inlays, matching the explicit user-facing scope. Referenced MCP tool-call
+  payloads are folded into the database snapshot; asset-complete recovery uses
+  full backups. Version-history inlay ownership remains a separate open gap.
 - **ETag as authorization (fixed 2026-07-28).** The patch-conflict promotion
   (P1) and the rebase promotion (P2) were the same defect class: adopting a
   server ETag before the matching authoritative state was installed, then using
@@ -161,8 +167,9 @@ de-fangs multiple findings at once.
   its only copy.
 - **Server-owned asset reachability (partially fixed 2026-07-29).** Boot asset
   GC and its publication race now use an authoritative, plugin-aware server
-  scan plus a persisted grace interval. Snapshot asset references and
-  version-history inlay references remain separate open ownership gaps.
+  scan plus a persisted grace interval. Retained snapshot references are outside
+  the documented DB-only contract; version-history inlay references remain a
+  separate open ownership gap.
 - **Deployment sweeps with incomplete preservation lists.** `install.sh`,
   `update.sh`, the best-effort path markers, and the Docker layout all decide
   what survives an update from a hard-coded list that can miss the user's real
