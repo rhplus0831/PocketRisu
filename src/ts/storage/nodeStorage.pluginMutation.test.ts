@@ -1538,6 +1538,7 @@ describe('NodeStorage plugin viewer pages', () => {
             pageSize: 50,
             pageCount: 200,
             total: 10_000,
+            totalBytes: 123_456,
             ownerFacets,
             unknownOwnerCount,
             ownerFacetTotal: 10_000,
@@ -1588,6 +1589,7 @@ describe('NodeStorage plugin viewer pages', () => {
             metrics: {
                 manifestParses: 1,
                 valueReads: count,
+                sizeValueReads: 10_000,
                 ownerReads: Math.ceil(count / 2),
                 maxRowParses: count > 0 ? 1 : 0,
             },
@@ -1604,6 +1606,7 @@ describe('NodeStorage plugin viewer pages', () => {
             { page: 2, pageSize: 50 },
         )).resolves.toMatchObject({
             total: 10_000,
+            totalBytes: 123_456,
             ownerFacets: [{ owner: 'Owner', count: 5_000 }],
         })
 
@@ -1644,6 +1647,7 @@ describe('NodeStorage plugin viewer pages', () => {
         expect(result.metrics).toEqual({
             manifestParses: 1,
             valueReads: 50,
+            sizeValueReads: 10_000,
             ownerReads: 25,
             maxRowParses: 1,
         })
@@ -1758,6 +1762,9 @@ describe('NodeStorage plugin viewer pages', () => {
         ['an extra meta property', (lines: string[]) => {
             const meta = JSON.parse(lines[0]); meta.extra = true; lines[0] = JSON.stringify(meta)
         }],
+        ['a negative total byte count', (lines: string[]) => {
+            const meta = JSON.parse(lines[0]); meta.totalBytes = -1; lines[0] = JSON.stringify(meta)
+        }],
         ['an extra entry property', (lines: string[]) => {
             const entry = JSON.parse(lines[1]); entry.extra = true; lines[1] = JSON.stringify(entry)
         }],
@@ -1773,6 +1780,9 @@ describe('NodeStorage plugin viewer pages', () => {
         }],
         ['a negative metric', (lines: string[]) => {
             const done = JSON.parse(lines.at(-1)!); done.metrics.ownerReads = -1; lines[lines.length - 1] = JSON.stringify(done)
+        }],
+        ['a negative size-read metric', (lines: string[]) => {
+            const done = JSON.parse(lines.at(-1)!); done.metrics.sizeValueReads = -1; lines[lines.length - 1] = JSON.stringify(done)
         }],
         ['noncanonical facet order', (lines: string[]) => {
             const meta = JSON.parse(lines[0]);

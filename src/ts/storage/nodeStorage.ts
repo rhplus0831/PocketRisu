@@ -756,6 +756,7 @@ export interface PluginStorageViewerPageTransport {
     pageSize: number
     pageCount: number
     total: number
+    totalBytes: number
     ownerFacets: { owner: string, count: number }[]
     unknownOwnerCount: number
     ownerFacetTotal: number
@@ -763,6 +764,7 @@ export interface PluginStorageViewerPageTransport {
     metrics: {
         manifestParses: number
         valueReads: number
+        sizeValueReads: number
         ownerReads: number
         maxRowParses: number
     }
@@ -3443,7 +3445,7 @@ export class NodeStorage{
                 if (meta || done || entries.length > 0 || !exactKeys(record, [
                     'event', 'version', 'generation', 'manifestRevision', 'databaseRevision',
                     'page', 'pageSize', 'pageCount', 'total', 'ownerFacets',
-                    'unknownOwnerCount', 'ownerFacetTotal',
+                    'totalBytes', 'unknownOwnerCount', 'ownerFacetTotal',
                 ])
                     || record.version !== 1
                     || record.generation !== generation
@@ -3456,6 +3458,7 @@ export class NodeStorage{
                     || (record.pageSize as number) < 1 || (record.pageSize as number) > 50
                     || !Number.isSafeInteger(record.pageCount) || (record.pageCount as number) < 1
                     || !Number.isSafeInteger(record.total) || (record.total as number) < 0
+                    || !Number.isSafeInteger(record.totalBytes) || (record.totalBytes as number) < 0
                     || !validOwnerFacets
                     || !Number.isSafeInteger(record.unknownOwnerCount)
                     || (record.unknownOwnerCount as number) < 0
@@ -3484,6 +3487,7 @@ export class NodeStorage{
                     pageSize: record.pageSize as number,
                     pageCount: record.pageCount as number,
                     total: record.total as number,
+                    totalBytes: record.totalBytes as number,
                     ownerFacets: (ownerFacets as Array<{ owner: string, count: number }>)
                         .map(facet => ({ ...facet })),
                     unknownOwnerCount: record.unknownOwnerCount as number,
@@ -3543,7 +3547,8 @@ export class NodeStorage{
                     || !/^sha256:[0-9a-f]{64}$/.test(record.pageToken)
                     || !metrics || Array.isArray(metrics)
                     || !exactKeys(metrics, [
-                        'manifestParses', 'valueReads', 'ownerReads', 'maxRowParses',
+                        'manifestParses', 'valueReads', 'sizeValueReads', 'ownerReads',
+                        'maxRowParses',
                     ])
                     || !Object.values(metrics).every(value => (
                         Number.isSafeInteger(value) && (value as number) >= 0
@@ -3597,9 +3602,12 @@ export class NodeStorage{
             )
             || done.metrics.manifestParses !== 1
             || done.metrics.valueReads !== entries.length
+            || done.metrics.sizeValueReads < 0
             || done.metrics.ownerReads < 0
             || done.metrics.ownerReads > entries.length
-            || done.metrics.maxRowParses !== (entries.length > 0 ? 1 : 0)) {
+            || done.metrics.maxRowParses !== (
+                entries.length > 0 || done.metrics.sizeValueReads > 0 ? 1 : 0
+            )) {
             throw malformed()
         }
         for (const entry of entries) {

@@ -2529,12 +2529,14 @@ export interface PluginSaveStorageViewerPage {
     pageSize: number;
     pageCount: number;
     total: number;
+    totalBytes: number;
     ownerFacets: { owner: string; count: number }[];
     unknownOwnerCount: number;
     ownerFacetTotal: number;
     metrics: {
         manifestParses: number;
         valueReads: number;
+        sizeValueReads: number;
         ownerReads: number;
         maxRowParses: number;
     };
@@ -2609,7 +2611,8 @@ export async function getPluginSaveStorageViewerPage(
         const values = db.pluginCustomStorage ?? createDatabasePluginStorageRecord();
         const meta = db.pluginStorageMeta ?? createDatabasePluginStorageRecord();
         const query = options.keyQuery?.trim().toLowerCase() ?? "";
-        const keyMatched = orderPluginStorageKeys(getPluginStorageRecordKeys(values))
+        const allKeys = orderPluginStorageKeys(getPluginStorageRecordKeys(values));
+        const keyMatched = allKeys
             .filter(key => !query || key.toLowerCase().includes(query));
         const ownerFacetCounts = new Map<string, number>();
         let unknownOwnerCount = 0;
@@ -2648,6 +2651,16 @@ export async function getPluginSaveStorageViewerPage(
                 ownerRecord: ownerRowPresent ? snapshotJsonValue(meta[key]) : undefined,
             };
         });
+        const sizeEncoder = new TextEncoder();
+        const totalBytes = allKeys.reduce((sum, key) => {
+            const next = sum + sizeEncoder.encode(
+                valueToPluginStorageViewerText(values[key]),
+            ).byteLength;
+            if (!Number.isSafeInteger(next)) {
+                throw new RangeError("Plugin storage viewer total size exceeds the safe integer range.");
+            }
+            return next;
+        }, 0);
         const entries: (PluginStorageViewerEntry & { revision: string })[] = [];
         for (const source of selectedSources) {
             throwIfAborted(options.signal);
@@ -2682,6 +2695,7 @@ export async function getPluginSaveStorageViewerPage(
                 ownerFacets.map(facet => [facet.owner, facet.count]),
                 unknownOwnerCount,
                 total,
+                totalBytes,
                 entries.map(entry => [
                     entry.key,
                     entry.owner ?? null,
@@ -2705,12 +2719,14 @@ export async function getPluginSaveStorageViewerPage(
             pageSize,
             pageCount,
             total,
+            totalBytes,
             ownerFacets,
             unknownOwnerCount,
             ownerFacetTotal: keyMatched.length,
             metrics: {
                 manifestParses: 0,
                 valueReads: entries.length,
+                sizeValueReads: allKeys.length,
                 ownerReads: 0,
                 maxRowParses: entries.length > 0 ? 1 : 0,
             },

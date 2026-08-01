@@ -21,6 +21,20 @@ if (!fs.existsSync(saveDir)) {
 const dbPath = path.join(saveDir, 'risuai.db');
 const db = new Database(dbPath);
 
+// Process-local invalidation token for derived views of optimized plugin
+// values. It is deliberately monotonic rather than transactional: an outer
+// transaction rollback may cause an unnecessary cache miss, but can never
+// leave a stale derived result cached.
+let pluginStorageMutationVersion = 0;
+
+function notePluginStorageMutation(key) {
+    if (isPluginValueKey(key)) pluginStorageMutationVersion += 1;
+}
+
+function getPluginStorageMutationVersion() {
+    return pluginStorageMutationVersion;
+}
+
 // WAL mode: better concurrent read performance, single-writer
 db.pragma('journal_mode = WAL');
 // Start in the power-loss durable mode. server.cjs may apply an explicit
@@ -495,6 +509,7 @@ const runKvSet = db.transaction((key, value) => {
     const quotaPlanned = consumePluginStorageQuotaPlan(key, value.length);
     if (!quotaPlanned) assertPluginWriteWithinLimits(key, value.length, previousSize);
     chunkStore.putValue(key, value);
+    notePluginStorageMutation(key);
     if (!quotaPlanned) updatePluginStorageUsageForWrite(key, value.length, previousSize);
     updatePluginStorageOwnerIndex(key, value);
     stmtRemoveDeletion.run(key);
@@ -512,6 +527,7 @@ const runKvSetFromFile = db.transaction((
     const quotaPlanned = consumePluginStorageQuotaPlan(key, size);
     if (!quotaPlanned) assertPluginWriteWithinLimits(key, size, previousSize);
     chunkStore.putValueFromFile(key, filePath);
+    notePluginStorageMutation(key);
     if (!quotaPlanned) updatePluginStorageUsageForWrite(key, size, previousSize);
     if (key.startsWith(PLUGIN_STORAGE_META_PREFIX)) {
         setPluginStorageOwnerIndex(
@@ -526,6 +542,7 @@ const runKvDel = db.transaction((key) => {
     const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
     const quotaPlanned = consumePluginStorageQuotaPlan(key, 0);
     chunkStore.dropValue(key);
+    notePluginStorageMutation(key);
     if (key.startsWith(PLUGIN_STORAGE_META_PREFIX)) stmtDeletePluginStorageOwner.run(key);
     if (!quotaPlanned && previousSize > 0) {
         stmtSetPluginStorageUsage.run(Math.max(0, getPluginStorageUsage() - previousSize));
@@ -547,6 +564,7 @@ const runKvDelPrefix = db.transaction((prefix, pattern) => {
     stmtManifestPublicationDelPrefix.run(pattern);
     stmtKvDelPrefix.run(pattern);
     stmtDeletePluginStorageOwnerPrefix.run(pattern);
+    if (prefixCanMatchPluginValues) pluginStorageMutationVersion += 1;
     if (removedPluginBytes > 0) {
         stmtSetPluginStorageUsage.run(Math.max(0, getPluginStorageUsage() - removedPluginBytes));
     }
@@ -624,6 +642,7 @@ const runKvCopyValue = db.transaction((srcKey, dstKey) => {
     // Chunked src copies only its manifest (chunks stay shared); raw src copies
     // the value. Used for snapshots — keeps them near-free and byte-identical.
     chunkStore.snapshotValue(srcKey, dstKey);
+    notePluginStorageMutation(dstKey);
     updatePluginStorageUsageForWrite(dstKey, sourceSize, previousSize);
     if (stmtKvUpdatedAt.get(dstKey)) stmtRemoveDeletion.run(dstKey);
 });
@@ -855,6 +874,7 @@ module.exports = {
     isDbBlobChunked,
     snapshotFootprint,
     getPluginStorageUsage,
+    getPluginStorageMutationVersion,
     reconcilePluginStorageUsage,
     withPluginStorageQuotaPlan,
     isLegacyHexMigrationComplete,

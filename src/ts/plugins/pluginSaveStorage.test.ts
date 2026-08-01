@@ -336,6 +336,7 @@ vi.mock("../storage/persistentKv", () => {
             pageSize: options.pageSize,
             pageCount: 1,
             total: 0,
+            totalBytes: 0,
             ownerFacets: [],
             unknownOwnerCount: 0,
             ownerFacetTotal: 0,
@@ -343,6 +344,7 @@ vi.mock("../storage/persistentKv", () => {
             metrics: {
                 manifestParses: 1,
                 valueReads: 0,
+                sizeValueReads: 0,
                 ownerReads: 0,
                 maxRowParses: 0,
             },
@@ -1823,6 +1825,7 @@ describe("plugin save storage transport", () => {
             pageSize: 50,
             pageCount: 200,
             total: 10_000,
+            totalBytes: 123_456,
             ownerFacets: [{ owner: "Owner", count: 10_000 }],
             unknownOwnerCount: 0,
             ownerFacetTotal: 10_000,
@@ -1838,6 +1841,7 @@ describe("plugin save storage transport", () => {
             metrics: {
                 manifestParses: 1,
                 valueReads: 50,
+                sizeValueReads: 10_000,
                 ownerReads: 50,
                 maxRowParses: 1,
             },
@@ -1857,6 +1861,7 @@ describe("plugin save storage transport", () => {
             revision: `sha256:${(37).toString(16).padStart(64, "0")}`,
         });
         expect(result.total).toBe(10_000);
+        expect(result.totalBytes).toBe(123_456);
         expect(readPersistentPluginStorageViewerPage).toHaveBeenCalledOnce();
         expect(readPersistentPluginStorageViewerPage).toHaveBeenCalledWith(
             "viewer-page-generation",
@@ -1927,6 +1932,10 @@ describe("plugin save storage transport", () => {
             page: 1,
             pageCount: 2,
             total: 2,
+            totalBytes: Object.values(database.pluginCustomStorage ?? {}).reduce(
+                (sum, value) => sum + new TextEncoder().encode(JSON.stringify(value)).byteLength,
+                0,
+            ),
             ownerFacets: [
                 { owner: "Owner A", count: 2 },
                 { owner: "Owner B", count: 1 },
@@ -1940,6 +1949,7 @@ describe("plugin save storage transport", () => {
             unknownOwner: true,
         });
         expect(unknown.total).toBe(1);
+        expect(unknown.totalBytes).toBe(owned.totalBytes);
         expect(unknown.entries.map(entry => entry.key)).toEqual(["unknown"]);
 
         const firstCollisionTuple = await getPluginSaveStorageViewerPage({

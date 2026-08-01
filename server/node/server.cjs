@@ -43,7 +43,7 @@ const { kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList,
         kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
         kvGetListEpoch, kvBumpListEpoch,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, createKvSnapshot,
-        withPluginStorageQuotaPlan,
+        getPluginStorageMutationVersion, withPluginStorageQuotaPlan,
         isLegacyHexMigrationComplete, markLegacyHexMigrationComplete,
         publishLegacyHexMigrationMarker,
         db: sqliteDb } = require('./db.cjs');
@@ -10022,6 +10022,17 @@ app.get('/api/storage/capacity', async (req, res, next) => {
  * one generation-bound snapshot. Clients use this instead of issuing two list
  * requests plus a separate manifest read for every batch or enumeration.
  */
+// Quota usage counts physical JSON bytes (including quarantined rows), while
+// the viewer reports UTF-8 bytes of each decoded logical value. Cache that
+// exact aggregate until a low-level plugin-value mutation invalidates it.
+let pluginStorageViewerTotalSizeCache = null;
+
+function pluginStorageViewerValueText(value) {
+    if (typeof value === 'string') return value;
+    if (value === null || value === undefined) return '';
+    return JSON.stringify(value);
+}
+
 app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     const firstHeader = (value) => Array.isArray(value) ? value[0] : value;
@@ -10056,12 +10067,14 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
     }
 
     let snapshot = null;
+    let snapshotMutationVersion = 0;
     let closed = false;
     let completed = false;
     const requestAbort = new AbortController();
     const metrics = {
         manifestParses: 0,
         valueReads: 0,
+        sizeValueReads: 0,
         ownerReads: 0,
         maxRowParses: 0,
     };
@@ -10078,11 +10091,16 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
         // Pin the SQLite view while holding the ordinary import/read queue only
         // long enough to flush and open it. Row streaming happens outside the
         // queue, so a slow or abandoned viewer cannot block PM4 mutations.
-        snapshot = await queueStorageReadAfterImports(async () => {
+        const pinned = await queueStorageReadAfterImports(async () => {
             await flushPendingDb();
             throwIfSignalAborted(requestAbort.signal);
-            return createKvSnapshot();
+            return {
+                snapshot: createKvSnapshot(),
+                mutationVersion: getPluginStorageMutationVersion(),
+            };
         }, requestAbort.signal);
+        snapshot = pinned.snapshot;
+        snapshotMutationVersion = pinned.mutationVersion;
         if (isClosed()) return;
 
         const rawDatabase = snapshot.kvGet('database/database.bin');
@@ -10114,7 +10132,7 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
         const physicalMeta = new Set(snapshot.kvList(PLUGIN_SAVE_META_PREFIX));
         const manifestMeta = new Set(activeManifest.metaKeys);
         const normalizedQuery = keyQuery.toLowerCase();
-        const keyMatchedValues = activeManifest.valueKeys
+        const authoritativeValues = activeManifest.valueKeys
             .filter((storageKey) => physicalValues.has(storageKey))
             .map((storageKey) => ({
                 storageKey,
@@ -10123,7 +10141,8 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
                     storageKey,
                     PLUGIN_SAVE_PREFIX,
                 ),
-            }))
+            }));
+        const keyMatchedValues = authoritativeValues
             .filter(({ key }) => !normalizedQuery || key.toLowerCase().includes(normalizedQuery))
             .sort((left, right) => comparePluginStorageRecordKeys(left.key, right.key));
         const candidateOwnerStorageKeys = keyMatchedValues
@@ -10177,6 +10196,42 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
         res.setHeader('cache-control', 'no-store');
         res.setHeader('x-accel-buffering', 'no');
         res.flushHeaders();
+        let totalBytes;
+        const cachedTotal = pluginStorageViewerTotalSizeCache;
+        if (cachedTotal
+            && cachedTotal.generation === generation
+            && cachedTotal.manifestRevision === manifestState.revision
+            && cachedTotal.mutationVersion === snapshotMutationVersion) {
+            totalBytes = cachedTotal.totalBytes;
+        } else {
+            totalBytes = 0;
+            for (const descriptor of authoritativeValues) {
+                await new Promise((resolve) => setImmediate(resolve));
+                if (isClosed()) return;
+                const valueBytes = snapshot.kvGet(descriptor.storageKey);
+                metrics.sizeValueReads += 1;
+                if (valueBytes === null) {
+                    throw pluginStorageNamespaceConflict(
+                        'A plugin storage viewer size row disappeared from its pinned snapshot',
+                    );
+                }
+                const value = parseOneRow(() => (
+                    validatePluginStorageRow(descriptor.storageKey, valueBytes)
+                ));
+                totalBytes += Buffer.byteLength(pluginStorageViewerValueText(value), 'utf-8');
+                if (!Number.isSafeInteger(totalBytes)) {
+                    throw new RangeError('Plugin storage viewer total size exceeds the safe integer range');
+                }
+            }
+            if (getPluginStorageMutationVersion() === snapshotMutationVersion) {
+                pluginStorageViewerTotalSizeCache = {
+                    generation,
+                    manifestRevision: manifestState.revision,
+                    mutationVersion: snapshotMutationVersion,
+                    totalBytes,
+                };
+            }
+        }
         if (!await writeWithBackpressure(res, `${JSON.stringify({
             event: 'meta',
             version: 1,
@@ -10187,6 +10242,7 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
             pageSize,
             pageCount,
             total,
+            totalBytes,
             ownerFacets,
             unknownOwnerCount,
             ownerFacetTotal: keyMatchedValues.length,
@@ -10227,11 +10283,7 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
             }
             await reportPluginStorageViewerTestProgress(metrics);
             if (isClosed()) return;
-            const text = typeof value === 'string'
-                ? value
-                : value === null || value === undefined
-                    ? ''
-                    : JSON.stringify(value);
+            const text = pluginStorageViewerValueText(value);
             const valueType = value === null
                 ? 'object'
                 : value === undefined || text === ''

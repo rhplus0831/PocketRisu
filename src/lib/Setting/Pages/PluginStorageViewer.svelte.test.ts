@@ -28,6 +28,7 @@ vi.mock('src/lang', () => ({
         pluginStorageLoadError: 'Load error',
         pluginStorageMetaChars: 'Characters',
         pluginStorageMetaSize: 'Size',
+        pluginStorageTotalSize: (size: string) => `Total size: ${size}`,
         pluginStorageMetaType: 'Type',
         pluginStorageNextPage: 'Next',
         pluginStorageOwner: 'Owner',
@@ -118,12 +119,14 @@ function pageResult(key: string, extraEntries: Array<Record<string, unknown>> = 
         pageSize: 50,
         pageCount: 1,
         total: 1 + extraEntries.length,
+        totalBytes: 1536,
         ownerFacets: [{ owner: 'Plugin Owner', count: 1 + extraEntries.length }],
         unknownOwnerCount: 0,
         ownerFacetTotal: 1 + extraEntries.length,
         metrics: {
             manifestParses: 1,
             valueReads: 1,
+            sizeValueReads: 1,
             ownerReads: 0,
             maxRowParses: 1,
         },
@@ -175,6 +178,17 @@ afterEach(() => {
 })
 
 describe('PluginStorageViewer component cancellation', () => {
+    test('shows the whole Save File total with byte-aware formatting', async () => {
+        viewerPage.mockResolvedValue(pageResult('sized'))
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginStorageViewer, { target })
+
+        await waitFor(() => expect(target.textContent).toContain('Total size: 1.5 KB'))
+
+        await unmount(component)
+    })
+
     test('changing the key filter while loading aborts the obsolete fetch and rejects its late commit', async () => {
         const requests: DeferredRequest[] = []
         viewerPage.mockImplementation((options: ViewerOptions) => (

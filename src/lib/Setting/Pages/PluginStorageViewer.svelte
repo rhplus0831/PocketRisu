@@ -77,6 +77,7 @@
     let page = $state(0)
     let pageCount = $state(1)
     let totalCount = $state(0)
+    let saveTotalBytes = $state<number | null>(null)
     let saveOwnerFacets = $state<{ owner: string; count: number }[]>([])
     let saveUnknownOwnerCount = $state(0)
     let loading = $state(false)
@@ -152,7 +153,8 @@
     function formatSize(bytes: number): string {
         if (bytes < 1024) return bytes + ' B'
         if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
-        return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
+        if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
+        return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
     }
 
     // ── backend access ───────────────────────────────────────────────────────
@@ -272,6 +274,7 @@
             page = result.page
             pageCount = result.pageCount
             totalCount = result.total
+            saveTotalBytes = result.totalBytes
             saveOwnerFacets = result.ownerFacets
             saveUnknownOwnerCount = result.unknownOwnerCount
             return
@@ -302,6 +305,7 @@
             if (isCancelledLoad(e, lease)) return
             loadError = e instanceof Error ? e.message : String(e)
             entries = []
+            if (selectedBackend === 'save') saveTotalBytes = null
         } finally {
             if (lease.isCurrent()) loading = false
             lease.finish()
@@ -315,6 +319,7 @@
         page = 0
         pageCount = 1
         totalCount = 0
+        saveTotalBytes = null
         saveOwnerFacets = []
         saveUnknownOwnerCount = 0
         try {
@@ -535,9 +540,14 @@
 
 <!-- Count + bulk delete + refresh -->
 <div class="flex items-center justify-between mb-2">
-    <span class="text-textcolor2 text-xs">
-        <ShBadge variant="secondary">{filtered.length}</ShBadge>
-        {language.pluginStoragePageCount(page + 1, pageCount, totalCount)}
+    <span class="flex flex-wrap items-center gap-x-2 text-textcolor2 text-xs">
+        <span>
+            <ShBadge variant="secondary">{filtered.length}</ShBadge>
+            {language.pluginStoragePageCount(page + 1, pageCount, totalCount)}
+        </span>
+        {#if backend === 'save' && saveTotalBytes !== null}
+            <span class="tabular-nums">{language.pluginStorageTotalSize(formatSize(saveTotalBytes))}</span>
+        {/if}
     </span>
     <div class="flex items-center gap-1">
         <ShButton

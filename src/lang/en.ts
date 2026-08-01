@@ -1933,6 +1933,7 @@ export const languageEnglish = {
     pluginStorageFormatJson: "Format JSON",
     pluginStorageMetaType: "Type",
     pluginStorageMetaSize: "Size",
+    pluginStorageTotalSize: (size: string) => `Total size: ${size}`,
     pluginStorageMetaChars: "Chars",
     pluginStorageOwner: "Origin",
     pluginStorageOwnerUnknown: "Unknown",

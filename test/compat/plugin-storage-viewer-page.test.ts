@@ -175,6 +175,12 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
       pageCount: 200,
       total: 10_000,
     })
+    expect(result.meta.totalBytes).toBe(
+      Array.from({ length: 10_000 }, (_, index) => Buffer.byteLength(JSON.stringify({
+        phase: 'old',
+        index,
+      }))).reduce((sum, size) => sum + size, 0),
+    )
     expect(result.meta.manifestRevision).toMatch(/^sha256:[0-9a-f]{64}$/)
     expect(result.meta.databaseRevision).toMatch(/^[0-9a-f]{32}$/)
     expect(result.meta.ownerFacetTotal).toBe(10_000)
@@ -196,12 +202,15 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
     expect(result.done.metrics).toEqual({
       manifestParses: 1,
       valueReads: 50,
+      sizeValueReads: 10_000,
       ownerReads: 50,
       maxRowParses: 1,
     })
 
     const searched = await readViewer(await viewer(client, '?key=key-0999&pageSize=50'))
     expect(searched.meta.total).toBe(10)
+    expect(searched.meta.totalBytes).toBe(result.meta.totalBytes)
+    expect(searched.done.metrics.sizeValueReads).toBe(0)
     expect(searched.entries.map(entry => entry.key)).toEqual(
       Array.from({ length: 10 }, (_, index) => `key-0999${index}`),
     )
@@ -227,6 +236,51 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
     ])
     expect(result.entries.map(entry => entry.key)).toContain('e\u0301')
     expect(result.entries.map(entry => entry.key)).toContain('\u00e9')
+  })
+
+  test('totalBytes uses logical UTF-8 value sizes, excludes foreign rows, and invalidates after writes', async () => {
+    const keys = ['string', 'null', 'object']
+    let seeded!: ReturnType<typeof seedViewer>
+    const rawValues = [
+      JSON.stringify('한글'),
+      'null',
+      '{  "value" : "é"  }',
+    ]
+    const server = await spawnServer({
+      seedSave: async saveDir => {
+        seeded = seedViewer(saveDir, keys.length, { keys })
+        const db = new Database(path.join(saveDir, 'risuai.db'))
+        const update = db.prepare('UPDATE kv SET value = ? WHERE key = ?')
+        db.transaction(() => {
+          keys.forEach((key, index) => update.run(Buffer.from(rawValues[index]), valueKey(key)))
+        })()
+        db.close()
+      },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+
+    const first = await readViewer(await viewer(client))
+    const expected = rawValues.reduce((sum, raw) => {
+      const value = JSON.parse(raw)
+      const text = typeof value === 'string' ? value : value === null ? '' : JSON.stringify(value)
+      return sum + Buffer.byteLength(text)
+    }, 0)
+    expect(first.meta.totalBytes).toBe(expected)
+    expect(first.entries.reduce((sum, entry) => sum + entry.size, 0)).toBe(expected)
+    expect(first.done.metrics.sizeValueReads).toBe(keys.length)
+
+    const mutation = await mutate(client, [keys[0]], seeded.manifest, 'expanded-phase')
+    expect(mutation.status).toBe(200)
+    const second = await readViewer(await viewer(client))
+    const replacementSize = Buffer.byteLength(JSON.stringify({
+      phase: 'expanded-phase',
+      index: 0,
+    }))
+    expect(second.meta.totalBytes).toBe(
+      expected - Buffer.byteLength('한글') + replacementSize,
+    )
+    expect(second.done.metrics.sizeValueReads).toBe(keys.length)
   })
 
   test('malformed legacy UTF-16 keys remain distinct and readable', async () => {

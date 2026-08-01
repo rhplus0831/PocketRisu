@@ -2108,6 +2108,7 @@ export const languageKorean = {
   pluginStorageFormatJson: "JSON 정렬",
   pluginStorageMetaType: "타입",
   pluginStorageMetaSize: "크기",
+  pluginStorageTotalSize: (size: string) => `전체 크기: ${size}`,
   pluginStorageMetaChars: "문자 수",
   pluginStorageOwner: "출처(추정)",
   pluginStorageOwnerUnknown: "미상",
