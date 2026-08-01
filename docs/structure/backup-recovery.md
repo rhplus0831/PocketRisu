@@ -1,14 +1,15 @@
 # Backup and recovery
 
 > Part of the [PocketRisu structure guide](../../STRUCTURE.md). Audited on
-> 2026-07-27 against `abee0232`. Prefer symbols and route names over line numbers.
+> 2026-08-01 against `818c3bc1`. Prefer symbols and route names over line numbers.
 
 ## Purpose and recovery taxonomy
 
 This document owns the boundaries that create, export, replace, or recover a coherent
 PocketRisu state. It covers archive framing, point-in-time sources, partial export jobs,
 bounded imports, save-folder replacement, automatic snapshots, corrupt-boot recovery,
-cancellation, and commit-outcome handling.
+per-chat pre-image history, cancellation, writer displacement, and commit-outcome
+handling.
 
 These mechanisms are intentionally different:
 
@@ -18,14 +19,19 @@ These mechanisms are intentionally different:
 | Main-target downgrade export | Non-destructive migration archive for the PocketRisu `main` rollback target; folds chats and plugin storage while retaining main-readable assets and inlays |
 | Upstream-target export | Migration archive; folds/filters PocketRisu state and intentionally omits inlays |
 | Server-file backup | Same strict full-state cut, published atomically into the configured backup directory |
-| Partial export job | Selected characters/personas/modules and referenced identity assets; recovery-oriented missing-chat policy |
+| Partial export job | Account-stripped logical database with chats/plugins folded, but only selected identity images; recovery-oriented missing-chat policy |
 | Automatic snapshot | DB recovery point stored under `database/dbbackup-*`; preserves a bare missing-chat stub with warning |
 | Save-folder import | Destructive replacement from a staged directory or ZIP |
-| Per-chat history | Best-effort overwrite pre-images plus required structural-deletion pre-images for one chat row; not part of `.bin` backup archives |
+| Per-chat history | Best-effort overwrite pre-images plus required structural-deletion pre-images for removed chat rows; not part of `.bin` backup archives |
 | Migration safety copy | One-purpose pre-migration material retained for downgrade/emergency recovery |
 
 Do not describe any one of these as “the backup.” Their data coverage, failure policy,
 destination, and restore semantics differ.
+
+There is no restorable settings-only archive surface. **Advanced → Export Settings for
+Bug Report** creates a filtered diagnostic JSON report, not a RisuSave backup, and the
+server export contract has no settings-only scope. A legacy `?mode=settings` query is not
+recognized and follows the ordinary full Node export path.
 
 ## Authoritative stores and archive format
 
@@ -35,20 +41,24 @@ The exported application graph spans:
 - full `chats/*` rows;
 - remembered MCP payload rows under `cache/mcp-tool-calls/` when referenced by exported chats;
 - the selected optimized [plugin storage](plugin-storage.md) generation and manifest;
-- `assets/*`, cold-storage, remote, draft, and metadata namespaces as applicable;
+- `assets/*`, cold-storage, draft, and metadata namespaces as applicable;
+- `remotes/*` source rows referenced by block-format databases, folded into the portable
+  `database.risudat` rather than emitted as independent archive entries;
 - safe ordinary assets under `save/assets/`;
 - inlay payloads and sidecars under `save/inlays/`.
 
 `server/node/backupEntryFormat.cjs` defines entry header framing and bounds.
 `server/node/streamBackupRisuSave.cjs` rewrites seekable RisuSave sources without
-materializing the full database object. `server/node/streamRisuSave.cjs` remains the
-object-based encoder for already-materialized state. `streamJsonToMsgpack.cjs`,
-`jsonValidateWorker.cjs`, `streamRisuLoad.cjs`, and `utils.cjs` own bounded compatibility
-format validation and conversion.
+materializing the full database object. `streamRisuSaveToFile()` in
+`server/node/streamRisuSave.cjs` accepts an already-decoded top-level database but writes
+chat bodies, plugin values, remembered MCP values, and escape envelopes to a private file
+one row/page at a time. `streamJsonToMsgpack.cjs`, `jsonValidateWorker.cjs`,
+`streamRisuLoad.cjs`, and `utils.cjs` own bounded compatibility validation and conversion.
 
 Archive entry names are constrained by the shared plugin/key policy and bodies by the
 framing format. The live stubs-only database is an internal representation; portability
-is assembled at export boundaries by joining the external rows.
+is assembled at export boundaries by joining the external rows. The finished database is
+a disk spool, not one aggregate JavaScript object or response buffer.
 
 ## Full and server-file exports
 
@@ -121,17 +131,27 @@ row-backed `serve` directory remains unsupported.
 
 Partial export is a server job, not a browser-memory serializer:
 
-1. The client creates a job with a client-chosen ID and selected entities.
-2. The server pins one SQLite view and verified copies of selected identity assets.
-3. It joins selected chat rows, folds the exact plugin publication when required, omits
-   account-wide state, and records missing assets rather than inventing bytes.
+1. The client creates a job with a client-chosen ID; there is no per-entity selector in
+   the current protocol.
+2. The server pins one SQLite view and verified copies of the selected identity images.
+3. It removes `account`, joins all referenced chat rows, folds the exact plugin
+   publication, selects referenced drafts and remembered MCP rows, and records missing
+   identity images rather than inventing bytes.
 4. The client polls progress and downloads the private completed archive.
 5. DELETE cancels preparation or releases the finished job. Cancellation tombstones make
    repeated cleanup safe; jobs also expire by TTL.
 
+The ordinary asset subset is limited to `.png` character/group portraits, the user icon,
+persona icons, custom background, folder images, and prompt-preset images referenced by
+the database. Inlays, cold-storage payloads, emotion/additional images, module assets,
+and other ordinary assets are not included. Partial export is therefore a smaller
+recovery/migration artifact, not a strict full backup even though its logical database
+still contains every character and chat.
+
 There is one active partial job per session. A missing referenced chat row is preserved
-as a bare stub with a warning. Sink construction or write failure must cancel both the
-response body and browser sink so the server can release the pin.
+as a bare stub with a warning; a missing selected image is counted and skipped. Sink
+construction or write failure must cancel both the response body and browser sink so the
+server can release the pin.
 
 The current endpoints are the create/status/cancel collection under
 `/api/backup/export/jobs` plus `/:jobId/download`. Calling the old partial scope through
@@ -184,6 +204,15 @@ limit unless the user has explicitly selected large restore.
 Directory and ZIP save-folder imports copy regular, non-symlink files into a stage before
 entering the replacement transaction. They reject missing live databases, duplicate
 entries, excessive entry counts/expanded bytes, unsupported links, and invalid names.
+Replacement clears the old `remotes/` and `coldstorage/` namespaces before publishing the
+imported dataset, so save-folder imports cannot retain orphaned rows from the prior user.
+Archive import accepts both `coldstorage/<uuid>[.json]` and the upstream
+`coldstorage_<uuid>.json` spelling and normalizes them to the runtime key.
+
+Both archive import and save-folder replacement flush pending database work and invoke
+the cooldown-aware `createBackupAndRotate()` before clearing live state. Snapshot failure
+or an active cooldown remains non-fatal, so this pre-replacement recovery point is a
+best-effort safety layer rather than the replacement transaction's commit proof.
 
 Composer-draft archive and save-folder rows remain in private staging until database
 ingestion has assigned missing chat IDs and normalized duplicate character IDs. The
@@ -243,8 +272,9 @@ corrupt database/plugin publication.
 
 Browser bootstrap then:
 
-1. receives raw live bytes from `/api/db/read-raw-for-boot` when the cache path cannot
-   produce a decodable database;
+1. uses the segmented cached database read when it can prove the result, otherwise reads
+   decode-free live bytes from `/api/db/read-raw-for-boot` (also the normal cache-disabled
+   path);
 2. requests metadata-only snapshot candidates;
 3. submits candidates newest-first to the server's atomic restore route;
 4. tries an older candidate only after a definitive not-committed result;
@@ -279,17 +309,69 @@ Client ownership lives in:
 - `src/ts/drive/backuplocal.ts`
 - `src/ts/storage/nodeStorage.ts`
 
+## Per-chat pre-image history
+
+`createChatBackupStore()` in `server/node/chatBackups.cjs` manages a filesystem history
+separate from RisuSave archives and database snapshots. Immediately before
+`POST /api/chat-content/:chaId/:chatIndex` overwrites an existing row, it atomically
+writes the raw prior bytes under `<root>/<chaId>/<chatId>/`. Ordinary captures are
+best-effort and have a 45-second per-chat cooldown. Explicit edit, delete-message, and
+reroll actions attach a sanitized reason for display; small cold-storage placeholder
+rows are skipped.
+
+Removing a chat reference is stricter. `captureChatDeletionPreImages()` forces a fresh
+`delete-chat` pre-image without the cooldown, and failure blocks the database publication
+that would delete the authoritative row. A missing row is the only no-capture success.
+
+Reconciliation runs after a debounce and at startup:
+
+- loose versions are gzip-compressed and every 25 versions are combined into a solid
+  bundle with an atomic metadata sidecar;
+- each chat has an exact 125-version default cap (four bundles plus one active 25-version
+  batch), including trimming entries out of an existing bundle;
+- the whole tree has a 50 MiB default budget, configurable with
+  `config/chat-backup-max-bytes`; `POCKETRISU_CHAT_BACKUP_MAX_BYTES` takes precedence,
+  and the effective value is clamped from 1 MiB through 50 GiB;
+- global eviction compares recovery points across chats by age. A bundle is indivisible
+  and is aged by its newest member; the newest version of each chat is protected, so the
+  tree can remain above budget when only protected versions remain.
+
+The default root is `save/chat-backups`; `POCKETRISU_CHAT_BACKUP_DIR` may relocate it.
+Startup migrates the legacy `<server-backup-root>/chat-backups` tree, deduplicating
+byte-identical files and leaving conflicting legacy files in place. Authenticated
+list/version/body routes live under `/api/chat-backups`. **System → Backups** can browse
+deleted identities and import a selected pre-image as a new chat with a fresh ID; it
+never overwrites the source or current chat.
+
 ## Plugin recovery contract
 
 `Database.pluginStorageGeneration`, `plugin-storage/manifest.json`, and the exact owned
 value/metadata rows form one plugin publication. Export, snapshot, and restore must use
 the matching set, not enumerate the raw prefixes.
 
-`pluginStorageFolded` signals that a snapshot contains a self-contained folded
+`pluginStorageFolded` signals that a database payload contains a self-contained folded
 publication. Exact restore may clear/replace only a proven prior ownership set. Unmarked
 historical snapshots retain external rows because destructive inference could erase the
 only surviving copy. Foreign or quarantined physical rows are not current data and are
 not silently adopted.
+
+Archive and save-folder imports stage an explicit `plugin-storage/manifest.json` with
+`importOpaqueRowFromFile()` exactly as supplied; only the accompanying value and metadata
+entry bodies receive ingress JSON validation. A later ownership selection parses the
+manifest and treats it as authoritative only when `resolveOwnedPluginStorageKeys()` can
+match its generation to the imported database and find every declared row. By contrast,
+folded database ingestion does not trust a transported manifest:
+`preparePluginStorageExternalization()` and the streaming ingestion callbacks encode the
+inline value/metadata set, remove the folded marker and inline maps, and build a new exact
+manifest with `createPluginStorageManifest()`. They retain a non-empty folded source
+generation or allocate one when absent; any separately imported manifest is replaced by
+the manifest constructed from the rows actually published.
+
+Optimized-mode startup uses the ETag-fenced `/api/plugin-storage/reconcile-boot` recovery
+route. For a block-format boot database, the server rederives both the raw-row ETag and
+the canonical decoded-view ETag from the same queued bytes, accepts the one supplied by
+the preceding authoritative read, and keeps that token for later saves. A genuinely
+different live database is a definitive conflict, not a recovery candidate.
 
 See [Plugin storage](plugin-storage.md) for mutation, CAS, generation, and transition
 semantics.
@@ -303,6 +385,14 @@ semantics.
 | Definitely not committed | Remain on current state; retry only when explicitly safe and requested |
 | Commit outcome unknown | Never replay automatically; warn and reload/re-read to reconcile |
 
+Destructive replacements also require the current writer session. A mutation-time 423 or
+a stale foreground check enters `enterWriterTakeoverFlow()` instead of replaying or
+silently reloading: the page is permanently fenced and the user chooses a frozen
+read-only view or an explicit reload that discards the stale in-memory state. Foreground
+checks defer while a chat operation is active and re-check after the asynchronous status
+read. This writer-displacement choice is separate from replacement commit-outcome
+reconciliation.
+
 Backup import streams use a strict NDJSON terminal event. Missing or malformed terminal
 events, truncation, status-zero completion, and transport loss after dispatch become
 `COMMIT_OUTCOME_UNKNOWN`. Save-folder and snapshot replacement use strict NDJSON events,
@@ -310,7 +400,9 @@ one destructive dispatch, and durable status reconciliation before reporting an 
 outcome. Authentication retry is not allowed once doing so could duplicate a committed
 replacement.
 
-## Limits, spools, and operator configuration
+## Spools, limits, and operator configuration
+
+### Private working roots
 
 Important private roots:
 
@@ -319,6 +411,13 @@ Important private roots:
 - `save/.partial-export-spool/`: private full/partial filesystem pins;
 - `save/.plugin-transition-staging/`: durable plugin mode-transition stages;
 - asset/inlay import staging and rollback directories beside their final stores.
+
+`streamBackupRisuSaveToFile()` and `streamRisuSaveToFile()` create database outputs in
+the database spool. Full and partial exports keep verified filesystem pins and completed
+partial archives under the partial-export spool. These roots have separate disk-headroom
+checks because an operator may place them on different volumes.
+
+### Finite restore and retention limits
 
 Important finite limits include:
 
@@ -334,24 +433,49 @@ Important finite limits include:
 | `RISU_RESTORE_MAX_DECODED_BYTES` | 4 GiB |
 | `RISU_RESTORE_DISK_HEADROOM_BYTES` | 256 MiB |
 | `RISU_RESTORE_MAX_LEGACY_BYTES` | 64 MiB |
+| `POCKETRISU_CHAT_BACKUP_MAX_BYTES` | 50 MiB; clamped to 1 MiB–50 GiB |
 
 Ordinary entry-count values are capped at one million. Large-restore ceilings are
 separate recovery controls; disk-backed metadata keeps memory bounded, but raising or
 overriding byte limits still increases disk, CPU, and recovery time.
 
+### Backup roots, updater, Docker, and hub hosting
+
+Server-file archives default to `<app>/backups`. **System → Backups** reads and updates
+`config/server-backup-path` through `/api/backup/server/path`; the server normalizes the
+path, rejects the app root and managed code directories, creates/probes the destination,
+and leaves existing archives at the previous path. Chat history defaults to
+`save/chat-backups` and can instead use `POCKETRISU_CHAT_BACKUP_DIR`; a relative value is
+resolved from the application working directory. Chat-root creation/capture is
+best-effort and has no equivalent path-management route or managed-root validation.
+
+The server records both resolved roots in `save/__backup_path` and
+`save/__chat_backup_path`. `update.sh` uses those dependency-free markers to preserve a
+safe custom top-level directory inside the application tree. A root outside the tree
+needs no updater exception; a marker that points at the app root or a managed code root
+stops the update before replacement.
+
 Docker Compose persists `/app/save` and `/app/backups` in separate explicitly named
 volumes. Default chat history under `/app/save/chat-backups` and default server archives
 under `/app/backups` therefore survive container replacement. Operators who configure a
-different server-backup path must mount that path themselves; changing the application
-setting does not create a Docker persistence boundary.
+different server-backup or chat-history path must mount that path themselves; changing
+application configuration does not create a Docker persistence boundary.
+
+When `POCKETRISU_HUB_HOSTING` is `true` or `1`, file-based server backup save/list,
+restore, download, delete, path, and reminder mutation routes are disabled and the
+Backups screen hides that section. Host disk and estimated archive statistics are also
+redacted. Downloaded full/partial exports, internal snapshots, and per-chat history remain
+available; hub snapshot bytes use the server-pinned `POCKETRISU_HUB_SNAPSHOT_CAP_MB`
+limit while clients may still change the snapshot count.
 
 ## Change map
 
 - Full/server point-in-time export: start at `pinFullBackupState()`,
-  `streamBackupRisuSave.cjs`, filesystem pin/copy helpers, disk reservations, and full
-  export regression suites.
+  `streamBackupRisuSave.cjs`, `streamRisuSaveToFile()`, filesystem pin/copy helpers, disk
+  reservations, and full export regression suites.
 - Partial jobs: update preparation/writer code, the `/api/backup/export/jobs` route
-  family, `NodeStorage.exportBackup()`, and `backuplocal.ts` together.
+  family, `partialBackupAssetKeys()`, `NodeStorage.exportBackup()`, and `backuplocal.ts`
+  together.
 - Archive framing: coordinate `backupEntryFormat.cjs`, shared key policy, import parser,
   and framing/round-trip tests.
 - Ingress and ZIP/save-folder handling: start in `importSpool.cjs`,
@@ -360,10 +484,15 @@ setting does not create a Docker persistence boundary.
   `bootSnapshotRecovery.ts`, `NodeStorage`, and bootstrap ordering.
 - Snapshot retention/chunk cost: update `createBackupAndRotate()`, `db.cjs`,
   `chunkStore.cjs`, snapshot routes, and settings bounds.
+- Chat pre-images: coordinate `chatBackups.cjs`, overwrite/deletion capture sites,
+  `/api/chat-backups`, `ChatBackupList.svelte`, global eviction, and Docker/updater roots.
 - Plugin folding/exact restore: coordinate with [Plugin storage](plugin-storage.md) and
   `snapshotPluginStorage.e2e.test.ts`.
 - Destructive result UX: update `storageError.ts`, `backupReplacementUi.ts`,
-  `snapshotRestoreUi.ts`, route acknowledgement schemas, and UI tests together.
+  `snapshotRestoreUi.ts`, `writerTakeover.ts`, route acknowledgement schemas, and UI
+  tests together.
+- Server-backup deployment: coordinate the path routes and markers in `server.cjs`,
+  `update.sh`, `docker-compose.yml`, hub-hosting guards, and their contract tests.
 
 ## Verification
 
@@ -375,11 +504,19 @@ Representative guarantees live in:
 - `test/compat/full-export-corruption.test.ts`
 - `test/compat/import-ingress-memory.test.ts`
 - `test/compat/export-concurrent-mutation.test.ts`
+- `test/compat/stream-risu-save.test.ts`
+- `test/compat/hub-hosting.test.ts`
+- `test/compat/docker-deployment-contract.test.ts`
+- `test/compat/plugin-storage-boot-reconcile.test.ts`
+- `server/node/chatBackups.test.ts`
+- `server/node/importJournal.test.ts`
+- `server/node/updateScript.test.ts`
 - `server/node/snapshotPluginStorage.e2e.test.ts`
 - `src/ts/storage/nodeStorage.bootRecovery.test.ts`
 - `src/ts/storage/nodeStorageAvailability.test.ts`
 - `src/ts/storage/backupReplacementUi.test.ts`
 - `src/ts/storage/snapshotRestoreUi.test.ts`
+- `src/ts/storage/writerTakeover.test.ts`
 - `src/ts/drive/backuplocal.test.ts`
 
 Run client, server, and compat suites because no single command aggregates them.

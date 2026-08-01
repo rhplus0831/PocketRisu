@@ -1,11 +1,19 @@
 # Media and translation
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-27 against `abee0232`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-01 against `818c3bc1`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
-This subsystem handles language translation, speech synthesis, image generation, notification audio, and chat-embedded media. Translation supports remote services, an auxiliary LLM, and browser-local Bergamot models; TTS supports browser speech plus several hosted/self-hosted providers and plugin hooks. Inlays give images, audio, video, and model signatures stable IDs outside chat records. On Node, safe-named ordinary assets and current inlay payloads live as files; historical hash-shaped mismatches have explicit filesystem identity markers, unsafe asset names and ownership metadata remain in SQLite, and inlay display metadata is mirrored in filesystem sidecars.
+This subsystem handles language translation, speech synthesis, image generation,
+notification/embedded audio, and chat-embedded media. Translation supports remote
+services, an auxiliary LLM, and browser-local Bergamot models; TTS supports browser
+speech plus several hosted/self-hosted providers and plugin hooks. Inlays give images,
+audio, video, and model signatures stable IDs outside chat records. On Node, safe-named
+ordinary assets and current inlay payloads live as files; historical hash-shaped
+mismatches have explicit filesystem identity markers, unsafe asset names and ownership
+metadata remain in SQLite, and inlay display metadata is published in filesystem
+sidecars.
 
 ## 2. Key files
 
@@ -19,9 +27,12 @@ This subsystem handles language translation, speech synthesis, image generation,
   - `translateMain(...)` dispatches to LLM, DeepL, DeepLX, Bergamot, experimental Google HTML scraping, or Google Translate GTX (`src/ts/translator/translator.ts:137`).
   - `translateVox()` is the English-to-Japanese compatibility path used by VOICEVOX (`src/ts/translator/translator.ts:259`).
   - `isExpTranslator()` classifies LLM, DeepL, and DeepLX as translation modes that should not initiate uncached translation during active generation (`src/ts/translator/translator.ts:268`).
-  - `translateHTML(...)` translates rendered chat output while preserving HTML structure and applying `edittrans` scripts (`src/ts/translator/translator.ts:273`).
-  - `translateLLM(...)` builds the auxiliary-model request, masks `<risu-style>` blocks, restores them, and populates the cache (`src/ts/translator/translator.ts:520`).
-  - Cache administration is exported through `clearLLMCache`, `getLLMCache`, `searchLLMCache`, `setLLMCache`, `exportLLMCacheAsJSON`, and `importLLMCacheFromJSON` (`src/ts/translator/translator.ts:600`, `src/ts/translator/translator.ts:605`, `src/ts/translator/translator.ts:609`, `src/ts/translator/translator.ts:631`, `src/ts/translator/translator.ts:636`, `src/ts/translator/translator.ts:651`).
+  - `translateHTML(...)` translates rendered chat output while preserving HTML structure and applying preset, module, then character `edittrans` scripts.
+  - `translateLLM(...)` builds the auxiliary-model request, masks `<risu-style>` blocks,
+    restores them on a successful response, and reads/writes both cache tiers under the
+    unchanged input text.
+  - Cache administration is exported through `clearLLMCache`, `getLLMCache`, `searchLLMCache`, `setLLMCache`, `exportLLMCacheAsJSON`, and `importLLMCacheFromJSON`.
+  - DeepL, DeepLX, and experimental Google requests made through `globalFetch` are categorized as `translate` in request logs; auxiliary LLM requests use the same source label through `requestChatData()`.
 
 - `src/ts/translator/bergamotTranslator.ts` — browser-local Firefox/Bergamot translation.
 
@@ -42,15 +53,16 @@ This subsystem handles language translation, speech synthesis, image generation,
 
 - `src/ts/translator/presets.test.ts` — covers legacy-state migration, selected-preset synchronization, encrypted `.risutl` round trips, and invalid file rejection (`src/ts/translator/presets.test.ts:28`, `src/ts/translator/presets.test.ts:98`).
 
-### TTS and notification audio
+### TTS and notification/embedded audio
 
 - `src/ts/process/tts.ts` — TTS preprocessing, provider requests, audio decoding, and playback.
 
   - `sayTTS(character, text)` is the synthesis entry point (`src/ts/process/tts.ts:80`).
   - Provider modes are `webspeech`, `elevenlab`, `VOICEVOX`, `openai`, `novelai`, `huggingface`, `vits`, `gptsovits`, and `fishspeech` (`src/ts/process/tts.ts:113`).
   - `playAudio(...)` runs postprocessors and plays decoded bytes through `AudioContext` (`src/ts/process/tts.ts:68`).
-  - `stopTTS()` stops the last `AudioBufferSourceNode` and cancels browser speech synthesis (`src/ts/process/tts.ts:429`).
-  - Voice discovery helpers are `getWebSpeechTTSVoices`, `getElevenTTSVoices`, `getVOICEVOXVoices`, and `getNovelAIVoices` (`src/ts/process/tts.ts:439`, `src/ts/process/tts.ts:445`, `src/ts/process/tts.ts:459`, `src/ts/process/tts.ts:473`).
+  - `stopTTS()` stops the last `AudioBufferSourceNode` and cancels browser speech synthesis (`src/ts/process/tts.ts:439`).
+  - Voice discovery helpers are `getWebSpeechTTSVoices`, `getElevenTTSVoices`,
+    `getVOICEVOXVoices`, and `getNovelAIVoices`.
   - `FixNAITTS()` supplies missing NovelAI TTS defaults on legacy characters (`src/ts/process/tts.ts:490`).
 
 - `src/ts/process/ttsHooks.ts` — global pre/post synthesis plugin-hook registries.
@@ -59,7 +71,8 @@ This subsystem handles language translation, speech synthesis, image generation,
   - Registration and unregistration APIs begin at `src/ts/process/ttsHooks.ts:32`.
   - `getTTSPreprocessors()` and `getTTSPostprocessors()` return defensive array copies (`src/ts/process/ttsHooks.ts:50`, `src/ts/process/ttsHooks.ts:57`).
   - `runHookPipeline(...)` chains field replacements, stops on `skip`, and isolates thrown or timed-out hooks (`src/ts/process/ttsHooks.ts:61`).
-  - `src/ts/process/ttsHooks.test.ts` and covers chaining, skipping, errors, timeouts, undefined fields, and synchronous hooks (`src/ts/process/ttsHooks.test.ts:16`).
+  - `src/ts/process/ttsHooks.test.ts` covers chaining, skipping, errors, timeouts,
+    undefined fields, and synchronous hooks.
 
 - `src/ts/notificationSound.ts` — message/translation completion sounds and picker previews.
 
@@ -67,6 +80,23 @@ This subsystem handles language translation, speech synthesis, image generation,
   - `resolveSoundUrl()` resolves either a bundled ID or an uploaded `assets/...` path (`src/ts/notificationSound.ts:49`).
   - `playNotificationSound()` is fire-and-forget and suppresses autoplay/missing-file failures (`src/ts/notificationSound.ts:66`).
   - `playSoundPreview()` maintains a single preview channel (`src/ts/notificationSound.ts:80`).
+
+- `src/lib/Setting/Pages/NotificationSoundSettings.svelte` and
+  `src/lib/Setting/Pages/Sound/` — notification sound controls and picker.
+
+  - Message completion and uncached LLM-translation completion have independent enable,
+    sound, and volume fields.
+  - `SoundPickerModal` offers bundled IDs and `.mp3`, `.wav`, `.ogg`, or `.m4a`
+    uploads. Uploads use `saveAsset()` and append `customSounds` metadata; removing a
+    picker row removes only that metadata and leaves ordinary asset GC to reclaim bytes.
+
+- `src/ts/parser/parser.svelte.ts` and `src/ts/observer.svelte.ts` — ordinary character
+  asset audio/BGM rendering.
+
+  - `assetRegex` includes `audio` and `bgm`; audio emits an autoplaying, looping control,
+    while BGM emits a hidden `risu-ctrl="bgm___auto___..."` marker.
+  - The DOM observer owns one global BGM `Audio` element at default volume 0.5, ignores
+    later BGM markers while it exists, and clears it only after `ended`.
 
 ### Media utilities
 
@@ -108,11 +138,15 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
   - `writeInlayImage()` resizes images to at most 1,048,576 pixels and stores PNG or WebP according to `inlayImageLossless` (`src/ts/process/files/inlays.ts:438`).
   - `saveInlayedSignature()` stores structured model signature data under the same ID system (`src/ts/process/files/inlays.ts:479`).
   - `getInlayAsset()` returns a base64 data URI; `getInlayAssetBlob()` returns a Blob (`src/ts/process/files/inlays.ts:490`, `src/ts/process/files/inlays.ts:507`).
-  - `setInlayAsset()` writes payload, explorer info, and ownership/time metadata sequentially (`src/ts/process/files/inlays.ts:600`).
-  - `removeInlayAsset()` and `removeInlayAssets()` use one guarded server mutation that preserves IDs referenced by stored or loaded-unsaved chats (`src/ts/process/files/inlays.ts:619`).
+  - `setInlayAsset()` writes payload, explorer info, and ownership/time metadata in that
+    order. These are three logical writes, not one client transaction.
+  - `removeInlayAsset()` delegates to `removeInlayAssets()`. Bulk deletion deduplicates
+    IDs and submits at most `INLAY_DELETE_BATCH_SIZE` (1,000) per guarded server
+    mutation, refreshing the loaded/unsaved-chat keep-set for every batch.
   - `scanInlayReferences()` scans authoritative server chat rows and merges token references from loaded chats so placeholders and unsaved edits are both covered (`src/ts/process/files/inlays.ts:716`).
   - `supportsInlayImage()` checks the current model’s `hasImageInput` flag (`src/ts/process/files/inlays.ts:697`).
-  - `src/ts/process/files/tests/inlays.test.ts` and exercises storage round trips, explorer metadata, uploads, resizing, and deletion (`src/ts/process/files/tests/inlays.test.ts:141`, `src/ts/process/files/tests/inlays.test.ts:407`, `src/ts/process/files/tests/inlays.test.ts:497`).
+  - `src/ts/process/files/tests/inlays.test.ts` exercises storage round trips, explorer
+    metadata, uploads, resizing, and deletion.
 
 - `src/ts/process/files/inlayMeta.ts` — creation/update metadata stored under `inlay_meta/<id>`.
 
@@ -131,8 +165,13 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 - `src/ts/process/stableDiff.ts` — provider-specific image-generation requests.
 
   - `stableDiff()` first asks the auxiliary model to turn chat context into an image prompt, then calls `generateAIImage()` (`src/ts/process/stableDiff.ts:11`).
-  - `generateAIImage()` supports Stable Diffusion WebUI, NovelAI, DALL-E 3, Stability AI, ComfyUI, fal, Google Imagen, OpenAI-compatible APIs, and WaveSpeed (`src/ts/process/stableDiff.ts:63`).
+  - `generateAIImage()` supports Stable Diffusion WebUI, NovelAI, DALL-E 3, Stability AI,
+    ComfyUI, fal, Google Imagen, OpenAI-compatible APIs, and WaveSpeed.
   - In inlay mode, provider branches generally return a data URI or remote image URL; normal view-screen mode generally updates `CharEmotion` (`src/ts/process/stableDiff.ts:92`, `src/ts/process/stableDiff.ts:358`, `src/ts/process/stableDiff.ts:567`).
+  - ComfyUI polling distinguishes execution errors/interruption from a successful history
+    item with no `SaveImage` output. Major provider submission requests made through
+    `globalFetch` use request-log category/source `image`; Comfy history/view polling is
+    intentionally native fetch traffic.
 
 - `src/ts/3d/threeload.ts` — explicitly marked legacy/not currently used and only re-exports dynamically imported Three.js/MMD classes (`src/ts/3d/threeload.ts:1`, `src/ts/3d/threeload.ts:4`).
 
@@ -146,21 +185,31 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 
 - `src/ts/storage/nodeStorage.ts` — authenticated client for server storage.
 
-  - `setItem`, `getItem`, `keys`, and `removeItem` use `/api/write`, `/api/read`, `/api/list`, and `/api/remove` (`src/ts/storage/nodeStorage.ts:298`, `:348`, `:470`, `:518`).
-  - `getItems()` and `setItems()` use the bulk asset endpoints (`src/ts/storage/nodeStorage.ts:626`, `:659`).
-  - `/api/session` establishes the cookie required for direct `<img>`, `<audio>`, and `<video>` URLs (`src/ts/storage/nodeStorage.ts:185`).
+  - `setItem`, `getItem`, `keys`, and `removeItem` use `/api/write`, `/api/read`,
+    `/api/list`, and `/api/remove`; `getItems()` and `setItems()` use the bulk asset
+    endpoints.
+  - `NodeStorage.initSession()` establishes the cookie required for direct `<img>`,
+    `<audio>`, and `<video>` URLs.
 
 - `server/node/server.cjs` — relevant storage code is distributed through the server.
 
-  - Current inlays are stored under `save/inlays` (`server/node/server.cjs:1024`).
-  - Safe ID/extension validation and filesystem path construction start at `server/node/server.cjs:1111`.
-  - Raw inlay read/write and sidecar helpers are at `server/node/server.cjs:1182`, `:1242`, and `:1281`.
-  - `/api/session` issues the direct-asset cookie (`server/node/server.cjs:3666`).
-  - `/api/asset/:hexKey` serves assets and inlays with MIME, ETag, and immutable caching (`server/node/server.cjs:3747`).
-  - `/api/inlays/references` scans authoritative chat rows; `/api/inlays/delete-unreferenced` revalidates under the storage queue before deleting. The compatibility `/api/remove` path applies the same reference guard to inlays (`server/node/server.cjs:7922`).
-  - `/api/read`, `/api/remove`, `/api/list`, and `/api/write` special-case inlay payloads and sidecars (`server/node/server.cjs:7680`, `:7963`, `:8051`, `:10620`).
-  - `/api/assets/bulk-read` and `/api/assets/bulk-write` support batched metadata/KV access (`server/node/server.cjs:4573`, `:4645`).
-  - `/api/inlays/compress` recompresses eligible filesystem images to WebP and streams progress as SSE (`server/node/server.cjs:6777`).
+  - Current inlays are stored under `save/inlays`; safe ID/extension validation and path
+    construction are centralized in `isSafeInlayId()`, `normalizeInlayExt()`, and the
+    `getInlay*Path()` helpers.
+  - `writeInlayFile()` durably stages both payload and sidecar, publishes payload first,
+    then commits an extension-changing replacement by renaming the sidecar. It removes
+    the old extension only after that commit and cleans temporary files on failure.
+  - `reconcileInterruptedInlayPublications()` removes abandoned publication temporaries
+    during the filesystem migration/bootstrap path.
+  - `/api/session` issues the direct-asset cookie; `/api/asset/:hexKey` serves assets and
+    inlays with MIME, ETag, and one-year immutable caching.
+  - `/api/inlays/references` scans authoritative chat rows;
+    `/api/inlays/delete-unreferenced` requires the active writer, accepts no more than
+    `MAX_INLAY_DELETE_BATCH`, and revalidates within the storage queue. The compatibility
+    `/api/remove` path applies the same reference guard to inlays.
+  - `/api/read`, `/api/remove`, `/api/list`, and `/api/write` special-case physical inlay
+    payloads and sidecars. `/api/assets/bulk-read` and `/api/assets/bulk-write` support
+    batched metadata/KV access; `/api/inlays/compress` streams WebP recompression progress.
 
 - `server/node/db.cjs` — SQLite KV implementation.
 
@@ -189,26 +238,61 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
    - lets Bergamot handle HTML directly when `htmlTranslation` is enabled (`src/ts/translator/translator.ts:313`);
    - otherwise walks DOM text nodes, skips `script`, `style`, and `translate="no"`, and limits concurrent work (`src/ts/translator/translator.ts:381`, `src/ts/translator/translator.ts:432`);
    - batches DeepLX text with `■` separators at about 5,000 characters, falling back to per-chunk translation if separators are not preserved (`src/ts/translator/translator.ts:337`);
-   - applies module and character `edittrans` regex scripts after translation (`src/ts/translator/translator.ts:667`).
+   - applies preset, module, then character `edittrans` regex scripts after translation
+     (`applyEdittransRegex()`).
 
-4. LLM translation builds a ChatML prompt from the selected preset, replaces `{{slot}}`, `{{slot::from}}`, `{{slot::content}}`, and `{{slot::tnote}}`, then calls `requestChatData(..., "translate")` without streaming (`src/ts/translator/translator.ts:555`, `src/ts/translator/translator.ts:575`).
+4. LLM translation builds a ChatML prompt from the selected preset, replaces `{{slot}}`,
+   `{{slot::from}}`, `{{slot::content}}`, and `{{slot::tnote}}`, then calls
+   `requestChatData(..., "translate")` without streaming.
 5. The LLM cache has two tiers:
 
    - an in-memory `Map<string,string>` (`src/ts/translator/translator.ts:28`);
    - persistent `cache/llm-translate/<hash>.json` entries containing the original key and value (`src/ts/translator/translator.ts:31`).
 
 6. Persistent cache operations use `forageStorage`, which is backed by `NodeStorage` in PocketRisu and therefore by server storage (`src/ts/storage/persistentKv.ts:41-68`, `src/ts/storage/autoStorage.ts:27`).
-7. `regenerate=true` bypasses reads but writes the new result back to both tiers (`src/ts/translator/translator.ts:520`, `src/ts/translator/translator.ts:594`).
-8. A translation-complete notification is played only when an LLM request was actually made rather than served from cache (`src/ts/translator/translator.ts:305`).
+7. The original, unmasked input is captured as `cacheKey` before `<risu-style>` content
+   becomes request placeholders. Reads and both writes therefore use the exact same key;
+   restored style contents appear only in the cached result.
+8. `regenerate=true` bypasses reads but writes the new result back to both tiers.
+9. A translation-complete notification is played only when an LLM request was actually
+   made rather than served from cache.
 
 ### TTS flow
 
-1. Speech is initiated manually by a message’s TTS button (`src/lib/ChatScreens/Chat.svelte:738`), automatically after generated output when `ttsAutoSpeech` is enabled (`src/ts/process/index.svelte.ts:1520`, `src/ts/process/index.svelte.ts:1582`), or through the `/speak` command (`src/ts/process/command.ts:93`).
+1. Speech is initiated manually by a message’s TTS button, automatically after generated
+   output when `ttsAutoSpeech` is enabled, or through the `/speak` command.
 2. `sayTTS()` resolves the current character if necessary, removes asterisks, optionally retains only quoted text, and runs preprocessor hooks (`src/ts/process/tts.ts:80`, `src/ts/process/tts.ts:91`, `src/ts/process/tts.ts:94`, `src/ts/process/tts.ts:104`).
 3. Provider-specific code synthesizes speech. VOICEVOX translates to Japanese first; Hugging Face can translate to the model language first (`src/ts/process/tts.ts:151`, `src/ts/process/tts.ts:250`).
 4. Byte-producing providers normally pass through `runPostprocessorPipeline()`, which clones the current audio buffer for each hook, supports replacement audio/MIME, and stops on `skip` (`src/ts/process/tts.ts:31`).
 5. The final bytes are decoded into an `AudioBuffer` and played. Web Speech and VITS use their own playback paths and therefore do not pass binary audio through postprocessors.
-6. Plugin API v3 registers hooks and automatically unregisters them when the plugin unloads (`src/ts/plugins/apiV3/v3.svelte.ts:822`).
+6. GPT-SoVITS with non-default volume still runs byte postprocessors first, then applies
+   its `GainNode`; the ordinary-volume path delegates directly to `playAudio()`.
+7. Plugin API v3's `addTTSPreprocessor()` and `addTTSPostprocessor()` register lifecycle
+   cleanup that unregisters their hooks when the plugin unloads.
+
+OpenAI, NovelAI, GPT-SoVITS, and Fish Speech calls made with `globalFetch` are tagged
+`tts` for request logs. ElevenLabs, VOICEVOX, Hugging Face, and the VITS bridge retain
+their direct/provider-specific request paths, so the category does not cover every TTS
+network call.
+
+### Notification and ordinary asset audio
+
+1. `NotificationSoundSettings` binds message and translation completion to separate
+   database fields. Bundled IDs resolve directly; custom `assets/...` values resolve
+   through `getFileSrc()`.
+2. `sendChatMain()` plays the message completion sound after the send concludes on this
+   client—success, failure, or abort—when enabled. Each completion creates its own
+   `Audio`, so separate notifications can overlap; picker previews use one replaceable
+   channel.
+3. `translateHTML()` plays the translation completion sound only on the uncached LLM
+   branch. Bergamot, DOM-chunk translation, and cache hits do not emit it.
+4. Ordinary `{{audio::...}}` assets render as autoplaying/looping controls.
+   `{{bgm::...}}` renders a hidden marker consumed by the global DOM observer. Because
+   BGM state is global and cleared only by `ended`, removing the originating markup does
+   not stop it and a looping track blocks later BGM markers.
+5. `App.svelte` implements `keepSessionAlive === "sound"` by starting a nearly silent,
+   looping bundled audio file on the first root click. It has no in-app stop path;
+   `"pip"` remains an empty branch even though it is present in the stored type.
 
 ### Inlay asset lifecycle
 
@@ -220,50 +304,89 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
    - multimodal provider responses and signatures (`src/ts/process/request/google.ts:760`).
 
 2. New assets normally receive UUIDs. Images are canvas-normalized; audio/video retain Blob bytes and their recognized extension (`src/ts/process/files/inlays.ts:423`, `src/ts/process/files/inlays.ts:430`, `src/ts/process/files/inlays.ts:465`).
-3. `setInlayAsset()` writes:
+3. `setInlayAsset()` performs three ordered logical writes:
 
    - serialized payload under `inlay/<id>`;
    - display/type data under `inlay_info/<id>`;
    - timestamps and optional character/chat ownership under `inlay_meta/<id>`.
 
-4. On `/api/write`, the Node server decodes an `inlay/<id>` data URI and writes `save/inlays/<id>.<ext>` plus `<id>.meta.json`; `inlay_meta` remains a SQLite KV record (`server/node/server.cjs:4244-4267`).
-5. Chats store only tokens. Composer attachments become `{{inlayed::<id>}}` before the user message is appended (`src/lib/ChatScreens/DefaultChatScreen.svelte:349`). Generated inline images normally use `{{inlay::<id>}}` (`src/ts/process/inlayScreen.ts:29`).
-6. When preparing model input, user-message inlays become multimodal parts if supported. Images fall back to image captioning for non-vision models. At most one audio/video item is added, and only while the multimodal list is still empty; assistant-side handling retains only `inlayeddata` tokens as model input (`src/ts/process/index.svelte.ts:819`, `src/ts/process/index.svelte.ts:841`).
-7. Rendering calls `parseInlayAssets()`, producing placeholders when type/URL data is not already cached. `ChatBody` invokes `resolveInlayPlaceholders()` after the Svelte HTML block is mounted (`src/lib/ChatScreens/ChatBody.svelte:244`, `src/lib/ChatScreens/ChatBody.svelte:252`).
-8. Near-viewport placeholders are resolved in batches of 20, classified from `inlay_info` unless image-priority mode is enabled, and replaced with `<img>`, `<video>`, or `<audio>` pointing to `/api/asset/<hex("inlay/<id>")>` (`src/ts/parser/parser.svelte.ts:739`, `src/ts/parser/parser.svelte.ts:746`, `src/ts/parser/parser.svelte.ts:768`).
-9. The server authenticates direct tags through the `risu-session` cookie and streams the raw file with its detected MIME type (`server/node/server.cjs:1647`, `:3747`).
+4. On `/api/write`, the Node server decodes the serialized `inlay/<id>` payload. Its
+   physical publication stages and fsyncs `save/inlays/<id>.<ext>` plus
+   `<id>.meta.json`, renames the payload, then renames the sidecar. For an extension
+   change the sidecar rename is the reader-visible commit point; the previous payload is
+   removed only afterward. A pre-commit failure rolls back a newly published
+   different-extension payload and leaves the old sidecar-selected source readable.
+5. The physical sidecar contains extension, name, type, and dimensions. Logical
+   `inlay_info/<id>` reads/writes map to it with a legacy KV fallback. The separate
+   `inlay_meta/<id>` SQLite KV row contains timestamps and optional character/chat
+   ownership and is not part of physical payload publication.
+6. Chats store only tokens. Composer attachments become `{{inlayed::<id>}}` before the
+   user message is appended. Generated inline images normally use `{{inlay::<id>}}`.
+7. When preparing model input, user-message inlays become multimodal parts if supported.
+   Images fall back to captioning for non-vision models. At most one audio/video item is
+   added, and only while the multimodal list is still empty; assistant-side handling
+   retains only `inlayeddata` tokens as model input.
+8. Rendering calls `parseInlayAssets()`, producing placeholders when type/URL data is not
+   cached. `ChatBody` invokes `resolveInlayPlaceholders()` after its HTML block mounts.
+9. Near-viewport placeholders are resolved in batches of 20, classified from
+   `inlay_info` unless image-priority mode is enabled, and replaced with direct media tags
+   pointing to `/api/asset/<hex("inlay/<id>")>`. The server authenticates these through
+   the `risu-session` cookie and streams the raw payload with detected MIME type.
+10. `removeInlayAssets()` deduplicates requests and loops over 1,000-ID batches. Before
+    every batch it refreshes loaded/unsaved chat references; the active-writer server
+    mutation rescans all authoritative chat rows, deletes only unreferenced payload,
+    sidecar, legacy thumbnail/info, and ownership records, and reports removed/referenced
+    IDs. Results accumulate across successful batches and the explorer cache is invalidated
+    in `finally`; a later-batch failure does not undo earlier committed batches.
 
 ### Image generation and view screens
 
-1. Non-inlay `imggen` view mode gathers the most recent user/character exchange and calls `stableDiff()` after response processing (`src/ts/process/index.svelte.ts:1883`).
+1. Non-inlay `imggen` view mode gathers the most recent user/character exchange and calls
+   `stableDiff()` after response processing.
 2. `stableDiff()` uses the character’s `newGenData.instructions` to ask the auxiliary model for a provider-ready prompt (`src/ts/process/stableDiff.ts:20`).
 3. `generateAIImage()` dispatches using database provider configuration. Normal mode generally writes the image into `CharEmotion`; inlay mode returns image data to its caller for durable inlay storage.
 4. Inlay view mode instead expects the model to emit `<ImgGen="...">`, directly applies `newGenData.prompt`/`negative`, displays `[Generating...]`, and asynchronously replaces it with a stored inlay token (`src/ts/process/inlayScreen.ts:12`).
+5. ComfyUI history entries can represent failed workflows. `generateAIImage()` surfaces
+   `execution_error`/`execution_interrupted`, and separately rejects successful histories
+   with no `SaveImage` output instead of dereferencing a missing image.
 
 ## 4. Entry points & dependencies
 
 ### Calls into this subsystem
 
-- Chat rendering and translation controls: `src/lib/ChatScreens/ChatBody.svelte:61` and `src/lib/ChatScreens/Chat.svelte:758`.
-- Composer input translation: `src/lib/ChatScreens/DefaultChatScreen.svelte:685`.
-- Suggested reply translation: `src/lib/ChatScreens/Suggestion.svelte:100`.
-- Character-field translation during character operations: `src/ts/characters.ts:187`.
-- Translation cache editing from a message: `src/lib/ChatScreens/Chat.svelte:150`.
-- Plugin cache lookups: `src/ts/plugins/apiV3/v3.svelte.ts:1350`.
-- Automatic TTS and inlay command processing: `src/ts/process/index.svelte.ts:1512`, `src/ts/process/index.svelte.ts:1520`.
+- Chat rendering and translation controls: `ChatBody.markParsing()` and the translation
+  action in `src/lib/ChatScreens/Chat.svelte`.
+- Composer input translation: `updateInputTransateMessage()` in
+  `src/lib/ChatScreens/DefaultChatScreen.svelte`.
+- Suggested reply translation: `src/lib/ChatScreens/Suggestion.svelte`.
+- Optional chat HTML-export translation: `exportChat()` in `src/ts/characters.ts`.
+- Translation cache editing from a message: the translation editor in
+  `src/lib/ChatScreens/Chat.svelte`.
+- Plugin cache lookups: `getLLMCache()`/`searchLLMCache()` calls in
+  `src/ts/plugins/apiV3/v3.svelte.ts`.
+- Automatic TTS and inlay command processing: the response-finalization branches in
+  `src/ts/process/index.svelte.ts`.
 - File upload: `src/ts/process/files/multisend.ts:194`.
-- Script and trigger image generation: `src/ts/process/scriptings.ts:363`, `src/ts/process/triggers.ts:1514`.
+- Script and trigger image generation: `generateAIImage()` calls in
+  `src/ts/process/scriptings.ts` and `src/ts/process/triggers.ts`.
 - Inlay gallery/explorer: `src/lib/Setting/Pages/InlayImageGallery.svelte:17`.
-- Character TTS/view-screen configuration: `src/lib/SideBars/CharConfig.svelte:391`, `src/lib/SideBars/CharConfig.svelte:700`.
+- Notification sound configuration: `NotificationSoundSettings.svelte`, `SoundSetting`,
+  and `SoundPickerModal`.
+- Ordinary audio/BGM tokens: `parseAdditionalAssets()` and the global DOM observer in
+  `src/ts/observer.svelte.ts`.
+- Character TTS/view-screen configuration: the view-screen and TTS branches in
+  `src/lib/SideBars/CharConfig.svelte`.
 
 ### Calls out from this subsystem
 
-- Translation and prompt generation use `requestChatData()` from the request subsystem (`src/ts/translator/translator.ts:575`, `src/ts/process/stableDiff.ts:34`).
+- Translation and prompt generation use `requestChatData()` from the request subsystem;
+  direct translation, image, and some TTS calls opt into its request-log categories
+  through `globalFetch` metadata.
 - Remote services use `globalFetch`, native `fetch`, or `fetchNative`.
 - Bergamot depends on `@browsermt/bergamot-translator`, IndexedDB, Mozilla model registries, and `fflate`.
 - TTS depends on Web Speech, Web Audio, provider APIs, `runVITS`, uploaded GPT-SoVITS reference assets, and optional translation.
 - Inlays depend on database/model metadata, `NodeStorage`, browser Blob/canvas APIs, and the parser/model-request pipelines.
-- Server image compression and thumbnails depend on `wasm-vips` (`server/node/server.cjs:25`, `:3734`, `:6777`).
+- Server image compression and thumbnails depend on `wasm-vips`.
 - Uploaded notification sounds use the ordinary `assets/<hash>.<ext>` path created by `saveAsset()` (`src/ts/globalApi.svelte.ts:203`).
 - Ordinary assets are garbage-collected by the Node server, not the browser. The collector scans the live database and active optimized plugin rows, marks an unreferenced candidate durably, and deletes it only on a later sweep after the configured grace interval.
 - The Hono alternative does not implement these storage routes; it currently only exposes a CSRF-protected hello route (`server/hono/src/app/index.ts:4`, `server/hono/src/app/index.ts:8`).
@@ -272,6 +395,9 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 
 - `runTranslator` does not use conventional source/target parameter semantics. It computes request languages as `from = reverse ? from : target` and `to = reverse ? target : from` (`src/ts/translator/translator.ts:73`). Audit existing callers before changing this legacy convention.
 - The simple translation cache and LLM cache are keyed by text, not by provider, source language, target language, preset, translator note, or character. Changing any of those can reuse stale translations until cache clear or regeneration.
+- LLM lookup and publication must retain the raw input as one immutable cache key.
+  `<risu-style>` masking mutates only the request text; keying a write by that temporary
+  form creates permanent misses and unreachable persistent entries.
 - `translateHTML()` deliberately avoids starting uncached LLM/DeepL/DeepLX work while a chat request is active (`src/ts/translator/translator.ts:293`).
 - LLM cache writes are fire-and-forget in normal translation (`src/ts/translator/translator.ts:595`); memory is updated before persistent storage finishes.
 - `runTranslator()` protects separate lines beginning with `{{img`, `{{raw`, `{{video`, or `{{audio`, but not the subsystem’s `{{inlay...}}` tokens (`src/ts/translator/translator.ts:87`). Translation-order changes can therefore affect inlay compatibility.
@@ -285,24 +411,47 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 - Web Speech and VITS bypass byte postprocessing. Any feature requiring universal audio-byte manipulation must account for those paths.
 - `stopTTS()` tracks only the most recently assigned buffer source, although it cancels all browser speech synthesis.
 - OpenAI TTS supports configurable response format in the request but currently labels playback as `audio/mpeg` (`src/ts/process/tts.ts:188`, `src/ts/process/tts.ts:210`).
+- Notification preview playback is single-channel, but completion playback is not.
+  `playNotificationSound()` intentionally creates independent `Audio` instances.
+- The translation completion sound is specifically an uncached LLM signal, not a general
+  “translation finished” hook. Message completion likewise follows local send conclusion,
+  not only a successful model result.
+- Ordinary BGM playback has no DOM-removal teardown and does not catch `play()` rejection.
+  A looping BGM never reaches `ended`, so it retains the global channel indefinitely.
 - Inlay tokens are a RisuAI compatibility contract:
 
   - `{{inlay::<id>}}` is an inline/generated reference.
   - `{{inlayed::<id>}}` is an attached reference and gets a `.risu-inlay-image` wrapper.
   - `{{inlayeddata::<id>}}` carries assistant-side multimodal/signature data.
 
-- Chat messages store IDs, never embedded bytes. Gallery deletion therefore revalidates against authoritative chat rows under the storage queue and preserves references from loaded, unsaved chats as an additional keep-set.
+- Chat messages store IDs, never embedded bytes. Every gallery deletion batch therefore
+  revalidates authoritative chat rows under the storage queue and preserves references
+  from loaded, unsaved chats as an additional keep-set.
+- Bulk inlay deletion is chunked, not globally atomic. Successful earlier batches remain
+  deleted if a later request fails; callers receive only a result after all batches finish.
 - `scanInlayReferences()` is server-aware and fail-closed in both gallery surfaces: no assets are classified as message-orphans until the authoritative scan succeeds.
 - Signature inlays are not rendered as visible media. They preserve provider/model metadata so a later request can replay the signature alongside the corresponding assistant content.
 - Image inlays are always re-encoded. Lossless mode stores PNG; default mode stores WebP quality 0.85. Original filenames/extensions are informational and do not dictate the encoded image format.
 - `postChatFile()` accepts `mpeg` and `avi`, while `postInlayAsset()` recognizes video only as `webm`, `mp4`, or `mkv` (`src/ts/process/files/multisend.ts:284`, `src/ts/process/files/inlays.ts:72`). Those accepted picker formats can consequently be discarded.
 - Upload extension matching is lowercase and case-sensitive; callers should normalize extensions before expanding format support.
 - `compressImage()` can route GIF through canvas recompression, which collapses animated input to a rasterized frame.
-- Current inlay payloads are filesystem files, despite the client-facing `NodeStorage` KV abstraction. Explorer info is mirrored in sidecars; ownership/time metadata remains in SQLite.
+- Current inlay payloads are filesystem files despite the client-facing `NodeStorage` KV
+  abstraction. Explorer info maps to sidecars; ownership/time metadata remains in SQLite.
+- Atomic-publication guarantees apply only to the server's physical payload/sidecar
+  protocol. The subsequent client writes to `inlay_info/<id>` and
+  `inlay_meta/<id>` are separate; a successful payload response does not make all three
+  logical writes transactional.
+- For extension-changing replacement, the sidecar is the commit pointer. Do not delete
+  the old payload before its rename, and keep startup cleanup for abandoned
+  `.inlay-publish-*` files. Same-extension payload replacement relies on atomic rename.
 - Safe-named `assets/*` values are filesystem-backed. Historical `assets/<content-hash>.<ext>` mismatches are tracked by private legacy-identity markers, while unsafe names retain the SQLite fallback, so code must use the storage helpers instead of assuming one physical backend for every asset key.
-- The server still reads and migrates legacy SQLite `inlay/<id>` JSON records (`server/node/server.cjs:1352-1433`). Preserve this fallback when changing storage format.
-- Direct asset URLs use one-year `immutable` caching (`server/node/server.cjs:3755-3762`). Reusing and overwriting an explicit inlay ID can leave a browser with a stale cached URL; new content normally needs a new ID.
-- Inlay IDs are validated against separators and traversal components before filesystem access (`server/node/server.cjs:1111-1139`).
+- The server still reads and migrates legacy SQLite `inlay/<id>` JSON records in
+  `migrateInlaysToFilesystem()`. Preserve this fallback when changing storage format.
+- Direct asset URLs use one-year `immutable` caching. Reusing and overwriting an explicit
+  inlay ID can leave a browser with a stale cached URL; new content normally needs a new
+  ID.
+- `isSafeInlayId()` rejects separators, NULs, and traversal components before filesystem
+  access.
 - `/api/asset/:hexKey` requires the session cookie, not the normal `risu-auth` request header. Initialization of `/api/session` is part of asset rendering, not merely login housekeeping.
 - `src/ts/3d/threeload.ts` is legacy and has no current consumers. Do not treat it as the live 3D rendering entry point.
 - Most image providers follow the inlay-vs-`CharEmotion` return contract, but branches are not perfectly uniform; verify a provider branch before relying on its return value.
@@ -310,30 +459,50 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 ## 6. Navigation hints
 
 - To add or change a translation provider, start at `translateMain()` (`src/ts/translator/translator.ts:137`) and expose its settings in `src/ts/setting/languageSettingsData.svelte.ts:116`.
-- To change input-language direction or debounce behavior, inspect `src/lib/ChatScreens/DefaultChatScreen.svelte:685`.
-- To change when messages auto-translate, inspect `src/lib/ChatScreens/ChatBody.svelte:61`.
-- To change Markdown-before/after-translation behavior, inspect `src/lib/ChatScreens/ChatBody.svelte:111` and `translateHTML()` (`src/ts/translator/translator.ts:273`).
-- To alter the LLM translation prompt/request, inspect `src/ts/translator/translator.ts:520` and `src/ts/translator/presets.ts:25`.
-- To change cache keying or persistence, inspect `src/ts/translator/translator.ts:28` and `src/ts/storage/persistentKv.ts:41-77`.
+- To change input-language direction or debounce behavior, inspect
+  `updateInputTransateMessage()` in `DefaultChatScreen.svelte`.
+- To change when messages auto-translate or Markdown-before/after-translation behavior,
+  inspect `ChatBody.markParsing()` and `translateHTML()`.
+- To alter the LLM translation prompt/request, inspect `translateLLM()` and
+  `defaultTranslatorPrompt` in `src/ts/translator/presets.ts`.
+- To change cache keying or persistence, inspect `translateLLM()`, the
+  `getPersistentLLMCache()`/`setPersistentLLMCache()` helpers, and
+  `src/ts/storage/persistentKv.ts`.
 - To change translator preset migration or file format, inspect `src/ts/translator/presets.ts:104` and `src/ts/translator/presets.ts:171`.
 - To add a TTS provider, add a mode under `src/ts/process/tts.ts:113` and its character settings under `src/lib/SideBars/CharConfig.svelte:700`.
 - To change TTS text normalization, inspect `src/ts/process/tts.ts:91`.
 - To change plugin hook semantics, inspect `src/ts/process/ttsHooks.ts:61` and the audio-specific pipeline at `src/ts/process/tts.ts:31`.
-- To change automatic TTS timing, inspect `src/ts/process/index.svelte.ts:1520` and `src/ts/process/index.svelte.ts:1582`.
-- To add an inlay-supported file extension, update the arrays at `src/ts/process/files/inlays.ts:64` and the picker at `src/ts/process/files/multisend.ts:198`.
+- To change automatic TTS timing, inspect the `ttsAutoSpeech` branches in
+  `src/ts/process/index.svelte.ts`.
+- To add an inlay-supported file extension, update `inlayImageExts`, `inlayAudioExts`,
+  and `inlayVideoExts` together with the upload picker in `multisend.ts`.
 - To change inlay image size/quality, inspect `writeInlayImage()` (`src/ts/process/files/inlays.ts:438`).
-- To change inlay storage records or metadata, inspect `setInlayAsset()` (`src/ts/process/files/inlays.ts:600`) and `buildInlayMeta()` (`src/ts/process/files/inlayMeta.ts:106`).
-- To change token syntax, update the shared regex at `src/ts/util/inlayTokens.ts:3` and audit parser/model-request regexes at `src/ts/parser/parser.svelte.ts:693` and `src/ts/process/index.svelte.ts:821`.
-- To change lazy media rendering, inspect `src/ts/parser/parser.svelte.ts:692` and `src/ts/parser/parser.svelte.ts:735`.
-- To change how uploaded inlays become chat references, inspect `src/lib/ChatScreens/DefaultChatScreen.svelte:349`.
-- To change which inlays are sent to models, inspect `src/ts/process/index.svelte.ts:819`.
-- To change server-side inlay layout, inspect `server/node/server.cjs:1111`, `:1182`, `:1281`, and the `/api/write` branch at `:4244`.
-- To change direct asset authentication or caching, inspect `server/node/server.cjs:1647`, `:3666`, and `:3747`.
-- To change bulk gallery metadata loading, inspect `src/ts/process/files/inlays.ts:572` and `server/node/server.cjs:4573`.
-- To change server-side batch inlay compression, inspect `server/node/server.cjs:6777`.
+- To change inlay logical records or ownership metadata, inspect `setInlayAsset()` and
+  `buildInlayMeta()`.
+- To change token syntax, update the shared regex in `src/ts/util/inlayTokens.ts` and audit
+  the parser and model-input token regexes in `parser.svelte.ts` and
+  `process/index.svelte.ts`.
+- To change lazy media rendering, inspect `parseInlayAssets()` and
+  `resolveInlayPlaceholders()`.
+- To change how uploads become chat references, inspect `postChatFile()` and the
+  `{{inlayed::...}}` append in `DefaultChatScreen.svelte`; model-input conversion lives
+  in the inlay-token branch of `src/ts/process/index.svelte.ts`.
+- To change physical inlay publication, inspect `writeInlayFile()`,
+  `writeInlaySidecar()`, `reconcileInterruptedInlayPublications()`, and the `inlay/`
+  branch of `/api/write` together.
+- To change deletion chunking or reference safety, inspect `INLAY_DELETE_BATCH_SIZE`,
+  `removeInlayAssets()`, `MAX_INLAY_DELETE_BATCH`, and
+  `/api/inlays/delete-unreferenced`.
+- To change direct asset authentication or caching, inspect `/api/session`,
+  `/api/asset/:hexKey`, and `NodeStorage.initSession()`.
+- To change bulk gallery metadata loading, inspect `listInlayExplorerItems()` and the
+  server bulk-asset endpoints.
+- To change server-side batch inlay compression, inspect `/api/inlays/compress`.
 - To add or alter an image-generation provider, inspect `generateAIImage()` (`src/ts/process/stableDiff.ts:63`).
 - To change model-emitted `<ImgGen>` behavior, inspect `src/ts/process/inlayScreen.ts:5` and `src/ts/process/inlayScreen.ts:15`.
-- To change completion sounds or add bundled presets, inspect `src/ts/notificationSound.ts:27` and `src/ts/notificationSound.ts:49`.
+- To change completion sounds or bundled presets, inspect `notificationSound.ts` and the
+  `NotificationSoundSettings.svelte`/`Sound/` components; ordinary BGM semantics live in
+  `parseAdditionalAssets()` and `src/ts/observer.svelte.ts`.
 
 ## 7. Related structure docs
 

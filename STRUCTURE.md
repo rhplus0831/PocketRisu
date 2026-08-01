@@ -2,7 +2,7 @@
 
 Navigation map for developers and AI agents. Start here, choose the owning subsystem,
 then use the change maps and symbol names in `docs/structure/`. Ownership and runtime
-behavior were audited on 2026-07-27 against `abee0232`. File paths and symbols are the
+behavior were audited on 2026-08-01 against `818c3bc1`. File paths and symbols are the
 durable references; line-number hints in the detail docs are approximate and should be
 confirmed with `rg`.
 
@@ -39,18 +39,18 @@ accepted, and PocketRisu-only state may have no upstream runtime meaning.
 ## Run and verify
 
 Use pnpm 10.34.1 and Node 22.12 or newer; Node 24 is recommended and used by current
-Docker/release builds. The five test commands below are separate suites—there is no
-aggregate `test:all` command.
+Docker/release builds. There is no aggregate `test:all` command. `pnpm test` runs the
+client suite followed by the server suite; `test:server` reruns only the latter.
 
 | Command | Purpose |
 |---|---|
 | `pnpm dev` | Frontend-only Vite server on `0.0.0.0:5174` with a strict port; no `/api` proxy |
 | `pnpm build` | Production build with sourcemaps to `dist/` |
-| `pnpm preview` | Preview the built frontend; still no backend API |
-| `pnpm runserver` | Start Express from the repository root; serves `dist/` on `$HOST:$PORT` (default port 6001) |
+| `pnpm preview` | Preview `dist/` on `localhost:4173` by default; still no backend API |
+| `pnpm runserver` | Start Express from the repository root; serves `dist/` on `$PORT` (default 6001), binding `$HOST` when set and otherwise all interfaces |
 | `pnpm check` | Svelte and TypeScript diagnostics |
 | `pnpm check:help` | Validate localized help-key coverage |
-| `pnpm test` | Browser/client unit tests under `src/` in happy-dom |
+| `pnpm test` | Browser/client unit tests under `src/` in happy-dom, followed by the server unit suite |
 | `pnpm test:server` | Node server unit tests with real `better-sqlite3` |
 | `pnpm test:compat` | Real-server storage/interchange integration tests: imports, exports, atomicity, caches, plugin storage |
 | `pnpm test:performance` | Isolated performance suite, run with resource cache disabled and enabled |
@@ -66,13 +66,13 @@ tests PocketRisu persistence and interchange behavior, not execution inside upst
 Browser client (src/)                         Node server (server/node/)
 ┌───────────────────────────────┐   HTTP/WS   ┌──────────────────────────────────┐
 │ index.html → src/main.ts      │ ─────────── │ server.cjs (Express)             │
-│ → App.svelte + loadData()     │  /api/*     │ ├ SQLite KV + protected chunks  │
-│ stores/runes select screens   │  /proxy2    │ ├ chats/* + pluginsave/* rows   │
-│                               │  WS jobs    │ ├ assets/inlays/history files   │
-│ DBState.db holds placeholders │             │ └ pins/spools/backups/recovery  │
-│ NodeStorage-backed, KV-shaped │             │                                  │
-│ server storage API            │             │ logs.cjs → save/logs.db         │
-│ optional verified IDB cache   │             │                                  │
+│ → App.svelte + loadData()     │  /api/*     │ ├ SQLite KV + protected chunks   │
+│ stores/runes select screens   │  /proxy2    │ ├ chats/* + pluginsave/* rows    │
+│                               │  WS jobs    │ ├ assets/inlays/history files    │
+│ DBState.db holds placeholders │             │ └ pins/spools/backups/recovery   │
+│ NodeStorage-backed, KV-shaped │             │ model-jobs.db + request journals │
+│ server storage API            │             │ request-logs.db                  │
+│ optional verified IDB cache   │             │ logs.cjs → save/logs.db          │
 └───────────────────────────────┘             └──────────────────────────────────┘
 ```
 
@@ -81,9 +81,13 @@ Browser client (src/)                         Node server (server/node/)
   replaces every chat with a wire `_stub` and saves authoritative chat rows first.
 - The opt-in IndexedDB resource cache stores verified, hash-addressed bytes plus
   resource manifests. It is disposable; the Node server remains authoritative.
-- Model traffic goes directly from the browser when allowed or through `/proxy2`.
-  Classic OpenAI-style local streaming can use restricted WebSocket proxy jobs with
-  `/proxy2` fallback. ModelPreset and non-streaming local requests use `/proxy2`.
+- Default non-preview, tool-free `ModelPreset` requests use reconnectable
+  `/api/model-jobs` for streaming and JSON responses, with the proxy-aware `/proxy2`
+  path as a job-creation fallback. Previews, tool loops, or disabled server-side jobs
+  use the normal direct/`/proxy2` transport.
+- Classic model traffic goes directly from the browser when allowed or through
+  `/proxy2`. Local OpenAI-style streaming can use restricted WebSocket proxy jobs with
+  `/proxy2` fallback; non-streaming local requests use `/proxy2`.
 - `server/hono/` remains a non-functional scaffold. The production server treats
   `process.cwd()` as the application root and does not load `.env` itself.
 - Remote non-localhost use requires a secure browser context by default. Use HTTPS;
@@ -112,13 +116,14 @@ Browser client (src/)                         Node server (server/node/)
 
 ### Send a message
 
-`DefaultChatScreen.sendMain()` handles commands and input transforms, then
-`sendChatMain()` owns the UI generation lock and delegates to `sendChat()` in
-`src/ts/process/index.svelte.ts`. The process layer assembles prompt buckets, lore,
-memory, attachments, and token budgets; `requestChatData()` applies request hooks,
-classic-versus-ModelPreset dispatch, retries, and provider/tool loops. Cumulative
-response snapshots return through output transforms and triggers before the save loop
-persists the mutation. See [chat pipeline](docs/structure/chat-pipeline.md),
+`DefaultChatScreen.sendMain()` owns the global UI gate, commands, attachments, and input
+transforms. `sendChatMain()` owns the target chat's generation guard and delegates to
+`sendChat()` in `src/ts/process/index.svelte.ts`. The process layer assembles prompt
+buckets, lore, memory, attachments, and token budgets. `requestChatData()` applies
+request hooks, classic-versus-ModelPreset dispatch, retries, and provider/tool loops.
+Responses surface as cumulative snapshots; output transforms run on a mode-dependent
+cadence, output triggers run after completion, and the save loop then persists the
+mutation. See [chat pipeline](docs/structure/chat-pipeline.md),
 [model providers](docs/structure/model-providers.md), and
 [scripting and extensions](docs/structure/scripting-extensions.md).
 
@@ -157,12 +162,13 @@ not-committed, or unknown outcomes. See
 |---|---|
 | `chaId` | Durable character ID and first component of a chat-row key |
 | `Chat.id` | Durable conversation ID used by chat rows, drafts, history, and caches |
-| `Message.chatId` / request `arg.chatId` | Generation ID used by status/logging flows |
+| `Message.chatId` | Persisted message identity; generated replies usually start with the generation UUID, but continuations can preserve it while `generationInfo.generationId` changes |
+| Request `arg.chatId` | Historical name for a main request's generation ID, used by status and request-log correlation |
 | Numeric script/parser `chatID` | Message-array index, not a durable conversation ID |
-| `ModelPreset` | Installed model configuration with a frozen profile snapshot and per-chat binding |
+| `ModelPreset` | Installed model configuration with a frozen profile snapshot, selected through per-chat bindings or optional global per-module overrides |
 | Prompt preset / `botPreset` | RisuAI-format prompt template selected through `botPresetsId` |
 | Ordinary asset | `assets/*`; safe names are normally files under `save/assets/` |
-| Inlay | `inlay/*` payload/sidecar plus `inlay_meta/*` ownership metadata |
+| Inlay | Payload under `save/inlays/` with a physical `<id>.meta.json` display/file sidecar; logical `inlay_meta/<id>` KV separately tracks timestamps and character/chat ownership |
 
 ## Cross-cutting contracts
 
@@ -179,7 +185,8 @@ not-committed, or unknown outcomes. See
   Provider and adapter parsers may handle deltas internally but must accumulate at that
   boundary. Output hooks therefore need to be repeat-safe.
 - `requestImmediateSave()` returns an outcome. Code that requires durability must confirm
-  `committed` or use the committed-save helper; merely awaiting the call is insufficient.
+  `outcome.status === 'committed'` or use the committed-save helper; merely awaiting the
+  call is insufficient.
 
 ### Client/server storage protocols
 
@@ -190,8 +197,11 @@ not-committed, or unknown outcomes. See
 - Browser caches are non-authoritative. Cache hits, segmented DB assembly, and list deltas
   must fall back to a full authoritative read on malformed, missing, stale, or
   unverifiable state.
-- The latest `/api/session` caller owns mutation rights. A displaced writer receives 423
-  and must reload or enter the frozen read-only recovery UI; stale dirty state must not be
+- `/api/session` registration records a boot but does not steal mutation rights. The
+  active writer remains authoritative; another session can take over only when it is
+  fresh relative to the last accepted write and makes a gesture-backed write. Fresh
+  passive compatibility writes do not move the lock; stale sessions receive 423 and
+  must reload or enter the frozen read-only recovery UI. Stale dirty state must not be
   replayed over the new writer.
 - Runtime KV/chat-row/asset/inlay mutations that can overlap a destructive import must use
   the storage queue. The held import transaction and startup recovery are deliberate,

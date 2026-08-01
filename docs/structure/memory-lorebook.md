@@ -1,7 +1,7 @@
 # Memory and lorebook
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-07-27 against `abee0232`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-01 against `818c3bc1`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -59,6 +59,8 @@ The memory-lorebook subsystem builds context that is not simply the recent chat 
   - `summarize()` formats summary input, calls the configured auxiliary API model or a local WebLLM model, removes thought blocks, and rejects empty output (`src/ts/process/memory/hypav3.ts:1684`).
   - `getCurrentHypaV3Preset()` and `createHypaV3Preset()` select and normalize preset settings (`src/ts/process/memory/hypav3.ts:1791`, `src/ts/process/memory/hypav3.ts:1802`).
 
+- `src/lib/Others/HypaV3Modal.svelte` — Inspect, search, categorize, mark, edit, and manually re-summarize persisted summaries. Search is limited to summaries visible under the active important/category filters and is invalidated when those filters change, so navigation never targets an unmounted result (`src/lib/Others/HypaV3Modal.svelte:101`, `src/lib/Others/HypaV3Modal.svelte:177`).
+
 - `src/ts/process/embedding/addinfo.ts` — Retrieval-augments a character description from `character.additionalText`.
   - `additionalInformations(char, chats)` splits additional text into blank-line-separated passages, embeds them, queries with the first four stored chat messages, and returns the top three passages (`src/ts/process/embedding/addinfo.ts:5`).
   - This directory contains no other embedding backend; actual backend selection lives under `process/memory/` and `process/transformers.ts`.
@@ -71,14 +73,14 @@ The memory-lorebook subsystem builds context that is not simply the recent chat 
   - `readModule()` decodes legacy RPack metadata and assets, retries failed asset saves, and assigns a new module UUID (`src/ts/process/modules.ts:125`).
   - `importModule()` accepts CHARX, `.risum`, native module JSON, native lorebooks, external lorebooks, and regex packs (`src/ts/process/modules.ts:256`).
   - `getModules()` resolves the active module set from global, chat, character, persona, and integration references (`src/ts/process/modules.ts:404`).
-  - `getModuleLorebooks()`, `getModuleAssets()`, `getModuleTriggers()`, `getModuleRegexScripts()`, `getModuleToggles()`, and `getModuleMcps()` flatten active module fields for consumers (`src/ts/process/modules.ts:436`, `src/ts/process/modules.ts:450`, `src/ts/process/modules.ts:465`, `src/ts/process/modules.ts:482`, `src/ts/process/modules.ts:496`, `src/ts/process/modules.ts:510`).
+  - `getModuleLorebooks()`, `getModuleAssets()`, `getModuleTriggers()`, `getModuleRegexScripts()`, `getModuleToggles()`, and `getModuleMcps()` flatten active module fields for consumers (`src/ts/process/modules.ts:436`, `src/ts/process/modules.ts:450`, `src/ts/process/modules.ts:465`, `src/ts/process/modules.ts:486`, `src/ts/process/modules.ts:500`, `src/ts/process/modules.ts:514`). `getModuleTriggers()` copies each trigger and annotates it with the containing module's `lowLevelAccess` and `moduleId`; it does not mutate the stored module.
   - `applyModule()` permanently copies a selected module’s lorebooks, regexes, and triggers into the current character (`src/ts/process/modules.ts:516`).
   - `moduleUpdate()` updates module-driven icon/background state and requests a GUI reload when active IDs change; `refreshModules()` invalidates the resolver cache (`src/ts/process/modules.ts:554`, `src/ts/process/modules.ts:587`).
 
 ### Important integration and storage files
 
-- `src/ts/process/index.svelte.ts` — Main prompt pipeline; calls additional-text retrieval, lorebook matching, and Hypa V3 (`src/ts/process/index.svelte.ts:401`, `src/ts/process/index.svelte.ts:422`, `src/ts/process/index.svelte.ts:953`).
-- `src/ts/storage/database.svelte.ts` — Defines `loreBook`, `character.globalLore`, `Chat.localLore`, module references, memory settings, and `Chat.hypaV3Data` (`src/ts/storage/database.svelte.ts:1513`, `src/ts/storage/database.svelte.ts:1549`, `src/ts/storage/database.svelte.ts:2034`).
+- `src/ts/process/index.svelte.ts` — Main prompt pipeline; calls additional-text retrieval, lorebook matching, and Hypa V3 (`src/ts/process/index.svelte.ts:458`, `src/ts/process/index.svelte.ts:480`, `src/ts/process/index.svelte.ts:1040`).
+- `src/ts/storage/database.svelte.ts` — Defines `loreBook`, `character.globalLore`, `Chat.localLore`, module references, memory settings, and `Chat.hypaV3Data` (`src/ts/storage/database.svelte.ts:1626`, `src/ts/storage/database.svelte.ts:1649`, `src/ts/storage/database.svelte.ts:2147`).
 - `src/ts/process/transformers.ts` — Runs browser-local embedding models with mean pooling and normalization (`src/ts/process/transformers.ts:61`).
 - `src/ts/storage/persistentKv.ts` — Stores hashed vector-cache JSON through `forageStorage`; reads/writes begin at `src/ts/storage/persistentKv.ts:41` and `:55`, and hashed-key construction is at `:75`.
 
@@ -86,7 +88,7 @@ The memory-lorebook subsystem builds context that is not simply the recent chat 
 
 ### Main prompt flow
 
-1. Prompt construction first creates normal system material and the character description. `additionalInformations()` may append embedding-selected passages from `character.additionalText` to that description (`src/ts/process/index.svelte.ts:398`).
+1. Prompt construction first creates normal system material and the character description. `additionalInformations()` may append embedding-selected passages from `character.additionalText` to that description (`src/ts/process/index.svelte.ts:458`).
 
 2. `loadLoreBookV3Prompt()` reads the selected character and current chat, then clones and concatenates:
    - `character.globalLore`,
@@ -95,7 +97,7 @@ The memory-lorebook subsystem builds context that is not simply the recent chat 
 
    This combined ordering is explicit at `src/ts/process/lorebook.svelte.ts:74`.
 
-3. Lore matching returns active entries with a resolved role, position, depth, ordering, token count, source label, and optional injection operation (`src/ts/process/lorebook.svelte.ts:231`).
+3. Lore matching returns active entries with a resolved role, position, depth, ordering, token count, source label, and optional injection operation (`src/ts/process/lorebook.svelte.ts:232`). Token admission counts the side-effect-free CBS-evaluated content rather than raw `{{...}}` source (`src/ts/process/lorebook.svelte.ts:565`).
 
 4. The prompt builder distributes those entries:
    - no position: `unformated.lorebook` (`src/ts/process/index.svelte.ts:453`);
@@ -105,9 +107,9 @@ The memory-lorebook subsystem builds context that is not simply the recent chat 
    - `pt_*`: substituted through nested `{{position::<name>}}` placeholders (`src/ts/process/index.svelte.ts:424`);
    - non-lore injections: applied to matching prompt-template locations by `positionParser()` (`src/ts/process/index.svelte.ts:520`, `src/ts/process/index.svelte.ts:543`).
 
-5. After chat messages and depth lore have been tokenized, Hypa V3 runs if the chat-level override or character default `supaMemory` is true and the global `db.hypaV3` flag is enabled (`src/ts/process/index.svelte.ts:953`).
+5. After chat messages and depth lore have been tokenized, Hypa V3 runs if the chat-level override or character default `supaMemory` is true and the global `db.hypaV3` flag is enabled (`src/ts/process/index.svelte.ts:1035`).
 
-6. Hypa V3 returns a shortened chat array and serialized state. The caller writes the state back to the current chat’s `hypaV3Data`, including partial state returned with recoverable errors (`src/ts/process/index.svelte.ts:958`).
+6. Hypa V3 returns a shortened chat array and serialized state. The caller writes the state back to the current chat’s `hypaV3Data`, including partial state returned with recoverable errors (`src/ts/process/index.svelte.ts:1040`).
 
 7. A generated memory message has `memo: "supaMemory"`. Without a prompt template it remains among chats and is wrapped in `<Previous Conversation>`; with a template memory card it is extracted into the template’s memory slot (`src/ts/process/index.svelte.ts:1006`, `src/ts/process/index.svelte.ts:1270`).
 
@@ -229,6 +231,10 @@ The two implementations differ in execution details:
 
 - Experimental `hypaMemoryV3MainExp()` collects all required batches first, summarizes them through a configurable `TaskRateLimiter`, and uses `HypaProcessorV2` for batched, metadata-aware similarity retrieval (`src/ts/process/memory/hypav3.ts:382`, `src/ts/process/memory/hypav3.ts:630`).
 
+### Hypa V3 inspection and repair
+
+The modal edits the selected chat's serialized `hypaV3Data` directly. Manual single or bulk re-summarization calls exported `summarize(..., true)`, which selects `reSummarizationPrompt`; automatic compression continues to use the ordinary summarization prompt. Search operates only over currently rendered summaries, resets when important/category filters change, and guards missing textarea/memo refs before scrolling. Summary edits remain chat-owned state and persist through the normal chat-row save path.
+
 ### Embedding backend flow
 
 - Local models call `runEmbedding()`, which loads a Transformers feature-extraction pipeline, mean-pools, and normalizes vectors. `GPU` model IDs select WebGPU; others use WASM (`src/ts/process/memory/hypamemory.ts:115`, `src/ts/process/transformers.ts:61`).
@@ -239,7 +245,9 @@ The two implementations differ in execution details:
 
 - `voyageContext3` and `voyageContext4` use grouped contextual document embeddings and separate query embeddings (`src/ts/process/memory/hypamemory.ts:104`, `src/ts/process/memory/contextualEmbedding.ts:51`).
 
-- Vector cache entries live both in the module-level `hypaVectorCache` map and `forageStorage` under hashed `cache/hypa-vector/` keys. In PocketRisu, `forageStorage` resolves through `NodeStorage`, so this persistent tier is server-backed rather than browser-only (`src/ts/process/memory/hypamemory.ts:39`, `src/ts/storage/autoStorage.ts:27`). Hypa V3 summary text itself is persisted per chat in `Chat.hypaV3Data` (`src/ts/storage/database.svelte.ts:2053`).
+- Remote custom, OpenAI, and Voyage embedding calls go through `globalFetch()` with request-log category `embedding` and source `memory`; local Transformers embeddings do not create remote request-log entries.
+
+- Vector cache entries live both in the module-level `hypaVectorCache` map and `forageStorage` under hashed `cache/hypa-vector/` keys. In PocketRisu, `forageStorage` resolves through `NodeStorage`, so this persistent tier is server-backed rather than browser-only (`src/ts/process/memory/hypamemory.ts:40`, `src/ts/storage/autoStorage.ts:26`). Hypa V3 summary text itself is persisted per chat in `Chat.hypaV3Data` (`src/ts/storage/database.svelte.ts:2167`).
 
 ### Module scoping and content projection
 
@@ -269,9 +277,9 @@ Each projection is consumed independently:
 ### Incoming calls
 
 - Main prompt construction calls:
-  - `additionalInformations()` at `src/ts/process/index.svelte.ts:401`;
-  - `loadLoreBookV3Prompt()` at `src/ts/process/index.svelte.ts:422`;
-  - `hypaMemoryV3()` at `src/ts/process/index.svelte.ts:958`.
+  - `additionalInformations()` at `src/ts/process/index.svelte.ts:458`;
+  - `loadLoreBookV3Prompt()` at `src/ts/process/index.svelte.ts:480`;
+  - `hypaMemoryV3()` at `src/ts/process/index.svelte.ts:1040`.
 
 - Low-level scripting can request the fully matched lorebook list through `loadLoreBooksMain` (`src/ts/process/scriptings.ts:789`).
 
@@ -279,7 +287,7 @@ Each projection is consumed independently:
 
 - Developer tooling calls `loadLoreBookV3Prompt()` to inspect current activation (`src/lib/SideBars/DevTool.svelte:272`).
 
-- The Hypa V3 modal calls exported `summarize(..., true)` for manual re-summarization (`src/lib/Others/HypaV3Modal.svelte:243`).
+- The Hypa V3 modal calls exported `summarize(..., true)` for manual re-summarization and confines search navigation to summaries visible under its active filters (`src/lib/Others/HypaV3Modal.svelte:243`).
 
 - Module getters are called by prompt parsing, regex processing, triggers, scripts, UI asset rendering, prompt toggles, and MCP initialization.
 
@@ -305,7 +313,7 @@ Each projection is consumed independently:
   - browser Transformers for local models;
   - `globalFetch` for OpenAI-compatible and Voyage APIs;
   - database credentials/settings;
-  - browser-backed `forageStorage`.
+  - `forageStorage`, which is backed by `NodeStorage` in PocketRisu's self-hosted runtime.
 
 - Modules depend on:
   - character-card conversion for modern export/import;
@@ -344,7 +352,7 @@ Each projection is consumed independently:
 
 - The `keepActivateAfterMatch` and `dontActivateAfterMatch` booleans are declared outside the per-entry loop and are not reset for each lore item (`src/ts/process/lorebook.svelte.ts:251`). Once set during a scan, subsequent activated entries may also write internal persistence variables.
 
-- Lore token budgeting tokenizes decorator-stripped content before CBS parsing. Later name/variable/position expansion and lore injection can therefore make the actual prompt larger than the budget; the source explicitly accepts incorrect token counts after lore-to-lore injection (`src/ts/process/lorebook.svelte.ts:571`, `src/ts/process/lorebook.svelte.ts:630`).
+- Lore token budgeting applies side-effect-free CBS parsing before tokenization, matching the later output path for ordinary variables and conditions. The returned prompt retains its decorator-stripped source for later parsing, and lore-to-lore injection still occurs after budgeting, so injection can make the actual prompt larger than the admitted count (`src/ts/process/lorebook.svelte.ts:565`, `src/ts/process/lorebook.svelte.ts:635`).
 
 - `@@inject_lore` targets the active entry’s `source`, which is its `comment` or fallback `lorebook N`. Changing comments can break injections (`src/ts/process/lorebook.svelte.ts:573`, `src/ts/process/lorebook.svelte.ts:634`).
 
@@ -359,7 +367,7 @@ Each projection is consumed independently:
 - Hypa V3 enablement has three layers:
   - global algorithm flag `db.hypaV3`;
   - per-chat `Chat.supaMemory`, falling back to character `character.supaMemory`;
-  - preset `alwaysToggleOn`, which writes `true` into the selected chat when character selection changes (`src/ts/process/index.svelte.ts:953`, `src/ts/stores.svelte.ts:225`).
+  - preset `alwaysToggleOn`, which writes `true` into the selected chat when character selection changes (`src/ts/process/index.svelte.ts:1035`, `src/ts/stores.svelte.ts:236`).
 
   `memoryAlgorithmType` is maintained by settings UI but is not what the prompt pipeline checks (`src/lib/Setting/Pages/OtherBotSettings.svelte:981`).
 
@@ -387,7 +395,7 @@ Each projection is consumed independently:
 
 - Lore `mode` has special runtime handling only for `child`; other values primarily serve UI/compatibility organization and should not be assumed to create additional matcher modes.
 
-- Module trigger projection mutates each source trigger by assigning `lowLevelAccess` from its containing module (`src/ts/process/modules.ts:465`). Consumers should not assume getters are pure.
+- Module trigger projection returns copied triggers with the containing module's `lowLevelAccess` and `moduleId`. The `moduleId` lets direct module-originated LLM calls resolve a per-module ModelPreset, while stored/exported trigger objects remain unchanged (`src/ts/process/modules.ts:465`).
 
 - `getModules()` caches on the joined reference IDs. Use `refreshModules()` when replacing module collections or changing resolution metadata such as namespace (`src/ts/process/modules.ts:402`, `src/ts/process/modules.ts:587`).
 
@@ -399,7 +407,7 @@ Each projection is consumed independently:
 
 - To add or modify a lore decorator, update the `CCardLib.decorator.parse()` switch at `src/ts/process/lorebook.svelte.ts:299`; also update editor highlighting in `src/ts/gui/highlight.ts:169` and relevant character-card conversion in `src/ts/characterCards.ts:995`.
 
-- To change lore priority or token-budget behavior, inspect candidate admission at `src/ts/process/lorebook.svelte.ts:603`.
+- To change lore priority or token-budget behavior, inspect CBS-aware counting at `src/ts/process/lorebook.svelte.ts:565` and candidate admission at `src/ts/process/lorebook.svelte.ts:608`.
 
 - To change lore prompt positions, edit both decorator validation at `src/ts/process/lorebook.svelte.ts:383` and prompt placement in `src/ts/process/index.svelte.ts:424`, `src/ts/process/index.svelte.ts:453`, and `src/ts/process/index.svelte.ts:941`.
 
@@ -417,11 +425,13 @@ Each projection is consumed independently:
 
 - To change summary prompting or model routing, inspect `summarize()` at `src/ts/process/memory/hypav3.ts:1684`.
 
+- To change Hypa V3 modal search/filter coupling or manual repair behavior, inspect `src/lib/Others/HypaV3Modal.svelte` and keep edits on the selected chat's `hypaV3Data`.
+
 - To change important/recent/similar/random recall allocation, inspect selection beginning at `src/ts/process/memory/hypav3.ts:503` and the preset defaults at `src/ts/process/memory/hypav3.ts:1802`.
 
 - To change semantic summary ranking, inspect experimental aggregation at `src/ts/process/memory/hypav3.ts:678` and legacy aggregation at `src/ts/process/memory/hypav3.ts:1366`.
 
-- To change long-term-memory persistence format, update the types at `src/ts/process/memory/hypav3.ts:54` and serializers at `src/ts/process/memory/hypav3.ts:1623`, together with `Chat.hypaV3Data` at `src/ts/storage/database.svelte.ts:2053`.
+- To change long-term-memory persistence format, update the types at `src/ts/process/memory/hypav3.ts:54` and serializers at `src/ts/process/memory/hypav3.ts:1623`, together with `Chat.hypaV3Data` at `src/ts/storage/database.svelte.ts:2167`.
 
 - To change how memory appears in prompt templates, inspect memory extraction at `src/ts/process/index.svelte.ts:997` and template insertion at `src/ts/process/index.svelte.ts:1270`.
 

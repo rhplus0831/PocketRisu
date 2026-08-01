@@ -1,7 +1,7 @@
 # Plugin storage
 
 > Part of the [PocketRisu structure guide](../../STRUCTURE.md). Audited on
-> 2026-07-27 against `abee0232`. Prefer the symbols below over volatile line numbers.
+> 2026-08-01 against `818c3bc1`. Prefer the symbols below over volatile line numbers.
 
 ## Purpose and scope
 
@@ -24,14 +24,23 @@ prefix keys and must not treat `clear()` as a per-plugin operation.
 
 Inline basic get/set preserves legacy structured-clone values. Versioned reads can
 surface those legacy rows for guarded migration or removal, but optimized storage and
-versioned/compound replacement values require detached, strict JSON. Optional automatic
-conversion can normalize legacy values before a mode change; conversion is a visible
-compatibility operation, not merely an implementation detail.
+versioned/compound replacement values require detached, strict JSON.
+`Database.autoConvertPluginStorageValues` is an independent compatibility setting, not
+part of the optimization toggle. When an ordinary optimized write or externalization
+cannot be represented as strict JSON, it may convert `Date`, `Map`, `Set`, `BigInt`,
+`undefined`, non-finite numbers, and sparse-array holes into documented JSON-compatible
+forms. It does not change inline values or relax versioned/compound replacement APIs;
+functions, circular references, accessors, symbols, and custom classes still fail.
 
 Optimized authority is not “every row under the prefix.” The manifest names the exact
 value and metadata rows in the selected generation. Undeclared physical rows are
 quarantined data and must not appear in live reads, exports, the viewer, or an exact
 restore.
+
+One compatibility exception exists for pre-generation optimized saves: when
+`optimizePluginMemory` is true and neither a generation nor a manifest exists, the
+existing physical prefix rows may be adopted. A disabled or imported database never
+uses this exception to make leftover rows authoritative.
 
 Manifest version 2 also makes its key sequence authoritative. Public V3 `keys()` and
 `key(index)` preserve the legacy `Object.keys()` contract across inline and optimized
@@ -40,6 +49,12 @@ adds exact logical-key mappings for fixed-size hashed physical names when a reve
 name would exceed the archive entry-name limit. Versions 1 and 2 remain valid migration
 baselines; ordinary short keys retain their existing names and do not force a manifest
 upgrade.
+
+The shared key policy limits physical archive entry names to 1,024 UTF-8 bytes, not
+logical plugin keys. Well-formed keys use the established UTF-8/base64url component;
+ill-formed JavaScript strings use a tagged UTF-16 code-unit encoding so lone surrogates
+round-trip. If either reversible form would exceed the physical limit, a fixed SHA-256
+name is used and manifest version 3 carries the exact hash-to-raw-key mapping.
 
 ## Architecture at a glance
 
@@ -56,7 +71,7 @@ pluginSaveStorage.ts
     ├─ mode barrier + per-key/key-set queues
     ├─ inline publication mutex
     ├─ owner/revision/generation tracking
-    └─ staged transition and boot recovery
+    └─ bulk/staged transition and boot recovery
     ▼
 persistentKv.ts / NodeStorage
     ├─ dedicated manifest/mutate/batch/clear APIs
@@ -65,7 +80,8 @@ persistentKv.ts / NodeStorage
     ▼
 Express + SQLite
     ├─ exact manifest-owned rows
-    ├─ atomic value + owner + generation publication
+    ├─ atomic value + owner + manifest publication
+    ├─ atomic mode + generation transitions
     ├─ quota and usage indexes
     └─ recovery-dirty snapshot token
 ```
@@ -101,6 +117,8 @@ Express + SQLite
   mutation semantics over `AutoStorage`.
 - `src/ts/storage/pluginStorageMutation.ts` and `pluginStorageBatch.ts` encode atomic
   mutation and batch requests.
+- `src/ts/storage/pluginStorageTransitionBulk.ts` encodes the negotiated framed mode
+  transition, including structured-clone MessagePack rows for externalization.
 - `src/ts/storage/jsonValue.ts` snapshots, validates, and converts JSON values without
   losing special own keys such as `__proto__`.
 - `src/ts/storage/pluginSaveKeyPolicy.ts`, `base64Url.ts`, and
@@ -117,7 +135,7 @@ Express + SQLite
 
 - `server/node/pluginSaveKeys.cjs` owns server key parsing and namespace constants.
 - `server/node/pluginStorageJson.cjs` validates raw keys, canonical encoded names, and
-  strict JSON rows.
+  strict JSON rows, and performs server-owned compatible-value transition conversion.
 - `server/node/pluginStorageLimits.cjs` owns authoritative per-value and aggregate
   limits. Defaults are 128 MiB per value and 1 GiB total optimized storage.
 - `server/node/db.cjs` owns atomic quota/owner accounting and the derived
@@ -126,7 +144,7 @@ Express + SQLite
   recovery routes; generic KV routes guard the reserved namespace.
 - `shared/plugin-save-key-policy.json` is the shared archive/key-name contract.
 - `src/lib/Setting/Pages/PluginSettings.svelte` owns compatibility, conversion,
-  optimization transition, recovery, and per-plugin permission controls.
+  optimization transition, and recovery controls.
 - `src/lib/Setting/Pages/PluginStorageViewer.svelte` owns paged inspection and
   revision-aware maintenance.
 
@@ -151,25 +169,38 @@ blindly. Re-read authoritative state, or reload when a generation/transition out
 cannot be proven.
 
 Optimized compound writes negotiate their transport through `/api/session`. Current
-clients use `framed-v1`: bounded canonical metadata names the CAS and binds each set
-value by length and SHA-256, followed by the raw JSON bytes. The server streams values
-to private spool files, validates them before queue admission, and publishes large rows
-through the file-backed chunk writer inside the existing atomic transaction. This lets
-a one-value guarded write reach the same configured per-value limit as ordinary
-`setItem()` without base64 expansion. Older servers use the retained 16 MiB JSON/base64
-batch fallback.
+clients use `framed-v1` for 1 through the negotiated maximum of at most 128 operations:
+bounded canonical metadata names the CAS and binds each set value by length and SHA-256,
+followed by the raw JSON bytes. The server streams values to private spool files,
+validates them before queue admission, and publishes large rows through the file-backed
+chunk writer inside the existing atomic transaction. This lets a one-value guarded write
+reach the same configured per-value limit as ordinary `setItem()` without base64
+expansion. Older servers use the retained 16 MiB JSON/base64 batch fallback.
 
-The same authenticated session advertises the generic configured per-value ceiling.
-Client transport preflights use that value before dispatching ordinary, compound, or
-transition row bodies. Servers without the capability retain the historical 128 MiB
-client fallback, while the server remains authoritative for every publication.
+The authenticated session advertises a generic per-value ceiling plus separate framed
+batch and transition capabilities. Ordinary writes preflight the generic ceiling;
+compound writes use the negotiated operation, metadata, value, and payload bounds;
+transitions use their negotiated entry, metadata, row, and payload bounds. Servers
+without the generic capability retain the historical 128 MiB client fallback, while
+missing framed capabilities select the buffered-batch or staged-transition compatibility
+paths. The server remains authoritative for every publication. A legacy optimized row
+already over a newly configured limit may be repaired only by a strict size decrease;
+new or growing over-limit values remain rejected.
 
 ### Immutable generations
 
-Generation helpers publish a prepared immutable key set and one manifest pointer. They
-are the preferred model for multi-row indexes, shards, or caches whose readers must not
-observe a partial prefix. Garbage collection may remove generations only after they are
-no longer selected or pinned.
+`pluginStorage.generations` is a plugin-authored repository layer over ordinary storage
+keys; its generation references are distinct from the optimized backend publication
+selected by `Database.pluginStorageGeneration`. `publish()` hashes prepared body rows,
+writes immutable bodies and a per-generation manifest, and advances a mutable head in
+one `atomicBatch()`. Existing generation keys are never reused.
+
+`load()` verifies the repository, head, manifest, body identifiers, hashes, and counts.
+It falls back once to the verified previous generation only for detected corruption;
+transport, authentication, and lineage failures remain hard errors. `garbageCollect()`
+requires the retired generation to be in the verified lineage, refuses the current and
+immediately previous generations, removes its bodies and manifest, and CAS-checks that
+the head stayed unchanged.
 
 ## Concurrency and atomic publication
 
@@ -179,46 +210,62 @@ no longer selected or pinned.
   uses a map-level mutex because the database stores one object graph.
 - Plugin lifecycle work and storage-mode work share coordination so enable/disable,
   unload cleanup, and mode transitions cannot publish incompatible state concurrently.
-- Server mutations enter the storage queue and publish values, owner records, the exact
-  manifest, the selected generation, quota state, and recovery-dirty token in one SQLite
-  transaction.
+- Ordinary server mutations enter the storage queue and publish values, owner records,
+  the revised exact manifest, quota state, and recovery-dirty token in one SQLite
+  transaction after checking the selected generation. They do not replace
+  `Database.pluginStorageGeneration`; mode transitions publish a fresh backend
+  generation together with the database mode and destination rows.
 - Generic `/api/write` and `/api/remove` paths must not mutate manifest-owned rows, and
   JSON Patch must not change optimized rows or publication controls. To preserve the
   original inline save behavior, database patches may update `pluginCustomStorage` and
-  `pluginStorageMeta` only after the server proves that the live authoritative mode is
-  inline. Those accepted patches retain the ordinary delayed database-patch durability
-  window.
+  `pluginStorageMeta` only after the server proves that `optimizePluginMemory` and
+  `pluginStorageFolded` are not true and no manifest is present. A retained generation
+  alone does not block inline patches. Those accepted patches retain the ordinary delayed
+  database-patch durability window; this is publication-state authorization, not an owner
+  check.
 
 Owner records contain plugin identity, update time, opaque revision, and generation.
-Revisions are concurrency tokens, not sortable timestamps.
+Their generation groups one logical mutation and is not the backend publication
+selector. Revisions are concurrency tokens, not sortable timestamps. Owners are
+inspection metadata rather than an authorization boundary; mutation routes authenticate
+and require the active writer session but do not compare the caller to an owner record.
 
 ## Mode transitions
 
-Production settings negotiate a bulk server protocol. On current servers, the client sends
-one framed request containing transition metadata and the complete inline plugin snapshot;
-the server validates and, when enabled, converts compatible rich values while writing an
-unpublished private stage. The client does not JSON-validate individual values first.
-Servers that do not advertise the bulk capability retain the earlier staged row protocol.
+Production settings negotiate a bulk server protocol. On current servers,
+externalization sends one framed request containing transition metadata and the complete
+inline plugin snapshot as structured-clone MessagePack rows. Internalization sends no
+row bodies; the server reads the selected optimized publication itself. The server owns
+validation and, when `Database.autoConvertPluginStorageValues` is enabled, compatible
+rich-value conversion while writing an unpublished private stage. The client does not
+JSON-validate individual externalization values first. Servers that do not advertise
+the bulk capability retain the earlier staged row protocol.
 
 1. The client validates record shape and transport limits, then sends one framed bulk request.
-2. The server validates keys and values, applies configured compatible-value conversion,
-   checks row counts, configured limits, source identity, and disk headroom, and writes a
-   private stage under `save/.plugin-transition-staging/`.
+2. The server validates keys and values, applies the independently configured compatible-
+   value conversion, checks row counts, negotiated limits, source identity, and disk
+   headroom, and writes a private stage under `save/.plugin-transition-staging/`.
 3. Ordinary database saves pause while the request and final database object are prepared.
 4. The server publishes the fresh generation, exact manifest, rows, mode, quota state, and
    recovery token atomically.
 5. A lost acknowledgement is reconciled from the stage receipt and live publication.
    If the outcome remains unknowable, saves are fenced and the UI requires reload.
 
+After database validation on Node startup, stage reconciliation resolves a stage only
+when the live mode, generation, and manifest prove its publication. Healthy boots remove
+unpublished stages; corrupt recovery boots preserve them rather than guessing.
+
 Externalization therefore uses one migration request instead of one upload request per row.
 Internalization is also one migration request; after commit the client performs one
 authoritative `database.bin` refresh rather than reading every optimized row separately.
 
-Reverse transitions accept rows up to the configured optimized-value ceiling and do not
-impose a smaller aggregate transport cap. The server copies SQLite/chunk data and converts
+The framed transition transport admits up to 100,000 rows, 64 MiB of metadata, a payload
+ceiling of the larger configured per-value or aggregate limit, and per-row staging up to
+the larger of 32 MiB or the configured per-value limit. Final publication quotas remain
+authoritative. During internalization, the server copies SQLite/chunk data and converts
 staged JSON to MessagePack in bounded pages. Inline mode itself still retains the finished
-plugin map in browser memory, so Settings asks for confirmation when the exact preflight is
-larger than 64 MiB total or contains a row larger than 32 MiB.
+plugin map in browser memory, so Settings asks for confirmation when the exact preflight
+is larger than 64 MiB total or contains a row larger than 32 MiB.
 
 `transitionPluginStorageMode()` is the production entry point. Optimized-mode startup
 uses the ETag-fenced `/api/plugin-storage/reconcile-boot` endpoint: the server validates
@@ -241,15 +288,24 @@ mode, external row bodies stay on the server during this scan; the browser recei
 the committed result envelope and rereads `database.bin` if inline recovery copies were
 removed. Inline mode still materializes the complete map in browser memory by design.
 
-The viewer obtains a generation-pinned, deterministic server snapshot. Paging, filters,
-owner facets, and value reads belong to the same publication. Edits and deletes are
-revision-bound; a concurrent change surfaces as a conflict instead of being overwritten.
+The viewer exposes three backends. In optimized mode, the Save File tab obtains a
+generation-pinned deterministic server page; in inline mode, it synchronously detaches
+only the selected in-memory page before yielding. In both cases key/owner filters, owner
+facets, and value reads come from one point-in-time publication, and edits/deletes are
+revision-bound so a concurrent change surfaces as a conflict. Local Storage
+(`safe_plugin_*` strings) and IndexedDB (`SafeLocalPluginStorage` JSON) are device-local
+and have no server publication token. All three retain at most 50 value bodies per page;
+value search intentionally scans only the resident page.
 
 ## Backup and restore boundary
 
 - Normal Node full exports include the exact manifest-owned optimized publication.
 - Upstream-target exports and partial/automatic snapshots fold that publication into a
   self-contained database representation as required by the target format.
+- Backup import validates value and owner rows as JSON but copies an explicit manifest
+  entry opaquely. Later generation/manifest authority checks reject or quarantine an
+  inconsistent imported publication; folded streaming imports build a fresh exact
+  manifest from the rows they ingest.
 - `pluginStorageFolded` is a recovery marker. Exact-set restore also depends on the
   selected generation/manifest proof; unmarked historical snapshots must not clear
   unrelated external rows.
@@ -271,8 +327,13 @@ See [Backup and recovery](backup-recovery.md) for export/import/snapshot behavio
 - Single/batch mutation semantics: start in `pluginSaveStorage.ts`,
   `pluginStorageMutation.ts`, `pluginStorageBatch.ts`, server route transaction code, and
   the atomicity suites under `test/compat/`.
-- Mode switching: start at `transitionPluginStorageMode()`, the staged server routes,
-  `databaseSave.ts`, `PluginSettings.svelte`, and transition-boundary tests.
+- Compatible-value conversion: update `Database.autoConvertPluginStorageValues`,
+  `prepareOptimizedPluginStorageValue()`, `jsonValue.ts`, the server
+  `convertCompatiblePluginStorageJson()`, Settings copy, and conversion tests together;
+  keep it independent of mode selection.
+- Mode switching: start at `transitionPluginStorageMode()`,
+  `applyBulkPluginStorageTransition()`, `pluginStorageTransitionBulk.ts`, the bulk/staged
+  server routes, `databaseSave.ts`, `PluginSettings.svelte`, and transition tests.
 - Viewer behavior: update the pinned server page protocol, `pluginStorageViewerPage.ts`,
   `PluginStorageViewer.svelte`, and viewer integration tests.
 - Backup/restore participation: coordinate this subsystem with
@@ -286,8 +347,12 @@ Representative suites include:
 - `src/ts/plugins/apiV3/pluginStorageGeneration.test.ts`
 - `src/ts/plugins/apiV3/pluginStorageUpdate.test.ts`
 - `src/ts/storage/pluginStorageBatch.test.ts`
+- `server/node/pluginSaveKeys.test.ts`
+- `server/node/pluginStorageJson.test.ts`
 - `test/compat/plugin-storage-mutation-atomicity.test.ts`
 - `test/compat/plugin-storage-batch-atomicity.test.ts`
+- `test/compat/plugin-storage-bulk-transition.test.ts`
+- `test/compat/plugin-storage-boot-reconcile.test.ts`
 - `test/compat/plugin-storage-staged-transition-boundaries.test.ts`
 - `test/compat/plugin-storage-viewer-page.test.ts`
 - `server/node/snapshotPluginStorage.e2e.test.ts`
