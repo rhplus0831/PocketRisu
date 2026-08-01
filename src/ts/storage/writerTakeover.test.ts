@@ -18,6 +18,7 @@ vi.mock('../../lang', () => ({
 }))
 
 import {
+    checkWriterTakeoverOnReturn,
     enterWriterTakeoverFlow,
     isWriterAccessLost,
     resetWriterTakeoverForTests,
@@ -45,6 +46,61 @@ describe('writer takeover recovery UI', () => {
         resetWriterTakeoverForTests()
         vi.unstubAllGlobals()
         document.body.innerHTML = ''
+    })
+
+    it('routes a stale foreground status through the explicit chooser', async () => {
+        mocks.alertSelect.mockResolvedValue('0')
+        const claimWriterAccessLoss = vi.fn(() => true)
+
+        await expect(checkWriterTakeoverOnReturn({
+            getWriterLockState: async () => 'stale',
+            isOperationActive: () => false,
+            claimWriterAccessLoss,
+        })).resolves.toBe(true)
+
+        await vi.waitFor(() => {
+            expect(document.getElementById('app')?.classList.contains('risu-writer-offline-frozen')).toBe(true)
+        })
+        expect(claimWriterAccessLoss).toHaveBeenCalledOnce()
+        expect(mocks.alertSelect).toHaveBeenCalledWith(
+            ['stay read-only', 'discard and reload'],
+            'another session took over',
+        )
+        expect(reload).not.toHaveBeenCalled()
+    })
+
+    it('does not claim writer loss for a current foreground session', async () => {
+        const claimWriterAccessLoss = vi.fn(() => true)
+
+        await expect(checkWriterTakeoverOnReturn({
+            getWriterLockState: async () => 'active',
+            isOperationActive: () => false,
+            claimWriterAccessLoss,
+        })).resolves.toBe(false)
+
+        expect(claimWriterAccessLoss).not.toHaveBeenCalled()
+        expect(mocks.alertSelect).not.toHaveBeenCalled()
+        expect(reload).not.toHaveBeenCalled()
+    })
+
+    it('defers recovery if a chat operation starts during the status request', async () => {
+        let resolveState!: (state: 'stale') => void
+        const state = new Promise<'stale'>(resolve => { resolveState = resolve })
+        const claimWriterAccessLoss = vi.fn(() => true)
+        let operationActive = false
+
+        const check = checkWriterTakeoverOnReturn({
+            getWriterLockState: () => state,
+            isOperationActive: () => operationActive,
+            claimWriterAccessLoss,
+        })
+        operationActive = true
+        resolveState('stale')
+
+        await expect(check).resolves.toBe(false)
+        expect(claimWriterAccessLoss).not.toHaveBeenCalled()
+        expect(mocks.alertSelect).not.toHaveBeenCalled()
+        expect(reload).not.toHaveBeenCalled()
     })
 
     it('latches once and stays frozen without automatically reloading', async () => {

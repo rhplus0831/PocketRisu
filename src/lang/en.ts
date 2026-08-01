@@ -1034,7 +1034,6 @@ export const languageEnglish = {
     writerTakeoverStayOffline: "Stay on this page (read-only)",
     writerTakeoverReload: "Discard, reload, and take write access",
     writerOfflineBanner: "Read-only: another session has write access. Copy any unsaved work before reloading.",
-    sessionHandoffReload: "Refreshed to the latest state because another device was in use.",
     addCharacter: "Add Character",
     importFromRealm: "Choose from RisuRealm",
     importFromRealmDesc: "Choose over 1000 characters in RisuRealm",

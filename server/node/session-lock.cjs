@@ -28,8 +28,9 @@
 //    fresh, so applying it cannot clobber; rejecting it instead would set off
 //    reload loops on boot-time auto-saves). lastWriteAt is not bumped — the
 //    lock holder did not write.
-//    Stale → rejected (423 → the client reloads; after the reload its boot is
-//    recent, so its next user action takes over cleanly).
+//    Stale → rejected. The client offers a read-only recovery view or an
+//    explicit reload; after reloading its boot is recent, so its next user
+//    action takes over cleanly.
 //
 // Serial device switching (the single-user pattern) therefore never shows a
 // block: you stop writing on A, open B (booted after A's last write), and B's
@@ -90,9 +91,9 @@ function createSessionLock(opts = {}) {
         return active ? active.id : null;
     }
 
-    // Side-effect-free view for the client's reload-on-return check.
-    // 'stale' is the only state that requires a reload: another session wrote
-    // AFTER this one booted, so this one's in-memory copy is outdated.
+    // Side-effect-free view for the client's foreground recovery check.
+    // 'stale' requires recovery: another session wrote AFTER this one booted,
+    // so this one's in-memory copy is outdated and must not write again.
     // 'fresh' needs nothing — the copy includes every accepted write, and the
     // next user action simply takes the lock over.
     function peek(id) {

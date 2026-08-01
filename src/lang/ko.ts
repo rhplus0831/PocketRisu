@@ -1128,8 +1128,6 @@ export const languageKorean = {
   writerTakeoverReload: "변경 사항을 버리고 새로고침하여 쓰기 권한 가져오기",
   writerOfflineBanner:
     "읽기 전용: 다른 세션에 쓰기 권한이 있습니다. 새로고침하기 전에 저장되지 않은 내용을 복사하세요.",
-  sessionHandoffReload:
-    "다른 기기에서 사용되어 최신 상태로 새로고침했어요.",
   addCharacter: "캐릭터 추가",
   importFromRealm: "RisuRealm에서 고르기",
   importFromRealmDesc:

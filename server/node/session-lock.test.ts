@@ -60,14 +60,14 @@ describe('session-lock', () => {
         expect(lock.activeId()).toBe('phone')
     })
 
-    it('a rejected session recovers by re-booting (reload) and writing again', () => {
+    it('a rejected session recovers after explicitly reloading and writing again', () => {
         const { lock } = makeLock()
         lock.register('pc')
         expect(lock.checkWrite('pc').ok).toBe(true)
         lock.register('phone')
         expect(lock.checkWrite('phone', true).ok).toBe(true) // phone took over (user action)
-        expect(lock.checkWrite('pc').ok).toBe(false)    // pc kicked → client reloads
-        lock.register('pc')                             // reload = fresh boot
+        expect(lock.checkWrite('pc').ok).toBe(false)    // pc enters recovery
+        lock.register('pc')                             // chosen reload = fresh boot
         expect(lock.checkWrite('pc', true)).toEqual({ ok: true, tookOver: true })
         expect(lock.activeId()).toBe('pc')
     })
@@ -132,7 +132,7 @@ describe('session-lock', () => {
         expect(lock.checkWrite('pc', true).ok).toBe(false)   // pc stale — gesture cannot force it
     })
 
-    // peek() drives the client's reload-on-return: reload ONLY when stale.
+    // peek() drives the client's explicit recovery flow on return.
     it('peek reports free/active/fresh/stale without side effects', () => {
         const { lock } = makeLock()
         expect(lock.peek('pc')).toBe('free')
@@ -142,7 +142,7 @@ describe('session-lock', () => {
         lock.register('phone')                          // phone boots after → fresh
         expect(lock.peek('phone')).toBe('fresh')        // no reload needed on phone
         expect(lock.checkWrite('phone', true).ok).toBe(true) // phone takes over
-        expect(lock.peek('pc')).toBe('stale')           // pc must reload on return
+        expect(lock.peek('pc')).toBe('stale')           // pc must not write without recovery
         // peek never mutates: repeated calls and ordering leave the lock alone
         expect(lock.peek('pc')).toBe('stale')
         expect(lock.activeId()).toBe('phone')

@@ -21,6 +21,14 @@ let writerAccessLost = false
 let offlineFreezeObserver: MutationObserver | null = null
 let removeInteractionGuards: (() => void) | null = null
 
+export type WriterLockState = 'free' | 'active' | 'fresh' | 'stale' | 'unknown'
+
+interface WriterTakeoverReturnCheck {
+    getWriterLockState: () => Promise<WriterLockState>
+    isOperationActive: () => boolean
+    claimWriterAccessLoss: () => boolean
+}
+
 export function isWriterAccessLost(): boolean {
     return writerAccessLost
 }
@@ -35,6 +43,27 @@ export function enterWriterTakeoverFlow(): void {
     writerAccessLost = true
     window.dispatchEvent(new CustomEvent(WRITER_ACCESS_LOST_EVENT))
     void runWriterTakeoverFlow()
+}
+
+/**
+ * Check writer authority when a page returns to the foreground. A stale page
+ * must use the same explicit recovery flow as a mutation-time 423 instead of
+ * discarding its in-memory state through an automatic reload.
+ */
+export async function checkWriterTakeoverOnReturn({
+    getWriterLockState,
+    isOperationActive,
+    claimWriterAccessLoss,
+}: WriterTakeoverReturnCheck): Promise<boolean> {
+    if (isOperationActive()) return false
+    if (await getWriterLockState() !== 'stale') return false
+
+    // The status request is asynchronous. If an input hook or generation began
+    // while it was in flight, let its eventual 423 enter the takeover flow.
+    if (isOperationActive() || !claimWriterAccessLoss()) return false
+
+    enterWriterTakeoverFlow()
+    return true
 }
 
 async function runWriterTakeoverFlow(): Promise<void> {

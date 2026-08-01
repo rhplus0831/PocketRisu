@@ -27,8 +27,9 @@ to edits inside the 500 ms debounce window or a queued retry.
 Writer fencing remains unchanged so a deferred client still cannot overwrite
 newer server state. The displaced page no longer reloads automatically:
 
-- Server-side 423 displacement and same-browser `BroadcastChannel`
-  displacement enter one shared, one-way takeover flow.
+- Server-side stale foreground detection, mutation-time 423 displacement, and
+  same-browser `BroadcastChannel` displacement enter one shared, one-way
+  takeover flow.
 - The active chat request is aborted, stale save retries pause, and the user is
   asked either to remain on the page or explicitly discard local unsaved state,
   reload, and take write access from the other session.

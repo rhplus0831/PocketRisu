@@ -332,7 +332,7 @@ outcome contracts are canonical in [Backup and recovery](backup-recovery.md).
 
 - JWT refresh has no maximum age beyond signature validity. `/api/token/refresh` disables expiration checking. Rotating `save/__jwt_secret` is the revocation boundary for a stolen signed token.
 
-- The writer lock is compatibility-optional. The last `/api/session` caller supplying `x-session-id` becomes the active writer, but `checkActiveSession()` allows requests with no `x-session-id` at `server/node/server.cjs:1690`. New mutation callers should send the header if they should participate in cross-device exclusion.
+- The writer lock is compatibility-optional. `/api/session` registers `x-session-id` without stealing an active lock; a fresh session takes over only when a later mutation carries recent-user-activity proof. Stale writers receive 423, while clients without `x-session-id` remain compatibility-exempt. New mutation callers should send the session header if they should participate in cross-device exclusion (`server/node/session-lock.cjs`, `server/node/server.cjs`).
 
 - Unset `HOST` binds all interfaces, and `/api/set_password` is intentionally unauthenticated while no password exists. Initial setup is therefore first-client-wins; bind `127.0.0.1` behind a reverse-access layer or set the password immediately on a trusted network.
 
