@@ -3986,6 +3986,14 @@ function isHex(str) {
     return hexRegex.test(str.toUpperCase().trim()) || str === '__password';
 }
 
+function decodeAndCanonicalizeHexPath(filePath) {
+    const pathBytes = Buffer.from(filePath, 'hex');
+    return {
+        canonicalPath: pathBytes.toString('hex'),
+        decodedKey: pathBytes.toString('utf-8'),
+    };
+}
+
 async function hashJSON(json){
     const hash = nodeCrypto.createHash('sha256');
     hash.update(JSON.stringify(json));
@@ -9390,7 +9398,7 @@ app.get('/api/read', async (req, res, next) => {
         return;
     }
     try {
-        const key = Buffer.from(filePath, 'hex').toString('utf-8');
+        const { decodedKey: key } = decodeAndCanonicalizeHexPath(filePath);
         // Flush pending patches before reading database.bin
         if (key === 'database/database.bin') {
             await flushPendingDb();
@@ -9747,7 +9755,7 @@ app.get('/api/remove', async (req, res, next) => {
     }
     try {
         await queueStorageMutation(async () => {
-            const key = Buffer.from(filePath, 'hex').toString('utf-8');
+            const { decodedKey: key } = decodeAndCanonicalizeHexPath(filePath);
             if (key === 'database/database.bin'
                 || key === PLUGIN_STORAGE_MANIFEST_KEY
                 || canonicalPluginStorageRowPrefix(key)) {
@@ -9888,7 +9896,7 @@ app.get('/api/plugin-storage/state', async (req, res, next) => {
     }
 
     try {
-        const valueKey = Buffer.from(filePath, 'hex').toString('utf-8');
+        const { decodedKey: valueKey } = decodeAndCanonicalizeHexPath(filePath);
         if (isHashedPluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX)) {
             assertArchiveSafePluginSaveStorageKey(valueKey);
         } else {
@@ -11312,7 +11320,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
     let valueHash = null;
     let valueSize = 0;
     try {
-        valueKey = Buffer.from(filePath, 'hex').toString('utf-8');
+        ({ decodedKey: valueKey } = decodeAndCanonicalizeHexPath(filePath));
         const hashedValueKey = isHashedPluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX);
         const rawKey = hashedValueKey
             ? null
@@ -13617,20 +13625,23 @@ app.post('/api/write', async (req, res, next) => {
         return;
     }
     if (!checkActiveSession(req, res)) return;
-    const filePath = req.headers['file-path'];
+    const rawFilePath = req.headers['file-path'];
     const fileContent = req.body;
-    if (!filePath || !fileContent) {
+    if (!rawFilePath || !fileContent) {
         res.status(400).send({ error:'File path required' });
         return;
     }
-    if(!isHex(filePath)){
+    if(!isHex(rawFilePath)){
         res.status(400).send({ error:'Invaild Path' });
         return;
     }
+    const {
+        canonicalPath: filePath,
+        decodedKey: key,
+    } = decodeAndCanonicalizeHexPath(rawFilePath);
     let shouldCreateBackup = false;
     try {
         await queueStorageMutation(async () => {
-            const key = Buffer.from(filePath, 'hex').toString('utf-8');
             const protectsPluginPublication = key === 'database/database.bin'
                 || key === PLUGIN_STORAGE_MANIFEST_KEY
                 || canonicalPluginStorageRowPrefix(key);
@@ -13980,23 +13991,25 @@ app.post('/api/patch', async (req, res, next) => {
         return;
     }
     if (!checkActiveSession(req, res)) return;
-    const filePath = req.headers['file-path'];
+    const rawFilePath = req.headers['file-path'];
     const patch = req.body.patch;
     const expectedHash = req.body.expectedHash;
 
-    if (!filePath || !patch || !expectedHash) {
+    if (!rawFilePath || !patch || !expectedHash) {
         res.status(400).send({ error: 'File path, patch, and expected hash required' });
         return;
     }
-    if (!isHex(filePath)) {
+    if (!isHex(rawFilePath)) {
         res.status(400).send({ error: 'Invaild Path' });
         return;
     }
+    const {
+        canonicalPath: filePath,
+        decodedKey,
+    } = decodeAndCanonicalizeHexPath(rawFilePath);
 
     try {
         await queueStorageMutation(async () => {
-            const decodedKey = Buffer.from(filePath, 'hex').toString('utf-8');
-
             // Manifest rows, optimized rows, mode controls, and whole-document
             // replacements must never reach dbCache or the eager externalizer.
             // Inline value/owner maps are different: database.bin is their sole

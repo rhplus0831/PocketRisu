@@ -331,6 +331,87 @@ describe('atomic database writes with external rows', () => {
     })
   })
 
+  test('mixed-case hex paths share one patch cache identity', async () => {
+    const { client, server, strippedDb } = await bootSeeded()
+    const afterUppercasePatch = structuredClone(strippedDb)
+    afterUppercasePatch.storageKeyIdentityMarker = 'uppercase patch'
+
+    const uppercasePatch = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_PATH_HEX.toUpperCase(),
+      },
+      body: JSON.stringify({
+        expectedHash: calculateHash(normalizeJSON(strippedDb)).toString(16),
+        patch: [{
+          op: 'add',
+          path: '/storageKeyIdentityMarker',
+          value: afterUppercasePatch.storageKeyIdentityMarker,
+        }],
+      }),
+    })
+    expect(uppercasePatch.status).toBe(200)
+
+    const canonicalPatch = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_PATH_HEX,
+      },
+      body: JSON.stringify({
+        expectedHash: calculateHash(normalizeJSON(afterUppercasePatch)).toString(16),
+        patch: [{
+          op: 'replace',
+          path: '/storageKeyIdentityMarker',
+          value: 'canonical patch',
+        }],
+      }),
+    })
+    expect(canonicalPatch.status).toBe(200)
+    expect((await flushDatabase(client)).status).toBe(200)
+
+    const storedDb = decodeRisuDat(readKv(server.cwd, DB_KEY)!) as Record<string, any>
+    expect(storedDb.storageKeyIdentityMarker).toBe('canonical patch')
+  })
+
+  test('a noncanonical patch timer cannot overwrite a later full write', async () => {
+    const { client, server, strippedDb } = await bootSeeded()
+    const uppercasePatch = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_PATH_HEX.toUpperCase(),
+      },
+      body: JSON.stringify({
+        expectedHash: calculateHash(normalizeJSON(strippedDb)).toString(16),
+        patch: [{
+          op: 'add',
+          path: '/storageKeyIdentityMarker',
+          value: 'stale patch',
+        }],
+      }),
+    })
+    expect(uppercasePatch.status).toBe(200)
+
+    const fullWrite = makeFullDatabase('new', false)
+    fullWrite.storageKeyIdentityMarker = 'full write'
+    const writeResponse = await writeFullDatabase(client, fullWrite)
+    expect(writeResponse.status).toBe(200)
+
+    const committedBytes = readKv(server.cwd, DB_KEY)
+    expect(committedBytes).not.toBeNull()
+    expect((decodeRisuDat(committedBytes!) as Record<string, any>).storageKeyIdentityMarker)
+      .toBe('full write')
+
+    await new Promise(resolve => setTimeout(resolve, 5_500))
+
+    const afterTimerBytes = readKv(server.cwd, DB_KEY)
+    expect(afterTimerBytes).toEqual(committedBytes)
+    expect((decodeRisuDat(afterTimerBytes!) as Record<string, any>).storageKeyIdentityMarker)
+      .toBe('full write')
+  })
+
   test('patch rejects a duplicate cold-chat id before updating the cache', async () => {
     const { client, server, strippedDb } = await bootSeeded()
     const before = snapshotExternalRows(server.cwd)
