@@ -41,7 +41,7 @@ const {
 
 const PAGE_BYTES = 64 * 1024;
 const MAX_METADATA_DESCRIPTOR_BYTES = 64 * 1024;
-const packr = new Packr({ useRecords: false });
+const packr = new Packr({ useRecords: false, variableMapSize: true });
 const fatalUtf8Decoder = new TextDecoder('utf-8', { fatal: true });
 const RISU_BLOCK_MAX_COUNT = 1_000_000;
 const RISU_REMOTE_MAX_COUNT = 1_000_000;

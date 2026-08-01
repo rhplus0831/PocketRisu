@@ -13,7 +13,7 @@ const MAX_JSON_DEPTH = 1024;
 // more than the 17 significant decimal digits binary64 can represent also
 // makes the ordinary conversion path agree with JSON.parse in practice.
 const MAX_SIGNIFICANT_NUMBER_PREFIX = 768;
-const packr = new Packr({ useRecords: false });
+const packr = new Packr({ useRecords: false, variableMapSize: true });
 const unpackr = new Unpackr({ int64AsType: 'number', useRecords: false });
 const SIMPLE_JSON_ESCAPES = new Map([
     [0x22, 0x22], [0x5c, 0x5c], [0x2f, 0x2f], [0x62, 0x08],

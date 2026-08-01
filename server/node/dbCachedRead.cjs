@@ -10,9 +10,11 @@ const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
 
 const packr = new Packr({
     useRecords: false,
+    variableMapSize: true,
 });
 
 const unpackr = new Unpackr({
+    copyBuffers: true,
     int64AsType: 'number',
     useRecords: false,
 });

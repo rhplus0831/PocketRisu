@@ -2,9 +2,11 @@ import { Packr, Unpackr } from 'msgpackr/index-no-eval'
 
 const packr = new Packr({
     useRecords: false,
+    variableMapSize: true,
 })
 
 const unpackr = new Unpackr({
+    copyBuffers: true,
     int64AsType: 'number',
     useRecords: false,
 })

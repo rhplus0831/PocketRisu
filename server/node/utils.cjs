@@ -1,4 +1,4 @@
-const { Packr, Unpackr, decode } = require('msgpackr');
+const { Packr, Unpackr } = require('msgpackr');
 const fflate = require('fflate');
 const { createHash, randomUUID } = require('crypto');
 const zlib = require('zlib');
@@ -87,10 +87,12 @@ async function decompressRisuSaveBlock(data, { signal, maxOutputBytes, onOutputC
 
 // Packr/Unpackr instances
 const packr = new Packr({
-    useRecords: false
+    useRecords: false,
+    variableMapSize: true,
 });
 
 const unpackr = new Unpackr({
+    copyBuffers: true,
     int64AsType: 'number',
     useRecords: false
 });
@@ -838,10 +840,10 @@ async function _decodeRisuSaveInternal(data, options = {}) {
         switch (header) {
             case "plugin-compressed":
                 data = data.slice(magicPluginStorageCompressedHeader.length);
-                return restoreLegacyPluginStorageKeys(decode(fflate.decompressSync(data)));
+                return restoreLegacyPluginStorageKeys(unpackr.decode(fflate.decompressSync(data)));
             case "compressed":
                 data = data.slice(magicCompressedHeader.length);
-                return decode(fflate.decompressSync(data));
+                return unpackr.decode(fflate.decompressSync(data));
             case "plugin-raw":
                 data = data.slice(magicPluginStorageHeader.length);
                 return restoreLegacyPluginStorageKeys(unpackr.decode(data));

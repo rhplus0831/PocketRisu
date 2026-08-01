@@ -557,26 +557,20 @@ describe('staged plugin transition verifier boundaries (real server)', () => {
 
   test('accepts 100000 exact inline descriptors and rejects authoritative entry 100001', async () => {
     const makeDatabaseAndRows = (count: number) => {
-      // The legacy msgpack writer intentionally uses the fast 16-bit map path.
-      // Split the protocol-wide ceiling across the two independent storage
-      // maps so the fixture itself remains a valid Risu save.
-      const valueCount = Math.ceil(count / 2)
+      // Keep every descriptor in one map so this protocol-boundary test also
+      // guards the standard MessagePack map32 path above 65,535 keys.
       const pluginCustomStorage: Record<string, number> = {}
-      const pluginStorageMeta: Record<string, number> = {}
       const rows: Array<{ storageKey: string, size: number }> = []
       for (let index = 0; index < count; index++) {
         const rawKey = `entry/${index}`
-        const prefix = index < valueCount ? VALUE_PREFIX : META_PREFIX
-        const target = index < valueCount ? pluginCustomStorage : pluginStorageMeta
-        target[rawKey] = index % 10
-        rows.push({ storageKey: encodeStorageKey(prefix, rawKey), size: 1 })
+        pluginCustomStorage[rawKey] = index % 10
+        rows.push({ storageKey: encodeStorageKey(VALUE_PREFIX, rawKey), size: 1 })
       }
       return {
         database: {
           characters: [],
           optimizePluginMemory: false,
           pluginCustomStorage,
-          pluginStorageMeta,
         },
         rows,
       }

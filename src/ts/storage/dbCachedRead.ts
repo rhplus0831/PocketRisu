@@ -141,7 +141,11 @@ async function resolveSegment(
 }
 
 function readBytes(value: unknown): Uint8Array | null {
-    if (value instanceof Uint8Array) return new Uint8Array(value)
+    // decodeRawMsgpack uses copyBuffers, so MessagePack binary values already
+    // own storage independent of the envelope. Reusing that owned Uint8Array
+    // preserves the existing one-copy cache-miss path instead of copying every
+    // segment a second time before hashing and persistence.
+    if (value instanceof Uint8Array) return value
     if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0))
     if (ArrayBuffer.isView(value)) {
         return new Uint8Array(new Uint8Array(value.buffer, value.byteOffset, value.byteLength))

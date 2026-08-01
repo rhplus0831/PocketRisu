@@ -22,7 +22,7 @@ const {
     validateJsonSource,
 } = require('./streamJsonToMsgpack.cjs');
 
-const packr = new Packr({ useRecords: false });
+const packr = new Packr({ useRecords: false, variableMapSize: true });
 const PAGE_BYTES = 64 * 1024;
 
 function collectionHeader(length, fixBase, type16, type32) {

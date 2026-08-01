@@ -5,14 +5,19 @@ import { describe, test, expect, vi } from 'vitest'
 // delegates to are pure once `compare` is injected.
 vi.mock('./database.svelte', () => ({}))
 vi.mock('./chatStorage', () => ({
-    // Identity stub — character path is exercised with empty `characters`
-    // arrays in this suite, but the mock has to exist so import resolution
-    // works.
-    chatToStub: (c: any) => c,
+    chatToStub: (chat: any) => {
+        if (chat?._stub === true && !Array.isArray(chat?.message)) return chat
+        const stub: any = { id: chat?.id ?? '', name: chat?.name ?? '', _stub: true }
+        for (const key of ['lastDate', 'folderId', 'modules']) {
+            if (chat && key in chat) stub[key] = chat[key]
+        }
+        return stub
+    },
 }))
 vi.mock('../globalApi.svelte', () => ({ forageStorage: { realStorage: null } }))
 
 const {
+    buildBoundedCharacterPatch,
     decodeRisuSave,
     diffArrayWithIdGuard,
     encodeRisuSaveLegacy,
@@ -41,6 +46,33 @@ describe('plugin storage legacy key envelope', () => {
         expect(rawKeys.map(key => decoded.pluginCustomStorage[key])).toEqual(
             rawKeys.map((_key, index) => ({ index })),
         )
+    })
+
+    test('round-trips one standard map above the map16 key ceiling', async () => {
+        const keyCount = 65_536
+        const pluginCustomStorage = Object.fromEntries(
+            Array.from({ length: keyCount }, (_, index) => [`key-${index}`, index]),
+        )
+
+        const decoded = await decodeRisuSave(encodeRisuSaveLegacy({
+            characters: [],
+            pluginCustomStorage,
+        }))
+        expect(Object.keys(decoded.pluginCustomStorage)).toHaveLength(keyCount)
+        expect(decoded.pluginCustomStorage['key-65535']).toBe(65_535)
+    })
+
+    test('decoded binary fields own storage independent of the legacy input', async () => {
+        for (const compression of ['noCompression', 'compression'] as const) {
+            const encoded = encodeRisuSaveLegacy({
+                characters: [],
+                binary: new Uint8Array([1, 2, 3, 4]),
+            }, compression)
+            const decoded = await decodeRisuSave(encoded)
+
+            expect(decoded.binary).toEqual(new Uint8Array([1, 2, 3, 4]))
+            expect(decoded.binary.buffer).not.toBe(encoded.buffer)
+        }
     })
 })
 
@@ -672,6 +704,80 @@ const dbWith = (characters: any[], rest: Record<string, any> = {}) => ({
     formatversion: 4, username: 'u', personaPrompt: 'p', botPresets: [], modules: [], characters, ...rest,
 })
 const clone = (o: any) => JSON.parse(JSON.stringify(o))
+
+describe('bounded character patches', () => {
+    test('keeps a granular diff when it fits both budgets', () => {
+        const normalized = chr('a')
+        expect(buildBoundedCharacterPatch(
+            [{ op: 'replace', path: '/desc', value: 'updated' }],
+            3,
+            normalized,
+            { maxOperations: 1, maxBytes: 1024 },
+        )).toEqual([{
+            op: 'replace',
+            path: '/characters/3/desc',
+            value: 'updated',
+        }])
+    })
+
+    test('falls back atomically when the operation or byte budget is exceeded', () => {
+        const normalized = chr('a', { desc: 'current' })
+        const operations = [
+            { op: 'replace', path: '/desc', value: 'first' },
+            { op: 'replace', path: '/firstMessage', value: 'second' },
+        ]
+        const expected = [{ op: 'replace', path: '/characters/0', value: normalized }]
+
+        expect(buildBoundedCharacterPatch(
+            operations,
+            0,
+            normalized,
+            { maxOperations: 1, maxBytes: Number.MAX_SAFE_INTEGER },
+        )).toEqual(expected)
+        expect(buildBoundedCharacterPatch(
+            operations.slice(0, 1),
+            0,
+            normalized,
+            { maxOperations: 1, maxBytes: 8 },
+        )).toEqual(expected)
+    })
+
+    test('a pathological character diff becomes one stub-only replace and converges', async () => {
+        const fieldCount = 32_769
+        const previousLore = Object.fromEntries(
+            Array.from({ length: fieldCount }, (_, index) => [`entry-${index}`, 0]),
+        )
+        const nextLore = Object.fromEntries(
+            Array.from({ length: fieldCount }, (_, index) => [`entry-${index}`, 1]),
+        )
+        const initial = dbWith([chr('a', { loreBook: previousLore })])
+        const fullChat = {
+            id: 'chat-a',
+            name: 'c',
+            message: [{ role: 'user', data: 'must stay in the chat row' }],
+        }
+        const next = dbWith([chr('a', { chats: [fullChat], loreBook: nextLore })])
+        const patcher = new RisuSavePatcher()
+        await patcher.init(initial)
+
+        const { patch } = await patcher.set(next, {
+            ...emptyToSave(),
+            character: ['a'],
+        })
+        expect(patch).toHaveLength(1)
+        expect(patch[0]).toMatchObject({ op: 'replace', path: '/characters/0' })
+        expect(patch[0].value.chats).toEqual([{ id: 'chat-a', name: 'c', _stub: true }])
+        expect(patch[0].value.chats[0]).not.toHaveProperty('message')
+
+        const reconstructed = applyOpsTo(normalizeJSON(initial), patch)
+        const expected = normalizeJSON(dbWith([chr('a', {
+            chats: [{ id: 'chat-a', name: 'c', _stub: true }],
+            loreBook: nextLore,
+        })]))
+        expect(reconstructed).toEqual(expected)
+        expect((await patcher.set(next, emptyToSave())).patch).toEqual([])
+    })
+})
 
 describe('fast-path — no-op detection after each transition', () => {
     test('init → identical save is a no-op', async () => {

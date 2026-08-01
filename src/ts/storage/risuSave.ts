@@ -1,4 +1,4 @@
-import { Packr, Unpackr, decode } from "msgpackr/index-no-eval";
+import { Packr, Unpackr } from "msgpackr/index-no-eval";
 import * as fflate from "fflate";
 import { createBotPresetTemplate, getDatabase, type Database } from "./database.svelte";
 import { forageStorage } from "../globalApi.svelte";
@@ -13,13 +13,19 @@ import {
 import { isWellFormedUnicode } from "./unicodeWellFormed";
 
 const packr = new Packr({
-    useRecords:false
+    useRecords:false,
+    variableMapSize:true,
 });
 
 const unpackr = new Unpackr({
+    copyBuffers:true,
     int64AsType: 'number',
     useRecords:false
 })
+
+const patchByteEncoder = new TextEncoder();
+export const CHARACTER_PATCH_MAX_OPERATIONS = 32_768;
+export const CHARACTER_PATCH_MAX_BYTES = 8 * 1024 * 1024;
 
 
 // NodeOnly: server cannot resolve remote blocks, always disable
@@ -948,10 +954,10 @@ export async function decodeRisuSave(data:Uint8Array, options: RisuSaveDecodeOpt
         switch(header){
             case "plugin-compressed":
                 data = data.slice(magicPluginStorageCompressedHeader.length)
-                return restoreLegacyPluginStorageKeys(decode(fflate.decompressSync(data)))
+                return restoreLegacyPluginStorageKeys(unpackr.decode(fflate.decompressSync(data)))
             case "compressed":
                 data = data.slice(magicCompressedHeader.length)
-                return decode(fflate.decompressSync(data))
+                return unpackr.decode(fflate.decompressSync(data))
             case "plugin-raw":
                 data = data.slice(magicPluginStorageHeader.length)
                 return restoreLegacyPluginStorageKeys(unpackr.decode(data))
@@ -1256,6 +1262,58 @@ export function diffArrayWithIdGuard(
         }
     }
     return ops
+}
+
+export type CharacterPatchBudget = {
+    maxOperations: number;
+    maxBytes: number;
+}
+
+const defaultCharacterPatchBudget: CharacterPatchBudget = {
+    maxOperations: CHARACTER_PATCH_MAX_OPERATIONS,
+    maxBytes: CHARACTER_PATCH_MAX_BYTES,
+}
+
+/**
+ * Scope one character's diff to its database path without ever spreading the
+ * operation array as function arguments. Oversized granular diffs are replaced
+ * atomically with the normalized, stub-only character so no partial diff can
+ * escape and the next patcher baseline remains identical to the server state.
+ *
+ * The byte budget applies to the granular JSON Patch representation. A single
+ * replacement is allowed to exceed it because dropping that replacement would
+ * turn a resource guard into data loss; the ordinary request/full-write limits
+ * remain responsible for bounding the complete character value.
+ */
+export function buildBoundedCharacterPatch(
+    operations: readonly any[],
+    characterIndex: number,
+    normalizedCharacter: any,
+    budget: CharacterPatchBudget = defaultCharacterPatchBudget,
+): any[] {
+    const replacement = [{
+        op: 'replace',
+        path: `/characters/${characterIndex}`,
+        value: normalizedCharacter,
+    }]
+    if (operations.length > budget.maxOperations) return replacement
+
+    const scoped: any[] = []
+    // Include the surrounding array and commas so the counter matches the
+    // serialized JSON Patch payload rather than only its operation bodies.
+    let encodedBytes = 2
+    for (const operation of operations) {
+        const scopedOperation = {
+            ...operation,
+            path: `/characters/${characterIndex}${operation.path}`,
+        }
+        const serialized = JSON.stringify(scopedOperation)
+        encodedBytes += patchByteEncoder.encode(serialized).byteLength
+            + (scoped.length === 0 ? 0 : 1)
+        if (encodedBytes > budget.maxBytes) return replacement
+        scoped.push(scopedOperation)
+    }
+    return scoped
 }
 
 export class RisuSavePatcher {
@@ -1578,11 +1636,12 @@ export class RisuSavePatcher {
                 const changedByHash = !!(curCharId && curCharHash !== this.hashBlocks[curCharId])
 
                 if (trackedBySave || changedByHash) {
-                    let charPatch = compare(lastChar, normChar).map((v) => {
-                        v.path = `/characters/${i}` + v.path;
-                        return v;
-                    })
-                    patch.push(...charPatch);
+                    const charPatch = buildBoundedCharacterPatch(
+                        compare(lastChar, normChar),
+                        i,
+                        normChar,
+                    )
+                    for (const operation of charPatch) patch.push(operation)
                     this.hashBlocks[normChar.chaId] = curCharHash ?? calculateHash(normChar);
                     this.lastSyncedDb.characters[i] = normChar;
                 }

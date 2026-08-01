@@ -98,6 +98,52 @@ describe('segmented cached database read', () => {
         expect(Object.prototype.hasOwnProperty.call(assembled.database.nested.object, 'missing')).toBe(true)
     })
 
+    it('round-trips a map32 database through full and segmented server codecs', async () => {
+        const keyCount = 65_536
+        const pluginCustomStorage = Object.fromEntries(
+            Array.from({ length: keyCount }, (_, index) => [`key-${index}`, index]),
+        )
+        const database = { ...representativeDatabase(), pluginCustomStorage }
+        const prepared = prepareDatabaseReadPayload(database)
+        const encodedSegments = encodeDatabaseSegments(database)
+        const envelope = buildCachedDbReadEnvelope(encodedSegments, parseDbCacheInventory({
+            cache: { version: 1, hashes: emptyInventory() },
+        }), prepared.etag)
+
+        const assembled = await decodeAndAssembleCachedDbRead(
+            encodeCachedDbReadEnvelope(envelope),
+            emptyInventory(),
+            async () => null,
+        )
+        const fullDecode = await decodeRisuSave(encodeRisuSaveLegacy(database))
+
+        expect(Object.keys(assembled.database.pluginCustomStorage)).toHaveLength(keyCount)
+        expect(assembled.database.pluginCustomStorage['key-65535']).toBe(65_535)
+        expect(assembled.database).toEqual(fullDecode)
+    })
+
+    it('detaches long-lived decoded binaries from retained cache segment bytes', async () => {
+        const database = {
+            ...representativeDatabase(),
+            binary: new Uint8Array([1, 2, 3, 4]),
+        }
+        const prepared = prepareDatabaseReadPayload(database)
+        const encodedSegments = encodeDatabaseSegments(database)
+        const envelope = buildCachedDbReadEnvelope(encodedSegments, parseDbCacheInventory({
+            cache: { version: 1, hashes: emptyInventory() },
+        }), prepared.etag)
+
+        const assembled = await decodeAndAssembleCachedDbRead(
+            encodeCachedDbReadEnvelope(envelope),
+            emptyInventory(),
+            async () => null,
+        )
+        const rootBytes = assembled.updates[0].entries[0].bytes
+
+        expect(Array.from(assembled.database.binary)).toEqual([1, 2, 3, 4])
+        expect(assembled.database.binary.buffer).not.toBe(rootBytes.buffer)
+    })
+
     it('preserves client/server compositional hash parity with the full decode', async () => {
         const database = representativeDatabase()
         const prepared = prepareDatabaseReadPayload(database)
