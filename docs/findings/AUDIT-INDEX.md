@@ -1,6 +1,6 @@
 # Audit findings — priority index
 
-Indexed 2026-07-27 from the 60 findings in [`docs/audit/`](audit/). The
+Indexed 2026-07-27 from the 60 findings in [`docs/findings/audit/`](audit/). The
 `Status` column uses `Open`, `Fixed`, `Deferred`, or `Intentional documented limitation`;
 34 findings are currently `Open`, 24 are `Fixed`, 1 is `Deferred`, and 1 is an
 `Intentional documented limitation`. Per-document severities are 15 High, 38 Medium, and 7 Low, but this

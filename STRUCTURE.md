@@ -105,7 +105,7 @@ Browser client (src/)                         Node server (server/node/)
 | `server/hono/` | Incomplete multi-runtime scaffold |
 | `shared/` | Contracts consumed by both client and server, currently plugin key policy |
 | `docs/structure/` | This architecture guide's subsystem references |
-| `docs/audit/`, `.archived-docs/` | Point-in-time risk reports and historical material, not canonical architecture |
+| `docs/findings/`, `.archived-docs/` | Point-in-time risk and compatibility reports, plus their indexes; historical material, not canonical architecture |
 | `test/compat/` | Real-server integration and storage/interchange regressions |
 | `test/performance/` | Resource-cache and storage performance scenarios |
 | `scripts/` | Portable/Termux build helpers, updater, and verification scripts |
@@ -245,5 +245,5 @@ not-committed, or unknown outcomes. See
 
 Approximate file sizes were removed from the root map because fast-moving storage and
 plugin modules made them misleading. When code moves, prefer updating symbol ownership
-and change maps over refreshing every line number. Treat `docs/audit/` findings as
+and change maps over refreshing every line number. Treat `docs/findings/audit/` findings as
 historical evidence whose resolution must be checked against current code.

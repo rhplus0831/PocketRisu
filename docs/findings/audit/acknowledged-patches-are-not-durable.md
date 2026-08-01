@@ -25,7 +25,7 @@ deferred patch. Crash before the flush leaves the row orphaned; the orphan
 grace-period sweep later deletes it, so the whole chat (content included) is
 eventually lost even though both writes were acknowledged.
 
-The v1 remediation (`../../.archived-docs/v1/patch-deletes-chat-rows-before-stub-persistence.md`)
+The v1 remediation (`../../../.archived-docs/v1/patch-deletes-chat-rows-before-stub-persistence.md`)
 made deferred persistence safe against *deletions* but deliberately kept the
 deferred timer; the ack-before-durable window itself was never addressed.
 

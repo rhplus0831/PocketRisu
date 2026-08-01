@@ -2405,7 +2405,7 @@ describe('plugin publication recovery snapshot scheduling', () => {
     }, 30_000)
 })
 
-// The audit regression (docs/audit/snapshots-omit-optimized-plugin-storage.md):
+// The audit regression (docs/findings/audit/snapshots-omit-optimized-plugin-storage.md):
 // snapshot V1 → change to V2, delete an old key, add a new key → restore →
 // the exact snapshot-time key set and values must come back.
 async function runRoundTrip(format: 'canonical' | 'gzip' | 'block'): Promise<void> {
