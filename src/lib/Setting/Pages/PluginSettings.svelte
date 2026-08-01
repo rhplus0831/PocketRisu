@@ -61,6 +61,9 @@
     let autoConvertPluginStorageValuesEnabled = $state(
         DBState.db.autoConvertPluginStorageValues === true,
     )
+    let optimizePluginMemoryEnabled = $state(
+        DBState.db.optimizePluginMemory === true,
+    )
     let confirmingPluginCompatibilityChange = $state(false)
     let permissionEditorPlugin = $state<string | null>(null)
     let permissionEditorLoading = $state(false)
@@ -136,13 +139,15 @@
                 },
                 onStart: ({ completed, total, completedBytes, totalBytes }) => {
                     loadingOverlayStore.set({
-                        active: total > 0,
-                        text: language.optimizePluginMemoryProgress(
-                            completed,
-                            total,
-                            formatPluginStorageTransitionBytes(completedBytes ?? 0),
-                            formatPluginStorageTransitionBytes(totalBytes ?? 0),
-                        ),
+                        active: true,
+                        text: total > 0
+                            ? language.optimizePluginMemoryProgress(
+                                completed,
+                                total,
+                                formatPluginStorageTransitionBytes(completedBytes ?? 0),
+                                formatPluginStorageTransitionBytes(totalBytes ?? 0),
+                            )
+                            : language.optimizePluginMemoryWorking,
                         onCancel: cancelTransition,
                     })
                 },
@@ -186,6 +191,7 @@
                 }
             }
         } finally {
+            optimizePluginMemoryEnabled = DBState.db.optimizePluginMemory === true
             loadingOverlayStore.set({ active: false, text: "", onCancel: null })
             reconcilingPluginStorage = false
         }
@@ -369,7 +375,7 @@
 
 <div class="my-4 rounded border border-darkborderc bg-darkbg/40 p-3">
     <CheckInput
-        check={DBState.db.optimizePluginMemory === true}
+        bind:check={optimizePluginMemoryEnabled}
         onChange={togglePluginMemoryOptimization}
         disabled={reconcilingPluginStorage || (
             DBState.db.optimizePluginMemory !== true && !optimizePluginMemoryEligible

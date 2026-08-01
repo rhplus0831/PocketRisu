@@ -21,12 +21,14 @@ const setPermissionDecision = vi.hoisted(() => vi.fn())
 const confirmReset = vi.hoisted(() => vi.fn())
 const mutationError = vi.hoisted(() => vi.fn())
 const mutationSuccess = vi.hoisted(() => vi.fn())
+const mutationWarning = vi.hoisted(() => vi.fn())
 const transitionStorageMode = vi.hoisted(() => vi.fn())
+const setLoadingOverlay = vi.hoisted(() => vi.fn())
 
 vi.mock('src/ts/stores.svelte', () => ({
     DBState: { db: pluginDatabase },
     hotReloading: [],
-    loadingOverlayStore: { set: vi.fn() },
+    loadingOverlayStore: { set: setLoadingOverlay },
     selIdState: { selId: -1 },
 }))
 
@@ -36,7 +38,7 @@ vi.mock('src/ts/alert', () => ({
     alertSelect: vi.fn(),
     notifyError: mutationError,
     notifySuccess: mutationSuccess,
-    notifyWarning: vi.fn(),
+    notifyWarning: mutationWarning,
 }))
 
 vi.mock('src/ts/plugins/apiV3/v3.svelte', () => ({
@@ -117,7 +119,9 @@ afterEach(() => {
     confirmReset.mockReset()
     mutationError.mockReset()
     mutationSuccess.mockReset()
+    mutationWarning.mockReset()
     transitionStorageMode.mockReset()
+    setLoadingOverlay.mockReset()
     pluginDatabase.legacyPluginCompatibility = false
     pluginDatabase.optimizePluginMemory = false
     pluginDatabase.autoConvertPluginStorageValues = false
@@ -259,6 +263,71 @@ describe('PluginSettings storage transition', () => {
         expect(confirmReset).toHaveBeenCalledWith(expect.stringContaining(
             String(40 * 1024 * 1024),
         ))
+        await waitFor(() => expect(checkbox!.checked).toBe(true))
+        expect(pluginDatabase.optimizePluginMemory).toBe(true)
+        expect(mutationWarning).toHaveBeenCalledWith(
+            'Plugin storage mode change cancelled.',
+        )
+
+        await unmount(component)
+    })
+
+    test('keeps an indeterminate overlay visible during a bulk disable', async () => {
+        pluginDatabase.optimizePluginMemory = true
+        let finishTransition: (() => void) | undefined
+        const transitionPending = new Promise<void>((resolve) => {
+            finishTransition = resolve
+        })
+        transitionStorageMode.mockImplementationOnce(async (
+            enabled: boolean,
+            options: {
+                onStart: (progress: {
+                    direction: 'internalize'
+                    completed: number
+                    total: number
+                    completedBytes: number
+                    totalBytes: number
+                }) => void
+            },
+        ) => {
+            expect(enabled).toBe(false)
+            options.onStart({
+                direction: 'internalize',
+                completed: 0,
+                total: 0,
+                completedBytes: 0,
+                totalBytes: 0,
+            })
+            await transitionPending
+            pluginDatabase.optimizePluginMemory = false
+            return { direction: 'internalize', values: 2, meta: 1 }
+        })
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginSettings, { target })
+        const checkbox = target.querySelector<HTMLInputElement>(
+            'input[alt="Optimize plugin memory usage"]',
+        )
+        expect(checkbox).not.toBeNull()
+
+        checkbox!.checked = false
+        checkbox!.dispatchEvent(new Event('change', { bubbles: true }))
+
+        await waitFor(() => {
+            expect(setLoadingOverlay.mock.calls.at(-1)?.[0]).toMatchObject({
+                active: true,
+                text: 'Changing plugin storage mode… This may take a while.',
+                onCancel: expect.any(Function),
+            })
+        })
+
+        finishTransition?.()
+        await waitFor(() => expect(pluginDatabase.optimizePluginMemory).toBe(false))
+        await waitFor(() => expect(setLoadingOverlay.mock.calls.at(-1)?.[0]).toEqual({
+            active: false,
+            text: '',
+            onCancel: null,
+        }))
 
         await unmount(component)
     })
