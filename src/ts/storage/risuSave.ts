@@ -299,7 +299,16 @@ type EncodeBlockOption = {
     remote: 'none'|'prefer'|'force'
 }
 
-const risuSaveCacheMap = new Map<string, {type: RisuSaveType, data: string, name: string}>();
+type RisuSaveCachedBlock = {type: RisuSaveType, data: string, name: string};
+type RisuSaveCacheGeneration = {
+    owner: symbol;
+    blocks: ReadonlyMap<string, RisuSaveCachedBlock>;
+};
+
+// At most one completed encoder generation is available to the permissive
+// recovery decoder. Encoder instances build their maps privately and publish
+// an immutable snapshot only after init()/set() completes.
+let risuSaveCacheGeneration: RisuSaveCacheGeneration|null = null;
 
 export type RisuSaveDecodeOptions = {
     strictBlockIntegrity?: boolean;
@@ -338,11 +347,33 @@ export class RisuSaveEncoder {
     // In-memory only (rebuilt by init()), so the representation is free to
     // differ from the patcher's protocol-level calculateHash.
     private characterJsons: { [key: string]: string } = {};
+    private readonly cacheGenerationOwner = Symbol('RisuSaveEncoder cache generation');
+    private readonly cachedBlocks = new Map<string, RisuSaveCachedBlock>();
+
+    private invalidatePublishedCache(){
+        if(risuSaveCacheGeneration?.owner === this.cacheGenerationOwner){
+            risuSaveCacheGeneration = null;
+        }
+    }
+
+    private publishCacheGeneration(){
+        risuSaveCacheGeneration = {
+            owner: this.cacheGenerationOwner,
+            blocks: new Map(this.cachedBlocks),
+        };
+    }
 
     async init(data:Database,arg:{
         compression?: boolean,
         skipRemoteSavingOnCharacters?: boolean
     } = {}){
+        // Cached recovery blocks are valid only for the lifetime of this
+        // encoder generation. A replacement encoder must not inherit blocks
+        // from the database (or account/import state) that preceded it.
+        this.invalidatePublishedCache();
+        this.cachedBlocks.clear();
+        this.blocks = {};
+        this.characterJsons = {};
         const {
             compression = false,
             skipRemoteSavingOnCharacters = true
@@ -362,7 +393,10 @@ export class RisuSaveEncoder {
             compression,
             data: JSON.stringify(obj),
             type: RisuSaveType.ROOT,
-            name: 'root'
+            name: 'root',
+            // The root is required to discover the directory and therefore
+            // can never itself be recovered through that directory.
+            cache: false,
         });
         this.blocks['preset'] = await this.encodeBlock({
             compression,
@@ -391,7 +425,6 @@ export class RisuSaveEncoder {
             type: RisuSaveType.PLUGIN_STORAGE,
             name: 'pluginStorage'
         });
-        this.characterJsons = {}
         for( const character of data.characters) {
             // Replace chats with stubs for database.bin — full chat data lives server-side
             const charForEncode = { ...character, chats: character.chats.map(c => chatToStub(c)) }
@@ -418,9 +451,11 @@ export class RisuSaveEncoder {
             type: RisuSaveType.CONFIG,
             name: "config"
         })
+        this.publishCacheGeneration();
     }
 
     async set(data:Database, toSave:toSaveType){
+        this.invalidatePublishedCache();
         let obj:Record<any,any> = {}
         let keys = Object.keys(data)
         for(const key of keys){
@@ -469,6 +504,7 @@ export class RisuSaveEncoder {
                 if(!savedId.has(chaId)){
                     delete this.blocks[chaId];
                     delete this.characterJsons[chaId];
+                    this.cachedBlocks.delete(`risuSaveBlock_${chaId}`);
                 }
             }
         }
@@ -484,6 +520,7 @@ export class RisuSaveEncoder {
             if (!currentCharacterIds.has(key)) {
                 delete this.blocks[key];
                 delete this.characterJsons[key];
+                this.cachedBlocks.delete(`risuSaveBlock_${key}`);
             }
         }
 
@@ -529,8 +566,10 @@ export class RisuSaveEncoder {
             compression: this.compression,
             data: JSON.stringify(obj),
             type: RisuSaveType.ROOT,
-            name: 'root'
+            name: 'root',
+            cache: false,
         });
+        this.publishCacheGeneration();
     }
 
     encode(arg:{
@@ -592,11 +631,21 @@ export class RisuSaveEncoder {
         buf.set(nameBuf, 3);
         buf.set(new Uint8Array(lengthBuf), 3 + nameBuf.length);
         buf.set(databuf, 7 + nameBuf.length);
-        risuSaveCacheMap.set(`risuSaveBlock_${arg.name}`, {
-            type: arg.type,
-            data: arg.data,
-            name: arg.name,
-        });
+        this.invalidatePublishedCache();
+        const cacheKey = `risuSaveBlock_${arg.name}`;
+        if(cacheBlock){
+            this.cachedBlocks.set(cacheKey, {
+                type: arg.type,
+                data: arg.data,
+                name: arg.name,
+            });
+        }
+        else{
+            // Opting out must also evict an entry left by an earlier encode
+            // in the same generation; merely skipping set() would leave stale
+            // data available to the recovery decoder.
+            this.cachedBlocks.delete(cacheKey);
+        }
         return buf;
     }
 
@@ -643,6 +692,9 @@ export class RisuSaveDecoder {
     }[] = []
     async decode(data: Uint8Array, options: RisuSaveDecodeOptions = {}): Promise<Database> {
         const strictBlockIntegrity = options.strictBlockIntegrity === true;
+        const recoveryBlocks = strictBlockIntegrity
+            ? null
+            : risuSaveCacheGeneration?.blocks ?? null;
         console.log('Decoding RisuSave data');
         let offset = magicRisuSaveHeader.length;
         //@ts-expect-error Database has required fields, but we initialize empty and populate incrementally during decode
@@ -745,14 +797,14 @@ export class RisuSaveDecoder {
                             console.log('RisuSave directory:', rootDirectory);
                             for(const dirKey of rootDirectory){
                                 directory.add(dirKey);
-                                if(!loadedBlocks.has(dirKey)){
+                                if(!loadedBlocks.has(dirKey) && !strictBlockIntegrity){
                                     try {
                                         console.log(`Loading directory block ${dirKey} from cache`);
                                         const dirData:{
                                             type:RisuSaveType
                                             data:string
                                             name:string
-                                        } = risuSaveCacheMap.get(`risuSaveBlock_${dirKey}`) ?? null;
+                                        } = recoveryBlocks?.get(`risuSaveBlock_${dirKey}`) ?? null;
 
                                         if(dirData){
                                             this.blocks.push({

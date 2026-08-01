@@ -16,6 +16,7 @@ vi.mock('./chatStorage', () => ({
 const {
     decodeAuthoritativeRisuSave,
     decodeRisuSave,
+    RisuSaveEncoder,
 } = await import('./risuSave')
 
 const header = Buffer.from('RISUSAVE\0', 'binary')
@@ -37,6 +38,48 @@ function rawBlock(type: number, name: string, body: Buffer): Buffer {
 
 function save(...blocks: Buffer[]): Uint8Array {
     return Buffer.concat([header, ...blocks])
+}
+
+function databaseWithCharacter(chaId: string) {
+    return {
+        marker: `database-${chaId}`,
+        characters: [{ chaId, name: chaId, chats: [] }],
+        botPresets: [],
+        modules: [],
+        plugins: [],
+        pluginCustomStorage: {},
+    }
+}
+
+function noTrackedChanges(character: string[] = []) {
+    return {
+        character,
+        chat: [],
+        root: false,
+        botPreset: false,
+        modules: false,
+        plugins: false,
+        pluginCustomStorage: false,
+    }
+}
+
+function retainEncodedBlock(encoded: ArrayBuffer, wantedName: string): Uint8Array {
+    const bytes = Buffer.from(encoded)
+    let offset = header.length
+    while (offset < bytes.length) {
+        const blockStart = offset
+        const nameLength = bytes[offset + 2]
+        const nameStart = offset + 3
+        const nameEnd = nameStart + nameLength
+        const name = bytes.subarray(nameStart, nameEnd).toString('utf-8')
+        const bodyLength = bytes.readUInt32LE(nameEnd)
+        const blockEnd = nameEnd + 4 + bodyLength
+        if (name === wantedName) {
+            return Buffer.concat([header, bytes.subarray(blockStart, blockEnd)])
+        }
+        offset = blockEnd
+    }
+    throw new Error(`Encoded block ${wantedName} was not found`)
 }
 
 describe('authoritative RisuSave block decoding', () => {
@@ -82,6 +125,76 @@ describe('authoritative RisuSave block decoding', () => {
                 __directory: ['missing-character'],
             }),
         ))).rejects.toMatchObject({ code: 'RISU_SAVE_INVALID' })
+    })
+
+    test('never recovers authoritative blocks from the encoder cache', async () => {
+        const chaId = 'strict-cached-character'
+        const database = databaseWithCharacter(chaId)
+        const encoder = new RisuSaveEncoder()
+        await encoder.init(database as never)
+        // set() writes the directory-bearing root used by normal persistence.
+        await encoder.set(database as never, noTrackedChanges())
+        const encoded = encoder.encode()
+        expect(encoded).not.toBeNull()
+        const rootOnly = retainEncodedBlock(encoded!, 'root')
+
+        // Permissive decoding retains the legacy same-generation recovery path.
+        await expect(decodeRisuSave(rootOnly)).resolves.toMatchObject({
+            characters: [{ chaId }],
+        })
+        // Authoritative validation must be a function of the supplied bytes.
+        await expect(decodeAuthoritativeRisuSave(rootOnly)).rejects.toMatchObject({
+            code: 'RISU_SAVE_INVALID',
+        })
+    })
+
+    test('evicts cached character JSON when its encoder block is deleted', async () => {
+        const chaId = 'deleted-cached-character'
+        const encoder = new RisuSaveEncoder()
+        const database = databaseWithCharacter(chaId)
+        await encoder.init(database as never)
+        await encoder.set({ ...database, characters: [] } as never, noTrackedChanges([chaId]))
+
+        const decoded = await decodeRisuSave(save(
+            block(1, 'root', { __directory: [chaId] }),
+        ))
+        expect(decoded.characters ?? []).toEqual([])
+    })
+
+    test('clears recovery blocks when a new encoder generation starts', async () => {
+        const chaId = 'previous-generation-character'
+        const previousEncoder = new RisuSaveEncoder()
+        await previousEncoder.init(databaseWithCharacter(chaId) as never)
+
+        const nextEncoder = new RisuSaveEncoder()
+        await nextEncoder.init({
+            ...databaseWithCharacter('unused'),
+            characters: [],
+        } as never)
+
+        const decoded = await decodeRisuSave(save(
+            block(1, 'root', { __directory: [chaId] }),
+        ))
+        expect(decoded.characters ?? []).toEqual([])
+    })
+
+    test('cache false evicts an earlier block from the same generation', async () => {
+        const chaId = 'cache-disabled-character'
+        const encoder = new RisuSaveEncoder()
+        await encoder.init(databaseWithCharacter(chaId) as never)
+        await encoder.encodeRawBlock({
+            compression: false,
+            data: JSON.stringify({ chaId, name: 'must-not-recover', chats: [] }),
+            type: 2,
+            name: chaId,
+            cache: false,
+        })
+        await encoder.set(databaseWithCharacter(chaId) as never, noTrackedChanges())
+
+        const decoded = await decodeRisuSave(save(
+            block(1, 'root', { __directory: [chaId] }),
+        ))
+        expect(decoded.characters ?? []).toEqual([])
     })
 
     test('rejects truncated framing instead of publishing blocks parsed before it', async () => {
