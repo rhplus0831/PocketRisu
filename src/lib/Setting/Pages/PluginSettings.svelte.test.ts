@@ -118,16 +118,20 @@ afterEach(() => {
     mutationError.mockReset()
     mutationSuccess.mockReset()
     transitionStorageMode.mockReset()
+    pluginDatabase.legacyPluginCompatibility = false
     pluginDatabase.optimizePluginMemory = false
     pluginDatabase.autoConvertPluginStorageValues = false
     document.body.replaceChildren()
 })
 
 describe('PluginSettings storage transition', () => {
-    test('keeps automatic value conversion available in the compatibility area', async () => {
+    test('groups both plugin compatibility settings in a named section', async () => {
         const target = document.createElement('div')
         document.body.append(target)
         const component = mount(PluginSettings, { target })
+        const section = target.querySelector<HTMLElement>(
+            'section[aria-labelledby="plugin-compatibility-heading"]',
+        )
         const compatibilityCheckbox = target.querySelector<HTMLInputElement>(
             'input[alt="Legacy plugin compatibility"]',
         )
@@ -136,17 +140,82 @@ describe('PluginSettings storage transition', () => {
         )
 
         expect(pluginDatabase.optimizePluginMemory).toBe(false)
+        expect(section).not.toBeNull()
+        expect(section!.querySelector('#plugin-compatibility-heading')?.textContent?.trim()).toBe(
+            'Compatibility',
+        )
         expect(compatibilityCheckbox).not.toBeNull()
         expect(conversionCheckbox).not.toBeNull()
         expect(conversionCheckbox!.disabled).toBe(false)
-        expect(conversionCheckbox!.closest('div.my-4')).toBe(
-            compatibilityCheckbox!.closest('div.my-4'),
+        expect(section!.contains(compatibilityCheckbox)).toBe(true)
+        expect(section!.contains(conversionCheckbox)).toBe(true)
+
+        await unmount(component)
+    })
+
+    test.each([
+        ['legacyPluginCompatibility', 'Legacy plugin compatibility'],
+        ['autoConvertPluginStorageValues', 'Automatically convert compatible plugin values'],
+    ] as const)('enables %s without confirmation', async (setting, label) => {
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginSettings, { target })
+        const checkbox = target.querySelector<HTMLInputElement>(`input[alt="${label}"]`)
+        expect(checkbox).not.toBeNull()
+
+        checkbox!.checked = true
+        checkbox!.dispatchEvent(new Event('change', { bubbles: true }))
+
+        expect(pluginDatabase[setting]).toBe(true)
+        expect(confirmReset).not.toHaveBeenCalled()
+
+        await unmount(component)
+    })
+
+    test.each([
+        ['legacyPluginCompatibility', 'Legacy plugin compatibility'],
+        ['autoConvertPluginStorageValues', 'Automatically convert compatible plugin values'],
+    ] as const)('keeps %s enabled when disabling is cancelled', async (setting, label) => {
+        pluginDatabase[setting] = true
+        confirmReset.mockResolvedValue(false)
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginSettings, { target })
+        const checkbox = target.querySelector<HTMLInputElement>(`input[alt="${label}"]`)
+        expect(checkbox).not.toBeNull()
+
+        checkbox!.checked = false
+        checkbox!.dispatchEvent(new Event('change', { bubbles: true }))
+
+        await waitFor(() => expect(confirmReset).toHaveBeenCalledWith(
+            'Disabling this option will break compatibility with nearly all plugins. Disabling it is not recommended.',
+        ))
+        await waitFor(() => expect(checkbox!.checked).toBe(true))
+        expect(pluginDatabase[setting]).toBe(true)
+
+        await unmount(component)
+    })
+
+    test.each([
+        ['legacyPluginCompatibility', 'Legacy plugin compatibility'],
+        ['autoConvertPluginStorageValues', 'Automatically convert compatible plugin values'],
+    ] as const)('disables %s after confirmation', async (setting, label) => {
+        pluginDatabase[setting] = true
+        confirmReset.mockResolvedValue(true)
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginSettings, { target })
+        const checkbox = target.querySelector<HTMLInputElement>(`input[alt="${label}"]`)
+        expect(checkbox).not.toBeNull()
+
+        checkbox!.checked = false
+        checkbox!.dispatchEvent(new Event('change', { bubbles: true }))
+
+        await waitFor(() => expect(pluginDatabase[setting]).toBe(false))
+        expect(confirmReset).toHaveBeenCalledWith(
+            'Disabling this option will break compatibility with nearly all plugins. Disabling it is not recommended.',
         )
-
-        conversionCheckbox!.checked = true
-        conversionCheckbox!.dispatchEvent(new Event('change', { bubbles: true }))
-
-        expect(pluginDatabase.autoConvertPluginStorageValues).toBe(true)
+        expect(checkbox!.checked).toBe(false)
 
         await unmount(component)
     })

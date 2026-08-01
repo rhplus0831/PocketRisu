@@ -765,6 +765,7 @@ export function setDatabase(data:Database){
     if (typeof data.localNetworkMode !== 'boolean') data.localNetworkMode = false
     data.localNetworkTimeoutSec ??= 600
     if (typeof data.localNetworkTimeoutSec !== 'number' || Number.isNaN(data.localNetworkTimeoutSec)) data.localNetworkTimeoutSec = 600
+    data.autoConvertPluginStorageValues ??= true
     data.legacyPluginCompatibility ??= true
     // Optimized mode deliberately retains only this empty compatibility map;
     // V3 values are read on demand from pluginsave/ by pluginSaveStorage.ts.

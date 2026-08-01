@@ -85,18 +85,21 @@ describe('createBotPresetTemplate', () => {
 })
 
 describe('database defaults', () => {
-    test('enables legacy plugin compatibility when no preference is stored', () => {
+    test('enables plugin compatibility settings when no preference is stored', () => {
         setDatabase(DBState.db)
 
         expect(DBState.db.legacyPluginCompatibility).toBe(true)
+        expect(DBState.db.autoConvertPluginStorageValues).toBe(true)
     })
 
-    test('preserves an explicit opt-out of legacy plugin compatibility', () => {
+    test('preserves explicit opt-outs of plugin compatibility settings', () => {
         DBState.db.legacyPluginCompatibility = false
+        DBState.db.autoConvertPluginStorageValues = false
 
         setDatabase(DBState.db)
 
         expect(DBState.db.legacyPluginCompatibility).toBe(false)
+        expect(DBState.db.autoConvertPluginStorageValues).toBe(false)
     })
 })
 

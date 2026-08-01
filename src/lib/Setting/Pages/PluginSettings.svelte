@@ -55,6 +55,13 @@
     let showParams = $state([])
     let reconcilingPluginStorage = $state(false)
     let retryingPluginStorageRecovery = $state(false)
+    let legacyPluginCompatibilityEnabled = $state(
+        DBState.db.legacyPluginCompatibility === true,
+    )
+    let autoConvertPluginStorageValuesEnabled = $state(
+        DBState.db.autoConvertPluginStorageValues === true,
+    )
+    let confirmingPluginCompatibilityChange = $state(false)
     let permissionEditorPlugin = $state<string | null>(null)
     let permissionEditorLoading = $state(false)
     let permissionDecisions = $state<Partial<Record<PluginPermissionDesc, PluginPermissionDecision>>>({})
@@ -64,6 +71,32 @@
     const optimizePluginMemoryEligible = $derived(
         canOptimizePluginMemory(DBState.db.plugins),
     )
+
+    async function updatePluginCompatibilitySetting(
+        setting: "legacyPluginCompatibility" | "autoConvertPluginStorageValues",
+        enabled: boolean,
+    ) {
+        if (enabled) {
+            DBState.db[setting] = true
+            return
+        }
+
+        confirmingPluginCompatibilityChange = true
+        try {
+            const confirmed = await alertConfirm(language.pluginCompatibilityDisableConfirm)
+            if (!confirmed) {
+                if (setting === "legacyPluginCompatibility") {
+                    legacyPluginCompatibilityEnabled = true
+                } else {
+                    autoConvertPluginStorageValuesEnabled = true
+                }
+                return
+            }
+            DBState.db[setting] = false
+        } finally {
+            confirmingPluginCompatibilityChange = false
+        }
+    }
 
     async function togglePluginMemoryOptimization(enabled: boolean) {
         if (reconcilingPluginStorage) return
@@ -297,27 +330,34 @@
     </div>
 {/if}
 
-<div class="my-4 rounded border border-darkborderc bg-darkbg/40 p-3">
+<section
+    class="my-4 rounded border border-darkborderc bg-darkbg/40 p-3"
+    aria-labelledby="plugin-compatibility-heading"
+>
+    <h2 id="plugin-compatibility-heading" class="mb-3 font-semibold text-textcolor">
+        {language.pluginCompatibilitySection}
+    </h2>
     <CheckInput
-        check={DBState.db.legacyPluginCompatibility === true}
-        onChange={(enabled) => {
-            DBState.db.legacyPluginCompatibility = enabled
-        }}
+        bind:check={legacyPluginCompatibilityEnabled}
+        onChange={(enabled) => updatePluginCompatibilitySetting(
+            "legacyPluginCompatibility",
+            enabled,
+        )}
+        disabled={confirmingPluginCompatibilityChange}
         margin={false}
         name={language.legacyPluginCompatibility}
-    >
-        <ShBadge variant="warning">Compatibility</ShBadge>
-    </CheckInput>
+    />
     <p class="mt-1 text-xs text-textcolor2">
         {language.legacyPluginCompatibilityDesc}
     </p>
     <div class="mt-3 border-t border-darkborderc pt-3">
         <CheckInput
-            check={DBState.db.autoConvertPluginStorageValues === true}
-            onChange={(enabled) => {
-                DBState.db.autoConvertPluginStorageValues = enabled
-            }}
-            disabled={reconcilingPluginStorage}
+            bind:check={autoConvertPluginStorageValuesEnabled}
+            onChange={(enabled) => updatePluginCompatibilitySetting(
+                "autoConvertPluginStorageValues",
+                enabled,
+            )}
+            disabled={reconcilingPluginStorage || confirmingPluginCompatibilityChange}
             margin={false}
             name={language.autoConvertPluginStorageValues}
         />
@@ -325,7 +365,7 @@
             {language.autoConvertPluginStorageValuesDesc}
         </p>
     </div>
-</div>
+</section>
 
 <div class="my-4 rounded border border-darkborderc bg-darkbg/40 p-3">
     <CheckInput
