@@ -825,12 +825,6 @@ export async function saveDb() {
 
         // ── database.bin: exclude chat payload (stubs only via encoder) ──
         await encoder.set(db, safeStructuredClone(toSave))
-        const encoded = encoder.encode()
-        if (!encoded) {
-            await sleep(1000)
-            return chatPersistStage.completeStubCommit({ committed: false, result: 'noop' })
-        }
-        const dbData = new Uint8Array(encoded)
 
         let saved = false
         let newEtag: string | undefined
@@ -1025,11 +1019,22 @@ export async function saveDb() {
             if (supportsPatchSync && !options?.forceFullWrite) {
                 console.warn('[Save] Patch rejected without a database conflict, falling through to ETag-guarded full write...')
             }
+            const currentEtag = forageStorage.getDbEtag()
+            if (supportsPatchSync && !currentEtag) {
+                throw new Error('Refusing an unversioned full database write; authoritative reload required')
+            }
+
+            // Keep the encoder's blocks current before patching, but assemble
+            // the payload-sized contiguous database only after the patch path
+            // has actually selected a full write.
+            const encoded = encoder.encode()
+            if (!encoded) {
+                await sleep(1000)
+                return chatPersistStage.completeStubCommit({ committed: false, result: 'noop' })
+            }
+            const dbData = new Uint8Array(encoded)
+
             try {
-                const currentEtag = forageStorage.getDbEtag()
-                if (supportsPatchSync && !currentEtag) {
-                    throw new Error('Refusing an unversioned full database write; authoritative reload required')
-                }
                 await forageStorage.setItem('database/database.bin', dbData, currentEtag ?? undefined)
             } catch (conflictErr) {
                 if (conflictErr instanceof ConflictError) {
