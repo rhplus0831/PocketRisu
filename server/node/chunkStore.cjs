@@ -47,6 +47,27 @@ function cdcSplit(buf) {
 // equals this 13-byte sentinel, so reads stay backward-compatible.
 const CHUNK_MARKER = Buffer.from('\x00RISUCHUNKED\x00', 'binary');
 const DEFAULT_THRESHOLD = 16 * 1024 * 1024; // values larger than this get chunked
+const CONTENT_VERIFICATION_MEMO_LIMIT = 4096;
+
+function createContentVerificationMemo(limit = CONTENT_VERIFICATION_MEMO_LIMIT) {
+    const revisions = new Map();
+    return {
+        has(key, revision) {
+            return Number.isSafeInteger(revision) && revisions.get(key) === revision;
+        },
+        remember(key, revision) {
+            if (!Number.isSafeInteger(revision) || revision < 0) return;
+            revisions.delete(key);
+            revisions.set(key, revision);
+            while (revisions.size > limit) {
+                revisions.delete(revisions.keys().next().value);
+            }
+        },
+        forget(key) {
+            revisions.delete(key);
+        },
+    };
+}
 
 function chunkCorruption(message) {
     const error = new Error(message);
@@ -115,7 +136,16 @@ function sizeFromAggregateRow(row) {
 
 // Read-only chunk-aware bindings for a pinned SQLite snapshot. Keep this
 // separate from createChunkStore so readonly connections prepare no writes.
-function createSnapshotReader(db) {
+function createSnapshotReader(db, opts = {}) {
+    const trustedContentMemo = opts.contentVerificationMemo ?? null;
+    const localContentMemo = createContentVerificationMemo();
+    const contentReadMetrics = {
+        fullVerificationAttempts: 0,
+        fullVerifications: 0,
+        warmReads: 0,
+        chunkDigestComputations: 0,
+        preallocatedReads: 0,
+    };
     const selKv = db.prepare(
         `SELECT value, EXISTS (
              SELECT 1 FROM chunk_manifest_publications p WHERE p.manifest_key = kv.key
@@ -188,14 +218,34 @@ function createSnapshotReader(db) {
           WHERE kv.key LIKE @pattern ESCAPE '\\'
           GROUP BY kv.key`,
     );
-    const selManifest = db.prepare('SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq');
+    const selManifest = db.prepare(
+        'SELECT seq, hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq',
+    );
     const selChunk = db.prepare('SELECT data FROM chunks WHERE hash = ?');
     const selManifestExists = db.prepare('SELECT 1 FROM manifest_chunks WHERE manifest_key = ? LIMIT 1');
     const selManifestMeta = db.prepare(
         'SELECT chunk_count, logical_size, logical_sha256 FROM chunk_manifest_meta WHERE manifest_key = ?',
     );
     const selManifestInventory = db.prepare(
-        'SELECT COUNT(*) AS chunk_count, MIN(seq) AS min_seq, MAX(seq) AS max_seq FROM manifest_chunks WHERE manifest_key = ?',
+        `SELECT COUNT(manifest.seq) AS chunk_count,
+                COUNT(chunk.hash) AS present_chunk_count,
+                MIN(manifest.seq) AS min_seq,
+                MAX(manifest.seq) AS max_seq,
+                COALESCE(SUM(LENGTH(chunk.data)), 0) AS stored_size,
+                MIN(LENGTH(chunk.data)) AS min_chunk_size,
+                MAX(LENGTH(chunk.data)) AS max_chunk_size,
+                COALESCE(SUM(CASE
+                    WHEN length(manifest.hash) = 64
+                     AND manifest.hash NOT GLOB '*[^0-9a-f]*' THEN 0
+                    ELSE 1
+                END), 0) AS invalid_hash_count
+           FROM manifest_chunks manifest
+           LEFT JOIN chunks chunk ON chunk.hash = manifest.hash
+          WHERE manifest.manifest_key = ?`,
+    );
+    const selContentRevision = db.prepare(
+        `SELECT source_revision, content_verified_revision
+           FROM chunk_manifest_inventory_revision WHERE manifest_key = ?`,
     );
     const selManifestPublication = db.prepare(
         'SELECT 1 FROM chunk_manifest_publications WHERE manifest_key = ?',
@@ -233,25 +283,72 @@ function createSnapshotReader(db) {
                 || inventory.min_seq !== 0 || inventory.max_seq !== inventory.chunk_count - 1) {
                 throw chunkCorruption(`Protected chunk manifest ${key} is incomplete`);
             }
-            const rows = selManifest.all(key);
-            const logicalHash = crypto.createHash('sha256');
+            const revision = selContentRevision.get(key) ?? null;
+            let warm = Number.isSafeInteger(revision?.source_revision)
+                && revision.source_revision >= 0
+                && (
+                    localContentMemo.has(key, revision.source_revision)
+                    || (
+                        revision.content_verified_revision === revision.source_revision
+                        && trustedContentMemo?.has(key, revision.source_revision)
+                    )
+                );
+            if (warm && (
+                inventory.present_chunk_count !== metadata.chunk_count
+                || inventory.stored_size !== metadata.logical_size
+                || !Number.isSafeInteger(inventory.min_chunk_size)
+                || inventory.min_chunk_size <= 0
+                || !Number.isSafeInteger(inventory.max_chunk_size)
+                || inventory.max_chunk_size > MAX_SIZE
+                || inventory.invalid_hash_count !== 0
+            )) {
+                // A warm proof never blesses structure. Fall through to the
+                // ordinary full verifier so its established corruption error
+                // remains the one surfaced to callers.
+                warm = false;
+            }
+            if (!warm) contentReadMetrics.fullVerificationAttempts += 1;
+            const logicalHash = warm ? null : crypto.createHash('sha256');
             let size = 0;
-            const parts = rows.map((entry, index) => {
-                const chunk = selChunk.get(entry.hash)?.data;
-                if (!/^[0-9a-f]{64}$/.test(entry.hash) || !Buffer.isBuffer(chunk)
+            const output = Buffer.allocUnsafe(metadata.logical_size);
+            contentReadMetrics.preallocatedReads += 1;
+            const entries = selManifest.all(key);
+            for (let index = 0; index < inventory.chunk_count; index++) {
+                const entry = entries[index];
+                const chunk = entry ? selChunk.get(entry.hash)?.data : null;
+                let hashMatches = true;
+                if (!warm && Buffer.isBuffer(chunk)) {
+                    contentReadMetrics.chunkDigestComputations += 1;
+                    hashMatches = crypto.createHash('sha256').update(chunk).digest('hex')
+                        === entry?.hash;
+                }
+                if (!entry || entry.seq !== index
+                    || !/^[0-9a-f]{64}$/.test(entry.hash) || !Buffer.isBuffer(chunk)
                     || chunk.length <= 0 || chunk.length > MAX_SIZE
-                    || crypto.createHash('sha256').update(chunk).digest('hex') !== entry.hash) {
+                    || !hashMatches) {
                     throw chunkCorruption(`Protected chunk manifest ${key} has an invalid row at ${index}`);
                 }
+                if (size + chunk.length > output.length) {
+                    throw chunkCorruption(`Protected chunk manifest ${key} failed logical verification`);
+                }
+                chunk.copy(output, size);
                 size += chunk.length;
-                logicalHash.update(chunk);
-                return chunk;
-            });
+                logicalHash?.update(chunk);
+            }
             if (size !== metadata.logical_size
-                || logicalHash.digest('hex') !== metadata.logical_sha256) {
+                || (!warm && logicalHash.digest('hex') !== metadata.logical_sha256)) {
                 throw chunkCorruption(`Protected chunk manifest ${key} failed logical verification`);
             }
-            return Buffer.concat(parts);
+            if (warm) {
+                contentReadMetrics.warmReads += 1;
+            } else {
+                contentReadMetrics.fullVerifications += 1;
+                if (Number.isSafeInteger(revision?.source_revision)
+                    && revision.source_revision >= 0) {
+                    localContentMemo.remember(key, revision.source_revision);
+                }
+            }
+            return output;
         }
         if (hasMarker && (isProtected || hasManifest || metadata)) {
             throw chunkCorruption(`Chunk manifest ${key} has inconsistent protection state`);
@@ -315,6 +412,7 @@ function createSnapshotReader(db) {
             size: metadata.logical_size,
             metadata,
             inventory,
+            revision: selContentRevision.get(key) ?? null,
         };
     }
 
@@ -329,10 +427,15 @@ function createSnapshotReader(db) {
         return part;
     }
 
-    function snapshotChunk(part, index) {
+    function snapshotChunk(part, index, verifyContent = true) {
         const row = selChunkDataPart.get({ hash: part.hash, read_length: MAX_SIZE });
+        let hashMatches = true;
+        if (verifyContent && Buffer.isBuffer(row?.data)) {
+            contentReadMetrics.chunkDigestComputations += 1;
+            hashMatches = crypto.createHash('sha256').update(row.data).digest('hex') === part.hash;
+        }
         if (!Buffer.isBuffer(row?.data) || row.data.length !== part.stored_size
-            || crypto.createHash('sha256').update(row.data).digest('hex') !== part.hash) {
+            || !hashMatches) {
             throw chunkCorruption(`Chunk manifest row ${index} failed verification`);
         }
         return row.data;
@@ -371,7 +474,7 @@ function createSnapshotReader(db) {
         let size = 0;
         let chunks = 0;
         let maxChunkBytes = 0;
-        const logicalHash = crypto.createHash('sha256');
+        let logicalHash = null;
         const writePart = async (data) => {
             await yieldToEventLoop();
             snapshotStreamAbort(options);
@@ -379,7 +482,7 @@ function createSnapshotReader(db) {
             size += data.length;
             chunks++;
             maxChunkBytes = Math.max(maxChunkBytes, data.length);
-            logicalHash.update(data);
+            logicalHash?.update(data);
             await options.onChunk?.({ index: chunks - 1, size: data.length });
             await yieldToEventLoop();
             snapshotStreamAbort(options);
@@ -387,15 +490,49 @@ function createSnapshotReader(db) {
         try {
             snapshotStreamAbort(options);
             if (state.chunked) {
+                let warm = Number.isSafeInteger(state.revision?.source_revision)
+                    && state.revision.source_revision >= 0
+                    && (
+                        localContentMemo.has(key, state.revision.source_revision)
+                        || (
+                            state.revision.content_verified_revision
+                                === state.revision.source_revision
+                            && trustedContentMemo?.has(key, state.revision.source_revision)
+                        )
+                    );
+                if (warm && (
+                    state.inventory.present_chunk_count !== state.metadata.chunk_count
+                    || state.inventory.stored_size !== state.metadata.logical_size
+                    || !Number.isSafeInteger(state.inventory.min_chunk_size)
+                    || state.inventory.min_chunk_size <= 0
+                    || !Number.isSafeInteger(state.inventory.max_chunk_size)
+                    || state.inventory.max_chunk_size > MAX_SIZE
+                    || state.inventory.invalid_hash_count !== 0
+                )) {
+                    warm = false;
+                }
+                if (!warm) {
+                    contentReadMetrics.fullVerificationAttempts += 1;
+                    logicalHash = crypto.createHash('sha256');
+                }
                 for (let index = 0; index < state.inventory.chunk_count; index++) {
                     snapshotStreamAbort(options);
                     const part = snapshotPart(key, index);
-                    await writePart(snapshotChunk(part, index));
+                    await writePart(snapshotChunk(part, index, !warm));
                 }
                 if (chunks !== state.metadata.chunk_count
                     || size !== state.metadata.logical_size
-                    || logicalHash.digest('hex') !== state.metadata.logical_sha256) {
+                    || (!warm && logicalHash.digest('hex') !== state.metadata.logical_sha256)) {
                     throw chunkCorruption(`Chunk manifest ${key} failed logical verification`);
+                }
+                if (warm) {
+                    contentReadMetrics.warmReads += 1;
+                } else {
+                    contentReadMetrics.fullVerifications += 1;
+                    if (Number.isSafeInteger(state.revision?.source_revision)
+                        && state.revision.source_revision >= 0) {
+                        localContentMemo.remember(key, state.revision.source_revision);
+                    }
                 }
             } else {
                 if (!Number.isSafeInteger(state.size) || state.size < 0) {
@@ -416,7 +553,6 @@ function createSnapshotReader(db) {
                     await writePart(part.data);
                     offset += part.data.length;
                 }
-                if (state.size === 0) logicalHash.digest('hex');
             }
             await fileHandle.sync();
             await fileHandle.close();
@@ -482,7 +618,15 @@ function createSnapshotReader(db) {
         return authoritative ? sizeFromAggregateRow(authoritative) : null;
     }
 
-    return { kvGet, kvList, kvListWithSizes, kvWriteToFile, kvReadRange, kvSize };
+    return {
+        kvGet,
+        kvList,
+        kvListWithSizes,
+        kvWriteToFile,
+        kvReadRange,
+        kvSize,
+        contentReadMetrics: () => ({ ...contentReadMetrics }),
+    };
 }
 
 // Bind chunk-aware get/put to a specific better-sqlite3 instance. db.cjs wires
@@ -490,6 +634,18 @@ function createSnapshotReader(db) {
 // db.cjs's schema); this creates only the chunk/manifest tables.
 function createChunkStore(db, opts = {}) {
     const threshold = normalizeThreshold(opts.threshold);
+    const contentVerificationMemo = opts.contentVerificationMemo
+        ?? createContentVerificationMemo();
+    const inFlightReads = new Map();
+    const contentMetrics = {
+        fullVerificationAttempts: 0,
+        fullVerifications: 0,
+        warmReads: 0,
+        chunkDigestComputations: 0,
+        preallocatedReads: 0,
+        singleFlightStarts: 0,
+        singleFlightJoins: 0,
+    };
 
     db.exec(`
         CREATE TABLE IF NOT EXISTS chunks (
@@ -517,9 +673,12 @@ function createChunkStore(db, opts = {}) {
             manifest_key TEXT PRIMARY KEY
         );
         CREATE TABLE IF NOT EXISTS chunk_manifest_inventory_revision (
-            manifest_key      TEXT PRIMARY KEY,
-            source_revision   INTEGER NOT NULL CHECK (source_revision >= 0),
-            verified_revision INTEGER CHECK (verified_revision IS NULL OR verified_revision >= 0)
+            manifest_key             TEXT PRIMARY KEY,
+            source_revision          INTEGER NOT NULL CHECK (source_revision >= 0),
+            verified_revision        INTEGER CHECK (verified_revision IS NULL OR verified_revision >= 0),
+            content_verified_revision INTEGER CHECK (
+                content_verified_revision IS NULL OR content_verified_revision >= 0
+            )
         );
 
         INSERT OR IGNORE INTO chunk_manifest_inventory_revision
@@ -769,6 +928,23 @@ function createChunkStore(db, opts = {}) {
         END;
     `);
 
+    // CREATE TABLE IF NOT EXISTS does not evolve Track 3.5 databases. Existing
+    // rows deliberately start cold: inventory verification proves only counts
+    // and lengths, never the stored content bytes.
+    const inventoryRevisionColumns = db.prepare(
+        'PRAGMA table_info(chunk_manifest_inventory_revision)',
+    ).all();
+    if (!inventoryRevisionColumns.some((column) => (
+        column.name === 'content_verified_revision'
+    ))) {
+        db.exec(`
+            ALTER TABLE chunk_manifest_inventory_revision
+            ADD COLUMN content_verified_revision INTEGER CHECK (
+                content_verified_revision IS NULL OR content_verified_revision >= 0
+            )
+        `);
+    }
+
     const insChunk = db.prepare('INSERT OR IGNORE INTO chunks (hash, data) VALUES (?, ?)');
     const delManifest = db.prepare('DELETE FROM manifest_chunks WHERE manifest_key = ?');
     const delManifestMeta = db.prepare('DELETE FROM chunk_manifest_meta WHERE manifest_key = ?');
@@ -796,7 +972,9 @@ function createChunkStore(db, opts = {}) {
     const selManifestKeys = db.prepare(
         'SELECT DISTINCT manifest_key FROM manifest_chunks ORDER BY manifest_key',
     );
-    const selManifest = db.prepare('SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq');
+    const selManifest = db.prepare(
+        'SELECT seq, hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq',
+    );
     const selManifestExists = db.prepare('SELECT 1 FROM manifest_chunks WHERE manifest_key = ? LIMIT 1');
     const selChunk = db.prepare('SELECT data FROM chunks WHERE hash = ?');
     const selValueStreamMetadata = db.prepare(
@@ -807,8 +985,25 @@ function createChunkStore(db, opts = {}) {
         'SELECT substr(value, @offset, @length) AS data FROM kv WHERE key = @key',
     );
     const selManifestStreamMetadata = db.prepare(
-        `SELECT COUNT(*) AS chunk_count, MIN(seq) AS min_seq, MAX(seq) AS max_seq
-         FROM manifest_chunks WHERE manifest_key = ?`,
+        `SELECT COUNT(manifest.seq) AS chunk_count,
+                COUNT(chunk.hash) AS present_chunk_count,
+                MIN(manifest.seq) AS min_seq,
+                MAX(manifest.seq) AS max_seq,
+                COALESCE(SUM(LENGTH(chunk.data)), 0) AS stored_size,
+                MIN(LENGTH(chunk.data)) AS min_chunk_size,
+                MAX(LENGTH(chunk.data)) AS max_chunk_size,
+                COALESCE(SUM(CASE
+                    WHEN length(manifest.hash) = 64
+                     AND manifest.hash NOT GLOB '*[^0-9a-f]*' THEN 0
+                    ELSE 1
+                END), 0) AS invalid_hash_count
+           FROM manifest_chunks manifest
+           LEFT JOIN chunks chunk ON chunk.hash = manifest.hash
+          WHERE manifest.manifest_key = ?`,
+    );
+    const selContentRevision = db.prepare(
+        `SELECT source_revision, content_verified_revision
+           FROM chunk_manifest_inventory_revision WHERE manifest_key = ?`,
     );
     const selManifestMeta = db.prepare(
         `SELECT chunk_count, logical_size, logical_sha256
@@ -948,10 +1143,20 @@ function createChunkStore(db, opts = {}) {
             SET verified_revision = source_revision
           WHERE manifest_key = ? AND source_revision = ?`,
     );
+    const markVerifiedContent = db.prepare(
+        `UPDATE chunk_manifest_inventory_revision
+            SET content_verified_revision = source_revision
+          WHERE manifest_key = ? AND source_revision = ?`,
+    );
     const insertVerifiedInventory = db.prepare(
         `INSERT OR IGNORE INTO chunk_manifest_inventory_revision
             (manifest_key, source_revision, verified_revision)
          VALUES (?, 0, 0)`,
+    );
+    const insertVerifiedContent = db.prepare(
+        `INSERT OR IGNORE INTO chunk_manifest_inventory_revision
+            (manifest_key, source_revision, verified_revision, content_verified_revision)
+         VALUES (?, 0, NULL, 0)`,
     );
     const deleteInventoryRevision = db.prepare(
         'DELETE FROM chunk_manifest_inventory_revision WHERE manifest_key = ?',
@@ -1061,30 +1266,72 @@ function createChunkStore(db, opts = {}) {
           WHERE EXISTS (SELECT 1 FROM kv WHERE kv.key = mc.manifest_key AND kv.value = ?))`,
     );
 
+    function markCurrentContentVerified(key) {
+        const revision = selContentRevision.get(key) ?? null;
+        if (Number.isSafeInteger(revision?.source_revision)
+            && revision.source_revision >= 0) {
+            markVerifiedContent.run(key, revision.source_revision);
+            return revision.source_revision;
+        }
+        insertVerifiedContent.run(key);
+        return selContentRevision.get(key)?.source_revision ?? null;
+    }
+
+    function storedChunkForPublication(chunk) {
+        const inserted = insChunk.run(chunk.hash, chunk.data);
+        if (inserted.changes === 1) return chunk.data;
+        const stored = selChunk.get(chunk.hash)?.data;
+        if (!Buffer.isBuffer(stored)
+            || stored.length <= 0 || stored.length > MAX_SIZE
+            || crypto.createHash('sha256').update(stored).digest('hex') !== chunk.hash) {
+            throw chunkCorruption(`Stored chunk ${chunk.hash} failed publish-time verification`);
+        }
+        return stored;
+    }
+
     // Atomic: clearing the old manifest, inserting new chunks, and writing the
     // marker all commit together. Orphaned chunks from a prior version are left
     // for GC (a later layer) — never deleted here.
-    const putValue = db.transaction((key, value) => {
+    const putValueTransaction = db.transaction((key, value) => {
         delManifestPublication.run(key);
         delManifest.run(key);
         delManifestMeta.run(key);
         if (value.length <= threshold) {
             kvSet.run(key, value, Date.now());
             deleteInventoryRevision.run(key);
-            return;
+            return null;
         }
         const chunks = cdcSplit(value);
-        for (const c of chunks) insChunk.run(c.hash, c.data);
-        for (let i = 0; i < chunks.length; i++) insManifest.run(key, i, chunks[i].hash);
+        const logicalHash = crypto.createHash('sha256');
+        let logicalSize = 0;
+        for (let i = 0; i < chunks.length; i++) {
+            const stored = storedChunkForPublication(chunks[i]);
+            insManifest.run(key, i, chunks[i].hash);
+            logicalHash.update(stored);
+            logicalSize += stored.length;
+        }
+        if (logicalSize !== value.length) {
+            throw chunkCorruption(`Stored chunks for ${key} failed publish-time length verification`);
+        }
         insManifestMeta.run(
             key,
             chunks.length,
-            value.length,
-            crypto.createHash('sha256').update(value).digest('hex'),
+            logicalSize,
+            logicalHash.digest('hex'),
         );
         insManifestPublication.run(key);
         kvSet.run(key, CHUNK_MARKER, Date.now());
+        return markCurrentContentVerified(key);
     });
+
+    function putValue(key, value) {
+        const verifiedRevision = putValueTransaction(key, value);
+        if (Number.isSafeInteger(verifiedRevision)) {
+            contentVerificationMemo.remember(key, verifiedRevision);
+        } else {
+            contentVerificationMemo.forget(key);
+        }
+    }
 
     function readFileRange(fd, length, position) {
         const buffer = Buffer.allocUnsafe(length);
@@ -1102,7 +1349,7 @@ function createChunkStore(db, opts = {}) {
     // Keep only one CDC window resident while producing the same chunks and
     // manifest as putValue. A raw value still needs one Buffer for SQLite's
     // direct-row bind, but values above the threshold never become monolithic.
-    const putValueFromFile = db.transaction((key, filePath) => {
+    const putValueFromFileTransaction = db.transaction((key, filePath) => {
         const fd = fs.openSync(filePath, 'r');
         try {
             const size = fs.fstatSync(fd).size;
@@ -1112,7 +1359,7 @@ function createChunkStore(db, opts = {}) {
             if (size <= threshold) {
                 kvSet.run(key, readFileRange(fd, size, 0), Date.now());
                 deleteInventoryRevision.run(key);
-                return;
+                return null;
             }
 
             let position = 0;
@@ -1121,42 +1368,102 @@ function createChunkStore(db, opts = {}) {
             while (position < size) {
                 const window = readFileRange(fd, Math.min(MAX_SIZE, size - position), position);
                 const chunk = cdcSplit(window)[0];
-                insChunk.run(chunk.hash, chunk.data);
+                const stored = storedChunkForPublication(chunk);
                 insManifest.run(key, sequence++, chunk.hash);
-                logicalHash.update(chunk.data);
+                logicalHash.update(stored);
+                if (stored.length !== chunk.data.length) {
+                    throw chunkCorruption(`Stored chunk ${chunk.hash} changed logical length`);
+                }
                 position += chunk.data.length;
             }
             insManifestMeta.run(key, sequence, size, logicalHash.digest('hex'));
             insManifestPublication.run(key);
             kvSet.run(key, CHUNK_MARKER, Date.now());
+            return markCurrentContentVerified(key);
         } finally {
             fs.closeSync(fd);
         }
     });
+
+    function putValueFromFile(key, filePath) {
+        const verifiedRevision = putValueFromFileTransaction(key, filePath);
+        if (Number.isSafeInteger(verifiedRevision)) {
+            contentVerificationMemo.remember(key, verifiedRevision);
+        } else {
+            contentVerificationMemo.forget(key);
+        }
+    }
 
     function getValue(key) {
         const row = kvGet.get(key);
         if (!row) return null;
         const state = publicationState(key, isChunked(row.value));
         if (!state.chunked) return row.value;
-        const logicalHash = crypto.createHash('sha256');
+        let warm = state.revision?.content_verified_revision === state.revision?.source_revision
+            && contentVerificationMemo.has(key, state.revision?.source_revision);
+        if (warm && !hasCheapContentStructure(state)) warm = false;
+        if (!warm) contentMetrics.fullVerificationAttempts += 1;
+        const logicalHash = warm ? null : crypto.createHash('sha256');
+        const output = Buffer.allocUnsafe(state.metadata.logical_size);
+        contentMetrics.preallocatedReads += 1;
         let size = 0;
-        const parts = selManifest.all(key).map((entry, index) => {
-            const chunk = selChunk.get(entry.hash)?.data;
-            if (!/^[0-9a-f]{64}$/.test(entry.hash) || !Buffer.isBuffer(chunk)
+        const entries = selManifest.all(key);
+        for (let index = 0; index < state.inventory.chunk_count; index++) {
+            const entry = entries[index];
+            const chunk = entry ? selChunk.get(entry.hash)?.data : null;
+            let hashMatches = true;
+            if (!warm && Buffer.isBuffer(chunk)) {
+                contentMetrics.chunkDigestComputations += 1;
+                hashMatches = crypto.createHash('sha256').update(chunk).digest('hex')
+                    === entry?.hash;
+            }
+            if (!entry || entry.seq !== index
+                || !/^[0-9a-f]{64}$/.test(entry.hash) || !Buffer.isBuffer(chunk)
                 || chunk.length <= 0 || chunk.length > MAX_SIZE
-                || crypto.createHash('sha256').update(chunk).digest('hex') !== entry.hash) {
+                || !hashMatches) {
                 throw chunkCorruption(`Protected chunk manifest ${key} has an invalid row at ${index}`);
             }
+            if (size + chunk.length > output.length) {
+                throw chunkCorruption(`Protected chunk manifest ${key} failed logical verification`);
+            }
+            chunk.copy(output, size);
             size += chunk.length;
-            logicalHash.update(chunk);
-            return chunk;
-        });
+            logicalHash?.update(chunk);
+        }
         if (size !== state.metadata.logical_size
-            || logicalHash.digest('hex') !== state.metadata.logical_sha256) {
+            || (!warm && logicalHash.digest('hex') !== state.metadata.logical_sha256)) {
             throw chunkCorruption(`Protected chunk manifest ${key} failed logical verification`);
         }
-        return Buffer.concat(parts);
+        if (warm) {
+            contentMetrics.warmReads += 1;
+        } else {
+            contentMetrics.fullVerifications += 1;
+            publishReadContentVerification(key, state.revision);
+        }
+        return output;
+    }
+
+    function getValueAsync(key) {
+        const existing = inFlightReads.get(key);
+        if (existing) {
+            contentMetrics.singleFlightJoins += 1;
+            return existing;
+        }
+        contentMetrics.singleFlightStarts += 1;
+        const read = new Promise((resolve, reject) => {
+            setImmediate(() => {
+                try {
+                    resolve(getValue(key));
+                } catch (error) {
+                    reject(error);
+                }
+            });
+        });
+        inFlightReads.set(key, read);
+        read.finally(() => {
+            if (inFlightReads.get(key) === read) inFlightReads.delete(key);
+        }).catch(() => {});
+        return read;
     }
 
     async function writeAll(fileHandle, data) {
@@ -1201,7 +1508,41 @@ function createChunkStore(db, opts = {}) {
             || metadata.chunk_count !== inventory.chunk_count) {
             throw chunkCorruption(`Protected chunk manifest ${key} metadata is invalid`);
         }
-        return { chunked: true, metadata, inventory };
+        return {
+            chunked: true,
+            metadata,
+            inventory,
+            revision: selContentRevision.get(key) ?? null,
+        };
+    }
+
+    function hasCheapContentStructure(state) {
+        return state.inventory.present_chunk_count === state.metadata.chunk_count
+            && state.inventory.stored_size === state.metadata.logical_size
+            && Number.isSafeInteger(state.inventory.min_chunk_size)
+            && state.inventory.min_chunk_size > 0
+            && Number.isSafeInteger(state.inventory.max_chunk_size)
+            && state.inventory.max_chunk_size <= MAX_SIZE
+            && state.inventory.invalid_hash_count === 0;
+    }
+
+    function publishReadContentVerification(key, selectedRevision) {
+        if (Number.isSafeInteger(selectedRevision?.source_revision)
+            && selectedRevision.source_revision >= 0) {
+            markVerifiedContent.run(key, selectedRevision.source_revision);
+        } else {
+            insertVerifiedContent.run(key);
+        }
+        const current = selContentRevision.get(key) ?? null;
+        if (Number.isSafeInteger(current?.source_revision)
+            && current.source_revision >= 0
+            && current.content_verified_revision === current.source_revision
+            && (
+                !Number.isSafeInteger(selectedRevision?.source_revision)
+                || selectedRevision.source_revision === current.source_revision
+            )) {
+            contentVerificationMemo.remember(key, current.source_revision);
+        }
     }
 
     /**
@@ -1304,103 +1645,123 @@ function createChunkStore(db, opts = {}) {
     }
 
     /**
+     * Iterate one logical value in bounded storage pages. A rejected iterator
+     * may already have yielded bytes, so consumers must publish only after the
+     * iterator completes successfully (writeValueToFile does this by deleting
+     * its private partial file on every failure).
+     */
+    async function* iterateValue(key, options = {}) {
+        const row = selValueStreamMetadata.get({ key, chunk_marker: CHUNK_MARKER });
+        if (!row) return;
+        const shouldAbort = () => options.signal?.aborted || options.shouldAbort?.() || false;
+        const throwIfAborted = () => {
+            if (shouldAbort()) throw streamError('KV value stream cancelled', 'KV_STREAM_ABORTED');
+        };
+        let size = 0;
+        let chunks = 0;
+        const yieldPart = async function* (data) {
+            await yieldToEventLoop();
+            throwIfAborted();
+            size += data.length;
+            chunks++;
+            yield data;
+            await yieldToEventLoop();
+            throwIfAborted();
+        };
+        throwIfAborted();
+        const state = publicationState(key, !!row.has_chunk_marker);
+        if (state.chunked) {
+            let warm = state.revision?.content_verified_revision === state.revision?.source_revision
+                && contentVerificationMemo.has(key, state.revision?.source_revision);
+            if (warm && !hasCheapContentStructure(state)) warm = false;
+            if (!warm) contentMetrics.fullVerificationAttempts += 1;
+            const logicalHash = warm ? null : crypto.createHash('sha256');
+            const inventory = state.inventory;
+            const expected = state.metadata;
+            for (let index = 0; index < inventory.chunk_count; index++) {
+                throwIfAborted();
+                // One completed statement per part: unlike .iterate(), no
+                // better-sqlite cursor remains open while consumers yield.
+                const part = selManifestPart.get({ key, seq: index });
+                if (!part || part.seq !== index
+                    || !Number.isSafeInteger(part.stored_size)
+                    || part.stored_size <= 0 || part.stored_size > MAX_SIZE) {
+                    throw streamError(`Chunk manifest row ${index} is missing or has an invalid size`);
+                }
+                if (!/^[0-9a-f]{64}$/.test(part.hash)) {
+                    throw streamError(`Chunk manifest row ${index} has a non-canonical hash`);
+                }
+                const chunkRow = selChunkDataPart.get({ hash: part.hash, read_length: MAX_SIZE });
+                if (!Buffer.isBuffer(chunkRow?.data)
+                    || chunkRow.data.length !== part.stored_size) {
+                    throw streamError(`Chunk manifest row ${index} is missing or truncated`);
+                }
+                if (!warm) {
+                    contentMetrics.chunkDigestComputations += 1;
+                    if (crypto.createHash('sha256').update(chunkRow.data).digest('hex') !== part.hash) {
+                        throw streamError(`Chunk manifest row ${index} failed canonical hash verification`);
+                    }
+                    logicalHash.update(chunkRow.data);
+                }
+                yield* yieldPart(chunkRow.data);
+            }
+            const actualHash = logicalHash?.digest('hex') ?? null;
+            if (chunks !== expected.chunk_count
+                || size !== expected.logical_size
+                || (!warm && actualHash !== expected.logical_sha256)) {
+                throw streamError('Chunk manifest logical length or hash does not match its publication');
+            }
+            if (warm) {
+                contentMetrics.warmReads += 1;
+            } else {
+                contentMetrics.fullVerifications += 1;
+                publishReadContentVerification(key, state.revision);
+            }
+            return;
+        }
+
+        if (!Number.isSafeInteger(row.raw_size) || row.raw_size < 0) {
+            throw streamError('Raw KV value has an invalid size');
+        }
+        let offset = 0;
+        while (offset < row.raw_size) {
+            throwIfAborted();
+            const part = selRawValuePart.get({
+                key,
+                offset: offset + 1,
+                length: Math.min(MAX_SIZE, row.raw_size - offset),
+            });
+            const data = part?.data;
+            if (!Buffer.isBuffer(data) || data.length <= 0 || data.length > MAX_SIZE) {
+                throw streamError(`Raw KV value is missing bytes at offset ${offset}`);
+            }
+            yield* yieldPart(data);
+            offset += data.length;
+        }
+    }
+
+    /**
      * Spool one logical value without reassembling its chunk manifest. At most
      * one stored chunk is handed to JavaScript at a time; incomplete files are
      * removed on cancellation, read errors, and write errors.
      */
     async function writeValueToFile(key, filePath, options = {}) {
-        // Metadata is fetched without selecting the BLOB.  In particular, a
-        // legacy raw 100 MiB row must not be copied into V8 merely to discover
-        // whether it is chunked.
         const row = selValueStreamMetadata.get({ key, chunk_marker: CHUNK_MARKER });
         if (!row) return null;
-        const shouldAbort = () => options.signal?.aborted || options.shouldAbort?.() || false;
-        const throwIfAborted = () => {
-            if (shouldAbort()) throw streamError('KV value stream cancelled', 'KV_STREAM_ABORTED');
-        };
         const fileHandle = await fs.promises.open(filePath, 'wx');
         let size = 0;
         let chunks = 0;
         let maxChunkBytes = 0;
-        const logicalHash = crypto.createHash('sha256');
-        const writePart = async (data) => {
-            // A macrotask yield on both sides is deliberate: socket close and
-            // AbortController events must be observable while a large snapshot
-            // is copied, rather than only after a synchronous SQLite iterator
-            // has exhausted every row.
-            await yieldToEventLoop();
-            throwIfAborted();
-            await writeAll(fileHandle, data);
-            size += data.length;
-            chunks++;
-            maxChunkBytes = Math.max(maxChunkBytes, data.length);
-            logicalHash.update(data);
-            options.onChunk?.({ index: chunks - 1, size: data.length });
-            await yieldToEventLoop();
-            throwIfAborted();
-        };
         try {
-            throwIfAborted();
-            const state = publicationState(key, !!row.has_chunk_marker);
-            if (state.chunked) {
-                const inventory = state.inventory;
-                const expected = state.metadata;
-                for (let index = 0; index < inventory.chunk_count; index++) {
-                    throwIfAborted();
-                    // One completed statement per part: unlike .iterate(), no
-                    // better-sqlite cursor remains open while file I/O yields.
-                    const part = selManifestPart.get({
-                        key,
-                        seq: index,
-                    });
-                    if (!part || part.seq !== index
-                        || !Number.isSafeInteger(part.stored_size)
-                        || part.stored_size <= 0 || part.stored_size > MAX_SIZE) {
-                        throw streamError(`Chunk manifest row ${index} is missing or has an invalid size`);
-                    }
-                    if (!/^[0-9a-f]{64}$/.test(part.hash)) {
-                        throw streamError(`Chunk manifest row ${index} has a non-canonical hash`);
-                    }
-                    const chunkRow = selChunkDataPart.get({ hash: part.hash, read_length: MAX_SIZE });
-                    if (!Buffer.isBuffer(chunkRow?.data)
-                        || chunkRow.data.length !== part.stored_size) {
-                        throw streamError(`Chunk manifest row ${index} is missing or truncated`);
-                    }
-                    if (crypto.createHash('sha256').update(chunkRow.data).digest('hex') !== part.hash) {
-                        throw streamError(`Chunk manifest row ${index} failed canonical hash verification`);
-                    }
-                    await writePart(chunkRow.data);
-                }
-                const actualHash = logicalHash.digest('hex');
-                if (expected && (
-                    chunks !== expected.chunk_count
-                    || size !== expected.logical_size
-                    || actualHash !== expected.logical_sha256
-                )) {
-                    throw streamError('Chunk manifest logical length or hash does not match its publication');
-                }
-            } else {
-                if (!Number.isSafeInteger(row.raw_size) || row.raw_size < 0) {
-                    throw streamError('Raw KV value has an invalid size');
-                }
-                let offset = 0;
-                while (offset < row.raw_size) {
-                    throwIfAborted();
-                    const part = selRawValuePart.get({
-                        key,
-                        offset: offset + 1,
-                        length: Math.min(MAX_SIZE, row.raw_size - offset),
-                    });
-                    const data = part?.data;
-                    if (!Buffer.isBuffer(data) || data.length <= 0 || data.length > MAX_SIZE) {
-                        throw streamError(`Raw KV value is missing bytes at offset ${offset}`);
-                    }
-                    await writePart(data);
-                    offset += data.length;
-                }
-                // Empty values still create an exact empty spool, without an
-                // artificial zero-length callback/part.
-                if (row.raw_size === 0) logicalHash.digest('hex');
+            for await (const data of iterateValue(key, options)) {
+                await writeAll(fileHandle, data);
+                size += data.length;
+                chunks++;
+                maxChunkBytes = Math.max(maxChunkBytes, data.length);
+                options.onChunk?.({ index: chunks - 1, size: data.length });
+            }
+            if (chunks === 0 && row.raw_size > 0) {
+                throw streamError(`KV value ${key} changed before streaming began`);
             }
             await fileHandle.close();
             return { filePath, size, chunks, maxChunkBytes };
@@ -1534,7 +1895,7 @@ function createChunkStore(db, opts = {}) {
     // Copy src's value to dst. For a chunked src, only the manifest (list of
     // chunk hashes) is copied — chunks stay shared, so a snapshot costs ~nothing
     // and never duplicates bytes. Mirrors kvCopyValue: missing src is a no-op.
-    const snapshotValue = db.transaction((srcKey, dstKey) => {
+    const snapshotValueTransaction = db.transaction((srcKey, dstKey) => {
         const row = kvGet.get(srcKey);
         if (!row) return;
         const state = publicationState(srcKey, isChunked(row.value));
@@ -1555,15 +1916,27 @@ function createChunkStore(db, opts = {}) {
         }
     });
 
+    function snapshotValue(srcKey, dstKey) {
+        snapshotValueTransaction(srcKey, dstKey);
+        // Manifest copies do not hash their exact stored bytes. A destination
+        // therefore stays cold even when its source happened to be warm.
+        contentVerificationMemo.forget(dstKey);
+    }
+
     // Remove a key entirely (its manifest + kv row). Chunks it referenced
     // become orphans, reclaimed by the next gc(). Used for snapshot rotation.
-    const dropValue = db.transaction((key) => {
+    const dropValueTransaction = db.transaction((key) => {
         delManifestPublication.run(key);
         delManifest.run(key);
         delManifestMeta.run(key);
         kvDel.run(key);
         deleteInventoryRevision.run(key);
     });
+
+    function dropValue(key) {
+        dropValueTransaction(key);
+        contentVerificationMemo.forget(key);
+    }
 
     // Reclaim unreferenced chunks. Returns the number deleted. Run opportunistically
     // (e.g. Optimize / periodic) — never on the hot save path.
@@ -1590,6 +1963,8 @@ function createChunkStore(db, opts = {}) {
         putValue,
         putValueFromFile,
         getValue,
+        getValueAsync,
+        iterateValue,
         writeValueToFile,
         sizeValue,
         listValuesWithSizes,
@@ -1601,6 +1976,8 @@ function createChunkStore(db, opts = {}) {
         gc,
         reclaimableBytes,
         isChunkedKey,
+        contentVerificationMemo,
+        contentReadMetrics: () => ({ ...contentMetrics }),
         sizeInventoryMetrics: () => ({ ...sizeInventoryMetrics }),
     };
 }

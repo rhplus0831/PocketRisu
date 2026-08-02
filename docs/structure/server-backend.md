@@ -224,7 +224,10 @@ buffered-body ledger.
 - `chunk_manifest_inventory_revision`, whose per-publication trigger-backed source and
   verified revisions allow size-only reads to use `logical_size` after one authoritative
   manifest/chunk inventory derivation. Missing or stale verification falls back to the
-  grouped derivation and corruption remains fail-closed.
+  grouped derivation and corruption remains fail-closed. Its separate
+  `content_verified_revision` binds exact stored-byte verification to the same source
+  revision without weakening the inventory proof; a process-local revision memo is also
+  required before content hashing may be skipped.
 - `plugin_storage_usage` and `plugin_storage_owners`, derived indexes for optimized
   storage quota and ownership accounting.
 - `replacement_operations`, the transaction-bound committed/not-committed status used to
@@ -634,6 +637,21 @@ callers may explicitly include usage deletion.
 - Chunk-aware deletion matters. `kvDel()` must go through `chunkStore.dropValue()` so manifests stop pinning chunks. Direct SQL deletion of a chunked logical key leaves stale metadata until GC repairs it.
 
 - A marker row alone is not proof of a chunked value. Protected publication metadata binds the complete sequence, chunk hashes, logical byte length, and whole-value SHA-256. Readers reject incomplete or corrupt publications with `KV_CHUNK_CORRUPT` instead of concatenating partial data.
+
+- Contiguous protected reads allocate `logical_size` once and copy chunks into place.
+  A publication is content-warm only when its persisted content-verification revision and
+  the process-local verified memo both match the trigger-backed source revision. Warm
+  reads still check manifest/chunk counts, sequence bounds, stored sizes, logical size,
+  and canonical hash shape; any mismatch returns to the full per-chunk and logical SHA-256
+  verifier. New buffer/file publications reuse write-time chunk hashes only after proving
+  deduplicated chunk rows contain the exact stored bytes.
+
+- The synchronous `kvGet()` contract remains intact. Async callers can use the Promise
+  wrapper to single-flight identical reads, while bounded consumers can use the verified
+  async iterator; `kvWriteToFile()` consumes that iterator and removes partial output on
+  failure. Read-only pinned snapshot connections never write verification state. They may
+  consume a live in-process proof only for the exact pinned source revision, and otherwise
+  keep any successful full verification in a snapshot-local memo.
 
 - Logical-size reads use stored `chunk_manifest_meta.logical_size` only while the
   publication's trigger-backed inventory revision matches its last authoritative

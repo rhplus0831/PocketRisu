@@ -658,8 +658,18 @@ function kvGet(key) {
     return chunkStore.getValue(key);
 }
 
+function kvGetAsync(key) {
+    // The SQLite implementation remains synchronous. This Promise boundary is
+    // solely where concurrent async callers can share one identical read.
+    return chunkStore.getValueAsync(key);
+}
+
 function kvWriteToFile(key, filePath, options) {
     return chunkStore.writeValueToFile(key, filePath, options);
+}
+
+function kvIterate(key, options) {
+    return chunkStore.iterateValue(key, options);
 }
 
 function checkKvSetFailpoint(key) {
@@ -828,7 +838,12 @@ function createKvSnapshot() {
         snapshotDb.exec('BEGIN');
         transactionOpen = true;
         snapshotDb.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get();
-        const reader = createSnapshotReader(snapshotDb);
+        const reader = createSnapshotReader(snapshotDb, {
+            // Snapshot connections remain read-only. They may consume a proof
+            // established by this process for the exact pinned source revision,
+            // but createSnapshotReader never writes verification state.
+            contentVerificationMemo: chunkStore.contentVerificationMemo,
+        });
         const viewerFacets = createPluginStorageViewerFacetSnapshot(snapshotDb);
         return {
             ...reader,
@@ -881,7 +896,9 @@ function reconcilePluginStorageOwners() {
     const rows = ownerKeys.prepare(
         `SELECT key FROM kv WHERE key LIKE 'pluginsave-meta/%'`,
     );
-    const reader = createSnapshotReader(ownerValues);
+    const reader = createSnapshotReader(ownerValues, {
+        contentVerificationMemo: chunkStore.contentVerificationMemo,
+    });
     const facetsWereCurrent = pluginStorageViewerFacets.state().current;
     const reconcile = db.transaction(() => {
         db.prepare('DELETE FROM plugin_storage_owners').run();
@@ -963,7 +980,7 @@ function clearEntities() {
 module.exports = {
     db,
     // KV
-    kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvListSelectedWithSizes, kvSize, kvGetUpdatedAt, kvGetDatabaseRevision, kvGetPluginStoragePublicationRevision, kvCopyValue,
+    kvGet, kvGetAsync, kvIterate, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvListSelectedWithSizes, kvSize, kvGetUpdatedAt, kvGetDatabaseRevision, kvGetPluginStoragePublicationRevision, kvCopyValue,
     kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
     kvGetListEpoch, kvBumpListEpoch,
     createKvSnapshot,

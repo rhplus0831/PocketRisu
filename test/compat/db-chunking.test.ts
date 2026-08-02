@@ -172,6 +172,59 @@ describe('chunking lifecycle (real server, low threshold)', () => {
     expect(response.status).toBe(500)
   })
 
+  test('publish-time content warmth is revision-bound and direct tampering fails closed', async () => {
+    const { client, srv } = await boot()
+    expect((await client.importBackup(oversizedSeed())).ok).toBe(true)
+
+    const sqlitePath = path.join(srv.cwd, 'save', 'risuai.db')
+    const db = new Database(sqlitePath)
+    const target = db.prepare(`
+      SELECT manifest.manifest_key AS key,
+             manifest.hash AS hash,
+             chunk.data AS data,
+             revision.source_revision AS sourceRevision,
+             revision.content_verified_revision AS contentVerifiedRevision
+        FROM manifest_chunks manifest
+        JOIN chunks chunk ON chunk.hash = manifest.hash
+        JOIN chunk_manifest_inventory_revision revision
+          ON revision.manifest_key = manifest.manifest_key
+       WHERE manifest.manifest_key LIKE 'chats/%'
+       ORDER BY manifest.manifest_key, manifest.seq
+       LIMIT 1
+    `).get() as {
+      key: string
+      hash: string
+      data: Buffer
+      sourceRevision: number
+      contentVerifiedRevision: number
+    } | undefined
+    expect(target).toBeTruthy()
+    expect(target!.contentVerifiedRevision).toBe(target!.sourceRevision)
+
+    const warmRead = await client.fetch('/api/read', {
+      headers: { 'file-path': Buffer.from(target!.key, 'utf8').toString('hex') },
+    })
+    expect(warmRead.status).toBe(200)
+    expect((await warmRead.arrayBuffer()).byteLength).toBeGreaterThan(4096)
+
+    const changed = Buffer.from(target!.data)
+    changed[0] ^= 0xff
+    db.prepare('UPDATE chunks SET data = ? WHERE hash = ?').run(changed, target!.hash)
+    const invalidated = db.prepare(`
+      SELECT source_revision AS sourceRevision,
+             content_verified_revision AS contentVerifiedRevision
+        FROM chunk_manifest_inventory_revision WHERE manifest_key = ?
+    `).get(target!.key) as { sourceRevision: number; contentVerifiedRevision: number | null }
+    db.close()
+    expect(invalidated.sourceRevision).toBeGreaterThan(target!.sourceRevision)
+    expect(invalidated.contentVerifiedRevision).not.toBe(invalidated.sourceRevision)
+
+    const corruptRead = await client.fetch('/api/read', {
+      headers: { 'file-path': Buffer.from(target!.key, 'utf8').toString('hex') },
+    })
+    expect(corruptRead.status).toBe(500)
+  })
+
   test('externalized DB exports to standard full .bin and round-trips into a fresh server', async () => {
     const { client } = await boot()
     await client.importBackup(oversizedSeed())

@@ -322,6 +322,7 @@ function createChatRowStore(options) {
     const {
         db,
         kvGet,
+        kvGetAsync = async (key) => kvGet(key),
         kvSet,
         kvDel,
         kvList,
@@ -461,6 +462,16 @@ function createChatRowStore(options) {
     function readChatRowRawWithMetadata(chaId, chatId) {
         const key = chatRowKey(chaId, chatId);
         const bytes = kvGet(key);
+        return chatRowStateFromBytes(key, bytes);
+    }
+
+    async function readChatRowRawWithMetadataAsync(chaId, chatId) {
+        const key = chatRowKey(chaId, chatId);
+        const bytes = await kvGetAsync(key);
+        return chatRowStateFromBytes(key, bytes);
+    }
+
+    function chatRowStateFromBytes(key, bytes) {
         if (bytes === null) return null;
         ensureChatRowMetadataSlot.run(key);
         const contentHash = contentDigest(bytes);
@@ -935,6 +946,7 @@ function createChatRowStore(options) {
         readChatRow,
         readChatRowRaw,
         readChatRowRawWithMetadata,
+        readChatRowRawWithMetadataAsync,
         repairChatRowMetadata,
         inspectChatRowForBackup,
         streamChatRowRawToFile,

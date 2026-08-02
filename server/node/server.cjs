@@ -39,7 +39,7 @@ const getVips = () => {
     }
     return _vipsPromise
 }
-const { kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList,
+const { kvGet, kvGetAsync, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList,
         kvDelPrefix, kvListWithSizes, kvListSelectedWithSizes, kvSize, kvGetUpdatedAt, kvGetDatabaseRevision, kvGetPluginStoragePublicationRevision, kvCopyValue, clearEntities, checkpointWal,
         kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
         kvGetListEpoch, kvBumpListEpoch,
@@ -375,6 +375,7 @@ const SAVE_INTERVAL = 5000;
 const chatRowStore = createChatRowStore({
     db: sqliteDb,
     kvGet,
+    kvGetAsync,
     kvSet,
     kvDel,
     kvList,
@@ -1030,9 +1031,11 @@ function comparePluginStorageRecordKeys(left, right) {
     return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function readPluginStorageState(valueKey, ownerKey) {
-    const valueBytes = kvGet(valueKey);
-    const ownerBytes = kvGet(ownerKey);
+async function readPluginStorageState(valueKey, ownerKey) {
+    const [valueBytes, ownerBytes] = await Promise.all([
+        kvGetAsync(valueKey),
+        kvGetAsync(ownerKey),
+    ]);
     const owner = parsePluginStorageOwnerRecord(ownerBytes);
     return {
         valueBytes,
@@ -1752,11 +1755,11 @@ async function prepareLiveDatabaseRead(source, { includeFullBlob = true } = {}) 
                 throw new Error('Cannot replace acknowledged dirty database cache state during a read');
             }
 
-            const raw = kvGet(DB_BLOB_KEY);
+            const raw = await kvGetAsync(DB_BLOB_KEY);
             if (raw === null) continue;
-            // Select bytes and token synchronously. If defensive migration or an
-            // out-of-process writer changes the row during async decoding, retry
-            // against the newly authoritative revision instead of caching stale data.
+            // The storage queue remains held across the async single-flight read.
+            // If defensive migration or an out-of-process writer changes the row
+            // during later decoding, retry against the newly authoritative revision.
             if (kvGetDatabaseRevision() !== selectedRevision) continue;
             strippedDatabase = await loadStrippedDatabase(raw, source);
             if (kvGetDatabaseRevision() !== selectedRevision) continue;
@@ -5452,46 +5455,43 @@ async function inspectOptimizedBootExternalRows({
         ? new Set(prefix === PLUGIN_SAVE_META_PREFIX ? manifest.metaKeys : manifest.valueKeys)
         : null;
     for (const storageKey of listed) {
-        const duplicateHash = (() => {
-            try {
-                decodeOptimizedBootStorageKey(storageKey, prefix, manifest);
-            } catch {
-                issues.push(pluginStorageBootRecoveryIssue('invalid-encoded-key', storageKey));
-                return null;
-            }
+        let duplicateHash = null;
+        try {
+            decodeOptimizedBootStorageKey(storageKey, prefix, manifest);
             if (generation && (!ownedKeys || !ownedKeys.has(storageKey))) {
                 // Generation-bound browser reads deliberately make undeclared
                 // physical rows look absent. Preserve that recovery diagnostic
                 // without transferring or parsing the quarantined body.
                 issues.push(pluginStorageBootRecoveryIssue('read-failed', storageKey));
-                return null;
+            } else {
+                let bytes;
+                let readFailed = false;
+                try {
+                    bytes = await kvGetAsync(storageKey);
+                } catch {
+                    issues.push(pluginStorageBootRecoveryIssue('read-failed', storageKey));
+                    readFailed = true;
+                }
+                if (!readFailed && !bytes) {
+                    issues.push(pluginStorageBootRecoveryIssue('read-failed', storageKey));
+                } else if (bytes) {
+                    try {
+                        const parsed = JSON.parse(bytes.toString('utf-8'));
+                        const canonical = serializePluginStorageRow(storageKey, parsed);
+                        duplicateHash = inlineStorageKeys.has(storageKey)
+                            ? sha256Hex(canonical)
+                            : null;
+                    } catch (error) {
+                        issues.push(pluginStorageBootRecoveryIssue(
+                            error instanceof SyntaxError ? 'invalid-json' : 'unsupported-json',
+                            storageKey,
+                        ));
+                    }
+                }
             }
-            let bytes;
-            try {
-                bytes = kvGet(storageKey);
-            } catch {
-                issues.push(pluginStorageBootRecoveryIssue('read-failed', storageKey));
-                return null;
-            }
-            if (!bytes) {
-                issues.push(pluginStorageBootRecoveryIssue('read-failed', storageKey));
-                return null;
-            }
-            let parsed;
-            try {
-                parsed = JSON.parse(bytes.toString('utf-8'));
-            } catch {
-                issues.push(pluginStorageBootRecoveryIssue('invalid-json', storageKey));
-                return null;
-            }
-            try {
-                const canonical = serializePluginStorageRow(storageKey, parsed);
-                return inlineStorageKeys.has(storageKey) ? sha256Hex(canonical) : null;
-            } catch {
-                issues.push(pluginStorageBootRecoveryIssue('unsupported-json', storageKey));
-                return null;
-            }
-        })();
+        } catch {
+            issues.push(pluginStorageBootRecoveryIssue('invalid-encoded-key', storageKey));
+        }
         if (duplicateHash) duplicateHashes.set(storageKey, duplicateHash);
         // The row Buffer, decoded string, parsed value and canonical bytes are
         // all out of scope here. Yield so V8 can reclaim them before the next
@@ -5939,7 +5939,7 @@ async function readGenerationBoundPluginStorageRow(req, storageKey) {
                     'Read database.bin before reading authoritative plugin storage rows',
                 );
             }
-            return kvGet(storageKey);
+            return kvGetAsync(storageKey);
         }
         if (
             expectedState.optimized !== (dbObj?.optimizePluginMemory === true)
@@ -5961,14 +5961,14 @@ async function readGenerationBoundPluginStorageRow(req, storageKey) {
                 : activeManifest.valueKeys;
             // Exact ownership is also enforced at the read boundary. A foreign
             // physical row must look absent even if a caller guesses its name.
-            return ownedKeys.includes(storageKey) ? kvGet(storageKey) : null;
+            return ownedKeys.includes(storageKey) ? kvGetAsync(storageKey) : null;
         }
         if (!legacyPublication) {
             throw pluginStorageNamespaceConflict(
                 'The legacy plugin storage publication changed before the row could be read',
             );
         }
-        return kvGet(storageKey);
+        return kvGetAsync(storageKey);
     });
 }
 
@@ -9748,7 +9748,7 @@ app.get('/api/read', async (req, res, next) => {
                     throw error;
                 }
             } else {
-                value = kvGet(key);
+                value = await kvGetAsync(key);
             }
         }
         if(value === null){
@@ -9852,7 +9852,7 @@ app.get('/api/db/read-raw-for-boot', async (req, res, next) => {
     try {
         const raw = await queueStorageReadAfterImports(async () => {
             await flushPendingDb();
-            return kvGet('database/database.bin');
+            return kvGetAsync('database/database.bin');
         });
         // A missing endpoint is also a 404. Use an explicit successful empty
         // response so newer clients never confuse version skew with a fresh
@@ -10257,7 +10257,7 @@ app.get('/api/plugin-storage/state', async (req, res, next) => {
                         'Read database.bin before reading authoritative plugin storage state',
                     );
                 }
-                return readPluginStorageState(valueKey, ownerKey);
+                return await readPluginStorageState(valueKey, ownerKey);
             }
             if (
                 expectedState.optimized !== (dbObj?.optimizePluginMemory === true)
@@ -10286,12 +10286,14 @@ app.get('/api/plugin-storage/state', async (req, res, next) => {
                         PLUGIN_SAVE_PREFIX,
                     );
                 }
-                const valueBytes = activeManifest.valueKeys.includes(valueKey)
-                    ? kvGet(valueKey)
-                    : null;
-                const ownerBytes = activeManifest.metaKeys.includes(ownerKey)
-                    ? kvGet(ownerKey)
-                    : null;
+                const [valueBytes, ownerBytes] = await Promise.all([
+                    activeManifest.valueKeys.includes(valueKey)
+                        ? kvGetAsync(valueKey)
+                        : null,
+                    activeManifest.metaKeys.includes(ownerKey)
+                        ? kvGetAsync(ownerKey)
+                        : null,
+                ]);
                 const owner = parsePluginStorageOwnerRecord(ownerBytes);
                 return {
                     valueBytes,
@@ -10308,7 +10310,7 @@ app.get('/api/plugin-storage/state', async (req, res, next) => {
                     'The legacy plugin storage publication changed before the state could be read',
                 );
             }
-            return readPluginStorageState(valueKey, ownerKey);
+            return await readPluginStorageState(valueKey, ownerKey);
         });
         return res.json({
             success: true,
@@ -16094,13 +16096,13 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             const expectedChatId = req.headers['x-chat-id'];
             let chatId = expectedChatId;
             let row = chatId
-                ? chatRowStore.readChatRowRawWithMetadata(chaId, chatId)
+                ? await chatRowStore.readChatRowRawWithMetadataAsync(chaId, chatId)
                 : null;
 
             // Header-less legacy callers resolve index→id through the stripped DB.
             // A failed id lookup also keeps the historical shifted-index 409 check.
             if (!row) {
-                const raw = kvGet('database/database.bin');
+                const raw = await kvGetAsync('database/database.bin');
                 if (!raw) return { status: 404, error: 'Database not found' };
                 const strippedDb = getCurrentDatabaseCacheValue(DB_HEX_KEY, { allowDirty: true })
                     || await loadStrippedDatabase(raw, 'ChatContent');
@@ -16112,7 +16114,7 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                 }
                 chatId = stub.id;
                 if (!chatId) return { status: 404, error: 'Chat not found' };
-                row = chatRowStore.readChatRowRawWithMetadata(chaId, chatId);
+                row = await chatRowStore.readChatRowRawWithMetadataAsync(chaId, chatId);
             }
             if (!row) return { status: 404, error: 'Chat not found' };
 

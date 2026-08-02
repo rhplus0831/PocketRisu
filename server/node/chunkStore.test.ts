@@ -32,6 +32,11 @@ const {
             },
         ) => Promise<{ filePath: string; size: number; chunks: number; maxChunkBytes: number } | null>
         getValue: (key: string) => Buffer | null
+        getValueAsync: (key: string) => Promise<Buffer | null>
+        iterateValue: (
+            key: string,
+            options?: { shouldAbort?: () => boolean; signal?: AbortSignal },
+        ) => AsyncIterable<Buffer>
         sizeValue: (key: string) => number | null
         listValuesWithSizes: (prefix: string) => Array<{ key: string; size: number }>
         listValuesWithSizesForKeys: (keys: string[]) => Array<{ key: string; size: number }>
@@ -46,6 +51,15 @@ const {
         gc: () => number
         isChunkedKey: (key: string) => boolean
         reclaimableBytes: () => number
+        contentReadMetrics: () => {
+            fullVerificationAttempts: number
+            fullVerifications: number
+            warmReads: number
+            chunkDigestComputations: number
+            preallocatedReads: number
+            singleFlightStarts: number
+            singleFlightJoins: number
+        }
         sizeInventoryMetrics: () => {
             fastSizeHits: number
             authoritativeSizeDerivations: number
@@ -54,7 +68,7 @@ const {
             snapshotAggregateQueries: number
         }
     }
-    createSnapshotReader: (db: any) => {
+    createSnapshotReader: (db: any, opts?: Record<string, unknown>) => {
         kvGet: (key: string) => Buffer | null
         kvListWithSizes: (prefix: string) => Array<{ key: string; size: number }>
         kvSize: (key: string) => number | null
@@ -68,6 +82,13 @@ const {
                 onChunk?: (chunk: { index: number; size: number }) => void | Promise<void>
             },
         ) => Promise<{ filePath: string; size: number; chunks: number; maxChunkBytes: number } | null>
+        contentReadMetrics: () => {
+            fullVerificationAttempts: number
+            fullVerifications: number
+            warmReads: number
+            chunkDigestComputations: number
+            preallocatedReads: number
+        }
     }
     normalizeThreshold: (value: unknown) => number
     CHUNK_MARKER: Buffer
@@ -170,6 +191,227 @@ describe('createChunkStore — chunk-aware kv (injected :memory: db)', () => {
         expect(got).not.toBeNull()
         expect((got as Buffer).equals(buf)).toBe(true)
         expect(countManifest(db, 'database/database.bin')).toBeGreaterThan(1) // 실제로 청킹됨
+    })
+
+    it('B1b: publish-time verification makes the first read warm and preallocated', () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const key = 'database/publish-warm.bin'
+        const value = seededBytes(300_000, 301)
+        store.putValue(key, value)
+
+        const revision = db.prepare(`
+            SELECT source_revision AS sourceRevision,
+                   content_verified_revision AS contentVerifiedRevision
+              FROM chunk_manifest_inventory_revision
+             WHERE manifest_key = ?
+        `).get(key) as { sourceRevision: number; contentVerifiedRevision: number }
+        expect(revision.contentVerifiedRevision).toBe(revision.sourceRevision)
+
+        const result = store.getValue(key)
+        expect(result).not.toBe(value)
+        expect(result).toEqual(value)
+        expect(store.contentReadMetrics()).toMatchObject({
+            fullVerificationAttempts: 0,
+            fullVerifications: 0,
+            warmReads: 1,
+            chunkDigestComputations: 0,
+            preallocatedReads: 1,
+        })
+    })
+
+    it('B1c: a new process memo verifies once, then skips per-chunk crypto', () => {
+        const db = freshDb()
+        const key = 'database/cold-then-warm.bin'
+        const value = seededBytes(300_000, 303)
+        createChunkStore(db, T).putValue(key, value)
+
+        const reopened = createChunkStore(db, T)
+        expect(reopened.getValue(key)).toEqual(value)
+        const afterFirst = reopened.contentReadMetrics()
+        expect(afterFirst).toMatchObject({
+            fullVerificationAttempts: 1,
+            fullVerifications: 1,
+            warmReads: 0,
+            preallocatedReads: 1,
+        })
+        expect(afterFirst.chunkDigestComputations).toBe(countManifest(db, key))
+
+        expect(reopened.getValue(key)).toEqual(value)
+        expect(reopened.contentReadMetrics()).toEqual({
+            ...afterFirst,
+            warmReads: 1,
+            preallocatedReads: 2,
+        })
+    })
+
+    it('B1d: the first authoritative read rejects every established corruption class', () => {
+        const corruptions: Array<{
+            name: string
+            mutate: (db: Database.Database, key: string) => void
+        }> = [
+            {
+                name: 'chunk-tamper',
+                mutate(db, key) {
+                    const row = db.prepare(`
+                        SELECT chunk.hash AS hash, chunk.data AS data
+                          FROM manifest_chunks manifest
+                          JOIN chunks chunk ON chunk.hash = manifest.hash
+                         WHERE manifest.manifest_key = ? ORDER BY manifest.seq LIMIT 1
+                    `).get(key) as { hash: string; data: Buffer }
+                    const changed = Buffer.from(row.data)
+                    changed[0] ^= 0xff
+                    db.prepare('UPDATE chunks SET data = ? WHERE hash = ?').run(changed, row.hash)
+                },
+            },
+            {
+                name: 'missing-chunk',
+                mutate(db, key) {
+                    const { hash } = db.prepare(
+                        'SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq LIMIT 1',
+                    ).get(key) as { hash: string }
+                    db.prepare('DELETE FROM chunks WHERE hash = ?').run(hash)
+                },
+            },
+            {
+                name: 'truncated-chunk',
+                mutate(db, key) {
+                    const row = db.prepare(`
+                        SELECT chunk.hash AS hash, chunk.data AS data
+                          FROM manifest_chunks manifest
+                          JOIN chunks chunk ON chunk.hash = manifest.hash
+                         WHERE manifest.manifest_key = ? ORDER BY manifest.seq LIMIT 1
+                    `).get(key) as { hash: string; data: Buffer }
+                    db.prepare('UPDATE chunks SET data = ? WHERE hash = ?')
+                        .run(row.data.subarray(0, row.data.length - 1), row.hash)
+                },
+            },
+            {
+                name: 'logical-size',
+                mutate(db, key) {
+                    db.prepare(`
+                        UPDATE chunk_manifest_meta SET logical_size = logical_size + 1
+                         WHERE manifest_key = ?
+                    `).run(key)
+                },
+            },
+        ]
+
+        for (const corruption of corruptions) {
+            const db = freshDb()
+            const key = `database/first-read-${corruption.name}.bin`
+            createChunkStore(db, T).putValue(key, seededBytes(300_000, 307))
+            corruption.mutate(db, key)
+            const firstReader = createChunkStore(db, T)
+            expect(() => firstReader.getValue(key)).toThrow(expect.objectContaining({
+                code: 'KV_CHUNK_CORRUPT',
+            }))
+            expect(firstReader.contentReadMetrics().fullVerificationAttempts).toBe(1)
+            db.close()
+        }
+    })
+
+    it('B1e: a warm read escalates same-revision structural damage to full verification', () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const key = 'database/warm-structure.bin'
+        store.putValue(key, seededBytes(300_000, 311))
+        const revision = db.prepare(`
+            SELECT source_revision AS sourceRevision
+              FROM chunk_manifest_inventory_revision WHERE manifest_key = ?
+        `).get(key) as { sourceRevision: number }
+        const { hash } = db.prepare(
+            'SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq LIMIT 1',
+        ).get(key) as { hash: string }
+        db.prepare('DELETE FROM chunks WHERE hash = ?').run(hash)
+        // Simulate same-revision structural page damage. The in-process memo is
+        // still warm, so only the cheap count/size guard can force the fallback.
+        db.prepare(`
+            UPDATE chunk_manifest_inventory_revision
+               SET source_revision = ?, content_verified_revision = ?
+             WHERE manifest_key = ?
+        `).run(revision.sourceRevision, revision.sourceRevision, key)
+
+        expect(() => store.getValue(key)).toThrow(expect.objectContaining({
+            code: 'KV_CHUNK_CORRUPT',
+        }))
+        expect(store.contentReadMetrics()).toMatchObject({
+            fullVerificationAttempts: 1,
+            fullVerifications: 0,
+            warmReads: 0,
+            chunkDigestComputations: 0,
+        })
+    })
+
+    it('B1f: a source revision bump invalidates publish-time warmth', () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const key = 'database/revision-bump.bin'
+        store.putValue(key, seededBytes(300_000, 313))
+        const row = db.prepare(`
+            SELECT chunk.hash AS hash, chunk.data AS data
+              FROM manifest_chunks manifest
+              JOIN chunks chunk ON chunk.hash = manifest.hash
+             WHERE manifest.manifest_key = ? ORDER BY manifest.seq LIMIT 1
+        `).get(key) as { hash: string; data: Buffer }
+        const changed = Buffer.from(row.data)
+        changed[0] ^= 0xff
+        db.prepare('UPDATE chunks SET data = ? WHERE hash = ?').run(changed, row.hash)
+        const revision = db.prepare(`
+            SELECT source_revision AS sourceRevision,
+                   content_verified_revision AS contentVerifiedRevision
+              FROM chunk_manifest_inventory_revision WHERE manifest_key = ?
+        `).get(key) as { sourceRevision: number; contentVerifiedRevision: number | null }
+        expect(revision.contentVerifiedRevision).not.toBe(revision.sourceRevision)
+
+        expect(() => store.getValue(key)).toThrow(expect.objectContaining({
+            code: 'KV_CHUNK_CORRUPT',
+        }))
+        expect(store.contentReadMetrics().fullVerificationAttempts).toBe(1)
+        expect(store.contentReadMetrics().chunkDigestComputations).toBe(1)
+    })
+
+    it('B1g: concurrent async reads share one full read and verification', async () => {
+        const db = freshDb()
+        const key = 'database/single-flight.bin'
+        const value = seededBytes(300_000, 317)
+        createChunkStore(db, T).putValue(key, value)
+        const reopened = createChunkStore(db, T)
+
+        const [first, second] = await Promise.all([
+            reopened.getValueAsync(key),
+            reopened.getValueAsync(key),
+        ])
+        expect(first).toBe(second)
+        expect(first).toEqual(value)
+        expect(reopened.contentReadMetrics()).toMatchObject({
+            fullVerificationAttempts: 1,
+            fullVerifications: 1,
+            singleFlightStarts: 1,
+            singleFlightJoins: 1,
+        })
+    })
+
+    it('B1h: existing inventory-revision tables migrate cold to a separate content column', () => {
+        const db = freshDb()
+        db.exec(`
+            CREATE TABLE chunk_manifest_inventory_revision (
+                manifest_key TEXT PRIMARY KEY,
+                source_revision INTEGER NOT NULL CHECK (source_revision >= 0),
+                verified_revision INTEGER CHECK (verified_revision IS NULL OR verified_revision >= 0)
+            )
+        `)
+        const store = createChunkStore(db, T)
+        const columns = db.prepare('PRAGMA table_info(chunk_manifest_inventory_revision)')
+            .all()
+            .map((column: any) => column.name)
+        expect(columns).toContain('content_verified_revision')
+
+        const key = 'database/migrated-revision.bin'
+        const value = seededBytes(200_000, 321)
+        store.putValue(key, value)
+        expect(store.getValue(key)).toEqual(value)
+        expect(store.contentReadMetrics().fullVerificationAttempts).toBe(0)
     })
 
     it('B2: 작은 값(<임계)은 평범한 행 — 청크 0', () => {
@@ -692,6 +934,34 @@ describe('writeValueToFile — bounded snapshot restore source', () => {
     const fileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'risu-chunk-read-file-'))
     afterAll(() => fs.rmSync(fileDir, { recursive: true, force: true }))
 
+    it('F0: verified async iteration yields bounded byte-identical parts', async () => {
+        const db = freshDb()
+        const key = 'database/iterated.bin'
+        const value = seededBytes(2 * 1024 * 1024, 319)
+        createChunkStore(db, T).putValue(key, value)
+        const reopened = createChunkStore(db, T)
+        const parts: Buffer[] = []
+        for await (const part of reopened.iterateValue(key)) {
+            expect(part.length).toBeLessThanOrEqual(65536)
+            parts.push(Buffer.from(part))
+        }
+        expect(Buffer.concat(parts)).toEqual(value)
+        expect(reopened.contentReadMetrics()).toMatchObject({
+            fullVerificationAttempts: 1,
+            fullVerifications: 1,
+            warmReads: 0,
+        })
+
+        let warmBytes = 0
+        for await (const part of reopened.iterateValue(key)) warmBytes += part.length
+        expect(warmBytes).toBe(value.length)
+        expect(reopened.contentReadMetrics()).toMatchObject({
+            fullVerificationAttempts: 1,
+            fullVerifications: 1,
+            warmReads: 1,
+        })
+    })
+
     it('F1: streams a high-chunk-count value with one bounded chunk at a time', async () => {
         const db = freshDb()
         const store = createChunkStore(db, T)
@@ -1008,6 +1278,58 @@ describe('writeValueToFile — bounded snapshot restore source', () => {
             code: 'KV_CHUNK_CORRUPT',
         })
         expect(fs.existsSync(filePath)).toBe(false)
+    })
+
+    it('F10b: readonly snapshots memoize only in process and never write verification state', async () => {
+        const databasePath = path.join(fileDir, 'readonly-content-memo.db')
+        const writer = new Database(databasePath)
+        writer.exec(
+            'CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0)',
+        )
+        const key = 'database/readonly-snapshot.bin'
+        const value = seededBytes(300_000, 323)
+        createChunkStore(writer, T).putValue(key, value)
+        writer.prepare(`
+            UPDATE chunk_manifest_inventory_revision
+               SET content_verified_revision = NULL
+             WHERE manifest_key = ?
+        `).run(key)
+        writer.close()
+
+        const readonly = new Database(databasePath, { readonly: true })
+        const reader = createSnapshotReader(readonly)
+        expect(reader.kvGet(key)).toEqual(value)
+        const firstMetrics = reader.contentReadMetrics()
+        expect(firstMetrics).toMatchObject({
+            fullVerificationAttempts: 1,
+            fullVerifications: 1,
+            warmReads: 0,
+            preallocatedReads: 1,
+        })
+        expect(reader.kvGet(key)).toEqual(value)
+        expect(reader.contentReadMetrics()).toEqual({
+            ...firstMetrics,
+            warmReads: 1,
+            preallocatedReads: 2,
+        })
+        const beforeSpool = reader.contentReadMetrics()
+        const spoolPath = path.join(fileDir, 'readonly-content-memo.tmp')
+        await reader.kvWriteToFile(key, spoolPath)
+        expect(fs.readFileSync(spoolPath)).toEqual(value)
+        expect(reader.contentReadMetrics()).toMatchObject({
+            fullVerificationAttempts: beforeSpool.fullVerificationAttempts,
+            fullVerifications: beforeSpool.fullVerifications,
+            warmReads: beforeSpool.warmReads + 1,
+            chunkDigestComputations: beforeSpool.chunkDigestComputations,
+        })
+        readonly.close()
+
+        const verification = new Database(databasePath, { readonly: true })
+        expect(verification.prepare(`
+            SELECT content_verified_revision AS contentVerifiedRevision
+              FROM chunk_manifest_inventory_revision WHERE manifest_key = ?
+        `).get(key)).toEqual({ contentVerifiedRevision: null })
+        verification.close()
     })
 
     it('F11: readonly snapshots page chunked and legacy rows with ranges, integrity, and cancellation', async () => {
