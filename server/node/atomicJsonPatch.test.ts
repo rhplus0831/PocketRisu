@@ -1,10 +1,15 @@
 import { describe, expect, it } from 'vitest'
+import { createRequire } from 'node:module'
 import jsonPatchPkg from 'fast-json-patch'
 import atomicPatchPkg from './atomicJsonPatch.cjs'
 
+const require = createRequire(import.meta.url)
 const { applyPatch } = jsonPatchPkg
 const { applyPatchAtomic } = atomicPatchPkg as {
     applyPatchAtomic: (document: unknown, patch: unknown[]) => Array<unknown> & { newDocument: any }
+}
+const { calculateHash } = require('./utils.cjs') as {
+    calculateHash: (value: unknown, memo?: WeakMap<object, number>) => number
 }
 
 function jsonClone<T>(value: T): T {
@@ -89,5 +94,32 @@ describe('atomic structural-sharing JSON Patch', () => {
         ])
 
         expect(result.newDocument).toBe(original)
+    })
+
+    it('reuses exact hashes for unchanged copy-on-write branches', () => {
+        let unchangedReads = 0
+        const unchanged = {
+            get payload() {
+                unchangedReads += 1
+                return ['large', 'shared', 'branch']
+            },
+        }
+        const original = {
+            changed: { value: 1 },
+            unchanged,
+        }
+        const memo = new WeakMap<object, number>()
+
+        calculateHash(original, memo)
+        expect(unchangedReads).toBe(1)
+
+        const patched = applyPatchAtomic(original, [
+            { op: 'replace', path: '/changed/value', value: 2 },
+        ]).newDocument
+        const memoizedHash = calculateHash(patched, memo)
+
+        expect(patched.unchanged).toBe(unchanged)
+        expect(unchangedReads).toBe(1)
+        expect(memoizedHash).toBe(calculateHash(jsonClone(patched)))
     })
 })

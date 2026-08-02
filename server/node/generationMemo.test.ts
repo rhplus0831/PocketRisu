@@ -6,6 +6,8 @@ const { createGenerationMemo } = generationMemoPkg as {
         bump: (key: string) => number
         getOrCompute: <T>(key: string, name: string, compute: () => T) => T
         seed: <T>(key: string, name: string, value: T) => void
+        deleteValue: (key: string, name: string, expectedGeneration?: number) => boolean
+        has: (key: string, name: string) => boolean
         generation: (key: string) => number
     }
 }
@@ -46,5 +48,25 @@ describe('mutation-generation derived value memo', () => {
         expect(memo.getOrCompute('database', 'etag', () => 'fresh-etag')).toBe('fresh-etag')
         expect(memo.getOrCompute('plugin', 'etag', unexpectedCompute)).toBe('plugin-etag')
         expect(unexpectedCompute).not.toHaveBeenCalled()
+    })
+
+    it('releases one derived value only for the generation that retained it', () => {
+        const memo = createGenerationMemo()
+        memo.bump('database')
+        const retainedGeneration = memo.generation('database')
+        memo.seed('database', 'canonical-encoding', Buffer.from('generation-1'))
+        memo.seed('database', 'etag', 'etag-1')
+
+        expect(memo.has('database', 'canonical-encoding')).toBe(true)
+        expect(memo.deleteValue('database', 'canonical-encoding', retainedGeneration)).toBe(true)
+        expect(memo.has('database', 'canonical-encoding')).toBe(false)
+        expect(memo.has('database', 'etag')).toBe(true)
+
+        memo.seed('database', 'canonical-encoding', Buffer.from('generation-1-retry'))
+        memo.bump('database')
+        memo.seed('database', 'canonical-encoding', Buffer.from('generation-2'))
+
+        expect(memo.deleteValue('database', 'canonical-encoding', retainedGeneration)).toBe(false)
+        expect(memo.has('database', 'canonical-encoding')).toBe(true)
     })
 })

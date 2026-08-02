@@ -1,6 +1,8 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import path from 'node:path'
 import { createRequire } from 'node:module'
+import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import Database from 'better-sqlite3'
 import { Packr } from 'msgpackr'
@@ -11,8 +13,9 @@ import { decodeBackup } from './helpers/decode.js'
 import { decodeRisuDat } from './helpers/normalize.js'
 
 const require = createRequire(import.meta.url)
-const { calculateHash, normalizeJSON } = require('../../server/node/utils.cjs') as {
+const { calculateHash, encodeRisuSaveLegacy, normalizeJSON } = require('../../server/node/utils.cjs') as {
   calculateHash: (value: unknown) => number
+  encodeRisuSaveLegacy: (value: unknown) => Uint8Array
   normalizeJSON: (value: unknown) => Record<string, any>
 }
 
@@ -20,6 +23,24 @@ const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
 const packr = new Packr({ useRecords: false })
 const DB_KEY = 'database/database.bin'
 const DB_PATH_HEX = Buffer.from(DB_KEY, 'utf-8').toString('hex')
+const DB_ENCODING_STATS_PATH = 'save/db-canonical-encoding-stats.json'
+const CANONICAL_ETAG_FIXTURE = {
+  characters: [],
+  botPresets: [],
+  modules: [],
+  personas: [],
+  marker: 'etag-fixture-한글',
+}
+const PATCHED_ETAG_FIXTURE = {
+  ...CANONICAL_ETAG_FIXTURE,
+  patched: true,
+}
+const CANONICAL_ETAG_FIXTURE_HEX = '005249535553415645000785aa6368617261637465727390aa626f745072657365747390a76d6f64756c657390a8706572736f6e617390a66d61726b6572b3657461672d666978747572652ded959ceab880'
+const PATCHED_ETAG_FIXTURE_HEX = '005249535553415645000786aa6368617261637465727390aa626f745072657365747390a76d6f64756c657390a8706572736f6e617390a66d61726b6572b3657461672d666978747572652ded959ceab880a770617463686564c3'
+const FULL_WRITE_ETAG_FIXTURE_HEX = '005249535553415645000785aa6368617261637465727390aa626f745072657365747390a76d6f64756c657390a8706572736f6e617390a66d61726b6572b266756c6c2d77726974652d66697874757265'
+const CANONICAL_ETAG_FIXTURE_MD5 = '6e82d052c924efc4c599e8debcebd381'
+const PATCHED_ETAG_FIXTURE_MD5 = '54fa7bbe51542a5b79458492e977c666'
+const FULL_WRITE_ETAG_FIXTURE_MD5 = '2448b9360ff1e973f728cd051b0e6317'
 const servers: ServerHandle[] = []
 
 afterAll(async () => {
@@ -189,6 +210,72 @@ function readKv(cwd: string, key: string): Buffer | null {
   }
 }
 
+interface CanonicalEncodingStats {
+  fullEncodes: number
+  retained: boolean
+  retainedGeneration: number | null
+  retainedRevision: number | null
+  releases: Record<string, number>
+}
+
+function readCanonicalEncodingStats(cwd: string): CanonicalEncodingStats {
+  return JSON.parse(
+    readFileSync(path.join(cwd, DB_ENCODING_STATS_PATH), 'utf-8'),
+  ) as CanonicalEncodingStats
+}
+
+async function bootCanonicalEtagFixture(options: {
+  failpoint?: string
+} = {}): Promise<{ client: RisuClient, server: ServerHandle }> {
+  const server = await spawnServer({
+    env: {
+      POCKETRISU_TEST_DB_CANONICAL_ENCODING_STATS_PATH: DB_ENCODING_STATS_PATH,
+      ...(options.failpoint ? { POCKETRISU_TEST_FAILPOINT: options.failpoint } : {}),
+    },
+    seedSave: async (saveDir) => {
+      const database = new Database(path.join(saveDir, 'risuai.db'))
+      try {
+        database.exec(`
+          CREATE TABLE kv (
+            key TEXT PRIMARY KEY,
+            value BLOB NOT NULL,
+            updated_at INTEGER NOT NULL
+          )
+        `)
+        const insert = database.prepare(
+          'INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+        )
+        const now = Date.now()
+        insert.run(DB_KEY, Buffer.from(CANONICAL_ETAG_FIXTURE_HEX, 'hex'), now)
+        insert.run('migration/chats-externalized', Buffer.from('done'), now)
+        insert.run('migration/disable-remote-saving', Buffer.from('done'), now)
+      } finally {
+        database.close()
+      }
+    },
+  })
+  servers.push(server)
+  return { client: await createClient(server.port, server.password), server }
+}
+
+async function patchCanonicalEtagFixture(client: RisuClient): Promise<Response> {
+  return client.fetch('/api/patch', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'file-path': DB_PATH_HEX,
+    },
+    body: JSON.stringify({
+      expectedHash: calculateHash(normalizeJSON(CANONICAL_ETAG_FIXTURE)).toString(16),
+      patch: [{ op: 'add', path: '/patched', value: true }],
+    }),
+  })
+}
+
+function md5(bytes: Uint8Array): string {
+  return createHash('md5').update(bytes).digest('hex')
+}
+
 async function writeFullDatabase(client: RisuClient, database: Record<string, any>): Promise<Response> {
   return client.fetch('/api/write', {
     method: 'POST',
@@ -231,6 +318,212 @@ async function flushDatabase(client: RisuClient): Promise<Response> {
 }
 
 describe('atomic database writes with external rows', () => {
+  test('shares one canonical patch encoding with persistence and preserves ETag bytes', async () => {
+    const { client, server } = await bootCanonicalEtagFixture()
+
+    expect(Buffer.from(encodeRisuSaveLegacy(CANONICAL_ETAG_FIXTURE)).toString('hex'))
+      .toBe(CANONICAL_ETAG_FIXTURE_HEX)
+    expect(Buffer.from(encodeRisuSaveLegacy(PATCHED_ETAG_FIXTURE)).toString('hex'))
+      .toBe(PATCHED_ETAG_FIXTURE_HEX)
+
+    const initialRead = await client.fetch('/api/read', {
+      headers: { 'file-path': DB_PATH_HEX },
+    })
+    expect(initialRead.status).toBe(200)
+    expect(initialRead.headers.get('x-db-etag')).toBe(CANONICAL_ETAG_FIXTURE_MD5)
+    expect(Buffer.from(await initialRead.arrayBuffer()).toString('hex'))
+      .toBe(CANONICAL_ETAG_FIXTURE_HEX)
+
+    const patchResponse = await patchCanonicalEtagFixture(client)
+    expect(patchResponse.status).toBe(200)
+    await expect(patchResponse.json()).resolves.toMatchObject({
+      success: true,
+      etag: PATCHED_ETAG_FIXTURE_MD5,
+    })
+    expect(readCanonicalEncodingStats(server.cwd)).toMatchObject({
+      fullEncodes: 1,
+      retained: true,
+    })
+
+    const flushResponse = await flushDatabase(client)
+    expect(flushResponse.status).toBe(200)
+    expect(readKv(server.cwd, DB_KEY)?.toString('hex')).toBe(PATCHED_ETAG_FIXTURE_HEX)
+    expect(readCanonicalEncodingStats(server.cwd)).toMatchObject({
+      fullEncodes: 1,
+      retained: false,
+      releases: { 'persist-success': 1 },
+    })
+
+    const ordinary = await client.fetch('/api/read', {
+      headers: { 'file-path': DB_PATH_HEX },
+    })
+    expect(ordinary.headers.get('x-db-etag')).toBe(PATCHED_ETAG_FIXTURE_MD5)
+    expect(Buffer.from(await ordinary.arrayBuffer()).toString('hex'))
+      .toBe(PATCHED_ETAG_FIXTURE_HEX)
+
+    const cached = await client.fetch('/api/db/read-cached', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        cache: {
+          version: 1,
+          hashes: { root: [], characters: [], botPresets: [], modules: [], personas: [] },
+        },
+      }),
+    })
+    expect(cached.status).toBe(200)
+    expect(cached.headers.get('x-db-etag')).toBe(PATCHED_ETAG_FIXTURE_MD5)
+
+    const raw = await client.fetch('/api/db/read-raw-for-boot')
+    const rawBytes = Buffer.from(await raw.arrayBuffer())
+    expect(raw.headers.get('x-db-etag')).toBe(PATCHED_ETAG_FIXTURE_MD5)
+    expect(rawBytes.toString('hex')).toBe(PATCHED_ETAG_FIXTURE_HEX)
+    expect(md5(rawBytes)).toBe(PATCHED_ETAG_FIXTURE_MD5)
+  })
+
+  test('full writes flush and discard retained patch bytes before replacing the generation', async () => {
+    const { client, server } = await bootCanonicalEtagFixture()
+    const patchResponse = await patchCanonicalEtagFixture(client)
+    const patchBody = await patchResponse.json() as { etag: string }
+    expect(patchResponse.status).toBe(200)
+    expect(readCanonicalEncodingStats(server.cwd).retained).toBe(true)
+
+    const replacement = {
+      characters: [],
+      botPresets: [],
+      modules: [],
+      personas: [],
+      marker: 'full-write-fixture',
+    }
+    const replacementBytes = Buffer.from(encodeRisuSaveLegacy(replacement))
+    expect(replacementBytes.toString('hex')).toBe(FULL_WRITE_ETAG_FIXTURE_HEX)
+    const writeResponse = await client.fetch('/api/write', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': DB_PATH_HEX,
+        'x-if-match': patchBody.etag,
+      },
+      body: new Uint8Array(replacementBytes),
+    })
+    expect(writeResponse.status).toBe(200)
+    await expect(writeResponse.json()).resolves.toMatchObject({
+      etag: FULL_WRITE_ETAG_FIXTURE_MD5,
+    })
+    expect(md5(replacementBytes)).toBe(FULL_WRITE_ETAG_FIXTURE_MD5)
+    expect(readKv(server.cwd, DB_KEY)).toEqual(replacementBytes)
+    expect(readCanonicalEncodingStats(server.cwd)).toMatchObject({
+      fullEncodes: 1,
+      retained: false,
+      releases: { 'persist-success': 1 },
+    })
+  })
+
+  test('a replacement patch releases the cancelled timer generation and persists only the latest bytes', async () => {
+    const { client, server } = await bootCanonicalEtagFixture()
+    expect((await patchCanonicalEtagFixture(client)).status).toBe(200)
+
+    const latestFixture = { ...PATCHED_ETAG_FIXTURE, latest: 'acknowledged' }
+    const replacementPatch = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_PATH_HEX,
+      },
+      body: JSON.stringify({
+        expectedHash: calculateHash(normalizeJSON(PATCHED_ETAG_FIXTURE)).toString(16),
+        patch: [{ op: 'add', path: '/latest', value: latestFixture.latest }],
+      }),
+    })
+    expect(replacementPatch.status).toBe(200)
+    const latestBytes = Buffer.from(encodeRisuSaveLegacy(latestFixture))
+    await expect(replacementPatch.json()).resolves.toMatchObject({ etag: md5(latestBytes) })
+    expect(readCanonicalEncodingStats(server.cwd)).toMatchObject({
+      fullEncodes: 2,
+      retained: true,
+      releases: { 'cache-replace': 1 },
+    })
+
+    expect((await flushDatabase(client)).status).toBe(200)
+    expect(readKv(server.cwd, DB_KEY)).toEqual(latestBytes)
+    expect(readCanonicalEncodingStats(server.cwd)).toMatchObject({
+      fullEncodes: 2,
+      retained: false,
+      releases: { 'cache-replace': 1, 'persist-success': 1 },
+    })
+  })
+
+  test('external revision conflicts discard retained bytes and keep the conflict envelope', async () => {
+    const { client, server } = await bootCanonicalEtagFixture()
+    expect((await patchCanonicalEtagFixture(client)).status).toBe(200)
+    expect(readCanonicalEncodingStats(server.cwd).retained).toBe(true)
+
+    const externalBytes = Buffer.from(encodeRisuSaveLegacy({
+      ...CANONICAL_ETAG_FIXTURE,
+      external: true,
+    }))
+    const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'))
+    try {
+      sqlite.prepare('UPDATE kv SET value = ? WHERE key = ?').run(externalBytes, DB_KEY)
+    } finally {
+      sqlite.close()
+    }
+
+    const conflict = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_PATH_HEX,
+      },
+      body: JSON.stringify({
+        expectedHash: calculateHash(normalizeJSON(PATCHED_ETAG_FIXTURE)).toString(16),
+        patch: [{ op: 'add', path: '/secondPatch', value: true }],
+      }),
+    })
+    expect(conflict.status).toBe(409)
+    await expect(conflict.json()).resolves.toEqual({
+      error: 'The authoritative database changed outside the decoded cache lifecycle',
+      code: 'DATABASE_CACHE_REVISION_CONFLICT',
+      retryable: false,
+    })
+    expect(readCanonicalEncodingStats(server.cwd)).toMatchObject({
+      fullEncodes: 1,
+      retained: false,
+      releases: { 'external-revision-conflict': 1 },
+    })
+  })
+
+  test('persist failure releases retained bytes for bounded retry', async () => {
+    const { client, server } = await bootCanonicalEtagFixture({
+      failpoint: 'key:database/database.bin',
+    })
+    expect((await patchCanonicalEtagFixture(client)).status).toBe(200)
+
+    const flushResponse = await flushDatabase(client)
+    expect(flushResponse.status).toBe(500)
+    expect(readKv(server.cwd, DB_KEY)?.toString('hex')).toBe(CANONICAL_ETAG_FIXTURE_HEX)
+    expect(readCanonicalEncodingStats(server.cwd)).toMatchObject({
+      fullEncodes: 1,
+      retained: false,
+      releases: { 'persist-error': 1 },
+    })
+  })
+
+  test('graceful shutdown persists the acknowledged encoding and releases it', async () => {
+    const { client, server } = await bootCanonicalEtagFixture()
+    expect((await patchCanonicalEtagFixture(client)).status).toBe(200)
+    expect(readCanonicalEncodingStats(server.cwd).retained).toBe(true)
+
+    await server.restart()
+
+    expect(readKv(server.cwd, DB_KEY)?.toString('hex')).toBe(PATCHED_ETAG_FIXTURE_HEX)
+    expect(readCanonicalEncodingStats(server.cwd)).toMatchObject({
+      fullEncodes: 1,
+      retained: false,
+      releases: { 'persist-success': 1 },
+    })
+  })
+
   test('full write rolls back plugin and chat rows when database.bin kvSet fails', async () => {
     const { client, server } = await bootSeeded('key:database/database.bin')
     const before = snapshotExternalRows(server.cwd)
@@ -309,7 +602,10 @@ describe('atomic database writes with external rows', () => {
   })
 
   test('patch hash mismatch returns a stable database-conflict envelope', async () => {
-    const { client } = await bootSeeded()
+    const { client, strippedDb } = await bootSeeded()
+    const expectedCurrentEtag = md5(
+      Buffer.from(encodeRisuSaveLegacy(normalizeJSON(strippedDb))),
+    )
 
     const response = await client.fetch('/api/patch', {
       method: 'POST',
@@ -327,7 +623,7 @@ describe('atomic database writes with external rows', () => {
     await expect(response.json()).resolves.toMatchObject({
       error: 'Hash mismatch - data out of sync',
       code: 'DATABASE_PATCH_CONFLICT',
-      currentEtag: expect.stringMatching(/^[0-9a-f]{32}$/),
+      currentEtag: expectedCurrentEtag,
     })
   })
 

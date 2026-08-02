@@ -34,11 +34,29 @@ function createGenerationMemo() {
         entry.values.set(name, value);
     }
 
+    function deleteValue(key, name, expectedGeneration) {
+        const generation = generations.get(key) || 0;
+        if (expectedGeneration !== undefined && expectedGeneration !== generation) {
+            return false;
+        }
+        const entry = entries.get(key);
+        if (!entry || entry.generation !== generation) return false;
+        return entry.values.delete(name);
+    }
+
+    function has(key, name) {
+        const generation = generations.get(key) || 0;
+        const entry = entries.get(key);
+        return Boolean(entry
+            && entry.generation === generation
+            && entry.values.has(name));
+    }
+
     function generation(key) {
         return generations.get(key) || 0;
     }
 
-    return { bump, getOrCompute, seed, generation };
+    return { bump, getOrCompute, seed, deleteValue, has, generation };
 }
 
 module.exports = { createGenerationMemo };

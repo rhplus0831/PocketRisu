@@ -970,23 +970,29 @@ const SEED_NULL = 37;
 /**
  * Calculate compositional hash for an object
  * @param {*} node - The value to hash
+ * @param {WeakMap<object, number>} [objectMemo] - Identity memo for immutable shared branches
  * @returns {number} - The hash value
  */
-function calculateHash(node) {
+function calculateHash(node, objectMemo) {
     if (node === null || node === undefined) return SEED_NULL;
     switch (typeof node) {
         case 'object':
+            if (objectMemo?.has(node)) return objectMemo.get(node);
+            let result;
             if (Array.isArray(node)) {
                 let arrayHash = SEED_ARRAY;
                 for (const item of node)
-                    arrayHash = (Math.imul(arrayHash, PRIME_MULTIPLIER) + calculateHash(item)) >>> 0;
-                return arrayHash;
+                    arrayHash = (Math.imul(arrayHash, PRIME_MULTIPLIER) + calculateHash(item, objectMemo)) >>> 0;
+                result = arrayHash;
             } else {
                 let objectHash = SEED_OBJECT;
                 for (const key in node)
-                    objectHash += (Math.imul(calculateHash(key), PRIME_MULTIPLIER) + calculateHash(node[key]));
-                return objectHash >>> 0;
+                    objectHash += (Math.imul(calculateHash(key, objectMemo), PRIME_MULTIPLIER)
+                        + calculateHash(node[key], objectMemo));
+                result = objectHash >>> 0;
             }
+            objectMemo?.set(node, result);
+            return result;
         case 'string':
             let strHash = 2166136261;
             for (let i = 0; i < node.length; i++)

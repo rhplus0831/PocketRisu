@@ -327,8 +327,26 @@ function fetchProxyTarget(target, options) {
 const dbDerivedValueMemo = createGenerationMemo();
 const dbSegmentMemo = createDatabaseSegmentMemo();
 let preserveDbSegmentMemoOnCacheMutation = false;
+// Atomic JSON patches preserve untouched object identities. Reuse only those
+// branch hashes across the explicitly marked copy-on-write cache handoff.
+let preserveDbHashMemoOnCacheMutation = false;
+let dbCompositionalHashMemo = new WeakMap();
 const DB_BLOB_KEY = 'database/database.bin';
 const DB_HEX_KEY = Buffer.from(DB_BLOB_KEY, 'utf-8').toString('hex');
+// A successful patch needs the same canonical bytes twice: immediately for its
+// ETag and later for the debounced write. Keep exactly one generation-bound
+// copy, then release it on persist completion or any cache invalidation.
+const DB_CANONICAL_ENCODING_MEMO_NAME = 'canonical-encoding';
+const DB_CANONICAL_ENCODING_TEST_STATS_PATH = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_DB_CANONICAL_ENCODING_STATS_PATH ?? '').trim() || null
+    : null;
+const dbCanonicalEncodingTestStats = {
+    fullEncodes: 0,
+    retained: false,
+    retainedGeneration: null,
+    retainedRevision: null,
+    releases: {},
+};
 const DB_CACHE_MAX_ENTRIES = 8;
 const DB_CACHE_MAX_ESTIMATED_BYTES = 1024 * 1024 * 1024;
 const DB_CACHE_MAX_ENTRY_ESTIMATED_BYTES = 512 * 1024 * 1024;
@@ -346,8 +364,12 @@ const dbCache = createRevisionBoundCache({
     isUnderMemoryPressure: () => (
         process.memoryUsage().heapUsed >= DB_CACHE_HEAP_LIMIT * DB_CACHE_HEAP_PRESSURE_RATIO
     ),
-    onMutation: (filePath) => {
+    onMutation: (filePath, reason) => {
+        releaseDbCacheCanonicalEncoding(filePath, `cache-${reason}`);
         dbDerivedValueMemo.bump(filePath);
+        if (filePath === DB_HEX_KEY && !preserveDbHashMemoOnCacheMutation) {
+            dbCompositionalHashMemo = new WeakMap();
+        }
         if (filePath === DB_HEX_KEY && !preserveDbSegmentMemoOnCacheMutation) {
             dbSegmentMemo.clear();
         }
@@ -392,6 +414,71 @@ function computeDatabaseEtagFromObject(databaseObject) {
     return computeBufferEtag(Buffer.from(encodeRisuSaveLegacy(databaseObject)));
 }
 
+function publishDbCanonicalEncodingTestStats() {
+    if (!DB_CANONICAL_ENCODING_TEST_STATS_PATH) return;
+    const statsPath = path.resolve(process.cwd(), DB_CANONICAL_ENCODING_TEST_STATS_PATH);
+    writeFileSync(statsPath, JSON.stringify(dbCanonicalEncodingTestStats), 'utf-8');
+}
+
+function noteDbCanonicalEncodingRetained(generation, revision) {
+    if (!DB_CANONICAL_ENCODING_TEST_STATS_PATH) return;
+    dbCanonicalEncodingTestStats.fullEncodes += 1;
+    dbCanonicalEncodingTestStats.retained = true;
+    dbCanonicalEncodingTestStats.retainedGeneration = generation;
+    dbCanonicalEncodingTestStats.retainedRevision = revision;
+    publishDbCanonicalEncodingTestStats();
+}
+
+function releaseDbCacheCanonicalEncoding(
+    filePath,
+    reason,
+    expectedGeneration = undefined,
+) {
+    const released = dbDerivedValueMemo.deleteValue(
+        filePath,
+        DB_CANONICAL_ENCODING_MEMO_NAME,
+        expectedGeneration,
+    );
+    if (!released || !DB_CANONICAL_ENCODING_TEST_STATS_PATH) return released;
+    dbCanonicalEncodingTestStats.retained = false;
+    dbCanonicalEncodingTestStats.retainedGeneration = null;
+    dbCanonicalEncodingTestStats.retainedRevision = null;
+    dbCanonicalEncodingTestStats.releases[reason]
+        = (dbCanonicalEncodingTestStats.releases[reason] ?? 0) + 1;
+    publishDbCanonicalEncodingTestStats();
+    return true;
+}
+
+function retainDbCacheCanonicalEncoding(filePath) {
+    const databaseObject = peekDbCacheValue(filePath);
+    const metadata = dbCache.metadata(filePath);
+    const generation = dbDerivedValueMemo.generation(filePath);
+    if (!databaseObject || !metadata) {
+        throw new DatabaseCacheRevisionConflict();
+    }
+    const retained = dbDerivedValueMemo.getOrCompute(
+        filePath,
+        DB_CANONICAL_ENCODING_MEMO_NAME,
+        () => {
+            const value = {
+                bytes: Buffer.from(encodeRisuSaveLegacy(databaseObject)),
+                databaseObject,
+                generation,
+                revision: metadata.revision,
+            };
+            noteDbCanonicalEncodingRetained(generation, metadata.revision);
+            return value;
+        },
+    );
+    if (retained.databaseObject !== databaseObject
+        || retained.generation !== generation
+        || retained.revision !== metadata.revision) {
+        releaseDbCacheCanonicalEncoding(filePath, 'binding-conflict', generation);
+        throw new DatabaseCacheRevisionConflict();
+    }
+    return retained;
+}
+
 // Keep every cache replacement/eviction behind these helpers: derived values
 // are valid only for the exact mutation generation in which they were built.
 function scheduleDbCachePrune() {
@@ -413,6 +500,7 @@ function getCurrentDatabaseCacheValue(filePath, { allowDirty = false } = {}) {
     const revision = kvGetDatabaseRevision();
     const retained = dbCache.metadata(filePath);
     if (retained?.dirty && retained.revision !== revision) {
+        releaseDbCacheCanonicalEncoding(filePath, 'external-revision-conflict');
         throw new DatabaseCacheRevisionConflict();
     }
     const value = dbCache.getForRevision(filePath, revision, { allowDirty });
@@ -427,14 +515,19 @@ function peekDbCacheValue(filePath) {
 function replaceDbCacheValue(filePath, value, metadata = {}) {
     const preserveSegmentMemo = filePath === DB_HEX_KEY
         && metadata.preserveSegmentMemo === true;
+    const preserveHashMemo = filePath === DB_HEX_KEY
+        && metadata.preserveHashMemo === true;
     if (filePath === DB_HEX_KEY && !preserveSegmentMemo) dbSegmentMemo.clear();
     if (preserveSegmentMemo) dbSegmentMemo.preserveForNextRevision();
     const previousPreserve = preserveDbSegmentMemoOnCacheMutation;
+    const previousHashPreserve = preserveDbHashMemoOnCacheMutation;
     preserveDbSegmentMemoOnCacheMutation = preserveSegmentMemo;
+    preserveDbHashMemoOnCacheMutation = preserveHashMemo;
     try {
         dbCache.set(filePath, value, metadata);
     } finally {
         preserveDbSegmentMemoOnCacheMutation = previousPreserve;
+        preserveDbHashMemoOnCacheMutation = previousHashPreserve;
     }
     scheduleDbCachePrune();
 }
@@ -460,15 +553,23 @@ function getDbCacheHash(filePath) {
     return dbDerivedValueMemo.getOrCompute(
         filePath,
         'hash',
-        () => calculateHash(peekDbCacheValue(filePath)).toString(16),
+        () => calculateHash(
+            peekDbCacheValue(filePath),
+            filePath === DB_HEX_KEY ? dbCompositionalHashMemo : undefined,
+        ).toString(16),
     );
 }
 
-function getDbCacheEtag(filePath) {
+function getDbCacheEtag(filePath, { retainCanonicalEncoding = false } = {}) {
+    const canonicalEncoding = retainCanonicalEncoding
+        ? retainDbCacheCanonicalEncoding(filePath)
+        : null;
     return dbDerivedValueMemo.getOrCompute(
         filePath,
         'etag',
-        () => computeDatabaseEtagFromObject(peekDbCacheValue(filePath)),
+        () => canonicalEncoding
+            ? computeBufferEtag(canonicalEncoding.bytes)
+            : computeDatabaseEtagFromObject(peekDbCacheValue(filePath)),
     );
 }
 
@@ -1809,7 +1910,10 @@ async function loadPatchCache(filePath, decodedKey) {
         const revision = kvGetDatabaseRevision();
         const retained = dbCache.metadata(filePath);
         if (retained?.dirty) {
-            if (retained.revision !== revision) throw new DatabaseCacheRevisionConflict();
+            if (retained.revision !== revision) {
+                releaseDbCacheCanonicalEncoding(filePath, 'external-revision-conflict');
+                throw new DatabaseCacheRevisionConflict();
+            }
             return peekDbCacheValue(filePath);
         }
         const cached = dbCache.getForRevision(filePath, revision);
@@ -2004,6 +2108,23 @@ async function captureChatDeletionPreImages(chatRowKeys) {
  * Persist the stubs-only patch cache.
  */
 async function persistDbCache(filePath, decodedKey) {
+    const generation = dbDerivedValueMemo.generation(filePath);
+    let succeeded = false;
+    try {
+        await persistDbCacheGeneration(filePath, decodedKey, generation);
+        succeeded = true;
+    } finally {
+        if (decodedKey === DB_BLOB_KEY) {
+            releaseDbCacheCanonicalEncoding(
+                filePath,
+                succeeded ? 'persist-success' : 'persist-error',
+                generation,
+            );
+        }
+    }
+}
+
+async function persistDbCacheGeneration(filePath, decodedKey, generation) {
     const cachedDb = peekDbCacheValue(filePath);
     if (!cachedDb) return;
     const cacheMetadata = dbCache.metadata(filePath);
@@ -2043,7 +2164,12 @@ async function persistDbCache(filePath, decodedKey) {
         ? preparePluginStorageExternalization(cachedDb)
         : { strippedDb: cachedDb, rows: [], changed: false };
     const strippedDb = pluginExternalization.strippedDb;
-    const data = Buffer.from(encodeRisuSaveLegacy(strippedDb));
+    if (decodedKey === DB_BLOB_KEY && strippedDb !== cachedDb) {
+        throw new Error('Acknowledged database patch cache was not normalized before persistence');
+    }
+    const data = decodedKey === DB_BLOB_KEY
+        ? retainDbCacheCanonicalEncoding(filePath).bytes
+        : Buffer.from(encodeRisuSaveLegacy(strippedDb));
     const referencedChatRows = decodedKey === 'database/database.bin'
         ? chatRowStore.referencedChatRowKeys(strippedDb)
         : new Set();
@@ -2051,12 +2177,21 @@ async function persistDbCache(filePath, decodedKey) {
         ? [...pendingChatRowDeletions].filter(key => !referencedChatRows.has(key))
         : [];
     await captureChatDeletionPreImages(chatRowsToDelete);
+    if (decodedKey === DB_BLOB_KEY && (
+        dbDerivedValueMemo.generation(filePath) !== generation
+        || peekDbCacheValue(filePath) !== cachedDb
+        || dbCache.metadata(filePath)?.revision !== cacheMetadata?.revision
+    )) {
+        throw new DatabaseCacheRevisionConflict();
+    }
     let committedRevision = null;
     try {
         // Must stay synchronous: better-sqlite3 commits when this callback returns.
         sqliteDb.transaction(() => {
             if (decodedKey === DB_BLOB_KEY
-                && cacheMetadata?.revision !== kvGetDatabaseRevision()) {
+                && (cacheMetadata?.revision !== kvGetDatabaseRevision()
+                    || dbDerivedValueMemo.generation(filePath) !== generation
+                    || peekDbCacheValue(filePath) !== cachedDb)) {
                 throw new DatabaseCacheRevisionConflict();
             }
             writePluginStorageRows(pluginExternalization.rows);
@@ -14664,6 +14799,7 @@ app.post('/api/patch', async (req, res, next) => {
             const cachedDb = await loadPatchCache(filePath, decodedKey);
             if (decodedKey === DB_BLOB_KEY
                 && dbCache.metadata(filePath)?.revision !== kvGetDatabaseRevision()) {
+                releaseDbCacheCanonicalEncoding(filePath, 'external-revision-conflict');
                 throw new DatabaseCacheRevisionConflict();
             }
 
@@ -14754,11 +14890,13 @@ app.post('/api/patch', async (req, res, next) => {
                 // something — otherwise the memoized hash/ETag would keep
                 // describing the pre-normalization shape.
                 if (snapshot === cachedDb && (externalized.changed || extracted > 0)) {
+                    dbCompositionalHashMemo = new WeakMap();
                     dbDerivedValueMemo.bump(filePath);
                 }
             }
             replaceDbCacheValue(filePath, snapshot, {
                 dirty: true,
+                preserveHashMemo: snapshot !== cachedDb,
                 preserveSegmentMemo,
             });
 
@@ -14822,7 +14960,7 @@ app.post('/api/patch', async (req, res, next) => {
 
             // Update ETag after successful patch (based on stripped version)
             if (decodedKey === 'database/database.bin') {
-                dbEtag = getDbCacheEtag(filePath);
+                dbEtag = getDbCacheEtag(filePath, { retainCanonicalEncoding: true });
             }
 
             const responsePayload = {

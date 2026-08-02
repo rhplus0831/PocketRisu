@@ -206,6 +206,16 @@ describe('server-side optimized plugin storage boot reconciliation', () => {
   test('accepts the cached-view ETag for a block-format database', async () => {
     const generation = '00000000-0000-4000-8000-000000000001'
     const valueKey = encodeStorageKey(VALUE_PREFIX, 'block-format')
+    const expectedDatabase = {
+      characters: [],
+      optimizePluginMemory: true,
+      pluginStorageGeneration: generation,
+      pluginCustomStorage: {},
+      botPresets: [{ id: 'boot-reconcile-preset' }],
+      modules: [],
+      plugins: [],
+      personas: [],
+    }
     const server = await trackedServer({
       generation,
       valueKeys: [valueKey],
@@ -215,8 +225,21 @@ describe('server-side optimized plugin storage boot reconciliation', () => {
     try {
       const client = await createClient(server.port, server.password)
       const cachedEtag = await cachedDatabaseEtag(client)
-      const rawEtag = await rawDatabaseEtag(client)
+      const rawResponse = await client.fetch('/api/db/read-raw-for-boot')
+      const rawBytes = Buffer.from(await rawResponse.arrayBuffer())
+      const rawEtag = rawResponse.headers.get('x-db-etag')
+      expect(rawBytes).toEqual(encodeBlockDatabase(expectedDatabase))
+      expect(rawEtag).toBe('d82e545831d6663d4503bc4a04dedd4a')
+      expect(cachedEtag).toBe('cf8a7fbc7834cb18ba8a67779828dd5a')
       expect(cachedEtag).not.toBe(rawEtag)
+
+      const ordinaryResponse = await client.fetch('/api/read', {
+        headers: { 'file-path': Buffer.from(DATABASE_KEY).toString('hex') },
+      })
+      expect(ordinaryResponse.headers.get('x-db-etag')).toBe(cachedEtag)
+      expect(Buffer.from(await ordinaryResponse.arrayBuffer())).toEqual(
+        encodeDatabase(expectedDatabase),
+      )
 
       const result = await reconcile(client, cachedEtag)
 
