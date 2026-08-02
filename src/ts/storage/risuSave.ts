@@ -696,11 +696,218 @@ export class RisuSaveDecoder {
         compression: boolean;
         content: string;
     }[] = []
+
+    private async decodeStrict(data: Uint8Array): Promise<Database> {
+        if (import.meta.env.DEV) {
+            console.log('Decoding authoritative RisuSave data');
+        }
+        let offset = magicRisuSaveHeader.length;
+        //@ts-expect-error Database has required fields, but we initialize empty and populate incrementally during decode
+        const db: Database = {};
+        const loadedBlocks = new Set<string>();
+        const directory = new Set<string>();
+        const pendingRemoteBlocks: Array<{
+            sourceName: string;
+            name: string;
+            type: RisuSaveType;
+        }> = [];
+        let rootBlocks = 0;
+
+        const consumeBlock = (name: string, type: RisuSaveType, blockData: Uint8Array) => {
+            loadedBlocks.add(name);
+            if (!isKnownJsonRisuSaveType(type)) {
+                console.warn(`Not Implemented RisuSaveType: ${type} for ${name}`);
+                return;
+            }
+
+            let parsed: any;
+            try {
+                parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(blockData));
+            } catch (error) {
+                throw blockIntegrityError(`Invalid RisuSave block ${name}`, error);
+            }
+
+            try {
+                switch (type) {
+                    case RisuSaveType.ROOT: {
+                        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                            throw blockIntegrityError(`Invalid RisuSave root block ${name}`);
+                        }
+                        rootBlocks++;
+                        for (const rootKey in parsed) {
+                            if (!db[rootKey] && !rootKey.startsWith('__')) {
+                                db[rootKey] = parsed[rootKey];
+                            }
+                            if (rootKey === '__directory') {
+                                const rootDirectory = parsed[rootKey];
+                                if (!Array.isArray(rootDirectory)
+                                    || rootDirectory.some(dirKey => typeof dirKey !== 'string')) {
+                                    throw blockIntegrityError(`Invalid RisuSave directory in root block ${name}`);
+                                }
+                                for (const dirKey of rootDirectory) {
+                                    directory.add(dirKey);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    case RisuSaveType.CHARACTER_WITH_CHAT:
+                    case RisuSaveType.CHARACTER_WITHOUT_CHAT: {
+                        db.characters ??= [];
+                        db.characters.push(parsed);
+                        break;
+                    }
+                    case RisuSaveType.BOTPRESET: {
+                        db.botPresets = parsed;
+                        break;
+                    }
+                    case RisuSaveType.MODULES: {
+                        db.modules = parsed;
+                        break;
+                    }
+                    case RisuSaveType.CONFIG:
+                    case RisuSaveType.LOADOUTS: {
+                        // These legacy blocks are still parsed for integrity, but ignored.
+                        break;
+                    }
+                    case RisuSaveType.PLUGINS: {
+                        db.plugins = parsed;
+                        break;
+                    }
+                    case RisuSaveType.PLUGIN_STORAGE: {
+                        db.pluginCustomStorage = parsed;
+                        break;
+                    }
+                    case RisuSaveType.REMOTE: {
+                        const remoteInfo = parsed as {
+                            v: number;
+                            type: RisuSaveType;
+                            name: string;
+                        };
+                        if (!remoteInfo
+                            || typeof remoteInfo.name !== 'string'
+                            || remoteInfo.name.length === 0
+                            || !Number.isInteger(remoteInfo.type)
+                            || !isKnownJsonRisuSaveType(remoteInfo.type)) {
+                            throw blockIntegrityError(`Invalid REMOTE block ${name}`);
+                        }
+                        // Preserve the historical ordering: ordinary blocks are consumed
+                        // first, then resolved REMOTE blocks in discovery order.
+                        pendingRemoteBlocks.push({
+                            sourceName: name,
+                            name: remoteInfo.name,
+                            type: remoteInfo.type,
+                        });
+                        break;
+                    }
+                    case RisuSaveType.ROOT_COMPONENT: {
+                        db[parsed.key] = parsed.data;
+                        break;
+                    }
+                    default: {
+                        console.warn(`Not Implemented RisuSaveType: ${type} for ${name}`);
+                    }
+                }
+            } catch (error) {
+                if (error instanceof RisuSaveBlockIntegrityError) throw error;
+                throw blockIntegrityError(`Invalid RisuSave block ${name}`, error);
+            }
+        };
+
+        while (offset < data.length) {
+            let name: string;
+            let type: RisuSaveType;
+            let blockData: Uint8Array;
+            try {
+                if (offset + 7 > data.length) {
+                    throw blockIntegrityError(`Truncated RisuSave block header at byte ${offset}`);
+                }
+                type = data[offset];
+                const compressionFlag = data[offset + 1];
+                if (compressionFlag !== 0 && compressionFlag !== 1) {
+                    throw blockIntegrityError(`Invalid RisuSave compression flag at byte ${offset + 1}`);
+                }
+                const compression = compressionFlag === 1;
+                offset += 2;
+
+                const nameLength = data[offset];
+                offset += 1;
+                if (offset + nameLength + 4 > data.length) {
+                    throw blockIntegrityError(`Truncated RisuSave block name at byte ${offset}`);
+                }
+                name = new TextDecoder('utf-8', { fatal: true })
+                    .decode(data.subarray(offset, offset + nameLength));
+                offset += nameLength;
+
+                const lengthBuf = new ArrayBuffer(4);
+                new Uint8Array(lengthBuf).set(data.slice(offset, offset + 4));
+                const length = new Uint32Array(lengthBuf)[0];
+                offset += 4;
+
+                if (offset + length > data.length) {
+                    throw blockIntegrityError(`Truncated RisuSave block body at byte ${offset}`);
+                }
+                blockData = data.subarray(offset, offset + length);
+                offset += length;
+
+                if (compression) {
+                    await checkCompressionStreams();
+                    const cs = new DecompressionStream('gzip');
+                    const writer = cs.writable.getWriter();
+                    writer.write(blockData as any);
+                    writer.close();
+                    const buf = await new Response(cs.readable).arrayBuffer();
+                    blockData = new Uint8Array(buf);
+                }
+            } catch (error) {
+                if (error instanceof RisuSaveBlockIntegrityError) throw error;
+                throw blockIntegrityError(`Failed to read RisuSave block at byte ${offset}`, error);
+            }
+
+            consumeBlock(name, type, blockData);
+        }
+
+        // REMOTE bodies are fetched only when they are ready to be consumed, so
+        // multiple remote values are not retained as decoded strings together.
+        for (let i = 0; i < pendingRemoteBlocks.length; i++) {
+            const remote = pendingRemoteBlocks[i];
+            const fileName = `remotes/${remote.name}.local.bin`;
+            let stored: unknown;
+            try {
+                stored = await forageStorage.getItem(fileName);
+            } catch (error) {
+                throw blockIntegrityError(`Invalid RisuSave block ${remote.sourceName}`, error);
+            }
+            if (!stored) {
+                throw blockIntegrityError(`Remote file ${fileName} not found.`);
+            }
+            consumeBlock(remote.name, remote.type, stored as Uint8Array);
+        }
+
+        if (rootBlocks === 0) {
+            throw blockIntegrityError('RisuSave data has no root block');
+        }
+        const missingBlocks = [...directory].filter(name => !loadedBlocks.has(name));
+        if (missingBlocks.length > 0) {
+            throw blockIntegrityError(
+                `RisuSave directory references missing block${missingBlocks.length === 1 ? '' : 's'}: ${missingBlocks.join(', ')}`,
+            );
+        }
+        if (!Array.isArray(db.botPresets) || db.botPresets.length === 0) {
+            db.botPresets = [createBotPresetTemplate()];
+            db.botPresetsId = 0;
+        }
+        if (import.meta.env.DEV) {
+            console.log('Decoded authoritative RisuSave data', db);
+        }
+        return db;
+    }
+
     async decode(data: Uint8Array, options: RisuSaveDecodeOptions = {}): Promise<Database> {
-        const strictBlockIntegrity = options.strictBlockIntegrity === true;
-        const recoveryBlocks = strictBlockIntegrity
-            ? null
-            : risuSaveCacheGeneration?.blocks ?? null;
+        if (options.strictBlockIntegrity === true) {
+            return this.decodeStrict(data);
+        }
+        const recoveryBlocks = risuSaveCacheGeneration?.blocks ?? null;
         console.log('Decoding RisuSave data');
         let offset = magicRisuSaveHeader.length;
         //@ts-expect-error Database has required fields, but we initialize empty and populate incrementally during decode
@@ -724,7 +931,7 @@ export class RisuSaveDecoder {
                 if (offset + nameLength + 4 > data.length) {
                     throw blockIntegrityError(`Truncated RisuSave block name at byte ${offset}`);
                 }
-                const name = new TextDecoder('utf-8', { fatal: strictBlockIntegrity })
+                const name = new TextDecoder('utf-8')
                     .decode(data.subarray(offset, offset + nameLength));
                 offset += nameLength;
 
@@ -756,36 +963,26 @@ export class RisuSaveDecoder {
                     name,
                     type,
                     compression,
-                    content: new TextDecoder('utf-8', {
-                        fatal: strictBlockIntegrity && isKnownJsonRisuSaveType(type),
-                    }).decode(blockData)
+                    content: new TextDecoder('utf-8').decode(blockData)
                 })   
             } catch (error) {
                 if (error instanceof RisuSaveBlockIntegrityError) {
-                    if (strictBlockIntegrity) throw error;
                     break;
-                }
-                if (strictBlockIntegrity) {
-                    throw blockIntegrityError(`Failed to read RisuSave block at byte ${offset}`, error);
                 }
                 continue
             }
         }
-        console.log('blocks',this.blocks)
+        if (import.meta.env.DEV) {
+            console.log('blocks',this.blocks)
+        }
         const directory = new Set<string>();
         let rootBlocks = 0;
         for(let i = 0; i < this.blocks.length; i++){
             const key = i;
             try {
-            if (strictBlockIntegrity && isKnownJsonRisuSaveType(this.blocks[key].type)) {
-                JSON.parse(this.blocks[key].content);
-            }
             switch(this.blocks[key].type){
                 case RisuSaveType.ROOT:{
                     const rootData = JSON.parse(this.blocks[key].content);
-                    if (strictBlockIntegrity && (!rootData || typeof rootData !== 'object' || Array.isArray(rootData))) {
-                        throw blockIntegrityError(`Invalid RisuSave root block ${this.blocks[key].name}`);
-                    }
                     rootBlocks++;
                     for(const rootKey in rootData){
                         if(!db[rootKey] && !rootKey.startsWith('__')){
@@ -795,15 +992,12 @@ export class RisuSaveDecoder {
                             const rootDirectory = rootData[rootKey];
                             if (!Array.isArray(rootDirectory)
                                 || rootDirectory.some(dirKey => typeof dirKey !== 'string')) {
-                                if (strictBlockIntegrity) {
-                                    throw blockIntegrityError(`Invalid RisuSave directory in root block ${this.blocks[key].name}`);
-                                }
                                 break;
                             }
                             console.log('RisuSave directory:', rootDirectory);
                             for(const dirKey of rootDirectory){
                                 directory.add(dirKey);
-                                if(!loadedBlocks.has(dirKey) && !strictBlockIntegrity){
+                                if(!loadedBlocks.has(dirKey)){
                                     try {
                                         console.log(`Loading directory block ${dirKey} from cache`);
                                         const dirData:{
@@ -823,7 +1017,6 @@ export class RisuSaveDecoder {
                                         }
                                     } catch (error) {
                                         console.error(`Error loading directory block ${dirKey}:`, error);
-                                        if (strictBlockIntegrity) throw error;
                                     }
                                 }
                             }
@@ -868,14 +1061,6 @@ export class RisuSaveDecoder {
                         type:RisuSaveType
                         name:string
                     } = JSON.parse(this.blocks[key].content);
-                    if (strictBlockIntegrity
-                        && (!remoteInfo
-                            || typeof remoteInfo.name !== 'string'
-                            || remoteInfo.name.length === 0
-                            || !Number.isInteger(remoteInfo.type)
-                            || !isKnownJsonRisuSaveType(remoteInfo.type))) {
-                        throw blockIntegrityError(`Invalid REMOTE block ${this.blocks[key].name}`);
-                    }
                     const fileName = `remotes/${remoteInfo.name}.local.bin`
                     let remoteData:Uint8Array|null = null
                     const stored = await forageStorage.getItem(fileName);
@@ -885,13 +1070,10 @@ export class RisuSaveDecoder {
 
                     if(!remoteData){
                         const message = `Remote file ${fileName} not found.`;
-                        if (strictBlockIntegrity) throw blockIntegrityError(message);
                         console.warn(message);
                         break;
                     }
-                    const decoded = new TextDecoder('utf-8', {
-                        fatal: strictBlockIntegrity && isKnownJsonRisuSaveType(remoteInfo.type),
-                    }).decode(remoteData)
+                    const decoded = new TextDecoder('utf-8').decode(remoteData)
 
                     //add to blocks for further processing
                     this.blocks.push({
@@ -918,24 +1100,9 @@ export class RisuSaveDecoder {
             } catch (error) {
                 console.error(`Error processing block ${this.blocks[key].name}:`, error);
 
-                if(strictBlockIntegrity && isKnownJsonRisuSaveType(this.blocks[key].type)){
-                    if (error instanceof RisuSaveBlockIntegrityError) throw error;
-                    throw blockIntegrityError(`Invalid RisuSave block ${this.blocks[key].name}`, error);
-                }
                 if(this.blocks[key].type === RisuSaveType.ROOT){
                     throw new Error('Failed to decode root block, cannot proceed with decoding RisuSave data');
                 }
-            }
-        }
-        if (strictBlockIntegrity) {
-            if (rootBlocks === 0) {
-                throw blockIntegrityError('RisuSave data has no root block');
-            }
-            const missingBlocks = [...directory].filter(name => !loadedBlocks.has(name));
-            if (missingBlocks.length > 0) {
-                throw blockIntegrityError(
-                    `RisuSave directory references missing block${missingBlocks.length === 1 ? '' : 's'}: ${missingBlocks.join(', ')}`,
-                );
             }
         }
         //to fix botpreset bugs
@@ -943,7 +1110,9 @@ export class RisuSaveDecoder {
             db.botPresets = [createBotPresetTemplate()]
             db.botPresetsId = 0
         }
-        console.log('Decoded RisuSave data', db);
+        if (import.meta.env.DEV) {
+            console.log('Decoded RisuSave data', db);
+        }
         return db;
     }
 }

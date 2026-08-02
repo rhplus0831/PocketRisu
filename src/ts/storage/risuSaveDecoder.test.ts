@@ -1,8 +1,12 @@
 import { describe, expect, test, vi } from 'vitest'
 
+const forageStorageMocks = vi.hoisted(() => ({
+    getItem: vi.fn(async () => null as Uint8Array | null),
+}))
+
 vi.mock('../globalApi.svelte', () => ({
     forageStorage: {
-        getItem: vi.fn(async () => null),
+        getItem: forageStorageMocks.getItem,
     },
 }))
 vi.mock('./database.svelte', () => ({
@@ -83,6 +87,58 @@ function retainEncodedBlock(encoded: ArrayBuffer, wantedName: string): Uint8Arra
 }
 
 describe('authoritative RisuSave block decoding', () => {
+    test('parses each known JSON block exactly once', async () => {
+        const directory = [
+            'config',
+            'character',
+            'chat',
+            'presets',
+            'modules',
+            'root-component',
+            'plugins',
+            'loadouts',
+            'plugin-storage',
+            'remote-character',
+            'future',
+        ]
+        const bytes = save(
+            block(1, 'root', { marker: 'parse-once', __directory: directory }),
+            block(0, 'config', { ignored: true }),
+            block(2, 'character', { chaId: 'character', chats: [] }),
+            block(3, 'chat', { ignored: true }),
+            block(4, 'presets', [{ id: 'preset' }]),
+            block(5, 'modules', []),
+            block(8, 'root-component', { key: 'componentMarker', data: 'present' }),
+            block(9, 'plugins', []),
+            block(10, 'loadouts', { ignored: true }),
+            block(11, 'plugin-storage', {}),
+            block(6, 'remote-character', {
+                v: 1,
+                type: 2,
+                name: 'remote-character',
+            }),
+            rawBlock(200, 'future', Buffer.from([0xff, 0x00, 0x7f])),
+        )
+        forageStorageMocks.getItem.mockResolvedValueOnce(
+            Buffer.from(JSON.stringify({ chaId: 'remote-character', chats: [] }), 'utf-8'),
+        )
+        const parse = vi.spyOn(JSON, 'parse')
+
+        try {
+            await expect(decodeAuthoritativeRisuSave(bytes)).resolves.toMatchObject({
+                marker: 'parse-once',
+                componentMarker: 'present',
+                characters: [
+                    { chaId: 'character', chats: [] },
+                    { chaId: 'remote-character', chats: [] },
+                ],
+            })
+            expect(parse).toHaveBeenCalledTimes(12)
+        } finally {
+            parse.mockRestore()
+        }
+    })
+
     test('accepts historical roots without a directory', async () => {
         await expect(decodeAuthoritativeRisuSave(save(
             block(1, 'root', { marker: 'historical' }),

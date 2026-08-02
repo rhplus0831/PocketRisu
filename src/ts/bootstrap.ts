@@ -176,7 +176,9 @@ export async function loadData() {
                         ? databaseRead.database as Database
                         : await decodeAuthoritativeRisuSave(databaseRead.bytes)
                     setPatchSyncBaseline(decoded)
-                    console.log(decoded)
+                    if (import.meta.env.DEV) {
+                        console.log(decoded)
+                    }
                     setDatabase(decoded)
                 } catch (error) {
                     console.error(error)
