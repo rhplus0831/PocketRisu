@@ -16,6 +16,7 @@ import { isHydrating, saveChatToServer, ensureChatHydrated, chatToStub, classify
 import {
     buildKnownChatIdsByCharacter,
     capturePreTrackingFullChatChanges,
+    CHECKPOINT_INTERVAL_MS,
     prepareChatPersistStage,
 } from "./storage/chatPersistStage";
 import { AutoStorage } from "./storage/autoStorage";
@@ -32,6 +33,7 @@ import { updateLorebooks } from "./characters";
 import { initMobileGesture } from "./hotkey";
 import { moduleUpdate } from "./process/modules";
 import { doingChat } from "./process/index.svelte";
+import { chatGenKey, generationStates } from "./process/generationState";
 import { chatOperationActive } from './process/chatSendState';
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
@@ -46,6 +48,7 @@ import {
     type DatabaseSaveOutcome,
 } from "./storage/databaseSave"
 import { DirtyTargetBridge } from "./storage/dirtyTargetBridge"
+import { watchActiveChatDirty } from "./storage/activeChatDirtyTracker.svelte"
 import {
     createRequestLogScope, recordRequestLog, fetchRequestLogs,
     type RequestLogCategory, type RequestLogSource, type RequestLogRoute,
@@ -525,10 +528,9 @@ export async function saveDb() {
         let didInitPluginsEffect = false
         let didInitPluginStorageEffect = false
         let didInitGeneralEffect = false
-        let trackedActiveChatKey = ''
-
         const debounceTime = 500; // 500 milliseconds
         let saveTimeout: ReturnType<typeof setTimeout> | null = null;
+        let rearmActiveChatDirty = () => {}
 
         selectedCharID.subscribe((v) => {
             selIdState = v
@@ -550,12 +552,14 @@ export async function saveDb() {
                 generationChatCheckpoints.clear()
             }
             if (wasDoingChat && !isDoingChat) {
+                rearmActiveChatDirty()
                 saveTimeoutExecute()
             }
         })
 
         // Start a best-effort save immediately when the page is hidden/unloaded.
         function flushImmediate() {
+            rearmActiveChatDirty()
             if (saveTimeout) {
                 clearTimeout(saveTimeout);
                 saveTimeout = null;
@@ -675,40 +679,39 @@ export async function saveDb() {
             }
             saveTimeoutExecute()
         })
-        $effect(() => {
-            const activeChar = DBState?.db?.characters?.[selIdState]
-            const activeChat = activeChar?.chats?.[activeChar?.chatPage]
-            if (activeChat) {
-                deepTouch(activeChat)
-            }
-
-            const activeChaId = activeChar?.chaId ?? ''
-            const activeChatId = activeChat?.id ?? ''
-            const activeKey = activeChaId && activeChatId ? `${activeChaId}|${activeChatId}` : ''
-
-            if (!activeKey) {
-                trackedActiveChatKey = ''
-                return
-            }
-
-            // Selecting a different chat establishes a new baseline; only later edits are dirty.
-            if (trackedActiveChatKey !== activeKey) {
-                trackedActiveChatKey = activeKey
-                return
-            }
-
-            if (isHydrating(activeChaId, activeChatId)) {
-                return
-            }
-
-            if (
-                changeTracker.chat[0]?.[0] !== activeChaId ||
-                changeTracker.chat[0]?.[1] !== activeChatId
-            ) {
-                changeTracker.chat.unshift([activeChaId, activeChatId])
-            }
-            saveTimeoutExecute()
+        const activeChatDirtyTracker = watchActiveChatDirty({
+            retouchDelayMs: ({ chatId }) => (
+                get(generationStates).get(chatGenKey(chatId))?.kind === 'live'
+                    ? CHECKPOINT_INTERVAL_MS
+                    : debounceTime
+            ),
+            select: () => {
+                const activeChar = DBState?.db?.characters?.[selIdState]
+                const activeChat = activeChar?.chats?.[activeChar?.chatPage]
+                const activeChaId = activeChar?.chaId ?? ''
+                const activeChatId = activeChat?.id ?? ''
+                return {
+                    chaId: activeChaId,
+                    chatId: activeChatId,
+                    chat: activeChat,
+                    suppressDirty: !!(
+                        activeChaId && activeChatId && isHydrating(activeChaId, activeChatId)
+                    ),
+                }
+            },
+            onDirty: (activeChaId, activeChatId) => {
+                if (
+                    changeTracker.chat[0]?.[0] !== activeChaId ||
+                    changeTracker.chat[0]?.[1] !== activeChatId
+                ) {
+                    changeTracker.chat.unshift([activeChaId, activeChatId])
+                }
+                saveTimeoutExecute()
+            },
         })
+        rearmActiveChatDirty = activeChatDirtyTracker.rearm
+
+        return activeChatDirtyTracker.stop
     })
 
     // The general character effect clears its initial queues while establishing
