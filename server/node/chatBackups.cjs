@@ -340,7 +340,11 @@ function createChatBackupStore(options) {
     const config = options || {};
     const {
         getChatBackupsRoot,
+        inspectChatRow,
         readChatRowRaw,
+        readChatRowRawWithMetadata,
+        repairChatRowMetadata,
+        streamChatRowRawToFile,
         logger = console,
         now = Date.now,
         decodeChat = decodeRisuSave,
@@ -367,6 +371,31 @@ function createChatBackupStore(options) {
     if (typeof readChatRowRaw !== 'function') {
         throw new TypeError('readChatRowRaw must be a function');
     }
+
+    const inspectRow = typeof inspectChatRow === 'function'
+        ? inspectChatRow
+        : (chaId, chatId) => {
+            const raw = readChatRowRaw(chaId, chatId);
+            return raw === null || raw === undefined
+                ? null
+                : { size: raw.length, coldStorage: null };
+        };
+    const selectSmallRow = typeof readChatRowRawWithMetadata === 'function'
+        ? readChatRowRawWithMetadata
+        : (chaId, chatId) => {
+            const raw = readChatRowRaw(chaId, chatId);
+            return raw === null || raw === undefined
+                ? null
+                : { bytes: Buffer.from(raw), contentHash: null, coldStorage: null };
+        };
+    const streamRowToFile = typeof streamChatRowRawToFile === 'function'
+        ? streamChatRowRawToFile
+        : async (chaId, chatId, filePath) => {
+            const raw = readChatRowRaw(chaId, chatId);
+            if (raw === null || raw === undefined) return null;
+            fs.writeFileSync(filePath, raw);
+            return { filePath, size: raw.length, chunks: 1, maxChunkBytes: raw.length };
+        };
 
     const bundleSize = Math.max(1, Math.floor(versionsPerBundle));
     const bundleLimit = Math.max(0, Math.floor(maxBundlesPerChat));
@@ -440,6 +469,41 @@ function createChatBackupStore(options) {
             if (directoryFd !== undefined) {
                 try { fs.closeSync(directoryFd); } catch {}
             }
+        }
+    }
+
+    async function writeFileAtomicFromSource(destination, writeSource) {
+        const temp = `${destination}.${process.pid}-${tempCounter++}.tmp`;
+        try {
+            const result = await writeSource(temp);
+            if (result === null || result === undefined) {
+                try { fs.unlinkSync(temp); } catch {}
+                return null;
+            }
+            let fileFd;
+            try {
+                fileFd = fs.openSync(temp, 'r');
+                fs.fsyncSync(fileFd);
+            } finally {
+                if (fileFd !== undefined) fs.closeSync(fileFd);
+            }
+            fs.renameSync(temp, destination);
+
+            let directoryFd;
+            try {
+                directoryFd = fs.openSync(path.dirname(destination), 'r');
+                fs.fsyncSync(directoryFd);
+            } catch {
+                // The file itself is already durable and published at this point.
+            } finally {
+                if (directoryFd !== undefined) {
+                    try { fs.closeSync(directoryFd); } catch {}
+                }
+            }
+            return result;
+        } catch (error) {
+            try { fs.unlinkSync(temp); } catch {}
+            throw error;
         }
     }
 
@@ -599,18 +663,26 @@ function createChatBackupStore(options) {
         required = false,
     } = {}) {
         try {
-            const existing = readChatRowRaw(chaId, chatId);
-            if (existing === null || existing === undefined) return 'skipped-no-row';
-            const raw = Buffer.from(existing);
+            const row = inspectRow(chaId, chatId);
+            if (row === null || row === undefined) return 'skipped-no-row';
 
-            if (!force && raw.length < 4096) {
-                try {
-                    const decoded = await decodeChat(raw);
-                    if (decoded?.message?.[0]?.data?.startsWith(COLD_STORAGE_HEADER)) {
-                        return 'skipped-cold-storage';
+            if (!force && row.size < 4096) {
+                if (row.coldStorage === true) return 'skipped-cold-storage';
+                if (row.coldStorage === null || row.coldStorage === undefined) {
+                    try {
+                        const selected = selectSmallRow(chaId, chatId);
+                        if (!selected) return 'skipped-no-row';
+                        const decoded = await decodeChat(selected.bytes);
+                        const coldStorage = decoded?.message?.[0]?.data
+                            ?.startsWith(COLD_STORAGE_HEADER) === true;
+                        if (typeof repairChatRowMetadata === 'function'
+                            && selected.contentHash !== null) {
+                            repairChatRowMetadata(selected, coldStorage);
+                        }
+                        if (coldStorage) return 'skipped-cold-storage';
+                    } catch (error) {
+                        log('warn', '[ChatBackups] Could not inspect a small row for cold storage; preserving it:', error);
                     }
-                } catch (error) {
-                    log('warn', '[ChatBackups] Could not inspect a small row for cold storage; preserving it:', error);
                 }
             }
 
@@ -633,7 +705,14 @@ function createChatBackupStore(options) {
             const seq = nextSequence(chatDir, currentTime);
             const safeReason = sanitizeBackupReason(reason);
             const filename = `v-${currentTime}-${seq}-${safeReason}.bin`;
-            writeFileAtomic(path.join(chatDir, filename), raw);
+            const streamed = await writeFileAtomicFromSource(
+                path.join(chatDir, filename),
+                (tempPath) => streamRowToFile(chaId, chatId, tempPath),
+            );
+            if (!streamed) return 'skipped-no-row';
+            if (streamed.size !== row.size) {
+                throw new Error('Streamed chat pre-image size changed during capture');
+            }
             newestByChatDir.set(chatDir, currentTime);
             scheduleReconcile();
             return 'captured';

@@ -379,6 +379,8 @@ const chatRowStore = createChatRowStore({
     kvDel,
     kvList,
     kvListWithSizes,
+    kvWriteToFile,
+    kvSize,
     kvGetUpdatedAt,
 });
 
@@ -1049,7 +1051,19 @@ function readPluginStorageState(valueKey, ownerKey) {
 const chatBackupStore = createChatBackupStore({
     getChatBackupsRoot: () => chatBackupsDir,
     logger,
+    inspectChatRow: (chaId, chatId) => (
+        chatRowStore.inspectChatRowForBackup(chaId, chatId)
+    ),
     readChatRowRaw: (chaId, chatId) => chatRowStore.readChatRowRaw(chaId, chatId),
+    repairChatRowMetadata: (rowState, coldStorage) => (
+        chatRowStore.repairChatRowMetadata(rowState, coldStorage)
+    ),
+    readChatRowRawWithMetadata: (chaId, chatId) => (
+        chatRowStore.readChatRowRawWithMetadata(chaId, chatId)
+    ),
+    streamChatRowRawToFile: (chaId, chatId, filePath) => (
+        chatRowStore.streamChatRowRawToFile(chaId, chatId, filePath)
+    ),
     getByteBudget: () => resolveChatBackupMaxBytes({ kvGet }),
     runStorageOperation: queueStorageOperation,
 });
@@ -16073,49 +16087,65 @@ function restoreColdStorageChat(chat) {
 app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
     try {
-        const chaId = req.params.chaId;
-        const chatIndex = parseInt(req.params.chatIndex, 10);
-        const expectedChatId = req.headers['x-chat-id'];
-        let chatId = expectedChatId;
-        let chat = chatId ? await chatRowStore.readChatRow(chaId, chatId) : null;
+        await importBarrier.waitUntilIdle();
+        const result = await (async () => {
+            const chaId = req.params.chaId;
+            const chatIndex = parseInt(req.params.chatIndex, 10);
+            const expectedChatId = req.headers['x-chat-id'];
+            let chatId = expectedChatId;
+            let row = chatId
+                ? chatRowStore.readChatRowRawWithMetadata(chaId, chatId)
+                : null;
 
-        // Header-less legacy callers resolve index→id through the stripped DB.
-        // A failed id lookup also keeps the historical shifted-index 409 check.
-        if (!chat) {
-            const raw = kvGet('database/database.bin');
-            if (!raw) return res.status(404).json({ error: 'Database not found' });
-            const strippedDb = getCurrentDatabaseCacheValue(DB_HEX_KEY, { allowDirty: true })
-                || await loadStrippedDatabase(raw, 'ChatContent');
-            const char = strippedDb.characters?.find(c => c?.chaId === chaId);
-            const stub = char?.chats?.[chatIndex];
-            if (!stub) return res.status(404).json({ error: 'Chat not found' });
-            if (expectedChatId && stub.id !== expectedChatId) {
-                return res.status(409).json({ error: 'Chat ID mismatch — index may have shifted' });
+            // Header-less legacy callers resolve index→id through the stripped DB.
+            // A failed id lookup also keeps the historical shifted-index 409 check.
+            if (!row) {
+                const raw = kvGet('database/database.bin');
+                if (!raw) return { status: 404, error: 'Database not found' };
+                const strippedDb = getCurrentDatabaseCacheValue(DB_HEX_KEY, { allowDirty: true })
+                    || await loadStrippedDatabase(raw, 'ChatContent');
+                const char = strippedDb.characters?.find(c => c?.chaId === chaId);
+                const stub = char?.chats?.[chatIndex];
+                if (!stub) return { status: 404, error: 'Chat not found' };
+                if (expectedChatId && stub.id !== expectedChatId) {
+                    return { status: 409, error: 'Chat ID mismatch — index may have shifted' };
+                }
+                chatId = stub.id;
+                if (!chatId) return { status: 404, error: 'Chat not found' };
+                row = chatRowStore.readChatRowRawWithMetadata(chaId, chatId);
             }
-            chatId = stub.id;
-            if (!chatId) return res.status(404).json({ error: 'Chat not found' });
-            chat = await chatRowStore.readChatRow(chaId, chatId);
-        }
-        if (!chat) return res.status(404).json({ error: 'Chat not found' });
+            if (!row) return { status: 404, error: 'Chat not found' };
 
-        const needsRehydration = isColdStorageChat(chat);
-        if (!restoreColdStorageChat(chat)) {
-            return res.status(500).json({ error: 'Cold storage restore failed' });
-        }
-        let encoded;
-        if (needsRehydration) {
-            // Cache-fill only, so it can be skipped rather than gated: writing it
-            // during an import would either be rolled back or strand a row under a
-            // chaId the import just cleared. The next read rehydrates again.
-            if (!importBarrier.isHeld()) {
-                chatRowStore.writeChatRow(chaId, chatId, chat);
+            let encoded = row.bytes;
+            let contentHash = row.contentHash;
+            // A matching warm derivative is the fast path: raw bytes already
+            // selected for the response require no decode or second store read.
+            // Missing/mismatched metadata falls back to the row body once and
+            // repairs the derivative only if the row's mutation token is still
+            // current after the asynchronous decode.
+            if (row.coldStorage !== false) {
+                const chat = await decodeRisuSave(row.bytes);
+                const needsRehydration = isColdStorageChat(chat);
+                if (!importBarrier.isHeld()) {
+                    chatRowStore.repairChatRowMetadata(row, needsRehydration);
+                }
+                if (needsRehydration) {
+                    if (!restoreColdStorageChat(chat)) {
+                        return { status: 500, error: 'Cold storage restore failed' };
+                    }
+                    encoded = Buffer.from(encodeRisuSaveLegacy(chat));
+                    // Cache-fill only, so it can be skipped rather than gated: an
+                    // import that claimed the barrier will replace this dataset.
+                    const storedHash = importBarrier.isHeld()
+                        ? null
+                        : chatRowStore.writeChatRowIfUnchanged(chaId, chatId, row, chat);
+                    contentHash = storedHash ?? sha256Hex(encoded);
+                }
             }
-            encoded = Buffer.from(encodeRisuSaveLegacy(chat));
-        } else {
-            encoded = chatRowStore.readChatRowRaw(chaId, chatId)
-                || Buffer.from(encodeRisuSaveLegacy(chat));
-        }
-        const contentHash = sha256Hex(encoded);
+            return { status: 200, encoded, contentHash };
+        })();
+        if (result.error) return res.status(result.status).json({ error: result.error });
+        const { encoded, contentHash } = result;
         res.setHeader('x-content-hash', contentHash);
         const cachedHashes = parseCachedHashesHeader(req.headers['x-cached-hashes']);
         if (cachedHashes.includes(contentHash)) {
@@ -16171,16 +16201,14 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                 chatId: expectedChatId,
                 reason: req.headers['x-chat-backup-reason'],
             });
+            let hash;
             if (isRawBinary && !healedHybrid) {
-                chatRowStore.writeChatRowRaw(chaId, expectedChatId, req.body);
+                hash = chatRowStore.writeChatRowRawOwned(chaId, expectedChatId, req.body, {
+                    coldStorage: isColdStorageChat(chatData),
+                });
             } else {
-                chatRowStore.writeChatRow(chaId, expectedChatId, chatData);
+                hash = chatRowStore.writeChatRow(chaId, expectedChatId, chatData);
             }
-            const storedBytes = chatRowStore.readChatRowRaw(chaId, expectedChatId);
-            if (!storedBytes) {
-                throw new Error('Stored chat row could not be read');
-            }
-            const hash = sha256Hex(storedBytes);
             // The authoritative row is already durable. Keep full recovery
             // snapshot assembly outside the response-critical mutation so a
             // large store cannot turn this acknowledgement into a timeout.

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import Database from 'better-sqlite3'
+import { createHash } from 'node:crypto'
 import chatRowsPkg from './chatRows.cjs'
 import chunkStorePkg from './chunkStore.cjs'
 import utilsPkg from './utils.cjs'
@@ -9,8 +10,28 @@ interface ChatRowStore {
     parseChatRowKey: (key: string) => { chaId: string; chatId: string } | null
     readChatRow: (chaId: string, chatId: string) => Promise<any | null>
     readChatRowRaw: (chaId: string, chatId: string) => Buffer | null
-    writeChatRow: (chaId: string, chatId: string, chat: any) => void
-    writeChatRowRaw: (chaId: string, chatId: string, value: Buffer) => void
+    readChatRowRawWithMetadata: (chaId: string, chatId: string) => {
+        key: string
+        rowToken: string
+        bytes: Buffer
+        contentHash: string
+        coldStorage: boolean | null
+    } | null
+    repairChatRowMetadata: (row: any, coldStorage: boolean) => boolean
+    writeChatRow: (chaId: string, chatId: string, chat: any) => string
+    writeChatRowIfUnchanged: (
+        chaId: string,
+        chatId: string,
+        row: any,
+        chat: any,
+    ) => string | null
+    writeChatRowRaw: (chaId: string, chatId: string, value: Buffer) => string
+    writeChatRowRawOwned: (
+        chaId: string,
+        chatId: string,
+        value: Buffer,
+        options?: { coldStorage?: boolean },
+    ) => string
     deleteChatRow: (chaId: string, chatId: string) => void
     deleteChatRowsForChar: (chaId: string) => number
     listChatRowKeysForChar: (chaId: string) => string[]
@@ -106,6 +127,8 @@ const { createChunkStore, isChunkableKey } = chunkStorePkg as {
         getValue: (key: string) => Buffer | null
         putValue: (key: string, value: Buffer) => void
         dropValue: (key: string) => void
+        writeValueToFile: (key: string, filePath: string, options?: any) => Promise<any>
+        sizeValue: (key: string) => number | null
     }
     isChunkableKey: (key: string) => boolean
 }
@@ -162,6 +185,10 @@ function makeHarness(options: {
         kvDel,
         kvList,
         kvListWithSizes,
+        kvWriteToFile: (key: string, filePath: string, streamOptions?: any) => (
+            chunks.writeValueToFile(key, filePath, streamOptions)
+        ),
+        kvSize: (key: string) => chunks.sizeValue(key),
         kvGetUpdatedAt,
         randomUUID: options.randomUUID,
     })
@@ -245,6 +272,91 @@ describe('chat row IO', () => {
         expect(store.deleteChatRowsForChar('char/one')).toBe(2)
         expect(store.listChatRowKeysForChar('char/one')).toEqual([])
         expect(store.listAllChatRowKeys()).toEqual([chatRowKey('char-two', 'c')])
+    })
+
+    it('returns the written-byte digest and makes buffer ownership explicit', () => {
+        const observed: Buffer[] = []
+        const { store } = makeHarness({
+            beforeSet: (key, value) => {
+                if (key.startsWith('chats/')) observed.push(value)
+            },
+        })
+        const retained = Buffer.from(encodeRisuSaveLegacy({
+            id: 'retained',
+            name: 'Retained',
+            message: [],
+        }))
+        const retainedHash = store.writeChatRowRaw('char', 'retained', retained)
+        expect(observed.at(-1)).not.toBe(retained)
+        expect(retainedHash).toBe(createHash('sha256').update(retained).digest('hex'))
+
+        const owned = Buffer.from(encodeRisuSaveLegacy({
+            id: 'owned',
+            name: 'Owned',
+            message: [],
+        }))
+        const ownedHash = store.writeChatRowRawOwned('char', 'owned', owned, {
+            coldStorage: false,
+        })
+        expect(observed.at(-1)).toBe(owned)
+        expect(ownedHash).toBe(createHash('sha256').update(owned).digest('hex'))
+    })
+
+    it('binds cold-state metadata to row bytes and repairs legacy gaps lazily', () => {
+        const { db, store, kvSet } = makeHarness()
+        const chat = {
+            id: 'chat',
+            name: 'Warm',
+            message: [{ role: 'user', data: 'hello' }],
+        }
+        const hash = store.writeChatRow('char', chat.id, chat)
+        const selected = store.readChatRowRawWithMetadata('char', chat.id)
+        expect(selected).toMatchObject({ contentHash: hash, coldStorage: false })
+
+        db.prepare('DELETE FROM chat_row_metadata WHERE row_key = ?')
+            .run(chatRowKey('char', chat.id))
+        const legacy = store.readChatRowRawWithMetadata('char', chat.id)
+        expect(legacy?.coldStorage).toBeNull()
+        expect(store.repairChatRowMetadata(legacy, false)).toBe(true)
+        expect(store.readChatRowRawWithMetadata('char', chat.id)?.coldStorage).toBe(false)
+
+        db.prepare(`
+            UPDATE chat_row_metadata
+               SET content_sha256 = ?, cold_storage = 1
+             WHERE row_key = ?
+        `).run('0'.repeat(64), chatRowKey('char', chat.id))
+        const inconsistent = store.readChatRowRawWithMetadata('char', chat.id)
+        expect(inconsistent?.coldStorage).toBeNull()
+        expect(store.repairChatRowMetadata(inconsistent, false)).toBe(true)
+
+        const replacement = Buffer.from(encodeRisuSaveLegacy({
+            ...chat,
+            message: [{ role: 'user', data: 'replacement' }],
+        }))
+        kvSet(chatRowKey('char', chat.id), replacement)
+        expect(store.readChatRowRawWithMetadata('char', chat.id)).toMatchObject({
+            contentHash: createHash('sha256').update(replacement).digest('hex'),
+            coldStorage: null,
+        })
+        expect(store.repairChatRowMetadata(legacy, false)).toBe(false)
+    })
+
+    it('does not let a cold cache-fill overwrite a concurrently replaced row', () => {
+        const { store } = makeHarness()
+        const cold = {
+            id: 'chat',
+            name: 'Cold',
+            message: [{ data: '\uEF01COLDSTORAGE\uEF01coldstorage/key' }],
+        }
+        store.writeChatRow('char', cold.id, cold)
+        const selected = store.readChatRowRawWithMetadata('char', cold.id)
+        const replacement = { ...cold, name: 'Newer', message: [] }
+        store.writeChatRow('char', cold.id, replacement)
+
+        expect(store.writeChatRowIfUnchanged(
+            'char', cold.id, selected, { ...cold, name: 'Restored', message: [] },
+        )).toBeNull()
+        expect(store.readChatRowRawWithMetadata('char', cold.id)?.coldStorage).toBe(false)
     })
 })
 

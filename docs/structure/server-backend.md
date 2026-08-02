@@ -229,6 +229,11 @@ buffered-body ledger.
   storage quota and ownership accounting.
 - `replacement_operations`, the transaction-bound committed/not-committed status used to
   reconcile destructive requests whose acknowledgement was lost.
+- `chat_row_metadata`, a rebuildable per-row derivative keyed by encoded chat-row
+  identity. A random mutation token binds SHA-256, logical size, and cold-storage state
+  to the current authoritative row; KV triggers invalidate it on every direct chat-row
+  write/delete, and missing or mismatched entries are repaired lazily from decoded row
+  bytes rather than through a boot-time store scan.
 - `storage_migrations`, the authoritative completion/version record for legacy save-folder
   ingestion; `.migrated_to_sqlite` is only its filesystem compatibility marker.
 - Possibly orphaned historical entity tables (`characters`, `chats`, `settings`, `presets`, `modules`); new installations do not create or use them, as documented at `server/node/db.cjs:51-54`.
@@ -347,16 +352,21 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
   Runtime chat bodies are never retained in a server-wide in-memory map.
 - `GET /api/chat-content/:chaId/:chatIndex` resolves the `x-chat-id` row directly when
   supplied, otherwise falls back through the stripped database's index and rejects an ID
-  mismatch with 409. It publishes `x-content-hash`, supports verified `204` cache hits,
-  and returns raw row bytes unless cold-storage rehydration was needed; that restored chat
-  is cached back only when no import owns the mutation barrier.
+  mismatch with 409. One raw row selection supplies both response bytes and SHA-256. A
+  matching warm `chat_row_metadata` derivative avoids decoding; missing or hash-mismatched
+  metadata decodes that same selection and conditionally repairs it by mutation token.
+  Cold rows are rehydrated from that selection and cache-filled only when the row is still
+  unchanged and no import owns the mutation barrier. The route supports verified `204`
+  cache hits and otherwise returns the historical raw/canonical response bytes.
 - `POST /api/chat-content/:chaId/:chatIndex` validates binary or JSON input and writes the
   row synchronously inside `queueStorageMutation()`. Immediately before overwrite it asks
-  `chatBackups.cjs` to capture the exact old raw row, optionally tagged by
-  `x-chat-backup-reason`; capture is best-effort and never blocks the authoritative save.
-  The route requires `x-chat-id`, rejects bare stubs, heals hybrid `_stub` payloads,
-  returns the stored row hash, and schedules the coalesced automatic snapshot only after
-  acknowledging the row. It never joins the five-second database debounce. During active
+  `chatBackups.cjs` to stream the exact old raw row from protected chunk storage into the
+  unchanged loose-version format, optionally tagged by `x-chat-backup-reason`; capture is
+  best-effort and never blocks the authoritative save. The route requires `x-chat-id`,
+  rejects bare stubs, heals hybrid `_stub` payloads, transfers ownership of binary request
+  Buffers to the writer, and returns the digest computed from those written bytes without
+  a committed-row reread. It schedules the coalesced automatic snapshot only after
+  acknowledging the row and never joins the five-second database debounce. During active
   generation the client row stage writes the first eligible dirty save, throttles later
   checkpoints to 20 seconds, and always queues a final idle save.
 - Frontend placeholders are hydrated through `fetchChatFromServer()` and
@@ -539,6 +549,12 @@ callers may explicitly include usage deletion.
   `findStubFlagLossChats()`. Removing one reopens the silent message-loss path.
 
 - Chat rows must go through `chatRows.cjs`. Key components are URI-encoded, large rows may have chunk manifests, and the row wire format must match `/api/chat-content`. Use `readChatRow()`, `writeChatRow()`/`writeChatRowRaw()`, and `deleteChatRow()` instead of hand-built keys or direct SQL (`server/node/chatRows.cjs:16`, `server/node/chatRows.cjs:246-266`).
+
+- Raw chat writers make ownership explicit. `writeChatRowRaw()` preserves the caller's
+  ownership by copying; `writeChatRowRawOwned()` consumes a Buffer and returns the SHA-256
+  of the exact bytes published. Both atomically invalidate or publish the matching
+  `chat_row_metadata` derivative. The derivative is operational and rebuildable, so
+  imports/restores do not transport it and legacy gaps fall back to authoritative decode.
 
 - Chat deletion is layered and atomic with its stub graph. Patches collect old-minus-new row keys, force a `delete-chat` pre-image for every still-present row, and delete them only in the same transaction that persists the new `database.bin`; capture failure aborts publication. Cache-warm full writes and plugin-storage transitions use the same pre-delete guard. `/api/db/optimize` additionally sweeps unreferenced `chats/` rows but preserves rows updated within the last hour so a chat POST arriving before its stub is not lost.
 

@@ -314,10 +314,13 @@ Client ownership lives in:
 `createChatBackupStore()` in `server/node/chatBackups.cjs` manages a filesystem history
 separate from RisuSave archives and database snapshots. Immediately before
 `POST /api/chat-content/:chaId/:chatIndex` overwrites an existing row, it atomically
-writes the raw prior bytes under `<root>/<chaId>/<chatId>/`. Ordinary captures are
-best-effort and have a 45-second per-chat cooldown. Explicit edit, delete-message, and
-reroll actions attach a sanitized reason for display; small cold-storage placeholder
-rows are skipped.
+publishes the raw prior bytes under `<root>/<chaId>/<chatId>/`. Production capture streams
+the protected logical row into the same loose `.bin` entry instead of assembling a second
+full Buffer, then fsyncs and renames it atomically. Ordinary captures are best-effort and
+have a 45-second per-chat cooldown. Explicit edit, delete-message, and reroll actions
+attach a sanitized reason for display; small cold-storage placeholder rows are skipped
+using the rebuildable per-row derivative, with a bounded legacy decode fallback when that
+metadata is absent.
 
 Removing a chat reference is stricter. `captureChatDeletionPreImages()` forces a fresh
 `delete-chat` pre-image without the cooldown, and failure blocks the database publication

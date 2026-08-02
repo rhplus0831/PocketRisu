@@ -404,6 +404,59 @@ describe('chat backup root and legacy migration', () => {
 })
 
 describe('chat backup capture', () => {
+    it('streams an exact loose pre-image without materializing the protected row', async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-chat-backups-stream-'))
+        tempRoots.push(root)
+        const expected = rawChat(1, 'x'.repeat(12_000))
+        const materializedRead = vi.fn(() => {
+            throw new Error('the production stream path must not read the full row')
+        })
+        let streamedParts = 0
+        let maxPartBytes = 0
+        const store = createChatBackupStore({
+            getChatBackupsRoot: () => path.join(root, 'chat-backups'),
+            readChatRowRaw: materializedRead,
+            inspectChatRow: () => ({ size: expected.length, coldStorage: false }),
+            streamChatRowRawToFile: async (
+                _chaId: string,
+                _chatId: string,
+                filePath: string,
+            ) => {
+                const fd = fs.openSync(filePath, 'wx')
+                try {
+                    for (let offset = 0; offset < expected.length; offset += 257) {
+                        const part = expected.subarray(offset, Math.min(expected.length, offset + 257))
+                        fs.writeSync(fd, part)
+                        streamedParts++
+                        maxPartBytes = Math.max(maxPartBytes, part.length)
+                    }
+                } finally {
+                    fs.closeSync(fd)
+                }
+                return {
+                    filePath,
+                    size: expected.length,
+                    chunks: streamedParts,
+                    maxChunkBytes: maxPartBytes,
+                }
+            },
+            now: () => 123_456,
+            cooldownMs: 0,
+            getByteBudget: () => 100 * 1024 * 1024,
+            byteBudgetMin: 1,
+            autoReconcile: false,
+        })
+        stores.push(store)
+
+        expect(await store.captureChatPreImage({ chaId: 'char', chatId: 'chat' }))
+            .toBe('captured')
+        const [version] = store.listChatBackups('char', 'chat')
+        expect(store.readChatBackup('char', 'chat', version.versionId)).toEqual(expected)
+        expect(materializedRead).not.toHaveBeenCalled()
+        expect(streamedParts).toBeGreaterThan(1)
+        expect(maxPartBytes).toBeLessThanOrEqual(257)
+    })
+
     it('skips a new chat and copies each old row before it is overwritten', async () => {
         const harness = makeHarness()
         const { store } = harness

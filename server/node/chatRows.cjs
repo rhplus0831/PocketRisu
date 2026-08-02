@@ -10,8 +10,10 @@ const { walkRisuSave } = require('./streamRisuLoad.cjs');
 
 const DB_BLOB_KEY = 'database/database.bin';
 const CHAT_PREFIX = 'chats/';
+const CHAT_ROW_METADATA_TABLE = 'chat_row_metadata';
 const EXTERNALIZATION_MARKER_KEY = 'migration/chats-externalized';
 const EXTERNALIZATION_MARKER_VALUE = Buffer.from('done', 'utf-8');
+const COLD_STORAGE_HEADER = '\uEF01COLDSTORAGE\uEF01';
 
 function chatRowKey(chaId, chatId) {
     return `${CHAT_PREFIX}${encodeURIComponent(chaId)}/${encodeURIComponent(chatId)}`;
@@ -29,6 +31,10 @@ function parseChatRowKey(key) {
     } catch {
         return null;
     }
+}
+
+function isColdStorageChat(chat) {
+    return chat?.message?.[0]?.data?.startsWith(COLD_STORAGE_HEADER) === true;
 }
 
 function chatToStub(chat) {
@@ -320,9 +326,127 @@ function createChatRowStore(options) {
         kvDel,
         kvList,
         kvListWithSizes,
+        kvWriteToFile,
+        kvSize,
         kvGetUpdatedAt = () => null,
         randomUUID = nodeCrypto.randomUUID,
     } = options;
+
+    // This derivative is deliberately outside the logical KV namespace: it is
+    // keyed by durable chat-row identity, is not exported, and can always be
+    // reconstructed from authoritative row bytes. KV triggers invalidate it on
+    // every direct chat-row mutation, including destructive replacement paths.
+    // Store-owned writers republish the matching metadata later in the same
+    // outer transaction as their row write.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ${CHAT_ROW_METADATA_TABLE} (
+        row_key        TEXT PRIMARY KEY,
+        row_token      TEXT NOT NULL,
+        content_sha256 TEXT CHECK (
+          content_sha256 IS NULL OR (
+            length(content_sha256) = 64 AND content_sha256 NOT GLOB '*[^0-9a-f]*'
+          )
+        ),
+        content_size   INTEGER CHECK (content_size IS NULL OR content_size >= 0),
+        cold_storage  INTEGER CHECK (cold_storage IS NULL OR cold_storage IN (0, 1)),
+        CHECK (
+          (content_sha256 IS NULL AND content_size IS NULL AND cold_storage IS NULL)
+          OR
+          (content_sha256 IS NOT NULL AND content_size IS NOT NULL AND cold_storage IS NOT NULL)
+        )
+      );
+
+      CREATE TRIGGER IF NOT EXISTS pocketrisu_chat_row_metadata_insert
+      AFTER INSERT ON kv
+      WHEN NEW.key LIKE 'chats/%'
+      BEGIN
+        INSERT INTO ${CHAT_ROW_METADATA_TABLE} (row_key, row_token)
+        VALUES (NEW.key, lower(hex(randomblob(16))))
+        ON CONFLICT(row_key) DO UPDATE SET
+          row_token = lower(hex(randomblob(16))),
+          content_sha256 = NULL,
+          content_size = NULL,
+          cold_storage = NULL;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS pocketrisu_chat_row_metadata_update
+      AFTER UPDATE OF key, value ON kv
+      WHEN OLD.key LIKE 'chats/%' OR NEW.key LIKE 'chats/%'
+      BEGIN
+        DELETE FROM ${CHAT_ROW_METADATA_TABLE} WHERE row_key = OLD.key;
+        INSERT INTO ${CHAT_ROW_METADATA_TABLE} (row_key, row_token)
+        SELECT NEW.key, lower(hex(randomblob(16))) WHERE NEW.key LIKE 'chats/%'
+        ON CONFLICT(row_key) DO UPDATE SET
+          row_token = lower(hex(randomblob(16))),
+          content_sha256 = NULL,
+          content_size = NULL,
+          cold_storage = NULL;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS pocketrisu_chat_row_metadata_delete
+      AFTER DELETE ON kv
+      WHEN OLD.key LIKE 'chats/%'
+      BEGIN
+        DELETE FROM ${CHAT_ROW_METADATA_TABLE} WHERE row_key = OLD.key;
+      END;
+    `);
+    const selectChatRowMetadata = db.prepare(`
+      SELECT row_token, content_sha256, content_size, cold_storage
+        FROM ${CHAT_ROW_METADATA_TABLE}
+       WHERE row_key = ?
+    `);
+    const ensureChatRowMetadataSlot = db.prepare(`
+      INSERT OR IGNORE INTO ${CHAT_ROW_METADATA_TABLE} (row_key, row_token)
+      SELECT key, lower(hex(randomblob(16))) FROM kv WHERE key = ?
+    `);
+    const publishChatRowMetadata = db.prepare(`
+      UPDATE ${CHAT_ROW_METADATA_TABLE}
+         SET content_sha256 = ?, content_size = ?, cold_storage = ?
+       WHERE row_key = ?
+    `);
+    const repairSelectedChatRowMetadata = db.prepare(`
+      UPDATE ${CHAT_ROW_METADATA_TABLE}
+         SET content_sha256 = ?, content_size = ?, cold_storage = ?
+       WHERE row_key = ? AND row_token = ?
+    `);
+
+    function contentDigest(buffer) {
+        return nodeCrypto.createHash('sha256').update(buffer).digest('hex');
+    }
+
+    function metadataForKey(key) {
+        const metadata = selectChatRowMetadata.get(key);
+        if (!metadata) return null;
+        return {
+            rowToken: metadata.row_token,
+            contentHash: metadata.content_sha256,
+            contentSize: metadata.content_size,
+            coldStorage: metadata.cold_storage === null
+                ? null
+                : metadata.cold_storage === 1,
+        };
+    }
+
+    const persistOwnedChatRow = db.transaction((key, buffer, coldStorage) => {
+        const digest = contentDigest(buffer);
+        kvSet(key, buffer);
+        if (typeof coldStorage === 'boolean') {
+            const published = publishChatRowMetadata.run(
+                digest,
+                buffer.length,
+                coldStorage ? 1 : 0,
+                key,
+            );
+            if (published.changes !== 1) {
+                throw new Error(`Chat row metadata slot was not published for ${key}`);
+            }
+        }
+        return digest;
+    });
+    const persistOwnedChatRowIfToken = db.transaction((key, expectedToken, buffer, coldStorage) => {
+        if (metadataForKey(key)?.rowToken !== expectedToken) return null;
+        return persistOwnedChatRow(key, buffer, coldStorage);
+    });
 
     async function readChatRow(chaId, chatId) {
         const value = readChatRowRaw(chaId, chatId);
@@ -334,12 +458,106 @@ function createChatRowStore(options) {
         return kvGet(chatRowKey(chaId, chatId));
     }
 
-    function writeChatRow(chaId, chatId, chatObj) {
-        kvSet(chatRowKey(chaId, chatId), Buffer.from(encodeRisuSaveLegacy(chatObj)));
+    function readChatRowRawWithMetadata(chaId, chatId) {
+        const key = chatRowKey(chaId, chatId);
+        const bytes = kvGet(key);
+        if (bytes === null) return null;
+        ensureChatRowMetadataSlot.run(key);
+        const contentHash = contentDigest(bytes);
+        const metadata = metadataForKey(key);
+        const metadataMatches = metadata !== null
+            && metadata.contentSize === bytes.length
+            && metadata.contentHash === contentHash;
+        return {
+            key,
+            rowToken: metadata?.rowToken ?? null,
+            bytes,
+            contentHash,
+            coldStorage: metadataMatches ? metadata.coldStorage : null,
+        };
     }
 
-    function writeChatRowRaw(chaId, chatId, buffer) {
-        kvSet(chatRowKey(chaId, chatId), Buffer.from(buffer));
+    // The mutation token makes this lazy derivative repair conditional on the
+    // exact row selection that was decoded, even when that decode yielded to
+    // another request. This never changes authoritative row bytes.
+    function repairChatRowMetadata(rowState, coldStorage) {
+        if (!rowState || typeof rowState.key !== 'string'
+            || !Buffer.isBuffer(rowState.bytes)
+            || !/^[0-9a-f]{64}$/.test(rowState.contentHash)
+            || typeof coldStorage !== 'boolean') {
+            throw new TypeError('A selected chat row and cold-storage state are required');
+        }
+        if (typeof rowState.rowToken !== 'string') return false;
+        const result = repairSelectedChatRowMetadata.run(
+            rowState.contentHash,
+            rowState.bytes.length,
+            coldStorage ? 1 : 0,
+            rowState.key,
+            rowState.rowToken,
+        );
+        return result.changes === 1;
+    }
+
+    function inspectChatRowForBackup(chaId, chatId) {
+        if (typeof kvSize !== 'function') {
+            const bytes = readChatRowRaw(chaId, chatId);
+            return bytes === null
+                ? null
+                : { size: bytes.length, coldStorage: null };
+        }
+        const key = chatRowKey(chaId, chatId);
+        const size = kvSize(key);
+        if (size === null) return null;
+        ensureChatRowMetadataSlot.run(key);
+        const metadata = metadataForKey(key);
+        return {
+            size,
+            coldStorage: metadata?.contentSize === size ? metadata.coldStorage : null,
+        };
+    }
+
+    function streamChatRowRawToFile(chaId, chatId, filePath, options) {
+        if (typeof kvWriteToFile !== 'function') {
+            throw new TypeError('kvWriteToFile is required to stream a chat row');
+        }
+        return kvWriteToFile(chatRowKey(chaId, chatId), filePath, options);
+    }
+
+    function writeChatRow(chaId, chatId, chatObj) {
+        const owned = Buffer.from(encodeRisuSaveLegacy(chatObj));
+        return writeChatRowRawOwned(chaId, chatId, owned, {
+            coldStorage: isColdStorageChat(chatObj),
+        });
+    }
+
+    function writeChatRowIfUnchanged(chaId, chatId, rowState, chatObj) {
+        if (!rowState || typeof rowState.rowToken !== 'string') return null;
+        const owned = Buffer.from(encodeRisuSaveLegacy(chatObj));
+        return persistOwnedChatRowIfToken(
+            chatRowKey(chaId, chatId),
+            rowState.rowToken,
+            owned,
+            isColdStorageChat(chatObj),
+        );
+    }
+
+    // Retained-buffer API: callers may continue using or mutating their input.
+    function writeChatRowRaw(chaId, chatId, buffer, options = {}) {
+        return writeChatRowRawOwned(chaId, chatId, Buffer.from(buffer), options);
+    }
+
+    // Ownership-transfer API: the caller gives up this Buffer after the call.
+    // The exact object is passed to kvSet and its digest is returned without a
+    // committed-row reread.
+    function writeChatRowRawOwned(chaId, chatId, buffer, options = {}) {
+        if (!Buffer.isBuffer(buffer)) {
+            throw new TypeError('Owned chat row bytes must be a Buffer');
+        }
+        return persistOwnedChatRow(
+            chatRowKey(chaId, chatId),
+            buffer,
+            options.coldStorage,
+        );
     }
 
     function deleteChatRow(chaId, chatId) {
@@ -716,8 +934,14 @@ function createChatRowStore(options) {
         parseChatRowKey,
         readChatRow,
         readChatRowRaw,
+        readChatRowRawWithMetadata,
+        repairChatRowMetadata,
+        inspectChatRowForBackup,
+        streamChatRowRawToFile,
         writeChatRow,
+        writeChatRowIfUnchanged,
         writeChatRowRaw,
+        writeChatRowRawOwned,
         deleteChatRow,
         deleteChatRowsForChar,
         listChatRowKeysForChar,
