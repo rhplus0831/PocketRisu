@@ -292,6 +292,77 @@ describe('database snapshot spool isolation', () => {
     expect((await readLatestSnapshot(client)).flushedThroughPinnedSnapshot).toBe(true)
   })
 
+  test('explicit flush retries a busy checkpoint until pinned assembly closes', async () => {
+    const gateName = 'flush-checkpoint-retry-gate'
+    const server = await spawnServer({
+      env: {
+        POCKETRISU_BACKUP_INTERVAL_MS: '0',
+        POCKETRISU_SNAPSHOT_ASSEMBLY_TEST_GATE_DIR: gateName,
+      },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const gateDir = path.join(server.cwd, gateName)
+    await mkdir(gateDir, { recursive: true })
+    await writeFile(path.join(gateDir, 'hold'), '')
+
+    expect((await writeDatabase(client, 'checkpoint-retry')).status).toBe(200)
+    await waitForFile(path.join(gateDir, 'entered'))
+
+    // Advance the WAL after the snapshot established its read mark so FULL
+    // cannot complete until the assembly gate releases and closes that pin.
+    expect((await writeKv(
+      client,
+      'snapshot-test/checkpoint-after-pin',
+      Buffer.from('committed'),
+    )).status).toBe(200)
+
+    const session = await client.fetch('/api/session', { method: 'POST' })
+    expect(session.status).toBe(200)
+    const cookie = session.headers.get('set-cookie')?.split(';', 1)[0]
+    expect(cookie).toBeTruthy()
+
+    let flushSettled = false
+    const flushPromise = client.fetch('/api/db/flush', {
+      method: 'POST',
+      headers: { cookie: cookie! },
+    }).finally(() => { flushSettled = true })
+    let busyAttemptObserved = false
+    const busyDeadline = Date.now() + 2_000
+    try {
+      while (Date.now() < busyDeadline) {
+        const durability = await client.fetch('/api/db/durability')
+        expect(durability.status).toBe(200)
+        const state = await durability.json() as {
+          lastCheckpoint?: { reason?: string; complete?: boolean }
+        }
+        if (state.lastCheckpoint?.reason === 'explicit-flush'
+          && state.lastCheckpoint.complete === false) {
+          busyAttemptObserved = true
+          break
+        }
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      expect(flushSettled).toBe(false)
+    } finally {
+      await writeFile(path.join(gateDir, 'release'), '')
+    }
+
+    const flushed = await flushPromise
+    expect(busyAttemptObserved).toBe(true)
+    expect(flushed.status).toBe(200)
+    await expect(flushed.json()).resolves.toMatchObject({
+      success: true,
+      durable: true,
+      checkpoint: {
+        mode: 'FULL',
+        reason: 'explicit-flush',
+        complete: true,
+        busy: 0,
+      },
+    })
+  })
+
   test('a destructive import during assembly invalidates the old spool before publication', async () => {
     const gateName = 'import-snapshot-gate'
     const statsName = 'import-snapshot-stats.json'

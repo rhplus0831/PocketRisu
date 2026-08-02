@@ -652,6 +652,8 @@ const SQLITE_DURABILITY_CONFIG_KEY = 'config/sqlite-durability-mode';
 const SQLITE_DURABILITY_ENV_KEY = 'POCKETRISU_SQLITE_DURABILITY_MODE';
 const SQLITE_MAINTENANCE_CHECKPOINT_INTERVAL_MS = 5 * 60 * 1000;
 const SQLITE_CHECKPOINT_RETRY_MS = 10 * 1000;
+const SQLITE_FOREGROUND_CHECKPOINT_RETRY_MS = 25;
+const SQLITE_FOREGROUND_CHECKPOINT_DEADLINE_MS = 3 * 1000;
 const SQLITE_DURABILITY_PROFILES = Object.freeze({
     durable: Object.freeze({
         synchronous: 'FULL',
@@ -736,6 +738,37 @@ function normalizeWalCheckpointResult(rawResult, mode, reason) {
 
 function runTrackedWalCheckpoint(mode, reason) {
     return normalizeWalCheckpointResult(checkpointWal(mode), mode, reason);
+}
+
+function runTrackedWalCheckpointWithoutBusyWait(mode, reason) {
+    const busyTimeout = Number(sqliteDb.pragma('busy_timeout', { simple: true }));
+    sqliteDb.pragma('busy_timeout = 0');
+    try {
+        return runTrackedWalCheckpoint(mode, reason);
+    } finally {
+        sqliteDb.pragma(`busy_timeout = ${busyTimeout}`);
+    }
+}
+
+async function runTrackedWalCheckpointWithBusyRetry(mode, reason, {
+    deadlineMs = SQLITE_FOREGROUND_CHECKPOINT_DEADLINE_MS,
+} = {}) {
+    const deadline = Date.now() + deadlineMs;
+    let checkpoint;
+    for (;;) {
+        // The connection normally waits up to five seconds inside a busy
+        // checkpoint. Foreground retries need the async deadline to remain in
+        // control, so each synchronous attempt temporarily disables that wait
+        // and restores it before yielding to any other work.
+        checkpoint = runTrackedWalCheckpointWithoutBusyWait(mode, reason);
+        if (checkpoint.complete) return checkpoint;
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) return checkpoint;
+        await new Promise((resolve) => setTimeout(
+            resolve,
+            Math.min(SQLITE_FOREGROUND_CHECKPOINT_RETRY_MS, remainingMs),
+        ));
+    }
 }
 
 function sqliteDurabilityState() {
@@ -14861,7 +14894,15 @@ app.post('/api/db/flush', sessionAuthMiddleware, async (req, res, next) => {
     try {
         await queueStorageMutation(async () => {
             await flushPendingDb();
-            const checkpoint = runTrackedWalCheckpoint('FULL', 'explicit-flush');
+            // A background automatic snapshot can hold a pinned WAL reader
+            // below the current end after the write that triggered it has
+            // already acknowledged. Assembly does not need this queue and
+            // closes the pin before publication re-enters it, so bounded async
+            // retries converge without deadlocking the queued flush.
+            const checkpoint = await runTrackedWalCheckpointWithBusyRetry(
+                'FULL',
+                'explicit-flush',
+            );
             if (!checkpoint.complete) {
                 return res.status(503).send({
                     success: false,
@@ -18919,7 +18960,9 @@ app.post('/api/self-update', async (req, res) => {
                 );
                 if (persisted) await createBackupAndRotate();
             } catch {}
-            try { runTrackedWalCheckpoint('TRUNCATE', 'self-update'); } catch {}
+            try {
+                await runTrackedWalCheckpointWithBusyRetry('TRUNCATE', 'self-update');
+            } catch {}
 
             const port = process.env.PORT || 6001;
 
@@ -19180,7 +19223,9 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
             );
             if (persisted) await createBackupAndRotate();
         } catch (e) { logger.error('[Server] Flush error:', e); }
-        try { runTrackedWalCheckpoint('TRUNCATE', 'graceful-shutdown'); } catch { /* non-fatal */ }
+        try {
+            await runTrackedWalCheckpointWithBusyRetry('TRUNCATE', 'graceful-shutdown');
+        } catch { /* non-fatal */ }
         try { modelJobs.close(); } catch (e) { logger.error('[ModelJobs] Close error:', e); }
         try { requestLogs.close(); } catch (e) { logger.error('[RequestLogs] Close error:', e); }
         process.exit(0);
