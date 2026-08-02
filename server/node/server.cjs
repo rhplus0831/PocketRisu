@@ -110,9 +110,8 @@ const {
     computeBufferEtag,
     parseDbCacheInventory,
     prepareDatabaseReadPayload,
-    encodeDatabaseSegments,
-    buildCachedDbReadEnvelope,
     encodeCachedDbReadEnvelope,
+    createDatabaseSegmentMemo,
 } = require('./dbCachedRead.cjs');
 const {
     createChatRowStore,
@@ -304,6 +303,10 @@ function fetchProxyTarget(target, options) {
 }
 
 const dbDerivedValueMemo = createGenerationMemo();
+const dbSegmentMemo = createDatabaseSegmentMemo();
+let preserveDbSegmentMemoOnCacheMutation = false;
+const DB_BLOB_KEY = 'database/database.bin';
+const DB_HEX_KEY = Buffer.from(DB_BLOB_KEY, 'utf-8').toString('hex');
 const DB_CACHE_MAX_ENTRIES = 8;
 const DB_CACHE_MAX_ESTIMATED_BYTES = 1024 * 1024 * 1024;
 const DB_CACHE_MAX_ENTRY_ESTIMATED_BYTES = 512 * 1024 * 1024;
@@ -321,7 +324,12 @@ const dbCache = createRevisionBoundCache({
     isUnderMemoryPressure: () => (
         process.memoryUsage().heapUsed >= DB_CACHE_HEAP_LIMIT * DB_CACHE_HEAP_PRESSURE_RATIO
     ),
-    onMutation: (filePath) => dbDerivedValueMemo.bump(filePath),
+    onMutation: (filePath) => {
+        dbDerivedValueMemo.bump(filePath);
+        if (filePath === DB_HEX_KEY && !preserveDbSegmentMemoOnCacheMutation) {
+            dbSegmentMemo.clear();
+        }
+    },
 });
 
 class DatabaseCacheRevisionConflict extends Error {
@@ -388,7 +396,17 @@ function peekDbCacheValue(filePath) {
 }
 
 function replaceDbCacheValue(filePath, value, metadata = {}) {
-    dbCache.set(filePath, value, metadata);
+    const preserveSegmentMemo = filePath === DB_HEX_KEY
+        && metadata.preserveSegmentMemo === true;
+    if (filePath === DB_HEX_KEY && !preserveSegmentMemo) dbSegmentMemo.clear();
+    if (preserveSegmentMemo) dbSegmentMemo.preserveForNextRevision();
+    const previousPreserve = preserveDbSegmentMemoOnCacheMutation;
+    preserveDbSegmentMemoOnCacheMutation = preserveSegmentMemo;
+    try {
+        dbCache.set(filePath, value, metadata);
+    } finally {
+        preserveDbSegmentMemoOnCacheMutation = previousPreserve;
+    }
     scheduleDbCachePrune();
 }
 
@@ -1010,8 +1028,6 @@ const chatBackupStore = createChatBackupStore({
     runStorageOperation: queueStorageOperation,
 });
 
-const DB_BLOB_KEY = 'database/database.bin';
-const DB_HEX_KEY = Buffer.from(DB_BLOB_KEY, 'utf-8').toString('hex');
 const DB_CACHE_TEST_DIAGNOSTICS = process.env.NODE_ENV === 'test';
 const CHAT_EXTERNALIZATION_MARKER_KEY = 'migration/chats-externalized';
 const CHAT_EXTERNALIZATION_MARKER_VALUE = Buffer.from('done', 'utf-8');
@@ -2017,6 +2033,7 @@ async function persistDbCache(filePath, decodedKey) {
             revision: committedRevision,
             estimatedBytes: data.length,
             dirty: false,
+            preserveSegmentMemo: true,
         });
         pendingChatRowDeletions.clear();
     }
@@ -9675,13 +9692,13 @@ app.post('/api/db/read-cached', (req, res, next) => {
                     includeFullBlob: false,
                 });
                 if (!prepared) return null;
-                const encodedSegments = encodeDatabaseSegments(prepared.strippedDatabase);
                 return {
                     prepared,
-                    envelope: buildCachedDbReadEnvelope(
-                        encodedSegments,
+                    cachedRead: dbSegmentMemo.build(
+                        prepared.strippedDatabase,
                         inventory,
                         prepared.etag,
+                        prepared.revision,
                     ),
                 };
             });
@@ -9690,14 +9707,31 @@ app.post('/api/db/read-cached', (req, res, next) => {
             return next(error);
         }
         if (!selected) return res.status(404).json({ error: 'Database not found' });
-        const { prepared, envelope } = selected;
+        const { prepared, cachedRead } = selected;
         rememberSessionPluginStorageState(req, prepared.strippedDatabase);
+        if (DB_CACHE_TEST_DIAGNOSTICS) {
+            res.setHeader(
+                'x-pocketrisu-test-db-segments-encoded',
+                String(cachedRead.stats.encodedSegments),
+            );
+            res.setHeader(
+                'x-pocketrisu-test-db-segments-reused',
+                String(cachedRead.stats.reusedSegments),
+            );
+        }
+        if (cachedRead.kind === 'raw-boot') {
+            res.setHeader('x-pocketrisu-db-cache-bypass', cachedRead.reason);
+            return res.status(413).json({
+                error: 'Database root exceeds the segmented cache value limit',
+                code: 'DATABASE_CACHE_ROOT_TOO_LARGE',
+            });
+        }
         res.setHeader('x-db-etag', prepared.etag);
         if (DB_CACHE_TEST_DIAGNOSTICS) {
             res.setHeader('x-pocketrisu-test-db-cache', prepared.cacheStatus);
         }
         res.setHeader('Content-Type', 'application/octet-stream');
-        res.send(encodeCachedDbReadEnvelope(envelope));
+        res.send(encodeCachedDbReadEnvelope(cachedRead.envelope));
     } catch (error) {
         next(error);
     }
@@ -14294,6 +14328,7 @@ app.post('/api/patch', async (req, res, next) => {
             // succeeds, every object reachable from dbCache remains untouched.
             const result = applyPatchAtomic(cachedDb, patch);
             const snapshot = result.newDocument;
+            let preserveSegmentMemo = false;
             if (decodedKey === 'database/database.bin') {
                 const duplicateChatIds = findDuplicateChatIds(snapshot);
                 if (duplicateChatIds.length > 0) {
@@ -14317,6 +14352,7 @@ app.post('/api/patch', async (req, res, next) => {
                 // that the debounced persist will write.
                 const externalized = externalizePluginStorageIfNeeded(snapshot);
                 const extracted = chatRowStore.extractPayloadChats(snapshot);
+                preserveSegmentMemo = extracted === 0;
                 trackPendingChatRowDeletions(cachedDb, snapshot);
                 // A patch with no mutating op (empty, or test-only) returns the
                 // cached object itself, so replaceDbCacheValue sees no identity
@@ -14328,7 +14364,10 @@ app.post('/api/patch', async (req, res, next) => {
                     dbDerivedValueMemo.bump(filePath);
                 }
             }
-            replaceDbCacheValue(filePath, snapshot, { dirty: true });
+            replaceDbCacheValue(filePath, snapshot, {
+                dirty: true,
+                preserveSegmentMemo,
+            });
 
             // Schedule stubs-only save to KV (debounced).
             if (saveTimers[filePath]) {

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
 import cachedReadPkg from './dbCachedRead.cjs'
 import utilsPkg from './utils.cjs'
 import {
@@ -21,6 +22,8 @@ const {
     encodeDatabaseSegments,
     buildCachedDbReadEnvelope,
     encodeCachedDbReadEnvelope,
+    encodeRawMsgpack,
+    createDatabaseSegmentMemo,
 } = cachedReadPkg as any
 
 const {
@@ -77,7 +80,158 @@ function inventoryAndBytes(encodedSegments: any): {
     return { inventory, bytesByHash }
 }
 
+function hashBytes(bytes: Uint8Array): string {
+    return createHash('sha256').update(bytes).digest('hex')
+}
+
+function inventoryFromEnvelope(envelope: any): DbCacheInventory {
+    const inventory = emptyInventory()
+    inventory.root = [hashBytes(envelope.root.bytes)]
+    for (const group of DB_CACHE_GROUPS.slice(1)) {
+        inventory[group as keyof DbCacheInventory] = envelope[group]
+            .map((segment: any) => hashBytes(segment.bytes))
+    }
+    return inventory
+}
+
+function countingSegmentEncoder() {
+    let calls = 0
+    return {
+        encode(value: unknown) {
+            calls += 1
+            const bytes = encodeRawMsgpack(value)
+            return { hash: hashBytes(bytes), bytes }
+        },
+        calls: () => calls,
+    }
+}
+
 describe('segmented cached database read', () => {
+    it('memoizes an unchanged publication so a fully warm read encodes no segments', () => {
+        const database = representativeDatabase()
+        const prepared = prepareDatabaseReadPayload(database)
+        const counter = countingSegmentEncoder()
+        const memo = createDatabaseSegmentMemo({ encodeSegment: counter.encode })
+        const empty = parseDbCacheInventory({ cache: { version: 1, hashes: emptyInventory() } })
+
+        const cold = memo.build(database, empty, prepared.etag, 41)
+        expect(cold.kind).toBe('envelope')
+        expect(cold.stats.encodedSegments).toBeGreaterThan(0)
+        expect(cold.stats.reusedSegments).toBe(0)
+        const coldCalls = counter.calls()
+
+        const fullInventory = inventoryFromEnvelope(cold.envelope)
+        const warm = memo.build(
+            database,
+            parseDbCacheInventory({ cache: { version: 1, hashes: fullInventory } }),
+            prepared.etag,
+            41,
+        )
+
+        expect(counter.calls()).toBe(coldCalls)
+        expect(warm.stats.encodedSegments).toBe(0)
+        expect(warm.stats.reusedSegments).toBe(coldCalls)
+        expect(warm.envelope.root).toEqual({ hash: fullInventory.root[0] })
+        for (const group of DB_CACHE_GROUPS.slice(1)) {
+            expect(warm.envelope[group].every((segment: any) => 'hash' in segment)).toBe(true)
+        }
+    })
+
+    it('carries only unchanged copy-on-write segments into the next revision', () => {
+        const database = representativeDatabase()
+        const prepared = prepareDatabaseReadPayload(database)
+        const counter = countingSegmentEncoder()
+        const memo = createDatabaseSegmentMemo({ encodeSegment: counter.encode })
+        const empty = parseDbCacheInventory({ cache: { version: 1, hashes: emptyInventory() } })
+        const initial = memo.build(database, empty, prepared.etag, 7)
+        const initialCalls = counter.calls()
+        const initialInventory = inventoryFromEnvelope(initial.envelope)
+
+        const changed = {
+            ...database,
+            characters: [{ ...database.characters[0], name: 'Changed' }],
+        }
+        memo.preserveForNextRevision()
+        const next = memo.build(
+            changed,
+            parseDbCacheInventory({ cache: { version: 1, hashes: initialInventory } }),
+            prepareDatabaseReadPayload(changed).etag,
+            8,
+        )
+
+        expect(counter.calls() - initialCalls).toBe(1)
+        expect(next.stats.encodedSegments).toBe(1)
+        expect(next.stats.reusedSegments).toBe(initialCalls - 1)
+        expect(next.envelope.root).toHaveProperty('hash')
+        expect(next.envelope.characters[0]).toHaveProperty('bytes')
+        expect(next.envelope.modules.every((segment: any) => 'hash' in segment)).toBe(true)
+    })
+
+    it('does not cross a revision without an explicit copy-on-write handoff', () => {
+        const database = representativeDatabase()
+        const counter = countingSegmentEncoder()
+        const memo = createDatabaseSegmentMemo({ encodeSegment: counter.encode })
+        const empty = parseDbCacheInventory({ cache: { version: 1, hashes: emptyInventory() } })
+        const first = memo.build(database, empty, 'a'.repeat(32), 12)
+        const firstCalls = counter.calls()
+
+        const second = memo.build(database, empty, 'b'.repeat(32), 13)
+
+        expect(second.stats.encodedSegments).toBe(firstCalls)
+        expect(second.stats.reusedSegments).toBe(0)
+        expect(counter.calls()).toBe(firstCalls * 2)
+    })
+
+    it('does not retain segment bytes beyond its aggregate or entry budgets', () => {
+        const database = representativeDatabase()
+        const counter = countingSegmentEncoder()
+        const memo = createDatabaseSegmentMemo({
+            encodeSegment: counter.encode,
+            maxBytes: 0,
+            maxEntries: 0,
+        })
+        const empty = parseDbCacheInventory({ cache: { version: 1, hashes: emptyInventory() } })
+
+        const first = memo.build(database, empty, 'a'.repeat(32), 18)
+        const firstCalls = counter.calls()
+        expect(first.stats).toMatchObject({ retainedBytes: 0, retainedEntries: 0 })
+
+        const second = memo.build(database, empty, 'a'.repeat(32), 18)
+        expect(second.stats).toMatchObject({
+            encodedSegments: firstCalls,
+            reusedSegments: 0,
+            retainedBytes: 0,
+            retainedEntries: 0,
+        })
+    })
+
+    it('bypasses the segmented envelope for an oversized root and memoizes that decision', () => {
+        const database = {
+            ...representativeDatabase(),
+            largeInlineRoot: 'x'.repeat(1024),
+        }
+        const counter = countingSegmentEncoder()
+        const memo = createDatabaseSegmentMemo({
+            encodeSegment: counter.encode,
+            maxValueBytes: 128,
+        })
+        const empty = parseDbCacheInventory({ cache: { version: 1, hashes: emptyInventory() } })
+
+        const first = memo.build(database, empty, 'a'.repeat(32), 21)
+        expect(first).toMatchObject({
+            kind: 'raw-boot',
+            reason: 'oversized-root',
+            stats: { encodedSegments: 1, reusedSegments: 0 },
+        })
+
+        const second = memo.build(database, empty, 'a'.repeat(32), 21)
+        expect(second).toMatchObject({
+            kind: 'raw-boot',
+            stats: { encodedSegments: 0, reusedSegments: 1 },
+        })
+        expect(counter.calls()).toBe(1)
+    })
+
     it('assembles raw msgpack segments identically to a full legacy decode', async () => {
         const database = representativeDatabase()
         const prepared = prepareDatabaseReadPayload(database)

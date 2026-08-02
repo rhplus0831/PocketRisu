@@ -223,6 +223,51 @@ describe('NodeStorage availability bounds', () => {
         expect(cache.persistResourceCacheManifests).not.toHaveBeenCalled()
     })
 
+    it('uses the authoritative raw boot path when the server bypasses an oversized root', async () => {
+        cache.getVerifiedManifestSnapshot.mockResolvedValue({
+            hashes: [],
+            bytesByHash: new Map(),
+        })
+        const authoritativeBytes = new Uint8Array([6, 5, 4])
+        const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+            if (String(input) === '/api/db/read-cached') {
+                return new Response(JSON.stringify({
+                    error: 'Database root exceeds the segmented cache value limit',
+                    code: 'DATABASE_CACHE_ROOT_TOO_LARGE',
+                }), {
+                    status: 413,
+                    headers: {
+                        'content-type': 'application/json',
+                        'x-pocketrisu-db-cache-bypass': 'oversized-root',
+                    },
+                })
+            }
+            if (String(input) === '/api/db/read-raw-for-boot') {
+                return new Response(authoritativeBytes as unknown as BodyInit, {
+                    status: 200,
+                    headers: { 'x-db-etag': 'e'.repeat(32) },
+                })
+            }
+            throw new Error(`Unexpected request: ${String(input)}`)
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        ;(NodeStorage as any).databaseStorageCapabilities = {
+            rawBootRead: true,
+            atomicCreate: true,
+            optimizedPluginStorageBootReconcile: true,
+        }
+
+        await expect(readyStorage().readDatabaseForBoot()).resolves.toEqual({
+            kind: 'bytes',
+            bytes: Buffer.from(authoritativeBytes),
+        })
+        expect(fetchMock).toHaveBeenCalledWith(
+            '/api/db/read-raw-for-boot',
+            expect.objectContaining({ method: 'GET' }),
+        )
+        expect(cache.persistResourceCacheManifests).not.toHaveBeenCalled()
+    })
+
     it('assigns legal large payloads a bounded transfer budget', () => {
         const timeoutMs = authoritativeStoragePayloadTimeoutMs(128 * 1024 * 1024)
 
