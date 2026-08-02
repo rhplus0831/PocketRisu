@@ -839,6 +839,52 @@ export function getCharacterSnapshot(index:number):character|undefined{
     return char ? $state.snapshot(char) as character : undefined
 }
 
+export interface CharacterChatSnapshotRef {
+    index: number
+    id?: string
+    name?: string
+}
+
+export interface CharacterInterchangeSnapshot {
+    character: character
+    chats: CharacterChatSnapshotRef[]
+}
+
+/**
+ * Snapshot character metadata without traversing any full chat bodies. Bulk
+ * interchange code can then snapshot or fetch one referenced chat at a time.
+ */
+export function getCharacterInterchangeSnapshot(index:number):CharacterInterchangeSnapshot|undefined{
+    const char = DBState.db.characters?.[index]
+    if(!char) return undefined
+    const chats = (char.chats ?? []).map((chat, chatIndex) => ({
+        index: chatIndex,
+        ...(chat && 'id' in chat ? { id: chat.id } : {}),
+        ...(chat && 'name' in chat ? { name: chat.name } : {}),
+    }))
+    const { chats: _chatBodies, ...metadata } = char
+    return {
+        character: {
+            ...($state.snapshot(metadata) as Omit<character, 'chats'>),
+            chats: [],
+        } as character,
+        chats,
+    }
+}
+
+/** Snapshot at most one current chat, resolving by durable id before index. */
+export function getCharacterChatSnapshot(
+    characterIndex:number,
+    ref:CharacterChatSnapshotRef,
+):Chat|undefined{
+    const chats = DBState.db.characters?.[characterIndex]?.chats
+    if(!Array.isArray(chats)) return undefined
+    const chat = ref.id
+        ? chats.find(candidate => candidate?.id === ref.id)
+        : chats[ref.index]
+    return chat ? $state.snapshot(chat) as Chat : undefined
+}
+
 export function getCurrentCharacter(options:getDatabaseOptions = {}):character{
     const index = get(selectedCharID)
     if(options.snapshot){

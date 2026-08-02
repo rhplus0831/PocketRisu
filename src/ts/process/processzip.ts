@@ -43,15 +43,28 @@ export async function processZip(dataArray: Uint8Array): Promise<string> {
     }
 }
 
+export interface StreamingByteWriter {
+    write(data: Uint8Array): void | Promise<void>
+    close(): void | Promise<void>
+}
+
 export class CharXWriter{
     zip:fflate.Zip
     writeEnd:boolean = false
-    apb = new AppendableBuffer()
+    #pendingOutput:Uint8Array[] = []
+    #zipError:Error|null = null
+    #ended = false
     #takenFilenames:Set<string> = new Set()
-    constructor(private writer:LocalWriter|WritableStreamDefaultWriter<Uint8Array>|VirtualWriter){
-        const handlerAsync = (err:Error, dat:Uint8Array, final:boolean) => {
-            if(dat){
-                this.apb.append(dat)
+    constructor(private writer:StreamingByteWriter|LocalWriter|WritableStreamDefaultWriter<Uint8Array>|VirtualWriter){
+        const handlerAsync = (err:Error|null, dat:Uint8Array, final:boolean) => {
+            if(err){
+                this.#zipError = err
+            }
+            if(dat?.byteLength){
+                // fflate hands ownership of each emitted chunk to the callback.
+                // Keep the chunks separate so flushing does not require the old
+                // AppendableBuffer growth plus `.buffer` getter copy.
+                this.#pendingOutput.push(dat)
             }
             if(final){
                 this.writeEnd = true
@@ -83,30 +96,87 @@ export class CharXWriter{
             canvas.toBlob(res, 'image/jpeg')
         }))
         const buf = await blob.arrayBuffer()
-        this.apb.append(new Uint8Array(buf))
+        await this.writer.write(new Uint8Array(buf))
     }
 
     async write(key:string,data:Uint8Array|string, level?:0|1|2|3|4|5|6|7|8|9){
-        key = this.#sanitizeZipFilename(key)
-        let dat:Uint8Array
-        if(typeof data === 'string'){
-            dat = new TextEncoder().encode(data)
+        const dat = typeof data === 'string' ? new TextEncoder().encode(data) : data
+        await this.writeEntry(key, async writer => {
+            await writer.write(dat)
+        }, level)
+    }
+
+    async writeIterable(
+        key:string,
+        chunks:Iterable<Uint8Array>|AsyncIterable<Uint8Array>,
+        level?:0|1|2|3|4|5|6|7|8|9,
+    ){
+        await this.writeEntry(key, async writer => {
+            for await (const chunk of chunks){
+                if(chunk.byteLength > 0){
+                    await writer.write(chunk)
+                }
+            }
+        }, level)
+    }
+
+    async writeEntry(
+        key:string,
+        produce:(writer:StreamingByteWriter) => void|Promise<void>,
+        level?:0|1|2|3|4|5|6|7|8|9,
+    ){
+        if(this.#ended){
+            throw new Error('Cannot add a ZIP entry after the archive has ended')
         }
-        else{
-            dat = data
-        }
-        this.writeEnd = false
-        const file = new fflate.ZipDeflate(key, {
+        const file = new fflate.ZipDeflate(this.#sanitizeZipFilename(key), {
             level: level ?? 0
-        });
+        })
         this.zip.add(file)
-        file.push(dat, true)
-        await this.writer.write(this.apb.buffer)
-        this.apb.clear()
-        if(this.writeEnd){
-            await this.writer.close()
+        let closed = false
+        const entryWriter:StreamingByteWriter = {
+            write: async (data) => {
+                if(closed){
+                    throw new Error('Cannot write to a closed ZIP entry')
+                }
+                if(data.byteLength === 0) return
+                file.push(data, false)
+                await this.#flushOutput()
+            },
+            close: async () => {
+                if(closed) return
+                closed = true
+                file.push(new Uint8Array(0), true)
+                await this.#flushOutput()
+            },
         }
-        
+        try{
+            await produce(entryWriter)
+            await entryWriter.close()
+        }
+        catch(error){
+            // fflate has no per-entry abort. Finalize the member so callers can
+            // still close/abort their destination without retaining its state.
+            await entryWriter.close()
+            throw error
+        }
+    }
+
+    async #flushOutput(){
+        if(this.#zipError){
+            const error = this.#zipError
+            this.#zipError = null
+            throw error
+        }
+        const chunks = this.#pendingOutput
+        this.#pendingOutput = []
+        for(const chunk of chunks){
+            await this.writer.write(chunk)
+        }
+        if(this.#zipError){
+            const error = this.#zipError
+            this.#zipError = null
+            throw error
+        }
     }
 
     #sanitizeZipFilename(filename:string) {
@@ -135,12 +205,14 @@ export class CharXWriter{
     }
 
     async end(){
+        if(this.#ended) return
+        this.#ended = true
         this.zip.end()
-        await this.writer.write(this.apb.buffer)
-        this.apb.clear()
-        if(this.writeEnd){
-            await this.writer.close()
+        await this.#flushOutput()
+        if(!this.writeEnd){
+            throw new Error('ZIP writer did not emit a final record')
         }
+        await this.writer.close()
     }
 }
 

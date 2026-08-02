@@ -67,6 +67,14 @@ export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer |
         dat = Buffer.from(dat, 'utf-8')
     }
     const data = new Uint8Array(dat)
+    await downloadFileParts(name, [data as unknown as BlobPart])
+}
+
+export async function downloadFileParts(
+    name: string,
+    parts: BlobPart[],
+    type = 'application/octet-stream',
+) {
     const downloadURL = (data: string, fileName: string) => {
         const a = document.createElement('a')
         a.href = data
@@ -77,7 +85,7 @@ export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer |
         a.remove()
     }
 
-    const blob = new Blob([data], { type: 'application/octet-stream' })
+    const blob = new Blob(parts, { type })
     const url = URL.createObjectURL(blob)
 
     downloadURL(url, name)

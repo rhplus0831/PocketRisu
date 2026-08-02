@@ -14,7 +14,7 @@ import { type CharacterCardV3, type LorebookEntry } from '@risuai/ccardlib'
 import { reencodeImage } from "./process/files/inlays"
 import { PngChunk } from "./pngChunk"
 import type { OnnxModelFiles } from "./process/transformers"
-import { CharXImporter, CharXSkippableChecker, CharXWriter } from "./process/processzip"
+import { CharXImporter, CharXSkippableChecker, CharXWriter, type StreamingByteWriter } from "./process/processzip"
 import { exportModuleLegacy, readModule, type RisuModule } from "./process/modules"
 
 
@@ -1159,7 +1159,7 @@ function createBaseV2(char:character) {
 
 export async function exportCharacterCard(char:character, type:'png'|'json'|'charx'|'charxJpeg' = 'png', arg:{
     password?:string
-    writer?:LocalWriter|VirtualWriter,
+    writer?:LocalWriter|VirtualWriter|StreamingByteWriter,
     spec?:'v2'|'v3'
     onProgress?:(msg:string, pct:number) => void
 } = {}) {
@@ -1186,7 +1186,14 @@ export async function exportCharacterCard(char:character, type:'png'|'json'|'cha
             const ext = nameExt[type]
             await (localWriter as LocalWriter).init(ext[0], [ext[1]])
         }
-        const writer = (type === 'charx' || type === 'charxJpeg') ? (new CharXWriter(localWriter)) : type === 'json' ? (new BlankWriter()) : (new PngChunk.streamWriter(img, localWriter))
+        const writer = (type === 'charx' || type === 'charxJpeg')
+            ? (new CharXWriter(localWriter))
+            : type === 'json'
+                ? (new BlankWriter())
+                : (new PngChunk.streamWriter(
+                    img,
+                    localWriter as LocalWriter|WritableStreamDefaultWriter<Uint8Array>|VirtualWriter,
+                ))
         await writer.init()
         if(writer instanceof CharXWriter && type === 'charxJpeg'){
             await writer.writeJpeg(img)
