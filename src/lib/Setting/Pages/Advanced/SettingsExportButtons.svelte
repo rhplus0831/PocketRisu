@@ -4,7 +4,8 @@
     import { DBState } from 'src/ts/stores.svelte';
     import { alertMd, notifySuccess } from "src/ts/alert";
     import { downloadFile } from "src/ts/globalApi.svelte";
-    import { getDatabase } from "src/ts/storage/database.svelte";
+    import { appVer, getDatabaseFieldsSnapshot, nodeOnlyVer } from "src/ts/storage/database.svelte";
+    import { buildSettingsBugReport, SETTINGS_BUG_REPORT_FIELDS } from "src/ts/setting/settingsReport";
     import { isNodeServer } from "src/ts/platform";
 
 </script>
@@ -27,32 +28,15 @@ Show Statistics
 <Button
     className="mt-4"
     onclick={async () => {
-        const db = safeStructuredClone(getDatabase({
-            snapshot: true
-        }))
-
-        const keyToRemove = [
-            'characters', 'loreBook', 'plugins', 'account', 'personas', 'username', 'userIcon', 'userNote',
-            'modules', 'enabledModules', 'botPresets', 'characterOrder', 'webUiUrl', 'characterOrder',
-            'hordeConfig', 'novelai', 'koboldURL', 'ooba', 'ainconfig', 'personaPrompt', 'promptTemplate',
-            'deeplOptions', 'google', 'customPromptTemplateToggle', 'globalChatVariables', 'comfyConfig',
-            'comfyUiUrl', 'translatorPrompt', 'translatorPresets', 'translatorPresetId', 'customModels', 'mcpURLs', 'authRefreshes'
-        ]
-        for(const key in db) {
-            if(
-                keyToRemove.includes(key) ||
-                key.toLowerCase().includes('key') || key.toLowerCase().includes('proxy')
-                || key.toLowerCase().includes('hypa')
-            ) {
-                delete db[key]
-            }
-        }
-
-        //@ts-expect-error meta is not defined in Database type, added for settings export report
-        db.meta = {
-            isNodeServer: isNodeServer,
-            protocol: location.protocol
-        }
+        const db = buildSettingsBugReport(
+            getDatabaseFieldsSnapshot(SETTINGS_BUG_REPORT_FIELDS),
+            {
+                isNodeServer,
+                protocol: location.protocol,
+                appVersion: appVer,
+                nodeOnlyVersion: nodeOnlyVer,
+            },
+        )
 
         const json = JSON.stringify(db, null, 2)
         await downloadFile('risuai-settings-report.json', new TextEncoder().encode(json))

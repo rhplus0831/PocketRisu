@@ -807,6 +807,11 @@ interface getDatabaseOptions{
     snapshot?:boolean
 }
 
+export type DatabaseSnapshotField = Exclude<
+    keyof Database,
+    'characters'|'pluginCustomStorage'|'pluginStorageMeta'
+>
+
 export function getDatabase(options:getDatabaseOptions = {}):Database{
     if(options.snapshot){
         return $state.snapshot(DBState.db) as Database
@@ -814,13 +819,35 @@ export function getDatabase(options:getDatabaseOptions = {}):Database{
     return DBState.db as Database
 }
 
-export function getCurrentCharacter(options:getDatabaseOptions = {}):character{
-    const db = getDatabase(options)
-    if(!db.characters){
-        db.characters = []
+/**
+ * Snapshot only the requested database roots. Character and plugin-storage
+ * roots have dedicated ownership rules and are deliberately excluded.
+ */
+export function getDatabaseFieldsSnapshot<K extends DatabaseSnapshotField>(
+    fields: readonly K[],
+): Pick<Database, K> {
+    const snapshot = {} as Pick<Database, K>
+    for (const field of fields) {
+        snapshot[field] = $state.snapshot(DBState.db[field]) as Database[K]
     }
-    const char = db.characters?.[get(selectedCharID)]
-    return char
+    return snapshot
+}
+
+/** Return a detached snapshot without traversing unrelated database roots. */
+export function getCharacterSnapshot(index:number):character|undefined{
+    const char = DBState.db.characters?.[index]
+    return char ? $state.snapshot(char) as character : undefined
+}
+
+export function getCurrentCharacter(options:getDatabaseOptions = {}):character{
+    const index = get(selectedCharID)
+    if(options.snapshot){
+        return getCharacterSnapshot(index) as character
+    }
+    if(!DBState.db.characters){
+        DBState.db.characters = []
+    }
+    return DBState.db.characters[index]
 }
 
 export function setCurrentCharacter(char:character){
@@ -831,12 +858,13 @@ export function setCurrentCharacter(char:character){
 }
 
 export function getCharacterByIndex(index:number,options:getDatabaseOptions = {}):character{
-    const db = getDatabase(options)
-    if(!db.characters){
-        db.characters = []
+    if(options.snapshot){
+        return getCharacterSnapshot(index) as character
     }
-    const char = db.characters?.[index]
-    return char
+    if(!DBState.db.characters){
+        DBState.db.characters = []
+    }
+    return DBState.db.characters[index]
 }
 
 export function setCharacterByIndex(index:number,char:character){

@@ -4,7 +4,7 @@ import { alertConfirm, alertError, alertStore, alertWait, notifySuccess } from '
 import { exportCharacterCard, importCharacterProcess } from './characterCards'
 import { LocalWriter, markCharacterDirty, markChatDirty, readImage, VirtualWriter } from './globalApi.svelte'
 import { language } from 'src/lang'
-import { type character, getDatabase, setDatabase, saveImage, normalizeChat } from './storage/database.svelte'
+import { type character, getCharacterSnapshot, getDatabase, setDatabase, saveImage, normalizeChat } from './storage/database.svelte'
 import type { Chat } from './storage/database.svelte'
 import { fetchChatFromServer } from './storage/chatStorage'
 import { selectSingleFile } from './util'
@@ -407,8 +407,7 @@ export async function exportCharacterPackage(
     }
 ): Promise<void> {
     try {
-        const db = getDatabase({ snapshot: true })
-        const char = safeStructuredClone(db.characters[charIndex]) as character
+        const char = getCharacterSnapshot(charIndex)
         if (!char) {
             alertError('Character not found')
             return
