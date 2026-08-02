@@ -324,6 +324,7 @@ function createChatRowStore(options) {
         kvGet,
         kvGetAsync = async (key) => kvGet(key),
         kvSet,
+        kvSetFromFile = null,
         kvDel,
         kvList,
         kvListWithSizes,
@@ -448,6 +449,35 @@ function createChatRowStore(options) {
         if (metadataForKey(key)?.rowToken !== expectedToken) return null;
         return persistOwnedChatRow(key, buffer, coldStorage);
     });
+    const persistChatRowFromFile = db.transaction((
+        key,
+        filePath,
+        coldStorage,
+        expectedHash,
+        chunkPlan,
+    ) => {
+        if (typeof kvSetFromFile !== 'function') {
+            throw new TypeError('kvSetFromFile is required for file-backed chat writes');
+        }
+        const result = kvSetFromFile(key, filePath, { chunkPlan });
+        const digest = result?.sha256 ?? expectedHash;
+        if (!/^[0-9a-f]{64}$/.test(digest ?? '')
+            || (expectedHash && digest !== expectedHash)) {
+            throw new Error(`Chat row file digest did not match its prepared source for ${key}`);
+        }
+        if (typeof coldStorage === 'boolean') {
+            const published = publishChatRowMetadata.run(
+                digest,
+                result.size,
+                coldStorage ? 1 : 0,
+                key,
+            );
+            if (published.changes !== 1) {
+                throw new Error(`Chat row metadata slot was not published for ${key}`);
+            }
+        }
+        return digest;
+    });
 
     async function readChatRow(chaId, chatId) {
         const value = readChatRowRaw(chaId, chatId);
@@ -568,6 +598,16 @@ function createChatRowStore(options) {
             chatRowKey(chaId, chatId),
             buffer,
             options.coldStorage,
+        );
+    }
+
+    function writeChatRowFromFile(chaId, chatId, filePath, options = {}) {
+        return persistChatRowFromFile(
+            chatRowKey(chaId, chatId),
+            filePath,
+            options.coldStorage,
+            options.contentHash ?? null,
+            options.chunkPlan ?? null,
         );
     }
 
@@ -954,6 +994,7 @@ function createChatRowStore(options) {
         writeChatRowIfUnchanged,
         writeChatRowRaw,
         writeChatRowRawOwned,
+        writeChatRowFromFile,
         deleteChatRow,
         deleteChatRowsForChar,
         listChatRowKeysForChar,

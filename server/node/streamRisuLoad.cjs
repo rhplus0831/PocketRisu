@@ -1485,6 +1485,7 @@ async function walkRisuSave(input, options = {}) {
         }
         let externalizePlugins = false;
         let strictPluginStorageActive = false;
+        let pluginStorageHasMetaField = false;
         let valueRecordInspection = { present: false, count: 0, decodedRecord: null };
         let metaRecordInspection = { present: false, count: 0, decodedRecord: null };
         if (options.externalizePluginStorage) {
@@ -1513,10 +1514,10 @@ async function walkRisuSave(input, options = {}) {
             }
             const hasValues = valueRecordInspection.count > 0
                 || escapedPluginFields.has('pluginCustomStorage');
-            const hasMetaField = metaRecordInspection.present
+            pluginStorageHasMetaField = metaRecordInspection.present
                 || escapedPluginFields.has('pluginStorageMeta');
             externalizePlugins = pluginStorageFolded
-                || (strictPluginStorageActive && (hasValues || hasMetaField));
+                || (strictPluginStorageActive && (hasValues || pluginStorageHasMetaField));
             if (pluginStorageFolded) {
                 if (typeof options.onPluginStorageFolded !== 'function') {
                     throw new TypeError(
@@ -1528,7 +1529,14 @@ async function walkRisuSave(input, options = {}) {
         }
 
         const remainder = {};
-        const pluginStats = { changed: externalizePlugins, values: 0, meta: 0 };
+        const pluginStats = {
+            changed: externalizePlugins,
+            values: 0,
+            meta: 0,
+            markerPresent: Boolean(foldedMarkerEntry),
+            folded: pluginStorageFolded,
+            hasMetaField: pluginStorageHasMetaField,
+        };
         const mcpToolCallStats = { changed: externalizeMcpToolCalls, entries: 0 };
         const processedExternalEscapes = new Set();
         for (const entry of rootEntries) {

@@ -441,8 +441,9 @@ replacement.
 
 Important private roots:
 
-- `save/.spool/` or `POCKETRISU_SPOOL_DIR`: database assembly, import-entry/database,
-  plugin-value, and snapshot-restore spools;
+- `save/.spool/` or `POCKETRISU_SPOOL_DIR`: admitted database/chat/KV request bodies and
+  their private validation stages, database assembly, import-entry/database, plugin-value,
+  and snapshot-restore spools;
 - `save/.partial-export-spool/`: private full/partial filesystem pins;
 - `save/.plugin-transition-staging/`: durable plugin mode-transition stages;
 - asset/inlay import staging and rollback directories beside their final stores.
@@ -451,6 +452,12 @@ Important private roots:
 the database spool. Full and partial exports keep verified filesystem pins and completed
 partial archives under the partial-export spool. These roots have separate disk-headroom
 checks because an operator may place them on different volumes.
+
+Admitted-write files use create-only randomized `.admitted-ingress-*` names and private
+`.admitted-write-stage-*` directories. Normal response/failure cleanup removes both;
+startup removes only stale entries with those exact prefixes. Request bytes continue to
+occupy the process-wide admission reservation until response finish/close even if their
+disk file has already been unlinked.
 
 ### Finite restore and retention limits
 

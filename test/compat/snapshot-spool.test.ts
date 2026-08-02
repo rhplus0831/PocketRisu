@@ -466,6 +466,10 @@ describe('database snapshot spool isolation', () => {
       env: {
         POCKETRISU_SPOOL_DIR: spoolPath,
         POCKETRISU_BACKUP_INTERVAL_MS: '3600000',
+        // This fixture intentionally makes the shared spool root unusable to
+        // isolate non-fatal snapshot scheduling. Admitted-spool pressure is
+        // covered separately by admitted-write-spool.test.ts.
+        POCKETRISU_TEST_DISABLE_ADMITTED_SPOOL: '1',
       },
       seedSave: async (saveDir) => {
         await writeFile(path.join(saveDir, 'blocked-spool'), 'not a directory')

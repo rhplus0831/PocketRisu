@@ -584,13 +584,16 @@ const runKvSetFromFile = db.transaction((
     providedOwner,
     displaySizeProvided,
     providedDisplaySize,
+    chunkPlan,
 ) => {
     if (typeof key !== 'string') throw new TypeError('KV key must be a string');
     const facetsWereCurrent = pluginStorageViewerFacets.state().current;
     const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
     const quotaPlanned = consumePluginStorageQuotaPlan(key, size);
     if (!quotaPlanned) assertPluginWriteWithinLimits(key, size, previousSize);
-    chunkStore.putValueFromFile(key, filePath);
+    const writeResult = chunkStore.putValueFromFile(key, filePath, {
+        chunkPlan,
+    });
     notePluginStorageMutation(key);
     if (!quotaPlanned) updatePluginStorageUsageForWrite(key, size, previousSize);
     if (key.startsWith(PLUGIN_STORAGE_META_PREFIX)) {
@@ -610,6 +613,7 @@ const runKvSetFromFile = db.transaction((
     }
     stmtRemoveDeletion.run(key);
     pluginStorageViewerFacets.finishMaintainedMutation(facetsWereCurrent, facetsMaintained);
+    return writeResult;
 });
 
 const runKvDel = db.transaction((key) => {
@@ -711,7 +715,7 @@ function kvSetFromFile(key, filePath, options = {}) {
         options,
         'pluginStorageDisplaySize',
     );
-    runKvSetFromFile(
+    return runKvSetFromFile(
         key,
         filePath,
         size,
@@ -719,6 +723,7 @@ function kvSetFromFile(key, filePath, options = {}) {
         ownerProvided ? options.pluginStorageOwner : null,
         displaySizeProvided,
         displaySizeProvided ? options.pluginStorageDisplaySize : null,
+        options.chunkPlan ?? null,
     );
 }
 

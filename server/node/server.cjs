@@ -65,6 +65,7 @@ const {
     reconcileLegacyHashAssetIdentity,
     writeAssetFile,
     writeAssetFileIfChanged,
+    writeAssetFileFromFile,
     readAssetFile,
     assetFileMtimeMs,
     deleteAssetFile,
@@ -151,6 +152,7 @@ const {
     inspectRisuSaveSource,
     readRisuSaveTopLevelFields,
     shouldStreamRisuSave,
+    walkRisuSave,
 } = require('./streamRisuLoad.cjs');
 
 async function readBackupRisuSaveTopLevelFields(input, requestedKeys, options = {}) {
@@ -236,6 +238,16 @@ const {
     createBufferedIngressMiddleware,
     sendClientUpgradeRequired,
 } = require('./bufferedIngress.cjs');
+const {
+    ADMITTED_INGRESS_SPOOL,
+    ADMITTED_INGRESS_SPOOL_PREFIX,
+    ADMITTED_WRITE_STAGE_PREFIX,
+    createAdmittedIngressSpoolMiddleware,
+    disposeAdmittedIngressSpool,
+    isAdmittedSpoolPressureError,
+    sendRetryableSpoolRefusal,
+} = require('./admittedIngressSpool.cjs');
+const { prepareFileChunkPlan } = require('./chunkPlan.cjs');
 const { readClientBuildStamp } = require('./buildStamp.cjs');
 const {
     CHAT_BACKUP_DIRNAME,
@@ -401,6 +413,7 @@ const chatRowStore = createChatRowStore({
     kvGet,
     kvGetAsync,
     kvSet,
+    kvSetFromFile,
     kvDel,
     kvList,
     kvListWithSizes,
@@ -2526,8 +2539,16 @@ app.use(createBufferedIngressMiddleware({
     ),
     expectedClientBuild,
 }));
+app.use(createAdmittedIngressSpoolMiddleware({
+    policySymbol: BUFFERED_INGRESS_POLICY,
+    spoolDir: () => databaseSpoolDir,
+    disabled: process.env.NODE_ENV === 'test'
+        && process.env.POCKETRISU_TEST_DISABLE_ADMITTED_SPOOL === '1',
+    globalBudgetBytes: bufferedIngressLimits.global,
+}));
 app.use((req, res, next) => {
     if (req.path === '/api/db/read-cached') return next();
+    if (req[ADMITTED_INGRESS_SPOOL]) return next();
     const policy = req[BUFFERED_INGRESS_POLICY];
     const parser = express.json({
         limit: policy?.bodyKind === 'json'
@@ -2547,6 +2568,7 @@ app.use((req, res, next) => {
         = req.path === '/api/plugin-storage/transition/stage/upload';
     const isStreamingPluginTransitionBulk
         = req.path === '/api/plugin-storage/transition/bulk';
+    if (req[ADMITTED_INGRESS_SPOOL]) return next();
     if (
         req.path === '/api/backup/import'
         || req.path === '/api/migrate/save-folder/upload'
@@ -2761,11 +2783,25 @@ if (databaseSpoolReady) {
                 || entry.name.startsWith(BACKUP_IMPORT_SPOOL_FILE_PREFIX)
                 || entry.name.startsWith(PLUGIN_VALUE_SPOOL_FILE_PREFIX)
                 || entry.name.startsWith(PLUGIN_BATCH_VALUE_SPOOL_FILE_PREFIX)
+                || entry.name.startsWith(ADMITTED_INGRESS_SPOOL_PREFIX)
             )) continue;
             try {
                 unlinkSync(path.join(databaseSpoolDir, entry.name));
             } catch (error) {
                 logger.warn(`[Backup] Could not remove orphaned spool file ${entry.name}:`, error);
+            }
+        }
+        for (const entry of readdirSync(databaseSpoolDir, { withFileTypes: true })) {
+            if (!entry.isDirectory() || !entry.name.startsWith(ADMITTED_WRITE_STAGE_PREFIX)) {
+                continue;
+            }
+            try {
+                fsSync.rmSync(path.join(databaseSpoolDir, entry.name), {
+                    recursive: true,
+                    force: true,
+                });
+            } catch (error) {
+                logger.warn(`[Backup] Could not remove orphaned admitted-write stage ${entry.name}:`, error);
             }
         }
     } catch (error) {
@@ -3701,6 +3737,37 @@ async function writeDurableInlayTempFile(filePath, value) {
     }
 }
 
+async function copyDurableInlayTempFile(sourcePath, filePath) {
+    let source;
+    let destination;
+    try {
+        source = await fs.open(sourcePath, 'r');
+        const stat = await source.stat();
+        if (!stat.isFile()) throw new Error('Inlay spool source must be a regular file');
+        destination = await fs.open(filePath, 'wx', 0o600);
+        const page = Buffer.allocUnsafe(256 * 1024);
+        let position = 0;
+        while (position < stat.size) {
+            const length = Math.min(page.length, stat.size - position);
+            const result = await source.read(page, 0, length, position);
+            if (result.bytesRead !== length) throw new Error('Inlay spool changed during publication');
+            let written = 0;
+            while (written < length) {
+                const output = await destination.write(page, written, length - written);
+                if (output.bytesWritten <= 0) {
+                    throw new Error('Inlay spool publication made no progress');
+                }
+                written += output.bytesWritten;
+            }
+            position += length;
+        }
+        await destination.sync();
+    } finally {
+        await source?.close().catch(() => {});
+        await destination?.close().catch(() => {});
+    }
+}
+
 function writeDurableInlayTempFileSync(filePath, value) {
     let descriptor;
     try {
@@ -3931,6 +3998,63 @@ async function writeInlayFile(id, ext, buffer, info = null) {
         // point, roll back its newly visible orphan. The prior sidecar-selected
         // source remains untouched. Same-extension rename is already atomic and
         // therefore still leaves one complete payload.
+        if (payloadPublished && !sidecarPublished && previousPath !== destinationPath) {
+            try {
+                await fs.unlink(destinationPath);
+                await fsyncInlayDirectory();
+            } catch (rollbackError) {
+                if (rollbackError?.code !== 'ENOENT') {
+                    logger.warn(
+                        `[InlayFS] Failed to roll back unpublished payload for ${id}:`,
+                        rollbackError?.message || rollbackError,
+                    );
+                }
+            }
+        }
+        throw error;
+    } finally {
+        await fs.unlink(payloadTemporaryPath).catch(() => {});
+        await fs.unlink(sidecarTemporaryPath).catch(() => {});
+    }
+    kvClearDeletion(`inlay/${id}`);
+}
+
+async function writeInlayFileFromFile(id, ext, sourcePath, info = null) {
+    await ensureInlayDir();
+    const normalizedExt = normalizeInlayExt(ext);
+    const destinationPath = getInlayFilePath(id, normalizedExt);
+    const sidecarPath = getInlaySidecarPath(id);
+    const previousPath = await resolveInlayFilePath(id);
+    const payloadTemporaryPath = newInlayTempPath('payload');
+    const sidecarTemporaryPath = newInlayTempPath('sidecar');
+    const sidecarValue = inlaySidecarValue(id, {
+        ...(info || {}),
+        ext: normalizedExt,
+    });
+    let payloadPublished = false;
+    let sidecarPublished = false;
+    try {
+        await copyDurableInlayTempFile(sourcePath, payloadTemporaryPath);
+        await writeDurableInlayTempFile(sidecarTemporaryPath, sidecarValue);
+        await reachInlayPublishTestBoundary('before-payload-publish', id);
+        await fs.rename(payloadTemporaryPath, destinationPath);
+        payloadPublished = true;
+        await fsyncInlayDirectory();
+        await reachInlayPublishTestBoundary('after-payload-publish', id);
+        await fs.rename(sidecarTemporaryPath, sidecarPath);
+        sidecarPublished = true;
+        await fsyncInlayDirectory();
+        if (previousPath && previousPath !== destinationPath) {
+            try {
+                await fs.unlink(previousPath);
+                await fsyncInlayDirectory();
+            } catch (error) {
+                if (error?.code !== 'ENOENT') {
+                    logger.warn(`[InlayFS] Failed to remove obsolete payload for ${id}:`, error?.message || error);
+                }
+            }
+        }
+    } catch (error) {
         if (payloadPublished && !sidecarPublished && previousPath !== destinationPath) {
             try {
                 await fs.unlink(destinationPath);
@@ -14673,13 +14797,572 @@ app.post('/api/plugin-storage/transition', async (req, res) => {
 const requestLogs = createRequestLogs({ saveDir: savePath });
 requestLogs.registerRoutes(app, { auth: checkAuth, activeSession: checkActiveSession });
 
+async function writePrivateAdmittedStageFile(filePath, value) {
+    const handle = await fs.open(filePath, 'wx', 0o600);
+    try {
+        await handle.writeFile(value);
+        await handle.sync();
+    } finally {
+        await handle.close();
+    }
+    return { filePath, size: (await fs.stat(filePath)).size };
+}
+
+async function prepareChunkPlanWithFallback(filePath, label) {
+    try {
+        return await prepareFileChunkPlan(filePath, {
+            forceFailure: process.env.NODE_ENV === 'test'
+                && process.env.POCKETRISU_TEST_CHUNK_WORKER_FAIL === '1',
+        });
+    } catch (error) {
+        logger.warn(
+            `[ChunkPlan] ${label} worker preparation failed; using synchronous file publication:`,
+            error?.message || error,
+        );
+        return null;
+    }
+}
+
+async function hashFile(filePath, algorithm) {
+    const digest = nodeCrypto.createHash(algorithm);
+    for await (const chunk of createReadStream(filePath)) digest.update(chunk);
+    return digest.digest('hex');
+}
+
+async function waitAtAdmittedWritePublishTestGate(kind) {
+    if (process.env.NODE_ENV !== 'test') return;
+    const gateDir = String(process.env.POCKETRISU_TEST_ADMITTED_WRITE_GATE_DIR ?? '').trim();
+    if (!gateDir) return;
+    const holdPath = path.join(gateDir, 'hold');
+    if (!existsSync(holdPath)) return;
+    await fs.mkdir(gateDir, { recursive: true });
+    await fs.writeFile(path.join(gateDir, 'entered'), kind, 'utf-8');
+    const releasePath = path.join(gateDir, 'release');
+    while (existsSync(holdPath) && !existsSync(releasePath)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+}
+
+async function decodeDatabaseSpoolForWrite(spool, stageDir, chatRows) {
+    const source = { filePath: spool.filePath, size: spool.size };
+    const inspection = await inspectRisuSaveSource(source);
+    if (!inspection.supported) {
+        // Preserve legacy/block/unknown compatibility. Canonical raw and
+        // compressed client saves take the cursor walker below and never
+        // materialize the HTTP body in this process.
+        return decodeAuthoritativeDatabase(await fs.readFile(spool.filePath));
+    }
+    const streamedPluginValues = Object.create(null);
+    const streamedPluginMeta = Object.create(null);
+    const walked = await walkRisuSave(source, {
+        inspection,
+        tempDir: databaseSpoolDir,
+        externalizePluginStorage: true,
+        onPluginStorageFolded: async () => {},
+        onPluginStorageEntry: async ({ field, key, value }) => {
+            Object.defineProperty(
+                field === 'pluginStorageMeta' ? streamedPluginMeta : streamedPluginValues,
+                key,
+                { configurable: true, enumerable: true, value, writable: true },
+            );
+        },
+        onMissingChatId: () => nodeCrypto.randomUUID(),
+        retainCharacterChats: () => false,
+        onChat: async ({ character, chat, externalizable }) => {
+            if (!externalizable || !Array.isArray(chat?.message)) return chat;
+            const payload = { ...chat };
+            if (payload._stub === true) delete payload._stub;
+            const index = chatRows.length;
+            const filePath = path.join(stageDir, `chat-${index}.bin`);
+            const bytes = Buffer.from(encodeRisuSaveLegacy(payload));
+            await writePrivateAdmittedStageFile(filePath, bytes);
+            chatRows.push({
+                chaId: character.chaId,
+                chatId: payload.id,
+                filePath,
+                coldStorage: isColdStorageChat(payload),
+            });
+            return chatRowStore.chatToStub(payload);
+        },
+    });
+    if (walked.pluginStats.changed) {
+        walked.remainder.pluginCustomStorage = streamedPluginValues;
+        if (walked.pluginStats.hasMetaField) {
+            walked.remainder.pluginStorageMeta = streamedPluginMeta;
+        }
+    }
+    if (walked.pluginStats.markerPresent) {
+        walked.remainder[PLUGIN_STORAGE_FOLDED_MARKER] = walked.pluginStats.folded;
+    }
+    return walked.remainder;
+}
+
+async function prepareSpooledDatabaseWrite(spool) {
+    const stageDir = await fs.mkdtemp(path.join(databaseSpoolDir, ADMITTED_WRITE_STAGE_PREFIX));
+    const chatRows = [];
+    try {
+        const incomingDb = await decodeDatabaseSpoolForWrite(spool, stageDir, chatRows);
+        const losses = findStubFlagLossChats(incomingDb);
+        if (losses.length > 0) {
+            const sample = losses.slice(0, 3)
+                .map(loss => `${loss.chaId}/${loss.chatId ?? loss.chatIndex}`).join(', ');
+            const error = new Error(
+                `write aborted: ${losses.length} chat(s) lost _stub flag without upgrade — `
+                + `would silently strip messages on disk. sample=[${sample}]`,
+            );
+            recordPersistFailure(error, '/api/write:stub-flag-loss');
+            logger.error(`[Write] ${error.message}`);
+            return {
+                stageDir,
+                refusal: { status: 500, body: { error: 'Write aborted: chat data integrity check failed' } },
+            };
+        }
+        const duplicateChaIds = findDuplicateChaIds(incomingDb);
+        if (duplicateChaIds.length > 0) {
+            const sample = duplicateChaIds.slice(0, 3).join(', ');
+            const error = new Error(
+                `write aborted: ${duplicateChaIds.length} duplicate chaId value(s) — `
+                + `would collapse distinct chat rows. sample=[${sample}]`,
+            );
+            recordPersistFailure(error, '/api/write:duplicate-cha-ids');
+            logger.error(`[Write] ${error.message}`);
+            return {
+                stageDir,
+                refusal: { status: 500, body: { error: 'Write aborted: chat data integrity check failed' } },
+            };
+        }
+        const duplicateChatIds = findDuplicateChatIds(incomingDb);
+        if (duplicateChatIds.length > 0) {
+            const error = new Error(
+                `write aborted: ${duplicateChatIds.length} duplicate chat id(s) — `
+                + `would alias authoritative rows. sample=[${duplicateChatIdSample(duplicateChatIds)}]`,
+            );
+            recordPersistFailure(error, '/api/write:duplicate-chat-ids');
+            logger.error(`[Write] ${error.message}`);
+            return {
+                stageDir,
+                refusal: { status: 500, body: { error: 'Write aborted: chat data integrity check failed' } },
+            };
+        }
+
+        const pluginExternalization = preparePluginStorageExternalization(incomingDb);
+        const strippedDb = pluginExternalization.strippedDb;
+        const normalizedDatabase = normalizeDecodedDatabaseForRead(strippedDb);
+        const pluginRows = [];
+        for (let index = 0; index < pluginExternalization.rows.length; index++) {
+            const row = pluginExternalization.rows[index];
+            const filePath = path.join(stageDir, `plugin-${index}.json`);
+            await writePrivateAdmittedStageFile(filePath, row.value);
+            const validated = validatePluginStorageRow(row.storageKey, row.value);
+            pluginRows.push({
+                storageKey: row.storageKey,
+                filePath,
+                displaySize: row.storageKey.startsWith(PLUGIN_SAVE_PREFIX)
+                    ? pluginStorageViewerDisplaySize(validated)
+                    : null,
+            });
+        }
+        pluginExternalization.rows = pluginRows;
+
+        const changed = chatRows.length > 0 || pluginExternalization.changed;
+        let persistedPath = spool.filePath;
+        let persistedSize = spool.size;
+        if (changed) {
+            persistedPath = path.join(stageDir, 'database.bin');
+            const streamed = await streamRisuSaveToFile({
+                dbObj: strippedDb,
+                filePath: persistedPath,
+                readChatRow: async () => null,
+                foldChatRows: false,
+            });
+            persistedSize = streamed.size;
+        }
+
+        const planned = await Promise.all([
+            prepareChunkPlanWithFallback(persistedPath, 'database write'),
+            ...chatRows.map(row => prepareChunkPlanWithFallback(row.filePath, 'database chat row')),
+            ...pluginRows.map(row => prepareChunkPlanWithFallback(row.filePath, 'database plugin row')),
+        ]);
+        const databasePlan = planned[0];
+        for (let index = 0; index < chatRows.length; index++) {
+            chatRows[index].chunkPlan = planned[index + 1];
+        }
+        for (let index = 0; index < pluginRows.length; index++) {
+            pluginRows[index].chunkPlan = planned[index + 1 + chatRows.length];
+        }
+        const etag = databasePlan?.md5 ?? await hashFile(persistedPath, 'md5');
+        return {
+            stageDir,
+            incomingDb,
+            strippedDb,
+            normalizedDatabase,
+            chatRows,
+            pluginExternalization,
+            persistedPath,
+            persistedSize,
+            databasePlan,
+            etag,
+        };
+    } catch (error) {
+        if (isAdmittedSpoolPressureError(error)) {
+            error.admittedWriteStageDir = stageDir;
+            throw error;
+        }
+        const diagnostic = logPluginStorageValidationFailure(
+            '[PluginStorage] Rejected invalid folded database row',
+            error,
+        );
+        if (diagnostic) return { stageDir, refusal: { status: 400, body: diagnostic } };
+        if (error instanceof PluginStorageLimitError) {
+            error.admittedWriteStageDir = stageDir;
+            throw error;
+        }
+        logger.error('[Write] Failed to externalize database payloads:', error.message);
+        if (error?.pluginStorageNamespaceConflict) {
+            return { stageDir, refusal: { status: 409, body: { error: error.message } } };
+        }
+        return { stageDir, refusal: { status: 500, body: { error: 'Database write failed' } } };
+    }
+}
+
+function writePreparedPluginStorageRows(rows) {
+    for (const row of rows) {
+        kvSetFromFile(row.storageKey, row.filePath, {
+            chunkPlan: row.chunkPlan,
+            ...(row.displaySize === null
+                ? {}
+                : { pluginStorageDisplaySize: row.displaySize }),
+        });
+    }
+}
+
+async function prepareSpooledChatWrite(spool) {
+    let stageDir = null;
+    try {
+        let chatData;
+        if (spool.bodyKind === 'raw') {
+            const source = { filePath: spool.filePath, size: spool.size };
+            try {
+                const inspection = await inspectRisuSaveSource(source);
+                chatData = inspection.supported
+                    ? (await walkRisuSave(source, { inspection, tempDir: databaseSpoolDir })).remainder
+                    : await decodeRisuSave(await fs.readFile(spool.filePath));
+            } catch {
+                return { refusal: { status: 400, body: { error: 'Invalid binary chat data' } } };
+            }
+        } else {
+            chatData = JSON.parse(await fs.readFile(spool.filePath, 'utf-8'));
+        }
+        if (!chatData) return { chatData };
+        if (chatData._stub === true && !Array.isArray(chatData.message)) {
+            return {
+                refusal: { status: 400, body: { error: 'Bare chat stubs cannot be stored as chat content' } },
+            };
+        }
+        let filePath = spool.filePath;
+        if (spool.bodyKind !== 'raw' || chatData._stub === true) {
+            if (chatData._stub === true) {
+                chatData = { ...chatData };
+                delete chatData._stub;
+            }
+            stageDir = await fs.mkdtemp(path.join(databaseSpoolDir, ADMITTED_WRITE_STAGE_PREFIX));
+            filePath = path.join(stageDir, 'chat.bin');
+            await writePrivateAdmittedStageFile(
+                filePath,
+                Buffer.from(encodeRisuSaveLegacy(chatData)),
+            );
+        }
+        const chunkPlan = await prepareChunkPlanWithFallback(filePath, 'chat write');
+        return {
+            chatData,
+            filePath,
+            stageDir,
+            chunkPlan,
+            contentHash: chunkPlan?.sha256 ?? null,
+            coldStorage: isColdStorageChat(chatData),
+        };
+    } catch (error) {
+        error.admittedWriteStageDir = stageDir;
+        throw error;
+    }
+}
+
+function verifyAssetHashFromDigest(key, digest) {
+    const match = typeof key === 'string'
+        ? key.match(/^assets\/([0-9a-f]{64})\.[A-Za-z0-9]{1,10}$/)
+        : null;
+    return match
+        ? { claimed: match[1], actual: digest, ok: match[1] === digest }
+        : { claimed: null, actual: null, ok: true };
+}
+
+function writeAssetValueFromSpool(key, spool, verification) {
+    const name = assetNameForKey(key);
+    if (name !== null && isSafeAssetName(name)) {
+        if (verification.legacyHashMismatch) markLegacyHashAsset(name);
+        const wrote = writeAssetFileFromFile(name, spool.filePath, {
+            skipIfUnchanged: verification.claimed !== null,
+        });
+        if (verification.ok) clearLegacyHashAsset(name);
+        kvDel(key);
+        kvClearDeletion(key);
+        assetGcCandidateStore.remove(key);
+        return wrote;
+    }
+    kvSetFromFile(key, spool.filePath, { chunkPlan: spool.chunkPlan });
+    assetGcCandidateStore.remove(key);
+    return true;
+}
+
+async function prepareSpooledGenericKvWrite(key, spool) {
+    let stageDir = null;
+    let parsedInlay = null;
+    let inlayPayloadPath = null;
+    let parsedInlayInfo = null;
+    try {
+        if (key.startsWith(PLUGIN_SAVE_PREFIX) || key.startsWith(PLUGIN_SAVE_META_PREFIX)) {
+            validatePluginStorageRow(key, await fs.readFile(spool.filePath));
+        }
+        if (key.startsWith('inlay/')) {
+            const id = key.slice('inlay/'.length);
+            parsedInlay = JSON.parse(await fs.readFile(spool.filePath, 'utf-8'));
+            const type = typeof parsedInlay?.type === 'string' ? parsedInlay.type : 'image';
+            const payload = type === 'signature'
+                ? Buffer.from(typeof parsedInlay?.data === 'string' ? parsedInlay.data : '', 'utf-8')
+                : decodeDataUri(parsedInlay?.data).buffer;
+            stageDir = await fs.mkdtemp(path.join(databaseSpoolDir, ADMITTED_WRITE_STAGE_PREFIX));
+            inlayPayloadPath = path.join(stageDir, 'inlay-payload');
+            await writePrivateAdmittedStageFile(inlayPayloadPath, payload);
+        } else if (key.startsWith('inlay_info/')) {
+            parsedInlayInfo = JSON.parse(await fs.readFile(spool.filePath, 'utf-8'));
+        }
+        const chunkPlan = key.startsWith('inlay/') || key.startsWith('inlay_info/')
+            ? null
+            : await prepareChunkPlanWithFallback(spool.filePath, `KV write ${key}`);
+        return {
+            stageDir,
+            chunkPlan,
+            parsedInlay,
+            inlayPayloadPath,
+            parsedInlayInfo,
+        };
+    } catch (error) {
+        error.admittedWriteStageDir = stageDir;
+        throw error;
+    }
+}
+
+async function handleSpooledKvWrite(req, res, next, {
+    filePath,
+    key,
+    spool,
+}) {
+    let prepared = null;
+    let shouldCreateBackup = false;
+    try {
+        if (key.startsWith(PLUGIN_SAVE_PREFIX) || key.startsWith(PLUGIN_SAVE_META_PREFIX)) {
+            try {
+                assertArchiveSafePluginSaveStorageKey(key);
+            } catch (error) {
+                return res.status(400).json({
+                    error: error?.message || 'Invalid plugin storage key',
+                    code: 'invalid_plugin_storage_key',
+                });
+            }
+        }
+        try {
+            prepared = key === 'database/database.bin'
+                ? await prepareSpooledDatabaseWrite(spool)
+                : await prepareSpooledGenericKvWrite(key, spool);
+        } catch (error) {
+            prepared = {
+                stageDir: error?.admittedWriteStageDir ?? null,
+                preparationError: error,
+            };
+        }
+        if (!prepared.refusal && !prepared.preparationError) {
+            await waitAtAdmittedWritePublishTestGate(
+                key === 'database/database.bin' ? 'database' : 'kv',
+            );
+        }
+
+        await queueStorageMutation(async () => {
+            const protectsPluginPublication = key === 'database/database.bin'
+                || key === PLUGIN_STORAGE_MANIFEST_KEY
+                || canonicalPluginStorageRowPrefix(key);
+            const livePluginPublication = protectsPluginPublication
+                ? await readLivePluginStoragePublication()
+                : null;
+            if (prepared.preparationError) throw prepared.preparationError;
+            if (prepared.refusal) {
+                return res.status(prepared.refusal.status).json(prepared.refusal.body);
+            }
+            if (key !== 'database/database.bin' && protectsPluginPublication) {
+                try {
+                    assertGenericPluginStorageMutationAllowed(key, livePluginPublication);
+                } catch (error) {
+                    if (error?.pluginStorageNamespaceConflict) {
+                        return res.status(409).json({ error: error.message });
+                    }
+                    throw error;
+                }
+            }
+            if (key === 'database/database.bin') {
+                const ifMatch = req.headers['x-if-match'];
+                if (ifMatch && dbEtag && ifMatch !== dbEtag) {
+                    return res.status(409).send({
+                        error: 'ETag mismatch - concurrent modification detected',
+                        currentEtag: dbEtag,
+                    });
+                }
+
+                const previousStrippedDb = getCurrentDatabaseCacheValue(filePath)
+                    || getCurrentDatabaseCacheValue(DB_HEX_KEY)
+                    || null;
+                try {
+                    assertGenericDatabasePluginPublicationAllowed(
+                        livePluginPublication,
+                        prepared.incomingDb,
+                        prepared.pluginExternalization,
+                    );
+                } catch (error) {
+                    if (error?.pluginStorageNamespaceConflict) {
+                        return res.status(409).json({ error: error.message });
+                    }
+                    throw error;
+                }
+                const chatRowsToDelete = previousStrippedDb
+                    ? chatRowStore.removedChatRowKeys(previousStrippedDb, prepared.strippedDb)
+                    : [];
+                await captureChatDeletionPreImages(chatRowsToDelete);
+                let committedDatabaseRevision = null;
+                sqliteDb.transaction(() => {
+                    writePreparedPluginStorageRows(prepared.pluginExternalization.rows);
+                    writePluginStorageManifest(prepared.pluginExternalization.manifest);
+                    for (const row of prepared.chatRows) {
+                        chatRowStore.writeChatRowFromFile(row.chaId, row.chatId, row.filePath, {
+                            contentHash: row.chunkPlan?.sha256 ?? null,
+                            chunkPlan: row.chunkPlan,
+                        });
+                    }
+                    kvSetFromFile(key, prepared.persistedPath, {
+                        chunkPlan: prepared.databasePlan,
+                    });
+                    if (previousStrippedDb) {
+                        chatRowStore.deleteRemovedChatRows(
+                            previousStrippedDb,
+                            prepared.strippedDb,
+                        );
+                    }
+                    committedDatabaseRevision = kvGetDatabaseRevision();
+                })();
+
+                invalidateDbCache();
+                replaceDbCacheValue(filePath, prepared.normalizedDatabase, {
+                    revision: committedDatabaseRevision,
+                    estimatedBytes: prepared.persistedSize,
+                    dirty: false,
+                });
+                dbEtag = prepared.etag;
+                seedDbCacheEtag(filePath, dbEtag);
+                rememberSessionPluginStorageState(req, prepared.normalizedDatabase);
+                shouldCreateBackup = true;
+                return res.send({ success: true, etag: dbEtag, hash: undefined });
+            }
+
+            let writeResult = null;
+            if (key.startsWith('inlay/')) {
+                const id = key.slice('inlay/'.length);
+                const parsed = prepared.parsedInlay;
+                const type = typeof parsed?.type === 'string' ? parsed.type : 'image';
+                const ext = normalizeInlayExt(parsed?.ext);
+                await writeInlayFileFromFile(id, ext, prepared.inlayPayloadPath, {
+                    ext,
+                    name: typeof parsed?.name === 'string' ? parsed.name : id,
+                    type,
+                    height: typeof parsed?.height === 'number' ? parsed.height : undefined,
+                    width: typeof parsed?.width === 'number' ? parsed.width : undefined,
+                });
+                kvDel(key);
+                kvDel(`inlay_thumb/${id}`);
+                kvDel(`inlay_info/${id}`);
+                kvClearDeletion(key);
+            } else if (key.startsWith('inlay_info/')) {
+                const id = key.slice('inlay_info/'.length);
+                await writeInlaySidecar(id, prepared.parsedInlayInfo);
+                kvDel(key);
+            } else if (key.startsWith('assets/')) {
+                const digest = prepared.chunkPlan?.sha256
+                    ?? await hashFile(spool.filePath, 'sha256');
+                const baseVerification = verifyAssetHashFromDigest(key, digest);
+                const assetVerification = {
+                    ...baseVerification,
+                    legacyHashMismatch: !baseVerification.ok
+                        && isLegacyHashAsset(key.slice('assets/'.length)),
+                };
+                if (!assetVerification.ok && !assetVerification.legacyHashMismatch) {
+                    return res.status(400).json({
+                        error: 'asset content does not match its SHA-256 name',
+                        key,
+                        expected: assetVerification.claimed,
+                        actual: assetVerification.actual,
+                    });
+                }
+                writeAssetValueFromSpool(key, {
+                    ...spool,
+                    chunkPlan: prepared.chunkPlan,
+                }, assetVerification);
+            } else {
+                writeResult = kvSetFromFile(key, spool.filePath, {
+                    chunkPlan: prepared.chunkPlan,
+                });
+            }
+
+            if (dbCache.has(filePath) || saveTimers[filePath]) {
+                invalidateDbCacheEntry(filePath);
+            }
+            return res.send({
+                success: true,
+                etag: undefined,
+                hash: key.startsWith(PLUGIN_SAVE_PREFIX)
+                    ? (prepared.chunkPlan?.sha256 ?? writeResult?.sha256)
+                    : undefined,
+            });
+        });
+        if (shouldCreateBackup) scheduleBackupAndRotate();
+    } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
+        if (error === prepared?.preparationError
+            && isAdmittedSpoolPressureError(error)) {
+            return sendRetryableSpoolRefusal(
+                res,
+                req[BUFFERED_INGRESS_POLICY],
+                bufferedIngressLimits.global,
+                spool.size,
+            );
+        }
+        const diagnostic = logPluginStorageValidationFailure(
+            '[PluginStorage] Rejected invalid row write',
+            error,
+        );
+        if (diagnostic) return res.status(400).json(diagnostic);
+        next(error);
+    } finally {
+        if (prepared?.stageDir) {
+            await fs.rm(prepared.stageDir, { recursive: true, force: true }).catch(() => {});
+        }
+        await disposeAdmittedIngressSpool(req);
+    }
+}
+
 app.post('/api/write', async (req, res, next) => {
     if(!await checkAuth(req, res)){
         return;
     }
     if (!checkActiveSession(req, res)) return;
     const rawFilePath = req.headers['file-path'];
-    const fileContent = req.body;
+    const admittedSpool = req[ADMITTED_INGRESS_SPOOL] ?? null;
+    const fileContent = admittedSpool ?? req.body;
     if (!rawFilePath || !fileContent) {
         res.status(400).send({ error:'File path required' });
         return;
@@ -14692,6 +15375,13 @@ app.post('/api/write', async (req, res, next) => {
         canonicalPath: filePath,
         decodedKey: key,
     } = decodeAndCanonicalizeHexPath(rawFilePath);
+    if (admittedSpool) {
+        return handleSpooledKvWrite(req, res, next, {
+            filePath,
+            key,
+            spool: admittedSpool,
+        });
+    }
     let shouldCreateBackup = false;
     try {
         await queueStorageMutation(async () => {
@@ -16611,8 +17301,86 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 });
 
 // POST /api/chat-content/:chaId/:chatIndex — save chat content to server
+async function handleSpooledChatWrite(req, res, next, spool) {
+    let prepared;
+    let shouldCreateBackup = false;
+    try {
+        try {
+            prepared = await prepareSpooledChatWrite(spool);
+        } catch (error) {
+            prepared = {
+                stageDir: error?.admittedWriteStageDir ?? null,
+                preparationError: error,
+            };
+        }
+        // Express historically parsed JSON before the authoritative session
+        // transition. Raw bodies were opaque and reached that transition
+        // before binary decode. Preserve that distinction on the spool path.
+        if (spool.bodyKind === 'json') {
+            if (prepared.preparationError) throw prepared.preparationError;
+            if (!checkActiveSession(req, res)) return;
+        }
+        if (!prepared.refusal && !prepared.preparationError) {
+            await waitAtAdmittedWritePublishTestGate('chat');
+        }
+        await queueStorageMutation(async () => {
+            if (prepared.preparationError) throw prepared.preparationError;
+            if (prepared.refusal) {
+                return res.status(prepared.refusal.status).json(prepared.refusal.body);
+            }
+            const chaId = req.params.chaId;
+            const expectedChatId = req.headers['x-chat-id'];
+            if (!prepared.chatData || !expectedChatId) {
+                return res.status(400).json({ error: 'Chat data and x-chat-id required' });
+            }
+            // Keep the exact old ordering: the prior authoritative row is
+            // captured after queue admission and immediately before publish.
+            await chatBackupStore.captureChatPreImage({
+                chaId,
+                chatId: expectedChatId,
+                reason: req.headers['x-chat-backup-reason'],
+            });
+            const hash = chatRowStore.writeChatRowFromFile(
+                chaId,
+                expectedChatId,
+                prepared.filePath,
+                {
+                    coldStorage: prepared.coldStorage,
+                    contentHash: prepared.contentHash,
+                    chunkPlan: prepared.chunkPlan,
+                },
+            );
+            shouldCreateBackup = true;
+            res.json({ success: true, hash });
+        });
+        if (shouldCreateBackup) scheduleBackupAndRotate();
+    } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
+        if (error === prepared?.preparationError
+            && isAdmittedSpoolPressureError(error)) {
+            return sendRetryableSpoolRefusal(
+                res,
+                req[BUFFERED_INGRESS_POLICY],
+                bufferedIngressLimits.global,
+                spool.size,
+            );
+        }
+        next(error);
+    } finally {
+        if (prepared?.stageDir) {
+            await fs.rm(prepared.stageDir, { recursive: true, force: true }).catch(() => {});
+        }
+        await disposeAdmittedIngressSpool(req);
+    }
+}
+
 app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
+    const admittedSpool = req[ADMITTED_INGRESS_SPOOL] ?? null;
+    if (admittedSpool) {
+        if (admittedSpool.bodyKind !== 'json' && !checkActiveSession(req, res)) return;
+        return handleSpooledChatWrite(req, res, next, admittedSpool);
+    }
     if (!checkActiveSession(req, res)) return;
     let shouldCreateBackup = false;
     try {

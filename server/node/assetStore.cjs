@@ -250,6 +250,97 @@ function createAssetStore(options = {}) {
         return true;
     }
 
+    function filesEqual(leftPath, rightPath, size) {
+        const left = fsOps.openSync(leftPath, 'r');
+        const right = fsOps.openSync(rightPath, 'r');
+        const leftPage = Buffer.allocUnsafe(256 * 1024);
+        const rightPage = Buffer.allocUnsafe(256 * 1024);
+        try {
+            let offset = 0;
+            while (offset < size) {
+                const length = Math.min(leftPage.length, size - offset);
+                const leftRead = fsOps.readSync(left, leftPage, 0, length, offset);
+                const rightRead = fsOps.readSync(right, rightPage, 0, length, offset);
+                if (leftRead !== length || rightRead !== length
+                    || !leftPage.subarray(0, length).equals(rightPage.subarray(0, length))) {
+                    return false;
+                }
+                offset += length;
+            }
+            return true;
+        } finally {
+            fsOps.closeSync(left);
+            fsOps.closeSync(right);
+        }
+    }
+
+    function writeAssetFileFromFile(name, sourcePath, { skipIfUnchanged = false } = {}) {
+        const destination = assetPathFor(name);
+        const sourceStat = fsOps.statSync(sourcePath);
+        if (!sourceStat.isFile()) throw new Error('Asset spool source must be a regular file');
+        ensureAssetDir();
+        if (skipIfUnchanged && assetFileSize(name) === sourceStat.size
+            && filesEqual(sourcePath, destination, sourceStat.size)) return false;
+
+        let tempPath;
+        let destinationDescriptor;
+        try {
+            for (let attempt = 0; attempt < 10; attempt++) {
+                tempPath = path.join(assetDir, `${ASSET_TEMP_PREFIX}${randomUUID()}`);
+                try {
+                    destinationDescriptor = fsOps.openSync(tempPath, 'wx', 0o600);
+                    break;
+                } catch (error) {
+                    if (error?.code !== 'EEXIST' || attempt === 9) throw error;
+                }
+            }
+            const sourceDescriptor = fsOps.openSync(sourcePath, 'r');
+            const page = Buffer.allocUnsafe(256 * 1024);
+            try {
+                let position = 0;
+                while (position < sourceStat.size) {
+                    const length = Math.min(page.length, sourceStat.size - position);
+                    const bytesRead = fsOps.readSync(
+                        sourceDescriptor,
+                        page,
+                        0,
+                        length,
+                        position,
+                    );
+                    if (bytesRead !== length) throw new Error('Asset spool changed during publication');
+                    let written = 0;
+                    while (written < bytesRead) {
+                        const count = fsOps.writeSync(
+                            destinationDescriptor,
+                            page,
+                            written,
+                            bytesRead - written,
+                        );
+                        if (count <= 0) throw new Error('Asset spool publication made no progress');
+                        written += count;
+                    }
+                    position += bytesRead;
+                }
+            } finally {
+                fsOps.closeSync(sourceDescriptor);
+            }
+            fsOps.fsyncSync(destinationDescriptor);
+            fsOps.closeSync(destinationDescriptor);
+            destinationDescriptor = undefined;
+            fsOps.renameSync(tempPath, destination);
+            tempPath = undefined;
+            fsyncDirectory(assetDir);
+            return true;
+        } finally {
+            if (destinationDescriptor !== undefined) {
+                try { fsOps.closeSync(destinationDescriptor); } catch {}
+            }
+            if (tempPath) {
+                try { fsOps.unlinkSync(tempPath); } catch {}
+            }
+        }
+    }
+
     function readAssetFile(name) {
         if (!fileStat(name)) return null;
         try {
@@ -416,6 +507,7 @@ function createAssetStore(options = {}) {
         reconcileLegacyHashAssetIdentity,
         writeAssetFile,
         writeAssetFileIfChanged,
+        writeAssetFileFromFile,
         readAssetFile,
         verifyStoredAssetHash,
         assetFileExists,

@@ -21,7 +21,7 @@ const MASK = 0x3fff;          // ~16KB average chunk (14 one-bits)
 
 // Split a buffer into ordered content-addressed chunks. Reassembling
 // chunks[].data in order reproduces the input exactly.
-function cdcSplit(buf) {
+function splitBuffer(buf, logicalHash = null) {
     const chunks = [];
     const len = buf.length;
     let start = 0;
@@ -35,10 +35,15 @@ function cdcSplit(buf) {
         }
         const data = buf.subarray(start, cut);
         const hash = crypto.createHash('sha256').update(data).digest('hex');
+        logicalHash?.update(data);
         chunks.push({ hash, data });
         start = cut;
     }
     return chunks;
+}
+
+function cdcSplit(buf) {
+    return splitBuffer(buf);
 }
 
 // Sentinel stored in kv.value for a chunked key. kv.value is NOT NULL, so a
@@ -645,6 +650,13 @@ function createChunkStore(db, opts = {}) {
         preallocatedReads: 0,
         singleFlightStarts: 0,
         singleFlightJoins: 0,
+    };
+    const writeMetrics = {
+        cdcPasses: 0,
+        logicalDigestPasses: 0,
+        secondFullValueDigestPasses: 0,
+        preparedFilePublications: 0,
+        synchronousFileFallbacks: 0,
     };
 
     db.exec(`
@@ -1299,38 +1311,46 @@ function createChunkStore(db, opts = {}) {
         if (value.length <= threshold) {
             kvSet.run(key, value, Date.now());
             deleteInventoryRevision.run(key);
-            return null;
+            return { verifiedRevision: null, sha256: null, size: value.length, chunked: false };
         }
-        const chunks = cdcSplit(value);
         const logicalHash = crypto.createHash('sha256');
+        const chunks = splitBuffer(value, logicalHash);
+        writeMetrics.cdcPasses++;
+        writeMetrics.logicalDigestPasses++;
         let logicalSize = 0;
         for (let i = 0; i < chunks.length; i++) {
             const stored = storedChunkForPublication(chunks[i]);
             insManifest.run(key, i, chunks[i].hash);
-            logicalHash.update(stored);
             logicalSize += stored.length;
         }
         if (logicalSize !== value.length) {
             throw chunkCorruption(`Stored chunks for ${key} failed publish-time length verification`);
         }
+        const sha256 = logicalHash.digest('hex');
         insManifestMeta.run(
             key,
             chunks.length,
             logicalSize,
-            logicalHash.digest('hex'),
+            sha256,
         );
         insManifestPublication.run(key);
         kvSet.run(key, CHUNK_MARKER, Date.now());
-        return markCurrentContentVerified(key);
+        return {
+            verifiedRevision: markCurrentContentVerified(key),
+            sha256,
+            size: logicalSize,
+            chunked: true,
+        };
     });
 
     function putValue(key, value) {
-        const verifiedRevision = putValueTransaction(key, value);
-        if (Number.isSafeInteger(verifiedRevision)) {
-            contentVerificationMemo.remember(key, verifiedRevision);
+        const result = putValueTransaction(key, value);
+        if (Number.isSafeInteger(result.verifiedRevision)) {
+            contentVerificationMemo.remember(key, result.verifiedRevision);
         } else {
             contentVerificationMemo.forget(key);
         }
+        return result;
     }
 
     function readFileRange(fd, length, position) {
@@ -1349,49 +1369,136 @@ function createChunkStore(db, opts = {}) {
     // Keep only one CDC window resident while producing the same chunks and
     // manifest as putValue. A raw value still needs one Buffer for SQLite's
     // direct-row bind, but values above the threshold never become monolithic.
-    const putValueFromFileTransaction = db.transaction((key, filePath) => {
+    function fileIdentity(stat) {
+        return {
+            size: stat.size,
+            dev: String(stat.dev),
+            ino: String(stat.ino),
+            mtimeMs: stat.mtimeMs,
+            ctimeMs: stat.ctimeMs,
+        };
+    }
+
+    function assertPreparedFilePlan(plan, stat) {
+        if (!plan || plan.version !== 1
+            || !Number.isSafeInteger(plan.size) || plan.size < 0
+            || plan.size !== stat.size
+            || !/^[0-9a-f]{64}$/.test(plan.sha256 ?? '')
+            || !Array.isArray(plan.chunks)
+            || JSON.stringify(plan.identity) !== JSON.stringify(fileIdentity(stat))) {
+            throw new Error('Prepared chunk plan no longer matches its private spool');
+        }
+        let position = 0;
+        for (const chunk of plan.chunks) {
+            if (!Number.isSafeInteger(chunk?.offset) || chunk.offset !== position
+                || !Number.isSafeInteger(chunk.length) || chunk.length <= 0
+                || chunk.length > MAX_SIZE
+                || !/^[0-9a-f]{64}$/.test(chunk.hash ?? '')) {
+                throw new Error('Prepared chunk plan is structurally invalid');
+            }
+            position += chunk.length;
+        }
+        if (position !== plan.size || (plan.size > 0) !== (plan.chunks.length > 0)) {
+            throw new Error('Prepared chunk plan has an invalid logical length');
+        }
+    }
+
+    function storedPreparedChunkForPublication(chunk) {
+        const inserted = insChunk.run(chunk.hash, chunk.data);
+        if (inserted.changes === 1) return chunk.data;
+        const stored = selChunk.get(chunk.hash)?.data;
+        // The worker already performed SHA-256. Exact comparison preserves the
+        // publish-time collision/corruption guard without repeating crypto on
+        // the event loop.
+        if (!Buffer.isBuffer(stored) || !stored.equals(chunk.data)) {
+            throw chunkCorruption(`Stored chunk ${chunk.hash} failed prepared publication verification`);
+        }
+        return stored;
+    }
+
+    const putValueFromFileTransaction = db.transaction((key, filePath, preparedPlan = null) => {
         const fd = fs.openSync(filePath, 'r');
         try {
-            const size = fs.fstatSync(fd).size;
+            const stat = fs.fstatSync(fd);
+            const size = stat.size;
+            if (preparedPlan) assertPreparedFilePlan(preparedPlan, stat);
             delManifestPublication.run(key);
             delManifest.run(key);
             delManifestMeta.run(key);
             if (size <= threshold) {
-                kvSet.run(key, readFileRange(fd, size, 0), Date.now());
+                const value = readFileRange(fd, size, 0);
+                kvSet.run(key, value, Date.now());
                 deleteInventoryRevision.run(key);
-                return null;
+                return {
+                    verifiedRevision: null,
+                    sha256: preparedPlan?.sha256
+                        ?? crypto.createHash('sha256').update(value).digest('hex'),
+                    size,
+                    chunked: false,
+                };
             }
 
             let position = 0;
             let sequence = 0;
-            const logicalHash = crypto.createHash('sha256');
-            while (position < size) {
-                const window = readFileRange(fd, Math.min(MAX_SIZE, size - position), position);
-                const chunk = cdcSplit(window)[0];
-                const stored = storedChunkForPublication(chunk);
-                insManifest.run(key, sequence++, chunk.hash);
-                logicalHash.update(stored);
-                if (stored.length !== chunk.data.length) {
-                    throw chunkCorruption(`Stored chunk ${chunk.hash} changed logical length`);
+            let sha256;
+            if (preparedPlan) {
+                writeMetrics.preparedFilePublications++;
+                for (const planned of preparedPlan.chunks) {
+                    const data = readFileRange(fd, planned.length, planned.offset);
+                    const stored = storedPreparedChunkForPublication({
+                        hash: planned.hash,
+                        data,
+                    });
+                    insManifest.run(key, sequence++, planned.hash);
+                    if (stored.length !== planned.length) {
+                        throw chunkCorruption(`Stored chunk ${planned.hash} changed logical length`);
+                    }
+                    position += planned.length;
                 }
-                position += chunk.data.length;
+                sha256 = preparedPlan.sha256;
+            } else {
+                writeMetrics.synchronousFileFallbacks++;
+                const logicalHash = crypto.createHash('sha256');
+                writeMetrics.cdcPasses++;
+                writeMetrics.logicalDigestPasses++;
+                while (position < size) {
+                    const window = readFileRange(fd, Math.min(MAX_SIZE, size - position), position);
+                    const chunk = cdcSplit(window)[0];
+                    logicalHash.update(chunk.data);
+                    const stored = storedChunkForPublication(chunk);
+                    insManifest.run(key, sequence++, chunk.hash);
+                    if (stored.length !== chunk.data.length) {
+                        throw chunkCorruption(`Stored chunk ${chunk.hash} changed logical length`);
+                    }
+                    position += chunk.data.length;
+                }
+                sha256 = logicalHash.digest('hex');
             }
-            insManifestMeta.run(key, sequence, size, logicalHash.digest('hex'));
+            if (position !== size) {
+                throw chunkCorruption(`Stored chunks for ${key} failed publish-time length verification`);
+            }
+            insManifestMeta.run(key, sequence, size, sha256);
             insManifestPublication.run(key);
             kvSet.run(key, CHUNK_MARKER, Date.now());
-            return markCurrentContentVerified(key);
+            return {
+                verifiedRevision: markCurrentContentVerified(key),
+                sha256,
+                size,
+                chunked: true,
+            };
         } finally {
             fs.closeSync(fd);
         }
     });
 
-    function putValueFromFile(key, filePath) {
-        const verifiedRevision = putValueFromFileTransaction(key, filePath);
-        if (Number.isSafeInteger(verifiedRevision)) {
-            contentVerificationMemo.remember(key, verifiedRevision);
+    function putValueFromFile(key, filePath, options = {}) {
+        const result = putValueFromFileTransaction(key, filePath, options.chunkPlan ?? null);
+        if (Number.isSafeInteger(result.verifiedRevision)) {
+            contentVerificationMemo.remember(key, result.verifiedRevision);
         } else {
             contentVerificationMemo.forget(key);
         }
+        return result;
     }
 
     function getValue(key) {
@@ -1979,6 +2086,7 @@ function createChunkStore(db, opts = {}) {
         contentVerificationMemo,
         contentReadMetrics: () => ({ ...contentMetrics }),
         sizeInventoryMetrics: () => ({ ...sizeInventoryMetrics }),
+        writeMetrics: () => ({ ...writeMetrics }),
     };
 }
 

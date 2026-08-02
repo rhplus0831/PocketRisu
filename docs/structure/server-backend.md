@@ -24,6 +24,8 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 | `server/node/importJournal.cjs` | Durable bridge between SQLite import transactions and filesystem asset/inlay directory swaps. It atomically writes/fsyncs `save/import_journal.json`, fsyncs staged trees, and recovers by finalizing committed swaps or restoring pre-import directories. |
 | `server/node/session-lock.cjs` | In-memory single-writer authority. `register()` records a boot without stealing; `checkWrite()` distinguishes the active writer, fresh gesture-backed takeover, fresh passive compatibility writes, and stale rejection; `peek()` provides a side-effect-free foreground status. |
 | `server/node/bufferedIngress.cjs` | Pre-parser admission for buffered JSON, octet-stream, and text bodies. It resolves auth/writer/route-limit policy, strictly validates uncompressed `Content-Length`, and reserves/relinquishes the process-wide in-flight byte budget without performing a writer-lock transition. |
+| `server/node/admittedIngressSpool.cjs` | Post-admission disk ingress for raw `/api/write` and raw/JSON chat-row writes. It consumes the already-reserved request in bounded pages, fsyncs a private spool, preserves the reservation through response finish/close, and maps spool-volume pressure to the admission layer's retryable refusal. |
+| `server/node/chunkPlan.cjs`, `chunkPlanWorker.cjs` | Bounded worker-thread preparation for private file sources. At most two workers by default scan FastCDC boundaries and compute per-chunk SHA-256 plus logical SHA-256/MD5 in one bounded-window pass; queued publication validates the immutable file identity and exact planned bytes. |
 | `server/node/model-jobs.cjs` | Durable upstream model relay. `createModelJobs()` stores non-secret job metadata in `save/model-jobs.db`, records exact provider response bytes in append-only journals under `save/model-jobs/`, tails running streams, supports claims, and owns 48-hour pending-send tombstones. Main jobs are recoverable; auxiliary pipeline requests are relay-only. |
 | `server/node/request-logs.cjs` | Provider request history and token usage in `save/request-logs.db`. `createRequestLogs()` masks/truncates request material, rotates heavy request bodies by byte budget, retains the small usage ledger, exposes query/statistics routes, and closes independently at shutdown. |
 | `server/node/pluginSaveKeys.cjs` | Canonical optimized-plugin prefixes, manifest/folded markers, and lossless physical-key policy: UTF-8/base64url, tagged ill-formed UTF-16, or manifest-v3-mapped archive-safe hashes. |
@@ -75,7 +77,7 @@ Persistent application data is primarily stored in SQLite through a binary-compa
    independent `model-jobs.db` and `request-logs.db` stores.
 3. `db.cjs` creates `save/`, opens `save/risuai.db`, enables WAL with the power-loss-durable `synchronous=FULL` default, and applies performance and lock pragmas near `server/node/db.cjs:23`. It creates the `kv`, deletion-journal, epoch, and operational migration-state tables, initializes the chunk store, then attempts legacy save-folder migration. Legacy values and their `storage_migrations` completion row commit together; `.migrated_to_sqlite` is an atomically published rollback/UI compatibility marker that startup reconciles against that state. `server.cjs` may apply only an explicit persisted or administrator-managed downgrade after this safe startup boundary.
 4. `server.cjs` installs fatal logging handlers before the rest of its initialization. It
-   then creates `save/`, creates/sweeps the database-assembly spool, resolves the
+   then creates `save/`, creates/sweeps the database-assembly and admitted-ingress spools, resolves the
    independent chat-history root, migrates legacy history from the configured
    server-backup directory, reads or creates the password/JWT/instance files, loads
    persisted direct-asset sessions, initializes the server-backup directory, and registers
@@ -99,6 +101,7 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `PORT` | HTTP/HTTPS port; default `6001`. |
 | `HOST` | Optional bind address passed to `server.listen()`; unset preserves the historical all-interfaces bind. Use `127.0.0.1` behind a local reverse proxy. |
 | `POCKETRISU_CHUNK_THRESHOLD` | Lowers the protected-chunk threshold for every logical KV namespace. The effective maximum/default is 16 MiB. |
+| `POCKETRISU_CHUNK_WORKERS` | Maximum admitted-write chunk-plan workers; default 2 and accepted range 1–4. Worker failures fall back to the existing synchronous file-source publication inside the mutation queue. |
 | `POCKETRISU_BACKUP_INTERVAL_MS` | Minimum interval between automatic DB snapshots; default five minutes. |
 | `POCKETRISU_ASSET_GC_GRACE_MS` | Minimum time an ordinary asset must remain unreferenced across independent server sweeps before deletion; default seven days. |
 | `POCKETRISU_ASSET_GC_START_DELAY_MS` | Delay before the first server-owned asset sweep; default 30 seconds. |
@@ -164,6 +167,17 @@ that authoritative check may refresh or transfer writer ownership. Direct-stream
 backup, migration, and plugin upload protocols retain their own bounds and bypass the
 buffered-body ledger.
 
+After that admission, raw `/api/write` bodies and raw/JSON chat POST bodies are consumed
+into `0600`, create-only files under `POCKETRISU_SPOOL_DIR` in at most 64 KiB pages;
+Express never constructs their payload-sized request `Buffer`. The exact admission
+reservation remains charged until response `finish`/`close`, even when route cleanup
+unlinks the spool earlier, so disk spooling does not increase concurrent admitted bytes.
+Disk-full, quota, or unavailable spool-volume failures use the same retryable
+`BUFFERED_INGRESS_BUSY` refusal. Validation and worker preparation happen before queue
+entry, but the private file has no publication authority: import fencing, ETag and plugin
+publication guards, prior database state, and chat pre-images are re-read or captured
+inside `queueStorageMutation()` immediately before the transactional publication.
+
 ### On-disk layout
 
 ```text
@@ -180,7 +194,7 @@ buffered-body ledger.
 │   ├── model-jobs.db-wal / -shm
 │   ├── model-jobs/
 │   │   └── <jobId>.journal            # exact append-only provider response bytes
-│   ├── .spool/                         # DB/import/value/restore spools (default)
+│   ├── .spool/                         # admitted-write/DB/import/value/restore spools (default)
 │   ├── .partial-export-spool/          # private full/partial filesystem pins
 │   ├── .plugin-transition-staging/     # durable staged plugin mode changes
 │   ├── assets/
@@ -279,6 +293,15 @@ extension-defined row accepted by the generic API remains restorable from a save
 
 Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB, approximately 16 KiB average, and SHA-256 content hashes at `server/node/chunkStore.cjs:18`. Values larger than 16 MiB are represented in `kv.value` by `CHUNK_MARKER`; reads concatenate manifest chunks through the bound store created at `server/node/chunkStore.cjs:114`.
 
+For admitted file-source writes, bounded workers produce the FastCDC plan and per-chunk
+and whole-value digests outside the event loop. The logical digest is advanced from each
+chunk during that same scan; there is no second full-value sweep. Publication remains a
+single SQLite transaction and revalidates the private file identity plus exact bytes of
+any deduplicated chunk before installing the protected manifest. Worker creation,
+execution, or result failure logs a degradation and uses the pre-existing synchronous
+`kvSetFromFile()` chunker; the mutation is never dropped or published from a partial
+plan.
+
 ### Main persistence flow
 
 #### Initial database load
@@ -324,7 +347,7 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 - `/api/patch` loads or reuses the stripped `dbCache` only at the exact current database-row revision, checks the client’s compositional hash, validates chat paths, applies RFC 6902 operations to a clone, externalizes any whole-chat payload operations, records old-minus-new chat rows for deferred deletion, updates the stripped-view ETag, and schedules persistence after five seconds. Manifest/external-row patches and database patches touching plugin mode, generation, folded markers, or optimized value/owner maps are rejected with `PLUGIN_STORAGE_PUBLICATION_GUARD`. The original inline behavior is retained only when the server proves that the live authoritative mode is inline; those database patches may update `pluginCustomStorage` and `pluginStorageMeta` through the ordinary delayed path.
 - The timer calls `persistDbCache()`, which verifies the cache's base revision before encoding and again inside the commit transaction, then commits the stubs-only database and queued chat-row deletions together. A failed stub write therefore cannot leave its former chat rows already deleted, and an external database-row change cannot be overwritten by an acknowledged stale patch cache. Successful persistence binds the retained clean graph to the newly committed revision.
 - Patch hash mismatches return `DATABASE_PATCH_CONFLICT`; the frontend keeps the response ETag provisional, reads and installs the matching authoritative database, and retries a patch from that baseline. Non-conflict rejections such as the chat guard may fall back to an ETag-guarded `NodeStorage.setItem()`/`/api/write`, while patch-enabled clients refuse unversioned full writes (`src/ts/globalApi.svelte.ts:965-1025`).
-- `/api/write` checks the stripped-view ETag, validates malformed/duplicate chat identities, splits any payload-bearing chats, preserves the selected plugin publication, and commits external chat rows, `database.bin`, and targeted chat deletion in one SQLite transaction. Plugin mode/generation changes use the specialized CAS/batch/transition protocols.
+- `/api/write` spools and validates its admitted bytes before queue entry, then checks the stripped-view ETag and the live selected plugin publication after queue admission. It derives prior chat deletions from the then-current database, captures their required pre-images, and commits staged external chat rows/plugin rows, `database.bin`, and targeted chat deletion in one SQLite transaction. A mutation that wins between validation and publication therefore produces the same ETag/plugin refusal as the buffered path. Plugin mode/generation changes use the specialized CAS/batch/transition protocols.
 - Ordinary request-time mutations run through the promise-based
   `queueStorageOperation()` FIFO, wrapped by `queueStorageMutation()`. An import claims the
   barrier first and then drains that FIFO: mutations already queued ahead of the drain
@@ -362,13 +385,14 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
   Cold rows are rehydrated from that selection and cache-filled only when the row is still
   unchanged and no import owns the mutation barrier. The route supports verified `204`
   cache hits and otherwise returns the historical raw/canonical response bytes.
-- `POST /api/chat-content/:chaId/:chatIndex` validates binary or JSON input and writes the
-  row synchronously inside `queueStorageMutation()`. Immediately before overwrite it asks
+- `POST /api/chat-content/:chaId/:chatIndex` spools and validates binary or JSON input
+  before queue entry and publishes the staged encoded row inside `queueStorageMutation()`.
+  Immediately before overwrite it asks
   `chatBackups.cjs` to stream the exact old raw row from protected chunk storage into the
   unchanged loose-version format, optionally tagged by `x-chat-backup-reason`; capture is
   best-effort and never blocks the authoritative save. The route requires `x-chat-id`,
-  rejects bare stubs, heals hybrid `_stub` payloads, transfers ownership of binary request
-  Buffers to the writer, and returns the digest computed from those written bytes without
+  rejects bare stubs, heals hybrid `_stub` payloads, and returns the digest computed during
+  the staged row's chunk-plan pass without
   a committed-row reread. It schedules the coalesced automatic snapshot only after
   acknowledging the row and never joins the five-second database debounce. During active
   generation the client row stage writes the first eligible dirty save, throttles later
