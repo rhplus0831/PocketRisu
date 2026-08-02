@@ -327,8 +327,13 @@ describe('AA3 atomic plugin storage batch', () => {
   })
 
   test('bulk transitions discard the parsed manifest selected by the prior generation', async () => {
-    const { client } = await boot()
+    const { server, client } = await boot()
     const before = await readManifest(client)
+    const initialViewer = await client.fetch('/api/plugin-storage/viewer-page', {
+      headers: { 'x-plugin-storage-generation': STORAGE_GENERATION },
+    })
+    expect(initialViewer.status, await initialViewer.clone().text()).toBe(200)
+    await initialViewer.text()
     const internalGeneration = randomUUID()
     const internalBody = bulkTransitionBody({
       version: 1,
@@ -410,6 +415,29 @@ describe('AA3 atomic plugin storage batch', () => {
       valueKeys: activeManifest.valueKeys,
       metaKeys: activeManifest.metaKeys,
     })
+    const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
+    const valueFacets = sqlite.prepare(`
+      SELECT storage_key, display_size
+        FROM plugin_storage_viewer_value_facets
+       ORDER BY storage_key
+    `).all() as Array<{ storage_key: string; display_size: number }>
+    const owners = sqlite.prepare(`
+      SELECT storage_key, owner FROM plugin_storage_owners ORDER BY storage_key
+    `).all() as Array<{ storage_key: string; owner: string }>
+    const facetRevision = sqlite.prepare(`
+      SELECT source_revision AS sourceRevision, indexed_revision AS indexedRevision
+        FROM plugin_storage_viewer_facet_revision WHERE id = 1
+    `).get() as { sourceRevision: number; indexedRevision: number }
+    sqlite.close()
+    expect(valueFacets).toEqual(keys.map(rawKey => ({
+      storage_key: valueKey(rawKey),
+      display_size: Buffer.byteLength(JSON.stringify(inlineDatabase.pluginCustomStorage[rawKey])),
+    })).sort((left, right) => left.storage_key.localeCompare(right.storage_key)))
+    expect(owners).toEqual(keys.map(rawKey => ({
+      storage_key: ownerKey(rawKey),
+      owner: 'AA3',
+    })).sort((left, right) => left.storage_key.localeCompare(right.storage_key)))
+    expect(facetRevision.indexedRevision).toBe(facetRevision.sourceRevision)
   }, 30_000)
 
   test('maps over-limit logical keys to fixed physical names and removes the mapping atomically', async () => {
@@ -931,6 +959,38 @@ describe('AA3 atomic plugin storage batch', () => {
       metaKeys: [ownerKey(restoredRawKey)],
     })
     expect(restoredManifest.manifest).not.toEqual(activeManifest)
+    const facetDb = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
+    expect(facetDb.prepare(`
+      SELECT storage_key, display_size
+        FROM plugin_storage_viewer_value_facets
+       WHERE storage_key = ?
+    `).get(valueKey(restoredRawKey))).toEqual({
+      storage_key: valueKey(restoredRawKey),
+      display_size: Buffer.byteLength(JSON.stringify({ restored: true })),
+    })
+    expect(facetDb.prepare(`
+      SELECT storage_key, owner FROM plugin_storage_owners WHERE storage_key = ?
+    `).get(ownerKey(restoredRawKey))).toEqual({
+      storage_key: ownerKey(restoredRawKey),
+      owner: 'Restored',
+    })
+    facetDb.close()
+    const viewer = await client.fetch('/api/plugin-storage/viewer-page', {
+      headers: { 'x-plugin-storage-generation': restoredGeneration },
+    })
+    expect(viewer.status, await viewer.clone().text()).toBe(200)
+    const events = (await viewer.text()).trim().split('\n').map(line => JSON.parse(line))
+    expect(events).toContainEqual(expect.objectContaining({
+      event: 'entry',
+      key: restoredRawKey,
+      owner: 'Restored',
+      text: JSON.stringify({ restored: true }),
+      size: Buffer.byteLength(JSON.stringify({ restored: true })),
+    }))
+    // The pre-upgrade seed has no complete display index. Restore maintains
+    // the replacement row transactionally, then the first viewer verifies the
+    // whole selected publication before marking the derivative current.
+    expect(events.at(-1).metrics.sizeValueReads).toBe(1)
   }, 30_000)
 
   test.each([

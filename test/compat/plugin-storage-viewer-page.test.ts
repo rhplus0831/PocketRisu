@@ -157,6 +157,26 @@ async function waitForFile(filePath: string, timeoutMs = 5_000): Promise<void> {
   }
 }
 
+async function waitForJsonFile<T>(
+  filePath: string,
+  predicate: (value: T) => boolean,
+  timeoutMs = 5_000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (existsSync(filePath)) {
+      try {
+        const value = JSON.parse(await readFile(filePath, 'utf-8')) as T
+        if (predicate(value)) return value
+      } catch {
+        // The test-only state file is replaced frequently while requests queue.
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Timed out waiting for matching JSON in ${filePath}`)
+}
+
 describe('PM3 point-in-time plugin storage viewer page', () => {
   test('a real 10k-key publication reads one default 50-row page with deterministic bounds', async () => {
     const server = await spawnServer({
@@ -280,7 +300,153 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
     expect(second.meta.totalBytes).toBe(
       expected - Buffer.byteLength('한글') + replacementSize,
     )
-    expect(second.done.metrics.sizeValueReads).toBe(keys.length)
+    expect(second.done.metrics.sizeValueReads).toBe(0)
+  })
+
+  test('cold and indexed pages are response-identical and the cold page reuses backfill values', async () => {
+    let gateDir = ''
+    const server = await spawnServer({
+      seedSave: async saveDir => {
+        seedViewer(saveDir, 60)
+        gateDir = path.join(path.dirname(saveDir), 'viewer-reuse')
+        await mkdir(gateDir, { recursive: true })
+      },
+      env: { POCKETRISU_TEST_PLUGIN_VIEWER_GATE_DIR: 'viewer-reuse' },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+
+    const cold = await readViewer(await viewer(client, '?page=1'))
+    const coldCounters = JSON.parse(await readFile(
+      path.join(gateDir, 'result.json'),
+      'utf-8',
+    ))
+    expect(coldCounters).toMatchObject({ backfillPasses: 1, pageValueReuses: 10 })
+
+    const indexed = await readViewer(await viewer(client, '?page=1'))
+    expect(indexed.meta).toEqual(cold.meta)
+    expect(indexed.entries).toEqual(cold.entries)
+    expect(indexed.done.pageToken).toBe(cold.done.pageToken)
+    expect(cold.done.metrics.sizeValueReads).toBe(60)
+    expect(indexed.done.metrics.sizeValueReads).toBe(0)
+  })
+
+  test('concurrent cold viewers share one authoritative facet backfill', async () => {
+    let gateDir = ''
+    const server = await spawnServer({
+      seedSave: async saveDir => {
+        seedViewer(saveDir, 250)
+        gateDir = path.join(path.dirname(saveDir), 'viewer-single-flight')
+        await mkdir(gateDir, { recursive: true })
+      },
+      env: { POCKETRISU_TEST_PLUGIN_VIEWER_GATE_DIR: 'viewer-single-flight' },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+
+    const results = await Promise.all(Array.from({ length: 8 }, async (_, index) => (
+      readViewer(await viewer(client, `?page=${index % 5}`))
+    )))
+    expect(results.every(result => result.meta.total === 250)).toBe(true)
+    const counters = JSON.parse(await readFile(path.join(gateDir, 'result.json'), 'utf-8'))
+    expect(counters.backfillPasses).toBe(1)
+  })
+
+  test('missing and falsely-current facets fall back to authority and rebuild without quarantine', async () => {
+    let seeded!: ReturnType<typeof seedViewer>
+    const server = await spawnServer({
+      seedSave: async saveDir => { seeded = seedViewer(saveDir, 4) },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const initial = await readViewer(await viewer(client))
+    expect(initial.entries).toHaveLength(4)
+
+    const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'))
+    sqlite.transaction(() => {
+      sqlite.prepare(
+        'DELETE FROM plugin_storage_viewer_value_facets WHERE storage_key = ?',
+      ).run(valueKey(seeded.keys[0]))
+      sqlite.prepare(
+        'UPDATE plugin_storage_owners SET owner = ? WHERE storage_key = ?',
+      ).run('Wrong owner', ownerKey(seeded.keys[0]))
+      // Simulate an unverifiable maintenance tool falsely claiming the partial
+      // derivative is current. Completeness must still force authority.
+      sqlite.prepare(`
+        UPDATE plugin_storage_viewer_facet_revision
+           SET indexed_revision = source_revision
+         WHERE id = 1
+      `).run()
+    })()
+    sqlite.close()
+
+    const rebuilt = await readViewer(await viewer(client))
+    expect(rebuilt.done.metrics.sizeValueReads).toBe(4)
+    expect(rebuilt.entries[0].owner).toBe('Owner 0')
+    expect(rebuilt.meta.totalBytes).toBe(initial.meta.totalBytes)
+
+    const verified = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
+    const facetKeys = verified.prepare(
+      'SELECT storage_key FROM plugin_storage_viewer_value_facets ORDER BY storage_key',
+    ).all().map((row: any) => row.storage_key)
+    const ownerRows = verified.prepare(
+      'SELECT storage_key, owner FROM plugin_storage_owners ORDER BY storage_key',
+    ).all() as Array<{ storage_key: string; owner: string }>
+    const revision = verified.prepare(`
+      SELECT source_revision AS sourceRevision, indexed_revision AS indexedRevision
+        FROM plugin_storage_viewer_facet_revision WHERE id = 1
+    `).get() as { sourceRevision: number; indexedRevision: number }
+    verified.close()
+    expect(facetKeys).toEqual(seeded.keys.map(valueKey).sort())
+    expect(facetKeys).not.toContain(valueKey('foreign'))
+    expect(ownerRows.find(row => row.storage_key === ownerKey(seeded.keys[0]))?.owner)
+      .toBe('Owner 0')
+    expect(ownerRows.some(row => row.storage_key === ownerKey('foreign'))).toBe(false)
+    expect(revision.indexedRevision).toBe(revision.sourceRevision)
+  })
+
+  test('batch set/remove updates display and owner facets in the publication transaction', async () => {
+    const server = await spawnServer({ seedSave: async saveDir => { seedViewer(saveDir, 2) } })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const initial = await readViewer(await viewer(client))
+    const replacement = { replaced: '한글' }
+    const response = await revisionBatch(client, initial.meta.manifestRevision, [
+      {
+        operation: 'set',
+        key: 'key-00000',
+        value: Buffer.from(JSON.stringify(replacement)).toString('base64'),
+        owner: 'Changed owner',
+      },
+      { operation: 'remove', key: 'key-00001' },
+    ])
+    expect(response.status, await response.clone().text()).toBe(200)
+
+    const result = await readViewer(await viewer(client))
+    expect(result.entries).toEqual([expect.objectContaining({
+      key: 'key-00000',
+      owner: 'Changed owner',
+      text: JSON.stringify(replacement),
+      size: Buffer.byteLength(JSON.stringify(replacement)),
+    })])
+    expect(result.done.metrics.sizeValueReads).toBe(0)
+
+    const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
+    const facets = sqlite.prepare(
+      'SELECT storage_key, display_size FROM plugin_storage_viewer_value_facets ORDER BY storage_key',
+    ).all() as Array<{ storage_key: string; display_size: number }>
+    const owners = sqlite.prepare(
+      'SELECT storage_key, owner FROM plugin_storage_owners ORDER BY storage_key',
+    ).all() as Array<{ storage_key: string; owner: string }>
+    sqlite.close()
+    expect(facets).toEqual([{
+      storage_key: valueKey('key-00000'),
+      display_size: Buffer.byteLength(JSON.stringify(replacement)),
+    }])
+    expect(owners).toEqual([{
+      storage_key: ownerKey('key-00000'),
+      owner: 'Changed owner',
+    }])
   })
 
   test('malformed legacy UTF-16 keys remain distinct and readable', async () => {
@@ -485,8 +651,9 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
     await waitForFile(path.join(gateDir, 'result.json'), 10_000)
     const metrics = JSON.parse(await readFile(path.join(gateDir, 'result.json'), 'utf-8'))
     expect(metrics.aborted).toBe(true)
-    expect(metrics.valueReads).toBeGreaterThan(0)
-    expect(metrics.valueReads).toBeLessThan(50)
+    // Assembly now completes and releases the snapshot before response
+    // backpressure. Disconnecting stops writes, not authoritative reads.
+    expect(metrics.valueReads).toBe(50)
     expect(metrics.ownerReads).toBeLessThanOrEqual(metrics.valueReads)
 
     const mutation = await mutate(client, seeded.keys.slice(0, 1), seeded.manifest, 'after-backpressure')
@@ -520,7 +687,7 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
     await expect(reader.read()).rejects.toMatchObject({ name: 'AbortError' })
     await waitForFile(path.join(gateDir, 'result.json'))
     const metrics = JSON.parse(await readFile(path.join(gateDir, 'result.json'), 'utf-8'))
-    expect(metrics).toMatchObject({ aborted: true, valueReads: 0, ownerReads: 0 })
+    expect(metrics).toMatchObject({ aborted: true, valueReads: 50, ownerReads: 50 })
 
     const mutation = await mutate(client, seeded.keys.slice(0, 1), seeded.manifest, 'after-abort')
     expect(mutation.status).toBe(200)
@@ -585,6 +752,48 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
     const importResponse = await importing
     await importResponse.text()
     expect(importResponse.ok).toBe(false)
+  }, 30_000)
+
+  test('caps pinned viewer snapshots and queues excess requests', async () => {
+    let gateDir = ''
+    const server = await spawnServer({
+      seedSave: async saveDir => {
+        seedViewer(saveDir, 20)
+        gateDir = path.join(path.dirname(saveDir), 'viewer-snapshot-cap')
+        await mkdir(gateDir, { recursive: true })
+        await writeFile(path.join(gateDir, 'snapshot-hold'), '')
+      },
+      env: {
+        POCKETRISU_TEST_PLUGIN_VIEWER_GATE_DIR: 'viewer-snapshot-cap',
+        POCKETRISU_TEST_PLUGIN_VIEWER_SNAPSHOT_CAP: '2',
+      },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+
+    const pending = Array.from({ length: 8 }, (_, index) => (
+      viewer(client, `?page=${index % 2}`)
+    ))
+    const held = await waitForJsonFile<{
+      active: number
+      queued: number
+      maxActive: number
+      cap: number
+    }>(
+      path.join(gateDir, 'snapshot-state.json'),
+      state => state.active === 2 && state.queued >= 1,
+      10_000,
+    )
+    expect(held).toMatchObject({ active: 2, cap: 2, maxActive: 2 })
+    await writeFile(path.join(gateDir, 'snapshot-release'), '')
+    const results = await Promise.all(pending.map(async response => readViewer(await response)))
+    expect(results).toHaveLength(8)
+    const released = await waitForJsonFile<{ active: number; maxActive: number }>(
+      path.join(gateDir, 'snapshot-state.json'),
+      state => state.active === 0,
+      10_000,
+    )
+    expect(released.maxActive).toBe(2)
   }, 30_000)
 
   test('rejects stale generations and page sizes above the hard maximum', async () => {

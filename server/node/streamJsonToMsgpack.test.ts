@@ -6,12 +6,22 @@ import { afterEach, describe, expect, test } from 'vitest'
 import { Unpackr } from 'msgpackr'
 
 const require = createRequire(import.meta.url)
-const { streamJsonFileToMessagePack } = require('./streamJsonToMsgpack.cjs') as {
+const { streamJsonFileToMessagePack, validateJsonSource } = require('./streamJsonToMsgpack.cjs') as {
   streamJsonFileToMessagePack: (
     source: { filePath: string; size: number },
     writer: MemoryWriter,
     options?: { signal?: AbortSignal; shouldAbort?: () => boolean },
   ) => Promise<void>
+  validateJsonSource: (
+    source: { filePath: string; size: number },
+  ) => Promise<{ type: string; length?: number; jsonSize?: number }>
+}
+const { pluginStorageViewerDisplaySizeFromMetadata } = require(
+  './pluginStorageViewerFacets.cjs',
+) as {
+  pluginStorageViewerDisplaySizeFromMetadata: (
+    metadata: { type: string; length?: number; jsonSize?: number },
+  ) => number
 }
 const unpackr = new Unpackr({ int64AsType: 'number', useRecords: false })
 const dirs: string[] = []
@@ -59,6 +69,18 @@ async function transcode(
   return unpackr.decode(writer.value())
 }
 
+async function displaySize(json: string): Promise<number> {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'stream-json-display-size-'))
+  dirs.push(dir)
+  const filePath = path.join(dir, 'row.json')
+  const bytes = Buffer.from(json, 'utf-8')
+  await writeFile(filePath, bytes)
+  return pluginStorageViewerDisplaySizeFromMetadata(await validateJsonSource({
+    filePath,
+    size: bytes.length,
+  }))
+}
+
 describe('streaming JSON to MessagePack', () => {
   test('matches JSON scalar, nested, duplicate-key, and numeric semantics', async () => {
     const json = '{"a":1,"a":2,"array":[true,false,null,-0,1.5e2],"nested":{"2":"b","1":"a"}}'
@@ -84,6 +106,25 @@ describe('streaming JSON to MessagePack', () => {
   test('streams a string whose escape crosses the 64 KiB input page', async () => {
     const json = `"${'x'.repeat(64 * 1024 - 2)}\\ud83d\\ude00-tail"`
     expect(await transcode(json)).toBe(JSON.parse(json))
+  })
+
+  test('derives exact viewer display sizes while streaming strict JSON', async () => {
+    const rows = [
+      String.raw`"한글\n\ud800"`,
+      'null',
+      '  { "escaped": "quote-\\\"-slash-\\\\", "lone": "\\ud800", "n": 1e2 }  ',
+      String.raw`["😀","\ud83d\ude00","\u0000","\b"]`,
+      String.raw`{"a":"discarded","a":1,"nested":{"\ud800":true,"\ud800":"last"}}`,
+      String.raw`{"\ud800":true,"�":"last"}`,
+      '-0',
+    ]
+    for (const row of rows) {
+      const value = await transcode(row)
+      const text = typeof value === 'string'
+        ? value
+        : value === null ? '' : JSON.stringify(value)
+      expect(await displaySize(row), row).toBe(Buffer.byteLength(text, 'utf-8'))
+    }
   })
 
   test('rejects malformed and non-finite plugin JSON numbers', async () => {

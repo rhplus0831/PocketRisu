@@ -44,6 +44,7 @@ const { kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList,
         kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
         kvGetListEpoch, kvBumpListEpoch,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, createKvSnapshot,
+        rebuildPluginStorageViewerFacets,
         getPluginStorageMutationVersion, withPluginStorageQuotaPlan,
         isLegacyHexMigrationComplete, markLegacyHexMigrationComplete,
         publishLegacyHexMigrationMarker,
@@ -132,6 +133,11 @@ const {
     scanMcpToolCallIdsFromFile,
 } = require('./mcpToolCallRecovery.cjs');
 const { validateJsonSource } = require('./streamJsonToMsgpack.cjs');
+const {
+    pluginStorageViewerDisplaySize,
+    pluginStorageViewerDisplaySizeFromMetadata,
+    pluginStorageViewerValueText,
+} = require('./pluginStorageViewerFacets.cjs');
 const {
     convertBlockRisuSaveToMessagePack,
     readBlockRisuSaveTopLevelFields,
@@ -3915,12 +3921,17 @@ async function validateAndImportPluginValueFile(
         decodeValidatedPluginStorageKey(key, PLUGIN_SAVE_PREFIX);
     }
     const valueMaxBytes = Math.min(maxBytes, PLUGIN_VALUE_MAX_BYTES);
+    let displayMetadata;
     try {
         await validateJsonFileStreaming(source.filePath, {
             size: source.size,
             maxBytes: valueMaxBytes,
             signal,
         });
+        displayMetadata = await validateJsonSource({
+            filePath: source.filePath,
+            size: source.size,
+        }, { signal });
     } catch (error) {
         if (error?.code === 'INVALID_PLUGIN_STORAGE_ROW') {
             throw new PluginStorageValidationError(key);
@@ -3928,7 +3939,11 @@ async function validateAndImportPluginValueFile(
         throw error;
     }
     throwIfImportAborted(signal);
-    kvSetFromFile(key, source.filePath);
+    kvSetFromFile(key, source.filePath, {
+        pluginStorageDisplaySize: pluginStorageViewerDisplaySizeFromMetadata(
+            displayMetadata,
+        ),
+    });
 }
 
 async function validateAndImportPluginMetadataFile(
@@ -10334,14 +10349,536 @@ app.get('/api/storage/capacity', async (req, res, next) => {
 // the viewer reports UTF-8 bytes of each decoded logical value. Cache that
 // exact aggregate until a low-level plugin-value mutation invalidates it.
 let pluginStorageViewerTotalSizeCache = null;
+const PLUGIN_STORAGE_VIEWER_SNAPSHOT_CAP = process.env.NODE_ENV === 'test'
+    ? Math.max(1, Math.min(8, Number.parseInt(
+        process.env.POCKETRISU_TEST_PLUGIN_VIEWER_SNAPSHOT_CAP ?? '2',
+        10,
+    ) || 2))
+    : 2;
+let pluginStorageViewerActiveSnapshots = 0;
+let pluginStorageViewerMaxActiveSnapshots = 0;
+const pluginStorageViewerSnapshotWaiters = [];
+const pluginStorageViewerBackfills = new Map();
+const pluginStorageViewerTestCounters = {
+    backfillPasses: 0,
+    pageValueReuses: 0,
+};
 
-function pluginStorageViewerValueText(value) {
-    if (typeof value === 'string') return value;
-    if (value === null || value === undefined) return '';
-    return JSON.stringify(value);
+async function reportPluginStorageViewerSnapshotState() {
+    if (!pluginStorageViewerTestGateDir) return;
+    await reportPluginStorageViewerTestProgress({
+        active: pluginStorageViewerActiveSnapshots,
+        queued: pluginStorageViewerSnapshotWaiters.length,
+        maxActive: pluginStorageViewerMaxActiveSnapshots,
+        cap: PLUGIN_STORAGE_VIEWER_SNAPSHOT_CAP,
+        ...pluginStorageViewerTestCounters,
+    }, 'snapshot-state.json');
 }
 
-app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
+function releasePluginStorageViewerSnapshotSlot() {
+    pluginStorageViewerActiveSnapshots = Math.max(0, pluginStorageViewerActiveSnapshots - 1);
+    while (pluginStorageViewerSnapshotWaiters.length > 0) {
+        const waiter = pluginStorageViewerSnapshotWaiters.shift();
+        if (waiter.signal?.aborted) continue;
+        waiter.signal?.removeEventListener('abort', waiter.onAbort);
+        pluginStorageViewerActiveSnapshots += 1;
+        pluginStorageViewerMaxActiveSnapshots = Math.max(
+            pluginStorageViewerMaxActiveSnapshots,
+            pluginStorageViewerActiveSnapshots,
+        );
+        waiter.resolve(releasePluginStorageViewerSnapshotSlot);
+        break;
+    }
+    reportPluginStorageViewerSnapshotState().catch(() => {});
+}
+
+function acquirePluginStorageViewerSnapshotSlot(signal) {
+    throwIfSignalAborted(signal);
+    if (pluginStorageViewerActiveSnapshots < PLUGIN_STORAGE_VIEWER_SNAPSHOT_CAP) {
+        pluginStorageViewerActiveSnapshots += 1;
+        pluginStorageViewerMaxActiveSnapshots = Math.max(
+            pluginStorageViewerMaxActiveSnapshots,
+            pluginStorageViewerActiveSnapshots,
+        );
+        reportPluginStorageViewerSnapshotState().catch(() => {});
+        return Promise.resolve(releasePluginStorageViewerSnapshotSlot);
+    }
+    return new Promise((resolve, reject) => {
+        const waiter = {
+            signal,
+            resolve,
+            reject,
+            onAbort: null,
+        };
+        waiter.onAbort = () => {
+            const index = pluginStorageViewerSnapshotWaiters.indexOf(waiter);
+            if (index >= 0) pluginStorageViewerSnapshotWaiters.splice(index, 1);
+            reject(signal.reason instanceof Error
+                ? signal.reason
+                : new DOMException('Plugin storage viewer cancelled', 'AbortError'));
+            reportPluginStorageViewerSnapshotState().catch(() => {});
+        };
+        signal?.addEventListener('abort', waiter.onAbort, { once: true });
+        pluginStorageViewerSnapshotWaiters.push(waiter);
+        reportPluginStorageViewerSnapshotState().catch(() => {});
+    });
+}
+
+async function waitAtPluginStorageViewerSnapshotTestGate(isClosed) {
+    if (!pluginStorageViewerTestGateDir) return;
+    const holdPath = path.join(pluginStorageViewerTestGateDir, 'snapshot-hold');
+    if (!existsSync(holdPath)) return;
+    await fs.mkdir(pluginStorageViewerTestGateDir, { recursive: true });
+    await fs.writeFile(
+        path.join(pluginStorageViewerTestGateDir, 'snapshot-entered'),
+        'snapshot-pinned',
+        'utf-8',
+    );
+    await reportPluginStorageViewerSnapshotState();
+    const releasePath = path.join(pluginStorageViewerTestGateDir, 'snapshot-release');
+    while (!isClosed() && existsSync(holdPath) && !existsSync(releasePath)) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+}
+
+function closePluginStorageViewerContext(context) {
+    if (!context || context.closed) return;
+    context.closed = true;
+    context.snapshot?.close();
+    context.releaseSnapshotSlot?.();
+}
+
+function pluginStorageViewerParseOne(metrics, operation) {
+    metrics.activeRowParses += 1;
+    metrics.maxRowParses = Math.max(metrics.maxRowParses, metrics.activeRowParses);
+    try {
+        return operation();
+    } finally {
+        metrics.activeRowParses -= 1;
+    }
+}
+
+function pluginStorageViewerOwner(record) {
+    return record
+        && typeof record.plugin === 'string'
+        && record.plugin.length > 0
+        && record.plugin.isWellFormed()
+        ? record.plugin
+        : null;
+}
+
+function selectPluginStorageViewerRows(context, options, ownerByStorageKey = null) {
+    const normalizedQuery = options.keyQuery.toLowerCase();
+    const keyMatchedValues = context.authoritativeValues
+        .filter(({ key }) => !normalizedQuery || key.toLowerCase().includes(normalizedQuery))
+        .sort((left, right) => comparePluginStorageRecordKeys(left.key, right.key));
+    const candidateOwnerStorageKeys = keyMatchedValues
+        .map(({ key }) => encodePluginSaveStorageKey(key, PLUGIN_SAVE_META_PREFIX))
+        .filter((storageKey) => (
+            context.manifestMeta.has(storageKey) && context.physicalMeta.has(storageKey)
+        ));
+    let ownerFacets;
+    let matchingOwnerStorageKeys = null;
+    if (ownerByStorageKey) {
+        const counts = new Map();
+        for (const storageKey of candidateOwnerStorageKeys) {
+            const owner = ownerByStorageKey.get(storageKey);
+            if (owner !== undefined) counts.set(owner, (counts.get(owner) ?? 0) + 1);
+        }
+        ownerFacets = [...counts]
+            .map(([owner, count]) => ({ owner, count }))
+            .sort((left, right) => left.owner < right.owner ? -1 : left.owner > right.owner ? 1 : 0);
+        if (options.ownerQueryValue !== undefined || options.unknownOwner) {
+            matchingOwnerStorageKeys = new Set(candidateOwnerStorageKeys.filter((storageKey) => {
+                const owner = ownerByStorageKey.get(storageKey);
+                return options.ownerQueryValue !== undefined
+                    ? owner === options.ownerQuery
+                    : owner !== undefined;
+            }));
+        }
+    } else {
+        ownerFacets = context.snapshot.viewerOwnerFacets(candidateOwnerStorageKeys)
+            .sort((left, right) => left.owner < right.owner ? -1 : left.owner > right.owner ? 1 : 0);
+        if (options.ownerQueryValue !== undefined || options.unknownOwner) {
+            matchingOwnerStorageKeys = new Set(context.snapshot.viewerOwnerKeys(
+                candidateOwnerStorageKeys,
+                options.ownerQueryValue !== undefined ? options.ownerQuery : null,
+            ));
+        }
+    }
+    const knownOwnerCount = ownerFacets.reduce((sum, facet) => sum + facet.count, 0);
+    const unknownOwnerCount = keyMatchedValues.length - knownOwnerCount;
+    const ownedValues = keyMatchedValues.filter(({ key }) => {
+        const ownerStorageKey = encodePluginSaveStorageKey(key, PLUGIN_SAVE_META_PREFIX);
+        if (options.unknownOwner) return !matchingOwnerStorageKeys.has(ownerStorageKey);
+        if (options.ownerQueryValue !== undefined) {
+            return matchingOwnerStorageKeys.has(ownerStorageKey);
+        }
+        return true;
+    });
+    const total = ownedValues.length;
+    const pageCount = Math.max(1, Math.ceil(total / options.pageSize));
+    const boundedPage = Math.min(options.page, pageCount - 1);
+    const pageRows = ownedValues.slice(
+        boundedPage * options.pageSize,
+        Math.min(total, (boundedPage + 1) * options.pageSize),
+    );
+    return {
+        ownerFacets,
+        unknownOwnerCount,
+        ownerFacetTotal: keyMatchedValues.length,
+        total,
+        pageCount,
+        boundedPage,
+        pageRows,
+    };
+}
+
+function pluginStorageViewerEntry(context, descriptor, valueBytes, value, ownerBytes) {
+    const ownerRecord = ownerBytes === null
+        ? null
+        : pluginStorageViewerParseOne(
+            context.metrics,
+            () => parsePluginStorageOwnerRecord(ownerBytes),
+        );
+    const owner = pluginStorageViewerOwner(ownerRecord);
+    const text = pluginStorageViewerValueText(value);
+    const valueType = value === null
+        ? 'object'
+        : value === undefined || text === ''
+            ? 'empty'
+            : Array.isArray(value)
+                ? 'array'
+                : typeof value;
+    const revision = pluginStorageRevision(valueBytes, ownerBytes);
+    const size = Buffer.byteLength(text, 'utf-8');
+    const contentHash = `sha256:${sha256Hex(Buffer.from(JSON.stringify([
+        descriptor.key,
+        owner,
+        text,
+        size,
+        valueType,
+        revision,
+    ]), 'utf-8'))}`;
+    return {
+        event: 'entry',
+        key: descriptor.key,
+        owner,
+        text,
+        size,
+        valueType,
+        revision,
+        contentHash,
+    };
+}
+
+async function assemblePluginStorageViewerEntries(
+    context,
+    pageRows,
+    isClosed,
+    reusedValues = new Map(),
+) {
+    const entries = [];
+    for (const descriptor of pageRows) {
+        await new Promise((resolve) => setImmediate(resolve));
+        throwIfSignalAborted(context.signal);
+        if (isClosed()) throw context.signal.reason;
+        let retained = reusedValues.get(descriptor.storageKey);
+        if (!retained) {
+            const valueBytes = context.snapshot.kvGet(descriptor.storageKey);
+            context.metrics.valueReads += 1;
+            if (valueBytes === null) {
+                throw pluginStorageNamespaceConflict(
+                    'A plugin storage viewer row disappeared from its pinned snapshot',
+                );
+            }
+            retained = {
+                valueBytes,
+                value: pluginStorageViewerParseOne(
+                    context.metrics,
+                    () => validatePluginStorageRow(descriptor.storageKey, valueBytes),
+                ),
+            };
+        }
+        const ownerStorageKey = encodePluginSaveStorageKey(
+            descriptor.key,
+            PLUGIN_SAVE_META_PREFIX,
+        );
+        let ownerBytes = null;
+        if (context.manifestMeta.has(ownerStorageKey)
+            && context.physicalMeta.has(ownerStorageKey)) {
+            ownerBytes = context.snapshot.kvGet(ownerStorageKey);
+            context.metrics.ownerReads += 1;
+        }
+        entries.push(pluginStorageViewerEntry(
+            context,
+            descriptor,
+            retained.valueBytes,
+            retained.value,
+            ownerBytes,
+        ));
+        await reportPluginStorageViewerTestProgress(context.metrics);
+    }
+    return entries;
+}
+
+function finalizePluginStorageViewerAssembly(context, options, selection, totalBytes, entries) {
+    const pageTokenEntries = entries.map((entry) => [entry.key, entry.contentHash]);
+    const pageTokenMaterial = JSON.stringify([
+        'pocketrisu-plugin-storage-viewer-page-v2',
+        context.generation,
+        context.manifestState.revision,
+        context.databaseRevision,
+        selection.boundedPage,
+        options.pageSize,
+        options.keyQuery,
+        options.ownerQueryValue === undefined ? null : options.ownerQuery,
+        options.unknownOwner,
+        selection.ownerFacets.map((facet) => [facet.owner, facet.count]),
+        selection.unknownOwnerCount,
+        pageTokenEntries,
+    ]);
+    return {
+        meta: {
+            event: 'meta',
+            version: 1,
+            generation: context.generation,
+            manifestRevision: context.manifestState.revision,
+            databaseRevision: context.databaseRevision,
+            page: selection.boundedPage,
+            pageSize: options.pageSize,
+            pageCount: selection.pageCount,
+            total: selection.total,
+            totalBytes,
+            ownerFacets: selection.ownerFacets,
+            unknownOwnerCount: selection.unknownOwnerCount,
+            ownerFacetTotal: selection.ownerFacetTotal,
+        },
+        entries,
+        done: {
+            event: 'done',
+            pageToken: `sha256:${sha256Hex(Buffer.from(pageTokenMaterial, 'utf-8'))}`,
+            metrics: {
+                manifestParses: context.metrics.manifestParses,
+                valueReads: context.metrics.valueReads,
+                sizeValueReads: context.metrics.sizeValueReads,
+                ownerReads: context.metrics.ownerReads,
+                maxRowParses: context.metrics.maxRowParses,
+            },
+        },
+    };
+}
+
+async function pinPluginStorageViewerContext(req, requestedGeneration, signal, isClosed, metrics) {
+    const releaseSnapshotSlot = await acquirePluginStorageViewerSnapshotSlot(signal);
+    let snapshot = null;
+    try {
+        const pinned = await queueStorageReadAfterImports(async () => {
+            await flushPendingDb();
+            throwIfSignalAborted(signal);
+            return {
+                snapshot: createKvSnapshot(),
+                mutationVersion: getPluginStorageMutationVersion(),
+            };
+        }, signal);
+        snapshot = pinned.snapshot;
+        await waitAtPluginStorageViewerSnapshotTestGate(isClosed);
+        throwIfSignalAborted(signal);
+        const rawDatabase = snapshot.kvGet('database/database.bin');
+        const dbObj = rawDatabase ? await decodeAuthoritativeRisuSave(rawDatabase, {
+            resolveRemote: async (name) => snapshot.kvGet(`remotes/${name}.local.bin`) || null,
+        }) : null;
+        const generation = pluginStorageGeneration(dbObj);
+        const manifestState = readPluginStorageManifestState(snapshot.kvGet);
+        metrics.manifestParses = 1;
+        const pinnedState = sessionPluginStorageReadState(req);
+        const activeManifest = generation
+            && dbObj?.optimizePluginMemory === true
+            && manifestState.valid
+            && manifestState.manifest?.generation === generation
+            ? manifestState.manifest
+            : null;
+        if (generation !== requestedGeneration
+            || !activeManifest
+            || (pinnedState && (
+                pinnedState.optimized !== true
+                || pinnedState.generation !== requestedGeneration
+            ))) {
+            throw pluginStorageNamespaceConflict(
+                'Plugin storage generation changed before the viewer page could be read',
+            );
+        }
+        const physicalValues = new Set(snapshot.kvList(PLUGIN_SAVE_PREFIX));
+        const physicalMeta = new Set(snapshot.kvList(PLUGIN_SAVE_META_PREFIX));
+        const authoritativeValues = activeManifest.valueKeys
+            .filter((storageKey) => physicalValues.has(storageKey))
+            .map((storageKey) => ({
+                storageKey,
+                key: decodeManifestPluginSaveStorageKey(
+                    activeManifest,
+                    storageKey,
+                    PLUGIN_SAVE_PREFIX,
+                ),
+            }));
+        return {
+            snapshot,
+            releaseSnapshotSlot,
+            closed: false,
+            signal,
+            metrics,
+            mutationVersion: pinned.mutationVersion,
+            rawDatabase,
+            databaseRevision: computeBufferEtag(rawDatabase),
+            generation,
+            manifestState,
+            activeManifest,
+            authoritativeValues,
+            physicalMeta,
+            manifestMeta: new Set(activeManifest.metaKeys),
+            facetState: snapshot.viewerFacetState(),
+        };
+    } catch (error) {
+        snapshot?.close();
+        releaseSnapshotSlot();
+        throw error;
+    }
+}
+
+function pluginStorageViewerTotalCacheMatches(context) {
+    const cached = pluginStorageViewerTotalSizeCache;
+    return cached
+        && cached.generation === context.generation
+        && cached.manifestRevision === context.manifestState.revision
+        && cached.mutationVersion === context.mutationVersion
+        && cached.sourceRevision === context.facetState.sourceRevision;
+}
+
+async function assemblePluginStorageViewerFromFacets(context, options, isClosed) {
+    if (!context.facetState.current) return null;
+    const storageKeys = context.authoritativeValues.map((row) => row.storageKey);
+    const summary = context.snapshot.viewerValueFacetSummary(storageKeys);
+    if (summary.count !== storageKeys.length
+        || !Number.isSafeInteger(summary.totalBytes)
+        || summary.totalBytes < 0) return null;
+    const totalBytes = pluginStorageViewerTotalCacheMatches(context)
+        ? pluginStorageViewerTotalSizeCache.totalBytes
+        : summary.totalBytes;
+    if (!pluginStorageViewerTotalCacheMatches(context)) {
+        pluginStorageViewerTotalSizeCache = {
+            generation: context.generation,
+            manifestRevision: context.manifestState.revision,
+            mutationVersion: context.mutationVersion,
+            sourceRevision: context.facetState.sourceRevision,
+            totalBytes,
+        };
+    }
+    const selection = selectPluginStorageViewerRows(context, options);
+    const entries = await assemblePluginStorageViewerEntries(
+        context,
+        selection.pageRows,
+        isClosed,
+    );
+    const pageFacets = new Map(context.snapshot.viewerValueFacets(
+        selection.pageRows.map((row) => row.storageKey),
+    ).map((facet) => [facet.storageKey, facet.displaySize]));
+    if (entries.some((entry, index) => (
+        pageFacets.get(selection.pageRows[index].storageKey) !== entry.size
+    ))) return null;
+    return finalizePluginStorageViewerAssembly(
+        context,
+        options,
+        selection,
+        totalBytes,
+        entries,
+    );
+}
+
+async function backfillPluginStorageViewerFacets(context, options, isClosed) {
+    pluginStorageViewerTestCounters.backfillPasses += 1;
+    await reportPluginStorageViewerSnapshotState();
+    const ownerByStorageKey = new Map();
+    const rebuiltOwners = [];
+    for (const storageKey of context.activeManifest.metaKeys) {
+        if (!context.physicalMeta.has(storageKey)) continue;
+        await new Promise((resolve) => setImmediate(resolve));
+        throwIfSignalAborted(context.signal);
+        if (isClosed()) throw context.signal.reason;
+        const bytes = context.snapshot.kvGet(storageKey);
+        const owner = pluginStorageViewerOwner(parsePluginStorageOwnerRecord(bytes));
+        if (owner !== null) {
+            ownerByStorageKey.set(storageKey, owner);
+            rebuiltOwners.push({ storageKey, owner });
+        }
+    }
+    const selection = selectPluginStorageViewerRows(context, options, ownerByStorageKey);
+    const pageKeys = new Set(selection.pageRows.map((row) => row.storageKey));
+    const reusedValues = new Map();
+    const rebuiltValues = [];
+    let totalBytes = 0;
+    for (const descriptor of context.authoritativeValues) {
+        await new Promise((resolve) => setImmediate(resolve));
+        throwIfSignalAborted(context.signal);
+        if (isClosed()) throw context.signal.reason;
+        const valueBytes = context.snapshot.kvGet(descriptor.storageKey);
+        context.metrics.sizeValueReads += 1;
+        if (valueBytes === null) {
+            throw pluginStorageNamespaceConflict(
+                'A plugin storage viewer size row disappeared from its pinned snapshot',
+            );
+        }
+        const value = pluginStorageViewerParseOne(
+            context.metrics,
+            () => validatePluginStorageRow(descriptor.storageKey, valueBytes),
+        );
+        const displaySize = pluginStorageViewerDisplaySize(value);
+        totalBytes += displaySize;
+        if (!Number.isSafeInteger(totalBytes)) {
+            throw new RangeError('Plugin storage viewer total size exceeds the safe integer range');
+        }
+        rebuiltValues.push({ storageKey: descriptor.storageKey, displaySize });
+        if (pageKeys.has(descriptor.storageKey)) {
+            reusedValues.set(descriptor.storageKey, { valueBytes, value });
+            context.metrics.valueReads += 1;
+            pluginStorageViewerTestCounters.pageValueReuses += 1;
+        }
+    }
+    let publication = null;
+    try {
+        publication = rebuildPluginStorageViewerFacets(
+            context.facetState.sourceRevision,
+            rebuiltValues,
+            rebuiltOwners,
+        );
+    } catch (error) {
+        logger.warn('[PluginStorage] Viewer facet rebuild was not published:', error);
+    }
+    if (publication?.published
+        && getPluginStorageMutationVersion() === context.mutationVersion) {
+        pluginStorageViewerTotalSizeCache = {
+            generation: context.generation,
+            manifestRevision: context.manifestState.revision,
+            mutationVersion: context.mutationVersion,
+            sourceRevision: publication.state.sourceRevision,
+            totalBytes,
+        };
+    }
+    const entries = await assemblePluginStorageViewerEntries(
+        context,
+        selection.pageRows,
+        isClosed,
+        reusedValues,
+    );
+    await reportPluginStorageViewerSnapshotState();
+    return finalizePluginStorageViewerAssembly(
+        context,
+        options,
+        selection,
+        totalBytes,
+        entries,
+    );
+}
+
+async function handlePluginStorageViewerPage(req, res, next) {
     if (!await checkAuth(req, res)) return;
     const firstHeader = (value) => Array.isArray(value) ? value[0] : value;
     const requestedGeneration = firstHeader(req.headers['x-plugin-storage-generation']);
@@ -10374,18 +10911,26 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
         });
     }
 
-    let snapshot = null;
-    let snapshotMutationVersion = 0;
-    let closed = false;
-    let completed = false;
-    const requestAbort = new AbortController();
+    const options = {
+        page,
+        pageSize,
+        keyQuery,
+        ownerQuery,
+        ownerQueryValue,
+        unknownOwner,
+    };
     const metrics = {
         manifestParses: 0,
         valueReads: 0,
         sizeValueReads: 0,
         ownerReads: 0,
         maxRowParses: 0,
+        activeRowParses: 0,
     };
+    let context = null;
+    let completed = false;
+    let closed = false;
+    const requestAbort = new AbortController();
     const isClosed = () => closed || req.aborted || res.destroyed;
     const onClose = () => {
         if (!completed) {
@@ -10396,257 +10941,96 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
     req.once('aborted', onClose);
     res.once('close', onClose);
     try {
-        // Pin the SQLite view while holding the ordinary import/read queue only
-        // long enough to flush and open it. Row streaming happens outside the
-        // queue, so a slow or abandoned viewer cannot block PM4 mutations.
-        const pinned = await queueStorageReadAfterImports(async () => {
-            await flushPendingDb();
-            throwIfSignalAborted(requestAbort.signal);
-            return {
-                snapshot: createKvSnapshot(),
-                mutationVersion: getPluginStorageMutationVersion(),
-            };
-        }, requestAbort.signal);
-        snapshot = pinned.snapshot;
-        snapshotMutationVersion = pinned.mutationVersion;
-        if (isClosed()) return;
-
-        const rawDatabase = snapshot.kvGet('database/database.bin');
-        const dbObj = rawDatabase ? await decodeAuthoritativeRisuSave(rawDatabase, {
-            resolveRemote: async (name) => snapshot.kvGet(`remotes/${name}.local.bin`) || null,
-        }) : null;
-        const generation = pluginStorageGeneration(dbObj);
-        const manifestState = readPluginStorageManifestState(snapshot.kvGet);
-        metrics.manifestParses = 1;
-        const pinnedState = sessionPluginStorageReadState(req);
-        const activeManifest = generation
-            && dbObj?.optimizePluginMemory === true
-            && manifestState.valid
-            && manifestState.manifest?.generation === generation
-            ? manifestState.manifest
-            : null;
-        if (generation !== requestedGeneration
-            || !activeManifest
-            || (pinnedState && (
-                pinnedState.optimized !== true
-                || pinnedState.generation !== requestedGeneration
-            ))) {
-            throw pluginStorageNamespaceConflict(
-                'Plugin storage generation changed before the viewer page could be read',
+        let assembly = null;
+        for (let attempt = 0; attempt < 4 && !assembly; attempt++) {
+            context = await pinPluginStorageViewerContext(
+                req,
+                requestedGeneration,
+                requestAbort.signal,
+                isClosed,
+                metrics,
             );
-        }
-
-        const physicalValues = new Set(snapshot.kvList(PLUGIN_SAVE_PREFIX));
-        const physicalMeta = new Set(snapshot.kvList(PLUGIN_SAVE_META_PREFIX));
-        const manifestMeta = new Set(activeManifest.metaKeys);
-        const normalizedQuery = keyQuery.toLowerCase();
-        const authoritativeValues = activeManifest.valueKeys
-            .filter((storageKey) => physicalValues.has(storageKey))
-            .map((storageKey) => ({
-                storageKey,
-                key: decodeManifestPluginSaveStorageKey(
-                    activeManifest,
-                    storageKey,
-                    PLUGIN_SAVE_PREFIX,
-                ),
-            }));
-        const keyMatchedValues = authoritativeValues
-            .filter(({ key }) => !normalizedQuery || key.toLowerCase().includes(normalizedQuery))
-            .sort((left, right) => comparePluginStorageRecordKeys(left.key, right.key));
-        const candidateOwnerStorageKeys = keyMatchedValues
-            .map(({ key }) => encodePluginSaveStorageKey(key, PLUGIN_SAVE_META_PREFIX))
-            .filter((storageKey) => manifestMeta.has(storageKey) && physicalMeta.has(storageKey));
-        const ownerFacets = snapshot.kvListPluginStorageOwnerFacets(candidateOwnerStorageKeys)
-            .sort((left, right) => left.owner < right.owner ? -1 : left.owner > right.owner ? 1 : 0);
-        const knownOwnerCount = ownerFacets.reduce((sum, facet) => sum + facet.count, 0);
-        const unknownOwnerCount = keyMatchedValues.length - knownOwnerCount;
-        const matchingOwnerStorageKeys = ownerQueryValue !== undefined || unknownOwner
-            ? new Set(snapshot.kvListPluginStorageOwnerKeys(
-                candidateOwnerStorageKeys,
-                ownerQueryValue !== undefined ? ownerQuery : null,
-            ))
-            : null;
-        const ownedValues = keyMatchedValues.filter(({ key }) => (
-            unknownOwner
-                ? !matchingOwnerStorageKeys.has(encodePluginSaveStorageKey(
-                    key,
-                    PLUGIN_SAVE_META_PREFIX,
-                ))
-                : ownerQueryValue !== undefined
-                    ? matchingOwnerStorageKeys.has(encodePluginSaveStorageKey(
-                        key,
-                        PLUGIN_SAVE_META_PREFIX,
-                    ))
-                    : true
-        ));
-        const total = ownedValues.length;
-        const pageCount = Math.max(1, Math.ceil(total / pageSize));
-        const boundedPage = Math.min(page, pageCount - 1);
-        const pageRows = ownedValues.slice(
-            boundedPage * pageSize,
-            Math.min(total, (boundedPage + 1) * pageSize),
-        );
-        const databaseRevision = computeBufferEtag(rawDatabase);
-        const pageTokenEntries = [];
-        let activeRowParses = 0;
-        const parseOneRow = (operation) => {
-            activeRowParses += 1;
-            metrics.maxRowParses = Math.max(metrics.maxRowParses, activeRowParses);
-            try {
-                return operation();
-            } finally {
-                activeRowParses -= 1;
+            assembly = await assemblePluginStorageViewerFromFacets(
+                context,
+                options,
+                isClosed,
+            );
+            if (assembly) {
+                closePluginStorageViewerContext(context);
+                context = null;
+                break;
             }
-        };
+
+            const backfillKey = JSON.stringify([
+                context.generation,
+                context.manifestState.revision,
+                context.databaseRevision,
+                context.facetState.sourceRevision,
+                context.mutationVersion,
+            ]);
+            const existing = pluginStorageViewerBackfills.get(backfillKey);
+            if (existing) {
+                closePluginStorageViewerContext(context);
+                context = null;
+                try {
+                    await existing;
+                } catch (error) {
+                    if (isClosed()) return;
+                    if (attempt === 3) throw error;
+                }
+                continue;
+            }
+
+            const backfillContext = context;
+            context = null;
+            const backfill = backfillPluginStorageViewerFacets(
+                backfillContext,
+                options,
+                isClosed,
+            ).finally(() => {
+                closePluginStorageViewerContext(backfillContext);
+                if (pluginStorageViewerBackfills.get(backfillKey) === backfill) {
+                    pluginStorageViewerBackfills.delete(backfillKey);
+                }
+            });
+            pluginStorageViewerBackfills.set(backfillKey, backfill);
+            assembly = await backfill;
+        }
+        if (!assembly) {
+            throw new Error('Plugin storage viewer facets could not be verified');
+        }
+        if (isClosed()) return;
 
         res.status(200);
         res.setHeader('content-type', 'application/x-ndjson; charset=utf-8');
         res.setHeader('cache-control', 'no-store');
         res.setHeader('x-accel-buffering', 'no');
         res.flushHeaders();
-        let totalBytes;
-        const cachedTotal = pluginStorageViewerTotalSizeCache;
-        if (cachedTotal
-            && cachedTotal.generation === generation
-            && cachedTotal.manifestRevision === manifestState.revision
-            && cachedTotal.mutationVersion === snapshotMutationVersion) {
-            totalBytes = cachedTotal.totalBytes;
-        } else {
-            totalBytes = 0;
-            for (const descriptor of authoritativeValues) {
-                await new Promise((resolve) => setImmediate(resolve));
-                if (isClosed()) return;
-                const valueBytes = snapshot.kvGet(descriptor.storageKey);
-                metrics.sizeValueReads += 1;
-                if (valueBytes === null) {
-                    throw pluginStorageNamespaceConflict(
-                        'A plugin storage viewer size row disappeared from its pinned snapshot',
-                    );
-                }
-                const value = parseOneRow(() => (
-                    validatePluginStorageRow(descriptor.storageKey, valueBytes)
-                ));
-                totalBytes += Buffer.byteLength(pluginStorageViewerValueText(value), 'utf-8');
-                if (!Number.isSafeInteger(totalBytes)) {
-                    throw new RangeError('Plugin storage viewer total size exceeds the safe integer range');
-                }
-            }
-            if (getPluginStorageMutationVersion() === snapshotMutationVersion) {
-                pluginStorageViewerTotalSizeCache = {
-                    generation,
-                    manifestRevision: manifestState.revision,
-                    mutationVersion: snapshotMutationVersion,
-                    totalBytes,
-                };
-            }
-        }
-        if (!await writeWithBackpressure(res, `${JSON.stringify({
-            event: 'meta',
-            version: 1,
-            generation,
-            manifestRevision: manifestState.revision,
-            databaseRevision,
-            page: boundedPage,
-            pageSize,
-            pageCount,
-            total,
-            totalBytes,
-            ownerFacets,
-            unknownOwnerCount,
-            ownerFacetTotal: keyMatchedValues.length,
-        })}\n`, isClosed)) return;
+        if (!await writeWithBackpressure(
+            res,
+            `${JSON.stringify(assembly.meta)}\n`,
+            isClosed,
+        )) return;
 
         await waitAtPluginStorageViewerTestGate(isClosed);
-        for (const descriptor of pageRows) {
-            // Yield between rows so a fetch abort is observed before another
-            // value/owner body is touched, even when SQLite reads are hot.
-            await new Promise((resolve) => setImmediate(resolve));
+        for (const entry of assembly.entries) {
             if (isClosed()) return;
-            const valueBytes = snapshot.kvGet(descriptor.storageKey);
-            metrics.valueReads += 1;
-            if (valueBytes === null) {
-                throw pluginStorageNamespaceConflict(
-                    'A plugin storage viewer row disappeared from its pinned snapshot',
-                );
-            }
-            const value = parseOneRow(() => (
-                validatePluginStorageRow(descriptor.storageKey, valueBytes)
-            ));
-            const ownerStorageKey = encodePluginSaveStorageKey(
-                descriptor.key,
-                PLUGIN_SAVE_META_PREFIX,
-            );
-            let ownerBytes = null;
-            let owner = null;
-            if (manifestMeta.has(ownerStorageKey) && physicalMeta.has(ownerStorageKey)) {
-                ownerBytes = snapshot.kvGet(ownerStorageKey);
-                metrics.ownerReads += 1;
-                const ownerRecord = parseOneRow(() => parsePluginStorageOwnerRecord(ownerBytes));
-                if (ownerRecord
-                    && typeof ownerRecord.plugin === 'string'
-                    && ownerRecord.plugin.length > 0
-                    && ownerRecord.plugin.isWellFormed()) {
-                    owner = ownerRecord.plugin;
-                }
-            }
-            await reportPluginStorageViewerTestProgress(metrics);
-            if (isClosed()) return;
-            const text = pluginStorageViewerValueText(value);
-            const valueType = value === null
-                ? 'object'
-                : value === undefined || text === ''
-                    ? 'empty'
-                    : Array.isArray(value)
-                        ? 'array'
-                        : typeof value;
-            const revision = pluginStorageRevision(valueBytes, ownerBytes);
-            const size = Buffer.byteLength(text, 'utf-8');
-            const contentHash = `sha256:${sha256Hex(Buffer.from(JSON.stringify([
-                descriptor.key,
-                owner,
-                text,
-                size,
-                valueType,
-                revision,
-            ]), 'utf-8'))}`;
-            pageTokenEntries.push([descriptor.key, contentHash]);
-            if (!await writeWithBackpressure(res, `${JSON.stringify({
-                event: 'entry',
-                key: descriptor.key,
-                owner,
-                text,
-                size,
-                valueType,
-                revision,
-                contentHash,
-            })}\n`, isClosed, () => reportPluginStorageViewerTestProgress(
-                metrics,
-                'backpressure.json',
-            ))) return;
+            if (!await writeWithBackpressure(
+                res,
+                `${JSON.stringify(entry)}\n`,
+                isClosed,
+                () => reportPluginStorageViewerTestProgress(
+                    metrics,
+                    'backpressure.json',
+                ),
+            )) return;
         }
         if (isClosed()) return;
-        // Canonical JSON arrays make every string boundary injective, including
-        // embedded NUL characters that would collide in delimiter framing.
-        const pageTokenMaterial = JSON.stringify([
-            'pocketrisu-plugin-storage-viewer-page-v2',
-            generation,
-            manifestState.revision,
-            databaseRevision,
-            boundedPage,
-            pageSize,
-            keyQuery,
-            ownerQueryValue === undefined ? null : ownerQuery,
-            unknownOwner,
-            ownerFacets.map((facet) => [facet.owner, facet.count]),
-            unknownOwnerCount,
-            pageTokenEntries,
-        ]);
-        const pageToken = `sha256:${sha256Hex(Buffer.from(pageTokenMaterial, 'utf-8'))}`;
-        if (!await writeWithBackpressure(res, `${JSON.stringify({
-            event: 'done',
-            pageToken,
-            metrics,
-        })}\n`, isClosed)) return;
+        if (!await writeWithBackpressure(
+            res,
+            `${JSON.stringify(assembly.done)}\n`,
+            isClosed,
+        )) return;
         completed = true;
         res.end();
     } catch (error) {
@@ -10672,18 +11056,28 @@ app.get('/api/plugin-storage/viewer-page', async (req, res, next) => {
     } finally {
         req.removeListener('aborted', onClose);
         res.removeListener('close', onClose);
-        snapshot?.close();
+        closePluginStorageViewerContext(context);
         if (pluginStorageViewerTestGateDir) {
             try {
                 await fs.writeFile(
                     path.join(pluginStorageViewerTestGateDir, 'result.json'),
-                    JSON.stringify({ ...metrics, aborted: !completed }),
+                    JSON.stringify({
+                        manifestParses: metrics.manifestParses,
+                        valueReads: metrics.valueReads,
+                        sizeValueReads: metrics.sizeValueReads,
+                        ownerReads: metrics.ownerReads,
+                        maxRowParses: metrics.maxRowParses,
+                        ...pluginStorageViewerTestCounters,
+                        aborted: !completed,
+                    }),
                     'utf-8',
                 );
             } catch {}
         }
     }
-});
+}
+
+app.get('/api/plugin-storage/viewer-page', handlePluginStorageViewerPage);
 
 app.get('/api/plugin-storage/manifest', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
@@ -10911,6 +11305,7 @@ function parsePluginStorageBatchEnvelope(body, { streamed = false } = {}) {
         let valueBytes = null;
         let valueSize;
         let valueHash;
+        let valueDisplaySize = null;
         if (streamed) {
             if (!Number.isSafeInteger(input.valueLength) || input.valueLength < 1) {
                 throw new Error(`Set operation ${index} requires a positive valueLength.`);
@@ -10942,7 +11337,9 @@ function parsePluginStorageBatchEnvelope(body, { streamed = false } = {}) {
             if (!Buffer.from(valueText, 'utf-8').equals(valueBytes)) {
                 throw new Error(`Set operation ${index} value must be valid UTF-8 JSON.`);
             }
-            validatePluginStorageRow(valueKey, valueBytes);
+            valueDisplaySize = pluginStorageViewerDisplaySize(
+                validatePluginStorageRow(valueKey, valueBytes),
+            );
             valueSize = valueBytes.length;
             valueHash = sha256Hex(valueBytes);
         }
@@ -10958,6 +11355,7 @@ function parsePluginStorageBatchEnvelope(body, { streamed = false } = {}) {
             valueFilePath: null,
             valueSize,
             valueHash,
+            valueDisplaySize,
             owner: input.owner,
             hasExpectedRevision,
             expectedRevision: input.expectedRevision,
@@ -11133,12 +11531,15 @@ async function receiveStreamedPluginStorageBatch(req, res) {
                 throw new Error(`Streamed plugin storage batch value ${index} failed its hash check.`);
             }
             try {
-                await validateJsonSource({
+                const displayMetadata = await validateJsonSource({
                     filePath: valueFilePath,
                     size: operation.valueSize,
                 }, {
                     shouldAbort: () => req.aborted || res.destroyed,
                 });
+                operation.valueDisplaySize = pluginStorageViewerDisplaySizeFromMetadata(
+                    displayMetadata,
+                );
             } catch {
                 throw new PluginStorageValidationError(operation.valueKey);
             }
@@ -11385,9 +11786,13 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                         const operation = operations[index];
                         if (operation.operation === 'set') {
                             if (operation.valueFilePath) {
-                                kvSetFromFile(operation.valueKey, operation.valueFilePath);
+                                kvSetFromFile(operation.valueKey, operation.valueFilePath, {
+                                    pluginStorageDisplaySize: operation.valueDisplaySize,
+                                });
                             } else {
-                                kvSet(operation.valueKey, operation.valueBytes);
+                                kvSet(operation.valueKey, operation.valueBytes, {
+                                    pluginStorageDisplaySize: operation.valueDisplaySize,
+                                });
                             }
                             hitPluginStorageBatchFailpoint(`after-value:${index}`);
                             if (operation.owner) {
@@ -11613,6 +12018,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
     let valueFilePath = null;
     let valueHash = null;
     let valueSize = 0;
+    let valueDisplaySize = null;
     try {
         ({ decodedKey: valueKey } = decodeAndCanonicalizeHexPath(filePath));
         const hashedValueKey = isHashedPluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX);
@@ -11666,7 +12072,9 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 valueSize = valueBytes.length;
                 valueHash = sha256Hex(valueBytes);
                 // Match every other optimized plugin row ingress boundary.
-                validatePluginStorageRow(valueKey, valueBytes);
+                valueDisplaySize = pluginStorageViewerDisplaySize(
+                    validatePluginStorageRow(valueKey, valueBytes),
+                );
             }
         } else {
             if (!['', 'preserve'].includes(ownerPolicyHeader)
@@ -11739,12 +12147,15 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
             // Strict validation stays outside the authoritative mutation queue.
             // The subsequent SQLite commit reads chunks directly from the spool.
             try {
-                await validateJsonSource({
+                const displayMetadata = await validateJsonSource({
                     filePath: valueFilePath,
                     size: valueSize,
                 }, {
                     shouldAbort: () => req.aborted || res.destroyed,
                 });
+                valueDisplaySize = pluginStorageViewerDisplaySizeFromMetadata(
+                    displayMetadata,
+                );
             } catch {
                 // Preserve the single-row mutation diagnostic instead of
                 // exposing parser-specific streaming errors to the client.
@@ -11843,8 +12254,16 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
             try {
                 sqliteDb.transaction(() => {
                     if (operation === 'set') {
-                        if (valueFilePath) kvSetFromFile(valueKey, valueFilePath);
-                        else kvSet(valueKey, valueBytes);
+                        if (valueFilePath) {
+                            kvSetFromFile(valueKey, valueFilePath, {
+                                pluginStorageDisplaySize: valueDisplaySize,
+                            });
+                        }
+                        else {
+                            kvSet(valueKey, valueBytes, {
+                                pluginStorageDisplaySize: valueDisplaySize,
+                            });
+                        }
                         hitPluginStorageMutationFailpoint('owner-write');
                         if (ownerPolicy === 'record') {
                             kvSet(ownerKey, ownerRecordBytes);
@@ -12333,6 +12752,9 @@ function authoritativeInlinePluginTransitionRows(liveDb) {
                 rawKey,
                 size: value.length,
                 sha256: sha256Hex(value),
+                displaySize: prefix === PLUGIN_SAVE_PREFIX
+                    ? pluginStorageViewerDisplaySize(descriptor.value)
+                    : null,
                 uploaded: false,
             });
             if (rows.length > 100_000) {
@@ -12424,17 +12846,24 @@ async function spoolPluginTransitionKvRow(storageKey, destinationPath, options =
         throw new PluginStorageValidationError(storageKey);
     }
     await fs.chmod(destinationPath, 0o600);
+    let displaySize = null;
     if (options.validateJson !== false) {
         try {
-            await validateJsonSource({ filePath: destinationPath, size: result.size }, {
+            const displayMetadata = await validateJsonSource({
+                filePath: destinationPath,
+                size: result.size,
+            }, {
                 shouldAbort: options.shouldAbort,
             });
+            if (storageKey.startsWith(PLUGIN_SAVE_PREFIX)) {
+                displaySize = pluginStorageViewerDisplaySizeFromMetadata(displayMetadata);
+            }
         } catch {
             throw new PluginStorageValidationError(storageKey);
         }
     }
     const sha256 = await computeFileSha256(destinationPath);
-    return { size: result.size, sha256 };
+    return { size: result.size, sha256, displaySize };
 }
 
 async function writeDurablePluginTransitionStageRow(storageKey, filePath, shouldAbort) {
@@ -12714,6 +13143,7 @@ app.post('/api/plugin-storage/transition/stage/begin', async (req, res, next) =>
                             rawKey,
                             size: staged.size,
                             sha256: staged.sha256,
+                            displaySize: staged.displaySize,
                             uploaded: true,
                         });
                     }
@@ -12806,10 +13236,17 @@ app.post('/api/plugin-storage/transition/stage/upload', async (req, res, next) =
             closeSync(fileDescriptor);
         }
         const hash = digest.digest('hex');
+        let displaySize = null;
         try {
-            await validateJsonSource({ filePath: temporaryPath, size: received }, {
+            const displayMetadata = await validateJsonSource({
+                filePath: temporaryPath,
+                size: received,
+            }, {
                 shouldAbort: () => req.aborted || res.destroyed,
             });
+            if (storageKey.startsWith(PLUGIN_SAVE_PREFIX)) {
+                displaySize = pluginStorageViewerDisplaySizeFromMetadata(displayMetadata);
+            }
         } catch {
             throw new PluginStorageValidationError(storageKey);
         }
@@ -12837,6 +13274,7 @@ app.post('/api/plugin-storage/transition/stage/upload', async (req, res, next) =
             fsyncPluginTransitionStageDirectory();
             temporaryPath = null;
             currentRow.uploaded = true;
+            currentRow.displaySize = displaySize;
             current.state = current.rows.every(entry => entry.uploaded) ? 'ready' : 'uploading';
             current.updatedAt = Date.now();
             writePluginTransitionStage(current);
@@ -13058,6 +13496,9 @@ app.post('/api/plugin-storage/transition/stage/finalize', async (req, res, next)
                         kvSetFromFile(
                             row.storageKey,
                             pluginTransitionStageRowPath(transitionId, row.index),
+                            row.storageKey.startsWith(PLUGIN_SAVE_PREFIX)
+                                ? { pluginStorageDisplaySize: row.displaySize }
+                                : {},
                         );
                         maybeFailPluginStorageTransaction(req, 'after-row');
                     }
@@ -13250,6 +13691,9 @@ async function commitReadyPluginStorageTransition(stage, req) {
                     kvSetFromFile(
                         row.storageKey,
                         pluginTransitionStageRowPath(stage.transitionId, row.index),
+                        row.storageKey.startsWith(PLUGIN_SAVE_PREFIX)
+                            ? { pluginStorageDisplaySize: row.displaySize }
+                            : {},
                     );
                     maybeFailPluginStorageTransaction(req, 'after-row');
                 }
@@ -13490,17 +13934,16 @@ async function receiveBulkPluginStorageTransition(req) {
                 );
             }
             let jsonBytes;
+            let jsonValue = richValue;
             try {
-                jsonBytes = serializePluginStorageRow(descriptor.storageKey, richValue);
+                jsonBytes = serializePluginStorageRow(descriptor.storageKey, jsonValue);
             } catch (strictError) {
                 if (!metadata.autoConvert || descriptor.prefix === PLUGIN_SAVE_META_PREFIX) {
                     throw strictError;
                 }
                 try {
-                    jsonBytes = serializePluginStorageRow(
-                        descriptor.storageKey,
-                        convertCompatiblePluginStorageJson(richValue),
-                    );
+                    jsonValue = convertCompatiblePluginStorageJson(richValue);
+                    jsonBytes = serializePluginStorageRow(descriptor.storageKey, jsonValue);
                 } catch {
                     throw strictError;
                 }
@@ -13526,6 +13969,9 @@ async function receiveBulkPluginStorageTransition(req) {
                 rawKey: descriptor.rawKey,
                 size: jsonBytes.length,
                 sha256: sha256Hex(jsonBytes),
+                displaySize: descriptor.prefix === PLUGIN_SAVE_PREFIX
+                    ? pluginStorageViewerDisplaySize(jsonValue)
+                    : null,
                 uploaded: true,
             });
         }
@@ -13673,6 +14119,7 @@ app.post('/api/plugin-storage/transition/bulk', async (req, res, next) => {
                         rawKey,
                         size: staged.size,
                         sha256: staged.sha256,
+                        displaySize: staged.displaySize,
                         uploaded: true,
                     });
                 }

@@ -136,6 +136,8 @@ Express + SQLite
 - `server/node/pluginSaveKeys.cjs` owns server key parsing and namespace constants.
 - `server/node/pluginStorageJson.cjs` validates raw keys, canonical encoded names, and
   strict JSON rows, and performs server-owned compatible-value transition conversion.
+- `server/node/pluginStorageViewerFacets.cjs` owns rebuildable display-size/owner facet
+  validity, streaming display-size semantics, and pinned-snapshot facet queries.
 - `server/node/pluginStorageLimits.cjs` owns authoritative per-value and aggregate
   limits. Defaults are 128 MiB per value and 1 GiB total optimized storage.
 - `server/node/db.cjs` owns atomic quota/owner accounting and the derived
@@ -300,6 +302,20 @@ revision-bound so a concurrent change surfaces as a conflict. Local Storage
 (`safe_plugin_*` strings) and IndexedDB (`SafeLocalPluginStorage` JSON) are device-local
 and have no server publication token. All three retain at most 50 value bodies per page;
 value search intentionally scans only the resident page.
+
+Optimized display sizes live in `plugin_storage_viewer_value_facets`; normalized owners
+remain in `plugin_storage_owners`. Both are operational, rebuildable metadata rather than
+publication authority. Low-level plugin KV writes maintain them in the enclosing SQLite
+transaction. A trigger-backed source/index revision detects missing, stale, direct-SQL,
+or unverifiable derivative state. The viewer still intersects physical rows with the
+exact selected manifest, and any facet mismatch falls back to one authoritative value
+and owner scan whose compare-published rebuild cannot replace a newer publication.
+
+Cold authoritative facet scans are single-flight per pinned publication proof and retain
+the requested page values for page assembly instead of parsing them twice. At most two
+viewer snapshot leases are active; excess requests wait abortably. A snapshot is closed
+after the page response has been assembled and before NDJSON backpressure or a slow
+client can retain its WAL view.
 
 ## Backup and restore boundary
 

@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('fs/promises');
+const crypto = require('crypto');
 const { TextDecoder } = require('util');
 const { Packr } = require('msgpackr');
 const { Unpackr } = require('msgpackr');
@@ -166,19 +167,32 @@ async function readHexCodeUnit(reader) {
     return value;
 }
 
-async function writeJsonString(reader, writer) {
+async function writeJsonString(reader, writer, captureIdentity = false) {
     await expectByte(reader, 0x22);
     const headerOffset = writer.position;
     await writer.write(Buffer.from([0xdb, 0, 0, 0, 0]));
     const contentOffset = writer.position;
     const decoder = new TextDecoder('utf-8', { fatal: true });
+    const identityHash = captureIdentity ? crypto.createHash('sha256') : null;
+    const updateIdentity = (value) => {
+        if (identityHash) identityHash.update(Buffer.from(value, 'utf16le'));
+    };
+    let jsonContentSize = 0;
+    const addJsonCodePoint = (codePoint, decodedBytes) => {
+        if (codePoint === 0x22 || codePoint === 0x5c) jsonContentSize += 2;
+        else if (codePoint === 0x08 || codePoint === 0x09 || codePoint === 0x0a
+            || codePoint === 0x0c || codePoint === 0x0d) jsonContentSize += 2;
+        else if (codePoint < 0x20) jsonContentSize += 6;
+        else jsonContentSize += decodedBytes;
+    };
     for (;;) {
         reader.throwIfAborted();
         const run = await reader.rawStringRun();
         if (run.length > 0) {
             // Validate incrementally without constructing a whole-row string.
-            decoder.decode(run, { stream: true });
+            updateIdentity(decoder.decode(run, { stream: true }));
             await writer.write(run);
+            jsonContentSize += run.length;
             continue;
         }
         const byte = await reader.read();
@@ -186,15 +200,17 @@ async function writeJsonString(reader, writer) {
             throw new SyntaxError('Invalid plugin storage JSON string');
         }
         if (byte === 0x22) {
-            decoder.decode();
+            updateIdentity(decoder.decode());
             break;
         }
         if (byte !== 0x5c) throw new SyntaxError('Invalid plugin storage JSON string');
-        decoder.decode();
+        updateIdentity(decoder.decode());
         const escape = await reader.read();
         const simple = SIMPLE_JSON_ESCAPES.get(escape);
         if (simple !== undefined) {
             await writer.write(Buffer.from([simple]));
+            updateIdentity(String.fromCharCode(simple));
+            addJsonCodePoint(simple, 1);
             continue;
         }
         if (escape !== 0x75) throw new SyntaxError('Invalid plugin storage JSON escape');
@@ -214,8 +230,15 @@ async function writeJsonString(reader, writer) {
                         // code unit retains its value (or is replaced if it too
                         // is an unpaired surrogate).
                         const second = low >= 0xd800 && low <= 0xdfff ? 0xfffd : low;
+                        const normalizedText = `\ufffd${String.fromCodePoint(second)}`;
                         await writer.write(Buffer.from(
-                            `\ufffd${String.fromCodePoint(second)}`,
+                            normalizedText,
+                            'utf-8',
+                        ));
+                        updateIdentity(normalizedText);
+                        addJsonCodePoint(0xfffd, 3);
+                        addJsonCodePoint(second, Buffer.byteLength(
+                            String.fromCodePoint(second),
                             'utf-8',
                         ));
                         continue;
@@ -227,7 +250,10 @@ async function writeJsonString(reader, writer) {
                         throw new SyntaxError('Invalid plugin storage JSON escape');
                     }
                     await writer.write(Buffer.from('\ufffd', 'utf-8'));
+                    updateIdentity(`\ufffd${String.fromCharCode(following)}`);
+                    addJsonCodePoint(0xfffd, 3);
                     await writer.write(Buffer.from([following]));
+                    addJsonCodePoint(following, 1);
                     continue;
                 }
             } else {
@@ -236,7 +262,10 @@ async function writeJsonString(reader, writer) {
         } else if (codePoint >= 0xdc00 && codePoint <= 0xdfff) {
             codePoint = 0xfffd;
         }
-        await writer.write(Buffer.from(String.fromCodePoint(codePoint), 'utf-8'));
+        updateIdentity(String.fromCodePoint(codePoint));
+        const encoded = Buffer.from(String.fromCodePoint(codePoint), 'utf-8');
+        await writer.write(encoded);
+        addJsonCodePoint(codePoint, encoded.length);
     }
     const length = writer.position - contentOffset;
     if (length > 0xffffffff) throw new RangeError('Plugin storage JSON string is too large');
@@ -244,7 +273,13 @@ async function writeJsonString(reader, writer) {
     header[0] = 0xdb;
     header.writeUInt32BE(length, 1);
     await writer.patch(headerOffset, header);
-    return { type: 'string', truthy: length > 0, length };
+    return {
+        type: 'string',
+        truthy: length > 0,
+        length,
+        jsonSize: jsonContentSize + 2,
+        ...(identityHash ? { identity: identityHash.digest('hex') } : {}),
+    };
 }
 
 async function readBoundedJsonString(reader, maxBytes = PAGE_BYTES) {
@@ -273,7 +308,11 @@ async function readBoundedJsonString(reader, maxBytes = PAGE_BYTES) {
 async function writeLiteral(reader, writer, literal, value) {
     for (const expected of Buffer.from(literal, 'ascii')) await expectByte(reader, expected);
     await writer.write(encodedScalar(value));
-    return { type: value === null ? 'null' : typeof value, truthy: Boolean(value) };
+    return {
+        type: value === null ? 'null' : typeof value,
+        truthy: Boolean(value),
+        jsonSize: literal.length,
+    };
 }
 
 async function writeNumber(reader, writer) {
@@ -433,7 +472,12 @@ async function writeNumber(reader, writer) {
     if (negative) value = -value;
     const normalizedValue = Object.is(value, -0) ? 0 : value;
     await writer.write(encodedScalar(normalizedValue));
-    return { type: 'number', truthy: normalizedValue !== 0, value: normalizedValue };
+    return {
+        type: 'number',
+        truthy: normalizedValue !== 0,
+        value: normalizedValue,
+        jsonSize: Buffer.byteLength(JSON.stringify(normalizedValue), 'utf-8'),
+    };
 }
 
 async function writeJsonValue(reader, writer, depth) {
@@ -450,11 +494,14 @@ async function writeJsonValue(reader, writer, depth) {
         const headerOffset = writer.position;
         await writer.write(Buffer.from([0xdd, 0, 0, 0, 0]));
         let count = 0;
+        let jsonSize = 2;
         await skipWhitespace(reader);
         if (await reader.peek() !== 0x5d) {
             for (;;) {
-                await writeJsonValue(reader, writer, depth + 1);
+                const value = await writeJsonValue(reader, writer, depth + 1);
+                jsonSize += value.jsonSize;
                 if (++count > 0xffffffff) throw new RangeError('Plugin storage JSON array is too large');
+                if (count > 1) jsonSize += 1;
                 await skipWhitespace(reader);
                 const separator = await reader.read();
                 if (separator === 0x5d) break;
@@ -467,13 +514,16 @@ async function writeJsonValue(reader, writer, depth) {
         header[0] = 0xdd;
         header.writeUInt32BE(count, 1);
         await writer.patch(headerOffset, header);
-        return { type: 'array', truthy: true, count };
+        return { type: 'array', truthy: true, count, jsonSize };
     }
     if (byte === 0x7b) {
         await reader.read();
         const headerOffset = writer.position;
         await writer.write(Buffer.from([0xdf, 0, 0, 0, 0]));
         let count = 0;
+        let uniqueCount = 0;
+        let jsonSize = 2;
+        const contributions = new Map();
         await skipWhitespace(reader);
         if (await reader.peek() !== 0x7d) {
             for (;;) {
@@ -481,11 +531,23 @@ async function writeJsonValue(reader, writer, depth) {
                 if (await reader.peek() !== 0x22) {
                     throw new SyntaxError('Invalid plugin storage JSON object key');
                 }
-                await writeJsonString(reader, writer);
+                const key = await writeJsonString(reader, writer, true);
                 await skipWhitespace(reader);
                 await expectByte(reader, 0x3a);
-                await writeJsonValue(reader, writer, depth + 1);
-                if (++count > 0xffffffff) throw new RangeError('Plugin storage JSON object is too large');
+                const value = await writeJsonValue(reader, writer, depth + 1);
+                if (++count > 0xffffffff) {
+                    throw new RangeError('Plugin storage JSON object is too large');
+                }
+                const contribution = key.jsonSize + 1 + value.jsonSize;
+                const previous = contributions.get(key.identity);
+                if (previous === undefined) {
+                    contributions.set(key.identity, contribution);
+                    jsonSize += contribution;
+                    if (++uniqueCount > 1) jsonSize += 1;
+                } else {
+                    contributions.set(key.identity, contribution);
+                    jsonSize += contribution - previous;
+                }
                 await skipWhitespace(reader);
                 const separator = await reader.read();
                 if (separator === 0x7d) break;
@@ -498,7 +560,7 @@ async function writeJsonValue(reader, writer, depth) {
         header[0] = 0xdf;
         header.writeUInt32BE(count, 1);
         await writer.patch(headerOffset, header);
-        return { type: 'object', truthy: true, count };
+        return { type: 'object', truthy: true, count, jsonSize };
     }
     throw new SyntaxError('Invalid plugin storage JSON value');
 }

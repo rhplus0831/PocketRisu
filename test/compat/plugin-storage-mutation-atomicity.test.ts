@@ -166,6 +166,7 @@ async function boot(
     | 'acknowledgement-loss',
   kvFailpoint?: string,
   seed: (saveDir: string) => void = seedRows,
+  facetFailpoint = '',
 ): Promise<{ server: ServerHandle; client: RisuClient }> {
   const server = await spawnServer({
     env: {
@@ -173,6 +174,9 @@ async function boot(
         ? { POCKETRISU_TEST_PLUGIN_MUTATION_FAILPOINT: pluginFailpoint }
         : {}),
       ...(kvFailpoint ? { POCKETRISU_TEST_FAILPOINT: kvFailpoint } : {}),
+      ...(facetFailpoint
+        ? { POCKETRISU_TEST_PLUGIN_VIEWER_FACET_FAILPOINT: facetFailpoint }
+        : {}),
     },
     seedSave: seed,
   })
@@ -189,6 +193,24 @@ function readRows(cwd: string): { value: Buffer | null; owner: Buffer | null } {
     return {
       value: value ? Buffer.from(value.value) : null,
       owner: owner ? Buffer.from(owner.value) : null,
+    }
+  } finally {
+    database.close()
+  }
+}
+
+function readFacets(cwd: string): { displaySize: number | null; owner: string | null } {
+  const database = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
+  try {
+    const display = database.prepare(
+      'SELECT display_size FROM plugin_storage_viewer_value_facets WHERE storage_key = ?',
+    ).get(VALUE_KEY) as { display_size: number } | undefined
+    const owner = database.prepare(
+      'SELECT owner FROM plugin_storage_owners WHERE storage_key = ?',
+    ).get(OWNER_KEY) as { owner: string } | undefined
+    return {
+      displaySize: display?.display_size ?? null,
+      owner: owner?.owner ?? null,
     }
   } finally {
     database.close()
@@ -346,6 +368,10 @@ describe('atomic optimized plugin value and owner acknowledgement', () => {
       hash: createHash('sha256').update(value).digest('hex'),
     })
     expect(readRows(server.cwd).value).toEqual(value)
+    expect(readFacets(server.cwd)).toEqual({
+      displaySize: Buffer.byteLength(JSON.stringify(JSON.parse(value.toString('utf-8')))),
+      owner: 'New Plugin',
+    })
     expect(readManifest(server.cwd)).toEqual({
       version: 2,
       generation: STORAGE_GENERATION,
@@ -498,6 +524,7 @@ describe('atomic optimized plugin value and owner acknowledgement', () => {
       verification: 'verified',
     })
     expect(readRows(server.cwd)).toEqual({ value: null, owner: OLD_OWNER })
+    expect(readFacets(server.cwd)).toEqual({ displaySize: null, owner: 'Old Plugin' })
     const database = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
     try {
       const row = database.prepare('SELECT value FROM kv WHERE key = ?').get(MANIFEST_KEY) as {
@@ -617,6 +644,33 @@ describe('atomic optimized plugin value and owner acknowledgement', () => {
       operation: 'set',
     })
     expect(readRows(server.cwd)).toEqual({ value: OLD_VALUE, owner: OLD_OWNER })
+  })
+
+  test('a display-facet write failure rolls the value, owner, and facet back atomically', async () => {
+    const { server, client } = await boot(
+      undefined,
+      undefined,
+      seedRows,
+      'value-write',
+    )
+
+    const response = await mutate(client, 'set', { generation: 'facet-failure' })
+
+    expect(response.status).toBe(500)
+    await expect(response.json()).resolves.toMatchObject({
+      outcome: 'not-committed',
+      operation: 'set',
+      code: 'PLUGIN_STORAGE_TRANSACTION_ROLLED_BACK',
+    })
+    expect(readRows(server.cwd)).toEqual({ value: OLD_VALUE, owner: OLD_OWNER })
+    const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
+    try {
+      expect(sqlite.prepare(
+        'SELECT display_size FROM plugin_storage_viewer_value_facets WHERE storage_key = ?',
+      ).get(VALUE_KEY)).toBeUndefined()
+    } finally {
+      sqlite.close()
+    }
   })
 
   test('owner-remove failure rolls the primary removal back', async () => {

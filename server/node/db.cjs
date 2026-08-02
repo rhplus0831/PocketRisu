@@ -9,7 +9,15 @@ const {
     createDatabaseRevisionTracker,
     createPluginStoragePublicationRevisionTracker,
 } = require('./databaseRevision.cjs');
-const { createPluginStorageOwnerScanner } = require('./pluginStorageJson.cjs');
+const {
+    createPluginStorageOwnerScanner,
+    validatePluginStorageRow,
+} = require('./pluginStorageJson.cjs');
+const {
+    createPluginStorageViewerFacetSnapshot,
+    createPluginStorageViewerFacetStore,
+    pluginStorageViewerDisplaySize,
+} = require('./pluginStorageViewerFacets.cjs');
 const {
     PLUGIN_VALUE_MAX_BYTES,
     PLUGIN_STORAGE_MAX_BYTES,
@@ -294,6 +302,11 @@ const chunkThreshold = process.env.POCKETRISU_CHUNK_THRESHOLD
     ? Number(process.env.POCKETRISU_CHUNK_THRESHOLD)
     : undefined;
 const chunkStore = createChunkStore(db, { threshold: chunkThreshold });
+const pluginStorageViewerFacets = createPluginStorageViewerFacetStore(db, {
+    failpoint: process.env.NODE_ENV === 'test'
+        ? String(process.env.POCKETRISU_TEST_PLUGIN_VIEWER_FACET_FAILPOINT ?? '').trim()
+        : '',
+});
 
 // Test-only kvSet failure injection, parsed once at startup:
 //   key:<exact-key> or prefix:<key-prefix>:<nth-write>
@@ -510,8 +523,26 @@ function consumePluginStorageQuotaPlan(key, nextSize) {
     return true;
 }
 
-const runKvSet = db.transaction((key, value) => {
+const runKvSet = db.transaction((key, value, displaySizeProvided, providedDisplaySize) => {
     if (typeof key !== 'string') throw new TypeError('KV key must be a string');
+    const facetsWereCurrent = pluginStorageViewerFacets.state().current;
+    let displaySize = null;
+    let facetsMaintained = true;
+    if (isPluginValueKey(key)) {
+        if (displaySizeProvided) displaySize = providedDisplaySize;
+        else {
+            try {
+                displaySize = pluginStorageViewerDisplaySize(
+                    validatePluginStorageRow(key, value),
+                );
+            } catch {
+                // Low-level maintenance and pre-generation rows may be
+                // quarantined invalid JSON. Preserve the authoritative bytes,
+                // remove any stale derivative, and force a viewer rebuild.
+                facetsMaintained = false;
+            }
+        }
+    }
     const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
     const quotaPlanned = consumePluginStorageQuotaPlan(key, value.length);
     if (!quotaPlanned) assertPluginWriteWithinLimits(key, value.length, previousSize);
@@ -519,7 +550,10 @@ const runKvSet = db.transaction((key, value) => {
     notePluginStorageMutation(key);
     if (!quotaPlanned) updatePluginStorageUsageForWrite(key, value.length, previousSize);
     updatePluginStorageOwnerIndex(key, value);
+    if (displaySize !== null) pluginStorageViewerFacets.maintainValue(key, displaySize);
+    else if (isPluginValueKey(key)) pluginStorageViewerFacets.removeValue(key);
     stmtRemoveDeletion.run(key);
+    pluginStorageViewerFacets.finishMaintainedMutation(facetsWereCurrent, facetsMaintained);
 });
 
 const runKvSetFromFile = db.transaction((
@@ -528,8 +562,11 @@ const runKvSetFromFile = db.transaction((
     size,
     ownerProvided,
     providedOwner,
+    displaySizeProvided,
+    providedDisplaySize,
 ) => {
     if (typeof key !== 'string') throw new TypeError('KV key must be a string');
+    const facetsWereCurrent = pluginStorageViewerFacets.state().current;
     const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
     const quotaPlanned = consumePluginStorageQuotaPlan(key, size);
     if (!quotaPlanned) assertPluginWriteWithinLimits(key, size, previousSize);
@@ -542,22 +579,36 @@ const runKvSetFromFile = db.transaction((
             ownerProvided ? providedOwner : pluginStorageOwnerFromFile(filePath),
         );
     }
+    let facetsMaintained = true;
+    if (isPluginValueKey(key)) {
+        if (displaySizeProvided) {
+            pluginStorageViewerFacets.maintainValue(key, providedDisplaySize);
+        } else {
+            pluginStorageViewerFacets.removeValue(key);
+            facetsMaintained = false;
+        }
+    }
     stmtRemoveDeletion.run(key);
+    pluginStorageViewerFacets.finishMaintainedMutation(facetsWereCurrent, facetsMaintained);
 });
 
 const runKvDel = db.transaction((key) => {
+    const facetsWereCurrent = pluginStorageViewerFacets.state().current;
     const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
     const quotaPlanned = consumePluginStorageQuotaPlan(key, 0);
     chunkStore.dropValue(key);
     notePluginStorageMutation(key);
     if (key.startsWith(PLUGIN_STORAGE_META_PREFIX)) stmtDeletePluginStorageOwner.run(key);
+    if (isPluginValueKey(key)) pluginStorageViewerFacets.removeValue(key);
     if (!quotaPlanned && previousSize > 0) {
         stmtSetPluginStorageUsage.run(Math.max(0, getPluginStorageUsage() - previousSize));
     }
     stmtRecordDeletion.run(key, Date.now());
+    pluginStorageViewerFacets.finishMaintainedMutation(facetsWereCurrent);
 });
 
 const runKvDelPrefix = db.transaction((prefix, pattern) => {
+    const facetsWereCurrent = pluginStorageViewerFacets.state().current;
     const prefixCanMatchPluginValues = prefix.startsWith('pluginsave/')
         || 'pluginsave/'.startsWith(prefix);
     const removedPluginBytes = prefixCanMatchPluginValues
@@ -571,10 +622,14 @@ const runKvDelPrefix = db.transaction((prefix, pattern) => {
     stmtManifestPublicationDelPrefix.run(pattern);
     stmtKvDelPrefix.run(pattern);
     stmtDeletePluginStorageOwnerPrefix.run(pattern);
+    pluginStorageViewerFacets.removeValuePrefix(prefix);
     if (prefixCanMatchPluginValues) pluginStorageMutationVersion += 1;
     if (removedPluginBytes > 0) {
         stmtSetPluginStorageUsage.run(Math.max(0, getPluginStorageUsage() - removedPluginBytes));
     }
+    pluginStorageViewerFacets.finishMaintainedMutation(
+        facetsWereCurrent || prefix.length === 0,
+    );
 });
 
 function kvGet(key) {
@@ -600,9 +655,18 @@ function checkKvSetFailpoint(key) {
     }
 }
 
-function kvSet(key, value) {
+function kvSet(key, value, options = {}) {
     checkKvSetFailpoint(key);
-    runKvSet(key, value);
+    const displaySizeProvided = Object.prototype.hasOwnProperty.call(
+        options,
+        'pluginStorageDisplaySize',
+    );
+    runKvSet(
+        key,
+        value,
+        displaySizeProvided,
+        displaySizeProvided ? options.pluginStorageDisplaySize : null,
+    );
 }
 
 function kvSetFromFile(key, filePath, options = {}) {
@@ -612,12 +676,18 @@ function kvSetFromFile(key, filePath, options = {}) {
         options,
         'pluginStorageOwner',
     );
+    const displaySizeProvided = Object.prototype.hasOwnProperty.call(
+        options,
+        'pluginStorageDisplaySize',
+    );
     runKvSetFromFile(
         key,
         filePath,
         size,
         ownerProvided,
         ownerProvided ? options.pluginStorageOwner : null,
+        displaySizeProvided,
+        displaySizeProvided ? options.pluginStorageDisplaySize : null,
     );
 }
 
@@ -734,42 +804,18 @@ function createKvSnapshot() {
         transactionOpen = true;
         snapshotDb.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get();
         const reader = createSnapshotReader(snapshotDb);
-        const listPluginStorageOwnerFacets = snapshotDb.prepare(`
-            WITH requested(storage_key) AS (
-                SELECT value FROM json_each(?)
-            )
-            SELECT owners.owner AS owner, COUNT(*) AS count
-              FROM plugin_storage_owners AS owners
-              JOIN requested ON requested.storage_key = owners.storage_key
-             GROUP BY owners.owner
-             ORDER BY owners.owner
-        `);
-        const listPluginStorageOwnerKeys = snapshotDb.prepare(`
-            WITH requested(storage_key) AS (
-                SELECT value FROM json_each(?)
-            )
-            SELECT owners.storage_key AS storageKey
-              FROM plugin_storage_owners AS owners
-              JOIN requested ON requested.storage_key = owners.storage_key
-             WHERE (? IS NULL OR owners.owner = ?)
-        `);
-        const getPluginStorageOwner = snapshotDb.prepare(
-            'SELECT owner FROM plugin_storage_owners WHERE storage_key = ?',
-        );
+        const viewerFacets = createPluginStorageViewerFacetSnapshot(snapshotDb);
         return {
             ...reader,
+            ...viewerFacets,
             kvListPluginStorageOwnerFacets(storageKeys) {
-                if (storageKeys.length === 0) return [];
-                return listPluginStorageOwnerFacets.all(JSON.stringify(storageKeys));
+                return viewerFacets.viewerOwnerFacets(storageKeys);
             },
             kvListPluginStorageOwnerKeys(storageKeys, owner = null) {
-                if (storageKeys.length === 0) return [];
-                return listPluginStorageOwnerKeys
-                    .all(JSON.stringify(storageKeys), owner, owner)
-                    .map((row) => row.storageKey);
+                return viewerFacets.viewerOwnerKeys(storageKeys, owner);
             },
             kvGetPluginStorageOwner(storageKey) {
-                return getPluginStorageOwner.get(storageKey)?.owner ?? null;
+                return viewerFacets.viewerOwner(storageKey);
             },
             close() {
                 if (closed) return;
@@ -811,6 +857,7 @@ function reconcilePluginStorageOwners() {
         `SELECT key FROM kv WHERE key LIKE 'pluginsave-meta/%'`,
     );
     const reader = createSnapshotReader(ownerValues);
+    const facetsWereCurrent = pluginStorageViewerFacets.state().current;
     const reconcile = db.transaction(() => {
         db.prepare('DELETE FROM plugin_storage_owners').run();
         for (const row of rows.iterate()) {
@@ -819,6 +866,7 @@ function reconcilePluginStorageOwners() {
                 pluginStorageOwnerFromReader(reader, row.key),
             );
         }
+        pluginStorageViewerFacets.finishMaintainedMutation(facetsWereCurrent);
     });
     try {
         reconcile();
@@ -827,6 +875,14 @@ function reconcilePluginStorageOwners() {
         ownerValues.close();
         ownerKeys.close();
     }
+}
+
+function rebuildPluginStorageViewerFacets(expectedSourceRevision, valueFacets, owners) {
+    return pluginStorageViewerFacets.replaceAll(
+        expectedSourceRevision,
+        valueFacets,
+        owners,
+    );
 }
 
 // The counter is an optimization, not an authority. Rebuild it on every boot
@@ -882,6 +938,7 @@ module.exports = {
     kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
     kvGetListEpoch, kvBumpListEpoch,
     createKvSnapshot,
+    rebuildPluginStorageViewerFacets,
     clearEntities,
     checkpointWal,
     gcChunks,
