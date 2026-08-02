@@ -1,6 +1,15 @@
 /**
  * Thin HTTP helpers for talking to a RisuAI-NodeOnly server during tests.
+ *
+ * Requests go through undici's fetch explicitly: under the node test
+ * environment this is the same implementation as global fetch, but the
+ * performance suites run under happy-dom, whose fetch polyfill omits
+ * Content-Length for empty byte bodies (real browsers and undici send 0) and
+ * strips the header when set manually — which the admission layer rejects.
  */
+import { fetch as httpFetch } from 'undici'
+
+const fetch = httpFetch as unknown as typeof globalThis.fetch
 
 export interface RisuClient {
   /** JWT auth token obtained from /api/login. */

@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, test, vi } from 'vitest'
+import Database from 'better-sqlite3'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -60,16 +61,31 @@ afterAll(async () => {
 })
 
 function makeRowStore() {
-  const values = new Map<string, Buffer>()
+  // The store's chat_row_metadata DDL, triggers, prepared statements, and
+  // fail-closed writers need a real SQLite kv table, so the kv fakes are
+  // backed by it rather than a Map.
+  const sqlite = new Database(':memory:')
+  sqlite.exec('CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB, updated_at INTEGER)')
+  const getStmt = sqlite.prepare('SELECT value FROM kv WHERE key = ?')
+  const setStmt = sqlite.prepare(
+    'INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+  )
+  const delStmt = sqlite.prepare('DELETE FROM kv WHERE key = ?')
+  const keysStmt = sqlite.prepare('SELECT key, length(value) AS size FROM kv ORDER BY key')
+  const listEntries = () => keysStmt.all() as Array<{ key: string; size: number }>
   const store = createChatRowStore({
-    db: { transaction: (fn: () => unknown) => fn },
-    kvGet: (key: string) => values.get(key) ?? null,
-    kvSet: (key: string, value: Buffer) => values.set(key, Buffer.from(value)),
-    kvDel: (key: string) => values.delete(key),
-    kvList: (prefix: string) => [...values.keys()].filter(key => key.startsWith(prefix)),
-    kvListWithSizes: (prefix: string) => [...values.entries()]
-      .filter(([key]) => key.startsWith(prefix))
-      .map(([key, value]) => ({ key, size: value.length })),
+    db: sqlite,
+    kvGet: (key: string) => {
+      const row = getStmt.get(key) as { value: Buffer } | undefined
+      return row ? Buffer.from(row.value) : null
+    },
+    kvSet: (key: string, value: Buffer) => setStmt.run(key, Buffer.from(value)),
+    kvDel: (key: string) => delStmt.run(key),
+    kvList: (prefix: string) => listEntries()
+      .map(({ key }) => key)
+      .filter(key => key.startsWith(prefix)),
+    kvListWithSizes: (prefix: string) => listEntries()
+      .filter(({ key }) => key.startsWith(prefix)),
     kvGetUpdatedAt: () => null,
   })
   return store
