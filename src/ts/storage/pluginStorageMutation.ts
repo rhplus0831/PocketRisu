@@ -48,6 +48,25 @@ const NOT_COMMITTED_ACKNOWLEDGEMENTS = new Map<number, {
     [503, { code: "IMPORT_IN_PROGRESS", retryable: true }],
 ]);
 
+const BUFFERED_INGRESS_ACKNOWLEDGEMENTS = new Map<string, {
+    status: number;
+    retryable: boolean;
+    includesBudget: boolean;
+}>([
+    ["BUFFERED_INGRESS_LENGTH_INVALID", {
+        status: 400, retryable: false, includesBudget: false,
+    }],
+    ["BUFFERED_INGRESS_LENGTH_REQUIRED", {
+        status: 411, retryable: false, includesBudget: false,
+    }],
+    ["BUFFERED_INGRESS_CONTENT_ENCODING_UNSUPPORTED", {
+        status: 415, retryable: false, includesBudget: false,
+    }],
+    ["BUFFERED_INGRESS_BUSY", {
+        status: 503, retryable: true, includesBudget: true,
+    }],
+]);
+
 function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -164,6 +183,37 @@ export function classifyPluginStorageMutationAcknowledgement(
             status,
             retryAfter: retryAfter ?? null,
             commitOutcomeUnknown: false,
+        };
+    }
+
+    const ingressAcknowledgement = typeof body.code === "string"
+        ? BUFFERED_INGRESS_ACKNOWLEDGEMENTS.get(body.code)
+        : undefined;
+    if (ingressAcknowledgement
+        && ingressAcknowledgement.status === status
+        && hasOnlyKeys(body, [
+            "success", "outcome", "operation", "error", "code", "retryable",
+            ...(ingressAcknowledgement.includesBudget ? ["limit", "actual"] : []),
+        ])
+        && body.success === false
+        && body.outcome === "not-committed"
+        && body.retryable === ingressAcknowledgement.retryable
+        && typeof body.error === "string"
+        && body.error.length > 0
+        && (!ingressAcknowledgement.includesBudget
+            || (Number.isSafeInteger(body.limit) && Number.isSafeInteger(body.actual)))) {
+        return {
+            outcome: "not-committed",
+            operation,
+            code: body.code as string,
+            error: body.error,
+            retryable: ingressAcknowledgement.retryable,
+            status,
+            retryAfter: retryAfter ?? null,
+            commitOutcomeUnknown: false,
+            ...(ingressAcknowledgement.includesBudget
+                ? { limit: body.limit as number, actual: body.actual as number }
+                : {}),
         };
     }
 

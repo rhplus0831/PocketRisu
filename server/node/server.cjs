@@ -221,6 +221,13 @@ const {
     PluginStorageLimitError,
 } = require('./pluginStorageLimits.cjs');
 const {
+    BUFFERED_INGRESS_POLICY,
+    createBufferedIngressLimits,
+    createInFlightByteBudget,
+    createRoutePolicyResolver,
+    createBufferedIngressMiddleware,
+} = require('./bufferedIngress.cjs');
+const {
     CHAT_BACKUP_DIRNAME,
     createChatBackupStore,
     migrateLegacyChatBackups,
@@ -2082,10 +2089,37 @@ app.use('/assets', express.static(path.join(process.cwd(), 'dist/assets'), {
     immutable: true,
 }));
 app.use(express.static(path.join(process.cwd(), 'dist'), {index: false, maxAge: 0}));
-const defaultJsonParser = express.json({ limit: '100mb' });
+const bufferedIngressLimits = createBufferedIngressLimits({
+    pluginValueMaxBytes: PLUGIN_VALUE_MAX_BYTES,
+    pluginStorageMaxBytes: PLUGIN_STORAGE_MAX_BYTES,
+    pluginBatchMaxBytes: PLUGIN_STORAGE_BATCH_MAX_BODY_BYTES,
+});
+const bufferedIngressBudget = createInFlightByteBudget(bufferedIngressLimits.global);
+app.use(createBufferedIngressMiddleware({
+    resolvePolicy: createRoutePolicyResolver(bufferedIngressLimits),
+    budget: bufferedIngressBudget,
+    authenticate: (req, res, allowExpired) => checkAuth(
+        req,
+        res,
+        false,
+        { allowExpired },
+    ),
+    authenticateCookie: (req, res) => checkSessionCookieAuth(req, res),
+    writerState: (req) => sessionLock.peek(
+        typeof req.headers['x-session-id'] === 'string'
+            ? req.headers['x-session-id']
+            : '',
+    ),
+}));
 app.use((req, res, next) => {
     if (req.path === '/api/db/read-cached') return next();
-    return defaultJsonParser(req, res, next);
+    const policy = req[BUFFERED_INGRESS_POLICY];
+    const parser = express.json({
+        limit: policy?.bodyKind === 'json'
+            ? policy.maxBytes
+            : bufferedIngressLimits.json,
+    });
+    return parser(req, res, next);
 });
 app.use((req, res, next) => {
     // These endpoints consume the request stream directly and must never be
@@ -2120,9 +2154,12 @@ app.use((req, res, next) => {
                 .startsWith(PLUGIN_SAVE_PREFIX);
         }
     }
+    const admissionPolicy = req[BUFFERED_INGRESS_POLICY];
     const parser = express.raw({
         type: 'application/octet-stream',
-        limit: isPluginStorageBatch
+        limit: admissionPolicy?.bodyKind === 'raw'
+            ? admissionPolicy.maxBytes
+            : isPluginStorageBatch
             ? PLUGIN_STORAGE_BATCH_MAX_BODY_BYTES
             : (pluginLegacyWrite || isBufferedPluginMutationSet)
                 ? PLUGIN_VALUE_MAX_BYTES
@@ -2168,7 +2205,14 @@ app.use((req, res, next) => {
         });
     });
 });
-app.use(express.text({ limit: '100mb' }));
+app.use((req, res, next) => {
+    const policy = req[BUFFERED_INGRESS_POLICY];
+    return express.text({
+        limit: policy?.bodyKind === 'text'
+            ? policy.maxBytes
+            : bufferedIngressLimits.json,
+    })(req, res, next);
+});
 const { pipeline, finished } = require('stream/promises')
 const sslPath = path.join(process.cwd(), 'server/node/ssl/certificate');
 const hubURL = 'https://sv.risuai.xyz';
@@ -4064,10 +4108,15 @@ function parseSessionCookie(req) {
     return null
 }
 
-function sessionAuthMiddleware(req, res, next) {
+function checkSessionCookieAuth(req, res) {
     const token = parseSessionCookie(req)
-    if (token && (sessions.get(token) ?? 0) > Date.now()) return next()
+    if (token && (sessions.get(token) ?? 0) > Date.now()) return true
     res.status(401).end()
+    return false
+}
+
+function sessionAuthMiddleware(req, res, next) {
+    if (checkSessionCookieAuth(req, res)) next()
 }
 
 // MIME detection by magic bytes (fallback when key has no extension)

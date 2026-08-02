@@ -215,7 +215,7 @@ hex-encoded logical keys.
 
 | Operation | Request | Payload / key fields | Size profile |
 |---|---|---|---|
-| Database patch | `POST /api/patch` (JSON, ≤100 MiB) | `{patch: [RFC 6902 ops], expectedHash}` | Proportional to changed fields, but ID-array structural changes embed whole arrays; a "patch" can approach database scale (chats always excluded) |
+| Database patch | `POST /api/patch` (JSON, ≤32 MiB) | `{patch: [RFC 6902 ops], expectedHash}` | Proportional to changed fields, but ID-array structural changes embed whole arrays; a "patch" can approach database scale (chats always excluded) |
 | Database full write | `POST /api/write` (octet-stream, `x-if-match: <MD5 ETag>`) | Complete uncompressed `RISUSAVE\0` block container, chats as stubs | O(database); dominated by characters/presets/modules/inline plugin storage |
 | Chat row | `POST /api/chat-content/:chaId/:chatIndex`, `x-chat-id`, optional `x-chat-backup-reason` | Entire chat, legacy RisuSave (header + MessagePack), uncompressed; **no version/ETag field** | O(chat); every save retransmits all messages |
 | Flush | `POST /api/db/flush` (keepalive) | none | tiny |
@@ -256,7 +256,9 @@ Consequences worth knowing:
 
 ### 5.2 Full-write path (`POST /api/write` for `database.bin`)
 
-Body buffered whole (generic 2 GiB cap) → ETag check — **only enforced when both**
+Pre-parser auth/stale-writer/declared-size admission → body buffered whole (512 MiB
+database-route cap by default, also charged to the process-wide 512 MiB ingress
+budget) → ETag check — **only enforced when both**
 `x-if-match` **and the in-process ETag exist**; a cache-cold (freshly restarted)
 server skips it (`server/node/server.cjs:10516-10525`) → full decode → guards
 (stub-loss chats rejected, duplicate `chaId` rejected) → `splitFullDb()` separates
@@ -373,11 +375,12 @@ process — a good trade for a self-hosted, large-dataset, single-writer deploym
 
 ### Per-request spikes (largest first)
 
-1. **Full database writes**: raw body Buffer + fully decoded object + stripped clone +
+1. **Full database writes**: admitted raw body Buffer + fully decoded object + stripped clone +
    every payload chat encoded simultaneously + re-encoded stripped blob — several
    database-sized representations at once; worst for legacy/imported monoliths that
-   still embed chats/plugin data. The generic body parser accepts up to 2 GiB, and
-   queued mutations can pin multiple bodies before the FIFO drains them.
+   still embed chats/plugin data. The database route admits at most 512 MiB by default,
+   and all concurrent buffered bodies share a 512 MiB declared-byte budget. One
+   admitted body still stays resident while it waits for and runs through the FIFO.
 2. **Segmented boot read** (`/api/db/read-cached`): reassembled raw value + decoded
    graph + full legacy blob (for the ETag) + every encoded segment + response
    envelope. A perfect client cache saves bytes on the wire but none of this server
@@ -518,10 +521,11 @@ Ranked by expected impact; all are grounded in the findings above.
    patches.** Maintain referenced-row sets incrementally from chat-identity-touching
    operations only; client-side, return no-op before `/api/patch` when
    `patch.length === 0`.
-9. **Tighten body limits and admission control.** Give `database.bin`, chat, and KV
-   endpoints realistic per-route caps instead of the generic 2 GiB parser, and bound
-   total queued buffered bytes so concurrent large uploads cannot pin multiple bodies
-   ahead of the serial queue.
+9. **Resolved — body limits and admission control.** `bufferedIngress.cjs` authenticates
+   and checks stale-writer eligibility before parsing, requires exact uncompressed
+   `Content-Length`, applies database/chat/KV/proxy/plugin/JSON route caps, and bounds
+   all concurrent parser reservations with a release-on-finish/close 512 MiB ledger.
+   The writer-lock transition remains inside the accepted mutation route.
 
 ### Smaller correctness/robustness items surfaced by this audit
 

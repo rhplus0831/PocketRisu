@@ -246,6 +246,27 @@ describe("plugin storage batch acknowledgement", () => {
         });
     });
 
+    test("accepts the exact retryable pre-buffer budget refusal", () => {
+        expect(classifyPluginStorageBatchAcknowledgement(503, {
+            success: false,
+            outcome: "not-committed",
+            operation: "batch",
+            error: "buffer budget is in use",
+            code: "BUFFERED_INGRESS_BUSY",
+            limit: 512,
+            actual: 640,
+            retryable: true,
+        }, "a".repeat(64), request.operations, 1)).toMatchObject({
+            outcome: "not-committed",
+            code: "BUFFERED_INGRESS_BUSY",
+            retryable: true,
+            retryAfter: 1,
+            limit: 512,
+            actual: 640,
+            commitOutcomeUnknown: false,
+        });
+    });
+
     test.each([
         [],
         [{ key: "extra", currentRevision: null, currentGeneration: null }],

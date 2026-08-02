@@ -2935,7 +2935,8 @@ export class NodeStorage{
             outcome.markDefinitiveResponse()
 
             if (result.outcome === 'not-committed'
-                && result.code === 'IMPORT_IN_PROGRESS'
+                && (result.code === 'IMPORT_IN_PROGRESS'
+                    || result.code === 'BUFFERED_INGRESS_BUSY')
                 && result.retryable === true
                 && retryIndex < PLUGIN_STORAGE_MAX_RETRIES) {
                 await this.waitForPluginStorageRetry(new StorageError(
@@ -3181,7 +3182,8 @@ export class NodeStorage{
             outcome.markDefinitiveResponse()
 
             if (result.outcome === 'not-committed'
-                && result.code === 'IMPORT_IN_PROGRESS'
+                && (result.code === 'IMPORT_IN_PROGRESS'
+                    || result.code === 'BUFFERED_INGRESS_BUSY')
                 && result.retryable
                 && retryIndex < PLUGIN_STORAGE_MAX_RETRIES) {
                 await this.waitForPluginStorageRetry(new StorageError(result.error, {

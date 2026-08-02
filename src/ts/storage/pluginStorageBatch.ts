@@ -7,6 +7,24 @@ export const PLUGIN_STORAGE_BATCH_STREAM_PREFIX_BYTES = 12;
 export const PLUGIN_STORAGE_REVISION_PATTERN = /^sha256:[0-9a-f]{64}$/;
 export const PLUGIN_STORAGE_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const PLUGIN_STORAGE_HASH_PATTERN = /^[0-9a-f]{64}$/;
+const BUFFERED_INGRESS_ACKNOWLEDGEMENTS = new Map<string, {
+    status: number;
+    retryable: boolean;
+    includesBudget: boolean;
+}>([
+    ["BUFFERED_INGRESS_LENGTH_INVALID", {
+        status: 400, retryable: false, includesBudget: false,
+    }],
+    ["BUFFERED_INGRESS_LENGTH_REQUIRED", {
+        status: 411, retryable: false, includesBudget: false,
+    }],
+    ["BUFFERED_INGRESS_CONTENT_ENCODING_UNSUPPORTED", {
+        status: 415, retryable: false, includesBudget: false,
+    }],
+    ["BUFFERED_INGRESS_BUSY", {
+        status: 503, retryable: true, includesBudget: true,
+    }],
+]);
 
 export interface PluginStorageBatchStreamCapabilities {
     transport: "framed-v1";
@@ -449,6 +467,37 @@ export function classifyPluginStorageBatchAcknowledgement(
             status,
             retryAfter,
             commitOutcomeUnknown: false,
+        };
+    }
+
+    const ingressAcknowledgement = typeof body.code === "string"
+        ? BUFFERED_INGRESS_ACKNOWLEDGEMENTS.get(body.code)
+        : undefined;
+    if (ingressAcknowledgement
+        && ingressAcknowledgement.status === status
+        && hasOnlyKeys(body, [
+            "success", "outcome", "operation", "error", "code", "retryable",
+            ...(ingressAcknowledgement.includesBudget ? ["limit", "actual"] : []),
+        ])
+        && body.success === false
+        && body.outcome === "not-committed"
+        && body.retryable === ingressAcknowledgement.retryable
+        && typeof body.error === "string"
+        && body.error.length > 0
+        && (!ingressAcknowledgement.includesBudget
+            || (Number.isSafeInteger(body.limit) && Number.isSafeInteger(body.actual)))) {
+        return {
+            outcome: "not-committed",
+            operation: "batch",
+            code: body.code as string,
+            error: body.error,
+            retryable: ingressAcknowledgement.retryable,
+            status,
+            retryAfter,
+            commitOutcomeUnknown: false,
+            ...(ingressAcknowledgement.includesBudget
+                ? { limit: body.limit as number, actual: body.actual as number }
+                : {}),
         };
     }
 

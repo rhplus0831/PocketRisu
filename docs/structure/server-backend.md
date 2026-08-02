@@ -23,6 +23,7 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 | `server/node/importBarrier.cjs` | Abort-aware exclusive import gate. `acquire()` claims a FIFO turn before draining older mutations; abandoned waiters are removed safely, later writes are refused, and stable reads can wait with an `AbortSignal`. |
 | `server/node/importJournal.cjs` | Durable bridge between SQLite import transactions and filesystem asset/inlay directory swaps. It atomically writes/fsyncs `save/import_journal.json`, fsyncs staged trees, and recovers by finalizing committed swaps or restoring pre-import directories. |
 | `server/node/session-lock.cjs` | In-memory single-writer authority. `register()` records a boot without stealing; `checkWrite()` distinguishes the active writer, fresh gesture-backed takeover, fresh passive compatibility writes, and stale rejection; `peek()` provides a side-effect-free foreground status. |
+| `server/node/bufferedIngress.cjs` | Pre-parser admission for buffered JSON, octet-stream, and text bodies. It resolves auth/writer/route-limit policy, strictly validates uncompressed `Content-Length`, and reserves/relinquishes the process-wide in-flight byte budget without performing a writer-lock transition. |
 | `server/node/model-jobs.cjs` | Durable upstream model relay. `createModelJobs()` stores non-secret job metadata in `save/model-jobs.db`, records exact provider response bytes in append-only journals under `save/model-jobs/`, tails running streams, supports claims, and owns 48-hour pending-send tombstones. Main jobs are recoverable; auxiliary pipeline requests are relay-only. |
 | `server/node/request-logs.cjs` | Provider request history and token usage in `save/request-logs.db`. `createRequestLogs()` masks/truncates request material, rotates heavy request bodies by byte budget, retains the small usage ledger, exposes query/statistics routes, and closes independently at shutdown. |
 | `server/node/pluginSaveKeys.cjs` | Canonical optimized-plugin prefixes, manifest/folded markers, and lossless physical-key policy: UTF-8/base64url, tagged ill-formed UTF-16, or manifest-v3-mapped archive-safe hashes. |
@@ -41,7 +42,7 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 | `server/node/backupSnapshot.test.ts`, `test/compat/export-concurrent-mutation.test.ts` | Prove pinned snapshot reads survive live updates/deletes, missing referenced chats abort exports, concurrent plugin changes cannot corrupt archive framing, and completed exports re-import exactly. |
 | `server/node/importBarrier.test.ts`, `server/node/importJournal.test.ts`, `test/compat/import-mutation-barrier.test.ts` | Cover hold-before-drain ordering, retryable mutation refusal, late import rollback, crash recovery for directory swaps, and list-epoch invalidation. |
 | `server/node/snapshotPluginStorage.e2e.test.ts`, `test/compat/snapshot-spool.test.ts` | Cover exact optimized-plugin recovery (including folded-empty/pre-marker cases), chunk-streamed snapshot writes, save-volume spooling, orphan cleanup, and non-fatal snapshot-only failures. |
-| `server/node/session-lock.test.ts`, `model-jobs.test.ts`, `request-logs.test.ts` | Cover writer registration/takeover compatibility, recoverable versus auxiliary job lifecycle and retention, journal streaming/security, pending sends, request masking/truncation/rotation, usage retention, route guards, and database closure. |
+| `server/node/bufferedIngress.test.ts`, `session-lock.test.ts`, `model-jobs.test.ts`, `request-logs.test.ts` | Cover pre-parser admission/limits/concurrent byte accounting, writer registration/takeover compatibility, recoverable versus auxiliary job lifecycle and retention, journal streaming/security, pending sends, request masking/truncation/rotation, usage retention, route guards, and database closure. Real-server ingress ordering and abort release are covered by `test/compat/buffered-ingress-admission.test.ts`. |
 | `server/node/logs.cjs` | Separate SQLite-backed client/server diagnostic log sink in `save/logs.db`. It masks credentials, batches writes, builds the server logger, installs fatal process handlers, and records otherwise-unlogged Express errors. This is distinct from provider request history and usage in `request-logs.cjs`. |
 | `server/node/utils.cjs` | Server-side implementation of RisuAI save formats, cached-read hash parsing, and patch-sync hashing. `RisuSaveType` must match the client enum; `decodeRisuSave()` accepts legacy raw, compressed, stream-compressed, and block formats; `calculateHash()`/`normalizeJSON()` must remain behaviorally aligned with the client. |
 | `server/node/readme.md` | Declares this tree as PocketRisu's production backend, documents root-CWD startup, and explicitly distinguishes the incomplete Hono scaffold. |
@@ -111,6 +112,11 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `POCKETRISU_SPOOL_DIR` | Relocates database assembly/import/value/restore spools. Default `save/.spool`; it does not relocate filesystem export pins or plugin transition stages. |
 | `POCKETRISU_PLUGIN_VALUE_MAX_BYTES` | Per optimized-plugin value cap; default 128 MiB. |
 | `POCKETRISU_PLUGIN_STORAGE_MAX_BYTES` | Aggregate optimized-plugin cap; default 1 GiB. |
+| `POCKETRISU_BUFFERED_INGRESS_MAX_BYTES` | Process-wide budget for concurrently admitted buffered request bodies; default 512 MiB. Every buffered route ceiling is also capped by this value. |
+| `POCKETRISU_DATABASE_WRITE_MAX_BYTES` | Buffered `database.bin` and legacy plugin-transition ceiling; default 512 MiB. |
+| `POCKETRISU_KV_WRITE_MAX_BYTES` | Buffered generic KV/octet-stream ceiling; default 256 MiB. |
+| `POCKETRISU_CHAT_WRITE_MAX_BYTES` | Buffered chat-row ceiling; default 128 MiB. |
+| `POCKETRISU_PROXY_BODY_MAX_BYTES` | Buffered proxy/hub-proxy body ceiling; default 100 MiB. |
 | `RISU_BACKUP_IMPORT_MAX_BYTES` | Overall archive/save-folder ingress cap; default 2 GiB. Zero or invalid values use the default. |
 | `RISU_LEGACY_DATABASE_IMPORT_MAX_BYTES` | Buffered legacy database cap; default 64 MiB and capped by the overall limit. |
 | `RISU_SAVE_FOLDER_IMPORT_MAX_ENTRIES` | Save-folder/ZIP entry cap; default 100,000, maximum 1,000,000. |
@@ -144,6 +150,17 @@ compatibility. A stale session receives HTTP 423, while clients that omit `x-ses
 remain compatibility-exempt. `GET /api/session/lock-status` calls side-effect-free
 `peek()` and never acquires authority. Lock state is in memory, so the first registration
 or write after a server restart becomes active.
+
+Buffered JSON, `application/octet-stream`, and plain-text requests pass through
+`bufferedIngress.cjs` before Express reads their bodies. Protected routes authenticate
+first; writer routes then use side-effect-free `sessionLock.peek()` to refuse stale
+clients. Admission requires an identity-encoded, exact `Content-Length`, applies the
+route ceiling, and reserves those bytes from the global budget until `finish` or
+`close`. Budget pressure returns retryable HTTP 503 with a definitive not-committed
+outcome. The mutation route still calls `checkActiveSession()` after parsing, so only
+that authoritative check may refresh or transfer writer ownership. Direct-stream
+backup, migration, and plugin upload protocols retain their own bounds and bypass the
+buffered-body ledger.
 
 ### On-disk layout
 
