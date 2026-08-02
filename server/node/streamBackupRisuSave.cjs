@@ -30,6 +30,13 @@ const {
 const { PLUGIN_STORAGE_FOLDED_MARKER } = require('./pluginSaveKeys.cjs');
 const { PluginStorageValidationError } = require('./pluginStorageJson.cjs');
 const {
+    MCP_TOOL_CALL_SNAPSHOT_FIELD,
+    MCP_TOOL_CALL_SNAPSHOT_MARKER,
+    mcpToolCallStorageKey,
+    parseMcpToolCallStorageKey,
+    scanMcpToolCallIdsFromFile,
+} = require('./mcpToolCallRecovery.cjs');
+const {
     readJsonObjectFields,
     readJsonRootFields,
     readJsonValue,
@@ -50,6 +57,24 @@ const KNOWN_RISU_SAVE_TYPES = new Set(Object.values(RisuSaveType));
 const INHERITED_OBJECT_TRUTHY_KEYS = new Set(
     Object.getOwnPropertyNames(Object.prototype).filter((key) => Boolean({}[key])),
 );
+
+function stringHeader(length) {
+    if (!Number.isInteger(length) || length < 0 || length > 0xffffffff) {
+        throw new RangeError(`Invalid msgpack string length: ${length}`);
+    }
+    if (length <= 31) return Buffer.from([0xa0 | length]);
+    if (length <= 0xff) return Buffer.from([0xd9, length]);
+    if (length <= 0xffff) {
+        const header = Buffer.allocUnsafe(3);
+        header[0] = 0xda;
+        header.writeUInt16BE(length, 1);
+        return header;
+    }
+    const header = Buffer.allocUnsafe(5);
+    header[0] = 0xdb;
+    header.writeUInt32BE(length, 1);
+    return header;
+}
 
 function encoded(value) {
     return Buffer.from(packr.encode(value));
@@ -288,6 +313,76 @@ async function parseExistingEscapeEnvelope(source, descriptor) {
     };
 }
 
+async function writeCanonicalDescriptor(writer, source, descriptor, depth = 0) {
+    if (depth > 1024) throw new Error('Plugin storage MessagePack nesting is too deep');
+    const kind = await descriptorCollectionKind(source, descriptor);
+    if (kind === 'array' || kind === 'map') {
+        const cursor = source.cursor(descriptor.offset);
+        const count = await readCollectionCount(cursor, kind);
+        await writer.write(kind === 'array' ? arrayHeader(count) : mapHeader(count));
+        const values = kind === 'array' ? count : count * 2;
+        for (let index = 0; index < values; index++) {
+            const child = await skipMessagePackValue(cursor);
+            await writeCanonicalDescriptor(writer, source, child, depth + 1);
+        }
+        if (cursor.position !== descriptor.offset + descriptor.length) {
+            throw new Error('Invalid streamed plugin storage MessagePack span');
+        }
+        return;
+    }
+    const stringSpan = await messagePackStringSpan(source, descriptor);
+    if (stringSpan) {
+        await writer.write(stringHeader(stringSpan.length));
+        await writer.copyRange(source, stringSpan.offset, stringSpan.length);
+        return;
+    }
+    await writer.copyDescriptor(source, descriptor);
+}
+
+async function writeCanonicalJsonRow(writer, rowSource, options) {
+    if (typeof options.tempDir !== 'string' || options.tempDir.length === 0) {
+        throw new Error('Canonical plugin row streaming requires a temporary directory');
+    }
+    if (!options.canonicalScratch) {
+        const filePath = path.join(
+            options.tempDir,
+            `.canonical-plugin-row-${process.pid}-${nodeCrypto.randomUUID()}.risudat`,
+        );
+        options.canonicalScratch = {
+            filePath,
+            handle: await fs.open(filePath, 'wx', 0o600),
+        };
+    }
+    const scratch = options.canonicalScratch;
+    await scratch.handle.truncate(0);
+    const normalizedWriter = new PagedFileWriter(
+        scratch.handle,
+        options.shouldAbort,
+        options.signal,
+    );
+    await normalizedWriter.write(Buffer.from(magicHeader));
+    await streamJsonFileToMessagePack(rowSource, normalizedWriter, options);
+    await withPreparedSource({
+        filePath: scratch.filePath,
+        size: normalizedWriter.position,
+    }, options, async (source, payloadOffset) => {
+        const cursor = source.cursor(payloadOffset);
+        const descriptor = await skipMessagePackValue(cursor);
+        if (cursor.position !== source.size) {
+            throw new Error('Trailing bytes after streamed plugin storage row');
+        }
+        await writeCanonicalDescriptor(writer, source, descriptor);
+    });
+}
+
+async function cleanupCanonicalScratch(options) {
+    const scratch = options.canonicalScratch;
+    options.canonicalScratch = null;
+    if (!scratch) return;
+    await scratch.handle.close().catch(() => {});
+    await fs.unlink(scratch.filePath).catch(() => {});
+}
+
 async function writeJsonRow(writer, row, readPluginRowSource, options) {
     const source = await readPluginRowSource(row.source);
     if (!source) throw new PluginStorageValidationError(row.source);
@@ -312,7 +407,11 @@ async function writeJsonRow(writer, row, readPluginRowSource, options) {
                 }
             }
         }
-        await streamJsonFileToMessagePack(source, writer, options);
+        if (options.canonicalJsonEncoding) {
+            await writeCanonicalJsonRow(writer, source, options);
+        } else {
+            await streamJsonFileToMessagePack(source, writer, options);
+        }
     } catch (error) {
         if (error?.code === 'BACKUP_STREAM_ABORTED') throw error;
         throw new PluginStorageValidationError(row.source);
@@ -338,7 +437,6 @@ async function writeJsonRowAsSerializedEscape(writer, row, readPluginRowSource, 
         );
         await normalizedWriter.write(Buffer.from(magicHeader));
         await streamJsonFileToMessagePack(source, normalizedWriter, options);
-        await normalizedHandle.sync();
         await normalizedHandle.close();
         normalizedHandle = null;
         await withPreparedSource({
@@ -1105,6 +1203,14 @@ async function transformChat(writer, dbSource, descriptor, chaId, options) {
         ? await decodeMetadata(dbSource, stubByKey.get('id').descriptor, 'chat id')
         : undefined;
     if (stubMarker !== true || !chatId) {
+        if (options.referencedMcpToolCallIds && dbSource.filePath) {
+            const ids = await scanMcpToolCallIdsFromFile(dbSource.filePath, {
+                shouldAbort: options.shouldAbort,
+                offset: descriptor.offset,
+                size: descriptor.length,
+            });
+            for (const id of ids) options.referencedMcpToolCallIds.add(id);
+        }
         await writer.copyDescriptor(dbSource, descriptor);
         return;
     }
@@ -1116,6 +1222,14 @@ async function transformChat(writer, dbSource, descriptor, chaId, options) {
         return;
     }
     try {
+        if (options.referencedMcpToolCallIds) {
+            const ids = await scanMcpToolCallIdsFromFile(rowSource.filePath, {
+                shouldAbort: options.shouldAbort,
+                offset: rowSource.offset ?? 0,
+                size: rowSource.size,
+            });
+            for (const id of ids) options.referencedMcpToolCallIds.add(id);
+        }
         await withPreparedSource(rowSource, options, async (chatSource, payloadOffset) => {
             const cursor = chatSource.cursor(payloadOffset);
             const fullDescriptor = await skipMessagePackValue(cursor);
@@ -1204,7 +1318,7 @@ async function transformCharacters(writer, source, descriptor, options) {
     }
 }
 
-async function streamBackupRisuSaveToFile({
+async function streamBackupRisuSaveCoreToFile({
     databaseSource,
     filePath,
     readChatRowSource,
@@ -1218,6 +1332,8 @@ async function streamBackupRisuSaveToFile({
     signal = null,
     tempDir = null,
     onMissingChatRow = throwMissingChatRow,
+    canonicalJsonEncoding = false,
+    referencedMcpToolCallIds = null,
 }) {
     if (typeof readChatRowSource !== 'function') {
         throw new TypeError('readChatRowSource must be a function');
@@ -1234,6 +1350,8 @@ async function streamBackupRisuSaveToFile({
         shouldAbort,
         signal,
         tempDir,
+        canonicalJsonEncoding,
+        referencedMcpToolCallIds,
     };
     options.throwIfAborted = () => writer.throwIfAborted();
     try {
@@ -1402,14 +1520,137 @@ async function streamBackupRisuSaveToFile({
         });
         } finally {
             if (transformedDatabase !== databaseSource) await transformedDatabase.cleanup?.();
+            await cleanupCanonicalScratch(options);
         }
         await handle.sync();
         await handle.close();
         return { filePath, size: writer.position, maxPageBytes: writer.maxPageBytes };
     } catch (error) {
+        await cleanupCanonicalScratch(options);
         await handle.close().catch(() => {});
         await fs.unlink(filePath).catch(() => {});
         throw error;
+    }
+}
+
+function throwMissingMcpToolCallRow(callId) {
+    throw new Error(`Missing remembered MCP tool-call row: ${callId}`);
+}
+
+async function foldMcpToolCallsIntoRisuSave({
+    databaseSource,
+    filePath,
+    mcpToolCalls,
+    shouldAbort,
+    signal,
+    tempDir,
+    canonicalJsonEncoding,
+    referencedMcpToolCallIds,
+    onMissingMcpToolCallRow,
+}) {
+    const rows = mcpToolCalls?.rows ?? [];
+    if (rows.length > 0 && typeof mcpToolCalls?.readRowSource !== 'function') {
+        throw new TypeError('mcpToolCalls requires readRowSource when rows are present');
+    }
+    const candidates = new Map();
+    for (const row of rows) {
+        if (!row || typeof row !== 'object' || Array.isArray(row)
+            || typeof row.key !== 'string' || typeof row.source !== 'string') {
+            throw new TypeError('Invalid remembered MCP tool-call row descriptor');
+        }
+        candidates.set(row.key, row);
+    }
+
+    const selected = [];
+    for (const callId of referencedMcpToolCallIds) {
+        const storageKey = mcpToolCallStorageKey(callId);
+        const parsed = storageKey ? parseMcpToolCallStorageKey(storageKey) : null;
+        const row = parsed ? candidates.get(parsed.suffix) : null;
+        if (!row) {
+            await onMissingMcpToolCallRow(callId);
+            continue;
+        }
+        selected.push(row);
+    }
+    selected.sort((left, right) => left.key.localeCompare(right.key));
+
+    const handle = await fs.open(filePath, 'wx', 0o600);
+    const writer = new PagedFileWriter(handle, shouldAbort, signal);
+    const options = { shouldAbort, signal, tempDir, canonicalJsonEncoding };
+    try {
+        await withPreparedSource(databaseSource, options, async (source, payloadOffset, inspection) => {
+            const cursor = source.cursor(payloadOffset);
+            const rootDescriptor = await skipMessagePackValue(cursor);
+            if (cursor.position !== source.size) {
+                throw new Error('Trailing bytes after backup database');
+            }
+            const rootEntries = await readMapEntries(source, rootDescriptor, 'database root');
+            if (!rootEntries) throw new Error('Backup database root must be a MessagePack map');
+            const retained = rootEntries.filter((entry) => (
+                entry.key !== MCP_TOOL_CALL_SNAPSHOT_FIELD
+                && entry.key !== MCP_TOOL_CALL_SNAPSHOT_MARKER
+            ));
+
+            await writer.write(Buffer.from(
+                inspection.pluginStorageEscapes ? magicPluginStorageHeader : magicHeader,
+            ));
+            await writer.write(mapHeader(retained.length + 2));
+            for (const entry of retained) {
+                await writer.write(encoded(entry.key));
+                await writer.copyDescriptor(source, entry.descriptor);
+            }
+            await writer.write(encoded(MCP_TOOL_CALL_SNAPSHOT_FIELD));
+            await writer.write(mapHeader(selected.length));
+            for (const row of selected) {
+                await writer.write(encoded(row.key));
+                await writeJsonRow(
+                    writer,
+                    row,
+                    mcpToolCalls.readRowSource,
+                    options,
+                );
+            }
+            await writer.write(encoded(MCP_TOOL_CALL_SNAPSHOT_MARKER));
+            await writer.write(encoded(true));
+        });
+        await cleanupCanonicalScratch(options);
+        await handle.sync();
+        await handle.close();
+        return { filePath, size: writer.position, maxPageBytes: writer.maxPageBytes };
+    } catch (error) {
+        await cleanupCanonicalScratch(options);
+        await handle.close().catch(() => {});
+        await fs.unlink(filePath).catch(() => {});
+        throw error;
+    }
+}
+
+async function streamBackupRisuSaveToFile(options) {
+    if (options.mcpToolCalls == null) {
+        return streamBackupRisuSaveCoreToFile(options);
+    }
+    const basePath = `${options.filePath}.mcp-base-${process.pid}-${nodeCrypto.randomUUID()}`;
+    const referencedMcpToolCallIds = new Set();
+    try {
+        const base = await streamBackupRisuSaveCoreToFile({
+            ...options,
+            filePath: basePath,
+            referencedMcpToolCallIds,
+        });
+        return await foldMcpToolCallsIntoRisuSave({
+            databaseSource: base,
+            filePath: options.filePath,
+            mcpToolCalls: options.mcpToolCalls,
+            shouldAbort: options.shouldAbort ?? (() => false),
+            signal: options.signal ?? null,
+            tempDir: options.tempDir,
+            canonicalJsonEncoding: options.canonicalJsonEncoding ?? false,
+            referencedMcpToolCallIds,
+            onMissingMcpToolCallRow: options.onMissingMcpToolCallRow
+                ?? throwMissingMcpToolCallRow,
+        });
+    } finally {
+        await fs.unlink(basePath).catch(() => {});
     }
 }
 

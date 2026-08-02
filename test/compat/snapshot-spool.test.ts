@@ -1,13 +1,20 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import { existsSync } from 'node:fs'
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { Packr } from 'msgpackr'
+import utilsPkg from '../../server/node/utils.cjs'
 import { createClient, type RisuClient } from './helpers/client.js'
+import { encodeBackup } from './helpers/encode.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 
 const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
 const packr = new Packr({ useRecords: false })
+const { calculateHash, decodeRisuSave, normalizeJSON } = utilsPkg as {
+  calculateHash: (value: unknown) => number
+  decodeRisuSave: (value: Buffer) => Promise<any>
+  normalizeJSON: (value: unknown) => any
+}
 const DB_BLOB_HEX = Buffer.from('database/database.bin', 'utf-8').toString('hex')
 const servers: ServerHandle[] = []
 
@@ -19,8 +26,8 @@ function encodeRisuDat(value: Record<string, unknown>): Buffer {
   return Buffer.concat([MAGIC_RAW, Buffer.from(packr.encode(value))])
 }
 
-function encodeDatabase(revision: string, characters: unknown[] = []): Buffer {
-  return encodeRisuDat({
+function databaseValue(revision: string, characters: unknown[] = []): Record<string, unknown> {
+  return {
     characters,
     apiType: 'openai',
     personas: [],
@@ -28,7 +35,11 @@ function encodeDatabase(revision: string, characters: unknown[] = []): Buffer {
     botPresetsId: 0,
     selectedCharacter: 0,
     snapshotSpoolRevision: revision,
-  })
+  }
+}
+
+function encodeDatabase(revision: string, characters: unknown[] = []): Buffer {
+  return encodeRisuDat(databaseValue(revision, characters))
 }
 
 function writeDatabase(
@@ -50,6 +61,34 @@ async function listSnapshots(client: RisuClient): Promise<Array<{ key: string }>
   const response = await client.fetch('/api/db/snapshots')
   expect(response.status).toBe(200)
   return ((await response.json()) as { snapshots: Array<{ key: string }> }).snapshots
+}
+
+async function readKv(client: RisuClient, key: string): Promise<Buffer | null> {
+  const response = await client.fetch('/api/read', {
+    headers: { 'file-path': Buffer.from(key, 'utf8').toString('hex') },
+  })
+  if (response.status === 404) return null
+  expect(response.status).toBe(200)
+  return Buffer.from(await response.arrayBuffer())
+}
+
+async function readLatestSnapshot(client: RisuClient): Promise<any> {
+  const [latest] = await listSnapshots(client)
+  expect(latest).toBeTruthy()
+  const bytes = await readKv(client, latest.key)
+  expect(bytes).toBeTruthy()
+  return decodeRisuSave(bytes!)
+}
+
+function writeKv(client: RisuClient, key: string, value: Buffer): Promise<Response> {
+  return client.fetch('/api/write', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'file-path': Buffer.from(key, 'utf8').toString('hex'),
+    },
+    body: new Uint8Array(value),
+  })
 }
 
 async function waitForFile(filePath: string, timeoutMs = 5_000): Promise<void> {
@@ -77,10 +116,12 @@ async function waitForSnapshotCount(
 describe('database snapshot spool isolation', () => {
   test('chat saves acknowledge before automatic snapshot publication', async () => {
     const gateName = 'chat-snapshot-gate'
+    const statsName = 'snapshot-stats.json'
     const server = await spawnServer({
       env: {
         POCKETRISU_BACKUP_INTERVAL_MS: '0',
-        POCKETRISU_PLUGIN_RECOVERY_SNAPSHOT_TEST_GATE_DIR: gateName,
+        POCKETRISU_SNAPSHOT_ASSEMBLY_TEST_GATE_DIR: gateName,
+        POCKETRISU_TEST_SNAPSHOT_STATS_PATH: statsName,
       },
     })
     servers.push(server)
@@ -104,6 +145,7 @@ describe('database snapshot spool isolation', () => {
     await writeFile(path.join(gateDir, 'hold'), '')
 
     let chatSave: Promise<Response> | null = null
+    let racingSave: Promise<Response> | null = null
     try {
       const chatBytes = encodeRisuDat({
         id: chatId,
@@ -145,12 +187,174 @@ describe('database snapshot spool isolation', () => {
       expect(stored.status).toBe(200)
       expect(stored.headers.get('x-content-hash')).toBe(acknowledgementBody.hash)
       expect(Buffer.from(await stored.arrayBuffer())).toEqual(chatBytes)
+
+      const racingBytes = encodeRisuDat({
+        id: chatId,
+        name: 'Snapshot chat',
+        message: [{ role: 'assistant', data: 'committed while pinned assembly waited' }],
+      })
+      racingSave = client.fetch(`/api/chat-content/${chaId}/0`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-chat-id': chatId,
+        },
+        body: new Uint8Array(racingBytes),
+      })
+      const raced = await Promise.race([
+        racingSave,
+        new Promise<null>(resolve => setTimeout(() => resolve(null), 1_000)),
+      ])
+      expect(raced).not.toBeNull()
+      expect(raced?.status).toBe(200)
     } finally {
       await writeFile(path.join(gateDir, 'release'), '')
       await chatSave?.catch(() => {})
+      await racingSave?.catch(() => {})
     }
 
     await waitForSnapshotCount(client, 2)
+    const latest = await readLatestSnapshot(client)
+    expect(latest.characters[0].chats[0].message).toEqual([
+      { role: 'assistant', data: 'committed while pinned assembly waited' },
+    ])
+    const stats = JSON.parse(
+      await readFile(path.join(server.cwd, statsName), 'utf8'),
+    ) as Record<string, number>
+    expect(stats).toMatchObject({
+      metadataProbes: expect.any(Number),
+      databaseBodySpools: expect.any(Number),
+      tokenMismatches: expect.any(Number),
+      publications: expect.any(Number),
+    })
+    expect(stats.metadataProbes).toBeGreaterThanOrEqual(3)
+    expect(stats.databaseBodySpools).toBeGreaterThanOrEqual(3)
+    expect(stats.tokenMismatches).toBeGreaterThanOrEqual(1)
+    expect(stats.publications).toBe(2)
+  })
+
+  test('explicit flush routes its pending-patch snapshot through pinned assembly', async () => {
+    const gateName = 'flush-snapshot-gate'
+    const server = await spawnServer({
+      env: {
+        POCKETRISU_BACKUP_INTERVAL_MS: '0',
+        POCKETRISU_SNAPSHOT_ASSEMBLY_TEST_GATE_DIR: gateName,
+      },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const initial = databaseValue('before-flush')
+
+    expect((await writeDatabase(client, 'before-flush')).status).toBe(200)
+    await waitForSnapshotCount(client, 1)
+    await new Promise(resolve => setTimeout(resolve, 150))
+
+    const gateDir = path.join(server.cwd, gateName)
+    await mkdir(gateDir, { recursive: true })
+    await writeFile(path.join(gateDir, 'hold'), '')
+    const patched = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_BLOB_HEX,
+      },
+      body: JSON.stringify({
+        expectedHash: calculateHash(normalizeJSON(initial)).toString(16),
+        patch: [{ op: 'add', path: '/flushedThroughPinnedSnapshot', value: true }],
+      }),
+    })
+    expect(patched.status).toBe(200)
+
+    const session = await client.fetch('/api/session', { method: 'POST' })
+    expect(session.status).toBe(200)
+    const cookie = session.headers.get('set-cookie')?.split(';', 1)[0]
+    expect(cookie).toBeTruthy()
+    const flushed = await client.fetch('/api/db/flush', {
+      method: 'POST',
+      headers: { cookie: cookie! },
+    })
+    expect(flushed.status).toBe(200)
+
+    await waitForFile(path.join(gateDir, 'entered'))
+    let probe: Response | null = null
+    try {
+      probe = await Promise.race([
+        writeKv(client, 'snapshot-test/flush-queue-probe', Buffer.from('committed')),
+        new Promise<null>(resolve => setTimeout(() => resolve(null), 1_000)),
+      ])
+      expect(probe).not.toBeNull()
+      expect(probe?.status).toBe(200)
+    } finally {
+      await writeFile(path.join(gateDir, 'release'), '')
+    }
+
+    await waitForSnapshotCount(client, 2)
+    expect((await readLatestSnapshot(client)).flushedThroughPinnedSnapshot).toBe(true)
+  })
+
+  test('a destructive import during assembly invalidates the old spool before publication', async () => {
+    const gateName = 'import-snapshot-gate'
+    const statsName = 'import-snapshot-stats.json'
+    const server = await spawnServer({
+      env: {
+        POCKETRISU_BACKUP_INTERVAL_MS: '0',
+        POCKETRISU_SNAPSHOT_ASSEMBLY_TEST_GATE_DIR: gateName,
+        POCKETRISU_TEST_SNAPSHOT_STATS_PATH: statsName,
+      },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+
+    expect((await writeDatabase(client, 'before-import')).status).toBe(200)
+    await waitForSnapshotCount(client, 1)
+    await new Promise(resolve => setTimeout(resolve, 150))
+
+    const gateDir = path.join(server.cwd, gateName)
+    await mkdir(gateDir, { recursive: true })
+    await writeFile(path.join(gateDir, 'hold'), '')
+    expect((await writeDatabase(client, 'must-never-publish')).status).toBe(200)
+    await waitForFile(path.join(gateDir, 'entered'))
+
+    const replacement = encodeBackup([
+      { name: 'database.risudat', data: encodeDatabase('imported-winner') },
+    ])
+    const importDone = client.importBackup(replacement)
+    let importBarrierObserved = false
+    const barrierDeadline = Date.now() + 5_000
+    for (let attempt = 0; Date.now() < barrierDeadline; attempt++) {
+      const probe = await writeKv(
+        client,
+        `snapshot-test/import-probe-${attempt}`,
+        Buffer.from('probe'),
+      )
+      await probe.text()
+      if (probe.status === 503) {
+        importBarrierObserved = true
+        break
+      }
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    await writeFile(path.join(gateDir, 'release'), '')
+    expect(importBarrierObserved).toBe(true)
+    expect((await importDone).ok).toBe(true)
+
+    await waitForSnapshotCount(client, 2)
+    const snapshots = await listSnapshots(client)
+    const decoded = await Promise.all(snapshots.map(async ({ key }) => {
+      const bytes = await readKv(client, key)
+      return decodeRisuSave(bytes!)
+    }))
+    expect(decoded.map(database => database.snapshotSpoolRevision)).toEqual([
+      'imported-winner',
+      'before-import',
+    ])
+    expect(decoded.some(database => (
+      database.snapshotSpoolRevision === 'must-never-publish'
+    ))).toBe(false)
+    const stats = JSON.parse(
+      await readFile(path.join(server.cwd, statsName), 'utf8'),
+    ) as Record<string, number>
+    expect(stats.tokenMismatches).toBeGreaterThanOrEqual(1)
   })
 
   test('hub writes snapshot through save/.spool without a backups directory', async () => {
@@ -181,7 +385,7 @@ describe('database snapshot spool isolation', () => {
     expect(existsSync(path.join(server.cwd, 'save', '.spool', blockOrphanName))).toBe(false)
 
     expect((await writeDatabase(client, 'hub-write')).status).toBe(200)
-    expect(await listSnapshots(client)).toHaveLength(1)
+    await waitForSnapshotCount(client, 1)
     expect(existsSync(path.join(server.cwd, 'backups'))).toBe(false)
   })
 
@@ -210,6 +414,6 @@ describe('database snapshot spool isolation', () => {
     await mkdir(absoluteSpoolPath)
 
     expect((await writeDatabase(client, 'recovered')).status).toBe(200)
-    expect(await listSnapshots(client)).toHaveLength(1)
+    await waitForSnapshotCount(client, 1)
   })
 })

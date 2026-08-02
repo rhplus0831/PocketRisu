@@ -79,12 +79,26 @@ function collectMcpToolCallIds(value, output = new Set(), seen = new Set()) {
  * Marker text is UTF-8 inside MessagePack string bodies, so a streaming decoder
  * finds it without materializing the potentially multi-gigabyte database.
  */
-async function scanMcpToolCallIdsFromFile(filePath, { shouldAbort = () => false } = {}) {
+async function scanMcpToolCallIdsFromFile(filePath, {
+    shouldAbort = () => false,
+    offset = 0,
+    size = null,
+} = {}) {
+    if (!Number.isSafeInteger(offset) || offset < 0
+        || (size !== null && (!Number.isSafeInteger(size) || size < 0))) {
+        throw new RangeError('Invalid remembered MCP tool-call scan range');
+    }
     const ids = new Set();
     const decoder = new TextDecoder('utf-8', { fatal: false });
     let carry = '';
 
-    for await (const chunk of fs.createReadStream(filePath)) {
+    const streamOptions = size === null
+        ? { start: offset }
+        : size === 0
+            ? null
+            : { start: offset, end: offset + size - 1 };
+    const chunks = streamOptions ? fs.createReadStream(filePath, streamOptions) : [];
+    for await (const chunk of chunks) {
         if (shouldAbort()) {
             const error = new Error('MCP tool-call reference scan cancelled');
             error.name = 'AbortError';

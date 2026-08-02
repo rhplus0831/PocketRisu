@@ -247,10 +247,23 @@ count and exclusive chunk cost.
 
 - Snapshot assembly uses the configured DB spool (`POCKETRISU_SPOOL_DIR` or
   `save/.spool`) and streams the final file through chunk-aware storage.
+- The short queued capture phase flushes any pending debounced database persist, opens
+  one read-only WAL snapshot, and records a global source token. The token combines the
+  database row/chunk revisions and verified logical size, every chat row mutation token
+  and chunk-inventory revision, the plugin publication and viewer-facet revisions,
+  aggregate plugin quota bytes, and the exact recovery-dirty token. The plugin
+  publication clock covers both the selected database generation and exact manifest.
+- Assembly then leaves the mutation queue and reads database, chat, selected plugin, and
+  remembered MCP rows only through that pinned snapshot. Large rows are copied or
+  transcoded in bounded pages. Publication re-enters the queue, recaptures the complete
+  token, and commits/rotates only on equality; a mismatch discards the private spool and
+  retries or reschedules. A destructive import therefore cannot publish the older spool.
 - Snapshot failure is non-fatal to the primary save. The cooldown advances only after
   the snapshot row commits.
 - Primary database and chat writes acknowledge their committed mutation before scheduling
   the coalesced snapshot, so full assembly is outside the response-critical path.
+- Explicit/read-triggered pending-state flushes schedule this same pinned protocol; they
+  do not assemble a second snapshot directly from live rows.
 - Optimized plugin data is folded with `pluginStorageFolded` and the selected
   generation/manifest proof.
 - Referenced remembered MCP calls are folded into a versioned private map. Restore

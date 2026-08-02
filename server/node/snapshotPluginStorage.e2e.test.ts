@@ -299,9 +299,25 @@ async function writeKeyResponse(
     })
 }
 
-async function writeKey(server: RunningServer, auth: AuthHeaders, key: string, body: Uint8Array): Promise<void> {
+async function writeKey(
+    server: RunningServer,
+    auth: AuthHeaders,
+    key: string,
+    body: Uint8Array,
+    waitForInitialSnapshot = true,
+): Promise<void> {
     const response = await writeKeyResponse(server, auth, key, body)
     if (!response.ok) throw new Error(`Write of ${key} failed (${response.status}): ${await response.text()}`)
+    // Automatic assembly intentionally no longer holds the storage queue. Most
+    // tests use this helper to establish a quiescent initial recovery point, so
+    // wait for that setup snapshot explicitly instead of relying on a later
+    // queued read being stuck behind its assembly.
+    if (key === 'database/database.bin' && waitForInitialSnapshot) {
+        await waitFor(
+            async () => (await listSnapshotKeys(server, auth)).length > 0,
+            20_000,
+        )
+    }
 }
 
 async function readKeyResponse(
@@ -745,13 +761,15 @@ describe('atomic plugin storage publication', () => {
             'database/database.bin',
             await readKey(server, auth, 'database/database.bin'),
         )
-        const snapshotValues = await Promise.all(
-            (await listSnapshotKeys(server, auth)).map(async (key) => {
-                const snapshot = await decodeRisuSave(await readKey(server, auth, key))
-                return snapshot.pluginCustomStorage?.alpha
-            }),
-        )
-        expect(snapshotValues).toContain('new')
+        await waitFor(async () => {
+            const snapshotValues = await Promise.all(
+                (await listSnapshotKeys(server, auth)).map(async (key) => {
+                    const snapshot = await decodeRisuSave(await readKey(server, auth, key))
+                    return snapshot.pluginCustomStorage?.alpha
+                }),
+            )
+            return snapshotValues.includes('new')
+        })
     }, 30_000)
 
     it.each(['after-row', 'after-manifest', 'after-database'])(
@@ -1156,6 +1174,11 @@ describe('atomic plugin storage publication', () => {
             optimizePluginMemory: true,
             pluginCustomStorage: {},
         }))
+        // This intentionally inconsistent optimized publication cannot create
+        // its own folded snapshot, but an earlier eligible setup write may
+        // still have a deferred publication. Establish a quiet baseline before
+        // proving the rejected generic requests schedule nothing.
+        await delay(500)
         const snapshotsBeforeRejectedStaging = await listSnapshotKeys(server, auth)
 
         expect((await writeKeyResponse(
@@ -1937,7 +1960,7 @@ describe('plugin publication recovery snapshot scheduling', () => {
             },
         )
         expect(chatResponse.status).toBe(200)
-        expect(await listSnapshotKeys(server, auth)).toHaveLength(2)
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
         expect((await mutateCurrentStorage(server, auth, {
             writes: [
                 { storageKey: valueRowKey('alpha'), value: 'after-plugin' },
@@ -2006,7 +2029,7 @@ describe('plugin publication recovery snapshot scheduling', () => {
         expect((await readKey(server, auth, pluginRecoveryDirtyKey)).length).toBe(0)
     }, 30_000)
 
-    it('cannot clear T2 when T2 replaces T1 after T1 assembly but before publication', async () => {
+    it('discards T1 when T2 replaces it after assembly and clears only the published token', async () => {
         const cwd = makeWorkDir()
         const gateDir = path.join(cwd, 'plugin-snapshot-gate')
         const server = await startServer(cwd, {
@@ -2037,23 +2060,16 @@ describe('plugin publication recovery snapshot scheduling', () => {
         await releaseSnapshotPublicationGate(gateDir)
         await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
 
-        // T1's already-assembled spool publishes, but its captured token must
-        // not acknowledge the newer T2 transaction.
-        let [latest] = await readSnapshotDatabases(server, auth)
-        expect(latest.db.pluginCustomStorage?.alpha).toBe('T1')
-        expect(latest.db.pluginStorageMeta?.alpha).toEqual({ plugin: 'owner-T1' })
-        expect((await readKey(server, auth, pluginRecoveryDirtyKey)).toString('utf-8'))
-            .toBe('token-T2')
-
-        await disarmSnapshotPublicationGate(gateDir)
-        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 3)
-        ;[latest] = await readSnapshotDatabases(server, auth)
+        // T1's already-assembled spool must fail the global token comparison.
+        // The bounded retry captures T2 and only that coherent point publishes.
+        const [latest] = await readSnapshotDatabases(server, auth)
         expect(latest.db.pluginCustomStorage?.alpha).toBe('T2')
         expect(latest.db.pluginStorageMeta?.alpha).toEqual({ plugin: 'owner-T2' })
         expect((await readKey(server, auth, pluginRecoveryDirtyKey)).length).toBe(0)
+        await disarmSnapshotPublicationGate(gateDir)
     }, 30_000)
 
-    it('serializes a concurrent logical mutation behind assembly and later snapshots its exact pair', async () => {
+    it('lets a concurrent logical mutation commit during assembly and never publishes T1', async () => {
         const cwd = makeWorkDir()
         const gateDir = path.join(cwd, 'plugin-snapshot-gate')
         const server = await startServer(cwd, {
@@ -2096,13 +2112,18 @@ describe('plugin publication recovery snapshot scheduling', () => {
             ],
             deletes: [],
         }).finally(() => { concurrentSettled = true })
-        await delay(100)
-        expect(concurrentSettled).toBe(false)
-
+        const concurrentResponse = await Promise.race([
+            concurrentMutation,
+            delay(1_000).then(() => null),
+        ])
         await releaseSnapshotPublicationGate(gateDir)
-        expect((await concurrentMutation).status).toBe(200)
+        expect(concurrentResponse).not.toBeNull()
+        expect(concurrentResponse?.status).toBe(200)
+        expect(concurrentSettled).toBe(true)
+
+        await concurrentMutation
         await disarmSnapshotPublicationGate(gateDir)
-        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 3)
+        await waitFor(async () => (await listSnapshotKeys(server, auth)).length === 2)
 
         const snapshots = await readSnapshotDatabases(server, auth)
         expect(snapshots.map(({ db }) => [
@@ -2110,7 +2131,6 @@ describe('plugin publication recovery snapshot scheduling', () => {
             db.pluginStorageMeta?.alpha?.plugin,
         ])).toEqual([
             ['T2', 'owner-T2'],
-            ['T1', 'owner-T1'],
             ['initial', 'owner-initial'],
         ])
         expect(snapshots.every(({ db }) => (
@@ -3089,16 +3109,18 @@ describe('automatic snapshots × optimized plugin storage', () => {
         })
         expect((await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).length).toBe(0)
 
-        const snapshots = await Promise.all(
-            (await listSnapshotKeys(server, auth)).map(async key => (
-                await decodeRisuSave(await readKey(server, auth, key))
-            )),
-        )
-        expect(snapshots.some(snapshot => (
-            snapshot.optimizePluginMemory === false
-            && snapshot.pluginStorageGeneration === disabledGeneration
-            && snapshot.pluginCustomStorage?.['window-key'] === 'snapshot-value'
-        ))).toBe(true)
+        await waitFor(async () => {
+            const snapshots = await Promise.all(
+                (await listSnapshotKeys(server, auth)).map(async key => (
+                    await decodeRisuSave(await readKey(server, auth, key))
+                )),
+            )
+            return snapshots.some(snapshot => (
+                snapshot.optimizePluginMemory === false
+                && snapshot.pluginStorageGeneration === disabledGeneration
+                && snapshot.pluginCustomStorage?.['window-key'] === 'snapshot-value'
+            ))
+        })
 
         await stopServer(server)
         const raw = openFixtureDatabase(cwd)
@@ -3136,7 +3158,7 @@ describe('automatic snapshots × optimized plugin storage', () => {
 
         const server = await startServer(cwd)
         const auth = await authenticate(server)
-        await writeKey(server, auth, 'database/database.bin', selectedDatabase)
+        await writeKey(server, auth, 'database/database.bin', selectedDatabase, false)
 
         // A generated optimized publication needs a complete matching
         // manifest. Treating this mismatch as an authoritative empty set would

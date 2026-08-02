@@ -750,6 +750,92 @@ function kvGetPluginStoragePublicationRevision() {
     return pluginStoragePublicationRevisionTracker.getRevision();
 }
 
+/**
+ * Capture the operational identities that bound an automatic database
+ * snapshot. The payload is intentionally metadata-only: large logical values
+ * are represented by trigger-backed clocks or row mutation tokens, never by
+ * reading their bodies into one Buffer.
+ */
+function captureSnapshotSourceToken(connection, logicalDatabaseSize) {
+    const databaseRevision = connection.prepare(`
+        SELECT revision FROM database_row_revision WHERE id = 1
+    `).get()?.revision ?? null;
+    const databaseInventoryRevision = connection.prepare(`
+        SELECT source_revision AS sourceRevision
+          FROM chunk_manifest_inventory_revision
+         WHERE manifest_key = 'database/database.bin'
+    `).get()?.sourceRevision ?? null;
+    const pluginPublicationRevision = connection.prepare(`
+        SELECT revision FROM plugin_storage_publication_revision WHERE id = 1
+    `).get()?.revision ?? null;
+    const pluginFacetRevision = connection.prepare(`
+        SELECT source_revision AS sourceRevision,
+               indexed_revision AS indexedRevision
+          FROM plugin_storage_viewer_facet_revision
+         WHERE id = 1
+    `).get() ?? {};
+    const pluginUsageBytes = connection.prepare(`
+        SELECT bytes FROM plugin_storage_usage WHERE id = 1
+    `).get()?.bytes ?? null;
+    const recoveryDirty = connection.prepare(`
+        SELECT value
+          FROM kv
+         WHERE key = 'config/plugin-storage-recovery-dirty'
+    `).get()?.value ?? null;
+
+    let chatRows;
+    try {
+        chatRows = connection.prepare(`
+            SELECT rows.key AS key,
+                   metadata.row_token AS rowToken,
+                   inventory.source_revision AS inventoryRevision
+              FROM kv AS rows
+              LEFT JOIN chat_row_metadata AS metadata
+                ON metadata.row_key = rows.key
+              LEFT JOIN chunk_manifest_inventory_revision AS inventory
+                ON inventory.manifest_key = rows.key
+             WHERE rows.key LIKE 'chats/%'
+             ORDER BY rows.key
+        `).all();
+    } catch (error) {
+        // db.cjs can be exercised directly before createChatRowStore() installs
+        // its rebuildable derivative. Production snapshot capture happens only
+        // after that store exists. Preserve a useful read-only fallback for
+        // lower-level callers without inventing a second chat revision clock.
+        if (!String(error?.message ?? '').includes('no such table: chat_row_metadata')) {
+            throw error;
+        }
+        chatRows = connection.prepare(`
+            SELECT rows.key AS key,
+                   NULL AS rowToken,
+                   inventory.source_revision AS inventoryRevision
+              FROM kv AS rows
+              LEFT JOIN chunk_manifest_inventory_revision AS inventory
+                ON inventory.manifest_key = rows.key
+             WHERE rows.key LIKE 'chats/%'
+             ORDER BY rows.key
+        `).all();
+    }
+
+    return {
+        databaseRevision,
+        databaseInventoryRevision,
+        databaseSize: logicalDatabaseSize,
+        chatRows,
+        pluginPublicationRevision,
+        pluginFacetSourceRevision: pluginFacetRevision.sourceRevision ?? null,
+        pluginFacetIndexedRevision: pluginFacetRevision.indexedRevision ?? null,
+        pluginUsageBytes,
+        recoveryDirtyToken: Buffer.isBuffer(recoveryDirty)
+            ? recoveryDirty.toString('base64url')
+            : null,
+    };
+}
+
+function kvGetSnapshotSourceToken() {
+    return captureSnapshotSourceToken(db, kvSize('database/database.bin'));
+}
+
 const runKvCopyValue = db.transaction((srcKey, dstKey) => {
     const sourceSize = chunkStore.sizeValue(srcKey);
     if (sourceSize === null) return;
@@ -848,6 +934,12 @@ function createKvSnapshot() {
         return {
             ...reader,
             ...viewerFacets,
+            kvGetSnapshotSourceToken() {
+                return captureSnapshotSourceToken(
+                    snapshotDb,
+                    reader.kvSize('database/database.bin'),
+                );
+            },
             kvListPluginStorageOwnerFacets(storageKeys) {
                 return viewerFacets.viewerOwnerFacets(storageKeys);
             },
@@ -980,7 +1072,7 @@ function clearEntities() {
 module.exports = {
     db,
     // KV
-    kvGet, kvGetAsync, kvIterate, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvListSelectedWithSizes, kvSize, kvGetUpdatedAt, kvGetDatabaseRevision, kvGetPluginStoragePublicationRevision, kvCopyValue,
+    kvGet, kvGetAsync, kvIterate, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvListSelectedWithSizes, kvSize, kvGetUpdatedAt, kvGetDatabaseRevision, kvGetPluginStoragePublicationRevision, kvGetSnapshotSourceToken, kvCopyValue,
     kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
     kvGetListEpoch, kvBumpListEpoch,
     createKvSnapshot,

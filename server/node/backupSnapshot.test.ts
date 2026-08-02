@@ -1,11 +1,12 @@
 import { execFile } from 'node:child_process'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import Database from 'better-sqlite3'
 import { afterEach, describe, expect, test } from 'vitest'
 import chunkStorePkg from './chunkStore.cjs'
+import streamBackupPkg from './streamBackupRisuSave.cjs'
 import streamSavePkg from './streamRisuSave.cjs'
 import utilsPkg from './utils.cjs'
 
@@ -28,6 +29,12 @@ const { streamRisuSaveToFile } = streamSavePkg as {
         readChatRow: (chaId: string, chatId: string) => Promise<unknown> | unknown
         onMissingChatRow?: (chaId: string, chatId: string) => Promise<void> | void
     }) => Promise<{ filePath: string; size: number }>
+}
+const { streamBackupRisuSaveToFile } = streamBackupPkg as {
+    streamBackupRisuSaveToFile: (options: Record<string, unknown>) => Promise<{
+        filePath: string
+        size: number
+    }>
 }
 const { decodeRisuSave, encodeRisuSaveLegacy } = utilsPkg as {
     decodeRisuSave: (value: Buffer) => Promise<any>
@@ -53,6 +60,109 @@ function createKvSchema(db: Database.Database): void {
 }
 
 describe('backup snapshot assembly', () => {
+    test('automatic snapshot existence is probed through verified metadata, not database kvGet', async () => {
+        const source = await readFile(path.resolve(import.meta.dirname, 'server.cjs'), 'utf8')
+        const captureStart = source.indexOf('async function captureAutomaticSnapshotSource')
+        const assemblyStart = source.indexOf('async function assembleAutomaticSnapshotSource')
+        expect(captureStart).toBeGreaterThanOrEqual(0)
+        expect(assemblyStart).toBeGreaterThan(captureStart)
+        const captureSource = source.slice(captureStart, assemblyStart)
+        expect(captureSource).toContain('snapshot.kvGetSnapshotSourceToken()')
+        expect(captureSource).toContain('sourceToken.databaseSize')
+        expect(captureSource).not.toMatch(/kvGet\([^)]*database\/database\.bin/)
+    })
+
+    test('pinned source-to-source assembly preserves the legacy snapshot bytes', async () => {
+        const chaId = 'byte-character'
+        const chatId = 'byte-chat'
+        const callId = 'remembered-call'
+        const mcpSuffix = `${Buffer.from(callId, 'utf8').toString('base64url')}.json`
+        const graph = {
+            characters: [{
+                chaId,
+                name: 'Character',
+                chats: [{ id: chatId, name: 'Stub name', _stub: true, folderId: 'folder' }],
+            }],
+            optimizePluginMemory: true,
+            pluginStorageGeneration: 'generation-byte-test',
+            pluginCustomStorage: {},
+            pluginStorageMeta: {},
+        }
+        const fullChat = {
+            id: chatId,
+            name: 'Full name',
+            message: [{
+                role: 'assistant',
+                data: `<tool_call>${callId}\uf100payload</tool_call>`,
+            }],
+            scriptstate: { exact: true },
+        }
+        const rowValues: Record<string, unknown> = {
+            'plugin-value': { nested: ['same', 42, true] },
+            'plugin-meta': { plugin: 'owner' },
+            'mcp-row': {
+                call: { id: callId, name: 'lookup' },
+                response: [{ type: 'text', text: 'remembered' }],
+            },
+        }
+        const pluginStorage = {
+            valueRows: [{ key: 'alpha', source: 'plugin-value' }],
+            metaRows: [{ key: 'alpha', source: 'plugin-meta' }],
+            readRow: (source: string) => rowValues[source],
+        }
+        const mcpToolCalls = {
+            rows: [{ key: mcpSuffix, source: 'mcp-row' }],
+            readRow: (source: string) => rowValues[source],
+        }
+        const legacyPath = await tempPath('legacy.risudat')
+        await streamRisuSaveToFile({
+            dbObj: graph,
+            filePath: legacyPath,
+            readChatRow: () => fullChat,
+            pluginStorage,
+            mcpToolCalls,
+            markPluginStorageFolded: true,
+        } as any)
+
+        const sourcePath = await tempPath('database.risudat')
+        const chatPath = await tempPath('chat.risudat')
+        const valuePaths = new Map<string, { filePath: string; size: number }>()
+        await writeFile(sourcePath, Buffer.from(encodeRisuSaveLegacy(graph)))
+        await writeFile(chatPath, Buffer.from(encodeRisuSaveLegacy(fullChat)))
+        for (const [source, value] of Object.entries(rowValues)) {
+            const filePath = await tempPath(`${source}.json`)
+            const bytes = Buffer.from(JSON.stringify(value), 'utf8')
+            await writeFile(filePath, bytes)
+            valuePaths.set(source, { filePath, size: bytes.length })
+        }
+        const streamedPath = await tempPath('streamed.risudat')
+        await streamBackupRisuSaveToFile({
+            databaseSource: {
+                filePath: sourcePath,
+                size: (await readFile(sourcePath)).length,
+            },
+            filePath: streamedPath,
+            tempDir: path.dirname(streamedPath),
+            readChatRowSource: () => ({
+                filePath: chatPath,
+                size: Buffer.from(encodeRisuSaveLegacy(fullChat)).length,
+            }),
+            pluginStorage: {
+                valueRows: pluginStorage.valueRows,
+                metaRows: pluginStorage.metaRows,
+                readRowSource: (source: string) => valuePaths.get(source),
+            },
+            mcpToolCalls: {
+                rows: mcpToolCalls.rows,
+                readRowSource: (source: string) => valuePaths.get(source),
+            },
+            markPluginStorageFolded: true,
+            canonicalJsonEncoding: true,
+        })
+
+        expect(await readFile(streamedPath)).toEqual(await readFile(legacyPath))
+    })
+
     test('createKvSnapshot reads raw and chunked values from its pinned WAL snapshot', async () => {
         const cwd = await mkdtemp(path.join(tmpdir(), 'risu-kv-snapshot-'))
         tempDirs.push(cwd)

@@ -33,8 +33,8 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 | `server/node/listDelta.cjs` | Builds full or delta `/api/list` responses from KV modification timestamps, the deletion journal, filesystem mtimes, and the list epoch. Delta eligibility is capped at six days. |
 | `server/node/assetStore.cjs` | Filesystem-backed implementation for safe `assets/*` keys, including atomic write/rename, SHA-256 filename verification, dual-source listing, migration, clear, and import staging helpers. |
 | `server/node/assetGc.cjs` | Bounded recursive asset-reference discovery, persisted candidate bookkeeping, and two-pass grace planning for server-owned ordinary-asset garbage collection. |
-| `server/node/streamRisuSave.cjs` | Object-based legacy encoder for already-materialized database state and automatic snapshot assembly. |
-| `server/node/streamBackupRisuSave.cjs` | Seekable source-to-source transformer for point-in-time full/partial export and folded external chat/plugin rows without monolithizing state in memory. |
+| `server/node/streamRisuSave.cjs` | Object-based legacy encoder for already-materialized database state and compatibility export paths. |
+| `server/node/streamBackupRisuSave.cjs` | Seekable source-to-source transformer for point-in-time full/partial export and automatic snapshots, including folded external chat/plugin/MCP rows without monolithizing state in memory. |
 | `server/node/streamRisuLoad.cjs` | Bounded streaming inspector/decoder for supported RisuSave formats and snapshot/import ingestion. |
 | `server/node/streamJsonToMsgpack.cjs`, `jsonValidateWorker.cjs` | Bounded JSON validation and streaming conversion used by import/restore compatibility paths. |
 | `server/node/backupEntryFormat.cjs` | Archive header/framing, entry name/body bounds, byte-size planning, and preflight. |
@@ -412,11 +412,16 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
 - Imports and save-folder replacements spool bounded ingress and entries to disk, hold the
   abortable import barrier, validate compatibility formats under finite limits, and pair
   the SQLite transaction with fsynced filesystem swaps through the durable journal.
-- Automatic snapshots use the configured database spool, fold the selected plugin
-  generation, preserve already-missing chats as bare stubs, and publish non-fatally into
-  chunk-aware KV storage. Snapshot restore is bounded by decoded-size and disk-headroom
-  limits, cancellable before commit, and atomic; its client wait is activity-based rather
-  than a fixed total deadline.
+- Automatic snapshots briefly hold the storage queue to flush pending database state,
+  pin one WAL snapshot, and capture a global token over database and chat revisions, the
+  selected plugin publication/manifest, plugin quota/owner facets, and recovery-dirty
+  state. Source-to-source assembly then runs outside the queue using only the pin. A
+  second queued phase publishes and rotates only if the full token still matches;
+  otherwise it discards and retries. They fold the selected plugin generation, preserve
+  already-missing chats as bare stubs, and publish non-fatally into chunk-aware KV
+  storage. Snapshot restore is bounded by decoded-size and disk-headroom limits,
+  cancellable before commit, and atomic; its client wait is activity-based rather than a
+  fixed total deadline.
 - Destructive routes distinguish committed, not-committed, and unknown outcomes. An
   interrupted save-folder/snapshot response first consults the durable replacement status;
   any still-unknown result is reconciled by reload/readback and never replayed automatically.
@@ -677,9 +682,11 @@ callers may explicitly include usage deletion.
 
 - Snapshot assembly is independent of file backups. Temporary `database.risudat` files
   belong in `save/.spool` or `POCKETRISU_SPOOL_DIR`, never under the optional server-backup
-  path. Automatic snapshots stream the finished file through `kvSetFromFile()` and contain
-  their own failures; advance `lastBackupTime` only after the snapshot row commits so a
-  spool failure retries on the next write.
+  path. Automatic snapshots stream the pinned source into a private finished file outside
+  the storage queue, then stream that file through `kvSetFromFile()` only after a queued
+  global-token comparison. They contain their own failures; advance `lastBackupTime` only
+  after the snapshot row commits so a spool failure retries on the next write. Pending
+  database flushes feed this same scheduler rather than assembling against live rows.
 
 - Automatic snapshot timestamps use 100 ms units. Creation divides `Date.now()` by 100;
   listing multiplies the parsed value by 100.
