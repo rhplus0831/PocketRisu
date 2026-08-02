@@ -2,6 +2,7 @@
     import { language } from "src/lang";
     import ShButton from "src/lib/UI/GUI/ShButton.svelte";
     import { alertConfirm, alertNormal } from "src/ts/alert";
+    import { clientBuildFetch } from "src/ts/storage/clientBuildHandshake";
 
     let compressing = $state(false);
     let progress = $state('');
@@ -20,7 +21,7 @@
         progress = '';
 
         try {
-            const res = await fetch('/api/inlays/compress', {
+            const res = await clientBuildFetch('/api/inlays/compress', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ quality: 85 }),

@@ -30,6 +30,7 @@
     import { alertConfirm, notifyError, notifySuccess } from 'src/ts/alert'
     import { forageStorage } from 'src/ts/globalApi.svelte'
     import { language, getCurrentLocale } from 'src/lang'
+    import { clientBuildFetch } from 'src/ts/storage/clientBuildHandshake'
 
     type LogLevel = 'error' | 'warning' | 'info'
     type LogOrigin = 'client' | 'server'
@@ -196,7 +197,7 @@
         if (!ok) return
         try {
             const auth = await forageStorage.createAuth()
-            const res = await fetch('/api/logs', {
+            const res = await clientBuildFetch('/api/logs', {
                 method: 'DELETE',
                 headers: { 'risu-auth': auth },
             })

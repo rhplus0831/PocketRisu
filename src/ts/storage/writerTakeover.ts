@@ -21,6 +21,8 @@ let writerAccessLost = false
 let offlineFreezeObserver: MutationObserver | null = null
 let removeInteractionGuards: (() => void) | null = null
 
+export type WriterTakeoverReason = 'session-takeover' | 'server-upgrade'
+
 export type WriterLockState = 'free' | 'active' | 'fresh' | 'stale' | 'unknown'
 
 interface WriterTakeoverReturnCheck {
@@ -38,11 +40,11 @@ export function isWriterAccessLost(): boolean {
  * The server remains authoritative: this flow never retries a stale write or
  * attempts to reclaim ownership without a full reload.
  */
-export function enterWriterTakeoverFlow(): void {
+export function enterWriterTakeoverFlow(reason: WriterTakeoverReason = 'session-takeover'): void {
     if (writerAccessLost) return
     writerAccessLost = true
     window.dispatchEvent(new CustomEvent(WRITER_ACCESS_LOST_EVENT))
-    void runWriterTakeoverFlow()
+    void runWriterTakeoverFlow(reason)
 }
 
 /**
@@ -66,12 +68,14 @@ export async function checkWriterTakeoverOnReturn({
     return true
 }
 
-async function runWriterTakeoverFlow(): Promise<void> {
+async function runWriterTakeoverFlow(reason: WriterTakeoverReason): Promise<void> {
     let selection = '0'
     try {
         selection = await alertSelect(
             [language.writerTakeoverStayOffline, language.writerTakeoverReload],
-            language.writerTakeoverBody,
+            reason === 'server-upgrade'
+                ? language.clientUpgradeDirtyBody
+                : language.writerTakeoverBody,
         )
     } catch (error) {
         console.error('[Writer] Failed to show takeover dialog:', error)
@@ -82,10 +86,10 @@ async function runWriterTakeoverFlow(): Promise<void> {
         return
     }
 
-    enterFrozenOfflineState()
+    enterFrozenOfflineState(reason)
 }
 
-function enterFrozenOfflineState(): void {
+function enterFrozenOfflineState(reason: WriterTakeoverReason): void {
     if (typeof document === 'undefined') return
     const appRoot = document.getElementById('app')
     if (!appRoot) return
@@ -103,7 +107,9 @@ function enterFrozenOfflineState(): void {
         banner.setAttribute('aria-live', 'polite')
 
         const message = document.createElement('span')
-        message.textContent = language.writerOfflineBanner
+        message.textContent = reason === 'server-upgrade'
+            ? language.clientUpgradeOfflineBanner
+            : language.writerOfflineBanner
         banner.appendChild(message)
 
         const reload = document.createElement('button')

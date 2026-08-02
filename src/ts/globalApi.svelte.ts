@@ -48,6 +48,11 @@ import {
     type DatabaseSaveOutcome,
 } from "./storage/databaseSave"
 import { DirtyTargetBridge } from "./storage/dirtyTargetBridge"
+import {
+    clientBuildFetch,
+    setClientBuildDirtyStateProbe,
+    type ClientUpgradeRequiredDetail,
+} from "./storage/clientBuildHandshake"
 import { watchActiveChatDirty } from "./storage/activeChatDirtyTracker.svelte"
 import {
     createRequestLogScope, recordRequestLog, fetchRequestLogs,
@@ -429,9 +434,14 @@ export async function saveDb() {
     // Cross-device single-writer lock: mirrors BroadcastChannel behavior
     // across devices via server-side session checks. Both a mutation-time 423
     // and a stale foreground status enter the same explicit recovery flow.
-    window.addEventListener('risu-session-deactivated', () => {
+    window.addEventListener('risu-session-deactivated', (event) => {
         if (claimWriterAccessLoss()) {
-            enterWriterTakeoverFlow()
+            const detail = (event as CustomEvent<ClientUpgradeRequiredDetail>).detail
+            enterWriterTakeoverFlow(
+                detail?.reason === 'server-upgrade'
+                    ? 'server-upgrade'
+                    : 'session-takeover',
+            )
         }
     })
 
@@ -494,6 +504,13 @@ export async function saveDb() {
         )
     }
 
+    setClientBuildDirtyStateProbe(() => (
+        changed
+        || saving.state
+        || hasTrackedChanges(changeTracker)
+        || get(chatOperationActive)
+    ))
+
     function takeTrackedChanges() {
         const toSave = safeStructuredClone(changeTracker)
         changeTracker.character = changeTracker.character.length === 0 ? [] : [changeTracker.character[0]]
@@ -508,7 +525,7 @@ export async function saveDb() {
 
     async function flushServerDbKeepalive() {
         try {
-            fetch('/api/db/flush', {
+            clientBuildFetch('/api/db/flush', {
                 method: 'POST',
                 keepalive: true,
                 credentials: 'same-origin'

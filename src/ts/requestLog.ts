@@ -17,6 +17,7 @@
 
 import { getDatabase } from './storage/database.svelte'
 import { getClientId } from './log'
+import { withClientBuildHeader } from './storage/clientBuild'
 
 export type RequestLogCategory = 'llm' | 'tts' | 'image' | 'translate' | 'embedding' | 'other'
 export type RequestLogSource =
@@ -146,7 +147,10 @@ async function send(entries: PendingEntry[]): Promise<void> {
         const auth = await forageStorage.createAuth()
         await fetch('/api/request-logs', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'risu-auth': auth },
+            headers: withClientBuildHeader({
+                'Content-Type': 'application/json',
+                'risu-auth': auth,
+            }),
             body: JSON.stringify(entries),
         })
     } catch {
@@ -322,8 +326,12 @@ export async function clearRequestLogs(withUsage = false): Promise<boolean> {
     try {
         const res = await fetch(`/api/request-logs${withUsage ? '?usage=1' : ''}`, {
             method: 'DELETE',
-            headers: await authHeaders(),
+            headers: withClientBuildHeader(await authHeaders()),
         })
+        if (res.status === 426) {
+            const { handleClientBuildResponse } = await import('./storage/clientBuildHandshake')
+            await handleClientBuildResponse(res)
+        }
         return res.ok
     } catch {
         return false

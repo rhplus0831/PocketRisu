@@ -58,6 +58,8 @@ export interface SpawnServerOptions {
    * Receives the absolute path to the `save/` dir.
    */
   seedSave?: (saveDir: string) => Promise<void>
+  /** Seed files such as dist/build-stamp.json before the server discovers them. */
+  seedRoot?: (rootDir: string) => Promise<void>
 }
 
 export async function spawnServer(opts: SpawnServerOptions = {}): Promise<ServerHandle> {
@@ -68,6 +70,7 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Server
   }
   await writeFile(path.join(tempDir, 'save', '__password'), TEST_PASSWORD, 'utf-8')
   if (opts.seedSave) await opts.seedSave(path.join(tempDir, 'save'))
+  if (opts.seedRoot) await opts.seedRoot(tempDir)
 
   let child: ChildProcess | null = null
   let exited = true

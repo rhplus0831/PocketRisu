@@ -1128,6 +1128,14 @@ export const languageKorean = {
   writerTakeoverReload: "변경 사항을 버리고 새로고침하여 쓰기 권한 가져오기",
   writerOfflineBanner:
     "읽기 전용: 다른 세션에 쓰기 권한이 있습니다. 새로고침하기 전에 저장되지 않은 내용을 복사하세요.",
+  clientUpgradeDirtyBody:
+    "서버가 업데이트되어 이 클라이언트에서는 더 이상 변경 사항을 저장할 수 없습니다. 저장되지 않은 내용을 복사할 수 있도록 읽기 전용 상태로 머무르거나, 해당 내용을 버리고 새 클라이언트 번들을 불러오세요.",
+  clientUpgradeOfflineBanner:
+    "읽기 전용: 서버에 더 새로운 클라이언트가 필요합니다. 새로고침하기 전에 저장되지 않은 내용을 복사하세요.",
+  clientUpgradeReloadFailed:
+    "새로고침 후에도 PocketRisu가 오래된 클라이언트를 사용하고 있습니다. 사이트 캐시를 지우거나 리버스 프록시 캐시를 확인한 뒤 수동으로 새로고침하세요.",
+  clientUpgradeInvalidResponse:
+    "서버에 클라이언트 업데이트가 필요하지만 올바른 빌드 정보가 없습니다. 서버 또는 프록시 설정을 확인한 뒤 수동으로 새로고침하세요.",
   addCharacter: "캐릭터 추가",
   importFromRealm: "RisuRealm에서 고르기",
   importFromRealmDesc:

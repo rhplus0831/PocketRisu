@@ -28,6 +28,7 @@
     import { language } from 'src/lang'
     import { LoadLocalBackup, SaveLocalBackup, SaveServerBackup } from 'src/ts/drive/backuplocal'
     import { runInternalSnapshotRestoreUi } from 'src/ts/storage/snapshotRestoreUi'
+    import { clientBuildFetch } from 'src/ts/storage/clientBuildHandshake'
 
     // ── Types ────────────────────────────────────────────────────────────────
     interface Snapshot { key: string; size: number | null; timestamp: number | null }
@@ -201,7 +202,7 @@
         limitsDialogError = null
         try {
             const auth = await forageStorage.createAuth()
-            const res = await fetch('/api/db/snapshots/limits', {
+            const res = await clientBuildFetch('/api/db/snapshots/limits', {
                 method: 'PUT',
                 headers: { 'risu-auth': auth, 'content-type': 'application/json' },
                 body: JSON.stringify(isHub ? { maxCount: c } : { maxCount: c, maxBytes: mb * 1024 * 1024 }),
@@ -250,7 +251,7 @@
         pathDialogError = null
         try {
             const auth = await forageStorage.createAuth()
-            const res = await fetch('/api/backup/server/path', {
+            const res = await clientBuildFetch('/api/backup/server/path', {
                 method: 'PUT',
                 headers: { 'risu-auth': auth, 'content-type': 'application/json' },
                 body: JSON.stringify({ path: trimmed }),
@@ -312,7 +313,7 @@
     async function saveBootReminder(next: boolean) {
         try {
             const auth = await forageStorage.createAuth()
-            const res = await fetch('/api/backup/boot-reminder', {
+            const res = await clientBuildFetch('/api/backup/boot-reminder', {
                 method: 'PUT',
                 headers: { 'risu-auth': auth, 'content-type': 'application/json' },
                 body: JSON.stringify({ enabled: next }),

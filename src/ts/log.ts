@@ -1,4 +1,5 @@
 import { UAParser } from 'ua-parser-js'
+import { withClientBuildHeader } from './storage/clientBuild'
 
 // forageStorage is imported lazily inside flush() so log-capture can be imported
 // very early in main.ts without dragging the full globalApi graph into bootstrap.
@@ -113,7 +114,10 @@ async function flush() {
         const auth = await forageStorage.createAuth()
         await fetch('/api/logs', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'risu-auth': auth },
+            headers: withClientBuildHeader({
+                'Content-Type': 'application/json',
+                'risu-auth': auth,
+            }),
             body: JSON.stringify(batch),
         })
     } catch {

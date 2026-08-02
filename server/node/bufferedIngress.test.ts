@@ -57,6 +57,7 @@ function middleware({
   budget = createInFlightByteBudget(32),
   authenticate = vi.fn(async () => true),
   writerState = vi.fn(() => 'active'),
+  expectedClientBuild = null as { version: string; stamp: string } | null,
 } = {}) {
   return {
     budget,
@@ -68,6 +69,7 @@ function middleware({
       authenticate,
       authenticateCookie: vi.fn(() => true),
       writerState,
+      expectedClientBuild,
     }),
   }
 }
@@ -98,7 +100,7 @@ describe('buffered ingress admission', () => {
     expect(parseContentLength(raw)).toBe(expected)
   })
 
-  test('keeps direct-stream routes outside the buffered budget', () => {
+  test('keeps direct-stream routes admission-only and outside the buffered budget', () => {
     expect(isStreamedIngress(request({
       path: '/api/plugin-storage/mutate',
       headers: {
@@ -109,7 +111,11 @@ describe('buffered ingress admission', () => {
     expect(createRoutePolicyResolver(limits())(request({
       path: '/api/backup/import',
       headers: { 'content-type': 'application/octet-stream' },
-    }))).toBeNull()
+    }))).toMatchObject({
+      admissionOnly: true,
+      writer: true,
+      maxBytes: 0,
+    })
   })
 
   test('authenticates before inspecting or reserving an untrusted body', async () => {
@@ -136,6 +142,87 @@ describe('buffered ingress admission', () => {
     expect(result.res.body).toEqual({ error: 'Session deactivated' })
     expect(writerState).toHaveBeenCalledOnce()
     expect(admission.budget.snapshot().usedBytes).toBe(0)
+  })
+
+  test.each([
+    ['missing', undefined],
+    ['mismatched', '1.9.0-old-build'],
+  ])('rejects a %s client stamp before reserving body bytes', async (_case, clientBuild) => {
+    const expectedClientBuild = {
+      version: '1.9.0',
+      stamp: `1.9.0-${'a'.repeat(64)}`,
+    }
+    const admission = middleware({ expectedClientBuild })
+    const headers = {
+      ...request().headers,
+      ...(clientBuild === undefined ? {} : { 'x-client-build': clientBuild }),
+    }
+    const result = await dispatch(admission.run, request({ headers }))
+
+    expect(result.res.statusCode).toBe(426)
+    expect(result.res.body).toMatchObject({
+      code: 'CLIENT_UPGRADE_REQUIRED',
+      expectedBuild: expectedClientBuild,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+    expect(result.res.headers.get('connection')).toBe('close')
+    expect(result.next).not.toHaveBeenCalled()
+    expect(admission.writerState).not.toHaveBeenCalled()
+    expect(admission.budget.snapshot().usedBytes).toBe(0)
+  })
+
+  test('admits a matching client stamp and fails open when no server stamp exists', async () => {
+    const expectedClientBuild = {
+      version: '1.9.0',
+      stamp: `1.9.0-${'b'.repeat(64)}`,
+    }
+    const matching = middleware({ expectedClientBuild })
+    const matched = await dispatch(matching.run, request({
+      headers: {
+        ...request().headers,
+        'x-client-build': expectedClientBuild.stamp,
+      },
+    }))
+    expect(matched.next).toHaveBeenCalledOnce()
+    expect(matching.budget.snapshot().usedBytes).toBe(8)
+    matched.res.emit('finish')
+
+    const disabled = middleware({ expectedClientBuild: null })
+    const failOpen = await dispatch(disabled.run)
+    expect(failOpen.next).toHaveBeenCalledOnce()
+    expect(disabled.budget.snapshot().usedBytes).toBe(8)
+    failOpen.res.emit('finish')
+  })
+
+  test('leaves reads open and admits direct plugin streams without byte charging', async () => {
+    const expectedClientBuild = {
+      version: '1.9.0',
+      stamp: `1.9.0-${'c'.repeat(64)}`,
+    }
+    const readAdmission = middleware({ expectedClientBuild })
+    const read = await dispatch(readAdmission.run, request({
+      path: '/api/db/read-cached',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': '2',
+      },
+    }))
+    expect(read.next).toHaveBeenCalledOnce()
+    expect(readAdmission.budget.snapshot().usedBytes).toBe(2)
+    read.res.emit('finish')
+
+    const streamAdmission = middleware({ expectedClientBuild })
+    const streamed = await dispatch(streamAdmission.run, request({
+      path: '/api/plugin-storage/transition/stage/upload',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'content-length': '999999999',
+        'x-client-build': expectedClientBuild.stamp,
+      },
+    }))
+    expect(streamed.next).toHaveBeenCalledOnce()
+    expect(streamAdmission.budget.snapshot().usedBytes).toBe(0)
   })
 
   test('requires a declared identity-encoded body before parsing', async () => {

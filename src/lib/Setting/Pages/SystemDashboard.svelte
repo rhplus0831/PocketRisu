@@ -34,6 +34,7 @@
         isResourceCacheSupported,
         type ResourceCacheStats,
     } from 'src/ts/storage/resourceCache'
+    import { clientBuildFetch } from 'src/ts/storage/clientBuildHandshake'
 
     // ── Types ────────────────────────────────────────────────────────────────
     interface PrefixInfo {
@@ -225,7 +226,7 @@
         durabilityError = null
         try {
             const auth = await forageStorage.createAuth()
-            const res = await fetch('/api/db/durability', {
+            const res = await clientBuildFetch('/api/db/durability', {
                 method: 'PUT',
                 headers: { 'risu-auth': auth, 'content-type': 'application/json' },
                 body: JSON.stringify({ mode: next }),
@@ -299,7 +300,7 @@
         walCleanupOpen = true
         try {
             const auth = await forageStorage.createAuth()
-            const res = await fetch('/api/db/wal-checkpoint', {
+            const res = await clientBuildFetch('/api/db/wal-checkpoint', {
                 method: 'POST',
                 headers: { 'risu-auth': auth },
             })
@@ -329,7 +330,7 @@
         optimizeOpen = true
         try {
             const auth = await forageStorage.createAuth()
-            const res = await fetch('/api/db/optimize', {
+            const res = await clientBuildFetch('/api/db/optimize', {
                 method: 'POST',
                 headers: { 'risu-auth': auth },
             })

@@ -1,6 +1,8 @@
 'use strict';
 
 const BUFFERED_INGRESS_POLICY = Symbol('bufferedIngressPolicy');
+const CLIENT_BUILD_HEADER = 'x-client-build';
+const CLIENT_UPGRADE_REQUIRED_CODE = 'CLIENT_UPGRADE_REQUIRED';
 
 const MIB = 1024 * 1024;
 const DEFAULT_BUFFERED_INGRESS_MAX_BYTES = 512 * MIB;
@@ -119,6 +121,7 @@ function isStreamedIngress(req) {
 }
 
 const WRITER_ROUTES = new Set([
+    'GET /api/remove',
     'POST /api/db/create-if-absent',
     'POST /api/plugin-storage/clear',
     'POST /api/inlays/delete-unreferenced',
@@ -126,6 +129,7 @@ const WRITER_ROUTES = new Set([
     'POST /api/plugin-storage/batch',
     'POST /api/plugin-storage/mutate',
     'DELETE /api/logs',
+    'DELETE /api/request-logs',
     'POST /api/plugin-storage/transition/stage/begin',
     'POST /api/plugin-storage/transition/stage/upload',
     'POST /api/plugin-storage/transition/stage/abort',
@@ -160,6 +164,9 @@ const WRITER_ROUTES = new Set([
 function isWriterRoute(req) {
     if (WRITER_ROUTES.has(`${req.method} ${req.path}`)) return true;
     if (req.method === 'POST' && /^\/api\/chat-content\/[^/]+\/[^/]+$/.test(req.path)) {
+        return true;
+    }
+    if (req.method === 'DELETE' && /^\/api\/backup\/server\/[^/]+$/.test(req.path)) {
         return true;
     }
     return false;
@@ -251,8 +258,24 @@ function rawPolicy(req, limits) {
 
 function createRoutePolicyResolver(limits) {
     return (req) => {
+        const writer = isWriterRoute(req);
         const bodyKind = requestBodyKind(req);
-        if (!bodyKind || isStreamedIngress(req)) return null;
+        if (!bodyKind
+            || isStreamedIngress(req)
+            || (writer && (req.method === 'GET' || req.method === 'DELETE'))) {
+            // Writer-only admission still runs for bodyless and directly
+            // streamed mutations. It authenticates and checks client/session
+            // identity, but deliberately never reserves buffered-ingress bytes.
+            if (!writer) return null;
+            return {
+                maxBytes: 0,
+                responseKind: 'generic',
+                bodyKind: null,
+                authMode: authMode(req),
+                writer: true,
+                admissionOnly: true,
+            };
+        }
         const bodyPolicy = bodyKind === 'raw'
             ? rawPolicy(req, limits)
             : bodyKind === 'json'
@@ -270,12 +293,20 @@ function createRoutePolicyResolver(limits) {
             maxBytes: Math.min(bodyPolicy.maxBytes, limits.global),
             bodyKind,
             authMode: authMode(req),
-            writer: isWriterRoute(req),
+            writer,
+            admissionOnly: false,
         };
     };
 }
 
-function admissionPayload(policy, { code, error, retryable, limit, actual }) {
+function admissionPayload(policy, {
+    code,
+    error,
+    retryable,
+    limit,
+    actual,
+    expectedBuild,
+}) {
     if (policy.responseKind === 'plugin-set' || policy.responseKind === 'plugin-batch') {
         return {
             success: false,
@@ -285,6 +316,7 @@ function admissionPayload(policy, { code, error, retryable, limit, actual }) {
             code,
             ...(limit === undefined ? {} : { limit }),
             ...(actual === undefined ? {} : { actual }),
+            ...(expectedBuild === undefined ? {} : { expectedBuild }),
             retryable,
         };
     }
@@ -293,6 +325,7 @@ function admissionPayload(policy, { code, error, retryable, limit, actual }) {
         code,
         ...(limit === undefined ? {} : { limit }),
         ...(actual === undefined ? {} : { actual }),
+        ...(expectedBuild === undefined ? {} : { expectedBuild }),
         retryable,
         commitOutcome: 'not-committed',
         commitOutcomeUnknown: false,
@@ -320,6 +353,7 @@ function createBufferedIngressMiddleware({
     authenticate,
     authenticateCookie,
     writerState,
+    expectedClientBuild = null,
 }) {
     if (typeof resolvePolicy !== 'function' || !budget) {
         throw new TypeError('resolvePolicy and budget are required');
@@ -335,9 +369,29 @@ function createBufferedIngressMiddleware({
             else if (policy.authMode === 'cookie') authenticated = authenticateCookie(req, res);
             if (!authenticated) return;
 
+            if (policy.writer && expectedClientBuild) {
+                const clientBuild = req.headers[CLIENT_BUILD_HEADER];
+                if (typeof clientBuild !== 'string'
+                    || clientBuild !== expectedClientBuild.stamp) {
+                    sendAdmissionError(res, policy, 426, {
+                        code: CLIENT_UPGRADE_REQUIRED_CODE,
+                        error: 'This client build does not match the server. Reload to continue.',
+                        expectedBuild: expectedClientBuild,
+                        retryable: false,
+                    });
+                    return;
+                }
+            }
+
             if (policy.writer && writerState(req) === 'stale') {
                 res.setHeader('Connection', 'close');
                 res.status(423).json({ error: 'Session deactivated' });
+                return;
+            }
+
+            if (policy.admissionOnly) {
+                req[BUFFERED_INGRESS_POLICY] = policy;
+                next();
                 return;
             }
 
@@ -414,6 +468,8 @@ function createBufferedIngressMiddleware({
 
 module.exports = {
     BUFFERED_INGRESS_POLICY,
+    CLIENT_BUILD_HEADER,
+    CLIENT_UPGRADE_REQUIRED_CODE,
     DEFAULT_BUFFERED_INGRESS_MAX_BYTES,
     DEFAULT_DATABASE_WRITE_MAX_BYTES,
     DEFAULT_KV_WRITE_MAX_BYTES,

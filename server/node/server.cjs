@@ -227,6 +227,7 @@ const {
     createRoutePolicyResolver,
     createBufferedIngressMiddleware,
 } = require('./bufferedIngress.cjs');
+const { readClientBuildStamp } = require('./buildStamp.cjs');
 const {
     CHAT_BACKUP_DIRNAME,
     createChatBackupStore,
@@ -241,6 +242,12 @@ const { addExtension, Unpackr } = require('msgpackr');
 
 // Install process-level error handlers before any other init so early crashes get logged.
 installProcessHandlers();
+const expectedClientBuild = readClientBuildStamp({ log: logger });
+if (expectedClientBuild) {
+    logger.info(
+        `[Build] Client build admission enabled for ${expectedClientBuild.version} (${expectedClientBuild.stamp})`,
+    );
+}
 
 // Node.js version check
 const [nodeMajor] = process.version.slice(1).split('.').map(Number);
@@ -2110,6 +2117,7 @@ app.use(createBufferedIngressMiddleware({
             ? req.headers['x-session-id']
             : '',
     ),
+    expectedClientBuild,
 }));
 app.use((req, res, next) => {
     if (req.path === '/api/db/read-cached') return next();
@@ -9341,6 +9349,7 @@ app.post('/api/session', async (req, res) => {
     res.setHeader('Set-Cookie', `risu-session=${token}; HttpOnly; SameSite=Strict; Max-Age=${maxAge}; Path=/`)
     res.json({
         ok: true,
+        build: expectedClientBuild,
         capabilities: {
             pluginStorage: {
                 maxValueBytes: PLUGIN_VALUE_MAX_BYTES,

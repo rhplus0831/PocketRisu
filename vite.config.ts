@@ -5,8 +5,23 @@ import strip from '@rollup/plugin-strip';
 import tailwindcss from '@tailwindcss/vite'
 import { readFileSync } from 'fs';
 import { execSync } from 'child_process';
+import { createHash, randomBytes } from 'crypto';
 
 const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'));
+
+// A fresh cryptographic build identity is embedded into the client and emitted
+// beside the exact dist bundle produced by this Vite invocation. Including the
+// stamp in the compiled client also makes it part of the output content.
+const buildHash = createHash('sha256')
+  .update(`${pkg.version}\0${Date.now()}\0${process.pid}\0`)
+  .update(randomBytes(32))
+  .digest('hex');
+const clientBuildStamp = `${pkg.version}-${buildHash}`;
+const clientBuildManifest = JSON.stringify({
+  version: pkg.version,
+  stamp: clientBuildStamp,
+  hash: buildHash,
+}, null, 2) + '\n';
 
 const git = (() => {
   // Hosted release builds unpack a `git archive` tarball, so there is no .git
@@ -32,8 +47,20 @@ export default defineConfig(({command, mode}) => {
       '__APP_VERSION__': JSON.stringify(pkg.version),
       '__APP_BRANCH__': JSON.stringify(git.branch),
       '__APP_COMMIT__': JSON.stringify(git.commit),
+      '__CLIENT_BUILD_STAMP__': JSON.stringify(clientBuildStamp),
     },
     plugins: [
+      {
+        name: 'pocketrisu-client-build-stamp',
+        apply: 'build',
+        generateBundle() {
+          this.emitFile({
+            type: 'asset',
+            fileName: 'build-stamp.json',
+            source: clientBuildManifest,
+          });
+        },
+      },
       svelte({
         preprocess: vitePreprocess(),
         onwarn: (warning, handler) => {

@@ -89,6 +89,14 @@ import {
     type PluginSaveStoragePrefix,
 } from "./pluginSaveKeyPolicy"
 import { isWellFormedUnicode } from "./unicodeWellFormed"
+import {
+    CLIENT_UPGRADE_REQUIRED_STATUS,
+    acceptMatchingClientBuild,
+    handleClientBuildResponse,
+    handleClientBuildXhr,
+    handleClientUpgradeRequired,
+} from "./clientBuildHandshake"
+import { CLIENT_BUILD_HEADER, clientBuildStamp } from "./clientBuild"
 
 /** Short availability bound for authentication and small control requests. */
 export const AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS = 15_000
@@ -1499,6 +1507,7 @@ export class NodeStorage{
                 headers: {
                     'risu-auth': await this.createAuth(signal),
                     'x-session-id': NodeStorage.sessionId,
+                    [CLIENT_BUILD_HEADER]: clientBuildStamp,
                 },
                 signal,
             })
@@ -1512,16 +1521,18 @@ export class NodeStorage{
                 } catch {
                     // Older servers may return an empty or non-JSON session body.
                 }
-                const capabilities = response && typeof response === 'object'
+                const sessionResponse = response && typeof response === 'object'
                     ? (response as {
+                        build?: unknown
                         capabilities?: {
                             pluginStorage?: unknown
                             pluginStorageBatch?: unknown
                             pluginStorageTransition?: unknown
                             database?: unknown
                         }
-                    }).capabilities
+                    })
                     : null
+                const capabilities = sessionResponse?.capabilities
                 NodeStorage.pluginStorageBatchCapabilities
                     = parsePluginStorageBatchStreamCapabilities(
                         capabilities?.pluginStorageBatch,
@@ -1541,6 +1552,16 @@ export class NodeStorage{
                 NodeStorage.databaseStorageCapabilities
                     = parseDatabaseStorageCapabilities(capabilities?.database)
                 NodeStorage.sessionInitialized = true
+                const advertisedBuild = sessionResponse?.build as {
+                    stamp?: unknown
+                } | null | undefined
+                if (typeof advertisedBuild?.stamp === 'string') {
+                    if (advertisedBuild.stamp === clientBuildStamp) {
+                        acceptMatchingClientBuild(sessionResponse?.build)
+                    } else {
+                        handleClientUpgradeRequired(sessionResponse?.build)
+                    }
+                }
             }
             // Non-ok (400/401/500): will retry on next checkAuth() call.
         } catch (error) {
@@ -1691,6 +1712,7 @@ export class NodeStorage{
             const headers = new Headers(init.headers)
             headers.set('risu-auth', await this.createAuth(signal))
             headers.set('x-session-id', NodeStorage.sessionId)
+            headers.set(CLIENT_BUILD_HEADER, clientBuildStamp)
             if (isUserActive()) headers.set('x-user-active', '1')
             throwIfAborted(signal)
             beforeDispatch?.()
@@ -1710,6 +1732,9 @@ export class NodeStorage{
             }
             outcome.markDefinitiveResponse()
             mutationOutcome?.markDefinitiveResponse()
+            if (response.status === CLIENT_UPGRADE_REQUIRED_STATUS) {
+                await handleClientBuildResponse(response)
+            }
             if (response.status === 423) {
                 window.dispatchEvent(new CustomEvent('risu-session-deactivated'))
             }
@@ -5246,6 +5271,7 @@ export class NodeStorage{
             xhr.setRequestHeader('content-type', 'application/x-risu-backup')
             xhr.setRequestHeader('risu-auth', authHeader)
             xhr.setRequestHeader('x-session-id', NodeStorage.sessionId)
+            xhr.setRequestHeader(CLIENT_BUILD_HEADER, clientBuildStamp)
             if (allowLargeRestore) xhr.setRequestHeader('x-risu-large-restore', '1')
             if (isUserActive()) xhr.setRequestHeader('x-user-active', '1')
             // Opt into NDJSON streaming so the server keeps the response socket
@@ -5363,6 +5389,7 @@ export class NodeStorage{
             )
             xhr.onload = () => {
                 if (settled) return
+                handleClientBuildXhr(xhr)
                 if (xhr.status === 0) {
                     settleFromTerminalOrUnknown(
                         'Backup import transport ended without an HTTP response.',
@@ -5416,6 +5443,7 @@ export class NodeStorage{
                 headers: {
                     'content-type': 'application/json',
                     'x-session-id': NodeStorage.sessionId,
+                    [CLIENT_BUILD_HEADER]: clientBuildStamp,
                 },
             },
             'write',
@@ -5474,6 +5502,7 @@ export class NodeStorage{
                     headers: {
                         'content-type': 'application/json',
                         'x-session-id': NodeStorage.sessionId,
+                        [CLIENT_BUILD_HEADER]: clientBuildStamp,
                     },
                     body: JSON.stringify({ filename }),
                 },
@@ -5927,6 +5956,7 @@ export class NodeStorage{
                 xhr.setRequestHeader('content-type', 'application/zip')
                 xhr.setRequestHeader('risu-auth', authHeader)
                 xhr.setRequestHeader('x-session-id', NodeStorage.sessionId)
+                xhr.setRequestHeader(CLIENT_BUILD_HEADER, clientBuildStamp)
                 if (isUserActive()) xhr.setRequestHeader('x-user-active', '1')
                 xhr.setRequestHeader('accept', 'application/x-ndjson')
                 xhr.setRequestHeader('x-risu-replacement-id', operationId)
@@ -6065,6 +6095,7 @@ export class NodeStorage{
                 false,
             )
             xhr.onload = () => {
+                handleClientBuildXhr(xhr)
                 // XHR status 0 means no authoritative HTTP response exists.
                 // Ignore even an exact-looking cached/proxy body: after send()
                 // the replacement outcome must remain unknown.
