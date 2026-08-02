@@ -226,6 +226,7 @@ const {
     createInFlightByteBudget,
     createRoutePolicyResolver,
     createBufferedIngressMiddleware,
+    sendClientUpgradeRequired,
 } = require('./bufferedIngress.cjs');
 const { readClientBuildStamp } = require('./buildStamp.cjs');
 const {
@@ -13739,164 +13740,14 @@ app.post('/api/plugin-storage/transition/bulk', async (req, res, next) => {
     }
 });
 
-app.post('/api/plugin-storage/transition', async (req, res, next) => {
+app.post('/api/plugin-storage/transition', async (req, res) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
-    try {
-        const plan = await decodeRisuSave(req.body);
-        if (plan?.version !== 1 || !(plan.database instanceof Uint8Array)) {
-            return res.status(400).json({ error: 'Invalid plugin storage transition envelope' });
-        }
-        const targetDatabaseBytes = Buffer.from(plan.database);
-        const targetDb = await decodeAuthoritativeDatabase(targetDatabaseBytes);
-        await queueStorageMutation(async () => {
-            await flushPendingDb();
-            const rawDatabase = kvGet('database/database.bin');
-            if (!rawDatabase) return res.status(409).json({ error: 'Database not found' });
-            const liveDb = await decodeAuthoritativeDatabase(rawDatabase);
-            const manifestState = readPluginStorageManifestState();
-            try {
-                assertPluginStorageSource(plan.source, liveDb, manifestState);
-            } catch (error) {
-                if (error?.pluginStorageConflict) {
-                    return res.status(409).json({ error: error.message, currentEtag: dbEtag });
-                }
-                throw error;
-            }
-            if (plan.expectedEtag && dbEtag && plan.expectedEtag !== dbEtag) {
-                return res.status(409).json({
-                    error: 'ETag mismatch - concurrent modification detected',
-                    currentEtag: dbEtag,
-                });
-            }
-
-            const targetOptimized = targetDb?.optimizePluginMemory === true;
-            const targetGeneration = pluginStorageGeneration(targetDb);
-            if (!targetGeneration || targetGeneration === pluginStorageGeneration(liveDb)) {
-                return res.status(400).json({
-                    error: 'A plugin storage transition must publish a fresh generation',
-                });
-            }
-            if (
-                !targetDb.pluginCustomStorage
-                || typeof targetDb.pluginCustomStorage !== 'object'
-                || Array.isArray(targetDb.pluginCustomStorage)
-                || (Object.hasOwn(targetDb, 'pluginStorageMeta') && (
-                    !targetDb.pluginStorageMeta
-                    || typeof targetDb.pluginStorageMeta !== 'object'
-                    || Array.isArray(targetDb.pluginStorageMeta)
-                ))
-            ) {
-                return res.status(400).json({ error: 'Invalid inline plugin storage records' });
-            }
-            const losses = findStubFlagLossChats(targetDb);
-            if (
-                losses.length > 0
-                || findDuplicateChaIds(targetDb).length > 0
-                || findDuplicateChatIds(targetDb).length > 0
-            ) {
-                return res.status(400).json({ error: 'Plugin storage transition failed database integrity checks' });
-            }
-
-            const sourceKeys = resolveOwnedPluginStorageKeys(liveDb);
-            if (targetOptimized) {
-                // The marker tells the shared ingest helper that the supplied
-                // inline maps are an exact generation, including an empty set.
-                targetDb[PLUGIN_STORAGE_FOLDED_MARKER] = true;
-            } else {
-                delete targetDb[PLUGIN_STORAGE_FOLDED_MARKER];
-            }
-            const splitDatabase = chatRowStore.splitFullDb(targetDb);
-            const chatRows = splitDatabase.chatEntries.map(entry => ({
-                ...entry,
-                value: Buffer.from(encodeRisuSaveLegacy(entry.chat)),
-            }));
-            const pluginExternalization = targetOptimized
-                ? preparePluginStorageExternalization(splitDatabase.strippedDb)
-                : {
-                    strippedDb: splitDatabase.strippedDb,
-                    rows: [],
-                    manifest: null,
-                };
-            if (
-                targetOptimized
-                && pluginExternalization.manifest?.generation !== targetGeneration
-            ) {
-                return res.status(400).json({ error: 'Target plugin generation was not preserved' });
-            }
-            const targetKeys = new Set([
-                ...(pluginExternalization.manifest?.valueKeys ?? []),
-                ...(pluginExternalization.manifest?.metaKeys ?? []),
-            ]);
-            const persistedDatabaseContent = Buffer.from(
-                encodeRisuSaveLegacy(pluginExternalization.strippedDb),
-            );
-            const quotaChanges = new Map(
-                sourceKeys.valueKeys.map(key => [key, { key, size: null }]),
-            );
-            for (const row of pluginExternalization.rows) {
-                if (row.storageKey.startsWith(PLUGIN_SAVE_PREFIX)) {
-                    quotaChanges.set(row.storageKey, {
-                        key: row.storageKey,
-                        size: row.value.length,
-                    });
-                }
-            }
-
-            const recoverySnapshotToken = newPluginRecoverySnapshotToken();
-            await captureChatDeletionPreImages(
-                chatRowStore.removedChatRowKeys(liveDb, pluginExternalization.strippedDb)
-            );
-            withPluginStorageQuotaPlan([...quotaChanges.values()], () => {
-                for (const row of pluginExternalization.rows) {
-                    kvSet(row.storageKey, row.value);
-                    maybeFailPluginStorageTransaction(req, 'after-row');
-                }
-                for (const storageKey of [...sourceKeys.valueKeys, ...sourceKeys.metaKeys]) {
-                    if (targetKeys.has(storageKey)) continue;
-                    kvDel(storageKey);
-                    maybeFailPluginStorageTransaction(req, 'after-row');
-                }
-                if (pluginExternalization.manifest) {
-                    writePluginStorageManifest(pluginExternalization.manifest);
-                } else {
-                    kvDel(PLUGIN_STORAGE_MANIFEST_KEY);
-                }
-                maybeFailPluginStorageTransaction(req, 'after-manifest');
-                for (const row of chatRows) {
-                    chatRowStore.writeChatRowRaw(row.chaId, row.chatId, row.value);
-                }
-                kvSet('database/database.bin', persistedDatabaseContent);
-                chatRowStore.deleteRemovedChatRows(liveDb, pluginExternalization.strippedDb);
-                maybeFailPluginStorageTransaction(req, 'after-database');
-                markPluginRecoverySnapshotDirty(recoverySnapshotToken);
-            });
-
-            invalidateDbCache();
-            dbEtag = computeBufferEtag(persistedDatabaseContent);
-            rememberSessionPluginStorageState(req, pluginExternalization.strippedDb);
-            schedulePluginRecoverySnapshot();
-            try {
-                await createBackupAndRotate();
-            } catch (error) {
-                logger.error('[Plugin storage] post-transition backup failed:', error);
-            }
-            res.json({ success: true, etag: dbEtag });
-        });
-    } catch (error) {
-        if (isImportInProgressError(error)) {
-            res.setHeader('Retry-After', '5');
-            return res.status(503).json({
-                success: false,
-                commitOutcome: 'not-committed',
-                commitOutcomeUnknown: false,
-                error: 'An import is in progress; retry this transition after it completes',
-                code: 'IMPORT_IN_PROGRESS',
-                retryable: true,
-            });
-        }
-        next(error);
-    }
+    return sendClientUpgradeRequired(
+        res,
+        req[BUFFERED_INGRESS_POLICY] ?? { responseKind: 'generic' },
+        expectedClientBuild,
+        'This plugin storage transition protocol is retired. Reload to continue.',
+    );
 });
 
 // Provider request history and token-usage statistics use their own rotated DB;

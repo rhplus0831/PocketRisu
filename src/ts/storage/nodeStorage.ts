@@ -69,6 +69,7 @@ import {
     preparePluginStorageBulkTransition,
     type PluginStorageBulkTransitionRequest,
     type PluginStorageBulkTransitionResult,
+    type PluginStorageTransitionSource,
     type PluginStorageTransitionStreamCapabilities,
 } from "./pluginStorageTransitionBulk"
 import {
@@ -790,21 +791,10 @@ export interface PluginStorageMutationTransport {
     deletes: string[]
 }
 
-export interface PluginStorageTransitionTransport {
-    version: 1
-    source: {
-        optimized: boolean
-        generation: string | null
-        manifest: PluginStorageManifestTransport | null
-    }
-    database: Uint8Array
-    expectedEtag?: string
-}
-
 export interface PluginStorageStagedTransitionBegin {
     version: 2
     transitionId: string
-    source: PluginStorageTransitionTransport['source']
+    source: PluginStorageTransitionSource
     targetOptimized: boolean
     targetGeneration: string
     rows: { storageKey: string, rawKey: string, size: number }[]
@@ -1997,29 +1987,25 @@ export class NodeStorage{
         }
     }
 
-    private async sendPluginStorageTransaction(
-        path: string,
-        payload: PluginStorageMutationTransport | PluginStorageTransitionTransport,
-        kind: 'write' | 'transition',
+    private async sendPluginStorageMutation(
+        payload: PluginStorageMutationTransport,
         externalSignal?: AbortSignal | null,
     ): Promise<{ etag?: string }> {
         // Serialization is local preparation, not transport availability.
         const requestBytes = encodeRisuSaveLegacy(payload)
         return runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
-            const response = await this.authFetch(path, {
+            const response = await this.authFetch('/api/plugin-storage/mutate', {
                 method: 'POST',
                 headers: { 'content-type': 'application/octet-stream' },
                 body: requestBytes as any,
                 signal,
             }, true, outcome, () => {
-                if ('writes' in payload) {
-                    for (const write of payload.writes) {
-                        if (write.storageKey.startsWith('pluginsave/')) {
-                            this.assertPluginStorageValueSize(
-                                write.valueBytes.byteLength,
-                                'write',
-                            )
-                        }
+                for (const write of payload.writes) {
+                    if (write.storageKey.startsWith('pluginsave/')) {
+                        this.assertPluginStorageValueSize(
+                            write.valueBytes.byteLength,
+                            'write',
+                        )
                     }
                 }
             })
@@ -2044,7 +2030,7 @@ export class NodeStorage{
             if (!response.ok) {
                 const storageError = await this.parseStorageFailureResponse(
                     failureResponse,
-                    kind,
+                    'write',
                     true,
                     signal,
                 )
@@ -2057,39 +2043,20 @@ export class NodeStorage{
                     code: 'COMMIT_OUTCOME_UNKNOWN',
                     retryable: false,
                     commitOutcomeUnknown: true,
-                    operation: kind,
+                    operation: 'write',
                 })
             }
             outcome.markDefinitiveResponse()
             if (typeof result.etag === 'string') this._lastDbEtag = result.etag
             return result
-        }, kind, kind === 'transition'
-            ? AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS
-            : authoritativeStoragePayloadTimeoutMs(requestBytes.byteLength), externalSignal)
+        }, 'write', authoritativeStoragePayloadTimeoutMs(requestBytes.byteLength), externalSignal)
     }
 
     async commitPluginStorageMutation(
         plan: PluginStorageMutationTransport,
         signal?: AbortSignal | null,
     ): Promise<void> {
-        await this.sendPluginStorageTransaction(
-            '/api/plugin-storage/mutate',
-            plan,
-            'write',
-            signal,
-        )
-    }
-
-    async commitPluginStorageTransition(
-        plan: PluginStorageTransitionTransport,
-        signal?: AbortSignal | null,
-    ): Promise<{ etag?: string }> {
-        return await this.sendPluginStorageTransaction(
-            '/api/plugin-storage/transition',
-            plan,
-            'transition',
-            signal,
-        )
+        await this.sendPluginStorageMutation(plan, signal)
     }
 
     async getPluginStorageTransitionStreamCapabilities(

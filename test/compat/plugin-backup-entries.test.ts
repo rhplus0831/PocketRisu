@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import path from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { request as httpRequest, type IncomingMessage } from 'node:http'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import Database from 'better-sqlite3'
@@ -16,11 +16,13 @@ import utilsPkg from '../../server/node/utils.cjs'
 import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
 
 const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
+const PLUGIN_TRANSITION_MAGIC = Buffer.from('PRISUT01', 'ascii')
+const PLUGIN_TRANSITION_PREFIX_BYTES = 12
 const PLUGIN_STORAGE_MANIFEST_KEY = 'plugin-storage/manifest.json'
 const packr = new Packr({ useRecords: false })
-const { decodeRisuSave, encodeRisuSaveLegacy } = utilsPkg as {
+const pluginTransitionPackr = new Packr({ structuredClone: true, useRecords: true })
+const { decodeRisuSave } = utilsPkg as {
   decodeRisuSave: (value: Uint8Array) => Promise<any>
-  encodeRisuSaveLegacy: (value: unknown) => Uint8Array
 }
 const { encodePluginSaveStorageKey } = pluginSaveKeysPkg as {
   encodePluginSaveStorageKey: (rawKey: string, prefix: string) => string
@@ -38,6 +40,54 @@ function pluginStorageKey(prefix: 'pluginsave/' | 'pluginsave-meta/', rawKey: st
   return rawKey.isWellFormed()
     ? `${prefix}${Buffer.from(rawKey).toString('base64url')}.json`
     : encodePluginSaveStorageKey(rawKey, prefix)
+}
+
+async function commitBulkPluginStorageTransition(
+  client: RisuClient,
+  source: { optimized: boolean; generation: string | null; manifest: unknown },
+  targetDatabase: Record<string, any>,
+): Promise<Response> {
+  const rows = targetDatabase.optimizePluginMemory === true
+    ? [
+        ...Object.entries(targetDatabase.pluginCustomStorage ?? {}).map(([rawKey, value]) => ({
+          rawKey,
+          storageKey: pluginStorageKey('pluginsave/', rawKey),
+          value,
+        })),
+        ...Object.entries(targetDatabase.pluginStorageMeta ?? {}).map(([rawKey, value]) => ({
+          rawKey,
+          storageKey: pluginStorageKey('pluginsave-meta/', rawKey),
+          value,
+        })),
+      ]
+    : []
+  const payloads = rows.map(({ value }) => Buffer.from(pluginTransitionPackr.encode(value)))
+  const metadataBytes = Buffer.from(JSON.stringify({
+    version: 1,
+    transitionId: randomUUID(),
+    source,
+    targetOptimized: targetDatabase.optimizePluginMemory === true,
+    targetGeneration: targetDatabase.pluginStorageGeneration,
+    autoConvert: true,
+    rows: rows.map(({ rawKey, storageKey }, index) => ({
+      rawKey,
+      storageKey,
+      valueLength: payloads[index].length,
+      valueHash: createHash('sha256').update(payloads[index]).digest('hex'),
+    })),
+  }), 'utf8')
+  const prefix = Buffer.alloc(PLUGIN_TRANSITION_PREFIX_BYTES)
+  PLUGIN_TRANSITION_MAGIC.copy(prefix)
+  prefix.writeUInt32BE(metadataBytes.length, PLUGIN_TRANSITION_MAGIC.length)
+  const body = Buffer.concat([prefix, metadataBytes, ...payloads])
+  return client.fetch('/api/plugin-storage/transition/bulk', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-pocketrisu-plugin-storage-transition',
+      'x-plugin-storage-transition-length': String(body.length),
+    },
+    body: new Uint8Array(body),
+  })
 }
 
 function encodeRisuDat(database: Record<string, unknown>): Buffer {
@@ -384,7 +434,7 @@ describe('external plugin rows in backup archives', () => {
     servers.push(source)
     const sourceClient = await createClient(source.port, source.password)
     const seed = withDatabaseFields(createSeedBackup({ characterCount: 1 }), {
-      optimizePluginMemory: true,
+      optimizePluginMemory: false,
       pluginCustomStorage: {},
     })
     expect((await sourceClient.importBackup(seed)).ok).toBe(true)
@@ -402,7 +452,7 @@ describe('external plugin rows in backup archives', () => {
     for (const [key, value] of [...valueRows, ...metaRows]) {
       writeFixtureKvValue(source.cwd, key, value)
     }
-    const storageGeneration = 'node-backup-generation'
+    const storageGeneration = randomUUID()
     const storageManifest = Buffer.from(JSON.stringify({
       version: 2,
       generation: storageGeneration,
@@ -410,34 +460,30 @@ describe('external plugin rows in backup archives', () => {
       metaKeys: [...metaRows.keys()],
     }))
     const sourceDatabase = decodeRisuDat(readKvValue(source.cwd, 'database/database.bin')!)
-    const transitionResponse = await sourceClient.fetch('/api/plugin-storage/transition', {
-      method: 'POST',
-      headers: { 'content-type': 'application/octet-stream' },
-      body: new Uint8Array(encodeRisuDat({
-        version: 1,
-        source: { optimized: true, generation: null, manifest: null },
-        database: encodeRisuDat({
-          ...sourceDatabase,
-          optimizePluginMemory: true,
-          pluginStorageGeneration: storageGeneration,
-          pluginCustomStorage: Object.fromEntries(
-            [...valueRows].map(([key, value]) => [
-              Buffer.from(key.slice('pluginsave/'.length, -'.json'.length), 'base64url')
-                .toString('utf-8'),
-              JSON.parse(value.toString('utf-8')),
-            ]),
-          ),
-          pluginStorageMeta: Object.fromEntries(
-            [...metaRows].map(([key, value]) => [
-              Buffer.from(key.slice('pluginsave-meta/'.length, -'.json'.length), 'base64url')
-                .toString('utf-8'),
-              JSON.parse(value.toString('utf-8')),
-            ]),
-          ),
-        }),
-      })),
-    })
-    expect(transitionResponse.status).toBe(200)
+    const transitionResponse = await commitBulkPluginStorageTransition(
+      sourceClient,
+      { optimized: false, generation: null, manifest: null },
+      {
+        ...sourceDatabase,
+        optimizePluginMemory: true,
+        pluginStorageGeneration: storageGeneration,
+        pluginCustomStorage: Object.fromEntries(
+          [...valueRows].map(([key, value]) => [
+            Buffer.from(key.slice('pluginsave/'.length, -'.json'.length), 'base64url')
+              .toString('utf-8'),
+            JSON.parse(value.toString('utf-8')),
+          ]),
+        ),
+        pluginStorageMeta: Object.fromEntries(
+          [...metaRows].map(([key, value]) => [
+            Buffer.from(key.slice('pluginsave-meta/'.length, -'.json'.length), 'base64url')
+              .toString('utf-8'),
+            JSON.parse(value.toString('utf-8')),
+          ]),
+        ),
+      },
+    )
+    expect(transitionResponse.status, await transitionResponse.clone().text()).toBe(200)
     expect(readKvValue(source.cwd, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(storageManifest)
     const foreignValueKey = pluginStorageKey('pluginsave/', 'foreign-row')
     const foreignMetaKey = pluginStorageKey('pluginsave-meta/', 'foreign-row')
@@ -583,7 +629,7 @@ describe('external plugin rows in backup archives', () => {
     servers.push(source)
     const sourceClient = await createClient(source.port, source.password)
     const seed = withDatabaseFields(createSeedBackup({ characterCount: 1 }), {
-      optimizePluginMemory: true,
+      optimizePluginMemory: false,
       pluginCustomStorage: {},
       account: { token: 'must-not-enter-partial-backup' },
     })
@@ -598,21 +644,18 @@ describe('external plugin rows in backup archives', () => {
       },
     ]))
     const sourceDatabase = decodeRisuDat(readKvValue(source.cwd, 'database/database.bin')!)
-    const transition = await sourceClient.fetch('/api/plugin-storage/transition', {
-      method: 'POST',
-      headers: { 'content-type': 'application/octet-stream' },
-      body: new Uint8Array(encodeRisuDat({
-        version: 1,
-        source: { optimized: true, generation: null, manifest: null },
-        database: encodeRisuDat({
-          ...sourceDatabase,
-          optimizePluginMemory: true,
-          pluginStorageGeneration: 'partial-export-generation',
-          pluginCustomStorage: values,
-        }),
-      })),
-    })
-    expect(transition.status).toBe(200)
+    const partialGeneration = randomUUID()
+    const transition = await commitBulkPluginStorageTransition(
+      sourceClient,
+      { optimized: false, generation: null, manifest: null },
+      {
+        ...sourceDatabase,
+        optimizePluginMemory: true,
+        pluginStorageGeneration: partialGeneration,
+        pluginCustomStorage: values,
+      },
+    )
+    expect(transition.status, await transition.clone().text()).toBe(200)
 
     const jobId = await startPartialExport(sourceClient)
     const backup = await downloadPartialExport(sourceClient, jobId)
@@ -646,7 +689,7 @@ describe('external plugin rows in backup archives', () => {
     const databaseEntry = seedEntries.find(entry => entry.name === 'database.risudat')!
     const database = decodeRisuDat(databaseEntry.data)
     ;(database.characters as Array<Record<string, unknown>>)[0].image = 'assets/proto-selected.png'
-    database.optimizePluginMemory = true
+    database.optimizePluginMemory = false
     database.pluginCustomStorage = {}
     database.account = { token: 'must-not-enter-partial-backup' }
     database.__pocketRisuPluginStorageEscapesV1 = {
@@ -658,7 +701,7 @@ describe('external plugin rows in backup archives', () => {
     seedEntries.push({ name: 'proto-selected.png', data: oldAsset })
     expect((await sourceClient.importBackup(encodeBackup(seedEntries))).ok).toBe(true)
 
-    const generation = 'partial-proto-export-generation'
+    const generation = randomUUID()
     const currentDatabase = decodeRisuDat(
       readKvValue(source.cwd, 'database/database.bin')!,
     )
@@ -708,22 +751,18 @@ describe('external plugin rows in backup archives', () => {
       value: { plugin: 'Malformed Key Owner', updatedAt: 4 },
       writable: true,
     })
-    const transition = await sourceClient.fetch('/api/plugin-storage/transition', {
-      method: 'POST',
-      headers: { 'content-type': 'application/octet-stream' },
-      body: new Uint8Array(encodeRisuDat({
-        version: 1,
-        source: { optimized: true, generation: null, manifest: null },
-        database: encodeRisuSaveLegacy({
-          ...currentDatabase,
-          optimizePluginMemory: true,
-          pluginStorageGeneration: generation,
-          pluginCustomStorage: initialValues,
-          pluginStorageMeta: initialMeta,
-        }),
-      })),
-    })
-    expect(transition.status).toBe(200)
+    const transition = await commitBulkPluginStorageTransition(
+      sourceClient,
+      { optimized: false, generation: null, manifest: null },
+      {
+        ...currentDatabase,
+        optimizePluginMemory: true,
+        pluginStorageGeneration: generation,
+        pluginCustomStorage: initialValues,
+        pluginStorageMeta: initialMeta,
+      },
+    )
+    expect(transition.status, await transition.clone().text()).toBe(200)
     await transition.text()
 
     const protoValueKey = pluginStorageKey('pluginsave/', '__proto__')

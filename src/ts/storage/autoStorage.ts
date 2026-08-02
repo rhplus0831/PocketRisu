@@ -6,7 +6,6 @@ import {
     type PluginStorageManifestSnapshotTransport,
     type PluginStorageManifestStateTransport,
     type PluginStorageViewerPageTransport,
-    type PluginStorageTransitionTransport,
     type StorageReadOptions,
 } from "./nodeStorage"
 import type {
@@ -237,14 +236,6 @@ export class AutoStorage{
     ): Promise<void> {
         await this.Init()
         return await this.realStorage.commitPluginStorageMutation(plan, signal)
-    }
-
-    async commitPluginStorageTransition(
-        plan: PluginStorageTransitionTransport,
-        signal?: AbortSignal | null,
-    ) {
-        await this.Init()
-        return await this.realStorage.commitPluginStorageTransition(plan, signal)
     }
 
     async beginPluginStorageTransition(

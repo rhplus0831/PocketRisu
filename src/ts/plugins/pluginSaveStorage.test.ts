@@ -214,7 +214,6 @@ vi.mock("../storage/persistentKv", () => {
             persistent.set("plugin-storage/manifest.json", mutation.nextManifest);
         }),
         commitPersistentPluginStorageBulkTransition: vi.fn(),
-        commitPersistentPluginStorageTransition: vi.fn(),
         getPersistentPluginStorageTransitionStreamCapabilities: vi.fn(async () => null),
         beginPersistentPluginStorageTransition: vi.fn(async (plan: any) => {
             stagedPlan = plan;
@@ -596,7 +595,6 @@ beforeEach(async () => {
         writePersistentJson,
         getPersistentPluginStorageTransitionStreamCapabilities,
         commitPersistentPluginStorageBulkTransition,
-        commitPersistentPluginStorageTransition,
     } = vi.mocked(await import("../storage/persistentKv"));
     listPersistentKeys.mockImplementation(async (prefix: string) =>
         [...persistent.keys()].filter((key) => key.startsWith(prefix))
@@ -699,7 +697,6 @@ beforeEach(async () => {
     });
     getPersistentPluginStorageTransitionStreamCapabilities.mockResolvedValue(null);
     commitPersistentPluginStorageBulkTransition.mockReset();
-    commitPersistentPluginStorageTransition.mockResolvedValue({ etag: "test-etag" });
 });
 
 describe("AA3 versioned atomic plugin storage", () => {
@@ -2891,39 +2888,17 @@ describe("reconcilePluginStorageMode", () => {
         persistent.set(valueKey, 42);
         persistent.set(metaKey, { plugin: "Test", updatedAt: 1 });
         installOwnershipManifest("production-failure", [valueKey], [metaKey]);
-        const {
-            commitPersistentPluginStorageTransition,
-            removePersistentKey,
-        } = vi.mocked(await import("../storage/persistentKv"));
+        const { removePersistentKey } = vi.mocked(await import("../storage/persistentKv"));
         await expect(reconcilePluginStorageMode()).rejects.toThrow(
             "must use transitionPluginStorageMode or boot recovery",
         );
 
-        expect(commitPersistentPluginStorageTransition).not.toHaveBeenCalled();
         expect(requestImmediateSave).not.toHaveBeenCalled();
         expect(database.optimizePluginMemory).toBe(false);
         expect(database.pluginCustomStorage.alpha).toBeUndefined();
         expect(persistent.get(valueKey)).toBe(42);
         expect(persistent.get(metaKey)).toEqual({ plugin: "Test", updatedAt: 1 });
         expect(removePersistentKey).not.toHaveBeenCalled();
-    });
-
-    test("direct production reconciliation never falls back to the aggregate v1 envelope", async () => {
-        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
-        persistent.set(valueKey, 42);
-        installOwnershipManifest("production-commit", [valueKey], []);
-
-        await expect(reconcilePluginStorageMode()).rejects.toThrow(
-            "must use transitionPluginStorageMode or boot recovery",
-        );
-
-        const { commitPersistentPluginStorageTransition } = vi.mocked(
-            await import("../storage/persistentKv"),
-        );
-        expect(commitPersistentPluginStorageTransition).not.toHaveBeenCalled();
-        expect(requestImmediateSave).not.toHaveBeenCalled();
-        expect(database.pluginCustomStorage.alpha).toBeUndefined();
-        expect(persistent.has(valueKey)).toBe(true);
     });
 
     test("internalized data survives a simulated refresh after external rows are deleted", async () => {
@@ -3621,7 +3596,6 @@ describe("transitionPluginStorageMode", () => {
         installOwnershipManifest("source-generation", [valueKey], [metaKey]);
         const {
             beginPersistentPluginStorageTransition,
-            commitPersistentPluginStorageTransition,
             finalizePersistentPluginStorageTransition,
             listPersistentKeys,
             readPersistentPluginStorageManifestSnapshot,
@@ -3635,7 +3609,6 @@ describe("transitionPluginStorageMode", () => {
             meta: 1,
         });
 
-        expect(commitPersistentPluginStorageTransition).not.toHaveBeenCalled();
         expect(beginPersistentPluginStorageTransition).toHaveBeenCalledOnce();
         const begin = beginPersistentPluginStorageTransition.mock.calls[0][0];
         expect(begin.source).toEqual({
@@ -3840,7 +3813,6 @@ describe("transitionPluginStorageMode", () => {
         });
         const {
             beginPersistentPluginStorageTransition,
-            commitPersistentPluginStorageTransition,
             finalizePersistentPluginStorageTransition,
             uploadPersistentPluginStorageTransitionRow,
         } = vi.mocked(await import("../storage/persistentKv"));
@@ -3888,7 +3860,6 @@ describe("transitionPluginStorageMode", () => {
         await expect(saveDuringTransition).resolves.toEqual({ status: "committed" });
         expect(databaseWriter).toHaveBeenCalledOnce();
 
-        expect(commitPersistentPluginStorageTransition).not.toHaveBeenCalled();
         const begin = beginPersistentPluginStorageTransition.mock.calls.at(-1)![0];
         expect(begin).not.toHaveProperty("database");
         expect(begin.rows).toHaveLength(3);

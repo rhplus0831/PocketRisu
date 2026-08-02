@@ -28,6 +28,7 @@ function openBodylessMutation(
   server: ServerHandle,
   token: string,
   requestPath = '/api/write',
+  clientBuild: string | null = '1.9.0-stale',
 ): { request: ClientRequest; response: Promise<{ status: number; body: any }> } {
   let request: ClientRequest
   const response = new Promise<{ status: number; body: any }>((resolve, reject) => {
@@ -41,7 +42,7 @@ function openBodylessMutation(
         'content-length': '999999999',
         'file-path': KEY_HEX,
         'risu-auth': token,
-        'x-client-build': '1.9.0-stale',
+        ...(clientBuild === null ? {} : { 'x-client-build': clientBuild }),
         connection: 'close',
       },
     }, incoming => {
@@ -121,6 +122,23 @@ describe('client build admission', () => {
     })
     streamed.request.destroy()
 
+    const retired = openBodylessMutation(
+      server,
+      client.token,
+      '/api/plugin-storage/transition',
+      EXPECTED_BUILD.stamp,
+    )
+    await expect(retired.response).resolves.toMatchObject({
+      status: 426,
+      body: {
+        code: 'CLIENT_UPGRADE_REQUIRED',
+        expectedBuild: EXPECTED_BUILD,
+        commitOutcome: 'not-committed',
+        commitOutcomeUnknown: false,
+      },
+    })
+    retired.request.destroy()
+
     const matching = await client.fetch('/api/write', {
       method: 'POST',
       headers: {
@@ -153,5 +171,23 @@ describe('client build admission', () => {
       body: 'legacy-compatible',
     })
     expect(response.status).toBe(200)
+
+    const retired = openBodylessMutation(
+      server,
+      client.token,
+      '/api/plugin-storage/transition',
+      null,
+    )
+    const rejection = await retired.response
+    expect(rejection).toMatchObject({
+      status: 426,
+      body: {
+        code: 'CLIENT_UPGRADE_REQUIRED',
+        commitOutcome: 'not-committed',
+        commitOutcomeUnknown: false,
+      },
+    })
+    expect(rejection.body).not.toHaveProperty('expectedBuild')
+    retired.request.destroy()
   })
 })

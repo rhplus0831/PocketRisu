@@ -241,6 +241,10 @@ rich-value conversion while writing an unpublished private stage. The client doe
 JSON-validate individual externalization values first. Servers that do not advertise
 the bulk capability retain the earlier staged row protocol.
 
+The legacy non-bulk `POST /api/plugin-storage/transition` protocol is retired. Its route
+remains registered only to reject residual callers before body parsing with the structured
+`426 CLIENT_UPGRADE_REQUIRED` response; it never performs a transition.
+
 1. The client validates record shape and transport limits, then sends one framed bulk request.
 2. The server validates keys and values, applies the independently configured compatible-
    value conversion, checks row counts, negotiated limits, source identity, and disk

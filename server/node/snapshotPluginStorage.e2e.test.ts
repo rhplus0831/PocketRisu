@@ -46,7 +46,10 @@ const {
 const serverEntry = path.resolve(process.cwd(), 'server/node/server.cjs')
 const testPasswordDigest = crypto.createHash('sha256').update('snapshot-plugin-test').digest('hex')
 const packr = new Packr({ useRecords: false })
+const pluginTransitionPackr = new Packr({ structuredClone: true, useRecords: true })
 const pluginRecoveryDirtyKey = 'config/plugin-storage-recovery-dirty'
+const pluginTransitionMagic = Buffer.from('PRISUT01', 'ascii')
+const pluginTransitionPrefixBytes = 12
 
 interface RunningServer {
     child: ChildProcessWithoutNullStreams
@@ -501,18 +504,49 @@ async function transitionStorage(
     database: Uint8Array,
     failpoint?: string,
 ): Promise<Response> {
-    return await fetch(`${server.origin}/api/plugin-storage/transition`, {
+    const targetDb = await decodeRisuSave(Buffer.from(database))
+    const rows = targetDb.optimizePluginMemory === true
+        ? [
+            ...Object.entries(targetDb.pluginCustomStorage ?? {}).map(([rawKey, value]) => ({
+                rawKey,
+                storageKey: encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_PREFIX),
+                value,
+            })),
+            ...Object.entries(targetDb.pluginStorageMeta ?? {}).map(([rawKey, value]) => ({
+                rawKey,
+                storageKey: encodePluginSaveStorageKey(rawKey, PLUGIN_SAVE_META_PREFIX),
+                value,
+            })),
+        ]
+        : []
+    const payloads = rows.map(({ value }) => Buffer.from(pluginTransitionPackr.encode(value)))
+    const metadataBytes = Buffer.from(JSON.stringify({
+        version: 1,
+        transitionId: crypto.randomUUID(),
+        source,
+        targetOptimized: targetDb.optimizePluginMemory === true,
+        targetGeneration: targetDb.pluginStorageGeneration,
+        autoConvert: true,
+        rows: rows.map(({ rawKey, storageKey }, index) => ({
+            rawKey,
+            storageKey,
+            valueLength: payloads[index].length,
+            valueHash: crypto.createHash('sha256').update(payloads[index]).digest('hex'),
+        })),
+    }), 'utf8')
+    const prefix = Buffer.alloc(pluginTransitionPrefixBytes)
+    pluginTransitionMagic.copy(prefix)
+    prefix.writeUInt32BE(metadataBytes.length, pluginTransitionMagic.length)
+    const body = Buffer.concat([prefix, metadataBytes, ...payloads])
+    return await fetch(`${server.origin}/api/plugin-storage/transition/bulk`, {
         method: 'POST',
         headers: {
             ...auth,
-            'content-type': 'application/octet-stream',
+            'content-type': 'application/x-pocketrisu-plugin-storage-transition',
+            'x-plugin-storage-transition-length': String(body.length),
             ...(failpoint ? { 'x-plugin-storage-failpoint': failpoint } : {}),
         },
-        body: encodeRisuSaveLegacy({
-            version: 1,
-            source,
-            database,
-        }),
+        body,
     })
 }
 
@@ -671,56 +705,6 @@ afterEach(async () => {
 })
 
 describe('atomic plugin storage publication', () => {
-    it('rolls an interrupted legacy adoption back to the legacy state', async () => {
-        const cwd = makeWorkDir()
-        let server = await startServer(cwd, {
-            POCKETRISU_PLUGIN_STORAGE_TEST_FAILPOINTS: '1',
-        })
-        let auth = await authenticate(server)
-        await writeKey(server, auth, 'database/database.bin', encodeRisuSaveLegacy({
-            characters: [],
-            optimizePluginMemory: true,
-            pluginCustomStorage: {},
-        }))
-        // Simulate a row left by a pre-BR2 server. New generic writes are
-        // rejected, but existing legacy rows still need atomic adoption.
-        const legacyFixture = openFixtureDatabase(cwd)
-        legacyFixture.prepare(
-            'INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
-        ).run(
-            valueRowKey('legacy'),
-            Buffer.from(JSON.stringify({ durable: true })),
-            Date.now(),
-        )
-        legacyFixture.close()
-        const response = await transitionStorage(server, auth, {
-            optimized: true,
-            generation: null,
-            manifest: null,
-        }, encodeRisuSaveLegacy({
-            characters: [],
-            optimizePluginMemory: true,
-            pluginStorageGeneration: crypto.randomUUID(),
-            pluginCustomStorage: { legacy: { durable: true } },
-        }), 'after-manifest')
-        expect(response.status).toBe(500)
-        expect(await response.text()).toContain('Injected plugin storage failure at after-manifest')
-
-        await stopServer(server)
-        server = await startServer(cwd, {
-            POCKETRISU_PLUGIN_STORAGE_TEST_FAILPOINTS: '1',
-        })
-        auth = await authenticate(server)
-        const restartedDb = await decodeRisuSave(
-            await readKey(server, auth, 'database/database.bin'),
-        )
-        expect(restartedDb.pluginStorageGeneration).toBeUndefined()
-        expect((await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).length).toBe(0)
-        expect(JSON.parse(
-            (await readKey(server, auth, valueRowKey('legacy'))).toString('utf-8'),
-        )).toEqual({ durable: true })
-    }, 30_000)
-
     it('publishes an existing-key update atomically for subsequent snapshots', async () => {
         const server = await startServer(makeWorkDir())
         const auth = await authenticate(server)
@@ -1329,18 +1313,33 @@ describe('atomic plugin storage publication', () => {
         )).toString('utf-8'))).toBe('old-generation-body')
 
         const newSession = await authenticate(server)
-        const newGeneration = crypto.randomUUID()
-        const transition = await transitionStorage(server, newSession, {
+        const inlineGeneration = crypto.randomUUID()
+        const internalize = await transitionStorage(server, newSession, {
             optimized: true,
             generation: oldGeneration,
             manifest: oldManifest,
         }, encodeRisuSaveLegacy({
             ...oldDb,
+            optimizePluginMemory: false,
+            pluginStorageGeneration: inlineGeneration,
+            pluginCustomStorage: { shared: 'old-generation-body' },
+        }))
+        expect(internalize.status, await internalize.clone().text()).toBe(200)
+        const inlineDb = await decodeRisuSave(
+            await readKey(server, newSession, 'database/database.bin'),
+        )
+        const newGeneration = crypto.randomUUID()
+        const transition = await transitionStorage(server, newSession, {
+            optimized: false,
+            generation: inlineGeneration,
+            manifest: null,
+        }, encodeRisuSaveLegacy({
+            ...inlineDb,
             optimizePluginMemory: true,
             pluginStorageGeneration: newGeneration,
             pluginCustomStorage: { shared: 'new-generation-body' },
         }))
-        expect(transition.status).toBe(200)
+        expect(transition.status, await transition.clone().text()).toBe(200)
 
         const explicitOldRead = await readKeyResponse(
             server,
@@ -3013,16 +3012,32 @@ describe('automatic snapshots × optimized plugin storage', () => {
         const legacyDb = await decodeRisuSave(
             await readKey(server, auth, 'database/database.bin'),
         )
-        const adoption = await transitionStorage(server, auth, {
+        const inlineGeneration = crypto.randomUUID()
+        const internalize = await transitionStorage(server, auth, {
             optimized: true,
             generation: null,
             manifest: null,
         }, encodeRisuSaveLegacy({
             ...legacyDb,
+            optimizePluginMemory: false,
+            pluginStorageGeneration: inlineGeneration,
+            pluginCustomStorage: {},
+        }))
+        expect(internalize.status, await internalize.clone().text()).toBe(200)
+        const inlineDb = await decodeRisuSave(
+            await readKey(server, auth, 'database/database.bin'),
+        )
+        const adoption = await transitionStorage(server, auth, {
+            optimized: false,
+            generation: inlineGeneration,
+            manifest: null,
+        }, encodeRisuSaveLegacy({
+            ...inlineDb,
+            optimizePluginMemory: true,
             pluginStorageGeneration: crypto.randomUUID(),
             pluginCustomStorage: {},
         }))
-        expect(adoption.status).toBe(200)
+        expect(adoption.status, await adoption.clone().text()).toBe(200)
 
         expect((await mutateCurrentStorage(server, auth, {
             writes: [{

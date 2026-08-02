@@ -3,6 +3,7 @@
 const BUFFERED_INGRESS_POLICY = Symbol('bufferedIngressPolicy');
 const CLIENT_BUILD_HEADER = 'x-client-build';
 const CLIENT_UPGRADE_REQUIRED_CODE = 'CLIENT_UPGRADE_REQUIRED';
+const RETIRED_PLUGIN_STORAGE_TRANSITION_PATH = '/api/plugin-storage/transition';
 
 const MIB = 1024 * 1024;
 const DEFAULT_BUFFERED_INGRESS_MAX_BYTES = 512 * MIB;
@@ -236,9 +237,6 @@ function rawPolicy(req, limits) {
         }
         return { maxBytes: limits.pluginStorage, responseKind: 'generic' };
     }
-    if (req.path === '/api/plugin-storage/transition') {
-        return { maxBytes: limits.database, responseKind: 'generic' };
-    }
     if (req.path === '/api/chat-content'
         || req.path.startsWith('/api/chat-content/')) {
         return { maxBytes: limits.chat, responseKind: 'generic' };
@@ -260,6 +258,17 @@ function createRoutePolicyResolver(limits) {
     return (req) => {
         const writer = isWriterRoute(req);
         const bodyKind = requestBodyKind(req);
+        if (req.method === 'POST' && req.path === RETIRED_PLUGIN_STORAGE_TRANSITION_PATH) {
+            return {
+                maxBytes: 0,
+                responseKind: 'generic',
+                bodyKind: null,
+                authMode: authMode(req),
+                writer: true,
+                admissionOnly: true,
+                retiredUpgradeRequired: true,
+            };
+        }
         if (!bodyKind
             || isStreamedIngress(req)
             || (writer && (req.method === 'GET' || req.method === 'DELETE'))) {
@@ -340,6 +349,20 @@ function sendAdmissionError(res, policy, status, details) {
     return res.status(status).json(admissionPayload(policy, details));
 }
 
+function sendClientUpgradeRequired(
+    res,
+    policy,
+    expectedBuild,
+    error = 'This client build does not match the server. Reload to continue.',
+) {
+    return sendAdmissionError(res, policy, 426, {
+        code: CLIENT_UPGRADE_REQUIRED_CODE,
+        error,
+        expectedBuild: expectedBuild ?? undefined,
+        retryable: false,
+    });
+}
+
 function tooLargeCode(policy) {
     if (policy.responseKind === 'plugin-set'
         || policy.responseKind === 'generic-plugin-value') return 'PLUGIN_VALUE_TOO_LARGE';
@@ -369,16 +392,21 @@ function createBufferedIngressMiddleware({
             else if (policy.authMode === 'cookie') authenticated = authenticateCookie(req, res);
             if (!authenticated) return;
 
+            if (policy.retiredUpgradeRequired) {
+                sendClientUpgradeRequired(
+                    res,
+                    policy,
+                    expectedClientBuild,
+                    'This plugin storage transition protocol is retired. Reload to continue.',
+                );
+                return;
+            }
+
             if (policy.writer && expectedClientBuild) {
                 const clientBuild = req.headers[CLIENT_BUILD_HEADER];
                 if (typeof clientBuild !== 'string'
                     || clientBuild !== expectedClientBuild.stamp) {
-                    sendAdmissionError(res, policy, 426, {
-                        code: CLIENT_UPGRADE_REQUIRED_CODE,
-                        error: 'This client build does not match the server. Reload to continue.',
-                        expectedBuild: expectedClientBuild,
-                        retryable: false,
-                    });
+                    sendClientUpgradeRequired(res, policy, expectedClientBuild);
                     return;
                 }
             }
@@ -484,5 +512,6 @@ module.exports = {
     isWriterRoute,
     createRoutePolicyResolver,
     admissionPayload,
+    sendClientUpgradeRequired,
     createBufferedIngressMiddleware,
 };

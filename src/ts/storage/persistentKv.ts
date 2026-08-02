@@ -20,7 +20,6 @@ import type {
     PluginStorageStagedTransitionBegin,
     PluginStorageStagedTransitionAbortTombstone,
     PluginStorageStagedTransitionStatus,
-    PluginStorageTransitionTransport,
     PluginStorageViewerPageTransport,
 } from "./nodeStorage";
 import type { PluginStorageBulkTransitionRequest } from "./pluginStorageTransitionBulk";
@@ -471,23 +470,6 @@ export async function commitPersistentPluginStorageMutation(
     } as const;
     if (signal) await forageStorage.commitPluginStorageMutation(plan, signal);
     else await forageStorage.commitPluginStorageMutation(plan);
-}
-
-export async function commitPersistentPluginStorageTransition(
-    transition: PluginStorageTransitionTransport,
-    signal?: AbortSignal | null,
-): Promise<{ etag?: string }> {
-    throwIfAborted(signal);
-    await ensureStorageReady(signal);
-    const plan = {
-        ...transition,
-        expectedEtag: transition.expectedEtag
-            ?? forageStorage.getDbEtag()
-            ?? undefined,
-    };
-    return signal
-        ? await forageStorage.commitPluginStorageTransition(plan, signal)
-        : await forageStorage.commitPluginStorageTransition(plan);
 }
 
 export async function getPersistentPluginStorageTransitionStreamCapabilities(

@@ -118,6 +118,46 @@ describe('buffered ingress admission', () => {
     })
   })
 
+  test.each([
+    ['matching served build', {
+      version: '1.9.0',
+      stamp: `1.9.0-${'e'.repeat(64)}`,
+    }],
+    ['no served build stamp', null],
+  ])('retires the legacy transition before body admission with %s', async (
+    _case,
+    expectedClientBuild,
+  ) => {
+    const admission = middleware({ expectedClientBuild })
+    const result = await dispatch(admission.run, request({
+      path: '/api/plugin-storage/transition',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'content-length': '999999999',
+        ...(expectedClientBuild
+          ? { 'x-client-build': expectedClientBuild.stamp }
+          : {}),
+      },
+    }))
+
+    expect(result.res.statusCode).toBe(426)
+    expect(result.res.body).toMatchObject({
+      code: 'CLIENT_UPGRADE_REQUIRED',
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+      retryable: false,
+    })
+    if (expectedClientBuild) {
+      expect(result.res.body).toMatchObject({ expectedBuild: expectedClientBuild })
+    } else {
+      expect(result.res.body).not.toHaveProperty('expectedBuild')
+    }
+    expect(result.res.headers.get('connection')).toBe('close')
+    expect(result.next).not.toHaveBeenCalled()
+    expect(admission.writerState).not.toHaveBeenCalled()
+    expect(admission.budget.snapshot().usedBytes).toBe(0)
+  })
+
   test('authenticates before inspecting or reserving an untrusted body', async () => {
     const authenticate = vi.fn(async (_req, res: FakeResponse) => {
       res.status(400).json({ error: 'No auth header' })

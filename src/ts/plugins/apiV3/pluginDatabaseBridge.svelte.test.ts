@@ -183,7 +183,6 @@ vi.mock("../../storage/persistentKv", () => {
         }
         storageMocks.persistent.set(manifestKey, cloneJson(mutation.nextManifest));
     },
-    commitPersistentPluginStorageTransition: vi.fn(),
     decodeStorageKeyComponent: decodeKey,
     listPersistentKeys: async (prefix = "", signal?: AbortSignal | null) => {
         throwIfAborted(signal);
