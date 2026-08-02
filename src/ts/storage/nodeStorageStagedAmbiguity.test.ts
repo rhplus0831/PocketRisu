@@ -11,6 +11,9 @@ const cache = vi.hoisted(() => ({
 }))
 
 vi.mock('./resourceCache', () => ({
+    RESOURCE_CACHE_MAX_ENTRIES: 32_768,
+    RESOURCE_CACHE_MAX_STORED_BYTES: 64 * 1024 * 1024,
+    RESOURCE_CACHE_MAX_VALUE_BYTES: 32 * 1024 * 1024,
     applyOwnedResourceCacheMutations: vi.fn(async () => undefined),
     getManifestHashes: cache.getManifestHashes,
     getVerifiedManifestSnapshot: cache.getVerifiedManifestSnapshot,

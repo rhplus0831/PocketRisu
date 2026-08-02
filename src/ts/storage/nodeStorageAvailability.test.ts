@@ -5,6 +5,7 @@ const cache = vi.hoisted(() => ({
     getManifestHashes: vi.fn(),
     getVerifiedManifestSnapshot: vi.fn(),
     getVerifiedCachedBytes: vi.fn(),
+    persistResourceCacheManifests: vi.fn(),
     sha256Bytes: vi.fn(),
     sha256OwnedBytes: vi.fn(),
     storeBytes: vi.fn(),
@@ -12,6 +13,9 @@ const cache = vi.hoisted(() => ({
 }))
 
 vi.mock('./resourceCache', () => ({
+    RESOURCE_CACHE_MAX_ENTRIES: 32_768,
+    RESOURCE_CACHE_MAX_STORED_BYTES: 64 * 1024 * 1024,
+    RESOURCE_CACHE_MAX_VALUE_BYTES: 32 * 1024 * 1024,
     applyOwnedResourceCacheMutations: vi.fn(async () => undefined),
     getManifestHashes: cache.getManifestHashes,
     getVerifiedManifestSnapshot: cache.getVerifiedManifestSnapshot,
@@ -20,7 +24,7 @@ vi.mock('./resourceCache', () => ({
     invalidateResourceCachePrefix: vi.fn(async () => undefined),
     isResourceCacheEnabled: () => cache.enabled,
     isSha256Hex: (value: unknown) => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value),
-    persistResourceCacheManifests: vi.fn(async () => undefined),
+    persistResourceCacheManifests: cache.persistResourceCacheManifests,
     sha256Bytes: cache.sha256Bytes,
     sha256OwnedBytes: cache.sha256OwnedBytes,
     settleBestEffortResourceCache: async <T>(operation: Promise<T>, fallback: T) => {
@@ -64,6 +68,11 @@ const {
 } = await import('./nodeStorage')
 const { StorageError } = await import('./storageError')
 const { encodeRisuSaveLegacy } = await import('./risuSave')
+const { encodeRawMsgpack } = await import('./rawMsgpack')
+
+function encodeOwnedRawMsgpack(value: unknown): Uint8Array {
+    return Uint8Array.from(encodeRawMsgpack(value))
+}
 
 const SMALL_PLUGIN_WRITE_TIMEOUT_MS = authoritativeStoragePayloadTimeoutMs(
     new TextEncoder().encode('{"value":1}').byteLength,
@@ -84,10 +93,16 @@ beforeEach(() => {
     ;(NodeStorage as any).pluginStorageCapabilities = {
         maxValueBytes: 128 * 1024 * 1024,
     }
+    ;(NodeStorage as any).databaseStorageCapabilities = {
+        rawBootRead: false,
+        atomicCreate: false,
+        optimizedPluginStorageBootReconcile: false,
+    }
     cache.enabled = true
     cache.getManifestHashes.mockResolvedValue([])
     cache.getVerifiedManifestSnapshot.mockResolvedValue(null)
     cache.getVerifiedCachedBytes.mockResolvedValue(null)
+    cache.persistResourceCacheManifests.mockResolvedValue(undefined)
     cache.sha256Bytes.mockResolvedValue('a'.repeat(64))
     cache.sha256OwnedBytes.mockResolvedValue('a'.repeat(64))
     cache.storeBytes.mockResolvedValue(undefined)
@@ -101,6 +116,113 @@ afterEach(() => {
 })
 
 describe('NodeStorage availability bounds', () => {
+    it('returns a verified cached database without awaiting best-effort persistence', async () => {
+        const persistence = Promise.withResolvers<void>()
+        cache.getVerifiedManifestSnapshot.mockResolvedValue({
+            hashes: [],
+            bytesByHash: new Map(),
+        })
+        cache.persistResourceCacheManifests.mockReturnValueOnce(persistence.promise)
+        const etag = 'b'.repeat(32)
+        const encodedEnvelope = encodeOwnedRawMsgpack({
+            version: 1,
+            etag,
+            root: { bytes: encodeOwnedRawMsgpack({ name: 'cached-boot' }) },
+            characters: [],
+            botPresets: [],
+            modules: [],
+            personas: [],
+        })
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(encodedEnvelope as unknown as BodyInit, {
+            status: 200,
+            headers: {
+                'content-type': 'application/octet-stream',
+                'x-db-etag': etag,
+            },
+        })))
+        ;(NodeStorage as any).databaseStorageCapabilities = {
+            rawBootRead: true,
+            atomicCreate: true,
+            optimizedPluginStorageBootReconcile: true,
+        }
+        const storage = readyStorage()
+        let result: Awaited<ReturnType<typeof storage.readDatabaseForBoot>> | undefined
+        let failure: unknown
+
+        try {
+            void storage.readDatabaseForBoot().then(
+                value => { result = value },
+                error => { failure = error },
+            )
+            await vi.waitFor(() => {
+                expect(failure).toBeUndefined()
+                expect(result).toEqual({
+                    kind: 'decoded',
+                    database: {
+                        name: 'cached-boot',
+                        characters: [],
+                        botPresets: [],
+                        modules: [],
+                        personas: [],
+                    },
+                })
+                expect(cache.persistResourceCacheManifests).toHaveBeenCalledOnce()
+            })
+        } finally {
+            persistence.resolve()
+        }
+    })
+
+    it('falls back to the authoritative raw boot read before publishing an invalid cache envelope', async () => {
+        cache.getVerifiedManifestSnapshot.mockResolvedValue({
+            hashes: [],
+            bytesByHash: new Map(),
+        })
+        const etag = 'c'.repeat(32)
+        const malformedEnvelope = encodeOwnedRawMsgpack({
+            version: 1,
+            etag,
+            // Array groups belong outside the root in this protocol.
+            root: { bytes: encodeOwnedRawMsgpack({ characters: [] }) },
+            characters: [],
+            botPresets: [],
+            modules: [],
+            personas: [],
+        })
+        const authoritativeBytes = new Uint8Array([9, 8, 7])
+        const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+            if (String(input) === '/api/db/read-cached') {
+                return new Response(malformedEnvelope as unknown as BodyInit, {
+                    status: 200,
+                    headers: { 'x-db-etag': etag },
+                })
+            }
+            if (String(input) === '/api/db/read-raw-for-boot') {
+                return new Response(authoritativeBytes as unknown as BodyInit, {
+                    status: 200,
+                    headers: { 'x-db-etag': 'd'.repeat(32) },
+                })
+            }
+            throw new Error(`Unexpected request: ${String(input)}`)
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        ;(NodeStorage as any).databaseStorageCapabilities = {
+            rawBootRead: true,
+            atomicCreate: true,
+            optimizedPluginStorageBootReconcile: true,
+        }
+
+        await expect(readyStorage().readDatabaseForBoot()).resolves.toEqual({
+            kind: 'bytes',
+            bytes: Buffer.from(authoritativeBytes),
+        })
+        expect(fetchMock).toHaveBeenCalledWith(
+            '/api/db/read-raw-for-boot',
+            expect.objectContaining({ method: 'GET' }),
+        )
+        expect(cache.persistResourceCacheManifests).not.toHaveBeenCalled()
+    })
+
     it('assigns legal large payloads a bounded transfer budget', () => {
         const timeoutMs = authoritativeStoragePayloadTimeoutMs(128 * 1024 * 1024)
 

@@ -41,6 +41,13 @@ export interface ResourceCacheManifestUpdate {
     kind: ResourceCacheManifestKind
 }
 
+interface PreparedResourceCacheManifestUpdates {
+    manifests: Array<Pick<ResourceCacheManifestUpdate, 'key' | 'hashes' | 'kind'>>
+    entries: Array<ResourceCacheByteEntry | null>
+    entrySizes: Map<string, number>
+    stagedBytes: number
+}
+
 export interface VerifiedResourceCacheManifest {
     hashes: string[]
     bytesByHash: Map<string, Uint8Array>
@@ -670,7 +677,7 @@ export function persistResourceCacheManifests(
 ): Promise<void> {
     if (!isResourceCacheEnabled()) return Promise.resolve()
     const prepared = prepareManifestUpdates(updates)
-    if (prepared.length === 0) return Promise.resolve()
+    if (prepared.manifests.length === 0) return Promise.resolve()
 
     const epoch = resourceCacheEpoch
     const operation = enqueueResourceCacheWrite(async () => {
@@ -679,7 +686,12 @@ export function persistResourceCacheManifests(
             if (!database) return
             await persistResourceCacheManifestUpdates(database, prepared)
             if (epoch !== resourceCacheEpoch || !isResourceCacheEnabled()) return
-            await accountResourceCachePruneDebt(database, epoch, prepared.length, 0)
+            await accountResourceCachePruneDebt(
+                database,
+                epoch,
+                prepared.manifests.length,
+                prepared.stagedBytes,
+            )
         })
     return operation
 }
@@ -852,9 +864,14 @@ async function persistOwnedResourceCacheMutations(
 
 function prepareManifestUpdates(
     updates: readonly ResourceCacheManifestUpdate[],
-): ResourceCacheManifestUpdate[] {
-    return updates.flatMap((update) => {
-        if (!nonEmptyString(update.key)) return []
+): PreparedResourceCacheManifestUpdates {
+    const manifests: PreparedResourceCacheManifestUpdates['manifests'] = []
+    const entries: Array<ResourceCacheByteEntry | null> = []
+    const entrySizes = new Map<string, number>()
+    let stagedBytes = 0
+
+    for (const update of updates) {
+        if (!nonEmptyString(update.key)) continue
         const hashLimit = resourceCacheManifestHashLimit(update.kind)
         const hashes: string[] = []
         const seen = new Set<string>()
@@ -864,30 +881,34 @@ function prepareManifestUpdates(
             hashes.push(hash)
             seen.add(hash)
         }
+        manifests.push({ key: update.key, hashes, kind: update.kind })
 
+        // Database boot donates immutable miss buffers. Keep one reference per
+        // content hash and enforce the same aggregate limits defensively before
+        // any background IndexedDB work is queued.
         const manifestHashes = new Set(hashes)
-        const entries: ResourceCacheByteEntry[] = []
-        const entryHashes = new Set<string>()
         for (const entry of update.entries) {
             if (
                 !manifestHashes.has(entry.hash)
-                || entryHashes.has(entry.hash)
+                || entrySizes.has(entry.hash)
+                || !isSha256Hex(entry.hash)
                 || entry.bytes.byteLength > RESOURCE_CACHE_MAX_VALUE_BYTES
+                || entrySizes.size >= RESOURCE_CACHE_MAX_ENTRIES
+                || entry.bytes.byteLength > RESOURCE_CACHE_MAX_STORED_BYTES - stagedBytes
             ) {
                 continue
             }
-            const bytes = new Uint8Array(entry.bytes.byteLength)
-            bytes.set(entry.bytes)
-            entries.push({ hash: entry.hash, bytes })
-            entryHashes.add(entry.hash)
+            entries.push(entry)
+            entrySizes.set(entry.hash, entry.bytes.byteLength)
+            stagedBytes += entry.bytes.byteLength
         }
-        return [{ key: update.key, hashes, entries, kind: update.kind }]
-    })
+    }
+    return { manifests, entries, entrySizes, stagedBytes }
 }
 
 async function persistResourceCacheManifestUpdates(
     database: IDBDatabase,
-    updates: readonly ResourceCacheManifestUpdate[],
+    prepared: PreparedResourceCacheManifestUpdates,
 ): Promise<void> {
     const transaction = database.transaction(
         [RESOURCE_CACHE_ENTRY_STORE, RESOURCE_CACHE_MANIFEST_STORE],
@@ -896,31 +917,32 @@ async function persistResourceCacheManifestUpdates(
     const done = transactionComplete(transaction)
     const entries = transaction.objectStore(RESOURCE_CACHE_ENTRY_STORE)
     const manifests = transaction.objectStore(RESOURCE_CACHE_MANIFEST_STORE)
-    const writtenHashes = new Set<string>()
     const now = Date.now()
 
-    for (const update of updates) {
+    // IndexedDB takes ownership through structured cloning at put(). Drop each
+    // donated JS reference immediately instead of retaining the complete boot
+    // miss set until the manifest transaction finishes.
+    for (let index = 0; index < prepared.entries.length; index += 1) {
+        const entry = prepared.entries[index]
+        if (!entry) continue
+        entries.put(entry.bytes, entry.hash)
+        prepared.entries[index] = null
+    }
+
+    for (const update of prepared.manifests) {
         const request = manifests.get(update.key)
         request.onsuccess = () => {
             const current = readStoredManifest(request.result, resourceCacheManifestHashLimit(update.kind))
             const currentSizes = new Map(
                 (current?.hashes ?? []).map((hash, index) => [hash, current?.sizes[index] ?? 0]),
             )
-            const updateEntries = new Map(update.entries.map((entry) => [entry.hash, entry]))
             const hashes: string[] = []
             const sizes: number[] = []
             for (const hash of update.hashes) {
-                const entry = updateEntries.get(hash)
-                const size = entry?.bytes.byteLength ?? currentSizes.get(hash)
+                const size = prepared.entrySizes.get(hash) ?? currentSizes.get(hash)
                 if (size === undefined || size > RESOURCE_CACHE_MAX_VALUE_BYTES) continue
                 hashes.push(hash)
                 sizes.push(size)
-            }
-
-            for (const entry of update.entries) {
-                if (writtenHashes.has(entry.hash)) continue
-                entries.put(entry.bytes, entry.hash)
-                writtenHashes.add(entry.hash)
             }
             if (hashes.length === 0) {
                 manifests.delete(update.key)

@@ -16,6 +16,9 @@ import {
     type DbCacheInventory,
 } from "./dbCachedRead"
 import {
+    RESOURCE_CACHE_MAX_ENTRIES,
+    RESOURCE_CACHE_MAX_STORED_BYTES,
+    RESOURCE_CACHE_MAX_VALUE_BYTES,
     applyOwnedResourceCacheMutations,
     getManifestHashes,
     getVerifiedManifestSnapshot,
@@ -4020,17 +4023,30 @@ export class NodeStorage{
             ) as DbCacheInventory
             const residentBytes = new Map<string, Uint8Array>()
             let remainingHashes = DB_CACHE_MAX_HASHES
+            let residentByteLength = 0
             for (const group of DB_CACHE_GROUPS) {
                 const snapshot = await getVerifiedManifestSnapshot(`db:${group}`)
                 if (!snapshot) throw new Error('Database resource cache is unavailable')
-                const selected = snapshot.hashes.slice(0, remainingHashes)
-                inventory[group] = selected
-                remainingHashes -= selected.length
-                for (const hash of selected) {
+                const selected: string[] = []
+                for (const hash of snapshot.hashes) {
+                    if (remainingHashes <= 0) break
                     const bytes = snapshot.bytesByHash.get(hash)
                     if (!bytes) throw new Error('Verified database cache entry is unavailable')
-                    residentBytes.set(hash, bytes)
+                    if (!residentBytes.has(hash)) {
+                        if (
+                            bytes.byteLength > RESOURCE_CACHE_MAX_VALUE_BYTES
+                            || bytes.byteLength > RESOURCE_CACHE_MAX_STORED_BYTES - residentByteLength
+                            || residentBytes.size >= RESOURCE_CACHE_MAX_ENTRIES
+                        ) {
+                            continue
+                        }
+                        residentBytes.set(hash, bytes)
+                        residentByteLength += bytes.byteLength
+                    }
+                    selected.push(hash)
+                    remainingHashes -= 1
                 }
+                inventory[group] = selected
             }
 
             const requestBody = JSON.stringify({ cache: { version: 1, hashes: inventory } })
@@ -4063,12 +4079,23 @@ export class NodeStorage{
                 encodedEnvelope,
                 inventory,
                 async (hash) => residentBytes.get(hash) ?? null,
+                {
+                    maxBytes: RESOURCE_CACHE_MAX_STORED_BYTES - residentByteLength,
+                    maxEntries: RESOURCE_CACHE_MAX_ENTRIES - residentBytes.size,
+                },
             )
             if (assembled.etag !== responseEtag) {
                 throw new Error('Cached database response ETag mismatch')
             }
             this._lastDbEtag = responseEtag
-            await persistResourceCacheManifests(assembled.updates)
+            // The segmented response is authoritative once its exact shape,
+            // resident hashes, and ETag are verified. IndexedDB is only a
+            // disposable accelerator, so its bounded write must not delay UI
+            // startup or turn a quota/stall into a second full database read.
+            void persistResourceCacheManifests(assembled.updates).catch(() => {
+                // Quota, IndexedDB, and cache-write failures never affect the
+                // already-validated authoritative database.
+            })
             return { kind: 'decoded', database: assembled.database }
         } catch {
             // The boot-only raw read intentionally does not decode or externalize

@@ -17,10 +17,12 @@ import {
     advanceResourceCachePruneDebt,
     clearResourceCache,
     formatHashBytes,
+    getVerifiedManifestSnapshot,
     getResourceCacheStats,
     isResourceCacheEnabled,
     mergeResourceManifestHashes,
     planResourceCacheRetention,
+    persistResourceCacheManifests,
     resourceCacheManifestHashLimit,
     selectResidentManifestHashes,
     settleBestEffortResourceCache,
@@ -229,6 +231,46 @@ describe('byte resource cache helpers', () => {
         expect(plan.manifests.find(({ key }) => key === 'db:characters')?.hashes).toHaveLength(12)
         expect(plan.manifests.find(({ key }) => key === 'chat:char/chat')?.hashes).toHaveLength(4)
         expect(plan.manifests.find(({ key }) => key === 'kv:pluginsave/value.json')?.hashes).toHaveLength(4)
+    })
+
+    it('persists donated boot misses once and publishes every referencing manifest', async () => {
+        vi.stubGlobal('indexedDB', fakeIndexedDB)
+        vi.stubGlobal('IDBKeyRange', FakeIDBKeyRange)
+        localStorage.setItem(RESOURCE_CACHE_LOCAL_STORAGE_KEY, 'true')
+        const bytes = new TextEncoder().encode('shared database segment')
+        const contentHash = await sha256Bytes(bytes)
+
+        try {
+            await persistResourceCacheManifests([
+                {
+                    key: 'db:root',
+                    hashes: [contentHash],
+                    entries: [{ hash: contentHash, bytes }],
+                    kind: 'database',
+                },
+                {
+                    key: 'db:characters',
+                    hashes: [contentHash],
+                    entries: [{ hash: contentHash, bytes }],
+                    kind: 'database',
+                },
+            ])
+
+            await expect(getVerifiedManifestSnapshot('db:root')).resolves.toMatchObject({
+                hashes: [contentHash],
+            })
+            await expect(getVerifiedManifestSnapshot('db:characters')).resolves.toMatchObject({
+                hashes: [contentHash],
+            })
+            await expect(getResourceCacheStats()).resolves.toMatchObject({
+                manifestCount: 2,
+                entryCount: 1,
+                totalBytes: bytes.byteLength,
+            })
+        } finally {
+            await clearResourceCache()
+            vi.unstubAllGlobals()
+        }
     })
 
     it('stays disabled when IndexedDB is unavailable', async () => {

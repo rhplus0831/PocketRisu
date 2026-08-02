@@ -265,7 +265,7 @@ The cache is an opt-in performance layer, separate from server-backed `forageSto
 
 Three protocols consume it:
 
-- Boot splits the stubs-only database into `root`, individual `characters`, `botPresets`, `modules`, and `personas`. The client advertises up to 8,192 verified hashes, reconstructs a MessagePack envelope from hits/misses, validates exact shape and ETag, then persists the new manifests.
+- Boot splits the stubs-only database into `root`, individual `characters`, `botPresets`, `modules`, and `personas`. The client advertises up to 8,192 verified hashes, reconstructs a MessagePack envelope from hits/misses, and validates exact shape and ETag. Verified resident bytes and admitted misses share the 64 MiB/32,768-entry boot staging budget; a miss beyond the remaining aggregate or 32 MiB per-value limit is decoded without cache hashing or retention. Once validation succeeds, boot returns the database while donated miss buffers persist in the background and are released after their IndexedDB `put`.
 - Chat and optimized `pluginsave/*` reads advertise recent verified hashes and accept a `204` only when `x-content-hash` names an advertised, locally present, re-hashed entry.
 - Successful plugin/chat writes compare the server-returned hash with the bytes just sent before seeding the cache.
 
