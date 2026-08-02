@@ -27,6 +27,7 @@ The client-storage subsystem owns PocketRisu’s canonical `Database` model, its
 | `src/ts/storage/pluginSaveKeyPolicy.ts` | Canonical optimized-plugin physical-key policy shared with the server: UTF-8/base64url for well-formed keys, tagged UTF-16 code units for ill-formed JavaScript strings, and manifest-mapped hashes for archive-overlimit names. |
 | `src/ts/storage/resourceCache.ts` | Disposable SHA-256-addressed IndexedDB cache for wire bytes and manifests. It owns enable/support checks, strict entry/manifest validation, verified reads, batched hashing, retention planning, write serialization, stats, pruning, and clearing. Limits include 64 MiB total, 32 MiB per value, 512 manifests, and 32,768 entries. |
 | `src/ts/storage/dbCachedRead.ts` | Client half of the segmented boot protocol. It decodes the raw MessagePack envelope, rejects unexpected shapes/unadvertised hits, re-hashes resident entries, assembles root plus array groups, and returns manifest updates with the server ETag. `rawMsgpack.ts` provides the record-free MessagePack decoder. |
+| `src/ts/storage/boundedMsgpack.ts` | Shared client MessagePack arena policy. Production encoders preserve their distinct wire profiles, but replace msgpackr's module-global target after it grows beyond 32 MiB or after an encode fails, preventing one-off payloads from remaining resident for the tab lifetime. |
 | `src/ts/bootstrap.ts` | Orders the secure-context gate, storage initialization, cached/raw boot read, decode/defaults, server-side snapshot recovery, optimized-plugin boot reconciliation, migrations, placeholder conversion, UI initialization, ID repair, and save-loop startup. |
 | `src/ts/storage/databaseSave.ts` | `DatabaseSaveCoordinator`, save pause/fencing, exact `DatabaseSaveOutcome`, and `requireCommittedDatabaseSave()` for callers that need durability. |
 | `src/ts/storage/writerTakeover.ts` | Process-global writer-loss latch, foreground `checkWriterTakeoverOnReturn()`, explicit read-only-versus-reload choice, and DOM interaction freeze. It never replays or journals the displaced page's dirty state. |
@@ -347,7 +348,7 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
 - Svelte 5 `$state`, `$effect`, `$state.snapshot`, and `tick` provide reactivity and hydration suppression.
 - `src/ts/stores.svelte.ts` owns `DBState`, `selectedCharID`, loading state, and selection state.
 - `src/ts/gui/deepTouch.svelte.ts` forces nested reactive reads for save dirty tracking.
-- `msgpackr` supplies legacy MessagePack encoding; `fflate` and browser compression streams supply compressed variants (`src/ts/storage/risuSave.ts:1-14`, `:26-67`).
+- `msgpackr` supplies legacy MessagePack encoding; every production client encoder uses `boundedMsgpack.ts` to cap its reusable module-global arena at 32 MiB without changing its codec options. `fflate` and browser compression streams supply compressed variants.
 - `fast-json-patch` is loaded lazily by `RisuSavePatcher.set()` (`src/ts/storage/risuSave.ts:927-930`).
 - `NodeStorage` calls Express endpoints for auth, KV, cached database reads, full/delta key lists, patching, chat bodies, chat history, backups, assets, and save-folder migration.
 - `jobRecovery.ts` calls the durable `/api/model-jobs` discovery, journal, and claim routes; request logging is published only after its chat-row save succeeds.

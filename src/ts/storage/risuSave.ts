@@ -11,11 +11,13 @@ import {
     hasPluginStorageRecordValue,
 } from "../plugins/pluginStorageRecord";
 import { isWellFormedUnicode } from "./unicodeWellFormed";
+import { createBoundedMsgpackEncoder } from "./boundedMsgpack";
 
 const packr = new Packr({
     useRecords:false,
     variableMapSize:true,
 });
+const encodeLegacyMsgpack = createBoundedMsgpackEncoder(packr);
 
 const unpackr = new Unpackr({
     copyBuffers:true,
@@ -229,7 +231,7 @@ async function checkCompressionStreams(){
 
 export function encodeRisuSaveLegacy(data:any, compression:'noCompression'|'compression' = 'noCompression'){
     const prepared = prepareLegacyPluginStorageKeys(data)
-    let encoded:Uint8Array = packr.encode(prepared.data)
+    let encoded:Uint8Array = encodeLegacyMsgpack(prepared.data)
     if(compression === 'compression'){
         encoded = fflate.compressSync(encoded)
         const header = prepared.escaped
@@ -252,7 +254,7 @@ export function encodeRisuSaveLegacy(data:any, compression:'noCompression'|'comp
 export async function encodeRisuSaveCompressionStream(data:any) {
     await checkCompressionStreams()
     const prepared = prepareLegacyPluginStorageKeys(data)
-    let encoded:Uint8Array = packr.encode(prepared.data)
+    let encoded:Uint8Array = encodeLegacyMsgpack(prepared.data)
     const cs = new CompressionStream('gzip');
     const writer = cs.writable.getWriter();
     writer.write(encoded as any);

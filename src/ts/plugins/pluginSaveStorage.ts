@@ -47,6 +47,7 @@ import { abortReason, awaitWithAbort, throwIfAborted } from "../storage/abort";
 import { sha256OwnedBytes } from "../storage/resourceCache";
 import { safeStructuredClone } from "../polyfill";
 import { Packr } from "msgpackr/index-no-eval";
+import { createBoundedMsgpackEncoder } from "../storage/boundedMsgpack";
 import {
     decodePluginSaveStorageKey,
     isHashedPluginSaveStorageKey,
@@ -1890,6 +1891,9 @@ const inlinePluginStorageRevisionPackr = new Packr({
     structuredClone: true,
     useRecords: false,
 });
+const encodeInlinePluginStorageRevision = createBoundedMsgpackEncoder(
+    inlinePluginStorageRevisionPackr,
+);
 
 function describePluginStorageFailure(
     error: unknown,
@@ -2041,7 +2045,7 @@ async function inlinePluginStorageRevision(
         // and guarded removal still need an opaque CAS token for those rows.
         // MessagePack's structured-clone mode preserves cycles and rich types;
         // copy its reusable encoder output before any later encode can run.
-        valueBytes = new Uint8Array(inlinePluginStorageRevisionPackr.encode(
+        valueBytes = new Uint8Array(encodeInlinePluginStorageRevision(
             safeStructuredClone(value),
         ));
         revisionDomain = "pocketrisu-plugin-storage-structured-clone-v1";

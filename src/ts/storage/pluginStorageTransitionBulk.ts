@@ -1,6 +1,7 @@
 import { addExtension, Packr } from "msgpackr/index-no-eval";
 import { sha256OwnedBytes } from "./resourceCache";
 import { StorageError } from "./storageError";
+import { createBoundedMsgpackEncoder } from "./boundedMsgpack";
 
 export const PLUGIN_STORAGE_TRANSITION_STREAM_MAGIC = "PRISUT01";
 export const PLUGIN_STORAGE_TRANSITION_STREAM_PREFIX_BYTES = 12;
@@ -105,6 +106,7 @@ const richValuePacker = new Packr({
     structuredClone: true,
     useRecords: true,
 });
+const encodeRichValue = createBoundedMsgpackEncoder(richValuePacker);
 
 export function parsePluginStorageTransitionStreamCapabilities(
     value: unknown,
@@ -177,7 +179,7 @@ export async function preparePluginStorageBulkTransition(
         try {
             // Copy the returned view: Packr may reuse its internal target on a
             // later encode, while Blob construction happens after this loop.
-            encoded = new Uint8Array(richValuePacker.encode(row.value));
+            encoded = new Uint8Array(encodeRichValue(row.value));
         } catch (error) {
             throw new StorageError(
                 "Plugin storage contains a value that cannot be transported for server-side migration.",

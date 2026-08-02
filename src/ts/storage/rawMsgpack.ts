@@ -1,9 +1,11 @@
 import { Packr, Unpackr } from 'msgpackr/index-no-eval'
+import { createBoundedMsgpackEncoder } from './boundedMsgpack'
 
 const packr = new Packr({
     useRecords: false,
     variableMapSize: true,
 })
+const encodeMsgpack = createBoundedMsgpackEncoder(packr)
 
 const unpackr = new Unpackr({
     copyBuffers: true,
@@ -12,7 +14,7 @@ const unpackr = new Unpackr({
 })
 
 export function encodeRawMsgpack(value: unknown): Uint8Array {
-    return packr.encode(value)
+    return encodeMsgpack(value)
 }
 
 export function decodeRawMsgpack(value: Uint8Array): any {

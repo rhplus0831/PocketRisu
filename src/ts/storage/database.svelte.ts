@@ -2930,11 +2930,11 @@ export async function downloadThemePreset(id: number, type: 'json'|'risutheme' =
     if(type === 'json'){
         downloadFile(pres.name + "_theme.json", Buffer.from(JSON.stringify(pres, null, 2)))
     } else {
-        const buf = fflate.compressSync(encodeMsgpack({
+        const buf = fflate.compressSync(encodePresetMsgpack({
             presetVersion: 1,
             type: 'theme',
             preset: await encryptBuffer(
-                encodeMsgpack(pres),
+                encodePresetMsgpack(pres),
                 'risutheme'
             )
         }))
@@ -2980,8 +2980,9 @@ export async function importThemePreset(f: {
     notifySuccess(language.successImport)
 }
 
-import { encode as encodeMsgpack, decode as decodeMsgpack } from "msgpackr/index-no-eval";
+import { Packr, decode as decodeMsgpack } from "msgpackr/index-no-eval";
 import * as fflate from "fflate";
+import { createBoundedMsgpackEncoder } from "./boundedMsgpack";
 import type { OnnxModelFiles } from '../process/transformers';
 import type { RisuModule } from '../process/modules';
 import { decodeRPack, encodeRPack } from '../rpack/rpack_js';
@@ -2991,6 +2992,8 @@ import type { HypaModel } from '../process/memory/hypamemory';
 import type { SerializableHypaV3Data } from '../process/memory/hypav3';
 import { defaultHotkeys, type Hotkey } from '../defaulthotkeys';
 import type { OpenAIChat } from '../process/index.svelte';
+
+const encodePresetMsgpack = createBoundedMsgpackEncoder(new Packr({ useRecords: false }));
 
 export async function downloadPreset(id:number, type:'json'|'risupreset'|'return' = 'json'){
     let db = getDatabase()
@@ -3010,11 +3013,11 @@ export async function downloadPreset(id:number, type:'json'|'risupreset'|'return
         downloadFile(pres.name + "_preset.json", Buffer.from(JSON.stringify(pres, null, 2)))
     }
     else if(type === 'risupreset' || type === 'return'){
-        const buf = fflate.compressSync(encodeMsgpack({
+        const buf = fflate.compressSync(encodePresetMsgpack({
             presetVersion: 2,
             type: 'preset',
             preset: await encryptBuffer(
-                encodeMsgpack(pres),
+                encodePresetMsgpack(pres),
                 'risupreset'
             )
         }))

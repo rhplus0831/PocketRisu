@@ -1,7 +1,12 @@
-import { decode as decodeMsgpack, encode as encodeMsgpack } from "msgpackr/index-no-eval";
+import { Packr, decode as decodeMsgpack } from "msgpackr/index-no-eval";
 import * as fflate from "fflate";
 import { decryptBuffer, encryptBuffer } from "src/ts/util";
 import { decodeRPack, encodeRPack } from "src/ts/rpack/rpack_js.js";
+import { createBoundedMsgpackEncoder } from "src/ts/storage/boundedMsgpack";
+
+const encodeTranslatorPresetMsgpack = createBoundedMsgpackEncoder(
+    new Packr({ useRecords: false }),
+);
 
 export interface TranslatorPreset {
     name: string;
@@ -220,7 +225,10 @@ export async function encodeTranslatorPresetFile(preset: TranslatorPreset): Prom
         preset
     );
     const encryptedPreset = new Uint8Array(
-        await encryptBuffer(encodeMsgpack(normalizedPreset), translatorPresetEncryptionKey)
+        await encryptBuffer(
+            encodeTranslatorPresetMsgpack(normalizedPreset),
+            translatorPresetEncryptionKey,
+        )
     );
     const payload: EncryptedTranslatorPresetFile = {
         translatorPresetVersion: 1,
@@ -228,7 +236,7 @@ export async function encodeTranslatorPresetFile(preset: TranslatorPreset): Prom
         preset: encryptedPreset,
     };
 
-    return await encodeRPack(fflate.compressSync(encodeMsgpack(payload)));
+    return await encodeRPack(fflate.compressSync(encodeTranslatorPresetMsgpack(payload)));
 }
 
 export async function decodeTranslatorPresetFile(data: Uint8Array): Promise<TranslatorPreset> {
