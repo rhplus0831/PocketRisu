@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import { randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import Database from 'better-sqlite3'
 import path from 'node:path'
 import { createClient } from './helpers/client.js'
@@ -187,6 +188,25 @@ describe('staged plugin storage transitions (real server)', () => {
     })
     expect(ownerUpload.status).toBe(200)
     expect((await ownerUpload.json() as any).state).toBe('ready')
+    const stageMetadata = JSON.parse(await readFile(path.join(
+      server.cwd,
+      'save',
+      '.plugin-transition-staging',
+      `.plugin-transition-stage-${externalId}.json`,
+    ), 'utf8')) as any
+    expect(stageMetadata.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        storageKey: valueKey,
+        uploaded: true,
+        stagedSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      }),
+      expect.objectContaining({
+        storageKey: ownerKey,
+        uploaded: true,
+        stagedSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      }),
+    ]))
+    for (const row of stageMetadata.rows) expect(row.stagedSha256).toBe(row.sha256)
 
     const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
     expect(sqlite.prepare('SELECT 1 FROM kv WHERE key = ?').get(valueKey)).toBeUndefined()

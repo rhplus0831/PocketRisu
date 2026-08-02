@@ -7,8 +7,10 @@ const { createGenerationMemo } = generationMemoPkg as {
         getOrCompute: <T>(key: string, name: string, compute: () => T) => T
         seed: <T>(key: string, name: string, value: T) => void
         deleteValue: (key: string, name: string, expectedGeneration?: number) => boolean
+        deleteKey: (key: string, expectedGeneration?: number) => boolean
         has: (key: string, name: string) => boolean
         generation: (key: string) => number
+        retention: () => { generations: number; entries: number; values: number }
     }
 }
 
@@ -68,5 +70,32 @@ describe('mutation-generation derived value memo', () => {
 
         expect(memo.deleteValue('database', 'canonical-encoding', retainedGeneration)).toBe(false)
         expect(memo.has('database', 'canonical-encoding')).toBe(true)
+    })
+
+    it('deletes retired keys without allowing generation-token reuse', () => {
+        const memo = createGenerationMemo()
+        const firstGeneration = memo.bump('retired')
+        memo.seed('retired', 'hash', 'old')
+        expect(memo.retention()).toEqual({ generations: 1, entries: 1, values: 1 })
+
+        expect(memo.deleteKey('retired', firstGeneration)).toBe(true)
+        expect(memo.retention()).toEqual({ generations: 0, entries: 0, values: 0 })
+
+        const reusedGeneration = memo.bump('retired')
+        expect(reusedGeneration).not.toBe(firstGeneration)
+        memo.seed('retired', 'hash', 'new')
+        expect(memo.deleteKey('retired', firstGeneration)).toBe(false)
+        expect(memo.getOrCompute('retired', 'hash', () => 'wrong')).toBe('new')
+    })
+
+    it('releases all generation and value retention for churned keys', () => {
+        const memo = createGenerationMemo()
+        for (let index = 0; index < 1_000; index++) {
+            const key = `cache-${index}`
+            memo.bump(key)
+            memo.seed(key, 'etag', `etag-${index}`)
+            expect(memo.deleteKey(key)).toBe(true)
+        }
+        expect(memo.retention()).toEqual({ generations: 0, entries: 0, values: 0 })
     })
 })

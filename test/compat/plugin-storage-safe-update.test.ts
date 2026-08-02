@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import Database from 'better-sqlite3'
 import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
@@ -257,5 +258,48 @@ describe('IP1 safe plugin storage read/update integration', () => {
       missing: false,
       revision: expect.stringMatching(/^sha256:/),
     })
+  })
+
+  test('bounds session read pins and makes an evicted session re-pin like a fresh session', async () => {
+    const statsName = 'plugin-read-session-stats.json'
+    const server = await spawnServer({
+      seedSave: async saveDir => seed(saveDir),
+      env: { POCKETRISU_TEST_PLUGIN_READ_STATE_STATS_PATH: statsName },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const databasePath = Buffer.from(DATABASE_KEY).toString('hex')
+    const rowPath = Buffer.from(valueKey('config')).toString('hex')
+    const readDatabase = async (sessionId: string) => {
+      const response = await client.fetch('/api/read', {
+        headers: { 'file-path': databasePath, 'x-session-id': sessionId },
+      })
+      expect(response.status).toBe(200)
+      await response.arrayBuffer()
+    }
+
+    await readDatabase('evicted-session')
+    for (let index = 0; index < 50; index++) await readDatabase(`churn-${index}`)
+
+    const stats = JSON.parse(await readFile(path.join(server.cwd, statsName), 'utf8')) as any
+    expect(stats).toMatchObject({ maxEntries: 50, size: 50, evictions: 1 })
+    expect(stats.keys).not.toContain('evicted-session')
+
+    const freshEquivalent = await client.fetch('/api/read', {
+      headers: { 'file-path': rowPath, 'x-session-id': 'evicted-session' },
+    })
+    expect(freshEquivalent.status).toBe(409)
+    await expect(freshEquivalent.json()).resolves.toEqual({
+      error: 'Read database.bin before reading authoritative plugin storage rows',
+    })
+
+    await readDatabase('evicted-session')
+    const repinned = await client.fetch('/api/read', {
+      headers: { 'file-path': rowPath, 'x-session-id': 'evicted-session' },
+    })
+    expect(repinned.status).toBe(200)
+    expect(Buffer.from(await repinned.arrayBuffer())).toEqual(
+      Buffer.from(JSON.stringify({ durable: 'config', entries: ['old'] })),
+    )
   })
 })

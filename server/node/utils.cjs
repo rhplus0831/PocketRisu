@@ -49,7 +49,46 @@ function risuSaveDecodeAbortError(signal) {
     return error;
 }
 
-async function decompressRisuSaveBlock(data, { signal, maxOutputBytes, onOutputChunk }) {
+function risuSaveDecodeLimitError(limit, actual) {
+    const error = new Error(`Decoded Risu save exceeds the safe preparation limit (${limit} bytes)`);
+    error.name = 'RisuSavePreparationLimitError';
+    error.code = 'RISU_SAVE_DECODED_TOO_LARGE';
+    error.status = 413;
+    error.limit = limit;
+    error.actual = actual;
+    error.retryable = false;
+    error.commitOutcome = 'not-committed';
+    error.commitOutcomeUnknown = false;
+    error.risuSavePreparationLimit = true;
+    return error;
+}
+
+// Whole-object compatibility decoding is reserved for legacy request/storage
+// seams that cannot use the cursor walker. Keep it at the same conservative
+// ceiling as legacy import materialization; canonical large saves are handled
+// by streamRisuLoad's disk-backed path instead.
+const DEFAULT_RISU_SAVE_COMPAT_DECODE_MAX_BYTES = 64 * 1024 * 1024;
+
+function decompressorFor(data, compression) {
+    if (compression === 'gzip') return zlib.createGunzip();
+    if (compression === 'zlib') return zlib.createInflate();
+    if (compression === 'deflate-raw') return zlib.createInflateRaw();
+    if (data[0] === 0x1f && data[1] === 0x8b) return zlib.createGunzip();
+    if (data.length >= 2
+        && (data[0] & 0x0f) === 8
+        && (((data[0] << 8) | data[1]) % 31) === 0) {
+        return zlib.createInflate();
+    }
+    return zlib.createInflateRaw();
+}
+
+async function decompressRisuSavePayload(data, {
+    signal,
+    maxOutputBytes = DEFAULT_RISU_SAVE_COMPAT_DECODE_MAX_BYTES,
+    onOutputChunk,
+    compression = 'auto',
+    makeLimitError = risuSaveDecodeLimitError,
+} = {}) {
     const parts = [];
     let outputBytes = 0;
     const sink = new Writable({
@@ -57,7 +96,7 @@ async function decompressRisuSaveBlock(data, { signal, maxOutputBytes, onOutputC
             const part = Buffer.from(chunk);
             outputBytes += part.length;
             if (!Number.isSafeInteger(outputBytes) || outputBytes > maxOutputBytes) {
-                callback(structuralRisuSaveError('RisuSave block exceeds its verified decode bound'));
+                callback(makeLimitError(maxOutputBytes, outputBytes));
                 return;
             }
             parts.push(part);
@@ -73,7 +112,7 @@ async function decompressRisuSaveBlock(data, { signal, maxOutputBytes, onOutputC
     try {
         await pipeline(
             Readable.from([Buffer.from(data)]),
-            zlib.createGunzip(),
+            decompressorFor(data, compression),
             sink,
             ...(signal ? [{ signal }] : []),
         );
@@ -83,6 +122,18 @@ async function decompressRisuSaveBlock(data, { signal, maxOutputBytes, onOutputC
         throw error;
     }
     return Buffer.concat(parts, outputBytes);
+}
+
+async function decompressRisuSaveBlock(data, { signal, maxOutputBytes, onOutputChunk }) {
+    return decompressRisuSavePayload(data, {
+        signal,
+        maxOutputBytes,
+        onOutputChunk,
+        compression: 'gzip',
+        makeLimitError: () => structuralRisuSaveError(
+            'RisuSave block exceeds its verified decode bound',
+        ),
+    });
 }
 
 // Packr/Unpackr instances
@@ -508,7 +559,7 @@ class RisuSaveDecoder {
             strictBlockJson = false,
             requireCompleteBlockSet = false,
             signal = null,
-            maxDecodedBytes = Number.MAX_SAFE_INTEGER,
+            maxDecodedBytes = DEFAULT_RISU_SAVE_COMPAT_DECODE_MAX_BYTES,
             onCompressedBlockDecode = null,
             onCompressedBlockDecodedChunk = null,
         } = options;
@@ -840,10 +891,20 @@ async function _decodeRisuSaveInternal(data, options = {}) {
         switch (header) {
             case "plugin-compressed":
                 data = data.slice(magicPluginStorageCompressedHeader.length);
-                return restoreLegacyPluginStorageKeys(unpackr.decode(fflate.decompressSync(data)));
+                return restoreLegacyPluginStorageKeys(unpackr.decode(
+                    await decompressRisuSavePayload(data, {
+                        signal: options.signal,
+                        maxOutputBytes: options.maxDecodedBytes,
+                        onOutputChunk: options.onDecodedChunk,
+                    }),
+                ));
             case "compressed":
                 data = data.slice(magicCompressedHeader.length);
-                return unpackr.decode(fflate.decompressSync(data));
+                return unpackr.decode(await decompressRisuSavePayload(data, {
+                    signal: options.signal,
+                    maxOutputBytes: options.maxDecodedBytes,
+                    onOutputChunk: options.onDecodedChunk,
+                }));
             case "plugin-raw":
                 data = data.slice(magicPluginStorageHeader.length);
                 return restoreLegacyPluginStorageKeys(unpackr.decode(data));
@@ -851,24 +912,24 @@ async function _decodeRisuSaveInternal(data, options = {}) {
                 data = data.slice(magicHeader.length);
                 return unpackr.decode(data);
             case "plugin-stream": {
-                await checkCompressionStreams();
                 data = data.slice(magicPluginStorageStreamHeader.length);
-                const cs = new DecompressionStream('gzip');
-                const writer = cs.writable.getWriter();
-                writer.write(data);
-                writer.close();
-                const buf = await new Response(cs.readable).arrayBuffer();
-                return restoreLegacyPluginStorageKeys(unpackr.decode(new Uint8Array(buf)));
+                const buf = await decompressRisuSavePayload(data, {
+                    signal: options.signal,
+                    maxOutputBytes: options.maxDecodedBytes,
+                    onOutputChunk: options.onDecodedChunk,
+                    compression: 'gzip',
+                });
+                return restoreLegacyPluginStorageKeys(unpackr.decode(buf));
             }
             case "stream": {
-                await checkCompressionStreams();
                 data = data.slice(magicStreamCompressedHeader.length);
-                const cs = new DecompressionStream('gzip');
-                const writer = cs.writable.getWriter();
-                writer.write(data);
-                writer.close();
-                const buf = await new Response(cs.readable).arrayBuffer();
-                return unpackr.decode(new Uint8Array(buf));
+                const buf = await decompressRisuSavePayload(data, {
+                    signal: options.signal,
+                    maxOutputBytes: options.maxDecodedBytes,
+                    onOutputChunk: options.onDecodedChunk,
+                    compression: 'gzip',
+                });
+                return unpackr.decode(buf);
             }
             case "risusave": {
                 const decoder = new RisuSaveDecoder();
@@ -891,7 +952,11 @@ async function _decodeRisuSaveInternal(data, options = {}) {
             const dec = unpackr.decode(realData);
             return dec;
         } catch (error) {
-            const buf = Buffer.from(fflate.decompressSync(Buffer.from(data)));
+            const buf = await decompressRisuSavePayload(data, {
+                signal: options.signal,
+                maxOutputBytes: options.maxDecodedBytes,
+                onOutputChunk: options.onDecodedChunk,
+            });
             try {
                 return JSON.parse(buf.toString('utf-8'));
             } catch (error) {

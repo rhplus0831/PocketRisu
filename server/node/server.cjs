@@ -96,6 +96,7 @@ const {
 const { createRequestLogs } = require('./request-logs.cjs');
 const { applyPatchAtomic } = require('./atomicJsonPatch.cjs');
 const { createGenerationMemo } = require('./generationMemo.cjs');
+const { openStageRowDownload } = require('./stageRowDownload.cjs');
 const { createRevisionBoundCache } = require('./revisionBoundCache.cjs');
 const { createPluginStorageManifestCache } = require('./pluginStorageManifestCache.cjs');
 const {
@@ -164,6 +165,24 @@ async function readBackupRisuSaveTopLevelFields(input, requestedKeys, options = 
         ...options,
         inspection,
     });
+}
+
+function risuSavePreparationRefusal(error) {
+    if (error?.risuSavePreparationLimit === true) {
+        return {
+            status: error.status ?? 413,
+            body: {
+                error: error.message,
+                code: error.code,
+                limit: error.limit,
+                actual: error.actual,
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            },
+        };
+    }
+    return null;
 }
 const {
     IMPORT_IO_PAGE_BYTES,
@@ -380,7 +399,8 @@ const dbCache = createRevisionBoundCache({
     ),
     onMutation: (filePath, reason) => {
         releaseDbCacheCanonicalEncoding(filePath, `cache-${reason}`);
-        dbDerivedValueMemo.bump(filePath);
+        if (reason === 'replace') dbDerivedValueMemo.bump(filePath);
+        else dbDerivedValueMemo.deleteKey(filePath);
         if (filePath === DB_HEX_KEY && !preserveDbHashMemoOnCacheMutation) {
             dbCompositionalHashMemo = new WeakMap();
         }
@@ -4718,8 +4738,27 @@ async function checkDiskSpace(requiredBytes, targetPath = path.join(process.cwd(
 // same protection extends across devices. Page loads register without stealing
 // the lock; a recent user gesture allows a freshly booted session to take over.
 const { createSessionLock } = require('./session-lock.cjs');
+const { createBoundedSessionState } = require('./boundedSessionState.cjs');
 const sessionLock = createSessionLock();
-const pluginStorageReadStateBySession = new Map();
+const PLUGIN_STORAGE_READ_SESSION_MAX_ENTRIES = 50;
+const pluginStorageReadStateStatsPath = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_PLUGIN_READ_STATE_STATS_PATH ?? '').trim() || null
+    : null;
+let pluginStorageReadStateBySession;
+
+function publishPluginStorageReadStateStats() {
+    if (!pluginStorageReadStateStatsPath || !pluginStorageReadStateBySession) return;
+    writeFileSync(
+        path.resolve(process.cwd(), pluginStorageReadStateStatsPath),
+        JSON.stringify(pluginStorageReadStateBySession.stats()),
+        'utf-8',
+    );
+}
+
+pluginStorageReadStateBySession = createBoundedSessionState({
+    maxEntries: PLUGIN_STORAGE_READ_SESSION_MAX_ENTRIES,
+    onEvict: publishPluginStorageReadStateStats,
+});
 
 function rememberSessionPluginStorageState(req, dbObj) {
     const clientSessionId = req.headers['x-session-id'];
@@ -4728,6 +4767,7 @@ function rememberSessionPluginStorageState(req, dbObj) {
         optimized: dbObj?.optimizePluginMemory === true,
         generation: pluginStorageGeneration(dbObj),
     });
+    publishPluginStorageReadStateStats();
 }
 
 function sessionPluginStorageReadState(req) {
@@ -13023,7 +13063,14 @@ app.delete('/api/logs', async (req, res, next) => {
 
 async function handlePluginStorageManifestMutation(req, res, next) {
     try {
-        const plan = await decodeRisuSave(req.body);
+        const inspection = await inspectRisuSaveSource(req.body);
+        const plan = inspection.format === 'raw'
+            ? await decodeRisuSave(req.body)
+            : await decodeBoundedLegacyRisuSave(req.body, {
+                inspection,
+                tempDir: databaseSpoolDir,
+                maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
+            });
         await queueStorageMutation(async () => {
             await flushPendingDb();
             const rawDatabase = kvGet('database/database.bin');
@@ -13144,6 +13191,8 @@ async function handlePluginStorageManifestMutation(req, res, next) {
                 retryable: true,
             });
         }
+        const refusal = risuSavePreparationRefusal(error);
+        if (refusal) return res.status(refusal.status).json(refusal.body);
         next(error);
     }
 }
@@ -13298,7 +13347,15 @@ function normalizedPluginTransitionRows(rows) {
         if (!Number.isSafeInteger(total)) {
             throw new TypeError('Plugin transition size exceeds the safe integer range');
         }
-        return { index, storageKey, rawKey, size, sha256: null, uploaded: false };
+        return {
+            index,
+            storageKey,
+            rawKey,
+            size,
+            sha256: null,
+            stagedSha256: null,
+            uploaded: false,
+        };
     });
 }
 
@@ -13339,6 +13396,7 @@ function authoritativeInlinePluginTransitionRows(liveDb) {
                 rawKey,
                 size: value.length,
                 sha256: sha256Hex(value),
+                stagedSha256: null,
                 displaySize: prefix === PLUGIN_SAVE_PREFIX
                     ? pluginStorageViewerDisplaySize(descriptor.value)
                     : null,
@@ -13426,8 +13484,10 @@ async function spoolPluginTransitionKvRow(storageKey, destinationPath, options =
             },
         );
     }
+    const digest = nodeCrypto.createHash('sha256');
     const result = await kvWriteToFile(storageKey, destinationPath, {
         shouldAbort: options.shouldAbort,
+        onBytes: (bytes) => digest.update(bytes),
     });
     if (!result || result.size !== expectedSize) {
         throw new PluginStorageValidationError(storageKey);
@@ -13449,7 +13509,7 @@ async function spoolPluginTransitionKvRow(storageKey, destinationPath, options =
             throw new PluginStorageValidationError(storageKey);
         }
     }
-    const sha256 = await computeFileSha256(destinationPath);
+    const sha256 = digest.digest('hex');
     return { size: result.size, sha256, displaySize };
 }
 
@@ -13734,6 +13794,7 @@ app.post('/api/plugin-storage/transition/stage/begin', async (req, res, next) =>
                             rawKey,
                             size: staged.size,
                             sha256: staged.sha256,
+                            stagedSha256: staged.sha256,
                             displaySize: staged.displaySize,
                             uploaded: true,
                         });
@@ -13865,6 +13926,7 @@ app.post('/api/plugin-storage/transition/stage/upload', async (req, res, next) =
             fsyncPluginTransitionStageDirectory();
             temporaryPath = null;
             currentRow.uploaded = true;
+            currentRow.stagedSha256 = hash;
             currentRow.displaySize = displaySize;
             current.state = current.rows.every(entry => entry.uploaded) ? 'ready' : 'uploading';
             current.updatedAt = Date.now();
@@ -13881,6 +13943,7 @@ app.post('/api/plugin-storage/transition/stage/upload', async (req, res, next) =
 app.get('/api/plugin-storage/transition/stage/row', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     if (!checkActiveSession(req, res)) return;
+    let download = null;
     try {
         const transitionId = req.headers['x-plugin-storage-transition'];
         const storageKey = req.headers['x-plugin-storage-key'];
@@ -13892,18 +13955,22 @@ app.get('/api/plugin-storage/transition/stage/row', async (req, res, next) => {
         if (!pluginTransitionStageBelongsToRequest(stage, req)
             || !row?.uploaded
             || stage.state === 'aborted') return res.status(404).end();
+        if (!/^[0-9a-f]{64}$/.test(row.sha256)
+            || row.stagedSha256 !== row.sha256) {
+            return res.status(409).json({ error: 'Staged transition row failed verification' });
+        }
         const filePath = pluginTransitionStageRowPath(transitionId, row.index);
-        const fileStat = await fs.stat(filePath);
-        if (!fileStat.isFile()
-            || fileStat.size !== row.size
-            || await computeFileSha256(filePath) !== row.sha256) {
+        download = await openStageRowDownload(filePath, row.size);
+        if (!download) {
             return res.status(409).json({ error: 'Staged transition row failed verification' });
         }
         res.setHeader('content-type', 'application/octet-stream');
         res.setHeader('content-length', row.size);
-        await pipeline(createReadStream(filePath), res);
+        await pipeline(download.stream, res);
     } catch (error) {
         next(error);
+    } finally {
+        await download?.close().catch(() => {});
     }
 });
 
@@ -14554,12 +14621,14 @@ async function receiveBulkPluginStorageTransition(req) {
                 descriptor.index,
                 jsonBytes,
             );
+            const stagedSha256 = sha256Hex(jsonBytes);
             rows.push({
                 index: descriptor.index,
                 storageKey: descriptor.storageKey,
                 rawKey: descriptor.rawKey,
                 size: jsonBytes.length,
-                sha256: sha256Hex(jsonBytes),
+                sha256: stagedSha256,
+                stagedSha256,
                 displaySize: descriptor.prefix === PLUGIN_SAVE_PREFIX
                     ? pluginStorageViewerDisplaySize(jsonValue)
                     : null,
@@ -14710,6 +14779,7 @@ app.post('/api/plugin-storage/transition/bulk', async (req, res, next) => {
                         rawKey,
                         size: staged.size,
                         sha256: staged.sha256,
+                        stagedSha256: staged.sha256,
                         displaySize: staged.displaySize,
                         uploaded: true,
                     });
@@ -14847,10 +14917,17 @@ async function decodeDatabaseSpoolForWrite(spool, stageDir, chatRows) {
     const source = { filePath: spool.filePath, size: spool.size };
     const inspection = await inspectRisuSaveSource(source);
     if (!inspection.supported) {
-        // Preserve legacy/block/unknown compatibility. Canonical raw and
-        // compressed client saves take the cursor walker below and never
-        // materialize the HTTP body in this process.
-        return decodeAuthoritativeDatabase(await fs.readFile(spool.filePath));
+        // Preserve legacy/block/unknown compatibility only under the same
+        // finite in-memory ceiling used by imports/restores. Headerless
+        // compressed fallbacks still expand to a 64 KiB-paged private file
+        // before the bounded compatibility decoder materializes them.
+        return decodeBoundedLegacyRisuSave(source, {
+            inspection,
+            tempDir: databaseSpoolDir,
+            maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
+            resolveRemoteSize: async (name) => kvSize(`remotes/${name}.local.bin`),
+            resolveRemote: async (name) => kvGet(`remotes/${name}.local.bin`),
+        });
     }
     const streamedPluginValues = Object.create(null);
     const streamedPluginMeta = Object.create(null);
@@ -15017,6 +15094,10 @@ async function prepareSpooledDatabaseWrite(spool) {
             error.admittedWriteStageDir = stageDir;
             throw error;
         }
+        const preparationRefusal = risuSavePreparationRefusal(error);
+        if (preparationRefusal) {
+            return { stageDir, refusal: preparationRefusal };
+        }
         logger.error('[Write] Failed to externalize database payloads:', error.message);
         if (error?.pluginStorageNamespaceConflict) {
             return { stageDir, refusal: { status: 409, body: { error: error.message } } };
@@ -15046,8 +15127,13 @@ async function prepareSpooledChatWrite(spool) {
                 const inspection = await inspectRisuSaveSource(source);
                 chatData = inspection.supported
                     ? (await walkRisuSave(source, { inspection, tempDir: databaseSpoolDir })).remainder
-                    : await decodeRisuSave(await fs.readFile(spool.filePath));
-            } catch {
+                    : await decodeBoundedLegacyRisuSave(source, {
+                        inspection,
+                        tempDir: databaseSpoolDir,
+                        maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
+                    });
+            } catch (error) {
+                if (error?.risuSavePreparationLimit === true) throw error;
                 return { refusal: { status: 400, body: { error: 'Invalid binary chat data' } } };
             }
         } else {
@@ -15332,6 +15418,10 @@ async function handleSpooledKvWrite(req, res, next, {
         if (shouldCreateBackup) scheduleBackupAndRotate();
     } catch (error) {
         if (isImportInProgressError(error)) return sendImportBusy(res);
+        const preparationRefusal = risuSavePreparationRefusal(error);
+        if (error === prepared?.preparationError && preparationRefusal) {
+            return res.status(preparationRefusal.status).json(preparationRefusal.body);
+        }
         if (error === prepared?.preparationError
             && isAdmittedSpoolPressureError(error)) {
             return sendRetryableSpoolRefusal(
@@ -15499,7 +15589,16 @@ app.post('/api/write', async (req, res, next) => {
                     const previousStrippedDb = getCurrentDatabaseCacheValue(filePath)
                         || getCurrentDatabaseCacheValue(DB_HEX_KEY)
                         || null;
-                    const incomingDb = await decodeAuthoritativeDatabase(fileContent);
+                    const incomingInspection = await inspectRisuSaveSource(fileContent);
+                    const incomingDb = incomingInspection.format === 'raw'
+                        ? await decodeAuthoritativeDatabase(fileContent)
+                        : await decodeBoundedLegacyRisuSave(fileContent, {
+                            inspection: incomingInspection,
+                            tempDir: databaseSpoolDir,
+                            maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
+                            resolveRemoteSize: async (name) => kvSize(`remotes/${name}.local.bin`),
+                            resolveRemote: async (name) => kvGet(`remotes/${name}.local.bin`),
+                        });
 
                     // Mirror the patch-persist guard:
                     // a malformed full-write payload could carry chats with
@@ -15599,6 +15698,11 @@ app.post('/api/write', async (req, res, next) => {
                         return;
                     }
                     if (e instanceof PluginStorageLimitError) throw e;
+                    const preparationRefusal = risuSavePreparationRefusal(e);
+                    if (preparationRefusal) {
+                        res.status(preparationRefusal.status).json(preparationRefusal.body);
+                        return;
+                    }
                     logger.error('[Write] Failed to externalize database payloads:', e.message);
                     if (e?.pluginStorageNamespaceConflict) {
                         res.status(409).json({ error: e.message });
@@ -17356,6 +17460,10 @@ async function handleSpooledChatWrite(req, res, next, spool) {
         if (shouldCreateBackup) scheduleBackupAndRotate();
     } catch (error) {
         if (isImportInProgressError(error)) return sendImportBusy(res);
+        const preparationRefusal = risuSavePreparationRefusal(error);
+        if (error === prepared?.preparationError && preparationRefusal) {
+            return res.status(preparationRefusal.status).json(preparationRefusal.body);
+        }
         if (error === prepared?.preparationError
             && isAdmittedSpoolPressureError(error)) {
             return sendRetryableSpoolRefusal(
@@ -17392,8 +17500,17 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             if (isRawBinary) {
                 // Binary msgpack body (application/octet-stream)
                 try {
-                    chatData = await decodeRisuSave(req.body);
+                    const inspection = await inspectRisuSaveSource(req.body);
+                    chatData = inspection.format === 'raw'
+                        ? await decodeRisuSave(req.body)
+                        : await decodeBoundedLegacyRisuSave(req.body, {
+                            inspection,
+                            tempDir: databaseSpoolDir,
+                            maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
+                        });
                 } catch (e) {
+                    const refusal = risuSavePreparationRefusal(e);
+                    if (refusal) return res.status(refusal.status).json(refusal.body);
                     return res.status(400).json({ error: 'Invalid binary chat data' });
                 }
             } else {

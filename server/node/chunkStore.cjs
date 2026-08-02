@@ -1865,6 +1865,7 @@ function createChunkStore(db, opts = {}) {
                 size += data.length;
                 chunks++;
                 maxChunkBytes = Math.max(maxChunkBytes, data.length);
+                options.onBytes?.(data);
                 options.onChunk?.({ index: chunks - 1, size: data.length });
             }
             if (chunks === 0 && row.raw_size > 0) {

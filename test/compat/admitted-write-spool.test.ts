@@ -1,6 +1,8 @@
 import { afterAll, describe, expect, test } from 'vitest'
-import { mkdir, readdir, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { gzipSync } from 'node:zlib'
 import path from 'node:path'
 import { createRequire } from 'node:module'
 import { Packr } from 'msgpackr'
@@ -8,12 +10,14 @@ import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { createClient, type RisuClient } from './helpers/client.js'
 
 const require = createRequire(import.meta.url)
-const { calculateHash, normalizeJSON } = require('../../server/node/utils.cjs') as {
+const { calculateHash, decodeRisuSave, normalizeJSON } = require('../../server/node/utils.cjs') as {
   calculateHash: (value: unknown) => number
+  decodeRisuSave: (value: Uint8Array) => Promise<Record<string, unknown>>
   normalizeJSON: (value: unknown) => Record<string, unknown>
 }
 
 const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
+const MAGIC_COMPRESSED = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 8])
 const packr = new Packr({ useRecords: false })
 const DB_KEY = 'database/database.bin'
 const DB_PATH = Buffer.from(DB_KEY).toString('hex')
@@ -25,6 +29,10 @@ afterAll(async () => {
 
 function encode(value: unknown): Buffer {
   return Buffer.concat([MAGIC_RAW, Buffer.from(packr.encode(value))])
+}
+
+function encodeCompressed(value: unknown): Buffer {
+  return Buffer.concat([MAGIC_COMPRESSED, gzipSync(packr.encode(value))])
 }
 
 async function boot(env: Record<string, string> = {}) {
@@ -238,4 +246,111 @@ describe('admitted database/chat/KV write spooling', () => {
     expect(entries).not.toContain('.admitted-ingress-orphan.tmp')
     expect(entries).toContain('unrelated.keep')
   })
+
+  test('refuses a compressed database whose declared input exceeds the existing ingress envelope', async () => {
+    const { server, client } = await boot({ POCKETRISU_DATABASE_WRITE_MAX_BYTES: '512' })
+    const body = encodeCompressed({
+      characters: [],
+      incompressible: randomBytes(2_048).toString('base64'),
+    })
+    expect(body.length).toBeGreaterThan(512)
+
+    const response = await client.fetch('/api/write', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream', 'file-path': DB_PATH },
+      body: new Uint8Array(body),
+    })
+    expect(response.status).toBe(413)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Request body exceeds the 512-byte route limit.',
+      code: 'BUFFERED_INGRESS_TOO_LARGE',
+      limit: 512,
+      actual: body.length,
+      retryable: false,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+    expect(await admittedArtifacts(server)).toEqual([])
+  })
+
+  test('refuses oversized compressed expansion with the restore preparation envelope', async () => {
+    const decodedLimit = 64 * 1024
+    const { server, client } = await boot({
+      RISU_RESTORE_MAX_DECODED_BYTES: String(decodedLimit),
+      RISU_RESTORE_DISK_HEADROOM_BYTES: '0',
+    })
+    const body = encodeCompressed({
+      characters: [],
+      padding: 'A'.repeat(decodedLimit * 3),
+    })
+
+    const response = await client.fetch('/api/write', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream', 'file-path': DB_PATH },
+      body: new Uint8Array(body),
+    })
+    expect(response.status).toBe(413)
+    await expect(response.json()).resolves.toMatchObject({
+      error: `Decoded Risu save exceeds the safe preparation limit (${decodedLimit} bytes)`,
+      code: 'RISU_SAVE_DECODED_TOO_LARGE',
+      limit: decodedLimit,
+      actual: expect.any(Number),
+      retryable: false,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+    expect(await admittedArtifacts(server)).toEqual([])
+  })
+
+  test('streams a valid expanded compressed database through admitted disk spools', async () => {
+    const gateDirName = 'compressed-write-gate'
+    const { server, client } = await boot({
+      POCKETRISU_TEST_ADMITTED_WRITE_GATE_DIR: gateDirName,
+      RISU_RESTORE_MAX_DECODED_BYTES: String(4 * 1024 * 1024),
+      RISU_RESTORE_DISK_HEADROOM_BYTES: '0',
+    })
+    const database = {
+      characters: [],
+      botPresets: [],
+      modules: [],
+      personas: [],
+      marker: 'streamed-compressed-write',
+      padding: 'B'.repeat(2 * 1024 * 1024),
+    }
+    const body = encodeCompressed(database)
+    const gateDir = path.join(server.cwd, gateDirName)
+    await mkdir(gateDir, { recursive: true })
+    await writeFile(path.join(gateDir, 'hold'), 'hold')
+
+    const pending = client.fetch('/api/write', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream', 'file-path': DB_PATH },
+      body: new Uint8Array(body),
+    })
+    await waitFor(path.join(gateDir, 'entered'))
+    const ingressSpools = (await readdir(path.join(server.cwd, 'save', '.spool')))
+      .filter(name => name.startsWith('.admitted-ingress-'))
+    expect(ingressSpools).toHaveLength(1)
+    expect((await stat(path.join(server.cwd, 'save', '.spool', ingressSpools[0]))).size)
+      .toBe(body.length)
+    await writeFile(path.join(gateDir, 'release'), 'release')
+
+    const response = await pending
+    expect(response.status).toBe(200)
+    const stored = await client.fetch('/api/read', { headers: { 'file-path': DB_PATH } })
+    expect(stored.status).toBe(200)
+    const decoded = await decodeRisuSave(new Uint8Array(await stored.arrayBuffer()))
+    expect(decoded).toMatchObject({
+      marker: 'streamed-compressed-write',
+      padding: database.padding,
+    })
+    expect(await admittedArtifacts(server)).toEqual([])
+
+    const decoderSource = await readFile(
+      path.resolve(import.meta.dirname, '../../server/node/utils.cjs'),
+      'utf8',
+    )
+    expect(decoderSource).not.toContain('decompressSync')
+    expect(decoderSource).not.toMatch(/Response\([^)]*readable[^)]*\)\.arrayBuffer\(\)/)
+  }, 30_000)
 })

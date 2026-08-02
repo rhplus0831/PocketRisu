@@ -276,26 +276,36 @@ describe('disk-backed streaming Risu ingest', () => {
         writable: true,
       })
     }
-    const entries: Array<{ field: string; key: string; value: unknown }> = []
-    const walked = await walkRisuSave(encodeRisuSaveLegacy({
+    const database = {
       botPresets: [{ id: 'stable-preset' }],
       characters: [],
       optimizePluginMemory: true,
       pluginCustomStorage,
       pluginStorageMeta,
-    }), {
-      externalizePluginStorage: true,
-      onPluginStorageEntry: (entry: { field: string; key: string; value: unknown }) => {
-        entries.push(entry)
-      },
-    })
+    }
+    for (const [variant, bytes] of [
+      ['plugin-raw', encodeRisuSaveLegacy(database)],
+      ['plugin-compressed', encodeRisuSaveLegacy(database, 'compression')],
+    ] as const) {
+      const entries: Array<{ field: string; key: string; value: unknown }> = []
+      const walked = await walkRisuSave(bytes, {
+        externalizePluginStorage: true,
+        onPluginStorageEntry: (entry: { field: string; key: string; value: unknown }) => {
+          entries.push(entry)
+        },
+      })
 
-    expect(entries.filter(entry => entry.field === 'pluginCustomStorage').map(entry => entry.key))
-      .toEqual(SPECIAL_PLUGIN_STORAGE_KEYS)
-    expect(entries.filter(entry => entry.field === 'pluginStorageMeta').map(entry => entry.key))
-      .toEqual(SPECIAL_PLUGIN_STORAGE_KEYS)
-    expect(walked.remainder.pluginCustomStorage).toEqual({})
-    expect(walked.remainder.pluginStorageMeta).toBeUndefined()
+      expect(
+        entries.filter(entry => entry.field === 'pluginCustomStorage').map(entry => entry.key),
+        variant,
+      ).toEqual(SPECIAL_PLUGIN_STORAGE_KEYS)
+      expect(
+        entries.filter(entry => entry.field === 'pluginStorageMeta').map(entry => entry.key),
+        variant,
+      ).toEqual(SPECIAL_PLUGIN_STORAGE_KEYS)
+      expect(walked.remainder.pluginCustomStorage, variant).toEqual({})
+      expect(walked.remainder.pluginStorageMeta, variant).toBeUndefined()
+    }
   })
 
   test.each([

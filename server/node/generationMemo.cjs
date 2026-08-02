@@ -3,9 +3,16 @@
 function createGenerationMemo() {
     const generations = new Map();
     const entries = new Map();
+    let nextGeneration = 1;
 
     function bump(key) {
-        const generation = (generations.get(key) || 0) + 1;
+        if (!Number.isSafeInteger(nextGeneration)) {
+            throw new RangeError('Generation memo exhausted its safe generation range');
+        }
+        // Process-wide uniqueness within this memo avoids an ABA collision if
+        // a retired key is deleted, later reused, and an older async consumer
+        // still holds its prior generation token.
+        const generation = nextGeneration++;
         generations.set(key, generation);
         entries.delete(key);
         return generation;
@@ -56,7 +63,36 @@ function createGenerationMemo() {
         return generations.get(key) || 0;
     }
 
-    return { bump, getOrCompute, seed, deleteValue, has, generation };
+    function deleteKey(key, expectedGeneration) {
+        const currentGeneration = generations.get(key) || 0;
+        if (expectedGeneration !== undefined && expectedGeneration !== currentGeneration) {
+            return false;
+        }
+        const hadGeneration = generations.delete(key);
+        const hadEntry = entries.delete(key);
+        return hadGeneration || hadEntry;
+    }
+
+    function retention() {
+        let values = 0;
+        for (const entry of entries.values()) values += entry.values.size;
+        return {
+            generations: generations.size,
+            entries: entries.size,
+            values,
+        };
+    }
+
+    return {
+        bump,
+        getOrCompute,
+        seed,
+        deleteValue,
+        deleteKey,
+        has,
+        generation,
+        retention,
+    };
 }
 
 module.exports = { createGenerationMemo };
