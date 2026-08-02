@@ -1,4 +1,6 @@
 import { afterAll, describe, expect, test } from 'vitest'
+import { createHash } from 'node:crypto'
+import { readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
@@ -230,6 +232,24 @@ async function mutateRaw(
   })
 }
 
+async function mutateStreamedRaw(
+  client: RisuClient,
+  body: Uint8Array,
+  owner = 'New Plugin',
+): Promise<Response> {
+  return client.fetch('/api/plugin-storage/mutate', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'file-path': Buffer.from(VALUE_KEY, 'utf-8').toString('hex'),
+      'x-plugin-storage-operation': 'set',
+      'x-plugin-storage-owner': Buffer.from(owner, 'utf-8').toString('base64url'),
+      'x-plugin-storage-stream': '1',
+    },
+    body,
+  })
+}
+
 async function restorePair(
   client: RisuClient,
   value: Uint8Array,
@@ -274,6 +294,78 @@ async function mutateWithClientOutcome(
 }
 
 describe('atomic optimized plugin value and owner acknowledgement', () => {
+  test('the streamed single-row route validates the spool without materializing it', () => {
+    const source = readFileSync(
+      new URL('../../server/node/server.cjs', import.meta.url),
+      'utf-8',
+    )
+    const routeStart = source.indexOf("app.post('/api/plugin-storage/mutate'")
+    const routeEnd = source.indexOf('// ─── /api/logs', routeStart)
+    expect(routeStart).toBeGreaterThanOrEqual(0)
+    expect(routeEnd).toBeGreaterThan(routeStart)
+
+    const route = source.slice(routeStart, routeEnd)
+    expect(route).toMatch(
+      /await validateJsonSource\(\{\s*filePath: valueFilePath,\s*size: valueSize,\s*\}/,
+    )
+    expect(route).not.toMatch(/readFileSync\(\s*valueFilePath\s*\)/)
+    expect(route).not.toMatch(
+      /validatePluginStorageRow\(\s*valueKey,\s*readFileSync\(\s*valueFilePath\s*\)\s*\)/,
+    )
+  })
+
+  test('a valid streamed single-row set commits the original spool bytes', async () => {
+    const { server, client } = await boot()
+    const value = Buffer.from(
+      '{"generation":"streamed","escapedLoneSurrogate":"\\ud800","nested":[1,2]}',
+      'utf-8',
+    )
+
+    const response = await mutateStreamedRaw(client, value)
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      success: true,
+      outcome: 'committed',
+      operation: 'set',
+      verification: 'verified',
+      hash: createHash('sha256').update(value).digest('hex'),
+    })
+    const rows = readRows(server.cwd)
+    expect(rows.value).toEqual(value)
+    expect(JSON.parse(rows.owner!.toString('utf-8'))).toMatchObject({
+      plugin: 'New Plugin',
+      updatedAt: expect.any(Number),
+    })
+    expect(readdirSync(path.join(server.cwd, 'save', '.spool')).filter(
+      name => name.startsWith('.plugin-value-'),
+    )).toEqual([])
+  })
+
+  test.each([
+    ['malformed JSON', Buffer.from('{"unfinished":', 'utf-8')],
+    ['ill-formed UTF-8', Buffer.from([0x22, 0xed, 0xa0, 0x80, 0x22])],
+  ])('a streamed single-row set refuses %s with the exact prior response', async (_name, value) => {
+    const { server, client } = await boot()
+
+    const response = await mutateStreamedRaw(client, value)
+
+    expect(response.status).toBe(400)
+    expect(await response.text()).toBe(JSON.stringify({
+      success: false,
+      outcome: 'not-committed',
+      operation: 'set',
+      error: 'Invalid plugin storage JSON row',
+      code: 'INVALID_PLUGIN_STORAGE_ROW',
+      encodedKey: VALUE_KEY,
+      retryable: false,
+    }))
+    expect(readRows(server.cwd)).toEqual({ value: OLD_VALUE, owner: OLD_OWNER })
+    expect(readdirSync(path.join(server.cwd, 'save', '.spool')).filter(
+      name => name.startsWith('.plugin-value-'),
+    )).toEqual([])
+  })
+
   test('mutates a tagged historical malformed key without colliding with valid Unicode', async () => {
     const { server, client } = await boot(undefined, undefined, seedMalformedKeyPublication)
     expect(MALFORMED_VALUE_KEY).not.toBe(encodePluginSaveStorageKey('�', 'pluginsave/'))

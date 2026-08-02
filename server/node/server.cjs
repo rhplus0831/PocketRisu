@@ -11729,7 +11729,18 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
             valueHash = digest.digest('hex');
             // Strict validation stays outside the authoritative mutation queue.
             // The subsequent SQLite commit reads chunks directly from the spool.
-            validatePluginStorageRow(valueKey, readFileSync(valueFilePath));
+            try {
+                await validateJsonSource({
+                    filePath: valueFilePath,
+                    size: valueSize,
+                }, {
+                    shouldAbort: () => req.aborted || res.destroyed,
+                });
+            } catch {
+                // Preserve the single-row mutation diagnostic instead of
+                // exposing parser-specific streaming errors to the client.
+                throw new PluginStorageValidationError(valueKey);
+            }
         } catch (error) {
             try { if (valueFilePath) unlinkSync(valueFilePath); } catch {}
             valueFilePath = null;
