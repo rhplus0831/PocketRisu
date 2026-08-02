@@ -43,6 +43,12 @@ describe('db list-delta wrappers', () => {
                 const firstEpoch = store.kvGetListEpoch();
                 const secondEpoch = store.kvBumpListEpoch();
                 const persistedEpoch = store.kvGetListEpoch();
+                const kvIndexes = store.db.prepare("PRAGMA index_list('kv')")
+                    .all().map((row) => row.name);
+                const modifiedPlan = store.db.prepare(
+                    "EXPLAIN QUERY PLAN SELECT key FROM kv INDEXED BY idx_kv_updated_at_key "
+                    + "WHERE updated_at >= ? AND key LIKE ? ESCAPE '\\\\'"
+                ).all(0, 'literal%');
 
                 console.log(JSON.stringify({
                     percentModified,
@@ -56,6 +62,8 @@ describe('db list-delta wrappers', () => {
                     firstEpoch,
                     secondEpoch,
                     persistedEpoch,
+                    kvIndexes,
+                    modifiedPlan,
                 }));
                 store.db.close();
             `
@@ -77,6 +85,10 @@ describe('db list-delta wrappers', () => {
             expect(result.firstEpoch).toMatch(/^[0-9a-f-]{36}$/)
             expect(result.secondEpoch).not.toBe(result.firstEpoch)
             expect(result.persistedEpoch).toBe(result.secondEpoch)
+            expect(result.kvIndexes).toContain('idx_kv_updated_at_key')
+            expect(result.modifiedPlan).toHaveLength(1)
+            expect(result.modifiedPlan[0].detail).toContain('idx_kv_updated_at_key')
+            expect(result.modifiedPlan[0].detail).not.toMatch(/^SCAN kv\b/)
         } finally {
             fs.rmSync(workDir, { recursive: true, force: true })
         }

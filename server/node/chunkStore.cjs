@@ -78,6 +78,41 @@ function isChunked(value) {
     return Buffer.isBuffer(value) && value.equals(CHUNK_MARKER);
 }
 
+function isValidManifestMetadata(row) {
+    return Number.isSafeInteger(row?.metadata_chunk_count) && row.metadata_chunk_count > 0
+        && Number.isSafeInteger(row?.logical_size) && row.logical_size > 0
+        && /^[0-9a-f]{64}$/.test(row?.logical_sha256 ?? '');
+}
+
+function hasCurrentVerifiedInventory(row) {
+    return !!row?.is_protected
+        && isValidManifestMetadata(row)
+        && Number.isSafeInteger(row?.source_revision)
+        && row.source_revision >= 0
+        && row.verified_revision === row.source_revision;
+}
+
+function sizeFromAggregateRow(row) {
+    if (!row?.has_marker) return row?.raw_size ?? null;
+    const manifestCount = Number(row.manifest_count ?? 0);
+    const presentChunkCount = Number(row.present_chunk_count ?? 0);
+    const storedSize = Number(row.stored_size ?? 0);
+    if (!row.is_protected) {
+        if (manifestCount > 0 || row.metadata_chunk_count !== null) {
+            throw chunkCorruption(`Chunk manifest ${row.key} has inconsistent protection state`);
+        }
+        return row.raw_size;
+    }
+    if (!isValidManifestMetadata(row)
+        || manifestCount !== row.metadata_chunk_count
+        || presentChunkCount !== row.metadata_chunk_count
+        || row.min_seq !== 0 || row.max_seq !== manifestCount - 1
+        || storedSize !== row.logical_size) {
+        throw chunkCorruption(`Protected chunk manifest ${row.key} is incomplete`);
+    }
+    return row.logical_size;
+}
+
 // Read-only chunk-aware bindings for a pinned SQLite snapshot. Keep this
 // separate from createChunkStore so readonly connections prepare no writes.
 function createSnapshotReader(db) {
@@ -88,11 +123,70 @@ function createSnapshotReader(db) {
     );
     const selKvList = db.prepare('SELECT key FROM kv');
     const selKvPrefix = db.prepare(`SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\'`);
-    const selKvPrefixSizes = db.prepare(
-        `SELECT key, LENGTH(value) AS size, value = @chunkMarker AS has_marker, EXISTS (
-             SELECT 1 FROM chunk_manifest_publications p WHERE p.manifest_key = kv.key
-         ) AS is_protected
-         FROM kv WHERE key LIKE @pattern ESCAPE '\\'`,
+    const selVerifiedSize = db.prepare(
+        `SELECT kv.key AS key,
+                LENGTH(kv.value) AS raw_size,
+                kv.value = @chunk_marker AS has_marker,
+                EXISTS (
+                    SELECT 1 FROM chunk_manifest_publications p
+                    WHERE p.manifest_key = kv.key
+                ) AS is_protected,
+                meta.chunk_count AS metadata_chunk_count,
+                meta.logical_size AS logical_size,
+                meta.logical_sha256 AS logical_sha256,
+                revision.source_revision AS source_revision,
+                revision.verified_revision AS verified_revision
+           FROM kv
+           LEFT JOIN chunk_manifest_meta meta ON meta.manifest_key = kv.key
+           LEFT JOIN chunk_manifest_inventory_revision revision
+                  ON revision.manifest_key = kv.key
+          WHERE kv.key = @key`,
+    );
+    const selKvPrefixVerifiedSizes = db.prepare(
+        `SELECT kv.key AS key,
+                LENGTH(kv.value) AS raw_size,
+                kv.value = @chunk_marker AS has_marker,
+                EXISTS (
+                    SELECT 1 FROM chunk_manifest_publications p
+                    WHERE p.manifest_key = kv.key
+                ) AS is_protected,
+                meta.chunk_count AS metadata_chunk_count,
+                meta.logical_size AS logical_size,
+                meta.logical_sha256 AS logical_sha256,
+                revision.source_revision AS source_revision,
+                revision.verified_revision AS verified_revision
+           FROM kv
+           LEFT JOIN chunk_manifest_meta meta ON meta.manifest_key = kv.key
+           LEFT JOIN chunk_manifest_inventory_revision revision
+                  ON revision.manifest_key = kv.key
+          WHERE kv.key LIKE @pattern ESCAPE '\\'`,
+    );
+    const selKvPrefixAggregateSizes = db.prepare(
+        `SELECT kv.key AS key,
+                LENGTH(kv.value) AS raw_size,
+                kv.value = @chunk_marker AS has_marker,
+                EXISTS (
+                    SELECT 1 FROM chunk_manifest_publications p
+                    WHERE p.manifest_key = kv.key
+                ) AS is_protected,
+                meta.chunk_count AS metadata_chunk_count,
+                meta.logical_size AS logical_size,
+                meta.logical_sha256 AS logical_sha256,
+                revision.source_revision AS source_revision,
+                revision.verified_revision AS verified_revision,
+                COUNT(manifest.seq) AS manifest_count,
+                COUNT(chunk.hash) AS present_chunk_count,
+                MIN(manifest.seq) AS min_seq,
+                MAX(manifest.seq) AS max_seq,
+                COALESCE(SUM(LENGTH(chunk.data)), 0) AS stored_size
+           FROM kv
+           LEFT JOIN chunk_manifest_meta meta ON meta.manifest_key = kv.key
+           LEFT JOIN chunk_manifest_inventory_revision revision
+                  ON revision.manifest_key = kv.key
+           LEFT JOIN manifest_chunks manifest ON manifest.manifest_key = kv.key
+           LEFT JOIN chunks chunk ON chunk.hash = manifest.hash
+          WHERE kv.key LIKE @pattern ESCAPE '\\'
+          GROUP BY kv.key`,
     );
     const selManifest = db.prepare('SELECT hash FROM manifest_chunks WHERE manifest_key = ? ORDER BY seq');
     const selChunk = db.prepare('SELECT data FROM chunks WHERE hash = ?');
@@ -175,27 +269,21 @@ function createSnapshotReader(db) {
 
     function kvListWithSizes(prefix) {
         const escaped = prefix.replace(/[\\%_]/g, '\\$&');
-        return selKvPrefixSizes.all({
-            chunkMarker: CHUNK_MARKER,
-            pattern: `${escaped}%`,
-        }).map((row) => {
-            if (!row.has_marker) return { key: row.key, size: row.size };
-            if (!row.is_protected) {
-                if (selManifestExists.get(row.key) || selManifestMeta.get(row.key)) {
-                    throw chunkCorruption(`Chunk manifest ${row.key} has inconsistent protection state`);
-                }
-                return { key: row.key, size: row.size };
-            }
-            const metadata = selManifestMeta.get(row.key);
-            const inventory = selManifestInventory.get(row.key);
-            const size = selSize.get(row.key).n;
-            if (!metadata || inventory.chunk_count !== metadata.chunk_count
-                || inventory.min_seq !== 0 || inventory.max_seq !== inventory.chunk_count - 1
-                || size !== metadata.logical_size) {
-                throw chunkCorruption(`Protected chunk manifest ${row.key} is incomplete`);
-            }
-            return { key: row.key, size };
-        });
+        const parameters = { chunk_marker: CHUNK_MARKER, pattern: `${escaped}%` };
+        const fastRows = selKvPrefixVerifiedSizes.all(parameters);
+        if (fastRows.every((row) => !row.has_marker || hasCurrentVerifiedInventory(row))) {
+            return fastRows.map((row) => ({
+                key: row.key,
+                size: row.has_marker ? row.logical_size : row.raw_size,
+            }));
+        }
+        // A pinned reader cannot publish verification state. One grouped query
+        // remains the authoritative fallback and replaces the former per-value
+        // COUNT/SUM loop.
+        return selKvPrefixAggregateSizes.all(parameters).map((row) => ({
+            key: row.key,
+            size: sizeFromAggregateRow(row),
+        }));
     }
 
     function snapshotPublicationState(key, row) {
@@ -383,9 +471,15 @@ function createSnapshotReader(db) {
     }
 
     function kvSize(key) {
-        const row = selValueStreamMetadata.get({ key, chunk_marker: CHUNK_MARKER });
+        const row = selVerifiedSize.get({ key, chunk_marker: CHUNK_MARKER });
         if (!row) return null;
-        return snapshotPublicationState(key, row).size;
+        if (!row.has_marker) return row.raw_size;
+        if (hasCurrentVerifiedInventory(row)) return row.logical_size;
+        const authoritative = selKvPrefixAggregateSizes.all({
+            chunk_marker: CHUNK_MARKER,
+            pattern: `${key.replace(/[\\%_]/g, '\\$&')}`,
+        }).find((entry) => entry.key === key);
+        return authoritative ? sizeFromAggregateRow(authoritative) : null;
     }
 
     return { kvGet, kvList, kvListWithSizes, kvWriteToFile, kvReadRange, kvSize };
@@ -422,6 +516,257 @@ function createChunkStore(db, opts = {}) {
         CREATE TABLE IF NOT EXISTS chunk_manifest_publications (
             manifest_key TEXT PRIMARY KEY
         );
+        CREATE TABLE IF NOT EXISTS chunk_manifest_inventory_revision (
+            manifest_key      TEXT PRIMARY KEY,
+            source_revision   INTEGER NOT NULL CHECK (source_revision >= 0),
+            verified_revision INTEGER CHECK (verified_revision IS NULL OR verified_revision >= 0)
+        );
+
+        INSERT OR IGNORE INTO chunk_manifest_inventory_revision
+            (manifest_key, source_revision, verified_revision)
+        SELECT manifest_key, 0, NULL FROM (
+            SELECT manifest_key FROM manifest_chunks
+            UNION SELECT manifest_key FROM chunk_manifest_meta
+            UNION SELECT manifest_key FROM chunk_manifest_publications
+        );
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_kv_insert
+        AFTER INSERT ON kv
+        WHEN NEW.value = X'00524953554348554E4B454400'
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            VALUES (NEW.key, 1, NULL)
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_kv_update
+        AFTER UPDATE OF key, value ON kv
+        WHEN OLD.value = X'00524953554348554E4B454400'
+          OR NEW.value = X'00524953554348554E4B454400'
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            VALUES (OLD.key, 1, NULL)
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            SELECT NEW.key, 1, NULL WHERE NEW.key <> OLD.key
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_kv_delete
+        AFTER DELETE ON kv
+        WHEN OLD.value = X'00524953554348554E4B454400'
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            VALUES (OLD.key, 1, NULL)
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_manifest_insert
+        AFTER INSERT ON manifest_chunks
+        WHEN EXISTS (
+            SELECT 1 FROM chunk_manifest_publications
+             WHERE manifest_key = NEW.manifest_key
+        )
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            VALUES (NEW.manifest_key, 1, NULL)
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_manifest_update
+        AFTER UPDATE ON manifest_chunks
+        WHEN EXISTS (
+            SELECT 1 FROM chunk_manifest_publications
+             WHERE manifest_key = OLD.manifest_key OR manifest_key = NEW.manifest_key
+        )
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            VALUES (OLD.manifest_key, 1, NULL)
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            SELECT NEW.manifest_key, 1, NULL
+             WHERE NEW.manifest_key <> OLD.manifest_key
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_manifest_delete
+        AFTER DELETE ON manifest_chunks
+        WHEN EXISTS (
+            SELECT 1 FROM chunk_manifest_publications
+             WHERE manifest_key = OLD.manifest_key
+        )
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            VALUES (OLD.manifest_key, 1, NULL)
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_meta_insert
+        AFTER INSERT ON chunk_manifest_meta
+        WHEN EXISTS (
+            SELECT 1 FROM chunk_manifest_publications
+             WHERE manifest_key = NEW.manifest_key
+        )
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            VALUES (NEW.manifest_key, 1, NULL)
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_meta_update
+        AFTER UPDATE ON chunk_manifest_meta
+        WHEN EXISTS (
+            SELECT 1 FROM chunk_manifest_publications
+             WHERE manifest_key = OLD.manifest_key OR manifest_key = NEW.manifest_key
+        )
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            VALUES (OLD.manifest_key, 1, NULL)
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            SELECT NEW.manifest_key, 1, NULL
+             WHERE NEW.manifest_key <> OLD.manifest_key
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_meta_delete
+        AFTER DELETE ON chunk_manifest_meta
+        WHEN EXISTS (
+            SELECT 1 FROM chunk_manifest_publications
+             WHERE manifest_key = OLD.manifest_key
+        )
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            VALUES (OLD.manifest_key, 1, NULL)
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_publication_insert
+        AFTER INSERT ON chunk_manifest_publications
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            VALUES (NEW.manifest_key, 1, NULL)
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_publication_update
+        AFTER UPDATE ON chunk_manifest_publications
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            VALUES (OLD.manifest_key, 1, NULL)
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            SELECT NEW.manifest_key, 1, NULL
+             WHERE NEW.manifest_key <> OLD.manifest_key
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_publication_delete
+        AFTER DELETE ON chunk_manifest_publications
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            VALUES (OLD.manifest_key, 1, NULL)
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_chunk_insert
+        AFTER INSERT ON chunks
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            SELECT DISTINCT manifest_key, 1, NULL
+              FROM manifest_chunks
+             WHERE hash = NEW.hash
+               AND EXISTS (
+                   SELECT 1 FROM chunk_manifest_publications publication
+                    WHERE publication.manifest_key = manifest_chunks.manifest_key
+               )
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_chunk_update
+        AFTER UPDATE ON chunks
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            SELECT DISTINCT manifest_key, 1, NULL
+              FROM manifest_chunks
+             WHERE (hash = OLD.hash OR hash = NEW.hash)
+               AND EXISTS (
+                   SELECT 1 FROM chunk_manifest_publications publication
+                    WHERE publication.manifest_key = manifest_chunks.manifest_key
+               )
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS pocketrisu_chunk_inventory_chunk_delete
+        AFTER DELETE ON chunks
+        BEGIN
+            INSERT INTO chunk_manifest_inventory_revision
+                (manifest_key, source_revision, verified_revision)
+            SELECT DISTINCT manifest_key, 1, NULL
+              FROM manifest_chunks
+             WHERE hash = OLD.hash
+               AND EXISTS (
+                   SELECT 1 FROM chunk_manifest_publications publication
+                    WHERE publication.manifest_key = manifest_chunks.manifest_key
+               )
+            ON CONFLICT(manifest_key) DO UPDATE SET
+                source_revision = source_revision + 1,
+                verified_revision = NULL;
+        END;
     `);
 
     const insChunk = db.prepare('INSERT OR IGNORE INTO chunks (hash, data) VALUES (?, ?)');
@@ -481,11 +826,173 @@ function createChunkStore(db, opts = {}) {
     const selSize = db.prepare(
         'SELECT SUM(LENGTH(c.data)) AS n FROM manifest_chunks m JOIN chunks c ON c.hash = m.hash WHERE m.manifest_key = ?',
     );
-    const selKvPrefixSizes = db.prepare(
-        `SELECT key, LENGTH(value) AS size, value = @chunkMarker AS has_marker, EXISTS (
-             SELECT 1 FROM chunk_manifest_publications p WHERE p.manifest_key = kv.key
-         ) AS is_protected
-         FROM kv WHERE key LIKE @pattern ESCAPE '\\'`,
+    const selVerifiedSize = db.prepare(
+        `SELECT kv.key AS key,
+                LENGTH(kv.value) AS raw_size,
+                kv.value = @chunk_marker AS has_marker,
+                EXISTS (
+                    SELECT 1 FROM chunk_manifest_publications p
+                    WHERE p.manifest_key = kv.key
+                ) AS is_protected,
+                meta.chunk_count AS metadata_chunk_count,
+                meta.logical_size AS logical_size,
+                meta.logical_sha256 AS logical_sha256,
+                revision.source_revision AS source_revision,
+                revision.verified_revision AS verified_revision
+           FROM kv
+           LEFT JOIN chunk_manifest_meta meta ON meta.manifest_key = kv.key
+           LEFT JOIN chunk_manifest_inventory_revision revision
+                  ON revision.manifest_key = kv.key
+          WHERE kv.key = @key`,
+    );
+    const selKvPrefixVerifiedSizes = db.prepare(
+        `SELECT kv.key AS key,
+                LENGTH(kv.value) AS raw_size,
+                kv.value = @chunk_marker AS has_marker,
+                EXISTS (
+                    SELECT 1 FROM chunk_manifest_publications p
+                    WHERE p.manifest_key = kv.key
+                ) AS is_protected,
+                meta.chunk_count AS metadata_chunk_count,
+                meta.logical_size AS logical_size,
+                meta.logical_sha256 AS logical_sha256,
+                revision.source_revision AS source_revision,
+                revision.verified_revision AS verified_revision
+           FROM kv
+           LEFT JOIN chunk_manifest_meta meta ON meta.manifest_key = kv.key
+           LEFT JOIN chunk_manifest_inventory_revision revision
+                  ON revision.manifest_key = kv.key
+          WHERE kv.key LIKE @pattern ESCAPE '\\'`,
+    );
+    const selKvPrefixAggregateSizes = db.prepare(
+        `SELECT kv.key AS key,
+                LENGTH(kv.value) AS raw_size,
+                kv.value = @chunk_marker AS has_marker,
+                EXISTS (
+                    SELECT 1 FROM chunk_manifest_publications p
+                    WHERE p.manifest_key = kv.key
+                ) AS is_protected,
+                meta.chunk_count AS metadata_chunk_count,
+                meta.logical_size AS logical_size,
+                meta.logical_sha256 AS logical_sha256,
+                revision.source_revision AS source_revision,
+                revision.verified_revision AS verified_revision,
+                COUNT(manifest.seq) AS manifest_count,
+                COUNT(chunk.hash) AS present_chunk_count,
+                MIN(manifest.seq) AS min_seq,
+                MAX(manifest.seq) AS max_seq,
+                COALESCE(SUM(LENGTH(chunk.data)), 0) AS stored_size
+           FROM kv
+           LEFT JOIN chunk_manifest_meta meta ON meta.manifest_key = kv.key
+           LEFT JOIN chunk_manifest_inventory_revision revision
+                  ON revision.manifest_key = kv.key
+           LEFT JOIN manifest_chunks manifest ON manifest.manifest_key = kv.key
+           LEFT JOIN chunks chunk ON chunk.hash = manifest.hash
+          WHERE kv.key LIKE @pattern ESCAPE '\\'
+          GROUP BY kv.key`,
+    );
+    const selSelectedVerifiedSizes = db.prepare(
+        `WITH requested(key) AS (
+             SELECT DISTINCT value FROM json_each(@keys)
+         )
+         SELECT kv.key AS key,
+                LENGTH(kv.value) AS raw_size,
+                kv.value = @chunk_marker AS has_marker,
+                EXISTS (
+                    SELECT 1 FROM chunk_manifest_publications p
+                    WHERE p.manifest_key = kv.key
+                ) AS is_protected,
+                meta.chunk_count AS metadata_chunk_count,
+                meta.logical_size AS logical_size,
+                meta.logical_sha256 AS logical_sha256,
+                revision.source_revision AS source_revision,
+                revision.verified_revision AS verified_revision
+           FROM requested
+           JOIN kv ON kv.key = requested.key
+           LEFT JOIN chunk_manifest_meta meta ON meta.manifest_key = kv.key
+           LEFT JOIN chunk_manifest_inventory_revision revision
+                  ON revision.manifest_key = kv.key`,
+    );
+    const selSelectedAggregateSizes = db.prepare(
+        `WITH requested(key) AS (
+             SELECT DISTINCT value FROM json_each(@keys)
+         )
+         SELECT kv.key AS key,
+                LENGTH(kv.value) AS raw_size,
+                kv.value = @chunk_marker AS has_marker,
+                EXISTS (
+                    SELECT 1 FROM chunk_manifest_publications p
+                    WHERE p.manifest_key = kv.key
+                ) AS is_protected,
+                meta.chunk_count AS metadata_chunk_count,
+                meta.logical_size AS logical_size,
+                meta.logical_sha256 AS logical_sha256,
+                revision.source_revision AS source_revision,
+                revision.verified_revision AS verified_revision,
+                COUNT(manifest.seq) AS manifest_count,
+                COUNT(chunk.hash) AS present_chunk_count,
+                MIN(manifest.seq) AS min_seq,
+                MAX(manifest.seq) AS max_seq,
+                COALESCE(SUM(LENGTH(chunk.data)), 0) AS stored_size
+           FROM requested
+           JOIN kv ON kv.key = requested.key
+           LEFT JOIN chunk_manifest_meta meta ON meta.manifest_key = kv.key
+           LEFT JOIN chunk_manifest_inventory_revision revision
+                  ON revision.manifest_key = kv.key
+           LEFT JOIN manifest_chunks manifest ON manifest.manifest_key = kv.key
+           LEFT JOIN chunks chunk ON chunk.hash = manifest.hash
+          GROUP BY kv.key`,
+    );
+    const markVerifiedInventory = db.prepare(
+        `UPDATE chunk_manifest_inventory_revision
+            SET verified_revision = source_revision
+          WHERE manifest_key = ? AND source_revision = ?`,
+    );
+    const insertVerifiedInventory = db.prepare(
+        `INSERT OR IGNORE INTO chunk_manifest_inventory_revision
+            (manifest_key, source_revision, verified_revision)
+         VALUES (?, 0, 0)`,
+    );
+    const deleteInventoryRevision = db.prepare(
+        'DELETE FROM chunk_manifest_inventory_revision WHERE manifest_key = ?',
+    );
+    const selSnapshotCosts = db.prepare(
+        `WITH reference_counts AS (
+             SELECT hash, COUNT(DISTINCT manifest_key) AS owner_count
+               FROM manifest_chunks
+              GROUP BY hash
+         ), requested_hashes AS (
+             SELECT DISTINCT manifest_key, hash
+               FROM manifest_chunks
+              WHERE manifest_key LIKE @pattern ESCAPE '\\'
+         ), exclusive_costs AS (
+             SELECT requested.manifest_key AS manifest_key,
+                    COALESCE(SUM(LENGTH(chunk.data)), 0) AS exclusive_size
+               FROM requested_hashes requested
+               JOIN reference_counts refs ON refs.hash = requested.hash
+                                         AND refs.owner_count = 1
+               JOIN chunks chunk ON chunk.hash = requested.hash
+              GROUP BY requested.manifest_key
+         )
+         SELECT kv.key AS key,
+                LENGTH(kv.value) AS raw_size,
+                kv.value = @chunk_marker AS has_marker,
+                EXISTS (
+                    SELECT 1 FROM chunk_manifest_publications publication
+                    WHERE publication.manifest_key = kv.key
+                ) AS is_protected,
+                COALESCE(exclusive.exclusive_size, 0) AS exclusive_size,
+                meta.chunk_count AS metadata_chunk_count,
+                meta.logical_size AS logical_size,
+                meta.logical_sha256 AS logical_sha256,
+                revision.source_revision AS source_revision,
+                revision.verified_revision AS verified_revision
+           FROM kv
+           LEFT JOIN exclusive_costs exclusive ON exclusive.manifest_key = kv.key
+           LEFT JOIN chunk_manifest_meta meta ON meta.manifest_key = kv.key
+           LEFT JOIN chunk_manifest_inventory_revision revision
+                  ON revision.manifest_key = kv.key
+          WHERE kv.key LIKE @pattern ESCAPE '\\'`,
     );
     // Physical bytes that deleting one manifest would make unreachable. Count
     // each chunk hash once even if repeated within the logical value.
@@ -558,11 +1065,12 @@ function createChunkStore(db, opts = {}) {
     // marker all commit together. Orphaned chunks from a prior version are left
     // for GC (a later layer) — never deleted here.
     const putValue = db.transaction((key, value) => {
+        delManifestPublication.run(key);
         delManifest.run(key);
         delManifestMeta.run(key);
-        delManifestPublication.run(key);
         if (value.length <= threshold) {
             kvSet.run(key, value, Date.now());
+            deleteInventoryRevision.run(key);
             return;
         }
         const chunks = cdcSplit(value);
@@ -598,11 +1106,12 @@ function createChunkStore(db, opts = {}) {
         const fd = fs.openSync(filePath, 'r');
         try {
             const size = fs.fstatSync(fd).size;
+            delManifestPublication.run(key);
             delManifest.run(key);
             delManifestMeta.run(key);
-            delManifestPublication.run(key);
             if (size <= threshold) {
                 kvSet.run(key, readFileRange(fd, size, 0), Date.now());
+                deleteInventoryRevision.run(key);
                 return;
             }
 
@@ -762,6 +1271,38 @@ function createChunkStore(db, opts = {}) {
 
     migrateLegacyManifestMetadata();
 
+    const sizeInventoryMetrics = {
+        fastSizeHits: 0,
+        authoritativeSizeDerivations: 0,
+        fastListingQueries: 0,
+        aggregateListingQueries: 0,
+        snapshotAggregateQueries: 0,
+    };
+
+    function publishVerifiedInventory(row) {
+        if (Number.isSafeInteger(row?.source_revision) && row.source_revision >= 0) {
+            markVerifiedInventory.run(row.key, row.source_revision);
+        } else {
+            // Upgrade or deliberately removed derivative row: the authoritative
+            // aggregate just verified this exact publication. INSERT OR IGNORE
+            // cannot bless a concurrent trigger-created newer revision.
+            insertVerifiedInventory.run(row.key);
+        }
+    }
+
+    function authoritativeSize(key) {
+        sizeInventoryMetrics.authoritativeSizeDerivations += 1;
+        const escaped = key.replace(/[\\%_]/g, '\\$&');
+        const row = selKvPrefixAggregateSizes.all({
+            chunk_marker: CHUNK_MARKER,
+            pattern: escaped,
+        }).find((entry) => entry.key === key);
+        if (!row) return null;
+        const size = sizeFromAggregateRow(row);
+        if (row.has_marker && row.is_protected) publishVerifiedInventory(row);
+        return size;
+    }
+
     /**
      * Spool one logical value without reassembling its chunk manifest. At most
      * one stored chunk is handed to JavaScript at a time; incomplete files are
@@ -871,34 +1412,109 @@ function createChunkStore(db, opts = {}) {
     }
 
     function sizeValue(key) {
-        const row = kvGet.get(key);
+        const row = selVerifiedSize.get({ key, chunk_marker: CHUNK_MARKER });
         if (!row) return null;
-        const state = publicationState(key, isChunked(row.value));
-        if (state.chunked) {
-            const size = selSize.get(key).n;
-            if (size !== state.metadata.logical_size) {
-                throw chunkCorruption(`Protected chunk manifest ${key} has missing chunk bytes`);
-            }
-            return size;
+        if (!row.has_marker) return row.raw_size;
+        if (hasCurrentVerifiedInventory(row)) {
+            sizeInventoryMetrics.fastSizeHits += 1;
+            return row.logical_size;
         }
-        return row.value.length;
+        return authoritativeSize(key);
     }
 
     // Enumerate logical payload sizes without reassembling chunk bodies. This
     // mirrors createSnapshotReader.kvListWithSizes for the live connection.
     function listValuesWithSizes(prefix) {
         const escaped = prefix.replace(/[\\%_]/g, '\\$&');
-        return selKvPrefixSizes.all({
-            chunkMarker: CHUNK_MARKER,
-            pattern: `${escaped}%`,
-        }).map((row) => {
-            const state = publicationState(row.key, !!row.has_marker);
-            if (!state.chunked) return { key: row.key, size: row.size };
-            const size = selSize.get(row.key).n;
-            if (size !== state.metadata.logical_size) {
-                throw chunkCorruption(`Protected chunk manifest ${row.key} has missing chunk bytes`);
-            }
+        const parameters = { chunk_marker: CHUNK_MARKER, pattern: `${escaped}%` };
+        sizeInventoryMetrics.fastListingQueries += 1;
+        const fastRows = selKvPrefixVerifiedSizes.all(parameters);
+        if (fastRows.every((row) => !row.has_marker || hasCurrentVerifiedInventory(row))) {
+            return fastRows.map((row) => ({
+                key: row.key,
+                size: row.has_marker ? row.logical_size : row.raw_size,
+            }));
+        }
+
+        sizeInventoryMetrics.aggregateListingQueries += 1;
+        const rows = selKvPrefixAggregateSizes.all(parameters);
+        return rows.map((row) => {
+            const size = sizeFromAggregateRow(row);
+            if (row.has_marker && row.is_protected) publishVerifiedInventory(row);
             return { key: row.key, size };
+        });
+    }
+
+    function listValuesWithSizesForKeys(keys) {
+        if (!Array.isArray(keys) || keys.some((key) => typeof key !== 'string')) {
+            throw new TypeError('KV size inventory keys must be strings');
+        }
+        if (keys.length === 0) return [];
+        const parameters = {
+            chunk_marker: CHUNK_MARKER,
+            keys: JSON.stringify(keys),
+        };
+        sizeInventoryMetrics.fastListingQueries += 1;
+        const fastRows = selSelectedVerifiedSizes.all(parameters);
+        if (fastRows.every((row) => !row.has_marker || hasCurrentVerifiedInventory(row))) {
+            return fastRows.map((row) => ({
+                key: row.key,
+                size: row.has_marker ? row.logical_size : row.raw_size,
+            }));
+        }
+        sizeInventoryMetrics.aggregateListingQueries += 1;
+        return selSelectedAggregateSizes.all(parameters).map((row) => {
+            const size = sizeFromAggregateRow(row);
+            if (row.has_marker && row.is_protected) publishVerifiedInventory(row);
+            return { key: row.key, size };
+        });
+    }
+
+    // Aggregate every requested snapshot in one reference-count pass. The old
+    // caller executed one correlated NOT EXISTS anti-join per snapshot. Logical
+    // sizes are obtained through the same revision-bound verified inventory used
+    // by kvSize/listing, so corruption still falls back to the full derivation.
+    function listSnapshotCostsExclusive(prefix) {
+        const logicalSizes = new Map(
+            listValuesWithSizes(prefix).map((entry) => [entry.key, entry.size]),
+        );
+        if (logicalSizes.size === 0) return [];
+        const escaped = prefix.replace(/[\\%_]/g, '\\$&');
+        sizeInventoryMetrics.snapshotAggregateQueries += 1;
+        const rows = selSnapshotCosts.all({
+            chunk_marker: CHUNK_MARKER,
+            pattern: `${escaped}%`,
+        });
+        for (const row of rows) {
+            if (row.has_marker && row.is_protected && !hasCurrentVerifiedInventory(row)) {
+                // The publication moved between the inventory and footprint
+                // statements. Re-derive once; never serve a cost bound to stale
+                // metadata.
+                const logicalSize = authoritativeSize(row.key);
+                if (logicalSize !== null) logicalSizes.set(row.key, logicalSize);
+            }
+        }
+        const finalRows = rows.some((row) => (
+            row.has_marker && row.is_protected && !hasCurrentVerifiedInventory(row)
+        ))
+            ? selSnapshotCosts.all({
+                chunk_marker: CHUNK_MARKER,
+                pattern: `${escaped}%`,
+            })
+            : rows;
+        return finalRows.map((row) => {
+            if (row.has_marker && row.is_protected && !hasCurrentVerifiedInventory(row)) {
+                throw chunkCorruption(`Protected chunk manifest ${row.key} changed during accounting`);
+            }
+            const logicalSize = logicalSizes.get(row.key);
+            if (!Number.isSafeInteger(logicalSize) || logicalSize < 0) {
+                throw chunkCorruption(`Snapshot ${row.key} changed during accounting`);
+            }
+            return {
+                key: row.key,
+                size: row.has_marker && row.is_protected ? row.exclusive_size : row.raw_size,
+                logicalSize,
+            };
         });
     }
 
@@ -925,9 +1541,9 @@ function createChunkStore(db, opts = {}) {
         if (state.chunked && selSize.get(srcKey).n !== state.metadata.logical_size) {
             throw chunkCorruption(`Protected chunk manifest ${srcKey} has missing chunk bytes`);
         }
+        delManifestPublication.run(dstKey);
         delManifest.run(dstKey);
         delManifestMeta.run(dstKey);
-        delManifestPublication.run(dstKey);
         if (state.chunked) {
             copyManifest.run(dstKey, srcKey);
             copyManifestMeta.run(dstKey, srcKey);
@@ -935,24 +1551,26 @@ function createChunkStore(db, opts = {}) {
             kvSet.run(dstKey, CHUNK_MARKER, Date.now());
         } else {
             kvSet.run(dstKey, row.value, Date.now());
+            deleteInventoryRevision.run(dstKey);
         }
     });
 
     // Remove a key entirely (its manifest + kv row). Chunks it referenced
     // become orphans, reclaimed by the next gc(). Used for snapshot rotation.
     const dropValue = db.transaction((key) => {
+        delManifestPublication.run(key);
         delManifest.run(key);
         delManifestMeta.run(key);
-        delManifestPublication.run(key);
         kvDel.run(key);
+        deleteInventoryRevision.run(key);
     });
 
     // Reclaim unreferenced chunks. Returns the number deleted. Run opportunistically
     // (e.g. Optimize / periodic) — never on the hot save path.
     function gc() {
+        gcStaleManifestPublications.run(CHUNK_MARKER);
         gcStaleManifests.run(CHUNK_MARKER);
         gcStaleManifestMeta.run(CHUNK_MARKER);
-        gcStaleManifestPublications.run(CHUNK_MARKER);
         return gcSweep.run().changes;
     }
 
@@ -975,12 +1593,15 @@ function createChunkStore(db, opts = {}) {
         writeValueToFile,
         sizeValue,
         listValuesWithSizes,
+        listValuesWithSizesForKeys,
+        listSnapshotCostsExclusive,
         snapshotCostExclusive,
         snapshotValue,
         dropValue,
         gc,
         reclaimableBytes,
         isChunkedKey,
+        sizeInventoryMetrics: () => ({ ...sizeInventoryMetrics }),
     };
 }
 

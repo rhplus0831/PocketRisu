@@ -139,6 +139,39 @@ describe('chunking lifecycle (real server, low threshold)', () => {
     expect(s.chunks.bytes).toBeGreaterThan(0)
   })
 
+  test('a verified size inventory is invalidated by chunk loss and falls back fail-closed', async () => {
+    const { client, srv } = await boot()
+    expect((await client.importBackup(oversizedSeed())).ok).toBe(true)
+
+    const baseline = await getStats(client)
+    expect(baseline.prefixes['chats/'].totalSize).toBeGreaterThan(0)
+
+    const sqlitePath = path.join(srv.cwd, 'save', 'risuai.db')
+    const db = new Database(sqlitePath)
+    const target = db.prepare(`
+      SELECT manifest.manifest_key AS key, manifest.hash AS hash
+        FROM manifest_chunks manifest
+        JOIN kv ON kv.key = manifest.manifest_key
+       WHERE manifest.manifest_key LIKE 'chats/%'
+       ORDER BY manifest.manifest_key, manifest.seq
+       LIMIT 1
+    `).get() as { key: string; hash: string } | undefined
+    expect(target).toBeTruthy()
+    db.prepare('DELETE FROM chunks WHERE hash = ?').run(target!.hash)
+    const revision = db.prepare(`
+      SELECT source_revision AS sourceRevision,
+             verified_revision AS verifiedRevision
+        FROM chunk_manifest_inventory_revision
+       WHERE manifest_key = ?
+    `).get(target!.key) as { sourceRevision: number; verifiedRevision: number | null }
+    db.close()
+
+    expect(revision.sourceRevision).toBeGreaterThan(0)
+    expect(revision.verifiedRevision).toBeNull()
+    const response = await client.fetch('/api/db/stats')
+    expect(response.status).toBe(500)
+  })
+
   test('externalized DB exports to standard full .bin and round-trips into a fresh server', async () => {
     const { client } = await boot()
     await client.importBackup(oversizedSeed())

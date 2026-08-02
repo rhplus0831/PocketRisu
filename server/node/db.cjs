@@ -75,6 +75,8 @@ const databaseRevisionTracker = createDatabaseRevisionTracker(db);
 const pluginStoragePublicationRevisionTracker =
     createPluginStoragePublicationRevisionTracker(db);
 db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_kv_updated_at_key ON kv(updated_at, key);
+
   CREATE TABLE IF NOT EXISTS deleted_keys (
     key        TEXT    PRIMARY KEY,
     deleted_at INTEGER NOT NULL
@@ -339,13 +341,19 @@ const stmtKvDelPrefix = db.prepare(`DELETE FROM kv WHERE key LIKE ? ESCAPE '\\'`
 const stmtManifestDelPrefix = db.prepare(`DELETE FROM manifest_chunks WHERE manifest_key LIKE ? ESCAPE '\\'`);
 const stmtManifestMetaDelPrefix = db.prepare(`DELETE FROM chunk_manifest_meta WHERE manifest_key LIKE ? ESCAPE '\\'`);
 const stmtManifestPublicationDelPrefix = db.prepare(`DELETE FROM chunk_manifest_publications WHERE manifest_key LIKE ? ESCAPE '\\'`);
+const stmtManifestInventoryDelPrefix = db.prepare(`DELETE FROM chunk_manifest_inventory_revision WHERE manifest_key LIKE ? ESCAPE '\\'`);
 const stmtKvUpdatedAt = db.prepare(`SELECT updated_at FROM kv WHERE key = ?`);
 const stmtRecordDeletion = db.prepare(`INSERT OR REPLACE INTO deleted_keys (key, deleted_at) VALUES (?, ?)`);
 const stmtRemoveDeletion = db.prepare(`DELETE FROM deleted_keys WHERE key = ?`);
 const stmtDeletedSince = db.prepare(`SELECT key FROM deleted_keys WHERE deleted_at >= ?`);
 const stmtDeletedSincePrefix = db.prepare(`SELECT key FROM deleted_keys WHERE deleted_at >= ? AND key LIKE ? ESCAPE '\\'`);
-const stmtModifiedSince = db.prepare(`SELECT key FROM kv WHERE updated_at >= ?`);
-const stmtModifiedSincePrefix = db.prepare(`SELECT key FROM kv WHERE updated_at >= ? AND key LIKE ? ESCAPE '\\'`);
+const stmtModifiedSince = db.prepare(
+    `SELECT key FROM kv INDEXED BY idx_kv_updated_at_key WHERE updated_at >= ?`,
+);
+const stmtModifiedSincePrefix = db.prepare(
+    `SELECT key FROM kv INDEXED BY idx_kv_updated_at_key
+     WHERE updated_at >= ? AND key LIKE ? ESCAPE '\\'`,
+);
 const stmtCleanupDeletions = db.prepare(`DELETE FROM deleted_keys WHERE deleted_at < ?`);
 const stmtRecordDeletionBulk = db.prepare(
     `INSERT OR REPLACE INTO deleted_keys (key, deleted_at) SELECT key, ? FROM kv WHERE key LIKE ? ESCAPE '\\'`
@@ -478,10 +486,22 @@ let activePluginStorageQuotaPlan = null;
 function withPluginStorageQuotaPlan(changes, operation) {
     if (activePluginStorageQuotaPlan) return operation();
     const planned = new Map();
+    const pluginChanges = [];
+    const requestedKeys = new Set();
     for (const change of changes) {
         if (!isPluginValueKey(change.key)) continue;
-        if (planned.has(change.key)) throw new Error(`Duplicate plugin quota plan key: ${change.key}`);
-        const previousSize = chunkStore.sizeValue(change.key) ?? 0;
+        if (requestedKeys.has(change.key)) {
+            throw new Error(`Duplicate plugin quota plan key: ${change.key}`);
+        }
+        requestedKeys.add(change.key);
+        pluginChanges.push(change);
+    }
+    const previousSizes = new Map(
+        chunkStore.listValuesWithSizesForKeys([...requestedKeys])
+            .map((entry) => [entry.key, entry.size]),
+    );
+    for (const change of pluginChanges) {
+        const previousSize = previousSizes.get(change.key) ?? 0;
         const nextSize = change.size === null ? 0 : change.size;
         if (!Number.isSafeInteger(nextSize) || nextSize < 0) assertPluginValueSize(nextSize);
         if (nextSize > PLUGIN_VALUE_MAX_BYTES && nextSize >= previousSize) {
@@ -617,10 +637,11 @@ const runKvDelPrefix = db.transaction((prefix, pattern) => {
             .reduce((sum, entry) => sum + entry.size, 0)
         : 0;
     stmtRecordDeletionBulk.run(Date.now(), pattern);
+    stmtManifestPublicationDelPrefix.run(pattern);
     stmtManifestDelPrefix.run(pattern);
     stmtManifestMetaDelPrefix.run(pattern);
-    stmtManifestPublicationDelPrefix.run(pattern);
     stmtKvDelPrefix.run(pattern);
+    stmtManifestInventoryDelPrefix.run(pattern);
     stmtDeletePluginStorageOwnerPrefix.run(pattern);
     pluginStorageViewerFacets.removeValuePrefix(prefix);
     if (prefixCanMatchPluginValues) pluginStorageMutationVersion += 1;
@@ -754,6 +775,10 @@ function kvList(prefix) {
 
 function kvListWithSizes(prefix) {
     return chunkStore.listValuesWithSizes(prefix);
+}
+
+function kvListSelectedWithSizes(keys) {
+    return chunkStore.listValuesWithSizesForKeys(keys);
 }
 
 function kvClearDeletion(key) {
@@ -922,6 +947,10 @@ function snapshotFootprint(key) {
     return chunkStore.snapshotCostExclusive(key);
 }
 
+function snapshotFootprints(prefix) {
+    return chunkStore.listSnapshotCostsExclusive(prefix);
+}
+
 function clearEntities() {
     // Entity tables may still exist from previous versions — clear them during backup import
     try {
@@ -934,7 +963,7 @@ function clearEntities() {
 module.exports = {
     db,
     // KV
-    kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvGetDatabaseRevision, kvGetPluginStoragePublicationRevision, kvCopyValue,
+    kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvListSelectedWithSizes, kvSize, kvGetUpdatedAt, kvGetDatabaseRevision, kvGetPluginStoragePublicationRevision, kvCopyValue,
     kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
     kvGetListEpoch, kvBumpListEpoch,
     createKvSnapshot,
@@ -945,6 +974,7 @@ module.exports = {
     reclaimableChunkBytes,
     isDbBlobChunked,
     snapshotFootprint,
+    snapshotFootprints,
     getPluginStorageUsage,
     getPluginStorageMutationVersion,
     reconcilePluginStorageUsage,

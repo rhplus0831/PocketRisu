@@ -34,12 +34,25 @@ const {
         getValue: (key: string) => Buffer | null
         sizeValue: (key: string) => number | null
         listValuesWithSizes: (prefix: string) => Array<{ key: string; size: number }>
+        listValuesWithSizesForKeys: (keys: string[]) => Array<{ key: string; size: number }>
+        listSnapshotCostsExclusive: (prefix: string) => Array<{
+            key: string
+            size: number
+            logicalSize: number
+        }>
         snapshotCostExclusive: (key: string) => number
         snapshotValue: (srcKey: string, dstKey: string) => void
         dropValue: (key: string) => void
         gc: () => number
         isChunkedKey: (key: string) => boolean
         reclaimableBytes: () => number
+        sizeInventoryMetrics: () => {
+            fastSizeHits: number
+            authoritativeSizeDerivations: number
+            fastListingQueries: number
+            aggregateListingQueries: number
+            snapshotAggregateQueries: number
+        }
     }
     createSnapshotReader: (db: any) => {
         kvGet: (key: string) => Buffer | null
@@ -221,6 +234,50 @@ describe('createChunkStore — chunk-aware kv (injected :memory: db)', () => {
         expect(store.sizeValue('missing')).toBeNull()
     })
 
+    it('B6b: revision-bound metadata is used only after authoritative verification', () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const big = seededBytes(200_000, 211)
+        store.putValue('big', big)
+
+        expect(store.sizeInventoryMetrics()).toMatchObject({
+            fastSizeHits: 0,
+            authoritativeSizeDerivations: 0,
+        })
+        expect(store.sizeValue('big')).toBe(big.length)
+        expect(store.sizeInventoryMetrics()).toMatchObject({
+            fastSizeHits: 0,
+            authoritativeSizeDerivations: 1,
+        })
+        const revision = db.prepare(`
+            SELECT source_revision AS sourceRevision,
+                   verified_revision AS verifiedRevision
+              FROM chunk_manifest_inventory_revision
+             WHERE manifest_key = 'big'
+        `).get() as { sourceRevision: number; verifiedRevision: number }
+        expect(revision).toMatchObject({
+            sourceRevision: expect.any(Number),
+            verifiedRevision: expect.any(Number),
+        })
+        expect(revision.sourceRevision).toBeLessThanOrEqual(3)
+        expect(revision.verifiedRevision).toBe(revision.sourceRevision)
+
+        expect(store.sizeValue('big')).toBe(big.length)
+        expect(store.sizeInventoryMetrics()).toMatchObject({
+            fastSizeHits: 1,
+            authoritativeSizeDerivations: 1,
+        })
+
+        const hash = db.prepare(
+            `SELECT hash FROM manifest_chunks WHERE manifest_key = 'big' ORDER BY seq LIMIT 1`,
+        ).get().hash as string
+        db.prepare('DELETE FROM chunks WHERE hash = ?').run(hash)
+        expect(() => store.sizeValue('big')).toThrow(expect.objectContaining({
+            code: 'KV_CHUNK_CORRUPT',
+        }))
+        expect(store.sizeInventoryMetrics().authoritativeSizeDerivations).toBe(2)
+    })
+
     it('B7: 없는 키는 null', () => {
         const store = createChunkStore(freshDb(), T)
         expect(store.getValue('nope')).toBeNull()
@@ -261,6 +318,60 @@ describe('createChunkStore — chunk-aware kv (injected :memory: db)', () => {
                 { key: 'pluginsave/bGFyZ2U.json', size: large.length },
                 { key: 'pluginsave/c21hbGw.json', size: 5 },
             ])
+    })
+
+    it('B10b: stale listings use one grouped fallback and then the verified fast path', () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const first = seededBytes(200_000, 221)
+        const second = seededBytes(180_000, 223)
+        store.putValue('pluginsave/a.json', first)
+        store.putValue('pluginsave/b.json', second)
+        store.putValue('pluginsave/raw.json', Buffer.from('raw'))
+
+        expect(store.listValuesWithSizes('pluginsave/').sort((a, b) => a.key.localeCompare(b.key)))
+            .toEqual([
+                { key: 'pluginsave/a.json', size: first.length },
+                { key: 'pluginsave/b.json', size: second.length },
+                { key: 'pluginsave/raw.json', size: 3 },
+            ])
+        expect(store.sizeInventoryMetrics()).toMatchObject({
+            authoritativeSizeDerivations: 0,
+            fastListingQueries: 1,
+            aggregateListingQueries: 1,
+        })
+
+        store.listValuesWithSizes('pluginsave/')
+        expect(store.sizeInventoryMetrics()).toMatchObject({
+            fastListingQueries: 2,
+            aggregateListingQueries: 1,
+        })
+    })
+
+    it('B10c: selected inventories aggregate only the requested authoritative rows', () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const selected = seededBytes(200_000, 231)
+        store.putValue('pluginsave/selected.json', selected)
+        store.putValue('pluginsave/quarantined.json', seededBytes(180_000, 233))
+        const quarantinedHash = db.prepare(`
+            SELECT hash FROM manifest_chunks
+             WHERE manifest_key = 'pluginsave/quarantined.json'
+             ORDER BY seq LIMIT 1
+        `).get().hash as string
+        db.prepare('DELETE FROM chunks WHERE hash = ?').run(quarantinedHash)
+
+        expect(store.listValuesWithSizesForKeys([
+            'pluginsave/missing.json',
+            'pluginsave/selected.json',
+        ])).toEqual([
+            { key: 'pluginsave/selected.json', size: selected.length },
+        ])
+        expect(store.sizeInventoryMetrics()).toMatchObject({
+            authoritativeSizeDerivations: 0,
+            fastListingQueries: 1,
+            aggregateListingQueries: 1,
+        })
     })
 })
 
@@ -355,6 +466,37 @@ describe('snapshotValue — 조각 공유 스냅샷 (kvCopyValue 청크 인식)'
 
         store.dropValue('snapA')
         expect(store.snapshotCostExclusive('snapB')).toBe(costB + sharedBytes)
+    })
+
+    it('C7: snapshot footprint inventory batches all keys with identical exact costs', () => {
+        const db = freshDb()
+        const store = createChunkStore(db, T)
+        const original = seededBytes(2_000_000, 227)
+        const changed = Buffer.concat([
+            original.subarray(0, 1_000_000),
+            seededBytes(120, 229),
+            original.subarray(1_000_000),
+        ])
+        store.putValue('live', original)
+        store.snapshotValue('live', 'snapshot/a')
+        store.putValue('live', changed)
+        store.snapshotValue('live', 'snapshot/b')
+        store.putValue('snapshot/raw', Buffer.alloc(500, 0x72))
+        store.dropValue('live')
+
+        const expected = new Map([
+            ['snapshot/a', store.snapshotCostExclusive('snapshot/a')],
+            ['snapshot/b', store.snapshotCostExclusive('snapshot/b')],
+            ['snapshot/raw', store.snapshotCostExclusive('snapshot/raw')],
+        ])
+        const aggregate = store.listSnapshotCostsExclusive('snapshot/')
+        expect(new Map(aggregate.map((entry) => [entry.key, entry.size]))).toEqual(expected)
+        expect(new Map(aggregate.map((entry) => [entry.key, entry.logicalSize]))).toEqual(new Map([
+            ['snapshot/a', original.length],
+            ['snapshot/b', changed.length],
+            ['snapshot/raw', 500],
+        ]))
+        expect(store.sizeInventoryMetrics().snapshotAggregateQueries).toBe(1)
     })
 })
 

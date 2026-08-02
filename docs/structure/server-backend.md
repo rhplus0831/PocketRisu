@@ -212,7 +212,8 @@ buffered-body ledger.
 
 `risuai.db` contains:
 
-- `kv(key TEXT PRIMARY KEY, value BLOB, updated_at INTEGER)`, created at `server/node/db.cjs:29`.
+- `kv(key TEXT PRIMARY KEY, value BLOB, updated_at INTEGER)`, with a covering
+  `(updated_at, key)` delta-list index, created at `server/node/db.cjs:29`.
 - `deleted_keys(key TEXT PRIMARY KEY, deleted_at INTEGER)`, a seven-day deletion journal used by delta key listings.
 - `sync_meta(id = 1, list_epoch TEXT)`, whose random epoch invalidates incompatible browser list caches.
 - `chunks(hash TEXT PRIMARY KEY, data BLOB)`, created at `server/node/chunkStore.cjs:117-121`.
@@ -220,6 +221,10 @@ buffered-body ledger.
 - `chunk_manifest_meta`, `chunk_manifest_protection`, and
   `chunk_manifest_publications`, which bind marker rows to complete chunk counts,
   logical length, and whole-value SHA-256 before readers accept them.
+- `chunk_manifest_inventory_revision`, whose per-publication trigger-backed source and
+  verified revisions allow size-only reads to use `logical_size` after one authoritative
+  manifest/chunk inventory derivation. Missing or stale verification falls back to the
+  grouped derivation and corruption remains fail-closed.
 - `plugin_storage_usage` and `plugin_storage_owners`, derived indexes for optimized
   storage quota and ownership accounting.
 - `replacement_operations`, the transaction-bound committed/not-committed status used to
@@ -331,6 +336,10 @@ Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB
   applicable. Corrupt-boot recovery performs no preflight mutation. A missing or
   mismatched epoch forces a full response, and deletion records are retained for seven
   days and cleaned at boot plus hourly.
+- KV delta selection is covered by `(updated_at, key)`. Inlay deltas retain the
+  authoritative per-file mtime scan only up to 1,024 payloads; larger directories return
+  a full authoritative key set with the same epoch/timestamp schema, bounding filesystem
+  stats without adding a second journal to the sidecar/import commit protocol.
 
 #### Externalized chat content
 
@@ -610,9 +619,15 @@ callers may explicitly include usage deletion.
 
 - A marker row alone is not proof of a chunked value. Protected publication metadata binds the complete sequence, chunk hashes, logical byte length, and whole-value SHA-256. Readers reject incomplete or corrupt publications with `KV_CHUNK_CORRUPT` instead of concatenating partial data.
 
-- Chat dashboard totals are chunk-aware. The `chats/` prefix total sums `kvSize()` for each
-  logical row; `LENGTH(kv.value)` would report only the 13-byte marker for a chunked chat.
-  The stats response also separates chat KV-row and referenced-chunk bytes so the
+- Logical-size reads use stored `chunk_manifest_meta.logical_size` only while the
+  publication's trigger-backed inventory revision matches its last authoritative
+  COUNT/sequence/stored-byte verification. Direct changes to marker, manifest, metadata,
+  publication, or referenced chunk rows invalidate that proof. Size listings fall back
+  through one grouped aggregate query rather than one COUNT/SUM pair per value.
+
+- Chat dashboard totals are chunk-aware. The `chats/` prefix total comes from one
+  revision-verified size inventory; `LENGTH(kv.value)` would report only the 13-byte
+  marker for a chunked chat. The stats response also separates chat KV-row and referenced-chunk bytes so the
   dashboard can allocate physical storage without double-counting the shared chunk table.
 
 - Chunk GC is deliberately off the save hot path. Replaced chunks become orphans and are
@@ -622,6 +637,9 @@ callers may explicitly include usage deletion.
   chunks referenced by that manifest and no other manifest (`snapshotCostExclusive()`).
   The list endpoint reports logical reassembled DB size. Do not substitute
   `LENGTH(kv.value)`, which is only the marker for chunked values.
+- Multi-snapshot usage and trimming obtain all exclusive costs from one grouped
+  reference-count query per accounting pass. Trimming still recomputes after each
+  deletion because a removed sibling can make shared chunks exclusive to a survivor.
 
 - Snapshot assembly is independent of file backups. Temporary `database.risudat` files
   belong in `save/.spool` or `POCKETRISU_SPOOL_DIR`, never under the optional server-backup

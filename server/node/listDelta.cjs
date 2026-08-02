@@ -1,6 +1,12 @@
 'use strict';
 
 const LIST_DELTA_MAX_AGE_MS = 6 * 24 * 60 * 60 * 1000;
+// Above this bound a full key-set response is cheaper and safer than issuing an
+// unbounded series of filesystem stats on the synchronous list hot path. Full
+// mode is already the authoritative browser-cache fallback and preserves the
+// epoch/timestamp contract without a separate filesystem journal that imports
+// and crash-recovery would also have to publish atomically.
+const MAX_INLAY_DELTA_STAT_ENTRIES = 1024;
 
 function canUseListDelta({ lastSync, clientEpoch, serverEpoch, now }) {
     return Number.isSafeInteger(lastSync)
@@ -42,6 +48,7 @@ async function buildListResponse(options) {
         listAssetEntries,
         listInlayEntries,
         statFile,
+        maxInlayDeltaStatEntries = MAX_INLAY_DELTA_STAT_ENTRIES,
     } = options;
 
     if (!canUseListDelta({ lastSync, clientEpoch, serverEpoch, now })) {
@@ -60,7 +67,19 @@ async function buildListResponse(options) {
 
     let added;
     if (keyPrefix === 'inlay/') {
-        const fileKeys = await modifiedInlayKeys(await listInlayEntries(), lastSync, statFile);
+        const inlayEntries = await listInlayEntries();
+        if (inlayEntries.length > maxInlayDeltaStatEntries) {
+            return {
+                mode: 'full',
+                content: uniqueKeys(
+                    inlayEntries.map((entry) => `inlay/${entry.id}`),
+                    listKv('inlay/'),
+                ),
+                timestamp: now,
+                epoch: serverEpoch,
+            };
+        }
+        const fileKeys = await modifiedInlayKeys(inlayEntries, lastSync, statFile);
         added = uniqueKeys(fileKeys, listModifiedKv(lastSync, 'inlay/'));
     } else {
         const fileKeys = listAssetEntries()
@@ -79,6 +98,7 @@ async function buildListResponse(options) {
 
 module.exports = {
     LIST_DELTA_MAX_AGE_MS,
+    MAX_INLAY_DELTA_STAT_ENTRIES,
     canUseListDelta,
     buildListResponse,
 };

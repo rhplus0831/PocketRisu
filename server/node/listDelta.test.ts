@@ -1,8 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 import pkg from './listDelta.cjs'
 
-const { LIST_DELTA_MAX_AGE_MS, buildListResponse, canUseListDelta } = pkg as {
+const {
+    LIST_DELTA_MAX_AGE_MS,
+    MAX_INLAY_DELTA_STAT_ENTRIES,
+    buildListResponse,
+    canUseListDelta,
+} = pkg as {
     LIST_DELTA_MAX_AGE_MS: number
+    MAX_INLAY_DELTA_STAT_ENTRIES: number
     canUseListDelta: (options: {
         lastSync: number
         clientEpoch: string
@@ -28,6 +34,7 @@ interface ListOptions {
     }>
     listInlayEntries: () => Promise<Array<{ id: string; filePath: string }>>
     statFile: (filePath: string) => Promise<{ mtimeMs: number }>
+    maxInlayDeltaStatEntries?: number
 }
 
 function options(overrides: Partial<ListOptions> = {}): ListOptions {
@@ -124,5 +131,29 @@ describe('delta list response', () => {
 
         expect(response.added).toEqual(['inlay/recent', 'inlay/kv-added'])
         expect(response.deleted).toEqual(['inlay/deleted'])
+    })
+
+    it('falls back to an authoritative full inlay list before the stat pass exceeds its bound', async () => {
+        const statFile = vi.fn(async () => ({ mtimeMs: 9_000 }))
+        const response = await buildListResponse(options({
+            keyPrefix: 'inlay/',
+            maxInlayDeltaStatEntries: 2,
+            listKv: () => ['inlay/legacy-kv', 'inlay/two'],
+            listInlayEntries: async () => [
+                { id: 'one', filePath: '/one' },
+                { id: 'two', filePath: '/two' },
+                { id: 'three', filePath: '/three' },
+            ],
+            statFile,
+        }))
+
+        expect(MAX_INLAY_DELTA_STAT_ENTRIES).toBeGreaterThan(0)
+        expect(statFile).not.toHaveBeenCalled()
+        expect(response).toEqual({
+            mode: 'full',
+            content: ['inlay/one', 'inlay/two', 'inlay/three', 'inlay/legacy-kv'],
+            timestamp: 10_000,
+            epoch: 'epoch-a',
+        })
     })
 })

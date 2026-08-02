@@ -40,10 +40,10 @@ const getVips = () => {
     return _vipsPromise
 }
 const { kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList,
-        kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvGetDatabaseRevision, kvGetPluginStoragePublicationRevision, kvCopyValue, clearEntities, checkpointWal,
+        kvDelPrefix, kvListWithSizes, kvListSelectedWithSizes, kvSize, kvGetUpdatedAt, kvGetDatabaseRevision, kvGetPluginStoragePublicationRevision, kvCopyValue, clearEntities, checkpointWal,
         kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
         kvGetListEpoch, kvBumpListEpoch,
-        gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, createKvSnapshot,
+        gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprints, createKvSnapshot,
         rebuildPluginStorageViewerFacets,
         getPluginStorageMutationVersion, withPluginStorageQuotaPlan,
         isLegacyHexMigrationComplete, markLegacyHexMigrationComplete,
@@ -1211,7 +1211,10 @@ function trimSnapshotsToLimits() {
     // Exclusive footprint is "what deleting this manifest frees". Removing a
     // sibling can make shared chunks exclusive, so recalculate after each trim.
     while (keys.length > 1) {
-        const totalBytes = keys.reduce((sum, key) => sum + snapshotFootprint(key), 0);
+        const costs = new Map(
+            snapshotFootprints(DB_BACKUP_PREFIX).map((entry) => [entry.key, entry.size]),
+        );
+        const totalBytes = keys.reduce((sum, key) => sum + (costs.get(key) ?? 0), 0);
         if (keys.length <= maxCount && totalBytes <= maxBytes) break;
         kvDel(keys.pop());
         removed++;
@@ -1227,13 +1230,12 @@ function trimSnapshotsToLimits() {
 //                  the snapshots would cost WITHOUT dedup. Drives the "saved by
 //                  deduplication" figure; never used for trimming.
 function snapshotUsage() {
-    const keys = kvList(DB_BACKUP_PREFIX);
-    let bytes = 0, logicalBytes = 0;
-    for (const k of keys) {
-        bytes += snapshotFootprint(k);
-        logicalBytes += (kvSize(k) || 0);
-    }
-    return { count: keys.length, bytes, logicalBytes };
+    const footprints = snapshotFootprints(DB_BACKUP_PREFIX);
+    return {
+        count: footprints.length,
+        bytes: footprints.reduce((sum, entry) => sum + entry.size, 0),
+        logicalBytes: footprints.reduce((sum, entry) => sum + entry.logicalSize, 0),
+    };
 }
 
 function warnAndPreserveMissingChatRow(source, chaId, chatId) {
@@ -12941,8 +12943,12 @@ async function assertInternalTransitionBounds(liveDb, sourceKeys) {
             );
         }
     };
-    for (const key of sourceKeys.valueKeys) addSize(kvSize(key));
-    for (const key of sourceKeys.metaKeys) addSize(kvSize(key));
+    const selectedSizes = new Map(
+        kvListSelectedWithSizes([...sourceKeys.valueKeys, ...sourceKeys.metaKeys])
+            .map((entry) => [entry.key, entry.size]),
+    );
+    for (const key of sourceKeys.valueKeys) addSize(selectedSizes.get(key));
+    for (const key of sourceKeys.metaKeys) addSize(selectedSizes.get(key));
     const accountInline = (record, prefix, externalKeys) => {
         for (const [rawKey, value] of Object.entries(record ?? {})) {
             const storageKey = encodeValidatedPluginStorageKey(rawKey, prefix);
@@ -16954,6 +16960,27 @@ function internalSnapshotMetadata(key) {
     return { ...parsed, size };
 }
 
+function listInternalSnapshotMetadata() {
+    const keys = kvList(DB_BACKUP_PREFIX);
+    try {
+        const sizes = new Map(
+            kvListWithSizes(DB_BACKUP_PREFIX).map((entry) => [entry.key, entry.size]),
+        );
+        return keys.map((key) => {
+            const parsed = parseInternalSnapshotKey(key);
+            if (!parsed) return null;
+            const size = sizes.get(key);
+            return Number.isSafeInteger(size) && size >= 0 ? { ...parsed, size } : null;
+        });
+    } catch (error) {
+        if (error?.code !== 'KV_CHUNK_CORRUPT') throw error;
+        // Discovery must still retain each corrupt candidate with size:null so
+        // boot recovery can try it and continue to an older snapshot. The rare
+        // damaged-state path deliberately falls back to the per-key verifier.
+        return keys.map(internalSnapshotMetadata);
+    }
+}
+
 function statsBasename(s) {
     if (!s) return '';
     return String(s).replace(/\\/g, '/').split('/').pop();
@@ -17100,12 +17127,13 @@ app.get('/api/db/stats', async (req, res, next) => {
         // Prefix breakdown — split database/ into the live blob vs rotated backups.
         const prefixes = {};
         prefixes[DB_BLOB_KEY] = { totalSize: dbBlobSize, count: dbBlobSize > 0 ? 1 : 0 };
-        const backupKeys = kvList(DB_BACKUP_PREFIX);
+        const backupEntries = kvListWithSizes(DB_BACKUP_PREFIX);
+        const backupKeys = backupEntries.map((entry) => entry.key);
         let backupTotal = 0;
         let backupOldest = null, backupNewest = null;
-        for (const k of backupKeys) {
-            const sz = kvSize(k) || 0;
-            backupTotal += sz;
+        for (const entry of backupEntries) {
+            const k = entry.key;
+            backupTotal += entry.size;
             const tsRaw = parseInt(k.slice(DB_BACKUP_PREFIX.length, -4), 10);
             if (Number.isFinite(tsRaw)) {
                 const ts = tsRaw * 100;
@@ -17116,8 +17144,10 @@ app.get('/api/db/stats', async (req, res, next) => {
         prefixes[DB_BACKUP_PREFIX] = { totalSize: backupTotal, count: backupKeys.length };
         const chatKeys = chatRowStore.listAllChatRowKeys();
         let chatTotal = 0, chatKvRowSize = 0;
-        for (const key of chatKeys) chatTotal += kvSize(key) || 0;
-        for (const entry of kvListWithSizes('chats/')) chatKvRowSize += entry.size;
+        const chatSizes = kvListWithSizes('chats/');
+        const chatSizeByKey = new Map(chatSizes.map((entry) => [entry.key, entry.size]));
+        for (const key of chatKeys) chatTotal += chatSizeByKey.get(key) || 0;
+        for (const entry of chatSizes) chatKvRowSize += entry.size;
         const chatChunkBytes = sqliteDb.prepare(
             `SELECT COALESCE(SUM(LENGTH(data)), 0) AS b
              FROM chunks
@@ -17589,8 +17619,7 @@ app.put('/api/db/snapshots/limits', async (req, res, next) => {
 app.get('/api/db/snapshots', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
-        const out = await queueStorageReadAfterImports(() => kvList(DB_BACKUP_PREFIX)
-            .map(internalSnapshotMetadata)
+        const out = await queueStorageReadAfterImports(() => listInternalSnapshotMetadata()
             .filter(Boolean)
             .sort((a, b) => b.timestamp - a.timestamp || b.key.localeCompare(a.key)));
         res.json({ snapshots: out });
