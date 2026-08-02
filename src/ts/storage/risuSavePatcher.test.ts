@@ -319,6 +319,71 @@ const emptyToSave = () => ({
     pluginCustomStorage: false,
 })
 
+async function acknowledgedSet(
+    patcher: InstanceType<typeof RisuSavePatcher>,
+    data: any,
+    toSave: ReturnType<typeof emptyToSave>,
+) {
+    const proposal = await patcher.set(data, toSave)
+    patcher.commit(proposal)
+    return proposal
+}
+
+describe('RisuSavePatcher acknowledgement boundary', () => {
+    test('a discarded transport attempt leaves every baseline at the server pre-image', async () => {
+        const baseline = {
+            characters: [],
+            botPresets: [{ id: 'preset-a', name: 'A' }],
+            modules: [{ id: 'module-a', name: 'A' }],
+            username: 'server',
+        }
+        const changed = {
+            ...baseline,
+            username: 'local',
+            modules: [{ id: 'module-a', name: 'Local A' }],
+        }
+        const patcher = new RisuSavePatcher()
+        await patcher.init(baseline)
+
+        const failedTransportProposal = await patcher.set(changed, {
+            ...emptyToSave(),
+            root: true,
+            modules: true,
+        })
+        patcher.discard(failedTransportProposal)
+
+        const retryProposal = await patcher.set(changed, {
+            ...emptyToSave(),
+            root: true,
+            modules: true,
+        })
+        expect(retryProposal.expectedHash).toBe(failedTransportProposal.expectedHash)
+        expect(retryProposal.patch).toEqual(failedTransportProposal.patch)
+
+        patcher.commit(retryProposal)
+        const afterAcknowledgement = await patcher.set(changed, emptyToSave())
+        expect(afterAcknowledgement.patch).toEqual([])
+    })
+
+    test('unions tracked branches with baseline-proven changes conservatively', async () => {
+        const baseline = dbWith([chr('a'), chr('b')])
+        const changed = clone(baseline)
+        changed.characters[1].desc = 'changed outside the tracker hint'
+        const patcher = new RisuSavePatcher()
+        await patcher.init(baseline)
+
+        const proposal = await patcher.set(changed, emptyToSave())
+        expect(patcher.conflictDirtyBranches(proposal).character).toContain('b')
+        patcher.discard(proposal)
+
+        changed.characters.push(chr('c'))
+        const structural = await patcher.set(changed, emptyToSave())
+        expect(new Set(patcher.conflictDirtyBranches(structural).character)).toEqual(
+            new Set(['a', 'b', 'c']),
+        )
+    })
+})
+
 describe('RisuSavePatcher.set — modules path', () => {
     test('deleting a front-loaded module emits a single replace op, no RangeError', async () => {
         const patcher = new RisuSavePatcher()
@@ -326,7 +391,7 @@ describe('RisuSavePatcher.set — modules path', () => {
         await patcher.init({ characters: [], botPresets: [], modules: initialModules })
 
         const newDb = { characters: [], botPresets: [], modules: [makeMod('b'), makeMod('c'), makeMod('d')] }
-        const { patch } = await patcher.set(newDb, { ...emptyToSave(), modules: true })
+        const { patch } = await acknowledgedSet(patcher, newDb, { ...emptyToSave(), modules: true })
 
         const moduleOps = patch.filter((p: any) => p.path === '/modules' || p.path.startsWith('/modules/'))
         expect(moduleOps).toEqual([
@@ -347,7 +412,7 @@ describe('RisuSavePatcher.set — modules path', () => {
             botPresets: [],
             modules: [makeMod('a'), makeMod('b', { description: 'new' })],
         }
-        const { patch } = await patcher.set(newDb, { ...emptyToSave(), modules: true })
+        const { patch } = await acknowledgedSet(patcher, newDb, { ...emptyToSave(), modules: true })
 
         const moduleOps = patch.filter((p: any) => p.path.startsWith('/modules/'))
         expect(moduleOps.length).toBeGreaterThan(0)
@@ -372,7 +437,7 @@ describe('RisuSavePatcher.set — modules path', () => {
         const next = big.slice(1)
         const newDb = { characters: [], botPresets: [], modules: next }
 
-        await expect(patcher.set(newDb, { ...emptyToSave(), modules: true })).resolves.toBeTruthy()
+        await expect(acknowledgedSet(patcher, newDb, { ...emptyToSave(), modules: true })).resolves.toBeTruthy()
     })
 
     test('subsequent set() picks up the new baseline after a structural change', async () => {
@@ -387,13 +452,13 @@ describe('RisuSavePatcher.set — modules path', () => {
         })
 
         // First call: delete 'a'.
-        await patcher.set(
+        await acknowledgedSet(patcher,
             { characters: [], botPresets: [], modules: [makeMod('b'), makeMod('c')] },
             { ...emptyToSave(), modules: true },
         )
 
         // Second call: no further change. Should emit 0 module ops.
-        const { patch } = await patcher.set(
+        const { patch } = await acknowledgedSet(patcher,
             { characters: [], botPresets: [], modules: [makeMod('b'), makeMod('c')] },
             { ...emptyToSave(), modules: true },
         )
@@ -424,7 +489,7 @@ describe('RisuSavePatcher.set — botPresets path', () => {
             botPresets: [preset('p1'), preset('p3')],
             modules: [],
         }
-        const { patch } = await patcher.set(newDb, { ...emptyToSave(), botPreset: true })
+        const { patch } = await acknowledgedSet(patcher, newDb, { ...emptyToSave(), botPreset: true })
         const presetOps = patch.filter((p: any) =>
             p.path === '/botPresets' || p.path.startsWith('/botPresets/'),
         )
@@ -445,7 +510,7 @@ describe('RisuSavePatcher.set — botPresets path', () => {
             botPresets: [preset('p1'), preset('p2', { temperature: 75 })],
             modules: [],
         }
-        const { patch } = await patcher.set(newDb, { ...emptyToSave(), botPreset: true })
+        const { patch } = await acknowledgedSet(patcher, newDb, { ...emptyToSave(), botPreset: true })
         const presetOps = patch.filter((p: any) => p.path.startsWith('/botPresets/'))
         expect(presetOps.length).toBeGreaterThan(0)
         for (const op of presetOps) expect(op.path.startsWith('/botPresets/1')).toBe(true)
@@ -456,7 +521,7 @@ describe('RisuSavePatcher.set — botPresets path', () => {
 // ──────────────────────────────────────────────────────────────────────────
 // Round-trip integrity — the strongest correctness invariant:
 //
-//   applyPatch(baseline, patcher.set(newState).patch) === normalize(newState)
+//   applyPatch(baseline, acknowledged patch proposal) === normalize(newState)
 //
 // In production, the server applies these patches with fast-json-patch's
 // applyPatch on its own copy of the DB. If our generated ops don't bring
@@ -486,7 +551,7 @@ async function runRoundTrip(
 ) {
     const patcher = new RisuSavePatcher()
     await patcher.init(initial)
-    const { patch } = await patcher.set(next, toSave)
+    const { patch } = await acknowledgedSet(patcher, next, toSave)
     // Simulate the server's pre-image: normalized initial state.
     const serverBaseline = normalizeJSON(initial)
     const afterApply = applyOpsTo(serverBaseline, patch)
@@ -666,10 +731,10 @@ describe('round-trip — patcher ops reconstruct the new state on a baseline', (
 
         // First save: delete one module.
         const after1 = { characters: [], botPresets: [], modules: [modules[1]] }
-        await patcher.set(after1, { ...emptyToSave(), modules: true })
+        await acknowledgedSet(patcher, after1, { ...emptyToSave(), modules: true })
 
         // Second save: no change since after1.
-        const { patch } = await patcher.set(after1, { ...emptyToSave(), modules: true })
+        const { patch } = await acknowledgedSet(patcher, after1, { ...emptyToSave(), modules: true })
         const moduleOrPresetOps = patch.filter((p: any) =>
             p.path === '/modules' || p.path.startsWith('/modules/') ||
             p.path === '/botPresets' || p.path.startsWith('/botPresets/'),
@@ -760,7 +825,7 @@ describe('bounded character patches', () => {
         const patcher = new RisuSavePatcher()
         await patcher.init(initial)
 
-        const { patch } = await patcher.set(next, {
+        const { patch } = await acknowledgedSet(patcher, next, {
             ...emptyToSave(),
             character: ['a'],
         })
@@ -775,7 +840,7 @@ describe('bounded character patches', () => {
             loreBook: nextLore,
         })]))
         expect(reconstructed).toEqual(expected)
-        expect((await patcher.set(next, emptyToSave())).patch).toEqual([])
+        expect((await acknowledgedSet(patcher, next, emptyToSave())).patch).toEqual([])
     })
 })
 
@@ -784,7 +849,7 @@ describe('fast-path — no-op detection after each transition', () => {
         const db = dbWith([chr('a'), chr('b')])
         const p = new RisuSavePatcher()
         await p.init(db)
-        const { patch } = await p.set(clone(db), emptyToSave())
+        const { patch } = await acknowledgedSet(p, clone(db), emptyToSave())
         expect(patch).toEqual([])
     })
 
@@ -794,10 +859,10 @@ describe('fast-path — no-op detection after each transition', () => {
         await p.init(db)
 
         const changed = clone(db); changed.personaPrompt = 'new persona'
-        const r1 = await p.set(clone(changed), { ...emptyToSave(), root: true })
+        const r1 = await acknowledgedSet(p, clone(changed), { ...emptyToSave(), root: true })
         expect(r1.patch.some((o: any) => o.path === '/personaPrompt')).toBe(true)
 
-        const r2 = await p.set(clone(changed), emptyToSave())
+        const r2 = await acknowledgedSet(p, clone(changed), emptyToSave())
         expect(r2.patch).toEqual([])
     })
 
@@ -809,10 +874,10 @@ describe('fast-path — no-op detection after each transition', () => {
         const changed = clone(db); changed.characters[1].desc = 'edited B'
         // Deliberately empty toSave.character: the change must be caught by the
         // JSON compare → protocol hash, not by the save-tracker hint.
-        const r1 = await p.set(clone(changed), emptyToSave())
+        const r1 = await acknowledgedSet(p, clone(changed), emptyToSave())
         expect(r1.patch.some((o: any) => o.path === '/characters/1/desc')).toBe(true)
 
-        const r2 = await p.set(clone(changed), emptyToSave())
+        const r2 = await acknowledgedSet(p, clone(changed), emptyToSave())
         expect(r2.patch).toEqual([])
     })
 
@@ -822,10 +887,10 @@ describe('fast-path — no-op detection after each transition', () => {
         await p.init(db)
 
         const changed = clone(db); changed.characters.push(chr('b'))
-        const r1 = await p.set(clone(changed), emptyToSave())
+        const r1 = await acknowledgedSet(p, clone(changed), emptyToSave())
         expect(r1.patch.some((o: any) => o.path === '/characters')).toBe(true)
 
-        const r2 = await p.set(clone(changed), emptyToSave())
+        const r2 = await acknowledgedSet(p, clone(changed), emptyToSave())
         expect(r2.patch).toEqual([])
     })
 
@@ -835,10 +900,10 @@ describe('fast-path — no-op detection after each transition', () => {
         await p.init(db)
 
         const changed = clone(db); changed.characters.splice(1, 1) // remove b
-        const r1 = await p.set(clone(changed), emptyToSave())
+        const r1 = await acknowledgedSet(p, clone(changed), emptyToSave())
         expect(r1.patch.some((o: any) => o.path === '/characters')).toBe(true)
 
-        const r2 = await p.set(clone(changed), emptyToSave())
+        const r2 = await acknowledgedSet(p, clone(changed), emptyToSave())
         expect(r2.patch).toEqual([])
     })
 
@@ -848,10 +913,10 @@ describe('fast-path — no-op detection after each transition', () => {
         await p.init(db)
 
         const changed = clone(db); changed.characters = [changed.characters[2], changed.characters[0], changed.characters[1]]
-        const r1 = await p.set(clone(changed), emptyToSave())
+        const r1 = await acknowledgedSet(p, clone(changed), emptyToSave())
         expect(r1.patch.some((o: any) => o.path === '/characters')).toBe(true)
 
-        const r2 = await p.set(clone(changed), emptyToSave())
+        const r2 = await acknowledgedSet(p, clone(changed), emptyToSave())
         expect(r2.patch).toEqual([])
     })
 })
@@ -863,11 +928,11 @@ describe('fast-path — a skipped block still catches a later change', () => {
         await p.init(db)
 
         // First: identical save → fast path skips char 'a' and 'b'.
-        expect((await p.set(clone(db), emptyToSave())).patch).toEqual([])
+        expect((await acknowledgedSet(p, clone(db), emptyToSave())).patch).toEqual([])
 
         // Then edit char 'a' (previously skipped). Must be caught.
         const edited = clone(db); edited.characters[0].firstMessage = 'hi'
-        const { patch } = await p.set(clone(edited), emptyToSave())
+        const { patch } = await acknowledgedSet(p, clone(edited), emptyToSave())
         expect(patch.some((o: any) => o.path === '/characters/0/firstMessage')).toBe(true)
     })
 
@@ -875,10 +940,10 @@ describe('fast-path — a skipped block still catches a later change', () => {
         const db = dbWith([chr('a')])
         const p = new RisuSavePatcher()
         await p.init(db)
-        expect((await p.set(clone(db), emptyToSave())).patch).toEqual([])
+        expect((await acknowledgedSet(p, clone(db), emptyToSave())).patch).toEqual([])
 
         const edited = clone(db); edited.username = 'renamed'
-        const { patch } = await p.set(clone(edited), emptyToSave())
+        const { patch } = await acknowledgedSet(p, clone(edited), emptyToSave())
         expect(patch.some((o: any) => o.path === '/username')).toBe(true)
     })
 })
@@ -898,7 +963,7 @@ describe('fast-path — shared (non-cyclic) references round-trip correctly', ()
 
         // Introduce a character that holds the same object under two keys.
         const withShared = dbWith([chr('a', { extA: shared, extB: shared })])
-        const { patch } = await p.set(withShared, { ...emptyToSave(), character: ['a'] })
+        const { patch } = await acknowledgedSet(p, withShared, { ...emptyToSave(), character: ['a'] })
 
         // Server reconstruction must hold the full object in BOTH places (no null).
         const server = JSON.parse(JSON.stringify(normalizeJSON(base)))
@@ -907,7 +972,7 @@ describe('fast-path — shared (non-cyclic) references round-trip correctly', ()
         expect(server.characters[0].extB).toEqual({ tag: 'v', n: 1 })
 
         // Identical re-save is a clean no-op (baseline converged).
-        expect((await p.set(withShared, emptyToSave())).patch).toEqual([])
+        expect((await acknowledgedSet(p, withShared, emptyToSave())).patch).toEqual([])
     })
 
     test('un-sharing into deep-equal objects is a no-op (no spurious ops)', async () => {
@@ -917,7 +982,7 @@ describe('fast-path — shared (non-cyclic) references round-trip correctly', ()
 
         // Un-share: two independent but deep-equal objects — content unchanged.
         const unshared = dbWith([chr('a', { extA: { tag: 'v', n: 1 }, extB: { tag: 'v', n: 1 } })])
-        const { patch } = await p.set(unshared, emptyToSave())
+        const { patch } = await acknowledgedSet(p, unshared, emptyToSave())
         expect(patch).toEqual([])
     })
 
@@ -928,7 +993,7 @@ describe('fast-path — shared (non-cyclic) references round-trip correctly', ()
 
         // Now genuinely change extB's content.
         const changed = dbWith([chr('a', { extA: { tag: 'v', n: 1 }, extB: { tag: 'v', n: 2 } })])
-        const { patch } = await p.set(changed, emptyToSave())
+        const { patch } = await acknowledgedSet(p, changed, emptyToSave())
         expect(patch.some((o: any) => o.path.startsWith('/characters/0/extB'))).toBe(true)
     })
 
@@ -940,13 +1005,13 @@ describe('fast-path — shared (non-cyclic) references round-trip correctly', ()
         await p.init(base)
 
         const withShared = dbWith([chr('a')], { sdProvider: shared, customCss: shared } as any)
-        const { patch } = await p.set(withShared, { ...emptyToSave(), root: true })
+        const { patch } = await acknowledgedSet(p, withShared, { ...emptyToSave(), root: true })
         const server = JSON.parse(JSON.stringify(normalizeJSON(base)))
         apply(server, patch)
         expect(server.sdProvider).toEqual({ theme: 'x' })
         expect(server.customCss).toEqual({ theme: 'x' })
 
-        expect((await p.set(withShared, emptyToSave())).patch).toEqual([])
+        expect((await acknowledgedSet(p, withShared, emptyToSave())).patch).toEqual([])
     })
 })
 
@@ -957,18 +1022,18 @@ describe('fast-path — expectedHash stays protocol-consistent', () => {
         await live.init(db)
 
         // Drive several transitions on the live patcher.
-        const s1 = clone(db); s1.personaPrompt = 'x'; await live.set(clone(s1), { ...emptyToSave(), root: true })
-        const s2 = clone(s1); s2.characters[0].desc = 'y'; await live.set(clone(s2), emptyToSave())
-        const s3 = clone(s2); s3.characters.push(chr('c')); await live.set(clone(s3), emptyToSave())
-        const s4 = clone(s3); s4.characters.splice(0, 1); await live.set(clone(s4), emptyToSave())
+        const s1 = clone(db); s1.personaPrompt = 'x'; await acknowledgedSet(live, clone(s1), { ...emptyToSave(), root: true })
+        const s2 = clone(s1); s2.characters[0].desc = 'y'; await acknowledgedSet(live, clone(s2), emptyToSave())
+        const s3 = clone(s2); s3.characters.push(chr('c')); await acknowledgedSet(live, clone(s3), emptyToSave())
+        const s4 = clone(s3); s4.characters.splice(0, 1); await acknowledgedSet(live, clone(s4), emptyToSave())
 
         // expectedHash of the live patcher's next save (pre-image = current state)
-        const liveHash = (await live.set(clone(s4), emptyToSave())).expectedHash
+        const liveHash = (await acknowledgedSet(live, clone(s4), emptyToSave())).expectedHash
 
         // A fresh patcher initialised directly to the final state must agree.
         const fresh = new RisuSavePatcher()
         await fresh.init(clone(s4))
-        const freshHash = (await fresh.set(clone(s4), emptyToSave())).expectedHash
+        const freshHash = (await acknowledgedSet(fresh, clone(s4), emptyToSave())).expectedHash
 
         expect(liveHash).toBe(freshHash)
     })
@@ -992,13 +1057,13 @@ describe('fast-path — per-root-key granularity', () => {
         await p.init(db)
 
         const changed = clone(db); changed.personaPrompt = 'edited'
-        const { patch } = await p.set(clone(changed), { ...emptyToSave(), root: true })
+        const { patch } = await acknowledgedSet(p, clone(changed), { ...emptyToSave(), root: true })
         expect(patch.length).toBeGreaterThan(0)
         for (const op of patch) {
             expect(op.path.startsWith('/personaPrompt')).toBe(true)
         }
 
-        const r2 = await p.set(clone(changed), emptyToSave())
+        const r2 = await acknowledgedSet(p, clone(changed), emptyToSave())
         expect(r2.patch).toEqual([])
     })
 
@@ -1008,14 +1073,14 @@ describe('fast-path — per-root-key granularity', () => {
         await p.init(db)
 
         const added = clone(db); added.newSetting = { on: true }
-        const r1 = await p.set(clone(added), { ...emptyToSave(), root: true })
+        const r1 = await acknowledgedSet(p, clone(added), { ...emptyToSave(), root: true })
         expect(r1.patch.some((o: any) => o.op === 'add' && o.path === '/newSetting')).toBe(true)
-        expect((await p.set(clone(added), emptyToSave())).patch).toEqual([])
+        expect((await acknowledgedSet(p, clone(added), emptyToSave())).patch).toEqual([])
 
         const removed = clone(added); delete removed.newSetting
-        const r2 = await p.set(clone(removed), { ...emptyToSave(), root: true })
+        const r2 = await acknowledgedSet(p, clone(removed), { ...emptyToSave(), root: true })
         expect(r2.patch.some((o: any) => o.op === 'remove' && o.path === '/newSetting')).toBe(true)
-        expect((await p.set(clone(removed), emptyToSave())).patch).toEqual([])
+        expect((await acknowledgedSet(p, clone(removed), emptyToSave())).patch).toEqual([])
     })
 
     test('an own __proto__ root key never produces a forbidden patch op', async () => {
@@ -1031,7 +1096,7 @@ describe('fast-path — per-root-key granularity', () => {
         const p = new RisuSavePatcher()
         await p.init(db)
         const changed = clone(db); changed.personaPrompt = 'edited'
-        const { patch } = await p.set(clone(changed), { ...emptyToSave(), root: true })
+        const { patch } = await acknowledgedSet(p, clone(changed), { ...emptyToSave(), root: true })
 
         expect(patch.some((o: any) => o.path === '/__proto__' || o.path.startsWith('/__proto__/'))).toBe(false)
         expect(patch.some((o: any) => o.path === '/personaPrompt')).toBe(true)
@@ -1039,7 +1104,7 @@ describe('fast-path — per-root-key granularity', () => {
         const serverState = JSON.parse(JSON.stringify(normalizeJSON(db)))
         expect(() => apply(serverState, patch)).not.toThrow()
         // And converge to a no-op.
-        expect((await p.set(clone(changed), emptyToSave())).patch).toEqual([])
+        expect((await acknowledgedSet(p, clone(changed), emptyToSave())).patch).toEqual([])
     })
 
     test('an own plugin storage __proto__ key uses a safe whole-map replacement', async () => {
@@ -1062,7 +1127,7 @@ describe('fast-path — per-root-key granularity', () => {
         const p = new RisuSavePatcher()
         await p.init(baseline)
 
-        const { patch } = await p.set(changed, {
+        const { patch } = await acknowledgedSet(p, changed, {
             ...emptyToSave(),
             pluginCustomStorage: true,
         })
@@ -1075,7 +1140,7 @@ describe('fast-path — per-root-key granularity', () => {
         expect(() => apply(serverState, patch, true)).not.toThrow()
         expect(Object.hasOwn(serverState.pluginCustomStorage, '__proto__')).toBe(true)
         expect(serverState.pluginCustomStorage.__proto__).toEqual({ version: 2 })
-        expect((await p.set(changed, emptyToSave())).patch).toEqual([])
+        expect((await acknowledgedSet(p, changed, emptyToSave())).patch).toEqual([])
     })
 
     test('a root value with toJSON()→undefined is kept, not removed', async () => {
@@ -1088,13 +1153,13 @@ describe('fast-path — per-root-key granularity', () => {
         await p.init(db)
 
         // Unchanged save: must be a pure no-op (no remove of /weird).
-        const { patch } = await p.set(db, { ...emptyToSave(), root: true })
+        const { patch } = await acknowledgedSet(p, db, { ...emptyToSave(), root: true })
         expect(patch.some((o: any) => o.path === '/weird' || o.path.startsWith('/weird/'))).toBe(false)
         expect(patch).toEqual([])
 
-        const liveHash = (await p.set(db, emptyToSave())).expectedHash
+        const liveHash = (await acknowledgedSet(p, db, emptyToSave())).expectedHash
         const fresh = new RisuSavePatcher(); await fresh.init(db)
-        expect(liveHash).toBe((await fresh.set(db, emptyToSave())).expectedHash)
+        expect(liveHash).toBe((await acknowledgedSet(fresh, db, emptyToSave())).expectedHash)
     })
 
     test('a top-level bigint root value drops cleanly — no undefined baseline / hash stays consistent', async () => {
@@ -1105,11 +1170,11 @@ describe('fast-path — per-root-key granularity', () => {
         db.bsig = 123n
         const p = new RisuSavePatcher()
         await p.init(db)
-        await p.set(db, { ...emptyToSave(), root: true })
+        await acknowledgedSet(p, db, { ...emptyToSave(), root: true })
 
-        const liveHash = (await p.set(db, emptyToSave())).expectedHash
+        const liveHash = (await acknowledgedSet(p, db, emptyToSave())).expectedHash
         const fresh = new RisuSavePatcher(); await fresh.init(db)
-        const freshHash = (await fresh.set(db, emptyToSave())).expectedHash
+        const freshHash = (await acknowledgedSet(fresh, db, emptyToSave())).expectedHash
         expect(liveHash).toBe(freshHash)
     })
 
@@ -1123,7 +1188,7 @@ describe('fast-path — per-root-key granularity', () => {
         changed.personaPrompt = 'new'
         changed.sdProvider = { x: 2, y: 3 }
         delete changed.themeList
-        const { patch } = await p.set(clone(changed), { ...emptyToSave(), root: true })
+        const { patch } = await acknowledgedSet(p, clone(changed), { ...emptyToSave(), root: true })
 
         const serverState = JSON.parse(JSON.stringify(normalizeJSON(db)))
         apply(serverState, patch)
@@ -1143,13 +1208,13 @@ describe('fast-path — per-module granularity', () => {
         await p.init(db)
 
         const changed = clone(db); changed.modules[1].lorebook[0].content = 'edited'
-        const { patch } = await p.set(clone(changed), { ...emptyToSave(), modules: true })
+        const { patch } = await acknowledgedSet(p, clone(changed), { ...emptyToSave(), modules: true })
         expect(patch.length).toBeGreaterThan(0)
         for (const op of patch) {
             expect(op.path.startsWith('/modules/1')).toBe(true)
         }
 
-        const r2 = await p.set(clone(changed), { ...emptyToSave(), modules: true })
+        const r2 = await acknowledgedSet(p, clone(changed), { ...emptyToSave(), modules: true })
         expect(r2.patch).toEqual([])
     })
 
@@ -1160,15 +1225,15 @@ describe('fast-path — per-module granularity', () => {
         await p.init(db)
 
         const added = clone(db); added.modules.push(mod('m3'))
-        const r1 = await p.set(clone(added), { ...emptyToSave(), modules: true })
+        const r1 = await acknowledgedSet(p, clone(added), { ...emptyToSave(), modules: true })
         expect(r1.patch).toEqual([{ op: 'replace', path: '/modules', value: normalizeJSON(clone(added)).modules }])
-        expect((await p.set(clone(added), { ...emptyToSave(), modules: true })).patch).toEqual([])
+        expect((await acknowledgedSet(p, clone(added), { ...emptyToSave(), modules: true })).patch).toEqual([])
 
         const reordered = clone(added); reordered.modules = [reordered.modules[2], reordered.modules[0], reordered.modules[1]]
-        const r2 = await p.set(clone(reordered), { ...emptyToSave(), modules: true })
+        const r2 = await acknowledgedSet(p, clone(reordered), { ...emptyToSave(), modules: true })
         expect(r2.patch.length).toBe(1)
         expect(r2.patch[0].path).toBe('/modules')
-        expect((await p.set(clone(reordered), { ...emptyToSave(), modules: true })).patch).toEqual([])
+        expect((await acknowledgedSet(p, clone(reordered), { ...emptyToSave(), modules: true })).patch).toEqual([])
     })
 
     test('per-module element-wise ops reconstruct the server state (applyPatch round-trip)', async () => {
@@ -1181,7 +1246,7 @@ describe('fast-path — per-module granularity', () => {
         const changed = clone(db)
         changed.modules[0].lorebook[0].content = 'edit0'
         changed.modules[2].name = 'renamed'
-        const { patch } = await p.set(clone(changed), { ...emptyToSave(), modules: true })
+        const { patch } = await acknowledgedSet(p, clone(changed), { ...emptyToSave(), modules: true })
 
         const serverState = JSON.parse(JSON.stringify(normalizeJSON(db)))
         apply(serverState, patch)
@@ -1196,14 +1261,14 @@ describe('fast-path — per-module granularity', () => {
 
         // Mutate one module via the element-wise path, then another save.
         const s1 = clone(db); s1.modules[0].lorebook[0].content = 'x1'
-        await live.set(clone(s1), { ...emptyToSave(), modules: true })
+        await acknowledgedSet(live, clone(s1), { ...emptyToSave(), modules: true })
         const s2 = clone(s1); s2.modules[1].name = 'renamed'
-        await live.set(clone(s2), { ...emptyToSave(), modules: true })
+        await acknowledgedSet(live, clone(s2), { ...emptyToSave(), modules: true })
 
-        const liveHash = (await live.set(clone(s2), emptyToSave())).expectedHash
+        const liveHash = (await acknowledgedSet(live, clone(s2), emptyToSave())).expectedHash
         const fresh = new RisuSavePatcher()
         await fresh.init(clone(s2))
-        const freshHash = (await fresh.set(clone(s2), emptyToSave())).expectedHash
+        const freshHash = (await acknowledgedSet(fresh, clone(s2), emptyToSave())).expectedHash
         expect(liveHash).toBe(freshHash)
     })
 
@@ -1217,14 +1282,14 @@ describe('fast-path — per-module granularity', () => {
         await live.init(db)
 
         const s1 = clone(db); s1.modules[0].lorebook[0].content = 'edited'
-        const r1 = await live.set(clone(s1), { ...emptyToSave(), modules: true })
+        const r1 = await acknowledgedSet(live, clone(s1), { ...emptyToSave(), modules: true })
         expect(r1.patch.some((o: any) => o.path.startsWith('/modules/0'))).toBe(true)
-        expect((await live.set(clone(s1), { ...emptyToSave(), modules: true })).patch).toEqual([])
+        expect((await acknowledgedSet(live, clone(s1), { ...emptyToSave(), modules: true })).patch).toEqual([])
 
-        const liveHash = (await live.set(clone(s1), emptyToSave())).expectedHash
+        const liveHash = (await acknowledgedSet(live, clone(s1), emptyToSave())).expectedHash
         const fresh = new RisuSavePatcher()
         await fresh.init(clone(s1))
-        const freshHash = (await fresh.set(clone(s1), emptyToSave())).expectedHash
+        const freshHash = (await acknowledgedSet(fresh, clone(s1), emptyToSave())).expectedHash
         expect(liveHash).toBe(freshHash)
     })
 
@@ -1236,14 +1301,14 @@ describe('fast-path — per-module granularity', () => {
 
         // Numeric id → structural fallback: whole-array replace, never element-wise.
         const s1 = clone(db); s1.modules[0].lorebook[0].content = 'edited'
-        const r1 = await live.set(clone(s1), { ...emptyToSave(), modules: true })
+        const r1 = await acknowledgedSet(live, clone(s1), { ...emptyToSave(), modules: true })
         expect(r1.patch.length).toBe(1)
         expect(r1.patch[0].path).toBe('/modules')
 
-        const liveHash = (await live.set(clone(s1), emptyToSave())).expectedHash
+        const liveHash = (await acknowledgedSet(live, clone(s1), emptyToSave())).expectedHash
         const fresh = new RisuSavePatcher()
         await fresh.init(clone(s1))
-        const freshHash = (await fresh.set(clone(s1), emptyToSave())).expectedHash
+        const freshHash = (await acknowledgedSet(fresh, clone(s1), emptyToSave())).expectedHash
         expect(liveHash).toBe(freshHash)
     })
 })

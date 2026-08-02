@@ -7,7 +7,9 @@ import {
 import {
     cloneDatabaseState,
     mergeTrackedDatabaseOnConflict,
+    mergeTrackedDatabaseOnConflictLegacyForTests,
 } from "./databaseClone";
+import type { toSaveType } from "./risuSave";
 
 function pluginRecord(value: unknown) {
     const record = createDatabasePluginStorageRecord<unknown>();
@@ -177,5 +179,198 @@ describe("database-aware plugin storage cloning", () => {
         expect(merged.characters[0].chats.map((chat: any) => chat.id)).toEqual([
             "concurrent-chat",
         ]);
+    });
+});
+
+type ConflictScenario = {
+    name: string;
+    mutateLocal?: (database: any) => void;
+    mutateRemote?: (database: any) => void;
+    toSave: toSaveType;
+};
+
+function tracked(overrides: Partial<toSaveType> = {}): toSaveType {
+    return { ...emptyToSave(), ...overrides };
+}
+
+function baseConflictDatabase() {
+    return {
+        username: "base-user",
+        personaPrompt: "base-prompt",
+        optimizePluginMemory: true,
+        pluginStorageGeneration: "authoritative-generation",
+        pluginStorageFolded: false,
+        characters: [
+            {
+                chaId: "char-a",
+                name: "Character A",
+                order: 0,
+                chats: [
+                    { id: "chat-a", name: "Chat A", message: [{ role: "user", data: "base-a" }] },
+                    { id: "chat-b", name: "Chat B", message: [{ role: "user", data: "base-b" }] },
+                ],
+            },
+            { chaId: "char-b", name: "Character B", order: 1, chats: [] },
+        ],
+        botPresets: [
+            { id: "preset-a", name: "Preset A", temperature: 70 },
+            { id: "preset-b", name: "Preset B", temperature: 80 },
+        ],
+        botPresetsId: 0,
+        modules: [
+            { id: "module-a", name: "Module A", data: "base-a" },
+            { id: "module-b", name: "Module B", data: "base-b" },
+        ],
+        plugins: [{ id: "plugin-a", version: "1.0.0" }],
+        pluginCustomStorage: pluginRecord({ source: "base-value" }),
+        pluginStorageMeta: pluginRecord({ plugin: "Base owner", updatedAt: 1 }),
+    } as any;
+}
+
+function triad(
+    branch: string,
+    mutateLocal: (database: any) => void,
+    mutateRemote: (database: any) => void,
+    toSave: toSaveType,
+): ConflictScenario[] {
+    return [
+        { name: `${branch}: local only`, mutateLocal, toSave },
+        { name: `${branch}: remote only`, mutateRemote, toSave: tracked() },
+        { name: `${branch}: both sides`, mutateLocal, mutateRemote, toSave },
+    ];
+}
+
+const conflictParityScenarios: ConflictScenario[] = [
+    ...triad(
+        "root",
+        db => { db.username = "local-user"; db.localRoot = { value: 1 }; },
+        db => { db.username = "remote-user"; db.remoteRoot = { value: 2 }; },
+        tracked({ root: true }),
+    ),
+    ...triad(
+        "character fields",
+        db => { db.characters[0].name = "Local A"; },
+        db => { db.characters[0].name = "Remote A"; },
+        tracked({ character: ["char-a"] }),
+    ),
+    ...triad(
+        "character add",
+        db => { db.characters.push({ chaId: "char-local", name: "Local add", chats: [] }); },
+        db => { db.characters.push({ chaId: "char-remote", name: "Remote add", chats: [] }); },
+        tracked({ character: ["char-local"] }),
+    ),
+    ...triad(
+        "character remove",
+        db => { db.characters = db.characters.filter((character: any) => character.chaId !== "char-b"); },
+        db => { db.characters[1].name = "Remote changed before local remove"; },
+        tracked({ character: ["char-b"] }),
+    ),
+    ...triad(
+        "character reorder",
+        db => { db.characters = [db.characters[1], db.characters[0]]; },
+        db => { db.characters[0].name = "Remote A during reorder"; },
+        tracked({ character: ["char-b", "char-a"] }),
+    ),
+    ...triad(
+        "chat",
+        db => { db.characters[0].chats[0].message[0].data = "local chat edit"; },
+        db => { db.characters[0].chats[0].message[0].data = "remote chat edit"; },
+        tracked({ chat: [["char-a", "chat-a"]] }),
+    ),
+    ...triad(
+        "bot presets",
+        db => { db.botPresets = [db.botPresets[1], { id: "preset-local", name: "Local preset" }]; db.botPresetsId = 1; },
+        db => { db.botPresets[0].temperature = 99; },
+        tracked({ botPreset: true }),
+    ),
+    ...triad(
+        "modules",
+        db => { db.modules = [{ id: "module-local", name: "Local module" }, db.modules[0]]; },
+        db => { db.modules[0].data = "remote module edit"; },
+        tracked({ modules: true }),
+    ),
+    ...triad(
+        "plugins",
+        db => { db.plugins = [{ id: "plugin-local", version: "2.0.0" }]; },
+        db => { db.plugins[0].version = "1.1.0"; },
+        tracked({ plugins: true }),
+    ),
+    ...triad(
+        "plugin values and metadata",
+        db => {
+            db.pluginCustomStorage = pluginRecord({ source: "local-value" });
+            db.pluginStorageMeta = pluginRecord({ plugin: "Local owner", updatedAt: 2 });
+        },
+        db => {
+            db.pluginCustomStorage = pluginRecord({ source: "remote-value" });
+            db.pluginStorageMeta = pluginRecord({ plugin: "Remote owner", updatedAt: 3 });
+        },
+        tracked({ pluginCustomStorage: true }),
+    ),
+    {
+        name: "degenerate: no local changes",
+        mutateRemote: db => {
+            db.username = "remote-only";
+            db.characters[0].chats.push({ id: "remote-chat", name: "Remote", message: [] });
+        },
+        toSave: tracked(),
+    },
+    {
+        name: "degenerate: no remote changes",
+        mutateLocal: db => {
+            db.personaPrompt = "local-only";
+            db.characters[0].chats[0].message[0].data = "local-only-chat";
+        },
+        toSave: tracked({ root: true, chat: [["char-a", "chat-a"]] }),
+    },
+];
+
+describe("in-place conflict merge differential parity", () => {
+    test.each(conflictParityScenarios)("$name", ({ mutateLocal, mutateRemote, toSave }) => {
+        const base = baseConflictDatabase();
+        const local = cloneDatabaseState(base);
+        const remote = cloneDatabaseState(base);
+        mutateLocal?.(local);
+        mutateRemote?.(remote);
+        const knownChats = new Map([
+            ["char-a", new Set(["chat-a", "chat-b"])],
+            ["char-b", new Set<string>()],
+        ]);
+
+        const legacy = mergeTrackedDatabaseOnConflictLegacyForTests(
+            cloneDatabaseState(remote),
+            cloneDatabaseState(local),
+            cloneDatabaseState(toSave as any),
+            knownChats,
+        );
+        const authoritativeWorkingGraph = cloneDatabaseState(remote);
+        const merged = mergeTrackedDatabaseOnConflict(
+            authoritativeWorkingGraph,
+            cloneDatabaseState(local),
+            cloneDatabaseState(toSave as any),
+            knownChats,
+        );
+
+        expect(merged).toBe(authoritativeWorkingGraph);
+        expect(merged).toEqual(legacy);
+    });
+
+    test("keeps optimized publication controls authoritative during a generic root merge", () => {
+        const local = baseConflictDatabase();
+        const latest = baseConflictDatabase();
+        local.username = "local root edit";
+        local.optimizePluginMemory = false;
+        local.pluginStorageGeneration = "stale-local-generation";
+        local.pluginStorageFolded = true;
+        latest.optimizePluginMemory = true;
+        latest.pluginStorageGeneration = "fresh-server-generation";
+        latest.pluginStorageFolded = false;
+
+        const merged = mergeTrackedDatabaseOnConflict(latest, local, tracked({ root: true }));
+
+        expect(merged.username).toBe("local root edit");
+        expect(merged.optimizePluginMemory).toBe(true);
+        expect(merged.pluginStorageGeneration).toBe("fresh-server-generation");
+        expect((merged as any).pluginStorageFolded).toBe(false);
     });
 });

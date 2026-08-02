@@ -355,6 +355,14 @@ export class RisuSaveEncoder {
     // In-memory only (rebuilt by init()), so the representation is free to
     // differ from the patcher's protocol-level calculateHash.
     private characterJsons: { [key: string]: string } = {};
+    private baselineJsons = {
+        root: '{}',
+        preset: '[]',
+        modules: '[]',
+        plugins: '[]',
+        pluginStorage: '{}',
+    };
+    private normalizedBaseline: Database | null = null;
     private readonly cacheGenerationOwner = Symbol('RisuSaveEncoder cache generation');
     private readonly cachedBlocks = new Map<string, RisuSaveCachedBlock>();
 
@@ -382,6 +390,14 @@ export class RisuSaveEncoder {
         this.cachedBlocks.clear();
         this.blocks = {};
         this.characterJsons = {};
+        this.normalizedBaseline = null;
+        this.baselineJsons = {
+            root: '{}',
+            preset: '[]',
+            modules: '[]',
+            plugins: '[]',
+            pluginStorage: '{}',
+        };
         const {
             compression = false,
             skipRemoteSavingOnCharacters = true
@@ -397,39 +413,44 @@ export class RisuSaveEncoder {
                 obj[key] = data[key]
             }
         }
+        this.baselineJsons.root = JSON.stringify(obj);
         this.blocks['root'] = await this.encodeBlock({
             compression,
-            data: JSON.stringify(obj),
+            data: this.baselineJsons.root,
             type: RisuSaveType.ROOT,
             name: 'root',
             // The root is required to discover the directory and therefore
             // can never itself be recovered through that directory.
             cache: false,
         });
+        this.baselineJsons.preset = JSON.stringify(data.botPresets);
         this.blocks['preset'] = await this.encodeBlock({
             compression,
-            data: JSON.stringify(data.botPresets),
+            data: this.baselineJsons.preset,
             type: RisuSaveType.BOTPRESET,
             name: 'preset'
         });
+        this.baselineJsons.modules = JSON.stringify(data.modules);
         this.blocks['modules'] = await this.encodeBlock({
             compression,
-            data: JSON.stringify(data.modules),
+            data: this.baselineJsons.modules,
             type: RisuSaveType.MODULES,
             name: 'modules'
         });
+        this.baselineJsons.plugins = JSON.stringify(data.plugins);
         this.blocks['plugins'] = await this.encodeBlock({
             compression,
-            data: JSON.stringify(data.plugins),
+            data: this.baselineJsons.plugins,
             type: RisuSaveType.PLUGINS,
             name: 'plugins'
         });
         // In optimized mode the reconciler keeps this object empty; retaining
         // the normal block keeps the save format compatible without pulling
         // any pluginsave/ KV values back into client memory.
+        this.baselineJsons.pluginStorage = JSON.stringify(data.pluginCustomStorage);
         this.blocks['pluginStorage'] = await this.encodeBlock({
             compression,
-            data: JSON.stringify(data.pluginCustomStorage),
+            data: this.baselineJsons.pluginStorage,
             type: RisuSaveType.PLUGIN_STORAGE,
             name: 'pluginStorage'
         });
@@ -464,6 +485,7 @@ export class RisuSaveEncoder {
 
     async set(data:Database, toSave:toSaveType){
         this.invalidatePublishedCache();
+        this.normalizedBaseline = null;
         let obj:Record<any,any> = {}
         let keys = Object.keys(data)
         for(const key of keys){
@@ -533,17 +555,19 @@ export class RisuSaveEncoder {
         }
 
         if(toSave.botPreset){
+            this.baselineJsons.preset = JSON.stringify(data.botPresets);
             this.blocks['preset'] = await this.encodeBlock({
                 compression: this.compression,
-                data: JSON.stringify(data.botPresets),
+                data: this.baselineJsons.preset,
                 type: RisuSaveType.BOTPRESET,
                 name: 'preset'
             });
         }
         if(toSave.modules){
+            this.baselineJsons.modules = JSON.stringify(data.modules);
             this.blocks['modules'] = await this.encodeBlock({
                 compression: this.compression,
-                data: JSON.stringify(data.modules),
+                data: this.baselineJsons.modules,
                 type: RisuSaveType.MODULES,
                 name: 'modules'
             });
@@ -552,27 +576,30 @@ export class RisuSaveEncoder {
         if(toSave.pluginCustomStorage){
             // Mode transitions mark this block dirty so externalization writes
             // an empty block and internalization writes the restored inline map.
+            this.baselineJsons.pluginStorage = JSON.stringify(data.pluginCustomStorage);
             this.blocks['pluginStorage'] = await this.encodeBlock({
                 compression: this.compression,
-                data: JSON.stringify(data.pluginCustomStorage),
+                data: this.baselineJsons.pluginStorage,
                 type: RisuSaveType.PLUGIN_STORAGE,
                 name: 'pluginStorage'
             });
         }
 
         if(toSave.plugins){
+            this.baselineJsons.plugins = JSON.stringify(data.plugins);
             this.blocks['plugins'] = await this.encodeBlock({
                 compression: this.compression,
-                data: JSON.stringify(data.plugins),
+                data: this.baselineJsons.plugins,
                 type: RisuSaveType.PLUGINS,
                 name: 'plugins'
             });
         }
 
         obj["__directory"] = Object.keys(this.blocks).filter(key => key !== 'root');
+        this.baselineJsons.root = JSON.stringify(obj);
         this.blocks['root'] = await this.encodeBlock({
             compression: this.compression,
-            data: JSON.stringify(obj),
+            data: this.baselineJsons.root,
             type: RisuSaveType.ROOT,
             name: 'root',
             cache: false,
@@ -600,8 +627,65 @@ export class RisuSaveEncoder {
             view.set(this.blocks[key], offset);
             offset += this.blocks[key].length;
         }
+        this.normalizedBaseline = this.buildNormalizedBaseline();
         console.log(Object.keys(this.blocks).length, 'blocks encoded');
         return arrayBuf;
+    }
+
+    private buildNormalizedBaseline(): Database {
+        const root = JSON.parse(this.baselineJsons.root) as Record<string, unknown>;
+        const baseline: Record<string, any> = {};
+        for (const key in root) {
+            if (!key.startsWith('__')) baseline[key] = root[key];
+        }
+        baseline.characters = [];
+        for (const key of Object.keys(this.blocks)) {
+            if (key === 'root' || key === 'preset' || key === 'modules'
+                || key === 'plugins' || key === 'pluginStorage' || key === 'config') {
+                continue;
+            }
+            const characterJson = this.characterJsons[key];
+            if (characterJson !== undefined) baseline.characters.push(JSON.parse(characterJson));
+        }
+        baseline.botPresets = JSON.parse(this.baselineJsons.preset);
+        baseline.modules = JSON.parse(this.baselineJsons.modules);
+        baseline.plugins = JSON.parse(this.baselineJsons.plugins);
+        baseline.pluginCustomStorage = JSON.parse(this.baselineJsons.pluginStorage);
+        if (!Array.isArray(baseline.botPresets) || baseline.botPresets.length === 0) {
+            baseline.botPresets = [createBotPresetTemplate()];
+            baseline.botPresetsId = 0;
+        }
+        return baseline as Database;
+    }
+
+    /** Transfer the exact graph represented by the most recent encode(). */
+    takeNormalizedBaseline(): Database {
+        if (!this.normalizedBaseline) {
+            throw new Error('RisuSave encoder has no assembled normalized baseline');
+        }
+        const baseline = this.normalizedBaseline;
+        this.normalizedBaseline = null;
+        return baseline;
+    }
+
+    discardNormalizedBaseline(): void {
+        this.normalizedBaseline = null;
+    }
+
+    /** Drop every payload reference before a replacement encoder is built. */
+    retire(): void {
+        this.invalidatePublishedCache();
+        this.blocks = {};
+        this.characterJsons = {};
+        this.cachedBlocks.clear();
+        this.normalizedBaseline = null;
+        this.baselineJsons = {
+            root: '{}',
+            preset: '[]',
+            modules: '[]',
+            plugins: '[]',
+            pluginStorage: '{}',
+        };
     }
 
     async encodeBlock(arg:EncodeBlockArg, option:EncodeBlockOption = { remote: 'none' }){
@@ -1487,8 +1571,28 @@ export function buildBoundedCharacterPatch(
     return scoped
 }
 
+export type RisuSavePatchProposal = {
+    patch: any[];
+    expectedHash: string;
+};
+
+type RisuSavePatcherState = {
+    lastSyncedDb: any;
+    hashBlocks: { [key: string]: number };
+    lastRootKeyJsons: Map<string, string>;
+    lastCharJsons: Map<string, string>;
+    lastModuleJsons: Map<string, string>;
+    moduleItemHashes: Map<string, number>;
+};
+
+type PendingRisuSavePatchProposal = {
+    revision: number;
+    state: RisuSavePatcherState | null;
+    conflictDirtyBranches: toSaveType;
+};
+
 export class RisuSavePatcher {
-    private lastSyncedDb: any;
+    private lastSyncedDb: any = { characters: [] };
     private hashBlocks: { [key: string]: number } = {};
     // Cheap change pre-check baselines. calculateHash over normalizeJSON'd data
     // is the client↔server patch protocol (the server recomputes the same hash,
@@ -1508,6 +1612,8 @@ export class RisuSavePatcher {
     private lastCharJsons = new Map<string, string>();
     private lastModuleJsons = new Map<string, string>();
     private moduleItemHashes = new Map<string, number>();
+    private revision = 0;
+    private pendingProposals = new WeakMap<RisuSavePatchProposal, PendingRisuSavePatchProposal>();
 
     hash(): string {
         this.hashBlocks['characters'] = SEED_ARRAY;
@@ -1524,7 +1630,18 @@ export class RisuSavePatcher {
     }
 
     async init(data: any) {
-        this.lastSyncedDb = normalizeJSON(data);
+        this.initializeBaseline(normalizeJSON(data));
+    }
+
+    /** Adopt an exact, detached database graph already normalized by the encoder. */
+    async initNormalizedBaseline(data: any) {
+        this.initializeBaseline(data);
+    }
+
+    private initializeBaseline(data: any) {
+        this.revision += 1;
+        this.pendingProposals = new WeakMap();
+        this.lastSyncedDb = data;
         if (!Array.isArray(this.lastSyncedDb.characters)) {
             this.lastSyncedDb.characters = [];
         }
@@ -1574,7 +1691,162 @@ export class RisuSavePatcher {
         }
     }
 
-    async set(data: any, toSave: toSaveType): Promise<{ patch: any[]; expectedHash: string }> {
+    private captureState(): RisuSavePatcherState {
+        return {
+            lastSyncedDb: this.lastSyncedDb,
+            hashBlocks: this.hashBlocks,
+            lastRootKeyJsons: this.lastRootKeyJsons,
+            lastCharJsons: this.lastCharJsons,
+            lastModuleJsons: this.lastModuleJsons,
+            moduleItemHashes: this.moduleItemHashes,
+        };
+    }
+
+    private applyState(state: RisuSavePatcherState): void {
+        this.lastSyncedDb = state.lastSyncedDb;
+        this.hashBlocks = state.hashBlocks;
+        this.lastRootKeyJsons = state.lastRootKeyJsons;
+        this.lastCharJsons = state.lastCharJsons;
+        this.lastModuleJsons = state.lastModuleJsons;
+        this.moduleItemHashes = state.moduleItemHashes;
+    }
+
+    private forkForProposal(): RisuSavePatcher {
+        const fork = new RisuSavePatcher();
+        fork.lastSyncedDb = {
+            ...this.lastSyncedDb,
+            characters: [...(this.lastSyncedDb.characters ?? [])],
+            modules: Array.isArray(this.lastSyncedDb.modules)
+                ? [...this.lastSyncedDb.modules]
+                : this.lastSyncedDb.modules,
+        };
+        fork.hashBlocks = { ...this.hashBlocks };
+        fork.lastRootKeyJsons = new Map(this.lastRootKeyJsons);
+        fork.lastCharJsons = new Map(this.lastCharJsons);
+        fork.lastModuleJsons = new Map(this.lastModuleJsons);
+        fork.moduleItemHashes = new Map(this.moduleItemHashes);
+        return fork;
+    }
+
+    /**
+     * Prepare a patch without advancing the acknowledged baseline. Call
+     * commit() only after the server accepts this exact proposal.
+     */
+    async set(data: any, toSave: toSaveType): Promise<RisuSavePatchProposal> {
+        const fork = this.forkForProposal();
+        const proposal = await fork.advance(data, toSave);
+        this.pendingProposals.set(proposal, {
+            revision: this.revision,
+            state: fork.captureState(),
+            conflictDirtyBranches: this.deriveConflictDirtyBranches(
+                proposal.patch,
+                data,
+                toSave,
+            ),
+        });
+        return proposal;
+    }
+
+    private deriveConflictDirtyBranches(
+        patch: any[],
+        data: any,
+        tracked: toSaveType,
+    ): toSaveType {
+        const dirty: toSaveType = {
+            character: [...tracked.character],
+            chat: tracked.chat.map(([chaId, chatId]) => [chaId, chatId]),
+            root: tracked.root,
+            botPreset: tracked.botPreset,
+            modules: tracked.modules,
+            plugins: tracked.plugins,
+            pluginCustomStorage: tracked.pluginCustomStorage,
+        };
+        const characterIds = new Set(dirty.character.filter(Boolean));
+        const baselineCharacters = Array.isArray(this.lastSyncedDb.characters)
+            ? this.lastSyncedDb.characters
+            : [];
+        const currentCharacters = Array.isArray(data.characters) ? data.characters : [];
+        const publicationControls = new Set([
+            'optimizePluginMemory',
+            'pluginStorageGeneration',
+            'pluginStorageFolded',
+        ]);
+
+        for (const operation of patch) {
+            const path = typeof operation?.path === 'string' ? operation.path : '';
+            if (path === '/characters') {
+                for (const character of [...baselineCharacters, ...currentCharacters]) {
+                    if (character?.chaId) characterIds.add(character.chaId);
+                }
+                continue;
+            }
+            const characterMatch = /^\/characters\/(\d+)(?:\/|$)/.exec(path);
+            if (characterMatch) {
+                const index = Number(characterMatch[1]);
+                const chaId = currentCharacters[index]?.chaId
+                    ?? baselineCharacters[index]?.chaId;
+                if (chaId) characterIds.add(chaId);
+                continue;
+            }
+            const root = path.split('/')[1]?.replaceAll('~1', '/').replaceAll('~0', '~');
+            if (root === 'botPresets') dirty.botPreset = true;
+            else if (root === 'modules') dirty.modules = true;
+            else if (root === 'plugins') dirty.plugins = true;
+            else if (root === 'pluginCustomStorage' || root === 'pluginStorageMeta') {
+                dirty.pluginCustomStorage = true;
+            } else if (root && !publicationControls.has(root)) {
+                dirty.root = true;
+            }
+        }
+        dirty.character = [...characterIds];
+        return dirty;
+    }
+
+    /** Dirty branches proven by the tracked signal plus this baseline diff. */
+    conflictDirtyBranches(proposal: RisuSavePatchProposal): toSaveType {
+        const pending = this.pendingProposals.get(proposal);
+        if (!pending || pending.revision !== this.revision) {
+            throw new Error('Cannot inspect a stale or foreign RisuSave patch proposal');
+        }
+        return {
+            ...pending.conflictDirtyBranches,
+            character: [...pending.conflictDirtyBranches.character],
+            chat: pending.conflictDirtyBranches.chat.map(
+                ([chaId, chatId]) => [chaId, chatId],
+            ),
+        };
+    }
+
+    commit(proposal: RisuSavePatchProposal): void {
+        const pending = this.pendingProposals.get(proposal);
+        this.pendingProposals.delete(proposal);
+        if (!pending?.state || pending.revision !== this.revision) {
+            throw new Error('Cannot commit a stale or foreign RisuSave patch proposal');
+        }
+        this.applyState(pending.state);
+        pending.state = null;
+        this.revision += 1;
+    }
+
+    discard(proposal: RisuSavePatchProposal): void {
+        const pending = this.pendingProposals.get(proposal);
+        if (pending) pending.state = null;
+        this.pendingProposals.delete(proposal);
+    }
+
+    /** Drop every payload reference before a replacement patcher is built. */
+    retire(): void {
+        this.revision += 1;
+        this.pendingProposals = new WeakMap();
+        this.lastSyncedDb = { characters: [] };
+        this.hashBlocks = {};
+        this.lastRootKeyJsons.clear();
+        this.lastCharJsons.clear();
+        this.lastModuleJsons.clear();
+        this.moduleItemHashes.clear();
+    }
+
+    private async advance(data: any, toSave: toSaveType): Promise<RisuSavePatchProposal> {
         const { compare } = await import('fast-json-patch')
         const expectedHash: string = this.hash();
         const patch: any[] = []

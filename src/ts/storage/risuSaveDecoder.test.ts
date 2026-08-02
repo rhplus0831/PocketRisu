@@ -21,6 +21,7 @@ const {
     decodeAuthoritativeRisuSave,
     decodeRisuSave,
     RisuSaveEncoder,
+    RisuSavePatcher,
 } = await import('./risuSave')
 
 const header = Buffer.from('RISUSAVE\0', 'binary')
@@ -273,5 +274,30 @@ describe('authoritative RisuSave block decoding', () => {
         await expect(decodeAuthoritativeRisuSave(save(
             block(2, 'character', { chaId: 'orphan', chats: [] }),
         ))).rejects.toMatchObject({ code: 'RISU_SAVE_INVALID' })
+    })
+
+    test('transfers the exact full-write baseline to a patcher without decoding its bytes', async () => {
+        const database = {
+            ...databaseWithCharacter('baseline-transfer-character'),
+            botPresets: [{ id: 'preset-a', name: 'Preset A' }],
+            username: 'wire-baseline',
+        }
+        const encoder = new RisuSaveEncoder()
+        await encoder.init(database as never)
+        await encoder.set(database as never, noTrackedChanges())
+        const encoded = encoder.encode()
+        expect(encoded).not.toBeNull()
+
+        const transferred = encoder.takeNormalizedBaseline()
+        const decoded = await decodeAuthoritativeRisuSave(new Uint8Array(encoded!))
+        expect(transferred).toEqual(decoded)
+        expect(() => encoder.takeNormalizedBaseline()).toThrow(
+            'RisuSave encoder has no assembled normalized baseline',
+        )
+
+        const patcher = new RisuSavePatcher()
+        await patcher.initNormalizedBaseline(transferred)
+        const proposal = await patcher.set(decoded, noTrackedChanges())
+        expect(proposal.patch).toEqual([])
     })
 })

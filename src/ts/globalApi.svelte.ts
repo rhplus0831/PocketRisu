@@ -54,6 +54,7 @@ import {
     type ClientUpgradeRequiredDetail,
 } from "./storage/clientBuildHandshake"
 import { watchActiveChatDirty } from "./storage/activeChatDirtyTracker.svelte"
+import { recordConflictRebaseGraphBudget } from "./storage/conflictRebaseBudget"
 import {
     createRequestLogScope, recordRequestLog, fetchRequestLogs,
     type RequestLogCategory, type RequestLogSource, type RequestLogRoute,
@@ -474,12 +475,12 @@ export async function saveDb() {
         pluginCustomStorage: false
     }
 
-    let encoder = new RisuSaveEncoder()
+    let encoder: RisuSaveEncoder | null = new RisuSaveEncoder()
     await encoder.init(getDatabase(), {
         compression: false
     })
 
-    let patcher = new RisuSavePatcher()
+    let patcher: RisuSavePatcher | null = new RisuSavePatcher()
     if (supportsPatchSync) {
         await patcher.init(initialSaveBaseline)
         patchSyncBaseline = null
@@ -772,10 +773,39 @@ export async function saveDb() {
         }
 
         const latestDb = await decodeAuthoritativeRisuSave(candidate.data) as Database
+        recordConflictRebaseGraphBudget({
+            phase: "candidate-decoded",
+            liveGraphs: [
+                "local-working",
+                "latest-authoritative-working",
+                "old-patcher-baseline",
+            ],
+        })
+
+        // Release the rejected encoder/patcher generation before constructing
+        // replacements. Proposal/full-write candidates are discarded by the
+        // caller before entry, so no unacknowledged graph survives this point.
+        encoder?.retire()
+        patcher?.retire()
+        encoder = null
+        patcher = null
+        recordConflictRebaseGraphBudget({
+            phase: "old-codecs-retired",
+            liveGraphs: ["local-working", "latest-authoritative-working"],
+        })
+
         // The patch baseline is the body paired with candidate.etag, not the
-        // merged local result. The retry can therefore submit the tracked local
-        // changes as a real patch against the authoritative server state.
-        const latestBaseline = cloneDatabaseState(latestDb)
+        // merged local result. Initialize it before mutating latestDb in place.
+        const nextPatcher = new RisuSavePatcher()
+        if (supportsPatchSync) await nextPatcher.init(latestDb)
+        recordConflictRebaseGraphBudget({
+            phase: "replacement-baseline-ready",
+            liveGraphs: [
+                "local-working",
+                "latest-authoritative-working",
+                "replacement-patcher-baseline",
+            ],
+        })
         const mergedDb = mergeTrackedDatabaseOnConflict(
             latestDb,
             db,
@@ -791,14 +821,16 @@ export async function saveDb() {
         await nextEncoder.init(getDatabase(), {
             compression: false
         })
-        let nextPatcher = patcher
-        if (supportsPatchSync) {
-            nextPatcher = new RisuSavePatcher()
-            await nextPatcher.init(latestBaseline)
-        }
-
         encoder = nextEncoder
         patcher = nextPatcher
+        recordConflictRebaseGraphBudget({
+            phase: "authoritative-graph-installed",
+            liveGraphs: [
+                "local-working",
+                "latest-authoritative-working",
+                "replacement-patcher-baseline",
+            ],
+        })
         // Publish the ETag last. Any failure above leaves the rejected response
         // unable to authorize a full write of stale client state.
         forageStorage.setDbEtag(candidate.etag)
@@ -843,14 +875,22 @@ export async function saveDb() {
             },
         })
 
+        const activeEncoder = encoder
+        const activePatcher = patcher
+        if (!activeEncoder || !activePatcher) {
+            throw new Error('Database save codecs are unavailable after conflict recovery')
+        }
+
         // ── database.bin: exclude chat payload (stubs only via encoder) ──
-        await encoder.set(db, safeStructuredClone(toSave))
+        await activeEncoder.set(db, safeStructuredClone(toSave))
 
         let saved = false
         let newEtag: string | undefined
+        let conflictRebaseToSave = toSave
 
         if (supportsPatchSync && !options?.forceFullWrite) {
-            const patchData = await patcher.set(db, safeStructuredClone(toSave))
+            const patchData = await activePatcher.set(db, safeStructuredClone(toSave))
+            conflictRebaseToSave = activePatcher.conflictDirtyBranches(patchData)
             // Refuse to send patches that would corrupt server-side lazy chats.
             // chatToStub strips chats to metadata before diffing, so the only
             // way these ops appear is a baseline desync. Falling through to a
@@ -881,7 +921,7 @@ export async function saveDb() {
                 // chat object has.
                 const affectedChats: Record<string, any> = {}
                 const seen = new Set<string>()
-                const baselineCharsLen = (patcher as any).lastSyncedDb?.characters?.length ?? -1
+                const baselineCharsLen = (activePatcher as any).lastSyncedDb?.characters?.length ?? -1
                 const currentCharsLen = db.characters?.length ?? -1
 
                 const summarize = (c: any) => {
@@ -936,7 +976,7 @@ export async function saveDb() {
                     seen.add(key)
                     if (seen.size > 5) break
                     const ci = +m[1], chi = +m[2]
-                    const baselineChar = (patcher as any).lastSyncedDb?.characters?.[ci]
+                    const baselineChar = (activePatcher as any).lastSyncedDb?.characters?.[ci]
                     const currentChar = db.characters?.[ci]
                     const baselineChat = baselineChar?.chats?.[chi]
                     const currentChat = currentChar?.chats?.[chi]
@@ -973,7 +1013,7 @@ export async function saveDb() {
                 const charsDistribution: Record<string, any> = {}
                 for (const k of Array.from(seen).slice(0, 3)) {
                     const ci = +k.split('/')[0]
-                    const baselineChats = (patcher as any).lastSyncedDb?.characters?.[ci]?.chats ?? []
+                    const baselineChats = (activePatcher as any).lastSyncedDb?.characters?.[ci]?.chats ?? []
                     const currentChats = db.characters?.[ci]?.chats ?? []
                     const tally = (chats: any[]) => {
                         const t = { total: chats.length, stub: 0, placeholder: 0, hybrid: 0, full: 0, neither: 0 }
@@ -1009,10 +1049,19 @@ export async function saveDb() {
                 console.error('[Save:guard-debug] affected chats (baseline / current / stubReplay):', affectedChats)
                 console.error('[Save:guard-debug] chats[] distribution per affected character:', charsDistribution)
                 }
+                activePatcher.discard(patchData)
                 // Leave saved=false so the full-write path below kicks in.
             } else {
-                const patchResult = await forageStorage.patchItem('database/database.bin', patchData)
+                let patchResult
+                try {
+                    patchResult = await forageStorage.patchItem('database/database.bin', patchData)
+                } catch (error) {
+                    activePatcher.discard(patchData)
+                    throw error
+                }
                 saved = patchResult.success
+                if (patchResult.success) activePatcher.commit(patchData)
+                else activePatcher.discard(patchData)
                 if (patchResult.success && patchResult.etag) {
                     newEtag = patchResult.etag
                     forageStorage.setDbEtag(patchResult.etag)
@@ -1029,7 +1078,7 @@ export async function saveDb() {
                 }
                 if (patchResult.conflict) {
                     console.warn('[Save] Patch conflict detected, rebasing tracked local changes on latest server DB...')
-                    await rebaseTrackedLocalChangesOnLatestServerDb(db, toSave)
+                    await rebaseTrackedLocalChangesOnLatestServerDb(db, conflictRebaseToSave)
                     await sleep(Math.min(500 * (savetrys + 1), 3000))
                     return chatPersistStage.completeStubCommit({ committed: false, result: 'retry' })
                 }
@@ -1047,7 +1096,7 @@ export async function saveDb() {
             // Keep the encoder's blocks current before patching, but assemble
             // the payload-sized contiguous database only after the patch path
             // has actually selected a full write.
-            const encoded = encoder.encode()
+            const encoded = activeEncoder.encode()
             if (!encoded) {
                 await sleep(1000)
                 return chatPersistStage.completeStubCommit({ committed: false, result: 'noop' })
@@ -1057,20 +1106,32 @@ export async function saveDb() {
             try {
                 await forageStorage.setItem('database/database.bin', dbData, currentEtag ?? undefined)
             } catch (conflictErr) {
+                activeEncoder.discardNormalizedBaseline()
                 if (conflictErr instanceof ConflictError) {
+                    if (supportsPatchSync && conflictRebaseToSave === toSave) {
+                        const dirtyProposal = await activePatcher.set(
+                            db,
+                            safeStructuredClone(toSave),
+                        )
+                        conflictRebaseToSave = activePatcher.conflictDirtyBranches(dirtyProposal)
+                        activePatcher.discard(dirtyProposal)
+                    }
                     console.warn('[Save] Full-write conflict detected, rebasing tracked local changes on latest server DB...')
-                    await rebaseTrackedLocalChangesOnLatestServerDb(db, toSave)
+                    await rebaseTrackedLocalChangesOnLatestServerDb(db, conflictRebaseToSave)
                     await sleep(Math.min(500 * (savetrys + 1), 3000))
                     return chatPersistStage.completeStubCommit({ committed: false, result: 'retry' })
                 }
                 throw conflictErr
             }
 
-            // Re-init patcher from the data we just wrote so both sides
-            // share the same baseline (including setDatabase defaults).
+            // Transfer the exact graph represented by the acknowledged bytes;
+            // no decode of our own full-write output is necessary.
             if (supportsPatchSync) {
-                const decodedDb = await decodeAuthoritativeRisuSave(dbData)
-                await patcher.init(decodedDb)
+                await activePatcher.initNormalizedBaseline(
+                    activeEncoder.takeNormalizedBaseline(),
+                )
+            } else {
+                activeEncoder.discardNormalizedBaseline()
             }
         }
 
@@ -1170,6 +1231,7 @@ export async function saveDb() {
         }
         changed = false
         if (requiresFullEncoderReload.state) {
+            encoder?.retire()
             encoder = new RisuSaveEncoder()
             await encoder.init(getDatabase(), {
                 compression: false,

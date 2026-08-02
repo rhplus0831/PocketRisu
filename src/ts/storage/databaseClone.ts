@@ -86,8 +86,13 @@ export function cloneDatabaseState<T extends Partial<Database>>(database: T): T 
     return clone;
 }
 
-/** Pure conflict merge used by the ETag rebase path. */
-export function mergeTrackedDatabaseOnConflict(
+/**
+ * The original whole-graph conflict merge. Kept only as a differential oracle
+ * for the data-loss-sensitive in-place implementation below.
+ *
+ * @internal
+ */
+export function mergeTrackedDatabaseOnConflictLegacyForTests(
     latest: Database,
     local: Database,
     toSave: toSaveType,
@@ -202,4 +207,138 @@ export function mergeTrackedDatabaseOnConflict(
     }
     merged.characters = mergedCharacters;
     return merged;
+}
+
+const GENERIC_ROOT_MERGE_EXCLUSIONS = new Set<PropertyKey>([
+    "characters",
+    "botPresets",
+    "modules",
+    "plugins",
+    "pluginCustomStorage",
+    "pluginStorageMeta",
+    // These fields select an optimized plugin-storage publication and move
+    // only through its generation-fenced CAS protocol. A generic conflict
+    // rebase must retain the freshly read authoritative values.
+    "optimizePluginMemory",
+    "pluginStorageGeneration",
+    "pluginStorageFolded",
+]);
+
+/**
+ * Overlay only conservatively tracked local branches onto the freshly decoded
+ * authoritative graph. `latest` becomes the one working graph; clean server
+ * branches retain their identity and only dirty local branches are cloned.
+ */
+export function mergeTrackedDatabaseOnConflict(
+    latest: Database,
+    local: Database,
+    toSave: toSaveType,
+    knownChatIdsByCharacter?: ReadonlyMap<string, ReadonlySet<string>>,
+): Database {
+    if (toSave.root) {
+        for (const key in local) {
+            if (!GENERIC_ROOT_MERGE_EXCLUSIONS.has(key)) {
+                latest[key] = cloneDatabaseField(key, local[key]);
+            }
+        }
+    }
+
+    if (toSave.botPreset) {
+        latest.botPresets = safeStructuredClone(local.botPresets);
+        latest.botPresetsId = local.botPresetsId;
+    }
+    if (toSave.modules) latest.modules = safeStructuredClone(local.modules);
+    if (toSave.plugins) latest.plugins = safeStructuredClone(local.plugins);
+    if (toSave.pluginCustomStorage) {
+        latest.pluginCustomStorage = cloneDatabasePluginStorageRecord(
+            local.pluginCustomStorage,
+        );
+        if (Object.hasOwn(local, "pluginStorageMeta")
+            && local.pluginStorageMeta !== undefined) {
+            latest.pluginStorageMeta = cloneDatabasePluginStorageRecord(
+                local.pluginStorageMeta,
+            );
+        } else {
+            delete latest.pluginStorageMeta;
+        }
+    }
+
+    const trackedCharIds = new Set<string>(toSave.character.filter(Boolean));
+    const trackedChatIdsByCharacter = new Map<string, Set<string>>();
+    for (const trackedChat of toSave.chat) {
+        const [chaId, chatId] = trackedChat ?? [];
+        if (!chaId || !chatId) continue;
+        const trackedIds = trackedChatIdsByCharacter.get(chaId) ?? new Set<string>();
+        trackedIds.add(chatId);
+        trackedChatIdsByCharacter.set(chaId, trackedIds);
+    }
+    const authoritativeCharacters = Array.isArray(latest.characters) ? latest.characters : [];
+    const localCharacters = Array.isArray(local.characters) ? local.characters : [];
+
+    for (const charId of trackedCharIds) {
+        const localChar = localCharacters.find(character => character?.chaId === charId);
+        const authoritativeIndex = authoritativeCharacters.findIndex(
+            character => character?.chaId === charId,
+        );
+        if (localChar) {
+            const clonedLocalChar = safeStructuredClone(localChar);
+            const authoritativeChats = authoritativeIndex >= 0
+                && Array.isArray(authoritativeCharacters[authoritativeIndex]?.chats)
+                ? authoritativeCharacters[authoritativeIndex].chats
+                : [];
+            const localChatIds = new Set(
+                (clonedLocalChar.chats ?? []).map(chat => chat?.id).filter(Boolean),
+            );
+            const previouslyKnownChatIds = knownChatIdsByCharacter?.get(charId);
+            clonedLocalChar.chats = [
+                ...(clonedLocalChar.chats ?? []),
+                ...authoritativeChats
+                    .filter(chat => chat?.id
+                        && !localChatIds.has(chat.id)
+                        && (!previouslyKnownChatIds || !previouslyKnownChatIds.has(chat.id)))
+                    .map(chat => safeStructuredClone(chat)),
+            ];
+            if (authoritativeIndex >= 0) {
+                authoritativeCharacters[authoritativeIndex] = clonedLocalChar;
+            } else {
+                authoritativeCharacters.push(clonedLocalChar);
+            }
+        } else if (authoritativeIndex >= 0) {
+            authoritativeCharacters.splice(authoritativeIndex, 1);
+        }
+    }
+
+    for (const [charId, trackedChatIds] of trackedChatIdsByCharacter) {
+        if (trackedCharIds.has(charId)) continue;
+        const localChar = localCharacters.find(character => character?.chaId === charId);
+        let authoritativeChar = authoritativeCharacters.find(
+            character => character?.chaId === charId,
+        );
+        if (!localChar) continue;
+        if (!authoritativeChar) {
+            authoritativeChar = safeStructuredClone(localChar);
+            authoritativeCharacters.push(authoritativeChar);
+            continue;
+        }
+        const authoritativeChats = Array.isArray(authoritativeChar.chats)
+            ? authoritativeChar.chats
+            : [];
+        const localChats = Array.isArray(localChar.chats) ? localChar.chats : [];
+        for (const chatId of trackedChatIds) {
+            const localChat = localChats.find(chat => chat?.id === chatId);
+            if (!localChat) continue;
+            const authoritativeChatIndex = authoritativeChats.findIndex(
+                chat => chat?.id === chatId,
+            );
+            const clonedLocalChat = safeStructuredClone(localChat);
+            if (authoritativeChatIndex >= 0) {
+                authoritativeChats[authoritativeChatIndex] = clonedLocalChat;
+            } else {
+                authoritativeChats.push(clonedLocalChat);
+            }
+        }
+        authoritativeChar.chats = authoritativeChats;
+    }
+    latest.characters = authoritativeCharacters;
+    return latest;
 }

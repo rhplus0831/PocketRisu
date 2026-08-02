@@ -16,7 +16,7 @@ The client-storage subsystem owns PocketRisu’s canonical `Database` model, its
 | `src/ts/storage/dirtyTargetBridge.ts`, `dirtyTargetDiff.ts` | Buffer explicit character/chat targets until the save loop is ready and compute compatibility-safe targets for V3 character-array replacements and package chat imports. The diff separates character/stub metadata from full chat rows and never promotes runtime placeholders to authoritative row data. |
 | `src/ts/storage/nodeStorage.ts` | HTTP client for the Node server. Besides auth, KV, patching, chat rows, cached boot reads, and key-list deltas, it owns bounded request/outcome handling, snapshot restore, backup jobs/replacements, and the generation-pinned plugin manifest/mutation/batch/transition protocols. |
 | `src/ts/storage/autoStorage.ts` | Compatibility facade that lazily selects `NodeStorage` and forwards the expanded chat, backup, snapshot, and plugin-storage protocols. Some read paths initialize defensively; ordinary writes still assume bootstrap completed initialization. |
-| `src/ts/storage/risuSave.ts` | All save codecs, incremental block encoding, normalization, patch generation, and client chat guards. Important symbols are `RisuSaveEncoder`, `RisuSaveDecoder`, `decodeRisuSave()`, `normalizeJSON()`, `diffArrayWithIdGuard()`, `RisuSavePatcher`, and `findDangerousChatOps()`. There are no separate production `normalizeJSON`, `risuSavePatcher`, or `chatGuards` files. |
+| `src/ts/storage/risuSave.ts` | All save codecs, incremental block encoding, normalization, transactional patch proposals, and client chat guards. `RisuSavePatcher.set()` prepares structurally shared state that commits only after acknowledgement; `RisuSaveEncoder.takeNormalizedBaseline()` transfers the exact full-write graph without decoding the assembled bytes. Important symbols are `RisuSaveEncoder`, `RisuSaveDecoder`, `decodeRisuSave()`, `normalizeJSON()`, `diffArrayWithIdGuard()`, `RisuSavePatcher`, and `findDangerousChatOps()`. There are no separate production `normalizeJSON`, `risuSavePatcher`, or `chatGuards` files. |
 | `src/ts/storage/chatStub.ts` | Runtime-independent stub type and predicate. `ChatStub` contains only identity/display metadata plus `_stub: true` (`:13`); `isChatStub()` additionally requires that no `message` array exists (`:36`). |
 | `src/ts/storage/chatStorage.ts` | Stub/placeholder conversion, lazy hydration, chat-backup reason tags, and version import. `setChatBackupReason()` records one-shot reasons; `saveChatToServer()` consumes them; `importChatBackup()` clones a recovered version under a fresh chat ID and explicitly dirties its target; and `ensureChatHydrated()` owns the hydration state machine. |
 | `src/ts/storage/chatPersistStage.ts` | Testable row-persistence stage used by `saveDb()`. `prepareChatPersistStage()` discovers changed/new chats, requires authoritative row writes before stub commit, checkpoints a generating chat at most once per 20 seconds, requeues it for the final post-generation save, and updates the known-chat baseline only after a committed stub database. |
@@ -31,7 +31,8 @@ The client-storage subsystem owns PocketRisu’s canonical `Database` model, its
 | `src/ts/bootstrap.ts` | Orders the secure-context gate, storage initialization, cached/raw boot read, decode/defaults, server-side snapshot recovery, optimized-plugin boot reconciliation, migrations, placeholder conversion, UI initialization, ID repair, and save-loop startup. |
 | `src/ts/storage/databaseSave.ts` | `DatabaseSaveCoordinator`, save pause/fencing, exact `DatabaseSaveOutcome`, and `requireCommittedDatabaseSave()` for callers that need durability. |
 | `src/ts/storage/writerTakeover.ts` | Process-global writer-loss latch, foreground `checkWriterTakeoverOnReturn()`, explicit read-only-versus-reload choice, and DOM interaction freeze. It never replays or journals the displaced page's dirty state. |
-| `src/ts/storage/databaseClone.ts` | Database-aware clone/merge helpers that preserve special own keys and avoid unsafe proxy cloning during conflicts and backup preparation. |
+| `src/ts/storage/databaseClone.ts` | Database-aware clone/merge helpers that preserve special own keys. Conflict recovery mutates the freshly decoded authoritative graph and clones only dirty local branches; the previous whole-graph merge remains exported only as a differential test oracle. |
+| `src/ts/storage/conflictRebaseBudget.ts` | Structural graph-lifecycle budget for conflict recovery. The asserted client bound is three live database graphs, down from the audited approximately-six-graph path. |
 | `src/ts/storage/bootSnapshotRecovery.ts` | Walks metadata-only snapshot candidates and asks the server to validate/publish them atomically. |
 | `src/ts/storage/backupReplacementUi.ts`, `snapshotRestoreUi.ts`, `storageError.ts` | Destructive replacement UX, committed/not-committed/unknown classification, no-replay policy, and hard-reload reconciliation. |
 | `src/ts/drive/backuplocal.ts` | Client UI for streamed normal, upstream-target, main-target rollback, and server-file exports; cancellable server-side partial export jobs; and bounded backup replacement. Detailed semantics live in [Backup and recovery](backup-recovery.md). |
@@ -175,18 +176,20 @@ version for every checkpoint.
 
 When `supportsPatchSync` is enabled (`src/ts/platform.ts:18`):
 
-- `RisuSavePatcher.set()` generates an RFC 6902 patch and expected compositional hash against the captured stub-only baseline.
+- `RisuSavePatcher.set()` generates an RFC 6902 patch and expected compositional hash against the captured stub-only baseline as an uncommitted proposal. The save loop calls `commit()` only after a successful server acknowledgement and `discard()` on rejection or transport failure.
 - `findDangerousChatOps()` rejects field-level operations outside the stub metadata allowlist before they leave the browser.
 - `/api/patch` applies the patch to the server's stripped cache; its response updates the cached ETag and may surface a deferred persistence warning.
 - A patch-hash conflict never promotes the rejected response's ETag. The client reads the
-  authoritative database and ETag as one provisional candidate, overlays tracked local
-  state, reinstalls runtime placeholders with `setDatabase()`, rebuilds the encoder from
-  the merge and the patcher from the authoritative baseline, publishes the ETag last, and
-  retries without marking the row stage's stub save committed.
+  authoritative database and ETag as one provisional candidate, retires the old codec
+  generation, initializes a patch baseline from that authoritative graph, overlays dirty
+  local branches into the decoded graph in place, reinstalls runtime placeholders with
+  `setDatabase()`, rebuilds the encoder, publishes the ETag last, and retries without
+  marking the row stage's stub save committed. Dirty branches are the conservative union
+  of the existing reactive/explicit tracker and changes proven by the patch baseline diff.
 - Non-conflict patch rejections such as the chat guard may fall through to an ETag-guarded
   full `database.bin` write. Patch-enabled clients refuse an unversioned full write, and
   an ETag conflict enters the same provisional rebase path.
-- A successful full write is decoded again to initialize the patcher from exactly what was transmitted.
+- A successful full write transfers the encoder's exact normalized wire graph into the patcher; the client does not decode the bytes it just encoded.
 - If an import owns the server mutation barrier, `/api/write` returns `503 IMPORT_IN_PROGRESS`; `NodeStorage.setItem()` fails the attempt and the coordinator requeues its tracked changes.
 
 #### Flush and commit boundary
@@ -450,8 +453,10 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
 
 - Patch conflict rebasing treats `plugins` and `pluginCustomStorage` as tracked branches
   instead of generic root fields; when their flags are dirty it explicitly overlays the
-  local copies alongside bot presets, modules, and tracked characters. Preserve those
-  explicit branches when changing the merge.
+  local copies alongside bot presets, modules, and tracked characters. The optimized
+  publication controls `optimizePluginMemory`, `pluginStorageGeneration`, and
+  `pluginStorageFolded` always remain authoritative and reconcile only through the CAS
+  publication protocol. Preserve those explicit boundaries when changing the merge.
 
 - The physical `botPresetsId` index remains part of upstream RisuAI compatibility even though new code prefers stable preset UUID helpers (`src/ts/storage/database.svelte.ts:1025-1030`, `:2341-2402`).
 

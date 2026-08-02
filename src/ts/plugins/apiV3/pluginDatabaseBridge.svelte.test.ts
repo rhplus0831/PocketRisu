@@ -1426,6 +1426,7 @@ describe("V3 mode-aware database bridge", () => {
         applyPatch(serverState, patchResult.patch, true);
         expect(serverState.pluginCustomStorage).toEqual({});
         expect(serverState.temperature).toBe(55);
+        patcher.commit(patchResult);
 
         const nextExpectedHash = (await patcher.set(testState.database, emptyToSave()))
             .expectedHash;

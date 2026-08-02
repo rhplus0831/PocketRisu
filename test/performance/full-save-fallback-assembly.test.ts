@@ -47,7 +47,9 @@ describe('full database fallback assembly', () => {
   test('assembles only after patch rejection or an explicit full write', async () => {
     vi.stubGlobal('__PATCH_SYNC__', true)
     const quietLog = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const quietError = vi.spyOn(console, 'error').mockImplementation(() => {})
     let fullSaveAssembly: ReturnType<typeof vi.spyOn> | null = null
+    let fullSaveDecode: ReturnType<typeof vi.spyOn> | null = null
 
     try {
       const {
@@ -56,16 +58,18 @@ describe('full database fallback assembly', () => {
         requestImmediateSave,
         saveDb,
       } = await import('../../src/ts/globalApi.svelte')
-      const { RisuSaveEncoder } = await import('../../src/ts/storage/risuSave')
+      const { RisuSaveDecoder, RisuSaveEncoder } = await import('../../src/ts/storage/risuSave')
       const { getDatabase, setDatabase } = await import('../../src/ts/storage/database.svelte')
 
       let etag = '00000000000000000000000000000001'
       const patchItem = vi.fn(async () => ({ success: true, etag }))
       const setItem = vi.fn(async () => undefined)
+      const readDatabaseCandidate = vi.fn()
       const storage = {
         _lastDbEtag: etag,
         patchItem,
         setItem,
+        readDatabaseCandidate,
         setDbEtag(nextEtag: string | null) {
           etag = nextEtag ?? etag
           this._lastDbEtag = nextEtag
@@ -93,6 +97,7 @@ describe('full database fallback assembly', () => {
         },
       } as any)
       fullSaveAssembly = vi.spyOn(RisuSaveEncoder.prototype, 'encode')
+      fullSaveDecode = vi.spyOn(RisuSaveDecoder.prototype, 'decode')
 
       let saveLoopFailure: unknown = null
       void saveDb().catch(error => {
@@ -100,6 +105,7 @@ describe('full database fallback assembly', () => {
       })
       await waitForCommittedSave(requestImmediateSave, { forceFullWrite: true })
       expect(saveLoopFailure).toBeNull()
+      expect(fullSaveDecode).not.toHaveBeenCalled()
 
       const character = getDatabase().characters[0]
 
@@ -123,6 +129,35 @@ describe('full database fallback assembly', () => {
       expect(patchItem).toHaveBeenCalledTimes(fallbackPatchCalls + 1)
       expect(setItem).toHaveBeenCalledTimes(fallbackWriteCalls + 1)
       expect(fullSaveAssembly).toHaveBeenCalledTimes(fallbackEncodeCalls + 1)
+      expect(fullSaveDecode).not.toHaveBeenCalled()
+
+      const failedTransportPatchCall = patchItem.mock.calls.length
+      patchItem.mockRejectedValueOnce(new Error('simulated patch transport failure'))
+      character.desc = `transport-failure-${Date.now()}`
+      markCharacterDirty(character.chaId)
+      const failedOutcome = await requestImmediateSave()
+      expect(failedOutcome.status).toBe('failed')
+      await waitForCommittedSave(requestImmediateSave)
+
+      const failedProposal = patchItem.mock.calls[failedTransportPatchCall]?.[1]
+      const retryProposal = patchItem.mock.calls[failedTransportPatchCall + 1]?.[1]
+      expect(retryProposal).toEqual(failedProposal)
+      expect(readDatabaseCandidate).not.toHaveBeenCalled()
+
+      const failedFullWritePatchCall = patchItem.mock.calls.length
+      patchItem.mockResolvedValueOnce({ success: false })
+      setItem.mockRejectedValueOnce(new Error('simulated full-write transport failure'))
+      character.desc = `full-write-transport-failure-${Date.now()}`
+      markCharacterDirty(character.chaId)
+      const failedFullWriteOutcome = await requestImmediateSave()
+      expect(failedFullWriteOutcome.status).toBe('failed')
+      await waitForCommittedSave(requestImmediateSave)
+
+      const fullWriteFallbackProposal = patchItem.mock.calls[failedFullWritePatchCall]?.[1]
+      const fullWriteRetryProposal = patchItem.mock.calls[failedFullWritePatchCall + 1]?.[1]
+      expect(fullWriteRetryProposal).toEqual(fullWriteFallbackProposal)
+      expect(readDatabaseCandidate).not.toHaveBeenCalled()
+      expect(fullSaveDecode).not.toHaveBeenCalled()
 
       const forcedEncodeCalls = fullSaveAssembly.mock.calls.length
       const forcedPatchCalls = patchItem.mock.calls.length
@@ -131,10 +166,13 @@ describe('full database fallback assembly', () => {
       expect(patchItem).toHaveBeenCalledTimes(forcedPatchCalls)
       expect(setItem).toHaveBeenCalledTimes(forcedWriteCalls + 1)
       expect(fullSaveAssembly).toHaveBeenCalledTimes(forcedEncodeCalls + 1)
+      expect(fullSaveDecode).not.toHaveBeenCalled()
       expect(saveLoopFailure).toBeNull()
     } finally {
       fullSaveAssembly?.mockRestore()
+      fullSaveDecode?.mockRestore()
       quietLog.mockRestore()
+      quietError.mockRestore()
       vi.unstubAllGlobals()
     }
   })
