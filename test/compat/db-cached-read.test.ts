@@ -1,6 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createHash } from 'node:crypto'
+import { join } from 'node:path'
+import Database from 'better-sqlite3'
 import { Unpackr } from 'msgpackr'
+import utilsPkg from '../../server/node/utils.cjs'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { createSeedBackup } from './helpers/seed.js'
@@ -8,6 +11,10 @@ import { createSeedBackup } from './helpers/seed.js'
 const DB_PATH_HEX = Buffer.from('database/database.bin').toString('hex')
 const GROUPS = ['root', 'characters', 'botPresets', 'modules', 'personas'] as const
 const unpackr = new Unpackr({ int64AsType: 'number', useRecords: false })
+const { decodeRisuSave, encodeRisuSaveLegacy } = utilsPkg as {
+  decodeRisuSave: (value: Uint8Array) => Promise<any>
+  encodeRisuSaveLegacy: (value: unknown) => Uint8Array
+}
 
 let server: ServerHandle
 let client: RisuClient
@@ -39,11 +46,13 @@ describe('cached database read route', () => {
       headers: { 'file-path': DB_PATH_HEX },
     })
     expect(ordinary.status).toBe(200)
+    expect(ordinary.headers.get('x-pocketrisu-test-db-cache')).toBe('miss')
     const ordinaryEtag = ordinary.headers.get('x-db-etag')
     expect(ordinaryEtag).toMatch(/^[0-9a-f]{32}$/)
 
     const missResponse = await cachedRead(emptyHashes())
     expect(missResponse.status).toBe(200)
+    expect(missResponse.headers.get('x-pocketrisu-test-db-cache')).toBe('hit')
     expect(missResponse.headers.get('content-type')).toContain('application/octet-stream')
     expect(missResponse.headers.get('x-db-etag')).toBe(ordinaryEtag)
     const missEnvelope = unpackr.decode(new Uint8Array(await missResponse.arrayBuffer())) as any
@@ -60,6 +69,7 @@ describe('cached database read route', () => {
     }
     const hitResponse = await cachedRead(fullHashes)
     expect(hitResponse.status).toBe(200)
+    expect(hitResponse.headers.get('x-pocketrisu-test-db-cache')).toBe('hit')
     expect(hitResponse.headers.get('x-db-etag')).toBe(ordinaryEtag)
     const hitEnvelope = unpackr.decode(new Uint8Array(await hitResponse.arrayBuffer())) as any
     expect(hitEnvelope.root).toEqual({ hash: fullHashes.root[0] })
@@ -67,6 +77,73 @@ describe('cached database read route', () => {
       expect(hitEnvelope[group].map((segment: any) => segment.hash)).toEqual(fullHashes[group])
       expect(hitEnvelope[group].every((segment: any) => !('bytes' in segment))).toBe(true)
     }
+  })
+
+  test('invalidates decoded reuse after an authoritative full write', async () => {
+    const initial = await client.fetch('/api/read', {
+      headers: { 'file-path': DB_PATH_HEX },
+    })
+    expect(initial.status).toBe(200)
+    const bytes = new Uint8Array(await initial.arrayBuffer())
+
+    const warm = await cachedRead(emptyHashes())
+    expect(warm.status).toBe(200)
+    expect(warm.headers.get('x-pocketrisu-test-db-cache')).toBe('hit')
+
+    const written = await client.fetch('/api/write', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': DB_PATH_HEX,
+      },
+      body: bytes,
+    })
+    expect(written.status).toBe(200)
+
+    const coldAfterWrite = await cachedRead(emptyHashes())
+    expect(coldAfterWrite.status).toBe(200)
+    expect(coldAfterWrite.headers.get('x-pocketrisu-test-db-cache')).toBe('miss')
+
+    const warmAgain = await cachedRead(emptyHashes())
+    expect(warmAgain.status).toBe(200)
+    expect(warmAgain.headers.get('x-pocketrisu-test-db-cache')).toBe('hit')
+  })
+
+  test('invalidates decoded reuse when SQLite changes without a timestamp change', async () => {
+    const warm = await cachedRead(emptyHashes())
+    expect(warm.status).toBe(200)
+    expect(warm.headers.get('x-pocketrisu-test-db-cache')).toBe('hit')
+
+    const sqlite = new Database(join(server.cwd, 'save', 'risuai.db'))
+    const marker = `external-${Date.now()}`
+    try {
+      const selected = sqlite.prepare(`
+        SELECT value, updated_at AS updatedAt
+        FROM kv
+        WHERE key = 'database/database.bin'
+      `).get() as { value: Buffer, updatedAt: number }
+      const externallyChanged = await decodeRisuSave(selected.value)
+      externallyChanged.cacheRevisionProbe = marker
+      const changed = sqlite.prepare(`
+        UPDATE kv
+        SET value = ?, updated_at = ?
+        WHERE key = 'database/database.bin'
+      `).run(Buffer.from(encodeRisuSaveLegacy(externallyChanged)), selected.updatedAt)
+      expect(changed.changes).toBe(1)
+    } finally {
+      sqlite.close()
+    }
+
+    const coldAfterExternalWrite = await cachedRead(emptyHashes())
+    expect(coldAfterExternalWrite.status).toBe(200)
+    expect(coldAfterExternalWrite.headers.get('x-pocketrisu-test-db-cache')).toBe('miss')
+
+    const authoritative = await client.fetch('/api/read', {
+      headers: { 'file-path': DB_PATH_HEX },
+    })
+    expect(authoritative.status).toBe(200)
+    expect(await decodeRisuSave(new Uint8Array(await authoritative.arrayBuffer())))
+      .toMatchObject({ cacheRevisionProbe: marker })
   })
 
   test('negotiates generic KV reads while database.bin ignores the cache header', async () => {

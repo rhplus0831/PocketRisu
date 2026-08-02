@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const { createChunkStore, createSnapshotReader } = require('./chunkStore.cjs');
+const { createDatabaseRevisionTracker } = require('./databaseRevision.cjs');
 const { createPluginStorageOwnerScanner } = require('./pluginStorageJson.cjs');
 const {
     PLUGIN_VALUE_MAX_BYTES,
@@ -59,6 +60,7 @@ db.exec(`
     updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
   )
 `);
+const databaseRevisionTracker = createDatabaseRevisionTracker(db);
 db.exec(`
   CREATE TABLE IF NOT EXISTS deleted_keys (
     key        TEXT    PRIMARY KEY,
@@ -634,6 +636,10 @@ function kvGetUpdatedAt(key) {
     return row ? row.updated_at : null;
 }
 
+function kvGetDatabaseRevision() {
+    return databaseRevisionTracker.getRevision();
+}
+
 const runKvCopyValue = db.transaction((srcKey, dstKey) => {
     const sourceSize = chunkStore.sizeValue(srcKey);
     if (sourceSize === null) return;
@@ -863,7 +869,7 @@ function clearEntities() {
 module.exports = {
     db,
     // KV
-    kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue,
+    kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList, kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvGetDatabaseRevision, kvCopyValue,
     kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
     kvGetListEpoch, kvBumpListEpoch,
     createKvSnapshot,

@@ -24,6 +24,7 @@ const {
 const fs = require('fs/promises')
 const nodeCrypto = require('crypto')
 const zlib = require('zlib')
+const v8 = require('v8')
 const rateLimit = require('express-rate-limit')
 const { WebSocketServer } = require('ws')
 const { fetch: undiciFetch } = require('undici')
@@ -39,7 +40,7 @@ const getVips = () => {
     return _vipsPromise
 }
 const { kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList,
-        kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvCopyValue, clearEntities, checkpointWal,
+        kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvGetDatabaseRevision, kvCopyValue, clearEntities, checkpointWal,
         kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
         kvGetListEpoch, kvBumpListEpoch,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, createKvSnapshot,
@@ -92,6 +93,7 @@ const {
 const { createRequestLogs } = require('./request-logs.cjs');
 const { applyPatchAtomic } = require('./atomicJsonPatch.cjs');
 const { createGenerationMemo } = require('./generationMemo.cjs');
+const { createRevisionBoundCache } = require('./revisionBoundCache.cjs');
 const {
     decodeRisuSave,
     decodeAuthoritativeRisuSave,
@@ -301,10 +303,36 @@ function fetchProxyTarget(target, options) {
     return fetch(target.url, options);
 }
 
-// In-memory database cache for patch-based sync
-// dbCache stores the STRIPPED (stubs-only) version matching what the client sees.
-let dbCache = {};
 const dbDerivedValueMemo = createGenerationMemo();
+const DB_CACHE_MAX_ENTRIES = 8;
+const DB_CACHE_MAX_ESTIMATED_BYTES = 1024 * 1024 * 1024;
+const DB_CACHE_MAX_ENTRY_ESTIMATED_BYTES = 512 * 1024 * 1024;
+const DB_CACHE_HEAP_PRESSURE_RATIO = 0.80;
+const DB_CACHE_HEAP_LIMIT = v8.getHeapStatistics().heap_size_limit;
+
+// In-memory database cache for patch-based sync. Entries store the STRIPPED
+// (stubs-only) view and are reusable only for the exact SQLite row revision.
+// Clean entries are LRU/size/heap-pressure evictable; acknowledged dirty patch
+// state is pinned until persistence succeeds or an explicit invalidation wins.
+const dbCache = createRevisionBoundCache({
+    maxEntries: DB_CACHE_MAX_ENTRIES,
+    maxEstimatedBytes: DB_CACHE_MAX_ESTIMATED_BYTES,
+    maxEntryEstimatedBytes: DB_CACHE_MAX_ENTRY_ESTIMATED_BYTES,
+    isUnderMemoryPressure: () => (
+        process.memoryUsage().heapUsed >= DB_CACHE_HEAP_LIMIT * DB_CACHE_HEAP_PRESSURE_RATIO
+    ),
+    onMutation: (filePath) => dbDerivedValueMemo.bump(filePath),
+});
+
+class DatabaseCacheRevisionConflict extends Error {
+    constructor() {
+        super('The authoritative database changed outside the decoded cache lifecycle');
+        this.name = 'DatabaseCacheRevisionConflict';
+        this.code = 'DATABASE_CACHE_REVISION_CONFLICT';
+    }
+}
+
+let dbCachePruneScheduled = false;
 let saveTimers = {};
 let dbPersistRetryPending = false;
 const pendingChatRowDeletions = new Set();
@@ -329,15 +357,48 @@ function computeDatabaseEtagFromObject(databaseObject) {
 
 // Keep every cache replacement/eviction behind these helpers: derived values
 // are valid only for the exact mutation generation in which they were built.
-function replaceDbCacheValue(filePath, value) {
-    if (dbCache[filePath] === value) return;
-    dbCache[filePath] = value;
-    dbDerivedValueMemo.bump(filePath);
+function scheduleDbCachePrune() {
+    if (dbCachePruneScheduled) return;
+    dbCachePruneScheduled = true;
+    setImmediate(() => {
+        dbCachePruneScheduled = false;
+        dbCache.prune();
+    });
+}
+
+function getDbCacheValue(filePath) {
+    const value = dbCache.get(filePath);
+    if (value !== undefined) scheduleDbCachePrune();
+    return value;
+}
+
+function getCurrentDatabaseCacheValue(filePath, { allowDirty = false } = {}) {
+    const revision = kvGetDatabaseRevision();
+    const retained = dbCache.metadata(filePath);
+    if (retained?.dirty && retained.revision !== revision) {
+        throw new DatabaseCacheRevisionConflict();
+    }
+    const value = dbCache.getForRevision(filePath, revision, { allowDirty });
+    if (value !== undefined) scheduleDbCachePrune();
+    return value;
+}
+
+function peekDbCacheValue(filePath) {
+    return dbCache.peek(filePath);
+}
+
+function replaceDbCacheValue(filePath, value, metadata = {}) {
+    dbCache.set(filePath, value, metadata);
+    scheduleDbCachePrune();
+}
+
+function markDbCacheClean(filePath, metadata = {}) {
+    dbCache.markClean(filePath, metadata);
+    scheduleDbCachePrune();
 }
 
 function deleteDbCacheValue(filePath) {
-    delete dbCache[filePath];
-    dbDerivedValueMemo.bump(filePath);
+    dbCache.delete(filePath);
 }
 
 function invalidateDbCacheEntry(filePath) {
@@ -352,7 +413,7 @@ function getDbCacheHash(filePath) {
     return dbDerivedValueMemo.getOrCompute(
         filePath,
         'hash',
-        () => calculateHash(dbCache[filePath]).toString(16),
+        () => calculateHash(peekDbCacheValue(filePath)).toString(16),
     );
 }
 
@@ -360,7 +421,7 @@ function getDbCacheEtag(filePath) {
     return dbDerivedValueMemo.getOrCompute(
         filePath,
         'etag',
-        () => computeDatabaseEtagFromObject(dbCache[filePath]),
+        () => computeDatabaseEtagFromObject(peekDbCacheValue(filePath)),
     );
 }
 
@@ -949,7 +1010,9 @@ const chatBackupStore = createChatBackupStore({
     runStorageOperation: queueStorageOperation,
 });
 
-const DB_HEX_KEY = Buffer.from('database/database.bin', 'utf-8').toString('hex');
+const DB_BLOB_KEY = 'database/database.bin';
+const DB_HEX_KEY = Buffer.from(DB_BLOB_KEY, 'utf-8').toString('hex');
+const DB_CACHE_TEST_DIAGNOSTICS = process.env.NODE_ENV === 'test';
 const CHAT_EXTERNALIZATION_MARKER_KEY = 'migration/chats-externalized';
 const CHAT_EXTERNALIZATION_MARKER_VALUE = Buffer.from('done', 'utf-8');
 const CHAT_ORPHAN_GRACE_MS = 60 * 60 * 1000;
@@ -1163,7 +1226,8 @@ async function createBackupAndRotate() {
             return { created: false, retryAfterMs: PLUGIN_RECOVERY_SNAPSHOT_RETRY_MS };
         }
         const capturedPluginRecoveryToken = kvGet(PLUGIN_RECOVERY_SNAPSHOT_DIRTY_KEY);
-        const strippedDb = dbCache[DB_HEX_KEY] || await loadStrippedDatabase(raw, 'snapshot');
+        const strippedDb = getCurrentDatabaseCacheValue(DB_HEX_KEY)
+            || await loadStrippedDatabase(raw, 'snapshot');
         backupDbSpool = await spoolSelfContainedBackupDatabase(strippedDb, {
             foldPluginStorage: true,
             foldMcpToolCalls: true,
@@ -1274,7 +1338,7 @@ async function flushPendingDb() {
     if (saveTimers[DB_HEX_KEY] || dbPersistRetryPending) {
         if (saveTimers[DB_HEX_KEY]) clearTimeout(saveTimers[DB_HEX_KEY]);
         delete saveTimers[DB_HEX_KEY];
-        if (dbCache[DB_HEX_KEY]) {
+        if (peekDbCacheValue(DB_HEX_KEY)) {
             try {
                 await persistDbCache(DB_HEX_KEY, 'database/database.bin');
                 dbPersistRetryPending = false;
@@ -1284,7 +1348,7 @@ async function flushPendingDb() {
                 // Retain an actionable pending state after consuming the timer.
                 // A plugin recovery retry must reattempt this database persist,
                 // never snapshot dbCache and clear its token over stale live bytes.
-                dbPersistRetryPending = Boolean(dbCache[DB_HEX_KEY]);
+                dbPersistRetryPending = Boolean(peekDbCacheValue(DB_HEX_KEY));
                 throw error;
             }
         } else {
@@ -1303,7 +1367,7 @@ function invalidateDbCache() {
 }
 
 function invalidateAllDbCaches() {
-    const filePaths = new Set([...Object.keys(dbCache), ...Object.keys(saveTimers)]);
+    const filePaths = new Set([...dbCache.keys(), ...Object.keys(saveTimers)]);
     filePaths.add(DB_HEX_KEY);
     for (const filePath of filePaths) invalidateDbCacheEntry(filePath);
     dbPersistRetryPending = false;
@@ -1608,13 +1672,111 @@ async function loadStrippedDatabase(raw, source) {
     return (await ingestDatabase(decoded)).strippedDb;
 }
 
-async function prepareLiveDatabaseRead(raw, source) {
-    const strippedDatabase = await loadStrippedDatabase(raw, source);
-    replaceDbCacheValue(DB_HEX_KEY, strippedDatabase);
-    const prepared = prepareDatabaseReadPayload(strippedDatabase);
-    seedDbCacheEtag(DB_HEX_KEY, prepared.etag);
-    dbEtag = prepared.etag;
-    return prepared;
+async function prepareLiveDatabaseRead(source, { includeFullBlob = true } = {}) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const selectedRevision = kvGetDatabaseRevision();
+        if (selectedRevision === null) {
+            const retained = dbCache.metadata(DB_HEX_KEY);
+            if (retained?.dirty) throw new DatabaseCacheRevisionConflict();
+            dbCache.getForRevision(DB_HEX_KEY, null);
+            dbEtag = null;
+            return null;
+        }
+
+        let cacheStatus = 'hit';
+        let strippedDatabase = dbCache.getForRevision(DB_HEX_KEY, selectedRevision);
+        if (strippedDatabase) scheduleDbCachePrune();
+        if (!strippedDatabase) {
+            const retained = dbCache.metadata(DB_HEX_KEY);
+            if (retained?.dirty) {
+                throw new Error('Cannot replace acknowledged dirty database cache state during a read');
+            }
+
+            const raw = kvGet(DB_BLOB_KEY);
+            if (raw === null) continue;
+            // Select bytes and token synchronously. If defensive migration or an
+            // out-of-process writer changes the row during async decoding, retry
+            // against the newly authoritative revision instead of caching stale data.
+            if (kvGetDatabaseRevision() !== selectedRevision) continue;
+            strippedDatabase = await loadStrippedDatabase(raw, source);
+            if (kvGetDatabaseRevision() !== selectedRevision) continue;
+            replaceDbCacheValue(DB_HEX_KEY, strippedDatabase, {
+                revision: selectedRevision,
+                estimatedBytes: raw.length,
+                dirty: false,
+            });
+            cacheStatus = 'miss';
+        }
+
+        let fullBlob;
+        let etag;
+        if (includeFullBlob) {
+            const prepared = prepareDatabaseReadPayload(strippedDatabase);
+            fullBlob = prepared.fullBlob;
+            etag = prepared.etag;
+            if (dbCache.has(DB_HEX_KEY)) seedDbCacheEtag(DB_HEX_KEY, etag);
+        } else if (dbCache.has(DB_HEX_KEY)) {
+            etag = getDbCacheEtag(DB_HEX_KEY);
+        } else {
+            etag = computeDatabaseEtagFromObject(strippedDatabase);
+        }
+        dbEtag = etag;
+        return { strippedDatabase, fullBlob, etag, cacheStatus, revision: selectedRevision };
+    }
+    throw new Error('Database changed repeatedly while preparing an authoritative read');
+}
+
+async function loadPatchCache(filePath, decodedKey) {
+    if (decodedKey !== DB_BLOB_KEY) {
+        const cached = getDbCacheValue(filePath);
+        if (cached) return cached;
+        const fileContent = kvGet(decodedKey);
+        const decoded = fileContent
+            ? normalizeJSON(await decodeRisuSave(fileContent))
+            : {};
+        replaceDbCacheValue(filePath, decoded, {
+            revision: null,
+            estimatedBytes: fileContent?.length ?? 0,
+            dirty: false,
+        });
+        return decoded;
+    }
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const revision = kvGetDatabaseRevision();
+        const retained = dbCache.metadata(filePath);
+        if (retained?.dirty) {
+            if (retained.revision !== revision) throw new DatabaseCacheRevisionConflict();
+            return peekDbCacheValue(filePath);
+        }
+        const cached = dbCache.getForRevision(filePath, revision);
+        if (cached) {
+            scheduleDbCachePrune();
+            return cached;
+        }
+
+        const fileContent = kvGet(decodedKey);
+        if (fileContent === null) {
+            if (kvGetDatabaseRevision() !== revision) continue;
+            const empty = {};
+            replaceDbCacheValue(filePath, empty, {
+                revision: null,
+                estimatedBytes: 0,
+                dirty: false,
+            });
+            return empty;
+        }
+        if (kvGetDatabaseRevision() !== revision) continue;
+        const decoded = await loadStrippedDatabase(fileContent, 'Patch');
+        if (kvGetDatabaseRevision() !== revision) continue;
+        replaceDbCacheValue(filePath, decoded, {
+            revision,
+            estimatedBytes: fileContent.length,
+            dirty: false,
+        });
+        return decoded;
+    }
+    throw new Error('Database changed repeatedly while preparing a patch');
 }
 
 async function migrateChatsToRowsIfNeeded() {
@@ -1779,8 +1941,13 @@ async function captureChatDeletionPreImages(chatRowKeys) {
  * Persist the stubs-only patch cache.
  */
 async function persistDbCache(filePath, decodedKey) {
-    const cachedDb = dbCache[filePath];
+    const cachedDb = peekDbCacheValue(filePath);
     if (!cachedDb) return;
+    const cacheMetadata = dbCache.metadata(filePath);
+    if (decodedKey === DB_BLOB_KEY
+        && cacheMetadata?.revision !== kvGetDatabaseRevision()) {
+        throw new DatabaseCacheRevisionConflict();
+    }
 
     // Disk protection guard: abort persist on metadata-only chats.
     // Invalidate dbCache so the next request re-reads from disk and rebuilds a
@@ -1821,13 +1988,21 @@ async function persistDbCache(filePath, decodedKey) {
         ? [...pendingChatRowDeletions].filter(key => !referencedChatRows.has(key))
         : [];
     await captureChatDeletionPreImages(chatRowsToDelete);
+    let committedRevision = null;
     try {
         // Must stay synchronous: better-sqlite3 commits when this callback returns.
         sqliteDb.transaction(() => {
+            if (decodedKey === DB_BLOB_KEY
+                && cacheMetadata?.revision !== kvGetDatabaseRevision()) {
+                throw new DatabaseCacheRevisionConflict();
+            }
             writePluginStorageRows(pluginExternalization.rows);
             writePluginStorageManifest(pluginExternalization.manifest);
             kvSet(decodedKey, data);
             for (const key of chatRowsToDelete) kvDel(key);
+            if (decodedKey === DB_BLOB_KEY) {
+                committedRevision = kvGetDatabaseRevision();
+            }
         })();
     } catch (err) {
         // Tag with BLOB size so the visibility layer can surface it to the user.
@@ -1838,7 +2013,11 @@ async function persistDbCache(filePath, decodedKey) {
         throw err;
     }
     if (decodedKey === 'database/database.bin') {
-        replaceDbCacheValue(filePath, strippedDb);
+        replaceDbCacheValue(filePath, strippedDb, {
+            revision: committedRevision,
+            estimatedBytes: data.length,
+            dirty: false,
+        });
         pendingChatRowDeletions.clear();
     }
 }
@@ -5062,11 +5241,10 @@ function canonicalPluginStorageRowPrefix(storageKey) {
 
 async function readLivePluginStoragePublication() {
     await flushPendingDb();
-    let dbObj = dbCache[DB_HEX_KEY] || null;
-    if (!dbObj) {
-        const rawDatabase = kvGet('database/database.bin');
-        dbObj = rawDatabase ? await decodeAuthoritativeDatabase(rawDatabase) : null;
-    }
+    const prepared = await prepareLiveDatabaseRead('PluginStoragePublication', {
+        includeFullBlob: false,
+    });
+    const dbObj = prepared?.strippedDatabase ?? null;
     return {
         dbObj,
         generation: pluginStorageGeneration(dbObj),
@@ -9399,9 +9577,29 @@ app.get('/api/read', async (req, res, next) => {
     }
     try {
         const { decodedKey: key } = decodeAndCanonicalizeHexPath(filePath);
-        // Flush pending patches before reading database.bin
         if (key === 'database/database.bin') {
-            await flushPendingDb();
+            let prepared;
+            try {
+                prepared = await queueStorageReadAfterImports(async () => {
+                    await flushPendingDb();
+                    return prepareLiveDatabaseRead('Read');
+                });
+            } catch (error) {
+                logger.error('[Read] Failed to load database.bin', error);
+                return next(error);
+            }
+            if (!prepared) return res.send();
+            rememberSessionPluginStorageState(req, prepared.strippedDatabase);
+            if (req.headers['if-none-match'] === prepared.etag) {
+                return res.status(304).end();
+            }
+            res.setHeader('x-db-etag', prepared.etag);
+            if (DB_CACHE_TEST_DIAGNOSTICS) {
+                res.setHeader('x-pocketrisu-test-db-cache', prepared.cacheStatus);
+            }
+            res.setHeader('Content-Type', 'application/octet-stream');
+            res.send(prepared.fullBlob);
+            return;
         }
         // Imports hold an open transaction on the server's only SQLite
         // connection while clearing and repopulating plugin rows. Waiting at
@@ -9434,31 +9632,12 @@ app.get('/api/read', async (req, res, next) => {
         if(value === null){
             res.send();
         } else {
-            // database.bin is stubs-only; recover defensively if an import path
-            // ever leaks a payload into the live row.
-            if (key === 'database/database.bin') {
-                try {
-                    const prepared = await prepareLiveDatabaseRead(value, 'Read');
-                    value = prepared.fullBlob;
-                    rememberSessionPluginStorageState(req, prepared.strippedDatabase);
-                } catch (e) {
-                    // Log the Error itself (not just e.message) so logger.*
-                    // tags it and the Express middleware won't re-log after next().
-                    logger.error('[Read] Failed to load database.bin', e);
-                    return next(e);
-                }
-                if (req.headers['if-none-match'] === dbEtag) {
-                    return res.status(304).end();
-                }
-                res.setHeader('x-db-etag', dbEtag);
-            } else {
-                const cachedHashes = parseCachedHashesHeader(req.headers['x-cached-hashes']);
-                if (cachedHashes.length > 0) {
-                    const contentHash = sha256Hex(value);
-                    res.setHeader('x-content-hash', contentHash);
-                    if (cachedHashes.includes(contentHash)) {
-                        return res.status(204).end();
-                    }
+            const cachedHashes = parseCachedHashesHeader(req.headers['x-cached-hashes']);
+            if (cachedHashes.length > 0) {
+                const contentHash = sha256Hex(value);
+                res.setHeader('x-content-hash', contentHash);
+                if (cachedHashes.includes(contentHash)) {
+                    return res.status(204).end();
                 }
             }
             res.setHeader('Content-Type', 'application/octet-stream');
@@ -9488,27 +9667,35 @@ app.post('/api/db/read-cached', (req, res, next) => {
     }
 
     try {
-        await flushPendingDb();
-        const raw = kvGet('database/database.bin');
-        if (raw === null) return res.status(404).json({ error: 'Database not found' });
-
-        let prepared;
+        let selected;
         try {
-            prepared = await prepareLiveDatabaseRead(raw, 'ReadCached');
+            selected = await queueStorageReadAfterImports(async () => {
+                await flushPendingDb();
+                const prepared = await prepareLiveDatabaseRead('ReadCached', {
+                    includeFullBlob: false,
+                });
+                if (!prepared) return null;
+                const encodedSegments = encodeDatabaseSegments(prepared.strippedDatabase);
+                return {
+                    prepared,
+                    envelope: buildCachedDbReadEnvelope(
+                        encodedSegments,
+                        inventory,
+                        prepared.etag,
+                    ),
+                };
+            });
         } catch (error) {
             logger.error('[ReadCached] Failed to load database.bin', error);
             return next(error);
         }
-
-        let encodedSegments;
-        try {
-            encodedSegments = encodeDatabaseSegments(prepared.strippedDatabase);
-        } catch (error) {
-            return res.status(409).json({ error: error.message });
-        }
-        const envelope = buildCachedDbReadEnvelope(encodedSegments, inventory, prepared.etag);
+        if (!selected) return res.status(404).json({ error: 'Database not found' });
+        const { prepared, envelope } = selected;
         rememberSessionPluginStorageState(req, prepared.strippedDatabase);
         res.setHeader('x-db-etag', prepared.etag);
+        if (DB_CACHE_TEST_DIAGNOSTICS) {
+            res.setHeader('x-pocketrisu-test-db-cache', prepared.cacheStatus);
+        }
         res.setHeader('Content-Type', 'application/octet-stream');
         res.send(encodeCachedDbReadEnvelope(envelope));
     } catch (error) {
@@ -9524,9 +9711,10 @@ app.post('/api/db/read-cached', (req, res, next) => {
 app.get('/api/db/read-raw-for-boot', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
-        await flushPendingDb();
-        await importBarrier.waitUntilIdle();
-        const raw = kvGet('database/database.bin');
+        const raw = await queueStorageReadAfterImports(async () => {
+            await flushPendingDb();
+            return kvGet('database/database.bin');
+        });
         // A missing endpoint is also a 404. Use an explicit successful empty
         // response so newer clients never confuse version skew with a fresh
         // installation and overwrite an older server's database.
@@ -9575,7 +9763,11 @@ app.post('/api/db/create-if-absent', async (req, res, next) => {
             }
 
             invalidateDbCache();
-            replaceDbCacheValue(DB_HEX_KEY, database);
+            replaceDbCacheValue(DB_HEX_KEY, database, {
+                revision: kvGetDatabaseRevision(),
+                estimatedBytes: encoded.length,
+                dirty: false,
+            });
             dbEtag = computeBufferEtag(encoded);
             seedDbCacheEtag(DB_HEX_KEY, dbEtag);
             rememberSessionPluginStorageState(req, database);
@@ -13751,7 +13943,9 @@ app.post('/api/write', async (req, res, next) => {
                     // Reuse the existing stripped cache when available. Do not
                     // decode the prior live row solely for targeted cleanup;
                     // optimize's grace-window sweep handles cache-cold writes.
-                    const previousStrippedDb = dbCache[filePath] || dbCache[DB_HEX_KEY] || null;
+                    const previousStrippedDb = getCurrentDatabaseCacheValue(filePath)
+                        || getCurrentDatabaseCacheValue(DB_HEX_KEY)
+                        || null;
                     const incomingDb = await decodeAuthoritativeDatabase(fileContent);
 
                     // Mirror the patch-persist guard:
@@ -13874,7 +14068,7 @@ app.post('/api/write', async (req, res, next) => {
                     await decodeAuthoritativeDatabase(persistedDatabaseContent),
                 );
                 shouldCreateBackup = true;
-            } else if (Object.hasOwn(dbCache, filePath) || saveTimers[filePath]) {
+            } else if (dbCache.has(filePath) || saveTimers[filePath]) {
                 // A full write supersedes any cached/debounced patch state for
                 // the same non-database key.
                 invalidateDbCacheEntry(filePath);
@@ -14038,18 +14232,12 @@ app.post('/api/patch', async (req, res, next) => {
                 });
             }
 
-            // Load database into memory if not already cached
-            // For database.bin, cache holds the STRIPPED version (stubs only)
-            if (!dbCache[filePath]) {
-                const fileContent = kvGet(decodedKey);
-                if (fileContent) {
-                    const decoded = decodedKey === 'database/database.bin'
-                        ? await loadStrippedDatabase(fileContent, 'Patch')
-                        : normalizeJSON(await decodeRisuSave(fileContent));
-                    replaceDbCacheValue(filePath, decoded);
-                } else {
-                    replaceDbCacheValue(filePath, {});
-                }
+            // For database.bin, reuse is valid only while the authoritative
+            // SQLite row revision still matches the decoded stubs-only graph.
+            const cachedDb = await loadPatchCache(filePath, decodedKey);
+            if (decodedKey === DB_BLOB_KEY
+                && dbCache.metadata(filePath)?.revision !== kvGetDatabaseRevision()) {
+                throw new DatabaseCacheRevisionConflict();
             }
 
             // Reject patch ops that touch chat-internal fields. Lazy loading
@@ -14104,7 +14292,6 @@ app.post('/api/patch', async (req, res, next) => {
 
             // Only patch-path ancestors are copied. Until the complete sequence
             // succeeds, every object reachable from dbCache remains untouched.
-            const cachedDb = dbCache[filePath];
             const result = applyPatchAtomic(cachedDb, patch);
             const snapshot = result.newDocument;
             if (decodedKey === 'database/database.bin') {
@@ -14141,7 +14328,7 @@ app.post('/api/patch', async (req, res, next) => {
                     dbDerivedValueMemo.bump(filePath);
                 }
             }
-            replaceDbCacheValue(filePath, snapshot);
+            replaceDbCacheValue(filePath, snapshot, { dirty: true });
 
             // Schedule stubs-only save to KV (debounced).
             if (saveTimers[filePath]) {
@@ -14155,7 +14342,7 @@ app.post('/api/patch', async (req, res, next) => {
                             await persistDbCache(filePath, decodedKey);
                             dbPersistRetryPending = false;
                         } else {
-                            const data = Buffer.from(encodeRisuSaveLegacy(dbCache[filePath]));
+                            const data = Buffer.from(encodeRisuSaveLegacy(peekDbCacheValue(filePath)));
                             try {
                                 kvSet(decodedKey, data);
                             } catch (err) {
@@ -14164,6 +14351,7 @@ app.post('/api/patch', async (req, res, next) => {
                                 }
                                 throw err;
                             }
+                            markDbCacheClean(filePath, { estimatedBytes: data.length });
                         }
                         // Persist succeeded — clear before backup so a backup-only
                         // failure isn't attributed to data loss.
@@ -14180,7 +14368,7 @@ app.post('/api/patch', async (req, res, next) => {
                             // persistDbCache may intentionally invalidate a
                             // malformed cache. Only retained cache state can be
                             // retried; otherwise the live database supersedes it.
-                            dbPersistRetryPending = Boolean(dbCache[filePath]);
+                            dbPersistRetryPending = Boolean(peekDbCacheValue(filePath));
                         }
                         logger.error(`[Patch] Error saving ${decodedKey}:`, error);
                         recordPersistFailure(error, `patch:${decodedKey}`);
@@ -14218,6 +14406,13 @@ app.post('/api/patch', async (req, res, next) => {
         });
     } catch (error) {
         if (isImportInProgressError(error)) return sendImportBusy(res);
+        if (error instanceof DatabaseCacheRevisionConflict) {
+            return res.status(409).json({
+                error: error.message,
+                code: error.code,
+                retryable: false,
+            });
+        }
         const diagnostic = logPluginStorageValidationFailure(
             '[PluginStorage] Rejected invalid patched database row',
             error
@@ -15473,7 +15668,7 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
         if (!chat) {
             const raw = kvGet('database/database.bin');
             if (!raw) return res.status(404).json({ error: 'Database not found' });
-            const strippedDb = dbCache[DB_HEX_KEY]
+            const strippedDb = getCurrentDatabaseCacheValue(DB_HEX_KEY, { allowDirty: true })
                 || await loadStrippedDatabase(raw, 'ChatContent');
             const char = strippedDb.characters?.find(c => c?.chaId === chaId);
             const stub = char?.chats?.[chatIndex];
@@ -16308,7 +16503,6 @@ app.post('/api/migrate/save-folder/cleanup/execute', async (req, res, next) => {
 
 // ── Storage dashboard endpoints ──────────────────────────────────────────────
 
-const DB_BLOB_KEY = 'database/database.bin';
 const DB_BACKUP_PREFIX = 'database/dbbackup-';
 const INTERNAL_SNAPSHOT_KEY_PATTERN = /^database\/dbbackup-(0|[1-9]\d*)\.bin$/;
 const ASSET_PREFIXES = ['assets/', 'remotes/', 'inlay/', 'inlay_thumb/', 'inlay_meta/', 'inlay_info/', 'coldstorage/'];
@@ -16559,7 +16753,7 @@ app.get('/api/db/stats', async (req, res, next) => {
         // Quick estimates from in-memory cache only — never decode the BLOB just for stats.
         let trashed = { count: 0, expiredCount: 0, available: false };
         let orphan = { count: 0, totalSize: 0, available: false };
-        const stripped = dbCache[DB_HEX_KEY];
+        const stripped = getCurrentDatabaseCacheValue(DB_HEX_KEY, { allowDirty: true });
         if (stripped?.characters) {
             const now = Date.now();
             const GRACE = 1000 * 60 * 60 * 24 * 3;
@@ -16795,7 +16989,8 @@ app.post('/api/db/optimize', async (req, res, next) => {
             const t0 = Date.now();
             const rawDb = kvGet(DB_BLOB_KEY);
             const strippedDb = rawDb
-                ? dbCache[DB_HEX_KEY] || await loadStrippedDatabase(rawDb, 'Optimize')
+                ? getCurrentDatabaseCacheValue(DB_HEX_KEY)
+                    || await loadStrippedDatabase(rawDb, 'Optimize')
                 : { characters: [] };
             const chatSweep = chatRowStore.sweepOrphanChatRows(strippedDb, {
                 graceMs: CHAT_ORPHAN_GRACE_MS,
