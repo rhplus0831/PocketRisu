@@ -94,7 +94,7 @@ describe('cached database read route', () => {
     }
   })
 
-  test('invalidates decoded reuse after an authoritative full write', async () => {
+  test('seeds decoded reuse after an authoritative full write', async () => {
     const initial = await client.fetch('/api/read', {
       headers: { 'file-path': DB_PATH_HEX },
     })
@@ -114,13 +114,16 @@ describe('cached database read route', () => {
       body: bytes,
     })
     expect(written.status).toBe(200)
+    const writeAcknowledgement = await written.json() as { etag?: string }
+    expect(writeAcknowledgement.etag).toMatch(/^[0-9a-f]{32}$/)
 
-    const coldAfterWrite = await cachedRead(emptyHashes())
-    expect(coldAfterWrite.status).toBe(200)
-    expect(coldAfterWrite.headers.get('x-pocketrisu-test-db-cache')).toBe('miss')
-    expect(Number(coldAfterWrite.headers.get('x-pocketrisu-test-db-segments-encoded')))
+    const warmAfterWrite = await cachedRead(emptyHashes())
+    expect(warmAfterWrite.status).toBe(200)
+    expect(warmAfterWrite.headers.get('x-pocketrisu-test-db-cache')).toBe('hit')
+    expect(warmAfterWrite.headers.get('x-db-etag')).toBe(writeAcknowledgement.etag)
+    expect(Number(warmAfterWrite.headers.get('x-pocketrisu-test-db-segments-encoded')))
       .toBeGreaterThan(0)
-    expect(coldAfterWrite.headers.get('x-pocketrisu-test-db-segments-reused')).toBe('0')
+    expect(warmAfterWrite.headers.get('x-pocketrisu-test-db-segments-reused')).toBe('0')
 
     const warmAgain = await cachedRead(emptyHashes())
     expect(warmAgain.status).toBe(200)

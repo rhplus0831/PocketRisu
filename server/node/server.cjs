@@ -13924,6 +13924,8 @@ app.post('/api/write', async (req, res, next) => {
                 ? await readLivePluginStoragePublication()
                 : null;
             let persistedDatabaseContent = fileContent;
+            let validatedStrippedDatabase = null;
+            let committedDatabaseRevision = null;
             if (
                 key.startsWith(PLUGIN_SAVE_PREFIX)
                 || key.startsWith(PLUGIN_SAVE_META_PREFIX)
@@ -14092,6 +14094,11 @@ app.post('/api/write', async (req, res, next) => {
                         pluginExternalization,
                     );
                     const strippedDb = pluginExternalization.strippedDb;
+                    // Full writes already paid for authoritative decoding and
+                    // validation. Retain the same normalized stubs-only graph
+                    // for the exact committed revision instead of decoding the
+                    // persisted bytes again here and once more on the next patch.
+                    validatedStrippedDatabase = normalizeDecodedDatabaseForRead(strippedDb);
                     if (chatRows.length > 0 || pluginExternalization.changed) {
                         persistedDatabaseContent = Buffer.from(encodeRisuSaveLegacy(strippedDb));
                     }
@@ -14112,6 +14119,7 @@ app.post('/api/write', async (req, res, next) => {
                         if (previousStrippedDb) {
                             chatRowStore.deleteRemovedChatRows(previousStrippedDb, strippedDb);
                         }
+                        committedDatabaseRevision = kvGetDatabaseRevision();
                     })();
                 } catch (e) {
                     const diagnostic = logPluginStorageValidationFailure(
@@ -14144,12 +14152,15 @@ app.post('/api/write', async (req, res, next) => {
             // snapshot is queued only after this user-visible mutation returns.
             if (key === 'database/database.bin') {
                 invalidateDbCache();
+                replaceDbCacheValue(filePath, validatedStrippedDatabase, {
+                    revision: committedDatabaseRevision,
+                    estimatedBytes: persistedDatabaseContent.length,
+                    dirty: false,
+                });
                 // ETag based on stripped version (what client sees)
                 dbEtag = computeBufferEtag(persistedDatabaseContent);
-                rememberSessionPluginStorageState(
-                    req,
-                    await decodeAuthoritativeDatabase(persistedDatabaseContent),
-                );
+                seedDbCacheEtag(filePath, dbEtag);
+                rememberSessionPluginStorageState(req, validatedStrippedDatabase);
                 shouldCreateBackup = true;
             } else if (dbCache.has(filePath) || saveTimers[filePath]) {
                 // A full write supersedes any cached/debounced patch state for
