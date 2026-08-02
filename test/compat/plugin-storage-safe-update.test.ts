@@ -55,11 +55,11 @@ async function boot(): Promise<{ server: ServerHandle; client: RisuClient }> {
   return { server, client: await createClient(server.port, server.password) }
 }
 
-function state(client: RisuClient, key: string): Promise<Response> {
+function state(client: RisuClient, key: string, generation = GENERATION): Promise<Response> {
   return client.fetch('/api/plugin-storage/state', {
     headers: {
       'file-path': Buffer.from(valueKey(key)).toString('hex'),
-      'x-plugin-storage-generation': GENERATION,
+      'x-plugin-storage-generation': generation,
     },
   })
 }
@@ -141,6 +141,47 @@ describe('IP1 safe plugin storage read/update integration', () => {
       missing: true,
       revision: null,
       generation: null,
+    })
+  })
+
+  test('direct SQLite generation and manifest replacement invalidates the parsed cache', async () => {
+    const { server } = await boot()
+    await server.restart({ POCKETRISU_TEST_PLUGIN_STATE_FAILPOINT: '' })
+    const firstClient = await createClient(server.port, server.password)
+    expect((await state(firstClient, 'config')).status).toBe(200)
+
+    const nextGeneration = `${GENERATION}-external`
+    const nextManifest = { ...manifest, generation: nextGeneration }
+    const db = new Database(path.join(server.cwd, 'save', 'risuai.db'))
+    try {
+      db.transaction(() => {
+        db.prepare('UPDATE kv SET value = ? WHERE key = ?').run(
+          Buffer.from(JSON.stringify(nextManifest)),
+          MANIFEST_KEY,
+        )
+        db.prepare('UPDATE kv SET value = ? WHERE key = ?').run(
+          Buffer.from(encodeRisuSaveLegacy({
+            characters: [],
+            optimizePluginMemory: true,
+            pluginStorageGeneration: nextGeneration,
+            pluginCustomStorage: {},
+          })),
+          DATABASE_KEY,
+        )
+      })()
+    } finally {
+      db.close()
+    }
+
+    // A fresh session pins the externally published generation. Reusing the
+    // prior parsed manifest would make this request conflict instead.
+    const nextClient = await createClient(server.port, server.password)
+    const response = await state(nextClient, 'config', nextGeneration)
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      success: true,
+      missing: false,
+      revision: expect.stringMatching(/^sha256:/),
     })
   })
 })

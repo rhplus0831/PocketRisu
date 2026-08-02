@@ -40,7 +40,7 @@ const getVips = () => {
     return _vipsPromise
 }
 const { kvGet, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList,
-        kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvGetDatabaseRevision, kvCopyValue, clearEntities, checkpointWal,
+        kvDelPrefix, kvListWithSizes, kvSize, kvGetUpdatedAt, kvGetDatabaseRevision, kvGetPluginStoragePublicationRevision, kvCopyValue, clearEntities, checkpointWal,
         kvClearDeletion, kvRecordDeletion, kvListModifiedSince, kvGetDeletedSince, kvCleanupOldDeletions,
         kvGetListEpoch, kvBumpListEpoch,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprint, createKvSnapshot,
@@ -94,6 +94,7 @@ const { createRequestLogs } = require('./request-logs.cjs');
 const { applyPatchAtomic } = require('./atomicJsonPatch.cjs');
 const { createGenerationMemo } = require('./generationMemo.cjs');
 const { createRevisionBoundCache } = require('./revisionBoundCache.cjs');
+const { createPluginStorageManifestCache } = require('./pluginStorageManifestCache.cjs');
 const {
     decodeRisuSave,
     decodeAuthoritativeRisuSave,
@@ -345,6 +346,10 @@ const dbCache = createRevisionBoundCache({
             dbSegmentMemo.clear();
         }
     },
+});
+const pluginStorageManifestCache = createPluginStorageManifestCache({
+    getRevision: kvGetPluginStoragePublicationRevision,
+    readState: () => readPluginStorageManifestStateUncached(kvGet),
 });
 
 class DatabaseCacheRevisionConflict extends Error {
@@ -1392,6 +1397,7 @@ async function flushPendingDb() {
 
 function invalidateDbCache() {
     invalidateDbCacheEntry(DB_HEX_KEY);
+    pluginStorageManifestCache.clear('database-publication-invalidation');
     dbPersistRetryPending = false;
     pendingChatRowDeletions.clear();
     dbEtag = null;
@@ -1401,6 +1407,7 @@ function invalidateAllDbCaches() {
     const filePaths = new Set([...dbCache.keys(), ...Object.keys(saveTimers)]);
     filePaths.add(DB_HEX_KEY);
     for (const filePath of filePaths) invalidateDbCacheEntry(filePath);
+    pluginStorageManifestCache.clear('destructive-publication-invalidation');
     dbPersistRetryPending = false;
     pendingChatRowDeletions.clear();
     dbEtag = null;
@@ -5105,11 +5112,10 @@ function writePluginStorageRows(rows) {
 }
 
 function writePluginStorageManifest(manifest) {
-    if (!manifest) return;
-    kvSet(
-        PLUGIN_STORAGE_MANIFEST_KEY,
-        Buffer.from(JSON.stringify(manifest), 'utf-8'),
-    );
+    if (!manifest) return null;
+    const bytes = Buffer.from(JSON.stringify(manifest), 'utf-8');
+    kvSet(PLUGIN_STORAGE_MANIFEST_KEY, bytes);
+    return bytes;
 }
 
 function pluginStorageManifestEquals(left, right) {
@@ -5145,7 +5151,7 @@ function normalizePluginStorageManifestRequest(value, fieldName, { nullable = fa
     return manifest;
 }
 
-function readPluginStorageManifestState(readValue = kvGet) {
+function readPluginStorageManifestStateUncached(readValue = kvGet) {
     const raw = readValue(PLUGIN_STORAGE_MANIFEST_KEY);
     if (!raw) return { manifest: null, present: false, valid: true, revision: null };
     try {
@@ -5159,6 +5165,13 @@ function readPluginStorageManifestState(readValue = kvGet) {
     } catch {
         return { manifest: null, present: true, valid: false, revision: null };
     }
+}
+
+function readPluginStorageManifestState(readValue) {
+    if (readValue !== undefined) {
+        return readPluginStorageManifestStateUncached(readValue);
+    }
+    return pluginStorageManifestCache.read().state;
 }
 
 function readStrictPluginStorageOwnershipManifest(readValue = kvGet) {
@@ -5320,10 +5333,12 @@ async function readLivePluginStoragePublication() {
         includeFullBlob: false,
     });
     const dbObj = prepared?.strippedDatabase ?? null;
+    const manifestEntry = pluginStorageManifestCache.read();
     return {
         dbObj,
         generation: pluginStorageGeneration(dbObj),
-        manifestState: readPluginStorageManifestState(),
+        manifestState: manifestEntry.state,
+        manifestEntry,
     };
 }
 
@@ -6069,7 +6084,7 @@ function parsePluginSaveJson(storageKey, readValue = kvGet) {
     return validatePluginStorageRow(storageKey, value);
 }
 
-function readPluginStorageManifest(readValue = kvGet) {
+function readPluginStorageManifest(readValue) {
     return readPluginStorageManifestState(readValue).manifest;
 }
 
@@ -11247,9 +11262,17 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
             let generation;
             let committedRevisions;
             let nextManifest;
+            let manifestUpdate;
+            let committedManifestBytes;
+            let committedPublicationRevision;
             try {
                 const publication = await readLivePluginStoragePublication();
-                const { dbObj, generation: liveGeneration, manifestState } = publication;
+                const {
+                    dbObj,
+                    generation: liveGeneration,
+                    manifestState,
+                    manifestEntry,
+                } = publication;
                 const pinnedState = sessionPluginStorageReadState(req);
                 const activeManifest = liveGeneration
                     && dbObj?.optimizePluginMemory === true
@@ -11276,36 +11299,33 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                     });
                 }
 
-                const nextValueKeys = new Set(activeManifest.valueKeys);
-                const nextMetaKeys = new Set(activeManifest.metaKeys);
-                const activeValueKeys = new Set(activeManifest.valueKeys);
-                const activeMetaKeys = new Set(activeManifest.metaKeys);
+                const valueAdds = [];
+                const valueDeletes = [];
+                const metaAdds = [];
+                const metaDeletes = [];
                 for (const operation of operations) {
                     if (operation.operation === 'set') {
-                        nextValueKeys.add(operation.valueKey);
-                        if (operation.owner) nextMetaKeys.add(operation.ownerKey);
-                        else nextMetaKeys.delete(operation.ownerKey);
+                        valueAdds.push(operation.valueKey);
+                        if (operation.owner) metaAdds.push(operation.ownerKey);
+                        else metaDeletes.push(operation.ownerKey);
                     } else {
-                        nextValueKeys.delete(operation.valueKey);
-                        nextMetaKeys.delete(operation.ownerKey);
+                        valueDeletes.push(operation.valueKey);
+                        metaDeletes.push(operation.ownerKey);
                     }
                 }
-                nextManifest = createPluginStorageManifest(
-                    requestedGeneration,
-                    nextValueKeys,
-                    nextMetaKeys,
-                    mergePluginStorageKeyMappings(
-                        activeManifest,
-                        operations.map(operation => operation.rawKey),
-                        nextValueKeys,
-                        nextMetaKeys,
-                    ),
-                );
+                manifestUpdate = pluginStorageManifestCache.prepareUpdate(manifestEntry, {
+                    valueAdds,
+                    valueDeletes,
+                    metaAdds,
+                    metaDeletes,
+                    rawKeys: operations.map(operation => operation.rawKey),
+                });
+                nextManifest = manifestUpdate.manifest;
                 const readActiveState = (operation) => {
-                    const valueBytes = activeValueKeys.has(operation.valueKey)
+                    const valueBytes = manifestEntry.valueKeys.has(operation.valueKey)
                         ? kvGet(operation.valueKey)
                         : null;
-                    const ownerBytes = activeMetaKeys.has(operation.ownerKey)
+                    const ownerBytes = manifestEntry.metaKeys.has(operation.ownerKey)
                         ? kvGet(operation.ownerKey)
                         : null;
                     const owner = parsePluginStorageOwnerRecord(ownerBytes);
@@ -11385,9 +11405,11 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                         hitPluginStorageBatchFailpoint(`after-operation:${index}`);
                     }
                     hitPluginStorageBatchFailpoint('pre-commit');
-                    writePluginStorageManifest(nextManifest);
+                    committedManifestBytes = writePluginStorageManifest(nextManifest);
                     hitPluginStorageBatchFailpoint('after-manifest');
                     markPluginRecoverySnapshotDirty(recoverySnapshotToken);
+                    committedPublicationRevision =
+                        kvGetPluginStoragePublicationRevision();
                     committedRevisions = operations.map(operation => ({
                         key: operation.rawKey,
                         revision: operation.operation === 'set'
@@ -11424,8 +11446,13 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                 });
             }
 
+            pluginStorageManifestCache.publishPrepared(manifestUpdate, {
+                revision: committedPublicationRevision,
+                manifestRevision: `sha256:${sha256Hex(committedManifestBytes)}`,
+            });
+
             // Establish the deferred BR1 recovery obligation from the known
-            // commit boundary before diagnostics or acknowledgement loss.
+            // commit boundary before acknowledgement loss.
             schedulePluginRecoverySnapshot();
 
             if (pluginStorageBatchFailpoint === 'acknowledgement-loss') {
@@ -11435,27 +11462,9 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
 
             let verification = 'verified';
             try {
+                // Retain the acknowledgement-downgrade failpoint without
+                // re-reading any committed row or manifest bytes.
                 hitPluginStorageBatchFailpoint('verification-read');
-                for (let index = 0; index < operations.length; index++) {
-                    const operation = operations[index];
-                    if (operation.operation === 'set' && operation.valueFilePath) {
-                        const storedOwner = kvGet(operation.ownerKey);
-                        const ownerMatches = operation.committedOwnerBytes
-                            ? storedOwner?.equals(operation.committedOwnerBytes) === true
-                            : storedOwner === null;
-                        if (kvSize(operation.valueKey) !== operation.valueSize || !ownerMatches) {
-                            throw new Error('Committed streamed plugin storage batch failed verification.');
-                        }
-                        continue;
-                    }
-                    const current = readPluginStorageState(operation.valueKey, operation.ownerKey);
-                    if (current.revision !== committedRevisions[index].revision) {
-                        throw new Error('Committed plugin storage batch failed verification.');
-                    }
-                }
-                if (!pluginStorageManifestEquals(readPluginStorageManifest(), nextManifest)) {
-                    throw new Error('Committed plugin storage manifest failed verification.');
-                }
             } catch (error) {
                 verification = 'unavailable';
                 logger.warn('[PluginStorageBatch] Post-commit verification unavailable:', error);
@@ -11793,8 +11802,6 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                     retryable: true,
                 });
             }
-            const nextValueKeys = new Set(activeManifest?.valueKeys ?? []);
-            const nextMetaKeys = new Set(activeManifest?.metaKeys ?? []);
             if (isHashedPluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX)) {
                 if (!activeManifest) {
                     return res.status(409).json({
@@ -11812,31 +11819,27 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                     PLUGIN_SAVE_PREFIX,
                 );
             }
+            let manifestUpdate = null;
             if (activeManifest) {
-                if (operation === 'set') nextValueKeys.add(valueKey);
-                else nextValueKeys.delete(valueKey);
+                const valueAdds = operation === 'set' ? [valueKey] : [];
+                const valueDeletes = operation === 'remove' ? [valueKey] : [];
+                const metaAdds = [];
+                const metaDeletes = [];
                 if ((operation === 'remove' && ownerPolicy !== 'preserve')
                     || (ownerPolicy === 'replace' && !owner)) {
-                    nextMetaKeys.delete(ownerKey);
+                    metaDeletes.push(ownerKey);
                 } else if (operation === 'set' && ownerPolicy !== 'preserve') {
-                    nextMetaKeys.add(ownerKey);
+                    metaAdds.push(ownerKey);
                 }
+                manifestUpdate = pluginStorageManifestCache.prepareUpdate(
+                    publication.manifestEntry,
+                    { valueAdds, valueDeletes, metaAdds, metaDeletes },
+                );
             }
-            const nextManifest = activeManifest
-                ? createPluginStorageManifest(
-                    liveGeneration,
-                    nextValueKeys,
-                    nextMetaKeys,
-                    mergePluginStorageKeyMappings(
-                        activeManifest,
-                        [],
-                        nextValueKeys,
-                        nextMetaKeys,
-                    ),
-                )
-                : null;
-            const preservedOwner = ownerPolicy === 'preserve' ? kvGet(ownerKey) : null;
+            const nextManifest = manifestUpdate?.manifest ?? null;
             const recoverySnapshotToken = newPluginRecoverySnapshotToken();
+            let committedManifestBytes = null;
+            let committedPublicationRevision = null;
             try {
                 sqliteDb.transaction(() => {
                     if (operation === 'set') {
@@ -11864,10 +11867,12 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                         if (ownerPolicy !== 'preserve') kvDel(ownerKey);
                     }
                     maybeFailPluginStorageTransaction(req, 'after-row');
-                    writePluginStorageManifest(nextManifest);
+                    committedManifestBytes = writePluginStorageManifest(nextManifest);
                     maybeFailPluginStorageTransaction(req, 'after-manifest');
                     hitPluginStorageMutationFailpoint('pre-commit');
                     markPluginRecoverySnapshotDirty(recoverySnapshotToken);
+                    committedPublicationRevision =
+                        kvGetPluginStoragePublicationRevision();
                 })();
             } catch (error) {
                 logger.warn('[PluginStorageMutation] Transaction rolled back:', error);
@@ -11884,8 +11889,15 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 });
             }
 
-            // Schedule from the known-commit boundary, before any diagnostic
-            // read or deliberately lost acknowledgement can return control.
+            if (manifestUpdate) {
+                pluginStorageManifestCache.publishPrepared(manifestUpdate, {
+                    revision: committedPublicationRevision,
+                    manifestRevision: `sha256:${sha256Hex(committedManifestBytes)}`,
+                });
+            }
+
+            // Schedule from the known-commit boundary before a deliberately
+            // lost acknowledgement can return control.
             schedulePluginRecoverySnapshot();
 
             if (pluginStorageMutationFailpoint === 'acknowledgement-loss') {
@@ -11897,32 +11909,13 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
 
             let verification = 'verified';
             try {
+                // Retain the acknowledgement-downgrade failpoint without
+                // re-reading any committed row or manifest bytes.
                 hitPluginStorageMutationFailpoint('verification-read');
-                const storedValue = valueFilePath ? null : kvGet(valueKey);
-                const storedOwner = kvGet(ownerKey);
-                const storedManifest = readPluginStorageManifest();
-                const valueMatches = operation === 'set'
-                    ? valueFilePath
-                        ? kvSize(valueKey) === valueSize
-                        : storedValue !== null && storedValue.equals(valueBytes)
-                    : storedValue === null;
-                const ownerMatches = operation === 'set' && ownerPolicy === 'record'
-                    ? storedOwner !== null && storedOwner.equals(ownerRecordBytes)
-                    : ownerPolicy === 'preserve'
-                        ? (storedOwner === null) === (preservedOwner === null)
-                            && (storedOwner === null || storedOwner.equals(preservedOwner))
-                        : operation === 'set' && owner
-                            ? storedOwner !== null
-                                && JSON.parse(storedOwner.toString('utf-8'))?.plugin === owner
-                            : storedOwner === null;
-                if (!valueMatches || !ownerMatches
-                    || !pluginStorageManifestEquals(storedManifest, nextManifest)) {
-                    throw new Error('Committed plugin storage rows failed verification.');
-                }
             } catch (error) {
                 // The writer transaction has already returned successfully.
                 // Never reject a known committed primary mutation because a
-                // later diagnostic read failed.
+                // test-only acknowledgement diagnostic failed.
                 verification = 'unavailable';
                 logger.warn('[PluginStorageMutation] Post-commit verification unavailable:', error);
             }

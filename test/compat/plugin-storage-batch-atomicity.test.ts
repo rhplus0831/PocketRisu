@@ -1,10 +1,10 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import Database from 'better-sqlite3'
 import path from 'node:path'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, readdir, writeFile } from 'node:fs/promises'
 import { gzipSync } from 'node:zlib'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { Packr } from 'msgpackr'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
@@ -18,6 +18,7 @@ const { encodeRisuSaveLegacy, decodeRisuSave, magicCompressedHeader } = utilsPkg
   magicCompressedHeader: Uint8Array
 }
 const packr = new Packr({ useRecords: false })
+const transitionPackr = new Packr({ structuredClone: true, useRecords: true })
 const {
   encodePluginSaveStorageKey,
   PLUGIN_SAVE_PREFIX,
@@ -177,6 +178,14 @@ function framedCompactEnvelope(
   ]))
 }
 
+function bulkTransitionBody(metadata: Record<string, unknown>, payloads: Buffer[]): Uint8Array {
+  const metadataBytes = Buffer.from(JSON.stringify(metadata), 'utf8')
+  const prefix = Buffer.alloc(12)
+  prefix.write('PRISUT01', 0, 'ascii')
+  prefix.writeUInt32BE(metadataBytes.byteLength, 8)
+  return new Uint8Array(Buffer.concat([prefix, metadataBytes, ...payloads]))
+}
+
 function batchBody(expectedRevision?: string | null): Uint8Array {
   return envelope(keys.map(key => ({
       operation: 'set',
@@ -264,9 +273,17 @@ async function readManifest(
   client: RisuClient,
   mode: 'snapshot' | 'state' = 'snapshot',
 ): Promise<any> {
+  return readManifestForGeneration(client, STORAGE_GENERATION, mode)
+}
+
+async function readManifestForGeneration(
+  client: RisuClient,
+  generation: string,
+  mode: 'snapshot' | 'state' = 'snapshot',
+): Promise<any> {
   const response = await client.fetch('/api/plugin-storage/manifest', {
     headers: {
-      'x-plugin-storage-generation': STORAGE_GENERATION,
+      'x-plugin-storage-generation': generation,
       'x-plugin-storage-manifest-mode': mode,
     },
   })
@@ -290,6 +307,111 @@ function readGeneration(cwd: string): 'old' | 'new' | 'torn' {
 }
 
 describe('AA3 atomic plugin storage batch', () => {
+  test('the committed batch path performs no post-commit row or manifest rereads', () => {
+    const source = readFileSync(
+      new URL('../../server/node/server.cjs', import.meta.url),
+      'utf-8',
+    )
+    const routeStart = source.indexOf("app.post('/api/plugin-storage/batch'")
+    const routeEnd = source.indexOf('const PLUGIN_STORAGE_SIZE_PREFIXES', routeStart)
+    expect(routeStart).toBeGreaterThanOrEqual(0)
+    expect(routeEnd).toBeGreaterThan(routeStart)
+    const route = source.slice(routeStart, routeEnd)
+    const committedStart = route.indexOf('pluginStorageManifestCache.publishPrepared')
+    expect(committedStart).toBeGreaterThanOrEqual(0)
+    const afterCommit = route.slice(committedStart)
+    expect(afterCommit).not.toMatch(/readPluginStorageState\(/)
+    expect(afterCommit).not.toMatch(/readPluginStorageManifest\(/)
+    expect(afterCommit).not.toMatch(/kvGet\(\s*operation\.ownerKey\s*\)/)
+    expect(afterCommit).not.toMatch(/kvSize\(\s*operation\.valueKey\s*\)/)
+  })
+
+  test('bulk transitions discard the parsed manifest selected by the prior generation', async () => {
+    const { client } = await boot()
+    const before = await readManifest(client)
+    const internalGeneration = randomUUID()
+    const internalBody = bulkTransitionBody({
+      version: 1,
+      transitionId: randomUUID(),
+      source: {
+        optimized: true,
+        generation: STORAGE_GENERATION,
+        manifest: before.manifest,
+      },
+      targetOptimized: false,
+      targetGeneration: internalGeneration,
+      autoConvert: true,
+      rows: [],
+    }, [])
+    const internal = await client.fetch('/api/plugin-storage/transition/bulk', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-pocketrisu-plugin-storage-transition',
+        'x-plugin-storage-transition-length': String(internalBody.byteLength),
+      },
+      body: internalBody,
+    })
+    expect(internal.status, await internal.clone().text()).toBe(200)
+
+    const databaseResponse = await client.fetch('/api/read', {
+      headers: { 'file-path': Buffer.from(DATABASE_KEY).toString('hex') },
+    })
+    const inlineDatabase = await decodeRisuSave(
+      new Uint8Array(await databaseResponse.arrayBuffer()),
+    ) as any
+    expect(inlineDatabase.optimizePluginMemory).toBe(false)
+    expect(inlineDatabase.pluginStorageGeneration).toBe(internalGeneration)
+
+    const rows = [
+      ...Object.entries(inlineDatabase.pluginCustomStorage).map(([rawKey, value]) => ({
+        rawKey,
+        storageKey: valueKey(rawKey),
+        value,
+      })),
+      ...Object.entries(inlineDatabase.pluginStorageMeta).map(([rawKey, value]) => ({
+        rawKey,
+        storageKey: ownerKey(rawKey),
+        value,
+      })),
+    ].map(row => {
+      const bytes = Buffer.from(transitionPackr.encode(row.value))
+      return {
+        bytes,
+        descriptor: {
+          rawKey: row.rawKey,
+          storageKey: row.storageKey,
+          valueLength: bytes.byteLength,
+          valueHash: createHash('sha256').update(bytes).digest('hex'),
+        },
+      }
+    })
+    const externalGeneration = randomUUID()
+    const externalBody = bulkTransitionBody({
+      version: 1,
+      transitionId: randomUUID(),
+      source: { optimized: false, generation: internalGeneration, manifest: null },
+      targetOptimized: true,
+      targetGeneration: externalGeneration,
+      autoConvert: true,
+      rows: rows.map(row => row.descriptor),
+    }, rows.map(row => row.bytes))
+    const external = await client.fetch('/api/plugin-storage/transition/bulk', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-pocketrisu-plugin-storage-transition',
+        'x-plugin-storage-transition-length': String(externalBody.byteLength),
+      },
+      body: externalBody,
+    })
+    expect(external.status, await external.clone().text()).toBe(200)
+    const after = await readManifestForGeneration(client, externalGeneration)
+    expect(after.manifest).toMatchObject({
+      generation: externalGeneration,
+      valueKeys: activeManifest.valueKeys,
+      metaKeys: activeManifest.metaKeys,
+    })
+  }, 30_000)
+
   test('maps over-limit logical keys to fixed physical names and removes the mapping atomically', async () => {
     const { server, client } = await boot()
     const key = `aa3/${'long-key-'.repeat(600)}`
@@ -696,6 +818,16 @@ describe('AA3 atomic plugin storage batch', () => {
     expect(response.status).toBe(200)
     const body = await response.json() as any
     expect(body).toMatchObject({ outcome: 'committed', operation: 'batch' })
+    expect(Object.keys(body)).toEqual([
+      'success',
+      'outcome',
+      'operation',
+      'verification',
+      'requestHash',
+      'generation',
+      'revisions',
+    ])
+    expect(body.verification).toBe('verified')
     expect(body.generation).toMatch(UUID_V4_PATTERN)
     expect(body.requestHash).toMatch(/^[0-9a-f]{64}$/)
     expect(body.revisions).toHaveLength(keys.length)
@@ -740,6 +872,66 @@ describe('AA3 atomic plugin storage batch', () => {
       })
     }
   })
+
+  test('a destructive snapshot restore discards the cached old manifest publication', async () => {
+    const snapshotKey = 'database/dbbackup-4300.bin'
+    const restoredRawKey = 'aa3/restored-cache-publication'
+    const server = await spawnServer({
+      seedSave: async saveDir => {
+        seed(saveDir)
+        const db = new Database(path.join(saveDir, 'risuai.db'))
+        db.prepare('INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)').run(
+          snapshotKey,
+          Buffer.from(encodeRisuSaveLegacy({
+            characters: [],
+            optimizePluginMemory: true,
+            pluginCustomStorage: {
+              [restoredRawKey]: { restored: true },
+            },
+            pluginStorageMeta: {
+              [restoredRawKey]: { plugin: 'Restored', updatedAt: 7 },
+            },
+          })),
+          2,
+        )
+        db.close()
+      },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+
+    // Populate the process cache with the original selected manifest.
+    expect((await readManifest(client)).manifest).toEqual(activeManifest)
+    const restore = await client.fetch('/api/db/snapshots/restore', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ key: snapshotKey }),
+    })
+    expect(restore.status, await restore.clone().text()).toBe(200)
+    await expect(restore.json()).resolves.toMatchObject({
+      ok: true,
+      key: snapshotKey,
+      commitOutcome: 'committed',
+      commitOutcomeUnknown: false,
+    })
+
+    const databaseResponse = await client.fetch('/api/read', {
+      headers: { 'file-path': Buffer.from(DATABASE_KEY).toString('hex') },
+    })
+    expect(databaseResponse.status).toBe(200)
+    const restoredDatabase = await decodeRisuSave(
+      new Uint8Array(await databaseResponse.arrayBuffer()),
+    ) as any
+    const restoredGeneration = restoredDatabase.pluginStorageGeneration
+    expect(restoredGeneration).toEqual(expect.any(String))
+    const restoredManifest = await readManifestForGeneration(client, restoredGeneration)
+    expect(restoredManifest.manifest).toMatchObject({
+      generation: restoredGeneration,
+      valueKeys: [valueKey(restoredRawKey)],
+      metaKeys: [ownerKey(restoredRawKey)],
+    })
+    expect(restoredManifest.manifest).not.toEqual(activeManifest)
+  }, 30_000)
 
   test.each([
     'before-transaction',

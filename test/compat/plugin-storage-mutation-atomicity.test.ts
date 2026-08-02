@@ -312,6 +312,46 @@ describe('atomic optimized plugin value and owner acknowledgement', () => {
     expect(route).not.toMatch(
       /validatePluginStorageRow\(\s*valueKey,\s*readFileSync\(\s*valueFilePath\s*\)\s*\)/,
     )
+
+    const committedStart = route.indexOf('pluginStorageManifestCache.publishPrepared')
+    expect(committedStart).toBeGreaterThanOrEqual(0)
+    const afterCommit = route.slice(committedStart)
+    expect(afterCommit).not.toMatch(/kvGet\(\s*valueKey\s*\)/)
+    expect(afterCommit).not.toMatch(/kvGet\(\s*ownerKey\s*\)/)
+    expect(afterCommit).not.toMatch(/kvSize\(\s*valueKey\s*\)/)
+    expect(afterCommit).not.toMatch(/readPluginStorageManifest\(/)
+  })
+
+  test('a buffered generation-bound set keeps the exact acknowledgement and publication bytes', async () => {
+    const { server, client } = await boot(undefined, undefined, seedActivePublication)
+    const value = Buffer.from('{"generation":"bounded-cache","order":[3,1,2]}', 'utf-8')
+    const response = await client.fetch('/api/plugin-storage/mutate', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': Buffer.from(VALUE_KEY, 'utf-8').toString('hex'),
+        'x-plugin-storage-operation': 'set',
+        'x-plugin-storage-owner': Buffer.from('New Plugin').toString('base64url'),
+        'x-plugin-storage-generation': STORAGE_GENERATION,
+      },
+      body: value,
+    })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toEqual({
+      success: true,
+      outcome: 'committed',
+      operation: 'set',
+      verification: 'verified',
+      hash: createHash('sha256').update(value).digest('hex'),
+    })
+    expect(readRows(server.cwd).value).toEqual(value)
+    expect(readManifest(server.cwd)).toEqual({
+      version: 2,
+      generation: STORAGE_GENERATION,
+      valueKeys: [VALUE_KEY],
+      metaKeys: [OWNER_KEY],
+    })
   })
 
   test('a valid streamed single-row set commits the original spool bytes', async () => {
