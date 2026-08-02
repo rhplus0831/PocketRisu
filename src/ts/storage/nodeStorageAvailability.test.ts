@@ -12,6 +12,14 @@ const cache = vi.hoisted(() => ({
     storeOwnedBytesWithKnownHash: vi.fn(),
 }))
 
+const codec = vi.hoisted(() => ({
+    encodeChatRowPayload: vi.fn(),
+}))
+
+vi.mock('./payloadCodecClient', () => ({
+    encodeChatRowPayload: codec.encodeChatRowPayload,
+}))
+
 vi.mock('./resourceCache', () => ({
     RESOURCE_CACHE_MAX_ENTRIES: 32_768,
     RESOURCE_CACHE_MAX_STORED_BYTES: 64 * 1024 * 1024,
@@ -107,6 +115,10 @@ beforeEach(() => {
     cache.sha256OwnedBytes.mockResolvedValue('a'.repeat(64))
     cache.storeBytes.mockResolvedValue(undefined)
     cache.storeOwnedBytesWithKnownHash.mockResolvedValue(undefined)
+    codec.encodeChatRowPayload.mockImplementation(async (_chat: unknown, hash: boolean) => ({
+        bytes: new Uint8Array([1, 2, 3]),
+        hash: hash ? 'a'.repeat(64) : null,
+    }))
     vi.mocked(encodeRisuSaveLegacy).mockReturnValue(new Uint8Array([1, 2, 3]))
 })
 
@@ -819,6 +831,34 @@ describe('NodeStorage availability bounds', () => {
 
         await expect(storage.saveChatContent('character', 0, 'chat', {}))
             .resolves.toBeUndefined()
+        expect(cache.storeBytes).not.toHaveBeenCalled()
+        expect(cache.storeOwnedBytesWithKnownHash).not.toHaveBeenCalled()
+    })
+
+    it('donates the exact encoded chat bytes only after a matching acknowledgement hash', async () => {
+        const encoded = new Uint8Array([7, 8, 9])
+        const hash = 'b'.repeat(64)
+        codec.encodeChatRowPayload.mockResolvedValueOnce({ bytes: encoded, hash })
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+            success: true,
+            hash,
+        }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+        })))
+        const storage = readyStorage()
+
+        await storage.saveChatContent('character', 0, 'chat', { name: 'checkpoint' })
+
+        expect(codec.encodeChatRowPayload).toHaveBeenCalledWith(
+            { name: 'checkpoint' },
+            true,
+        )
+        expect(cache.storeOwnedBytesWithKnownHash).toHaveBeenCalledWith(
+            'chat:character/chat',
+            hash,
+            encoded,
+        )
         expect(cache.storeBytes).not.toHaveBeenCalled()
     })
 

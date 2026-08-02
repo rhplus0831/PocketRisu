@@ -1,24 +1,36 @@
-import { Packr, Unpackr } from "msgpackr/index-no-eval";
+import { Unpackr } from "msgpackr/index-no-eval";
 import * as fflate from "fflate";
 import { createBotPresetTemplate, getDatabase, type Database } from "./database.svelte";
 import { forageStorage } from "../globalApi.svelte";
 import { chatToStub } from "./chatStorage";
 import {
-    copyDatabasePluginStorageRecord,
-    createDatabasePluginStorageRecord,
     definePluginStorageRecordValue,
     getPluginStorageRecordKeys,
     hasPluginStorageRecordValue,
-} from "../plugins/pluginStorageRecord";
-import { isWellFormedUnicode } from "./unicodeWellFormed";
-import { createBoundedMsgpackEncoder } from "./boundedMsgpack";
+} from '../plugins/pluginStorageRecord';
+import {
+    magicCompressedHeader,
+    magicHeader,
+    magicPluginStorageCompressedHeader,
+    magicPluginStorageHeader,
+    magicPluginStorageStreamHeader,
+    magicStreamCompressedHeader,
+    restoreLegacyPluginStorageKeys,
+    encodeRisuSaveCompressionStream,
+    encodeRisuSaveLegacy,
+} from "./legacyRisuSaveCodec";
+import {
+    applyRisuSaveBotPresetDefault,
+    decodeStrictRisuSaveBlocks,
+    magicRisuSaveHeader,
+    RisuSaveBlockIntegrityError,
+    RisuSaveType,
+} from "./strictRisuSaveCodec";
+import { ensureCompressionStreams } from "./compressionStreams";
 import type { RisuSaveDirtyRevisions, RisuSaveRevisionBranch } from "./databaseDirtyRevisions";
 
-const packr = new Packr({
-    useRecords:false,
-    variableMapSize:true,
-});
-const encodeLegacyMsgpack = createBoundedMsgpackEncoder(packr);
+export { encodeRisuSaveCompressionStream, encodeRisuSaveLegacy };
+export { RisuSaveBlockIntegrityError } from './strictRisuSaveCodec';
 
 const unpackr = new Unpackr({
     copyBuffers:true,
@@ -34,241 +46,6 @@ export const CHARACTER_PATCH_MAX_BYTES = 8 * 1024 * 1024;
 // NodeOnly: server cannot resolve remote blocks, always disable
 const disableRemoteSaving = () => true
 const checkedRemoteExistence = new Set<string>();
-const magicHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7]); 
-const magicCompressedHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 8]);
-const magicStreamCompressedHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 9]);
-const magicPluginStorageHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 10]);
-const magicPluginStorageCompressedHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 11]);
-const magicPluginStorageStreamHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 12]);
-const magicRisuSaveHeader = new TextEncoder().encode("RISUSAVE\0");
-const pluginStorageLegacyEscapeField = "__pocketRisuPluginStorageEscapesV1";
-const pluginStorageLegacyEscapeMarker = "PocketRisu.plugin-storage-escapes";
-
-type PluginStorageLegacyEscape = {
-    field: "pluginCustomStorage" | "pluginStorageMeta";
-    index: number;
-    key: string;
-    value: unknown;
-};
-
-type SerializedLegacyEscapeValue = [0] | [1, string];
-type PluginStorageLegacyEscapeEnvelope = [
-    typeof pluginStorageLegacyEscapeMarker,
-    1 | 2,
-    SerializedLegacyEscapeValue | null,
-    Array<
-        | [PluginStorageLegacyEscape["field"], number, SerializedLegacyEscapeValue]
-        | [PluginStorageLegacyEscape["field"], number, string, SerializedLegacyEscapeValue]
-    >,
-];
-
-function serializeLegacyEscapeValue(value: unknown): SerializedLegacyEscapeValue {
-    const json = JSON.stringify(value);
-    return json === undefined ? [0] : [1, json];
-}
-
-function deserializeLegacyEscapeValue(value: unknown): { valid: boolean; value?: unknown } {
-    if (!Array.isArray(value)) return { valid: false };
-    if (value.length === 1 && value[0] === 0) return { valid: true, value: undefined };
-    if (value.length !== 2 || value[0] !== 1 || typeof value[1] !== "string") {
-        return { valid: false };
-    }
-    try {
-        return { valid: true, value: JSON.parse(value[1]) };
-    } catch {
-        return { valid: false };
-    }
-}
-
-function parseLegacyPluginStorageEnvelope(value: unknown): {
-    originalField: { present: boolean; value?: unknown };
-    escapes: PluginStorageLegacyEscape[];
-} | null {
-    if (!Array.isArray(value)
-        || value.length !== 4
-        || value[0] !== pluginStorageLegacyEscapeMarker
-        || (value[1] !== 1 && value[1] !== 2)
-        || (value[2] !== null && !Array.isArray(value[2]))
-        || !Array.isArray(value[3])
-        || (value[2] === null && value[3].length === 0)) {
-        return null;
-    }
-    const original = value[2] === null
-        ? { valid: true, present: false, value: undefined }
-        : { ...deserializeLegacyEscapeValue(value[2]), present: true };
-    if (!original.valid) return null;
-
-    const seen = new Set<string>();
-    const escapes: PluginStorageLegacyEscape[] = [];
-    for (const entry of value[3]) {
-        const version = value[1];
-        if (!Array.isArray(entry)
-            || entry.length !== (version === 1 ? 3 : 4)
-            || (entry[0] !== "pluginCustomStorage" && entry[0] !== "pluginStorageMeta")
-            || !Number.isInteger(entry[1])
-            || entry[1] < 0) {
-            return null;
-        }
-        let key = "__proto__";
-        if (version === 2) {
-            if (typeof entry[2] !== "string") return null;
-            try {
-                key = JSON.parse(entry[2]);
-            } catch {
-                return null;
-            }
-            if (typeof key !== "string"
-                || JSON.stringify(key) !== entry[2]
-                || (key !== "__proto__" && isWellFormedUnicode(key))) return null;
-        }
-        const identity = `${entry[0]}\0${key}`;
-        if (seen.has(identity)) return null;
-        const parsed = deserializeLegacyEscapeValue(entry[version === 1 ? 2 : 3]);
-        if (!parsed.valid) return null;
-        seen.add(identity);
-        escapes.push({ field: entry[0], index: entry[1], key, value: parsed.value });
-    }
-    return {
-        originalField: { present: original.present, value: original.value },
-        escapes,
-    };
-}
-
-function prepareLegacyPluginStorageKeys(data: any): { data: any; escaped: boolean } {
-    const escapes: PluginStorageLegacyEscape[] = [];
-    let prepared = data;
-    for (const field of ["pluginCustomStorage", "pluginStorageMeta"] as const) {
-        const record = data?.[field] as Record<string, unknown> | undefined;
-        const keys = getPluginStorageRecordKeys(record);
-        const escapedKeys = keys.filter(key => (
-            key === "__proto__" || !isWellFormedUnicode(key)
-        ));
-        if (escapedKeys.length === 0) continue;
-        if (prepared === data) prepared = { ...data };
-        const recordCopy = copyDatabasePluginStorageRecord(record);
-        for (const key of escapedKeys) {
-            escapes.push({
-                field,
-                index: keys.indexOf(key),
-                key,
-                value: recordCopy[key],
-            });
-            delete recordCopy[key];
-        }
-        prepared[field] = recordCopy;
-    }
-    if (escapes.length === 0) return { data, escaped: false };
-
-    const hasReservedField = hasPluginStorageRecordValue(data, pluginStorageLegacyEscapeField);
-    const envelope: PluginStorageLegacyEscapeEnvelope = [
-        pluginStorageLegacyEscapeMarker,
-        2,
-        hasReservedField ? serializeLegacyEscapeValue(data[pluginStorageLegacyEscapeField]) : null,
-        escapes.map(escape => [
-            escape.field,
-            escape.index,
-            JSON.stringify(escape.key),
-            serializeLegacyEscapeValue(escape.value),
-        ]),
-    ];
-    Object.defineProperty(prepared, pluginStorageLegacyEscapeField, {
-        configurable: true,
-        enumerable: true,
-        value: envelope,
-        writable: true,
-    });
-    return { data: prepared, escaped: true };
-}
-
-function restoreLegacyPluginStorageKeys(data: any): any {
-    if (!hasPluginStorageRecordValue(data, pluginStorageLegacyEscapeField)) return data;
-    const envelope = parseLegacyPluginStorageEnvelope(data[pluginStorageLegacyEscapeField]);
-    if (!envelope) return data;
-    for (const field of ["pluginCustomStorage", "pluginStorageMeta"] as const) {
-        const fieldEscapes = envelope.escapes
-            .filter(escape => escape.field === field)
-            .sort((left, right) => left.index - right.index);
-        if (fieldEscapes.length === 0) continue;
-        const source = data[field] ?? createDatabasePluginStorageRecord();
-        const record = createDatabasePluginStorageRecord<unknown>();
-        const entries = getPluginStorageRecordKeys(source)
-            .map(key => ({ key, value: source[key] }));
-        for (const escape of fieldEscapes) {
-            entries.splice(Math.min(escape.index, entries.length), 0, {
-                key: escape.key,
-                value: escape.value,
-            });
-        }
-        for (const entry of entries) {
-            definePluginStorageRecordValue(record, entry.key, entry.value);
-        }
-        data[field] = record;
-    }
-    if (envelope.originalField.present) {
-        definePluginStorageRecordValue(
-            data,
-            pluginStorageLegacyEscapeField,
-            envelope.originalField.value,
-        );
-    } else {
-        delete data[pluginStorageLegacyEscapeField];
-    }
-    return data;
-}
-
-
-async function checkCompressionStreams(){
-    if(!CompressionStream){
-        const {makeCompressionStream} = await import('compression-streams-polyfill/ponyfill');
-        //@ts-expect-error polyfill CompressionStream type is incompatible with globalThis.CompressionStream
-        globalThis.CompressionStream = makeCompressionStream(TransformStream);
-    }
-    if(!DecompressionStream){
-        const {makeDecompressionStream} = await import('compression-streams-polyfill/ponyfill');
-        //@ts-expect-error polyfill DecompressionStream type is incompatible with globalThis.DecompressionStream
-        globalThis.DecompressionStream = makeDecompressionStream(TransformStream);
-    }
-}
-
-export function encodeRisuSaveLegacy(data:any, compression:'noCompression'|'compression' = 'noCompression'){
-    const prepared = prepareLegacyPluginStorageKeys(data)
-    let encoded:Uint8Array = encodeLegacyMsgpack(prepared.data)
-    if(compression === 'compression'){
-        encoded = fflate.compressSync(encoded)
-        const header = prepared.escaped
-            ? magicPluginStorageCompressedHeader
-            : magicCompressedHeader
-        const result = new Uint8Array(encoded.length + header.length);
-        result.set(header, 0)
-        result.set(encoded, header.length)
-        return result
-    }
-    else{
-        const header = prepared.escaped ? magicPluginStorageHeader : magicHeader
-        const result = new Uint8Array(encoded.length + header.length);
-        result.set(header, 0)
-        result.set(encoded, header.length)
-        return result
-    }
-}
-
-export async function encodeRisuSaveCompressionStream(data:any) {
-    await checkCompressionStreams()
-    const prepared = prepareLegacyPluginStorageKeys(data)
-    let encoded:Uint8Array = encodeLegacyMsgpack(prepared.data)
-    const cs = new CompressionStream('gzip');
-    const writer = cs.writable.getWriter();
-    writer.write(encoded as any);
-    writer.close();
-    const buf = await new Response(cs.readable).arrayBuffer()
-    const header = prepared.escaped
-        ? magicPluginStorageStreamHeader
-        : magicStreamCompressedHeader
-    const result = new Uint8Array(new Uint8Array(buf).length + header.length);
-    result.set(header, 0)
-    result.set(new Uint8Array(buf), header.length)
-    return result
-}
 
 export type toSaveType = {
     character: string[];
@@ -319,21 +96,6 @@ function isRevisionBranchDirty(
     return revisions.pluginCustomStorage !== null
 }
 
-enum RisuSaveType {
-    CONFIG = 0,
-    ROOT = 1,
-    CHARACTER_WITH_CHAT = 2,
-    CHAT = 3,
-    BOTPRESET = 4,
-    MODULES = 5,
-    REMOTE = 6,
-    CHARACTER_WITHOUT_CHAT = 7,
-    ROOT_COMPONENT = 8,
-    PLUGINS = 9,
-    LOADOUTS = 10,
-    PLUGIN_STORAGE = 11,
-}
-
 type EncodeBlockArg = {
     compression:boolean
     data:string
@@ -361,15 +123,6 @@ let risuSaveCacheGeneration: RisuSaveCacheGeneration|null = null;
 export type RisuSaveDecodeOptions = {
     strictBlockIntegrity?: boolean;
 };
-
-export class RisuSaveBlockIntegrityError extends Error {
-    readonly code = "RISU_SAVE_INVALID";
-
-    constructor(message: string, options?: ErrorOptions) {
-        super(message, options);
-        this.name = "RisuSaveBlockIntegrityError";
-    }
-}
 
 function blockIntegrityError(message: string, cause?: unknown): RisuSaveBlockIntegrityError {
     return new RisuSaveBlockIntegrityError(
@@ -868,7 +621,7 @@ export class RisuSaveEncoder {
         let databuf: Uint8Array;
         const cacheBlock = arg.cache ?? true;
         if(arg.compression){
-            await checkCompressionStreams();
+            await ensureCompressionStreams();
             const cs = new CompressionStream('gzip');
             const writer = cs.writable.getWriter();
             writer.write(new TextEncoder().encode(arg.data));
@@ -953,202 +706,15 @@ export class RisuSaveDecoder {
         if (import.meta.env.DEV) {
             console.log('Decoding authoritative RisuSave data');
         }
-        let offset = magicRisuSaveHeader.length;
-        //@ts-expect-error Database has required fields, but we initialize empty and populate incrementally during decode
-        const db: Database = {};
-        const loadedBlocks = new Set<string>();
-        const directory = new Set<string>();
-        const pendingRemoteBlocks: Array<{
-            sourceName: string;
-            name: string;
-            type: RisuSaveType;
-        }> = [];
-        let rootBlocks = 0;
-
-        const consumeBlock = (name: string, type: RisuSaveType, blockData: Uint8Array) => {
-            loadedBlocks.add(name);
-            if (!isKnownJsonRisuSaveType(type)) {
-                console.warn(`Not Implemented RisuSaveType: ${type} for ${name}`);
-                return;
-            }
-
-            let parsed: any;
-            try {
-                parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(blockData));
-            } catch (error) {
-                throw blockIntegrityError(`Invalid RisuSave block ${name}`, error);
-            }
-
-            try {
-                switch (type) {
-                    case RisuSaveType.ROOT: {
-                        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-                            throw blockIntegrityError(`Invalid RisuSave root block ${name}`);
-                        }
-                        rootBlocks++;
-                        for (const rootKey in parsed) {
-                            if (!db[rootKey] && !rootKey.startsWith('__')) {
-                                db[rootKey] = parsed[rootKey];
-                            }
-                            if (rootKey === '__directory') {
-                                const rootDirectory = parsed[rootKey];
-                                if (!Array.isArray(rootDirectory)
-                                    || rootDirectory.some(dirKey => typeof dirKey !== 'string')) {
-                                    throw blockIntegrityError(`Invalid RisuSave directory in root block ${name}`);
-                                }
-                                for (const dirKey of rootDirectory) {
-                                    directory.add(dirKey);
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    case RisuSaveType.CHARACTER_WITH_CHAT:
-                    case RisuSaveType.CHARACTER_WITHOUT_CHAT: {
-                        db.characters ??= [];
-                        db.characters.push(parsed);
-                        break;
-                    }
-                    case RisuSaveType.BOTPRESET: {
-                        db.botPresets = parsed;
-                        break;
-                    }
-                    case RisuSaveType.MODULES: {
-                        db.modules = parsed;
-                        break;
-                    }
-                    case RisuSaveType.CONFIG:
-                    case RisuSaveType.LOADOUTS: {
-                        // These legacy blocks are still parsed for integrity, but ignored.
-                        break;
-                    }
-                    case RisuSaveType.PLUGINS: {
-                        db.plugins = parsed;
-                        break;
-                    }
-                    case RisuSaveType.PLUGIN_STORAGE: {
-                        db.pluginCustomStorage = parsed;
-                        break;
-                    }
-                    case RisuSaveType.REMOTE: {
-                        const remoteInfo = parsed as {
-                            v: number;
-                            type: RisuSaveType;
-                            name: string;
-                        };
-                        if (!remoteInfo
-                            || typeof remoteInfo.name !== 'string'
-                            || remoteInfo.name.length === 0
-                            || !Number.isInteger(remoteInfo.type)
-                            || !isKnownJsonRisuSaveType(remoteInfo.type)) {
-                            throw blockIntegrityError(`Invalid REMOTE block ${name}`);
-                        }
-                        // Preserve the historical ordering: ordinary blocks are consumed
-                        // first, then resolved REMOTE blocks in discovery order.
-                        pendingRemoteBlocks.push({
-                            sourceName: name,
-                            name: remoteInfo.name,
-                            type: remoteInfo.type,
-                        });
-                        break;
-                    }
-                    case RisuSaveType.ROOT_COMPONENT: {
-                        db[parsed.key] = parsed.data;
-                        break;
-                    }
-                    default: {
-                        console.warn(`Not Implemented RisuSaveType: ${type} for ${name}`);
-                    }
-                }
-            } catch (error) {
-                if (error instanceof RisuSaveBlockIntegrityError) throw error;
-                throw blockIntegrityError(`Invalid RisuSave block ${name}`, error);
-            }
-        };
-
-        while (offset < data.length) {
-            let name: string;
-            let type: RisuSaveType;
-            let blockData: Uint8Array;
-            try {
-                if (offset + 7 > data.length) {
-                    throw blockIntegrityError(`Truncated RisuSave block header at byte ${offset}`);
-                }
-                type = data[offset];
-                const compressionFlag = data[offset + 1];
-                if (compressionFlag !== 0 && compressionFlag !== 1) {
-                    throw blockIntegrityError(`Invalid RisuSave compression flag at byte ${offset + 1}`);
-                }
-                const compression = compressionFlag === 1;
-                offset += 2;
-
-                const nameLength = data[offset];
-                offset += 1;
-                if (offset + nameLength + 4 > data.length) {
-                    throw blockIntegrityError(`Truncated RisuSave block name at byte ${offset}`);
-                }
-                name = new TextDecoder('utf-8', { fatal: true })
-                    .decode(data.subarray(offset, offset + nameLength));
-                offset += nameLength;
-
-                const lengthBuf = new ArrayBuffer(4);
-                new Uint8Array(lengthBuf).set(data.slice(offset, offset + 4));
-                const length = new Uint32Array(lengthBuf)[0];
-                offset += 4;
-
-                if (offset + length > data.length) {
-                    throw blockIntegrityError(`Truncated RisuSave block body at byte ${offset}`);
-                }
-                blockData = data.subarray(offset, offset + length);
-                offset += length;
-
-                if (compression) {
-                    await checkCompressionStreams();
-                    const cs = new DecompressionStream('gzip');
-                    const writer = cs.writable.getWriter();
-                    writer.write(blockData as any);
-                    writer.close();
-                    const buf = await new Response(cs.readable).arrayBuffer();
-                    blockData = new Uint8Array(buf);
-                }
-            } catch (error) {
-                if (error instanceof RisuSaveBlockIntegrityError) throw error;
-                throw blockIntegrityError(`Failed to read RisuSave block at byte ${offset}`, error);
-            }
-
-            consumeBlock(name, type, blockData);
-        }
-
-        // REMOTE bodies are fetched only when they are ready to be consumed, so
-        // multiple remote values are not retained as decoded strings together.
-        for (let i = 0; i < pendingRemoteBlocks.length; i++) {
-            const remote = pendingRemoteBlocks[i];
-            const fileName = `remotes/${remote.name}.local.bin`;
-            let stored: unknown;
-            try {
-                stored = await forageStorage.getItem(fileName);
-            } catch (error) {
-                throw blockIntegrityError(`Invalid RisuSave block ${remote.sourceName}`, error);
-            }
-            if (!stored) {
-                throw blockIntegrityError(`Remote file ${fileName} not found.`);
-            }
-            consumeBlock(remote.name, remote.type, stored as Uint8Array);
-        }
-
-        if (rootBlocks === 0) {
-            throw blockIntegrityError('RisuSave data has no root block');
-        }
-        const missingBlocks = [...directory].filter(name => !loadedBlocks.has(name));
-        if (missingBlocks.length > 0) {
-            throw blockIntegrityError(
-                `RisuSave directory references missing block${missingBlocks.length === 1 ? '' : 's'}: ${missingBlocks.join(', ')}`,
-            );
-        }
-        if (!Array.isArray(db.botPresets) || db.botPresets.length === 0) {
-            db.botPresets = [createBotPresetTemplate()];
-            db.botPresetsId = 0;
-        }
+        const db = applyRisuSaveBotPresetDefault(
+            await decodeStrictRisuSaveBlocks(data, {
+                readRemoteBlock: async (fileName) => {
+                    const stored = await forageStorage.getItem(fileName)
+                    return stored ? stored as Uint8Array : null
+                },
+            }),
+            createBotPresetTemplate,
+        ) as Database;
         if (import.meta.env.DEV) {
             console.log('Decoded authoritative RisuSave data', db);
         }
@@ -1201,7 +767,7 @@ export class RisuSaveDecoder {
 
                 if (compression) {
                     //decode using DecompressionStream
-                    await checkCompressionStreams();
+                    await ensureCompressionStreams();
                     const cs = new DecompressionStream('gzip');
                     const writer = cs.writable.getWriter();
                     writer.write(blockData as any);
@@ -1386,7 +952,7 @@ export async function decodeRisuSave(data:Uint8Array, options: RisuSaveDecodeOpt
                 data = data.slice(magicHeader.length)
                 return unpackr.decode(data)
             case "plugin-stream":{
-                await checkCompressionStreams()
+                await ensureCompressionStreams()
                 data = data.slice(magicPluginStorageStreamHeader.length)
                 const cs = new DecompressionStream('gzip');
                 const writer = cs.writable.getWriter();
@@ -1396,7 +962,7 @@ export async function decodeRisuSave(data:Uint8Array, options: RisuSaveDecodeOpt
                 return restoreLegacyPluginStorageKeys(unpackr.decode(new Uint8Array(buf)))
             }
             case "stream":{
-                await checkCompressionStreams()
+                await ensureCompressionStreams()
                 data = data.slice(magicStreamCompressedHeader.length)
                 const cs = new DecompressionStream('gzip');
                 const writer = cs.writable.getWriter();

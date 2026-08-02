@@ -1,3 +1,7 @@
+import { sha256OwnedBytes } from './payloadHash'
+
+export { formatHashBytes, sha256OwnedBytes } from './payloadHash'
+
 export const RESOURCE_CACHE_DATABASE = 'pocketrisu-resource-cache-v1'
 export const RESOURCE_CACHE_LOCAL_STORAGE_KEY = 'pocketrisu-resource-cache'
 export const RESOURCE_CACHE_MAX_MANIFESTS = 512
@@ -235,22 +239,10 @@ function resourceCacheManifestKind(resourceKey: string): ResourceCacheManifestKi
     return resourceKey.startsWith('db:') ? 'database' : 'item'
 }
 
-export function formatHashBytes(bytes: Uint8Array): string {
-    return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')
-}
-
 export async function sha256Bytes(bytes: Uint8Array): Promise<string> {
     const copied = new Uint8Array(bytes.byteLength)
     copied.set(bytes)
     return sha256OwnedBytes(copied)
-}
-
-/** Hash a fresh immutable caller-owned buffer without another full-size copy. */
-export async function sha256OwnedBytes(bytes: Uint8Array): Promise<string> {
-    const subtle = globalThis.crypto?.subtle
-    if (!subtle) throw new Error('Web Crypto SHA-256 is unavailable')
-    const digest = await subtle.digest('SHA-256', bytes as BufferSource)
-    return formatHashBytes(new Uint8Array(digest))
 }
 
 export function isResourceCacheSupported(): boolean {

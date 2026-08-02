@@ -9,6 +9,7 @@ import { language } from "src/lang"
 import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
 import { normalizeChat, type Chat } from "./database.svelte"
+import { encodeChatRowPayload } from "./payloadCodecClient"
 import {
     DB_CACHE_GROUPS,
     DB_CACHE_MAX_HASHES,
@@ -27,7 +28,6 @@ import {
     isResourceCacheEnabled,
     isSha256Hex,
     persistResourceCacheManifests,
-    sha256Bytes,
     sha256OwnedBytes,
     settleBestEffortResourceCache,
     storeBytes,
@@ -5730,13 +5730,11 @@ export class NodeStorage{
     }
 
     async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any, backupReason?: string): Promise<void> {
-        const encoded = encodeRisuSaveLegacy(chat)
         const cacheEnabled = isResourceCacheEnabled()
-        // Cache hashing may run concurrently, but it is not part of the
-        // authoritative transport deadline.
-        const requestHash = cacheEnabled
-            ? sha256Bytes(encoded).catch(() => null)
-            : null
+        const { bytes: encoded, hash: requestHash } = await encodeChatRowPayload(
+            chat,
+            cacheEnabled,
+        )
         const headers: Record<string, string> = {
             'content-type': 'application/octet-stream',
             'x-chat-id': chatId,
@@ -5751,7 +5749,7 @@ export class NodeStorage{
                     {
                         method: 'POST',
                         headers,
-                        body: encoded,
+                        body: encoded as unknown as BodyInit,
                         signal,
                     },
                     true,
@@ -5800,12 +5798,15 @@ export class NodeStorage{
             'write',
             authoritativeStoragePayloadTimeoutMs(encoded.byteLength),
         )
-        if (!cacheEnabled || !requestHash) return
-
-        const encodedHash = await requestHash
-        if (!encodedHash || response.hash !== encodedHash) return
+        if (!cacheEnabled || !requestHash || response.hash !== requestHash) return
         try {
-            await storeBytes(`chat:${chaId}/${chatId}`, encoded)
+            // The exact request buffer stays immutable through acknowledgement,
+            // then ownership is donated to IndexedDB under the matching hash.
+            await storeOwnedBytesWithKnownHash(
+                `chat:${chaId}/${chatId}`,
+                requestHash,
+                encoded,
+            )
         } catch {
             // The server write succeeded; cache persistence is best-effort.
         }
