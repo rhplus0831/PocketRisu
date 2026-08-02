@@ -19,7 +19,7 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 | `server/node/db.cjs` | Opens `save/risuai.db`, applies SQLite pragmas, owns KV/delta-list primitives, pins read-only WAL snapshots, initializes chunks, and maintains derived plugin usage/owner indexes and atomic quota plans. |
 | `server/node/chunkStore.cjs` | Protected content-defined storage for the live DB, automatic snapshots, chat rows, and plugin values. It owns manifest metadata/publications, logical size/SHA verification, bounded raw-row streaming, snapshot sharing/cost, and mark/sweep GC. |
 | `server/node/chatRows.cjs` | Injected chat-row store and the monolith-ingestion boundary. It owns encoded chat keys, missing/duplicate-ID repair, stub semantics, referenced-row diff/sweep helpers, split/assembly, and the transactional `ingestFullDatabase()` and `ingestStreamingDatabase()` paths. Duplicate `chaId` repair happens before row keys are finalized. |
-| `server/node/chatBackups.cjs` | Per-chat pre-image history. Ordinary overwrites are best-effort and enforce a 45-second per-chat cooldown; structural chat deletion forces a cooldown-exempt capture and fails closed. The store gzip-compresses loose versions, builds up to four 25-version solid bundles plus one active loose batch, enforces an exact 125-version logical cap, applies a globally age-ordered byte budget using each bundle's newest member as its age, lists versions, and restores raw bytes. Reconciliation verifies a derivative’s decompressed bytes/bounds before deleting its source and fsyncs atomic publications. |
+| `server/node/chatBackups.cjs` | Per-chat pre-image history. Ordinary overwrites are best-effort and enforce a 45-second per-chat cooldown; structural chat deletion forces a cooldown-exempt capture and fails closed. Reconciliation streams each loose version into an atomic, self-describing `.frame` containing one independent gzip member, enforces the exact 125-version default plus a 256 MiB per-chat uncompressed-byte default, applies the separate globally age-ordered compressed-disk budget, and restores exact raw bytes by inflating only the selected frame. Legacy solid v1 bundles remain readable and migrate through bounded one-pass extraction without becoming authoritative until every replacement is durable. |
 | `server/node/importBarrier.cjs` | Abort-aware exclusive import gate. `acquire()` claims a FIFO turn before draining older mutations; abandoned waiters are removed safely, later writes are refused, and stable reads can wait with an `AbortSignal`. |
 | `server/node/importJournal.cjs` | Durable bridge between SQLite import transactions and filesystem asset/inlay directory swaps. It atomically writes/fsyncs `save/import_journal.json`, fsyncs staged trees, and recovers by finalizing committed swaps or restoring pre-import directories. |
 | `server/node/session-lock.cjs` | In-memory single-writer authority. `register()` records a boot without stealing; `checkWrite()` distinguishes the active writer, fresh gesture-backed takeover, fresh passive compatibility writes, and stale rejection; `peek()` provides a side-effect-free foreground status. |
@@ -83,9 +83,10 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 5. `startServer()` resolves interrupted filesystem swaps, then read-only preflights the live database before any migration or epoch write. A valid database gets the epoch bump plus asset, inlay, chat, plugin-stage, and legacy `REMOTE` migrations. A corrupt database skips those mutations and listens in authenticated snapshot-recovery mode so the original bytes remain recoverable. The chat migration first writes `migration-backup/pre-chat-externalization-<timestamp>.bin`, then records `migration/chats-externalized`.
 6. TLS is enabled only when both `server/node/ssl/certificate/server.key` and `server.crt` can be read; otherwise it starts plain HTTP.
 7. Both HTTP and HTTPS servers install the proxy-job WebSocket upgrade handler before listening.
-8. After listening, the server reconciles chat-version files, compressing/bundling them,
-   trimming only versions beyond the per-chat logical cap, and enforcing their byte
-   budget. Shutdown handlers flush debounced database writes, truncate-checkpoint WAL, and
+8. After listening, the server reconciles chat-version files, streaming each loose source
+   into an independently compressed frame, migrating legacy solid bundles with bounded
+   state, trimming the oldest versions beyond the count or per-chat uncompressed-byte cap,
+   and enforcing the separate compressed-disk budget. Shutdown handlers flush debounced database writes, truncate-checkpoint WAL, and
    close the model-job and request-log databases. The durability scheduler runs verified
    one-minute checkpoints in balanced mode and five-minute checkpoints in performance
    mode, retries busy attempts, and retains five-minute truncate maintenance in durable
@@ -109,6 +110,7 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `POCKETRISU_SQLITE_DURABILITY_MODE` | Administrator-managed SQLite durability policy: `durable`, `balanced`, or `performance`. Invalid values fail safe to `durable`. Any explicit value locks the System-dashboard control; hub mode is always administrator-managed and defaults to `durable` when unset. |
 | `POCKETRISU_CHAT_BACKUP_DIR` | Overrides the final chat-history directory. Absolute paths are used directly; relative paths resolve from `process.cwd()`. The default is `<savePath>/chat-backups` (normally `save/chat-backups`, or `/app/save/chat-backups` in Docker). This operator setting also applies in hub mode and is independent of the server-file-backup path/API. |
 | `POCKETRISU_CHAT_BACKUP_MAX_BYTES` | Overrides the global per-chat-history budget in bytes. Default 50 MiB; clamped to 1 MiB–50 GiB. It takes precedence over the `config/chat-backup-max-bytes` KV setting. |
+| `POCKETRISU_CHAT_BACKUP_MAX_UNCOMPRESSED_BYTES` | Overrides the per-chat retained uncompressed-byte cap. Default 256 MiB; clamped to 1 MiB–50 GiB. It takes precedence over `config/chat-backup-max-uncompressed-bytes`. The newest recovery point remains protected when it alone exceeds the cap. |
 | `POCKETRISU_SPOOL_DIR` | Relocates database assembly/import/value/restore spools. Default `save/.spool`; it does not relocate filesystem export pins or plugin transition stages. |
 | `POCKETRISU_PLUGIN_VALUE_MAX_BYTES` | Per optimized-plugin value cap; default 128 MiB. |
 | `POCKETRISU_PLUGIN_STORAGE_MAX_BYTES` | Aggregate optimized-plugin cap; default 1 GiB. |
@@ -190,9 +192,8 @@ buffered-body ledger.
 │   │   └── .migrated_to_fs
 │   ├── chat-backups/
 │   │   └── <chaId>/<chatId>/           # encoded path components
-│   │       ├── v-<ts>-<seq>-<reason>.bin.gz
-│   │       ├── archive-<first>-<last>.bundle
-│   │       └── archive-<first>-<last>.meta.json
+│   │       ├── v-<ts>-<seq>-<reason>.frame
+│   │       └── archive-*.{bundle,meta.json} # readable legacy v1, migrated on reconcile
 │   ├── __password
 │   ├── __jwt_secret
 │   ├── __instance_id
@@ -262,7 +263,7 @@ Important KV namespaces include:
 - `inlay_meta/`: inlay metadata still kept in KV.
 - `drafts/<chaId>/<chatId>`: unsent per-chat composer text and timestamp, independent of
   the chat body.
-- `config/`: snapshot limits, backup path, boot-reminder settings, and the optional chat-history byte budget.
+- `config/`: snapshot limits, backup path, boot-reminder settings, and the optional chat-history compressed-disk and per-chat uncompressed-byte budgets.
 - `config/plugin-storage-recovery-dirty`: durable token scheduling recovery capture after
   plugin-only atomic publications.
 - `import_journal/marker`: transaction-side half of the filesystem import journal; present only while a staged asset/inlay directory publication may require startup recovery.
@@ -576,7 +577,7 @@ callers may explicitly include usage deletion.
 
 - Chat backups are pre-images, not post-save snapshots. For ordinary overwrites, `captureChatPreImage()` stays immediately before the chat-row write inside the shared storage queue; failures are logged and swallowed so recovery history cannot make a message save fail. Structural deletion is different: `captureChatDeletionPreImages()` holds the same queue, forces capture before the deleting transaction, and propagates failures so the row and stub graph remain authoritative. The newest version for each chat is protected during global budget eviction, but the ordinary 45-second cooldown means not every intermediate streaming/edit state is retained.
 
-- Chat backup archives are filesystem-internal. IDs are path-component encoded and version IDs/reasons are strictly sanitized. A derivative is authoritative only after decompression, bounds, and byte-equality validation; reconciliation regenerates an invalid gzip/bundle and fsyncs atomic publication before deleting a source. Use `chatBackups.cjs` rather than reading or rewriting this tree ad hoc.
+- Chat backup archives are filesystem-internal. IDs are path-component encoded and version IDs/reasons are strictly sanitized. Each current frame carries fixed magic plus a bounded header with codec, raw size/SHA-256, content type, and version metadata, followed by one gzip member. A derivative is authoritative only after streamed decompression and exact size/hash validation; reconciliation fsyncs its atomic publication before deleting a source. Legacy solid bundles remain readable and are withdrawn only after bounded extraction has durably published every entry. Use `chatBackups.cjs` rather than reading or rewriting this tree ad hoc.
 
 - Downgrading after chat externalization is unsupported. Older servers interpret the live
   stubs-only blob as the whole database. Recovery for a downgrade is the boot-created

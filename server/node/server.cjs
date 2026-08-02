@@ -243,6 +243,7 @@ const {
     migrateLegacyChatBackups,
     resolveChatBackupDir,
     resolveChatBackupMaxBytes,
+    resolveChatBackupMaxUncompressedBytes,
 } = require('./chatBackups.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
@@ -1170,6 +1171,7 @@ const chatBackupStore = createChatBackupStore({
         chatRowStore.streamChatRowRawToFile(chaId, chatId, filePath)
     ),
     getByteBudget: () => resolveChatBackupMaxBytes({ kvGet }),
+    getUncompressedByteBudget: () => resolveChatBackupMaxUncompressedBytes({ kvGet }),
     runStorageOperation: queueStorageOperation,
 });
 
@@ -19226,7 +19228,8 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
         .then((result) => {
             logger.info(
                 `[ChatBackups] Startup reconcile complete: `
-                + `${result.gzipped} gzip, ${result.bundlesCreated} bundle, `
+                + `${result.framesCreated} frame(s), `
+                + `${result.legacyBundlesMigrated} legacy bundle migration(s), `
                 + `${result.budgetItemsRemoved} budget eviction(s)`
             );
         })

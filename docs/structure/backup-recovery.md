@@ -341,16 +341,35 @@ that would delete the authoritative row. A missing row is the only no-capture su
 
 Reconciliation runs after a debounce and at startup:
 
-- loose versions are gzip-compressed and every 25 versions are combined into a solid
-  bundle with an atomic metadata sidecar;
-- each chat has an exact 125-version default cap (four bundles plus one active 25-version
-  batch), including trimming entries out of an existing bundle;
+- each loose version is streamed into one atomically published, self-describing `.frame`:
+  fixed magic, a bounded JSON header with codec/raw size/SHA-256/content type/version
+  metadata, and one independently decompressible gzip member;
+- each chat keeps the exact 125-version default count cap and also has a 256 MiB default
+  retained uncompressed-byte cap. Both delete oldest versions first, while the newest
+  recovery point remains protected if it alone exceeds the uncompressed cap;
 - the whole tree has a 50 MiB default budget, configurable with
   `config/chat-backup-max-bytes`; `POCKETRISU_CHAT_BACKUP_MAX_BYTES` takes precedence,
   and the effective value is clamped from 1 MiB through 50 GiB;
-- global eviction compares recovery points across chats by age. A bundle is indivisible
-  and is aged by its newest member; the newest version of each chat is protected, so the
-  tree can remain above budget when only protected versions remain.
+- the per-chat uncompressed cap is configurable with
+  `config/chat-backup-max-uncompressed-bytes`;
+  `POCKETRISU_CHAT_BACKUP_MAX_UNCOMPRESSED_BYTES` takes precedence, with the same 1 MiB
+  through 50 GiB clamp;
+- global eviction compares individual recovery points across chats by age and protects
+  the newest version of each chat, so the tree can remain above the compressed-disk
+  budget when only protected versions remain.
+
+Frame compression and decompression use asynchronous zlib streams. Creation never
+concatenates versions, reads inflate only the requested current frame, and reconciliation
+holds at most one bounded legacy entry or stream chunk uncompressed. Existing solid v1
+bundles remain listable/readable; reconciliation migrates them in one streaming pass,
+publishes every extracted source durably, and only then withdraws the old metadata and
+bundle. An interrupted migration therefore retains either the legacy source or exact
+loose/frame replacements.
+
+The frame is intentionally row-oriented rather than history-container-specific. Its
+media type, codec, raw length/hash, and version identity are inside the frame,
+so a future per-row `chats/` full-backup entry can use the same frame body. Full-backup
+archive output/import remains unchanged today.
 
 The default root is `save/chat-backups`; `POCKETRISU_CHAT_BACKUP_DIR` may relocate it.
 Startup migrates the legacy `<server-backup-root>/chat-backups` tree, deduplicating
@@ -450,6 +469,7 @@ Important finite limits include:
 | `RISU_RESTORE_DISK_HEADROOM_BYTES` | 256 MiB |
 | `RISU_RESTORE_MAX_LEGACY_BYTES` | 64 MiB |
 | `POCKETRISU_CHAT_BACKUP_MAX_BYTES` | 50 MiB; clamped to 1 MiB–50 GiB |
+| `POCKETRISU_CHAT_BACKUP_MAX_UNCOMPRESSED_BYTES` | 256 MiB per chat; clamped to 1 MiB–50 GiB |
 
 Ordinary entry-count values are capped at one million. Large-restore ceilings are
 separate recovery controls; disk-backed metadata keeps memory bounded, but raising or

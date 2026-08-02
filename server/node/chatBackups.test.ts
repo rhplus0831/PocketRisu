@@ -26,9 +26,14 @@ interface ChatBackupStore {
     reconcileChatBackups: () => Promise<{
         staleTempsRemoved: number
         gzipped: number
+        framesCreated: number
         bundlesCreated: number
         bundlesRotated: number
+        legacyBundlesMigrated: number
         versionsTrimmed: number
+        uncompressedVersionsTrimmed: number
+        totalUncompressedBytes: number
+        maxUncompressedBytes: number
         budgetItemsRemoved: number
         totalBytes: number
         maxBytes: number
@@ -46,7 +51,7 @@ interface ChatBackupStore {
         chaId: string,
         chatId: string,
         versionId: string,
-    ) => Buffer | null
+    ) => Promise<Buffer | null>
     close: () => void
 }
 
@@ -55,8 +60,11 @@ const {
     migrateLegacyChatBackups,
     resolveChatBackupDir,
     resolveChatBackupMaxBytes,
+    resolveChatBackupMaxUncompressedBytes,
     sanitizeBackupReason,
     CHAT_BACKUP_MAX_BYTES_KEY,
+    CHAT_BACKUP_MAX_UNCOMPRESSED_BYTES_KEY,
+    FRAME_FORMAT,
     COLD_STORAGE_HEADER,
 } = chatBackupsPkg as {
     createChatBackupStore: (options: any) => ChatBackupStore
@@ -68,8 +76,11 @@ const {
     }
     resolveChatBackupDir: (options?: any) => string
     resolveChatBackupMaxBytes: (options?: any) => number
+    resolveChatBackupMaxUncompressedBytes: (options?: any) => number
     sanitizeBackupReason: (reason?: unknown) => string
     CHAT_BACKUP_MAX_BYTES_KEY: string
+    CHAT_BACKUP_MAX_UNCOMPRESSED_BYTES_KEY: string
+    FRAME_FORMAT: string
     COLD_STORAGE_HEADER: string
 }
 const { decodeRisuSave, encodeRisuSaveLegacy } = utilsPkg as {
@@ -125,55 +136,48 @@ function recursiveSnapshot(directory: string, base = directory): Array<{
         .sort((a, b) => a.name.localeCompare(b.name))
 }
 
-interface LooseFixture {
-    filename: string
+function writeLegacySolidBundle(directory: string, fixtures: Array<{
     versionId: string
-    ts: number
     raw: Buffer
-}
-
-function gzipCapturedRawFiles(directory: string): LooseFixture[] {
-    return fs.readdirSync(directory)
-        .filter(filename => filename.endsWith('.bin'))
-        .map((filename) => {
-            const rawPath = path.join(directory, filename)
-            const raw = fs.readFileSync(rawPath)
-            const compressedFilename = `${filename}.gz`
-            fs.writeFileSync(path.join(directory, compressedFilename), zlib.gzipSync(raw))
-            fs.unlinkSync(rawPath)
-            const versionId = filename.slice(0, -'.bin'.length)
-            return {
-                filename: compressedFilename,
-                versionId,
-                ts: Number(/^v-(\d+)-/.exec(versionId)?.[1]),
-                raw,
-            }
-        })
-        .sort((a, b) => a.ts - b.ts)
-}
-
-function writeCorruptBundleClaim(directory: string, loose: LooseFixture[]) {
-    const bundleFile = `archive-${loose[0].ts}-${loose.at(-1)?.ts}.bundle`
-    const bundlePath = path.join(directory, bundleFile)
-    const corruptBundle = Buffer.from('garbage')
+}>) {
     let offset = 0
-    const entries = loose.map((entry) => {
-        const metaEntry = {
-            versionId: entry.versionId,
+    const entries = fixtures.map(({ versionId, raw }) => {
+        const match = /^v-(\d+)-(\d+)-([a-z0-9_-]+)$/.exec(versionId)
+        if (!match) throw new Error(`invalid test version ID: ${versionId}`)
+        const entry = {
+            versionId,
+            ts: Number(match[1]),
+            reason: match[3],
             offset,
-            size: entry.raw.length,
+            size: raw.length,
         }
-        offset += entry.raw.length
-        return metaEntry
+        offset += raw.length
+        return entry
     })
-    fs.writeFileSync(bundlePath, corruptBundle)
+    const bundle = zlib.gzipSync(Buffer.concat(fixtures.map(({ raw }) => raw)))
+    const bundleFile = `archive-${entries[0].ts}-${entries.at(-1)?.ts}.bundle`
+    const bundlePath = path.join(directory, bundleFile)
+    fs.writeFileSync(bundlePath, bundle)
     fs.writeFileSync(bundlePath.replace(/\.bundle$/, '.meta.json'), `${JSON.stringify({
         format: 'pocketrisu-chat-backup-bundle-v1',
         entryCount: entries.length,
-        compressedSize: corruptBundle.length,
+        compressedSize: bundle.length,
         entries,
     })}\n`)
-    return bundlePath
+    return { bundleFile, bundlePath }
+}
+
+function readFrameFixture(filename: string) {
+    const bytes = fs.readFileSync(filename)
+    expect(bytes.subarray(0, 8).toString('ascii')).toBe('PRCHATF1')
+    const headerBytes = bytes.readUInt32LE(8)
+    const compressedBytes = Number(bytes.readBigUInt64LE(12))
+    const payloadOffset = 20 + headerBytes
+    expect(payloadOffset + compressedBytes).toBe(bytes.length)
+    return {
+        header: JSON.parse(bytes.subarray(20, payloadOffset).toString('utf-8')),
+        payload: bytes.subarray(payloadOffset),
+    }
 }
 
 function makeHarness(options: {
@@ -184,12 +188,15 @@ function makeHarness(options: {
     maxVersionsPerChat?: number
     decodeChat?: (raw: Buffer) => Promise<any>
     maxBytes?: number
+    maxUncompressedBytes?: number
+    diagnostics?: { onEvent: (event: Record<string, any>) => void }
 } = {}) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-chat-backups-'))
     tempRoots.push(root)
     const rows = new Map<string, Buffer>()
     let clock = options.now ?? 1_000_000
     let maxBytes = options.maxBytes ?? 100 * 1024 * 1024
+    let maxUncompressedBytes = options.maxUncompressedBytes ?? 100 * 1024 * 1024
     const logger = {
         info: vi.fn(),
         warn: vi.fn(),
@@ -207,8 +214,11 @@ function makeHarness(options: {
         maxBundlesPerChat: options.maxBundlesPerChat ?? 4,
         maxVersionsPerChat: options.maxVersionsPerChat,
         getByteBudget: () => maxBytes,
+        getUncompressedByteBudget: () => maxUncompressedBytes,
         byteBudgetMin: 1,
+        uncompressedByteBudgetMin: 1,
         autoReconcile: false,
+        diagnostics: options.diagnostics,
         decodeChat: options.decodeChat ?? decodeRisuSave,
     })
     stores.push(store)
@@ -229,6 +239,9 @@ function makeHarness(options: {
         },
         setMaxBytes(value: number) {
             maxBytes = value
+        },
+        setMaxUncompressedBytes(value: number) {
+            maxUncompressedBytes = value
         },
     }
 }
@@ -293,7 +306,7 @@ describe('chat backup root and legacy migration', () => {
         stores.push(replacement)
         expect(replacement.listChatBackups('char', 'chat').map(version => version.versionId))
             .toEqual([before.versionId])
-        expect(replacement.readChatBackup('char', 'chat', before.versionId)?.equals(expected))
+        expect((await replacement.readChatBackup('char', 'chat', before.versionId))?.equals(expected))
             .toBe(true)
     })
 
@@ -323,7 +336,7 @@ describe('chat backup root and legacy migration', () => {
             expect(await store.captureChatPreImage({ chaId: 'hub-char', chatId: 'hub-chat' }))
                 .toBe('captured')
             const [version] = store.listChatBackups('hub-char', 'hub-chat')
-            expect(store.readChatBackup('hub-char', 'hub-chat', version.versionId)?.equals(expected))
+            expect((await store.readChatBackup('hub-char', 'hub-chat', version.versionId))?.equals(expected))
                 .toBe(true)
             expect(root).toBe(path.join(savePath, 'chat-backups'))
             if (canEnforceReadOnly) expect(fs.existsSync(path.join(appRoot, 'backups'))).toBe(false)
@@ -375,7 +388,7 @@ describe('chat backup root and legacy migration', () => {
         stores.push(migratedStore)
         expect(migratedStore.listChatBackups('char', 'chat').map(version => version.versionId))
             .toEqual([legacyVersion.versionId])
-        expect(migratedStore.readChatBackup('char', 'chat', legacyVersion.versionId)?.equals(expected))
+        expect((await migratedStore.readChatBackup('char', 'chat', legacyVersion.versionId))?.equals(expected))
             .toBe(true)
     })
 
@@ -451,7 +464,7 @@ describe('chat backup capture', () => {
         expect(await store.captureChatPreImage({ chaId: 'char', chatId: 'chat' }))
             .toBe('captured')
         const [version] = store.listChatBackups('char', 'chat')
-        expect(store.readChatBackup('char', 'chat', version.versionId)).toEqual(expected)
+        expect(await store.readChatBackup('char', 'chat', version.versionId)).toEqual(expected)
         expect(materializedRead).not.toHaveBeenCalled()
         expect(streamedParts).toBeGreaterThan(1)
         expect(maxPartBytes).toBeLessThanOrEqual(257)
@@ -488,11 +501,11 @@ describe('chat backup capture', () => {
 
         const versions = store.listChatBackups('char', 'chat')
         expect(versions).toHaveLength(2)
-        expect(store.readChatBackup('char', 'chat', versions[1].versionId)?.equals(oldFirst))
+        expect((await store.readChatBackup('char', 'chat', versions[1].versionId))?.equals(oldFirst))
             .toBe(true)
-        expect(store.readChatBackup('char', 'chat', versions[0].versionId)?.equals(incomingFirst))
+        expect((await store.readChatBackup('char', 'chat', versions[0].versionId))?.equals(incomingFirst))
             .toBe(true)
-        expect(store.readChatBackup('char', 'chat', versions[0].versionId)?.equals(incomingSecond))
+        expect((await store.readChatBackup('char', 'chat', versions[0].versionId))?.equals(incomingSecond))
             .toBe(false)
     })
 
@@ -548,7 +561,7 @@ describe('chat backup capture', () => {
         const versions = harness.store.listChatBackups('char', 'chat')
         expect(versions).toHaveLength(2)
         expect(versions[0].reason).toBe('delete-chat')
-        expect(harness.store.readChatBackup('char', 'chat', versions[0].versionId)?.equals(coldStub))
+        expect((await harness.store.readChatBackup('char', 'chat', versions[0].versionId))?.equals(coldStub))
             .toBe(true)
     })
 
@@ -628,7 +641,7 @@ describe('chat backup capture', () => {
         })).toBe('captured')
         expect(decodeSpy).toHaveBeenCalledTimes(1)
         const [version] = harness.store.listChatBackups('char', 'large')
-        expect(harness.store.readChatBackup('char', 'large', version.versionId)?.equals(large))
+        expect((await harness.store.readChatBackup('char', 'large', version.versionId))?.equals(large))
             .toBe(true)
     })
 
@@ -676,313 +689,221 @@ describe('chat backup capture', () => {
 })
 
 describe('chat backup reconcile and reads', () => {
-    it('gzips loose raws, removes stale temps, prunes empties, and is idempotent', async () => {
+    it('streams independently compressed self-describing frames and is idempotent', async () => {
         const harness = makeHarness()
-        harness.setRow('char', 'chat', rawChat(1))
-        await harness.store.captureChatPreImage({
-            chaId: 'char',
-            chatId: 'chat',
-            reason: 'save',
-        })
+        const expected = rawChat(1, 'x'.repeat(256_000))
+        harness.setRow('char', 'chat', expected)
+        await harness.store.captureChatPreImage({ chaId: 'char', chatId: 'chat', reason: 'save' })
 
         const tree = path.join(harness.root, 'chat-backups')
         const staleDir = path.join(tree, 'stale-char', 'stale-chat')
         const emptyDir = path.join(tree, 'empty-char', 'empty-chat')
         fs.mkdirSync(staleDir, { recursive: true })
         fs.mkdirSync(emptyDir, { recursive: true })
-        fs.writeFileSync(path.join(staleDir, 'interrupted.bundle.tmp'), 'partial')
+        fs.writeFileSync(path.join(staleDir, 'interrupted.frame.tmp'), 'partial')
 
-        const firstResult = await harness.store.reconcileChatBackups()
-        expect(firstResult.staleTempsRemoved).toBe(1)
-        expect(firstResult.gzipped).toBe(1)
-        const names = fs.readdirSync(chatDir(harness.root, 'char', 'chat'))
-        expect(names).toHaveLength(1)
-        expect(names[0]).toMatch(/\.bin\.gz$/)
+        const first = await harness.store.reconcileChatBackups()
+        expect(first).toMatchObject({ staleTempsRemoved: 1, gzipped: 1, framesCreated: 1 })
+        const directory = chatDir(harness.root, 'char', 'chat')
+        const names = fs.readdirSync(directory)
+        expect(names).toEqual(['v-1000000-0-save.frame'])
+        const frame = readFrameFixture(path.join(directory, names[0]))
+        expect(frame.header).toMatchObject({
+            format: FRAME_FORMAT,
+            contentType: 'application/vnd.pocketrisu.chat-row',
+            compression: 'gzip',
+            uncompressedSize: expected.length,
+            versionId: 'v-1000000-0-save',
+            timestamp: 1_000_000,
+            sequence: 0,
+            reason: 'save',
+        })
+        expect(zlib.gunzipSync(frame.payload)).toEqual(expected)
+        expect(await harness.store.readChatBackup('char', 'chat', frame.header.versionId))
+            .toEqual(expected)
         expect(fs.existsSync(path.join(tree, 'stale-char'))).toBe(false)
         expect(fs.existsSync(path.join(tree, 'empty-char'))).toBe(false)
 
+        const source = fs.readFileSync(path.join(process.cwd(), 'server/node/chatBackups.cjs'), 'utf-8')
+        expect(source).not.toContain('gzipSync')
+        expect(source).not.toContain('gunzipSync')
+        expect(source).not.toContain('Buffer.concat(rawEntries)')
+
         const snapshot = recursiveSnapshot(tree)
-        const secondResult = await harness.store.reconcileChatBackups()
-        expect(secondResult.staleTempsRemoved).toBe(0)
-        expect(secondResult.gzipped).toBe(0)
-        expect(secondResult.bundlesCreated).toBe(0)
-        expect(secondResult.bundlesRotated).toBe(0)
-        expect(secondResult.budgetItemsRemoved).toBe(0)
+        expect(await harness.store.reconcileChatBackups()).toMatchObject({
+            staleTempsRemoved: 0,
+            gzipped: 0,
+            framesCreated: 0,
+            budgetItemsRemoved: 0,
+        })
         expect(recursiveSnapshot(tree)).toEqual(snapshot)
     })
 
-    it('solid-bundles the oldest 25 with correct metadata and byte-exact reads', async () => {
-        const harness = makeHarness({ now: 10_000 })
-        const expected = new Map<number, Buffer>()
-        for (let index = 0; index < 25; index++) {
-            const raw = rawChat(index, 'mostly-identical-content')
-            expected.set(10_000 + index, raw)
+    it('decompresses only the requested frame for a single-version read', async () => {
+        const events: Array<Record<string, any>> = []
+        const harness = makeHarness({
+            now: 10_000,
+            diagnostics: { onEvent: event => events.push(event) },
+        })
+        const expected = new Map<string, Buffer>()
+        for (let index = 0; index < 3; index++) {
+            const raw = rawChat(index, String(index).repeat(80_000))
             harness.setRow('char', 'chat', raw)
-            await harness.store.captureChatPreImage({
-                chaId: 'char',
-                chatId: 'chat',
-                reason: 'autosave',
-            })
+            await harness.store.captureChatPreImage({ chaId: 'char', chatId: 'chat', reason: 'read' })
+            expected.set(`v-${10_000 + index}-0-read`, raw)
             harness.advance()
         }
+        await harness.store.reconcileChatBackups()
 
-        const result = await harness.store.reconcileChatBackups()
-        expect(result.gzipped).toBe(25)
-        expect(result.bundlesCreated).toBe(1)
-        const directory = chatDir(harness.root, 'char', 'chat')
-        const names = fs.readdirSync(directory).sort()
-        expect(names).toEqual([
-            'archive-10000-10024.bundle',
-            'archive-10000-10024.meta.json',
-        ])
-
-        const meta = JSON.parse(
-            fs.readFileSync(path.join(directory, 'archive-10000-10024.meta.json'), 'utf-8'),
-        )
-        expect(meta.format).toBe('pocketrisu-chat-backup-bundle-v1')
-        expect(meta.entryCount).toBe(25)
-        expect(meta.compressedSize).toBe(
-            fs.statSync(path.join(directory, 'archive-10000-10024.bundle')).size,
-        )
-        expect(meta.entries[0]).toMatchObject({
-            versionId: 'v-10000-0-autosave',
-            ts: 10_000,
-            reason: 'autosave',
-            offset: 0,
-            size: expected.get(10_000)?.length,
-        })
-        for (let index = 1; index < meta.entries.length; index++) {
-            expect(meta.entries[index].offset).toBe(
-                meta.entries[index - 1].offset + meta.entries[index - 1].size,
-            )
-        }
-
-        for (const entry of meta.entries) {
-            expect(
-                harness.store.readChatBackup('char', 'chat', entry.versionId)
-                    ?.equals(expected.get(entry.ts) as Buffer),
-            ).toBe(true)
-        }
+        events.length = 0
+        const requested = 'v-10001-0-read'
+        expect(await harness.store.readChatBackup('char', 'chat', requested))
+            .toEqual(expected.get(requested))
+        const starts = events.filter(event => event.event === 'decompress-start')
+        expect(starts).toEqual([expect.objectContaining({
+            operation: 'read',
+            versionId: requested,
+            storage: 'frame',
+            frameFile: `${requested}.frame`,
+        })])
+        expect(events.filter(event => event.event === 'uncompressed-state')
+            .map(event => event.bufferedFrames)).toEqual([1, 0])
     })
 
     it.each([
         {
-            state: 'non-gzip garbage',
-            derivative: () => Buffer.from('garbage'),
+            state: 'a non-frame garbage derivative',
+            derivative: () => Buffer.from('corrupt derivative'),
         },
         {
-            state: 'a valid gzip of the wrong bytes',
-            derivative: () => zlib.gzipSync(Buffer.from('wrong backup bytes')),
+            state: 'a valid magic with a garbage header',
+            derivative: () => Buffer.concat([
+                Buffer.from('PRCHATF1', 'ascii'),
+                Buffer.from('garbage header and lengths'),
+            ]),
         },
         {
-            state: 'an empty rename-published gzip',
+            state: 'an empty rename-published frame',
             derivative: () => Buffer.alloc(0),
         },
-    ])('regenerates $state instead of deleting its good raw source', async ({ derivative }) => {
+    ])('regenerates $state before deleting its exact raw source', async ({ derivative }) => {
         const harness = makeHarness()
         const expected = rawChat(70)
         harness.setRow('char', 'chat', expected)
-        await harness.store.captureChatPreImage({
-            chaId: 'char',
-            chatId: 'chat',
-            reason: 'save',
-        })
-
+        await harness.store.captureChatPreImage({ chaId: 'char', chatId: 'chat', reason: 'save' })
         const directory = chatDir(harness.root, 'char', 'chat')
         const rawFilename = fs.readdirSync(directory).find(name => name.endsWith('.bin')) as string
-        const versionId = rawFilename.slice(0, -'.bin'.length)
-        const gzipPath = path.join(directory, `${rawFilename}.gz`)
-        fs.writeFileSync(gzipPath, derivative())
+        const versionId = rawFilename.slice(0, -4)
+        fs.writeFileSync(path.join(directory, `${versionId}.frame`), derivative())
 
         await harness.store.reconcileChatBackups()
 
-        expect(harness.store.readChatBackup('char', 'chat', versionId)?.equals(expected)).toBe(true)
-        expect(zlib.gunzipSync(fs.readFileSync(gzipPath)).equals(expected)).toBe(true)
+        expect(fs.existsSync(path.join(directory, rawFilename))).toBe(false)
+        expect(await harness.store.readChatBackup('char', 'chat', versionId)).toEqual(expected)
     })
 
-    it('keeps loose versions when a corrupt bundle claims them below the threshold', async () => {
-        const harness = makeHarness({ now: 30_000, versionsPerBundle: 3 })
-        for (let index = 0; index < 2; index++) {
-            harness.setRow('char', 'chat', rawChat(80 + index))
-            await harness.store.captureChatPreImage({
-                chaId: 'char',
-                chatId: 'chat',
-                reason: 'save',
-            })
+    it('enforces the count cap by deleting one oldest frame without decompression', async () => {
+        const events: Array<Record<string, any>> = []
+        const harness = makeHarness({
+            now: 20_000,
+            maxVersionsPerChat: 3,
+            diagnostics: { onEvent: event => events.push(event) },
+        })
+        for (let index = 0; index < 4; index++) {
+            harness.setRow('char', 'chat', rawChat(index))
+            await harness.store.captureChatPreImage({ chaId: 'char', chatId: 'chat', reason: 'cap' })
             harness.advance()
         }
-
-        const directory = chatDir(harness.root, 'char', 'chat')
-        const loose = gzipCapturedRawFiles(directory)
-        writeCorruptBundleClaim(directory, loose)
-
-        await harness.store.reconcileChatBackups()
-
-        for (const entry of loose) {
-            expect(fs.existsSync(path.join(directory, entry.filename))).toBe(true)
-            expect(
-                harness.store.readChatBackup('char', 'chat', entry.versionId)?.equals(entry.raw),
-            ).toBe(true)
-        }
-    })
-
-    it('regenerates a corrupt bundle that claims a full loose batch', async () => {
-        const harness = makeHarness({ now: 40_000, versionsPerBundle: 3 })
-        for (let index = 0; index < 3; index++) {
-            harness.setRow('char', 'chat', rawChat(90 + index))
-            await harness.store.captureChatPreImage({
-                chaId: 'char',
-                chatId: 'chat',
-                reason: 'save',
-            })
-            harness.advance()
-        }
-
-        const directory = chatDir(harness.root, 'char', 'chat')
-        const loose = gzipCapturedRawFiles(directory)
-        const bundlePath = writeCorruptBundleClaim(directory, loose)
 
         const result = await harness.store.reconcileChatBackups()
-
-        expect(result.bundlesCreated).toBe(1)
-        expect(
-            zlib.gunzipSync(fs.readFileSync(bundlePath)).equals(
-                Buffer.concat(loose.map(entry => entry.raw)),
-            ),
-        ).toBe(true)
-        for (const entry of loose) {
-            expect(fs.existsSync(path.join(directory, entry.filename))).toBe(false)
-            expect(
-                harness.store.readChatBackup('char', 'chat', entry.versionId)?.equals(entry.raw),
-            ).toBe(true)
-        }
-    })
-
-    it('retains exactly 125 versions and then evicts only the single oldest version', async () => {
-        const harness = makeHarness({ now: 20_000 })
-        const raws: Buffer[] = []
-        for (let index = 0; index < 125; index++) {
-            const raw = rawChat(index)
-            raws.push(raw)
-            harness.setRow('char', 'chat', raw)
-            await harness.store.captureChatPreImage({
-                chaId: 'char',
-                chatId: 'chat',
-                reason: 'save',
-            })
-            harness.advance()
-        }
-
-        const boundary = await harness.store.reconcileChatBackups()
-        expect(boundary.versionsTrimmed).toBe(0)
-        expect(harness.store.listChatBackups('char', 'chat')).toHaveLength(125)
-        for (let index = 0; index < raws.length; index++) {
-            expect(harness.store.readChatBackup(
-                'char',
-                'chat',
-                `v-${20_000 + index}-0-save`,
-            )?.equals(raws[index])).toBe(true)
-        }
-
-        const newest = rawChat(125)
-        harness.setRow('char', 'chat', newest)
-        await harness.store.captureChatPreImage({
-            chaId: 'char',
-            chatId: 'chat',
-            reason: 'save',
-        })
-
-        const overflow = await harness.store.reconcileChatBackups()
-        expect(overflow.versionsTrimmed).toBe(1)
-        const versions = harness.store.listChatBackups('char', 'chat')
-        expect(versions).toHaveLength(125)
-        expect(versions[0].versionId).toBe('v-20125-0-save')
-        expect(versions.at(-1)?.versionId).toBe('v-20001-0-save')
-        expect(harness.store.readChatBackup('char', 'chat', 'v-20000-0-save')).toBeNull()
-        expect(harness.store.readChatBackup('char', 'chat', 'v-20001-0-save')
-            ?.equals(raws[1])).toBe(true)
-        expect(harness.store.readChatBackup('char', 'chat', 'v-20125-0-save')
-            ?.equals(newest)).toBe(true)
-    })
-
-    it('enforces a configurable exact cap and remains idempotent after trimming a bundle', async () => {
-        const harness = makeHarness({
-            now: 30_000,
-            versionsPerBundle: 2,
-            maxBundlesPerChat: 2,
-        })
-        const raws: Buffer[] = []
-        for (let index = 0; index < 7; index++) {
-            const raw = rawChat(200 + index)
-            raws.push(raw)
-            harness.setRow('char', 'chat', raw)
-            await harness.store.captureChatPreImage({
-                chaId: 'char',
-                chatId: 'chat',
-                reason: 'small',
-            })
-            harness.advance()
-        }
-
-        const first = await harness.store.reconcileChatBackups()
-        expect(first.versionsTrimmed).toBe(1)
-        const versions = harness.store.listChatBackups('char', 'chat')
-        expect(versions.map(version => version.versionId)).toEqual(
-            Array.from({ length: 6 }, (_, index) => `v-${30_006 - index}-0-small`),
-        )
-        expect(harness.store.readChatBackup('char', 'chat', 'v-30000-0-small')).toBeNull()
-        for (let index = 1; index < raws.length; index++) {
-            expect(harness.store.readChatBackup(
-                'char',
-                'chat',
-                `v-${30_000 + index}-0-small`,
-            )?.equals(raws[index])).toBe(true)
-        }
-
-        const newest = rawChat(207)
-        harness.setRow('char', 'chat', newest)
-        await harness.store.captureChatPreImage({
-            chaId: 'char',
-            chatId: 'chat',
-            reason: 'small',
-        })
-        const next = await harness.store.reconcileChatBackups()
-        expect(next.versionsTrimmed).toBe(1)
+        expect(result.versionsTrimmed).toBe(1)
         expect(harness.store.listChatBackups('char', 'chat').map(version => version.versionId))
-            .toEqual(Array.from(
-                { length: 6 },
-                (_, index) => `v-${30_007 - index}-0-small`,
-            ))
-        expect(harness.store.readChatBackup('char', 'chat', 'v-30001-0-small')).toBeNull()
-        expect(harness.store.readChatBackup('char', 'chat', 'v-30007-0-small')
-            ?.equals(newest)).toBe(true)
-
-        const tree = path.join(harness.root, 'chat-backups')
-        const snapshot = recursiveSnapshot(tree)
-        const idempotent = await harness.store.reconcileChatBackups()
-        expect(idempotent.versionsTrimmed).toBe(0)
-        expect(recursiveSnapshot(tree)).toEqual(snapshot)
+            .toEqual(['v-20003-0-cap', 'v-20002-0-cap', 'v-20001-0-cap'])
+        expect(await harness.store.readChatBackup('char', 'chat', 'v-20000-0-cap')).toBeNull()
+        expect(events.some(event => event.event === 'version-delete'
+            && event.versionId === 'v-20000-0-cap')).toBe(true)
+        const deleteIndex = events.findIndex(event => event.event === 'version-delete')
+        expect(events.slice(deleteIndex).some(event => event.event === 'decompress-start')).toBe(false)
     })
 
-    it('keeps every retained version recoverable when bundle withdrawal fails', async () => {
-        const harness = makeHarness({
-            now: 40_000,
-            versionsPerBundle: 2,
-            maxBundlesPerChat: 1,
-        })
-        const raws: Buffer[] = []
-        for (let index = 0; index < 5; index++) {
-            const raw = rawChat(300 + index)
-            raws.push(raw)
+    it('enforces the configurable per-chat uncompressed-byte cap oldest first', async () => {
+        const raws = [rawChat(1, 'a'.repeat(5_000)), rawChat(2, 'b'.repeat(6_000)), rawChat(3, 'c'.repeat(7_000))]
+        const harness = makeHarness({ now: 30_000 })
+        harness.setMaxUncompressedBytes(raws[1].length + raws[2].length)
+        for (const raw of raws) {
             harness.setRow('char', 'chat', raw)
-            await harness.store.captureChatPreImage({
-                chaId: 'char',
-                chatId: 'chat',
-                reason: 'failure',
-            })
+            await harness.store.captureChatPreImage({ chaId: 'char', chatId: 'chat', reason: 'bytes' })
             harness.advance()
         }
 
+        const result = await harness.store.reconcileChatBackups()
+        expect(result.uncompressedVersionsTrimmed).toBe(1)
+        expect(result.totalUncompressedBytes).toBeLessThanOrEqual(result.maxUncompressedBytes)
+        expect(harness.store.listChatBackups('char', 'chat').map(version => version.versionId))
+            .toEqual(['v-30002-0-bytes', 'v-30001-0-bytes'])
+        expect(await harness.store.readChatBackup('char', 'chat', 'v-30000-0-bytes')).toBeNull()
+        expect(await harness.store.readChatBackup('char', 'chat', 'v-30001-0-bytes'))
+            .toEqual(raws[1])
+    })
+
+    it('lists, reads, and crash-safely migrates a byte-exact old solid bundle', async () => {
+        const events: Array<Record<string, any>> = []
+        const harness = makeHarness({ diagnostics: { onEvent: event => events.push(event) } })
+        const directory = chatDir(harness.root, 'legacy-char', 'legacy-chat')
+        fs.mkdirSync(directory, { recursive: true })
+        const fixtures = [0, 1, 2].map(index => ({
+            versionId: `v-${40_000 + index}-0-legacy`,
+            raw: rawChat(400 + index, String(index).repeat(100_000)),
+        }))
+        const legacy = writeLegacySolidBundle(directory, fixtures)
+
+        expect(harness.store.listChatBackups('legacy-char', 'legacy-chat')).toEqual(
+            [...fixtures].reverse().map(({ versionId, raw }) => ({
+                versionId,
+                ts: Number(/^v-(\d+)-/.exec(versionId)?.[1]),
+                reason: 'legacy',
+                size: raw.length,
+                storage: 'bundle',
+                bundleFile: legacy.bundleFile,
+            })),
+        )
+        for (const fixture of fixtures) {
+            expect(await harness.store.readChatBackup(
+                'legacy-char',
+                'legacy-chat',
+                fixture.versionId,
+            )).toEqual(fixture.raw)
+        }
+
+        events.length = 0
+        const result = await harness.store.reconcileChatBackups()
+        expect(result.legacyBundlesMigrated).toBe(1)
+        expect(fs.existsSync(legacy.bundlePath)).toBe(false)
+        expect(fs.existsSync(legacy.bundlePath.replace(/\.bundle$/, '.meta.json'))).toBe(false)
+        expect(fs.readdirSync(directory).sort()).toEqual(
+            fixtures.map(({ versionId }) => `${versionId}.frame`).sort(),
+        )
+        expect(Math.max(...events
+            .filter(event => event.event === 'uncompressed-chunk')
+            .map(event => event.bufferedFrames))).toBeLessThanOrEqual(1)
+        for (const fixture of fixtures) {
+            expect(await harness.store.readChatBackup(
+                'legacy-char',
+                'legacy-chat',
+                fixture.versionId,
+            )).toEqual(fixture.raw)
+        }
+    })
+
+    it('keeps every legacy version restorable when bundle withdrawal is interrupted', async () => {
+        const harness = makeHarness()
+        const directory = chatDir(harness.root, 'legacy-char', 'legacy-chat')
+        fs.mkdirSync(directory, { recursive: true })
+        const fixtures = [0, 1].map(index => ({
+            versionId: `v-${50_000 + index}-0-failure`,
+            raw: rawChat(500 + index),
+        }))
+        const legacy = writeLegacySolidBundle(directory, fixtures)
         const unlinkSync = fs.unlinkSync.bind(fs)
         let rejectedWithdrawal = false
         const unlinkSpy = vi.spyOn(fs, 'unlinkSync').mockImplementation((filename) => {
@@ -992,184 +913,107 @@ describe('chat backup reconcile and reads', () => {
             }
             return unlinkSync(filename)
         })
-        const failed = await harness.store.reconcileChatBackups()
-            .finally(() => unlinkSpy.mockRestore())
+        await harness.store.reconcileChatBackups().finally(() => unlinkSpy.mockRestore())
 
         expect(rejectedWithdrawal).toBe(true)
-        expect(failed.versionsTrimmed).toBe(0)
-        expect(harness.store.listChatBackups('char', 'chat')).toHaveLength(5)
-        for (let index = 0; index < raws.length; index++) {
-            expect(harness.store.readChatBackup(
-                'char',
-                'chat',
-                `v-${40_000 + index}-0-failure`,
-            )?.equals(raws[index])).toBe(true)
+        expect(fs.existsSync(legacy.bundlePath)).toBe(true)
+        expect(fs.existsSync(legacy.bundlePath.replace(/\.bundle$/, '.meta.json'))).toBe(true)
+        for (const fixture of fixtures) {
+            expect(await harness.store.readChatBackup(
+                'legacy-char',
+                'legacy-chat',
+                fixture.versionId,
+            )).toEqual(fixture.raw)
         }
 
-        const retried = await harness.store.reconcileChatBackups()
-        expect(retried.versionsTrimmed).toBe(1)
-        expect(harness.store.listChatBackups('char', 'chat')).toHaveLength(4)
-        expect(harness.store.readChatBackup('char', 'chat', 'v-40000-0-failure')).toBeNull()
-        for (let index = 1; index < raws.length; index++) {
-            expect(harness.store.readChatBackup(
-                'char',
-                'chat',
-                `v-${40_000 + index}-0-failure`,
-            )?.equals(raws[index])).toBe(true)
-        }
+        expect((await harness.store.reconcileChatBackups()).legacyBundlesMigrated).toBe(1)
+        expect(fs.readdirSync(directory).every(name => name.endsWith('.frame'))).toBe(true)
     })
 
-    it('evicts every eligible unit when necessary and preserves each chat newest', async () => {
-        const harness = makeHarness({
-            now: 100,
-            versionsPerBundle: 3,
-            maxBytes: 100 * 1024 * 1024,
-        })
-        for (const timestamp of [100, 200, 300, 400]) {
+    it('retains the exact default 125-version count and evicts only the oldest overflow', async () => {
+        const harness = makeHarness({ now: 60_000 })
+        for (let index = 0; index < 126; index++) {
+            harness.setRow('char', 'chat', rawChat(index))
+            await harness.store.captureChatPreImage({ chaId: 'char', chatId: 'chat', reason: 'default' })
+            harness.advance()
+        }
+
+        const result = await harness.store.reconcileChatBackups()
+        const versions = harness.store.listChatBackups('char', 'chat')
+        expect(result.versionsTrimmed).toBe(1)
+        expect(versions).toHaveLength(125)
+        expect(versions[0].versionId).toBe('v-60125-0-default')
+        expect(versions.at(-1)?.versionId).toBe('v-60001-0-default')
+        expect(await harness.store.readChatBackup('char', 'chat', 'v-60000-0-default')).toBeNull()
+    })
+
+    it('enforces the compressed disk budget globally and preserves each chat newest', async () => {
+        const harness = makeHarness({ maxBytes: 100 * 1024 * 1024 })
+        for (const timestamp of [100, 200, 300]) {
             harness.setNow(timestamp)
             harness.setRow('char-a', 'chat-a', rawChat(timestamp))
-            await harness.store.captureChatPreImage({
-                chaId: 'char-a',
-                chatId: 'chat-a',
-                reason: 'a',
-            })
+            await harness.store.captureChatPreImage({ chaId: 'char-a', chatId: 'chat-a', reason: 'a' })
         }
         for (const timestamp of [150, 250]) {
             harness.setNow(timestamp)
             harness.setRow('char-b', 'chat-b', rawChat(timestamp))
-            await harness.store.captureChatPreImage({
-                chaId: 'char-b',
-                chatId: 'chat-b',
-                reason: 'b',
-            })
+            await harness.store.captureChatPreImage({ chaId: 'char-b', chatId: 'chat-b', reason: 'b' })
         }
         await harness.store.reconcileChatBackups()
-        expect(harness.store.listChatBackups('char-a', 'chat-a').map(v => v.storage))
-            .toEqual(['loose', 'bundle', 'bundle', 'bundle'])
-        expect(harness.store.listChatBackups('char-b', 'chat-b')).toHaveLength(2)
 
         harness.setMaxBytes(1)
         const result = await harness.store.reconcileChatBackups()
         expect(result.totalBytes).toBeGreaterThan(result.maxBytes)
-        expect(harness.store.listChatBackups('char-a', 'chat-a').map(v => v.ts))
-            .toEqual([400])
-        expect(harness.store.listChatBackups('char-b', 'chat-b').map(v => v.ts))
+        expect(harness.store.listChatBackups('char-a', 'chat-a').map(version => version.ts))
+            .toEqual([300])
+        expect(harness.store.listChatBackups('char-b', 'chat-b').map(version => version.ts))
             .toEqual([250])
-        expect(harness.store.readChatBackup(
-            'char-a',
-            'chat-a',
-            'v-400-0-a',
-        )).not.toBeNull()
-        expect(harness.store.readChatBackup(
-            'char-b',
-            'chat-b',
-            'v-250-0-b',
-        )).not.toBeNull()
-    })
-
-    it('evicts one older loose version before a newer cross-chat bundle', async () => {
-        const harness = makeHarness({
-            versionsPerBundle: 3,
-            maxBytes: 100 * 1024 * 1024,
-        })
-        for (const timestamp of [200, 201, 202, 300]) {
-            harness.setNow(timestamp)
-            harness.setRow('char-a', 'chat-a', rawChat(timestamp))
-            await harness.store.captureChatPreImage({
-                chaId: 'char-a',
-                chatId: 'chat-a',
-                reason: 'a',
-            })
-        }
-        for (const timestamp of [100, 150]) {
-            harness.setNow(timestamp)
-            harness.setRow('char-b', 'chat-b', rawChat(timestamp))
-            await harness.store.captureChatPreImage({
-                chaId: 'char-b',
-                chatId: 'chat-b',
-                reason: 'b',
-            })
-        }
-
-        const before = await harness.store.reconcileChatBackups()
-        const olderLoosePath = path.join(
-            chatDir(harness.root, 'char-b', 'chat-b'),
-            'v-100-0-b.bin.gz',
-        )
-        expect(fs.existsSync(olderLoosePath)).toBe(true)
-        harness.setMaxBytes(before.totalBytes - fs.statSync(olderLoosePath).size)
-
-        const result = await harness.store.reconcileChatBackups()
-
-        expect(result.budgetItemsRemoved).toBe(1)
-        expect(result.totalBytes).toBe(result.maxBytes)
-        expect(harness.store.readChatBackup('char-b', 'chat-b', 'v-100-0-b')).toBeNull()
-        expect(harness.store.readChatBackup('char-b', 'chat-b', 'v-150-0-b')).not.toBeNull()
-        for (const timestamp of [200, 201, 202, 300]) {
-            expect(harness.store.readChatBackup(
-                'char-a',
-                'chat-a',
-                `v-${timestamp}-0-a`,
-            )).not.toBeNull()
-        }
-        expect(harness.store.listChatBackups('char-a', 'chat-a').filter(
-            version => version.storage === 'bundle',
-        )).toHaveLength(3)
+        expect(await harness.store.readChatBackup('char-a', 'chat-a', 'v-300-0-a')).not.toBeNull()
+        expect(await harness.store.readChatBackup('char-b', 'chat-b', 'v-250-0-b')).not.toBeNull()
     })
 })
 
 describe('chat backup listing', () => {
-    it('orders and summarizes loose plus bundled versions without decompressing bundles', async () => {
-        const harness = makeHarness({ now: 50_000 })
+    it('orders and summarizes framed versions without decompressing payloads', async () => {
+        const events: Array<Record<string, any>> = []
+        const harness = makeHarness({
+            now: 70_000,
+            diagnostics: { onEvent: event => events.push(event) },
+        })
         const expectedSizes = new Map<number, number>()
-        for (let index = 0; index < 25; index++) {
+        for (let index = 0; index < 27; index++) {
             const raw = rawChat(index)
-            expectedSizes.set(50_000 + index, raw.length)
+            expectedSizes.set(70_000 + index, raw.length)
             harness.setRow('char/雪', 'chat%one', raw)
             await harness.store.captureChatPreImage({
                 chaId: 'char/雪',
                 chatId: 'chat%one',
-                reason: 'archive',
+                reason: 'frame',
             })
             harness.advance()
         }
         await harness.store.reconcileChatBackups()
-
-        for (let index = 25; index < 27; index++) {
-            const raw = rawChat(index)
-            expectedSizes.set(50_000 + index, raw.length)
-            harness.setRow('char/雪', 'chat%one', raw)
-            await harness.store.captureChatPreImage({
-                chaId: 'char/雪',
-                chatId: 'chat%one',
-                reason: 'loose',
-            })
-            harness.advance()
-        }
-        await harness.store.reconcileChatBackups()
-
+        events.length = 0
         const versions = harness.store.listChatBackups('char/雪', 'chat%one')
         expect(versions).toHaveLength(27)
         expect(versions.map(version => version.ts)).toEqual(
-            Array.from({ length: 27 }, (_, index) => 50_026 - index),
+            Array.from({ length: 27 }, (_, index) => 70_026 - index),
         )
-        expect(versions.slice(0, 2).every(version => (
-            version.storage === 'loose' && version.bundleFile === undefined
-        ))).toBe(true)
-        expect(versions.slice(2).every(version => (
+        expect(versions.every(version => (
             version.storage === 'bundle'
-            && version.bundleFile === 'archive-50000-50024.bundle'
+            && version.bundleFile === `${version.versionId}.frame`
         ))).toBe(true)
         for (const version of versions) {
             expect(version.size).toBe(expectedSizes.get(version.ts))
         }
+        expect(events).toEqual([])
 
         expect(harness.store.listChatBackupChats()).toEqual([{
             chaId: 'char/雪',
             chatId: 'chat%one',
             versionCount: 27,
-            newestTs: 50_026,
-            oldestTs: 50_000,
+            newestTs: 70_026,
+            oldestTs: 70_000,
             totalBytes: expect.any(Number),
         }])
         expect(harness.store.listChatBackupChats()[0].totalBytes).toBeGreaterThan(0)
@@ -1205,5 +1049,28 @@ describe('chat backup byte-budget configuration', () => {
             ...base,
             env: { POCKETRISU_CHAT_BACKUP_MAX_BYTES: 'not-a-number' },
         })).toBe(100)
+    })
+
+    it('applies KV and env precedence to the uncompressed-byte cap', () => {
+        const values = new Map<string, Buffer>()
+        const kvGet = (key: string) => values.get(key) ?? null
+        const base = {
+            kvGet,
+            defaultBytes: 500,
+            minBytes: 100,
+            maxBytes: 1_000,
+        }
+
+        expect(resolveChatBackupMaxUncompressedBytes({ ...base, env: {} })).toBe(500)
+        values.set(CHAT_BACKUP_MAX_UNCOMPRESSED_BYTES_KEY, Buffer.from('700'))
+        expect(resolveChatBackupMaxUncompressedBytes({ ...base, env: {} })).toBe(700)
+        expect(resolveChatBackupMaxUncompressedBytes({
+            ...base,
+            env: { POCKETRISU_CHAT_BACKUP_MAX_UNCOMPRESSED_BYTES: '900' },
+        })).toBe(900)
+        expect(resolveChatBackupMaxUncompressedBytes({
+            ...base,
+            env: { POCKETRISU_CHAT_BACKUP_MAX_UNCOMPRESSED_BYTES: '5000' },
+        })).toBe(1_000)
     })
 })

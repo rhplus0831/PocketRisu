@@ -225,6 +225,50 @@ describe('chat content row serving', () => {
     expect(route).not.toContain('Stored chat row could not be read')
   })
 
+  test('POST overwrite history returns the byte-exact streamed pre-image', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const first = encodeRisuDat({
+      id: 'pre-image-chat',
+      name: 'First state',
+      message: [{ role: 'user', data: 'byte-exact first state' }],
+    })
+    const second = encodeRisuDat({
+      id: 'pre-image-chat',
+      name: 'Second state',
+      message: [{ role: 'user', data: 'replacement state' }],
+    })
+    for (const bytes of [first, second]) {
+      const response = await client.fetch('/api/chat-content/pre-image-char/0', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-chat-id': 'pre-image-chat',
+          'x-chat-backup-reason': 'edit-message',
+        },
+        body: new Uint8Array(bytes),
+      })
+      expect(response.status).toBe(200)
+    }
+
+    const historyResponse = await client.fetch(
+      '/api/chat-backups/pre-image-char/pre-image-chat',
+    )
+    expect(historyResponse.status).toBe(200)
+    const history = await historyResponse.json() as {
+      versions: Array<{ versionId: string; reason: string; size: number }>
+    }
+    expect(history.versions).toHaveLength(1)
+    expect(history.versions[0]).toMatchObject({ reason: 'edit-message', size: first.length })
+
+    const versionResponse = await client.fetch(
+      `/api/chat-backups/pre-image-char/pre-image-chat/${history.versions[0].versionId}`,
+    )
+    expect(versionResponse.status).toBe(200)
+    expect(Buffer.from(await versionResponse.arrayBuffer())).toEqual(first)
+  })
+
   test('GET selects one raw row and never calls the decoded row reader on its warm path', () => {
     const source = readFileSync(
       new URL('../../server/node/server.cjs', import.meta.url),
