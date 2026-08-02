@@ -120,7 +120,8 @@ Express + SQLite
 - `src/ts/storage/pluginStorageTransitionBulk.ts` encodes the negotiated framed mode
   transition, including structured-clone MessagePack rows for externalization.
 - `src/ts/storage/jsonValue.ts` snapshots, validates, and converts JSON values without
-  losing special own keys such as `__proto__`.
+  losing special own keys such as `__proto__`; persistent writes fuse descriptor-only
+  validation with direct UTF-8 serialization instead of building a second JSON graph.
 - `src/ts/storage/pluginSaveKeyPolicy.ts`, `base64Url.ts`, and
   `unicodeWellFormed.ts` implement canonical reversible keys plus the versioned,
   fixed-size hash mapping used only for over-limit physical names.
@@ -169,6 +170,15 @@ Express + SQLite
 An outcome of `unknown` means the request may already have committed. Never replay it
 blindly. Re-read authoritative state, or reload when a generation/transition outcome
 cannot be proven.
+
+Current optimized versioned reads use `/api/plugin-storage/state/raw`. A present row is
+the exact stored byte sequence; headers carry `json-v1` plus its content type, byte
+length, SHA-256 content digest, opaque row revision/generation, and selected publication
+generation/manifest revision. A proven absence is `204` with the publication identity
+and no row metadata. The browser verifies the header-bound length/digest and parses the
+stored JSON bytes directly. The retained `/api/plugin-storage/state` JSON/base64 response
+remains available to an old client during build-upgrade recovery, but current clients do
+not probe or negotiate between the two routes.
 
 Optimized compound writes negotiate their transport through `/api/session`. Current
 clients use `framed-v1` for 1 through the negotiated maximum of at most 128 operations:
@@ -264,6 +274,10 @@ unpublished stages; corrupt recovery boots preserve them rather than guessing.
 Externalization therefore uses one migration request instead of one upload request per row.
 Internalization is also one migration request; after commit the client performs one
 authoritative `database.bin` refresh rather than reading every optimized row separately.
+During externalization, each MessagePack row is copied into immutable Blob storage before
+the next row is encoded. The final request Blob references those per-row Blobs, bounding
+live encoder-array retention to one row while preserving the single-request atomic server
+publication.
 
 The framed transition transport admits up to 100,000 rows, 64 MiB of metadata, a payload
 ceiling of the larger configured per-value or aggregate limit, and per-row staging up to

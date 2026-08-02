@@ -1,6 +1,10 @@
 import { hasher } from "../parser/parser.svelte";
 import { forageStorage } from "../globalApi.svelte";
-import { stringifyJsonValue } from "./jsonValue";
+import {
+    serializeJsonValueToUtf8,
+    stringifyJsonValue,
+    type JsonValueSerializationOptions,
+} from "./jsonValue";
 import { assertWellFormedUnicode } from "./unicodeWellFormed";
 import { awaitWithAbort, throwIfAborted } from "./abort";
 import { StorageError } from "./storageError";
@@ -97,9 +101,11 @@ export interface PreparedPersistentJson {
     byteLength: number;
 }
 
-export function preparePersistentJson<T>(value: T): PreparedPersistentJson {
-    const serialized = stringifyJsonValue(value);
-    const bytes = encoder.encode(serialized);
+export function preparePersistentJson<T>(
+    value: T,
+    options?: JsonValueSerializationOptions,
+): PreparedPersistentJson {
+    const bytes = serializeJsonValueToUtf8(value, options);
     const byteLength = bytes.byteLength;
     return { bytes, byteLength };
 }

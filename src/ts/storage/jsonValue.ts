@@ -138,6 +138,288 @@ export function snapshotJsonValue<T>(input: T): T {
     return createJsonSnapshot(input, false);
 }
 
+const JSON_HEX = "0123456789abcdef";
+
+/**
+ * Small owned UTF-8 sink for strict JSON serialization. It grows geometrically
+ * and returns a view over its private buffer, so a complete intermediate JSON
+ * string or detached object graph is never required by the persistence path.
+ */
+class JsonUtf8Writer {
+    private bytes = new Uint8Array(1024);
+    private length = 0;
+
+    private reserve(additional: number): void {
+        const required = this.length + additional;
+        if (required <= this.bytes.byteLength) return;
+        let capacity = this.bytes.byteLength;
+        while (capacity < required) {
+            capacity = Math.max(required, capacity * 2);
+        }
+        const next = new Uint8Array(capacity);
+        next.set(this.bytes);
+        this.bytes = next;
+    }
+
+    byte(value: number): void {
+        this.reserve(1);
+        this.bytes[this.length++] = value;
+    }
+
+    ascii(value: string): void {
+        this.reserve(value.length);
+        for (let index = 0; index < value.length; index += 1) {
+            this.bytes[this.length++] = value.charCodeAt(index);
+        }
+    }
+
+    private unicodeEscape(codeUnit: number): void {
+        this.reserve(6);
+        this.bytes[this.length++] = 0x5c;
+        this.bytes[this.length++] = 0x75;
+        this.bytes[this.length++] = JSON_HEX.charCodeAt((codeUnit >>> 12) & 0xf);
+        this.bytes[this.length++] = JSON_HEX.charCodeAt((codeUnit >>> 8) & 0xf);
+        this.bytes[this.length++] = JSON_HEX.charCodeAt((codeUnit >>> 4) & 0xf);
+        this.bytes[this.length++] = JSON_HEX.charCodeAt(codeUnit & 0xf);
+    }
+
+    private codePoint(value: number): void {
+        if (value <= 0x7f) {
+            this.byte(value);
+            return;
+        }
+        if (value <= 0x7ff) {
+            this.reserve(2);
+            this.bytes[this.length++] = 0xc0 | (value >>> 6);
+            this.bytes[this.length++] = 0x80 | (value & 0x3f);
+            return;
+        }
+        if (value <= 0xffff) {
+            this.reserve(3);
+            this.bytes[this.length++] = 0xe0 | (value >>> 12);
+            this.bytes[this.length++] = 0x80 | ((value >>> 6) & 0x3f);
+            this.bytes[this.length++] = 0x80 | (value & 0x3f);
+            return;
+        }
+        this.reserve(4);
+        this.bytes[this.length++] = 0xf0 | (value >>> 18);
+        this.bytes[this.length++] = 0x80 | ((value >>> 12) & 0x3f);
+        this.bytes[this.length++] = 0x80 | ((value >>> 6) & 0x3f);
+        this.bytes[this.length++] = 0x80 | (value & 0x3f);
+    }
+
+    string(value: string): void {
+        this.byte(0x22);
+        for (let index = 0; index < value.length; index += 1) {
+            const codeUnit = value.charCodeAt(index);
+            if (codeUnit === 0x22 || codeUnit === 0x5c) {
+                this.byte(0x5c);
+                this.byte(codeUnit);
+            } else if (codeUnit === 0x08) {
+                this.ascii("\\b");
+            } else if (codeUnit === 0x09) {
+                this.ascii("\\t");
+            } else if (codeUnit === 0x0a) {
+                this.ascii("\\n");
+            } else if (codeUnit === 0x0c) {
+                this.ascii("\\f");
+            } else if (codeUnit === 0x0d) {
+                this.ascii("\\r");
+            } else if (codeUnit < 0x20) {
+                this.unicodeEscape(codeUnit);
+            } else if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+                const low = value.charCodeAt(index + 1);
+                if (low >= 0xdc00 && low <= 0xdfff) {
+                    this.codePoint(
+                        0x10000 + ((codeUnit - 0xd800) << 10) + (low - 0xdc00),
+                    );
+                    index += 1;
+                } else {
+                    this.unicodeEscape(codeUnit);
+                }
+            } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+                this.unicodeEscape(codeUnit);
+            } else {
+                this.codePoint(codeUnit);
+            }
+        }
+        this.byte(0x22);
+    }
+
+    finish(): Uint8Array {
+        return this.bytes.subarray(0, this.length);
+    }
+}
+
+export interface JsonValueSerializationOptions {
+    /** Test/diagnostic hook: called exactly once for each serialized value. */
+    onVisit?: (path: string, value: unknown) => void;
+    /** Preserve the established V3 atomic-batch validation messages/rules. */
+    validation?: "persistent" | "plugin-batch";
+}
+
+/**
+ * Validate and serialize one strict JSON value directly into owned UTF-8
+ * bytes. Descriptor-only traversal keeps the existing refusal surface without
+ * invoking getters or `toJSON`, while one visiting set detects only cycles
+ * (repeated non-cyclic references remain valid JSON, as before).
+ */
+export function serializeJsonValueToUtf8(
+    input: unknown,
+    options: JsonValueSerializationOptions = {},
+): Uint8Array {
+    const writer = new JsonUtf8Writer();
+    const visiting = new Set<object>();
+    const pluginBatch = options.validation === "plugin-batch";
+
+    const serialize = (value: unknown, path: string): void => {
+        options.onVisit?.(path, value);
+        if (value === null) {
+            writer.ascii("null");
+            return;
+        }
+        if (typeof value === "string") {
+            writer.string(value);
+            return;
+        }
+        if (typeof value === "boolean") {
+            writer.ascii(value ? "true" : "false");
+            return;
+        }
+        if (typeof value === "number") {
+            if (!Number.isFinite(value)) {
+                throw new TypeError(pluginBatch
+                    ? `Plugin batch value must be finite at ${path}.`
+                    : `Persistent JSON requires a finite number at ${path}.`);
+            }
+            writer.ascii(Object.is(value, -0) ? "0" : String(value));
+            return;
+        }
+        if (typeof value !== "object") {
+            throw new TypeError(pluginBatch
+                ? `Plugin batch value is not JSON-representable at ${path}.`
+                : `Persistent storage requires JSON data at ${path}.`);
+        }
+
+        if (visiting.has(value)) {
+            throw new TypeError(pluginBatch
+                ? `Plugin batch value is cyclic at ${path}.`
+                : `Persistent JSON does not accept circular data at ${path}.`);
+        }
+        const isArray = Array.isArray(value);
+        const prototype = Reflect.getPrototypeOf(value);
+        const prototypeConstructor = prototype
+            ? Reflect.getOwnPropertyDescriptor(prototype, "constructor")?.value
+            : null;
+        if (!isArray && prototype !== null && (pluginBatch
+            ? (typeof prototypeConstructor !== "function"
+                || prototypeConstructor.name !== "Object")
+            : prototype !== Object.prototype)) {
+            throw new TypeError(pluginBatch
+                ? `Plugin batch values require plain objects at ${path}.`
+                : `Persistent JSON requires plain objects at ${path}.`);
+        }
+
+        visiting.add(value);
+        try {
+            if (isArray) {
+                const lengthDescriptor = Reflect.getOwnPropertyDescriptor(value, "length");
+                const length = lengthDescriptor && "value" in lengthDescriptor
+                    ? lengthDescriptor.value
+                    : undefined;
+                if (!Number.isSafeInteger(length) || length < 0) {
+                    throw new TypeError(pluginBatch
+                        ? `Plugin batch arrays must be dense at ${path}.`
+                        : `Persistent JSON received an invalid array at ${path}.`);
+                }
+                for (const key of Reflect.ownKeys(value)) {
+                    if (key === "length") continue;
+                    if (typeof key !== "string") {
+                        throw new TypeError(pluginBatch
+                            ? `Plugin batch arrays must be dense at ${path}.`
+                            : `Persistent JSON does not accept symbol keys at ${path}.`);
+                    }
+                    const index = Number(key);
+                    if (!Number.isInteger(index)
+                        || index < 0
+                        || index >= length
+                        || String(index) !== key) {
+                        throw new TypeError(pluginBatch
+                            ? `Plugin batch arrays must be dense at ${path}.`
+                            : `Persistent JSON arrays do not accept extra property ${JSON.stringify(key)} at ${path}.`);
+                    }
+                }
+
+                writer.byte(0x5b);
+                for (let index = 0; index < length; index += 1) {
+                    const descriptor = Reflect.getOwnPropertyDescriptor(value, String(index));
+                    if (!descriptor) {
+                        throw new TypeError(pluginBatch
+                            ? `Plugin batch arrays must be dense at ${path}[${index}].`
+                            : `Persistent JSON does not accept array holes at ${path}[${index}].`);
+                    }
+                    if (!("value" in descriptor)) {
+                        throw new TypeError(pluginBatch
+                            ? `Plugin batch arrays must be dense at ${path}[${index}].`
+                            : `Persistent JSON does not accept accessors at ${path}[${index}].`);
+                    }
+                    if (!descriptor.enumerable) {
+                        throw new TypeError(pluginBatch
+                            ? `Plugin batch arrays must be dense at ${path}[${index}].`
+                            : `Persistent JSON requires enumerable array data at ${path}[${index}].`);
+                    }
+                    if (index > 0) writer.byte(0x2c);
+                    serialize(descriptor.value, `${path}[${index}]`);
+                }
+                writer.byte(0x5d);
+                return;
+            }
+
+            const keys = Reflect.ownKeys(value);
+            const seen = new Set<PropertyKey>(keys);
+            if (!pluginBatch) {
+                for (const key of Object.getOwnPropertyNames(Object.prototype)) {
+                    if (!seen.has(key) && Reflect.getOwnPropertyDescriptor(value, key)) {
+                        keys.push(key);
+                        seen.add(key);
+                    }
+                }
+            }
+            writer.byte(0x7b);
+            let emitted = 0;
+            for (const key of keys) {
+                if (typeof key !== "string") {
+                    throw new TypeError(pluginBatch
+                        ? `Plugin batch symbols are invalid at ${path}.`
+                        : `Persistent JSON does not accept symbol keys at ${path}.`);
+                }
+                const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+                if (!descriptor || !("value" in descriptor)) {
+                    throw new TypeError(pluginBatch
+                        ? `Plugin batch values require enumerable data properties at ${path}.${key}.`
+                        : `Persistent JSON does not accept accessors at ${path}.${key}.`);
+                }
+                if (!descriptor.enumerable) {
+                    throw new TypeError(pluginBatch
+                        ? `Plugin batch values require enumerable data properties at ${path}.${key}.`
+                        : `Persistent JSON requires enumerable object data at ${path}.${key}.`);
+                }
+                if (emitted > 0) writer.byte(0x2c);
+                writer.string(key);
+                writer.byte(0x3a);
+                serialize(descriptor.value, `${path}.${key}`);
+                emitted += 1;
+            }
+            writer.byte(0x7d);
+        } finally {
+            visiting.delete(value);
+        }
+    };
+
+    serialize(input, "$");
+    return writer.finish();
+}
+
 const dateGetTime = Date.prototype.getTime;
 const dateToISOString = Date.prototype.toISOString;
 const mapForEach = Map.prototype.forEach;
@@ -324,11 +606,5 @@ export function convertCompatibleJsonValue(input: unknown): unknown {
 }
 
 export function stringifyJsonValue(value: unknown): string {
-    const serialized = JSON.stringify(createJsonSnapshot(value, true));
-    if (serialized === undefined) {
-        // The validator should make this unreachable; keep the persistence
-        // boundary defensive if its accepted value set changes later.
-        throw new TypeError("Persistent storage requires a representable JSON value.");
-    }
-    return serialized;
+    return new TextDecoder().decode(serializeJsonValueToUtf8(value));
 }

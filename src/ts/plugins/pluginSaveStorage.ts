@@ -142,10 +142,8 @@ class PluginStorageBarrier {
 
     acquireShared(signal?: AbortSignal | null): Promise<() => void> {
         throwIfAborted(signal);
-        if (!this.exclusiveActive && this.waiters.length === 0) {
-            this.activeShared += 1;
-            return Promise.resolve(this.sharedRelease());
-        }
+        const immediate = this.tryAcquireShared(signal);
+        if (immediate) return Promise.resolve(immediate);
         return new Promise((resolve, reject) => {
             const waiter: BarrierWaiter = { kind: "shared", resolve, reject };
             if (signal) {
@@ -156,6 +154,13 @@ class PluginStorageBarrier {
             this.waiters.push(waiter);
             this.drain();
         });
+    }
+
+    tryAcquireShared(signal?: AbortSignal | null): (() => void) | null {
+        throwIfAborted(signal);
+        if (this.exclusiveActive || this.waiters.length > 0) return null;
+        this.activeShared += 1;
+        return this.sharedRelease();
     }
 
     acquireExclusive(
@@ -311,6 +316,20 @@ async function withPluginSaveStorageScopes<T>(
     // submitted before a transition part of the old-mode drain, while calls
     // submitted after it wait for the new mode.
     const releaseBarrier = await storageBarrier.acquireShared(signal);
+    return await withAdmittedPluginSaveStorageScopes(
+        scopes,
+        operation,
+        releaseBarrier,
+        signal,
+    );
+}
+
+async function withAdmittedPluginSaveStorageScopes<T>(
+    scopes: readonly string[],
+    operation: () => Promise<T>,
+    releaseBarrier: () => void,
+    signal?: AbortSignal | null,
+): Promise<T> {
     const previous = scopes.map(scope => storageScopeQueues.get(scope) ?? Promise.resolve());
     let resolveResult!: (value: T | PromiseLike<T>) => void;
     let rejectResult!: (error: unknown) => void;
@@ -344,6 +363,36 @@ async function withPluginSaveStorageScopes<T>(
     });
 
     return await awaitWithAbort(result, signal);
+}
+
+/**
+ * Prepare an invocation synchronously after immediate shared admission. The
+ * selected storage mode cannot change until the queued operation releases its
+ * reservation, so optimized writes can serialize the caller value directly
+ * before the public method returns. A transition already in progress returns
+ * null and the caller uses the structured-clone compatibility fallback.
+ */
+function withImmediatelyAdmittedPluginSaveStorageKey<P, T>(
+    key: string,
+    prepare: () => P,
+    operation: (prepared: P) => Promise<T>,
+    signal?: AbortSignal | null,
+): Promise<T> | null {
+    const releaseBarrier = storageBarrier.tryAcquireShared(signal);
+    if (!releaseBarrier) return null;
+    let prepared: P;
+    try {
+        prepared = prepare();
+    } catch (error) {
+        releaseBarrier();
+        return Promise.reject(error);
+    }
+    return withAdmittedPluginSaveStorageScopes(
+        [`save:${normalizePluginStorageKey(key)}`],
+        () => operation(prepared),
+        releaseBarrier,
+        signal,
+    );
 }
 
 function normalizePluginStorageKey(key: unknown): string {
@@ -923,7 +972,6 @@ function cloneInlinePluginStorageRecord(
 }
 
 interface PreparedOptimizedPluginStorageValue {
-    snapshot: unknown;
     prepared: ReturnType<typeof preparePersistentJson>;
 }
 
@@ -936,15 +984,19 @@ function prepareOptimizedPluginStorageValue(
     owner?: string,
     autoConvert = false,
 ): PreparedOptimizedPluginStorageValue {
-    let snapshot: unknown;
+    let prepared: ReturnType<typeof preparePersistentJson> | undefined;
     try {
-        snapshot = snapshotJsonValue(value);
+        // Strict JSON validation and UTF-8 serialization are one descriptor-
+        // only traversal. No detached JSON tree or complete UTF-16 JSON string
+        // is retained on the ordinary optimized persistence path.
+        prepared = preparePersistentJson(value);
     } catch (error) {
         let cause = error;
         let converted = false;
         if (autoConvert) {
             try {
-                snapshot = convertCompatibleJsonValue(value);
+                const snapshot = convertCompatibleJsonValue(value);
+                prepared = preparePersistentJson(snapshot);
                 converted = true;
             } catch (conversionError) {
                 cause = conversionError;
@@ -972,8 +1024,7 @@ function prepareOptimizedPluginStorageValue(
 
     try {
         return {
-            snapshot,
-            prepared: preparePersistentJson(snapshot),
+            prepared: prepared!,
         };
     } catch (error) {
         if (error instanceof StorageError && error.code === "PLUGIN_VALUE_TOO_LARGE") {
@@ -992,6 +1043,27 @@ function prepareOptimizedPluginStorageValue(
             );
         }
         throw error;
+    }
+}
+
+type PluginStorageSetInvocation =
+    | { mode: "inline"; snapshot: unknown }
+    | { mode: "optimized"; prepared: ReturnType<typeof preparePersistentJson> }
+    | { mode: "deferred"; snapshot: unknown };
+
+function prepareImmediatelyAdmittedPluginStorageSet(
+    value: unknown,
+): PluginStorageSetInvocation {
+    if (!getDatabase().optimizePluginMemory) {
+        return { mode: "inline", snapshot: safeStructuredClone(value) };
+    }
+    try {
+        return { mode: "optimized", prepared: preparePersistentJson(value) };
+    } catch {
+        // Preserve the historical structured-clone normalization and the
+        // operation-time auto-conversion setting for uncommon rich/invalid
+        // values. Strict JSON values never enter this fallback.
+        return { mode: "deferred", snapshot: safeStructuredClone(value) };
     }
 }
 
@@ -1184,7 +1256,7 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
             );
             if (db.optimizePluginMemory) {
                 if (replacement !== undefined) {
-                    const optimizedReplacement = createDatabasePluginStorageRecord<unknown>();
+                    const optimizedReplacementKeys = new Set<string>();
                     const preparedValues = new Map<string, ReturnType<typeof preparePersistentJson>>();
                     for (const key of getPluginStorageRecordKeys(replacement)) {
                         const optimizedValue = prepareOptimizedPluginStorageValue(
@@ -1192,11 +1264,7 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
                             undefined,
                             db.autoConvertPluginStorageValues === true,
                         );
-                        definePluginStorageRecordValue(
-                            optimizedReplacement,
-                            key,
-                            optimizedValue.snapshot,
-                        );
+                        optimizedReplacementKeys.add(key);
                         preparedValues.set(key, optimizedValue.prepared);
                     }
                     for (const key of compatibilityKeys) {
@@ -1205,17 +1273,13 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
                             compatibilityOwner,
                             db.autoConvertPluginStorageValues === true,
                         );
-                        definePluginStorageRecordValue(
-                            optimizedReplacement,
-                            key,
-                            optimizedValue.snapshot,
-                        );
+                        optimizedReplacementKeys.add(key);
                         preparedValues.set(key, optimizedValue.prepared);
                     }
                     // Archive constraints apply only once the locked, live
                     // backend is known to be external. Prepare every
                     // destination before any persistent or database mutation.
-                    const prepared = getPluginStorageRecordKeys(optimizedReplacement).map((key) => ({
+                    const prepared = [...optimizedReplacementKeys].map((key) => ({
                         key,
                         storageKey: makeArchiveSafePluginSaveStorageKey(
                             PLUGIN_SAVE_PREFIX,
@@ -1258,7 +1322,7 @@ export async function updateDatabaseWithPluginStorageSnapshot<T>(
                             ownership.manifest,
                         );
                         if (rawKey === null
-                            || !hasPluginStorageRecordValue(optimizedReplacement, rawKey)) continue;
+                            || !optimizedReplacementKeys.has(rawKey)) continue;
                         const existingValueKey = makeArchiveSafePluginSaveStorageKey(
                             PLUGIN_SAVE_PREFIX,
                             rawKey,
@@ -1462,52 +1526,72 @@ export async function setPluginSaveStorageItem<T>(
 ): Promise<void> {
     throwIfAborted(signal);
     const normalizedKey = normalizePluginStorageKey(key);
-    // Preserve invocation-time structured-clone behavior while the operation
-    // waits. JSON validation is intentionally deferred until the locked mode
-    // is known to be optimized.
-    const inlineSnapshot = safeStructuredClone(value);
-    try {
-        await withPluginSaveStorageKeyLock(normalizedKey, async () => {
-            throwIfAborted(signal);
-            const db = getDatabase();
-            if (!db.optimizePluginMemory) {
-                await withInlinePluginStoragePublishLock(async () => {
-                    const next = cloneInlinePluginStorageRecord(
-                        db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
-                    );
-                    definePluginStorageRecordValue(next, normalizedKey, inlineSnapshot);
-                    db.pluginCustomStorage = next;
-                }, signal);
-                return;
+    const publish = async (invocation: PluginStorageSetInvocation): Promise<void> => {
+        throwIfAborted(signal);
+        const db = getDatabase();
+        if (!db.optimizePluginMemory) {
+            if (invocation.mode === "optimized") {
+                throw new Error("Plugin storage mode changed after shared admission.");
             }
-            const { prepared } = prepareOptimizedPluginStorageValue(
-                inlineSnapshot,
+            await withInlinePluginStoragePublishLock(async () => {
+                const next = cloneInlinePluginStorageRecord(
+                    db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
+                );
+                definePluginStorageRecordValue(next, normalizedKey, invocation.snapshot);
+                db.pluginCustomStorage = next;
+            }, signal);
+            return;
+        }
+        if (invocation.mode === "inline") {
+            throw new Error("Plugin storage mode changed after shared admission.");
+        }
+        const prepared = invocation.mode === "optimized"
+            ? invocation.prepared
+            : prepareOptimizedPluginStorageValue(
+                invocation.snapshot,
                 undefined,
                 db.autoConvertPluginStorageValues === true,
-            );
-            const storageKey = makeArchiveSafePluginSaveStorageKey(
-                PLUGIN_SAVE_PREFIX,
-                normalizedKey,
-            );
-            if (db.pluginStorageGeneration
-                && !isHashedPluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX)) {
-                await setPreparedPersistentPluginStoragePreservingOwner(
-                    storageKey,
-                    prepared,
-                    signal,
-                    db.pluginStorageGeneration,
-                );
-                return;
-            }
-            await commitOptimizedStorageMutation(
-                db,
-                [{ storageKey, valueBytes: prepared.bytes }],
-                [],
-                values => values.add(storageKey),
+            ).prepared;
+        const storageKey = makeArchiveSafePluginSaveStorageKey(
+            PLUGIN_SAVE_PREFIX,
+            normalizedKey,
+        );
+        if (db.pluginStorageGeneration
+            && !isHashedPluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX)) {
+            await setPreparedPersistentPluginStoragePreservingOwner(
+                storageKey,
+                prepared,
                 signal,
-                [normalizedKey],
+                db.pluginStorageGeneration,
             );
-        }, signal);
+            return;
+        }
+        await commitOptimizedStorageMutation(
+            db,
+            [{ storageKey, valueBytes: prepared.bytes }],
+            [],
+            values => values.add(storageKey),
+            signal,
+            [normalizedKey],
+        );
+    };
+    try {
+        const admitted = withImmediatelyAdmittedPluginSaveStorageKey(
+            normalizedKey,
+            () => prepareImmediatelyAdmittedPluginStorageSet(value),
+            publish,
+            signal,
+        );
+        if (admitted) {
+            await admitted;
+        } else {
+            const snapshot = safeStructuredClone(value);
+            await withPluginSaveStorageKeyLock(
+                normalizedKey,
+                () => publish({ mode: "deferred", snapshot }),
+                signal,
+            );
+        }
     } finally {
         // A timed-out remote mutation may have committed even though its
         // acknowledgement was lost, so no enumeration snapshot remains valid.
@@ -1524,91 +1608,114 @@ export async function setOwnedPluginSaveStorageItem<T>(
 ): Promise<void> {
     throwIfAborted(signal);
     const normalizedKey = normalizePluginStorageKey(key);
-    const inlineSnapshot = safeStructuredClone(value);
-    try {
-        await withPluginSaveStorageKeyLock(normalizedKey, async () => {
-            throwIfAborted(signal);
-            const db = getDatabase();
-            const ownerRecord = createPluginStorageOwnerRecord(owner);
-            if (db.optimizePluginMemory) {
-                const { snapshot, prepared: preparedValue } = prepareOptimizedPluginStorageValue(
-                    inlineSnapshot,
+    const publish = async (invocation: PluginStorageSetInvocation): Promise<void> => {
+        throwIfAborted(signal);
+        const db = getDatabase();
+        const ownerRecord = createPluginStorageOwnerRecord(owner);
+        if (db.optimizePluginMemory) {
+            if (invocation.mode === "inline") {
+                throw new Error("Plugin storage mode changed after shared admission.");
+            }
+            const preparedValue = invocation.mode === "optimized"
+                ? invocation.prepared
+                : prepareOptimizedPluginStorageValue(
+                    invocation.snapshot,
                     owner,
                     db.autoConvertPluginStorageValues === true,
-                );
-                const valueStorageKey = makeArchiveSafePluginSaveStorageKey(
-                    PLUGIN_SAVE_PREFIX,
-                    normalizedKey,
-                );
-                // The server derives this row, but preflight its stricter archive
-                // boundary before dispatching either side of the transaction.
-                const metaStorageKey = makeArchiveSafePluginSaveStorageKey(
-                    PLUGIN_SAVE_META_PREFIX,
-                    normalizedKey,
-                );
-                if (db.pluginStorageGeneration) {
-                    if (
-                        isHashedPluginSaveStorageKey(valueStorageKey, PLUGIN_SAVE_PREFIX)
-                        || isHashedPluginSaveStorageKey(metaStorageKey, PLUGIN_SAVE_META_PREFIX)
-                    ) {
-                        await commitHashedOwnedPluginStorageMutation(db, {
-                            operation: "set",
-                            key: normalizedKey,
-                            valueBytes: preparedValue.bytes,
-                            ownedValueBytes: true,
-                            owner,
-                        }, signal);
-                    } else {
-                        await mutatePersistentPluginStorage(
-                            valueStorageKey,
-                            "set",
-                            snapshot,
-                            owner,
-                            signal,
-                            db.pluginStorageGeneration,
-                            preparedValue,
-                        );
-                    }
+                ).prepared;
+            const valueStorageKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_PREFIX,
+                normalizedKey,
+            );
+            // The server derives this row, but preflight its stricter archive
+            // boundary before dispatching either side of the transaction.
+            const metaStorageKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_META_PREFIX,
+                normalizedKey,
+            );
+            if (db.pluginStorageGeneration) {
+                if (
+                    isHashedPluginSaveStorageKey(valueStorageKey, PLUGIN_SAVE_PREFIX)
+                    || isHashedPluginSaveStorageKey(metaStorageKey, PLUGIN_SAVE_META_PREFIX)
+                ) {
+                    await commitHashedOwnedPluginStorageMutation(db, {
+                        operation: "set",
+                        key: normalizedKey,
+                        valueBytes: preparedValue.bytes,
+                        ownedValueBytes: true,
+                        owner,
+                    }, signal);
                 } else {
                     await mutatePersistentPluginStorage(
                         valueStorageKey,
                         "set",
-                        snapshot,
+                        undefined,
                         owner,
                         signal,
-                        undefined,
+                        db.pluginStorageGeneration,
                         preparedValue,
                     );
                 }
-                return;
+            } else {
+                await mutatePersistentPluginStorage(
+                    valueStorageKey,
+                    "set",
+                    undefined,
+                    owner,
+                    signal,
+                    undefined,
+                    preparedValue,
+                );
             }
+            return;
+        }
+        if (invocation.mode === "optimized") {
+            throw new Error("Plugin storage mode changed after shared admission.");
+        }
 
-            await withInlinePluginStoragePublishLock(async () => {
-                const nextValues = cloneInlinePluginStorageRecord(
-                    db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
-                );
-                const nextMeta = cloneJsonPluginStorageRecord(
-                    db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
-                        NonNullable<Database["pluginStorageMeta"]>[string]
-                    >(),
-                    "pluginStorageMeta",
-                );
-                definePluginStorageRecordValue(nextValues, normalizedKey, inlineSnapshot);
-                if (owner) {
-                    definePluginStorageRecordValue(nextMeta, normalizedKey, ownerRecord);
-                } else {
-                    delete nextMeta[normalizedKey];
-                }
-                // Both detached records have passed preflight. Publish synchronously,
-                // with no await or observable plugin callback between the two fields.
-                db.pluginCustomStorage = nextValues;
-                if (getPluginStorageRecordKeys(nextMeta).length > 0) {
-                    db.pluginStorageMeta = nextMeta;
-                } else {
-                    delete db.pluginStorageMeta;
-                }
-            }, signal);
+        await withInlinePluginStoragePublishLock(async () => {
+            const nextValues = cloneInlinePluginStorageRecord(
+                db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
+            );
+            const nextMeta = cloneJsonPluginStorageRecord(
+                db.pluginStorageMeta ?? createDatabasePluginStorageRecord<
+                    NonNullable<Database["pluginStorageMeta"]>[string]
+                >(),
+                "pluginStorageMeta",
+            );
+            definePluginStorageRecordValue(nextValues, normalizedKey, invocation.snapshot);
+            if (owner) {
+                definePluginStorageRecordValue(nextMeta, normalizedKey, ownerRecord);
+            } else {
+                delete nextMeta[normalizedKey];
+            }
+            // Both detached records have passed preflight. Publish synchronously,
+            // with no await or observable plugin callback between the two fields.
+            db.pluginCustomStorage = nextValues;
+            if (getPluginStorageRecordKeys(nextMeta).length > 0) {
+                db.pluginStorageMeta = nextMeta;
+            } else {
+                delete db.pluginStorageMeta;
+            }
         }, signal);
+    };
+    try {
+        const admitted = withImmediatelyAdmittedPluginSaveStorageKey(
+            normalizedKey,
+            () => prepareImmediatelyAdmittedPluginStorageSet(value),
+            publish,
+            signal,
+        );
+        if (admitted) {
+            await admitted;
+        } else {
+            const snapshot = safeStructuredClone(value);
+            await withPluginSaveStorageKeyLock(
+                normalizedKey,
+                () => publish({ mode: "deferred", snapshot }),
+                signal,
+            );
+        }
     } finally {
         invalidateStorageEnumerationSnapshot();
     }
@@ -2212,7 +2319,7 @@ export async function atomicBatchOwnedPluginSaveStorage(
         | {
             type: "set";
             key: string;
-            value: unknown;
+            valueBytes: Uint8Array;
             expectedRevision?: string | null;
         }
         | {
@@ -2245,7 +2352,9 @@ export async function atomicBatchOwnedPluginSaveStorage(
             detached.push({
                 type: "set",
                 key,
-                value: snapshotPluginBatchValue(mutation.value),
+                valueBytes: preparePersistentJson(mutation.value, {
+                    validation: "plugin-batch",
+                }).bytes,
                 ...expected,
             });
         } else {
@@ -2264,7 +2373,7 @@ export async function atomicBatchOwnedPluginSaveStorage(
             prepared.push({
                 operation: "set",
                 key: mutation.key,
-                valueBytes: preparePersistentJson(mutation.value).bytes,
+                valueBytes: mutation.valueBytes,
                 ownedValueBytes: true,
                 owner,
                 ...(Object.prototype.hasOwnProperty.call(mutation, "expectedRevision")

@@ -91,7 +91,8 @@ vi.mock("./apiV3/transpiler", () => ({
     pluginCodeTranspiler: vi.fn(async (code: string) => code),
 }));
 
-vi.mock("../storage/persistentKv", () => {
+vi.mock("../storage/persistentKv", async () => {
+    const { serializeJsonValueToUtf8 } = await import("../storage/jsonValue");
     const encode = (value: string) => {
         if (!value.isWellFormed()) {
             throw new Error(
@@ -407,8 +408,8 @@ vi.mock("../storage/persistentKv", () => {
             return { ...await stagedStatus(), state: "committed" as const };
         }),
         writePersistentJson,
-        preparePersistentJson: vi.fn((value: unknown) => {
-            const bytes = new TextEncoder().encode(JSON.stringify(value));
+        preparePersistentJson: vi.fn((value: unknown, options?: unknown) => {
+            const bytes = serializeJsonValueToUtf8(value, options as never);
             return { bytes, byteLength: bytes.byteLength, value };
         }),
         writePreparedPersistentJson: vi.fn(
@@ -612,11 +613,19 @@ beforeEach(async () => {
         operation: "set" | "remove",
         value?: unknown,
         owner = "",
+        _signal?: AbortSignal | null,
+        _generation?: string,
+        prepared?: { bytes: Uint8Array },
     ) => {
         const encodedKey = valueKey.slice(PLUGIN_SAVE_PREFIX.length, -".json".length);
         const metaKey = `${PLUGIN_SAVE_META_PREFIX}${encodedKey}.json`;
         if (operation === "set") {
-            persistent.set(valueKey, value);
+            persistent.set(
+                valueKey,
+                prepared
+                    ? JSON.parse(new TextDecoder().decode(prepared.bytes))
+                    : value,
+            );
             if (owner) persistent.set(metaKey, { plugin: owner, updatedAt: Date.now() });
             else persistent.delete(metaKey);
         } else {
@@ -1599,7 +1608,7 @@ describe("plugin save storage transport", () => {
         expect(mutatePersistentPluginStorage).toHaveBeenCalledWith(
             encoded(PLUGIN_SAVE_PREFIX, rawKey),
             "set",
-            { value: "maximum" },
+            undefined,
             "Boundary Plugin",
             undefined,
             undefined,
@@ -1980,6 +1989,7 @@ describe("plugin save storage transport", () => {
         installOwnershipManifest("set-generation", [], []);
         const {
             listPersistentKeys,
+            preparePersistentJson,
             readPersistentPluginStorageManifestSnapshot,
             readPersistentPluginStorageManifestState,
             setPreparedPersistentPluginStoragePreservingOwner,
@@ -1988,6 +1998,7 @@ describe("plugin save storage transport", () => {
         await setPluginSaveStorageItem("alpha", { once: true });
 
         expect(setPreparedPersistentPluginStoragePreservingOwner).toHaveBeenCalledOnce();
+        expect(preparePersistentJson).toHaveBeenCalledOnce();
         expect(setPreparedPersistentPluginStoragePreservingOwner).toHaveBeenCalledWith(
             encoded(PLUGIN_SAVE_PREFIX, "alpha"),
             expect.objectContaining({ bytes: expect.any(Uint8Array) }),

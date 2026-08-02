@@ -78,7 +78,8 @@ vi.mock("src/ts/gui/colorscheme", () => ({
     updateTextThemeAndCSS: vi.fn(),
 }));
 
-vi.mock("../../storage/persistentKv", () => {
+vi.mock("../../storage/persistentKv", async () => {
+    const { serializeJsonValueToUtf8 } = await import("../../storage/jsonValue");
     const writePersistentJson = async (
         key: string,
         value: unknown,
@@ -195,6 +196,8 @@ vi.mock("../../storage/persistentKv", () => {
         valueOrSignal?: unknown,
         owner = "",
         signal?: AbortSignal | null,
+        _generation?: string,
+        prepared?: { bytes: Uint8Array },
     ) => {
         const activeSignal = operation === "remove"
             ? valueOrSignal as AbortSignal | null | undefined
@@ -204,7 +207,12 @@ vi.mock("../../storage/persistentKv", () => {
         if (operation === "set") {
             await storageMocks.writeGate?.(valueKey, activeSignal);
             throwIfAborted(activeSignal);
-            storageMocks.persistent.set(valueKey, cloneJson(valueOrSignal));
+            storageMocks.persistent.set(
+                valueKey,
+                prepared
+                    ? JSON.parse(new TextDecoder().decode(prepared.bytes))
+                    : cloneJson(valueOrSignal),
+            );
             if (owner) {
                 storageMocks.persistent.set(ownerKey, {
                     plugin: owner,
@@ -304,12 +312,15 @@ vi.mock("../../storage/persistentKv", () => {
     },
         setPreparedPersistentPluginStoragePreservingOwner: async (
             key: string,
-            prepared: { value: unknown },
+            prepared: { bytes: Uint8Array },
             signal?: AbortSignal | null,
         ) => {
             await storageMocks.writeGate?.(key, signal);
             throwIfAborted(signal);
-            storageMocks.persistent.set(key, cloneJson(prepared.value));
+            storageMocks.persistent.set(
+                key,
+                JSON.parse(new TextDecoder().decode(prepared.bytes)),
+            );
             return {
                 outcome: "committed" as const,
                 operation: "set" as const,
@@ -317,15 +328,19 @@ vi.mock("../../storage/persistentKv", () => {
             };
         },
         writePersistentJson,
-        preparePersistentJson: (value: unknown) => {
-            const bytes = new TextEncoder().encode(JSON.stringify(value));
-            return { bytes, byteLength: bytes.byteLength, value: cloneJson(value) };
+        preparePersistentJson: (value: unknown, options?: unknown) => {
+            const bytes = serializeJsonValueToUtf8(value, options as never);
+            return { bytes, byteLength: bytes.byteLength };
         },
         writePreparedPersistentJson: async (
             key: string,
-            prepared: { value: unknown },
+            prepared: { bytes: Uint8Array },
             signal?: AbortSignal | null,
-        ) => writePersistentJson(key, prepared.value, signal),
+        ) => writePersistentJson(
+            key,
+            JSON.parse(new TextDecoder().decode(prepared.bytes)),
+            signal,
+        ),
     };
 });
 

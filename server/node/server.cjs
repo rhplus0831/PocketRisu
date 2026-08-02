@@ -2461,7 +2461,11 @@ function shouldCompress(req, res) {
     // Original upstream server has no compression middleware at all,
     // so proxy responses were never compressed in the first place.
     const url = req.originalUrl || req.url;
-    if (url.startsWith('/proxy') || url.startsWith('/hub-proxy') || url.startsWith('/api/backup/export') || url.startsWith('/api/backup/server/download/')) {
+    if (url.startsWith('/proxy')
+        || url.startsWith('/hub-proxy')
+        || url.startsWith('/api/backup/export')
+        || url.startsWith('/api/backup/server/download/')
+        || url.startsWith('/api/plugin-storage/state/raw')) {
         return false;
     }
 
@@ -10568,109 +10572,78 @@ app.get('/api/list', async (req, res, next) => {
     }
 });
 
-/** Read one logical plugin value together with its opaque CAS revision. */
-app.get('/api/plugin-storage/state', async (req, res, next) => {
-    if (!await checkAuth(req, res)) return;
-    const firstHeader = (value) => Array.isArray(value) ? value[0] : value;
-    const filePath = firstHeader(req.headers['file-path']);
-    const requestedGeneration = firstHeader(req.headers['x-plugin-storage-generation']);
-    if (typeof filePath !== 'string' || !isHex(filePath)) {
-        return res.status(400).json({
-            success: false,
-            error: 'A valid value row path is required.',
-            code: 'INVALID_PLUGIN_STORAGE_STATE_READ',
-        });
-    }
-    if (requestedGeneration !== undefined
-        && (typeof requestedGeneration !== 'string' || requestedGeneration.length === 0)) {
-        return res.status(400).json({
-            success: false,
-            error: 'Plugin storage generation must be a non-empty string.',
-            code: 'INVALID_PLUGIN_STORAGE_STATE_READ',
-        });
-    }
+const PLUGIN_STORAGE_JSON_CONTENT_TYPE = 'application/json';
+const PLUGIN_STORAGE_JSON_CODEC = 'json-v1';
 
-    if (pluginStorageStateFailpoint === 'read') {
-        res.setHeader('Retry-After', '0');
-        return res.status(503).json({
-            success: false,
-            error: 'Injected plugin storage state read failure.',
-            code: 'TEMPORARY_STORAGE_FAILURE',
-            retryAfter: 0,
-            retryable: true,
-        });
-    }
+async function readAuthoritativePluginStorageState(req, valueKey, requestedGeneration) {
+    const ownerKey = `${PLUGIN_SAVE_META_PREFIX}${valueKey.slice(PLUGIN_SAVE_PREFIX.length)}`;
+    return await queueStorageReadAfterImports(async () => {
+        const publication = await readLivePluginStoragePublication();
+        const { dbObj, generation, manifestState } = publication;
+        const pinnedState = sessionPluginStorageReadState(req);
+        const expectedState = requestedGeneration !== undefined
+            ? { optimized: true, generation: requestedGeneration }
+            : pinnedState;
+        const activeManifest = generation
+            && dbObj?.optimizePluginMemory === true
+            && manifestState.valid
+            && manifestState.manifest?.generation === generation
+            ? manifestState.manifest
+            : null;
+        const legacyPublication = !generation
+            && dbObj?.optimizePluginMemory === true
+            && !manifestState.present;
 
-    try {
-        const { decodedKey: valueKey } = decodeAndCanonicalizeHexPath(filePath);
-        if (isHashedPluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX)) {
-            assertArchiveSafePluginSaveStorageKey(valueKey);
-        } else {
-            decodePluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX);
-        }
-        const ownerKey = `${PLUGIN_SAVE_META_PREFIX}${valueKey.slice(PLUGIN_SAVE_PREFIX.length)}`;
-        const state = await queueStorageReadAfterImports(async () => {
-            const publication = await readLivePluginStoragePublication();
-            const { dbObj, generation, manifestState } = publication;
-            const pinnedState = sessionPluginStorageReadState(req);
-            const expectedState = requestedGeneration !== undefined
-                ? { optimized: true, generation: requestedGeneration }
-                : pinnedState;
-            const activeManifest = generation
-                && dbObj?.optimizePluginMemory === true
-                && manifestState.valid
-                && manifestState.manifest?.generation === generation
-                ? manifestState.manifest
-                : null;
-            const legacyPublication = !generation
-                && dbObj?.optimizePluginMemory === true
-                && !manifestState.present;
-
-            if (!expectedState) {
-                if (activeManifest || legacyPublication) {
-                    throw pluginStorageNamespaceConflict(
-                        'Read database.bin before reading authoritative plugin storage state',
-                    );
-                }
-                return await readPluginStorageState(valueKey, ownerKey);
-            }
-            if (
-                expectedState.optimized !== (dbObj?.optimizePluginMemory === true)
-                || expectedState.generation !== generation
-                || (requestedGeneration !== undefined && pinnedState && (
-                    pinnedState.optimized !== true
-                    || pinnedState.generation !== requestedGeneration
-                ))
-            ) {
+        if (!expectedState) {
+            if (activeManifest || legacyPublication) {
                 throw pluginStorageNamespaceConflict(
-                    'Plugin storage generation changed before the state could be read',
+                    'Read database.bin before reading authoritative plugin storage state',
                 );
             }
-            if (generation) {
-                if (!activeManifest) {
-                    throw pluginStorageNamespaceConflict(
-                        'The selected plugin storage generation has no matching manifest',
-                    );
-                }
-                if (isHashedPluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX)
-                    && (activeManifest.valueKeys.includes(valueKey)
-                        || activeManifest.metaKeys.includes(ownerKey))) {
-                    decodeManifestPluginSaveStorageKey(
-                        activeManifest,
-                        valueKey,
-                        PLUGIN_SAVE_PREFIX,
-                    );
-                }
-                const [valueBytes, ownerBytes] = await Promise.all([
-                    activeManifest.valueKeys.includes(valueKey)
-                        ? kvGetAsync(valueKey)
-                        : null,
-                    activeManifest.metaKeys.includes(ownerKey)
-                        ? kvGetAsync(ownerKey)
-                        : null,
-                ]);
-                const owner = parsePluginStorageOwnerRecord(ownerBytes);
-                return {
+            return {
+                state: await readPluginStorageState(valueKey, ownerKey),
+                publicationGeneration: null,
+                publicationRevision: null,
+            };
+        }
+        if (
+            expectedState.optimized !== (dbObj?.optimizePluginMemory === true)
+            || expectedState.generation !== generation
+            || (requestedGeneration !== undefined && pinnedState && (
+                pinnedState.optimized !== true
+                || pinnedState.generation !== requestedGeneration
+            ))
+        ) {
+            throw pluginStorageNamespaceConflict(
+                'Plugin storage generation changed before the state could be read',
+            );
+        }
+        if (generation) {
+            if (!activeManifest) {
+                throw pluginStorageNamespaceConflict(
+                    'The selected plugin storage generation has no matching manifest',
+                );
+            }
+            if (isHashedPluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX)
+                && (activeManifest.valueKeys.includes(valueKey)
+                    || activeManifest.metaKeys.includes(ownerKey))) {
+                decodeManifestPluginSaveStorageKey(
+                    activeManifest,
+                    valueKey,
+                    PLUGIN_SAVE_PREFIX,
+                );
+            }
+            const [valueBytes, ownerBytes] = await Promise.all([
+                activeManifest.valueKeys.includes(valueKey)
+                    ? kvGetAsync(valueKey)
+                    : null,
+                activeManifest.metaKeys.includes(ownerKey)
+                    ? kvGetAsync(ownerKey)
+                    : null,
+            ]);
+            const owner = parsePluginStorageOwnerRecord(ownerBytes);
+            return {
+                state: {
                     valueBytes,
                     ownerBytes,
                     revision: pluginStorageRevision(valueBytes, ownerBytes),
@@ -10678,40 +10651,137 @@ app.get('/api/plugin-storage/state', async (req, res, next) => {
                         && isCanonicalPluginStorageOwnerRecord(owner, ownerBytes)
                         ? owner.generation
                         : null,
-                };
-            }
-            if (!legacyPublication) {
-                throw pluginStorageNamespaceConflict(
-                    'The legacy plugin storage publication changed before the state could be read',
-                );
-            }
-            return await readPluginStorageState(valueKey, ownerKey);
-        });
-        return res.json({
-            success: true,
-            missing: state.valueBytes === null,
-            value: state.valueBytes?.toString('base64'),
-            revision: state.revision,
-            generation: state.generation,
-        });
-    } catch (error) {
-        if (error?.pluginStorageNamespaceConflict) {
-            return res.status(409).json({
-                success: false,
-                error: error.message,
-                code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
-            });
+                },
+                publicationGeneration: generation,
+                publicationRevision: manifestState.revision,
+            };
         }
-        if (error instanceof RangeError || error?.message?.includes('plugin storage key')) {
+        if (!legacyPublication) {
+            throw pluginStorageNamespaceConflict(
+                'The legacy plugin storage publication changed before the state could be read',
+            );
+        }
+        return {
+            state: await readPluginStorageState(valueKey, ownerKey),
+            publicationGeneration: null,
+            publicationRevision: null,
+        };
+    });
+}
+
+function handlePluginStorageStateRead({ binary }) {
+    return async (req, res, next) => {
+        if (!await checkAuth(req, res)) return;
+        const firstHeader = (value) => Array.isArray(value) ? value[0] : value;
+        const filePath = firstHeader(req.headers['file-path']);
+        const requestedGeneration = firstHeader(req.headers['x-plugin-storage-generation']);
+        if (typeof filePath !== 'string' || !isHex(filePath)) {
             return res.status(400).json({
                 success: false,
-                error: error instanceof Error ? error.message : String(error),
+                error: 'A valid value row path is required.',
                 code: 'INVALID_PLUGIN_STORAGE_STATE_READ',
             });
         }
-        next(error);
-    }
-});
+        if (requestedGeneration !== undefined
+            && (typeof requestedGeneration !== 'string' || requestedGeneration.length === 0)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Plugin storage generation must be a non-empty string.',
+                code: 'INVALID_PLUGIN_STORAGE_STATE_READ',
+            });
+        }
+
+        if (pluginStorageStateFailpoint === 'read') {
+            res.setHeader('Retry-After', '0');
+            return res.status(503).json({
+                success: false,
+                error: 'Injected plugin storage state read failure.',
+                code: 'TEMPORARY_STORAGE_FAILURE',
+                retryAfter: 0,
+                retryable: true,
+            });
+        }
+
+        try {
+            const { decodedKey: valueKey } = decodeAndCanonicalizeHexPath(filePath);
+            if (isHashedPluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX)) {
+                assertArchiveSafePluginSaveStorageKey(valueKey);
+            } else {
+                decodePluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX);
+            }
+            const publication = await readAuthoritativePluginStorageState(
+                req,
+                valueKey,
+                requestedGeneration,
+            );
+            const { state } = publication;
+            if (binary) {
+                res.setHeader(
+                    'x-plugin-storage-missing',
+                    state.valueBytes === null ? '1' : '0',
+                );
+                if (publication.publicationGeneration !== null) {
+                    res.setHeader(
+                        'x-plugin-storage-publication-generation',
+                        publication.publicationGeneration,
+                    );
+                }
+                if (publication.publicationRevision !== null) {
+                    res.setHeader(
+                        'x-plugin-storage-publication-revision',
+                        publication.publicationRevision,
+                    );
+                }
+                if (state.valueBytes === null) return res.status(204).end();
+
+                res.setHeader('Content-Type', PLUGIN_STORAGE_JSON_CONTENT_TYPE);
+                res.setHeader('Content-Length', String(state.valueBytes.byteLength));
+                res.setHeader('x-plugin-storage-codec', PLUGIN_STORAGE_JSON_CODEC);
+                res.setHeader(
+                    'x-plugin-storage-byte-length',
+                    String(state.valueBytes.byteLength),
+                );
+                res.setHeader(
+                    'x-plugin-storage-content-digest',
+                    `sha256:${sha256Hex(state.valueBytes)}`,
+                );
+                res.setHeader('x-plugin-storage-row-revision', state.revision);
+                if (state.generation !== null) {
+                    res.setHeader('x-plugin-storage-row-generation', state.generation);
+                }
+                return res.status(200).end(state.valueBytes);
+            }
+            return res.json({
+                success: true,
+                missing: state.valueBytes === null,
+                value: state.valueBytes?.toString('base64'),
+                revision: state.revision,
+                generation: state.generation,
+            });
+        } catch (error) {
+            if (error?.pluginStorageNamespaceConflict) {
+                return res.status(409).json({
+                    success: false,
+                    error: error.message,
+                    code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
+                });
+            }
+            if (error instanceof RangeError || error?.message?.includes('plugin storage key')) {
+                return res.status(400).json({
+                    success: false,
+                    error: error instanceof Error ? error.message : String(error),
+                    code: 'INVALID_PLUGIN_STORAGE_STATE_READ',
+                });
+            }
+            next(error);
+        }
+    };
+}
+
+/** Retained byte-compatible JSON/base64 read for stale-client recovery. */
+app.get('/api/plugin-storage/state', handlePluginStorageStateRead({ binary: false }));
+/** Current client read: exact stored row bytes with extensible codec/identity headers. */
+app.get('/api/plugin-storage/state/raw', handlePluginStorageStateRead({ binary: true }));
 
 // Lightweight capacity preflight for operations that temporarily need both
 // the external plugin rows and a newly-expanded database blob on the save

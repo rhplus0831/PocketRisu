@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
     convertCompatibleJsonValue,
+    serializeJsonValueToUtf8,
     snapshotJsonValue,
     stringifyJsonValue,
 } from "./jsonValue";
@@ -81,6 +82,30 @@ describe("persistent JSON values", () => {
         });
         expect(Object.is(snapshot.array[0], -0)).toBe(false);
         expect(snapshot.array[1]).not.toBe(snapshot.repeated);
+    });
+
+    it("validates and emits UTF-8 in one observed traversal", () => {
+        const visits: string[] = [];
+        const value = {
+            text: "quote: \" slash: \\ emoji: 😀 lone: \ud800",
+            nested: [-0, true, null],
+            ["__proto__"]: { safe: "own" },
+        };
+        const bytes = serializeJsonValueToUtf8(value, {
+            onVisit: path => visits.push(path),
+        });
+
+        expect(Buffer.from(bytes)).toEqual(Buffer.from(JSON.stringify(value), "utf8"));
+        expect(visits).toEqual([
+            "$",
+            "$.text",
+            "$.nested",
+            "$.nested[0]",
+            "$.nested[1]",
+            "$.nested[2]",
+            "$.__proto__",
+            "$.__proto__.safe",
+        ]);
     });
 
     it("converts compatible non-JSON values without dropping their data", () => {

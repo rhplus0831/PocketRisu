@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { Unpackr } from "msgpackr/index-no-eval";
 import {
     parsePluginStorageTransitionStreamCapabilities,
@@ -98,5 +98,44 @@ describe("bulk plugin storage transition framing", () => {
             maxValueBytes: 64,
             maxPayloadBytes: 64,
         })).rejects.toBeInstanceOf(PluginStorageTransitionPreparationError);
+    });
+
+    test("hands each encoded row to Blob storage before encoding the next row", async () => {
+        const NativeBlob = Blob;
+        const constructions: BlobPart[][] = [];
+        class ObservedBlob extends NativeBlob {
+            constructor(parts: BlobPart[] = [], options?: BlobPropertyBag) {
+                constructions.push([...parts]);
+                super(parts, options);
+            }
+        }
+        vi.stubGlobal("Blob", ObservedBlob);
+        try {
+            const prepared = await preparePluginStorageBulkTransition({
+                transitionId: "11111111-1111-4111-8111-111111111111",
+                source: { optimized: false, generation: null, manifest: null },
+                targetOptimized: true,
+                targetGeneration: "22222222-2222-4222-8222-222222222222",
+                autoConvert: false,
+                rows: Array.from({ length: 3 }, (_, index) => ({
+                    rawKey: `row-${index}`,
+                    storageKey: `pluginsave/cm93LS${index}.json`,
+                    value: { index, payload: "x".repeat(32) },
+                })),
+            }, capabilities);
+
+            expect(constructions).toHaveLength(4);
+            for (const rowParts of constructions.slice(0, 3)) {
+                expect(rowParts).toHaveLength(1);
+                expect(ArrayBuffer.isView(rowParts[0])).toBe(true);
+            }
+            const finalParts = constructions.at(-1)!;
+            expect(finalParts).toHaveLength(5);
+            expect(finalParts.slice(2).every(part => part instanceof NativeBlob)).toBe(true);
+            expect(finalParts.slice(2).some(part => ArrayBuffer.isView(part))).toBe(false);
+            expect(prepared.body).toBeInstanceOf(NativeBlob);
+        } finally {
+            vi.unstubAllGlobals();
+        }
     });
 });

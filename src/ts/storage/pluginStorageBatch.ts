@@ -124,6 +124,12 @@ export interface PluginStorageVersionedState {
     valueBytes: Uint8Array | null;
     revision: string | null;
     generation: string | null;
+    publicationGeneration: string | null;
+    publicationRevision: string | null;
+    byteLength: number;
+    contentDigest: string | null;
+    contentType: string | null;
+    codec: string | null;
 }
 
 export class PluginStorageBatchPreparationError extends RangeError {

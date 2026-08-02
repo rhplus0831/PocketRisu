@@ -159,7 +159,10 @@ export async function preparePluginStorageBulkTransition(
     }
 
     let payloadBytes = 0;
-    const encodedRows: Uint8Array[] = [];
+    // Each encoded row is copied into immutable Blob storage immediately.
+    // The final Blob can then reference these row Blobs without retaining all
+    // Packr-backed Uint8Arrays until the complete publication is assembled.
+    const rowBlobs: Blob[] = [];
     const rowMetadata: Array<{
         rawKey: string;
         storageKey: string;
@@ -177,9 +180,7 @@ export async function preparePluginStorageBulkTransition(
         seen.add(row.storageKey);
         let encoded: Uint8Array;
         try {
-            // Copy the returned view: Packr may reuse its internal target on a
-            // later encode, while Blob construction happens after this loop.
-            encoded = new Uint8Array(encodeRichValue(row.value));
+            encoded = encodeRichValue(row.value);
         } catch (error) {
             throw new StorageError(
                 "Plugin storage contains a value that cannot be transported for server-side migration.",
@@ -220,7 +221,10 @@ export async function preparePluginStorageBulkTransition(
         if (!SHA256_PATTERN.test(valueHash)) {
             throw new TypeError("Plugin transition transport produced an invalid row hash.");
         }
-        encodedRows.push(encoded);
+        // Blob construction snapshots the current view synchronously. Later
+        // Packr reuse cannot change this row and the Uint8Array can fall out of
+        // scope before the next row is encoded.
+        rowBlobs.push(new Blob([encoded as unknown as BlobPart]));
         rowMetadata.push({
             rawKey: row.rawKey,
             storageKey: row.storageKey,
@@ -261,7 +265,7 @@ export async function preparePluginStorageBulkTransition(
         + payloadBytes;
     return {
         body: new Blob(
-            [prefix, metadataBytes, ...encodedRows] as unknown as BlobPart[],
+            [prefix, metadataBytes, ...rowBlobs] as unknown as BlobPart[],
             { type: "application/x-pocketrisu-plugin-storage-transition" },
         ),
         byteLength,

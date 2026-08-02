@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from 'vit
 import { Buffer as BrowserBuffer } from 'buffer'
 import { Buffer as NodeBuffer } from 'node:buffer'
 import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 
 const cache = vi.hoisted(() => ({
     enabled: true,
@@ -1272,35 +1273,68 @@ describe('NodeStorage AA3 batch acknowledgement', () => {
 })
 
 describe('NodeStorage AA3 versioned state response', () => {
-    test('accepts exact missing and present state envelopes', async () => {
+    const publicationGeneration = 'selected-generation'
+    const publicationRevision = `sha256:${'d'.repeat(64)}`
+    const rowRevision = `sha256:${'c'.repeat(64)}`
+    const rowGeneration = '123e4567-e89b-42d3-a456-426614174000'
+    const binaryStateResponse = (
+        bytes: Uint8Array | null,
+        overrides: Record<string, string> = {},
+    ) => new Response(
+        bytes === null ? null : new Blob([bytes as unknown as BlobPart]),
+        {
+        status: bytes === null ? 204 : 200,
+        headers: {
+            'x-plugin-storage-missing': bytes === null ? '1' : '0',
+            'x-plugin-storage-publication-generation': publicationGeneration,
+            'x-plugin-storage-publication-revision': publicationRevision,
+            ...(bytes === null ? {} : {
+                'content-type': 'application/json',
+                'content-length': String(bytes.byteLength),
+                'x-plugin-storage-codec': 'json-v1',
+                'x-plugin-storage-byte-length': String(bytes.byteLength),
+                'x-plugin-storage-content-digest': `sha256:${valueHash}`,
+                'x-plugin-storage-row-revision': rowRevision,
+                'x-plugin-storage-row-generation': rowGeneration,
+            }),
+            ...overrides,
+        },
+        },
+    )
+
+    test('accepts exact missing and present binary state metadata', async () => {
         const missing = new NodeStorage()
-        ;(missing as any).authFetch = vi.fn(async () => response({
-            success: true,
-            missing: true,
-            revision: null,
-            generation: null,
-        }))
+        ;(missing as any).authFetch = vi.fn(async () => binaryStateResponse(null))
         await expect(missing.getPluginStorageState(valueKey)).resolves.toEqual({
             missing: true,
             valueBytes: null,
             revision: null,
             generation: null,
+            publicationGeneration,
+            publicationRevision,
+            byteLength: 0,
+            contentDigest: null,
+            contentType: null,
+            codec: null,
         })
 
         const present = new NodeStorage()
-        ;(present as any).authFetch = vi.fn(async () => response({
-            success: true,
-            missing: false,
-            value: Buffer.from(valueBytes).toString('base64'),
-            revision: `sha256:${'c'.repeat(64)}`,
-            generation: '123e4567-e89b-42d3-a456-426614174000',
-        }))
+        ;(present as any).authFetch = vi.fn(async () => binaryStateResponse(valueBytes))
         await expect(present.getPluginStorageState(valueKey)).resolves.toEqual({
             missing: false,
             valueBytes,
-            revision: `sha256:${'c'.repeat(64)}`,
-            generation: '123e4567-e89b-42d3-a456-426614174000',
+            revision: rowRevision,
+            generation: rowGeneration,
+            publicationGeneration,
+            publicationRevision,
+            byteLength: valueBytes.byteLength,
+            contentDigest: `sha256:${valueHash}`,
+            contentType: 'application/json',
+            codec: 'json-v1',
         })
+        expect(cache.sha256OwnedBytes).toHaveBeenCalledOnce()
+        expect((present as any).authFetch.mock.calls[0][0])
+            .toBe('/api/plugin-storage/state/raw')
     })
 
     test('pins state reads to the selected BR2 publication generation', async () => {
@@ -1311,12 +1345,7 @@ describe('NodeStorage AA3 versioned state response', () => {
             init?: RequestInit,
         ) => {
             receivedInit = init
-            return response({
-                success: true,
-                missing: true,
-                revision: null,
-                generation: null,
-            })
+            return binaryStateResponse(null)
         })
         ;(storage as any).authFetch = authFetch
 
@@ -1329,53 +1358,62 @@ describe('NodeStorage AA3 versioned state response', () => {
     })
 
     test.each([
-        ['extra field', {
-            success: true,
-            missing: true,
-            revision: null,
-            generation: null,
-            injected: true,
+        ['missing value with row metadata', null, {
+            'x-plugin-storage-row-revision': rowRevision,
         }],
-        ['missing value with non-null revision', {
-            success: true,
-            missing: true,
-            revision: `sha256:${'c'.repeat(64)}`,
-            generation: null,
+        ['unpaired publication identity', null, {
+            'x-plugin-storage-publication-revision': '',
         }],
-        ['missing value with non-null generation', {
-            success: true,
-            missing: true,
-            revision: null,
-            generation: '123e4567-e89b-42d3-a456-426614174000',
+        ['present value with missing row revision', valueBytes, {
+            'x-plugin-storage-row-revision': '',
         }],
-        ['present value with null revision', {
-            success: true,
-            missing: false,
-            value: Buffer.from(valueBytes).toString('base64'),
-            revision: null,
-            generation: null,
+        ['noncanonical row generation UUID', valueBytes, {
+            'x-plugin-storage-row-generation': '123e4567-e89b-12d3-a456-426614174000',
         }],
-        ['noncanonical generation UUID', {
-            success: true,
-            missing: false,
-            value: Buffer.from(valueBytes).toString('base64'),
-            revision: `sha256:${'c'.repeat(64)}`,
-            generation: '123e4567-e89b-12d3-a456-426614174000',
+        ['incorrect byte length', valueBytes, {
+            'content-length': String(valueBytes.byteLength + 1),
+            'x-plugin-storage-byte-length': String(valueBytes.byteLength + 1),
         }],
-        ['noncanonical base64', {
-            success: true,
-            missing: false,
-            value: 'AA=',
-            revision: `sha256:${'c'.repeat(64)}`,
-            generation: null,
+        ['incorrect digest', valueBytes, {
+            'x-plugin-storage-content-digest': `sha256:${'0'.repeat(64)}`,
         }],
-    ] as const)('rejects a %s response', async (_name, body) => {
+        ['unsupported content type', valueBytes, {
+            'content-type': 'application/octet-stream',
+        }],
+        ['unsupported codec', valueBytes, {
+            'x-plugin-storage-codec': 'msgpack-v1',
+        }],
+    ] as const)('rejects %s', async (_name, bytes, headerOverrides) => {
         const storage = new NodeStorage()
-        ;(storage as any).authFetch = vi.fn(async () => response(body))
+        ;(storage as any).authFetch = vi.fn(async () => binaryStateResponse(
+            bytes,
+            headerOverrides,
+        ))
 
         await expect(storage.getPluginStorageState(valueKey)).rejects.toMatchObject({
             code: 'STORAGE_RESPONSE_ERROR',
         })
+    })
+
+    test('rejects a publication identity that differs from the selected generation', async () => {
+        const storage = new NodeStorage()
+        ;(storage as any).authFetch = vi.fn(async () => binaryStateResponse(null))
+
+        await expect(storage.getPluginStorageState(valueKey, {
+            pluginStorageGeneration: 'different-generation',
+        })).rejects.toMatchObject({ code: 'STORAGE_RESPONSE_ERROR' })
+    })
+
+    test('contains no base64 conversion in the authoritative state read path', () => {
+        const source = readFileSync('src/ts/storage/nodeStorage.ts', 'utf8')
+        const start = source.indexOf('private async getPluginStorageStateAuthoritative')
+        const end = source.indexOf('async getPluginStorageManifestSnapshot', start)
+        expect(start).toBeGreaterThanOrEqual(0)
+        expect(end).toBeGreaterThan(start)
+        const implementation = source.slice(start, end)
+        expect(implementation).toContain('/api/plugin-storage/state/raw')
+        expect(implementation).not.toMatch(/base64/i)
+        expect(implementation).not.toContain('.json()')
     })
 })
 

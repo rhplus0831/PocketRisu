@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import Database from 'better-sqlite3'
+import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
@@ -17,6 +18,7 @@ const MANIFEST_KEY = 'plugin-storage/manifest.json'
 const DATABASE_KEY = 'database/database.bin'
 const FALLBACK_KEYS = ['config', 'credential', 'index', 'ledger', 'shard']
 const ALL_KEYS = [...FALLBACK_KEYS, 'nullable']
+const NULLABLE_ROW_GENERATION = '123e4567-e89b-42d3-a456-426614174000'
 const valueKey = (key: string) => `pluginsave/${Buffer.from(key).toString('base64url')}.json`
 const ownerKey = (key: string) => `pluginsave-meta/${Buffer.from(key).toString('base64url')}.json`
 const manifest = {
@@ -35,7 +37,12 @@ function seed(saveDir: string): void {
     insert.run(ownerKey(key), Buffer.from(JSON.stringify({ plugin: 'Existing', updatedAt: 1 })), 1)
   }
   insert.run(valueKey('nullable'), Buffer.from('null'), 1)
-  insert.run(ownerKey('nullable'), Buffer.from(JSON.stringify({ plugin: 'Existing', updatedAt: 1 })), 1)
+  insert.run(ownerKey('nullable'), Buffer.from(JSON.stringify({
+    plugin: 'Existing',
+    updatedAt: 1,
+    revision: '223e4567-e89b-42d3-a456-426614174000',
+    generation: NULLABLE_ROW_GENERATION,
+  })), 1)
   insert.run(MANIFEST_KEY, Buffer.from(JSON.stringify(manifest)), 1)
   insert.run(DATABASE_KEY, Buffer.from(encodeRisuSaveLegacy({
     characters: [],
@@ -57,6 +64,15 @@ async function boot(): Promise<{ server: ServerHandle; client: RisuClient }> {
 
 function state(client: RisuClient, key: string, generation = GENERATION): Promise<Response> {
   return client.fetch('/api/plugin-storage/state', {
+    headers: {
+      'file-path': Buffer.from(valueKey(key)).toString('hex'),
+      'x-plugin-storage-generation': generation,
+    },
+  })
+}
+
+function rawState(client: RisuClient, key: string, generation = GENERATION): Promise<Response> {
+  return client.fetch('/api/plugin-storage/state/raw', {
     headers: {
       'file-path': Buffer.from(valueKey(key)).toString('hex'),
       'x-plugin-storage-generation': generation,
@@ -134,6 +150,28 @@ describe('IP1 safe plugin storage read/update integration', () => {
     expect(Buffer.from(nullableBody.value, 'base64').toString()).toBe('null')
     expect(nullableBody.revision).toMatch(/^sha256:/)
 
+    const rawNullable = await rawState(client, 'nullable')
+    expect(rawNullable.status).toBe(200)
+    const rawBytes = Buffer.from(await rawNullable.arrayBuffer())
+    expect(rawBytes).toEqual(Buffer.from(nullableBody.value, 'base64'))
+    expect(rawBytes.toString()).toBe('null')
+    expect(rawNullable.headers.get('content-type')).toBe('application/json')
+    expect(rawNullable.headers.get('x-plugin-storage-codec')).toBe('json-v1')
+    expect(rawNullable.headers.get('x-plugin-storage-byte-length')).toBe('4')
+    expect(rawNullable.headers.get('content-length')).toBe('4')
+    expect(rawNullable.headers.get('x-plugin-storage-content-digest')).toBe(
+      `sha256:${createHash('sha256').update(rawBytes).digest('hex')}`,
+    )
+    expect(rawNullable.headers.get('x-plugin-storage-row-revision'))
+      .toBe(nullableBody.revision)
+    expect(rawNullable.headers.get('x-plugin-storage-row-generation'))
+      .toBe(NULLABLE_ROW_GENERATION)
+    expect(rawNullable.headers.get('x-plugin-storage-publication-generation'))
+      .toBe(GENERATION)
+    expect(rawNullable.headers.get('x-plugin-storage-publication-revision')).toBe(
+      `sha256:${createHash('sha256').update(JSON.stringify(manifest)).digest('hex')}`,
+    )
+
     const missing = await state(client, 'actually-missing')
     expect(missing.status).toBe(200)
     await expect(missing.json()).resolves.toEqual({
@@ -142,6 +180,42 @@ describe('IP1 safe plugin storage read/update integration', () => {
       revision: null,
       generation: null,
     })
+
+    const rawMissing = await rawState(client, 'actually-missing')
+    expect(rawMissing.status).toBe(204)
+    expect((await rawMissing.arrayBuffer()).byteLength).toBe(0)
+    expect(rawMissing.headers.get('x-plugin-storage-missing')).toBe('1')
+    expect(rawMissing.headers.get('x-plugin-storage-publication-generation'))
+      .toBe(GENERATION)
+    expect(rawMissing.headers.get('x-plugin-storage-publication-revision')).toMatch(/^sha256:/)
+    expect(rawMissing.headers.get('x-plugin-storage-row-revision')).toBeNull()
+    expect(rawMissing.headers.get('x-plugin-storage-codec')).toBeNull()
+  })
+
+  test('binary and JSON state reads have byte-identical refusal envelopes', async () => {
+    const { server, client } = await boot()
+
+    const failedJson = await state(client, 'config')
+    const failedRaw = await rawState(client, 'config')
+    expect(failedRaw.status).toBe(failedJson.status)
+    expect(await failedRaw.text()).toBe(await failedJson.text())
+
+    await server.restart({ POCKETRISU_TEST_PLUGIN_STATE_FAILPOINT: '' })
+    const current = await createClient(server.port, server.password)
+    for (const headers of [
+      { 'file-path': 'not-hex', 'x-plugin-storage-generation': GENERATION },
+      {
+        'file-path': Buffer.from(valueKey('config')).toString('hex'),
+        'x-plugin-storage-generation': `${GENERATION}-stale`,
+      },
+    ]) {
+      const [json, raw] = await Promise.all([
+        current.fetch('/api/plugin-storage/state', { headers }),
+        current.fetch('/api/plugin-storage/state/raw', { headers }),
+      ])
+      expect(raw.status).toBe(json.status)
+      expect(await raw.text()).toBe(await json.text())
+    }
   })
 
   test('direct SQLite generation and manifest replacement invalidates the parsed cache', async () => {

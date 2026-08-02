@@ -267,6 +267,16 @@ describe('persistent JSON preparation', () => {
         expect(Buffer.from(prepared.bytes)).toEqual(expected)
     })
 
+    it('does not whole-tree stringify or build a protected snapshot before bytes', () => {
+        const stringify = vi.spyOn(JSON, 'stringify')
+        const prepared = preparePersistentJson({ nested: ['direct', 1, true] })
+
+        expect(JSON.parse(new TextDecoder().decode(prepared.bytes))).toEqual({
+            nested: ['direct', 1, true],
+        })
+        expect(stringify).not.toHaveBeenCalled()
+    })
+
     it('does not invoke toJSON and rejects values with no JSON representation', () => {
         let calls = 0
         expect(() => preparePersistentJson({

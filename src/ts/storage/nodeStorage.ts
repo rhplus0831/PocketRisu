@@ -3244,7 +3244,7 @@ export class NodeStorage{
             valueKey,
             'read',
             false,
-            () => this.authFetch('/api/plugin-storage/state', {
+            () => this.authFetch('/api/plugin-storage/state/raw', {
                 method: 'GET',
                 headers,
                 signal,
@@ -3252,58 +3252,88 @@ export class NodeStorage{
             [],
             signal,
         )
-        const body = await awaitWithAbort(response.json(), signal) as unknown
-        if (!body || typeof body !== 'object' || Array.isArray(body)) {
-            throw new StorageError('Plugin storage state response was malformed.', {
+        const malformed = (message = 'Plugin storage state response was malformed.') => (
+            new StorageError(message, {
                 code: 'STORAGE_RESPONSE_ERROR', operation: 'read', retryable: true,
             })
+        )
+        const missingHeader = response.headers.get('x-plugin-storage-missing')
+        const publicationGeneration = response.headers.get(
+            'x-plugin-storage-publication-generation',
+        )
+        const publicationRevision = response.headers.get(
+            'x-plugin-storage-publication-revision',
+        )
+        if ((missingHeader !== '0' && missingHeader !== '1')
+            || (publicationGeneration === null) !== (publicationRevision === null)
+            || (publicationGeneration !== null && publicationGeneration.length === 0)
+            || (publicationRevision !== null
+                && !/^sha256:[0-9a-f]{64}$/.test(publicationRevision))
+            || (pluginStorageGeneration !== undefined
+                && publicationGeneration !== pluginStorageGeneration)) {
+            throw malformed()
         }
-        const record = body as Record<string, unknown>
-        const allowed = new Set(['success', 'missing', 'value', 'revision', 'generation'])
-        if (Object.keys(record).some(key => !allowed.has(key))
-            || record.success !== true
-            || typeof record.missing !== 'boolean'
-            || (record.revision !== null
-                && (typeof record.revision !== 'string'
-                    || !/^sha256:[0-9a-f]{64}$/.test(record.revision)))
-            || (record.generation !== null
-                && (typeof record.generation !== 'string'
-                    || !PLUGIN_STORAGE_UUID_PATTERN.test(record.generation)))) {
-            throw new StorageError('Plugin storage state response was malformed.', {
-                code: 'STORAGE_RESPONSE_ERROR', operation: 'read', retryable: true,
-            })
-        }
-        if (record.missing === true) {
-            if (record.value !== undefined
-                || record.revision !== null
-                || record.generation !== null) {
-                throw new StorageError('Missing plugin storage state included a value.', {
-                    code: 'STORAGE_RESPONSE_ERROR', operation: 'read', retryable: true,
-                })
+        if (response.status === 204) {
+            if (missingHeader !== '1'
+                || response.headers.get('x-plugin-storage-row-revision') !== null
+                || response.headers.get('x-plugin-storage-row-generation') !== null
+                || response.headers.get('x-plugin-storage-byte-length') !== null
+                || response.headers.get('x-plugin-storage-content-digest') !== null
+                || response.headers.get('x-plugin-storage-codec') !== null) {
+                throw malformed('Missing plugin storage state included value metadata.')
             }
             return {
                 missing: true,
                 valueBytes: null,
                 revision: null,
                 generation: null,
+                publicationGeneration,
+                publicationRevision,
+                byteLength: 0,
+                contentDigest: null,
+                contentType: null,
+                codec: null,
             }
         }
-        if (typeof record.value !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(record.value)) {
-            throw new StorageError('Plugin storage state value was malformed.', {
-                code: 'STORAGE_RESPONSE_ERROR', operation: 'read', retryable: true,
-            })
+        if (response.status !== 200 || missingHeader !== '0') throw malformed()
+
+        const revision = response.headers.get('x-plugin-storage-row-revision')
+        const rowGeneration = response.headers.get('x-plugin-storage-row-generation')
+        const byteLengthText = response.headers.get('x-plugin-storage-byte-length')
+        const contentLengthText = response.headers.get('content-length')
+        const contentDigest = response.headers.get('x-plugin-storage-content-digest')
+        const codec = response.headers.get('x-plugin-storage-codec')
+        const contentTypeHeader = response.headers.get('content-type')
+        const contentType = contentTypeHeader?.split(';', 1)[0].trim().toLowerCase() ?? null
+        if (revision === null || !/^sha256:[0-9a-f]{64}$/.test(revision)
+            || (rowGeneration !== null && !PLUGIN_STORAGE_UUID_PATTERN.test(rowGeneration))
+            || byteLengthText === null || !/^(0|[1-9][0-9]*)$/.test(byteLengthText)
+            || (contentLengthText !== null && contentLengthText !== byteLengthText)
+            || contentDigest === null || !/^sha256:[0-9a-f]{64}$/.test(contentDigest)
+            || contentType !== 'application/json'
+            || codec !== 'json-v1') {
+            throw malformed('Plugin storage state value metadata was malformed.')
         }
-        const valueBytes = new Uint8Array(Buffer.from(record.value, 'base64'))
-        if (Buffer.from(valueBytes).toString('base64') !== record.value || record.revision === null) {
-            throw new StorageError('Plugin storage state value was malformed.', {
-                code: 'STORAGE_RESPONSE_ERROR', operation: 'read', retryable: true,
-            })
+        const byteLength = Number(byteLengthText)
+        if (!Number.isSafeInteger(byteLength)) {
+            throw malformed('Plugin storage state value metadata was malformed.')
+        }
+        const valueBytes = new Uint8Array(await awaitWithAbort(response.arrayBuffer(), signal))
+        const receivedDigest = `sha256:${await sha256OwnedBytes(valueBytes)}`
+        if (valueBytes.byteLength !== byteLength || receivedDigest !== contentDigest) {
+            throw malformed('Plugin storage state value failed its integrity check.')
         }
         return {
             missing: false,
             valueBytes,
-            revision: record.revision as string,
-            generation: record.generation as string | null,
+            revision,
+            generation: rowGeneration,
+            publicationGeneration,
+            publicationRevision,
+            byteLength,
+            contentDigest,
+            contentType,
+            codec,
         }
     }
 
