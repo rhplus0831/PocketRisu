@@ -123,10 +123,15 @@ const {
     chatRowKey,
     parseChatRowKey,
     hasChatPayloads,
+    isCanonicalRawChatRow,
     findDuplicateChaIds,
     findDuplicateChatIds,
     validateDatabaseShape,
 } = require('./chatRows.cjs');
+const {
+    CHAT_DELTA_CONTENT_TYPE,
+    ChatDeltaValidationError,
+} = require('./chatDelta.cjs');
 const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
 const {
     MCP_TOOL_CALL_CACHE_PREFIX,
@@ -440,6 +445,24 @@ const chatRowStore = createChatRowStore({
     kvWriteToFile,
     kvSize,
     kvGetUpdatedAt,
+    chatDeltaCompactMaxOperations: Number.isSafeInteger(Number(
+        process.env.POCKETRISU_CHAT_DELTA_COMPACT_MAX_OPERATIONS,
+    )) && Number(process.env.POCKETRISU_CHAT_DELTA_COMPACT_MAX_OPERATIONS) > 0
+        ? Number(process.env.POCKETRISU_CHAT_DELTA_COMPACT_MAX_OPERATIONS)
+        : 64,
+    chatDeltaCompactMaxBytes: Number.isSafeInteger(Number(
+        process.env.POCKETRISU_CHAT_DELTA_COMPACT_MAX_BYTES,
+    )) && Number(process.env.POCKETRISU_CHAT_DELTA_COMPACT_MAX_BYTES) > 0
+        ? Number(process.env.POCKETRISU_CHAT_DELTA_COMPACT_MAX_BYTES)
+        : 1024 * 1024,
+    chatDeltaCompactionFailpoint: process.env.NODE_ENV === 'test'
+        && process.env.POCKETRISU_TEST_CHAT_DELTA_COMPACTION_FAILPOINT
+        ? (stage) => {
+            if (stage === process.env.POCKETRISU_TEST_CHAT_DELTA_COMPACTION_FAILPOINT) {
+                throw new Error(`Injected chat delta compaction failure at ${stage}`);
+            }
+        }
+        : null,
 });
 
 // ETag for database.bin
@@ -1227,8 +1250,8 @@ const chatBackupStore = createChatBackupStore({
         chatRowStore.inspectChatRowForBackup(chaId, chatId)
     ),
     readChatRowRaw: (chaId, chatId) => chatRowStore.readChatRowRaw(chaId, chatId),
-    repairChatRowMetadata: (rowState, coldStorage) => (
-        chatRowStore.repairChatRowMetadata(rowState, coldStorage)
+    repairChatRowMetadata: (rowState, coldStorage, messageCount) => (
+        chatRowStore.repairChatRowMetadata(rowState, coldStorage, messageCount)
     ),
     readChatRowRawWithMetadata: (chaId, chatId) => (
         chatRowStore.readChatRowRawWithMetadata(chaId, chatId)
@@ -1497,6 +1520,7 @@ async function captureAutomaticSnapshotSource(storageAlreadyExclusive) {
 async function assembleAutomaticSnapshotSource(captured) {
     const { snapshot } = captured;
     const spoolRow = (key) => spoolBackupSnapshotRow(snapshot, key);
+    const spoolChatRow = (key) => spoolLogicalChatSnapshotRow(snapshot, key);
     let assemblyGateReached = false;
     const databaseSource = await spoolBackupSnapshotRow(snapshot, DB_BLOB_KEY, {
         onChunk: async () => {
@@ -1544,7 +1568,7 @@ async function assembleAutomaticSnapshotSource(captured) {
         const result = await streamBackupRisuSaveToFile({
             databaseSource,
             filePath,
-            readChatRowSource: (chaId, chatId) => spoolRow(
+            readChatRowSource: (chaId, chatId) => spoolChatRow(
                 chatRowKey(chaId, chatId),
             ),
             readRemoteRowSource: (name) => spoolRow(
@@ -2571,6 +2595,7 @@ app.use((req, res, next) => {
     if (req[ADMITTED_INGRESS_SPOOL]) return next();
     const policy = req[BUFFERED_INGRESS_POLICY];
     const parser = express.json({
+        type: ['application/json', CHAT_DELTA_CONTENT_TYPE],
         limit: policy?.bodyKind === 'json'
             ? policy.maxBytes
             : bufferedIngressLimits.json,
@@ -6817,7 +6842,10 @@ async function spoolSelfContainedBackupDatabase(
             dbObj: strippedDb,
             filePath,
             readChatRow: async (chaId, chatId) => {
-                const value = reader.kvGet(chatRowKey(chaId, chatId));
+                const value = chatRowStore.materializeChatRowBytesFromReader(
+                    reader,
+                    chatRowKey(chaId, chatId),
+                );
                 return value === null ? null : decodeRisuSave(value);
             },
             pluginStorage,
@@ -6861,6 +6889,53 @@ async function spoolBackupSnapshotRow(snapshot, key, {
         await fs.unlink(rowPath).catch(() => {});
         throw error;
     }
+}
+
+async function spoolLogicalChatSnapshotRow(snapshot, key, options = {}) {
+    const metadata = typeof snapshot.chatRowMetadata === 'function'
+        ? snapshot.chatRowMetadata(key)
+        : null;
+    if (!metadata || metadata.log_count === 0) {
+        return spoolBackupSnapshotRow(snapshot, key, options);
+    }
+    if (options.signal?.aborted || options.shouldAbort?.()) {
+        throw new DOMException('Snapshot chat-row spool was aborted', 'AbortError');
+    }
+    const bytes = chatRowStore.materializeChatRowBytesFromReader(snapshot, key);
+    if (bytes === null) return null;
+    if (bytes.length !== metadata.content_size) {
+        throw new Error(`Snapshot logical chat-row size mismatch: ${key}`);
+    }
+    const rowPath = path.join(
+        databaseSpoolDir,
+        `${DATABASE_SPOOL_FILE_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}.row`,
+    );
+    try {
+        await fs.writeFile(rowPath, bytes, { flag: 'wx', mode: 0o600 });
+        return {
+            filePath: rowPath,
+            size: bytes.length,
+            cleanup: () => fs.unlink(rowPath).catch(() => {}),
+        };
+    } catch (error) {
+        await fs.unlink(rowPath).catch(() => {});
+        throw error;
+    }
+}
+
+function listLogicalChatRowsWithSizes(reader) {
+    return reader.kvListWithSizes('chats/').map((entry) => {
+        const metadata = typeof reader.chatRowMetadata === 'function'
+            ? reader.chatRowMetadata(entry.key)
+            : null;
+        const logicalSize = metadata?.log_count > 0
+            ? metadata.content_size
+            : entry.size;
+        if (!Number.isSafeInteger(logicalSize) || logicalSize < 0) {
+            throw new Error(`Chat row has an invalid logical size: ${entry.key}`);
+        }
+        return { ...entry, size: logicalSize };
+    });
 }
 
 function canStreamImportedDatabase(inspection) {
@@ -6978,6 +7053,11 @@ async function buildSelfContainedBackupDatabase({
                 signal,
                 shouldAbort,
             });
+            const spoolSnapshotChatRow = (key) => spoolLogicalChatSnapshotRow(
+                snapshot,
+                key,
+                { signal, shouldAbort },
+            );
             const pluginStorage = foldPluginStorage
                 ? resolveOwnedPluginStorageRows(databaseState ?? {}, snapshot)
                 : null;
@@ -6985,7 +7065,7 @@ async function buildSelfContainedBackupDatabase({
                 return await streamBackupRisuSaveToFile({
                     databaseSource,
                     filePath,
-                    readChatRowSource: (chaId, chatId) => spoolSnapshotRow(
+                    readChatRowSource: (chaId, chatId) => spoolSnapshotChatRow(
                         chatRowKey(chaId, chatId),
                     ),
                     readRemoteRowSource: (name) => spoolSnapshotRow(
@@ -8091,7 +8171,7 @@ async function pinFullBackupState({ target, signal, archiveTargetPath = null }) 
                 throw new Error('RisuSave REMOTE inventory exceeds the bounded limit');
             }
             const assemblyRows = [
-                ...snapshot.kvListWithSizes('chats/'),
+                ...listLogicalChatRowsWithSizes(snapshot),
                 ...(foldPluginStorage ? snapshot.kvListWithSizes(PLUGIN_SAVE_PREFIX) : []),
                 ...(foldPluginStorage ? snapshot.kvListWithSizes(PLUGIN_SAVE_META_PREFIX) : []),
                 // REMOTE rows are not archive entries. They are private source
@@ -8424,7 +8504,7 @@ async function pinPartialExportState(job) {
                 ...selectedEntries,
             ]);
             const assemblyBytes = [
-                ...snapshot.kvListWithSizes('chats/'),
+                ...listLogicalChatRowsWithSizes(snapshot),
                 ...snapshot.kvListWithSizes(PLUGIN_SAVE_PREFIX),
                 ...snapshot.kvListWithSizes(PLUGIN_SAVE_META_PREFIX),
             ].reduce(
@@ -14958,6 +15038,8 @@ async function decodeDatabaseSpoolForWrite(spool, stageDir, chatRows) {
                 chatId: payload.id,
                 filePath,
                 coldStorage: isColdStorageChat(payload),
+                messageCount: payload.message.length,
+                logSupported: true,
             });
             return chatRowStore.chatToStub(payload);
         },
@@ -15121,10 +15203,12 @@ async function prepareSpooledChatWrite(spool) {
     let stageDir = null;
     try {
         let chatData;
+        let logSupported = false;
         if (spool.bodyKind === 'raw') {
             const source = { filePath: spool.filePath, size: spool.size };
             try {
                 const inspection = await inspectRisuSaveSource(source);
+                logSupported = inspection.format === 'raw';
                 chatData = inspection.supported
                     ? (await walkRisuSave(source, { inspection, tempDir: databaseSpoolDir })).remainder
                     : await decodeBoundedLegacyRisuSave(source, {
@@ -15157,6 +15241,7 @@ async function prepareSpooledChatWrite(spool) {
                 filePath,
                 Buffer.from(encodeRisuSaveLegacy(chatData)),
             );
+            logSupported = true;
         }
         const chunkPlan = await prepareChunkPlanWithFallback(filePath, 'chat write');
         return {
@@ -15166,6 +15251,8 @@ async function prepareSpooledChatWrite(spool) {
             chunkPlan,
             contentHash: chunkPlan?.sha256 ?? null,
             coldStorage: isColdStorageChat(chatData),
+            messageCount: Array.isArray(chatData.message) ? chatData.message.length : 0,
+            logSupported,
         };
     } catch (error) {
         error.admittedWriteStageDir = stageDir;
@@ -15329,6 +15416,9 @@ async function handleSpooledKvWrite(req, res, next, {
                         chatRowStore.writeChatRowFromFile(row.chaId, row.chatId, row.filePath, {
                             contentHash: row.chunkPlan?.sha256 ?? null,
                             chunkPlan: row.chunkPlan,
+                            coldStorage: row.coldStorage,
+                            messageCount: row.messageCount,
+                            logSupported: row.logSupported,
                         });
                     }
                     kvSetFromFile(key, prepared.persistedPath, {
@@ -15651,6 +15741,10 @@ app.post('/api/write', async (req, res, next) => {
                     const chatRows = splitDatabase.chatEntries.map(entry => ({
                         ...entry,
                         value: Buffer.from(encodeRisuSaveLegacy(entry.chat)),
+                        coldStorage: isColdStorageChat(entry.chat),
+                        messageCount: Array.isArray(entry.chat?.message)
+                            ? entry.chat.message.length
+                            : 0,
                     }));
                     const pluginExternalization = preparePluginStorageExternalization(
                         splitDatabase.strippedDb
@@ -15680,7 +15774,11 @@ app.post('/api/write', async (req, res, next) => {
                         writePluginStorageRows(pluginExternalization.rows);
                         writePluginStorageManifest(pluginExternalization.manifest);
                         for (const row of chatRows) {
-                            chatRowStore.writeChatRowRaw(row.chaId, row.chatId, row.value);
+                            chatRowStore.writeChatRowRaw(row.chaId, row.chatId, row.value, {
+                                coldStorage: row.coldStorage,
+                                messageCount: row.messageCount,
+                                logSupported: true,
+                            });
                         }
                         kvSet(key, persistedDatabaseContent);
                         if (previousStrippedDb) {
@@ -17373,7 +17471,11 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                 const chat = await decodeRisuSave(row.bytes);
                 const needsRehydration = isColdStorageChat(chat);
                 if (!importBarrier.isHeld()) {
-                    chatRowStore.repairChatRowMetadata(row, needsRehydration);
+                    chatRowStore.repairChatRowMetadata(
+                        row,
+                        needsRehydration,
+                        Array.isArray(chat?.message) ? chat.message.length : 0,
+                    );
                 }
                 if (needsRehydration) {
                     if (!restoreColdStorageChat(chat)) {
@@ -17405,6 +17507,113 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 });
 
 // POST /api/chat-content/:chaId/:chatIndex — save chat content to server
+const pendingChatDeltaCompactions = new Set();
+
+function sendChatDeltaRefusal(res, result, status = 409) {
+    const code = result?.code ?? 'CHAT_DELTA_CONFLICT';
+    const messages = {
+        CHAT_DELTA_BASE_MISSING: 'The chat row has no base for this delta.',
+        CHAT_DELTA_BASE_UNAVAILABLE: 'The chat row does not support exact delta replay.',
+        CHAT_DELTA_BASE_MISMATCH: 'The chat row changed since the acknowledged base.',
+        CHAT_DELTA_LOG_CONFLICT: 'The chat operation log is not appendable.',
+    };
+    return res.status(status).json({
+        success: false,
+        error: messages[code] ?? result?.message ?? 'The chat delta was refused.',
+        code,
+        retryable: false,
+        commitOutcome: 'not-committed',
+        commitOutcomeUnknown: false,
+        ...(result?.currentHash ? { currentHash: result.currentHash } : {}),
+    });
+}
+
+function scheduleChatDeltaCompaction(chaId, chatId) {
+    const key = chatRowKey(chaId, chatId);
+    if (pendingChatDeltaCompactions.has(key)) return;
+    pendingChatDeltaCompactions.add(key);
+    setImmediate(() => {
+        queueStorageMutation(() => chatRowStore.compactChatRow(chaId, chatId))
+            .catch(error => {
+                logger.error(`[ChatDelta] Compaction failed for ${key}:`, error);
+            })
+            .finally(() => pendingChatDeltaCompactions.delete(key));
+    });
+}
+
+async function handleChatDeltaWrite(req, res, next) {
+    let shouldCreateBackup = false;
+    let shouldCompact = false;
+    try {
+        await queueStorageMutation(async () => {
+            const chaId = req.params.chaId;
+            const expectedChatId = req.headers['x-chat-id'];
+            if (!expectedChatId || typeof expectedChatId !== 'string') {
+                return res.status(400).json({
+                    error: 'Chat delta and x-chat-id required',
+                    code: 'CHAT_DELTA_INVALID',
+                    retryable: false,
+                    commitOutcome: 'not-committed',
+                    commitOutcomeUnknown: false,
+                });
+            }
+            let inspection;
+            try {
+                inspection = chatRowStore.inspectChatDelta(
+                    chaId,
+                    expectedChatId,
+                    req.body,
+                    { maxResultBytes: bufferedIngressLimits.chat },
+                );
+            } catch (error) {
+                if (error instanceof ChatDeltaValidationError) {
+                    return sendChatDeltaRefusal(res, error, error.status ?? 400);
+                }
+                throw error;
+            }
+            if (!inspection.applied) return sendChatDeltaRefusal(res, inspection);
+
+            // As on a full-row write, capture the exact prior logical bytes
+            // after queue admission and immediately before the atomic append.
+            await chatBackupStore.captureChatPreImage({
+                chaId,
+                chatId: expectedChatId,
+                reason: req.headers['x-chat-backup-reason'],
+            });
+            let result;
+            try {
+                result = chatRowStore.appendChatDelta(
+                    chaId,
+                    expectedChatId,
+                    req.body,
+                    { maxResultBytes: bufferedIngressLimits.chat },
+                );
+            } catch (error) {
+                if (error instanceof ChatDeltaValidationError) {
+                    return sendChatDeltaRefusal(res, error, error.status ?? 400);
+                }
+                throw error;
+            }
+            if (!result.applied) return sendChatDeltaRefusal(res, result);
+            shouldCreateBackup = true;
+            shouldCompact = result.shouldCompact;
+            res.json({
+                success: true,
+                hash: result.hash,
+                size: result.size,
+                log: { count: result.logCount, bytes: result.logBytes },
+            });
+        });
+        if (shouldCreateBackup) scheduleBackupAndRotate();
+        if (shouldCompact) {
+            scheduleChatDeltaCompaction(req.params.chaId, req.headers['x-chat-id']);
+        }
+    } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
+        next(error);
+    }
+}
+
 async function handleSpooledChatWrite(req, res, next, spool) {
     let prepared;
     let shouldCreateBackup = false;
@@ -17450,6 +17659,8 @@ async function handleSpooledChatWrite(req, res, next, spool) {
                 prepared.filePath,
                 {
                     coldStorage: prepared.coldStorage,
+                    messageCount: prepared.messageCount,
+                    logSupported: prepared.logSupported,
                     contentHash: prepared.contentHash,
                     chunkPlan: prepared.chunkPlan,
                 },
@@ -17484,6 +17695,14 @@ async function handleSpooledChatWrite(req, res, next, spool) {
 
 app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
     if (!await checkAuth(req, res)) { return; }
+    const contentType = String(req.headers['content-type'] ?? '')
+        .split(';', 1)[0]
+        .trim()
+        .toLowerCase();
+    if (contentType === CHAT_DELTA_CONTENT_TYPE) {
+        if (!checkActiveSession(req, res)) return;
+        return handleChatDeltaWrite(req, res, next);
+    }
     const admittedSpool = req[ADMITTED_INGRESS_SPOOL] ?? null;
     if (admittedSpool) {
         if (admittedSpool.bodyKind !== 'json' && !checkActiveSession(req, res)) return;
@@ -17542,6 +17761,8 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             if (isRawBinary && !healedHybrid) {
                 hash = chatRowStore.writeChatRowRawOwned(chaId, expectedChatId, req.body, {
                     coldStorage: isColdStorageChat(chatData),
+                    messageCount: Array.isArray(chatData.message) ? chatData.message.length : 0,
+                    logSupported: isCanonicalRawChatRow(req.body),
                 });
             } else {
                 hash = chatRowStore.writeChatRow(chaId, expectedChatId, chatData);
@@ -18511,7 +18732,12 @@ app.get('/api/db/stats', async (req, res, next) => {
         let chatTotal = 0, chatKvRowSize = 0;
         const chatSizes = kvListWithSizes('chats/');
         const chatSizeByKey = new Map(chatSizes.map((entry) => [entry.key, entry.size]));
-        for (const key of chatKeys) chatTotal += chatSizeByKey.get(key) || 0;
+        for (const key of chatKeys) {
+            const metadata = chatRowStore.metadataForKey(key);
+            chatTotal += metadata?.logCount > 0
+                ? metadata.contentSize
+                : (chatSizeByKey.get(key) || 0);
+        }
         for (const entry of chatSizes) chatKvRowSize += entry.size;
         const chatChunkBytes = sqliteDb.prepare(
             `SELECT COALESCE(SUM(LENGTH(data)), 0) AS b

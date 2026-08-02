@@ -19,6 +19,12 @@ import { createSeedBackup } from './helpers/seed.js'
 import { decodeRisuDat, normalizeBackup, fingerprintAssets } from './helpers/normalize.js'
 import { encodeBackup } from './helpers/encode.js'
 import { decodeBackup } from './helpers/decode.js'
+import utilsPkg from '../../server/node/utils.cjs'
+
+const { encodeRisuSaveLegacy } = utilsPkg as {
+  encodeRisuSaveLegacy: (value: unknown) => Uint8Array
+}
+const CHAT_DELTA_CONTENT_TYPE = 'application/vnd.pocketrisu.chat-delta+json'
 
 // Track servers so we can clean them all up even if a test fails.
 const servers: ServerHandle[] = []
@@ -146,6 +152,69 @@ describe('backup round-trip', () => {
     for (let i = 0; i < normA.normalized.characters.length; i++) {
       expect(normB.normalized.characters[i].firstMessages)
         .toEqual(normA.normalized.characters[i].firstMessages)
+    }
+  })
+
+  test('exports and restores the materialized logical row behind a delta log', async () => {
+    const srvA = await spawnServer()
+    servers.push(srvA)
+    const clientA = await createClient(srvA.port, srvA.password)
+    expect((await clientA.importBackup(createSeedBackup({
+      characterCount: 1,
+      chatsPerCharacter: 1,
+      messagesPerChat: 1,
+    }))).ok).toBe(true)
+
+    const getBase = await clientA.fetch('/api/chat-content/test-char-0/0', {
+      headers: { 'x-chat-id': 'chat-0-0' },
+    })
+    expect(getBase.status).toBe(200)
+    const baseBytes = Buffer.from(await getBase.arrayBuffer())
+    const base = decodeRisuDat(baseBytes) as any
+    const logical = {
+      ...base,
+      message: [
+        ...base.message,
+        { role: 'char', data: 'persisted through operation-log export' },
+      ],
+    }
+    const logicalBytes = Buffer.from(encodeRisuSaveLegacy(logical))
+    const logicalHash = createHash('sha256').update(logicalBytes).digest('hex')
+    const delta = await clientA.fetch('/api/chat-content/test-char-0/0', {
+      method: 'POST',
+      headers: { 'content-type': CHAT_DELTA_CONTENT_TYPE, 'x-chat-id': 'chat-0-0' },
+      body: JSON.stringify({
+        version: 1,
+        baseHash: getBase.headers.get('x-content-hash'),
+        resultHash: logicalHash,
+        resultSize: logicalBytes.length,
+        patch: [{ op: 'add', path: '/message/-', value: logical.message.at(-1) }],
+      }),
+    })
+    expect(delta.status).toBe(200)
+    expect((await delta.json() as any).hash).toBe(logicalHash)
+
+    const exported = await clientA.exportBackup()
+    const exportedDb = normalizeBackup(exported).raw as any
+    expect(exportedDb.characters[0].chats[0].message).toEqual(logical.message)
+
+    const srvB = await spawnServer()
+    servers.push(srvB)
+    const clientB = await createClient(srvB.port, srvB.password)
+    expect((await clientB.importBackup(exported)).ok).toBe(true)
+    const restored = await clientB.fetch('/api/chat-content/test-char-0/0', {
+      headers: { 'x-chat-id': 'chat-0-0' },
+    })
+    expect(restored.status).toBe(200)
+    expect(restored.headers.get('x-content-hash')).toBe(logicalHash)
+    expect(Buffer.from(await restored.arrayBuffer())).toEqual(logicalBytes)
+
+    const restoredDb = new Database(path.join(srvB.cwd, 'save', 'risuai.db'), { readonly: true })
+    try {
+      expect(restoredDb.prepare('SELECT COUNT(*) count FROM chat_row_operations').get())
+        .toEqual({ count: 0 })
+    } finally {
+      restoredDb.close()
     }
   })
 

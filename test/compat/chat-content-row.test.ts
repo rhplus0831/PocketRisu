@@ -10,6 +10,7 @@ import { decodeRisuDat } from './helpers/normalize.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 
 const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
+const CHAT_DELTA_CONTENT_TYPE = 'application/vnd.pocketrisu.chat-delta+json'
 const COLD_STORAGE_HEADER = '\uEF01COLDSTORAGE\uEF01'
 const packr = new Packr({ useRecords: false, variableMapSize: true })
 const servers: ServerHandle[] = []
@@ -86,21 +87,52 @@ function metadata(cwd: string, key: string): {
   contentHash: string | null
   contentSize: number | null
   coldStorage: number | null
+  messageCount: number | null
+  logSupported: number | null
+  logCount: number
+  logBytes: number
 } | null {
   const db = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
   try {
     const row = db.prepare(`
       SELECT content_sha256 AS contentHash,
              content_size AS contentSize,
-             cold_storage AS coldStorage
+             cold_storage AS coldStorage,
+             message_count AS messageCount,
+             log_supported AS logSupported,
+             log_count AS logCount,
+             log_bytes AS logBytes
         FROM chat_row_metadata
        WHERE row_key = ?
     `).get(key) as {
       contentHash: string | null
       contentSize: number | null
       coldStorage: number | null
+      messageCount: number | null
+      logSupported: number | null
+      logCount: number
+      logBytes: number
     } | undefined
     return row ?? null
+  } finally {
+    db.close()
+  }
+}
+
+function operationLog(cwd: string, key: string): Array<{
+  sequence: number
+  baseHash: string
+  resultHash: string
+  patch: unknown
+}> {
+  const db = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
+  try {
+    return (db.prepare(`
+      SELECT sequence, base_sha256 AS baseHash, result_sha256 AS resultHash, patch_json AS patch
+        FROM chat_row_operations
+       WHERE row_key = ?
+       ORDER BY sequence
+    `).all(key) as Array<any>).map(row => ({ ...row, patch: JSON.parse(row.patch) }))
   } finally {
     db.close()
   }
@@ -223,6 +255,218 @@ describe('chat content row serving', () => {
     expect(route).toContain('writeChatRowRawOwned')
     expect(route).not.toContain('readChatRowRaw(')
     expect(route).not.toContain('Stored chat row could not be read')
+  })
+
+  test('delta POST appends O(delta), acknowledges the logical digest, and GET/pre-image materialize exactly', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const base = {
+      id: 'delta-chat',
+      name: 'Delta chat',
+      message: [{ role: 'user', data: 'base message' }],
+      note: '',
+      localLore: [],
+    }
+    const logical = {
+      ...base,
+      message: [
+        { role: 'user', data: 'edited base message' },
+        { role: 'char', data: 'streamed continuation' },
+      ],
+    }
+    const baseBytes = encodeRisuDat(base)
+    const logicalBytes = encodeRisuDat(logical)
+    const baseHash = createHash('sha256').update(baseBytes).digest('hex')
+    const logicalHash = createHash('sha256').update(logicalBytes).digest('hex')
+    const rowKey = 'chats/delta-char/delta-chat'
+
+    const fullResponse = await client.fetch('/api/chat-content/delta-char/0', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-chat-id': 'delta-chat',
+      },
+      body: new Uint8Array(baseBytes),
+    })
+    expect(fullResponse.status).toBe(200)
+    expect(await fullResponse.json()).toEqual({ success: true, hash: baseHash })
+
+    const deltaPatch = [
+      { op: 'replace', path: '/message/0', value: logical.message[0] },
+      { op: 'add', path: '/message/-', value: logical.message[1] },
+    ]
+    const deltaResponse = await client.fetch('/api/chat-content/delta-char/0', {
+      method: 'POST',
+      headers: {
+        'content-type': CHAT_DELTA_CONTENT_TYPE,
+        'x-chat-id': 'delta-chat',
+        'x-chat-backup-reason': 'streaming-checkpoint',
+      },
+      body: JSON.stringify({
+        version: 1,
+        baseHash,
+        resultHash: logicalHash,
+        resultSize: logicalBytes.length,
+        patch: deltaPatch,
+      }),
+    })
+    expect(deltaResponse.status).toBe(200)
+    expect(await deltaResponse.json()).toEqual({
+      success: true,
+      hash: logicalHash,
+      size: logicalBytes.length,
+      log: {
+        count: 1,
+        bytes: Buffer.byteLength(JSON.stringify(deltaPatch)),
+      },
+    })
+    // Until compaction, the protected KV value remains the byte-exact base.
+    expect(rawKvRow(server.cwd, rowKey)).toEqual(baseBytes)
+    expect(metadata(server.cwd, rowKey)).toMatchObject({
+      contentHash: logicalHash,
+      contentSize: logicalBytes.length,
+      coldStorage: 0,
+      messageCount: 2,
+      logSupported: 1,
+      logCount: 1,
+    })
+    expect(operationLog(server.cwd, rowKey)).toEqual([{
+      sequence: 1,
+      baseHash,
+      resultHash: logicalHash,
+      patch: deltaPatch,
+    }])
+
+    const getResponse = await client.fetch('/api/chat-content/delta-char/0', {
+      headers: { 'x-chat-id': 'delta-chat' },
+    })
+    expect(getResponse.status).toBe(200)
+    expect(getResponse.headers.get('x-content-hash')).toBe(logicalHash)
+    expect(Buffer.from(await getResponse.arrayBuffer())).toEqual(logicalBytes)
+
+    const historyResponse = await client.fetch('/api/chat-backups/delta-char/delta-chat')
+    const history = await historyResponse.json() as {
+      versions: Array<{ versionId: string; reason: string; size: number }>
+    }
+    expect(history.versions).toHaveLength(1)
+    expect(history.versions[0]).toMatchObject({
+      reason: 'streaming-checkpoint',
+      size: baseBytes.length,
+    })
+    const preImageResponse = await client.fetch(
+      `/api/chat-backups/delta-char/delta-chat/${history.versions[0].versionId}`,
+    )
+    expect(Buffer.from(await preImageResponse.arrayBuffer())).toEqual(baseBytes)
+  })
+
+  test('delta refusal envelopes are definitive and a full-row fallback remains byte-identical', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const base = { id: 'fallback-chat', message: [{ data: 'base' }] }
+    const fallback = { id: 'fallback-chat', message: [{ data: 'full fallback' }] }
+    const baseBytes = encodeRisuDat(base)
+    const fallbackBytes = encodeRisuDat(fallback)
+    const fallbackHash = createHash('sha256').update(fallbackBytes).digest('hex')
+    await client.fetch('/api/chat-content/fallback-char/0', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream', 'x-chat-id': 'fallback-chat' },
+      body: new Uint8Array(baseBytes),
+    })
+
+    const staleResponse = await client.fetch('/api/chat-content/fallback-char/0', {
+      method: 'POST',
+      headers: { 'content-type': CHAT_DELTA_CONTENT_TYPE, 'x-chat-id': 'fallback-chat' },
+      body: JSON.stringify({
+        version: 1,
+        baseHash: '0'.repeat(64),
+        resultHash: fallbackHash,
+        resultSize: fallbackBytes.length,
+        patch: [{ op: 'replace', path: '/message/0', value: fallback.message[0] }],
+      }),
+    })
+    expect(staleResponse.status).toBe(409)
+    expect(await staleResponse.json()).toMatchObject({
+      success: false,
+      code: 'CHAT_DELTA_BASE_MISMATCH',
+      retryable: false,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+      currentHash: createHash('sha256').update(baseBytes).digest('hex'),
+    })
+
+    const malformedResponse = await client.fetch('/api/chat-content/fallback-char/0', {
+      method: 'POST',
+      headers: { 'content-type': CHAT_DELTA_CONTENT_TYPE, 'x-chat-id': 'fallback-chat' },
+      body: JSON.stringify({ version: 1, unexpected: true }),
+    })
+    expect(malformedResponse.status).toBe(400)
+    expect(await malformedResponse.json()).toMatchObject({
+      code: 'CHAT_DELTA_INVALID',
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
+
+    const fallbackResponse = await client.fetch('/api/chat-content/fallback-char/0', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream', 'x-chat-id': 'fallback-chat' },
+      body: new Uint8Array(fallbackBytes),
+    })
+    expect(await fallbackResponse.json()).toEqual({ success: true, hash: fallbackHash })
+    expect(operationLog(server.cwd, 'chats/fallback-char/fallback-chat')).toEqual([])
+    const get = await client.fetch('/api/chat-content/fallback-char/0', {
+      headers: { 'x-chat-id': 'fallback-chat' },
+    })
+    expect(Buffer.from(await get.arrayBuffer())).toEqual(fallbackBytes)
+  })
+
+  test('queued threshold compaction atomically retains the logical row and clears applied entries', async () => {
+    const server = await spawnServer({
+      env: { POCKETRISU_CHAT_DELTA_COMPACT_MAX_OPERATIONS: '2' },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const versions = [
+      { id: 'compact-chat', message: [{ data: 'zero' }] },
+      { id: 'compact-chat', message: [{ data: 'one' }] },
+      { id: 'compact-chat', message: [{ data: 'two' }] },
+    ]
+    const encoded = versions.map(encodeRisuDat)
+    const hashes = encoded.map(bytes => createHash('sha256').update(bytes).digest('hex'))
+    await client.fetch('/api/chat-content/compact-char/0', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream', 'x-chat-id': 'compact-chat' },
+      body: new Uint8Array(encoded[0]),
+    })
+    for (let index = 1; index < versions.length; index++) {
+      const response = await client.fetch('/api/chat-content/compact-char/0', {
+        method: 'POST',
+        headers: { 'content-type': CHAT_DELTA_CONTENT_TYPE, 'x-chat-id': 'compact-chat' },
+        body: JSON.stringify({
+          version: 1,
+          baseHash: hashes[index - 1],
+          resultHash: hashes[index],
+          resultSize: encoded[index].length,
+          patch: [{ op: 'replace', path: '/message/0', value: versions[index].message[0] }],
+        }),
+      })
+      expect(response.status).toBe(200)
+    }
+
+    const key = 'chats/compact-char/compact-chat'
+    await expect.poll(() => operationLog(server.cwd, key).length, { timeout: 5_000 }).toBe(0)
+    expect(rawKvRow(server.cwd, key)).toEqual(encoded[2])
+    expect(metadata(server.cwd, key)).toMatchObject({
+      contentHash: hashes[2],
+      contentSize: encoded[2].length,
+      logCount: 0,
+      logBytes: 0,
+    })
+    const get = await client.fetch('/api/chat-content/compact-char/0', {
+      headers: { 'x-chat-id': 'compact-chat' },
+    })
+    expect(Buffer.from(await get.arrayBuffer())).toEqual(encoded[2])
   })
 
   test('POST overwrite history returns the byte-exact streamed pre-image', async () => {

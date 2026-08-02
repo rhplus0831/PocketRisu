@@ -247,11 +247,17 @@ inside `queueStorageMutation()` immediately before the transactional publication
   storage quota and ownership accounting.
 - `replacement_operations`, the transaction-bound committed/not-committed status used to
   reconcile destructive requests whose acknowledgement was lost.
-- `chat_row_metadata`, a rebuildable per-row derivative keyed by encoded chat-row
-  identity. A random mutation token binds SHA-256, logical size, and cold-storage state
-  to the current authoritative row; KV triggers invalidate it on every direct chat-row
-  write/delete, and missing or mismatched entries are repaired lazily from decoded row
-  bytes rather than through a boot-time store scan.
+- `chat_row_metadata`, the per-row logical publication keyed by encoded chat-row identity.
+  A random mutation token binds the materialized-row SHA-256, materialized byte length,
+  cold-storage state, message count, log capability, and current log count/bytes. KV
+  triggers clear logs and invalidate metadata on every direct full-row write/delete;
+  legacy gaps are repaired lazily rather than through a boot-time scan.
+- `chat_row_operations`, the authoritative ordered extension for a chat base row. Each
+  `(row_key, sequence)` entry records the self-describing
+  `pocketrisu-chat-operation-v1` format, `application/json-patch+json` media type,
+  base/result SHA-256 commitments, result size, and bounded normalized patch JSON.
+  Existing `chats/*` rows are already valid base rows with empty logs; no data migration
+  is required.
 - `storage_migrations`, the authoritative completion/version record for legacy save-folder
   ingestion; `.migrated_to_sqlite` is only its filesystem compatibility marker.
 - Possibly orphaned historical entity tables (`characters`, `chats`, `settings`, `presets`, `modules`); new installations do not create or use them, as documented at `server/node/db.cjs:51-54`.
@@ -259,7 +265,9 @@ inside `queueStorageMutation()` immediately before the transactional publication
 Important KV namespaces include:
 
 - `database/database.bin`: canonical stubs-only database save; chat bodies are not stored inline.
-- `chats/<encodeURIComponent(chaId)>/<encodeURIComponent(chatId)>`: one legacy-encoded full chat body per row, managed by `server/node/chatRows.cjs`.
+- `chats/<encodeURIComponent(chaId)>/<encodeURIComponent(chatId)>`: one legacy-encoded
+  base chat body per row, optionally followed logically by `chat_row_operations`; every
+  public reader sees the exact materialized legacy row. Managed by `server/node/chatRows.cjs`.
 - `pluginsave/<physicalName>`: one UTF-8 `JSON.stringify` value per optimized plugin save
   key. A physical name is `<base64url>.json` for a well-formed raw key,
   `utf16-v1.<base64url-code-units>.json` for an ill-formed JavaScript string, or
@@ -379,13 +387,17 @@ plan.
   Runtime chat bodies are never retained in a server-wide in-memory map.
 - `GET /api/chat-content/:chaId/:chatIndex` resolves the `x-chat-id` row directly when
   supplied, otherwise falls back through the stripped database's index and rejects an ID
-  mismatch with 409. One raw row selection supplies both response bytes and SHA-256. A
-  matching warm `chat_row_metadata` derivative avoids decoding; missing or hash-mismatched
-  metadata decodes that same selection and conditionally repairs it by mutation token.
+  mismatch with 409. A log-free warm row remains one protected raw read. A row with a log
+  replays its bounded whole-message operations on demand, legacy-encodes once, and verifies
+  the exact materialized SHA-256/length against `chat_row_metadata`; the 64-operation or
+  1 MiB defaults bound this work until queued compaction. Async protected reads bind base
+  selection to `row_token` and retry if a checkpoint wins across the await.
+  Missing or hash-mismatched metadata decodes the same selection and conditionally repairs
+  it by mutation token.
   Cold rows are rehydrated from that selection and cache-filled only when the row is still
   unchanged and no import owns the mutation barrier. The route supports verified `204`
   cache hits and otherwise returns the historical raw/canonical response bytes.
-- `POST /api/chat-content/:chaId/:chatIndex` spools and validates binary or JSON input
+- A full `POST /api/chat-content/:chaId/:chatIndex` spools and validates binary or JSON input
   before queue entry and publishes the staged encoded row inside `queueStorageMutation()`.
   Immediately before overwrite it asks
   `chatBackups.cjs` to stream the exact old raw row from protected chunk storage into the
@@ -397,6 +409,22 @@ plan.
   acknowledging the row and never joins the five-second database debounce. During active
   generation the client row stage writes the first eligible dirty save, throttles later
   checkpoints to 20 seconds, and always queues a final idle save.
+- The same route accepts `application/vnd.pocketrisu.chat-delta+json` without the full-row
+  spool. Its exact v1 schema is `{version, baseHash, resultHash, resultSize, patch}`. The
+  normalized patch is non-empty, at most 1,024 operations and just under the existing
+  32 MiB `/api/patch` admission bound, and may only replace an existing whole
+  `/message/<index>` or append at `/message/-`. The server requires a warm canonical base,
+  exact current base hash, consistent log chain, and legal result size. Refusals are
+  definitive `CHAT_DELTA_*` envelopes with `commitOutcome: "not-committed"`; it never
+  approximates an unsupported delta.
+- Append commits the operation entry, materialized digest/size/message count, log totals,
+  and a new `row_token` in one SQLite transaction. At 64 entries or 1 MiB of stored patch
+  JSON, a deduplicated background storage-queue task materializes and rewrites the base,
+  atomically clears applied entries through the KV triggers, and republishes identical
+  logical metadata. The defaults avoid rewriting an ordinary generation after only a few
+  checkpoints while bounding replay to a small operation loop and at most 1 MiB of patch
+  input. A crash/failpoint anywhere in that transaction rolls back to the readable old
+  base+log pair.
 - Frontend placeholders are hydrated through `fetchChatFromServer()` and
   `ensureChatHydrated()` in `src/ts/storage/chatStorage.ts`.
 - Metadata fields retained in stubs are exactly `id`, `name`, `_stub`, `lastDate`,
@@ -586,8 +614,14 @@ callers may explicitly include usage deletion.
 - Raw chat writers make ownership explicit. `writeChatRowRaw()` preserves the caller's
   ownership by copying; `writeChatRowRawOwned()` consumes a Buffer and returns the SHA-256
   of the exact bytes published. Both atomically invalidate or publish the matching
-  `chat_row_metadata` derivative. The derivative is operational and rebuildable, so
-  imports/restores do not transport it and legacy gaps fall back to authoritative decode.
+  `chat_row_metadata` publication and clear any operation log. Imports/restores do not
+  transport metadata or operation entries: they ingest the already materialized row as a
+  fresh base. Legacy metadata gaps fall back to authoritative decode or a full-row write.
+
+- Logical chat consumers must use the store materializer. Automatic snapshots, full and
+  partial exports, monolith assembly, pre-images, duplication, and migrations therefore
+  see base+log bytes exactly as if the client had sent the same content in a full-row POST.
+  Do not read `chats/*` directly for a logical export.
 
 - Chat deletion is layered and atomic with its stub graph. Patches collect old-minus-new row keys, force a `delete-chat` pre-image for every still-present row, and delete them only in the same transaction that persists the new `database.bin`; capture failure aborts publication. Cache-warm full writes and plugin-storage transitions use the same pre-delete guard. `/api/db/optimize` additionally sweeps unreferenced `chats/` rows but preserves rows updated within the last hour so a chat POST arriving before its stub is not lost.
 

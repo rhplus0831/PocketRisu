@@ -254,10 +254,13 @@ count and exclusive chunk cost.
   aggregate plugin quota bytes, and the exact recovery-dirty token. The plugin
   publication clock covers both the selected database generation and exact manifest.
 - Assembly then leaves the mutation queue and reads database, chat, selected plugin, and
-  remembered MCP rows only through that pinned snapshot. Large rows are copied or
-  transcoded in bounded pages. Publication re-enters the queue, recaptures the complete
-  token, and commits/rotates only on equality; a mismatch discards the private spool and
-  retries or reschedules. A destructive import therefore cannot publish the older spool.
+  remembered MCP rows only through that pinned snapshot. Chat rows with operation logs
+  materialize from the pinned base, pinned ordered entries, and pinned logical metadata;
+  a snapshot never publishes a base-only or torn view. Large log-free rows are copied and
+  other rows are transcoded in bounded pages/work. Publication re-enters the queue,
+  recaptures the complete token, and commits/rotates only on equality; every log append
+  and compaction advances the same chat `row_token`, so a racing checkpoint discards the
+  private spool and retries or reschedules.
 - Snapshot failure is non-fatal to the primary save. The cooldown advances only after
   the snapshot row commits.
 - Primary database and chat writes acknowledge their committed mutation before scheduling
@@ -326,10 +329,11 @@ Client ownership lives in:
 
 `createChatBackupStore()` in `server/node/chatBackups.cjs` manages a filesystem history
 separate from RisuSave archives and database snapshots. Immediately before
-`POST /api/chat-content/:chaId/:chatIndex` overwrites an existing row, it atomically
-publishes the raw prior bytes under `<root>/<chaId>/<chatId>/`. Production capture streams
-the protected logical row into the same loose `.bin` entry instead of assembling a second
-full Buffer, then fsyncs and renames it atomically. Ordinary captures are best-effort and
+`POST /api/chat-content/:chaId/:chatIndex` replaces or extends an existing row, it
+atomically publishes the exact prior materialized bytes under `<root>/<chaId>/<chatId>/`.
+Log-free capture streams the protected base; logged capture replays the bounded log and
+publishes byte-for-byte what a full-row write of that logical content would have captured,
+then fsyncs and renames it atomically. Ordinary captures are best-effort and
 have a 45-second per-chat cooldown. Explicit edit, delete-message, and reroll actions
 attach a sanitized reason for display; small cold-storage placeholder rows are skipped
 using the rebuildable per-row derivative, with a bounded legacy decode fallback when that
@@ -369,7 +373,11 @@ loose/frame replacements.
 The frame is intentionally row-oriented rather than history-container-specific. Its
 media type, codec, raw length/hash, and version identity are inside the frame,
 so a future per-row `chats/` full-backup entry can use the same frame body. Full-backup
-archive output/import remains unchanged today.
+archive output/import remains unchanged today. The live chat operation table follows the
+same extension principle: every entry carries an explicit operation format and patch media
+type plus base/result commitments. A future per-row archive can add ordered operation
+frames without changing logical readers; today's deferred per-row `chats/` archive entries
+remain deferred, so exports materialize base+log into `database.risudat`.
 
 The default root is `save/chat-backups`; `POCKETRISU_CHAT_BACKUP_DIR` may relocate it.
 Startup migrates the legacy `<server-backup-root>/chat-backups` tree, deduplicating

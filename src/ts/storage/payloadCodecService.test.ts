@@ -127,6 +127,52 @@ describe('PayloadCodecService', () => {
         expect(shim.detachedWorkerResults).toEqual([0])
     })
 
+    it('prepares an exact whole-message delta in the codec worker path', async () => {
+        const previous = representativeChat('checkpoint')
+        const current = structuredClone(previous)
+        current.message[1].data = 'streamed edit'
+        current.message.push({
+            role: 'char',
+            data: 'new message',
+            chatId: 'message-3',
+            generationInfo: { model: 'test-model', inputTokens: 2, outputTokens: 1 },
+            swipes: ['new message'],
+        })
+        const expectedBytes = encodeRisuSaveLegacy(current)
+        const expectedHash = await sha256OwnedBytes(expectedBytes)
+        const service = new PayloadCodecService({ supportsWorker: () => false, idleMs: -1 })
+
+        await expect(service.prepareChatCheckpoint(previous, current)).resolves.toEqual({
+            bytes: expectedBytes,
+            hash: expectedHash,
+            patch: [
+                { op: 'replace', path: '/message/1', value: current.message[1] },
+                { op: 'add', path: '/message/-', value: current.message[2] },
+            ],
+        })
+    })
+
+    it('falls back when JSON equality cannot prove byte-exact MessagePack replay', async () => {
+        const previous = {
+            id: 'chat',
+            message: [{ role: 'user', data: 'same' }],
+        }
+        const reordered = {
+            id: 'chat',
+            message: [{ data: 'same', role: 'user' }],
+        }
+        const changedTopLevel = {
+            ...previous,
+            name: 'not representable by the chat delta subset',
+        }
+        const service = new PayloadCodecService({ supportsWorker: () => false, idleMs: -1 })
+
+        await expect(service.prepareChatCheckpoint(previous, reordered))
+            .resolves.toMatchObject({ patch: null })
+        await expect(service.prepareChatCheckpoint(previous, changedTopLevel))
+            .resolves.toMatchObject({ patch: null })
+    })
+
     it('transfers an owned strict block copy while retaining crash-retry bytes', async () => {
         const bytes = save(
             block(1, 'root', { marker: 'worker', __directory: ['character'] }),

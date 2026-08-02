@@ -193,6 +193,25 @@ export class PayloadCodecService {
         })
     }
 
+    prepareChatCheckpoint(previousChat: unknown | null, chat: unknown): Promise<{
+        bytes: Uint8Array
+        hash: string | null
+        patch: import('./chatDelta').ChatDeltaOperation[] | null
+    }> {
+        const operation: PayloadCodecOperation = {
+            kind: 'prepare-chat-checkpoint',
+            previousChat,
+            chat,
+        }
+        return this.enqueue(async () => {
+            const result = await this.executeWithFallback(operation)
+            if (result.kind !== 'prepare-chat-checkpoint') {
+                throw new Error('Unexpected codec worker result')
+            }
+            return { bytes: result.bytes, hash: result.hash, patch: result.patch }
+        })
+    }
+
     decodeStrictBlock(bytes: Uint8Array): Promise<StrictRisuSaveDatabase> {
         const fallbackOperation: PayloadCodecOperation = {
             kind: 'decode-strict-block',

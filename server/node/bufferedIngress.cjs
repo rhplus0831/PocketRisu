@@ -1,5 +1,7 @@
 'use strict';
 
+const { CHAT_DELTA_CONTENT_TYPE } = require('./chatDelta.cjs');
+
 const BUFFERED_INGRESS_POLICY = Symbol('bufferedIngressPolicy');
 const CLIENT_BUILD_HEADER = 'x-client-build';
 const CLIENT_UPGRADE_REQUIRED_CODE = 'CLIENT_UPGRADE_REQUIRED';
@@ -106,6 +108,13 @@ function requestBodyKind(req) {
     return null;
 }
 
+function isChatDeltaRequest(req) {
+    return String(req.headers?.['content-type'] ?? '')
+        .split(';', 1)[0]
+        .trim()
+        .toLowerCase() === CHAT_DELTA_CONTENT_TYPE;
+}
+
 function isStreamedIngress(req) {
     const requestPath = req.path;
     if (requestPath === '/api/backup/import'
@@ -208,7 +217,9 @@ function jsonLimit(req, limits) {
     if (req.path === '/api/db/read-cached') return limits.jsonReadCached;
     if (req.path === '/api/patch') return limits.jsonPatch;
     if (req.path.startsWith('/api/chat-content/')) {
-        return Math.min(limits.chat, limits.json);
+        return isChatDeltaRequest(req)
+            ? limits.jsonPatch
+            : Math.min(limits.chat, limits.json);
     }
     if (req.path === '/api/plugin-storage/transition/stage/begin') return 64 * MIB;
     if (req.path === '/proxy'
@@ -511,6 +522,7 @@ module.exports = {
     isStreamedIngress,
     isWriterRoute,
     createRoutePolicyResolver,
+    isChatDeltaRequest,
     admissionPayload,
     sendClientUpgradeRequired,
     createBufferedIngressMiddleware,

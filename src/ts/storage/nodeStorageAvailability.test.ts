@@ -14,10 +14,12 @@ const cache = vi.hoisted(() => ({
 
 const codec = vi.hoisted(() => ({
     encodeChatRowPayload: vi.fn(),
+    prepareChatRowCheckpoint: vi.fn(),
 }))
 
 vi.mock('./payloadCodecClient', () => ({
     encodeChatRowPayload: codec.encodeChatRowPayload,
+    prepareChatRowCheckpoint: codec.prepareChatRowCheckpoint,
 }))
 
 vi.mock('./resourceCache', () => ({
@@ -118,6 +120,15 @@ beforeEach(() => {
     codec.encodeChatRowPayload.mockImplementation(async (_chat: unknown, hash: boolean) => ({
         bytes: new Uint8Array([1, 2, 3]),
         hash: hash ? 'a'.repeat(64) : null,
+    }))
+    codec.prepareChatRowCheckpoint.mockImplementation(async (
+        _previousChat: unknown,
+        chat: unknown,
+    ) => ({
+        bytes: new Uint8Array([1, 2, 3]),
+        hash: 'a'.repeat(64),
+        patch: null,
+        snapshot: structuredClone(chat),
     }))
     vi.mocked(encodeRisuSaveLegacy).mockReturnValue(new Uint8Array([1, 2, 3]))
 })
@@ -838,7 +849,12 @@ describe('NodeStorage availability bounds', () => {
     it('donates the exact encoded chat bytes only after a matching acknowledgement hash', async () => {
         const encoded = new Uint8Array([7, 8, 9])
         const hash = 'b'.repeat(64)
-        codec.encodeChatRowPayload.mockResolvedValueOnce({ bytes: encoded, hash })
+        codec.prepareChatRowCheckpoint.mockResolvedValueOnce({
+            bytes: encoded,
+            hash,
+            patch: null,
+            snapshot: { name: 'checkpoint' },
+        })
         vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
             success: true,
             hash,
@@ -850,9 +866,9 @@ describe('NodeStorage availability bounds', () => {
 
         await storage.saveChatContent('character', 0, 'chat', { name: 'checkpoint' })
 
-        expect(codec.encodeChatRowPayload).toHaveBeenCalledWith(
+        expect(codec.prepareChatRowCheckpoint).toHaveBeenCalledWith(
+            null,
             { name: 'checkpoint' },
-            true,
         )
         expect(cache.storeOwnedBytesWithKnownHash).toHaveBeenCalledWith(
             'chat:character/chat',
@@ -860,6 +876,152 @@ describe('NodeStorage availability bounds', () => {
             encoded,
         )
         expect(cache.storeBytes).not.toHaveBeenCalled()
+    })
+
+    it('uploads a delta only after an exact base acknowledgement and verifies its logical hash', async () => {
+        cache.enabled = false
+        const baseHash = 'a'.repeat(64)
+        const resultHash = 'b'.repeat(64)
+        const base = { message: [{ data: 'base' }] }
+        const result = { message: [{ data: 'edited' }] }
+        codec.prepareChatRowCheckpoint
+            .mockResolvedValueOnce({
+                bytes: new Uint8Array(2_048),
+                hash: baseHash,
+                patch: null,
+                snapshot: base,
+            })
+            .mockResolvedValueOnce({
+                bytes: new Uint8Array(2_048),
+                hash: resultHash,
+                patch: [{ op: 'replace', path: '/message/0', value: result.message[0] }],
+                snapshot: result,
+            })
+        const requests: RequestInit[] = []
+        vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+            requests.push(init ?? {})
+            const hash = requests.length === 1 ? baseHash : resultHash
+            return new Response(JSON.stringify({ success: true, hash }), {
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+            })
+        }))
+        const storage = readyStorage()
+
+        await storage.saveChatContent('character', 0, 'chat', base)
+        await storage.saveChatContent('character', 0, 'chat', result)
+
+        expect(requests).toHaveLength(2)
+        expect(new Headers(requests[1].headers).get('content-type'))
+            .toBe('application/vnd.pocketrisu.chat-delta+json')
+        expect(JSON.parse(requests[1].body as string)).toEqual({
+            version: 1,
+            baseHash,
+            resultHash,
+            resultSize: 2_048,
+            patch: [{ op: 'replace', path: '/message/0', value: result.message[0] }],
+        })
+        expect(codec.prepareChatRowCheckpoint).toHaveBeenNthCalledWith(2, base, result)
+    })
+
+    it('retries the prepared full row after a definitive delta refusal', async () => {
+        cache.enabled = false
+        const baseHash = 'a'.repeat(64)
+        const resultHash = 'b'.repeat(64)
+        const base = { message: [{ data: 'base' }] }
+        const result = { message: [{ data: 'edited' }] }
+        const fullBytes = new Uint8Array(2_048)
+        codec.prepareChatRowCheckpoint
+            .mockResolvedValueOnce({
+                bytes: fullBytes,
+                hash: baseHash,
+                patch: null,
+                snapshot: base,
+            })
+            .mockResolvedValueOnce({
+                bytes: fullBytes,
+                hash: resultHash,
+                patch: [{ op: 'replace', path: '/message/0', value: result.message[0] }],
+                snapshot: result,
+            })
+        const requests: RequestInit[] = []
+        vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+            requests.push(init ?? {})
+            if (requests.length === 1) {
+                return new Response(JSON.stringify({ success: true, hash: baseHash }), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            if (requests.length === 2) {
+                return new Response(JSON.stringify({
+                    success: false,
+                    error: 'stale base',
+                    code: 'CHAT_DELTA_BASE_MISMATCH',
+                    retryable: false,
+                    commitOutcome: 'not-committed',
+                    commitOutcomeUnknown: false,
+                }), {
+                    status: 409,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            return new Response(JSON.stringify({ success: true, hash: resultHash }), {
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+            })
+        }))
+        const storage = readyStorage()
+
+        await storage.saveChatContent('character', 0, 'chat', base)
+        await storage.saveChatContent('character', 0, 'chat', result)
+
+        expect(requests).toHaveLength(3)
+        expect(new Headers(requests[1].headers).get('content-type'))
+            .toBe('application/vnd.pocketrisu.chat-delta+json')
+        expect(new Headers(requests[2].headers).get('content-type'))
+            .toBe('application/octet-stream')
+        expect(requests[2].body).toBe(fullBytes)
+    })
+
+    it('retries the full row when a successful delta acknowledgement has the wrong digest', async () => {
+        cache.enabled = false
+        const baseHash = 'a'.repeat(64)
+        const resultHash = 'b'.repeat(64)
+        const base = { message: [{ data: 'base' }] }
+        const result = { message: [{ data: 'result' }] }
+        const bytes = new Uint8Array(2_048)
+        codec.prepareChatRowCheckpoint
+            .mockResolvedValueOnce({ bytes, hash: baseHash, patch: null, snapshot: base })
+            .mockResolvedValueOnce({
+                bytes,
+                hash: resultHash,
+                patch: [{ op: 'replace', path: '/message/0', value: result.message[0] }],
+                snapshot: result,
+            })
+        const requests: RequestInit[] = []
+        vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+            requests.push(init ?? {})
+            const hash = requests.length === 1
+                ? baseHash
+                : requests.length === 2
+                    ? 'c'.repeat(64)
+                    : resultHash
+            return new Response(JSON.stringify({ success: true, hash }), {
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+            })
+        }))
+        const storage = readyStorage()
+
+        await storage.saveChatContent('character', 0, 'chat', base)
+        await storage.saveChatContent('character', 0, 'chat', result)
+
+        expect(requests).toHaveLength(3)
+        expect(new Headers(requests[1].headers).get('content-type'))
+            .toBe('application/vnd.pocketrisu.chat-delta+json')
+        expect(new Headers(requests[2].headers).get('content-type'))
+            .toBe('application/octet-stream')
     })
 
     it('classifies a timed-out bulk asset write as commit-outcome unknown', async () => {

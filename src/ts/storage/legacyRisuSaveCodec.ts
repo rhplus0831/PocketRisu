@@ -17,6 +17,67 @@ const packr = new Packr({
 })
 const encodeLegacyMsgpack = createBoundedMsgpackEncoder(packr)
 
+/** Normalize a live graph to the JSON-safe shape used by persistence codecs. */
+export function normalizeJSON(
+    value: any,
+    seen?: WeakSet<object>,
+    preservePluginStorageKeys = false,
+): any {
+    if (value === null || value === undefined) return null
+    if (typeof value !== 'object') {
+        if (typeof value === 'number' && !isFinite(value)) return null
+        if (typeof value === 'function'
+            || typeof value === 'symbol'
+            || typeof value === 'bigint') return undefined
+        return value
+    }
+    if (value instanceof Date) return value.toISOString()
+    if (value instanceof RegExp || value instanceof Error) return {}
+    if (!seen) seen = new WeakSet()
+    if (seen.has(value)) {
+        console.warn('[normalizeJSON] Circular reference detected and replaced with null')
+        return null
+    }
+    seen.add(value)
+    if (Array.isArray(value)) {
+        const result: any[] = []
+        for (const item of value) {
+            if (item === undefined) {
+                result.push(null)
+            } else {
+                const normalized = normalizeJSON(item, seen, preservePluginStorageKeys)
+                result.push(normalized === undefined ? null : normalized)
+            }
+        }
+        seen.delete(value)
+        return result
+    }
+    const result: Record<string, any> = {}
+    const keys = preservePluginStorageKeys
+        ? getPluginStorageRecordKeys(value)
+        : Object.keys(value)
+    for (const key of keys) {
+        if (!Object.prototype.hasOwnProperty.call(value, key)) continue
+        const propValue = value[key]
+        if (propValue === undefined) continue
+        const normalized = normalizeJSON(
+            propValue,
+            seen,
+            preservePluginStorageKeys
+                || key === 'pluginCustomStorage'
+                || key === 'pluginStorageMeta',
+        )
+        if (normalized === undefined) continue
+        if (preservePluginStorageKeys) {
+            definePluginStorageRecordValue(result, key, normalized)
+        } else {
+            result[key] = normalized
+        }
+    }
+    seen.delete(value)
+    return result
+}
+
 export const magicHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
 export const magicCompressedHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 8])
 export const magicStreamCompressedHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 9])

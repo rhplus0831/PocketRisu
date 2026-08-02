@@ -936,6 +936,28 @@ function createKvSnapshot() {
             contentVerificationMemo: chunkStore.contentVerificationMemo,
         });
         const viewerFacets = createPluginStorageViewerFacetSnapshot(snapshotDb);
+        let selectChatRowMetadata = null;
+        let selectChatRowOperations = null;
+        try {
+            selectChatRowMetadata = snapshotDb.prepare(`
+              SELECT row_token, content_sha256, content_size, cold_storage,
+                     message_count, log_supported, log_count, log_bytes
+                FROM chat_row_metadata
+               WHERE row_key = ?
+            `);
+            selectChatRowOperations = snapshotDb.prepare(`
+              SELECT sequence, format, content_type, base_sha256, result_sha256,
+                     result_size, patch_json, patch_bytes, created_at
+                FROM chat_row_operations
+               WHERE row_key = ?
+               ORDER BY sequence
+            `);
+        } catch (error) {
+            // Lower-level db tests may pin a snapshot before the chat store has
+            // installed its rebuildable derivative tables. Production creates
+            // the store before any snapshot endpoint becomes reachable.
+            if (!String(error?.message ?? '').includes('no such table')) throw error;
+        }
         return {
             ...reader,
             ...viewerFacets,
@@ -953,6 +975,12 @@ function createKvSnapshot() {
             },
             kvGetPluginStorageOwner(storageKey) {
                 return viewerFacets.viewerOwner(storageKey);
+            },
+            chatRowMetadata(rowKey) {
+                return selectChatRowMetadata?.get(rowKey) ?? null;
+            },
+            chatRowOperationEntries(rowKey) {
+                return selectChatRowOperations?.all(rowKey) ?? [];
             },
             close() {
                 if (closed) return;

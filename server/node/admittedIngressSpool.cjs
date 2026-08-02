@@ -3,7 +3,11 @@
 const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
-const { admissionPayload, parseContentLength } = require('./bufferedIngress.cjs');
+const {
+    admissionPayload,
+    isChatDeltaRequest,
+    parseContentLength,
+} = require('./bufferedIngress.cjs');
 
 const ADMITTED_INGRESS_SPOOL = Symbol('admittedIngressSpool');
 const ADMITTED_INGRESS_SPOOL_PREFIX = '.admitted-ingress-';
@@ -27,6 +31,7 @@ function shouldSpoolAdmittedIngress(req, policy, { disabled = false } = {}) {
     }
     return req.method === 'POST'
         && /^\/api\/chat-content\/[^/]+\/[^/]+$/.test(req.path)
+        && !isChatDeltaRequest(req)
         && (policy.bodyKind === 'raw' || policy.bodyKind === 'json');
 }
 

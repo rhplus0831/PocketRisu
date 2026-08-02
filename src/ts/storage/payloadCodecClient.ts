@@ -7,6 +7,7 @@ import {
     isRisuSaveBlockFormat,
 } from './strictRisuSaveCodec'
 import { snapshotPayload } from './payloadSnapshot'
+import type { ChatDeltaOperation } from './chatDelta'
 
 let payloadCodecService = new PayloadCodecService()
 
@@ -23,6 +24,27 @@ export async function encodeChatRowPayload(
     // synchronously at the old encode point, before any awaited worker work.
     const snapshot = snapshotPayload(chat)
     return payloadCodecService.encodeChat(snapshot, hash)
+}
+
+export async function prepareChatRowCheckpoint(
+    previousChat: unknown | null,
+    chat: unknown,
+): Promise<{
+    bytes: Uint8Array
+    hash: string | null
+    patch: ChatDeltaOperation[] | null
+    snapshot: unknown
+}> {
+    // Both graphs are captured before the worker boundary. The returned current
+    // snapshot becomes the next acknowledged baseline only after an exact hash
+    // acknowledgement; failed/refused requests retain the previous baseline.
+    const previousSnapshot = previousChat === null ? null : snapshotPayload(previousChat)
+    const snapshot = snapshotPayload(chat)
+    const result = await payloadCodecService.prepareChatCheckpoint(
+        previousSnapshot,
+        snapshot,
+    )
+    return { ...result, snapshot }
 }
 
 export async function decodeAuthoritativeRisuSaveWithCodecWorker(

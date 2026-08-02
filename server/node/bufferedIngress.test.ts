@@ -118,6 +118,24 @@ describe('buffered ingress admission', () => {
     })
   })
 
+  test('bounds chat deltas like JSON Patch while retaining full-row chat limits', () => {
+    const resolve = createRoutePolicyResolver(limits())
+    expect(resolve(request({
+      path: '/api/chat-content/character/0',
+      headers: {
+        'content-type': 'application/vnd.pocketrisu.chat-delta+json',
+        'content-length': '512',
+      },
+    }))).toMatchObject({ bodyKind: 'json', maxBytes: 32 * 1024 * 1024 })
+    expect(resolve(request({
+      path: '/api/chat-content/character/0',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'content-length': '512',
+      },
+    }))).toMatchObject({ bodyKind: 'raw', maxBytes: 128 * 1024 * 1024 })
+  })
+
   test.each([
     ['matching served build', {
       version: '1.9.0',

@@ -249,9 +249,22 @@ Opening a placeholder invokes this flow:
 5. It yields one animation frame, replaces the placeholder, waits one Svelte tick, and clears hydration suppression.
 
 The server also verifies `x-chat-id` if it falls back to index lookup, returning 409 on an
-index mismatch. Saving a chat captures an eligible pre-image, writes its row synchronously,
-returns its content hash for cache seeding, and schedules the coalesced automatic snapshot
-only after acknowledgement; it does not wait for or schedule the database debounce.
+index mismatch. `NodeStorage` retains the exact decoded graph only after verifying a GET's
+bytes against `x-content-hash`, or after a save acknowledgement matches the worker-produced
+logical-row digest. The next checkpoint worker legacy-encodes/hashes the current row and
+normalizes a JSON Patch candidate against that acknowledged graph. Only whole-message
+replacements and appends are eligible, and replay is byte-compared against the full
+MessagePack result so object-key order or any non-message change forces a full-row write.
+
+An eligible smaller payload uses
+`application/vnd.pocketrisu.chat-delta+json` with
+`{version:1, baseHash, resultHash, resultSize, patch}`. Durability is established only when
+the server returns the exact expected materialized digest. A definitive `CHAT_DELTA_*`
+refusal (missing/unsupported base, base mismatch, invalid schema, or log conflict), a
+missing hash, or a mismatched success hash retries the already-prepared byte-identical full
+row. Transport/commit ambiguity does not replay. Successful full or delta saves retain the
+same dirty-stage, draft, final-generation, cache-seeding, and row-before-stub lifecycles;
+the server still schedules snapshots only after acknowledgement.
 
 #### Recovered model-job publication
 
@@ -275,7 +288,9 @@ Three protocols consume it:
 
 - Boot splits the stubs-only database into `root`, individual `characters`, `botPresets`, `modules`, and `personas`. The client advertises up to 8,192 verified hashes, reconstructs a MessagePack envelope from hits/misses, and validates exact shape and ETag. Verified resident bytes and admitted misses share the 64 MiB/32,768-entry boot staging budget; a miss beyond the remaining aggregate or 32 MiB per-value limit is decoded without cache hashing or retention. Once validation succeeds, boot returns the database while donated miss buffers persist in the background and are released after their IndexedDB `put`.
 - Chat and optimized `pluginsave/*` reads advertise recent verified hashes and accept a `204` only when `x-content-hash` names an advertised, locally present, re-hashed entry.
-- Successful plugin/chat writes compare the server-returned hash with the bytes just sent before seeding the cache.
+- Successful plugin/chat writes compare the server-returned hash with the exact logical
+  bytes prepared by the codec worker before seeding the cache; delta uploads seed those
+  same materialized bytes even though only the patch crossed the network.
 
 Retention is deliberately bounded and best-effort: 512 manifests, four ordinary hashes
 per manifest, up to 8,192 hashes in a database manifest, 32,768 entries, 64 MiB total, and
@@ -402,7 +417,11 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
   after an unknown outcome. Ordinary database-save transport failures retain/requeue dirty
   state for retry and do not automatically establish that no prior request committed.
 
-- Generation chat persistence is throttled, not disabled. The first save in a generation writes the dirty row, later saves write only after the 20-second checkpoint interval, every candidate remains dirty for the final idle-transition save, and page-hide forces a row write. The server’s independent 45-second pre-image cooldown limits recovery-history churn.
+- Generation chat persistence is throttled, not disabled. The first save in a generation
+  writes a full base when no acknowledged base exists; later eligible 20-second checkpoints
+  append deltas, every candidate remains dirty for the final idle-transition save, and
+  page-hide forces a row write. Refusal fallback does not clear dirty state early. The
+  server’s independent 45-second pre-image cooldown limits recovery-history churn.
 
 - Optimized plugin physical keys use `makeArchiveSafePluginSaveStorageKey()`, not the
   generic encoded-key rule. Well-formed strings retain UTF-8/base64url names; ill-formed

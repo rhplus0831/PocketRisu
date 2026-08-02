@@ -17,6 +17,10 @@ interface ChatRowStore {
         contentHash: string
         coldStorage: boolean | null
     } | null
+    readChatRowRawWithMetadataAsync: (
+        chaId: string,
+        chatId: string,
+    ) => Promise<ReturnType<ChatRowStore['readChatRowRawWithMetadata']>>
     repairChatRowMetadata: (row: any, coldStorage: boolean) => boolean
     writeChatRow: (chaId: string, chatId: string, chat: any) => string
     writeChatRowIfUnchanged: (
@@ -30,8 +34,23 @@ interface ChatRowStore {
         chaId: string,
         chatId: string,
         value: Buffer,
-        options?: { coldStorage?: boolean },
+        options?: { coldStorage?: boolean; messageCount?: number; logSupported?: boolean },
     ) => string
+    appendChatDelta: (
+        chaId: string,
+        chatId: string,
+        payload: any,
+        options?: { maxResultBytes?: number },
+    ) => any
+    inspectChatDelta: ChatRowStore['appendChatDelta']
+    compactChatRow: (
+        chaId: string,
+        chatId: string,
+        options?: { force?: boolean },
+    ) => { compacted: boolean; reason: string }
+    operationEntriesForKey: (key: string) => any[]
+    metadataForKey: (key: string) => any
+    materializeChatRowBytesFromReader: (reader: any, key: string) => Buffer | null
     deleteChatRow: (chaId: string, chatId: string) => void
     deleteChatRowsForChar: (chaId: string) => number
     listChatRowKeysForChar: (chaId: string) => string[]
@@ -142,6 +161,10 @@ function makeHarness(options: {
     threshold?: number
     beforeSet?: (key: string, value: Buffer) => void
     randomUUID?: () => string
+    chatDeltaCompactMaxOperations?: number
+    chatDeltaCompactMaxBytes?: number
+    chatDeltaCompactionFailpoint?: (stage: string, key: string) => void
+    kvGetAsync?: (key: string, read: (key: string) => Buffer | null) => Promise<Buffer | null>
 } = {}) {
     const db = new Database(':memory:')
     db.exec(
@@ -181,6 +204,9 @@ function makeHarness(options: {
     const store = createChatRowStore({
         db,
         kvGet,
+        kvGetAsync: options.kvGetAsync
+            ? (key: string) => options.kvGetAsync!(key, kvGet)
+            : undefined,
         kvSet,
         kvDel,
         kvList,
@@ -191,6 +217,9 @@ function makeHarness(options: {
         kvSize: (key: string) => chunks.sizeValue(key),
         kvGetUpdatedAt,
         randomUUID: options.randomUUID,
+        chatDeltaCompactMaxOperations: options.chatDeltaCompactMaxOperations,
+        chatDeltaCompactMaxBytes: options.chatDeltaCompactMaxBytes,
+        chatDeltaCompactionFailpoint: options.chatDeltaCompactionFailpoint,
     })
     return { db, store, kvGet, kvSet }
 }
@@ -357,6 +386,191 @@ describe('chat row IO', () => {
             'char', cold.id, selected, { ...cold, name: 'Restored', message: [] },
         )).toBeNull()
         expect(store.readChatRowRawWithMetadata('char', cold.id)?.coldStorage).toBe(false)
+    })
+})
+
+describe('chat operation-log rows', () => {
+    const digest = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex')
+
+    function delta(base: any, result: any, patch: any[]) {
+        const baseBytes = Buffer.from(encodeRisuSaveLegacy(base))
+        const resultBytes = Buffer.from(encodeRisuSaveLegacy(result))
+        return {
+            baseBytes,
+            resultBytes,
+            payload: {
+                version: 1,
+                baseHash: digest(baseBytes),
+                resultHash: digest(resultBytes),
+                resultSize: resultBytes.length,
+                patch,
+            },
+        }
+    }
+
+    it('atomically appends and materializes exact logical bytes while advancing metadata', () => {
+        let uuid = 0
+        const { db, store, kvGet } = makeHarness({
+            randomUUID: () => `00000000-0000-4000-8000-${String(++uuid).padStart(12, '0')}`,
+        })
+        const base = {
+            id: 'chat',
+            name: 'Chat',
+            message: [{ role: 'user', data: 'one' }],
+        }
+        const result = {
+            ...base,
+            message: [
+                { role: 'user', data: 'one edited' },
+                { role: 'char', data: 'two' },
+            ],
+        }
+        const prepared = delta(base, result, [
+            { op: 'replace', path: '/message/0', value: result.message[0] },
+            { op: 'add', path: '/message/-', value: result.message[1] },
+        ])
+        store.writeChatRow('char', 'chat', base)
+        const key = store.chatRowKey('char', 'chat')
+        const baseToken = store.metadataForKey(key).rowToken
+
+        expect(store.inspectChatDelta('char', 'chat', prepared.payload)).toEqual({ applied: true })
+        expect(store.appendChatDelta('char', 'chat', prepared.payload)).toMatchObject({
+            applied: true,
+            hash: prepared.payload.resultHash,
+            size: prepared.resultBytes.length,
+            logCount: 1,
+        })
+        expect(kvGet(key)?.equals(prepared.baseBytes)).toBe(true)
+        expect(store.readChatRowRaw('char', 'chat')?.equals(prepared.resultBytes)).toBe(true)
+        expect(store.metadataForKey(key)).toMatchObject({
+            contentHash: prepared.payload.resultHash,
+            contentSize: prepared.resultBytes.length,
+            messageCount: 2,
+            logSupported: true,
+            logCount: 1,
+        })
+        expect(store.metadataForKey(key).rowToken).not.toBe(baseToken)
+        expect(store.operationEntriesForKey(key)).toHaveLength(1)
+        expect(db.prepare('SELECT COUNT(*) count FROM chat_row_operations').get())
+            .toEqual({ count: 1 })
+    })
+
+    it('refuses missing, unsupported, stale, malformed, and conflicting bases without an append', () => {
+        const { db, store, kvSet } = makeHarness()
+        const base = { id: 'chat', message: [{ data: 'one' }] }
+        const result = { ...base, message: [{ data: 'two' }] }
+        const prepared = delta(base, result, [
+            { op: 'replace', path: '/message/0', value: result.message[0] },
+        ])
+
+        expect(store.appendChatDelta('char', 'missing', prepared.payload))
+            .toMatchObject({ applied: false, code: 'CHAT_DELTA_BASE_MISSING' })
+        kvSet(store.chatRowKey('char', 'legacy'), prepared.baseBytes)
+        expect(store.appendChatDelta('char', 'legacy', prepared.payload))
+            .toMatchObject({ applied: false, code: 'CHAT_DELTA_BASE_UNAVAILABLE' })
+
+        store.writeChatRow('char', 'chat', base)
+        expect(store.appendChatDelta('char', 'chat', {
+            ...prepared.payload,
+            baseHash: '0'.repeat(64),
+        })).toMatchObject({ applied: false, code: 'CHAT_DELTA_BASE_MISMATCH' })
+        expect(() => store.appendChatDelta('char', 'chat', {
+            ...prepared.payload,
+            patch: [{ op: 'replace', path: '/name', value: 'forbidden' }],
+        })).toThrow(/replace path does not identify an existing message/)
+
+        expect(store.appendChatDelta('char', 'chat', prepared.payload).applied).toBe(true)
+        db.prepare('DELETE FROM chat_row_operations WHERE row_key = ?')
+            .run(store.chatRowKey('char', 'chat'))
+        expect(store.appendChatDelta('char', 'chat', {
+            ...prepared.payload,
+            baseHash: prepared.payload.resultHash,
+        })).toMatchObject({ applied: false, code: 'CHAT_DELTA_LOG_CONFLICT' })
+    })
+
+    it('compacts past the count threshold and retains exact bytes with an empty log', () => {
+        const { store, kvGet } = makeHarness({ chatDeltaCompactMaxOperations: 2 })
+        const base = { id: 'chat', message: [{ data: 'zero' }] }
+        const one = { ...base, message: [{ data: 'one' }] }
+        const two = { ...base, message: [{ data: 'two' }] }
+        const first = delta(base, one, [
+            { op: 'replace', path: '/message/0', value: one.message[0] },
+        ])
+        const second = delta(one, two, [
+            { op: 'replace', path: '/message/0', value: two.message[0] },
+        ])
+        store.writeChatRow('char', 'chat', base)
+        expect(store.appendChatDelta('char', 'chat', first.payload).shouldCompact).toBe(false)
+        expect(store.appendChatDelta('char', 'chat', second.payload).shouldCompact).toBe(true)
+        const before = store.metadataForKey(store.chatRowKey('char', 'chat'))
+
+        expect(store.compactChatRow('char', 'chat')).toEqual({
+            compacted: true,
+            reason: 'compacted',
+        })
+        const key = store.chatRowKey('char', 'chat')
+        expect(kvGet(key)?.equals(second.resultBytes)).toBe(true)
+        expect(store.readChatRowRaw('char', 'chat')?.equals(second.resultBytes)).toBe(true)
+        expect(store.operationEntriesForKey(key)).toEqual([])
+        expect(store.metadataForKey(key)).toMatchObject({
+            contentHash: second.payload.resultHash,
+            contentSize: second.resultBytes.length,
+            messageCount: 1,
+            logCount: 0,
+            logBytes: 0,
+        })
+        expect(store.metadataForKey(key).rowToken).not.toBe(before.rowToken)
+    })
+
+    it('rolls back a crash failpoint after the base write, leaving base+log readable', () => {
+        const { store, kvGet } = makeHarness({
+            chatDeltaCompactionFailpoint: (stage) => {
+                if (stage === 'after-base-write') throw new Error('injected crash')
+            },
+        })
+        const base = { id: 'chat', message: [{ data: 'base' }] }
+        const result = { ...base, message: [{ data: 'logical' }] }
+        const prepared = delta(base, result, [
+            { op: 'replace', path: '/message/0', value: result.message[0] },
+        ])
+        store.writeChatRow('char', 'chat', base)
+        store.appendChatDelta('char', 'chat', prepared.payload)
+        const key = store.chatRowKey('char', 'chat')
+        const before = store.metadataForKey(key)
+
+        expect(() => store.compactChatRow('char', 'chat', { force: true }))
+            .toThrow('injected crash')
+        expect(kvGet(key)?.equals(prepared.baseBytes)).toBe(true)
+        expect(store.operationEntriesForKey(key)).toHaveLength(1)
+        expect(store.metadataForKey(key)).toEqual(before)
+        expect(store.readChatRowRaw('char', 'chat')?.equals(prepared.resultBytes)).toBe(true)
+    })
+
+    it('retries an async GET selection when a delta advances the row token', async () => {
+        const gate = Promise.withResolvers<void>()
+        let reads = 0
+        const { store } = makeHarness({
+            kvGetAsync: async (key, read) => {
+                const selected = read(key)
+                if (++reads === 1) await gate.promise
+                return selected
+            },
+        })
+        const base = { id: 'chat', message: [{ data: 'base' }] }
+        const result = { ...base, message: [{ data: 'after raced append' }] }
+        const prepared = delta(base, result, [
+            { op: 'replace', path: '/message/0', value: result.message[0] },
+        ])
+        store.writeChatRow('char', 'chat', base)
+
+        const pending = store.readChatRowRawWithMetadataAsync('char', 'chat')
+        store.appendChatDelta('char', 'chat', prepared.payload)
+        gate.resolve()
+
+        const selected = await pending
+        expect(reads).toBe(2)
+        expect(selected?.bytes.equals(prepared.resultBytes)).toBe(true)
+        expect(selected?.contentHash).toBe(prepared.payload.resultHash)
     })
 })
 

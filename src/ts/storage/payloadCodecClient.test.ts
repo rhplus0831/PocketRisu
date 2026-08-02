@@ -12,6 +12,7 @@ const risuSaveMocks = vi.hoisted(() => ({
 
 vi.mock('./risuSave', () => ({
     decodeAuthoritativeRisuSave: risuSaveMocks.decodeAuthoritativeRisuSave,
+    normalizeJSON: (value: unknown) => structuredClone(value),
 }))
 
 vi.mock('./database.svelte', () => ({
@@ -21,6 +22,7 @@ vi.mock('./database.svelte', () => ({
 const {
     decodeAuthoritativeRisuSaveWithCodecWorker,
     encodeChatRowPayload,
+    prepareChatRowCheckpoint,
     setPayloadCodecServiceForTests,
 } = await import('./payloadCodecClient')
 
@@ -80,6 +82,33 @@ describe('payload codec client integration', () => {
         await expect(encoded).resolves.toMatchObject({
             bytes: encodeRisuSaveLegacy(original),
             hash: null,
+        })
+    })
+
+    it('snapshots both checkpoint graphs before worker work and returns the acknowledged baseline', async () => {
+        setPayloadCodecServiceForTests(new PayloadCodecService({
+            supportsWorker: () => false,
+            idleMs: -1,
+        }))
+        const previous = {
+            id: 'chat',
+            message: [{ role: 'user', data: 'previous' }],
+        }
+        const current = {
+            id: 'chat',
+            message: [{ role: 'user', data: 'current' }],
+        }
+        const previousLive = new Proxy(structuredClone(previous), {})
+        const currentLive = new Proxy(structuredClone(current), {})
+
+        const pending = prepareChatRowCheckpoint(previousLive, currentLive)
+        previousLive.message[0].data = 'mutated too late'
+        currentLive.message[0].data = 'mutated too late'
+
+        await expect(pending).resolves.toMatchObject({
+            bytes: encodeRisuSaveLegacy(current),
+            patch: [{ op: 'replace', path: '/message/0', value: current.message[0] }],
+            snapshot: current,
         })
     })
 

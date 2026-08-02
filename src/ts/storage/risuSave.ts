@@ -3,11 +3,7 @@ import * as fflate from "fflate";
 import { createBotPresetTemplate, getDatabase, type Database } from "./database.svelte";
 import { forageStorage } from "../globalApi.svelte";
 import { chatToStub } from "./chatStorage";
-import {
-    definePluginStorageRecordValue,
-    getPluginStorageRecordKeys,
-    hasPluginStorageRecordValue,
-} from '../plugins/pluginStorageRecord';
+import { hasPluginStorageRecordValue } from '../plugins/pluginStorageRecord';
 import {
     magicCompressedHeader,
     magicHeader,
@@ -15,6 +11,7 @@ import {
     magicPluginStorageHeader,
     magicPluginStorageStreamHeader,
     magicStreamCompressedHeader,
+    normalizeJSON,
     restoreLegacyPluginStorageKeys,
     encodeRisuSaveCompressionStream,
     encodeRisuSaveLegacy,
@@ -29,7 +26,7 @@ import {
 import { ensureCompressionStreams } from "./compressionStreams";
 import type { RisuSaveDirtyRevisions, RisuSaveRevisionBranch } from "./databaseDirtyRevisions";
 
-export { encodeRisuSaveCompressionStream, encodeRisuSaveLegacy };
+export { encodeRisuSaveCompressionStream, encodeRisuSaveLegacy, normalizeJSON };
 export { RisuSaveBlockIntegrityError } from './strictRisuSaveCodec';
 
 const unpackr = new Unpackr({
@@ -1136,70 +1133,6 @@ export function calculateHash(node: any): number {
         default:
             return 0;
     }
-}
-
-export function normalizeJSON(
-    value: any,
-    seen?: WeakSet<object>,
-    preservePluginStorageKeys = false,
-): any {
-    if (value === null || value === undefined) return null;
-    if (typeof value !== 'object') {
-        if (typeof value === 'number' && !isFinite(value)) return null;
-        if (typeof value === 'function' ||
-            typeof value === 'symbol' ||
-            typeof value === 'bigint')
-            return undefined;
-        return value;
-    }
-    if (value instanceof Date) return value.toISOString();
-    if (value instanceof RegExp || value instanceof Error) return {};
-    if (!seen) seen = new WeakSet();
-    if (seen.has(value)) {
-        console.warn('[normalizeJSON] Circular reference detected and replaced with null')
-        return null;
-    }
-    seen.add(value);
-    if (Array.isArray(value)) {
-        const result: any[] = [];
-        for (const item of value) {
-            if (item === undefined) {
-                result.push(null);
-            } else {
-                const normalized = normalizeJSON(item, seen, preservePluginStorageKeys);
-                result.push(normalized === undefined ? null : normalized);
-            }
-        }
-        seen.delete(value);
-        return result;
-    }
-    const result: Record<string, any> = {};
-    const keys = preservePluginStorageKeys
-        ? getPluginStorageRecordKeys(value)
-        : Object.keys(value);
-    for (const key of keys) {
-        if (Object.prototype.hasOwnProperty.call(value, key)) {
-            const propValue = value[key];
-            if (propValue !== undefined) {
-                const normalized = normalizeJSON(
-                    propValue,
-                    seen,
-                    preservePluginStorageKeys
-                        || key === "pluginCustomStorage"
-                        || key === "pluginStorageMeta",
-                );
-                if (normalized !== undefined) {
-                    if (preservePluginStorageKeys) {
-                        definePluginStorageRecordValue(result, key, normalized);
-                    } else {
-                        result[key] = normalized;
-                    }
-                }
-            }
-        }
-    }
-    seen.delete(value);
-    return result;
 }
 
 // Compare two arrays element-wise, but emit a single `replace` op covering the

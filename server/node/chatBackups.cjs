@@ -844,7 +844,11 @@ function createChatBackupStore(options) {
                             ?.startsWith(COLD_STORAGE_HEADER) === true;
                         if (typeof repairChatRowMetadata === 'function'
                             && selected.contentHash !== null) {
-                            repairChatRowMetadata(selected, coldStorage);
+                            repairChatRowMetadata(
+                                selected,
+                                coldStorage,
+                                Array.isArray(decoded?.message) ? decoded.message.length : 0,
+                            );
                         }
                         if (coldStorage) return 'skipped-cold-storage';
                     } catch (error) {

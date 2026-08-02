@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { Packr } from 'msgpackr'
+import { createHash } from 'node:crypto'
 import utilsPkg from '../../server/node/utils.cjs'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { encodeBackup } from './helpers/encode.js'
@@ -10,12 +11,14 @@ import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 
 const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
 const packr = new Packr({ useRecords: false })
-const { calculateHash, decodeRisuSave, normalizeJSON } = utilsPkg as {
+const { calculateHash, decodeRisuSave, encodeRisuSaveLegacy, normalizeJSON } = utilsPkg as {
   calculateHash: (value: unknown) => number
   decodeRisuSave: (value: Buffer) => Promise<any>
+  encodeRisuSaveLegacy: (value: unknown) => Uint8Array
   normalizeJSON: (value: unknown) => any
 }
 const DB_BLOB_HEX = Buffer.from('database/database.bin', 'utf-8').toString('hex')
+const CHAT_DELTA_CONTENT_TYPE = 'application/vnd.pocketrisu.chat-delta+json'
 const servers: ServerHandle[] = []
 
 afterAll(async () => {
@@ -231,6 +234,81 @@ describe('database snapshot spool isolation', () => {
     expect(stats.databaseBodySpools).toBeGreaterThanOrEqual(3)
     expect(stats.tokenMismatches).toBeGreaterThanOrEqual(1)
     expect(stats.publications).toBe(2)
+  })
+
+  test('a delta append racing pinned assembly invalidates the older log view', async () => {
+    const gateName = 'chat-delta-snapshot-gate'
+    const statsName = 'chat-delta-snapshot-stats.json'
+    const server = await spawnServer({
+      env: {
+        POCKETRISU_BACKUP_INTERVAL_MS: '0',
+        POCKETRISU_SNAPSHOT_ASSEMBLY_TEST_GATE_DIR: gateName,
+        POCKETRISU_TEST_SNAPSHOT_STATS_PATH: statsName,
+      },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const chaId = 'delta-snapshot-character'
+    const chatId = 'delta-snapshot-chat'
+    const character = {
+      chaId,
+      chats: [{ id: chatId, name: 'Delta snapshot chat', _stub: true }],
+    }
+    expect((await writeDatabase(client, 'delta-snapshot', [character])).status).toBe(200)
+    await waitForSnapshotCount(client, 1)
+    await new Promise(resolve => setTimeout(resolve, 150))
+
+    const versions = [
+      { id: chatId, name: 'Delta snapshot chat', message: [{ data: 'base' }] },
+      { id: chatId, name: 'Delta snapshot chat', message: [{ data: 'first delta' }] },
+      { id: chatId, name: 'Delta snapshot chat', message: [{ data: 'racing delta' }] },
+    ]
+    const bytes = versions.map(value => Buffer.from(encodeRisuSaveLegacy(value)))
+    const hashes = bytes.map(value => createHash('sha256').update(value).digest('hex'))
+    expect((await client.fetch(`/api/chat-content/${chaId}/0`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream', 'x-chat-id': chatId },
+      body: new Uint8Array(bytes[0]),
+    })).status).toBe(200)
+    await waitForSnapshotCount(client, 2)
+    await new Promise(resolve => setTimeout(resolve, 150))
+
+    const gateDir = path.join(server.cwd, gateName)
+    await mkdir(gateDir, { recursive: true })
+    await writeFile(path.join(gateDir, 'hold'), '')
+    const postDelta = (index: 1 | 2) => client.fetch(`/api/chat-content/${chaId}/0`, {
+      method: 'POST',
+      headers: { 'content-type': CHAT_DELTA_CONTENT_TYPE, 'x-chat-id': chatId },
+      body: JSON.stringify({
+        version: 1,
+        baseHash: hashes[index - 1],
+        resultHash: hashes[index],
+        resultSize: bytes[index].length,
+        patch: [{ op: 'replace', path: '/message/0', value: versions[index].message[0] }],
+      }),
+    })
+
+    try {
+      expect((await postDelta(1)).status).toBe(200)
+      await waitForFile(path.join(gateDir, 'entered'))
+      const raced = await Promise.race([
+        postDelta(2),
+        new Promise<null>(resolve => setTimeout(() => resolve(null), 1_000)),
+      ])
+      expect(raced).not.toBeNull()
+      expect(raced?.status).toBe(200)
+    } finally {
+      await writeFile(path.join(gateDir, 'release'), '')
+    }
+
+    await waitForSnapshotCount(client, 3)
+    const latest = await readLatestSnapshot(client)
+    expect(latest.characters[0].chats[0].message).toEqual([{ data: 'racing delta' }])
+    const stats = JSON.parse(
+      await readFile(path.join(server.cwd, statsName), 'utf8'),
+    ) as Record<string, number>
+    expect(stats.tokenMismatches).toBeGreaterThanOrEqual(1)
+    expect(stats.publications).toBe(3)
   })
 
   test('explicit flush routes its pending-patch snapshot through pinned assembly', async () => {

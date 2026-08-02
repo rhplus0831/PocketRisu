@@ -9,7 +9,13 @@ import { language } from "src/lang"
 import { alertInput, waitAlert, notifyError } from "../alert"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave"
 import { normalizeChat, type Chat } from "./database.svelte"
-import { encodeChatRowPayload } from "./payloadCodecClient"
+import { prepareChatRowCheckpoint } from "./payloadCodecClient"
+import {
+    CHAT_DELTA_CONTENT_TYPE,
+    CHAT_DELTA_VERSION,
+    type ChatDeltaRequest,
+} from './chatDelta'
+import { snapshotPayload } from './payloadSnapshot'
 import {
     DB_CACHE_GROUPS,
     DB_CACHE_MAX_HASHES,
@@ -28,6 +34,7 @@ import {
     isResourceCacheEnabled,
     isSha256Hex,
     persistResourceCacheManifests,
+    sha256Bytes,
     sha256OwnedBytes,
     settleBestEffortResourceCache,
     storeBytes,
@@ -1442,6 +1449,49 @@ export class NodeStorage{
         controller: AbortController
         promise: Promise<string>
     } | null = null
+    private readonly acknowledgedChatRows = new Map<string, {
+        hash: string
+        chat: unknown
+    }>()
+
+    private chatAcknowledgementKey(chaId: string, chatId: string): string {
+        return JSON.stringify([chaId, chatId])
+    }
+
+    private forgetChatAcknowledgement(chaId: string, chatId: string): void {
+        this.acknowledgedChatRows.delete(this.chatAcknowledgementKey(chaId, chatId))
+    }
+
+    private rememberChatAcknowledgement(
+        chaId: string,
+        chatId: string,
+        hash: string,
+        chat: unknown,
+    ): void {
+        this.acknowledgedChatRows.set(this.chatAcknowledgementKey(chaId, chatId), {
+            hash,
+            chat: snapshotPayload(chat),
+        })
+    }
+
+    private async rememberVerifiedChatRead(
+        chaId: string,
+        chatId: string,
+        hash: string | null,
+        bytes: Uint8Array,
+        chat: unknown,
+    ): Promise<void> {
+        if (!isSha256Hex(hash)) {
+            this.forgetChatAcknowledgement(chaId, chatId)
+            return
+        }
+        const actual = await sha256Bytes(bytes).catch(() => null)
+        if (actual !== hash) {
+            this.forgetChatAcknowledgement(chaId, chatId)
+            return
+        }
+        this.rememberChatAcknowledgement(chaId, chatId, hash, chat)
+    }
 
     async createAuth(signal?: AbortSignal | null){
         throwIfAborted(signal)
@@ -5684,7 +5734,17 @@ export class NodeStorage{
             if (da.status === 404) return null
             if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
             const buffer = new Uint8Array(await awaitWithAbort(da.arrayBuffer(), signal))
-            return normalizeChat(await decodeRisuSave(buffer))
+            const decoded = await decodeRisuSave(buffer)
+            const acknowledged = snapshotPayload(decoded)
+            const chat = normalizeChat(decoded)
+            await this.rememberVerifiedChatRead(
+                chaId,
+                chatId,
+                da.headers.get('x-content-hash'),
+                buffer,
+                acknowledged,
+            )
+            return chat
         }
 
         const resourceKey = `chat:${chaId}/${chatId}`
@@ -5709,7 +5769,10 @@ export class NodeStorage{
                 }
                 const cachedBytes = await getVerifiedCachedBytes(contentHash)
                 if (!cachedBytes) throw new Error('Cached chat bytes are unavailable')
-                const chat = normalizeChat(await decodeRisuSave(cachedBytes))
+                const decoded = await decodeRisuSave(cachedBytes)
+                const acknowledged = snapshotPayload(decoded)
+                const chat = normalizeChat(decoded)
+                this.rememberChatAcknowledgement(chaId, chatId, contentHash, acknowledged)
                 void touchResourceCacheManifest(resourceKey)
                 return chat
             } catch {
@@ -5722,34 +5785,46 @@ export class NodeStorage{
         }
         if (da.status < 200 || da.status >= 300) throw new Error(`fetchChatContent error: ${da.status}`)
         const buffer = new Uint8Array(await awaitWithAbort(da.arrayBuffer(), signal))
-        const chat = normalizeChat(await decodeRisuSave(buffer))
+        const decoded = await decodeRisuSave(buffer)
+        const acknowledged = snapshotPayload(decoded)
+        const chat = normalizeChat(decoded)
+        await this.rememberVerifiedChatRead(
+            chaId,
+            chatId,
+            da.headers.get('x-content-hash'),
+            buffer,
+            acknowledged,
+        )
         void storeBytes(resourceKey, buffer).catch(() => {
             // IndexedDB, quota, and Web Crypto anomalies are non-authoritative.
         })
         return chat
     }
 
-    async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any, backupReason?: string): Promise<void> {
-        const cacheEnabled = isResourceCacheEnabled()
-        const { bytes: encoded, hash: requestHash } = await encodeChatRowPayload(
-            chat,
-            cacheEnabled,
-        )
+    private async postChatContent(
+        chaId: string,
+        chatIndex: number,
+        chatId: string,
+        body: BodyInit,
+        contentType: string,
+        byteLength: number,
+        backupReason?: string,
+    ): Promise<{ hash?: string }> {
         const headers: Record<string, string> = {
-            'content-type': 'application/octet-stream',
+            'content-type': contentType,
             'x-chat-id': chatId,
         }
         if (backupReason !== undefined) {
             headers['x-chat-backup-reason'] = backupReason
         }
-        const response = await runBoundedAuthoritativeStorageOperation(
+        return runBoundedAuthoritativeStorageOperation(
             async (signal, outcome) => {
                 const da = await this.authFetch(
                     `/api/chat-content/${encodeURIComponent(chaId)}/${chatIndex}`,
                     {
                         method: 'POST',
                         headers,
-                        body: encoded as unknown as BodyInit,
+                        body,
                         signal,
                     },
                     true,
@@ -5796,12 +5871,91 @@ export class NodeStorage{
                 return payload as { hash?: string }
             },
             'write',
-            authoritativeStoragePayloadTimeoutMs(encoded.byteLength),
+            authoritativeStoragePayloadTimeoutMs(byteLength),
         )
+    }
+
+    async saveChatContent(chaId: string, chatIndex: number, chatId: string, chat: any, backupReason?: string): Promise<void> {
+        const cacheEnabled = isResourceCacheEnabled()
+        const acknowledgementKey = this.chatAcknowledgementKey(chaId, chatId)
+        const previous = this.acknowledgedChatRows.get(acknowledgementKey) ?? null
+        const prepared = await prepareChatRowCheckpoint(previous?.chat ?? null, chat)
+        const { bytes: encoded, hash: requestHash } = prepared
+        let response: { hash?: string } | null = null
+
+        if (previous && requestHash && prepared.patch) {
+            const delta: ChatDeltaRequest = {
+                version: CHAT_DELTA_VERSION,
+                baseHash: previous.hash,
+                resultHash: requestHash,
+                resultSize: encoded.byteLength,
+                patch: prepared.patch,
+            }
+            const deltaBody = JSON.stringify(delta)
+            const deltaBytes = new TextEncoder().encode(deltaBody).byteLength
+            if (deltaBytes < encoded.byteLength) {
+                try {
+                    response = await this.postChatContent(
+                        chaId,
+                        chatIndex,
+                        chatId,
+                        deltaBody,
+                        CHAT_DELTA_CONTENT_TYPE,
+                        deltaBytes,
+                        backupReason,
+                    )
+                } catch (error) {
+                    const deltaRefusal = error instanceof StorageError
+                        && error.commitOutcomeUnknown === false
+                        && error.commitOutcome !== 'committed'
+                        && error.code?.startsWith('CHAT_DELTA_') === true
+                    if (!deltaRefusal) throw error
+                }
+                // A delta is durable only when the server acknowledges the
+                // exact materialized-row digest. A refusal or mismatch uses the
+                // byte-identical full-row fallback from the same worker result.
+                if (response?.hash !== requestHash) response = null
+            }
+        }
+
+        if (!response) {
+            response = await this.postChatContent(
+                chaId,
+                chatIndex,
+                chatId,
+                encoded as unknown as BodyInit,
+                'application/octet-stream',
+                encoded.byteLength,
+                backupReason,
+            )
+        }
+
+        if (response.hash === requestHash && requestHash) {
+            this.rememberChatAcknowledgement(
+                chaId,
+                chatId,
+                requestHash,
+                prepared.snapshot,
+            )
+        } else {
+            this.forgetChatAcknowledgement(chaId, chatId)
+            // Preserve the historical hashless full-row acknowledgement for a
+            // legacy server. A present-but-different digest is never accepted.
+            if (response.hash !== undefined) {
+                throw new StorageError('Chat save acknowledgement digest did not match.', {
+                    code: 'CHAT_ACK_HASH_MISMATCH',
+                    retryable: false,
+                    commitOutcome: 'committed',
+                    operation: 'write',
+                })
+            }
+        }
+
         if (!cacheEnabled || !requestHash || response.hash !== requestHash) return
         try {
-            // The exact request buffer stays immutable through acknowledgement,
-            // then ownership is donated to IndexedDB under the matching hash.
+            // These exact materialized bytes stay immutable through the digest
+            // acknowledgement, then ownership is donated to IndexedDB. On the
+            // delta path they were not uploaded, but identify the same logical row.
             await storeOwnedBytesWithKnownHash(
                 `chat:${chaId}/${chatId}`,
                 requestHash,

@@ -46,6 +46,29 @@ function request(body: Buffer, policySymbol: symbol) {
 }
 
 describe('admitted ingress disk spool', () => {
+  test('leaves bounded structured chat deltas on the JSON parser path', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-admitted-delta-'))
+    roots.push(root)
+    const policySymbol = Symbol('policy')
+    const body = Buffer.from('{"version":1}')
+    const req = request(body, policySymbol)
+    req.path = '/api/chat-content/character/0'
+    req.headers['content-type'] = 'application/vnd.pocketrisu.chat-delta+json'
+    req[policySymbol].bodyKind = 'json'
+    const res = new FakeResponse()
+    const next = vi.fn()
+    const middleware = createAdmittedIngressSpoolMiddleware({
+      policySymbol,
+      spoolDir: () => root,
+      globalBudgetBytes: 1024,
+    })
+
+    await middleware(req, res, next)
+    expect(next).toHaveBeenCalledOnce()
+    expect(req[ADMITTED_INGRESS_SPOOL]).toBeUndefined()
+    expect(admittedIngressSpoolMetrics()).toMatchObject({ requests: 0, bytes: 0 })
+  })
+
   test('bypasses req.body and writes even one payload-sized source chunk in bounded pages', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-admitted-spool-'))
     roots.push(root)

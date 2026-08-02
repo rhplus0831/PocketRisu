@@ -11,7 +11,9 @@ const workerScope = self as unknown as DedicatedWorkerGlobalScope
 let operationChain: Promise<void> = Promise.resolve()
 
 function resultTransfers(result: Awaited<ReturnType<typeof runPayloadCodecOperation>>): Transferable[] {
-    return result.kind === 'encode-chat' ? [result.bytes.buffer as ArrayBuffer] : []
+    return result.kind === 'encode-chat' || result.kind === 'prepare-chat-checkpoint'
+        ? [result.bytes.buffer as ArrayBuffer]
+        : []
 }
 
 workerScope.addEventListener('message', (event: MessageEvent<PayloadCodecWorkerRequest>) => {
