@@ -1,4 +1,5 @@
 import { describe, test, expect, vi } from 'vitest'
+import { DatabaseDirtyRevisionLedger, type RisuSaveDirtyRevisions } from './databaseDirtyRevisions'
 
 // Mock heavy deps so importing risuSave.ts doesn't pull the Svelte runtime
 // or trigger module-level side effects. The patcher and the helper it
@@ -21,6 +22,7 @@ const {
     decodeRisuSave,
     diffArrayWithIdGuard,
     encodeRisuSaveLegacy,
+    RisuSaveEncoder,
     RisuSavePatcher,
 } = await import('./risuSave')
 const { compare } = await import('fast-json-patch')
@@ -323,8 +325,9 @@ async function acknowledgedSet(
     patcher: InstanceType<typeof RisuSavePatcher>,
     data: any,
     toSave: ReturnType<typeof emptyToSave>,
+    revisions?: RisuSaveDirtyRevisions,
 ) {
-    const proposal = await patcher.set(data, toSave)
+    const proposal = await patcher.set(data, toSave, revisions)
     patcher.commit(proposal)
     return proposal
 }
@@ -765,10 +768,171 @@ const chr = (chaId: string, fields: Record<string, any> = {}) => ({
     chatPage: 0,
     ...fields,
 })
-const dbWith = (characters: any[], rest: Record<string, any> = {}) => ({
+const dbWith = (characters: any[], rest: Record<string, any> = {}): any => ({
     formatversion: 4, username: 'u', personaPrompt: 'p', botPresets: [], modules: [], characters, ...rest,
 })
 const clone = (o: any) => JSON.parse(JSON.stringify(o))
+
+function trustedRevisionLedger(data: any) {
+    const ledger = new DatabaseDirtyRevisionLedger()
+    ledger.trustRootStructure(true)
+    for (const key of Object.keys(data)) {
+        if (!['characters', 'botPresets', 'modules', 'plugins', 'pluginCustomStorage'].includes(key)) {
+            ledger.trustRootKey(key, true)
+        }
+    }
+    ledger.trustCharacterStructure(true)
+    for (const character of data.characters ?? []) {
+        if (character?.chaId) ledger.trustCharacter(character.chaId, true)
+    }
+    ledger.trustModuleStructure(true)
+    ledger.trustBranch('modulesStructural', true)
+    for (const module of data.modules ?? []) {
+        if (typeof module?.id === 'string') ledger.trustModule(module.id, true)
+    }
+    ledger.trustBranch('botPreset', true)
+    ledger.trustBranch('plugins', true)
+    ledger.trustBranch('pluginCustomStorage', true)
+    return ledger
+}
+
+describe('dirty revision serialization gates', () => {
+    test('an unrelated root-key save serializes no untouched characters in encoder or patcher', async () => {
+        const baseline = dbWith(Array.from({ length: 64 }, (_, index) => (
+            chr(`char-${index}`, { desc: 'large'.repeat(1_000) })
+        )), {
+            plugins: [],
+            pluginCustomStorage: {},
+        })
+        const events: Array<{ codec: string; branch: string; identity: string }> = []
+        const options = {
+            verifyDirtyRevisions: false,
+            onWork: (event: { codec: string; branch: string; identity: string }) => events.push(event),
+        }
+        const encoder = new RisuSaveEncoder(options as any)
+        const patcher = new RisuSavePatcher(options as any)
+        await encoder.init(baseline)
+        await patcher.init(baseline)
+        const ledger = trustedRevisionLedger(baseline)
+
+        baseline.personaPrompt = 'edited root key'
+        ledger.markRootKey('personaPrompt')
+        const revisions = ledger.capture()
+        events.length = 0
+        await encoder.set(baseline, { ...emptyToSave(), root: true }, revisions)
+        const proposal = await patcher.set(baseline, { ...emptyToSave(), root: true }, revisions)
+
+        expect(events.filter(event => event.branch === 'character')).toEqual([])
+        expect(proposal.patch.some((operation: any) => operation.path === '/personaPrompt')).toBe(true)
+        patcher.commit(proposal)
+        ledger.commit(revisions)
+    })
+
+    test('character-only updates do not rebuild root after the directory baseline is established', async () => {
+        const database = dbWith([chr('a'), chr('b')], {
+            plugins: [],
+            pluginCustomStorage: {},
+        })
+        const events: Array<{ branch: string; work: string }> = []
+        const encoder = new RisuSaveEncoder({
+            verifyDirtyRevisions: false,
+            onWork: event => events.push(event),
+        })
+        await encoder.init(database)
+        const ledger = trustedRevisionLedger(database)
+
+        // Establish a clean set before the character-only mutation.
+        await encoder.set(database, emptyToSave(), ledger.capture())
+        events.length = 0
+        database.characters[1].desc = 'changed'
+        ledger.markCharacter('b')
+        await encoder.set(database, { ...emptyToSave(), character: ['b'] }, ledger.capture())
+
+        expect(events.some(event => event.branch === 'root' && event.work === 'json-encode')).toBe(false)
+        expect(events.filter(event => event.branch === 'character')).toHaveLength(1)
+    })
+
+    test('character additions still rebuild root so __directory names the new block', async () => {
+        const database = dbWith([chr('a')], {
+            botPresets: [{ id: 'preset-a', name: 'Preset A' }],
+            plugins: [],
+            pluginCustomStorage: {},
+        })
+        const events: Array<{ branch: string; work: string }> = []
+        const encoder = new RisuSaveEncoder({
+            verifyDirtyRevisions: false,
+            onWork: event => events.push(event),
+        })
+        await encoder.init(database)
+        const ledger = trustedRevisionLedger(database)
+        await encoder.set(database, emptyToSave(), ledger.capture())
+
+        database.characters.push(chr('b'))
+        ledger.markCharacter('b')
+        ledger.trustCharacter('b', true)
+        events.length = 0
+        await encoder.set(database, { ...emptyToSave(), character: ['b'] }, ledger.capture())
+
+        expect(events.some(event => event.branch === 'root' && event.work === 'json-encode')).toBe(true)
+        const encoded = encoder.encode()
+        expect(encoded).not.toBeNull()
+        const decoded = await decodeRisuSave(new Uint8Array(encoded!))
+        expect(decoded.characters.map((character: any) => character.chaId)).toEqual(['a', 'b'])
+    })
+
+    test('dual-run verification throws with branch identity on a missed character mutation', async () => {
+        const database = dbWith([chr('a'), chr('b')], {
+            plugins: [],
+            pluginCustomStorage: {},
+        })
+        const ledger = trustedRevisionLedger(database)
+        const clean = ledger.capture()
+        const encoder = new RisuSaveEncoder({ verifyDirtyRevisions: true })
+        const patcher = new RisuSavePatcher({ verifyDirtyRevisions: true })
+        await encoder.init(database)
+        await patcher.init(database)
+
+        database.characters[1].desc = 'mutation that bypassed revision instrumentation'
+        await expect(encoder.set(database, emptyToSave(), clean))
+            .rejects.toThrow(/encoder character:b revision says clean/)
+        await expect(patcher.set(database, emptyToSave(), clean))
+            .rejects.toThrow(/patcher character:b revision says clean/)
+    })
+
+    test('dual-run verification identifies a missed root-key mutation', async () => {
+        const database = dbWith([chr('a')])
+        const ledger = trustedRevisionLedger(database)
+        const clean = ledger.capture()
+        const patcher = new RisuSavePatcher({ verifyDirtyRevisions: true })
+        await patcher.init(database)
+
+        database.personaPrompt = 'untracked root mutation'
+        await expect(patcher.set(database, emptyToSave(), clean))
+            .rejects.toThrow(/patcher root:personaPrompt revision says clean/)
+    })
+
+    test('untrusted branches retain JSON equality as the correctness authority', async () => {
+        const database = dbWith([chr('a')])
+        const untrustedLedger = new DatabaseDirtyRevisionLedger()
+        const events: Array<{ codec: string; branch: string }> = []
+        const options = {
+            verifyDirtyRevisions: false,
+            onWork: (event: { codec: string; branch: string }) => events.push(event),
+        }
+        const encoder = new RisuSaveEncoder(options as any)
+        const patcher = new RisuSavePatcher(options as any)
+        await encoder.init(database)
+        await patcher.init(database)
+
+        database.characters[0].desc = 'mutation in an untrusted branch'
+        const untrustedClean = untrustedLedger.capture()
+        await encoder.set(database, emptyToSave(), untrustedClean)
+        const proposal = await patcher.set(database, emptyToSave(), untrustedClean)
+
+        expect(events.filter(event => event.branch === 'character')).toHaveLength(2)
+        expect(proposal.patch.some((operation: any) => operation.path === '/characters/0/desc')).toBe(true)
+    })
+})
 
 describe('bounded character patches', () => {
     test('keeps a granular diff when it fits both budgets', () => {

@@ -597,11 +597,13 @@ describe("V3 mode-aware database bridge", () => {
         DBState.db = testState.database;
         const api = makeRisuaiAPIV3(document.createElement("iframe"), plugin as any) as any;
 
-        const result = api.setCharacterToIndex(1, {
+        const callerOwned = {
             chaId: "char-b",
             name: "B updated",
             chats: [],
-        });
+        };
+        const result = api.setCharacterToIndex(1, callerOwned);
+        callerOwned.name = "late raw-alias mutation";
 
         expect(result).toBeUndefined();
         expect(testState.database.characters[1].name).toBe("B updated");

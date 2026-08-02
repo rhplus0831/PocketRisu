@@ -12,6 +12,7 @@ import {
 } from "../plugins/pluginStorageRecord";
 import { isWellFormedUnicode } from "./unicodeWellFormed";
 import { createBoundedMsgpackEncoder } from "./boundedMsgpack";
+import type { RisuSaveDirtyRevisions, RisuSaveRevisionBranch } from "./databaseDirtyRevisions";
 
 const packr = new Packr({
     useRecords:false,
@@ -279,6 +280,45 @@ export type toSaveType = {
     pluginCustomStorage: boolean;
 }
 
+export type RisuSaveWorkEvent = {
+    codec: 'encoder' | 'patcher'
+    branch: 'root' | 'character' | 'botPreset' | 'module' | 'plugins' | 'pluginCustomStorage'
+    identity: string
+    work: 'json-equality' | 'json-encode'
+}
+
+export interface RisuSaveCodecOptions {
+    /** Test/env-gated dual run: trusted clean revisions are checked against JSON equality. */
+    verifyDirtyRevisions?: boolean
+    onWork?: (event: RisuSaveWorkEvent) => void
+}
+
+function defaultDirtyRevisionVerification(): boolean {
+    return import.meta.env.MODE === 'test'
+        || import.meta.env.VITE_RISU_SAVE_VERIFY_DIRTY_REVISIONS === 'true'
+}
+
+function revisionDivergence(
+    codec: 'encoder' | 'patcher',
+    branch: string,
+): Error {
+    return new Error(
+        `RisuSave dirty revision divergence: ${codec} ${branch} revision says clean but JSON equality says dirty`,
+    )
+}
+
+function isRevisionBranchDirty(
+    revisions: RisuSaveDirtyRevisions | undefined,
+    branch: RisuSaveRevisionBranch,
+): boolean {
+    if (!revisions) return false
+    if (branch === 'botPreset') return revisions.botPreset !== null
+    if (branch === 'charactersStructural') return revisions.charactersStructural !== null
+    if (branch === 'modulesStructural') return revisions.modulesStructural !== null
+    if (branch === 'plugins') return revisions.plugins !== null
+    return revisions.pluginCustomStorage !== null
+}
+
 enum RisuSaveType {
     CONFIG = 0,
     ROOT = 1,
@@ -363,8 +403,25 @@ export class RisuSaveEncoder {
         pluginStorage: '{}',
     };
     private normalizedBaseline: Database | null = null;
+    private lastDirectory: string[] = [];
     private readonly cacheGenerationOwner = Symbol('RisuSaveEncoder cache generation');
     private readonly cachedBlocks = new Map<string, RisuSaveCachedBlock>();
+    private readonly verifyDirtyRevisions: boolean;
+    private readonly onWork?: (event: RisuSaveWorkEvent) => void;
+
+    constructor(options: RisuSaveCodecOptions = {}) {
+        this.verifyDirtyRevisions = options.verifyDirtyRevisions
+            ?? defaultDirtyRevisionVerification();
+        this.onWork = options.onWork;
+    }
+
+    private recordWork(
+        branch: RisuSaveWorkEvent['branch'],
+        identity: string,
+        work: RisuSaveWorkEvent['work'],
+    ): void {
+        this.onWork?.({ codec: 'encoder', branch, identity, work });
+    }
 
     private invalidatePublishedCache(){
         if(risuSaveCacheGeneration?.owner === this.cacheGenerationOwner){
@@ -391,6 +448,7 @@ export class RisuSaveEncoder {
         this.blocks = {};
         this.characterJsons = {};
         this.normalizedBaseline = null;
+        this.lastDirectory = [];
         this.baselineJsons = {
             root: '{}',
             preset: '[]',
@@ -413,16 +471,10 @@ export class RisuSaveEncoder {
                 obj[key] = data[key]
             }
         }
-        this.baselineJsons.root = JSON.stringify(obj);
-        this.blocks['root'] = await this.encodeBlock({
-            compression,
-            data: this.baselineJsons.root,
-            type: RisuSaveType.ROOT,
-            name: 'root',
-            // The root is required to discover the directory and therefore
-            // can never itself be recovered through that directory.
-            cache: false,
-        });
+        // Reserve the first block slot now, then fill it after every directory
+        // member exists. Assignment preserves insertion order, keeping root
+        // first without encoding an incomplete directory.
+        this.blocks['root'] = new Uint8Array();
         this.baselineJsons.preset = JSON.stringify(data.botPresets);
         this.blocks['preset'] = await this.encodeBlock({
             compression,
@@ -480,22 +532,28 @@ export class RisuSaveEncoder {
             type: RisuSaveType.CONFIG,
             name: "config"
         })
+        this.lastDirectory = Object.keys(this.blocks).filter(key => key !== 'root');
+        obj.__directory = this.lastDirectory;
+        this.baselineJsons.root = JSON.stringify(obj);
+        this.blocks['root'] = await this.encodeBlock({
+            compression,
+            data: this.baselineJsons.root,
+            type: RisuSaveType.ROOT,
+            name: 'root',
+            // The root is required to discover the directory and therefore
+            // can never itself be recovered through that directory.
+            cache: false,
+        });
         this.publishCacheGeneration();
     }
 
-    async set(data:Database, toSave:toSaveType){
+    async set(
+        data: Database,
+        toSave: toSaveType,
+        revisions?: RisuSaveDirtyRevisions,
+    ){
         this.invalidatePublishedCache();
         this.normalizedBaseline = null;
-        let obj:Record<any,any> = {}
-        let keys = Object.keys(data)
-        for(const key of keys){
-            if(
-                key !== 'characters' && key !== 'botPresets' && key !== 'modules' &&
-                key !== 'plugins' && key !== 'pluginCustomStorage'
-            ){
-                obj[key] = data[key]
-            }
-        }
 
         const savedId = new Set<string>();
         for(const character of data.characters) {
@@ -505,10 +563,29 @@ export class RisuSaveEncoder {
             const chaId = character.chaId
             savedId.add(chaId)
             const index = toSave.character.indexOf(chaId);
+            const revisionDirty = revisions?.characters.has(chaId) === true;
+            const trustedClean = !!revisions
+                && !revisionDirty
+                && revisions.isCharacterTrusted(chaId);
+            if (trustedClean && index === -1 && this.blocks[chaId]) {
+                if (this.verifyDirtyRevisions) {
+                    const charForVerify = {
+                        ...character,
+                        chats: character.chats.map(c => chatToStub(c)),
+                    }
+                    this.recordWork('character', chaId, 'json-equality')
+                    const currentJson = JSON.stringify(charForVerify)
+                    if (this.characterJsons[chaId] !== currentJson) {
+                        throw revisionDivergence('encoder', `character:${chaId}`)
+                    }
+                }
+                continue
+            }
             // Compare against the stub-replaced character so hydration (stub →
             // full chat) doesn't read as a change of the character itself.
             // Raw stringify (see init): circular refs fail the save loudly.
             const charForEncode = { ...character, chats: character.chats.map(c => chatToStub(c)) }
+            this.recordWork('character', chaId, revisionDirty || index !== -1 ? 'json-encode' : 'json-equality')
             const charJson = JSON.stringify(charForEncode)
             const hasChanged = this.characterJsons[chaId] !== charJson
 
@@ -554,7 +631,11 @@ export class RisuSaveEncoder {
             }
         }
 
-        if(toSave.botPreset){
+        const botPresetDirty = toSave.botPreset
+            || isRevisionBranchDirty(revisions, 'botPreset')
+            || (!!revisions && !revisions.isBranchTrusted('botPreset'))
+        if(botPresetDirty){
+            this.recordWork('botPreset', 'botPresets', 'json-encode')
             this.baselineJsons.preset = JSON.stringify(data.botPresets);
             this.blocks['preset'] = await this.encodeBlock({
                 compression: this.compression,
@@ -563,7 +644,18 @@ export class RisuSaveEncoder {
                 name: 'preset'
             });
         }
-        if(toSave.modules){
+        const modulesDirty = toSave.modules
+            || (revisions?.modules.size ?? 0) > 0
+            || isRevisionBranchDirty(revisions, 'modulesStructural')
+            || (!!revisions && (
+                !revisions.isBranchTrusted('modulesStructural')
+                || (data.modules ?? []).some((module: any) => (
+                    typeof module?.id !== 'string'
+                    || !revisions.isModuleTrusted(module.id)
+                ))
+            ))
+        if(modulesDirty){
+            this.recordWork('module', 'modules', 'json-encode')
             this.baselineJsons.modules = JSON.stringify(data.modules);
             this.blocks['modules'] = await this.encodeBlock({
                 compression: this.compression,
@@ -573,9 +665,13 @@ export class RisuSaveEncoder {
             });
         }
 
-        if(toSave.pluginCustomStorage){
+        const pluginStorageDirty = toSave.pluginCustomStorage
+            || isRevisionBranchDirty(revisions, 'pluginCustomStorage')
+            || (!!revisions && !revisions.isBranchTrusted('pluginCustomStorage'))
+        if(pluginStorageDirty){
             // Mode transitions mark this block dirty so externalization writes
             // an empty block and internalization writes the restored inline map.
+            this.recordWork('pluginCustomStorage', 'pluginCustomStorage', 'json-encode')
             this.baselineJsons.pluginStorage = JSON.stringify(data.pluginCustomStorage);
             this.blocks['pluginStorage'] = await this.encodeBlock({
                 compression: this.compression,
@@ -585,7 +681,11 @@ export class RisuSaveEncoder {
             });
         }
 
-        if(toSave.plugins){
+        const pluginsDirty = toSave.plugins
+            || isRevisionBranchDirty(revisions, 'plugins')
+            || (!!revisions && !revisions.isBranchTrusted('plugins'))
+        if(pluginsDirty){
+            this.recordWork('plugins', 'plugins', 'json-encode')
             this.baselineJsons.plugins = JSON.stringify(data.plugins);
             this.blocks['plugins'] = await this.encodeBlock({
                 compression: this.compression,
@@ -595,15 +695,80 @@ export class RisuSaveEncoder {
             });
         }
 
-        obj["__directory"] = Object.keys(this.blocks).filter(key => key !== 'root');
-        this.baselineJsons.root = JSON.stringify(obj);
-        this.blocks['root'] = await this.encodeBlock({
-            compression: this.compression,
-            data: this.baselineJsons.root,
-            type: RisuSaveType.ROOT,
-            name: 'root',
-            cache: false,
-        });
+        const nextDirectory = Object.keys(this.blocks).filter(key => key !== 'root');
+        const directoryChanged = nextDirectory.length !== this.lastDirectory.length
+            || nextDirectory.some((key, index) => key !== this.lastDirectory[index]);
+        const rootKeys = Object.keys(data).filter(key => (
+            key !== 'characters' && key !== 'botPresets' && key !== 'modules'
+            && key !== 'plugins' && key !== 'pluginCustomStorage'
+        ));
+        const baselineRoot = JSON.parse(this.baselineJsons.root) as Record<string, unknown>;
+        const baselineRootKeys = Object.keys(baselineRoot).filter(key => key !== '__directory');
+        const allRootKeys = new Set([...rootKeys, ...baselineRootKeys]);
+        const rootTrusted = !!revisions
+            && [...allRootKeys].every(key => revisions.isRootKeyTrusted(key));
+        const rootRevisionDirty = !!revisions && revisions.rootKeys.size > 0;
+        const rebuildRoot = directoryChanged
+            || rootRevisionDirty
+            || !revisions
+            || !rootTrusted;
+
+        if (rebuildRoot) {
+            const obj: Record<string, any> = {}
+            for (const key of rootKeys) obj[key] = data[key]
+            obj.__directory = nextDirectory
+            this.recordWork('root', 'root', 'json-encode')
+            this.baselineJsons.root = JSON.stringify(obj);
+            this.blocks['root'] = await this.encodeBlock({
+                compression: this.compression,
+                data: this.baselineJsons.root,
+                type: RisuSaveType.ROOT,
+                name: 'root',
+                cache: false,
+            });
+            this.lastDirectory = nextDirectory;
+        } else if (this.verifyDirtyRevisions) {
+            const obj: Record<string, any> = {}
+            for (const key of rootKeys) obj[key] = data[key]
+            obj.__directory = nextDirectory
+            this.recordWork('root', 'root', 'json-equality')
+            if (JSON.stringify(obj) !== this.baselineJsons.root) {
+                throw revisionDivergence('encoder', 'root')
+            }
+        }
+
+        if (revisions && this.verifyDirtyRevisions) {
+            const verifyCleanBlock = (
+                branch: RisuSaveRevisionBranch,
+                workBranch: RisuSaveWorkEvent['branch'],
+                identity: string,
+                current: unknown,
+                baseline: string,
+                dirty: boolean,
+            ) => {
+                if (dirty || !revisions.isBranchTrusted(branch)) return
+                this.recordWork(workBranch, identity, 'json-equality')
+                if (JSON.stringify(current) !== baseline) {
+                    throw revisionDivergence('encoder', identity)
+                }
+            }
+            verifyCleanBlock('botPreset', 'botPreset', 'botPresets', data.botPresets, this.baselineJsons.preset, !!botPresetDirty)
+            verifyCleanBlock('plugins', 'plugins', 'plugins', data.plugins, this.baselineJsons.plugins, !!pluginsDirty)
+            verifyCleanBlock(
+                'pluginCustomStorage',
+                'pluginCustomStorage',
+                'pluginCustomStorage',
+                data.pluginCustomStorage,
+                this.baselineJsons.pluginStorage,
+                !!pluginStorageDirty,
+            )
+            if (!modulesDirty && revisions.isBranchTrusted('modulesStructural')) {
+                this.recordWork('module', 'modules', 'json-equality')
+                if (JSON.stringify(data.modules) !== this.baselineJsons.modules) {
+                    throw revisionDivergence('encoder', 'modules')
+                }
+            }
+        }
         this.publishCacheGeneration();
     }
 
@@ -679,6 +844,7 @@ export class RisuSaveEncoder {
         this.characterJsons = {};
         this.cachedBlocks.clear();
         this.normalizedBaseline = null;
+        this.lastDirectory = [];
         this.baselineJsons = {
             root: '{}',
             preset: '[]',
@@ -1614,6 +1780,22 @@ export class RisuSavePatcher {
     private moduleItemHashes = new Map<string, number>();
     private revision = 0;
     private pendingProposals = new WeakMap<RisuSavePatchProposal, PendingRisuSavePatchProposal>();
+    private readonly verifyDirtyRevisions: boolean;
+    private readonly onWork?: (event: RisuSaveWorkEvent) => void;
+
+    constructor(options: RisuSaveCodecOptions = {}) {
+        this.verifyDirtyRevisions = options.verifyDirtyRevisions
+            ?? defaultDirtyRevisionVerification();
+        this.onWork = options.onWork;
+    }
+
+    private recordWork(
+        branch: RisuSaveWorkEvent['branch'],
+        identity: string,
+        work: RisuSaveWorkEvent['work'],
+    ): void {
+        this.onWork?.({ codec: 'patcher', branch, identity, work });
+    }
 
     hash(): string {
         this.hashBlocks['characters'] = SEED_ARRAY;
@@ -1712,7 +1894,10 @@ export class RisuSavePatcher {
     }
 
     private forkForProposal(): RisuSavePatcher {
-        const fork = new RisuSavePatcher();
+        const fork = new RisuSavePatcher({
+            verifyDirtyRevisions: this.verifyDirtyRevisions,
+            onWork: this.onWork,
+        });
         fork.lastSyncedDb = {
             ...this.lastSyncedDb,
             characters: [...(this.lastSyncedDb.characters ?? [])],
@@ -1732,9 +1917,13 @@ export class RisuSavePatcher {
      * Prepare a patch without advancing the acknowledged baseline. Call
      * commit() only after the server accepts this exact proposal.
      */
-    async set(data: any, toSave: toSaveType): Promise<RisuSavePatchProposal> {
+    async set(
+        data: any,
+        toSave: toSaveType,
+        revisions?: RisuSaveDirtyRevisions,
+    ): Promise<RisuSavePatchProposal> {
         const fork = this.forkForProposal();
-        const proposal = await fork.advance(data, toSave);
+        const proposal = await fork.advance(data, toSave, revisions);
         this.pendingProposals.set(proposal, {
             revision: this.revision,
             state: fork.captureState(),
@@ -1846,7 +2035,11 @@ export class RisuSavePatcher {
         this.moduleItemHashes.clear();
     }
 
-    private async advance(data: any, toSave: toSaveType): Promise<RisuSavePatchProposal> {
+    private async advance(
+        data: any,
+        toSave: toSaveType,
+        revisions?: RisuSaveDirtyRevisions,
+    ): Promise<RisuSavePatchProposal> {
         const { compare } = await import('fast-json-patch')
         const expectedHash: string = this.hash();
         const patch: any[] = []
@@ -1877,6 +2070,22 @@ export class RisuSavePatcher {
         // (see init()) so normalize-affected data always falls to the full path.
         const nextRoot: any = {}
         const removedRootKeys = new Set(Object.keys(lastRoot))
+        const rootKeyRevisionDirty = (key: string) => {
+            if (!revisions) return false
+            if (key === 'plugins') return revisions.plugins !== null
+            if (key === 'pluginCustomStorage') {
+                return revisions.pluginCustomStorage !== null
+            }
+            return revisions.rootKeys.has(key)
+        }
+        const rootKeyTrusted = (key: string) => {
+            if (!revisions) return false
+            if (key === 'plugins') return revisions.isBranchTrusted('plugins')
+            if (key === 'pluginCustomStorage') {
+                return revisions.isBranchTrusted('pluginCustomStorage')
+            }
+            return revisions.isRootKeyTrusted(key)
+        }
         for (const key of Object.keys(curRoot)) {
             // An own '__proto__' key can't round-trip through JSON Patch — the
             // server's applyPatch rejects any op touching it (prototype-pollution
@@ -1889,7 +2098,56 @@ export class RisuSavePatcher {
             // hasOwn, not `in`: membership must match the baseline's OWN keys
             // (`in` would treat inherited names like 'toString' as present).
             const hadKey = Object.hasOwn(lastRoot, key)
+            const revisionDirty = rootKeyRevisionDirty(key)
+            const trustedClean = !!revisions && !revisionDirty && rootKeyTrusted(key)
+            if (trustedClean) {
+                if (this.verifyDirtyRevisions) {
+                    this.recordWork(
+                        key === 'plugins' ? 'plugins'
+                            : key === 'pluginCustomStorage' ? 'pluginCustomStorage'
+                            : 'root',
+                        key,
+                        'json-equality',
+                    )
+                    let rawMatches = false
+                    try {
+                        const currentJson = JSON.stringify(curRoot[key])
+                        rawMatches = currentJson !== undefined
+                            && hadKey
+                            && currentJson === this.lastRootKeyJsons.get(key)
+                    } catch {
+                        rawMatches = false
+                    }
+                    if (!rawMatches) {
+                        const preservePluginStorageKeys = key === 'pluginCustomStorage'
+                            || key === 'pluginStorageMeta'
+                        const normVal = normalizeJSON(
+                            curRoot[key],
+                            undefined,
+                            preservePluginStorageKeys,
+                        )
+                        const equalityOps = normVal === undefined
+                            ? (hadKey ? compare({ [key]: lastRoot[key] }, {}) : [])
+                            : compare(hadKey ? { [key]: lastRoot[key] } : {}, { [key]: normVal })
+                        if (equalityOps.length > 0) {
+                            throw revisionDivergence('patcher', `root:${key}`)
+                        }
+                    }
+                }
+                if (hadKey) {
+                    removedRootKeys.delete(key)
+                    nextRoot[key] = lastRoot[key]
+                }
+                continue
+            }
             let curKeyJson: string | undefined
+            this.recordWork(
+                key === 'plugins' ? 'plugins'
+                    : key === 'pluginCustomStorage' ? 'pluginCustomStorage'
+                    : 'root',
+                key,
+                'json-equality',
+            )
             try { curKeyJson = JSON.stringify(curRoot[key]) } catch { curKeyJson = undefined }
             // Fast skip: raw JSON equals the normalized baseline ⇒ present and
             // unchanged. curKeyJson can be undefined for non-serializable values
@@ -1947,12 +2205,23 @@ export class RisuSavePatcher {
         for (const key of removedRootKeys) {
             // Key deleted from the live db (or its value normalized to undefined)
             // → emit the remove op (escaping via compare) and drop its caches.
+            if (
+                revisions
+                && !rootKeyRevisionDirty(key)
+                && rootKeyTrusted(key)
+                && this.verifyDirtyRevisions
+            ) {
+                throw revisionDivergence('patcher', `root:${key}`)
+            }
             for (const p of compare({ [key]: lastRoot[key] }, {})) patch.push(p)
             delete this.hashBlocks[key]
             this.lastRootKeyJsons.delete(key)
         }
 
-        if (toSave.botPreset) {
+        const botPresetDirty = toSave.botPreset
+            || isRevisionBranchDirty(revisions, 'botPreset')
+            || (!!revisions && !revisions.isBranchTrusted('botPreset'))
+        if (botPresetDirty) {
             const normBotPresets = normalizeJSON(curBotPresets) ?? []
             const ops = diffArrayWithIdGuard(compare, '/botPresets', lastBotPresets, normBotPresets, 'id')
             for (const op of ops) patch.push(op)
@@ -1960,7 +2229,17 @@ export class RisuSavePatcher {
             this.lastSyncedDb.botPresets = normBotPresets;
         }
 
-        if (toSave.modules) {
+        const modulesDirty = toSave.modules
+            || (revisions?.modules.size ?? 0) > 0
+            || isRevisionBranchDirty(revisions, 'modulesStructural')
+            || (!!revisions && (
+                !revisions.isBranchTrusted('modulesStructural')
+                || (Array.isArray(curModules) ? curModules : []).some((module: any) => (
+                    typeof module?.id !== 'string'
+                    || !revisions.isModuleTrusted(module.id)
+                ))
+            ))
+        if (modulesDirty) {
             // Per-MODULE cheap pre-check, mirroring diffArrayWithIdGuard's
             // structural-vs-elementwise pivot: editing one module's lorebook
             // changes the modules block on every save, so only the edited
@@ -1998,7 +2277,31 @@ export class RisuSavePatcher {
                 // Same structure (all ids valid, string-typed, aligned) → element-wise.
                 for (let i = 0; i < curModulesArr.length; i++) {
                     const id = curModulesArr[i].id
+                    const revisionDirty = revisions?.modules.has(id) === true
+                    const trustedClean = !!revisions
+                        && !revisionDirty
+                        && revisions.isModuleTrusted(id)
+                    if (trustedClean) {
+                        if (this.verifyDirtyRevisions) {
+                            this.recordWork('module', id, 'json-equality')
+                            let rawMatches = false
+                            try {
+                                rawMatches = JSON.stringify(curModulesArr[i])
+                                    === this.lastModuleJsons.get(id)
+                            } catch {
+                                rawMatches = false
+                            }
+                            if (!rawMatches) {
+                                const normModule = normalizeJSON(curModulesArr[i])
+                                if (compare(lastModulesArr[i], normModule).length > 0) {
+                                    throw revisionDivergence('patcher', `module:${id}`)
+                                }
+                            }
+                        }
+                        continue
+                    }
                     let curModJson: string | null = null
+                    this.recordWork('module', id, revisionDirty ? 'json-encode' : 'json-equality')
                     try { curModJson = JSON.stringify(curModulesArr[i]) } catch { curModJson = null }
                     if (curModJson !== null && curModJson === this.lastModuleJsons.get(id) && this.moduleItemHashes.has(id)) {
                         continue // unchanged: baseline slot + item hash stay valid
@@ -2023,6 +2326,33 @@ export class RisuSavePatcher {
                 }
                 this.hashBlocks['modules'] = modulesHash
             }
+        } else if (
+            revisions
+            && revisions.isBranchTrusted('modulesStructural')
+            && this.verifyDirtyRevisions
+        ) {
+            const lastModulesArr: any[] = Array.isArray(lastModules) ? lastModules : []
+            const curModulesArr: any[] = Array.isArray(curModules) ? curModules : []
+            if (lastModulesArr.length !== curModulesArr.length) {
+                throw revisionDivergence('patcher', 'modules:structure')
+            }
+            for (let i = 0; i < curModulesArr.length; i++) {
+                const id = curModulesArr[i]?.id
+                this.recordWork('module', String(id ?? i), 'json-equality')
+                let rawMatches = false
+                try {
+                    rawMatches = typeof id === 'string'
+                        && JSON.stringify(curModulesArr[i]) === this.lastModuleJsons.get(id)
+                } catch {
+                    rawMatches = false
+                }
+                if (!rawMatches) {
+                    const normModule = normalizeJSON(curModulesArr[i])
+                    if (compare(lastModulesArr[i], normModule).length > 0) {
+                        throw revisionDivergence('patcher', `module:${String(id ?? i)}`)
+                    }
+                }
+            }
         }
 
         // Detect structural changes (additions, deletions, reordering)
@@ -2038,6 +2368,19 @@ export class RisuSavePatcher {
         }
 
         if (structuralChange) {
+            if (
+                revisions
+                && this.verifyDirtyRevisions
+                && revisions.charactersStructural === null
+                && [...new Set([...lastIds, ...curIds])]
+                    .filter(Boolean)
+                    .every((chaId: string) => (
+                        !revisions.characters.has(chaId)
+                        && revisions.isCharacterTrusted(chaId)
+                    ))
+            ) {
+                throw revisionDivergence('patcher', 'characters:structure')
+            }
             // Structural change → replace entire characters array (safe for deletions/additions)
             const normChars = normalizeJSON(curCharacters.map(withStubs))
             patch.push({ op: 'replace', path: '/characters', value: normChars })
@@ -2064,11 +2407,41 @@ export class RisuSavePatcher {
                 const curChar = curCharacters[i]
                 const curCharId = curChar?.chaId
                 const trackedBySave = toSave.character.includes(curCharId ?? '')
+                const revisionDirty = revisions?.characters.has(curCharId ?? '') === true
+                const trustedClean = !!revisions
+                    && !revisionDirty
+                    && !!curCharId
+                    && revisions.isCharacterTrusted(curCharId)
+
+                if (trustedClean && !trackedBySave) {
+                    if (this.verifyDirtyRevisions) {
+                        this.recordWork('character', curCharId, 'json-equality')
+                        let rawMatches = false
+                        try {
+                            rawMatches = JSON.stringify(withStubs(curChar))
+                                === this.lastCharJsons.get(curCharId)
+                        } catch {
+                            rawMatches = false
+                        }
+                        if (!rawMatches) {
+                            const normChar = normalizeJSON(withStubs(curChar))
+                            if (compare(lastChar, normChar).length > 0) {
+                                throw revisionDivergence('patcher', `character:${curCharId}`)
+                            }
+                        }
+                    }
+                    continue
+                }
 
                 // Cheap pre-check: identical JSON ⇒ identical data ⇒ stored
                 // hash, baseline and (empty) diff are all still valid — skip
                 // the normalize + protocol hash + compare entirely.
                 let curJson: string | null = null
+                this.recordWork(
+                    'character',
+                    String(curCharId ?? i),
+                    revisionDirty || trackedBySave ? 'json-encode' : 'json-equality',
+                )
                 try { curJson = JSON.stringify(withStubs(curChar)) } catch { curJson = null }
                 if (!trackedBySave && curCharId && curJson !== null && curJson === this.lastCharJsons.get(curCharId)) {
                     continue

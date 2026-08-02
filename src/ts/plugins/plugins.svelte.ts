@@ -33,6 +33,7 @@ import {
     setDatabasePluginStorageRecordValue,
 } from "./pluginStorageRecord";
 import { markPluginStorageKeySetChanged } from "./pluginStorageEnumeration";
+import { cloneDatabaseField } from "../storage/databaseClone";
 
 export const customProviderStore = writable([] as string[])
 
@@ -1750,7 +1751,10 @@ export const getV2PluginAPIs = (generation?: V2PluginApiGeneration) => {
         setChar: (char: any) => {
             const db = getDatabase()
             const charid = get(selectedCharID)
-            db.characters[charid] = char
+            // Do not retain a plugin-owned raw alias behind Svelte's deep
+            // proxy. Later writes through that alias would bypass reactive
+            // dirty revisions.
+            db.characters[charid] = cloneDatabaseField('characters', char)
             setDatabaseLite(db)
         },
         addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string }>, options?: PluginV2ProviderOptions) => {
@@ -2108,7 +2112,7 @@ export const getV2PluginAPIs = (generation?: V2PluginApiGeneration) => {
                         db.pluginCustomStorage = readLegacyStorageInput(newDb, key, true) as any
                         markPluginStorageKeySetChanged()
                     } else {
-                        (db as any)[key] = newDb[key]
+                        (db as any)[key] = cloneDatabaseField(key, newDb[key])
                     }
                 }
                 else{
@@ -2139,7 +2143,7 @@ export const getV2PluginAPIs = (generation?: V2PluginApiGeneration) => {
                         db.pluginCustomStorage = readLegacyStorageInput(newDb, key, true) as any
                         markPluginStorageKeySetChanged()
                     } else {
-                        (db as any)[key] = newDb[key]
+                        (db as any)[key] = cloneDatabaseField(key, newDb[key])
                     }
                 }
                 else{

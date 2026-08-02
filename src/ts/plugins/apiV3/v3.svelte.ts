@@ -1680,7 +1680,10 @@ export const makeRisuaiAPIV3 = (
                 const previousCharacters = snapshotCharactersForDirtyTracking([
                     db.characters[charId],
                 ]);
-                DBState.db.characters[charId] = char
+                // Break the guest-owned raw alias before the value enters the
+                // canonical Svelte proxy; all later mutations must use the
+                // reactive state returned by PocketRisu.
+                DBState.db.characters[charId] = cloneDatabaseField('characters', char)
                 scheduleCharacterDirtyTargets(previousCharacters, [
                     DBState.db.characters[charId],
                 ]);

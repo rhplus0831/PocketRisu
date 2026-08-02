@@ -28,7 +28,6 @@ import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
 import { language } from "src/lang";
 import { startObserveDom } from "./observer.svelte";
 import { updateGuisize } from "./gui/guisize";
-import { deepTouch } from "./gui/deepTouch.svelte";
 import { updateLorebooks } from "./characters";
 import { initMobileGesture } from "./hotkey";
 import { moduleUpdate } from "./process/modules";
@@ -55,6 +54,8 @@ import {
 } from "./storage/clientBuildHandshake"
 import { watchActiveChatDirty } from "./storage/activeChatDirtyTracker.svelte"
 import { recordConflictRebaseGraphBudget } from "./storage/conflictRebaseBudget"
+import { watchDatabaseDirtyRevisions } from "./storage/databaseDirtyRevisionTracker.svelte"
+import type { RisuSaveDirtyRevisions } from "./storage/databaseDirtyRevisions"
 import {
     createRequestLogScope, recordRequestLog, fetchRequestLogs,
     type RequestLogCategory, type RequestLogSource, type RequestLogRoute,
@@ -391,9 +392,9 @@ export function requestImmediateSave(options?: {
     return requestImmediateSaveImpl(options)
 }
 
-// The reactive dirty tracker only watches the selected character, so code that
-// mutates a non-selected character (e.g. chat backup import from settings)
-// must mark it dirty explicitly or the change never persists.
+// Explicit arbitrary-target writers keep this bridge even though the state
+// tracker now observes every proxied character. It gives import/plugin paths a
+// synchronous durable target and covers work queued before saveDb() starts.
 export function markCharacterDirty(chaId: string) {
     dirtyTargetBridge.markCharacter(chaId)
 }
@@ -482,6 +483,11 @@ export async function saveDb() {
         plugins: false,
         pluginCustomStorage: false
     }
+    let databaseDirtyRevisionTracker: ReturnType<typeof watchDatabaseDirtyRevisions> | null = null
+    // The boot patch baseline can predate setDatabase() defaults/plugin startup.
+    // One acknowledged equality-fallback save is required before clean
+    // revisions may be trusted against that baseline.
+    let revisionTrustReady = false
 
     let encoder: RisuSaveEncoder | null = new RisuSaveEncoder()
     await encoder.init(getDatabase(), {
@@ -492,6 +498,32 @@ export async function saveDb() {
     if (supportsPatchSync) {
         await patcher.init(initialSaveBaseline)
         patchSyncBaseline = null
+        // setDatabase() defaults and plugin startup run before reactive
+        // revision effects exist. Prove whether that live graph still matches
+        // the server-read patch baseline once at startup; if it does not,
+        // schedule a conservative all-branch synchronization. This is the
+        // equality-backed foundation required before clean revisions can skip.
+        const startupProposal = await patcher.set(getDatabase(), {
+            character: [],
+            chat: [],
+            root: true,
+            botPreset: true,
+            modules: true,
+            plugins: true,
+            pluginCustomStorage: true,
+        })
+        if (startupProposal.patch.length > 0) {
+            changeTracker.character = (getDatabase().characters ?? [])
+                .map(character => character?.chaId)
+                .filter((chaId): chaId is string => !!chaId)
+            changeTracker.root = true
+            changeTracker.botPreset = true
+            changeTracker.modules = true
+            changeTracker.plugins = true
+            changeTracker.pluginCustomStorage = true
+            changed = true
+        }
+        patcher.discard(startupProposal)
     }
     if (capturePreTrackingPluginStorageChanges(
         changeTracker,
@@ -517,6 +549,7 @@ export async function saveDb() {
         changed
         || saving.state
         || hasTrackedChanges(changeTracker)
+        || !!databaseDirtyRevisionTracker?.ledger.hasDirty()
         || get(chatOperationActive)
     ))
 
@@ -547,13 +580,6 @@ export async function saveDb() {
     $effect.root(() => {
 
         let selIdState = $state(0)
-        let knownCharacterIds = new Set<string>((getDatabase()?.characters ?? []).map((character) => character?.chaId).filter(Boolean))
-        let didInitRootEffect = false
-        let didInitBotPresetEffect = false
-        let didInitModulesEffect = false
-        let didInitPluginsEffect = false
-        let didInitPluginStorageEffect = false
-        let didInitGeneralEffect = false
         const debounceTime = 500; // 500 milliseconds
         let saveTimeout: ReturnType<typeof setTimeout> | null = null;
         let rearmActiveChatDirty = () => {}
@@ -602,108 +628,39 @@ export async function saveDb() {
         });
         window.addEventListener('pagehide', flushImmediate);
 
-        $effect(() => {
-            for (const key in DBState.db) {
-                if (
-                    key !== 'characters' && key !== 'botPresets' && key !== 'modules' &&
-                    key !== 'plugins' && key !== 'pluginCustomStorage'
-                    && key !== 'pluginStorageMeta'
-                ) {
-                    deepTouch(DBState.db[key])
-                }
-            }
-            if (!didInitRootEffect) {
-                didInitRootEffect = true
-                return
-            }
-            changeTracker.root = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            DBState.db.botPresetsId
-            try { deepTouch(DBState.db.botPresets) } catch (e) {
-                console.warn('[Save] deepTouch(botPresets) failed:', e)
-                return
-            }
-            if (!didInitBotPresetEffect) {
-                didInitBotPresetEffect = true
-                return
-            }
-            changeTracker.botPreset = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            try { deepTouch(DBState.db.modules) } catch (e) {
-                console.warn('[Save] deepTouch(modules) failed:', e)
-                return
-            }
-            if (!didInitModulesEffect) {
-                didInitModulesEffect = true
-                return
-            }
-            changeTracker.modules = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            deepTouch(DBState.db.plugins)
-            if (!didInitPluginsEffect) {
-                didInitPluginsEffect = true
-                return
-            }
-            changeTracker.plugins = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            // In optimized mode this remains an empty compatibility map except
-            // during a reconciler transition; tracking it is what persists the
-            // final empty/restored pluginStorage save block.
-            deepTouch(DBState.db.pluginCustomStorage)
-            deepTouch(DBState.db.pluginStorageMeta)
-            if (!didInitPluginStorageEffect) {
-                didInitPluginStorageEffect = true
-                return
-            }
-            changeTracker.pluginCustomStorage = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            const currentCharacterIds = (DBState?.db?.characters ?? []).map((character) => character?.chaId).filter(Boolean)
-            deepTouch(currentCharacterIds)
-
-            const currentCharacterIdSet = new Set<string>(currentCharacterIds)
-            for (const previousCharacterId of knownCharacterIds) {
-                if (!currentCharacterIdSet.has(previousCharacterId)) {
-                    changeTracker.character = [previousCharacterId, ...changeTracker.character.filter((v) => v !== previousCharacterId)]
-                }
-            }
-            knownCharacterIds = currentCharacterIdSet
-
-            if (DBState?.db?.characters?.[selIdState]) {
-                for (const key in DBState.db.characters[selIdState]) {
-                    // Exclude chats — chat changes are tracked via chat-specific server save, not database.bin
-                    if (key !== 'chats') {
-                        deepTouch(DBState.db.characters[selIdState][key])
+        databaseDirtyRevisionTracker = watchDatabaseDirtyRevisions({
+            getDatabase,
+            onDirty: {
+                rootKey: () => {
+                    changeTracker.root = true
+                    saveTimeoutExecute()
+                },
+                character: (chaId) => {
+                    if (chaId) {
+                        changeTracker.character = [
+                            chaId,
+                            ...changeTracker.character.filter(id => id !== chaId),
+                        ]
                     }
-                }
-                // Track stub metadata and chat ordering for database.bin persistence.
-                deepTouch(DBState.db.characters[selIdState].chats.map(c => ({
-                    id: c.id,
-                    name: c.name,
-                    lastDate: c.lastDate,
-                    folderId: c.folderId,
-                    modules: c.modules,
-                })))
-                if (changeTracker.character[0] !== DBState.db.characters[selIdState]?.chaId) {
-                    changeTracker.character.unshift(DBState.db.characters[selIdState]?.chaId)
-                }
-            }
-            if (!didInitGeneralEffect) {
-                didInitGeneralEffect = true
-                changeTracker.character = []
-                changeTracker.chat = []
-                return
-            }
-            saveTimeoutExecute()
+                    saveTimeoutExecute()
+                },
+                botPreset: () => {
+                    changeTracker.botPreset = true
+                    saveTimeoutExecute()
+                },
+                module: () => {
+                    changeTracker.modules = true
+                    saveTimeoutExecute()
+                },
+                plugins: () => {
+                    changeTracker.plugins = true
+                    saveTimeoutExecute()
+                },
+                pluginCustomStorage: () => {
+                    changeTracker.pluginCustomStorage = true
+                    saveTimeoutExecute()
+                },
+            },
         })
         const activeChatDirtyTracker = watchActiveChatDirty({
             retouchDelayMs: ({ chatId }) => (
@@ -737,18 +694,25 @@ export async function saveDb() {
         })
         rearmActiveChatDirty = activeChatDirtyTracker.rearm
 
-        return activeChatDirtyTracker.stop
+        return () => {
+            activeChatDirtyTracker.stop()
+            databaseDirtyRevisionTracker?.stop()
+            databaseDirtyRevisionTracker = null
+        }
     })
 
-    // The general character effect clears its initial queues while establishing
-    // a clean reactive baseline. Reconcile startup-created/replaced full chats
-    // only after that initialization so their row writes cannot be discarded.
+    // The state tracker establishes a clean reactive baseline synchronously;
+    // reconcile startup-created/replaced full chats after its first flush so
+    // their row writes cannot be discarded as initialization noise.
     await tick()
     if (capturePreTrackingFullChatChanges(
         changeTracker,
         getDatabase(),
         initialSaveBaseline,
     )) {
+        for (const chaId of changeTracker.character) {
+            databaseDirtyRevisionTracker?.markCharacter(chaId)
+        }
         changed = true
     }
 
@@ -775,6 +739,10 @@ export async function saveDb() {
     }
 
     async function rebaseTrackedLocalChangesOnLatestServerDb(db: Database, toSave: toSaveType) {
+        // The replacement patcher is based on the authoritative candidate,
+        // while the installed live graph includes local overlays. Require one
+        // full equality run before clean revisions become authoritative again.
+        revisionTrustReady = false
         const candidate = await forageStorage.readDatabaseCandidate()
         if (!candidate.data || candidate.data.length === 0) {
             throw new Error('Conflict recovery could not read the authoritative database')
@@ -848,6 +816,7 @@ export async function saveDb() {
 
     async function persistTrackedChanges(
         toSave: toSaveType,
+        dirtyRevisions: RisuSaveDirtyRevisions | undefined,
         options?: {
             forceFullWrite?: boolean
             skipBroadcast?: boolean
@@ -890,14 +859,18 @@ export async function saveDb() {
         }
 
         // ── database.bin: exclude chat payload (stubs only via encoder) ──
-        await activeEncoder.set(db, safeStructuredClone(toSave))
+        await activeEncoder.set(db, safeStructuredClone(toSave), dirtyRevisions)
 
         let saved = false
         let newEtag: string | undefined
         let conflictRebaseToSave = toSave
 
         if (supportsPatchSync && !options?.forceFullWrite) {
-            const patchData = await activePatcher.set(db, safeStructuredClone(toSave))
+            const patchData = await activePatcher.set(
+                db,
+                safeStructuredClone(toSave),
+                dirtyRevisions,
+            )
             conflictRebaseToSave = activePatcher.conflictDirtyBranches(patchData)
             // Refuse to send patches that would corrupt server-side lazy chats.
             // chatToStub strips chats to metadata before diffing, so the only
@@ -1120,6 +1093,7 @@ export async function saveDb() {
                         const dirtyProposal = await activePatcher.set(
                             db,
                             safeStructuredClone(toSave),
+                            dirtyRevisions,
                         )
                         conflictRebaseToSave = activePatcher.conflictDirtyBranches(dirtyProposal)
                         activePatcher.discard(dirtyProposal)
@@ -1157,31 +1131,55 @@ export async function saveDb() {
     }): Promise<DatabaseSaveOutcome> {
         return saveCoordinator.run(async () => {
             const toSave = takeTrackedChanges()
-            if (!hasTrackedChanges(toSave) && !options?.forceFullWrite) {
+            const revisionProposal = databaseDirtyRevisionTracker?.ledger.capture()
+            const hasDirtyRevisions = revisionProposal
+                ? databaseDirtyRevisionTracker?.ledger.hasDirty(revisionProposal) === true
+                : false
+            if (!hasTrackedChanges(toSave) && !hasDirtyRevisions && !options?.forceFullWrite) {
                 return { status: 'committed' }
             }
 
             saving.state = true
             try {
-                const result = await persistTrackedChanges(toSave, options)
+                const result = await persistTrackedChanges(
+                    toSave,
+                    revisionTrustReady ? revisionProposal : undefined,
+                    options,
+                )
                 if (result === 'saved') {
+                    if (revisionProposal) {
+                        databaseDirtyRevisionTracker?.ledger.commit(revisionProposal)
+                    }
+                    revisionTrustReady = true
                     savetrys = 0
                     return { status: 'committed' }
                 } else if (result === 'retry') {
+                    if (revisionProposal) {
+                        databaseDirtyRevisionTracker?.ledger.discard(revisionProposal)
+                    }
                     return { status: 'retry' }
                 } else if (result === 'displaced') {
+                    if (revisionProposal) {
+                        databaseDirtyRevisionTracker?.ledger.discard(revisionProposal)
+                    }
                     return { status: 'displaced' }
-                } else if (result === 'noop' && hasTrackedChanges(toSave)) {
+                } else if (result === 'noop' && (hasTrackedChanges(toSave) || hasDirtyRevisions)) {
                     requeueTrackedChanges(toSave)
                     // Once displaced, pause instead of spinning forever. The
                     // frozen page can only leave through an explicit reload.
                     if (!gotChannel) changed = true
+                }
+                if (revisionProposal) {
+                    databaseDirtyRevisionTracker?.ledger.discard(revisionProposal)
                 }
                 return {
                     status: 'failed',
                     error: new Error('Database save completed without a durable write'),
                 }
             } catch (error) {
+                if (revisionProposal) {
+                    databaseDirtyRevisionTracker?.ledger.discard(revisionProposal)
+                }
                 requeueTrackedChanges(toSave)
                 savetrys += 1
                 if (savetrys > 4) {
@@ -1217,6 +1215,7 @@ export async function saveDb() {
     // and are drained into the first ordinary save.
     dirtyTargetBridge.activate({
         character: (chaId) => {
+            databaseDirtyRevisionTracker?.markCharacter(chaId)
             changeTracker.character = [chaId, ...changeTracker.character.filter(id => id !== chaId)]
             changed = true
         },

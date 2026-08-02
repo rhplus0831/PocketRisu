@@ -21,6 +21,7 @@ The client-storage subsystem owns PocketRisu’s canonical `Database` model, its
 | `src/ts/storage/chatStorage.ts` | Stub/placeholder conversion, lazy hydration, chat-backup reason tags, and version import. `setChatBackupReason()` records one-shot reasons; `saveChatToServer()` consumes them; `importChatBackup()` clones a recovered version under a fresh chat ID and explicitly dirties its target; and `ensureChatHydrated()` owns the hydration state machine. |
 | `src/ts/storage/chatPersistStage.ts` | Testable row-persistence stage used by `saveDb()`. `prepareChatPersistStage()` discovers changed/new chats, requires authoritative row writes before stub commit, checkpoints a generating chat at most once per 20 seconds, requeues it for the final post-generation save, and updates the known-chat baseline only after a committed stub database. |
 | `src/ts/storage/activeChatDirtyTracker.svelte.ts` | Batches the active chat's deep reactive subscription without weakening mutation coverage. The first nested mutation queues the live chat and drops the expensive nested dependencies; a revision timer re-arms them once per ordinary save window or generation checkpoint interval. Selection and hydration remain explicit clean-baseline cases. |
+| `src/ts/storage/databaseDirtyRevisions.ts`, `databaseDirtyRevisionTracker.svelte.ts` | Own acknowledgement-scoped dirty revisions and state-layer observation for root keys, every character's database/stub projection, modules, presets, plugins, and plugin-storage metadata. Independent deep-proxy effects avoid waking untouched branches; discarded/failed saves retain revisions, while commits clear only the exact acknowledged revision. |
 | `src/ts/chatLoadPages.ts` | Validates message-render limits. Defaults are 30 initially and 15 additionally (`:1-2`); normalization is at `:4`; database-facing getters are at `:17` and `:21`. Despite the names, these values count messages, not server pages. |
 | `src/ts/storage/chatDraft.ts` | Stores per-chat unsent composer text outside `Chat`. `ChatDraftSession` distinguishes loading, ready, error, and closed states so a temporary empty composer cannot delete an unread draft after a failed or in-flight load. |
 | `src/ts/storage/persistentKv.ts` | JSON/KV primitives plus structured plugin mutation, version, batch, generation, and commit-outcome helpers. Reads can opt into verified resource caching; hashed and reversible key builders remain common plugin/MCP primitives. |
@@ -142,10 +143,10 @@ no longer exist.
 
 #### Dirty tracking and scheduling
 
-1. A `toSaveType` tracker separates root, character, chat, bot-preset, module, plugin, and plugin-storage changes.
-2. Svelte effects `deepTouch` the relevant state branches. Initial effect runs are suppressed so loading itself is not treated as an edit.
+1. A `toSaveType` tracker separates root, character, chat, bot-preset, module, plugin, and plugin-storage changes. A parallel monotonic revision ledger keeps per-root-key, per-character, and per-module identities plus collection revisions until acknowledgement.
+2. Independent Svelte effects `deepTouch` each relevant state branch. Initial effect runs establish trusted clean coverage without treating loading as an edit; an observation failure marks that branch untrusted so codecs retain their JSON-equality fallback.
    Before those effects install, `capturePreTrackingPluginStorageChanges()` compares the untouched server baseline with state changed during plugin startup so early plugin writes are not lost.
-3. Root collections are tracked separately for efficient patching. Character tracking deliberately excludes full `chats`; it observes character fields plus chat ordering/stub metadata.
+3. Root keys and collections are tracked separately for efficient patching. Every character is observed independently; character tracking deliberately excludes full `chats` and observes character fields plus chat ordering/stub metadata. Plugin guest inputs are cloned before entering the state proxy so a retained caller-owned raw alias cannot bypass revisions.
 4. A second tracker deeply observes only the active chat. The first mutation queues the live row, then nested subscriptions are dropped and re-armed once per 500 ms ordinary save window or, when that chat is generating, the 20-second checkpoint interval. Mutations inside the gap are already included in the queued live object. Switching chat establishes a baseline, hydration activity is ignored, and generation completion/page hide force an immediate re-arm.
 5. Normal edits set `changed` after a 500 ms debounce. The permanent loop polls every 200 ms, serializes through `DatabaseSaveCoordinator`, and retries failures with bounded backoff.
 6. `requestImmediateSave()` queues behind older in-flight work and returns a
@@ -155,6 +156,7 @@ no longer exist.
    staged publication. `blockDatabaseSavesUntilReload()` is the explicit fence used when
    a specialized atomic transition has an unresolved outcome; the ordinary database save
    loop requeues failed or ambiguous attempts rather than installing that fence itself.
+7. Codec revision trust is withheld until an equality-backed acknowledged save aligns the boot/server baseline with the post-default, post-plugin live graph. Patch conflicts with a fresh authoritative baseline reset that gate for the first rebased save.
 
 #### Row-before-stub persistence
 
