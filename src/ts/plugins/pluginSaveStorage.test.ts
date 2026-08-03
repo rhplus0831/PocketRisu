@@ -1216,6 +1216,258 @@ describe("AA3 versioned atomic plugin storage", () => {
         ))).toEqual({ detached: true });
     });
 
+    test("a committed batch echo skips the next manifest-state preflight", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("cached-generation", [], []);
+        const {
+            batchPersistentPluginStorage,
+            readPersistentPluginStorageManifestState,
+        } = vi.mocked(await import("../storage/persistentKv"));
+        const requestedRevisions: string[] = [];
+        batchPersistentPluginStorage.mockImplementation(async (request: any) => {
+            requestedRevisions.push(request.expectedManifestRevision);
+            const nextRevision = `sha256:${requestedRevisions.length.toString(16).repeat(64)}`;
+            return {
+                outcome: "committed",
+                generation: crypto.randomUUID(),
+                manifestRevision: nextRevision,
+                revisions: request.operations.map((operation: any) => ({
+                    key: operation.key,
+                    revision: operation.operation === "set"
+                        ? `sha256:${"a".repeat(64)}`
+                        : null,
+                })),
+            } as any;
+        });
+
+        const rawKey = "k".repeat(753);
+        await setOwnedPluginSaveStorageItem(rawKey, { version: 1 }, "Cache Plugin");
+        await setOwnedPluginSaveStorageItem(rawKey, { version: 2 }, "Cache Plugin");
+
+        expect(readPersistentPluginStorageManifestState).toHaveBeenCalledOnce();
+        expect(requestedRevisions).toEqual([
+            `sha256:${"d".repeat(64)}`,
+            `sha256:${"1".repeat(64)}`,
+        ]);
+    });
+
+    test("a stale cached token self-heals from the 409 echo without a state GET", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("self-heal-generation", [], []);
+        const {
+            batchPersistentPluginStorage,
+            readPersistentPluginStorageManifestState,
+        } = vi.mocked(await import("../storage/persistentKv"));
+        const requestedRevisions: string[] = [];
+        const firstRevision = `sha256:${"1".repeat(64)}`;
+        const externalRevision = `sha256:${"2".repeat(64)}`;
+        const healedRevision = `sha256:${"3".repeat(64)}`;
+        batchPersistentPluginStorage.mockImplementation(async (request: any) => {
+            requestedRevisions.push(request.expectedManifestRevision);
+            if (requestedRevisions.length === 2) {
+                return {
+                    outcome: "not-committed",
+                    code: "PLUGIN_STORAGE_GENERATION_CONFLICT",
+                    error: "manifest changed",
+                    retryable: true,
+                    status: 409,
+                    retryAfter: null,
+                    commitOutcomeUnknown: false,
+                    currentGeneration: "self-heal-generation",
+                    currentManifestRevision: externalRevision,
+                } as any;
+            }
+            return {
+                outcome: "committed",
+                generation: crypto.randomUUID(),
+                manifestRevision: requestedRevisions.length === 1
+                    ? firstRevision
+                    : healedRevision,
+                revisions: request.operations.map((operation: any) => ({
+                    key: operation.key,
+                    revision: `sha256:${"a".repeat(64)}`,
+                })),
+            } as any;
+        });
+
+        const rawKey = "s".repeat(753);
+        await setOwnedPluginSaveStorageItem(rawKey, { version: 1 }, "Cache Plugin");
+        await setOwnedPluginSaveStorageItem(rawKey, { version: 2 }, "Cache Plugin");
+
+        expect(readPersistentPluginStorageManifestState).toHaveBeenCalledOnce();
+        expect(requestedRevisions).toEqual([
+            `sha256:${"d".repeat(64)}`,
+            firstRevision,
+            externalRevision,
+        ]);
+    });
+
+    test("an old-server acknowledgement omission preserves preflight behavior", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("legacy-server-generation", [], []);
+        const {
+            batchPersistentPluginStorage,
+            readPersistentPluginStorageManifestState,
+        } = vi.mocked(await import("../storage/persistentKv"));
+        const stateRevisions = [
+            `sha256:${"4".repeat(64)}`,
+            `sha256:${"5".repeat(64)}`,
+        ];
+        readPersistentPluginStorageManifestState.mockImplementation(async generation => ({
+            generation,
+            manifestRevision: stateRevisions.shift()!,
+        }));
+        const requestedRevisions: string[] = [];
+        batchPersistentPluginStorage.mockImplementation(async (request: any) => {
+            requestedRevisions.push(request.expectedManifestRevision);
+            return {
+                outcome: "committed",
+                generation: crypto.randomUUID(),
+                revisions: request.operations.map((operation: any) => ({
+                    key: operation.key,
+                    revision: `sha256:${"a".repeat(64)}`,
+                })),
+            } as any;
+        });
+
+        const rawKey = "o".repeat(753);
+        await setOwnedPluginSaveStorageItem(rawKey, { version: 1 }, "Legacy Plugin");
+        await setOwnedPluginSaveStorageItem(rawKey, { version: 2 }, "Legacy Plugin");
+
+        expect(readPersistentPluginStorageManifestState).toHaveBeenCalledTimes(2);
+        expect(requestedRevisions).toEqual([
+            `sha256:${"4".repeat(64)}`,
+            `sha256:${"5".repeat(64)}`,
+        ]);
+    });
+
+    test("a database generation change invalidates the cached token", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("first-generation", [], []);
+        const {
+            batchPersistentPluginStorage,
+            readPersistentPluginStorageManifestState,
+        } = vi.mocked(await import("../storage/persistentKv"));
+        readPersistentPluginStorageManifestState.mockImplementation(async generation => ({
+            generation,
+            manifestRevision: generation === "first-generation"
+                ? `sha256:${"6".repeat(64)}`
+                : `sha256:${"7".repeat(64)}`,
+        }));
+        const requested: Array<{ generation: string; revision: string }> = [];
+        batchPersistentPluginStorage.mockImplementation(async (request: any) => {
+            requested.push({
+                generation: request.generation,
+                revision: request.expectedManifestRevision,
+            });
+            return {
+                outcome: "committed",
+                generation: crypto.randomUUID(),
+                manifestRevision: `sha256:${"8".repeat(64)}`,
+                revisions: request.operations.map((operation: any) => ({
+                    key: operation.key,
+                    revision: `sha256:${"a".repeat(64)}`,
+                })),
+            } as any;
+        });
+
+        const rawKey = "g".repeat(753);
+        await setOwnedPluginSaveStorageItem(rawKey, { generation: 1 }, "Cache Plugin");
+        installOwnershipManifest("second-generation", [], []);
+        await setOwnedPluginSaveStorageItem(rawKey, { generation: 2 }, "Cache Plugin");
+
+        expect(readPersistentPluginStorageManifestState).toHaveBeenCalledTimes(2);
+        expect(requested).toEqual([
+            { generation: "first-generation", revision: `sha256:${"6".repeat(64)}` },
+            { generation: "second-generation", revision: `sha256:${"7".repeat(64)}` },
+        ]);
+    });
+
+    test("an unknown commit outcome drops the cached token", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("unknown-outcome-generation", [], []);
+        const {
+            batchPersistentPluginStorage,
+            readPersistentPluginStorageManifestState,
+        } = vi.mocked(await import("../storage/persistentKv"));
+        const { StorageError } = await import("../storage/storageError");
+        const requestedRevisions: string[] = [];
+        batchPersistentPluginStorage.mockImplementation(async (request: any) => {
+            requestedRevisions.push(request.expectedManifestRevision);
+            if (requestedRevisions.length === 2) {
+                throw new StorageError("acknowledgement lost", {
+                    code: "COMMIT_OUTCOME_UNKNOWN",
+                    operation: "batch",
+                    commitOutcomeUnknown: true,
+                });
+            }
+            return {
+                outcome: "committed",
+                generation: crypto.randomUUID(),
+                manifestRevision: `sha256:${"a".repeat(64)}`,
+                revisions: request.operations.map((operation: any) => ({
+                    key: operation.key,
+                    revision: `sha256:${"b".repeat(64)}`,
+                })),
+            } as any;
+        });
+        readPersistentPluginStorageManifestState
+            .mockResolvedValueOnce({
+                generation: "unknown-outcome-generation",
+                manifestRevision: `sha256:${"c".repeat(64)}`,
+            })
+            .mockResolvedValueOnce({
+                generation: "unknown-outcome-generation",
+                manifestRevision: `sha256:${"d".repeat(64)}`,
+            });
+
+        const rawKey = "u".repeat(753);
+        await setOwnedPluginSaveStorageItem(rawKey, { version: 1 }, "Cache Plugin");
+        await expect(setOwnedPluginSaveStorageItem(
+            rawKey,
+            { version: 2 },
+            "Cache Plugin",
+        )).rejects.toMatchObject({ code: "COMMIT_OUTCOME_UNKNOWN" });
+        await setOwnedPluginSaveStorageItem(rawKey, { version: 3 }, "Cache Plugin");
+
+        expect(requestedRevisions).toEqual([
+            `sha256:${"c".repeat(64)}`,
+            `sha256:${"a".repeat(64)}`,
+            `sha256:${"d".repeat(64)}`,
+        ]);
+        expect(readPersistentPluginStorageManifestState).toHaveBeenCalledTimes(2);
+    });
+
+    test("a validated single-mutation echo seeds the batch cache", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("mutate-seed-generation", [], []);
+        const {
+            batchPersistentPluginStorage,
+            mutatePersistentPluginStorage,
+            readPersistentPluginStorageManifestState,
+        } = vi.mocked(await import("../storage/persistentKv"));
+        const mutateRevision = `sha256:${"9".repeat(64)}`;
+        mutatePersistentPluginStorage.mockResolvedValue({
+            outcome: "committed",
+            operation: "set",
+            verification: "verified",
+            manifestRevision: mutateRevision,
+        });
+
+        await setOwnedPluginSaveStorageItem("short", { version: 1 }, "Cache Plugin");
+        await setOwnedPluginSaveStorageItem(
+            "m".repeat(753),
+            { version: 2 },
+            "Cache Plugin",
+        );
+
+        expect(readPersistentPluginStorageManifestState).not.toHaveBeenCalled();
+        expect(batchPersistentPluginStorage).toHaveBeenCalledWith(
+            expect.objectContaining({ expectedManifestRevision: mutateRevision }),
+            undefined,
+        );
+    });
+
     test("orders overlapping key sets without deadlock while disjoint batches proceed", async () => {
         database.optimizePluginMemory = true;
         installOwnershipManifest("selected-generation", [], []);

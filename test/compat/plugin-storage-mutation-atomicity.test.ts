@@ -157,6 +157,18 @@ function readManifest(cwd: string): any {
   }
 }
 
+function readManifestBytes(cwd: string): Buffer {
+  const database = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
+  try {
+    const row = database.prepare('SELECT value FROM kv WHERE key = ?').get(MANIFEST_KEY) as {
+      value: Buffer
+    }
+    return Buffer.from(row.value)
+  } finally {
+    database.close()
+  }
+}
+
 async function boot(
   pluginFailpoint?:
     | 'owner-write'
@@ -360,12 +372,15 @@ describe('atomic optimized plugin value and owner acknowledgement', () => {
     })
 
     expect(response.status).toBe(200)
+    const manifestRevision = `sha256:${createHash('sha256')
+      .update(readManifestBytes(server.cwd)).digest('hex')}`
     await expect(response.json()).resolves.toEqual({
       success: true,
       outcome: 'committed',
       operation: 'set',
       verification: 'verified',
       hash: createHash('sha256').update(value).digest('hex'),
+      manifestRevision,
     })
     expect(readRows(server.cwd).value).toEqual(value)
     expect(readFacets(server.cwd)).toEqual({
@@ -377,6 +392,29 @@ describe('atomic optimized plugin value and owner acknowledgement', () => {
       generation: STORAGE_GENERATION,
       valueKeys: [VALUE_KEY],
       metaKeys: [OWNER_KEY],
+    })
+  })
+
+  test('a generation conflict echoes the current valid optimized publication', async () => {
+    const { server, client } = await boot(undefined, undefined, seedActivePublication)
+    const response = await client.fetch('/api/plugin-storage/mutate', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'file-path': Buffer.from(VALUE_KEY, 'utf-8').toString('hex'),
+        'x-plugin-storage-operation': 'remove',
+        'x-plugin-storage-generation': `${STORAGE_GENERATION}-stale`,
+      },
+      body: new Uint8Array(),
+    })
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toMatchObject({
+      outcome: 'not-committed',
+      code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
+      currentGeneration: STORAGE_GENERATION,
+      currentManifestRevision: `sha256:${createHash('sha256')
+        .update(readManifestBytes(server.cwd)).digest('hex')}`,
     })
   })
 

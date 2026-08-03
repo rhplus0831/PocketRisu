@@ -43,6 +43,7 @@ import {
     requireCommittedDatabaseSave,
 } from "../storage/databaseSave";
 import { StorageError } from "../storage/storageError";
+import type { PluginStorageMutationResult } from "../storage/pluginStorageMutation";
 import { abortReason, awaitWithAbort, throwIfAborted } from "../storage/abort";
 import { sha256OwnedBytes } from "../storage/resourceCache";
 import { safeStructuredClone } from "../polyfill";
@@ -259,6 +260,86 @@ let storageOwnershipSnapshot: {
     keySetGeneration: number;
     ownership: PluginStorageOwnership;
 } | null = null;
+const manifestRevisionCache = new WeakMap<Database, {
+    generation: string;
+    manifestRevision: string;
+}>();
+
+function invalidateManifestRevision(db: Database): void {
+    manifestRevisionCache.delete(db);
+}
+
+function cachedManifestRevision(db: Database, generation: string): string | null {
+    const cached = manifestRevisionCache.get(db);
+    if (db.pluginStorageGeneration !== generation || cached?.generation !== generation) {
+        if (cached) manifestRevisionCache.delete(db);
+        return null;
+    }
+    return cached.manifestRevision;
+}
+
+function recordManifestRevision(
+    db: Database,
+    generation: string,
+    manifestRevision: string | undefined,
+): void {
+    if (db.pluginStorageGeneration !== generation
+        || typeof manifestRevision !== "string"
+        || !PLUGIN_STORAGE_REVISION_PATTERN.test(manifestRevision)) {
+        invalidateManifestRevision(db);
+        return;
+    }
+    manifestRevisionCache.set(db, { generation, manifestRevision });
+}
+
+function recordManifestRevisionAcknowledgement(
+    db: Database,
+    generation: string,
+    result: { outcome: string; manifestRevision?: string },
+): void {
+    recordManifestRevision(
+        db,
+        generation,
+        result.outcome === "committed" ? result.manifestRevision : undefined,
+    );
+}
+
+function recordManifestRevisionConflict(
+    db: Database,
+    generation: string,
+    result: { currentGeneration?: string; currentManifestRevision?: string },
+): void {
+    recordManifestRevision(
+        db,
+        generation,
+        result.currentGeneration === generation
+            ? result.currentManifestRevision
+            : undefined,
+    );
+}
+
+function invalidateManifestRevisionAfterError(db: Database, error: unknown): void {
+    if (error instanceof StorageError
+        && (error.commitOutcomeUnknown
+            || error.code === "COMMIT_OUTCOME_UNKNOWN"
+            || error.code === "PLUGIN_STORAGE_GENERATION_CONFLICT")) {
+        invalidateManifestRevision(db);
+    }
+}
+
+async function recordOptimizedMutationAcknowledgement(
+    db: Database,
+    generation: string,
+    mutation: Promise<PluginStorageMutationResult>,
+): Promise<void> {
+    try {
+        const result = await mutation;
+        recordManifestRevisionAcknowledgement(db, generation, result);
+    } catch (error) {
+        invalidateManifestRevisionAfterError(db, error);
+        throw error;
+    }
+}
 
 function invalidateStorageEnumerationSnapshot(): void {
     storageEnumerationSnapshot = null;
@@ -818,6 +899,9 @@ async function commitOptimizedStorageMutation(
             metaKeys,
         );
         try {
+            // This legacy full-manifest route does not expose its publication
+            // token through the client transport. Do not retain an older echo.
+            invalidateManifestRevision(db);
             await commitPersistentPluginStorageMutation({
                 generation,
                 expectedManifest: ownership.manifest,
@@ -855,14 +939,27 @@ async function commitHashedOwnedPluginStorageMutation(
                 "Optimized plugin storage is not reconciled; reload to complete its atomic adoption.",
             );
         }
-        const manifestState = await readPersistentPluginStorageManifestState(generation, signal);
-        const result = await batchPersistentPluginStorage({
-            generation,
-            expectedManifestRevision: manifestState.manifestRevision,
-            operations: [operation],
-        }, signal);
-        if (result.outcome === "committed") return;
-        if (result.code === "PLUGIN_STORAGE_GENERATION_CONFLICT" && attempt < 2) continue;
+        const expectedManifestRevision = cachedManifestRevision(db, generation)
+            ?? (await readPersistentPluginStorageManifestState(generation, signal)).manifestRevision;
+        let result;
+        try {
+            result = await batchPersistentPluginStorage({
+                generation,
+                expectedManifestRevision,
+                operations: [operation],
+            }, signal);
+        } catch (error) {
+            invalidateManifestRevisionAfterError(db, error);
+            throw error;
+        }
+        if (result.outcome === "committed") {
+            recordManifestRevisionAcknowledgement(db, generation, result);
+            return;
+        }
+        if (result.code === "PLUGIN_STORAGE_GENERATION_CONFLICT") {
+            recordManifestRevisionConflict(db, generation, result);
+            if (attempt < 2) continue;
+        }
         throw new StorageError(result.error ?? "Plugin storage mutation failed.", {
             status: result.status,
             code: result.code,
@@ -1558,11 +1655,16 @@ export async function setPluginSaveStorageItem<T>(
         );
         if (db.pluginStorageGeneration
             && !isHashedPluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX)) {
-            await setPreparedPersistentPluginStoragePreservingOwner(
-                storageKey,
-                prepared,
-                signal,
-                db.pluginStorageGeneration,
+            const generation = db.pluginStorageGeneration;
+            await recordOptimizedMutationAcknowledgement(
+                db,
+                generation,
+                setPreparedPersistentPluginStoragePreservingOwner(
+                    storageKey,
+                    prepared,
+                    signal,
+                    generation,
+                ),
             );
             return;
         }
@@ -1646,14 +1748,19 @@ export async function setOwnedPluginSaveStorageItem<T>(
                         owner,
                     }, signal);
                 } else {
-                    await mutatePersistentPluginStorage(
-                        valueStorageKey,
-                        "set",
-                        undefined,
-                        owner,
-                        signal,
-                        db.pluginStorageGeneration,
-                        preparedValue,
+                    const generation = db.pluginStorageGeneration;
+                    await recordOptimizedMutationAcknowledgement(
+                        db,
+                        generation,
+                        mutatePersistentPluginStorage(
+                            valueStorageKey,
+                            "set",
+                            undefined,
+                            owner,
+                            signal,
+                            generation,
+                            preparedValue,
+                        ),
                     );
                 }
             } else {
@@ -1747,10 +1854,15 @@ export async function removePluginSaveStorageItem(
             );
             if (db.pluginStorageGeneration
                 && !isHashedPluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX)) {
-                await removePersistentPluginStoragePreservingOwner(
-                    storageKey,
-                    signal,
-                    db.pluginStorageGeneration,
+                const generation = db.pluginStorageGeneration;
+                await recordOptimizedMutationAcknowledgement(
+                    db,
+                    generation,
+                    removePersistentPluginStoragePreservingOwner(
+                        storageKey,
+                        signal,
+                        generation,
+                    ),
                 );
                 return;
             }
@@ -1796,11 +1908,16 @@ export async function removeOwnedPluginSaveStorageItem(
                             key: normalizedKey,
                         }, signal);
                     } else {
-                        await mutatePersistentPluginStorage(
-                            valueStorageKey,
-                            "remove",
-                            signal,
-                            db.pluginStorageGeneration,
+                        const generation = db.pluginStorageGeneration;
+                        await recordOptimizedMutationAcknowledgement(
+                            db,
+                            generation,
+                            mutatePersistentPluginStorage(
+                                valueStorageKey,
+                                "remove",
+                                signal,
+                                generation,
+                            ),
                         );
                     }
                 } else {
@@ -2402,16 +2519,24 @@ export async function atomicBatchOwnedPluginSaveStorage(
                             "Optimized plugin storage is not reconciled; reload to complete its atomic adoption.",
                         );
                     }
-                    const manifestState = await readPersistentPluginStorageManifestState(
-                        generation,
-                        signal,
-                    );
-                    const result = await batchPersistentPluginStorage({
-                        generation,
-                        expectedManifestRevision: manifestState.manifestRevision,
-                        operations: prepared,
-                    }, signal);
+                    const expectedManifestRevision = cachedManifestRevision(db, generation)
+                        ?? (await readPersistentPluginStorageManifestState(
+                            generation,
+                            signal,
+                        )).manifestRevision;
+                    let result;
+                    try {
+                        result = await batchPersistentPluginStorage({
+                            generation,
+                            expectedManifestRevision,
+                            operations: prepared,
+                        }, signal);
+                    } catch (error) {
+                        invalidateManifestRevisionAfterError(db, error);
+                        throw error;
+                    }
                     if (result.outcome === "committed") {
+                        recordManifestRevisionAcknowledgement(db, generation, result);
                         return {
                             committed: true,
                             generation: result.generation,
@@ -2421,10 +2546,9 @@ export async function atomicBatchOwnedPluginSaveStorage(
                             })),
                         };
                     }
-                    if (result.code === "PLUGIN_STORAGE_GENERATION_CONFLICT" && attempt < 2) {
-                        continue;
-                    }
                     if (result.code === "PLUGIN_STORAGE_GENERATION_CONFLICT") {
+                        recordManifestRevisionConflict(db, generation, result);
+                        if (attempt < 2) continue;
                         throw new StorageError(result.error, {
                             status: result.status,
                             code: result.code,
@@ -3752,6 +3876,7 @@ async function applyPluginStorageReconciliation(
                 total,
             });
         }
+        invalidateManifestRevision(db);
         db.pluginStorageGeneration = prepared.generation;
         await deps.writePersistentJson(
             PLUGIN_STORAGE_MANIFEST_KEY,
@@ -3784,6 +3909,7 @@ async function applyPluginStorageReconciliation(
     }
 
     db.pluginCustomStorage = prepared.nextValues;
+    invalidateManifestRevision(db);
     db.pluginStorageGeneration = prepared.generation;
     if (
         prepared.metaStorageKeys.length > 0
@@ -3995,6 +4121,7 @@ async function applyBulkPluginStorageTransition(
             }
         }
 
+        invalidateManifestRevision(db);
         db.optimizePluginMemory = target;
         db.pluginStorageGeneration = targetGeneration;
         if (target) {
@@ -4247,6 +4374,7 @@ async function applyStagedPluginStorageTransition(
             });
         }
 
+        invalidateManifestRevision(db);
         db.optimizePluginMemory = target;
         db.pluginStorageGeneration = targetGeneration;
         if (target) {
@@ -5050,6 +5178,7 @@ export async function transitionPluginStorageMode(
                     transitionOptions,
                     true,
                 );
+                invalidateManifestRevision(db);
                 db.optimizePluginMemory = target;
 
                 try {
@@ -5065,6 +5194,7 @@ export async function transitionPluginStorageMode(
                     }
                     return result;
                 } catch (transitionError) {
+                    invalidateManifestRevision(db);
                     db.optimizePluginMemory = previous;
                     try {
                         const rollbackPrepared = await preparePluginStorageReconciliation(

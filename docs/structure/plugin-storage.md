@@ -189,6 +189,15 @@ chunk writer inside the existing atomic transaction. This lets a one-value guard
 reach the same configured per-value limit as ordinary `setItem()` without base64
 expansion. Older servers use the retained 16 MiB JSON/base64 batch fallback.
 
+Committed optimized `mutate` and `batch` acknowledgements may echo `manifestRevision`,
+the SHA-256 token of the exact committed manifest bytes. The browser retains a validated
+echo only for the current database object and `pluginStorageGeneration`; later compact
+batch CAS writes can use it without a manifest-state preflight. A generation-conflict
+response may likewise include `currentGeneration` and `currentManifestRevision` when the
+server can prove a valid live optimized publication. A same-generation echo can drive the
+next bounded retry directly. Missing echoes retain compatibility with older servers: the
+browser drops its token and performs the existing state GET before the next attempt.
+
 The authenticated session advertises a generic per-value ceiling plus separate framed
 batch and transition capabilities. Ordinary writes preflight the generic ceiling;
 compound writes use the negotiated operation, metadata, value, and payload bounds;
@@ -227,6 +236,11 @@ the head stayed unchanged.
   transaction after checking the selected generation. They do not replace
   `Database.pluginStorageGeneration`; mode transitions publish a fresh backend
   generation together with the database mode and destination rows.
+- Compact batches always keep the manifest CAS at the server commit boundary. A cached
+  revision changes only how the client learns the expected token. Unknown commit outcomes,
+  acknowledgement omissions, database replacement, and generation changes invalidate the
+  client token; conflict retries remain bounded and fall back to the authoritative
+  manifest-state read when no same-generation echo is available.
 - Generic `/api/write` and `/api/remove` paths must not mutate manifest-owned rows, and
   JSON Patch must not change optimized rows or publication controls. To preserve the
   original inline save behavior, database patches may update `pluginCustomStorage` and

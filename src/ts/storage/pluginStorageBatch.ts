@@ -93,6 +93,8 @@ export type PluginStorageBatchResult =
         requestHash: string;
         generation: string;
         revisions: PluginStorageRevisionResult[];
+        /** Exact optimized publication token after this batch committed. */
+        manifestRevision?: string;
         status: 200;
         commitOutcomeUnknown: false;
     }
@@ -107,6 +109,9 @@ export type PluginStorageBatchResult =
         limit?: number;
         actual?: number;
         conflicts?: PluginStorageConflictResult[];
+        /** Live optimized publication returned by a generation conflict, when provable. */
+        currentManifestRevision?: string;
+        currentGeneration?: string;
         commitOutcomeUnknown: false;
     }
     | {
@@ -425,13 +430,14 @@ export function classifyPluginStorageBatchAcknowledgement(
         const revisions = parseRevisionList(body.revisions, expectedOperations);
         if (hasOnlyKeys(body, [
             "success", "outcome", "operation", "verification",
-            "requestHash", "generation", "revisions",
+            "requestHash", "generation", "revisions", "manifestRevision",
         ])
             && body.success === true
             && body.outcome === "committed"
             && (body.verification === "verified" || body.verification === "unavailable")
             && body.requestHash === expectedRequestHash
             && validUuid(body.generation)
+            && (body.manifestRevision === undefined || validRevision(body.manifestRevision))
             && revisions) {
             return {
                 outcome: "committed",
@@ -440,6 +446,9 @@ export function classifyPluginStorageBatchAcknowledgement(
                 requestHash: body.requestHash,
                 generation: body.generation,
                 revisions,
+                ...(typeof body.manifestRevision === "string"
+                    ? { manifestRevision: body.manifestRevision }
+                    : {}),
                 status: 200,
                 commitOutcomeUnknown: false,
             };
@@ -560,13 +569,18 @@ export function classifyPluginStorageBatchAcknowledgement(
     if (status === 409
         && hasOnlyKeys(body, [
             "success", "outcome", "operation", "error", "code", "retryable",
+            "currentManifestRevision", "currentGeneration",
         ])
         && body.success === false
         && body.outcome === "not-committed"
         && body.code === "PLUGIN_STORAGE_GENERATION_CONFLICT"
         && body.retryable === true
         && typeof body.error === "string"
-        && body.error.length > 0) {
+        && body.error.length > 0
+        && ((body.currentManifestRevision === undefined && body.currentGeneration === undefined)
+            || (validRevision(body.currentManifestRevision)
+                && typeof body.currentGeneration === "string"
+                && body.currentGeneration.length > 0))) {
         return {
             outcome: "not-committed",
             operation: "batch",
@@ -576,6 +590,12 @@ export function classifyPluginStorageBatchAcknowledgement(
             status,
             retryAfter,
             commitOutcomeUnknown: false,
+            ...(typeof body.currentManifestRevision === "string"
+                ? {
+                    currentManifestRevision: body.currentManifestRevision,
+                    currentGeneration: body.currentGeneration as string,
+                }
+                : {}),
         };
     }
 

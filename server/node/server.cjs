@@ -12404,6 +12404,12 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                         error: 'Plugin storage generation or manifest changed before the batch committed.',
                         code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
                         retryable: true,
+                        ...(activeManifest && manifestState.revision
+                            ? {
+                                currentGeneration: liveGeneration,
+                                currentManifestRevision: manifestState.revision,
+                            }
+                            : {}),
                     });
                 }
 
@@ -12558,9 +12564,10 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                 });
             }
 
+            const committedManifestRevision = `sha256:${sha256Hex(committedManifestBytes)}`;
             pluginStorageManifestCache.publishPrepared(manifestUpdate, {
                 revision: committedPublicationRevision,
-                manifestRevision: `sha256:${sha256Hex(committedManifestBytes)}`,
+                manifestRevision: committedManifestRevision,
             });
 
             // Establish the deferred BR1 recovery obligation from the known
@@ -12590,6 +12597,7 @@ app.post('/api/plugin-storage/batch', async (req, res, next) => {
                 requestHash,
                 generation,
                 revisions: committedRevisions,
+                manifestRevision: committedManifestRevision,
             };
             if (pluginStorageBatchFailpoint === 'acknowledgement-delay') {
                 const acknowledgementTimer = setTimeout(() => {
@@ -12918,6 +12926,12 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                     error: 'Plugin storage generation changed before the mutation committed.',
                     code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
                     retryable: true,
+                    ...(activeManifest && publication.manifestState.revision
+                        ? {
+                            currentGeneration: liveGeneration,
+                            currentManifestRevision: publication.manifestState.revision,
+                        }
+                        : {}),
                 });
             }
             if (isHashedPluginSaveStorageKey(valueKey, PLUGIN_SAVE_PREFIX)) {
@@ -12929,6 +12943,12 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                         error: 'A hashed plugin storage key requires an active mapped manifest.',
                         code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
                         retryable: true,
+                        ...(activeManifest && publication.manifestState.revision
+                            ? {
+                                currentGeneration: liveGeneration,
+                                currentManifestRevision: publication.manifestState.revision,
+                            }
+                            : {}),
                     });
                 }
                 decodeManifestPluginSaveStorageKey(
@@ -13015,10 +13035,13 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 });
             }
 
+            const committedManifestRevision = manifestUpdate
+                ? `sha256:${sha256Hex(committedManifestBytes)}`
+                : null;
             if (manifestUpdate) {
                 pluginStorageManifestCache.publishPrepared(manifestUpdate, {
                     revision: committedPublicationRevision,
-                    manifestRevision: `sha256:${sha256Hex(committedManifestBytes)}`,
+                    manifestRevision: committedManifestRevision,
                 });
             }
 
@@ -13052,6 +13075,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 operation,
                 verification,
                 hash: operation === 'set' ? valueHash : undefined,
+                ...(committedManifestRevision ? { manifestRevision: committedManifestRevision } : {}),
             });
         });
     } catch (error) {

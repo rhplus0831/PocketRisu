@@ -41,6 +41,7 @@ function ack(overrides: Record<string, unknown> = {}) {
             verification: "verified",
             requestHash,
             generation: "123e4567-e89b-42d3-a456-426614174000",
+            manifestRevision: `sha256:${"d".repeat(64)}`,
             revisions: [
                 {
                     key: "body",
@@ -163,7 +164,11 @@ describe("plugin storage batch acknowledgement", () => {
         const { body, requestHash } = ack();
         expect(classifyPluginStorageBatchAcknowledgement(
             200, body, requestHash, request.operations,
-        )).toMatchObject({ outcome: "committed", generation: body.generation });
+        )).toMatchObject({
+            outcome: "committed",
+            generation: body.generation,
+            manifestRevision: body.manifestRevision,
+        });
     });
 
     test.each([
@@ -203,6 +208,7 @@ describe("plugin storage batch acknowledgement", () => {
         { generation: "123E4567-E89B-42D3-A456-426614174000" },
         { generation: "123e4567-e89b-42d3-7456-426614174000" },
         { generation: "------------------------------------" },
+        { manifestRevision: `sha256:${"D".repeat(64)}` },
         { extra: true },
     ])("treats malformed committed envelopes as outcome unknown", override => {
         const { body, requestHash } = ack(override);
@@ -239,10 +245,49 @@ describe("plugin storage batch acknowledgement", () => {
             error: "manifest changed",
             code: "PLUGIN_STORAGE_GENERATION_CONFLICT",
             retryable: true,
+            currentGeneration: "selected-generation",
+            currentManifestRevision: `sha256:${"e".repeat(64)}`,
         }, "a".repeat(64), request.operations)).toMatchObject({
             outcome: "not-committed",
             code: "PLUGIN_STORAGE_GENERATION_CONFLICT",
             retryable: true,
+            currentGeneration: "selected-generation",
+            currentManifestRevision: `sha256:${"e".repeat(64)}`,
+        });
+    });
+
+    test("keeps old-server committed and conflict acknowledgements compatible", () => {
+        const { body, requestHash } = ack();
+        const { manifestRevision: _omitted, ...legacyBody } = body;
+        expect(classifyPluginStorageBatchAcknowledgement(
+            200, legacyBody, requestHash, request.operations,
+        )).toMatchObject({ outcome: "committed" });
+
+        expect(classifyPluginStorageBatchAcknowledgement(409, {
+            success: false,
+            outcome: "not-committed",
+            operation: "batch",
+            error: "manifest changed",
+            code: "PLUGIN_STORAGE_GENERATION_CONFLICT",
+            retryable: true,
+        }, "a".repeat(64), request.operations)).toMatchObject({
+            outcome: "not-committed",
+            code: "PLUGIN_STORAGE_GENERATION_CONFLICT",
+        });
+    });
+
+    test("rejects an incomplete current-publication conflict echo", () => {
+        expect(classifyPluginStorageBatchAcknowledgement(409, {
+            success: false,
+            outcome: "not-committed",
+            operation: "batch",
+            error: "manifest changed",
+            code: "PLUGIN_STORAGE_GENERATION_CONFLICT",
+            retryable: true,
+            currentManifestRevision: `sha256:${"e".repeat(64)}`,
+        }, "a".repeat(64), request.operations)).toMatchObject({
+            outcome: "unknown",
+            commitOutcomeUnknown: true,
         });
     });
 

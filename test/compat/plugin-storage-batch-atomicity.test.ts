@@ -226,6 +226,18 @@ function readPhysicalPair(cwd: string, key: string): { value: Buffer; owner: Buf
   return { value, owner }
 }
 
+function readManifestBytes(cwd: string): Buffer {
+  const db = new Database(path.join(cwd, 'save', 'risuai.db'), { readonly: true })
+  try {
+    const row = db.prepare('SELECT value FROM kv WHERE key = ?').get(
+      'plugin-storage/manifest.json',
+    ) as { value: Buffer }
+    return Buffer.from(row.value)
+  } finally {
+    db.close()
+  }
+}
+
 function countedBatchBody(
   count: number,
   expectedManifest: typeof activeManifest = activeManifest,
@@ -854,10 +866,13 @@ describe('AA3 atomic plugin storage batch', () => {
       'requestHash',
       'generation',
       'revisions',
+      'manifestRevision',
     ])
     expect(body.verification).toBe('verified')
     expect(body.generation).toMatch(UUID_V4_PATTERN)
     expect(body.requestHash).toMatch(/^[0-9a-f]{64}$/)
+    expect(body.manifestRevision).toBe(`sha256:${createHash('sha256')
+      .update(readManifestBytes(server.cwd)).digest('hex')}`)
     expect(body.revisions).toHaveLength(keys.length)
     expect(body.revisions.map((row: any) => row.key)).toEqual(keys)
     expect(body.revisions.every((row: any) => REVISION_PATTERN.test(row.revision))).toBe(true)
@@ -1110,6 +1125,9 @@ describe('AA3 atomic plugin storage batch', () => {
       outcome: 'not-committed',
       code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
       retryable: true,
+      currentGeneration: STORAGE_GENERATION,
+      currentManifestRevision: `sha256:${createHash('sha256')
+        .update(readManifestBytes(server.cwd)).digest('hex')}`,
     })
     expect(readGeneration(server.cwd)).toBe('old')
   })
@@ -1148,7 +1166,7 @@ describe('AA3 atomic plugin storage batch', () => {
   })
 
   test('compact manifest CAS commits with the current token and rejects a stale token', async () => {
-    const { client } = await boot()
+    const { server, client } = await boot()
     const state = await readManifest(client, 'state')
     const operation = {
       operation: 'set',
@@ -1162,6 +1180,8 @@ describe('AA3 atomic plugin storage batch', () => {
     ))
     expect(committed.status).toBe(200)
     const committedBody = await committed.json() as any
+    expect(committedBody.manifestRevision).toBe(`sha256:${createHash('sha256')
+      .update(readManifestBytes(server.cwd)).digest('hex')}`)
     expect(committedBody.revisions).toEqual([{
       key: 'aa3/new-compact',
       revision: expect.stringMatching(REVISION_PATTERN),
@@ -1176,6 +1196,8 @@ describe('AA3 atomic plugin storage batch', () => {
     await expect(stale.json()).resolves.toMatchObject({
       outcome: 'not-committed',
       code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
+      currentGeneration: STORAGE_GENERATION,
+      currentManifestRevision: committedBody.manifestRevision,
     })
     await expect(readState(client, 'aa3/new-compact')).resolves.toMatchObject({ missing: false })
   })

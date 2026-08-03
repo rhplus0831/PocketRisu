@@ -114,13 +114,14 @@ function batchImportBusy(retryAfter = '0'): Response {
     }, 503, { 'retry-after': retryAfter })
 }
 
-function committedSet(): Response {
+function committedSet(manifestRevision?: string): Response {
     return response({
         success: true,
         outcome: 'committed',
         operation: 'set',
         verification: 'verified',
         hash: valueHash,
+        ...(manifestRevision ? { manifestRevision } : {}),
     })
 }
 
@@ -174,6 +175,50 @@ afterAll(() => {
 })
 
 describe('NodeStorage atomic plugin mutation cache publication', () => {
+    test('returns a validated manifest revision echo and accepts an old server omission', async () => {
+        const manifestRevision = `sha256:${'d'.repeat(64)}`
+        const current = storageWithResponse(committedSet(manifestRevision))
+        await expect(current.mutatePluginStorage({
+            operation: 'set',
+            valueKey,
+            valueBytes,
+            owner: 'Plugin',
+        })).resolves.toMatchObject({ outcome: 'committed', manifestRevision })
+
+        const legacy = storageWithResponse(committedSet())
+        const legacyResult = await legacy.mutatePluginStorage({
+            operation: 'set',
+            valueKey,
+            valueBytes,
+            owner: 'Plugin',
+        })
+        expect(legacyResult).toMatchObject({ outcome: 'committed' })
+        expect(legacyResult).not.toHaveProperty('manifestRevision')
+    })
+
+    test('returns a validated current publication from a generation conflict', async () => {
+        const currentManifestRevision = `sha256:${'e'.repeat(64)}`
+        const storage = storageWithResponse(response({
+            success: false,
+            outcome: 'not-committed',
+            operation: 'remove',
+            code: 'PLUGIN_STORAGE_GENERATION_CONFLICT',
+            error: 'generation changed',
+            retryable: true,
+            currentGeneration: 'selected-generation',
+            currentManifestRevision,
+        }, 409))
+
+        await expect(storage.mutatePluginStorage({
+            operation: 'remove',
+            valueKey,
+            generation: 'selected-generation',
+        })).resolves.toMatchObject({
+            outcome: 'not-committed',
+            currentGeneration: 'selected-generation',
+            currentManifestRevision,
+        })
+    })
     test('encodes owner headers with the Buffer polyfill used by the browser app', async () => {
         vi.stubGlobal('Buffer', BrowserBuffer)
         const owner = '☸에로스 타워'
@@ -646,6 +691,14 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
             verification: 'verified',
             hash: valueHash,
             injected: true,
+        }],
+        ['malformed manifest revision', 200, {
+            success: true,
+            outcome: 'committed',
+            operation: 'set',
+            verification: 'verified',
+            hash: valueHash,
+            manifestRevision: `sha256:${'D'.repeat(64)}`,
         }],
     ] as const)(
         '%s acknowledgement is unknown and cannot publish cache state',

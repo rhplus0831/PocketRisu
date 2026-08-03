@@ -35,9 +35,15 @@ export interface PluginStorageMutationResult {
     limit?: number;
     actual?: number;
     commitOutcomeUnknown?: boolean;
+    /** Exact optimized publication token after a trusted committed acknowledgement. */
+    manifestRevision?: string;
+    /** Live optimized publication returned by a generation conflict, when provable. */
+    currentManifestRevision?: string;
+    currentGeneration?: string;
 }
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const MANIFEST_REVISION_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const NOT_COMMITTED_ACKNOWLEDGEMENTS = new Map<number, {
     code: string;
     retryable: boolean;
@@ -131,6 +137,9 @@ export function classifyPluginStorageMutationAcknowledgement(
                 && SHA256_PATTERN.test(expectedValueHash)
                 && body.hash === expectedValueHash
             : body.hash === undefined;
+        const manifestRevisionIsValid = body.manifestRevision === undefined
+            || (typeof body.manifestRevision === "string"
+                && MANIFEST_REVISION_PATTERN.test(body.manifestRevision));
         if (
             hasOnlyKeys(body, [
                 "success",
@@ -138,11 +147,13 @@ export function classifyPluginStorageMutationAcknowledgement(
                 "operation",
                 "verification",
                 ...(operation === "set" ? ["hash"] : []),
+                "manifestRevision",
             ])
             && body.success === true
             && body.outcome === "committed"
             && (body.verification === "verified" || body.verification === "unavailable")
             && hashIsValid
+            && manifestRevisionIsValid
             && body.code === undefined
             && body.error === undefined
             && body.retryable === undefined
@@ -154,6 +165,9 @@ export function classifyPluginStorageMutationAcknowledgement(
                 status,
                 commitOutcomeUnknown: false,
                 ...(operation === "set" ? { hash: body.hash as string } : {}),
+                ...(typeof body.manifestRevision === "string"
+                    ? { manifestRevision: body.manifestRevision }
+                    : {}),
             };
         }
         return unknownAcknowledgement(operation, status);
@@ -218,6 +232,15 @@ export function classifyPluginStorageMutationAcknowledgement(
     }
 
     const expected = NOT_COMMITTED_ACKNOWLEDGEMENTS.get(status);
+    const hasCurrentPublication = body.currentManifestRevision !== undefined
+        || body.currentGeneration !== undefined;
+    const currentPublicationIsValid = !hasCurrentPublication
+        || (status === 409
+            && body.code === "PLUGIN_STORAGE_GENERATION_CONFLICT"
+            && typeof body.currentManifestRevision === "string"
+            && MANIFEST_REVISION_PATTERN.test(body.currentManifestRevision)
+            && typeof body.currentGeneration === "string"
+            && body.currentGeneration.length > 0);
     if (
         expected
         && hasOnlyKeys(body, [
@@ -227,6 +250,8 @@ export function classifyPluginStorageMutationAcknowledgement(
             "error",
             "code",
             "retryable",
+            "currentManifestRevision",
+            "currentGeneration",
         ])
         && body.success === false
         && body.outcome === "not-committed"
@@ -236,6 +261,7 @@ export function classifyPluginStorageMutationAcknowledgement(
         && body.error.length > 0
         && body.verification === undefined
         && body.hash === undefined
+        && currentPublicationIsValid
     ) {
         return {
             outcome: "not-committed",
@@ -246,6 +272,12 @@ export function classifyPluginStorageMutationAcknowledgement(
             status,
             retryAfter: retryAfter ?? null,
             commitOutcomeUnknown: false,
+            ...(typeof body.currentManifestRevision === "string"
+                ? {
+                    currentManifestRevision: body.currentManifestRevision,
+                    currentGeneration: body.currentGeneration as string,
+                }
+                : {}),
         };
     }
 
