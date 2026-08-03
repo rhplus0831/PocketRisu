@@ -1,7 +1,7 @@
 # UI layer
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-01 against `818c3bc1`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -92,8 +92,8 @@ The `src/lib/` tree combines major feature screens, desktop and mobile shells, s
 | `src/lib/Setting/Pages/SystemBackup.svelte` | Unified backup screen for server backups, automatic snapshots and retention limits, per-chat recovery copies, and local backup download/restore. It also owns backup-path, disk-space, and boot-reminder controls when not hub-hosted. |
 | `src/lib/Setting/Pages/RequestLogs.svelte` | Paged request-log viewer with category/source/result filters, loaded-page search, lazy body/detail fetch, retention usage, and capture toggles. It replaces the former alert-based request viewer. |
 | `src/lib/Setting/Pages/UsageStats.svelte` | LLM request/token summaries over 7/30/90-day or all-time windows, with source filters and daily/model/source breakdowns. |
-| `src/lib/Setting/Pages/PluginStorageViewer.svelte` | Paged flat-key viewer for save, localStorage, and IndexedDB plugin backends. Save-backend edits/deletes are revision-guarded; stale or outcome-unknown mutations reload authoritative state. |
-| `src/lib/Setting/Pages/PluginSettings.svelte` | Plugin lifecycle/permission editor plus plugin-storage controls. Mode transitions use cancellable progress UI; boot reconciliation failures expose retry and redacted diagnostic-copy actions. Value auto-conversion is independent of the storage-mode toggle. |
+| `src/lib/Setting/Pages/PluginStorageViewer.svelte` | Paged flat-key viewer for save, localStorage, and IndexedDB plugin backends. It exposes owner facets plus an unknown-owner filter, and the save tab shows the server-computed total bytes. Save-backend edits/deletes are revision-guarded; stale or outcome-unknown mutations reload authoritative state. |
+| `src/lib/Setting/Pages/PluginSettings.svelte` | Plugin lifecycle/permission editor plus plugin-storage controls. Mode transitions use cancellable progress UI. A recovery alert links to restore points and exposes retry, management, and redacted diagnostic copy; its management dialog can download, use an inline copy, or delete an affected row. Value auto-conversion is independent of the storage-mode toggle. |
 | `src/lib/Setting/ChatBackupList.svelte` | Expands server-captured chat histories, resolves live/deleted character and chat labels, fetches a selected version, chooses a target character, and imports it as a new chat through the storage subsystem. |
 | `src/lib/Setting/Pages/Advanced/ResourceCacheSettings.svelte` | Toggles the opt-in verified IndexedDB resource cache and shows current entry/byte usage when supported. |
 | `src/lib/UI/GUI/SettingPage.svelte` | Standard page title/body wrapper (`src/lib/UI/GUI/SettingPage.svelte:13`). |
@@ -166,8 +166,9 @@ sets the relevant submenu store, then retries scrolling to the `data-setting-id`
 maintenance surface; `SystemBackup` is the single home for server backups, snapshots,
 chat-recovery copies, and local backups. `RequestLogs` pages through metadata and fetches
 large bodies only when expanded, while `UsageStats` aggregates LLM token data. The Plugin
-Storage viewer switches among save/local/IDB backends and treats conflicts or unknown
-mutation outcomes as reread conditions.
+Storage viewer switches among save/local/IDB backends, offers origin-owner facets with a
+separate unknown-owner filter, and displays total logical bytes for the save backend. It
+treats conflicts or unknown mutation outcomes as reread conditions.
 
 The dashboard gives externalized optimized-plugin values, owner metadata, and their
 publication manifest a dedicated Plugin data slice. Its byte reconciliation keeps KV-row
@@ -177,8 +178,12 @@ data.
 Plugin storage mode and value conversion are configured in `PluginSettings`, not in the
 viewer. A mode transition waits for plugin lifecycle idle, exposes cancel/progress state,
 and handles large inline transitions explicitly. If boot reconciliation leaves diagnostic
-issues, the page offers retry and a redacted diagnostic copy rather than displaying raw
-plugin keys or values.
+issues, an embedded alert lists encoded issue identifiers and offers restore-point
+navigation, management, retry, and a redacted diagnostic copy. The management dialog
+loads proof-bound issue details, reports external/inline copy availability, and exposes
+only the actions authorized for each issue: download the affected data, use the inline
+copy, or delete it. Its footer refreshes the inspection; completed resolutions rerun
+reconciliation and close the dialog when no issue remains.
 
 ### Desktop, responsive overlay, and mobile layouts
 
@@ -228,11 +233,12 @@ The toggle-preset chooser intentionally uses `togglePresetsOpenStore`, not the s
 
 A mutation-time 423 or a stale foreground writer check enters
 `enterWriterTakeoverFlow()`. The dialog offers reload or staying on the current in-memory
-projection. Staying does not reclaim authority: `enterFrozenOfflineState()` makes text
-controls read-only, disables contenteditable, captures mutation-oriented pointer/keyboard
-events, observes later DOM additions, and installs a persistent reload banner. Safe
-selection/copy/find and navigation keys remain available. The latch is permanent until a
-full reload so stale state is never replayed over the new writer.
+projection. Staying calls `enterFrozenOfflineState()`, which makes text controls
+read-only, disables contenteditable, captures mutation-oriented pointer/keyboard events,
+observes later DOM additions, and installs a persistent reload banner. Safe
+selection/copy/find and navigation keys remain available; returning to an editable UI
+requires a full reload. See [client storage](client-storage.md) for the save-loop reaction
+and [server backend](server-backend.md) for the canonical writer-lock protocol.
 
 ## 4. Entry points & dependencies
 
@@ -265,7 +271,10 @@ full reload so stale state is never replayed over the new writer.
 
 - Svelte 5 runes and classic Svelte stores coexist. Use direct rune access for `DBState`/`$state` objects, but `$store` syntax or `.set()`/`.update()` for `writable` stores. `stores.svelte.ts` must retain its `.svelte.ts` form because it contains runes.
 - `DBState.db` is the canonical live data model, not a disposable UI copy (`src/ts/stores.svelte.ts:144`). Most inputs bind directly into it; replacing or cloning subobjects casually can interfere with references and persistence tracking.
-- Persistence effects depend on deep reactive reads. `deepTouch()` is deliberately used instead of `$state.snapshot()` to avoid cloning large characters/modules (`src/ts/gui/deepTouch.svelte.ts:1`). Adding non-plain objects to persisted data can force the slower snapshot fallback.
+- UI code should mutate the canonical rune-backed model instead of manually reproducing
+  persistence behavior. The bounded active-chat tracker and other storage effects use
+  `deepTouch()` to establish dependencies without cloning large graphs; their observation,
+  fallback, and scheduling rules are canonical in [client storage](client-storage.md).
 - General navigation is not represented in the browser URL. Adding a screen normally requires a store value and a render branch, not a route configuration.
 - Settings route numbers are an internal cross-file coordination surface, not persisted
   user data. Adding or reordering a page requires synchronized menu/render/deep-link
@@ -286,7 +295,7 @@ full reload so stale state is never replayed over the new writer.
 - Save/loading indicators are not cosmetic: writer displacement, uncertain save outcomes, boot snapshot recovery, partial backup jobs, and plugin-storage reconciliation all have dedicated UI states. Preserve the distinction between retryable work, an unknown outcome requiring reread, and lost writer authority.
 - The writer-takeover “stay” path is intentionally irreversible without reload. Do not
   add a retry-write action to the frozen projection or let later DOM additions escape its
-  read-only guards.
+  read-only guards; coordinate protocol changes with [server backend](server-backend.md).
 - The composer contains the non-Tailwind class `plugin-compat-items-stretch`; plugins use it as a DOM anchor, so it must not be renamed during visual cleanup (`src/lib/ChatScreens/DefaultChatScreen.svelte:900`).
 - Global hotkeys deliberately depend on stable CSS hooks such as `.button-icon-reroll`, `.button-icon-edit`, `.text-input-area`, and `.button-icon-send` (`src/ts/hotkey.ts:34`). Renaming those classes silently breaks configured hotkeys.
 - Escape handling checks both the legacy alert singleton and open ARIA dialogs to avoid closing a settings drawer behind a modal (`src/ts/hotkey.ts:179`).
@@ -374,7 +383,8 @@ full reload so stale state is never replayed over the new writer.
 
 ## 7. Related structure docs
 
-- [Client storage](client-storage.md) covers reactive persistence, chat hydration, save outcomes, and writer fencing.
+- [Client storage](client-storage.md) covers reactive persistence, chat hydration, save outcomes, and the client writer-loss reaction.
+- [Server backend](server-backend.md) defines the canonical writer-lock protocol.
 - [Chat pipeline](chat-pipeline.md) covers generation and message parsing behind the chat UI.
 - [Presets and profiles](presets-profiles.md) and [model providers](model-providers.md) cover model settings behavior.
 - [Scripting and extensions](scripting-extensions.md) and [plugin storage](plugin-storage.md) cover extension UI and storage-viewer semantics.

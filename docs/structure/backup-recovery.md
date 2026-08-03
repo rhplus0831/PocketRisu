@@ -1,7 +1,7 @@
 # Backup and recovery
 
 > Part of the [PocketRisu structure guide](../../STRUCTURE.md). Audited on
-> 2026-08-01 against `818c3bc1`. Prefer symbols and route names over line numbers.
+> 2026-08-04 against `95c2ea30`. Prefer symbols and route names over line numbers.
 
 ## Purpose and recovery taxonomy
 
@@ -33,7 +33,12 @@ Bug Report** creates a filtered diagnostic JSON report, not a RisuSave backup, a
 server export contract has no settings-only scope. A legacy `?mode=settings` query is not
 recognized and follows the ordinary full Node export path.
 
-## Authoritative stores and archive format
+## Archive formats, exports, and imports
+
+This half covers portable archive assembly, migration exports, bounded ingress, and the
+exclusive transaction that replaces the live dataset.
+
+### Authoritative stores and archive format
 
 The exported application graph spans:
 
@@ -60,7 +65,7 @@ framing format. The live stubs-only database is an internal representation; port
 is assembled at export boundaries by joining the external rows. The finished database is
 a disk spool, not one aggregate JavaScript object or response buffer.
 
-## Full and server-file exports
+### Full and server-file exports
 
 Full download and server-file export share a strict point-in-time protocol:
 
@@ -96,7 +101,7 @@ name collisions are probed rather than overwritten. Download responses remain
 uncompressed at Express level so archive framing and keepalives are not buffered by
 middleware.
 
-### Upstream-target migration
+#### Upstream-target migration
 
 `target=upstream` is not a lossless PocketRisu backup. It folds supported external state
 and omits `inlay/`, `inlay_sidecar/`, and `inlay_meta/`; existing inlay references can
@@ -104,7 +109,7 @@ therefore become unresolved. Use the normal Node export for PocketRisu restore. 
 accepts supported unencrypted upstream `.bin` data, not encrypted risuai.xyz account
 backups.
 
-### PocketRisu main-target downgrade
+#### PocketRisu main-target downgrade
 
 `target=main` is the supported non-destructive path for rolling a `serve` installation
 back to the audited PocketRisu `main` storage contract. It uses the same pinned full-state
@@ -127,7 +132,7 @@ Rollback** and warns about the two omitted namespaces. Restore the result into a
 PocketRisu backup until verification completes. Directly booting `main` against the
 row-backed `serve` directory remains unsupported.
 
-## Partial export jobs
+### Partial export jobs
 
 Partial export is a server job, not a browser-memory serializer:
 
@@ -157,7 +162,10 @@ The current endpoints are the create/status/cancel collection under
 `/api/backup/export/jobs` plus `/:jobId/download`. Calling the old partial scope through
 the full-export endpoint returns `PARTIAL_EXPORT_JOB_REQUIRED`.
 
-## Bounded import and save-folder replacement
+Character-package and dataset export streams are separate interchange surfaces; see
+[Characters and personas](characters-personas.md) and [Client storage](client-storage.md).
+
+### Bounded import and save-folder replacement
 
 Destructive replacement acquires an abortable FIFO import turn before draining older
 queued mutations. Later authoritative writes receive retryable
@@ -227,19 +235,24 @@ Publication coordinates:
 - one SQLite transaction;
 - authoritative chat/plugin/database ingestion;
 - fsynced asset/inlay staging trees;
-- `save/import_journal.json` plus the SQLite marker;
+- a paired, fsynced `save/import_journal.json` and transaction-side
+  `import_journal/marker`, written before filesystem renames; after SQLite commit the
+  journal's `committed` phase is persisted before cleanup, and startup uses the pair to
+  finalize the committed swap or restore the old directories;
 - list-epoch invalidation;
 - rollback or startup recovery of filesystem swaps.
-
-The journal phase is persisted before cleanup so startup can distinguish a committed
-replacement from one that must restore its old directories.
 
 Current clients negotiate a strict NDJSON activity stream for directory and ZIP
 replacement. Upload progress, server heartbeats, and phase events refresh a two-minute
 browser inactivity watchdog; there is no total wall-clock deadline. Legacy clients that
 do not request the stream retain the JSON response contract.
 
-## Automatic snapshots
+## Recovery services
+
+This half covers server-maintained recovery points, corrupt-boot replacement, chat-row
+pre-images, and the plugin-specific safeguards used when live state is damaged.
+
+### Automatic snapshots
 
 Automatic snapshots assemble a self-contained database recovery row under
 `database/dbbackup-*`. They are triggered by eligible committed mutations and rotated by
@@ -267,6 +280,13 @@ count and exclusive chunk cost.
   the coalesced snapshot, so full assembly is outside the response-critical path.
 - Explicit/read-triggered pending-state flushes schedule this same pinned protocol; they
   do not assemble a second snapshot directly from live rows.
+- A foreground `/api/db/flush` drains pending database work and then requests a `FULL`
+  WAL checkpoint. Because an assembling snapshot can hold an older pinned reader, each
+  synchronous checkpoint attempt temporarily disables SQLite's five-second busy wait and
+  the server retries asynchronously every 25 ms for at most three seconds. If it is still
+  busy, the route preserves its retryable `503` response with `durable: false` and an
+  `unknown` outcome; background durability checkpoints instead reschedule a busy attempt
+  after ten seconds.
 - Optimized plugin data is folded with `pluginStorageFolded` and the selected
   generation/manifest proof.
 - Referenced remembered MCP calls are folded into a versioned private map. Restore
@@ -280,7 +300,7 @@ count and exclusive chunk cost.
 Snapshots do not contain the filesystem per-chat pre-image tree. Their displayed logical
 size and retention's exclusive physical chunk cost are different measures.
 
-## Corrupt-boot recovery and snapshot restore
+### Corrupt-boot recovery and snapshot restore
 
 The server preflights the live database before startup migrations or list-epoch writes.
 If validation fails, it listens in authenticated recovery mode without rewriting the
@@ -333,7 +353,7 @@ Client ownership lives in:
 - `src/ts/drive/backuplocal.ts`
 - `src/ts/storage/nodeStorage.ts`
 
-## Per-chat pre-image history
+### Per-chat pre-image history
 
 `createChatBackupStore()` in `server/node/chatBackups.cjs` manages a filesystem history
 separate from RisuSave archives and database snapshots. Immediately before
@@ -394,38 +414,34 @@ list/version/body routes live under `/api/chat-backups`. **System → Backups** 
 deleted identities and import a selected pre-image as a new chat with a fresh ID; it
 never overwrites the source or current chat.
 
-## Plugin recovery contract
+### Plugin recovery contract
 
-`Database.pluginStorageGeneration`, `plugin-storage/manifest.json`, and the exact owned
-value/metadata rows form one plugin publication. Export, snapshot, and restore must use
-the matching set, not enumerate the raw prefixes.
+[Plugin storage](plugin-storage.md) is canonical for persisted modes, generation/manifest
+authority, atomic publication, transitions, and the folded-versus-explicit restore
+boundary. Backup and import code consumes that contract with these consequences:
 
-`pluginStorageFolded` signals that a database payload contains a self-contained folded
-publication. Exact restore may clear/replace only a proven prior ownership set. Unmarked
-historical snapshots retain external rows because destructive inference could erase the
-only surviving copy. Foreign or quarantined physical rows are not current data and are
-not silently adopted.
+- Normal full exports carry the exact manifest-selected value and owner rows. Partial and
+  automatic recovery artifacts fold the selected publication into their self-contained
+  database payload.
+- Exact restore may clear or replace only a proven prior ownership set. Unmarked historical
+  snapshots retain external rows, while foreign, quarantined, or undeclared physical rows
+  are never adopted as current data.
+- Archive and save-folder imports stage an explicit manifest opaquely while validating the
+  accompanying value and metadata bodies. It becomes authoritative only when its
+  generation matches the imported database and every declared row exists. Folded database
+  ingestion instead externalizes the inline set, removes the folded marker and inline
+  maps, and constructs a fresh exact manifest from the rows actually published.
 
-Archive and save-folder imports stage an explicit `plugin-storage/manifest.json` with
-`importOpaqueRowFromFile()` exactly as supplied; only the accompanying value and metadata
-entry bodies receive ingress JSON validation. A later ownership selection parses the
-manifest and treats it as authoritative only when `resolveOwnedPluginStorageKeys()` can
-match its generation to the imported database and find every declared row. By contrast,
-folded database ingestion does not trust a transported manifest:
-`preparePluginStorageExternalization()` and the streaming ingestion callbacks encode the
-inline value/metadata set, remove the folded marker and inline maps, and build a new exact
-manifest with `createPluginStorageManifest()`. They retain a non-empty folded source
-generation or allocate one when absent; any separately imported manifest is replaced by
-the manifest constructed from the rows actually published.
-
-Optimized-mode startup uses the ETag-fenced `/api/plugin-storage/reconcile-boot` recovery
-route. For a block-format boot database, the server rederives both the raw-row ETag and
-the canonical decoded-view ETag from the same queued bytes, accepts the one supplied by
-the preceding authoritative read, and keeps that token for later saves. A genuinely
-different live database is a definitive conflict, not a recovery candidate.
-
-See [Plugin storage](plugin-storage.md) for mutation, CAS, generation, and transition
-semantics.
+The server-side generation fence used by boot recovery and ordinary plugin requests also
+keeps its session memory bounded. `createBoundedSessionState()` records the mode and
+generation established by each browser's latest authoritative database read or
+publication in a 50-entry, access-refreshed LRU; eviction drops the old session pin, while
+live publication checks remain authoritative until a later database read repins that
+session. On the retained staged-transition compatibility path, a row download first
+revalidates stage ownership and its stored hash proof, then `openStageRowDownload()` opens
+one read-only descriptor, checks regular-file type and exact size, and returns the
+response stream and close handle from that same descriptor. Validation and delivery
+therefore cannot reopen different path contents.
 
 ## Cancellation and outcome rules
 

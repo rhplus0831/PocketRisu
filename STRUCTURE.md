@@ -2,7 +2,7 @@
 
 Navigation map for developers and AI agents. Start here, choose the owning subsystem,
 then use the change maps and symbol names in `docs/structure/`. Ownership and runtime
-behavior were audited on 2026-08-01 against `818c3bc1`. File paths and symbols are the
+behavior were audited on 2026-08-04 against `95c2ea30`. File paths and symbols are the
 durable references; line-number hints in the detail docs are approximate and should be
 confirmed with `rg`.
 
@@ -27,10 +27,10 @@ accepted, and PocketRisu-only state may have no upstream runtime meaning.
 | Sending, prompt assembly, token budgeting, attachments | [Chat pipeline](docs/structure/chat-pipeline.md) | Memory, extensions, providers, media |
 | Provider wire formats, streaming, tools, or transport | [Model providers](docs/structure/model-providers.md) | Presets/profiles, server backend |
 | Model profiles, prompt presets, credentials, bindings, Gemini cache | [Presets and profiles](docs/structure/presets-profiles.md) | Model providers, chat pipeline |
-| Database fields, save timing, chat hydration, drafts, browser cache | [Client storage](docs/structure/client-storage.md) | Server backend, backup/recovery |
-| Routes, auth, SQLite, chunks, proxying, filesystem stores | [Server backend](docs/structure/server-backend.md) | Client storage, backup/recovery |
-| Backups, partial exports, imports, snapshots, destructive restore | [Backup and recovery](docs/structure/backup-recovery.md) | Server backend, client storage |
-| Plugin KV semantics, CAS/batches, generations, transitions, viewer | [Plugin storage](docs/structure/plugin-storage.md) | Extensions, client/server storage |
+| Database fields, save timing, chat hydration, drafts, browser cache | [Client storage](docs/structure/client-storage.md) | Server backend, backup/recovery, plugin storage |
+| Routes, auth, SQLite, chunks, proxying, filesystem stores, observability | [Server backend](docs/structure/server-backend.md) | Client storage, backup/recovery, plugin storage |
+| Backups, partial exports, imports, snapshots, destructive restore | [Backup and recovery](docs/structure/backup-recovery.md) | Server backend, client storage, plugin storage |
+| Plugin KV semantics, CAS/batches, generations, transitions, viewer | [Plugin storage](docs/structure/plugin-storage.md) | Extensions, client/server storage, backup/recovery |
 | Cards, personas, packages, Realm, character interchange | [Characters and personas](docs/structure/characters-personas.md) | Media, memory, presets |
 | Lore activation, Hypa V3, embeddings, modules | [Memory and lorebook](docs/structure/memory-lorebook.md) | Chat pipeline, characters |
 | CBS, regex, triggers, Lua, plugin lifecycle, MCP | [Scripting and extensions](docs/structure/scripting-extensions.md) | Chat pipeline, providers, plugin storage |
@@ -69,11 +69,12 @@ Browser client (src/)                         Node server (server/node/)
 │ → App.svelte + loadData()     │  /api/*     │ ├ SQLite KV + protected chunks   │
 │ stores/runes select screens   │  /proxy2    │ ├ chats/* + pluginsave/* rows    │
 │                               │  WS jobs    │ ├ assets/inlays/history files    │
-│ DBState.db holds placeholders │             │ └ pins/spools/backups/recovery   │
-│ NodeStorage-backed, KV-shaped │             │ model-jobs.db + request journals │
-│ server storage API            │             │ request-logs.db                  │
-│ optional verified IDB cache   │             │ logs.cjs → save/logs.db          │
-└───────────────────────────────┘             └──────────────────────────────────┘
+│ DBState.db holds placeholders │             │ ├ admitted spools + chunk workers│
+│ NodeStorage-backed, KV-shaped │             │ └ pins/backups/plugin recovery   │
+│ server API + codec worker     │             │ model-jobs.db + request journals │
+│ optional verified IDB cache   │             │ request-logs.db + save/logs.db   │
+└───────────────────────────────┘             │ opt-in save/trace                │
+                                              └──────────────────────────────────┘
 ```
 
 - The browser holds the whole `Database` proxy in `DBState.db`. Unopened chats are
@@ -81,6 +82,11 @@ Browser client (src/)                         Node server (server/node/)
   replaces every chat with a wire `_stub` and saves authoritative chat rows first.
 - The opt-in IndexedDB resource cache stores verified, hash-addressed bytes plus
   resource manifests. It is disposable; the Node server remains authoritative.
+- Payload-sized client encoding, hashing, and chat-delta preparation use a browser
+  codec worker; the server disk-spools selected admitted writes and plans chunks in
+  bounded worker threads, with synchronous fallbacks when worker offload is unavailable.
+- `TRACE_REQUEST_FOR_DEBUG=true` writes bounded debug traces under `save/trace`; the
+  server also exposes authenticated plugin-storage recovery management routes.
 - Default non-preview, tool-free `ModelPreset` requests use reconnectable
   `/api/model-jobs` for streaming and JSON responses, with the proxy-aware `/proxy2`
   path as a job-creation fallback. Previews, tool loops, or disabled server-side jobs
@@ -131,9 +137,10 @@ mutation. See [chat pipeline](docs/structure/chat-pipeline.md),
 
 Ordinary UI code mutates `DBState.db`. `saveDb()` tracks deep reactive reads, stages
 changed chat bodies to `/api/chat-content`, then commits the stubs-only database through
-JSON Patch or an ETag-guarded full write. Generation checkpoints can persist active chat
-rows before final completion. Plugin storage, drafts, assets, inlays, and destructive
-recovery use explicit protocols rather than this implicit save loop. See
+JSON Patch or an ETag-guarded full write. Generation checkpoints can persist bounded chat
+operation-log deltas for asynchronous server compaction; full-row writes remain the
+fallback. Plugin storage, drafts, assets, inlays, and destructive recovery use explicit
+protocols rather than this implicit save loop. See
 [client storage](docs/structure/client-storage.md),
 [server backend](docs/structure/server-backend.md), and
 [plugin storage](docs/structure/plugin-storage.md).
@@ -153,7 +160,8 @@ Full/server exports require a valid live database and every referenced chat, the
 pinned WAL view to verified private filesystem copies. Partial exports and automatic
 snapshots have explicit recovery-oriented missing-chat policies. Destructive imports and
 restores stage bounded input behind the import barrier and report committed,
-not-committed, or unknown outcomes. See
+not-committed, or unknown outcomes. Character-package chat import/export and dataset
+export process chat JSON incrementally instead of materializing every chat row at once. See
 [backup and recovery](docs/structure/backup-recovery.md).
 
 ## Vocabulary that prevents expensive mistakes
@@ -197,12 +205,12 @@ not-committed, or unknown outcomes. See
 - Browser caches are non-authoritative. Cache hits, segmented DB assembly, and list deltas
   must fall back to a full authoritative read on malformed, missing, stale, or
   unverifiable state.
-- `/api/session` registration records a boot but does not steal mutation rights. The
-  active writer remains authoritative; another session can take over only when it is
-  fresh relative to the last accepted write and makes a gesture-backed write. Fresh
-  passive compatibility writes do not move the lock; stale sessions receive 423 and
-  must reload or enter the frozen read-only recovery UI. Stale dirty state must not be
-  replayed over the new writer.
+- `/api/session` registration does not steal mutation rights. Only a fresh,
+  gesture-backed write can take over; stale writers receive 423 and must reload or stay
+  frozen in recovery. Stale dirty state must never be replayed over the active writer.
+- Writer mutations carry `x-client-build`. A mismatch with the server's `dist` build
+  stamp is rejected with HTTP 426 `CLIENT_UPGRADE_REQUIRED`; clean pages reload and
+  dirty pages enter writer recovery.
 - Runtime KV/chat-row/asset/inlay mutations that can overlap a destructive import must use
   the storage queue. The held import transaction and startup recovery are deliberate,
   bounded exceptions.
@@ -213,10 +221,11 @@ not-committed, or unknown outcomes. See
   `pluginStorageGeneration`, `plugin-storage/manifest.json`, value rows, and owner rows
   move together. Prefix rows absent from the matching manifest are quarantined physical
   data, not current state.
-- Use the dedicated versioned mutation, batch, generation, and capability-negotiated transition APIs
-  for optimized rows and publication controls. Generic KV writes never mutate those
-  roots. Ordinary database patches may update the inline value/owner maps only after
-  the server proves that the live authoritative mode is inline.
+- Use the dedicated versioned mutation, batch, and generation APIs; mode changes use
+  only the staged or bulk transition routes. The legacy non-bulk
+  `/api/plugin-storage/transition` returns HTTP 426 and is not a live transition API.
+  Generic KV writes never mutate those roots. Ordinary database patches may update the
+  inline value/owner maps only after the server proves the authoritative mode is inline.
 - Never replay a storage or destructive-replacement request whose commit outcome is
   unknown. Re-read or reload authoritative state and reconcile first.
 
@@ -225,11 +234,10 @@ not-committed, or unknown outcomes. See
 - Full and server-file exports require a valid live database and all referenced chats.
   Automatic snapshots and partial jobs deliberately preserve a bare stub for an already
   missing chat so damaged state still has a recovery point.
-- Full exports combine one pinned SQLite view with verified private filesystem copies.
-  Database assembly uses `POCKETRISU_SPOOL_DIR` or `save/.spool`; filesystem pins remain
-  under `save/.partial-export-spool`.
-- Imports are exclusive replacement transactions. Bounded ingress/staging, the abortable
-  import barrier, SQLite transaction, and filesystem swap journal are one safety protocol.
+- Full exports combine one pinned SQLite view with verified private filesystem copies;
+  their temporary data stays on the configured save/spool volumes.
+- Imports are exclusive replacements. Bounded staging, the import barrier, the SQLite
+  transaction, and the filesystem swap journal form one safety protocol.
 - Upstream migration exports are intentionally lossy for PocketRisu-only inlays. RisuAI
   quirks such as `extentions`, RPack framing, legacy save fallbacks, and index-based
   `botPresetsId` are deliberate data-format contracts. The mutating `GET /api/remove` is
@@ -245,5 +253,6 @@ not-committed, or unknown outcomes. See
 
 Approximate file sizes were removed from the root map because fast-moving storage and
 plugin modules made them misleading. When code moves, prefer updating symbol ownership
-and change maps over refreshing every line number. Treat `docs/findings/audit/` findings as
-historical evidence whose resolution must be checked against current code.
+and change maps over refreshing every line number. Treat `docs/findings/` (including
+`docs/findings/audit/`) and `.archived-docs/` as historical evidence whose resolution
+must be checked against current code.

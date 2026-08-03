@@ -1,7 +1,7 @@
 # Characters and personas
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-01 against `818c3bc1`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -64,26 +64,23 @@ Character metadata lives inside the main database object, while image and other 
 
 - `src/ts/characterPackage.ts` — PocketRisu package ZIPs bundling a character card with optional chats, bound personas, and inlays.
 
-  - `PackageManifest` defines `type: "risuCharacterPackage"` and `version: 1` at `src/ts/characterPackage.ts:21`.
-  - `scanCharacterInlayIds()` finds `{{inlay::...}}`, `{{inlayed::...}}`, and `{{inlayeddata::...}}` references in chat message text at `src/ts/characterPackage.ts:65`.
-  - `getCharacterBoundPersonas()` resolves unique `Chat.bindedPersona` IDs against `db.personas` at `src/ts/characterPackage.ts:82`.
-  - `buildPersonaPng()` embeds the persona JSON in a `persona` PNG text chunk at `src/ts/characterPackage.ts:103`.
-  - Package validation requires `manifest.json`, the exact manifest type, and version 1 at `src/ts/characterPackage.ts:141`.
-  - Persona import and old-to-new persona ID mapping are implemented at `src/ts/characterPackage.ts:186`.
-  - Chat replacement/append, chat-ID regeneration, persona-ID remapping, and folder collision handling live at `src/ts/characterPackage.ts:260`.
-  - Inlay import and metadata restoration begin at `src/ts/characterPackage.ts:318`.
-  - `markImportedChatsDirty()` publishes the package's character block and full chat rows to the ordinary save scheduler at `src/ts/characterPackage.ts:320`.
-  - `exportCharacterPackage()` builds the outer ZIP at `src/ts/characterPackage.ts:400`.
-  - `importCharacterPackage()` creates a new character from a package at `src/ts/characterPackage.ts:624`.
-  - `importPackageToCharacter()` appends package chats/personas/inlays to an existing character but does not replace that character’s card fields at `src/ts/characterPackage.ts:715`.
+  - `PackageManifest` defines `type: "risuCharacterPackage"` and `version: 1`; `parseAndValidatePackage()` reads that member through the indexed streaming ZIP reader and validates the exact type/version.
+  - `scanCharacterInlayIds()` recognizes `{{inlay::...}}`, `{{inlayed::...}}`, and `{{inlayeddata::...}}`; export scans one streamed chat at a time to collect referenced IDs and bound personas.
+  - `importChatsToCharacter()` parses `chats/chats.json` incrementally, remaps persona/folder identities, assigns each chat a new UUID, writes the normalized authoritative row immediately, and retains only a placeholder for database publication.
+  - `exportCharacterPackage()` writes the outer ZIP incrementally and supplies `chats/chats.json` as an async iterable rather than materializing all chats or the archive.
+  - `importCharacterPackage()` creates a new character from a package; `importPackageToCharacter()` appends package chats/personas/inlays to an existing character but deliberately ignores the packaged card fields.
+
+- `src/ts/storage/interchangeChatStream.ts` — bounded character/chat read path shared by package and dataset export. `streamCharacterChats()` snapshots or fetches chats in stable source order with `INTERCHANGE_CHAT_LOOKAHEAD = 2`; a missing authoritative row raises `MissingInterchangeChatError` instead of silently exporting an empty body.
+
+- `src/ts/storage/streamedJson.ts` — incremental JSON framing and parsing. `encodePackageChatsJson()` emits `risuAllChats` version 2 one chat at a time; `parsePackageChatsJson()` invokes its callback as each array item completes. `encodePrettyJsonArray()` is the general async JSON-array encoder used by dataset export.
+
+- `src/ts/process/zipStream.ts` — indexes a replayable `Blob`/`Uint8Array`, then inflates selected ZIP members sequentially with 64 KiB source chunks and stream backpressure. Helpers that request one complete member still materialize that member.
 
 ### Chat interchange and persistence targets
 
 - `src/ts/chatImport.ts` — lossless hidden-payload encoding for HTML chat export and validated HTML import. `parseChatHtmlExport()` delegates local identity allocation to `prepareChatForImport()`.
 - `src/ts/storage/chatStorage.ts` — authoritative chat-row I/O and shared imported-chat normalization. `prepareChatForImport()` clones a transported chat, strips `_stub`/`_placeholder`, fills required containers, and always assigns a fresh `Chat.id` (`src/ts/storage/chatStorage.ts:145`).
-- `src/ts/storage/dirtyTargetBridge.ts` — buffers explicit character/chat dirty targets even before `saveDb()` has installed its reactive trackers.
-- `src/ts/storage/dirtyTargetDiff.ts` — computes arbitrary-target character-block and full-chat-row changes. `collectImportedChatDirtyTargets()` excludes placeholders and names the package rows that must be persisted (`src/ts/storage/dirtyTargetDiff.ts:124`).
-- `src/ts/storage/chatPersistStage.ts` — rejects duplicate chat IDs within one character before writing rows, and writes full chat rows before allowing the stubs-only database commit (`src/ts/storage/chatPersistStage.ts:23`, `src/ts/storage/chatPersistStage.ts:247`).
+- `src/ts/storage/chatPersistStage.ts` — final duplicate-ID and row-before-stub guard for ordinary reactive persistence. Package import establishes each chat row directly before installing its placeholder; save scheduling and arbitrary-target dirty bridges are owned by [Client storage](client-storage.md).
 
 ### Persona cards
 
@@ -284,30 +281,31 @@ The low-level exporter can also write a V2 card object as ordinary JSON; base64 
 
 Export:
 
-1. Clone the character and hydrate every identified placeholder chat. A missing server row aborts export to prevent silent data loss.
-2. Resolve personas referenced by `Chat.bindedPersona`.
-3. Scan hydrated message text for inlay IDs.
-4. Create an outer ZIP and optional inner V3 CharX.
-5. Write `chats/chats.json` as `risuAllChats` version 2.
-6. Write each persona as `persona/<name>.png`.
-7. Write inlay payloads plus `inlays/meta.json`.
-8. Write `manifest.json` last.
+1. `getCharacterInterchangeSnapshot()` detaches character metadata and records only each chat’s index, durable ID, and name; it does not traverse every chat body.
+2. `streamCharacterChats()` preflights those references in source order with a two-row lookahead. Live rows are snapshotted individually, cold placeholders are fetched without hydrating the runtime database, and any missing authoritative row aborts export.
+3. The preflight collects referenced persona and inlay IDs without retaining the chat bodies.
+4. `LocalWriter` and `CharXWriter` stream the outer ZIP and optional inner V3 CharX to the download sink.
+5. `encodePackageChatsJson()` streams a second bounded chat pass into `chats/chats.json` as `risuAllChats` version 2, serializing one chat at a time.
+6. Persona PNGs and inlay members are written sequentially, then `manifest.json` is written last.
 
 New-character import:
 
-1. Fully unzip the package and validate the manifest.
-2. Import the inner CharX, or create a blank character for an empty package.
-3. Import personas and build an old-ID-to-new-ID map.
-4. Replace the new character’s chats, remapping persona IDs and regenerating chat IDs.
-5. Restore inlays and commit ordering.
+1. Index the replayable ZIP, read only `manifest.json`, and validate the exact package type/version; selected members are subsequently inflated one at a time with backpressure rather than through whole-archive `fflate.unzip`.
+2. Stream the inner CharX into its importer, or create a blank character for an empty package.
+3. Import selected persona members and build an old-ID-to-new-ID map.
+4. Read chat metadata, then parse `chats/chats.json` incrementally. Each callback remaps persona/folder IDs, assigns a fresh chat UUID, normalizes and directly persists the authoritative row, and appends only its placeholder to the new character.
+5. Stream selected inlay members sequentially, publish the character metadata/stub block through normal client storage, and repair ordering.
 
 Existing-character import ignores the packaged character card itself and appends only personas, chats/folders, and inlays.
 
-### Imported chat identity and save scheduling
+### Imported chat identity
 
 Chat IDs are authoritative row identities, not portable identities. JSON V1/V2 and HTML chat imports go through `prepareChatForImport()`; JSONL creates a fresh ID directly; and package import assigns every transported chat a new UUID before insertion. The shared helper also removes wire/runtime placeholder markers so an imported body can never hydrate through its source row.
 
-Ordinary reactive save tracking watches only the selected character and active chat. Package import may create or append to an off-screen character, so it calls `markCharacterDirty()` and `markChatDirty()` through `markImportedChatsDirty()`. `DirtyTargetBridge` queues marks made before the save loop is ready, and `saveDb()` later writes full authoritative chat rows before committing the stubs-only database. These marks schedule the normal asynchronous save; they are not an immediate durability acknowledgement.
+Package import is a specialized row-first path: it writes each regenerated full row while
+streaming, then inserts the corresponding runtime placeholder. The normal save scheduler,
+explicit dirty-target APIs, and durability outcomes are documented canonically in
+[Client storage](client-storage.md).
 
 As a final collision guard, `prepareChatPersistStage()` refuses duplicate `Chat.id` values within one character before any row/stub publication. Startup `assignIds()` repairs duplicate full-chat IDs, but deliberately leaves a duplicate cold placeholder visible so persistence fails closed instead of renaming a stub away from its existing row (`src/ts/bootstrap.ts:794`).
 
@@ -338,19 +336,19 @@ The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streami
 - Startup invokes `characterURLImport()` after loading an initialized database at `src/ts/bootstrap.ts:80`.
 - Realm UI calls `getRisuHub()`, `getRealmInfo()`, and `downloadRisuHub()`.
 - Module import calls `importCharacterProcess({returnCharacter: true})` to convert V3 CharX into a module at `src/ts/process/modules.ts:263`.
-- Character-package export/import calls `exportCharacterCard()` and `importCharacterProcess()` at `src/ts/characterPackage.ts:488` and `src/ts/characterPackage.ts:667`.
+- Character-package export/import calls `exportCharacterCard()` and `importCharacterProcess()` while routing outer members through `CharXWriter` and the indexed `zipStream.ts` reader.
 
 ### Calls out of this subsystem
 
-- Reactive data: `getDatabase()`, `setDatabase()`, `setDatabaseLite()`, character accessors, `selectedCharID`, and Realm/mobile stores.
+- Reactive data: `getDatabase()`, `setDatabase()`, `setDatabaseLite()`, narrow character/interchange snapshot accessors, `selectedCharID`, and Realm/mobile stores.
 - Binary persistence: `saveAsset()`, `readImage()`, `loadAsset()`, `getFileSrc()`, `LocalWriter`, and `VirtualWriter`.
 - Archive/codec libraries: `fflate`, Node/browser `Buffer`, PNG CRC32, MsgPack, and RPack.
 - Card types: `@risuai/ccardlib`.
 - Identity: `uuid` V4 for characters, chats, personas, folders, modules, and VITS models.
 - Lore/script compatibility: `readModule()`, `exportModuleLegacy()`, and internal lore conversion.
 - Inlays: `getInlayAsset()`, `setInlayAsset()`, batch info, and metadata functions.
-- Cold chat storage: `ensureChatHydrated()` and `fetchChatFromServer()`.
-- Background persistence: `markCharacterDirty()`, `markChatDirty()`, `DirtyTargetBridge`, and the chat-row persist stage.
+- Cold chat storage: `ensureChatHydrated()`, `fetchChatFromServer()`, direct package-row publication through `saveChatToServer()`, and bounded `streamCharacterChats()` reads.
+- Background metadata/stub persistence enters the normal [client storage](client-storage.md) save loop after package row publication.
 - Remote services: `/hub-proxy`, `realm.risuai.net`, Chub’s download API, service-worker share endpoints, and URL hash imports.
 - Prompt/render consumers obtain persona overrides through `getUserName()`, `getUserIcon()`, and `getPersonaPrompt()` at `src/ts/util.ts:81`, `src/ts/util.ts:90`, and `src/ts/util.ts:99`.
 
@@ -394,16 +392,21 @@ The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streami
 - `getRisuHub()` accepts remote `additionalHTML`, and `RealmMain.svelte` renders it through `{@html ...}` at `src/lib/UI/Realm/RealmMain.svelte:144`. Treat the hub response as a trusted HTML source.
 - Realm catalog/resource/report/remove traffic uses `/hub-proxy`, but the dynamic card download calls `realm.risuai.net` directly.
 - `lightningRealmImport` only affects embedded PNG asset handling and only when legacy account sync is enabled. CharX import does not use that optimization.
-- Package import fully materializes the outer ZIP with `fflate.unzip`; unlike CharX import, it is not streaming and can consume substantial memory.
-- Package export hydrates identified placeholder chats before scanning personas/inlays. An anomalous placeholder without a chat ID currently bypasses that hydration check, so callers must not manufacture id-less placeholders.
+- Package ZIP import indexes the central directory and streams selected entries sequentially
+  with 64 KiB input chunks and backpressure. This is a bounded working-set design, not a
+  hard archive/entry-size limit: the central directory is one allocation, and manifest,
+  persona, and inlay helpers still materialize one selected member at a time.
+- Package export snapshots/fetches chats with a two-row lookahead instead of hydrating the
+  whole character. An anomalous placeholder without a chat ID is still treated as a local
+  row and bypasses the missing-row check, so callers must not manufacture id-less placeholders.
 - Importing a package into an existing character intentionally ignores the package’s inner CharX and only appends associated data.
 - Package chat import regenerates chat IDs. Append mode also remaps colliding folder IDs.
 - Inlay IDs are not regenerated. Existing local IDs are skipped, so a collision reuses the local inlay even if the package contains different bytes.
-- Package persona duplicate detection includes the original persona ID and original icon storage string at `src/ts/characterPackage.ts:229`; cross-install duplicates therefore rarely qualify as exact duplicates.
+- Package persona duplicate detection includes the original persona ID and original icon storage string; cross-install duplicates therefore rarely qualify as exact duplicates.
 - Package persona import does not currently copy the manifest’s `largePortrait` value into newly appended personas, despite exporting it.
 - Standalone persona PNG interchange preserves only name, prompt, note, and the PNG used as icon. Stable IDs, large portraits, embedded modules, and other advanced persona state do not round-trip.
 - Package chat IDs are regenerated and bound persona IDs are remapped, but chat IDs recorded inside imported inlay ownership metadata are not remapped to the new chat IDs.
-- If new-character package import fails after adding personas or inlays, rollback explicitly removes only the newly created character at `src/ts/characterPackage.ts:690`; associated writes may remain.
+- If new-character package import fails after adding personas, chat rows, or inlays, rollback explicitly removes only the newly created character; associated writes may remain.
 - License restrictions are enforced by the character-config UI, not by `exportCharacterPackage()` itself. Restricted licenses disable ordinary card export and force `includeCharacter: false` at `src/lib/SideBars/CharConfig.svelte:630`.
 - Asset paths stored anywhere in the stripped database are discovered by the server's bounded recursive reachability scan. New external asset-reference stores must be joined into `collectDatabaseAssetReferences()` and covered by fail-closed cleanup tests.
 
@@ -425,16 +428,17 @@ The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streami
 - To change the Risu-specific module embedded in CharX, inspect `src/ts/characterCards.ts:1389` and `src/ts/process/modules.ts:61`.
 - To change `.risum` compatibility framing, edit `src/ts/process/modules.ts:61` and its inverse at `src/ts/process/modules.ts:125`.
 - To change `.risup` compatibility, inspect `downloadPreset()` and `importPreset()` at `src/ts/storage/database.svelte.ts:2966` and `src/ts/storage/database.svelte.ts:3017`, plus `src/ts/rpack/rpack_js.js:9`.
-- To change imported-chat normalization or identity allocation, inspect `prepareChatForImport()` in `src/ts/storage/chatStorage.ts`, HTML parsing in `src/ts/chatImport.ts`, and package UUID assignment in `src/ts/characterPackage.ts:261`.
-- To change off-screen package-save scheduling, inspect `markImportedChatsDirty()` in `src/ts/characterPackage.ts`, `DirtyTargetBridge`, and `collectImportedChatDirtyTargets()`.
+- To change imported-chat normalization or identity allocation, inspect `prepareChatForImport()` in `src/ts/storage/chatStorage.ts`, HTML parsing in `src/ts/chatImport.ts`, and the UUID assignment inside `importChatsToCharacter()`.
+- To change package row/stub publication, inspect `importChatsToCharacter()` and the
+  canonical save scheduling contracts in [Client storage](client-storage.md).
 - To add a new importable extension, update file dispatch at `src/ts/characterCards.ts:45`, URL/PWA routing at `src/ts/characterCards.ts:492`, and global drag-and-drop at `src/App.svelte:49`.
 - To change persona selection synchronization, inspect `src/ts/persona.ts:29` and `src/ts/persona.ts:37`.
 - To change standalone persona-card fields, update the `PersonaCard` shape at `src/ts/persona.ts:50` and both PNG paths at `src/ts/persona.ts:56` and `src/ts/persona.ts:106`.
-- To change chat-bound persona behavior, inspect `src/ts/util.ts:65` and package persona remapping at `src/ts/characterPackage.ts:260`.
-- To change package contents or versioning, start with `PackageManifest` at `src/ts/characterPackage.ts:21`, export at `src/ts/characterPackage.ts:392`, and validation at `src/ts/characterPackage.ts:141`.
-- To change package import into a new character, inspect `src/ts/characterPackage.ts:616`.
-- To change append-to-existing semantics, inspect `src/ts/characterPackage.ts:286` and `src/ts/characterPackage.ts:702`.
-- To change which inlays are packaged, inspect the reference regex at `src/ts/characterPackage.ts:63` and inlay export at `src/ts/characterPackage.ts:546`.
+- To change chat-bound persona behavior, inspect `src/ts/util.ts:65` and persona remapping inside `importChatsToCharacter()`.
+- To change package contents or versioning, start with `PackageManifest`, `exportCharacterPackage()`, and `parseAndValidatePackage()`.
+- To change package import into a new character, inspect `importCharacterPackage()`.
+- To change append-to-existing semantics, inspect `importChatsToCharacter()` and `importPackageToCharacter()`.
+- To change which inlays are packaged, inspect `INLAY_REF_REGEX`, the streamed preflight in `exportCharacterPackage()`, and `importInlays()`.
 - To change Realm catalog queries, edit `src/ts/characterCards.ts:1598` and `src/lib/UI/Realm/RealmMain.svelte:21`.
 - To change Realm download/import behavior, edit `src/ts/characterCards.ts:1627`.
 - To change Realm deep-link handling, inspect `src/ts/characterCards.ts:341`, `src/ts/characterCards.ts:356`, and startup invocation at `src/ts/bootstrap.ts:80`.
@@ -446,6 +450,6 @@ The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streami
 
 - `src/ts/interchangeability.ts` is the character ↔ module ↔ persona conversion map, including lore indicators used to preserve selected fields.
 - [Media and translation](media-translation.md) covers inlay persistence and ownership metadata.
-- [Client storage](client-storage.md) covers placeholder/cold-chat hydration used by package export.
+- [Client storage](client-storage.md) covers narrow snapshots, cold-chat reads, row-first publication, and save scheduling used by package interchange.
 - [Chat pipeline](chat-pipeline.md) covers chat behavior; chat JSON/JSONL/TXT/HTML interchange remains co-located in `src/ts/characters.ts`.
 - [Memory and lorebook](memory-lorebook.md) covers live module projection and lore execution.

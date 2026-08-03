@@ -1,7 +1,7 @@
 # Plugin storage
 
 > Part of the [PocketRisu structure guide](../../STRUCTURE.md). Audited on
-> 2026-08-01 against `818c3bc1`. Prefer the symbols below over volatile line numbers.
+> 2026-08-04 against `95c2ea30`. Prefer the symbols below over volatile line numbers.
 
 ## Purpose and scope
 
@@ -138,6 +138,8 @@ Express + SQLite
 - `server/node/pluginSaveKeys.cjs` owns server key parsing and namespace constants.
 - `server/node/pluginStorageJson.cjs` validates raw keys, canonical encoded names, and
   strict JSON rows, and performs server-owned compatible-value transition conversion.
+- `server/node/pluginStorageManifestCache.cjs` retains one parsed live manifest entry
+  only for the exact trigger-backed publication revision.
 - `server/node/pluginStorageViewerFacets.cjs` owns rebuildable display-size/owner facet
   validity, streaming display-size semantics, and pinned-snapshot facet queries.
 - `server/node/pluginStorageLimits.cjs` owns authoritative per-value and aggregate
@@ -153,6 +155,14 @@ Express + SQLite
   management dialog.
 - `src/lib/Setting/Pages/PluginStorageViewer.svelte` owns paged inspection and
   revision-aware maintenance.
+
+Quota and dashboard accounting intentionally measure different sets. The aggregate quota
+counts logical optimized value bodies only. The dashboard's plugin category includes
+value rows, owner sidecars, and the exact publication manifest, and keeps their logical
+payload total separate from physical SQLite KV-row bytes and referenced chunk bodies.
+Shared chunks are attributed to chats first, then plugin storage; only the remainder
+belongs to the database slice. The plugin physical payload is therefore its KV-row bytes
+plus its disjoint chunk bytes, not total SQLite page or index overhead.
 
 ## API semantics
 
@@ -198,6 +208,16 @@ chunk writer inside the existing atomic transaction. This lets a one-value guard
 reach the same configured per-value limit as ordinary `setItem()` without base64
 expansion. Older servers use the retained 16 MiB JSON/base64 batch fallback.
 
+Large single-row set mutations use a parallel streaming path. The server requires an
+exact positive `Content-Length`, enforces the per-value limit while writing a create-only
+private spool, computes SHA-256 during that pass, then validates strict JSON and derives
+viewer metadata before entering the mutation queue. The transaction reads the admitted
+file through the chunk writer; the browser accepts a committed acknowledgement only when
+the echoed server hash matches its locally prepared body hash. Length mismatch, abort,
+validation failure, and normal completion all clean the spool. Invalid JSON retains the
+single-row `PluginStorageValidationError` diagnostic instead of exposing parser-specific
+streaming errors.
+
 Committed optimized `mutate` and `batch` acknowledgements may echo `manifestRevision`,
 the SHA-256 token of the exact committed manifest bytes. Optimized `mutate`
 acknowledgements additionally echo `previousManifestRevision`, captured from the live
@@ -225,6 +245,15 @@ full manifest snapshot. Concurrent cold ownership misses for the same database o
 generation share one snapshot request; callers retain independent cancellation, and the
 shared request is cancelled only after every waiter leaves. Thus external imports or
 rewrites remain observable without an unconditional snapshot scan.
+
+The server has an independent parsed-manifest cache. A trigger-backed revision advances
+when either `database/database.bin` or `plugin-storage/manifest.json` changes. A read
+samples that revision before parsing and again afterward, caches the entry only when both
+samples match, and retries once before returning a fresh uncached parse. Cache hits must
+match the currently sampled revision; committed manifest mutations restamp their prepared
+entry with the post-transaction revision, while database or destructive-publication
+invalidation clears it. Parsed manifest sets and mappings therefore never authorize a
+different live publication revision.
 
 Manifest state and snapshot reads share an endpoint but not an HTTP-cache identity. State
 responses carry `Cache-Control: no-store`, while snapshot responses retain Express weak
@@ -483,7 +512,7 @@ Run the client, server, and compat suites; no one command aggregates them.
 - [Plugin development guide](../../plugins.md)
 - [V2-to-V3 migration guide](../../src/ts/plugins/migrationGuide.md)
 - [Safe compound plugin-storage updates](../../docs-human/en/plugin-storage.md)
-- [Mutation outcome handling](../plugin-storage-mutation-outcomes.md)
+- [Mutation outcome handling](../../.archived-docs/plugin-storage-mutation-outcomes.md)
 - [Scripting and extensions](scripting-extensions.md)
 - [Client storage](client-storage.md)
 - [Server backend](server-backend.md)

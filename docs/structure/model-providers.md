@@ -1,7 +1,7 @@
 # Model providers
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-01 against `818c3bc1`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -331,6 +331,9 @@ Only main jobs participate in the server's one-running-job-per-chat guard and re
 
 The server marks jobs left running across a server restart as failed because their in-memory credentials and upstream sockets cannot be restored. Terminal rows/journals are rotated by age and count while unclaimed main responses receive retention preference. Pending-send tombstones live in the same SQLite database but contain no prompt or response data; they cover browser-pipeline death before a recoverable main job exists.
 
+The relay, journal, metadata, retention, and route contracts are documented from the
+server side in [server backend](server-backend.md#durable-model-requests-and-recovery).
+
 #### Recovery after browser loss
 
 `initModelJobRecovery()` runs discovery at boot, when the page becomes visible, and on `online`. Unclaimed terminal main jobs are decoded with the same OpenAI-compatible, Anthropic, or Gemini JSON/SSE parsers used by live adapters. Recovery matches `generationInfo.generationId` or message `chatId`, fills a shorter partial message or inserts a new one, explicitly saves the chat row, records provider usage, and only then claims the job. This ordering makes retries idempotent and avoids losing a response when persistence fails.
@@ -339,15 +342,19 @@ A still-running main job creates a `background` entry in the per-chat generation
 
 #### Request logging and usage
 
-Request logging defaults on. Tagged classic calls are recorded by `globalFetch()` or a scoped `fetchNative()` wrapper; untagged asset/polling/plugin traffic is intentionally excluded. ModelPreset requests create one scope around whichever transport is selected. Scoped logs record direct, `/proxy2`, WebSocket-proxy, or `job` route, request/response metadata, and text bodies while stripping inline base64 media. Streaming responses are teed so logging does not consume the provider branch. Recovered jobs synthesize the same category of log entry after their chat row is durable.
-
-Adapters attach authoritative usage when providers report it:
+Generic request capture, credential masking, retention, direct/proxy/job route storage,
+recovered-job publication ordering, and the `/api/request-logs` persistence API are
+documented in [server backend](server-backend.md#request-logging-and-observability).
+Provider-specific responsibility here is usage parsing:
 
 - OpenAI-compatible parses prompt/completion totals plus cached and reasoning detail fields. Streaming usage requires the opt-in `requestLogStreamUsage`, which adds `stream_options: {include_usage: true}`; it is disabled by default because strict compatible servers may reject the field.
 - Anthropic merges input/cache usage from `message_start` with output usage from `message_delta`; cache reads and writes are folded into prompt tokens, with reads also exposed as cached tokens.
 - Gemini reads `usageMetadata`, including cached-content token counts.
 
 The ModelPreset request-status display counts live text with fixed local tiktoken via `encodeWithTokenizer(..., 'tik')`, avoiding model-selected network tokenizers, and replaces the approximate completion count with provider usage when available.
+
+The opt-in `TRACE_REQUEST_FOR_DEBUG` facility is server-side HTTP tracing, not a provider
+hook and not a provider API. See [server backend](server-backend.md#request-logging-and-observability).
 
 ### Browser/proxy transport and WebSocket proxy jobs
 
@@ -388,7 +395,9 @@ Explicit local-network routing changes the behavior:
 - Plugins can transform prompts/results or provide complete model implementations.
 - `globalFetch()`/`fetchNative()` provide logging, interception, timeout, direct-fetch, and proxy behavior.
 - `makeJobFetch()` and `server/node/model-jobs.cjs` provide durable ModelPreset transport, while `jobRecovery.ts` hydrates/saves recovered chats and publishes recovered usage.
-- `src/ts/requestLog.ts` and the server request-log API retain request bodies, response bodies, routes, and token usage when logging is enabled.
+- `src/ts/requestLog.ts` supplies provider metadata and parsed usage to the generic
+  request-log path; [server backend](server-backend.md#request-logging-and-observability)
+  owns masking, retention, persistence, and routes.
 - The preset path calls `src/ts/preset/adapter/`, whose concrete send entry points are OpenAI-compatible (`src/ts/preset/adapter/openaiCompatible.ts:49`), Anthropic (`src/ts/preset/adapter/anthropicMessages.ts:64`), and Gemini (`src/ts/preset/adapter/googleGemini.ts:81`).
 - Browser-local code depends on `@huggingface/transformers`, `@mlc-ai/web-llm`, Cache Storage, IndexedDB-backed assets, WebGPU/WASM, and Web Audio.
 
@@ -547,6 +556,7 @@ Explicit local-network routing changes the behavior:
 
 - [Presets and profiles](presets-profiles.md) covers ModelPreset configuration, profile snapshots, chat/module bindings, credentials, and persistence.
 - [Chat pipeline](chat-pipeline.md) covers the provider-neutral prompt and streaming consumer.
-- [Server backend](server-backend.md) covers `/proxy2`, streaming jobs, authentication, and SSRF restrictions.
+- [Server backend](server-backend.md) covers `/proxy2`, streaming jobs, authentication,
+  SSRF restrictions, and request-log/debug-trace persistence.
 - [Scripting and extensions](scripting-extensions.md) covers plugin providers and MCP tool registration.
 - [UI layer](ui-layer.md) covers provider/model selection and settings surfaces.

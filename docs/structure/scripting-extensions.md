@@ -1,7 +1,7 @@
 # Scripting and extensions
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-01 against `818c3bc1`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -182,6 +182,13 @@ PocketRisu exposes four overlapping extension mechanisms: CBS template expressio
   - MCP declarations begin near the top of the file, `PluginStorage` defines the complete
     save-storage surface, and `RisuaiPluginAPI` assembles provider, TTS, scripts,
     replacers, MCP, LLM, storage, UI, and IPC declarations.
+  - Save-storage helpers are grouped by purpose: `generations.publish()`, `load()`, and
+    `garbageCollect()` manage immutable multi-row publications; `readItem()` and
+    `setFromRead()` preserve explicit read outcomes, while `atomicBatch()`,
+    `rewriteItem()`, and `updateItem()` provide compound, replacement, and guarded
+    transform mutations; `setItemWithOutcome()`, `removeItemWithOutcome()`, and
+    `removeItemConfirmed()` expose acknowledgement ambiguity and authoritative-removal
+    confirmation. See [plugin storage](plugin-storage.md) for their storage semantics.
 
 - `src/ts/plugins/apiV3/developMode.ts` — `hotReloadPluginFiles()` polls a selected JS/TS file every 500 ms and re-imports it; only V3 hot reload is accepted by `importPlugin()` (`src/ts/plugins/apiV3/developMode.ts:5`, `src/ts/plugins/apiV3/developMode.ts:32`).
 
@@ -385,9 +392,16 @@ externalization, but it neither makes V2/V2.1 compatible with optimized storage 
 relaxes strict versioned/compound writes. Plugin reloads and storage-mode transitions
 share the lifecycle lock, so teardown/startup cannot race a backend publication change.
 
-See [Plugin storage](plugin-storage.md) for persistence authority, conversion details,
-generation/batch rules, transitions, recovery, backups, and viewer semantics. Plugin
-authors should also follow [Safe V3 plugin-storage mutations](../plugin-storage-mutation-outcomes.md).
+Current clients prepare mode transitions as consolidated binary bodies and send them to
+`POST /api/plugin-storage/transition/bulk` with the internal
+`application/x-pocketrisu-plugin-storage-transition` content type. The legacy non-bulk
+`POST /api/plugin-storage/transition` route is retired and responds with structured HTTP
+426 upgrade-required instead of performing a transition. This transport is host/server
+plumbing and does not change the public V3 plugin API.
+
+See [plugin storage](plugin-storage.md) for persistence authority, conversion details,
+generation/batch rules, transition framing and fallback, recovery, backups, viewer
+semantics, and safe mutation-outcome handling.
 
 ### MCP-to-model flow
 

@@ -1,7 +1,7 @@
 # Client storage
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-01 against `818c3bc1`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -11,12 +11,13 @@ The client-storage subsystem owns PocketRisu’s canonical `Database` model, its
 
 | File | Role and important symbols |
 |---|---|
-| `src/ts/storage/database.svelte.ts` | Canonical data model, defaults, Svelte-state accessors, preset/theme helpers. `setDatabase()` fills defaults and normalizes imported data; `setDatabaseLite()` only assigns `DBState.db`; `getDatabase()` can return a `$state.snapshot`. The model now includes `optimizePluginMemory` and its inline/external ownership metadata. |
+| `src/ts/storage/database.svelte.ts` | Canonical data model, defaults, Svelte-state accessors, preset/theme helpers. `setDatabase()` fills defaults and normalizes imported data; `setDatabaseLite()` only assigns `DBState.db`; `getDatabase()` can return a whole-graph `$state.snapshot`. Narrow serialization accessors are `getDatabaseFieldsSnapshot()`, `getCharacterSnapshot()`, metadata-only `getCharacterInterchangeSnapshot()`, and ID-aware `getCharacterChatSnapshot()`. The model also includes `optimizePluginMemory` and its inline/external ownership metadata. |
 | `src/ts/globalApi.svelte.ts` | Creates the process-wide `forageStorage` adapter and implements database persistence. `requestImmediateSave()` returns an explicit save outcome; `markCharacterDirty()` and `markChatDirty()` bridge arbitrary-target mutations; and `saveDb()` installs reactive effects, writer-displacement checks, and the permanent save loop. It delegates save coordination to `databaseSave.ts` and row-before-stub/checkpoint decisions to `chatPersistStage.ts`. |
-| `src/ts/storage/dirtyTargetBridge.ts`, `dirtyTargetDiff.ts` | Buffer explicit character/chat targets until the save loop is ready and compute compatibility-safe targets for V3 character-array replacements and package chat imports. The diff separates character/stub metadata from full chat rows and never promotes runtime placeholders to authoritative row data. |
-| `src/ts/storage/nodeStorage.ts` | HTTP client for the Node server. Besides auth, KV, patching, chat rows, cached boot reads, and key-list deltas, it owns bounded request/outcome handling, snapshot restore, backup jobs/replacements, and the generation-pinned plugin manifest/mutation/batch/transition protocols. |
+| `src/ts/storage/dirtyTargetBridge.ts`, `dirtyTargetDiff.ts` | Buffer explicit character/chat targets until the save loop is ready and compute compatibility-safe targets for V3 character-array replacements. The diff separates character/stub metadata from full chat rows and never promotes runtime placeholders to authoritative row data; streamed package import now writes its rows directly instead of using that diff. |
+| `src/ts/storage/nodeStorage.ts` | HTTP client for the Node server. Besides auth, KV, patching, chat rows, cached boot reads, and key-list deltas, it owns bounded request/outcome handling, snapshot restore, backup jobs/replacements, and plugin-storage administration. `getPluginStorageRecoveryManagementInspection()`, `downloadPluginStorageRecoveryRow()`, and `resolvePluginStorageRecoveryIssue()` provide inspection, integrity-verified download, and no-replay resolution with unknown-outcome classification. `getPluginStorageManifestSnapshot()`, `getPluginStorageManifestState()`, and `getPluginStorageViewerPage()` expose generation-pinned snapshot/revision state and authenticated paging; manifest diagnostics can carry an `x-risu-diag` token. Detailed storage semantics live in [Plugin storage](plugin-storage.md). |
 | `src/ts/storage/autoStorage.ts` | Compatibility facade that lazily selects `NodeStorage` and forwards the expanded chat, backup, snapshot, and plugin-storage protocols. Some read paths initialize defensively; ordinary writes still assume bootstrap completed initialization. |
-| `src/ts/storage/risuSave.ts` | All save codecs, incremental block encoding, normalization, transactional patch proposals, and client chat guards. `RisuSavePatcher.set()` prepares structurally shared state that commits only after acknowledgement; `RisuSaveEncoder.takeNormalizedBaseline()` transfers the exact full-write graph without decoding the assembled bytes. Important symbols are `RisuSaveEncoder`, `RisuSaveDecoder`, `decodeRisuSave()`, `normalizeJSON()`, `diffArrayWithIdGuard()`, `RisuSavePatcher`, and `findDangerousChatOps()`. There are no separate production `normalizeJSON`, `risuSavePatcher`, or `chatGuards` files. |
+| `src/ts/storage/risuSave.ts`, `legacyRisuSaveCodec.ts`, `strictRisuSaveCodec.ts` | Split RisuSave codec boundary. `legacyRisuSaveCodec.ts` owns JSON normalization and historical MessagePack/compression encoders; `strictRisuSaveCodec.ts` owns strict `RISUSAVE\0` block decoding and integrity/type checks. `risuSave.ts` imports those modules and re-exports selected public codec surfaces while retaining incremental block encoding, permissive recovery decoding, transactional patch proposals, and chat guards. `RisuSavePatcher.set()` prepares structurally shared state that commits only after acknowledgement; `RisuSaveEncoder.takeNormalizedBaseline()` transfers the exact full-write graph without decoding the assembled bytes. |
+| `src/ts/storage/payloadCodecClient.ts`, `payloadCodecService.ts`, `payloadCodec.worker.ts` | Worker-capable payload boundary. `encodeChatRowPayload()` snapshots and encodes a chat row; `prepareChatRowCheckpoint()` snapshots the acknowledged/current rows and prepares exact bytes, digest, and an eligible operation-log delta; `decodeAuthoritativeRisuSaveWithCodecWorker()` offloads strict decoding for non-REMOTE block-format databases. `PayloadCodecService` serializes operations through an on-demand module worker, uses the same operations inline when workers are unsupported, and disables a failed worker for the service lifetime before falling back. |
 | `src/ts/storage/chatStub.ts` | Runtime-independent stub type and predicate. `ChatStub` contains only identity/display metadata plus `_stub: true` (`:13`); `isChatStub()` additionally requires that no `message` array exists (`:36`). |
 | `src/ts/storage/chatStorage.ts` | Stub/placeholder conversion, lazy hydration, chat-backup reason tags, and version import. `setChatBackupReason()` records one-shot reasons; `saveChatToServer()` consumes them; `importChatBackup()` clones a recovered version under a fresh chat ID and explicitly dirties its target; and `ensureChatHydrated()` owns the hydration state machine. |
 | `src/ts/storage/chatPersistStage.ts` | Testable row-persistence stage used by `saveDb()`. `prepareChatPersistStage()` discovers changed/new chats, requires authoritative row writes before stub commit, checkpoints a generating chat at most once per 20 seconds, requeues it for the final post-generation save, and updates the known-chat baseline only after a committed stub database. |
@@ -32,12 +33,13 @@ The client-storage subsystem owns PocketRisu’s canonical `Database` model, its
 | `src/ts/bootstrap.ts` | Orders the secure-context gate, storage initialization, cached/raw boot read, decode/defaults, server-side snapshot recovery, optimized-plugin boot reconciliation, migrations, placeholder conversion, UI initialization, ID repair, and save-loop startup. |
 | `src/ts/storage/databaseSave.ts` | `DatabaseSaveCoordinator`, save pause/fencing, exact `DatabaseSaveOutcome`, and `requireCommittedDatabaseSave()` for callers that need durability. |
 | `src/ts/storage/writerTakeover.ts` | Process-global writer-loss latch, foreground `checkWriterTakeoverOnReturn()`, explicit read-only-versus-reload choice, and DOM interaction freeze. It never replays or journals the displaced page's dirty state. |
+| `src/ts/storage/clientBuild.ts`, `clientBuildHandshake.ts` | Client build stamp/header and upgrade handshake. Session and mutation requests advertise the client build; `handleClientUpgradeRequired()` reloads a clean page once behind a session guard, while dirty or indeterminate pages enter the existing frozen writer-recovery flow instead of risking local edits. |
 | `src/ts/storage/databaseClone.ts` | Database-aware clone/merge helpers that preserve special own keys. Conflict recovery mutates the freshly decoded authoritative graph and clones only dirty local branches; the previous whole-graph merge remains exported only as a differential test oracle. |
 | `src/ts/storage/conflictRebaseBudget.ts` | Structural graph-lifecycle budget for conflict recovery. The asserted client bound is three live database graphs, down from the audited approximately-six-graph path. |
 | `src/ts/storage/bootSnapshotRecovery.ts` | Walks metadata-only snapshot candidates and asks the server to validate/publish them atomically. |
 | `src/ts/storage/backupReplacementUi.ts`, `snapshotRestoreUi.ts`, `storageError.ts` | Destructive replacement UX, committed/not-committed/unknown classification, no-replay policy, and hard-reload reconciliation. |
 | `src/ts/drive/backuplocal.ts` | Client UI for streamed normal, upstream-target, main-target rollback, and server-file exports; cancellable server-side partial export jobs; and bounded backup replacement. Detailed semantics live in [Backup and recovery](backup-recovery.md). |
-| `src/ts/storage/exportAsDataset.ts` | Produces a JSON array containing character identity, description, each chat’s messages, and lorebook. The sole entry point is `exportAsDataset()` (`:6`). |
+| `src/ts/storage/exportAsDataset.ts` | `streamDatasetRows()` resolves characters through metadata-only interchange snapshots and streams their chat messages through the bounded chat reader; `encodeDatasetBlobParts()` consumes `encodePrettyJsonArray()` without constructing one aggregate JSON string, and `exportAsDataset()` downloads the resulting JSON-array parts. |
 | `src/ts/storage/defaultPrompts.ts` | Supplies prompt defaults consumed by `setDatabase()`, including `defaultMainPrompt`, `defaultJailbreak`, and `defaultAutoSuggestPrompt` (`:3-7`). |
 | `src/ts/interchangeability.ts` | Schema conversion among characters, personas, and modules. Character/module conversions are at `:6` and `:54`; character/persona conversions at `:121` and `:135`; persona/module conversions at `:146` and `:173`. This is object-schema compatibility, not the `.bin` codec. |
 
@@ -73,6 +75,16 @@ Code needing a non-reactive copy uses `getDatabase({ snapshot: true })`, which i
 `$state.snapshot`. Current character/chat access is index-based through `selectedCharID`
 and `character.chatPage`; see `getCurrentCharacter()` and `getCurrentChat()`.
 
+Whole-database snapshots deliberately remain available, but bulk serializers should use
+the narrow accessors when they do not need every reactive root. `getDatabaseFieldsSnapshot()`
+snapshots only named non-character, non-plugin-storage roots; `getCharacterSnapshot()`
+detaches one character; and `getCharacterInterchangeSnapshot()` snapshots character
+metadata while retaining only index/ID/name references for its chats. Interchange code
+then calls `getCharacterChatSnapshot()` one row at a time; it resolves by durable chat ID
+when present and uses the captured index only for an id-less reference, so a reorder cannot
+silently select an unrelated identified row. These APIs
+avoid traversing unrelated roots and, for interchange, unrelated chat bodies.
+
 `setDatabase()` handles additive/default migrations such as:
 
 - Missing root arrays, prompts, API settings, UI settings, personas, presets, and modules.
@@ -90,8 +102,11 @@ Structural/versioned migrations that need broader context live separately in `bo
 
 1. Reject remote plain-HTTP boot unless `POCKETRISU_ALLOW_INSECURE_CONTEXT` was injected
    by the server, because WebCrypto is required for content-addressed integrity.
-2. Initialize `forageStorage`, which creates `NodeStorage`, negotiate database capabilities
-   through `/api/session`, then call `readDatabaseForBoot()`. A server advertising
+2. Initialize `forageStorage`, which creates `NodeStorage`, and POST `/api/session` with
+   the per-tab session ID and client build stamp. The response negotiates database and
+   plugin-storage capabilities and advertises the server build. A mismatched clean page
+   reloads once; a page with dirty or indeterminate local state enters writer recovery.
+   Then call `readDatabaseForBoot()`. A server advertising
    `database.rawBootRead` uses the segmented root/characters/botPresets/modules/personas
    read when the resource cache is enabled and otherwise uses
    `/api/db/read-raw-for-boot`, so corrupt authoritative bytes can enter recovery without
@@ -108,7 +123,9 @@ Structural/versioned migrations that need broader context live separately in `bo
    read/list proof before the compatibility `/api/write`. Only the winning creator applies
    fresh-install UI defaults.
 4. Decode full bytes or accept the already decoded/verified segmented result, capture an
-   untouched patch baseline, and only then call `setDatabase()`. Capturing first matters
+   untouched patch baseline, and only then call `setDatabase()`. Strict block-format
+   databases without REMOTE blocks decode through `PayloadCodecService`; other formats
+   and unavailable or failed workers use the same authoritative decoder inline. Capturing first matters
    because `setDatabase()` adds client defaults that should subsequently be synchronized
    to the server.
 5. On decode failure, request metadata-only snapshot candidates and submit them newest-first to the server's bounded atomic restore route. The wait has no total wall-clock deadline: strict NDJSON activity refreshes a two-minute inactivity watchdog, and a lost response is reconciled through the durable operation-status route. Try an older candidate only after a definitive not-committed result; a committed or unknown result stops fallback. Folded snapshot/chat/plugin bodies never enter browser memory.
@@ -149,14 +166,25 @@ no longer exist.
 3. Root keys and collections are tracked separately for efficient patching. Every character is observed independently; character tracking deliberately excludes full `chats` and observes character fields plus chat ordering/stub metadata. Plugin guest inputs are cloned before entering the state proxy so a retained caller-owned raw alias cannot bypass revisions.
 4. A second tracker deeply observes only the active chat. The first mutation queues the live row, then nested subscriptions are dropped and re-armed once per 500 ms ordinary save window or, when that chat is generating, the 20-second checkpoint interval. Mutations inside the gap are already included in the queued live object. Switching chat establishes a baseline, hydration activity is ignored, and generation completion/page hide force an immediate re-arm.
 5. Normal edits set `changed` after a 500 ms debounce. The permanent loop polls every 200 ms, serializes through `DatabaseSaveCoordinator`, and retries failures with bounded backoff.
-6. `requestImmediateSave()` queues behind older in-flight work and returns a
+6. `markCharacterDirty()` and `markChatDirty()` provide synchronous targets for off-screen,
+   arbitrary, or pre-tracker mutations. `DirtyTargetBridge` buffers calls made before
+   `saveDb()` activates its sink. Ordinary imports that mutate observed live-proxy branches
+   enter the same schedule reactively. Package import writes each streamed chat row directly
+   and marks the character so its placeholder/stub block enters this loop; chat-history
+   import appends a full live chat and marks both its character and row. Explicit marks use
+   the normal asynchronous debounce and are not durability acknowledgements.
+7. `triggerSave()` snapshots both explicit targets and the dirty-revision ledger. When
+   neither contains work and no full write is forced, it returns a committed no-op before
+   row staging or codec serialization. Once revision trust is established, the encoder
+   and patcher also skip equality/encoding work for clean trusted branches; startup and
+   conflict rebase each require one equality-backed acknowledged save before that shortcut.
+8. `requestImmediateSave()` queues behind older in-flight work and returns a
    `DatabaseSaveOutcome`. Callers that need durability must require
    `outcome.status === 'committed'` or use `requireCommittedDatabaseSave()`; merely
    awaiting the promise is not a durability proof. The coordinator can pause saves during
    staged publication. `blockDatabaseSavesUntilReload()` is the explicit fence used when
    a specialized atomic transition has an unresolved outcome; the ordinary database save
    loop requeues failed or ambiguous attempts rather than installing that fence itself.
-7. Codec revision trust is withheld until an equality-backed acknowledged save aligns the boot/server baseline with the post-default, post-plugin live graph. Patch conflicts with a fresh authoritative baseline reset that gate for the first rebased save.
 
 #### Row-before-stub persistence
 
@@ -167,6 +195,23 @@ succeed does `RisuSaveEncoder.set()` project each chat to `chatToStub()`. The st
 `completeStubCommit()` promotes newly discovered chat IDs into the known baseline only
 after the patch/full-write outcome is committed. No-op, conflict, and retry paths retain
 the dirty proof rather than creating a phantom known stub.
+
+`NodeStorage.saveChatContent()` calls `prepareChatRowCheckpoint()` before the request. The
+client snapshots the live current row and its last acknowledged baseline synchronously,
+then `PayloadCodecService` legacy-encodes and hashes the current row and, when safe,
+prepares a JSON Patch operation-log delta. The on-demand `payloadCodec.worker.ts` performs
+that work off the main thread; unavailable, failed, or unsupported worker execution falls
+back to the identical inline operation. The acknowledged snapshot advances only after the
+server returns the exact expected materialized digest.
+
+Only whole-message replacements and appends are delta-eligible, and replay against the
+acknowledged base must reproduce byte-identical MessagePack; any non-message change or
+object-key-order difference selects a full-row write. An eligible smaller payload uses
+`application/vnd.pocketrisu.chat-delta+json` with version, base/result hashes, result size,
+and patch. A definitive `CHAT_DELTA_*` refusal, missing success hash, or mismatched success
+hash retries the already-prepared byte-identical full row. A transport or commit-ambiguous
+result is never replayed. Full and delta paths share the same dirty-stage, final-generation,
+cache-seeding, snapshot-scheduling, and row-before-stub lifecycles.
 
 On a `doingChat` false→true transition, the per-generation checkpoint tracker is cleared.
 The first eligible save during generation writes the dirty row; later writes are limited
@@ -184,10 +229,11 @@ When `supportsPatchSync` is enabled (`src/ts/platform.ts:18`):
 - A patch-hash conflict never promotes the rejected response's ETag. The client reads the
   authoritative database and ETag as one provisional candidate, retires the old codec
   generation, initializes a patch baseline from that authoritative graph, overlays dirty
-  local branches into the decoded graph in place, reinstalls runtime placeholders with
-  `setDatabase()`, rebuilds the encoder, publishes the ETag last, and retries without
-  marking the row stage's stub save committed. Dirty branches are the conservative union
-  of the existing reactive/explicit tracker and changes proven by the patch baseline diff.
+  local branches into the decoded graph in place, and leaves clean authoritative branches
+  untouched. It then reinstalls runtime placeholders with `setDatabase()`, rebuilds the
+  encoder, publishes the ETag last, and retries without marking the row stage's stub save
+  committed. Dirty branches are the conservative union of the existing reactive/explicit
+  tracker and changes proven by the patch baseline diff.
 - Non-conflict patch rejections such as the chat guard may fall through to an ETag-guarded
   full `database.bin` write. Patch-enabled clients refuse an unversioned full write, and
   an ETag conflict enters the same provisional rebase path.
@@ -214,13 +260,18 @@ before observing either acknowledgement, so this remains a best-effort final att
 
 Before a same-browser database publication, `saveDb()` broadcasts its local ID through
 `BroadcastChannel('risu-db')`; another tab that receives it enters the same displacement
-flow. Across browsers/devices, `NodeStorage` keeps one `x-session-id` in `sessionStorage`
-and marks a write
-`x-user-active: true` only within 15 seconds of a pointer or keyboard gesture. Registering
-through `/api/session` records the boot but does not steal an existing writer. The active
-session may write; a fresh session takes authority only with a gesture-backed write. A
-fresh passive compatibility write is accepted without changing the lock, clients without
-a session ID retain legacy compatibility, and stale sessions receive HTTP 423.
+flow. Across browsers/devices, `NodeStorage` keeps one `x-session-id` in `sessionStorage`,
+adds the client build to session/mutation requests, and marks recent pointer/keyboard
+activity on writes. Registration itself does not claim authority; a mutation-time HTTP
+423 tells the client that this page has been displaced. The server's freshness,
+gesture-backed acquisition, compatibility-client, and lock-transition rules are canonical
+in [Server backend](server-backend.md).
+
+A build mismatch follows the same preservation boundary. `clientBuildHandshake.ts`
+automatically reloads a clean page at most once for the advertised server build. If the
+dirty-state probe reports queued/in-flight save work or active chat work—or the probe
+cannot prove cleanliness—the handshake dispatches `risu-session-deactivated` with a
+server-upgrade reason and preserves the page through writer recovery.
 
 The client also polls side-effect-free `GET /api/session/lock-status` after focus or
 visibility return, at most once every five seconds. `checkWriterTakeoverOnReturn()` defers
@@ -249,22 +300,9 @@ Opening a placeholder invokes this flow:
 5. It yields one animation frame, replaces the placeholder, waits one Svelte tick, and clears hydration suppression.
 
 The server also verifies `x-chat-id` if it falls back to index lookup, returning 409 on an
-index mismatch. `NodeStorage` retains the exact decoded graph only after verifying a GET's
-bytes against `x-content-hash`, or after a save acknowledgement matches the worker-produced
-logical-row digest. The next checkpoint worker legacy-encodes/hashes the current row and
-normalizes a JSON Patch candidate against that acknowledged graph. Only whole-message
-replacements and appends are eligible, and replay is byte-compared against the full
-MessagePack result so object-key order or any non-message change forces a full-row write.
-
-An eligible smaller payload uses
-`application/vnd.pocketrisu.chat-delta+json` with
-`{version:1, baseHash, resultHash, resultSize, patch}`. Durability is established only when
-the server returns the exact expected materialized digest. A definitive `CHAT_DELTA_*`
-refusal (missing/unsupported base, base mismatch, invalid schema, or log conflict), a
-missing hash, or a mismatched success hash retries the already-prepared byte-identical full
-row. Transport/commit ambiguity does not replay. Successful full or delta saves retain the
-same dirty-stage, draft, final-generation, cache-seeding, and row-before-stub lifecycles;
-the server still schedules snapshots only after acknowledgement.
+index mismatch. `NodeStorage` accepts a hydrated GET graph only after verifying its bytes
+against `x-content-hash`. Chat write encoding, operation-log deltas, digest acknowledgement,
+and full-row fallback are part of the canonical save loop above.
 
 #### Recovered model-job publication
 
@@ -341,6 +379,11 @@ composer cannot delete a draft whose read is pending or failed.
 - `target=upstream` is a lossy migration export: it omits composer drafts plus inlay payload, sidecar, and metadata namespaces. Use the normal Node export for PocketRisu recovery.
 - `target=main` is the non-destructive downgrade export for the audited PocketRisu main branch. It folds chat and optimized plugin rows, retains main-readable assets/inlays, omits unsupported draft and remembered-MCP rows, and rejects newer escape-aware plugin save headers before download.
 - Per-chat pre-image import remains separate: it decodes one history version, assigns a fresh chat ID, and saves it as a new chat instead of overwriting current row identity.
+- Dataset export remains browser-side rather than a server point-in-time job.
+  `streamDatasetRows()` uses metadata-only character snapshots plus the two-row-lookahead
+  `streamCharacterChats()` reader, so cold chats are fetched and emitted one at a time
+  instead of becoming empty arrays. `encodePrettyJsonArray()` avoids one aggregate JSON
+  string, although the resulting immutable `Blob` parts remain retained until download.
 
 See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snapshot, limit, cancellation, and outcome contracts.
 
@@ -358,6 +401,7 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
 | `src/lib/Setting/Pages/SystemBackup.svelte` | Exposes normal local/server backup operations. |
 | `src/lib/Setting/ChatBackupList.svelte` | Lists server-side per-chat histories and imports a selected pre-image as a new chat into any current character. |
 | `src/lib/Setting/Pages/Advanced/ResourceCacheSettings.svelte` and `SystemDashboard.svelte` | Enable/disable the disposable browser cache, display its usage, and clear it. |
+| `src/lib/Setting/Pages/PluginSettings.svelte` and `PluginStorageViewer.svelte` | Consume bounded recovery inspection/download/resolution and manifest/viewer reads from `NodeStorage`; [Plugin storage](plugin-storage.md) owns their domain semantics. |
 | `src/ts/process/request/jobRecovery.ts` | Polls running model jobs to terminal and publishes completed, unclaimed results into chat rows after boot/visibility/online recovery. |
 | `src/lib/Setting/Pages/MigrationSettings.svelte` | Exposes main-target rollback export, upstream-target export/import, partial backup, save-folder migration, and dataset export. |
 | `src/ts/plugins/plugins.svelte.ts` | Uses `setDatabaseLite()` and then explicitly requests an immediate save after plugin import. |
@@ -369,8 +413,8 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
 - `src/ts/stores.svelte.ts` owns `DBState`, `selectedCharID`, loading state, and selection state.
 - `src/ts/gui/deepTouch.svelte.ts` forces nested reactive reads for save dirty tracking.
 - `msgpackr` supplies legacy MessagePack encoding; every production client encoder uses `boundedMsgpack.ts` to cap its reusable module-global arena at 32 MiB without changing its codec options. `fflate` and browser compression streams supply compressed variants.
-- `fast-json-patch` is loaded lazily by `RisuSavePatcher.set()` (`src/ts/storage/risuSave.ts:927-930`).
-- `NodeStorage` calls Express endpoints for auth, KV, cached database reads, full/delta key lists, patching, chat bodies, chat history, backups, assets, and save-folder migration.
+- `fast-json-patch` is loaded lazily by `RisuSavePatcher.set()`.
+- `NodeStorage` calls Express endpoints for auth/session/build negotiation, KV, cached database reads, full/delta key lists, patching, chat bodies, chat history, backups, assets, save-folder migration, and plugin-storage recovery/manifest/viewer administration.
 - `jobRecovery.ts` calls the durable `/api/model-jobs` discovery, journal, and claim routes; request logging is published only after its chat-row save succeeds.
 - `server/node/server.cjs` owns SQLite persistence, ETags, session locking, chat-row routing, backup framing, and the server-side copies of chat guards; `server/node/chatRows.cjs` owns split/assembly and row semantics.
 - Browser WebCrypto and IndexedDB back `resourceCache.ts`; `server/node/dbCachedRead.cjs` is its database-segmentation counterpart, while server `x-content-hash`/`x-cached-hashes` handling covers KV/chat entries.
@@ -423,14 +467,8 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
   page-hide forces a row write. Refusal fallback does not clear dirty state early. The
   server’s independent 45-second pre-image cooldown limits recovery-history churn.
 
-- Optimized plugin physical keys use `makeArchiveSafePluginSaveStorageKey()`, not the
-  generic encoded-key rule. Well-formed strings retain UTF-8/base64url names; ill-formed
-  JavaScript strings use tagged `utf16-v1.` UTF-16 code units; and a value or owner name
-  over the 1,024-byte archive limit becomes `sha256-v1.<digest>.json` with an exact
-  component-to-raw-key mapping in manifest v3. Current optimized authority is
-  generation/manifest-bound, and production mode changes use the consolidated bulk
-  server transition when advertised or its private staged fallback. Both publish the
-  mode, fresh backend generation, database, manifest, and rows atomically. See
+- Optimized plugin keys, publications, recovery resolution, and viewer snapshots use
+  dedicated protocols rather than generic KV assumptions. Coordinate those changes with
   [Plugin storage](plugin-storage.md).
 
 - Backup-reason tags are one-shot. `saveChatToServer()` consumes the pending reason before the network call, so a failed write will not automatically reuse it on retry. Reasons are descriptive recovery metadata, not durability controls.
@@ -439,23 +477,32 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
 
 - Render pagination is not storage pagination. Increasing `chatLoadInitialPages` or `chatLoadAdditionalPages` changes DOM/component load only; it does not reduce the hydrated chat payload.
 
-- `exportAsDataset()` does not hydrate placeholders before reading `chat.message` (`src/ts/storage/exportAsDataset.ts:10-18`). On the normal lazy-loaded runtime database, unopened chats therefore export as empty message arrays. Any correctness fix should explicitly hydrate or reject missing chat content; the server-side partial-export job is not a browser-hydration example.
+- Dataset export now resolves placeholder rows through the bounded interchange chat
+  reader and aborts on a missing row. It is still a browser-side serialization rather than
+  the server-owned, point-in-time partial-export protocol described in
+  [Backup and recovery](backup-recovery.md).
 
 - Partial export is a cancellable server job and does not serialize browser memory. Keep its selected-asset, missing-row, cancellation, and point-in-time behavior in sync with [Backup and recovery](backup-recovery.md).
 
 - Ordinary patch persistence legacy-encodes the stubs-only cache. A normal full write with no embedded chat payloads preserves the client bytes verbatim; only payload extraction forces a stripped re-encode.
 
-- `decodeRisuSave()` supports raw, fflate-compressed, gzip-stream, RISUSAVE block-stream, headerless MessagePack, old `\0\0RISU` data, compressed JSON, and compressed MessagePack fallbacks (`src/ts/storage/risuSave.ts:598-641`, `:644-690`). Removing fallback paths can strand upstream or historical backups.
+- `decodeRisuSave()` in `risuSave.ts` supports raw, fflate-compressed, gzip-stream,
+  RISUSAVE block-stream, headerless MessagePack, old `\0\0RISU` data, compressed JSON,
+  and compressed MessagePack fallbacks. Removing fallback paths can strand upstream or
+  historical backups.
 
 - NodeOnly disables creation of remote character blocks but retains decoder support. The
   server also has a one-time `migrateRemoteBlocksIfNeeded()` migration for old upstream
   `remotes/<chaId>.local.bin` saves.
 
-- `normalizeJSON()` is part of the client/server patch protocol. It maps non-finite numbers and circular references to `null`, dates to ISO strings, regex/errors to `{}`, and omits unsupported object properties (`src/ts/storage/risuSave.ts:745-789`). Changing it requires matching server hashing/normalization behavior and patch-protocol tests.
+- `normalizeJSON()` in `legacyRisuSaveCodec.ts` is part of the client/server patch
+  protocol. It maps non-finite numbers and circular references to `null`, dates to ISO
+  strings, regex/errors to `{}`, and omits unsupported object properties. Changing it
+  requires matching server hashing/normalization behavior and patch-protocol tests.
 
-- `calculateHash()` is likewise protocol-level and must stay byte-for-byte behaviorally compatible with the server implementation (`src/ts/storage/risuSave.ts:704-743`).
+- `calculateHash()` is likewise protocol-level and must stay byte-for-byte behaviorally compatible with the server implementation.
 
-- Arrays with stable IDs use whole-array replacement on add/delete/reorder or invalid/duplicate IDs, avoiding enormous index-shift diffs (`src/ts/storage/risuSave.ts:791-837`). Callers must iterate returned operations instead of spreading a potentially huge list.
+- Arrays with stable IDs use whole-array replacement on add/delete/reorder or invalid/duplicate IDs, avoiding enormous index-shift diffs. Callers must iterate returned operations instead of spreading a potentially huge list.
 
 - The save loop assumes `forageStorage.Init()` ran during bootstrap. `getItemCached()`, `readDatabaseForBoot()`, and `keys()` now initialize defensively, but core `setItem()`, `getItem()`, `removeItem()`, and `patchItem()` still forward through `realStorage` directly.
 
@@ -472,12 +519,9 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
 
 - Draft write/remove queues isolate persistence failures so they cannot block chat interaction. Reads are different: `loadChatDraft()` returns explicit found/absent/error state, and `ChatDraftSession` prevents a failed or pending load from turning temporary empty UI into a destructive remove.
 
-- Patch conflict rebasing treats `plugins` and `pluginCustomStorage` as tracked branches
-  instead of generic root fields; when their flags are dirty it explicitly overlays the
-  local copies alongside bot presets, modules, and tracked characters. The optimized
-  publication controls `optimizePluginMemory`, `pluginStorageGeneration`, and
-  `pluginStorageFolded` always remain authoritative and reconcile only through the CAS
-  publication protocol. Preserve those explicit boundaries when changing the merge.
+- Conflict rebase may overlay dirty inline plugin branches, but optimized publication
+  selectors remain authoritative protocol state. Preserve the boundary documented in
+  [Plugin storage](plugin-storage.md).
 
 - The physical `botPresetsId` index remains part of upstream RisuAI compatibility even though new code prefers stable preset UUID helpers (`src/ts/storage/database.svelte.ts:1025-1030`, `:2341-2402`).
 
@@ -517,9 +561,17 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
 - To change lazy chat loading, inspect `ensureChatHydrated()` and
   `NodeStorage.fetchChatContent()`.
 
+- To change chat-row worker encoding, checkpoint delta preparation, or strict-save worker
+  decode, inspect `payloadCodecClient.ts`, `payloadCodecService.ts`,
+  `payloadCodecOperations.ts`, and `payloadCodec.worker.ts` together.
+
 - To change writer takeover, inspect `server/node/session-lock.cjs`, `NodeStorage`'s session
   headers, `checkWriterTakeoverOnReturn()`, and `writerTakeover.ts` together; registration,
   passive compatibility writes, and gesture-backed acquisition are distinct cases.
+
+- To change build-upgrade behavior, inspect `clientBuild.ts`,
+  `clientBuildHandshake.ts`, the save-loop dirty-state probe, and `NodeStorage` session/XHR
+  headers together.
 
 - To change crash recovery for model requests, inspect
   `src/ts/process/request/jobRecovery.ts`, `server/node/model-jobs.cjs`, and
@@ -528,6 +580,10 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
 - To change database boot caching, update `NodeStorage.readDatabaseForBoot()`, `src/ts/storage/dbCachedRead.ts`, `src/ts/storage/rawMsgpack.ts`, `server/node/dbCachedRead.cjs`, and `/api/db/read-cached` as one protocol.
 
 - To change chat/plugin cache limits, verification, retention, or UI, start in `src/ts/storage/resourceCache.ts` and its tests; coordinate hash headers and response hashes with the server routes.
+
+- To change plugin-storage recovery management, manifest revision/snapshot reads, or viewer
+  paging, start with [Plugin storage](plugin-storage.md) and then update the corresponding
+  `NodeStorage`/`AutoStorage` methods and Settings consumers.
 
 - To change delta key listing, update `NodeStorage.keys()`, its `risu-list-cache` schema, `server/node/listDelta.cjs`, and the deletion-journal/epoch helpers in `server/node/db.cjs`.
 

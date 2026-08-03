@@ -1,7 +1,7 @@
 # Chat pipeline
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-01 against `818c3bc1`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -274,7 +274,25 @@ After the response body is stored:
 - Optional IGP and emotion-selection follow-up requests occur after the main message is stored (`src/ts/process/index.svelte.ts:1817`, `src/ts/process/index.svelte.ts:2015`).
 - Stage timing metadata is finalized on the last message near the end of `sendChat()` (`src/ts/process/index.svelte.ts:2105`).
 
-There is no explicit database write in `sendChat()`. Message-array mutations are observed through Svelte’s deep `DBState` tracking; the active chat is marked dirty, debounced by 500 ms, and eventually persisted through the save loop. `prepareChatPersistStage()` writes the first dirty row of a live-generation period before its stub may commit, permits later checkpoints after 20 seconds, and keeps affected chats requeued so the compatibility `doingChat` live→idle transition writes authoritative final responses (`src/ts/storage/chatPersistStage.ts:247-306`; `src/ts/globalApi.svelte.ts:546-554`, `:812`).
+There is no explicit database write in `sendChat()`. Once the pipeline mutates the active
+hydrated chat, a bounded tracker queues that row; it does not deep-walk the whole
+`DBState` graph on every reactive flush. The tracker re-establishes active-chat
+subscriptions on the ordinary roughly 500 ms save cadence, or roughly every 20 seconds
+for a live generation. The first eligible generation save writes a checkpoint, later
+checkpoints are limited to that 20-second cadence, and the live→idle transition schedules
+the final response save (`watchActiveChatDirty()` in
+`src/ts/storage/activeChatDirtyTracker.svelte.ts`, `prepareChatPersistStage()` in
+`src/ts/storage/chatPersistStage.ts`). See [client storage](client-storage.md) for the
+canonical save-loop scheduling and durability rules.
+
+When a prior chat row has an exact acknowledged baseline, a checkpoint may send a
+smaller validated patch containing whole-message replacements/appends. The server can
+append it to the versioned `pocketrisu-chat-operation-v1` log and acknowledges the
+materialized row hash/size plus log operation/byte counts; it schedules asynchronous
+compaction at the default threshold of 64 operations or 1 MiB. An ineligible or
+definitively refused delta falls back to the already prepared full-row write. See
+[client storage](client-storage.md) and [server backend](server-backend.md) for the
+protocol, fallback, and compaction contracts.
 
 Output translation is not part of persisted response post-processing. `ChatBody.svelte` translates parsed or pre-parsed text only for display at `src/lib/ChatScreens/ChatBody.svelte:104`. Composer translation similarly updates `messageInput` before send through `updateInputTransateMessage()` at `src/lib/ChatScreens/DefaultChatScreen.svelte:685`.
 
@@ -401,13 +419,18 @@ Legacy multi-speaker history compatibility remains: character messages may carry
 
 - Preview modes avoid storing a generated assistant response, but they still enter prompt construction and its hooks; treat them as diagnostic execution, not a universally read-only operation.
 
-- Generation persistence is checkpointed independently of the provider stream. Do not restore a blanket `doingChat` save skip: it can make a new durable stub point at no chat row or leave an existing row at its pre-turn state. The checkpoint stage throttles writes while preserving row-before-stub ordering and a final idle save.
+- Generation persistence is checkpointed independently of the provider stream. Do not
+  restore a blanket `doingChat` save skip; the row-before-stub and final-idle-save
+  contracts are canonical in [client storage](client-storage.md).
 
 - Server pending-send tombstones are enabled only with `nodeOnlyServerSideRequests === true`, are fire-and-forget, and contain no pipeline state. They are a best-effort way to re-run a send that died before a recoverable main job existed, not a substitute for model-job journals.
 
 - Job recovery writes raw adapter-decoded output. It deliberately does not replay `editoutput`, output triggers, inlay processing, translation, TTS, or auto-continue because those live hooks can have side effects.
 
-- Losing writer authority during generation aborts persistence and must surface as a displaced-writer outcome. Do not keep mutating the local chat under the assumption that a later save can overwrite the active writer.
+- Losing writer authority during generation aborts persistence and must surface as a
+  displaced-writer outcome. The client reaction and server lock protocol are documented
+  in [client storage](client-storage.md) and [server backend](server-backend.md); the
+  pipeline must not continue mutating in expectation of a later overwrite.
 
 - Aborting a stream clears `isStreaming` but does not remove the already-created partial character message (streaming `finally` near `src/ts/process/index.svelte.ts:1675`). A normal aborted send can leave partial output in history.
 
@@ -421,7 +444,9 @@ Legacy multi-speaker history compatibility remains: character messages may carry
 
 - Group-chat fields and historical `saying` IDs remain for RisuAI compatibility, but new code must not expose group-chat creation without restoring the entire unsupported path: boot currently deletes such records.
 
-- Mutating `DBState` is normally sufficient for persistence, but only the active hydrated chat is deeply tracked as a chat record. Avoid bypassing the active-chat setters/state model during asynchronous generation.
+- Mutating `DBState` is normally sufficient for persistence, but only the active hydrated
+  chat receives the bounded deep tracker used for chat-row dirtiness. Avoid bypassing the
+  active-chat setters/state model during asynchronous generation.
 
 ## 6. Navigation hints
 
@@ -473,7 +498,10 @@ Legacy multi-speaker history compatibility remains: character messages may carry
 
 - To change output translation, use the display pipeline at `src/lib/ChatScreens/ChatBody.svelte:104`; translated output is not stored by `sendChat()`.
 
-- To change when generated messages reach SQLite-backed persistence, inspect active-chat tracking at `src/ts/globalApi.svelte.ts:634` and row staging in `src/ts/storage/chatPersistStage.ts`, not the model pipeline.
+- To change when generated messages reach SQLite-backed persistence, inspect
+  `src/ts/storage/activeChatDirtyTracker.svelte.ts`, its wiring in
+  `src/ts/globalApi.svelte.ts`, and row staging in
+  `src/ts/storage/chatPersistStage.ts`, not the model pipeline.
 
 ## 7. Related structure docs
 

@@ -1,7 +1,7 @@
 # Server backend
 
 > Part of the PocketRisu structure docs — see [STRUCTURE.md](../../STRUCTURE.md) for the top-level map and subsystem index.
-> Audited 2026-08-01 against `818c3bc1`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
+> Audited 2026-08-04 against `95c2ea30`. Paths and symbols are authoritative; line-number hints are approximate and should be verified with `rg`.
 
 ## 1. Purpose & overview
 
@@ -23,13 +23,17 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 | `server/node/importBarrier.cjs` | Abort-aware exclusive import gate. `acquire()` claims a FIFO turn before draining older mutations; abandoned waiters are removed safely, later writes are refused, and stable reads can wait with an `AbortSignal`. |
 | `server/node/importJournal.cjs` | Durable bridge between SQLite import transactions and filesystem asset/inlay directory swaps. It atomically writes/fsyncs `save/import_journal.json`, fsyncs staged trees, and recovers by finalizing committed swaps or restoring pre-import directories. |
 | `server/node/session-lock.cjs` | In-memory single-writer authority. `register()` records a boot without stealing; `checkWrite()` distinguishes the active writer, fresh gesture-backed takeover, fresh passive compatibility writes, and stale rejection; `peek()` provides a side-effect-free foreground status. |
-| `server/node/bufferedIngress.cjs` | Pre-parser admission for buffered JSON, octet-stream, and text bodies. It resolves auth/writer/route-limit policy, strictly validates uncompressed `Content-Length`, and reserves/relinquishes the process-wide in-flight byte budget without performing a writer-lock transition. |
+| `server/node/boundedSessionState.cjs` | Bounded LRU state for per-browser protocol pins. The server uses `createBoundedSessionState()` to retain at most 50 session-scoped plugin-publication read states independently of writer authority. |
+| `server/node/bufferedIngress.cjs` | Pre-parser admission for buffered JSON, octet-stream, and text bodies, plus identity-only admission for bodyless/direct-stream writers. It resolves auth/writer/route-limit policy, rejects retired protocols and mismatched client builds before reading a body, strictly validates uncompressed `Content-Length`, and reserves/relinquishes the process-wide in-flight byte budget without performing a writer-lock transition. |
+| `server/node/buildStamp.cjs` | Loads and validates `dist/build-stamp.json` for writer-mutation admission. `readClientBuildStamp()` returns `null` and logs a warning on any read, parse, or shape failure, deliberately disabling the build check rather than blocking the server. |
 | `server/node/admittedIngressSpool.cjs` | Post-admission disk ingress for raw `/api/write` and raw/JSON chat-row writes. It consumes the already-reserved request in bounded pages, fsyncs a private spool, preserves the reservation through response finish/close, and maps spool-volume pressure to the admission layer's retryable refusal. |
 | `server/node/chunkPlan.cjs`, `chunkPlanWorker.cjs` | Bounded worker-thread preparation for private file sources. At most two workers by default scan FastCDC boundaries and compute per-chunk SHA-256 plus logical SHA-256/MD5 in one bounded-window pass; queued publication validates the immutable file identity and exact planned bytes. |
 | `server/node/model-jobs.cjs` | Durable upstream model relay. `createModelJobs()` stores non-secret job metadata in `save/model-jobs.db`, records exact provider response bytes in append-only journals under `save/model-jobs/`, tails running streams, supports claims, and owns 48-hour pending-send tombstones. Main jobs are recoverable; auxiliary pipeline requests are relay-only. |
 | `server/node/request-logs.cjs` | Provider request history and token usage in `save/request-logs.db`. `createRequestLogs()` masks/truncates request material, rotates heavy request bodies by byte budget, retains the small usage ledger, exposes query/statistics routes, and closes independently at shutdown. |
+| `server/node/request-trace.cjs` | Opt-in whole-exchange debug tracing. `createRequestTracer()` captures only completed non-streaming HTTP exchanges, writes atomic gzip files under `save/trace`, and retains the newest 500 without affecting request handling on trace failures. |
 | `server/node/pluginSaveKeys.cjs` | Canonical optimized-plugin prefixes, manifest/folded markers, and lossless physical-key policy: UTF-8/base64url, tagged ill-formed UTF-16, or manifest-v3-mapped archive-safe hashes. |
-| `server/node/pluginStorageJson.cjs`, `pluginStorageLimits.cjs` | Strict JSON/key/row validation plus authoritative per-value and aggregate optimized-storage limits. |
+| `server/node/pluginStorageJson.cjs`, `pluginStorageLimits.cjs` | Strict and lossless plugin-row codecs, key/row validation, and authoritative per-value and aggregate optimized-storage limits. `lossless-json-v1` is distinguished by the `PRISUL01` frame magic; metadata remains strict-JSON-only. |
+| `server/node/stageRowDownload.cjs` | Opens one validated read-only descriptor for a staged plugin transition row and streams from that same descriptor, avoiding a validation/reopen race. |
 | `server/node/dbCachedRead.cjs` | Server half of the optional segmented boot-read protocol. It validates the client's hash inventory, splits the stubs-only database into root/character/preset/module/persona MessagePack segments, and emits bytes only for cache misses while preserving the full-view ETag. |
 | `server/node/databaseRevision.cjs`, `revisionBoundCache.cjs` | Transactional generation tracking and bounded decoded-cache reuse for `database.bin`. SQLite triggers advance a monotonic operational revision on insert, key/value update, and delete; clean decoded entries are revision-checked and LRU/size/heap-pressure evictable, while acknowledged dirty patch state remains pinned until persistence or explicit invalidation. |
 | `server/node/listDelta.cjs` | Builds full or delta `/api/list` responses from KV modification timestamps, the deletion journal, filesystem mtimes, and the list epoch. Delta eligibility is capped at six days. |
@@ -76,8 +80,10 @@ Persistent application data is primarily stored in SQLite through a binary-compa
    create/open `risuai.db` and `logs.db`. Route initialization later creates the
    independent `model-jobs.db` and `request-logs.db` stores.
 3. `db.cjs` creates `save/`, opens `save/risuai.db`, enables WAL with the power-loss-durable `synchronous=FULL` default, and applies performance and lock pragmas near `server/node/db.cjs:23`. It creates the `kv`, deletion-journal, epoch, and operational migration-state tables, initializes the chunk store, then attempts legacy save-folder migration. Legacy values and their `storage_migrations` completion row commit together; `.migrated_to_sqlite` is an atomically published rollback/UI compatibility marker that startup reconciles against that state. `server.cjs` may apply only an explicit persisted or administrator-managed downgrade after this safe startup boundary.
-4. `server.cjs` installs fatal logging handlers before the rest of its initialization. It
-   then creates `save/`, creates/sweeps the database-assembly and admitted-ingress spools, resolves the
+4. `server.cjs` installs fatal logging handlers before the rest of its initialization,
+   then reads and validates `dist/build-stamp.json`. A valid stamp enables writer build
+   admission and is logged; any read/parse/shape failure logs a warning and returns `null`,
+   so build admission is fail-open. The server then creates `save/`, creates/sweeps the database-assembly and admitted-ingress spools, resolves the
    independent chat-history root, migrates legacy history from the configured
    server-backup directory, reads or creates the password/JWT/instance files, loads
    persisted direct-asset sessions, initializes the server-backup directory, and registers
@@ -108,7 +114,7 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `POCKETRISU_ASSET_GC_INTERVAL_MS` | Delay between later asset sweeps; default 24 hours and clamped to at least one second. |
 | `POCKETRISU_ASSET_GC_AUTO` | Set to `0` to disable automatic sweeps or `1` to force-enable them in test environments. The authenticated `/api/assets/cleanup` maintenance endpoint remains available. |
 | `POCKETRISU_ALLOW_INSECURE_CONTEXT` | Allows client boot outside HTTPS or localhost only when exactly `1` or `true`; bypasses the WebCrypto integrity gate at the operator's risk. |
-| `TRACE_REQUEST_FOR_DEBUG` | Enables gzip-compressed non-streaming HTTP request/response traces under `save/trace` only when exactly `true`. Traces may contain sensitive data, are intended only for debugging, exclude request streams, response streams, and WebSocket upgrades, and retain the newest 500 files. |
+| `TRACE_REQUEST_FOR_DEBUG` | When exactly `true`, enables whole-exchange debug traces and injects the frontend plugin-storage diagnostic flag. See [request logging and observability](#request-logging-and-observability). |
 | `POCKETRISU_HUB_HOSTING` | Enables shared/multi-instance hub hosting when set to `TRUE`/`true` or `1`. It hides host-disk statistics from `/api/db/stats`, disables the file-based server-backup feature with `403` responses, and pins the snapshot retention byte cap to `POCKETRISU_HUB_SNAPSHOT_CAP_MB` (only the snapshot count stays adjustable). |
 | `POCKETRISU_HUB_SNAPSHOT_CAP_MB` | Hub-mode snapshot byte cap in MB, applied to both the limits endpoints and trim rotation; unset or invalid falls back to 500 MB, clamped to the 10 MB–50 GB safety bounds. Ignored outside hub mode. |
 | `POCKETRISU_SQLITE_DURABILITY_MODE` | Administrator-managed SQLite durability policy: `durable`, `balanced`, or `performance`. Invalid values fail safe to `durable`. Any explicit value locks the System-dashboard control; hub mode is always administrator-managed and defaults to `durable` when unset. |
@@ -141,11 +147,12 @@ The server reads configuration directly from `process.env`; it does not load `.e
 
 ### Authentication and writer authority
 
-The Node backend uses short-lived server-issued HMAC-SHA256 JWTs for ordinary API
-requests and a seven-day opaque direct-session cookie for assets, flush/compress routes,
-and JWT renewal through `/api/test_auth`. `/api/session` persists the cookie token,
-advertises database/plugin capabilities, and registers the browser's optional
-`x-session-id` with the in-memory `sessionLock`.
+This subsection is the canonical server-side lock protocol. The Node backend uses
+short-lived server-issued HMAC-SHA256 JWTs for ordinary API requests and a seven-day
+opaque direct-session cookie for assets, flush/compress routes, and JWT renewal through
+`/api/test_auth`. `/api/session` persists the cookie token, advertises database/plugin
+capabilities, and registers the browser's optional `x-session-id` with the in-memory
+`sessionLock`.
 
 Registration does not steal an active writer. `checkActiveSession()` applies
 `sessionLock.checkWrite()` at mutation time: the active session passes and refreshes its
@@ -157,15 +164,26 @@ remain compatibility-exempt. `GET /api/session/lock-status` calls side-effect-fr
 `peek()` and never acquires authority. Lock state is in memory, so the first registration
 or write after a server restart becomes active.
 
+Session-scoped plugin read pins are separate from that writer lock.
+`pluginStorageReadStateBySession` uses `createBoundedSessionState()` as a 50-entry LRU;
+reads refresh the session's entry and churn evicts the oldest boot ID, bounding this
+per-browser compatibility state without changing mutation authority.
+
 Buffered JSON, `application/octet-stream`, and plain-text requests pass through
 `bufferedIngress.cjs` before Express reads their bodies. Protected routes authenticate
-first; writer routes then use side-effect-free `sessionLock.peek()` to refuse stale
-clients. Admission requires an identity-encoded, exact `Content-Length`, applies the
-route ceiling, and reserves those bytes from the global budget until `finish` or
-`close`. Budget pressure returns retryable HTTP 503 with a definitive not-committed
-outcome. The mutation route still calls `checkActiveSession()` after parsing, so only
-that authoritative check may refresh or transfer writer ownership. Direct-stream
-backup, migration, and plugin upload protocols retain their own bounds and bypass the
+first. The retired direct plugin-transition protocol is then rejected at admission;
+otherwise, when `expectedClientBuild` was loaded from `dist/build-stamp.json`, every
+writer mutation must present the exact `x-client-build` stamp. A missing or mismatched
+stamp returns HTTP 426 `CLIENT_UPGRADE_REQUIRED` with a definitive not-committed outcome
+before body reservation or parsing. Retired-protocol requests receive that same 426 even
+when stamp loading failed open. Writer routes next use side-effect-free
+`sessionLock.peek()` to refuse stale clients. Admission requires an identity-encoded,
+exact `Content-Length`, applies the route ceiling, and reserves those bytes from the
+global budget until `finish` or `close`. Budget pressure returns retryable HTTP 503 with
+a definitive not-committed outcome. The mutation route still calls
+`checkActiveSession()` after parsing, so only that authoritative check may refresh or
+transfer writer ownership. Bodyless and direct-stream writer protocols pass through the
+identity/build/session checks but retain their own body bounds and bypass the
 buffered-body ledger.
 
 After that admission, raw `/api/write` bodies and raw/JSON chat POST bodies are consumed
@@ -271,13 +289,17 @@ Important KV namespaces include:
 - `chats/<encodeURIComponent(chaId)>/<encodeURIComponent(chatId)>`: one legacy-encoded
   base chat body per row, optionally followed logically by `chat_row_operations`; every
   public reader sees the exact materialized legacy row. Managed by `server/node/chatRows.cjs`.
-- `pluginsave/<physicalName>`: one UTF-8 `JSON.stringify` value per optimized plugin save
-  key. A physical name is `<base64url>.json` for a well-formed raw key,
+- `pluginsave/<physicalName>`: one codec-discriminated optimized plugin VALUE row per key.
+  `json-v1` is unframed UTF-8 strict JSON; `lossless-json-v1` starts with ASCII
+  `PRISUL01` and carries a tagged JSON payload that preserves values such as `undefined`
+  and array holes during recovery. A physical name is `<base64url>.json` for a
+  well-formed raw key,
   `utf16-v1.<base64url-code-units>.json` for an ill-formed JavaScript string, or
   `sha256-v1.<64-hex>.json` when the prefixed name would exceed the 1,024-byte archive
   limit.
-- `pluginsave-meta/<physicalName>`: matching optimized plugin ownership rows using the
-  same physical name.
+- `pluginsave-meta/<physicalName>`: matching optimized plugin METADATA/ownership rows
+  using the same physical name. These rows must use strict `json-v1`; lossless framing is
+  invalid metadata.
 - `plugin-storage/manifest.json`: exact generation-bound value/metadata key set; manifest
   v3 supplies the raw-key mappings required by every hashed physical component.
 - `database/dbbackup-<timestamp/100>.bin`: full, assembled DB-only automatic snapshots,
@@ -353,9 +375,18 @@ plan.
   valid inline copy or deletes an unrecoverable row with its manifest/owner/quota state.
   Every action rescans the live publication and rejects a stale opaque token before
   mutation; response envelopes exclude decoded keys, values, and exception text.
+  Recovery canonicalization accepts either codec for VALUE rows and falls back to
+  `lossless-json-v1` when an inline value cannot be represented by strict JSON, but it
+  rejects lossless METADATA rows so owner state remains strict JSON.
+- Staged transition downloads call `openStageRowDownload()` to validate size and create a
+  stream from one already-open read-only descriptor. Validation and delivery therefore
+  cannot observe two different row files through a size-check-then-reopen race.
 - Monolith-shaped inputs from boot migration, backup/snapshot restore, save-folder import, or defensive route recovery pass through `ingestDatabase()`. Supported raw or gzip/zlib MessagePack inputs above `RISU_STREAM_INGEST_MIN_BYTES` route to `ingestStreamingDatabase()`: the walker retains byte offsets for the root and character fields, decodes one chat at a time, and writes chat rows plus the stripped DB in one transaction without constructing or persisting the full monolith. Missing-ID assignment, duplicate handling, orphan-folder normalization, stub projection, cold-storage restoration, stale-row sweeping, and optimized plugin splitting share the same semantics as `ingestFullDatabase()`. Legacy block saves, bare deflate/JSON fallbacks, and unsupported compressed payloads retain the in-memory decoder.
-- The HTML root injects `globalThis.__NODE__` and `globalThis.__PATCH_SYNC__`;
-  `src/ts/platform.ts` turns those into frontend feature flags.
+- The HTML root injects `globalThis.__NODE__`, `globalThis.__PATCH_SYNC__`, and
+  `globalThis.__ALLOW_INSECURE_CONTEXT__`; it also sets
+  `globalThis.__PLUGIN_STORAGE_DIAG__` from the debug-tracing gate. `src/ts/platform.ts`
+  consumes the platform/security flags, while plugin-storage diagnostics read their
+  dedicated global directly.
 
 #### Patch save and full-write fallback
 
@@ -374,9 +405,15 @@ plan.
   transaction, KV/chat-row/asset writes must use `queueStorageMutation()`, never
   `queueStorageOperation()` directly.
 
-#### Hash-aware resource and key-list reads
+#### Hash-verified resource cache and key-list reads
 
-- When the opt-in browser resource cache is enabled, ordinary non-database KV reads and chat-row reads advertise locally resident SHA-256 values in `x-cached-hashes`. `/api/read` and the chat endpoint return `204` plus `x-content-hash` on a match; otherwise they return authoritative bytes. The browser re-hashes cached bytes before decoding and retries without the cache header on any inconsistency.
+- This is the server counterpart of the disposable verified browser cache documented in
+  [client storage](client-storage.md). When that cache is enabled, ordinary non-database
+  KV reads and chat-row reads advertise locally resident SHA-256 values in
+  `x-cached-hashes`. `/api/read` and the chat endpoint return `204` plus
+  `x-content-hash` on a match; otherwise they return authoritative bytes. The browser
+  re-hashes cached bytes before decoding and retries without the cache header on any
+  inconsistency.
 - `/api/write` and the chat POST return the authoritative content hash so successful client writes can seed the disposable cache without downloading the same bytes again.
 - `GET /api/list` waits for the import barrier to become idle, then supports full and delta responses. `NodeStorage.keys()` caches each prefix's key set, timestamp, and server epoch in a small separate IndexedDB database; a valid delta merges `added`/`deleted`, while missing, stale (older than six days), future-dated, or epoch-mismatched state receives a full list.
 - SQLite `updated_at`, the `deleted_keys` journal, filesystem asset/inlay mtimes, and
@@ -471,9 +508,11 @@ plan.
   archive is published. Missing chats fail closed.
 - Partial export is a cancellable server job with selected assets and a recovery-oriented
   missing-chat policy. It is not assembled from browser memory.
-- Imports and save-folder replacements spool bounded ingress and entries to disk, hold the
-  abortable import barrier, validate compatibility formats under finite limits, and pair
-  the SQLite transaction with fsynced filesystem swaps through the durable journal.
+- Destructive import implementations are split across `importBackupFromSource()`,
+  `importSpool.cjs`, `importBarrier.cjs`, and `importJournal.cjs`: they provide bounded
+  private ingress, exclusive mutation admission, and the SQLite/filesystem publication
+  bridge. The complete barrier and outcome protocol is canonical in
+  [backup and recovery](backup-recovery.md).
 - Automatic snapshots briefly hold the storage queue to flush pending database state,
   pin one WAL snapshot, and capture a global token over database and chat revisions, the
   selected plugin publication/manifest, plugin quota/owner facets, and recovery-dirty
@@ -505,6 +544,9 @@ headers, request bodies, and credentials remain in memory. Main jobs participate
 recovery and the per-chat running-job guard; auxiliary pipeline jobs use the reconnectable
 relay but never appear in recovery lists.
 
+Client job selection, adapter decoding, and retry behavior are documented in
+[model providers](model-providers.md#durable-server-side-generation).
+
 Active and unclaimed-main listings let `jobRecovery.ts` install a background per-chat
 guard for running jobs and poll their status with a 3-to-15-second backoff. It reads and
 decodes the journal only after the job becomes terminal; recovery does not reattach a live
@@ -516,12 +558,43 @@ expire after seven days. Unclaimed main jobs are protected from age expiry but s
 share the 50-terminal-record cap. Pending-send rows are atomic, per-chat one-shot recovery
 markers and expire after 48 hours.
 
-`createRequestLogs()` stores masked provider request/response diagnostics separately from
-`logs.db`. The `requests` table rotates toward a 256 MiB body budget while retaining at
+### Request logging and observability
+
+Generic provider request capture is client-produced but server-persisted and enabled by
+default. Tagged provider calls enter this path; unrelated asset, polling, and untagged
+plugin traffic does not. Classic calls use `globalFetch()` or a scoped `fetchNative()`;
+ModelPreset creates one `createRequestLogScope()` around the selected direct,
+`/proxy2`/WebSocket-proxy, or durable `job` transport. Scoped text responses are teed
+without consuming the provider branch, inline base64 media is stripped, and the batch
+waits for adapter usage. The legacy `globalFetch()` JSON recorder is the documented
+inline-media-redaction exception. The server's `createRequestLogs()` accepts
+authenticated batches at `/api/request-logs`, normalizes the `direct`/`proxy`/`job` route
+label, and masks credentials in URLs, headers, request/response bodies, and errors before
+writing `save/request-logs.db`. Provider wire usage parsing remains documented in
+[model providers](model-providers.md#request-logging-and-usage).
+
+The `requests` table rotates toward a 256 MiB captured-body budget while retaining at
 least 50 recent rows; request/response bodies are capped at 2 MiB, headers at 16 KiB, and
-ingest batches at 50. The compact LLM `usage` table is not rotated, so token statistics
-survive deletion of heavy request bodies. Clearing request history is writer-guarded;
-callers may explicitly include usage deletion.
+ingest batches at 50. The compact LLM-only `usage` row is written in the same transaction
+but is not rotated, so statistics survive deletion of heavy bodies. Authenticated list,
+detail, usage, and storage-stat routes expose the data; clearing request history is
+writer-guarded and deletes usage only when explicitly requested. This database is
+independent of both portable `.bin` exports and the bounded application diagnostic log
+in `save/logs.db`.
+
+Recovered durable jobs order their side effects deliberately: the client first commits
+the recovered external chat row, then queues the synthesized `job` request-log/usage
+entry, and only then claims the job. A failed chat save therefore leaves the job
+available for retry without double-counting provider usage.
+
+`TRACE_REQUEST_FOR_DEBUG=true` is a separate, opt-in HTTP debugging facility, not a
+provider hook. Its middleware is installed after compression and before static serving
+and mutation admission. It records only completed non-streaming HTTP exchanges to atomic
+gzip files under `save/trace`, excludes streamed request bodies, streamed/SSE/NDJSON
+responses, and WebSocket upgrades, and retains the newest 500 files. Traces include
+headers and bodies and may contain sensitive data. The same gate injects
+`globalThis.__PLUGIN_STORAGE_DIAG__` into the SPA so frontend plugin-storage diagnostics
+are sent to the ordinary application log; it adds no provider API.
 
 ### HTTP API route catalog
 
@@ -534,17 +607,17 @@ callers may explicitly include usage deletion.
 | Provider credentials | `POST /api/model-preset/google-service-account/token` signs a Google service-account JWT server-side and exchanges it only at Google's documented OAuth endpoint. | `src/ts/preset/adapter/googleServiceAccount/token.ts`. |
 | Durable model requests | `POST /api/model-jobs`; filtered active/unclaimed `GET /api/model-jobs`; `GET /api/model-jobs/:id` and `.../stream`; claim and delete routes; plus create/list/delete/atomic-claim routes under `/api/pending-sends`. | Model-preset job transport and `src/ts/process/request/jobRecovery.ts`. |
 | Key/value storage | `GET /api/read`, raw recovery `GET /api/db/read-raw-for-boot`, segmented `POST /api/db/read-cached`, create-only `POST /api/db/create-if-absent`, `GET /api/remove`, full/delta `GET /api/list`, `POST /api/write`, `POST /api/patch`, and cookie-authenticated `POST /api/db/flush`. | `NodeStorage`, bootstrap, and the save loop. |
-| Plugin storage | Boot reconcile; proof-bound recovery inspection/download/resolve; state, viewer-page, manifest, mutate, batch, clear, capacity/size; consolidated `/api/plugin-storage/transition/bulk`; and staged begin/upload/row/status/finalize/abort routes. The retired direct `/api/plugin-storage/transition` remains registered only as a pre-body `426 CLIENT_UPGRADE_REQUIRED` rejection. Generic KV routes guard the reserved publication roots. | `NodeStorage`, `persistentKv.ts`, `pluginSaveStorage.ts`, bootstrap, and Plugin Settings/Viewer. |
+| Plugin storage | Boot reconcile; proof-bound recovery inspection/download/resolve; state, viewer-page, manifest, mutate, batch, clear, capacity/size; consolidated `/api/plugin-storage/transition/bulk`; and staged begin/upload/row/status/finalize/abort routes. Manifest reads in `state` mode explicitly send `Cache-Control: no-store`. The retired direct `/api/plugin-storage/transition` remains registered only as a pre-body `426 CLIENT_UPGRADE_REQUIRED` rejection. Generic KV routes guard the reserved publication roots. | `NodeStorage`, `persistentKv.ts`, `pluginSaveStorage.ts`, bootstrap, and Plugin Settings/Viewer. |
 | Asset serving/bulk | `GET /api/asset/:hexKey`, `POST /api/assets/bulk-read`, `POST /api/assets/bulk-write`, and maintenance `POST /api/assets/cleanup`. | Direct URLs from `src/ts/globalApi.svelte.ts`; bulk methods and System dashboard. |
 | Diagnostic logs | `POST /api/logs` ingests client batches, `GET /api/logs` filters/paginates, and writer-guarded `DELETE /api/logs` clears. | Batch uploader in `src/ts/log.ts`; settings queries in `SystemSettings.svelte`. |
-| Provider request logs | `POST/GET /api/request-logs`, `GET /api/request-logs/usage`, `/stats`, and `/:id`, plus writer-guarded `DELETE /api/request-logs` with optional usage deletion. | `src/ts/requestLog.ts` and request-log/statistics settings UI. |
+| Provider request logs | `POST/GET /api/request-logs`, `GET /api/request-logs/usage`, `/stats`, and `/:id`, plus writer-guarded `DELETE /api/request-logs` with optional usage deletion. See [request logging and observability](#request-logging-and-observability). | `src/ts/requestLog.ts` and request-log/statistics settings UI. |
 | Portable backup | Strict full/upstream/main `GET /api/backup/export`, bounded import preparation/streaming, and cancellable partial-export job create/status/delete/download routes under `/api/backup/export/jobs`. | `NodeStorage` and `backuplocal.ts`; see [Backup and recovery](backup-recovery.md). |
 | Server backup | `POST /api/backup/server/save`, `GET .../list`, `POST .../restore`, `DELETE .../:filename`, and `GET .../download/:filename`. | `NodeStorage` server-backup methods. |
 | Chat-version recovery | `GET /api/chat-backups`, `GET /api/chat-backups/:chaId/:chatId`, and `GET /api/chat-backups/:chaId/:chatId/:versionId` list histories and return one raw pre-image. | `NodeStorage` chat-backup methods and `src/lib/Setting/ChatBackupList.svelte`. |
 | Backup settings | `GET/PUT /api/backup/boot-reminder` and `GET/PUT /api/backup/server/path`. | `SystemBackup.svelte`; boot prompt in `src/ts/bootstrap.ts`. |
 | Lazy chats | `GET/POST /api/chat-content/:chaId/:chatIndex` reads/writes individual chat rows, negotiates cached hashes, and captures eligible pre-images before overwrite. | `NodeStorage.fetchChatContent()` and `saveChatContent()`. |
 | Save-folder migration | `POST /api/migrate/save-folder/scan`, `/execute`, `/upload`, `/cleanup/scan`, and `/cleanup/execute`. | `NodeStorage` migration methods. |
-| Storage dashboard | `GET /api/db/stats`, `/api/db/stats/characters`, `/api/db/stats/modules`, and `/api/db/durability`; `PUT /api/db/durability`; `POST /api/db/optimize`; `POST /api/db/wal-checkpoint`. Durability defaults to `FULL`; explicit flush verifies a `FULL` checkpoint and briefly retries a busy pinned-snapshot reader before retaining its retryable `503` contract. | `SystemDashboard.svelte`. |
+| Storage dashboard | `GET /api/db/stats`, `/api/db/stats/characters`, `/api/db/stats/modules`, and `/api/db/durability`; `PUT /api/db/durability`; `POST /api/db/optimize`; `POST /api/db/wal-checkpoint`. `/api/db/stats` exposes the whole optimized-storage category—value rows, metadata sidecars, and the manifest row—as `pluginStorage` with `count`, `totalSize`, `kvRowSize`, `chunkBytes`, and `physicalSize`. Durability defaults to `FULL`; explicit flush verifies a `FULL` checkpoint and briefly retries a busy pinned-snapshot reader before retaining its retryable `503` contract. | `SystemDashboard.svelte`. |
 | DB snapshots and replacement status | `GET/PUT /api/db/snapshots/limits`, metadata-only `GET`, `DELETE`, bounded atomic/cancellable `POST /api/db/snapshots/restore`, and authenticated `GET /api/replacement-operations/:operationId` reconciliation. | Bootstrap recovery, save-folder restore, `SystemBackup.svelte`, and `snapshotRestoreUi.ts`. |
 | Inlay maintenance | `GET /api/inlays/references`, `POST /api/inlays/delete-unreferenced`, and cookie-authenticated SSE `POST /api/inlays/compress`. | Inlay cleanup and `InlayCompressButton.svelte`. |
 | Public/update | Unauthenticated `GET /api/public-stats` and `GET /api/update-check`; authenticated `POST /api/self-update`. | `src/ts/publicStats.ts` and `src/ts/update.ts`. |
@@ -638,7 +711,11 @@ callers may explicitly include usage deletion.
   duplicate `chaId` values before externalizing rows and copies any referenced pre-existing
   stub rows into the new namespace; direct full writes reject duplicates at the boundary.
 
-- Imports own the write connection exclusively. Every destructive import (backup import, file-server restore, save-folder execute/upload, snapshot restore) holds `importBarrier` across its whole window, and the barrier claims its hold before draining the storage queue. The server has one writable `better-sqlite3` connection, so any statement issued while an import's raw transaction is open silently joins it — and would be discarded by its `ROLLBACK`. Never `acquire()` the barrier from inside a queued storage operation (the drain would deadlock), and never mutate the database outside `queueStorageMutation()`. Coverage: `server/node/importBarrier.test.ts` and `test/compat/import-mutation-barrier.test.ts`.
+- `importBarrier.cjs` owns destructive-import exclusivity over the server's single writable
+  SQLite connection, while `queueStorageMutation()` is the ordinary mutation boundary.
+  Never acquire the barrier from inside a queued operation; the implementation would
+  deadlock while draining that same queue. The full ordering and rollback contract is
+  canonical in [backup and recovery](backup-recovery.md).
 
 - Replacement outcome rows are deliberately outside KV so importing a new logical database cannot erase them. Register before dispatch, write `committed` in the same SQLite transaction as replacement publication, and expose only the authenticated status route. Startup may classify a leftover `running` row as `not-committed` precisely because a committed publication cannot exist without its transactional status update.
 
@@ -659,7 +736,9 @@ callers may explicitly include usage deletion.
   inline maps or external rows, exact manifest, quota state, and recovery token. Generic
   KV routes and JSON Patch cannot mutate those optimized roots or controls. A database
   patch may update only the inline value/owner maps after an authoritative inline-mode
-  check. See [Plugin storage](plugin-storage.md).
+  check. A manifest-changing `mutate` acknowledgement includes both the committed
+  `manifestRevision` and `previousManifestRevision`. See
+  [plugin storage](plugin-storage.md) for canonical cross-boundary publication semantics.
 
 - `pluginStorageFolded` changes restore semantics. It proves a self-contained folded snapshot only with the selected generation/manifest contract. Exact restore replaces a proven owned set; unmarked historical snapshots retain external rows, and foreign/quarantined physical rows are not silently adopted.
 
@@ -734,10 +813,11 @@ callers may explicitly include usage deletion.
 
 - Chat and optimized-plugin dashboard totals are chunk-aware. Logical totals come from
   revision-verified size inventories; `LENGTH(kv.value)` would report only the 13-byte
-  marker for a chunked value. The stats response separately reports physical KV-row and
-  referenced-chunk bytes. Shared chunks are attributed to chats first, then plugin
-  storage, leaving the remainder in the database slice so the dashboard categories do
-  not double-count the chunk table.
+  marker for a chunked value. `/api/db/stats` names the optimized category
+  `pluginStorage`, with `count`, logical `totalSize`, physical `kvRowSize` and
+  `chunkBytes`, and their combined `physicalSize`. Shared chunks are attributed to chats
+  first, then plugin storage, leaving the remainder in the database slice so dashboard
+  categories do not double-count the chunk table.
 
 - Chunk GC is deliberately off the save hot path. Replaced chunks become orphans and are
   reclaimed during `/api/db/optimize`.
@@ -769,9 +849,11 @@ callers may explicitly include usage deletion.
   `shouldCompress()` excludes proxy, download, SSE, and NDJSON cases. Re-enabling gzip can
   buffer heartbeats and reintroduce reverse-proxy timeouts.
 
-- Backup imports are destructive replacement operations. Ingress and each archive/ZIP/save-folder entry are privately spooled under finite byte/count/headroom limits. Preserve cancellation, pre-import recovery, barrier, cleanup, SQLite transaction, filesystem journal, and exact committed/not-committed/unknown outcome classification.
-
-- Filesystem swaps are part of the import commit protocol. Staging trees are fsynced before publication. The journal and KV marker precede directory renames; after SQLite commit, phase `committed` persists before backup-directory/marker cleanup. Startup recovery uses both records to finalize or roll back the swap.
+- Backup imports are implemented by `importBackupFromSource()`, `importSpool.cjs`,
+  `importBarrier.cjs`, and `importJournal.cjs`; preserve those bounded-ingress,
+  exclusivity, and SQLite/filesystem publication boundaries. Import ordering, recovery,
+  and outcome classification are canonical in
+  [backup and recovery](backup-recovery.md).
 
 ### Proxy, deployment, and observability
 
