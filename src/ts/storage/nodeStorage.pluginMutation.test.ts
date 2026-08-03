@@ -114,7 +114,10 @@ function batchImportBusy(retryAfter = '0'): Response {
     }, 503, { 'retry-after': retryAfter })
 }
 
-function committedSet(manifestRevision?: string): Response {
+function committedSet(
+    manifestRevision?: string,
+    previousManifestRevision?: string,
+): Response {
     return response({
         success: true,
         outcome: 'committed',
@@ -122,6 +125,7 @@ function committedSet(manifestRevision?: string): Response {
         verification: 'verified',
         hash: valueHash,
         ...(manifestRevision ? { manifestRevision } : {}),
+        ...(previousManifestRevision ? { previousManifestRevision } : {}),
     })
 }
 
@@ -175,10 +179,26 @@ afterAll(() => {
 })
 
 describe('NodeStorage atomic plugin mutation cache publication', () => {
-    test('returns a validated manifest revision echo and accepts an old server omission', async () => {
+    test('returns validated previous/current manifest echoes and accepts old server omissions', async () => {
         const manifestRevision = `sha256:${'d'.repeat(64)}`
-        const current = storageWithResponse(committedSet(manifestRevision))
+        const previousManifestRevision = `sha256:${'c'.repeat(64)}`
+        const current = storageWithResponse(committedSet(
+            manifestRevision,
+            previousManifestRevision,
+        ))
         await expect(current.mutatePluginStorage({
+            operation: 'set',
+            valueKey,
+            valueBytes,
+            owner: 'Plugin',
+        })).resolves.toMatchObject({
+            outcome: 'committed',
+            manifestRevision,
+            previousManifestRevision,
+        })
+
+        const phaseOne = storageWithResponse(committedSet(manifestRevision))
+        await expect(phaseOne.mutatePluginStorage({
             operation: 'set',
             valueKey,
             valueBytes,
@@ -699,6 +719,23 @@ describe('NodeStorage atomic plugin mutation cache publication', () => {
             verification: 'verified',
             hash: valueHash,
             manifestRevision: `sha256:${'D'.repeat(64)}`,
+        }],
+        ['previous revision without committed revision', 200, {
+            success: true,
+            outcome: 'committed',
+            operation: 'set',
+            verification: 'verified',
+            hash: valueHash,
+            previousManifestRevision: `sha256:${'c'.repeat(64)}`,
+        }],
+        ['malformed previous manifest revision', 200, {
+            success: true,
+            outcome: 'committed',
+            operation: 'set',
+            verification: 'verified',
+            hash: valueHash,
+            manifestRevision: `sha256:${'d'.repeat(64)}`,
+            previousManifestRevision: `sha256:${'C'.repeat(64)}`,
         }],
     ] as const)(
         '%s acknowledgement is unknown and cannot publish cache state',

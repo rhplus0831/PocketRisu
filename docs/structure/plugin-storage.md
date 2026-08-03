@@ -195,9 +195,11 @@ reach the same configured per-value limit as ordinary `setItem()` without base64
 expansion. Older servers use the retained 16 MiB JSON/base64 batch fallback.
 
 Committed optimized `mutate` and `batch` acknowledgements may echo `manifestRevision`,
-the SHA-256 token of the exact committed manifest bytes. The browser retains a validated
-echo only for the current database object and `pluginStorageGeneration`; later compact
-batch CAS writes can use it without a manifest-state preflight. A generation-conflict
+the SHA-256 token of the exact committed manifest bytes. Optimized `mutate`
+acknowledgements additionally echo `previousManifestRevision`, captured from the live
+publication already read before the transaction. The browser retains validated echoes
+only for the current database object and `pluginStorageGeneration`; later compact batch
+CAS writes can use the successor without a manifest-state preflight. A generation-conflict
 response may likewise include `currentGeneration` and `currentManifestRevision` when the
 server can prove a valid live optimized publication. A same-generation echo can drive the
 next bounded retry directly. Missing echoes retain compatibility with older servers: the
@@ -207,12 +209,25 @@ An optimized manifest snapshot is cached together with the `manifestRevision` fr
 its exact value, owner, and key-mapping ownership was built. When a compact CAS commits
 against that same stamped predecessor and echoes its successor revision, the browser
 applies only the successfully committed operations it can derive exactly and restamps the
-snapshot. Missing echoes, generation changes, unknown outcomes, legacy full-manifest
-writes, and any ambiguous key-set effect retain the conservative full invalidation path.
+snapshot. A single-key mutate can do the same when its stamped predecessor matches
+`previousManifestRevision`: value-only operations preserve owner membership, owned
+operations update both memberships, and equal predecessor/successor revisions retain the
+unchanged snapshot directly. Missing echoes, generation changes, unknown outcomes, legacy
+full-manifest writes, and any ambiguous key-set effect retain the conservative full
+invalidation path.
 `keys()` remains fresh-verified on every call: it compares the stamp with the lightweight
 manifest-state response and reuses ownership only on equality, otherwise fetching a new
-full manifest snapshot. Thus external imports or rewrites remain observable without an
-unconditional snapshot scan.
+full manifest snapshot. Concurrent cold ownership misses for the same database object and
+generation share one snapshot request; callers retain independent cancellation, and the
+shared request is cancelled only after every waiter leaves. Thus external imports or
+rewrites remain observable without an unconditional snapshot scan.
+
+Manifest state and snapshot reads share an endpoint but not an HTTP-cache identity. State
+responses carry `Cache-Control: no-store`, while snapshot responses retain Express weak
+ETag revalidation. A state proof therefore cannot replace the browser's cached full
+snapshot representation. The snapshot response still duplicates the manifest's key arrays
+in its outer ownership fields; removing that transfer overhead requires explicit
+capability negotiation with strict older clients and remains future work.
 
 The authenticated session advertises a generic per-value ceiling plus separate framed
 batch and transition capabilities. Ordinary writes preflight the generic ceiling;
@@ -261,6 +276,9 @@ the head stayed unchanged.
   ownership reads. A concurrent mutation, a snapshot without a matching predecessor
   stamp, or a database/generation change prevents restamping and falls back to
   invalidation; a client-derived mapping is added only for a key in its committed write.
+  Single-key mutate restamps use the server-proven predecessor and the exact local
+  value/owner membership effect; equality of predecessor and successor proves that no
+  manifest membership delta is needed.
 - Generic `/api/write` and `/api/remove` paths must not mutate manifest-owned rows, and
   JSON Patch must not change optimized rows or publication controls. To preserve the
   original inline save behavior, database patches may update `pluginCustomStorage` and

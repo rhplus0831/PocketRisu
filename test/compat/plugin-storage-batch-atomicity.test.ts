@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, readdir, writeFile } from 'node:fs/promises'
 import { gzipSync } from 'node:zlib'
 import { createHash, randomUUID } from 'node:crypto'
+import { request as httpRequest } from 'node:http'
 import { Packr } from 'msgpackr'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
@@ -1163,6 +1164,59 @@ describe('AA3 atomic plugin storage batch', () => {
       generation: STORAGE_GENERATION,
       manifestRevision: snapshot.manifestRevision,
     })
+  })
+
+  test('state reads bypass the HTTP cache without changing snapshot ETag revalidation', async () => {
+    const { server, client } = await boot()
+    const snapshotHeaders = {
+      'x-plugin-storage-generation': STORAGE_GENERATION,
+      'x-plugin-storage-manifest-mode': 'snapshot',
+    }
+    const firstSnapshot = await client.fetch('/api/plugin-storage/manifest', {
+      headers: snapshotHeaders,
+    })
+    expect(firstSnapshot.status).toBe(200)
+    expect(firstSnapshot.headers.get('cache-control')).toBeNull()
+    const snapshotEtag = firstSnapshot.headers.get('etag')
+    expect(snapshotEtag).toBeTruthy()
+    await firstSnapshot.arrayBuffer()
+
+    const state = await client.fetch('/api/plugin-storage/manifest', {
+      headers: {
+        'x-plugin-storage-generation': STORAGE_GENERATION,
+        'x-plugin-storage-manifest-mode': 'state',
+      },
+    })
+    expect(state.status).toBe(200)
+    expect(state.headers.get('cache-control')).toBe('no-store')
+    await state.arrayBuffer()
+
+    const revalidatedSnapshot = await new Promise<{
+      status: number | undefined
+      cacheControl: string | string[] | undefined
+    }>((resolve, reject) => {
+      const request = httpRequest({
+        hostname: '127.0.0.1',
+        port: server.port,
+        path: '/api/plugin-storage/manifest',
+        method: 'GET',
+        headers: {
+          ...snapshotHeaders,
+          'if-none-match': snapshotEtag!,
+          'risu-auth': client.token,
+        },
+      }, response => {
+        response.resume()
+        response.once('end', () => resolve({
+          status: response.statusCode,
+          cacheControl: response.headers['cache-control'],
+        }))
+      })
+      request.once('error', reject)
+      request.end()
+    })
+    expect(revalidatedSnapshot.status).toBe(304)
+    expect(revalidatedSnapshot.cacheControl).toBeUndefined()
   })
 
   test('compact manifest CAS commits with the current token and rejects a stale token', async () => {

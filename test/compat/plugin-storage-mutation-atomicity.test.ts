@@ -359,6 +359,8 @@ describe('atomic optimized plugin value and owner acknowledgement', () => {
   test('a buffered generation-bound set keeps the exact acknowledgement and publication bytes', async () => {
     const { server, client } = await boot(undefined, undefined, seedActivePublication)
     const value = Buffer.from('{"generation":"bounded-cache","order":[3,1,2]}', 'utf-8')
+    const previousManifestRevision = `sha256:${createHash('sha256')
+      .update(readManifestBytes(server.cwd)).digest('hex')}`
     const response = await client.fetch('/api/plugin-storage/mutate', {
       method: 'POST',
       headers: {
@@ -381,6 +383,7 @@ describe('atomic optimized plugin value and owner acknowledgement', () => {
       verification: 'verified',
       hash: createHash('sha256').update(value).digest('hex'),
       manifestRevision,
+      previousManifestRevision,
     })
     expect(readRows(server.cwd).value).toEqual(value)
     expect(readFacets(server.cwd)).toEqual({

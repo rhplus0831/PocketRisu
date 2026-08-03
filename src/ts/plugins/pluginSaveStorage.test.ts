@@ -1485,6 +1485,189 @@ describe("AA3 versioned atomic plugin storage", () => {
         );
     });
 
+    test("retains stamped ownership across a value-only mutate with an unchanged manifest", async () => {
+        database.optimizePluginMemory = true;
+        const generation = "mutate-retain-generation";
+        const revision = `sha256:${"d".repeat(64)}`;
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "retained-value");
+        persistent.set(valueKey, { version: 1 });
+        installOwnershipManifest(generation, [valueKey], []);
+        persistent.set(PLUGIN_STORAGE_MANIFEST_KEY, {
+            version: 2,
+            generation,
+            valueKeys: [valueKey],
+            metaKeys: [],
+        });
+        const {
+            readPersistentPluginStorageManifestSnapshot,
+            readPersistentPluginStorageManifestState,
+            setPreparedPersistentPluginStoragePreservingOwner,
+        } = vi.mocked(await import("../storage/persistentKv"));
+
+        await expect(getPluginSaveStorageItem("retained-value"))
+            .resolves.toEqual({ version: 1 });
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["retained-value"]);
+        readPersistentPluginStorageManifestSnapshot.mockClear();
+        readPersistentPluginStorageManifestState.mockClear();
+        resetPluginStorageDiagnosticsForTest();
+        setPreparedPersistentPluginStoragePreservingOwner.mockImplementationOnce(
+            async (storageKey, prepared) => {
+                persistent.set(
+                    storageKey,
+                    JSON.parse(new TextDecoder().decode(prepared.bytes)),
+                );
+                return {
+                    outcome: "committed",
+                    operation: "set",
+                    verification: "verified",
+                    previousManifestRevision: revision,
+                    manifestRevision: revision,
+                };
+            },
+        );
+
+        await setPluginSaveStorageItem("retained-value", { version: 2 });
+        await expect(getPluginSaveStorageItem("retained-value"))
+            .resolves.toEqual({ version: 2 });
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["retained-value"]);
+
+        expect(readPersistentPluginStorageManifestSnapshot).not.toHaveBeenCalled();
+        expect(readPersistentPluginStorageManifestState).toHaveBeenCalledOnce();
+        expect(getPluginStorageDiagnosticEventsForTest()).toEqual(expect.arrayContaining([
+            expect.objectContaining({ kind: "restamp", source: "mutate-retain" }),
+        ]));
+        expect(getPluginStorageDiagnosticEventsForTest()).not.toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                kind: "invalidate",
+                source: "mutate-conservative",
+            }),
+        ]));
+    });
+
+    test("restamps owned remove and set mutations through both manifest revisions", async () => {
+        database.optimizePluginMemory = true;
+        const generation = "mutate-cycle-generation";
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "cycled-value");
+        const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "cycled-value");
+        persistent.set(valueKey, { version: 1 });
+        persistent.set(metaKey, { plugin: "Cycle Plugin", updatedAt: 1 });
+        installOwnershipManifest(generation, [valueKey], [metaKey]);
+        const {
+            mutatePersistentPluginStorage,
+            readPersistentPluginStorageManifestSnapshot,
+            readPersistentPluginStorageManifestState,
+        } = vi.mocked(await import("../storage/persistentKv"));
+        let currentRevision = `sha256:${"d".repeat(64)}`;
+        const revisions = [
+            `sha256:${"e".repeat(64)}`,
+            `sha256:${"f".repeat(64)}`,
+        ];
+
+        await expect(getPluginSaveStorageItem("cycled-value"))
+            .resolves.toEqual({ version: 1 });
+        readPersistentPluginStorageManifestSnapshot.mockClear();
+        readPersistentPluginStorageManifestState.mockClear();
+        readPersistentPluginStorageManifestState.mockImplementation(async () => ({
+            generation,
+            manifestRevision: currentRevision,
+        }));
+        mutatePersistentPluginStorage.mockImplementation(async (
+            storageKey: string,
+            operation: "set" | "remove",
+            valueOrSignal?: unknown,
+            owner = "",
+            _signal?: AbortSignal | null,
+            _generation?: string,
+            prepared?: { bytes: Uint8Array },
+        ) => {
+            const previousManifestRevision = currentRevision;
+            currentRevision = revisions.shift()!;
+            if (operation === "remove") {
+                persistent.delete(storageKey);
+                persistent.delete(metaKey);
+                installOwnershipManifest(generation, [], []);
+            } else {
+                persistent.set(
+                    storageKey,
+                    prepared
+                        ? JSON.parse(new TextDecoder().decode(prepared.bytes))
+                        : valueOrSignal,
+                );
+                persistent.set(metaKey, { plugin: owner, updatedAt: 2 });
+                installOwnershipManifest(generation, [storageKey], [metaKey]);
+            }
+            return {
+                outcome: "committed",
+                operation,
+                verification: "verified",
+                previousManifestRevision,
+                manifestRevision: currentRevision,
+            };
+        });
+
+        await removeOwnedPluginSaveStorageItem("cycled-value");
+        await expect(getPluginSaveStorageItem("cycled-value")).resolves.toBeNull();
+        await setOwnedPluginSaveStorageItem(
+            "cycled-value",
+            { version: 2 },
+            "Cycle Plugin",
+        );
+        await expect(getPluginSaveStorageItem("cycled-value"))
+            .resolves.toEqual({ version: 2 });
+        await expect(getPluginSaveStorageOwners()).resolves.toEqual({
+            "cycled-value": "Cycle Plugin",
+        });
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["cycled-value"]);
+
+        expect(readPersistentPluginStorageManifestSnapshot).not.toHaveBeenCalled();
+        expect(getPluginStorageDiagnosticEventsForTest().filter(event => (
+            event.kind === "restamp" && event.source === "mutate-delta"
+        ))).toHaveLength(2);
+    });
+
+    test("keeps old-server mutate acknowledgements on conservative invalidation", async () => {
+        database.optimizePluginMemory = true;
+        const generation = "mutate-old-server-generation";
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "legacy-mutate");
+        persistent.set(valueKey, { version: 1 });
+        installOwnershipManifest(generation, [valueKey], []);
+        const {
+            readPersistentPluginStorageManifestSnapshot,
+            setPreparedPersistentPluginStoragePreservingOwner,
+        } = vi.mocked(await import("../storage/persistentKv"));
+
+        await expect(getPluginSaveStorageItem("legacy-mutate"))
+            .resolves.toEqual({ version: 1 });
+        readPersistentPluginStorageManifestSnapshot.mockClear();
+        resetPluginStorageDiagnosticsForTest();
+        setPreparedPersistentPluginStoragePreservingOwner.mockImplementationOnce(
+            async (storageKey, prepared) => {
+                persistent.set(
+                    storageKey,
+                    JSON.parse(new TextDecoder().decode(prepared.bytes)),
+                );
+                return {
+                    outcome: "committed",
+                    operation: "set",
+                    verification: "verified",
+                    manifestRevision: `sha256:${"e".repeat(64)}`,
+                };
+            },
+        );
+
+        await setPluginSaveStorageItem("legacy-mutate", { version: 2 });
+        await expect(getPluginSaveStorageItem("legacy-mutate"))
+            .resolves.toEqual({ version: 2 });
+
+        expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledOnce();
+        expect(getPluginStorageDiagnosticEventsForTest()).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                kind: "invalidate",
+                source: "mutate-conservative",
+            }),
+        ]));
+    });
+
     test("maintains a stamped ownership snapshot from an echoed batch delta", async () => {
         database.optimizePluginMemory = true;
         const generation = "ownership-delta-generation";
@@ -2435,8 +2618,10 @@ describe("plugin save storage transport", () => {
         );
         const controller = new AbortController();
         let observedAbort = false;
+        let transportSignal: AbortSignal | null | undefined;
         readPersistentPluginStorageManifestSnapshot.mockImplementationOnce(
             async (_generation, signal) => await new Promise((_resolve, reject) => {
+                transportSignal = signal;
                 signal?.addEventListener("abort", () => {
                     observedAbort = true;
                     reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
@@ -2448,14 +2633,105 @@ describe("plugin save storage transport", () => {
         await vi.waitFor(() => {
             expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledWith(
                 "abort-generation",
-                controller.signal,
+                expect.anything(),
                 expect.stringMatching(/^keys-fresh:no-snapshot:ksg=\d+:db=\d+$/),
             );
         });
+        expect(transportSignal).not.toBe(controller.signal);
         controller.abort(new DOMException("cancel snapshot", "AbortError"));
 
         await expect(listing).rejects.toMatchObject({ name: "AbortError" });
         expect(observedAbort).toBe(true);
+    });
+
+    test("single-flights concurrent cold ownership reads and stores the snapshot once", async () => {
+        database.optimizePluginMemory = true;
+        const generation = "single-flight-generation";
+        const keys = Array.from({ length: 6 }, (_, index) => `cold-${index}`);
+        const valueKeys = keys.map(key => encoded(PLUGIN_SAVE_PREFIX, key));
+        valueKeys.forEach((valueKey, index) => persistent.set(valueKey, { index }));
+        installOwnershipManifest(generation, valueKeys, []);
+        const { readPersistentPluginStorageManifestSnapshot } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        let releaseSnapshot!: () => void;
+        const snapshotGate = new Promise<void>(resolve => { releaseSnapshot = resolve; });
+        readPersistentPluginStorageManifestSnapshot.mockImplementationOnce(
+            async requestedGeneration => {
+                await snapshotGate;
+                return {
+                    generation: requestedGeneration,
+                    manifestRevision: `sha256:${"d".repeat(64)}`,
+                    manifest: persistent.get(PLUGIN_STORAGE_MANIFEST_KEY) as any,
+                    valueKeys,
+                    metaKeys: [],
+                };
+            },
+        );
+
+        const reads = keys.map(key => getPluginSaveStorageItem<{ index: number }>(key));
+        await vi.waitFor(() => {
+            expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledOnce();
+            expect(getPluginStorageDiagnosticEventsForTest().filter(
+                event => event.kind === "snapshot-join",
+            )).toHaveLength(keys.length - 1);
+        });
+        releaseSnapshot();
+
+        await expect(Promise.all(reads)).resolves.toEqual(
+            keys.map((_, index) => ({ index })),
+        );
+        expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledOnce();
+        expect(getPluginStorageDiagnosticEventsForTest().filter(event => (
+            event.kind === "stamp-store" && event.outcome === "stored"
+        ))).toHaveLength(1);
+    });
+
+    test("aborting one ownership waiter leaves the shared snapshot available to others", async () => {
+        database.optimizePluginMemory = true;
+        const generation = "single-flight-abort-generation";
+        const firstKey = encoded(PLUGIN_SAVE_PREFIX, "first-waiter");
+        const secondKey = encoded(PLUGIN_SAVE_PREFIX, "second-waiter");
+        persistent.set(firstKey, { waiter: 1 });
+        persistent.set(secondKey, { waiter: 2 });
+        installOwnershipManifest(generation, [firstKey, secondKey], []);
+        const { readPersistentPluginStorageManifestSnapshot } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        let transportSignal: AbortSignal | null | undefined;
+        let resolveSnapshot!: () => void;
+        const snapshotGate = new Promise<void>(resolve => { resolveSnapshot = resolve; });
+        readPersistentPluginStorageManifestSnapshot.mockImplementationOnce(
+            async (requestedGeneration, signal) => {
+                transportSignal = signal;
+                await snapshotGate;
+                return {
+                    generation: requestedGeneration,
+                    manifestRevision: `sha256:${"d".repeat(64)}`,
+                    manifest: persistent.get(PLUGIN_STORAGE_MANIFEST_KEY) as any,
+                    valueKeys: [firstKey, secondKey],
+                    metaKeys: [],
+                };
+            },
+        );
+        const firstController = new AbortController();
+        const first = getPluginSaveStorageItem("first-waiter", firstController.signal);
+        const second = getPluginSaveStorageItem("second-waiter");
+        await vi.waitFor(() => {
+            expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledOnce();
+            expect(getPluginStorageDiagnosticEventsForTest()).toEqual(expect.arrayContaining([
+                expect.objectContaining({ kind: "snapshot-join", shared: true }),
+            ]));
+        });
+
+        firstController.abort(new DOMException("cancel first waiter", "AbortError"));
+        await expect(first).rejects.toMatchObject({ name: "AbortError" });
+        expect(transportSignal?.aborted).toBe(false);
+        resolveSnapshot();
+
+        await expect(second).resolves.toEqual({ waiter: 2 });
+        expect(transportSignal?.aborted).toBe(false);
+        expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledOnce();
     });
 
     test("one generation snapshot feeds enumeration and a page of value reads", async () => {

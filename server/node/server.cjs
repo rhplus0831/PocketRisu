@@ -11810,6 +11810,9 @@ app.get('/api/plugin-storage/manifest', async (req, res, next) => {
             code: 'INVALID_PLUGIN_STORAGE_MANIFEST_READ',
         });
     }
+    if (requestedMode === 'state') {
+        res.set('Cache-Control', 'no-store');
+    }
 
     try {
         const snapshot = await queueStorageReadAfterImports(async () => {
@@ -12979,6 +12982,9 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 );
             }
             const nextManifest = manifestUpdate?.manifest ?? null;
+            const previousManifestRevision = manifestUpdate
+                ? publication.manifestState.revision
+                : null;
             const recoverySnapshotToken = newPluginRecoverySnapshotToken();
             let committedManifestBytes = null;
             let committedPublicationRevision = null;
@@ -13079,7 +13085,12 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 operation,
                 verification,
                 hash: operation === 'set' ? valueHash : undefined,
-                ...(committedManifestRevision ? { manifestRevision: committedManifestRevision } : {}),
+                ...(committedManifestRevision
+                    ? {
+                        manifestRevision: committedManifestRevision,
+                        previousManifestRevision,
+                    }
+                    : {}),
             });
         });
     } catch (error) {

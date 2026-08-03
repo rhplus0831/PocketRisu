@@ -37,6 +37,8 @@ export interface PluginStorageMutationResult {
     commitOutcomeUnknown?: boolean;
     /** Exact optimized publication token after a trusted committed acknowledgement. */
     manifestRevision?: string;
+    /** Exact optimized publication token immediately before the committed mutation. */
+    previousManifestRevision?: string;
     /** Live optimized publication returned by a generation conflict, when provable. */
     currentManifestRevision?: string;
     currentGeneration?: string;
@@ -140,6 +142,11 @@ export function classifyPluginStorageMutationAcknowledgement(
         const manifestRevisionIsValid = body.manifestRevision === undefined
             || (typeof body.manifestRevision === "string"
                 && MANIFEST_REVISION_PATTERN.test(body.manifestRevision));
+        const previousManifestRevisionIsValid = body.previousManifestRevision === undefined
+            || (typeof body.manifestRevision === "string"
+                && MANIFEST_REVISION_PATTERN.test(body.manifestRevision)
+                && typeof body.previousManifestRevision === "string"
+                && MANIFEST_REVISION_PATTERN.test(body.previousManifestRevision));
         if (
             hasOnlyKeys(body, [
                 "success",
@@ -148,12 +155,14 @@ export function classifyPluginStorageMutationAcknowledgement(
                 "verification",
                 ...(operation === "set" ? ["hash"] : []),
                 "manifestRevision",
+                "previousManifestRevision",
             ])
             && body.success === true
             && body.outcome === "committed"
             && (body.verification === "verified" || body.verification === "unavailable")
             && hashIsValid
             && manifestRevisionIsValid
+            && previousManifestRevisionIsValid
             && body.code === undefined
             && body.error === undefined
             && body.retryable === undefined
@@ -167,6 +176,9 @@ export function classifyPluginStorageMutationAcknowledgement(
                 ...(operation === "set" ? { hash: body.hash as string } : {}),
                 ...(typeof body.manifestRevision === "string"
                     ? { manifestRevision: body.manifestRevision }
+                    : {}),
+                ...(typeof body.previousManifestRevision === "string"
+                    ? { previousManifestRevision: body.previousManifestRevision }
                     : {}),
             };
         }

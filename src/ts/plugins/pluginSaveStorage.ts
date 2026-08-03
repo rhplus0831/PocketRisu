@@ -283,9 +283,21 @@ interface PluginStorageSnapshotReadDiagnostic {
     reason: PluginStorageSnapshotReadReason;
     keySetGeneration: number;
     stamp: string | null;
+    shared?: boolean;
 }
 
 let storageOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null;
+interface PluginStorageOwnershipSnapshotFlight {
+    database: Database;
+    generation: string;
+    keySetGeneration: number;
+    controller: AbortController;
+    promise: Promise<PluginStorageOwnership>;
+    waiters: Set<symbol>;
+    settled: boolean;
+    caller: string;
+}
+let storageOwnershipSnapshotFlight: PluginStorageOwnershipSnapshotFlight | null = null;
 const manifestRevisionCache = new WeakMap<Database, {
     generation: string;
     manifestRevision: string;
@@ -424,15 +436,28 @@ async function recordOptimizedMutationAcknowledgement(
     db: Database,
     generation: string,
     mutation: Promise<PluginStorageMutationResult>,
-): Promise<void> {
+    delta: PluginStorageSingleMutationOwnershipDelta,
+): Promise<PluginStorageOwnershipSnapshot | null> {
+    const keySetGeneration = getPluginStorageKeySetGeneration();
     try {
         const result = await mutation;
+        recordManifestRevisionAcknowledgement(db, generation, result);
         if (result.outcome === "committed") {
+            const retained = applyCommittedPluginStorageSingleMutationOwnershipDelta(
+                db,
+                generation,
+                result.previousManifestRevision,
+                result.manifestRevision,
+                delta,
+                keySetGeneration,
+            );
+            if (retained) return retained;
             recordPluginStorageInvalidation(db, "mutate-conservative", {
+                previousRevision: result.previousManifestRevision ?? null,
                 currentRevision: result.manifestRevision ?? null,
             });
         }
-        recordManifestRevisionAcknowledgement(db, generation, result);
+        return null;
     } catch (error) {
         invalidateManifestRevisionAfterError(db, error);
         throw error;
@@ -909,6 +934,7 @@ function applyCommittedPluginStorageOwnershipDelta(
         };
         storageOwnershipSnapshot = nextSnapshot;
         recordPluginStorageDiagnostic("restamp", {
+            source: "batch-delta",
             ...pluginStorageDiagnosticContext(db, keySetGeneration),
             predecessor: expectedManifestRevision,
             successor: committedManifestRevision,
@@ -918,6 +944,111 @@ function applyCommittedPluginStorageOwnershipDelta(
     } catch {
         // The server commit is already authoritative. Any local derivation
         // doubt must degrade to the existing full-snapshot refresh behavior.
+        return null;
+    }
+}
+
+interface PluginStorageSingleMutationOwnershipDelta {
+    valueStorageKey: string;
+    valueAction: "add" | "remove";
+    metaStorageKey?: string;
+    metaAction: "add" | "remove" | "preserve";
+}
+
+function applyCommittedPluginStorageSingleMutationOwnershipDelta(
+    db: Database,
+    generation: string,
+    previousManifestRevision: string | undefined,
+    committedManifestRevision: string | undefined,
+    delta: PluginStorageSingleMutationOwnershipDelta,
+    keySetGeneration: number,
+): PluginStorageOwnershipSnapshot | null {
+    if (typeof previousManifestRevision !== "string"
+        || !PLUGIN_STORAGE_REVISION_PATTERN.test(previousManifestRevision)
+        || typeof committedManifestRevision !== "string"
+        || !PLUGIN_STORAGE_REVISION_PATTERN.test(committedManifestRevision)
+        || (delta.metaAction !== "preserve" && !delta.metaStorageKey)) return null;
+    const snapshot = storageOwnershipSnapshot;
+    if (!snapshot
+        || snapshot.database !== db
+        || snapshot.generation !== generation
+        || snapshot.manifestRevision !== previousManifestRevision
+        || snapshot.keySetGeneration !== keySetGeneration
+        || getPluginStorageKeySetGeneration() !== keySetGeneration
+        || getDatabase() !== db
+        || db.optimizePluginMemory !== true
+        || db.pluginStorageGeneration !== generation
+        || !snapshot.ownership.manifestPresent
+        || !snapshot.ownership.manifestValid
+        || snapshot.ownership.manifest?.generation !== generation) return null;
+
+    if (previousManifestRevision === committedManifestRevision) {
+        recordPluginStorageDiagnostic("restamp", {
+            source: "mutate-retain",
+            ...pluginStorageDiagnosticContext(db, keySetGeneration),
+            predecessor: previousManifestRevision,
+            successor: committedManifestRevision,
+            operations: 1,
+        });
+        return snapshot;
+    }
+
+    try {
+        const manifestValueKeys = new Set(snapshot.ownership.manifest.valueKeys);
+        const manifestMetaKeys = new Set(snapshot.ownership.manifest.metaKeys);
+        const physicalValueKeys = new Set(snapshot.ownership.valueKeys);
+        const physicalMetaKeys = new Set(snapshot.ownership.metaKeys);
+        if (delta.valueAction === "add") {
+            manifestValueKeys.add(delta.valueStorageKey);
+            physicalValueKeys.add(delta.valueStorageKey);
+        } else {
+            manifestValueKeys.delete(delta.valueStorageKey);
+            physicalValueKeys.delete(delta.valueStorageKey);
+        }
+        if (delta.metaAction === "add") {
+            manifestMetaKeys.add(delta.metaStorageKey!);
+            physicalMetaKeys.add(delta.metaStorageKey!);
+        } else if (delta.metaAction === "remove") {
+            manifestMetaKeys.delete(delta.metaStorageKey!);
+            physicalMetaKeys.delete(delta.metaStorageKey!);
+        }
+        const keyMappings = mergedPluginStorageKeyMappings(
+            snapshot.ownership.manifest,
+            [],
+            manifestValueKeys,
+            manifestMetaKeys,
+        );
+        const manifest = buildPluginStorageManifest(
+            generation,
+            manifestValueKeys,
+            manifestMetaKeys,
+            keyMappings,
+        );
+        const ownership: PluginStorageOwnership = {
+            manifest,
+            manifestPresent: true,
+            manifestValid: true,
+            valueKeys: [...physicalValueKeys],
+            metaKeys: [...physicalMetaKeys],
+            manifestRevision: committedManifestRevision,
+        };
+        const nextSnapshot: PluginStorageOwnershipSnapshot = {
+            database: db,
+            generation,
+            keySetGeneration,
+            manifestRevision: committedManifestRevision,
+            ownership,
+        };
+        storageOwnershipSnapshot = nextSnapshot;
+        recordPluginStorageDiagnostic("restamp", {
+            source: "mutate-delta",
+            ...pluginStorageDiagnosticContext(db, keySetGeneration),
+            predecessor: previousManifestRevision,
+            successor: committedManifestRevision,
+            operations: 1,
+        });
+        return nextSnapshot;
+    } catch {
         return null;
     }
 }
@@ -1012,6 +1143,7 @@ async function readCurrentOwnership(
         recordPluginStorageDiagnostic("snapshot-read", {
             caller: diagnostic.caller,
             reason: diagnostic.reason,
+            shared: diagnostic.shared ?? false,
             ...diagnosticContext,
             stamp: diagnostic.stamp,
         });
@@ -1065,43 +1197,21 @@ function clonePluginStorageOwnership(ownership: PluginStorageOwnership): PluginS
     };
 }
 
-async function readCachedCurrentOwnership(
+async function readAndStoreCurrentOwnership(
     db: Database,
-    signal?: AbortSignal | null,
-    refresh = false,
-    caller = "unknown",
-    diagnosticReason?: PluginStorageSnapshotReadReason,
-    diagnosticStamp?: string | null,
+    generation: string | undefined,
+    keySetGeneration: number,
+    signal: AbortSignal | null | undefined,
+    caller: string,
+    missReason: PluginStorageSnapshotReadReason,
+    diagnosticStamp: string | null,
 ): Promise<PluginStorageOwnership> {
-    const generation = db.optimizePluginMemory === true
-        ? db.pluginStorageGeneration
-        : undefined;
-    const keySetGeneration = getPluginStorageKeySetGeneration();
-    if (!refresh
-        && generation
-        && storageOwnershipSnapshot?.database === db
-        && storageOwnershipSnapshot.generation === generation
-        && storageOwnershipSnapshot.keySetGeneration === keySetGeneration) {
-        throwIfAborted(signal);
-        return clonePluginStorageOwnership(storageOwnershipSnapshot.ownership);
-    }
-    const missReason = diagnosticReason
-        ?? (refresh
-            ? "forced-refresh"
-            : !storageOwnershipSnapshot
-                ? "no-snapshot"
-                : storageOwnershipSnapshot.database !== db
-                    ? "db-changed"
-                    : storageOwnershipSnapshot.generation !== generation
-                        ? "generation-changed"
-                        : "keyset-changed");
     const ownership = await readCurrentOwnership(db, signal, {
         caller,
         reason: missReason,
         keySetGeneration,
-        stamp: diagnosticStamp === undefined
-            ? storageOwnershipSnapshot?.manifestRevision ?? null
-            : diagnosticStamp,
+        stamp: diagnosticStamp,
+        shared: false,
     });
     const storeDatabase = getDatabase();
     const storeKeySetGeneration = getPluginStorageKeySetGeneration();
@@ -1140,6 +1250,147 @@ async function readCachedCurrentOwnership(
         recordManifestRevision(db, generation, ownership.manifestRevision);
     }
     return ownership;
+}
+
+function abortOwnershipSnapshotFlight(
+    flight: PluginStorageOwnershipSnapshotFlight,
+    reason: unknown,
+): void {
+    if (storageOwnershipSnapshotFlight === flight) storageOwnershipSnapshotFlight = null;
+    if (!flight.settled) flight.controller.abort(reason);
+}
+
+function waitForOwnershipSnapshotFlight(
+    flight: PluginStorageOwnershipSnapshotFlight,
+    signal?: AbortSignal | null,
+): Promise<PluginStorageOwnership> {
+    throwIfAborted(signal);
+    const waiter = Symbol("plugin-storage-ownership-snapshot-waiter");
+    flight.waiters.add(waiter);
+    return new Promise<PluginStorageOwnership>((resolve, reject) => {
+        let finished = false;
+        const cleanup = () => {
+            if (signal) signal.removeEventListener("abort", onAbort);
+            flight.waiters.delete(waiter);
+            if (!flight.settled && flight.waiters.size === 0) {
+                abortOwnershipSnapshotFlight(flight, signal
+                    ? abortReason(signal)
+                    : new DOMException("The ownership snapshot was abandoned.", "AbortError"));
+            }
+        };
+        const finish = (settle: () => void) => {
+            if (finished) return;
+            finished = true;
+            cleanup();
+            settle();
+        };
+        const onAbort = () => finish(() => reject(abortReason(signal!)));
+        if (signal) signal.addEventListener("abort", onAbort, { once: true });
+        flight.promise.then(
+            ownership => finish(() => resolve(clonePluginStorageOwnership(ownership))),
+            error => finish(() => reject(error)),
+        );
+    });
+}
+
+async function readCachedCurrentOwnership(
+    db: Database,
+    signal?: AbortSignal | null,
+    refresh = false,
+    caller = "unknown",
+    diagnosticReason?: PluginStorageSnapshotReadReason,
+    diagnosticStamp?: string | null,
+): Promise<PluginStorageOwnership> {
+    const generation = db.optimizePluginMemory === true
+        ? db.pluginStorageGeneration
+        : undefined;
+    const keySetGeneration = getPluginStorageKeySetGeneration();
+    if (!refresh
+        && generation
+        && storageOwnershipSnapshot?.database === db
+        && storageOwnershipSnapshot.generation === generation
+        && storageOwnershipSnapshot.keySetGeneration === keySetGeneration) {
+        throwIfAborted(signal);
+        return clonePluginStorageOwnership(storageOwnershipSnapshot.ownership);
+    }
+    throwIfAborted(signal);
+    const missReason = diagnosticReason
+        ?? (refresh
+            ? "forced-refresh"
+            : !storageOwnershipSnapshot
+                ? "no-snapshot"
+                : storageOwnershipSnapshot.database !== db
+                    ? "db-changed"
+                    : storageOwnershipSnapshot.generation !== generation
+                        ? "generation-changed"
+                        : "keyset-changed");
+    const stamp = diagnosticStamp === undefined
+        ? storageOwnershipSnapshot?.manifestRevision ?? null
+        : diagnosticStamp;
+    if (!generation) {
+        return readAndStoreCurrentOwnership(
+            db,
+            generation,
+            keySetGeneration,
+            signal,
+            caller,
+            missReason,
+            stamp,
+        );
+    }
+
+    let flight = storageOwnershipSnapshotFlight;
+    if (flight && (flight.database !== db || flight.generation !== generation)) {
+        abortOwnershipSnapshotFlight(
+            flight,
+            new DOMException("The plugin storage publication changed.", "AbortError"),
+        );
+        flight = null;
+    }
+    if (flight && flight.keySetGeneration !== keySetGeneration) {
+        // Let callers already bound to the older key-set generation settle,
+        // but never let a newer miss join a snapshot whose store guard must fail.
+        flight = null;
+    }
+    if (!flight) {
+        const controller = new AbortController();
+        flight = {
+            database: db,
+            generation,
+            keySetGeneration,
+            controller,
+            promise: Promise.resolve(undefined as never),
+            waiters: new Set(),
+            settled: false,
+            caller,
+        };
+        const createdFlight = flight;
+        createdFlight.promise = readAndStoreCurrentOwnership(
+            db,
+            generation,
+            keySetGeneration,
+            controller.signal,
+            caller,
+            missReason,
+            stamp,
+        ).finally(() => {
+            createdFlight.settled = true;
+            if (storageOwnershipSnapshotFlight === createdFlight) {
+                storageOwnershipSnapshotFlight = null;
+            }
+        });
+        storageOwnershipSnapshotFlight = createdFlight;
+    } else {
+        recordPluginStorageDiagnostic("snapshot-join", {
+            caller,
+            reason: missReason,
+            shared: true,
+            ownerCaller: flight.caller,
+            ...pluginStorageDiagnosticContext(db, keySetGeneration),
+            stamp,
+        });
+    }
+    return waitForOwnershipSnapshotFlight(flight, signal);
 }
 
 async function readFreshVerifiedPluginStorageOwnership(
@@ -2046,6 +2297,7 @@ export async function setPluginSaveStorageItem<T>(
 ): Promise<void> {
     throwIfAborted(signal);
     const normalizedKey = normalizePluginStorageKey(key);
+    let retainedOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null;
     const publish = async (invocation: PluginStorageSetInvocation): Promise<void> => {
         throwIfAborted(signal);
         const db = getDatabase();
@@ -2079,7 +2331,7 @@ export async function setPluginSaveStorageItem<T>(
         if (db.pluginStorageGeneration
             && !isHashedPluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX)) {
             const generation = db.pluginStorageGeneration;
-            await recordOptimizedMutationAcknowledgement(
+            retainedOwnershipSnapshot = await recordOptimizedMutationAcknowledgement(
                 db,
                 generation,
                 setPreparedPersistentPluginStoragePreservingOwner(
@@ -2088,6 +2340,11 @@ export async function setPluginSaveStorageItem<T>(
                     signal,
                     generation,
                 ),
+                {
+                    valueStorageKey: storageKey,
+                    valueAction: "add",
+                    metaAction: "preserve",
+                },
             );
             return;
         }
@@ -2120,7 +2377,7 @@ export async function setPluginSaveStorageItem<T>(
     } finally {
         // A timed-out remote mutation may have committed even though its
         // acknowledgement was lost, so no enumeration snapshot remains valid.
-        invalidateStorageEnumerationSnapshot();
+        invalidateStorageEnumerationSnapshot(retainedOwnershipSnapshot);
     }
 }
 
@@ -2173,7 +2430,7 @@ export async function setOwnedPluginSaveStorageItem<T>(
                     }, signal);
                 } else {
                     const generation = db.pluginStorageGeneration;
-                    await recordOptimizedMutationAcknowledgement(
+                    retainedOwnershipSnapshot = await recordOptimizedMutationAcknowledgement(
                         db,
                         generation,
                         mutatePersistentPluginStorage(
@@ -2185,6 +2442,12 @@ export async function setOwnedPluginSaveStorageItem<T>(
                             generation,
                             preparedValue,
                         ),
+                        {
+                            valueStorageKey,
+                            valueAction: "add",
+                            metaStorageKey,
+                            metaAction: owner ? "add" : "remove",
+                        },
                     );
                 }
             } else {
@@ -2257,6 +2520,7 @@ export async function removePluginSaveStorageItem(
     signal?: AbortSignal | null,
 ): Promise<void> {
     const normalizedKey = normalizePluginStorageKey(key);
+    let retainedOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null;
     try {
         await withPluginSaveStorageKeyLock(normalizedKey, async () => {
             throwIfAborted(signal);
@@ -2279,7 +2543,7 @@ export async function removePluginSaveStorageItem(
             if (db.pluginStorageGeneration
                 && !isHashedPluginSaveStorageKey(storageKey, PLUGIN_SAVE_PREFIX)) {
                 const generation = db.pluginStorageGeneration;
-                await recordOptimizedMutationAcknowledgement(
+                retainedOwnershipSnapshot = await recordOptimizedMutationAcknowledgement(
                     db,
                     generation,
                     removePersistentPluginStoragePreservingOwner(
@@ -2287,6 +2551,11 @@ export async function removePluginSaveStorageItem(
                         signal,
                         generation,
                     ),
+                    {
+                        valueStorageKey: storageKey,
+                        valueAction: "remove",
+                        metaAction: "preserve",
+                    },
                 );
                 return;
             }
@@ -2299,7 +2568,7 @@ export async function removePluginSaveStorageItem(
             );
         }, signal);
     } finally {
-        invalidateStorageEnumerationSnapshot();
+        invalidateStorageEnumerationSnapshot(retainedOwnershipSnapshot);
     }
 }
 
@@ -2334,7 +2603,7 @@ export async function removeOwnedPluginSaveStorageItem(
                         }, signal);
                     } else {
                         const generation = db.pluginStorageGeneration;
-                        await recordOptimizedMutationAcknowledgement(
+                        retainedOwnershipSnapshot = await recordOptimizedMutationAcknowledgement(
                             db,
                             generation,
                             mutatePersistentPluginStorage(
@@ -2343,6 +2612,12 @@ export async function removeOwnedPluginSaveStorageItem(
                                 signal,
                                 generation,
                             ),
+                            {
+                                valueStorageKey,
+                                valueAction: "remove",
+                                metaStorageKey,
+                                metaAction: "remove",
+                            },
                         );
                     }
                 } else {
