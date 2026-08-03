@@ -94,6 +94,7 @@ const {
     logger, installProcessHandlers, expressErrorMiddleware,
 } = require('./logs.cjs');
 const { createRequestLogs } = require('./request-logs.cjs');
+const { createRequestTracer, isRequestTracingEnabled } = require('./request-trace.cjs');
 const { applyPatchAtomic } = require('./atomicJsonPatch.cjs');
 const { createGenerationMemo } = require('./generationMemo.cjs');
 const { openStageRowDownload } = require('./stageRowDownload.cjs');
@@ -260,6 +261,7 @@ const {
     createInFlightByteBudget,
     createRoutePolicyResolver,
     createBufferedIngressMiddleware,
+    isStreamedIngress,
     sendClientUpgradeRequired,
 } = require('./bufferedIngress.cjs');
 const {
@@ -2554,6 +2556,23 @@ function shouldCompress(req, res) {
 app.use(compression({
     filter: shouldCompress,
 }));
+if (isRequestTracingEnabled()) {
+    console.warn(
+        '[RequestTrace] Request tracing is active because TRACE_REQUEST_FOR_DEBUG=true. '
+        + 'Trace files may contain sensitive data and request tracing is not recommended '
+        + 'outside debugging sessions.',
+    );
+    const requestTracer = createRequestTracer({
+        traceDir: path.join(process.cwd(), 'save', 'trace'),
+        maxTraces: 500,
+        isStreamingRequest: req => Boolean(req[ADMITTED_INGRESS_SPOOL])
+            || isStreamedIngress(req),
+        onError: (context, error) => logger.warn(
+            `[RequestTrace] Failed while ${context}: ${error?.stack || error}`,
+        ),
+    });
+    app.use(requestTracer.middleware);
+}
 // Vite 산출물은 해시 파일명이므로 /assets는 장기 캐시 안전
 app.use('/assets', express.static(path.join(process.cwd(), 'dist/assets'), {
     maxAge: '1y',
@@ -2605,23 +2624,8 @@ app.use((req, res, next) => {
 app.use((req, res, next) => {
     // These endpoints consume the request stream directly and must never be
     // pre-buffered by the generic octet-stream parser.
-    const isStreamingPluginMutation = req.path === '/api/plugin-storage/mutate'
-        && req.headers['x-plugin-storage-stream'] === '1';
-    const isStreamingPluginBatch = req.path === '/api/plugin-storage/batch'
-        && req.headers['x-plugin-storage-batch-stream'] === '1';
-    const isStreamingPluginTransitionUpload
-        = req.path === '/api/plugin-storage/transition/stage/upload';
-    const isStreamingPluginTransitionBulk
-        = req.path === '/api/plugin-storage/transition/bulk';
     if (req[ADMITTED_INGRESS_SPOOL]) return next();
-    if (
-        req.path === '/api/backup/import'
-        || req.path === '/api/migrate/save-folder/upload'
-        || isStreamingPluginMutation
-        || isStreamingPluginBatch
-        || isStreamingPluginTransitionUpload
-        || isStreamingPluginTransitionBulk
-    ) return next();
+    if (isStreamedIngress(req)) return next();
     const isPluginStorageBatch = req.path === '/api/plugin-storage/batch';
     const isBufferedPluginMutationSet = req.path === '/api/plugin-storage/mutate'
         && req.headers['x-plugin-storage-operation'] === 'set';

@@ -108,6 +108,7 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `POCKETRISU_ASSET_GC_INTERVAL_MS` | Delay between later asset sweeps; default 24 hours and clamped to at least one second. |
 | `POCKETRISU_ASSET_GC_AUTO` | Set to `0` to disable automatic sweeps or `1` to force-enable them in test environments. The authenticated `/api/assets/cleanup` maintenance endpoint remains available. |
 | `POCKETRISU_ALLOW_INSECURE_CONTEXT` | Allows client boot outside HTTPS or localhost only when exactly `1` or `true`; bypasses the WebCrypto integrity gate at the operator's risk. |
+| `TRACE_REQUEST_FOR_DEBUG` | Enables gzip-compressed non-streaming HTTP request/response traces under `save/trace` only when exactly `true`. Traces may contain sensitive data, are intended only for debugging, exclude request streams, response streams, and WebSocket upgrades, and retain the newest 500 files. |
 | `POCKETRISU_HUB_HOSTING` | Enables shared/multi-instance hub hosting when set to `TRUE`/`true` or `1`. It hides host-disk statistics from `/api/db/stats`, disables the file-based server-backup feature with `403` responses, and pins the snapshot retention byte cap to `POCKETRISU_HUB_SNAPSHOT_CAP_MB` (only the snapshot count stays adjustable). |
 | `POCKETRISU_HUB_SNAPSHOT_CAP_MB` | Hub-mode snapshot byte cap in MB, applied to both the limits endpoints and trim rotation; unset or invalid falls back to 500 MB, clamped to the 10 MB–50 GB safety bounds. Ignored outside hub mode. |
 | `POCKETRISU_SQLITE_DURABILITY_MODE` | Administrator-managed SQLite durability policy: `durable`, `balanced`, or `performance`. Invalid values fail safe to `durable`. Any explicit value locks the System-dashboard control; hub mode is always administrator-managed and defaults to `durable` when unset. |
@@ -194,6 +195,8 @@ inside `queueStorageMutation()` immediately before the transactional publication
 │   ├── model-jobs.db-wal / -shm
 │   ├── model-jobs/
 │   │   └── <jobId>.journal            # exact append-only provider response bytes
+│   ├── trace/                           # opt-in TRACE_REQUEST_FOR_DEBUG output
+│   │   └── request-*.json.gz            # newest 500 non-streaming HTTP exchanges
 │   ├── .spool/                         # admitted-write/DB/import/value/restore spools (default)
 │   ├── .partial-export-spool/          # private full/partial filesystem pins
 │   ├── .plugin-transition-staging/     # durable staged plugin mode changes
