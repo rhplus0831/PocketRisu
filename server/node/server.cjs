@@ -248,6 +248,7 @@ const {
     decodeValidatedPluginStorageKey,
     encodeValidatedPluginStorageKey,
     isPluginStorageValidationError,
+    parsePluginStorageJsonBuffer,
     pluginStorageCodecForBuffer,
     serializeLosslessPluginStorageRow,
     serializePluginStorageRow,
@@ -5976,6 +5977,25 @@ function pluginStorageBootRecoveryIssue(code, encodedKey) {
     return { code, encodedKey };
 }
 
+function serializeOptimizedPluginStorageRow(storageKey, prefix, value) {
+    try {
+        return serializePluginStorageRow(storageKey, value);
+    } catch (error) {
+        if (prefix !== PLUGIN_SAVE_PREFIX) throw error;
+        return serializeLosslessPluginStorageRow(storageKey, value);
+    }
+}
+
+function canonicalizeOptimizedPluginStorageRow(storageKey, prefix, bytes) {
+    const codec = pluginStorageCodecForBuffer(bytes);
+    if (prefix === PLUGIN_SAVE_META_PREFIX
+        && codec === PLUGIN_STORAGE_LOSSLESS_CODEC) {
+        throw new TypeError('Plugin storage metadata requires strict JSON');
+    }
+    const parsed = parsePluginStorageJsonBuffer(bytes, storageKey);
+    return serializeOptimizedPluginStorageRow(storageKey, prefix, parsed);
+}
+
 function collectOptimizedBootInlineEntries(dbObj, field, prefix, issues) {
     const source = dbObj?.[field] ?? {};
     if (source === null || typeof source !== 'object' || Array.isArray(source)) {
@@ -6009,10 +6029,15 @@ function collectOptimizedBootInlineEntries(dbObj, field, prefix, issues) {
             continue;
         }
         try {
-            const canonical = serializePluginStorageRow(storageKey, descriptor.value);
+            const canonical = serializeOptimizedPluginStorageRow(
+                storageKey,
+                prefix,
+                descriptor.value,
+            );
             entries.push({
                 rawKey,
                 storageKey,
+                prefix,
                 value: descriptor.value,
                 canonicalHash: sha256Hex(canonical),
             });
@@ -6072,8 +6097,11 @@ async function inspectOptimizedBootExternalRows({
                     issues.push(pluginStorageBootRecoveryIssue('read-failed', storageKey));
                 } else if (bytes) {
                     try {
-                        const parsed = JSON.parse(bytes.toString('utf-8'));
-                        const canonical = serializePluginStorageRow(storageKey, parsed);
+                        const canonical = canonicalizeOptimizedPluginStorageRow(
+                            storageKey,
+                            prefix,
+                            bytes,
+                        );
                         duplicateHash = inlineStorageKeys.has(storageKey)
                             ? sha256Hex(canonical)
                             : null;
@@ -6127,7 +6155,11 @@ function nextOptimizedBootRecoveryManifest(manifest, generation, entries) {
 function publishOptimizedBootRecoveryRows(entries, generation, manifest) {
     const prepared = entries.map(entry => ({
         ...entry,
-        bytes: serializePluginStorageRow(entry.storageKey, entry.value),
+        bytes: serializeOptimizedPluginStorageRow(
+            entry.storageKey,
+            entry.prefix,
+            entry.value,
+        ),
     }));
     const nextManifest = nextOptimizedBootRecoveryManifest(manifest, generation, prepared);
     const recoverySnapshotToken = newPluginRecoverySnapshotToken();
@@ -6614,8 +6646,11 @@ async function inspectOptimizedPluginStorageRecoveryManagement() {
 
             let canonicalHash = null;
             try {
-                const parsed = JSON.parse(externalBytes.toString('utf-8'));
-                canonicalHash = sha256Hex(serializePluginStorageRow(encodedKey, parsed));
+                canonicalHash = sha256Hex(canonicalizeOptimizedPluginStorageRow(
+                    encodedKey,
+                    prefix,
+                    externalBytes,
+                ));
             } catch (error) {
                 issues.push(internalPluginStorageRecoveryManagementIssue(
                     error instanceof SyntaxError ? 'invalid-json' : 'unsupported-json',

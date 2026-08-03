@@ -2,12 +2,20 @@ import { afterAll, describe, expect, test } from 'vitest'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import utilsPkg from '../../server/node/utils.cjs'
+import pluginStorageJsonPkg from '../../server/node/pluginStorageJson.cjs'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { decodeRisuDat } from './helpers/normalize.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 
 const { encodeRisuSaveLegacy } = utilsPkg as {
   encodeRisuSaveLegacy: (value: unknown) => Uint8Array
+}
+const {
+  serializeLosslessPluginStorageRow,
+  validatePluginStorageRow,
+} = pluginStorageJsonPkg as {
+  serializeLosslessPluginStorageRow: (storageKey: string, value: unknown) => Buffer
+  validatePluginStorageRow: (storageKey: string, value: Uint8Array) => unknown
 }
 
 const DATABASE_KEY = 'database/database.bin'
@@ -405,6 +413,106 @@ describe('server-side optimized plugin storage boot reconciliation', () => {
       })
       expect(result.text).not.toContain(marker)
       expect(result.text).not.toContain(Buffer.from(JSON.stringify({ marker })).toString('base64'))
+    } finally {
+      await disposeServer(server)
+    }
+  }, 30_000)
+
+  test('accepts a lossless optimized value without entering recovery mode', async () => {
+    const generation = '11111111-1111-4111-8111-111111111112'
+    const valueKey = encodeStorageKey(VALUE_PREFIX, 'pm_store')
+    const marker = 'lossless-value-must-not-cross-the-boot-reconcile-response'
+    const storedValue = {
+      marker,
+      optional: undefined,
+      nested: [{ optional: undefined }],
+    }
+    const storedBytes = serializeLosslessPluginStorageRow(valueKey, storedValue)
+    const server = await trackedServer({
+      generation,
+      valueKeys: [valueKey],
+      rows: [{ key: valueKey, value: storedBytes }],
+    })
+    try {
+      const client = await createClient(server.port, server.password)
+      const before = await rawDatabase(client)
+      const result = await reconcile(client, before.etag)
+
+      expect(result.response.status).toBe(200)
+      expect(result.body).toMatchObject({
+        success: true,
+        direction: 'none',
+        values: 0,
+        meta: 0,
+        issues: [],
+        databaseChanged: false,
+        storageChanged: false,
+      })
+      expect(result.text).not.toContain(marker)
+      expect(result.text).not.toContain(storedBytes.toString('base64'))
+      expect(readSqliteBytes(server, valueKey)).toEqual(storedBytes)
+      const decoded = validatePluginStorageRow(valueKey, storedBytes) as typeof storedValue
+      expect(Object.hasOwn(decoded, 'optional')).toBe(true)
+      expect(decoded.optional).toBeUndefined()
+      expect(Object.hasOwn(decoded.nested[0], 'optional')).toBe(true)
+      expect(decoded.nested[0].optional).toBeUndefined()
+      const inspection = await inspectRecovery(client)
+      expect(inspection.body).toMatchObject({
+        success: true,
+        mode: 'optimized',
+        issues: [],
+      })
+      expect(inspection.text).not.toContain(marker)
+      expect(inspection.text).not.toContain(storedBytes.toString('base64'))
+    } finally {
+      await disposeServer(server)
+    }
+  }, 30_000)
+
+  test('copies a missing lossless inline value and clears the recovered copy', async () => {
+    const generation = '11111111-1111-4111-8111-111111111113'
+    const valueKey = encodeStorageKey(VALUE_PREFIX, 'pm_store')
+    const inlineValue = {
+      optional: undefined,
+      nested: [{ optional: undefined }],
+    }
+    const server = await trackedServer({ generation, valueKeys: [], rows: [] })
+    try {
+      replaceDatabase(server, {
+        characters: [],
+        optimizePluginMemory: true,
+        pluginStorageGeneration: generation,
+        pluginCustomStorage: { pm_store: inlineValue },
+      })
+      const client = await createClient(server.port, server.password)
+      const before = await rawDatabase(client)
+      const result = await reconcile(client, before.etag)
+
+      expect(result.response.status).toBe(200)
+      expect(result.body).toMatchObject({
+        success: true,
+        direction: 'externalize',
+        values: 1,
+        meta: 0,
+        issues: [],
+        databaseChanged: true,
+        storageChanged: true,
+      })
+      const storedBytes = readSqliteBytes(server, valueKey)
+      expect(storedBytes?.subarray(0, 8).toString('ascii')).toBe('PRISUL01')
+      const decoded = validatePluginStorageRow(valueKey, storedBytes!) as typeof inlineValue
+      expect(Object.hasOwn(decoded, 'optional')).toBe(true)
+      expect(decoded.optional).toBeUndefined()
+      expect(Object.hasOwn(decoded.nested[0], 'optional')).toBe(true)
+      expect(decoded.nested[0].optional).toBeUndefined()
+      expect(readSqliteJson(server, MANIFEST_KEY)).toMatchObject({
+        generation,
+        valueKeys: [valueKey],
+      })
+      const after = await rawDatabase(client)
+      expect(after.database.pluginCustomStorage).toEqual({})
+      expect(after.database.pluginStorageMeta).toBeUndefined()
+      expect(after.etag).toBe(result.body.etag)
     } finally {
       await disposeServer(server)
     }
