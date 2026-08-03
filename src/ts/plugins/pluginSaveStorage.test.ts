@@ -461,6 +461,11 @@ const {
     withPluginSaveStorageKeyLock,
     withPluginSaveStorageLock,
 } = await import("./pluginSaveStorage");
+const {
+    getPluginStorageDiagnosticEventsForTest,
+    resetPluginStorageDiagnosticsForTest,
+} = await import("./pluginStorageDiagnostics");
+const { markPluginStorageKeySetChanged } = await import("./pluginStorageEnumeration");
 const { makeArchiveSafePluginSaveStorageKey } = await import(
     "../storage/pluginSaveKeyPolicy"
 );
@@ -568,6 +573,8 @@ function makeInvalidRecord(
 
 beforeEach(async () => {
     vi.clearAllMocks();
+    (globalThis as { __PLUGIN_STORAGE_DIAG__?: unknown }).__PLUGIN_STORAGE_DIAG__ = true;
+    resetPluginStorageDiagnosticsForTest();
     persistent.clear();
     requestImmediateSave.mockReset().mockResolvedValue({ status: "committed" });
     teardownV3PluginsMock.mockReset().mockResolvedValue(undefined);
@@ -1209,6 +1216,7 @@ describe("AA3 versioned atomic plugin storage", () => {
         expect(readPersistentPluginStorageManifestState).toHaveBeenCalledWith(
             "selected-generation",
             undefined,
+            expect.stringMatching(/^preflight-fallback:no-token:ksg=\d+:db=\d+$/),
         );
         expect(readPersistentPluginStorageManifestSnapshot).not.toHaveBeenCalled();
         expect(listPersistentKeys).not.toHaveBeenCalled();
@@ -1776,6 +1784,114 @@ describe("AA3 versioned atomic plugin storage", () => {
         expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledOnce();
     });
 
+    test("diagnoses a forced keys refresh without an ownership stamp", async () => {
+        await setPluginSaveStorageItem("reset-diagnostic-cache", true);
+        resetPluginStorageDiagnosticsForTest();
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("diagnostic-keys-generation", [], []);
+
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual([]);
+
+        expect(getPluginStorageDiagnosticEventsForTest()).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                kind: "snapshot-read",
+                caller: "keys-fresh",
+                reason: "no-snapshot",
+                generation: "diagnostic-keys-generation",
+                stamp: null,
+            }),
+        ]));
+    });
+
+    test("diagnoses conservative invalidation after a single mutate", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("diagnostic-mutate-generation", [], []);
+        resetPluginStorageDiagnosticsForTest();
+
+        await setPluginSaveStorageItem("short-key", { diagnostic: true });
+
+        expect(getPluginStorageDiagnosticEventsForTest()).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                kind: "invalidate",
+                source: "mutate-conservative",
+                generation: "diagnostic-mutate-generation",
+            }),
+        ]));
+    });
+
+    test("diagnoses a stamp-store rejection when the database identity changes", async () => {
+        await setPluginSaveStorageItem("reset-diagnostic-cache", true);
+        resetPluginStorageDiagnosticsForTest();
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("diagnostic-db-change-generation", [], []);
+        const { readPersistentPluginStorageManifestSnapshot } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        readPersistentPluginStorageManifestSnapshot.mockImplementationOnce(async generation => {
+            database = {
+                ...database,
+                pluginCustomStorage: {},
+            };
+            return {
+                generation,
+                manifestRevision: `sha256:${"d".repeat(64)}`,
+                manifest: {
+                    version: 2,
+                    generation,
+                    valueKeys: [],
+                    metaKeys: [],
+                },
+                valueKeys: [],
+                metaKeys: [],
+            };
+        });
+
+        await expect(getPluginSaveStorageItem("missing")).resolves.toBeNull();
+
+        expect(getPluginStorageDiagnosticEventsForTest()).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                kind: "stamp-store",
+                outcome: "rejected-db-changed",
+                generation: "diagnostic-db-change-generation",
+            }),
+        ]));
+    });
+
+    test("diagnoses a stamp-store rejection when the key set moves", async () => {
+        await setPluginSaveStorageItem("reset-diagnostic-cache", true);
+        resetPluginStorageDiagnosticsForTest();
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("diagnostic-keyset-change-generation", [], []);
+        const { readPersistentPluginStorageManifestSnapshot } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        readPersistentPluginStorageManifestSnapshot.mockImplementationOnce(async generation => {
+            markPluginStorageKeySetChanged();
+            return {
+                generation,
+                manifestRevision: `sha256:${"d".repeat(64)}`,
+                manifest: {
+                    version: 2,
+                    generation,
+                    valueKeys: [],
+                    metaKeys: [],
+                },
+                valueKeys: [],
+                metaKeys: [],
+            };
+        });
+
+        await expect(getPluginSaveStorageItem("missing")).resolves.toBeNull();
+
+        expect(getPluginStorageDiagnosticEventsForTest()).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                kind: "stamp-store",
+                outcome: "rejected-keyset-moved",
+                generation: "diagnostic-keyset-change-generation",
+            }),
+        ]));
+    });
+
     test("orders overlapping key sets without deadlock while disjoint batches proceed", async () => {
         database.optimizePluginMemory = true;
         installOwnershipManifest("selected-generation", [], []);
@@ -2333,6 +2449,7 @@ describe("plugin save storage transport", () => {
             expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledWith(
                 "abort-generation",
                 controller.signal,
+                expect.stringMatching(/^keys-fresh:no-snapshot:ksg=\d+:db=\d+$/),
             );
         });
         controller.abort(new DOMException("cancel snapshot", "AbortError"));
@@ -4198,6 +4315,7 @@ describe("transitionPluginStorageMode", () => {
         expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledWith(
             "source-generation",
             undefined,
+            expect.stringMatching(/^transition:forced-refresh:ksg=\d+:db=\d+$/),
         );
         expect(listPersistentKeys).not.toHaveBeenCalled();
         expect(finalizePersistentPluginStorageTransition).toHaveBeenCalledOnce();

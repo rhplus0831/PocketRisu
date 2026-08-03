@@ -100,6 +100,12 @@ import {
     valueToPluginStorageViewerText,
     type PluginStorageViewerEntry,
 } from "./pluginStorageViewerPage";
+import {
+    pluginStorageDiagnosticDbId,
+    pluginStorageDiagnosticsEnabled,
+    recordPluginStorageDiagnostic,
+    type PluginStorageDiagnosticValue,
+} from "./pluginStorageDiagnostics";
 
 export { PLUGIN_SAVE_META_PREFIX, PLUGIN_SAVE_PREFIX };
 export const PLUGIN_STORAGE_MANIFEST_KEY = "plugin-storage/manifest.json";
@@ -263,11 +269,61 @@ interface PluginStorageOwnershipSnapshot {
     ownership: PluginStorageOwnership;
 }
 
+type PluginStorageSnapshotReadReason =
+    | "no-snapshot"
+    | "db-changed"
+    | "generation-changed"
+    | "keyset-changed"
+    | "bad-stamp"
+    | "forced-refresh"
+    | "state-mismatch";
+
+interface PluginStorageSnapshotReadDiagnostic {
+    caller: string;
+    reason: PluginStorageSnapshotReadReason;
+    keySetGeneration: number;
+    stamp: string | null;
+}
+
 let storageOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null;
 const manifestRevisionCache = new WeakMap<Database, {
     generation: string;
     manifestRevision: string;
 }>();
+
+function pluginStorageDiagnosticContext(
+    db: Database,
+    keySetGeneration = getPluginStorageKeySetGeneration(),
+): Record<string, PluginStorageDiagnosticValue> & { dbId: number } {
+    return {
+        dbId: pluginStorageDiagnosticDbId(db),
+        keySetGeneration,
+        generation: db.pluginStorageGeneration ?? null,
+    };
+}
+
+function pluginStorageManifestDiagnosticToken(
+    caller: string,
+    reason: string,
+    dbId: number,
+    keySetGeneration: number,
+): string | undefined {
+    if (!pluginStorageDiagnosticsEnabled()) return undefined;
+    return `${caller}:${reason}:ksg=${keySetGeneration}:db=${dbId}`;
+}
+
+function recordPluginStorageInvalidation(
+    db: Database,
+    source: string,
+    fields: Record<string, PluginStorageDiagnosticValue> = {},
+): void {
+    recordPluginStorageDiagnostic("invalidate", {
+        source,
+        ...pluginStorageDiagnosticContext(db),
+        stamp: storageOwnershipSnapshot?.manifestRevision ?? null,
+        ...fields,
+    });
+}
 
 function invalidateManifestRevision(db: Database): void {
     manifestRevisionCache.delete(db);
@@ -301,6 +357,11 @@ function recordManifestRevisionAcknowledgement(
     generation: string,
     result: { outcome: string; manifestRevision?: string },
 ): void {
+    if (result.outcome === "committed"
+        && (typeof result.manifestRevision !== "string"
+            || !PLUGIN_STORAGE_REVISION_PATTERN.test(result.manifestRevision))) {
+        recordPluginStorageInvalidation(db, "ack-no-echo");
+    }
     recordManifestRevision(
         db,
         generation,
@@ -327,6 +388,7 @@ function invalidateManifestRevisionAfterError(db: Database, error: unknown): voi
         && (error.commitOutcomeUnknown
             || error.code === "COMMIT_OUTCOME_UNKNOWN"
             || error.code === "PLUGIN_STORAGE_GENERATION_CONFLICT")) {
+        recordPluginStorageInvalidation(db, `error-${error.code ?? "unknown"}`);
         invalidateManifestRevision(db);
     }
 }
@@ -349,6 +411,10 @@ function observePluginStoragePublication(
         && storageOwnershipSnapshot.generation === publicationGeneration
         && storageOwnershipSnapshot.keySetGeneration === keySetGeneration
         && storageOwnershipSnapshot.manifestRevision !== publicationRevision) {
+        recordPluginStorageInvalidation(db, "observe-publication-mismatch", {
+            previousRevision: storageOwnershipSnapshot.manifestRevision,
+            currentRevision: publicationRevision,
+        });
         storageOwnershipSnapshot = null;
         storageEnumerationSnapshot = null;
     }
@@ -361,6 +427,11 @@ async function recordOptimizedMutationAcknowledgement(
 ): Promise<void> {
     try {
         const result = await mutation;
+        if (result.outcome === "committed") {
+            recordPluginStorageInvalidation(db, "mutate-conservative", {
+                currentRevision: result.manifestRevision ?? null,
+            });
+        }
         recordManifestRevisionAcknowledgement(db, generation, result);
     } catch (error) {
         invalidateManifestRevisionAfterError(db, error);
@@ -370,17 +441,30 @@ async function recordOptimizedMutationAcknowledgement(
 
 function invalidateStorageEnumerationSnapshot(
     retainedOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null,
+    diagnosticSource = "enumeration-bump",
 ): void {
     storageEnumerationSnapshot = null;
+    const db = getDatabase();
+    const previousStamp = storageOwnershipSnapshot?.manifestRevision ?? null;
     const previousKeySetGeneration = getPluginStorageKeySetGeneration();
     markPluginStorageKeySetChanged();
+    let retained = false;
     if (retainedOwnershipSnapshot
         && storageOwnershipSnapshot === retainedOwnershipSnapshot
         && retainedOwnershipSnapshot.keySetGeneration === previousKeySetGeneration) {
         retainedOwnershipSnapshot.keySetGeneration = getPluginStorageKeySetGeneration();
+        retained = true;
     } else {
         storageOwnershipSnapshot = null;
     }
+    recordPluginStorageDiagnostic("invalidate", {
+        source: diagnosticSource,
+        ...pluginStorageDiagnosticContext(db, getPluginStorageKeySetGeneration()),
+        preKeySetGeneration: previousKeySetGeneration,
+        postKeySetGeneration: getPluginStorageKeySetGeneration(),
+        retained,
+        stamp: previousStamp,
+    });
 }
 
 /**
@@ -824,6 +908,12 @@ function applyCommittedPluginStorageOwnershipDelta(
             ownership,
         };
         storageOwnershipSnapshot = nextSnapshot;
+        recordPluginStorageDiagnostic("restamp", {
+            ...pluginStorageDiagnosticContext(db, keySetGeneration),
+            predecessor: expectedManifestRevision,
+            successor: committedManifestRevision,
+            operations: operations.length,
+        });
         return nextSnapshot;
     } catch {
         // The server commit is already authoritative. Any local derivation
@@ -907,11 +997,33 @@ async function resolvePluginStorageOwnership(
 async function readCurrentOwnership(
     db: Database,
     signal?: AbortSignal | null,
+    diagnostic: PluginStorageSnapshotReadDiagnostic = {
+        caller: "unknown",
+        reason: "forced-refresh",
+        keySetGeneration: getPluginStorageKeySetGeneration(),
+        stamp: storageOwnershipSnapshot?.manifestRevision ?? null,
+    },
 ): Promise<PluginStorageOwnership> {
     if (db.optimizePluginMemory === true && db.pluginStorageGeneration) {
+        const diagnosticContext = pluginStorageDiagnosticContext(
+            db,
+            diagnostic.keySetGeneration,
+        );
+        recordPluginStorageDiagnostic("snapshot-read", {
+            caller: diagnostic.caller,
+            reason: diagnostic.reason,
+            ...diagnosticContext,
+            stamp: diagnostic.stamp,
+        });
         const snapshot = await readPersistentPluginStorageManifestSnapshot(
             db.pluginStorageGeneration,
             signal,
+            pluginStorageManifestDiagnosticToken(
+                diagnostic.caller,
+                diagnostic.reason,
+                diagnosticContext.dbId,
+                diagnostic.keySetGeneration,
+            ),
         );
         return {
             manifest: snapshot.manifest,
@@ -957,6 +1069,9 @@ async function readCachedCurrentOwnership(
     db: Database,
     signal?: AbortSignal | null,
     refresh = false,
+    caller = "unknown",
+    diagnosticReason?: PluginStorageSnapshotReadReason,
+    diagnosticStamp?: string | null,
 ): Promise<PluginStorageOwnership> {
     const generation = db.optimizePluginMemory === true
         ? db.pluginStorageGeneration
@@ -970,7 +1085,45 @@ async function readCachedCurrentOwnership(
         throwIfAborted(signal);
         return clonePluginStorageOwnership(storageOwnershipSnapshot.ownership);
     }
-    const ownership = await readCurrentOwnership(db, signal);
+    const missReason = diagnosticReason
+        ?? (refresh
+            ? "forced-refresh"
+            : !storageOwnershipSnapshot
+                ? "no-snapshot"
+                : storageOwnershipSnapshot.database !== db
+                    ? "db-changed"
+                    : storageOwnershipSnapshot.generation !== generation
+                        ? "generation-changed"
+                        : "keyset-changed");
+    const ownership = await readCurrentOwnership(db, signal, {
+        caller,
+        reason: missReason,
+        keySetGeneration,
+        stamp: diagnosticStamp === undefined
+            ? storageOwnershipSnapshot?.manifestRevision ?? null
+            : diagnosticStamp,
+    });
+    const storeDatabase = getDatabase();
+    const storeKeySetGeneration = getPluginStorageKeySetGeneration();
+    const storeOutcome = !generation || !ownership.manifestRevision
+        ? "rejected-no-revision"
+        : storeDatabase !== db
+            ? "rejected-db-changed"
+            : db.optimizePluginMemory !== true || db.pluginStorageGeneration !== generation
+                ? "rejected-generation-changed"
+                : keySetGeneration !== storeKeySetGeneration
+                    ? "rejected-keyset-moved"
+                    : "stored";
+    const storeDiagnosticContext = pluginStorageDiagnosticContext(db, keySetGeneration);
+    const currentDbId = pluginStorageDiagnosticDbId(storeDatabase);
+    recordPluginStorageDiagnostic("stamp-store", {
+        caller,
+        outcome: storeOutcome,
+        ...storeDiagnosticContext,
+        currentDbId,
+        currentKeySetGeneration: storeKeySetGeneration,
+        stamp: ownership.manifestRevision ?? null,
+    });
     if (generation
         && ownership.manifestRevision
         && getDatabase() === db
@@ -1004,11 +1157,45 @@ async function readFreshVerifiedPluginStorageOwnership(
         || snapshot.generation !== generation
         || snapshot.keySetGeneration !== keySetGeneration
         || !PLUGIN_STORAGE_REVISION_PATTERN.test(snapshot.manifestRevision)) {
-        return readCachedCurrentOwnership(db, signal, true);
+        const reason: PluginStorageSnapshotReadReason = !generation
+            ? "generation-changed"
+            : !snapshot
+                ? "no-snapshot"
+                : snapshot.database !== db
+                    ? "db-changed"
+                    : snapshot.generation !== generation
+                        ? "generation-changed"
+                        : snapshot.keySetGeneration !== keySetGeneration
+                            ? "keyset-changed"
+                            : "bad-stamp";
+        return readCachedCurrentOwnership(
+            db,
+            signal,
+            true,
+            "keys-fresh",
+            reason,
+            snapshot?.manifestRevision ?? null,
+        );
     }
 
-    const state = await readPersistentPluginStorageManifestState(generation, signal);
+    const diagnosticContext = pluginStorageDiagnosticContext(db, keySetGeneration);
+    recordPluginStorageDiagnostic("state-read", {
+        caller: "keys-freshness",
+        ...diagnosticContext,
+        stamp: snapshot.manifestRevision,
+    });
+    const state = await readPersistentPluginStorageManifestState(
+        generation,
+        signal,
+        pluginStorageManifestDiagnosticToken(
+            "keys-fresh",
+            "stamp-check",
+            diagnosticContext.dbId,
+            keySetGeneration,
+        ),
+    );
     recordManifestRevision(db, generation, state.manifestRevision);
+    let refreshReason: PluginStorageSnapshotReadReason = "state-mismatch";
     if (getDatabase() === db
         && db.optimizePluginMemory === true
         && db.pluginStorageGeneration === generation
@@ -1017,10 +1204,52 @@ async function readFreshVerifiedPluginStorageOwnership(
         if (state.manifestRevision === snapshot.manifestRevision) {
             return clonePluginStorageOwnership(snapshot.ownership);
         }
+        recordPluginStorageInvalidation(db, "state-mismatch", {
+            previousRevision: snapshot.manifestRevision,
+            currentRevision: state.manifestRevision,
+        });
         storageOwnershipSnapshot = null;
         storageEnumerationSnapshot = null;
+    } else if (getDatabase() !== db) {
+        refreshReason = "db-changed";
+    } else if (db.optimizePluginMemory !== true
+        || db.pluginStorageGeneration !== generation) {
+        refreshReason = "generation-changed";
+    } else if (getPluginStorageKeySetGeneration() !== keySetGeneration) {
+        refreshReason = "keyset-changed";
     }
-    return readCachedCurrentOwnership(db, signal, true);
+    return readCachedCurrentOwnership(
+        db,
+        signal,
+        true,
+        "keys-fresh",
+        refreshReason,
+        snapshot.manifestRevision,
+    );
+}
+
+function readPluginStorageManifestStateForPreflight(
+    db: Database,
+    generation: string,
+    signal?: AbortSignal | null,
+): ReturnType<typeof readPersistentPluginStorageManifestState> {
+    const keySetGeneration = getPluginStorageKeySetGeneration();
+    const diagnosticContext = pluginStorageDiagnosticContext(db, keySetGeneration);
+    recordPluginStorageDiagnostic("state-read", {
+        caller: "preflight-fallback",
+        ...diagnosticContext,
+        stamp: storageOwnershipSnapshot?.manifestRevision ?? null,
+    });
+    return readPersistentPluginStorageManifestState(
+        generation,
+        signal,
+        pluginStorageManifestDiagnosticToken(
+            "preflight-fallback",
+            "no-token",
+            diagnosticContext.dbId,
+            keySetGeneration,
+        ),
+    );
 }
 
 function readGenerationBoundPluginStorageJson<T>(
@@ -1050,7 +1279,12 @@ async function commitOptimizedStorageMutation(
 ): Promise<void> {
     const generation = db.pluginStorageGeneration;
     for (let attempt = 0; ; attempt++) {
-        const ownership = await readCurrentOwnership(db, signal);
+        const ownership = await readCurrentOwnership(db, signal, {
+            caller: "commit-legacy",
+            reason: "forced-refresh",
+            keySetGeneration: getPluginStorageKeySetGeneration(),
+            stamp: storageOwnershipSnapshot?.manifestRevision ?? null,
+        });
         if (
             !generation
             || !ownership.manifestValid
@@ -1072,6 +1306,7 @@ async function commitOptimizedStorageMutation(
         try {
             // This legacy full-manifest route does not expose its publication
             // token through the client transport. Do not retain an older echo.
+            recordPluginStorageInvalidation(db, "commit-legacy");
             invalidateManifestRevision(db);
             await commitPersistentPluginStorageMutation({
                 generation,
@@ -1111,7 +1346,11 @@ async function commitHashedOwnedPluginStorageMutation(
             );
         }
         const expectedManifestRevision = cachedManifestRevision(db, generation)
-            ?? (await readPersistentPluginStorageManifestState(generation, signal)).manifestRevision;
+            ?? (await readPluginStorageManifestStateForPreflight(
+                db,
+                generation,
+                signal,
+            )).manifestRevision;
         const keySetGeneration = getPluginStorageKeySetGeneration();
         let result;
         try {
@@ -1782,7 +2021,12 @@ export async function getPluginSaveStorageItem<T>(
             normalizedKey,
         );
         if (db.pluginStorageGeneration) {
-            const ownership = await readCachedCurrentOwnership(db, signal);
+            const ownership = await readCachedCurrentOwnership(
+                db,
+                signal,
+                false,
+                "get-item",
+            );
             if (!ownership.valueKeys.includes(storageKey)) return null;
         }
         return await readGenerationBoundPluginStorageJson<T>(
@@ -2715,7 +2959,8 @@ export async function atomicBatchOwnedPluginSaveStorage(
                         );
                     }
                     const expectedManifestRevision = cachedManifestRevision(db, generation)
-                        ?? (await readPersistentPluginStorageManifestState(
+                        ?? (await readPluginStorageManifestStateForPreflight(
+                            db,
                             generation,
                             signal,
                         )).manifestRevision;
@@ -2885,7 +3130,12 @@ export async function clearPluginSaveStorage(signal?: AbortSignal | null): Promi
                 db.pluginCustomStorage = createDatabasePluginStorageRecord();
                 return;
             }
-            const ownership = await readCurrentOwnership(db, signal);
+            const ownership = await readCurrentOwnership(db, signal, {
+                caller: "clear",
+                reason: "forced-refresh",
+                keySetGeneration: getPluginStorageKeySetGeneration(),
+                stamp: storageOwnershipSnapshot?.manifestRevision ?? null,
+            });
             await commitOptimizedStorageMutation(
                 db,
                 [],
@@ -2906,7 +3156,12 @@ export async function clearOwnedPluginSaveStorage(signal?: AbortSignal | null): 
             throwIfAborted(signal);
             const db = getDatabase();
             if (db.optimizePluginMemory) {
-                const ownership = await readCurrentOwnership(db, signal);
+                const ownership = await readCurrentOwnership(db, signal, {
+                    caller: "clear",
+                    reason: "forced-refresh",
+                    keySetGeneration: getPluginStorageKeySetGeneration(),
+                    stamp: storageOwnershipSnapshot?.manifestRevision ?? null,
+                });
                 await commitOptimizedStorageMutation(
                     db,
                     [],
@@ -2939,9 +3194,31 @@ async function getPluginSaveStorageEnumerationSnapshot(
             && storageEnumerationSnapshot.optimized === (db.optimizePluginMemory === true)
             && storageEnumerationSnapshot.generation === getPluginStorageKeySetGeneration()
         ) {
+            const diagnosticContext = pluginStorageDiagnosticContext(db);
+            recordPluginStorageDiagnostic("enum-hit", {
+                ...diagnosticContext,
+                stamp: storageOwnershipSnapshot?.manifestRevision ?? null,
+            });
             return [...storageEnumerationSnapshot.keys];
         }
-        const generation = getPluginStorageKeySetGeneration();
+        const keySetGeneration = getPluginStorageKeySetGeneration();
+        const diagnosticContext = pluginStorageDiagnosticContext(db, keySetGeneration);
+        const enumMissReason = refresh
+            ? "forced"
+            : !storageEnumerationSnapshot
+                ? "no-snapshot"
+                : storageEnumerationSnapshot.database !== db
+                    ? "db-changed"
+                    : storageEnumerationSnapshot.optimized
+                        !== (db.optimizePluginMemory === true)
+                        ? "generation-changed"
+                        : "generation-changed";
+        recordPluginStorageDiagnostic("enum-miss", {
+            reason: enumMissReason,
+            ...diagnosticContext,
+            stamp: storageOwnershipSnapshot?.manifestRevision ?? null,
+        });
+        const generation = keySetGeneration;
         const keys = !db.optimizePluginMemory
             ? validatedPluginStorageRecordKeys(
                 db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
@@ -3225,7 +3502,12 @@ export async function setPluginSaveStorageOwner(
             PLUGIN_SAVE_META_PREFIX,
             normalizedKey,
         );
-        const ownership = await readCurrentOwnership(db, signal);
+        const ownership = await readCurrentOwnership(db, signal, {
+            caller: "owners",
+            reason: "forced-refresh",
+            keySetGeneration: getPluginStorageKeySetGeneration(),
+            stamp: storageOwnershipSnapshot?.manifestRevision ?? null,
+        });
         const valueStorageKey = makeArchiveSafePluginSaveStorageKey(
             PLUGIN_SAVE_PREFIX,
             normalizedKey,
@@ -3285,7 +3567,12 @@ export async function clearPluginSaveStorageOwners(
             delete db.pluginStorageMeta;
             return;
         }
-        const ownership = await readCurrentOwnership(db, signal);
+        const ownership = await readCurrentOwnership(db, signal, {
+            caller: "owners",
+            reason: "forced-refresh",
+            keySetGeneration: getPluginStorageKeySetGeneration(),
+            stamp: storageOwnershipSnapshot?.manifestRevision ?? null,
+        });
         await commitOptimizedStorageMutation(
             db,
             [],
@@ -3312,7 +3599,12 @@ export async function getPluginSaveStorageOwners(
             }
             return out;
         }
-        const ownership = await readCachedCurrentOwnership(db, signal);
+        const ownership = await readCachedCurrentOwnership(
+            db,
+            signal,
+            false,
+            "owners",
+        );
         const activeValues = new Set(ownership.valueKeys);
         const entries = await Promise.all(ownership.metaKeys.map(async fullKey => {
             const key = decodeListedStorageKey(
@@ -3343,7 +3635,13 @@ export async function getPluginSaveStorageOwners(
 
 export async function countExternalizedPluginStorageEntries(): Promise<number> {
     return withPluginSaveStorageLock(async () => {
-        const ownership = await readCurrentOwnership(getDatabase());
+        const db = getDatabase();
+        const ownership = await readCurrentOwnership(db, undefined, {
+            caller: "export",
+            reason: "forced-refresh",
+            keySetGeneration: getPluginStorageKeySetGeneration(),
+            stamp: storageOwnershipSnapshot?.manifestRevision ?? null,
+        });
         return ownership.valueKeys.length + ownership.metaKeys.length;
     });
 }
@@ -3825,7 +4123,7 @@ async function preparePluginStorageReconciliation(
     options: Omit<PluginStorageReconcileOptions, "dependencies">,
     rotateGeneration = false,
 ): Promise<PreparedReconciliation> {
-    invalidateStorageEnumerationSnapshot();
+    invalidateStorageEnumerationSnapshot(null, "reconcile");
     const db = deps.getDatabase();
 
     if (target) {
@@ -4080,6 +4378,7 @@ async function applyPluginStorageReconciliation(
                 total,
             });
         }
+        recordPluginStorageInvalidation(db, "reconcile");
         invalidateManifestRevision(db);
         db.pluginStorageGeneration = prepared.generation;
         await deps.writePersistentJson(
@@ -4113,6 +4412,7 @@ async function applyPluginStorageReconciliation(
     }
 
     db.pluginCustomStorage = prepared.nextValues;
+    recordPluginStorageInvalidation(db, "reconcile");
     invalidateManifestRevision(db);
     db.pluginStorageGeneration = prepared.generation;
     if (
@@ -4267,7 +4567,12 @@ async function applyBulkPluginStorageTransition(
     options: Omit<PluginStorageReconcileOptions, "dependencies">,
 ): Promise<PluginStorageReconcileResult> {
     const db = deps.getDatabase();
-    const sourceOwnership = await readCurrentOwnership(db, options.signal);
+    const sourceOwnership = await readCurrentOwnership(db, options.signal, {
+        caller: "transition",
+        reason: "forced-refresh",
+        keySetGeneration: getPluginStorageKeySetGeneration(),
+        stamp: storageOwnershipSnapshot?.manifestRevision ?? null,
+    });
     if (!sourceOwnership.manifestValid
         || (db.optimizePluginMemory === true
             && db.pluginStorageGeneration
@@ -4325,6 +4630,7 @@ async function applyBulkPluginStorageTransition(
             }
         }
 
+        recordPluginStorageInvalidation(db, "transition");
         invalidateManifestRevision(db);
         db.optimizePluginMemory = target;
         db.pluginStorageGeneration = targetGeneration;
@@ -4369,7 +4675,12 @@ async function applyStagedPluginStorageTransition(
     options: Omit<PluginStorageReconcileOptions, "dependencies">,
 ): Promise<PluginStorageReconcileResult> {
     const db = deps.getDatabase();
-    const sourceOwnership = await readCurrentOwnership(db, options.signal);
+    const sourceOwnership = await readCurrentOwnership(db, options.signal, {
+        caller: "transition",
+        reason: "forced-refresh",
+        keySetGeneration: getPluginStorageKeySetGeneration(),
+        stamp: storageOwnershipSnapshot?.manifestRevision ?? null,
+    });
     if (
         !sourceOwnership.manifestValid
         || (db.pluginStorageGeneration
@@ -4578,6 +4889,7 @@ async function applyStagedPluginStorageTransition(
             });
         }
 
+        recordPluginStorageInvalidation(db, "transition");
         invalidateManifestRevision(db);
         db.optimizePluginMemory = target;
         db.pluginStorageGeneration = targetGeneration;
@@ -4904,7 +5216,7 @@ export async function reconcilePluginStorageModeForBoot(
     try {
         return await withPluginSaveStorageLock(async () => {
         throwIfAborted(signal);
-        invalidateStorageEnumerationSnapshot();
+        invalidateStorageEnumerationSnapshot(null, "reconcile");
         const db = deps.getDatabase();
         const target = db.optimizePluginMemory === true;
         const selectedGeneration = typeof db.pluginStorageGeneration === "string"
@@ -5382,6 +5694,7 @@ export async function transitionPluginStorageMode(
                     transitionOptions,
                     true,
                 );
+                recordPluginStorageInvalidation(db, "transition");
                 invalidateManifestRevision(db);
                 db.optimizePluginMemory = target;
 
@@ -5398,6 +5711,7 @@ export async function transitionPluginStorageMode(
                     }
                     return result;
                 } catch (transitionError) {
+                    recordPluginStorageInvalidation(db, "transition");
                     invalidateManifestRevision(db);
                     db.optimizePluginMemory = previous;
                     try {

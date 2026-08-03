@@ -1512,6 +1512,8 @@ describe('NodeStorage plugin manifest snapshots', () => {
             'x-plugin-storage-generation': generation,
             'x-plugin-storage-manifest-mode': 'state',
         })
+        expect((storage as any).authFetch.mock.calls[0][1].headers)
+            .not.toHaveProperty('x-risu-diag')
     })
 
     test('accepts only physically present manifest-owned snapshot rows', async () => {
@@ -1530,6 +1532,34 @@ describe('NodeStorage plugin manifest snapshots', () => {
             manifest,
             valueKeys: ['pluginsave/YQ.json'],
             metaKeys: ['pluginsave-meta/YQ.json'],
+        })
+        expect((storage as any).authFetch.mock.calls[0][1].headers)
+            .not.toHaveProperty('x-risu-diag')
+    })
+
+    test('attributes manifest state and snapshot requests with an optional diagnostic token', async () => {
+        const token = 'keys-fresh:no-snapshot:ksg=42:db=1'
+        const stateStorage = storageWithResponse(response({
+            success: true,
+            generation,
+            manifestRevision,
+        }))
+        await stateStorage.getPluginStorageManifestState(generation, undefined, token)
+        expect((stateStorage as any).authFetch.mock.calls[0][1].headers).toMatchObject({
+            'x-risu-diag': token,
+        })
+
+        const snapshotStorage = storageWithResponse(response({
+            success: true,
+            generation,
+            manifestRevision,
+            manifest,
+            valueKeys: ['pluginsave/YQ.json'],
+            metaKeys: ['pluginsave-meta/YQ.json'],
+        }))
+        await snapshotStorage.getPluginStorageManifestSnapshot(generation, undefined, token)
+        expect((snapshotStorage as any).authFetch.mock.calls[0][1].headers).toMatchObject({
+            'x-risu-diag': token,
         })
     })
 

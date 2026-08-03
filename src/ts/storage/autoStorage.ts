@@ -145,17 +145,31 @@ export class AutoStorage{
     async getPluginStorageManifestSnapshot(
         generation: string,
         signal?: AbortSignal | null,
+        diagnosticToken?: string,
     ): Promise<PluginStorageManifestSnapshotTransport> {
         await this.Init()
-        return await this.realStorage.getPluginStorageManifestSnapshot(generation, signal)
+        return diagnosticToken === undefined
+            ? await this.realStorage.getPluginStorageManifestSnapshot(generation, signal)
+            : await this.realStorage.getPluginStorageManifestSnapshot(
+                generation,
+                signal,
+                diagnosticToken,
+            )
     }
 
     async getPluginStorageManifestState(
         generation: string,
         signal?: AbortSignal | null,
+        diagnosticToken?: string,
     ): Promise<PluginStorageManifestStateTransport> {
         await this.Init()
-        return await this.realStorage.getPluginStorageManifestState(generation, signal)
+        return diagnosticToken === undefined
+            ? await this.realStorage.getPluginStorageManifestState(generation, signal)
+            : await this.realStorage.getPluginStorageManifestState(
+                generation,
+                signal,
+                diagnosticToken,
+            )
     }
 
     async getPluginStorageViewerPage(

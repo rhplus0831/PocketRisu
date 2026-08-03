@@ -3390,9 +3390,14 @@ export class NodeStorage{
     async getPluginStorageManifestSnapshot(
         generation: string,
         externalSignal?: AbortSignal | null,
+        diagnosticToken?: string,
     ): Promise<PluginStorageManifestSnapshotTransport> {
         return runBoundedAuthoritativeStorageOperation(
-            signal => this.getPluginStorageManifestSnapshotAuthoritative(generation, signal),
+            signal => this.getPluginStorageManifestSnapshotAuthoritative(
+                generation,
+                signal,
+                diagnosticToken,
+            ),
             'list',
             AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS,
             externalSignal,
@@ -3731,9 +3736,14 @@ export class NodeStorage{
     async getPluginStorageManifestState(
         generation: string,
         externalSignal?: AbortSignal | null,
+        diagnosticToken?: string,
     ): Promise<PluginStorageManifestStateTransport> {
         return runBoundedAuthoritativeStorageOperation(
-            signal => this.getPluginStorageManifestStateAuthoritative(generation, signal),
+            signal => this.getPluginStorageManifestStateAuthoritative(
+                generation,
+                signal,
+                diagnosticToken,
+            ),
             'list',
             AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS,
             externalSignal,
@@ -3743,6 +3753,7 @@ export class NodeStorage{
     private async getPluginStorageManifestStateAuthoritative(
         generation: string,
         signal: AbortSignal,
+        diagnosticToken?: string,
     ): Promise<PluginStorageManifestStateTransport> {
         if (typeof generation !== 'string' || generation.length === 0) {
             throw new TypeError('Plugin storage generation must be a non-empty string')
@@ -3756,6 +3767,9 @@ export class NodeStorage{
                 headers: {
                     'x-plugin-storage-generation': generation,
                     'x-plugin-storage-manifest-mode': 'state',
+                    ...(diagnosticToken === undefined
+                        ? {}
+                        : { 'x-risu-diag': diagnosticToken }),
                 },
                 signal,
             }),
@@ -3784,6 +3798,7 @@ export class NodeStorage{
     private async getPluginStorageManifestSnapshotAuthoritative(
         generation: string,
         signal: AbortSignal,
+        diagnosticToken?: string,
     ): Promise<PluginStorageManifestSnapshotTransport> {
         if (typeof generation !== 'string' || generation.length === 0) {
             throw new TypeError('Plugin storage generation must be a non-empty string')
@@ -3794,7 +3809,12 @@ export class NodeStorage{
             false,
             () => this.authFetch('/api/plugin-storage/manifest', {
                 method: 'GET',
-                headers: { 'x-plugin-storage-generation': generation },
+                headers: {
+                    'x-plugin-storage-generation': generation,
+                    ...(diagnosticToken === undefined
+                        ? {}
+                        : { 'x-risu-diag': diagnosticToken }),
+                },
                 signal,
             }),
             [],

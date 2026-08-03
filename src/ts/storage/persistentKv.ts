@@ -360,19 +360,29 @@ export async function readPersistentPluginStorageState<T>(
 export async function readPersistentPluginStorageManifestSnapshot(
     generation: string,
     signal?: AbortSignal | null,
+    diagnosticToken?: string,
 ): Promise<PluginStorageManifestSnapshotTransport> {
     throwIfAborted(signal);
     await ensureStorageReady(signal);
-    return await forageStorage.getPluginStorageManifestSnapshot(generation, signal);
+    return diagnosticToken === undefined
+        ? await forageStorage.getPluginStorageManifestSnapshot(generation, signal)
+        : await forageStorage.getPluginStorageManifestSnapshot(
+            generation,
+            signal,
+            diagnosticToken,
+        );
 }
 
 export async function readPersistentPluginStorageManifestState(
     generation: string,
     signal?: AbortSignal | null,
+    diagnosticToken?: string,
 ): Promise<{ generation: string; manifestRevision: string }> {
     throwIfAborted(signal);
     await ensureStorageReady(signal);
-    return await forageStorage.getPluginStorageManifestState(generation, signal);
+    return diagnosticToken === undefined
+        ? await forageStorage.getPluginStorageManifestState(generation, signal)
+        : await forageStorage.getPluginStorageManifestState(generation, signal, diagnosticToken);
 }
 
 export async function readPersistentPluginStorageViewerPage(
