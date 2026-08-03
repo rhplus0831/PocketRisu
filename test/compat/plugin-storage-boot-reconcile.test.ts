@@ -202,6 +202,62 @@ function readSqliteJson(server: ServerHandle, key: string): unknown {
   }
 }
 
+function replaceSqliteRow(server: ServerHandle, key: string, value: Buffer): void {
+  const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'))
+  try {
+    sqlite.prepare('UPDATE kv SET value = ?, updated_at = ? WHERE key = ?')
+      .run(value, Date.now(), key)
+  } finally {
+    sqlite.close()
+  }
+}
+
+function readSqliteBytes(server: ServerHandle, key: string): Buffer | null {
+  const sqlite = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
+  try {
+    const row = sqlite.prepare('SELECT value FROM kv WHERE key = ?').get(key) as
+      | { value: Buffer }
+      | undefined
+    return row ? Buffer.from(row.value) : null
+  } finally {
+    sqlite.close()
+  }
+}
+
+async function inspectRecovery(client: RisuClient): Promise<{
+  text: string
+  body: Record<string, any>
+}> {
+  const response = await client.fetch('/api/plugin-storage/recovery')
+  expect(response.status).toBe(200)
+  const text = await response.text()
+  return { text, body: JSON.parse(text) as Record<string, any> }
+}
+
+async function resolveRecovery(
+  client: RisuClient,
+  issue: Record<string, any>,
+  action: 'use-inline' | 'delete',
+): Promise<{ response: Response, body: Record<string, any> }> {
+  const response = await client.fetch('/api/plugin-storage/recovery/resolve', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-session-id': 'plugin-storage-recovery-test',
+      'x-user-active': '1',
+    },
+    body: JSON.stringify({
+      encodedKey: issue.encodedKey,
+      token: issue.token,
+      action,
+    }),
+  })
+  return {
+    response,
+    body: await response.json() as Record<string, any>,
+  }
+}
+
 describe('server-side optimized plugin storage boot reconciliation', () => {
   test('accepts the cached-view ETag for a block-format database', async () => {
     const generation = '00000000-0000-4000-8000-000000000001'
@@ -462,6 +518,182 @@ describe('server-side optimized plugin storage boot reconciliation', () => {
       })
       expect(result.text).not.toContain('unterminated')
       expect(result.text).not.toContain(corrupt.toString('base64'))
+    } finally {
+      await disposeServer(server)
+    }
+  }, 30_000)
+
+  test('downloads exact corrupt bytes and replaces them only after explicit inline recovery', async () => {
+    const generation = '55555555-5555-4555-8555-555555555555'
+    const rawKey = 'recoverable-corrupt-row'
+    const valueKey = encodeStorageKey(VALUE_PREFIX, rawKey)
+    const corruptMarker = 'corrupt-external-copy-must-not-appear-in-inspection'
+    const inlineMarker = 'selected-inline-copy-must-not-appear-in-inspection'
+    const corrupt = Buffer.from(`{"secret":"${corruptMarker}"`)
+    const server = await trackedServer({
+      generation,
+      valueKeys: [valueKey],
+      rows: [{ key: valueKey, value: corrupt }],
+    })
+    try {
+      replaceDatabase(server, {
+        characters: [],
+        optimizePluginMemory: true,
+        pluginStorageGeneration: generation,
+        pluginCustomStorage: { [rawKey]: { marker: inlineMarker } },
+      })
+      const client = await createClient(server.port, server.password)
+      const inspection = await inspectRecovery(client)
+
+      expect(inspection.body).toMatchObject({
+        success: true,
+        mode: 'optimized',
+        issues: [{
+          code: 'invalid-json',
+          encodedKey: valueKey,
+          kind: 'value',
+          inlineAvailable: true,
+          externalAvailable: true,
+          externalSize: corrupt.length,
+          actions: { download: true, useInline: true, delete: false },
+        }],
+      })
+      expect(inspection.text).not.toContain(corruptMarker)
+      expect(inspection.text).not.toContain(inlineMarker)
+
+      const issue = inspection.body.issues[0] as Record<string, any>
+      const query = new URLSearchParams({
+        encodedKey: issue.encodedKey,
+        token: issue.token,
+      })
+      const download = await client.fetch(`/api/plugin-storage/recovery/download?${query}`)
+      expect(download.status).toBe(200)
+      expect(download.headers.get('content-type')).toBe('application/octet-stream')
+      expect(download.headers.get('x-content-sha256')).toMatch(/^[0-9a-f]{64}$/)
+      expect(Buffer.from(await download.arrayBuffer())).toEqual(corrupt)
+
+      const resolution = await resolveRecovery(client, issue, 'use-inline')
+      expect(resolution.response.status).toBe(200)
+      expect(resolution.body).toMatchObject({
+        success: true,
+        commitOutcome: 'committed',
+        commitOutcomeUnknown: false,
+        action: 'use-inline',
+        encodedKey: valueKey,
+      })
+      expect(readSqliteJson(server, valueKey)).toEqual({ marker: inlineMarker })
+      expect((await rawDatabase(client)).database.pluginCustomStorage)
+        .toEqual({ [rawKey]: { marker: inlineMarker } })
+
+      const beforeCleanup = await rawDatabase(client)
+      const cleanup = await reconcile(client, beforeCleanup.etag)
+      expect(cleanup.response.status).toBe(200)
+      expect(cleanup.body).toMatchObject({
+        issues: [],
+        databaseChanged: true,
+        storageChanged: false,
+      })
+      expect((await rawDatabase(client)).database.pluginCustomStorage).toEqual({})
+    } finally {
+      await disposeServer(server)
+    }
+  }, 30_000)
+
+  test('rejects stale destructive tokens and deletes an unrecoverable value with its owner', async () => {
+    const generation = '66666666-6666-4666-8666-666666666666'
+    const rawKey = 'unrecoverable-corrupt-row'
+    const valueKey = encodeStorageKey(VALUE_PREFIX, rawKey)
+    const ownerKey = encodeStorageKey(META_PREFIX, rawKey)
+    const firstCorrupt = Buffer.from('{"first":"unterminated"')
+    const secondCorrupt = Buffer.from('{"second":"still-unterminated"')
+    const server = await trackedServer({
+      generation,
+      valueKeys: [valueKey],
+      metaKeys: [ownerKey],
+      rows: [
+        { key: valueKey, value: firstCorrupt },
+        { key: ownerKey, value: Buffer.from(JSON.stringify('plugin-id')) },
+      ],
+    })
+    try {
+      const client = await createClient(server.port, server.password)
+      const initial = await inspectRecovery(client)
+      const staleIssue = initial.body.issues.find(
+        (issue: Record<string, any>) => issue.encodedKey === valueKey,
+      ) as Record<string, any>
+      expect(staleIssue).toMatchObject({
+        code: 'invalid-json',
+        inlineAvailable: false,
+        actions: { download: true, useInline: false, delete: true },
+      })
+
+      replaceSqliteRow(server, valueKey, secondCorrupt)
+      const staleResolution = await resolveRecovery(client, staleIssue, 'delete')
+      expect(staleResolution.response.status).toBe(409)
+      expect(staleResolution.body).toMatchObject({
+        success: false,
+        commitOutcome: 'not-committed',
+        commitOutcomeUnknown: false,
+        code: 'PLUGIN_STORAGE_RECOVERY_STALE',
+      })
+      expect(readSqliteBytes(server, valueKey)).toEqual(secondCorrupt)
+      expect(readSqliteJson(server, ownerKey)).toBe('plugin-id')
+
+      const refreshed = await inspectRecovery(client)
+      const currentIssue = refreshed.body.issues.find(
+        (issue: Record<string, any>) => issue.encodedKey === valueKey,
+      ) as Record<string, any>
+      expect(currentIssue.token).not.toBe(staleIssue.token)
+      const deletion = await resolveRecovery(client, currentIssue, 'delete')
+      expect(deletion.response.status, JSON.stringify(deletion.body)).toBe(200)
+      expect(deletion.body).toMatchObject({
+        success: true,
+        action: 'delete',
+        encodedKey: valueKey,
+      })
+      expect(readSqliteBytes(server, valueKey)).toBeNull()
+      expect(readSqliteBytes(server, ownerKey)).toBeNull()
+      expect(readSqliteJson(server, MANIFEST_KEY)).toMatchObject({
+        generation,
+        valueKeys: [],
+        metaKeys: [],
+      })
+      expect((await inspectRecovery(client)).body.issues).toEqual([])
+    } finally {
+      await disposeServer(server)
+    }
+  }, 30_000)
+
+  test('deletes a quarantined invalid encoded row without changing the selected manifest', async () => {
+    const generation = '77777777-7777-4777-8777-777777777777'
+    const invalidEncodedKey = `${VALUE_PREFIX}not+canonical.json`
+    const server = await trackedServer({
+      generation,
+      valueKeys: [],
+      rows: [{
+        key: invalidEncodedKey,
+        value: Buffer.from(JSON.stringify({ stranded: true })),
+      }],
+    })
+    try {
+      const client = await createClient(server.port, server.password)
+      const inspection = await inspectRecovery(client)
+      const issue = inspection.body.issues.find(
+        (candidate: Record<string, any>) => candidate.encodedKey === invalidEncodedKey,
+      ) as Record<string, any>
+      expect(issue).toMatchObject({
+        code: 'invalid-encoded-key',
+        actions: { download: true, useInline: false, delete: true },
+      })
+
+      const deletion = await resolveRecovery(client, issue, 'delete')
+      expect(deletion.response.status, JSON.stringify(deletion.body)).toBe(200)
+      expect(readSqliteBytes(server, invalidEncodedKey)).toBeNull()
+      expect(readSqliteJson(server, MANIFEST_KEY)).toMatchObject({
+        generation,
+        valueKeys: [],
+      })
+      expect((await inspectRecovery(client)).body.issues).toEqual([])
     } finally {
       await disposeServer(server)
     }

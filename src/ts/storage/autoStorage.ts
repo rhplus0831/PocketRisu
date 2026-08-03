@@ -6,6 +6,8 @@ import {
     type PluginStorageManifestSnapshotTransport,
     type PluginStorageManifestStateTransport,
     type PluginStorageViewerPageTransport,
+    type PluginStorageRecoveryManagementIssueTransport,
+    type PluginStorageRecoveryResolutionAction,
     type StorageReadOptions,
 } from "./nodeStorage"
 import type {
@@ -62,6 +64,31 @@ export class AutoStorage{
         return signal
             ? await this.realStorage.reconcileOptimizedPluginStorageForBoot(signal)
             : await this.realStorage.reconcileOptimizedPluginStorageForBoot()
+    }
+    async getPluginStorageRecoveryManagementInspection(signal?: AbortSignal | null) {
+        await this.Init()
+        return signal
+            ? await this.realStorage.getPluginStorageRecoveryManagementInspection(signal)
+            : await this.realStorage.getPluginStorageRecoveryManagementInspection()
+    }
+    async downloadPluginStorageRecoveryRow(
+        issue: Pick<PluginStorageRecoveryManagementIssueTransport, 'encodedKey' | 'token'>,
+        signal?: AbortSignal | null,
+    ) {
+        await this.Init()
+        return signal
+            ? await this.realStorage.downloadPluginStorageRecoveryRow(issue, signal)
+            : await this.realStorage.downloadPluginStorageRecoveryRow(issue)
+    }
+    async resolvePluginStorageRecoveryIssue(
+        issue: Pick<PluginStorageRecoveryManagementIssueTransport, 'encodedKey' | 'token'>,
+        action: PluginStorageRecoveryResolutionAction,
+        signal?: AbortSignal | null,
+    ) {
+        await this.Init()
+        return signal
+            ? await this.realStorage.resolvePluginStorageRecoveryIssue(issue, action, signal)
+            : await this.realStorage.resolvePluginStorageRecoveryIssue(issue, action)
     }
     async createDatabaseIfAbsent(value: Uint8Array, signal?: AbortSignal | null) {
         await this.Init()

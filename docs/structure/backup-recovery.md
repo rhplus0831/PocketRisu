@@ -302,6 +302,14 @@ Restore first spools the selected logical snapshot through the chunk-aware reade
 Canonical formats are cursor-ingested at any supported size; compatibility-only formats
 use a bounded legacy decoder.
 
+Plugin-storage quarantine warnings therefore lead users to the restore-point UI first.
+When no suitable point exists, the secondary affected-data manager can download an exact
+corrupt optimized row, explicitly select a still-valid inline copy, or delete an
+unrecoverable row. Those row-level actions are not snapshot restores: they revalidate an
+opaque live-publication proof and mutate only the selected row plus its owner, manifest,
+quota, and recovery-dirty state. The inline source is kept until the normal boot
+reconciliation validates the repaired publication.
+
 The restore transaction replaces the live stub graph, external chat rows, migration
 markers, and the provably owned plugin publication together. Cancellation while queued or
 before commit removes/rolls back the operation. Snapshot restore uses the same strict

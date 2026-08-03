@@ -145,10 +145,12 @@ Express + SQLite
 - `server/node/db.cjs` owns atomic quota/owner accounting and the derived
   `plugin_storage_usage` and `plugin_storage_owners` tables.
 - `server/node/server.cjs` owns manifest, mutation, viewer, transition, capacity, and
-  recovery routes; generic KV routes guard the reserved namespace.
+  recovery routes, including proof-bound affected-row inspection/download/resolution;
+  generic KV routes guard the reserved namespace.
 - `shared/plugin-save-key-policy.json` is the shared archive/key-name contract.
 - `src/lib/Setting/Pages/PluginSettings.svelte` owns compatibility, conversion,
-  optimization transition, and recovery controls.
+  optimization transition, restore-first recovery guidance, and the affected-data
+  management dialog.
 - `src/lib/Setting/Pages/PluginStorageViewer.svelte` owns paged inspection and
   revision-aware maintenance.
 
@@ -365,6 +367,31 @@ suspect source is not allowed to become an empty authoritative publication. In o
 mode, external row bodies stay on the server during this scan; the browser receives only
 the committed result envelope and rereads `database.bin` if inline recovery copies were
 removed. Inline mode still materializes the complete map in browser memory by design.
+
+Plugin Settings presents restore points as the primary recovery path. **Check again**
+calls the optimized server reconciliation endpoint when that backend is selected; it does
+not replay the legacy browser read/rewrite loop. **Manage affected data** uses three
+dedicated authenticated routes:
+
+- `GET /api/plugin-storage/recovery` rebuilds an encoded-key-only issue inventory and
+  returns per-issue action availability plus an opaque HMAC token. The token binds the
+  selected database bytes, generation, manifest revision, inline candidate, and exact
+  external-row hash.
+- `GET /api/plugin-storage/recovery/download` revalidates that proof, privately spools
+  the exact external row, and streams it with its SHA-256. `NodeStorage` independently
+  hashes the received bytes before exposing the download.
+- `POST /api/plugin-storage/recovery/resolve` is active-session fenced and accepts one
+  explicit `use-inline` or `delete` action. A stale proof returns a definitive 409 without
+  mutation. Inline recovery atomically replaces the row and adopts it into the selected
+  manifest when needed; deletion is offered only without a usable inline copy and removes
+  a value's owner sidecar plus manifest membership in the same quota-accounted SQLite
+  transaction. Both actions retain the inline database copy until ordinary boot
+  reconciliation proves the repaired publication and clears it.
+
+Inspection and mutation responses never contain decoded keys, plugin values, or caught
+exception text. Manifest corruption, list/read failures, and other states without a safe
+row-level action remain restore-point or operator-repair cases rather than being guessed
+away by the manager.
 
 The viewer exposes three backends. In optimized mode, the Save File tab obtains a
 generation-pinned deterministic server page; in inline mode, it synchronously detaches

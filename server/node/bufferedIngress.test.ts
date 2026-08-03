@@ -118,6 +118,20 @@ describe('buffered ingress admission', () => {
     })
   })
 
+  test('admits plugin recovery resolution as a bounded writer mutation', () => {
+    expect(createRoutePolicyResolver(limits())(request({
+      path: '/api/plugin-storage/recovery/resolve',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': '256',
+      },
+    }))).toMatchObject({
+      bodyKind: 'json',
+      writer: true,
+      admissionOnly: false,
+    })
+  })
+
   test('bounds chat deltas like JSON Patch while retaining full-row chat limits', () => {
     const resolve = createRoutePolicyResolver(limits())
     expect(resolve(request({

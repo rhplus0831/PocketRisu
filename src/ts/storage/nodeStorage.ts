@@ -46,6 +46,7 @@ import { getThrownMessage, StorageError } from "./storageError"
 import { awaitWithAbort, forwardAbortSignal, throwIfAborted } from "./abort"
 import { encodeBase64UrlBytes, encodeUtf8Base64Url } from "./base64Url"
 import { v4 as uuidv4 } from "uuid"
+import { Sha256 } from "@aws-crypto/sha256-js"
 import type {
     PluginStorageMutationRequest,
     PluginStorageMutationResult,
@@ -708,6 +709,50 @@ export interface OptimizedPluginStorageBootReconcileTransport {
     storageChanged: boolean
 }
 
+export type PluginStorageRecoveryManagementIssueKind =
+    | 'value'
+    | 'metadata'
+    | 'manifest'
+    | 'storage'
+
+export interface PluginStorageRecoveryManagementIssueTransport {
+    code: PluginStorageRecoveryIssue['code']
+    encodedKey: string
+    kind: PluginStorageRecoveryManagementIssueKind
+    inlineAvailable: boolean
+    externalAvailable: boolean
+    externalSize: number | null
+    actions: {
+        download: boolean
+        useInline: boolean
+        delete: boolean
+    }
+    token: string
+}
+
+export interface PluginStorageRecoveryManagementInspectionTransport {
+    success: true
+    mode: 'optimized' | 'inline'
+    checkedAt: number
+    issues: PluginStorageRecoveryManagementIssueTransport[]
+}
+
+export interface PluginStorageRecoveryDownloadTransport {
+    blob: Blob
+    filename: string
+    sha256: string
+}
+
+export type PluginStorageRecoveryResolutionAction = 'use-inline' | 'delete'
+
+export interface PluginStorageRecoveryResolutionTransport {
+    success: true
+    commitOutcome: 'committed'
+    commitOutcomeUnknown: false
+    action: PluginStorageRecoveryResolutionAction
+    encodedKey: string
+}
+
 const PLUGIN_STORAGE_BOOT_ISSUE_CODES = new Set([
     'invalid-encoded-key',
     'invalid-json',
@@ -760,6 +805,86 @@ function isOptimizedPluginStorageBootReconcileTransport(
             && typeof record.encodedKey === 'string'
             && record.encodedKey.length > 0
     })
+}
+
+function isPluginStorageRecoveryManagementInspectionTransport(
+    value: unknown,
+): value is PluginStorageRecoveryManagementInspectionTransport {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const result = value as Record<string, unknown>
+    if (Object.keys(result).length !== 4
+        || result.success !== true
+        || (result.mode !== 'optimized' && result.mode !== 'inline')
+        || !Number.isSafeInteger(result.checkedAt)
+        || (result.checkedAt as number) < 0
+        || !Array.isArray(result.issues)) return false
+    return result.issues.every(issue => {
+        if (!issue || typeof issue !== 'object' || Array.isArray(issue)) return false
+        const record = issue as Record<string, unknown>
+        const actions = record.actions
+        return Object.keys(record).length === 8
+            && typeof record.code === 'string'
+            && PLUGIN_STORAGE_BOOT_ISSUE_CODES.has(record.code)
+            && typeof record.encodedKey === 'string'
+            && record.encodedKey.length > 0
+            && ['value', 'metadata', 'manifest', 'storage'].includes(String(record.kind))
+            && typeof record.inlineAvailable === 'boolean'
+            && typeof record.externalAvailable === 'boolean'
+            && (record.externalSize === null
+                || (Number.isSafeInteger(record.externalSize) && (record.externalSize as number) >= 0))
+            && actions !== null
+            && typeof actions === 'object'
+            && !Array.isArray(actions)
+            && Object.keys(actions as Record<string, unknown>).length === 3
+            && typeof (actions as Record<string, unknown>).download === 'boolean'
+            && typeof (actions as Record<string, unknown>).useInline === 'boolean'
+            && typeof (actions as Record<string, unknown>).delete === 'boolean'
+            && (actions as Record<string, unknown>).download === record.externalAvailable
+            && (!(actions as Record<string, unknown>).useInline
+                || record.inlineAvailable === true)
+            && (!(actions as Record<string, unknown>).delete
+                || (record.externalAvailable === true && record.inlineAvailable === false))
+            && !((actions as Record<string, unknown>).useInline
+                && (actions as Record<string, unknown>).delete)
+            && (record.externalAvailable === true || record.externalSize === null)
+            && typeof record.token === 'string'
+            && /^[A-Za-z0-9_-]{43}$/.test(record.token)
+    })
+}
+
+function isPluginStorageRecoveryResolutionTransport(
+    value: unknown,
+    action: PluginStorageRecoveryResolutionAction,
+    encodedKey: string,
+): value is PluginStorageRecoveryResolutionTransport {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const result = value as Record<string, unknown>
+    return Object.keys(result).length === 5
+        && result.success === true
+        && result.commitOutcome === 'committed'
+        && result.commitOutcomeUnknown === false
+        && result.action === action
+        && result.encodedKey === encodedKey
+}
+
+function recoveryDownloadFilename(header: string | null): string {
+    const match = header?.match(/filename="([A-Za-z0-9._-]+)"/)
+    return match?.[1] ?? 'plugin-storage-recovery.bin'
+}
+
+async function hashPluginStorageRecoveryDownload(
+    blob: Blob,
+    signal?: AbortSignal | null,
+): Promise<string> {
+    const bytes = new Uint8Array(await awaitWithAbort(blob.arrayBuffer(), signal))
+    if (globalThis.crypto?.subtle) return await sha256OwnedBytes(bytes)
+
+    // NodeOnly intentionally supports plain HTTP on trusted LANs, where Web
+    // Crypto may be unavailable. Keep exact-download verification functional
+    // with the already-bundled pure-JS SHA-256 implementation.
+    const hash = new Sha256()
+    hash.update(bytes)
+    return Array.from(hash.digestSync(), byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
 export interface PluginStorageViewerEntryTransport {
@@ -2764,6 +2889,174 @@ export class NodeStorage{
                 void invalidateResourceCachePrefix(`kv:${PLUGIN_STORAGE_PREFIXES[0]}`)
                 void invalidateResourceCachePrefix(`kv:${PLUGIN_STORAGE_PREFIXES[1]}`)
             }
+            return payload
+        }, 'transition', AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS, externalSignal)
+    }
+
+    async getPluginStorageRecoveryManagementInspection(
+        externalSignal?: AbortSignal | null,
+    ): Promise<PluginStorageRecoveryManagementInspectionTransport> {
+        await runBoundedAuthoritativeStorageOperation(
+            signal => this.checkAuth(signal),
+            'read',
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+        return runBoundedAuthoritativeStorageOperation(async signal => {
+            const response = await this.requestStorage(
+                'plugin-storage/recovery',
+                'read',
+                false,
+                () => this.authFetch('/api/plugin-storage/recovery', {
+                    method: 'GET',
+                    signal,
+                }),
+                [],
+                signal,
+            )
+            const payload = await awaitWithAbort(response.json(), signal)
+            if (!isPluginStorageRecoveryManagementInspectionTransport(payload)) {
+                throw new StorageError('Plugin storage recovery inspection was malformed.', {
+                    status: response.status,
+                    code: 'STORAGE_RESPONSE_ERROR',
+                    retryable: true,
+                    operation: 'read',
+                })
+            }
+            return payload
+        }, 'read', AUTHORITATIVE_STORAGE_METADATA_TIMEOUT_MS, externalSignal)
+    }
+
+    async downloadPluginStorageRecoveryRow(
+        issue: Pick<PluginStorageRecoveryManagementIssueTransport, 'encodedKey' | 'token'>,
+        externalSignal?: AbortSignal | null,
+    ): Promise<PluginStorageRecoveryDownloadTransport> {
+        await runBoundedAuthoritativeStorageOperation(
+            signal => this.checkAuth(signal),
+            'read',
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+        return runBoundedAuthoritativeStorageOperation(async signal => {
+            const query = new URLSearchParams({
+                encodedKey: issue.encodedKey,
+                token: issue.token,
+            })
+            const response = await this.requestStorage(
+                'plugin-storage/recovery/download',
+                'read',
+                false,
+                () => this.authFetch(`/api/plugin-storage/recovery/download?${query}`, {
+                    method: 'GET',
+                    signal,
+                }),
+                [],
+                signal,
+            )
+            const sha256 = response.headers.get('x-content-sha256')
+            if (!sha256 || !/^[0-9a-f]{64}$/.test(sha256)) {
+                throw new StorageError('Plugin storage recovery download lacked an integrity hash.', {
+                    status: response.status,
+                    code: 'STORAGE_RESPONSE_ERROR',
+                    retryable: true,
+                    operation: 'read',
+                })
+            }
+            const blob = await awaitWithAbort(response.blob(), signal)
+            const contentLength = response.headers.get('content-length')
+            if (contentLength !== null
+                && (!/^\d+$/.test(contentLength) || Number(contentLength) !== blob.size)) {
+                throw new StorageError('Plugin storage recovery download changed length.', {
+                    status: response.status,
+                    code: 'STORAGE_RESPONSE_ERROR',
+                    retryable: true,
+                    operation: 'read',
+                })
+            }
+            const actualHash = await hashPluginStorageRecoveryDownload(blob, signal)
+            if (actualHash !== sha256) {
+                throw new StorageError('Plugin storage recovery download failed its integrity check.', {
+                    status: response.status,
+                    code: 'STORAGE_RESPONSE_ERROR',
+                    retryable: true,
+                    operation: 'read',
+                })
+            }
+            return {
+                blob,
+                filename: recoveryDownloadFilename(response.headers.get('content-disposition')),
+                sha256,
+            }
+        }, 'read', AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS, externalSignal)
+    }
+
+    async resolvePluginStorageRecoveryIssue(
+        issue: Pick<PluginStorageRecoveryManagementIssueTransport, 'encodedKey' | 'token'>,
+        action: PluginStorageRecoveryResolutionAction,
+        externalSignal?: AbortSignal | null,
+    ): Promise<PluginStorageRecoveryResolutionTransport> {
+        await runBoundedAuthoritativeStorageOperation(
+            signal => this.checkAuth(signal),
+            'read',
+            AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
+            externalSignal,
+        )
+        return runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
+            const response = await this.requestStorage(
+                'plugin-storage/recovery/resolve',
+                'transition',
+                true,
+                () => this.authFetch('/api/plugin-storage/recovery/resolve', {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({
+                        encodedKey: issue.encodedKey,
+                        token: issue.token,
+                        action,
+                    }),
+                    signal,
+                }, true, outcome),
+                [],
+                signal,
+                outcome,
+            )
+            outcome.markRequestDispatched()
+            let payload: unknown
+            try {
+                payload = await awaitWithAbort(response.json(), signal)
+            } catch (error) {
+                throw new StorageError(
+                    'Plugin storage recovery returned an unreadable acknowledgement.',
+                    {
+                        status: response.status,
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcomeUnknown: true,
+                        operation: 'transition',
+                        cause: error,
+                    },
+                )
+            }
+            if (!isPluginStorageRecoveryResolutionTransport(
+                payload,
+                action,
+                issue.encodedKey,
+            )) {
+                throw new StorageError(
+                    'Plugin storage recovery returned an invalid acknowledgement.',
+                    {
+                        status: response.status,
+                        code: 'COMMIT_OUTCOME_UNKNOWN',
+                        retryable: false,
+                        commitOutcomeUnknown: true,
+                        operation: 'transition',
+                    },
+                )
+            }
+            outcome.markDefinitiveResponse()
+            void listCacheDelete(['', ...PLUGIN_STORAGE_PREFIXES])
+            void invalidateResourceCachePrefix(`kv:${PLUGIN_STORAGE_PREFIXES[0]}`)
+            void invalidateResourceCachePrefix(`kv:${PLUGIN_STORAGE_PREFIXES[1]}`)
             return payload
         }, 'transition', AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS, externalSignal)
     }

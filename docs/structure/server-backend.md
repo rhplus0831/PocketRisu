@@ -347,6 +347,12 @@ plan.
   A truly stale token returns `PLUGIN_STORAGE_BOOT_CONFLICT`. If reconciliation removes
   recovered inline copies, it returns the changed database ETag so bootstrap rereads the
   paired row and token.
+- `GET /api/plugin-storage/recovery` exposes only encoded-key issue metadata and
+  proof-bound action availability. Its download route streams an exact privately spooled
+  affected row with SHA-256, while writer-fenced `POST .../resolve` atomically adopts a
+  valid inline copy or deletes an unrecoverable row with its manifest/owner/quota state.
+  Every action rescans the live publication and rejects a stale opaque token before
+  mutation; response envelopes exclude decoded keys, values, and exception text.
 - Monolith-shaped inputs from boot migration, backup/snapshot restore, save-folder import, or defensive route recovery pass through `ingestDatabase()`. Supported raw or gzip/zlib MessagePack inputs above `RISU_STREAM_INGEST_MIN_BYTES` route to `ingestStreamingDatabase()`: the walker retains byte offsets for the root and character fields, decodes one chat at a time, and writes chat rows plus the stripped DB in one transaction without constructing or persisting the full monolith. Missing-ID assignment, duplicate handling, orphan-folder normalization, stub projection, cold-storage restoration, stale-row sweeping, and optimized plugin splitting share the same semantics as `ingestFullDatabase()`. Legacy block saves, bare deflate/JSON fallbacks, and unsupported compressed payloads retain the in-memory decoder.
 - The HTML root injects `globalThis.__NODE__` and `globalThis.__PATCH_SYNC__`;
   `src/ts/platform.ts` turns those into frontend feature flags.
@@ -528,7 +534,7 @@ callers may explicitly include usage deletion.
 | Provider credentials | `POST /api/model-preset/google-service-account/token` signs a Google service-account JWT server-side and exchanges it only at Google's documented OAuth endpoint. | `src/ts/preset/adapter/googleServiceAccount/token.ts`. |
 | Durable model requests | `POST /api/model-jobs`; filtered active/unclaimed `GET /api/model-jobs`; `GET /api/model-jobs/:id` and `.../stream`; claim and delete routes; plus create/list/delete/atomic-claim routes under `/api/pending-sends`. | Model-preset job transport and `src/ts/process/request/jobRecovery.ts`. |
 | Key/value storage | `GET /api/read`, raw recovery `GET /api/db/read-raw-for-boot`, segmented `POST /api/db/read-cached`, create-only `POST /api/db/create-if-absent`, `GET /api/remove`, full/delta `GET /api/list`, `POST /api/write`, `POST /api/patch`, and cookie-authenticated `POST /api/db/flush`. | `NodeStorage`, bootstrap, and the save loop. |
-| Plugin storage | Boot reconcile, state, viewer-page, manifest, mutate, batch, clear, capacity/size, consolidated `/api/plugin-storage/transition/bulk`, and staged begin/upload/row/status/finalize/abort routes. The retired direct `/api/plugin-storage/transition` remains registered only as a pre-body `426 CLIENT_UPGRADE_REQUIRED` rejection. Generic KV routes guard the reserved publication roots. | `NodeStorage`, `persistentKv.ts`, `pluginSaveStorage.ts`, bootstrap, and Plugin Settings/Viewer. |
+| Plugin storage | Boot reconcile; proof-bound recovery inspection/download/resolve; state, viewer-page, manifest, mutate, batch, clear, capacity/size; consolidated `/api/plugin-storage/transition/bulk`; and staged begin/upload/row/status/finalize/abort routes. The retired direct `/api/plugin-storage/transition` remains registered only as a pre-body `426 CLIENT_UPGRADE_REQUIRED` rejection. Generic KV routes guard the reserved publication roots. | `NodeStorage`, `persistentKv.ts`, `pluginSaveStorage.ts`, bootstrap, and Plugin Settings/Viewer. |
 | Asset serving/bulk | `GET /api/asset/:hexKey`, `POST /api/assets/bulk-read`, `POST /api/assets/bulk-write`, and maintenance `POST /api/assets/cleanup`. | Direct URLs from `src/ts/globalApi.svelte.ts`; bulk methods and System dashboard. |
 | Diagnostic logs | `POST /api/logs` ingests client batches, `GET /api/logs` filters/paginates, and writer-guarded `DELETE /api/logs` clears. | Batch uploader in `src/ts/log.ts`; settings queries in `SystemSettings.svelte`. |
 | Provider request logs | `POST/GET /api/request-logs`, `GET /api/request-logs/usage`, `/stats`, and `/:id`, plus writer-guarded `DELETE /api/request-logs` with optional usage deletion. | `src/ts/requestLog.ts` and request-log/statistics settings UI. |
@@ -827,6 +833,11 @@ callers may explicitly include usage deletion.
   `/api/db/read-cached`, `/api/db/read-raw-for-boot`,
   `/api/db/create-if-absent`, `/api/plugin-storage/reconcile-boot`,
   `server/node/dbCachedRead.cjs`, and `NodeStorage.readDatabaseForBoot()` together.
+
+- To change optimized plugin recovery management, update the inspection/download/resolve
+  routes, their proof token and atomic publication helpers, the matching `NodeStorage`
+  validators, `PluginSettings.svelte`, and the boot-reconcile compatibility tests
+  together. Preserve the encoded-key-only diagnostic boundary.
 
 - To change verified browser-cache negotiation, update `parseCachedHashesHeader()` and
   `sha256Hex()` in `server/node/utils.cjs`, the hash-aware database/KV/chat routes, and

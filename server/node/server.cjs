@@ -45,7 +45,7 @@ const { kvGet, kvGetAsync, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList,
         kvGetListEpoch, kvBumpListEpoch,
         gcChunks, reclaimableChunkBytes, isDbBlobChunked, snapshotFootprints, createKvSnapshot,
         kvGetSnapshotSourceToken,
-        rebuildPluginStorageViewerFacets,
+        rebuildPluginStorageViewerFacets, reconcilePluginStorageUsage,
         getPluginStorageMutationVersion, withPluginStorageQuotaPlan,
         isLegacyHexMigrationComplete, markLegacyHexMigrationComplete,
         publishLegacyHexMigrationMarker,
@@ -2751,6 +2751,7 @@ const PARTIAL_EXPORT_MAX_CANCELLATION_TOMBSTONES = 256;
 const PARTIAL_EXPORT_MAX_ACTIVE_JOBS = 1;
 const PLUGIN_VALUE_SPOOL_FILE_PREFIX = '.plugin-value-';
 const PLUGIN_BATCH_VALUE_SPOOL_FILE_PREFIX = '.plugin-batch-value-';
+const PLUGIN_RECOVERY_DOWNLOAD_SPOOL_FILE_PREFIX = '.plugin-recovery-download-';
 const PLUGIN_TRANSITION_STAGE_PREFIX = '.plugin-transition-stage-';
 const PLUGIN_TRANSITION_STAGE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // A mode transition must accept every row that optimized storage itself can
@@ -2836,6 +2837,7 @@ if (databaseSpoolReady) {
                 || entry.name.startsWith(BACKUP_IMPORT_SPOOL_FILE_PREFIX)
                 || entry.name.startsWith(PLUGIN_VALUE_SPOOL_FILE_PREFIX)
                 || entry.name.startsWith(PLUGIN_BATCH_VALUE_SPOOL_FILE_PREFIX)
+                || entry.name.startsWith(PLUGIN_RECOVERY_DOWNLOAD_SPOOL_FILE_PREFIX)
                 || entry.name.startsWith(ADMITTED_INGRESS_SPOOL_PREFIX)
             )) continue;
             try {
@@ -6392,6 +6394,426 @@ async function reconcileOptimizedPluginStorageForBoot(req, expectedEtag) {
     });
     if (copiedRows || result.databaseChanged) schedulePluginRecoverySnapshot();
     return result;
+}
+
+const pluginStorageRecoveryManagementSecret = nodeCrypto.randomBytes(32);
+
+function pluginStorageRecoveryManagementKind(encodedKey) {
+    if (encodedKey === PLUGIN_STORAGE_MANIFEST_KEY) return 'manifest';
+    if (encodedKey.startsWith(PLUGIN_SAVE_META_PREFIX)) return 'metadata';
+    if (encodedKey.startsWith(PLUGIN_SAVE_PREFIX)) return 'value';
+    return 'storage';
+}
+
+function pluginStorageRecoveryManagementToken(context, issue) {
+    return nodeCrypto.createHmac('sha256', pluginStorageRecoveryManagementSecret)
+        .update(JSON.stringify([
+            issue.code,
+            issue.encodedKey,
+            context.databaseRevision,
+            context.generation ?? '',
+            context.manifestRevision ?? '',
+            issue.externalHash ?? '',
+            issue.inlineEntry?.canonicalHash ?? '',
+            issue.externalAvailable === true,
+            issue.inlineEntry !== null,
+            issue.owned === true,
+            issue.canUseInline === true,
+            issue.canDelete === true,
+        ]))
+        .digest('base64url');
+}
+
+function publicPluginStorageRecoveryManagementIssue(context, issue) {
+    return {
+        code: issue.code,
+        encodedKey: issue.encodedKey,
+        kind: pluginStorageRecoveryManagementKind(issue.encodedKey),
+        inlineAvailable: issue.inlineEntry !== null,
+        externalAvailable: issue.externalAvailable === true,
+        externalSize: Number.isSafeInteger(issue.externalSize) ? issue.externalSize : null,
+        actions: {
+            download: issue.externalAvailable === true,
+            useInline: issue.canUseInline === true,
+            delete: issue.canDelete === true,
+        },
+        token: pluginStorageRecoveryManagementToken(context, issue),
+    };
+}
+
+function internalPluginStorageRecoveryManagementIssue(code, encodedKey, overrides = {}) {
+    return {
+        code,
+        encodedKey,
+        rawKey: null,
+        prefix: null,
+        inlineEntry: null,
+        externalAvailable: false,
+        externalSize: null,
+        externalHash: null,
+        owned: false,
+        canUseInline: false,
+        canDelete: false,
+        ...overrides,
+    };
+}
+
+/**
+ * Rebuild an encoded-key-only recovery management view from the live optimized
+ * publication. Values remain server-side; the returned action token binds the
+ * database row, manifest, inline candidate, and exact external bytes.
+ */
+async function inspectOptimizedPluginStorageRecoveryManagement() {
+    await flushPendingDb();
+    const rawDatabase = kvGet('database/database.bin');
+    if (!rawDatabase) throw new Error('Database not found');
+    const liveDb = await decodeAuthoritativeDatabase(rawDatabase);
+    const databaseRevision = sha256Hex(rawDatabase);
+    if (liveDb?.optimizePluginMemory !== true) {
+        return {
+            mode: 'inline',
+            checkedAt: Date.now(),
+            context: {
+                databaseRevision,
+                generation: null,
+                manifestRevision: null,
+            },
+            issues: [],
+            liveDb,
+            manifestEntry: null,
+        };
+    }
+
+    const collectionIssues = [];
+    const inlineValues = collectOptimizedBootInlineEntries(
+        liveDb,
+        'pluginCustomStorage',
+        PLUGIN_SAVE_PREFIX,
+        collectionIssues,
+    );
+    const inlineMeta = collectOptimizedBootInlineEntries(
+        liveDb,
+        'pluginStorageMeta',
+        PLUGIN_SAVE_META_PREFIX,
+        collectionIssues,
+    );
+    const inlineValueByStorageKey = new Map(
+        inlineValues.entries.map(entry => [entry.storageKey, entry]),
+    );
+    const inlineMetaByStorageKey = new Map(
+        inlineMeta.entries.map(entry => [entry.storageKey, entry]),
+    );
+    const generation = pluginStorageGeneration(liveDb);
+    const manifestBytes = kvGet(PLUGIN_STORAGE_MANIFEST_KEY);
+    const manifestEntry = pluginStorageManifestCache.read();
+    const manifestState = manifestEntry.state;
+    const manifest = generation
+        && manifestState.valid === true
+        && manifestState.manifest?.generation === generation
+        ? manifestState.manifest
+        : null;
+    const context = {
+        databaseRevision,
+        generation,
+        manifestRevision: Buffer.isBuffer(manifestBytes) ? sha256Hex(manifestBytes) : null,
+    };
+    const canMutatePublication = generation === null || manifest !== null;
+    const issues = collectionIssues.map(issue => internalPluginStorageRecoveryManagementIssue(
+        issue.code,
+        issue.encodedKey,
+    ));
+
+    if (manifestState.present && manifestState.valid !== true) {
+        issues.push(internalPluginStorageRecoveryManagementIssue(
+            'invalid-json',
+            PLUGIN_STORAGE_MANIFEST_KEY,
+            {
+                externalAvailable: Buffer.isBuffer(manifestBytes),
+                externalSize: Buffer.isBuffer(manifestBytes) ? manifestBytes.length : null,
+                externalHash: Buffer.isBuffer(manifestBytes) ? sha256Hex(manifestBytes) : null,
+            },
+        ));
+    }
+
+    const scanPrefix = async (prefix, listed, inlineByStorageKey) => {
+        const ownedKeys = generation && manifest
+            ? new Set(prefix === PLUGIN_SAVE_META_PREFIX ? manifest.metaKeys : manifest.valueKeys)
+            : null;
+        for (const encodedKey of listed) {
+            let rawKey = null;
+            try {
+                rawKey = decodeOptimizedBootStorageKey(encodedKey, prefix, manifest);
+            } catch {
+                const inlineEntry = inlineByStorageKey.get(encodedKey) ?? null;
+                rawKey = inlineEntry?.rawKey ?? null;
+                const externalBytes = kvGet(encodedKey);
+                issues.push(internalPluginStorageRecoveryManagementIssue(
+                    'invalid-encoded-key',
+                    encodedKey,
+                    {
+                        rawKey,
+                        prefix,
+                        inlineEntry,
+                        externalAvailable: Buffer.isBuffer(externalBytes),
+                        externalSize: Buffer.isBuffer(externalBytes) ? externalBytes.length : null,
+                        externalHash: Buffer.isBuffer(externalBytes) ? sha256Hex(externalBytes) : null,
+                        owned: ownedKeys?.has(encodedKey) === true,
+                        canUseInline: inlineEntry !== null && canMutatePublication,
+                        canDelete: Buffer.isBuffer(externalBytes)
+                            && inlineEntry === null
+                            && canMutatePublication,
+                    },
+                ));
+                continue;
+            }
+
+            const inlineEntry = inlineByStorageKey.get(encodedKey) ?? null;
+            let externalBytes = null;
+            try {
+                externalBytes = await kvGetAsync(encodedKey);
+            } catch {
+                issues.push(internalPluginStorageRecoveryManagementIssue(
+                    'read-failed',
+                    encodedKey,
+                    { rawKey, prefix, inlineEntry },
+                ));
+                continue;
+            }
+            if (!Buffer.isBuffer(externalBytes)) {
+                issues.push(internalPluginStorageRecoveryManagementIssue(
+                    'read-failed',
+                    encodedKey,
+                    { rawKey, prefix, inlineEntry },
+                ));
+                continue;
+            }
+
+            const externalHash = sha256Hex(externalBytes);
+            const owned = generation === null || ownedKeys?.has(encodedKey) === true;
+            const common = {
+                rawKey,
+                prefix,
+                inlineEntry,
+                externalAvailable: true,
+                externalSize: externalBytes.length,
+                externalHash,
+                owned,
+            };
+            if (generation && !owned) {
+                issues.push(internalPluginStorageRecoveryManagementIssue(
+                    'read-failed',
+                    encodedKey,
+                    {
+                        ...common,
+                        canUseInline: inlineEntry !== null && canMutatePublication,
+                        canDelete: inlineEntry === null && canMutatePublication,
+                    },
+                ));
+                continue;
+            }
+
+            let canonicalHash = null;
+            try {
+                const parsed = JSON.parse(externalBytes.toString('utf-8'));
+                canonicalHash = sha256Hex(serializePluginStorageRow(encodedKey, parsed));
+            } catch (error) {
+                issues.push(internalPluginStorageRecoveryManagementIssue(
+                    error instanceof SyntaxError ? 'invalid-json' : 'unsupported-json',
+                    encodedKey,
+                    {
+                        ...common,
+                        canUseInline: inlineEntry !== null && canMutatePublication,
+                        canDelete: inlineEntry === null && canMutatePublication,
+                    },
+                ));
+                continue;
+            }
+            if (inlineEntry && canonicalHash !== inlineEntry.canonicalHash) {
+                issues.push(internalPluginStorageRecoveryManagementIssue(
+                    'conflicting-copies',
+                    encodedKey,
+                    {
+                        ...common,
+                        canUseInline: canMutatePublication,
+                    },
+                ));
+            }
+        }
+    };
+
+    let listedValues = [];
+    let listedMeta = [];
+    try {
+        listedValues = kvList(PLUGIN_SAVE_PREFIX);
+    } catch {
+        issues.push(internalPluginStorageRecoveryManagementIssue('list-failed', PLUGIN_SAVE_PREFIX));
+    }
+    try {
+        listedMeta = kvList(PLUGIN_SAVE_META_PREFIX);
+    } catch {
+        issues.push(internalPluginStorageRecoveryManagementIssue('list-failed', PLUGIN_SAVE_META_PREFIX));
+    }
+    await scanPrefix(PLUGIN_SAVE_PREFIX, listedValues, inlineValueByStorageKey);
+    await scanPrefix(PLUGIN_SAVE_META_PREFIX, listedMeta, inlineMetaByStorageKey);
+
+    // Deleting a value also removes its ownership sidecar. Do not offer that
+    // action while a recoverable inline owner copy would be discarded with it.
+    for (const issue of issues) {
+        if (!issue.canDelete || issue.prefix !== PLUGIN_SAVE_PREFIX || issue.rawKey === null) continue;
+        const inlineMetaKey = encodePluginSaveStorageKey(issue.rawKey, PLUGIN_SAVE_META_PREFIX);
+        if (inlineMetaByStorageKey.has(inlineMetaKey)) issue.canDelete = false;
+    }
+
+    return {
+        mode: 'optimized',
+        checkedAt: Date.now(),
+        context,
+        issues,
+        liveDb,
+        manifestEntry,
+    };
+}
+
+function publicOptimizedPluginStorageRecoveryManagementInspection(inspection) {
+    return {
+        success: true,
+        mode: inspection.mode,
+        checkedAt: inspection.checkedAt,
+        issues: inspection.issues.map(issue => (
+            publicPluginStorageRecoveryManagementIssue(inspection.context, issue)
+        )),
+    };
+}
+
+function findOptimizedPluginStorageRecoveryManagementIssue(inspection, encodedKey, token) {
+    return inspection.issues.find(issue => (
+        issue.encodedKey === encodedKey
+        && pluginStorageRecoveryManagementToken(inspection.context, issue) === token
+    )) ?? null;
+}
+
+function preparePluginStorageRecoveryManifestUpdate(inspection, changes) {
+    if (inspection.context.generation === null) return null;
+    return pluginStorageManifestCache.prepareUpdate(inspection.manifestEntry, changes);
+}
+
+function pluginStorageRecoveryProofChanged() {
+    const error = new Error('Plugin storage recovery proof changed');
+    error.pluginStorageRecoveryStale = true;
+    return error;
+}
+
+function assertPluginStorageRecoveryProofCurrent(inspection, issue) {
+    try {
+        const databaseBytes = kvGet('database/database.bin');
+        if (!Buffer.isBuffer(databaseBytes)
+            || sha256Hex(databaseBytes) !== inspection.context.databaseRevision) {
+            throw pluginStorageRecoveryProofChanged();
+        }
+        const manifestBytes = kvGet(PLUGIN_STORAGE_MANIFEST_KEY);
+        const manifestRevision = Buffer.isBuffer(manifestBytes)
+            ? sha256Hex(manifestBytes)
+            : null;
+        if (manifestRevision !== inspection.context.manifestRevision) {
+            throw pluginStorageRecoveryProofChanged();
+        }
+        const externalBytes = kvGet(issue.encodedKey);
+        if (!Buffer.isBuffer(externalBytes)
+            || externalBytes.length !== issue.externalSize
+            || sha256Hex(externalBytes) !== issue.externalHash) {
+            throw pluginStorageRecoveryProofChanged();
+        }
+    } catch (error) {
+        if (error?.pluginStorageRecoveryStale) throw error;
+        throw pluginStorageRecoveryProofChanged();
+    }
+}
+
+function resolveOptimizedPluginStorageRecoveryIssue(inspection, issue, action) {
+    let manifestUpdate = null;
+    let committedManifestBytes = null;
+    let committedPublicationRevision = null;
+    const recoverySnapshotToken = newPluginRecoverySnapshotToken();
+    sqliteDb.transaction(() => {
+        assertPluginStorageRecoveryProofCurrent(inspection, issue);
+        // Suspicious rows may have been restored or edited outside the ordinary
+        // mutation API. Repair derived quota accounting inside the same write
+        // transaction that revalidates and resolves the selected row.
+        reconcilePluginStorageUsage();
+
+        if (action === 'use-inline') {
+            if (!issue.canUseInline || !issue.inlineEntry || issue.rawKey === null || !issue.prefix) {
+                throw new TypeError('The inline recovery action is unavailable.');
+            }
+            const rowBytes = serializePluginStorageRow(issue.encodedKey, issue.inlineEntry.value);
+            if (inspection.context.generation && !issue.owned) {
+                manifestUpdate = preparePluginStorageRecoveryManifestUpdate(inspection, {
+                    valueAdds: issue.prefix === PLUGIN_SAVE_PREFIX ? [issue.encodedKey] : [],
+                    metaAdds: issue.prefix === PLUGIN_SAVE_META_PREFIX ? [issue.encodedKey] : [],
+                    rawKeys: [issue.rawKey],
+                });
+            }
+            withPluginStorageQuotaPlan(
+                issue.prefix === PLUGIN_SAVE_PREFIX
+                    ? [{ key: issue.encodedKey, size: rowBytes.length }]
+                    : [],
+                () => {
+                    kvSet(issue.encodedKey, rowBytes);
+                    if (manifestUpdate) {
+                        committedManifestBytes = writePluginStorageManifest(manifestUpdate.manifest);
+                    }
+                    markPluginRecoverySnapshotDirty(recoverySnapshotToken);
+                    committedPublicationRevision = kvGetPluginStoragePublicationRevision();
+                },
+            );
+        } else if (action === 'delete') {
+            if (!issue.canDelete || !issue.externalAvailable) {
+                throw new TypeError('The delete recovery action is unavailable.');
+            }
+            const valueDeletes = [];
+            const metaDeletes = [];
+            const deleteKeys = [issue.encodedKey];
+            if (issue.prefix === PLUGIN_SAVE_PREFIX) {
+                valueDeletes.push(issue.encodedKey);
+                if (issue.rawKey !== null) {
+                    const ownerKey = encodePluginSaveStorageKey(issue.rawKey, PLUGIN_SAVE_META_PREFIX);
+                    metaDeletes.push(ownerKey);
+                    if (kvSize(ownerKey) !== null) deleteKeys.push(ownerKey);
+                }
+            } else if (issue.prefix === PLUGIN_SAVE_META_PREFIX) {
+                metaDeletes.push(issue.encodedKey);
+            }
+            if (inspection.context.generation) {
+                manifestUpdate = preparePluginStorageRecoveryManifestUpdate(inspection, {
+                    valueDeletes,
+                    metaDeletes,
+                });
+            }
+            withPluginStorageQuotaPlan(
+                deleteKeys
+                    .filter(key => key.startsWith(PLUGIN_SAVE_PREFIX))
+                    .map(key => ({ key, size: null })),
+                () => {
+                    for (const key of deleteKeys) kvDel(key);
+                    if (manifestUpdate) {
+                        committedManifestBytes = writePluginStorageManifest(manifestUpdate.manifest);
+                    }
+                    markPluginRecoverySnapshotDirty(recoverySnapshotToken);
+                    committedPublicationRevision = kvGetPluginStoragePublicationRevision();
+                },
+            );
+        } else {
+            throw new TypeError('Unknown plugin storage recovery action.');
+        }
+    })();
+
+    if (manifestUpdate) {
+        pluginStorageManifestCache.publishPrepared(manifestUpdate, {
+            revision: committedPublicationRevision,
+            manifestRevision: `sha256:${sha256Hex(committedManifestBytes)}`,
+        });
+    }
+    schedulePluginRecoverySnapshot();
 }
 
 function pluginStorageNamespaceConflict(message) {
@@ -11947,6 +12369,191 @@ app.post('/api/plugin-storage/reconcile-boot', async (req, res, next) => {
             });
         }
         next(error);
+    }
+});
+
+app.get('/api/plugin-storage/recovery', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    try {
+        const inspection = await queueStorageReadAfterImports(
+            () => inspectOptimizedPluginStorageRecoveryManagement(),
+        );
+        res.setHeader('Cache-Control', 'no-store');
+        return res.json(publicOptimizedPluginStorageRecoveryManagementInspection(inspection));
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.get('/api/plugin-storage/recovery/download', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    const encodedKey = req.query.encodedKey;
+    const token = req.query.token;
+    if (typeof encodedKey !== 'string' || encodedKey.length === 0
+        || typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) {
+        return res.status(400).json({
+            success: false,
+            code: 'INVALID_PLUGIN_STORAGE_RECOVERY_REQUEST',
+            error: 'A recovery issue key and token are required.',
+            retryable: false,
+        });
+    }
+    if (!databaseSpoolReady) {
+        return res.status(503).json({
+            success: false,
+            code: 'PLUGIN_STORAGE_RECOVERY_DOWNLOAD_UNAVAILABLE',
+            error: 'The recovery download spool is unavailable.',
+            retryable: true,
+        });
+    }
+
+    const spoolPath = path.join(
+        databaseSpoolDir,
+        `${PLUGIN_RECOVERY_DOWNLOAD_SPOOL_FILE_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}.bin`,
+    );
+    const requestAbort = new AbortController();
+    const abortDownload = () => {
+        if (!res.writableFinished && !requestAbort.signal.aborted) {
+            requestAbort.abort(new DOMException(
+                'Plugin storage recovery download closed',
+                'AbortError',
+            ));
+        }
+    };
+    req.once('aborted', abortDownload);
+    res.once('close', abortDownload);
+    let prepared = null;
+    try {
+        prepared = await queueStorageReadAfterImports(async () => {
+            const inspection = await inspectOptimizedPluginStorageRecoveryManagement();
+            const issue = findOptimizedPluginStorageRecoveryManagementIssue(
+                inspection,
+                encodedKey,
+                token,
+            );
+            if (!issue || !issue.externalAvailable) return null;
+            const digest = nodeCrypto.createHash('sha256');
+            const row = await kvWriteToFile(encodedKey, spoolPath, {
+                signal: requestAbort.signal,
+                onBytes: bytes => digest.update(bytes),
+            });
+            if (!row || row.size !== issue.externalSize
+                || digest.digest('hex') !== issue.externalHash) {
+                await fs.unlink(spoolPath).catch(() => {});
+                return null;
+            }
+            await fs.chmod(spoolPath, 0o600);
+            return {
+                size: row.size,
+                sha256: issue.externalHash,
+                filename: `plugin-storage-recovery-${sha256Hex(Buffer.from(encodedKey, 'utf-8')).slice(0, 12)}.bin`,
+            };
+        }, requestAbort.signal);
+        if (!prepared) {
+            return res.status(409).json({
+                success: false,
+                code: 'PLUGIN_STORAGE_RECOVERY_STALE',
+                error: 'The affected row changed; refresh recovery details before downloading it.',
+                retryable: true,
+            });
+        }
+        res.status(200);
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Length', String(prepared.size));
+        res.setHeader('Content-Disposition', `attachment; filename="${prepared.filename}"`);
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('X-Content-SHA256', prepared.sha256);
+        await pipeline(createReadStream(spoolPath), res);
+    } catch (error) {
+        if (!res.headersSent) next(error);
+        else if (!res.destroyed) res.destroy(error);
+    } finally {
+        req.removeListener('aborted', abortDownload);
+        res.removeListener('close', abortDownload);
+        await fs.unlink(spoolPath).catch(() => {});
+    }
+});
+
+app.post('/api/plugin-storage/recovery/resolve', async (req, res, next) => {
+    if (!await checkAuth(req, res)) return;
+    if (!checkActiveSession(req, res)) return;
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).length !== 3
+        || Object.keys(body).some(key => !['encodedKey', 'token', 'action'].includes(key))
+        || typeof body.encodedKey !== 'string' || body.encodedKey.length === 0
+        || typeof body.token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(body.token)
+        || (body.action !== 'use-inline' && body.action !== 'delete')) {
+        return res.status(400).json({
+            success: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+            code: 'INVALID_PLUGIN_STORAGE_RECOVERY_REQUEST',
+            error: 'The recovery resolution request is invalid.',
+            retryable: false,
+        });
+    }
+
+    try {
+        const result = await queueStorageMutation(async () => {
+            const inspection = await inspectOptimizedPluginStorageRecoveryManagement();
+            const issue = findOptimizedPluginStorageRecoveryManagementIssue(
+                inspection,
+                body.encodedKey,
+                body.token,
+            );
+            if (!issue) return { stale: true };
+            if ((body.action === 'use-inline' && !issue.canUseInline)
+                || (body.action === 'delete' && !issue.canDelete)) {
+                return { unavailable: true };
+            }
+            try {
+                resolveOptimizedPluginStorageRecoveryIssue(inspection, issue, body.action);
+            } catch (error) {
+                if (error?.pluginStorageRecoveryStale) return { stale: true };
+                throw error;
+            }
+            return { committed: true };
+        });
+        if (result.stale) {
+            return res.status(409).json({
+                success: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+                code: 'PLUGIN_STORAGE_RECOVERY_STALE',
+                error: 'The affected row changed; refresh recovery details before continuing.',
+                retryable: true,
+            });
+        }
+        if (result.unavailable) {
+            return res.status(409).json({
+                success: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+                code: 'PLUGIN_STORAGE_RECOVERY_ACTION_UNAVAILABLE',
+                error: 'That recovery action is no longer available.',
+                retryable: true,
+            });
+        }
+        return res.json({
+            success: true,
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+            action: body.action,
+            encodedKey: body.encodedKey,
+        });
+    } catch (error) {
+        if (isImportInProgressError(error)) return sendImportBusy(res);
+        logger.warn('[PluginStorageRecovery] Recovery action rolled back:', error);
+        return res.status(500).json({
+            success: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+            code: 'PLUGIN_STORAGE_RECOVERY_ROLLED_BACK',
+            error: 'The recovery action rolled back without changing plugin storage.',
+            retryable: false,
+        });
     }
 });
 

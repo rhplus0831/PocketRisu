@@ -24,6 +24,31 @@ const mutationSuccess = vi.hoisted(() => vi.fn())
 const mutationWarning = vi.hoisted(() => vi.fn())
 const transitionStorageMode = vi.hoisted(() => vi.fn())
 const setLoadingOverlay = vi.hoisted(() => vi.fn())
+const legacyReconcile = vi.hoisted(() => vi.fn())
+const modernReconcile = vi.hoisted(() => vi.fn())
+const inspectRecovery = vi.hoisted(() => vi.fn())
+const downloadRecovery = vi.hoisted(() => vi.fn())
+const resolveRecovery = vi.hoisted(() => vi.fn())
+const openSettingsMock = vi.hoisted(() => vi.fn())
+const recoveryHarness = vi.hoisted(() => {
+    type Recovery = null | {
+        direction: 'externalize' | 'internalize'
+        issues: Array<{ code: string, encodedKey: string }>
+    }
+    let value: Recovery = null
+    const subscribers = new Set<(next: Recovery) => void>()
+    return {
+        subscribe(run: (next: Recovery) => void) {
+            subscribers.add(run)
+            run(value)
+            return () => subscribers.delete(run)
+        },
+        set(next: Recovery) {
+            value = next
+            for (const run of subscribers) run(value)
+        },
+    }
+})
 
 vi.mock('src/ts/stores.svelte', () => ({
     DBState: { db: pluginDatabase },
@@ -67,18 +92,30 @@ vi.mock('src/ts/plugins/pluginMemoryOptimization', () => ({
 }))
 
 vi.mock('src/ts/plugins/pluginSaveStorage', () => ({
-    reconcilePluginStorageModeForBoot: vi.fn(),
+    reconcilePluginStorageModeForBoot: legacyReconcile,
     transitionPluginStorageMode: transitionStorageMode,
 }))
 
 vi.mock('src/ts/plugins/pluginStorageRecovery', () => ({
-    createPluginStorageRecoveryDiagnostic: vi.fn(),
-    pluginStorageRecoveryStore: {
-        subscribe(run: (value: null) => void) {
-            run(null)
-            return () => undefined
-        },
+    createPluginStorageRecoveryDiagnostic: vi.fn(() => 'encoded diagnostics'),
+    pluginStorageRecoveryStore: recoveryHarness,
+    setPluginStorageRecoveryState: recoveryHarness.set,
+}))
+
+vi.mock('src/ts/globalApi.svelte', async importOriginal => ({
+    ...await importOriginal<typeof import('src/ts/globalApi.svelte')>(),
+    forageStorage: {
+        reconcileOptimizedPluginStorageForBoot: modernReconcile,
+        getPluginStorageRecoveryManagementInspection: inspectRecovery,
+        downloadPluginStorageRecoveryRow: downloadRecovery,
+        resolvePluginStorageRecoveryIssue: resolveRecovery,
     },
+}))
+
+vi.mock('src/ts/routing', () => ({
+    openSettings: openSettingsMock,
+    SettingsRoute: { System: 22 },
+    SystemTab: { Backups: 1 },
 }))
 
 vi.mock('src/ts/plugins/pluginStorageTransitionUi', () => ({
@@ -122,10 +159,143 @@ afterEach(() => {
     mutationWarning.mockReset()
     transitionStorageMode.mockReset()
     setLoadingOverlay.mockReset()
+    legacyReconcile.mockReset()
+    modernReconcile.mockReset()
+    inspectRecovery.mockReset()
+    downloadRecovery.mockReset()
+    resolveRecovery.mockReset()
+    openSettingsMock.mockReset()
+    recoveryHarness.set(null)
     pluginDatabase.legacyPluginCompatibility = false
     pluginDatabase.optimizePluginMemory = false
     pluginDatabase.autoConvertPluginStorageValues = false
     document.body.replaceChildren()
+})
+
+describe('PluginSettings recovery management', () => {
+    const encodedKey = 'pluginsave/cG1fc3RvcmU.json'
+    const warningState = {
+        direction: 'externalize' as const,
+        issues: [{ code: 'invalid-json', encodedKey }],
+    }
+    const managedIssue = {
+        code: 'invalid-json',
+        encodedKey,
+        kind: 'value',
+        inlineAvailable: true,
+        externalAvailable: true,
+        externalSize: 23,
+        actions: { download: true, useInline: true, delete: false },
+        token: 't'.repeat(43),
+    }
+
+    test('leads with restore points and opens the affected-data manager separately', async () => {
+        recoveryHarness.set(warningState)
+        inspectRecovery.mockResolvedValue({
+            success: true,
+            mode: 'optimized',
+            checkedAt: 123,
+            issues: [managedIssue],
+        })
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginSettings, { target })
+
+        click(buttonWithText(target, 'Restore from restore point'))
+        expect(openSettingsMock).toHaveBeenCalledWith(22, 1)
+
+        click(buttonWithText(target, 'Manage affected data…'))
+        await waitFor(() => {
+            expect(inspectRecovery).toHaveBeenCalledOnce()
+            expect(document.body.textContent).toContain('Manage affected plugin data')
+            expect(document.body.textContent).toContain(encodedKey)
+            expect(buttonWithText(document.body, 'Download raw copy')).toBeTruthy()
+            expect(buttonWithText(document.body, 'Use inline copy')).toBeTruthy()
+        })
+        expect([...document.body.querySelectorAll('button')].some(
+            button => button.textContent?.trim() === 'Delete unrecoverable data',
+        )).toBe(false)
+
+        await unmount(component)
+    })
+
+    test('checks optimized recovery on the server instead of replaying the legacy read path', async () => {
+        pluginDatabase.optimizePluginMemory = true
+        recoveryHarness.set(warningState)
+        modernReconcile.mockResolvedValue({
+            direction: 'externalize',
+            values: 0,
+            meta: 0,
+            issues: warningState.issues,
+            databaseChanged: false,
+            storageChanged: false,
+        })
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginSettings, { target })
+
+        click(buttonWithText(target, 'Check again'))
+
+        await waitFor(() => expect(modernReconcile).toHaveBeenCalledOnce())
+        expect(legacyReconcile).not.toHaveBeenCalled()
+        await waitFor(() => expect(mutationWarning).toHaveBeenCalledWith(
+            '1 affected plugin storage entry is still present. No data was changed.',
+        ))
+
+        await unmount(component)
+    })
+
+    test('requires confirmation before replacing a corrupt row with its inline copy', async () => {
+        pluginDatabase.optimizePluginMemory = true
+        recoveryHarness.set(warningState)
+        inspectRecovery.mockResolvedValue({
+            success: true,
+            mode: 'optimized',
+            checkedAt: 123,
+            issues: [managedIssue],
+        })
+        confirmReset.mockResolvedValue(true)
+        resolveRecovery.mockResolvedValue({
+            success: true,
+            commitOutcome: 'committed',
+            commitOutcomeUnknown: false,
+            action: 'use-inline',
+            encodedKey,
+        })
+        modernReconcile.mockResolvedValue({
+            direction: 'none',
+            values: 0,
+            meta: 0,
+            issues: [],
+            databaseChanged: false,
+            storageChanged: false,
+        })
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginSettings, { target })
+
+        click(buttonWithText(target, 'Manage affected data…'))
+        await waitFor(() => {
+            expect(inspectRecovery).toHaveBeenCalledOnce()
+            expect(buttonWithText(document.body, 'Use inline copy')).toBeTruthy()
+        })
+        click(buttonWithText(document.body, 'Use inline copy'))
+
+        await waitFor(() => expect(resolveRecovery).toHaveBeenCalledWith(
+            managedIssue,
+            'use-inline',
+        ))
+        expect(confirmReset).toHaveBeenCalledWith(expect.stringContaining(encodedKey))
+        await waitFor(() => expect(modernReconcile).toHaveBeenCalledOnce())
+        expect(mutationSuccess).toHaveBeenCalledWith(
+            'Replaced the affected external row with the inline copy.',
+        )
+        await waitFor(() => {
+            expect(document.body.textContent).not.toContain('Manage affected plugin data')
+        })
+
+        await unmount(component)
+    })
 })
 
 describe('PluginSettings storage transition', () => {

@@ -1877,12 +1877,53 @@ export const languageKorean = {
     `플러그인 저장소 조정 문제 ${count}개를 격리했습니다. 앱과 영향을 받지 않은 플러그인은 계속 로드됩니다. 설정 → 플러그인의 복구 패널을 확인하세요.`,
   pluginStorageRecoveryTitle: "플러그인 저장소 복구 필요",
   pluginStorageRecoveryDesc:
-    "자동 조정 중 의심스러운 행을 발견했습니다. PocketRisu는 행을 덮어쓰거나 삭제하지 않고 인라인 및 외부 복사본을 보존했습니다. 일시적인 서버 접근 문제를 해결하거나 백업에서 데이터를 복구한 뒤 다시 시도하세요. 진단 정보에는 인코딩된 키만 포함됩니다.",
-  pluginStorageRecoveryRetry: "조정 다시 시도",
+    "PocketRisu가 하나 이상의 플러그인 저장소 항목을 검증하지 못했습니다. 데이터를 덮어쓰거나 삭제하지 않았습니다. 정상적인 복원 지점에서 복원하는 것이 가장 안전합니다. 사용할 수 있는 복원 지점이 없다면 영향을 받은 데이터를 직접 관리할 수 있습니다. 진단 정보에는 인코딩된 키만 포함됩니다.",
+  pluginStorageRecoveryRestorePoint: "복원 지점에서 복원",
+  pluginStorageRecoveryManage: "영향받은 데이터 관리…",
+  pluginStorageRecoveryCheckAgain: "다시 확인",
   pluginStorageRecoveryCopy: "진단 정보 복사",
   pluginStorageRecoveryRetrySuccess: "플러그인 저장소 조정을 완료했습니다. 격리가 해제되었습니다.",
+  pluginStorageRecoveryStillAffected: (count: number) =>
+    `영향받은 플러그인 저장소 항목 ${count}개가 아직 남아 있습니다. 데이터는 변경되지 않았습니다.`,
+  pluginStorageRecoveryLastChecked: (time: string) => `마지막 확인: ${time}`,
   pluginStorageRecoveryCopySuccess: "인코딩된 키 진단 정보를 복사했습니다.",
   pluginStorageRecoveryCopyFailed: "플러그인 저장소 진단 정보를 복사하지 못했습니다.",
+  pluginStorageRecoveryManagerTitle: "영향받은 플러그인 데이터 관리",
+  pluginStorageRecoveryManagerDesc:
+    "변경하기 전에 정확한 복사본을 다운로드할 수 있습니다. 인라인 복구는 영향을 받은 외부 행을 교체합니다. 사용할 수 있는 인라인 복사본이 없을 때만 삭제할 수 있습니다.",
+  pluginStorageRecoveryManagerLoading: "영향받은 데이터를 검사하는 중…",
+  pluginStorageRecoveryManagerLoadFailed:
+    "영향받은 데이터를 검사하지 못했습니다. 서버 연결을 확인한 뒤 다시 시도하세요.",
+  pluginStorageRecoveryManagerOptimizedOnly:
+    "직접 관리는 최적화된 플러그인 저장소에서 사용할 수 있습니다. 이 복구 상태에서는 복원 지점을 사용하세요.",
+  pluginStorageRecoveryManagerEmpty: "영향받은 최적화 플러그인 저장소 항목이 없습니다.",
+  pluginStorageRecoveryKind: {
+    value: "값",
+    metadata: "소유권 메타데이터",
+    manifest: "매니페스트",
+    storage: "저장소",
+  },
+  pluginStorageRecoveryExternalCopy: "외부 복사본",
+  pluginStorageRecoveryInlineCopy: "인라인 복사본",
+  pluginStorageRecoveryAvailable: "사용 가능",
+  pluginStorageRecoveryUnavailable: "사용 불가",
+  pluginStorageRecoveryDownload: "원본 복사본 다운로드",
+  pluginStorageRecoveryDownloadSuccess: "영향받은 행의 정확한 복사본을 다운로드했습니다.",
+  pluginStorageRecoveryDownloadFailed:
+    "영향받은 행을 다운로드하지 못했습니다. 복구 세부 정보를 새로 고친 뒤 다시 시도하세요.",
+  pluginStorageRecoveryUseInline: "인라인 복사본 사용",
+  pluginStorageRecoveryUseInlineConfirm: (encodedKey: string) =>
+    `영향받은 외부 행을 유효한 인라인 복사본으로 교체할까요?\n\n${encodedKey}\n\n나중에 필요할 수 있다면 먼저 외부 행을 다운로드하세요.`,
+  pluginStorageRecoveryUseInlineSuccess: "영향받은 외부 행을 인라인 복사본으로 교체했습니다.",
+  pluginStorageRecoveryDelete: "복구할 수 없는 데이터 삭제",
+  pluginStorageRecoveryDeleteConfirm: (encodedKey: string) =>
+    `복구할 수 없는 플러그인 저장소 항목을 영구적으로 삭제할까요?\n\n${encodedKey}\n\n이 작업은 되돌릴 수 없습니다. 나중에 필요할 수 있다면 먼저 원본 복사본을 다운로드하세요.`,
+  pluginStorageRecoveryDeleteSuccess: "복구할 수 없는 플러그인 저장소 항목을 삭제했습니다.",
+  pluginStorageRecoveryActionFailed:
+    "복구 작업이 완료되지 않았습니다. 확인되지 않은 작업은 다시 시도하지 않았습니다.",
+  pluginStorageRecoveryNoDirectAction:
+    "이 문제는 직접 복구할 수 없습니다. 정상적인 복원 지점을 사용하거나 서버 접근 문제를 해결한 뒤 다시 확인하세요.",
+  pluginStorageRecoveryRefreshDetails: "세부 정보 새로 고침",
   partialBackupFirstConfirm:
     "⚠️ 경고: 부분 로컬 백업 ⚠️\n\n이 백업은 최소한의 필수 정보만 빠르게 저장하는 기능입니다.\n\n포함되는 것:\n- 데이터베이스 (채팅 기록, 캐릭터, 모듈, 플러그인, 프롬프트, 설정 등)\n- 캐릭터 프로필 아이콘 (메인 이미지)\n- 사용자 아이콘 및 커스텀 배경\n- 페르소나 아이콘\n- 폴더 이미지\n- 봇 프리셋 이미지\n\n⚠️ 포함되지 않는 것:\n- 감정 이미지\n- 추가 캐릭터 에셋\n- VITS 음성 파일\n- 기타 모든 추가 미디어 파일\n\n이 백업 파일에는 모든 캐릭터 에셋이 포함되지 않습니다!\n완전한 백업이 필요하다면 일반 로컬 백업을 사용하세요.\n\n그래도 계속하시겠습니까?",
   partialBackupSecondConfirm:

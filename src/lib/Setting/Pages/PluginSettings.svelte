@@ -1,8 +1,24 @@
 <script lang="ts">
-    import { PlusIcon, TrashIcon, LinkIcon, CodeXmlIcon, PowerIcon, PowerOffIcon, ShieldIcon } from "@lucide/svelte";
+    import {
+        PlusIcon,
+        TrashIcon,
+        LinkIcon,
+        CodeXmlIcon,
+        PowerIcon,
+        PowerOffIcon,
+        ShieldIcon,
+        TriangleAlert,
+        DownloadIcon,
+        RefreshCwIcon,
+        RotateCcwIcon,
+        WrenchIcon,
+        LoaderCircleIcon,
+    } from "@lucide/svelte";
     import { language } from "src/lang";
     import SettingPage from "src/lib/UI/GUI/SettingPage.svelte";
     import ShButton from "src/lib/UI/GUI/ShButton.svelte";
+    import ShDialog from "src/lib/UI/GUI/ShDialog.svelte";
+    import ShBadge from "src/lib/UI/GUI/ShBadge.svelte";
     import {
         alertConfirm,
         alertMd,
@@ -11,9 +27,9 @@
         notifySuccess,
         notifyWarning,
     } from "src/ts/alert";
-    import { TriangleAlert } from '@lucide/svelte';
-
     import { DBState, hotReloading, loadingOverlayStore } from "src/ts/stores.svelte";
+    import { forageStorage } from "src/ts/globalApi.svelte";
+    import { openSettings, SettingsRoute, SystemTab } from "src/ts/routing";
     import {
         checkPluginUpdate,
         createBlankPlugin,
@@ -37,7 +53,6 @@
     import CheckInput from "src/lib/UI/GUI/CheckInput.svelte";
     import TextAreaInput from "src/lib/UI/GUI/TextAreaInput.svelte";
     import { hotReloadPluginFiles } from "src/ts/plugins/apiV3/developMode";
-    import ShBadge from "src/lib/UI/GUI/ShBadge.svelte";
     import {
         canOptimizePluginMemory,
         waitForPluginLifecycleIdle,
@@ -49,12 +64,24 @@
     import {
         createPluginStorageRecoveryDiagnostic,
         pluginStorageRecoveryStore,
+        setPluginStorageRecoveryState,
     } from "src/ts/plugins/pluginStorageRecovery";
     import { formatPluginStorageTransitionBytes } from "src/ts/plugins/pluginStorageTransitionUi";
+    import type {
+        PluginStorageRecoveryManagementInspectionTransport,
+        PluginStorageRecoveryManagementIssueTransport,
+        PluginStorageRecoveryResolutionAction,
+    } from "src/ts/storage/nodeStorage";
 
     let showParams = $state([])
     let reconcilingPluginStorage = $state(false)
     let retryingPluginStorageRecovery = $state(false)
+    let pluginStorageRecoveryManagerOpen = $state(false)
+    let pluginStorageRecoveryManagerLoading = $state(false)
+    let pluginStorageRecoveryManagerError = $state(false)
+    let pluginStorageRecoveryInspection = $state<PluginStorageRecoveryManagementInspectionTransport | null>(null)
+    let pluginStorageRecoveryBusyKey = $state<string | null>(null)
+    let pluginStorageRecoveryLastCheckedAt = $state<number | null>(null)
     let legacyPluginCompatibilityEnabled = $state(
         DBState.db.legacyPluginCompatibility === true,
     )
@@ -197,15 +224,45 @@
         }
     }
 
+    function openPluginStorageRestorePoints() {
+        openSettings(SettingsRoute.System, SystemTab.Backups)
+    }
+
+    async function reconcileCurrentPluginStorageRecovery() {
+        const serverResult = DBState.db.optimizePluginMemory === true
+            ? await forageStorage.reconcileOptimizedPluginStorageForBoot()
+            : null
+        if (serverResult) {
+            setPluginStorageRecoveryState(
+                serverResult.issues.length > 0
+                    ? { direction: "externalize", issues: serverResult.issues }
+                    : null,
+            )
+            if (serverResult.databaseChanged) {
+                // The server cleared recovered inline copies in the same
+                // publication. Discard this stale in-memory database/ETag.
+                location.reload()
+            }
+            return {
+                direction: serverResult.direction,
+                values: serverResult.values,
+                meta: serverResult.meta,
+                issues: serverResult.issues,
+            }
+        }
+        return await reconcilePluginStorageModeForBoot()
+    }
+
     async function retryPluginStorageRecovery() {
         if (retryingPluginStorageRecovery) return
         retryingPluginStorageRecovery = true
         try {
-            const result = await reconcilePluginStorageModeForBoot()
+            const result = await reconcileCurrentPluginStorageRecovery()
+            pluginStorageRecoveryLastCheckedAt = Date.now()
             if (result.issues.length === 0) {
                 notifySuccess(language.pluginStorageRecoveryRetrySuccess)
             } else {
-                notifyWarning(language.pluginStorageRecoveryBootWarning(result.issues.length))
+                notifyWarning(language.pluginStorageRecoveryStillAffected(result.issues.length))
             }
         } catch {
             // Recovery diagnostics must never echo arbitrary exception text:
@@ -213,6 +270,100 @@
             notifyWarning(language.pluginStorageRecoveryBootWarning(1))
         } finally {
             retryingPluginStorageRecovery = false
+        }
+    }
+
+    function formatPluginStorageRecoveryBytes(value: number | null): string {
+        if (value === null) return ""
+        if (value < 1024) return `${value} B`
+        if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+        return `${(value / 1024 / 1024).toFixed(1)} MB`
+    }
+
+    async function loadPluginStorageRecoveryManagement() {
+        pluginStorageRecoveryManagerLoading = true
+        pluginStorageRecoveryManagerError = false
+        try {
+            pluginStorageRecoveryInspection = await forageStorage
+                .getPluginStorageRecoveryManagementInspection()
+        } catch (error) {
+            console.error("[Plugin storage] Could not load recovery management details", error)
+            pluginStorageRecoveryInspection = null
+            pluginStorageRecoveryManagerError = true
+        } finally {
+            pluginStorageRecoveryManagerLoading = false
+        }
+    }
+
+    async function openPluginStorageRecoveryManagement() {
+        pluginStorageRecoveryManagerOpen = true
+        await loadPluginStorageRecoveryManagement()
+    }
+
+    function savePluginStorageRecoveryDownload(
+        download: Awaited<ReturnType<typeof forageStorage.downloadPluginStorageRecoveryRow>>,
+    ) {
+        const url = URL.createObjectURL(download.blob)
+        const anchor = document.createElement("a")
+        anchor.href = url
+        anchor.download = download.filename
+        anchor.rel = "noopener"
+        document.body.append(anchor)
+        anchor.click()
+        anchor.remove()
+        setTimeout(() => URL.revokeObjectURL(url), 0)
+    }
+
+    async function downloadPluginStorageRecoveryIssue(
+        issue: PluginStorageRecoveryManagementIssueTransport,
+    ) {
+        if (!issue.actions.download || pluginStorageRecoveryBusyKey) return
+        pluginStorageRecoveryBusyKey = `download:${issue.encodedKey}`
+        try {
+            savePluginStorageRecoveryDownload(
+                await forageStorage.downloadPluginStorageRecoveryRow(issue),
+            )
+            notifySuccess(language.pluginStorageRecoveryDownloadSuccess)
+        } catch (error) {
+            console.error("[Plugin storage] Could not download affected data", error)
+            notifyError(language.pluginStorageRecoveryDownloadFailed)
+            await loadPluginStorageRecoveryManagement()
+        } finally {
+            pluginStorageRecoveryBusyKey = null
+        }
+    }
+
+    async function resolvePluginStorageRecoveryIssue(
+        issue: PluginStorageRecoveryManagementIssueTransport,
+        action: PluginStorageRecoveryResolutionAction,
+    ) {
+        if (pluginStorageRecoveryBusyKey) return
+        const confirmed = await alertConfirm(
+            action === "use-inline"
+                ? language.pluginStorageRecoveryUseInlineConfirm(issue.encodedKey)
+                : language.pluginStorageRecoveryDeleteConfirm(issue.encodedKey),
+        )
+        if (!confirmed) return
+        pluginStorageRecoveryBusyKey = `${action}:${issue.encodedKey}`
+        try {
+            await forageStorage.resolvePluginStorageRecoveryIssue(issue, action)
+            notifySuccess(
+                action === "use-inline"
+                    ? language.pluginStorageRecoveryUseInlineSuccess
+                    : language.pluginStorageRecoveryDeleteSuccess,
+            )
+            await retryPluginStorageRecovery()
+            if ($pluginStorageRecoveryStore) {
+                await loadPluginStorageRecoveryManagement()
+            } else {
+                pluginStorageRecoveryManagerOpen = false
+            }
+        } catch (error) {
+            console.error("[Plugin storage] Recovery action failed", error)
+            notifyError(language.pluginStorageRecoveryActionFailed)
+            await loadPluginStorageRecoveryManagement()
+        } finally {
+            pluginStorageRecoveryBusyKey = null
         }
     }
 
@@ -324,16 +475,181 @@
             <ShButton
                 size="sm"
                 variant="primary"
+                onclick={openPluginStorageRestorePoints}
+            >
+                <RotateCcwIcon size={14} />
+                {language.pluginStorageRecoveryRestorePoint}
+            </ShButton>
+            <ShButton
+                size="sm"
+                variant="outline"
+                onclick={openPluginStorageRecoveryManagement}
+            >
+                <WrenchIcon size={14} />
+                {language.pluginStorageRecoveryManage}
+            </ShButton>
+            <ShButton
+                size="sm"
+                variant="ghost"
                 onclick={retryPluginStorageRecovery}
                 disabled={retryingPluginStorageRecovery}
             >
-                {language.pluginStorageRecoveryRetry}
+                <RefreshCwIcon size={14} class={retryingPluginStorageRecovery ? "animate-spin" : ""} />
+                {language.pluginStorageRecoveryCheckAgain}
             </ShButton>
-            <ShButton size="sm" variant="outline" onclick={copyPluginStorageRecoveryDiagnostic}>
+            <ShButton size="sm" variant="ghost" onclick={copyPluginStorageRecoveryDiagnostic}>
                 {language.pluginStorageRecoveryCopy}
             </ShButton>
         </div>
+        {#if pluginStorageRecoveryLastCheckedAt !== null}
+            <p class="mt-2 text-xs text-textcolor2">
+                {language.pluginStorageRecoveryLastChecked(
+                    new Date(pluginStorageRecoveryLastCheckedAt).toLocaleTimeString(),
+                )}
+            </p>
+        {/if}
     </div>
+{/if}
+
+{#if pluginStorageRecoveryManagerOpen}
+    <ShDialog
+        bind:open={pluginStorageRecoveryManagerOpen}
+        size="lg"
+        tier="base"
+        closeOnEscape={true}
+        closeOnOutsideClick={pluginStorageRecoveryBusyKey === null}
+    >
+    {#snippet title()}{language.pluginStorageRecoveryManagerTitle}{/snippet}
+    {#snippet description()}{language.pluginStorageRecoveryManagerDesc}{/snippet}
+
+    {#if pluginStorageRecoveryManagerLoading}
+        <div class="flex items-center justify-center gap-2 py-10 text-sm text-textcolor2">
+            <LoaderCircleIcon size={18} class="animate-spin" />
+            {language.pluginStorageRecoveryManagerLoading}
+        </div>
+    {:else if pluginStorageRecoveryManagerError}
+        <div class="rounded-md border border-draculared/40 bg-draculared/10 p-3 text-sm text-red-300">
+            {language.pluginStorageRecoveryManagerLoadFailed}
+        </div>
+    {:else if pluginStorageRecoveryInspection?.mode !== "optimized"}
+        <div class="rounded-md border border-darkborderc bg-darkbg/40 p-3 text-sm text-textcolor2">
+            {language.pluginStorageRecoveryManagerOptimizedOnly}
+        </div>
+    {:else if pluginStorageRecoveryInspection.issues.length === 0}
+        <div class="rounded-md border border-success/40 bg-success/10 p-3 text-sm text-success">
+            {language.pluginStorageRecoveryManagerEmpty}
+        </div>
+    {:else}
+        <div class="max-h-[55vh] overflow-y-auto rounded-md border border-darkborderc bg-darkbg/30">
+            {#each pluginStorageRecoveryInspection.issues as issue, index (`${issue.code}:${issue.encodedKey}:${issue.token}`)}
+                <div class="p-3 {index > 0 ? 'border-t border-darkborderc/60' : ''}">
+                    <div class="flex flex-wrap items-start justify-between gap-2">
+                        <div class="min-w-0 flex-1">
+                            <div class="flex flex-wrap items-center gap-2">
+                                <ShBadge variant="warning">{issue.code}</ShBadge>
+                                <ShBadge variant="outline">
+                                    {language.pluginStorageRecoveryKind[issue.kind]}
+                                </ShBadge>
+                                {#if issue.externalSize !== null}
+                                    <span class="text-xs text-textcolor2 tabular-nums">
+                                        {formatPluginStorageRecoveryBytes(issue.externalSize)}
+                                    </span>
+                                {/if}
+                            </div>
+                            <div class="mt-2 break-all font-mono text-xs text-textcolor2">
+                                {issue.encodedKey}
+                            </div>
+                            <div class="mt-2 flex flex-wrap gap-2 text-xs text-textcolor2">
+                                <span>
+                                    {language.pluginStorageRecoveryExternalCopy}:
+                                    {issue.externalAvailable
+                                        ? language.pluginStorageRecoveryAvailable
+                                        : language.pluginStorageRecoveryUnavailable}
+                                </span>
+                                <span>
+                                    {language.pluginStorageRecoveryInlineCopy}:
+                                    {issue.inlineAvailable
+                                        ? language.pluginStorageRecoveryAvailable
+                                        : language.pluginStorageRecoveryUnavailable}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mt-3 flex flex-wrap gap-2">
+                        {#if issue.actions.download}
+                            <ShButton
+                                size="xs"
+                                variant="outline"
+                                onclick={() => downloadPluginStorageRecoveryIssue(issue)}
+                                disabled={pluginStorageRecoveryBusyKey !== null}
+                            >
+                                {#if pluginStorageRecoveryBusyKey === `download:${issue.encodedKey}`}
+                                    <LoaderCircleIcon size={13} class="animate-spin" />
+                                {:else}
+                                    <DownloadIcon size={13} />
+                                {/if}
+                                {language.pluginStorageRecoveryDownload}
+                            </ShButton>
+                        {/if}
+                        {#if issue.actions.useInline}
+                            <ShButton
+                                size="xs"
+                                variant="primary"
+                                onclick={() => resolvePluginStorageRecoveryIssue(issue, "use-inline")}
+                                disabled={pluginStorageRecoveryBusyKey !== null}
+                            >
+                                {#if pluginStorageRecoveryBusyKey === `use-inline:${issue.encodedKey}`}
+                                    <LoaderCircleIcon size={13} class="animate-spin" />
+                                {:else}
+                                    <RotateCcwIcon size={13} />
+                                {/if}
+                                {language.pluginStorageRecoveryUseInline}
+                            </ShButton>
+                        {/if}
+                        {#if issue.actions.delete}
+                            <ShButton
+                                size="xs"
+                                variant="destructive"
+                                onclick={() => resolvePluginStorageRecoveryIssue(issue, "delete")}
+                                disabled={pluginStorageRecoveryBusyKey !== null}
+                            >
+                                {#if pluginStorageRecoveryBusyKey === `delete:${issue.encodedKey}`}
+                                    <LoaderCircleIcon size={13} class="animate-spin" />
+                                {:else}
+                                    <TrashIcon size={13} />
+                                {/if}
+                                {language.pluginStorageRecoveryDelete}
+                            </ShButton>
+                        {/if}
+                        {#if !issue.actions.download && !issue.actions.useInline && !issue.actions.delete}
+                            <span class="text-xs text-textcolor2">
+                                {language.pluginStorageRecoveryNoDirectAction}
+                            </span>
+                        {/if}
+                    </div>
+                </div>
+            {/each}
+        </div>
+    {/if}
+
+    {#snippet footer()}
+        <ShButton
+            variant="outline"
+            onclick={loadPluginStorageRecoveryManagement}
+            disabled={pluginStorageRecoveryManagerLoading || pluginStorageRecoveryBusyKey !== null}
+        >
+            <RefreshCwIcon size={14} class={pluginStorageRecoveryManagerLoading ? "animate-spin" : ""} />
+            {language.pluginStorageRecoveryRefreshDetails}
+        </ShButton>
+        <ShButton
+            onclick={() => { pluginStorageRecoveryManagerOpen = false }}
+            disabled={pluginStorageRecoveryBusyKey !== null}
+        >
+            {language.close}
+        </ShButton>
+    {/snippet}
+    </ShDialog>
 {/if}
 
 <section

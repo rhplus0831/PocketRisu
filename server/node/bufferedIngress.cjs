@@ -136,6 +136,7 @@ const WRITER_ROUTES = new Set([
     'POST /api/plugin-storage/clear',
     'POST /api/inlays/delete-unreferenced',
     'POST /api/plugin-storage/reconcile-boot',
+    'POST /api/plugin-storage/recovery/resolve',
     'POST /api/plugin-storage/batch',
     'POST /api/plugin-storage/mutate',
     'DELETE /api/logs',

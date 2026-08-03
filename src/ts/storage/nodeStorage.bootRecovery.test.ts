@@ -682,6 +682,147 @@ describe('NodeStorage boot snapshot recovery', () => {
         expect(fetchMock).not.toHaveBeenCalled()
     })
 
+    it('accepts only encoded-key recovery inspection metadata', async () => {
+        const encodedKey = 'pluginsave/corrupt.json'
+        const token = 't'.repeat(43)
+        const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            expect(String(input)).toBe('/api/plugin-storage/recovery')
+            expect(init?.method).toBe('GET')
+            return new Response(JSON.stringify({
+                success: true,
+                mode: 'optimized',
+                checkedAt: 123,
+                issues: [{
+                    code: 'invalid-json',
+                    encodedKey,
+                    kind: 'value',
+                    inlineAvailable: true,
+                    externalAvailable: true,
+                    externalSize: 17,
+                    actions: { download: true, useInline: true, delete: false },
+                    token,
+                }],
+            }), { status: 200, headers: { 'content-type': 'application/json' } })
+        })
+        vi.stubGlobal('fetch', fetchMock)
+
+        await expect(readyStorage().getPluginStorageRecoveryManagementInspection())
+            .resolves.toEqual({
+                success: true,
+                mode: 'optimized',
+                checkedAt: 123,
+                issues: [{
+                    code: 'invalid-json',
+                    encodedKey,
+                    kind: 'value',
+                    inlineAvailable: true,
+                    externalAvailable: true,
+                    externalSize: 17,
+                    actions: { download: true, useInline: true, delete: false },
+                    token,
+                }],
+            })
+        expect(fetchMock).toHaveBeenCalledOnce()
+    })
+
+    it('verifies recovery download bytes before returning a file', async () => {
+        const encodedKey = 'pluginsave/corrupt.json'
+        const token = 'u'.repeat(43)
+        const corrupt = new Uint8Array([0xff, 0x00, 0x7b, 0x01])
+        const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+            const requestUrl = new URL(String(input), 'https://example.test')
+            expect(requestUrl.pathname).toBe('/api/plugin-storage/recovery/download')
+            expect(requestUrl.searchParams.get('encodedKey')).toBe(encodedKey)
+            expect(requestUrl.searchParams.get('token')).toBe(token)
+            return new Response(corrupt, {
+                status: 200,
+                headers: {
+                    'content-length': String(corrupt.length),
+                    'content-disposition': 'attachment; filename="recovery-safe.bin"',
+                    'x-content-sha256': 'a'.repeat(64),
+                },
+            })
+        })
+        vi.stubGlobal('fetch', fetchMock)
+
+        const result = await readyStorage().downloadPluginStorageRecoveryRow({
+            encodedKey,
+            token,
+        })
+
+        expect(result.filename).toBe('recovery-safe.bin')
+        expect(result.sha256).toBe('a'.repeat(64))
+        expect(new Uint8Array(await result.blob.arrayBuffer())).toEqual(corrupt)
+        expect(resourceCache.sha256OwnedBytes).toHaveBeenCalledWith(corrupt)
+    })
+
+    it('rejects a recovery download whose bytes do not match the server hash', async () => {
+        vi.mocked(resourceCache.sha256OwnedBytes).mockResolvedValueOnce('b'.repeat(64))
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), {
+            status: 200,
+            headers: {
+                'content-length': '3',
+                'x-content-sha256': 'a'.repeat(64),
+            },
+        })))
+
+        await expect(readyStorage().downloadPluginStorageRecoveryRow({
+            encodedKey: 'pluginsave/corrupt.json',
+            token: 'v'.repeat(43),
+        })).rejects.toMatchObject({
+            code: 'STORAGE_RESPONSE_ERROR',
+            operation: 'read',
+        } satisfies Partial<InstanceType<typeof StorageError>>)
+    })
+
+    it('verifies recovery downloads without Web Crypto on plain HTTP clients', async () => {
+        const bytes = new Uint8Array([9, 8, 7, 6])
+        const expectedHash = crypto.createHash('sha256').update(bytes).digest('hex')
+        vi.stubGlobal('crypto', {})
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(bytes, {
+            status: 200,
+            headers: {
+                'content-length': String(bytes.length),
+                'x-content-sha256': expectedHash,
+            },
+        })))
+
+        await expect(readyStorage().downloadPluginStorageRecoveryRow({
+            encodedKey: 'pluginsave/plain-http.json',
+            token: 'x'.repeat(43),
+        })).resolves.toMatchObject({ sha256: expectedHash })
+        expect(resourceCache.sha256OwnedBytes).not.toHaveBeenCalled()
+    })
+
+    it('sends one explicit recovery mutation and requires its exact acknowledgement', async () => {
+        const encodedKey = 'pluginsave/corrupt.json'
+        const token = 'w'.repeat(43)
+        const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            expect(String(input)).toBe('/api/plugin-storage/recovery/resolve')
+            expect(init?.method).toBe('POST')
+            expect(JSON.parse(String(init?.body))).toEqual({
+                encodedKey,
+                token,
+                action: 'delete',
+            })
+            return new Response(JSON.stringify({
+                success: true,
+                commitOutcome: 'committed',
+                commitOutcomeUnknown: false,
+                action: 'delete',
+                encodedKey,
+            }), { status: 200, headers: { 'content-type': 'application/json' } })
+        })
+        vi.stubGlobal('fetch', fetchMock)
+
+        await expect(readyStorage().resolvePluginStorageRecoveryIssue(
+            { encodedKey, token },
+            'delete',
+        )).resolves.toMatchObject({ action: 'delete', encodedKey })
+        expect(fetchMock).toHaveBeenCalledOnce()
+        expect(resourceCache.invalidateResourceCachePrefix).toHaveBeenCalledTimes(2)
+    })
+
     it('accepts only the complete committed restore acknowledgement', async () => {
         const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
             expect(String(input)).toBe('/api/db/snapshots/restore')
