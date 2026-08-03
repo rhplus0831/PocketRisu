@@ -176,7 +176,12 @@ the exact stored byte sequence; headers carry `json-v1` plus its content type, b
 length, SHA-256 content digest, opaque row revision/generation, and selected publication
 generation/manifest revision. A proven absence is `204` with the publication identity
 and no row metadata. The browser verifies the header-bound length/digest and parses the
-stored JSON bytes directly. The retained `/api/plugin-storage/state` JSON/base64 response
+stored JSON bytes directly. A valid same-generation publication identity also refreshes
+the browser's manifest-revision token and invalidates a differently stamped ownership
+snapshot without eagerly refetching it. A generation-pinned raw read requires a paired,
+well-formed publication identity for that generation; missing, malformed, or mismatched
+headers are a malformed storage response rather than a proven absence. The retained
+`/api/plugin-storage/state` JSON/base64 response carries the same publication headers and
 remains available to an old client during build-upgrade recovery, but current clients do
 not probe or negotiate between the two routes.
 
@@ -197,6 +202,17 @@ response may likewise include `currentGeneration` and `currentManifestRevision` 
 server can prove a valid live optimized publication. A same-generation echo can drive the
 next bounded retry directly. Missing echoes retain compatibility with older servers: the
 browser drops its token and performs the existing state GET before the next attempt.
+
+An optimized manifest snapshot is cached together with the `manifestRevision` from which
+its exact value, owner, and key-mapping ownership was built. When a compact CAS commits
+against that same stamped predecessor and echoes its successor revision, the browser
+applies only the successfully committed operations it can derive exactly and restamps the
+snapshot. Missing echoes, generation changes, unknown outcomes, legacy full-manifest
+writes, and any ambiguous key-set effect retain the conservative full invalidation path.
+`keys()` remains fresh-verified on every call: it compares the stamp with the lightweight
+manifest-state response and reuses ownership only on equality, otherwise fetching a new
+full manifest snapshot. Thus external imports or rewrites remain observable without an
+unconditional snapshot scan.
 
 The authenticated session advertises a generic per-value ceiling plus separate framed
 batch and transition capabilities. Ordinary writes preflight the generic ceiling;
@@ -241,6 +257,10 @@ the head stayed unchanged.
   acknowledgement omissions, database replacement, and generation changes invalidate the
   client token; conflict retries remain bounded and fall back to the authoritative
   manifest-state read when no same-generation echo is available.
+- Ownership-delta publication uses the same local key-set generation comparison as
+  ownership reads. A concurrent mutation, a snapshot without a matching predecessor
+  stamp, or a database/generation change prevents restamping and falls back to
+  invalidation; a client-derived mapping is added only for a key in its committed write.
 - Generic `/api/write` and `/api/remove` paths must not mutate manifest-owned rows, and
   JSON Patch must not change optimized rows or publication controls. To preserve the
   original inline save behavior, database patches may update `pluginCustomStorage` and

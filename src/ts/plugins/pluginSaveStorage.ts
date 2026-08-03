@@ -118,6 +118,7 @@ interface PluginStorageOwnership {
     manifestValid: boolean;
     valueKeys: string[];
     metaKeys: string[];
+    manifestRevision?: string;
 }
 
 export const PLUGIN_STORAGE_TRANSITION_WAIT_TIMEOUT_MS = 30_000;
@@ -254,12 +255,15 @@ let storageEnumerationSnapshot: {
     generation: number;
     keys: string[];
 } | null = null;
-let storageOwnershipSnapshot: {
+interface PluginStorageOwnershipSnapshot {
     database: Database;
     generation: string;
     keySetGeneration: number;
+    manifestRevision: string;
     ownership: PluginStorageOwnership;
-} | null = null;
+}
+
+let storageOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null;
 const manifestRevisionCache = new WeakMap<Database, {
     generation: string;
     manifestRevision: string;
@@ -327,6 +331,29 @@ function invalidateManifestRevisionAfterError(db: Database, error: unknown): voi
     }
 }
 
+function observePluginStoragePublication(
+    db: Database,
+    publicationGeneration: string | null,
+    publicationRevision: string | null,
+    keySetGeneration: number,
+): void {
+    if (getDatabase() !== db
+        || db.optimizePluginMemory !== true
+        || db.pluginStorageGeneration !== publicationGeneration
+        || getPluginStorageKeySetGeneration() !== keySetGeneration
+        || publicationGeneration === null
+        || publicationRevision === null
+        || !PLUGIN_STORAGE_REVISION_PATTERN.test(publicationRevision)) return;
+    recordManifestRevision(db, publicationGeneration, publicationRevision);
+    if (storageOwnershipSnapshot?.database === db
+        && storageOwnershipSnapshot.generation === publicationGeneration
+        && storageOwnershipSnapshot.keySetGeneration === keySetGeneration
+        && storageOwnershipSnapshot.manifestRevision !== publicationRevision) {
+        storageOwnershipSnapshot = null;
+        storageEnumerationSnapshot = null;
+    }
+}
+
 async function recordOptimizedMutationAcknowledgement(
     db: Database,
     generation: string,
@@ -341,10 +368,19 @@ async function recordOptimizedMutationAcknowledgement(
     }
 }
 
-function invalidateStorageEnumerationSnapshot(): void {
+function invalidateStorageEnumerationSnapshot(
+    retainedOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null,
+): void {
     storageEnumerationSnapshot = null;
-    storageOwnershipSnapshot = null;
+    const previousKeySetGeneration = getPluginStorageKeySetGeneration();
     markPluginStorageKeySetChanged();
+    if (retainedOwnershipSnapshot
+        && storageOwnershipSnapshot === retainedOwnershipSnapshot
+        && retainedOwnershipSnapshot.keySetGeneration === previousKeySetGeneration) {
+        retainedOwnershipSnapshot.keySetGeneration = getPluginStorageKeySetGeneration();
+    } else {
+        storageOwnershipSnapshot = null;
+    }
 }
 
 /**
@@ -703,6 +739,99 @@ function mergedPluginStorageKeyMappings(
     return [...mappings].filter(([component]) => declared.has(component));
 }
 
+function applyCommittedPluginStorageOwnershipDelta(
+    db: Database,
+    generation: string,
+    expectedManifestRevision: string,
+    committedManifestRevision: string | undefined,
+    operations: readonly PersistentPluginStorageBatchOperation[],
+    keySetGeneration: number,
+): PluginStorageOwnershipSnapshot | null {
+    if (typeof committedManifestRevision !== "string"
+        || !PLUGIN_STORAGE_REVISION_PATTERN.test(committedManifestRevision)) return null;
+    const snapshot = storageOwnershipSnapshot;
+    if (!snapshot
+        || snapshot.database !== db
+        || snapshot.generation !== generation
+        || snapshot.manifestRevision !== expectedManifestRevision
+        || snapshot.keySetGeneration !== keySetGeneration
+        || getPluginStorageKeySetGeneration() !== keySetGeneration
+        || getDatabase() !== db
+        || db.optimizePluginMemory !== true
+        || db.pluginStorageGeneration !== generation
+        || !snapshot.ownership.manifestPresent
+        || !snapshot.ownership.manifestValid
+        || snapshot.ownership.manifest?.generation !== generation) return null;
+
+    try {
+        const manifestValueKeys = new Set(snapshot.ownership.manifest.valueKeys);
+        const manifestMetaKeys = new Set(snapshot.ownership.manifest.metaKeys);
+        const physicalValueKeys = new Set(snapshot.ownership.valueKeys);
+        const physicalMetaKeys = new Set(snapshot.ownership.metaKeys);
+        const rawKeys: string[] = [];
+        for (const operation of operations) {
+            const valueKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_PREFIX,
+                operation.key,
+            );
+            const metaKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_META_PREFIX,
+                operation.key,
+            );
+            rawKeys.push(operation.key);
+            if (operation.operation === "set") {
+                manifestValueKeys.add(valueKey);
+                physicalValueKeys.add(valueKey);
+                if (operation.owner) {
+                    manifestMetaKeys.add(metaKey);
+                    physicalMetaKeys.add(metaKey);
+                } else {
+                    manifestMetaKeys.delete(metaKey);
+                    physicalMetaKeys.delete(metaKey);
+                }
+            } else {
+                manifestValueKeys.delete(valueKey);
+                manifestMetaKeys.delete(metaKey);
+                physicalValueKeys.delete(valueKey);
+                physicalMetaKeys.delete(metaKey);
+            }
+        }
+        const keyMappings = mergedPluginStorageKeyMappings(
+            snapshot.ownership.manifest,
+            rawKeys,
+            manifestValueKeys,
+            manifestMetaKeys,
+        );
+        const manifest = buildPluginStorageManifest(
+            generation,
+            manifestValueKeys,
+            manifestMetaKeys,
+            keyMappings,
+        );
+        const ownership: PluginStorageOwnership = {
+            manifest,
+            manifestPresent: true,
+            manifestValid: true,
+            valueKeys: [...physicalValueKeys],
+            metaKeys: [...physicalMetaKeys],
+            manifestRevision: committedManifestRevision,
+        };
+        const nextSnapshot: PluginStorageOwnershipSnapshot = {
+            database: db,
+            generation,
+            keySetGeneration,
+            manifestRevision: committedManifestRevision,
+            ownership,
+        };
+        storageOwnershipSnapshot = nextSnapshot;
+        return nextSnapshot;
+    } catch {
+        // The server commit is already authoritative. Any local derivation
+        // doubt must degrade to the existing full-snapshot refresh behavior.
+        return null;
+    }
+}
+
 async function resolvePluginStorageOwnership(
     db: Database,
     listedValueKeys: string[],
@@ -790,6 +919,7 @@ async function readCurrentOwnership(
             manifestValid: true,
             valueKeys: snapshot.valueKeys,
             metaKeys: snapshot.metaKeys,
+            manifestRevision: snapshot.manifestRevision,
         };
     }
     const [valueKeys, metaKeys] = await Promise.all([
@@ -841,15 +971,56 @@ async function readCachedCurrentOwnership(
         return clonePluginStorageOwnership(storageOwnershipSnapshot.ownership);
     }
     const ownership = await readCurrentOwnership(db, signal);
-    if (generation && keySetGeneration === getPluginStorageKeySetGeneration()) {
+    if (generation
+        && ownership.manifestRevision
+        && getDatabase() === db
+        && db.optimizePluginMemory === true
+        && db.pluginStorageGeneration === generation
+        && keySetGeneration === getPluginStorageKeySetGeneration()) {
         storageOwnershipSnapshot = {
             database: db,
             generation,
             keySetGeneration,
+            manifestRevision: ownership.manifestRevision,
             ownership: clonePluginStorageOwnership(ownership),
         };
+        recordManifestRevision(db, generation, ownership.manifestRevision);
     }
     return ownership;
+}
+
+async function readFreshVerifiedPluginStorageOwnership(
+    db: Database,
+    signal?: AbortSignal | null,
+): Promise<PluginStorageOwnership> {
+    const generation = db.optimizePluginMemory === true
+        ? db.pluginStorageGeneration
+        : undefined;
+    const keySetGeneration = getPluginStorageKeySetGeneration();
+    const snapshot = storageOwnershipSnapshot;
+    if (!generation
+        || !snapshot
+        || snapshot.database !== db
+        || snapshot.generation !== generation
+        || snapshot.keySetGeneration !== keySetGeneration
+        || !PLUGIN_STORAGE_REVISION_PATTERN.test(snapshot.manifestRevision)) {
+        return readCachedCurrentOwnership(db, signal, true);
+    }
+
+    const state = await readPersistentPluginStorageManifestState(generation, signal);
+    recordManifestRevision(db, generation, state.manifestRevision);
+    if (getDatabase() === db
+        && db.optimizePluginMemory === true
+        && db.pluginStorageGeneration === generation
+        && getPluginStorageKeySetGeneration() === keySetGeneration
+        && storageOwnershipSnapshot === snapshot) {
+        if (state.manifestRevision === snapshot.manifestRevision) {
+            return clonePluginStorageOwnership(snapshot.ownership);
+        }
+        storageOwnershipSnapshot = null;
+        storageEnumerationSnapshot = null;
+    }
+    return readCachedCurrentOwnership(db, signal, true);
 }
 
 function readGenerationBoundPluginStorageJson<T>(
@@ -931,7 +1102,7 @@ async function commitHashedOwnedPluginStorageMutation(
     db: Database,
     operation: PersistentPluginStorageBatchOperation,
     signal?: AbortSignal | null,
-): Promise<void> {
+): Promise<PluginStorageOwnershipSnapshot | null> {
     for (let attempt = 0; ; attempt++) {
         const generation = db.pluginStorageGeneration;
         if (!generation) {
@@ -941,6 +1112,7 @@ async function commitHashedOwnedPluginStorageMutation(
         }
         const expectedManifestRevision = cachedManifestRevision(db, generation)
             ?? (await readPersistentPluginStorageManifestState(generation, signal)).manifestRevision;
+        const keySetGeneration = getPluginStorageKeySetGeneration();
         let result;
         try {
             result = await batchPersistentPluginStorage({
@@ -954,7 +1126,14 @@ async function commitHashedOwnedPluginStorageMutation(
         }
         if (result.outcome === "committed") {
             recordManifestRevisionAcknowledgement(db, generation, result);
-            return;
+            return applyCommittedPluginStorageOwnershipDelta(
+                db,
+                generation,
+                expectedManifestRevision,
+                result.manifestRevision,
+                [operation],
+                keySetGeneration,
+            );
         }
         if (result.code === "PLUGIN_STORAGE_GENERATION_CONFLICT") {
             recordManifestRevisionConflict(db, generation, result);
@@ -1241,7 +1420,7 @@ async function listDecodedStorageKeys(
     prefix: string,
     signal?: AbortSignal | null,
 ): Promise<string[]> {
-    const ownership = await readCachedCurrentOwnership(getDatabase(), signal, true);
+    const ownership = await readFreshVerifiedPluginStorageOwnership(getDatabase(), signal);
     const storageKeys = prefix === PLUGIN_SAVE_META_PREFIX
         ? ownership.metaKeys
         : ownership.valueKeys;
@@ -1710,6 +1889,7 @@ export async function setOwnedPluginSaveStorageItem<T>(
 ): Promise<void> {
     throwIfAborted(signal);
     const normalizedKey = normalizePluginStorageKey(key);
+    let retainedOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null;
     const publish = async (invocation: PluginStorageSetInvocation): Promise<void> => {
         throwIfAborted(signal);
         const db = getDatabase();
@@ -1740,7 +1920,7 @@ export async function setOwnedPluginSaveStorageItem<T>(
                     isHashedPluginSaveStorageKey(valueStorageKey, PLUGIN_SAVE_PREFIX)
                     || isHashedPluginSaveStorageKey(metaStorageKey, PLUGIN_SAVE_META_PREFIX)
                 ) {
-                    await commitHashedOwnedPluginStorageMutation(db, {
+                    retainedOwnershipSnapshot = await commitHashedOwnedPluginStorageMutation(db, {
                         operation: "set",
                         key: normalizedKey,
                         valueBytes: preparedValue.bytes,
@@ -1824,7 +2004,7 @@ export async function setOwnedPluginSaveStorageItem<T>(
             );
         }
     } finally {
-        invalidateStorageEnumerationSnapshot();
+        invalidateStorageEnumerationSnapshot(retainedOwnershipSnapshot);
     }
 }
 
@@ -1885,6 +2065,7 @@ export async function removeOwnedPluginSaveStorageItem(
     signal?: AbortSignal | null,
 ): Promise<void> {
     const normalizedKey = normalizePluginStorageKey(key);
+    let retainedOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null;
     try {
         await withPluginSaveStorageKeyLock(normalizedKey, async () => {
             throwIfAborted(signal);
@@ -1903,7 +2084,7 @@ export async function removeOwnedPluginSaveStorageItem(
                         isHashedPluginSaveStorageKey(valueStorageKey, PLUGIN_SAVE_PREFIX)
                         || isHashedPluginSaveStorageKey(metaStorageKey, PLUGIN_SAVE_META_PREFIX)
                     ) {
-                        await commitHashedOwnedPluginStorageMutation(db, {
+                        retainedOwnershipSnapshot = await commitHashedOwnedPluginStorageMutation(db, {
                             operation: "remove",
                             key: normalizedKey,
                         }, signal);
@@ -1952,7 +2133,7 @@ export async function removeOwnedPluginSaveStorageItem(
             }, signal);
         }, signal);
     } finally {
-        invalidateStorageEnumerationSnapshot();
+        invalidateStorageEnumerationSnapshot(retainedOwnershipSnapshot);
     }
 }
 
@@ -2305,11 +2486,24 @@ export async function getPluginSaveStorageItemWithRevision(
                 normalizedKey,
             );
             makeArchiveSafePluginSaveStorageKey(PLUGIN_SAVE_META_PREFIX, normalizedKey);
-            return readPersistentPluginStorageState(
+            const keySetGeneration = getPluginStorageKeySetGeneration();
+            const state = await readPersistentPluginStorageState(
                 storageKey,
                 signal,
                 db.pluginStorageGeneration,
             );
+            const {
+                publicationGeneration,
+                publicationRevision,
+                ...result
+            } = state;
+            observePluginStoragePublication(
+                db,
+                publicationGeneration,
+                publicationRevision,
+                keySetGeneration,
+            );
+            return result;
         }
         if (!hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) {
             return { status: "missing", value: null, revision: null, generation: null };
@@ -2507,6 +2701,7 @@ export async function atomicBatchOwnedPluginSaveStorage(
             });
         }
     }
+    let retainedOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null;
     try {
         return await withPluginSaveStorageKeySetLock([...seen], async () => {
             throwIfAborted(signal);
@@ -2524,6 +2719,7 @@ export async function atomicBatchOwnedPluginSaveStorage(
                             generation,
                             signal,
                         )).manifestRevision;
+                    const keySetGeneration = getPluginStorageKeySetGeneration();
                     let result;
                     try {
                         result = await batchPersistentPluginStorage({
@@ -2537,6 +2733,14 @@ export async function atomicBatchOwnedPluginSaveStorage(
                     }
                     if (result.outcome === "committed") {
                         recordManifestRevisionAcknowledgement(db, generation, result);
+                        retainedOwnershipSnapshot = applyCommittedPluginStorageOwnershipDelta(
+                            db,
+                            generation,
+                            expectedManifestRevision,
+                            result.manifestRevision,
+                            prepared,
+                            keySetGeneration,
+                        );
                         return {
                             committed: true,
                             generation: result.generation,
@@ -2668,7 +2872,7 @@ export async function atomicBatchOwnedPluginSaveStorage(
             }, signal);
         }, signal);
     } finally {
-        invalidateStorageEnumerationSnapshot();
+        invalidateStorageEnumerationSnapshot(retainedOwnershipSnapshot);
     }
 }
 

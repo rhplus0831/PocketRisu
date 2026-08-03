@@ -351,13 +351,22 @@ vi.mock("../storage/persistentKv", async () => {
         })),
         readPersistentPluginStorageState: vi.fn(async (valueKey: string) => {
             if (!persistent.has(valueKey)) {
-                return { status: "missing" as const, value: null, revision: null, generation: null };
+                return {
+                    status: "missing" as const,
+                    value: null,
+                    revision: null,
+                    generation: null,
+                    publicationGeneration: null,
+                    publicationRevision: null,
+                };
             }
             return {
                 status: "value" as const,
                 value: persistent.get(valueKey),
                 revision: `sha256:${"b".repeat(64)}`,
                 generation: null,
+                publicationGeneration: null,
+                publicationRevision: null,
             };
         }),
         readPersistentPluginStorageTransitionRow: vi.fn(async (
@@ -1466,6 +1475,305 @@ describe("AA3 versioned atomic plugin storage", () => {
             expect.objectContaining({ expectedManifestRevision: mutateRevision }),
             undefined,
         );
+    });
+
+    test("maintains a stamped ownership snapshot from an echoed batch delta", async () => {
+        database.optimizePluginMemory = true;
+        const generation = "ownership-delta-generation";
+        const committedRevision = `sha256:${"e".repeat(64)}`;
+        installOwnershipManifest(generation, [], []);
+        const {
+            batchPersistentPluginStorage,
+            readPersistentPluginStorageManifestSnapshot,
+            readPersistentPluginStorageManifestState,
+        } = vi.mocked(await import("../storage/persistentKv"));
+
+        await expect(getPluginSaveStorageItem("local-key")).resolves.toBeNull();
+        readPersistentPluginStorageManifestSnapshot.mockClear();
+        readPersistentPluginStorageManifestState.mockClear();
+        readPersistentPluginStorageManifestState.mockResolvedValue({
+            generation,
+            manifestRevision: committedRevision,
+        });
+        batchPersistentPluginStorage.mockImplementation(async (request: any) => {
+            const operation = request.operations[0];
+            const valueKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_PREFIX,
+                operation.key,
+            );
+            const metaKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_META_PREFIX,
+                operation.key,
+            );
+            persistent.set(valueKey, JSON.parse(new TextDecoder().decode(operation.valueBytes)));
+            persistent.set(metaKey, { plugin: operation.owner, updatedAt: 1 });
+            installOwnershipManifest(generation, [valueKey], [metaKey]);
+            return {
+                outcome: "committed",
+                generation: crypto.randomUUID(),
+                manifestRevision: committedRevision,
+                revisions: [{
+                    key: operation.key,
+                    revision: `sha256:${"a".repeat(64)}`,
+                    valueHash: "b".repeat(64),
+                }],
+            } as any;
+        });
+
+        await expect(atomicBatchOwnedPluginSaveStorage([{
+            type: "set",
+            key: "local-key",
+            value: { local: true },
+        }], "Delta Plugin")).resolves.toMatchObject({ committed: true });
+        await expect(getPluginSaveStorageItem("local-key")).resolves.toEqual({ local: true });
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["local-key"]);
+
+        expect(readPersistentPluginStorageManifestState).toHaveBeenCalledOnce();
+        expect(readPersistentPluginStorageManifestSnapshot).not.toHaveBeenCalled();
+    });
+
+    test("updates cached ownership and mappings for hashed set and remove", async () => {
+        database.optimizePluginMemory = true;
+        const generation = "hashed-ownership-delta-generation";
+        let committedRevision = `sha256:${"c".repeat(64)}`;
+        const rawKey = "m".repeat(760);
+        installOwnershipManifest(generation, [], []);
+        const {
+            batchPersistentPluginStorage,
+            readPersistentPluginStorageManifestSnapshot,
+            readPersistentPluginStorageManifestState,
+        } = vi.mocked(await import("../storage/persistentKv"));
+
+        await expect(getPluginSaveStorageItem(rawKey)).resolves.toBeNull();
+        readPersistentPluginStorageManifestSnapshot.mockClear();
+        readPersistentPluginStorageManifestState.mockClear();
+        readPersistentPluginStorageManifestState.mockImplementation(async () => ({
+            generation,
+            manifestRevision: committedRevision,
+        }));
+        batchPersistentPluginStorage.mockImplementation(async (request: any) => {
+            const operation = request.operations[0];
+            const valueKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_PREFIX,
+                operation.key,
+            );
+            const metaKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_META_PREFIX,
+                operation.key,
+            );
+            if (operation.operation === "set") {
+                persistent.set(valueKey, JSON.parse(new TextDecoder().decode(operation.valueBytes)));
+                persistent.set(metaKey, { plugin: operation.owner, updatedAt: 1 });
+            } else {
+                persistent.delete(valueKey);
+                persistent.delete(metaKey);
+            }
+            return {
+                outcome: "committed",
+                generation: crypto.randomUUID(),
+                manifestRevision: committedRevision,
+                revisions: [{
+                    key: operation.key,
+                    revision: operation.operation === "set"
+                        ? `sha256:${"a".repeat(64)}`
+                        : null,
+                    valueHash: operation.operation === "set" ? "b".repeat(64) : null,
+                }],
+            } as any;
+        });
+
+        await setOwnedPluginSaveStorageItem(rawKey, { mapped: true }, "Mapping Plugin");
+        await expect(getPluginSaveStorageItem(rawKey)).resolves.toEqual({ mapped: true });
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual([rawKey]);
+
+        committedRevision = `sha256:${"f".repeat(64)}`;
+        await removeOwnedPluginSaveStorageItem(rawKey);
+        await expect(getPluginSaveStorageItem(rawKey)).resolves.toBeNull();
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual([]);
+
+        expect(readPersistentPluginStorageManifestState).toHaveBeenCalledTimes(2);
+        expect(readPersistentPluginStorageManifestSnapshot).not.toHaveBeenCalled();
+    });
+
+    test("invalidates ownership when a committed acknowledgement omits its revision", async () => {
+        database.optimizePluginMemory = true;
+        const generation = "unstamped-ack-generation";
+        installOwnershipManifest(generation, [], []);
+        const {
+            batchPersistentPluginStorage,
+            readPersistentPluginStorageManifestSnapshot,
+        } = vi.mocked(await import("../storage/persistentKv"));
+
+        await expect(getPluginSaveStorageItem("legacy-key")).resolves.toBeNull();
+        readPersistentPluginStorageManifestSnapshot.mockClear();
+        batchPersistentPluginStorage.mockImplementation(async (request: any) => {
+            const operation = request.operations[0];
+            const valueKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_PREFIX,
+                operation.key,
+            );
+            const metaKey = makeArchiveSafePluginSaveStorageKey(
+                PLUGIN_SAVE_META_PREFIX,
+                operation.key,
+            );
+            persistent.set(valueKey, JSON.parse(new TextDecoder().decode(operation.valueBytes)));
+            persistent.set(metaKey, { plugin: operation.owner, updatedAt: 1 });
+            installOwnershipManifest(generation, [valueKey], [metaKey]);
+            return {
+                outcome: "committed",
+                generation: crypto.randomUUID(),
+                revisions: [{
+                    key: operation.key,
+                    revision: `sha256:${"a".repeat(64)}`,
+                    valueHash: "b".repeat(64),
+                }],
+            } as any;
+        });
+
+        await atomicBatchOwnedPluginSaveStorage([{
+            type: "set",
+            key: "legacy-key",
+            value: { legacy: true },
+        }], "Legacy Plugin");
+        await expect(getPluginSaveStorageItem("legacy-key")).resolves.toEqual({ legacy: true });
+
+        expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledOnce();
+    });
+
+    test("refetches ownership when keys observes an external revision", async () => {
+        database.optimizePluginMemory = true;
+        const generation = "external-ownership-generation";
+        const alphaKey = encoded(PLUGIN_SAVE_PREFIX, "alpha");
+        const betaKey = encoded(PLUGIN_SAVE_PREFIX, "beta");
+        persistent.set(alphaKey, { external: 1 });
+        installOwnershipManifest(generation, [alphaKey], []);
+        const {
+            readPersistentPluginStorageManifestSnapshot,
+            readPersistentPluginStorageManifestState,
+        } = vi.mocked(await import("../storage/persistentKv"));
+
+        await expect(getPluginSaveStorageItem("alpha")).resolves.toEqual({ external: 1 });
+        readPersistentPluginStorageManifestSnapshot.mockClear();
+        readPersistentPluginStorageManifestState.mockClear();
+        persistent.set(betaKey, { external: 2 });
+        installOwnershipManifest(generation, [alphaKey, betaKey], []);
+        const externalRevision = `sha256:${"f".repeat(64)}`;
+        readPersistentPluginStorageManifestState.mockResolvedValue({
+            generation,
+            manifestRevision: externalRevision,
+        });
+        readPersistentPluginStorageManifestSnapshot.mockResolvedValue({
+            generation,
+            manifestRevision: externalRevision,
+            manifest: persistent.get(PLUGIN_STORAGE_MANIFEST_KEY) as any,
+            valueKeys: [alphaKey, betaKey],
+            metaKeys: [],
+        });
+
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual(["alpha", "beta"]);
+        expect(readPersistentPluginStorageManifestState).toHaveBeenCalledOnce();
+        expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledOnce();
+    });
+
+    test("does not reuse a stamped ownership snapshot across generations", async () => {
+        database.optimizePluginMemory = true;
+        const firstKey = encoded(PLUGIN_SAVE_PREFIX, "first");
+        const secondKey = encoded(PLUGIN_SAVE_PREFIX, "second");
+        persistent.set(firstKey, 1);
+        installOwnershipManifest("ownership-generation-one", [firstKey], []);
+        const {
+            readPersistentPluginStorageManifestSnapshot,
+            readPersistentPluginStorageManifestState,
+        } = vi.mocked(await import("../storage/persistentKv"));
+
+        await expect(getPluginSaveStorageItem("first")).resolves.toBe(1);
+        readPersistentPluginStorageManifestSnapshot.mockClear();
+        readPersistentPluginStorageManifestState.mockClear();
+        persistent.set(secondKey, 2);
+        installOwnershipManifest("ownership-generation-two", [secondKey], []);
+
+        await expect(getPluginSaveStorageItem("second")).resolves.toBe(2);
+        expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledOnce();
+        expect(readPersistentPluginStorageManifestState).not.toHaveBeenCalled();
+    });
+
+    test("uses a validated per-key publication identity as the next CAS token", async () => {
+        database.optimizePluginMemory = true;
+        const generation = "state-header-generation";
+        const publicationRevision = `sha256:${"9".repeat(64)}`;
+        installOwnershipManifest(generation, [], []);
+        const {
+            batchPersistentPluginStorage,
+            readPersistentPluginStorageManifestState,
+            readPersistentPluginStorageState,
+        } = vi.mocked(await import("../storage/persistentKv"));
+        readPersistentPluginStorageState.mockResolvedValueOnce({
+            status: "missing",
+            value: null,
+            revision: null,
+            generation: null,
+            publicationGeneration: generation,
+            publicationRevision,
+        });
+        batchPersistentPluginStorage.mockImplementation(async (request: any) => ({
+            outcome: "committed",
+            generation: crypto.randomUUID(),
+            manifestRevision: `sha256:${"a".repeat(64)}`,
+            revisions: request.operations.map((operation: any) => ({
+                key: operation.key,
+                revision: `sha256:${"b".repeat(64)}`,
+                valueHash: "c".repeat(64),
+            })),
+        } as any));
+
+        await expect(getPluginSaveStorageItemWithRevision("header-seed"))
+            .resolves.toMatchObject({ status: "missing" });
+        await setOwnedPluginSaveStorageItem("h".repeat(753), 1, "Header Plugin");
+
+        expect(readPersistentPluginStorageManifestState).not.toHaveBeenCalled();
+        expect(batchPersistentPluginStorage).toHaveBeenCalledWith(
+            expect.objectContaining({ expectedManifestRevision: publicationRevision }),
+            undefined,
+        );
+    });
+
+    test("invalidates a stamped ownership snapshot from a newer per-key publication", async () => {
+        database.optimizePluginMemory = true;
+        const generation = "state-header-stale-ownership-generation";
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "retained");
+        const publicationRevision = `sha256:${"8".repeat(64)}`;
+        persistent.set(valueKey, { retained: true });
+        installOwnershipManifest(generation, [valueKey], []);
+        const {
+            readPersistentPluginStorageManifestSnapshot,
+            readPersistentPluginStorageState,
+        } = vi.mocked(await import("../storage/persistentKv"));
+
+        await expect(getPluginSaveStorageItem("retained"))
+            .resolves.toEqual({ retained: true });
+        readPersistentPluginStorageManifestSnapshot.mockClear();
+        readPersistentPluginStorageState.mockResolvedValueOnce({
+            status: "missing",
+            value: null,
+            revision: null,
+            generation: null,
+            publicationGeneration: generation,
+            publicationRevision,
+        });
+        readPersistentPluginStorageManifestSnapshot.mockResolvedValueOnce({
+            generation,
+            manifestRevision: publicationRevision,
+            manifest: persistent.get(PLUGIN_STORAGE_MANIFEST_KEY) as any,
+            valueKeys: [valueKey],
+            metaKeys: [],
+        });
+
+        await expect(getPluginSaveStorageItemWithRevision("probe"))
+            .resolves.toMatchObject({ status: "missing" });
+        await expect(getPluginSaveStorageItem("retained"))
+            .resolves.toEqual({ retained: true });
+
+        expect(readPersistentPluginStorageManifestSnapshot).toHaveBeenCalledOnce();
     });
 
     test("orders overlapping key sets without deadlock while disjoint batches proceed", async () => {

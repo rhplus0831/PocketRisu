@@ -10959,23 +10959,23 @@ function handlePluginStorageStateRead({ binary }) {
                 requestedGeneration,
             );
             const { state } = publication;
+            if (publication.publicationGeneration !== null) {
+                res.setHeader(
+                    'x-plugin-storage-publication-generation',
+                    publication.publicationGeneration,
+                );
+            }
+            if (publication.publicationRevision !== null) {
+                res.setHeader(
+                    'x-plugin-storage-publication-revision',
+                    publication.publicationRevision,
+                );
+            }
             if (binary) {
                 res.setHeader(
                     'x-plugin-storage-missing',
                     state.valueBytes === null ? '1' : '0',
                 );
-                if (publication.publicationGeneration !== null) {
-                    res.setHeader(
-                        'x-plugin-storage-publication-generation',
-                        publication.publicationGeneration,
-                    );
-                }
-                if (publication.publicationRevision !== null) {
-                    res.setHeader(
-                        'x-plugin-storage-publication-revision',
-                        publication.publicationRevision,
-                    );
-                }
                 if (state.valueBytes === null) return res.status(204).end();
 
                 res.setHeader('Content-Type', PLUGIN_STORAGE_JSON_CONTENT_TYPE);

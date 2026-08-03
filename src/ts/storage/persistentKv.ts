@@ -312,11 +312,15 @@ export async function readPersistentPluginStorageState<T>(
     value: null;
     revision: null;
     generation: string | null;
+    publicationGeneration: string | null;
+    publicationRevision: string | null;
 } | {
     status: "value";
     value: T;
     revision: string;
     generation: string | null;
+    publicationGeneration: string | null;
+    publicationRevision: string | null;
 }> {
     await ensureStorageReady(signal);
     const readOptions = {
@@ -327,7 +331,14 @@ export async function readPersistentPluginStorageState<T>(
         ? await forageStorage.getPluginStorageState(valueStorageKey, readOptions)
         : await forageStorage.getPluginStorageState(valueStorageKey);
     if (state.missing) {
-        return { status: "missing", value: null, revision: null, generation: state.generation };
+        return {
+            status: "missing",
+            value: null,
+            revision: null,
+            generation: state.generation,
+            publicationGeneration: state.publicationGeneration,
+            publicationRevision: state.publicationRevision,
+        };
     }
     if (!state.valueBytes || !state.revision) {
         throw new StorageError("Plugin storage state omitted committed value bytes.", {
@@ -341,6 +352,8 @@ export async function readPersistentPluginStorageState<T>(
         value: JSON.parse(decoder.decode(state.valueBytes)) as T,
         revision: state.revision,
         generation: state.generation,
+        publicationGeneration: state.publicationGeneration,
+        publicationRevision: state.publicationRevision,
     };
 }
 

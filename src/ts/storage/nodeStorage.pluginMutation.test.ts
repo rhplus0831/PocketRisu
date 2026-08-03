@@ -1417,6 +1417,9 @@ describe('NodeStorage AA3 versioned state response', () => {
         ['unpaired publication identity', null, {
             'x-plugin-storage-publication-revision': '',
         }],
+        ['malformed publication revision', null, {
+            'x-plugin-storage-publication-revision': 'not-a-revision',
+        }],
         ['present value with missing row revision', valueBytes, {
             'x-plugin-storage-row-revision': '',
         }],
@@ -1446,6 +1449,18 @@ describe('NodeStorage AA3 versioned state response', () => {
         await expect(storage.getPluginStorageState(valueKey)).rejects.toMatchObject({
             code: 'STORAGE_RESPONSE_ERROR',
         })
+    })
+
+    test('rejects a missing publication identity on a pinned state read', async () => {
+        const storage = new NodeStorage()
+        ;(storage as any).authFetch = vi.fn(async () => new Response(null, {
+            status: 204,
+            headers: { 'x-plugin-storage-missing': '1' },
+        }))
+
+        await expect(storage.getPluginStorageState(valueKey, {
+            pluginStorageGeneration: publicationGeneration,
+        })).rejects.toMatchObject({ code: 'STORAGE_RESPONSE_ERROR' })
     })
 
     test('rejects a publication identity that differs from the selected generation', async () => {

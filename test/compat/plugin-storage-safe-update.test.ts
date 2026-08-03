@@ -146,6 +146,10 @@ describe('IP1 safe plugin storage read/update integration', () => {
 
     const nullable = await state(client, 'nullable')
     expect(nullable.status).toBe(200)
+    expect(nullable.headers.get('x-plugin-storage-publication-generation')).toBe(GENERATION)
+    expect(nullable.headers.get('x-plugin-storage-publication-revision')).toBe(
+      `sha256:${createHash('sha256').update(JSON.stringify(manifest)).digest('hex')}`,
+    )
     const nullableBody = await nullable.json() as any
     expect(nullableBody).toMatchObject({ missing: false })
     expect(Buffer.from(nullableBody.value, 'base64').toString()).toBe('null')
@@ -175,6 +179,8 @@ describe('IP1 safe plugin storage read/update integration', () => {
 
     const missing = await state(client, 'actually-missing')
     expect(missing.status).toBe(200)
+    expect(missing.headers.get('x-plugin-storage-publication-generation')).toBe(GENERATION)
+    expect(missing.headers.get('x-plugin-storage-publication-revision')).toMatch(/^sha256:/)
     await expect(missing.json()).resolves.toEqual({
       success: true,
       missing: true,
