@@ -1270,7 +1270,9 @@ interface PluginStorage {
      * JSON values. Unsupported optimized values reject with StorageError code
      * `PLUGIN_STORAGE_VALUE_UNSUPPORTED`; oversized values use
      * `PLUGIN_VALUE_TOO_LARGE`. The user can opt into conservative automatic
-     * conversion for ordinary setItem writes; compound/versioned replacement
+     * conversion for ordinary setItem writes. That compatibility path preserves
+     * `undefined` and sparse holes in versioned lossless optimized rows while
+     * retaining strict JSON rows for already-compatible values. Compound/versioned replacement
      * values remain strictly JSON-only, although versioned reads can expose a
      * legacy inline rich value for migration or guarded removal.
      * @returns Promise that resolves when item is stored

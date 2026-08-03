@@ -23,6 +23,9 @@ const { pluginStorageViewerDisplaySizeFromMetadata } = require(
     metadata: { type: string; length?: number; jsonSize?: number },
   ) => number
 }
+const { serializeLosslessPluginStorageRow } = require('./pluginStorageJson.cjs') as {
+  serializeLosslessPluginStorageRow: (storageKey: string, value: unknown) => Buffer
+}
 const unpackr = new Unpackr({ int64AsType: 'number', useRecords: false })
 const dirs: string[] = []
 
@@ -69,6 +72,16 @@ async function transcode(
   return unpackr.decode(writer.value())
 }
 
+async function transcodeBytes(bytes: Buffer): Promise<unknown> {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'stream-lossless-msgpack-'))
+  dirs.push(dir)
+  const filePath = path.join(dir, 'row.bin')
+  await writeFile(filePath, bytes)
+  const writer = new MemoryWriter()
+  await streamJsonFileToMessagePack({ filePath, size: bytes.length }, writer)
+  return unpackr.decode(writer.value())
+}
+
 async function displaySize(json: string): Promise<number> {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'stream-json-display-size-'))
   dirs.push(dir)
@@ -82,6 +95,23 @@ async function displaySize(json: string): Promise<number> {
 }
 
 describe('streaming JSON to MessagePack', () => {
+  test('decodes lossless plugin rows while streaming transitions and backups', async () => {
+    const sparse = new Array(3)
+    sparse[1] = { path: undefined }
+    const bytes = serializeLosslessPluginStorageRow(
+      `pluginsave/${Buffer.from('codec').toString('base64url')}.json`,
+      { root: undefined, sparse },
+    )
+    const decoded = await transcodeBytes(bytes) as any
+
+    expect(Object.prototype.hasOwnProperty.call(decoded, 'root')).toBe(true)
+    expect(decoded.root).toBeUndefined()
+    // MessagePack has an undefined scalar but no sparse-array primitive. The
+    // durable optimized codec retains holes; inline RisuSave uses undefined
+    // elements for those positions during a mode transition.
+    expect(decoded.sparse).toEqual([undefined, { path: undefined }, undefined])
+  })
+
   test('matches JSON scalar, nested, duplicate-key, and numeric semantics', async () => {
     const json = '{"a":1,"a":2,"array":[true,false,null,-0,1.5e2],"nested":{"2":"b","1":"a"}}'
     const expected = JSON.parse(json)

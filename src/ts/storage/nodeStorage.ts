@@ -71,6 +71,12 @@ import {
 } from "./pluginStorageBatch"
 import type { PluginStorageBatchStreamCapabilities } from "./pluginStorageBatch"
 import {
+    PLUGIN_STORAGE_JSON_CODEC,
+    PLUGIN_STORAGE_JSON_CONTENT_TYPE,
+    PLUGIN_STORAGE_LOSSLESS_CODEC,
+    PLUGIN_STORAGE_LOSSLESS_CONTENT_TYPE,
+} from "./pluginStorageValueCodec"
+import {
     isPluginStorageBulkTransitionResult,
     parsePluginStorageTransitionStreamCapabilities,
     preparePluginStorageBulkTransition,
@@ -3355,13 +3361,16 @@ export class NodeStorage{
         const codec = response.headers.get('x-plugin-storage-codec')
         const contentTypeHeader = response.headers.get('content-type')
         const contentType = contentTypeHeader?.split(';', 1)[0].trim().toLowerCase() ?? null
+        const codecMetadataValid = codec === PLUGIN_STORAGE_JSON_CODEC
+            ? contentType === PLUGIN_STORAGE_JSON_CONTENT_TYPE
+            : codec === PLUGIN_STORAGE_LOSSLESS_CODEC
+                && contentType === PLUGIN_STORAGE_LOSSLESS_CONTENT_TYPE
         if (revision === null || !/^sha256:[0-9a-f]{64}$/.test(revision)
             || (rowGeneration !== null && !PLUGIN_STORAGE_UUID_PATTERN.test(rowGeneration))
             || byteLengthText === null || !/^(0|[1-9][0-9]*)$/.test(byteLengthText)
             || (contentLengthText !== null && contentLengthText !== byteLengthText)
             || contentDigest === null || !/^sha256:[0-9a-f]{64}$/.test(contentDigest)
-            || contentType !== 'application/json'
-            || codec !== 'json-v1') {
+            || !codecMetadataValid) {
             throw malformed('Plugin storage state value metadata was malformed.')
         }
         const byteLength = Number(byteLengthText)

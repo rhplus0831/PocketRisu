@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import { decodePluginStorageValueBytes } from "../storage/pluginStorageValueCodec";
 
 type MockV3PluginInitializationOutcome =
     | { pluginName: string; status: "fulfilled" }
@@ -93,6 +94,10 @@ vi.mock("./apiV3/transpiler", () => ({
 
 vi.mock("../storage/persistentKv", async () => {
     const { serializeJsonValueToUtf8 } = await import("../storage/jsonValue");
+    const { decodePluginStorageValueBytes } = await import(
+        "../storage/pluginStorageValueCodec"
+    );
+    const decodePrepared = (bytes: Uint8Array) => decodePluginStorageValueBytes(bytes);
     const encode = (value: string) => {
         if (!value.isWellFormed()) {
             throw new Error(
@@ -171,7 +176,7 @@ vi.mock("../storage/persistentKv", async () => {
                 const valueKey = `pluginsave/${encode(operation.key)}.json`;
                 const metaKey = `pluginsave-meta/${encode(operation.key)}.json`;
                 if (operation.operation === "set") {
-                    persistent.set(valueKey, JSON.parse(new TextDecoder().decode(operation.valueBytes)));
+                    persistent.set(valueKey, decodePrepared(operation.valueBytes));
                     persistent.set(metaKey, {
                         plugin: operation.owner,
                         updatedAt: Date.now(),
@@ -208,7 +213,7 @@ vi.mock("../storage/persistentKv", async () => {
             for (const write of mutation.writes) {
                 persistent.set(
                     write.storageKey,
-                    JSON.parse(new TextDecoder().decode(write.valueBytes)),
+                    decodePrepared(write.valueBytes),
                 );
             }
             for (const key of mutation.deletes) persistent.delete(key);
@@ -280,7 +285,7 @@ vi.mock("../storage/persistentKv", async () => {
         ) => {
             persistent.set(
                 valueKey,
-                prepared.value ?? JSON.parse(new TextDecoder().decode(prepared.bytes)),
+                prepared.value ?? decodePrepared(prepared.bytes),
             );
             return {
                 outcome: "committed" as const,
@@ -394,7 +399,7 @@ vi.mock("../storage/persistentKv", async () => {
                 for (const [storageKey, bytes] of stagedRows) {
                     persistent.set(
                         storageKey,
-                        JSON.parse(new TextDecoder().decode(bytes)),
+                        decodePrepared(bytes),
                     );
                 }
                 persistent.set("plugin-storage/manifest.json", {
@@ -639,7 +644,7 @@ beforeEach(async () => {
             persistent.set(
                 valueKey,
                 prepared
-                    ? JSON.parse(new TextDecoder().decode(prepared.bytes))
+                    ? decodePluginStorageValueBytes(prepared.bytes)
                     : value,
             );
             if (owner) persistent.set(metaKey, { plugin: owner, updatedAt: Date.now() });
@@ -682,7 +687,7 @@ beforeEach(async () => {
     ) => {
         persistent.set(
             valueKey,
-            prepared.value ?? JSON.parse(new TextDecoder().decode(prepared.bytes)),
+            prepared.value ?? decodePluginStorageValueBytes(prepared.bytes),
         );
         const manifest = persistent.get(PLUGIN_STORAGE_MANIFEST_KEY) as any;
         if (manifest) {
@@ -1514,7 +1519,7 @@ describe("AA3 versioned atomic plugin storage", () => {
             async (storageKey, prepared) => {
                 persistent.set(
                     storageKey,
-                    JSON.parse(new TextDecoder().decode(prepared.bytes)),
+                    decodePluginStorageValueBytes(prepared.bytes),
                 );
                 return {
                     outcome: "committed",
@@ -1590,7 +1595,7 @@ describe("AA3 versioned atomic plugin storage", () => {
                 persistent.set(
                     storageKey,
                     prepared
-                        ? JSON.parse(new TextDecoder().decode(prepared.bytes))
+                        ? decodePluginStorageValueBytes(prepared.bytes)
                         : valueOrSignal,
                 );
                 persistent.set(metaKey, { plugin: owner, updatedAt: 2 });
@@ -1644,7 +1649,7 @@ describe("AA3 versioned atomic plugin storage", () => {
             async (storageKey, prepared) => {
                 persistent.set(
                     storageKey,
-                    JSON.parse(new TextDecoder().decode(prepared.bytes)),
+                    decodePluginStorageValueBytes(prepared.bytes),
                 );
                 return {
                     outcome: "committed",
@@ -1696,7 +1701,7 @@ describe("AA3 versioned atomic plugin storage", () => {
                 PLUGIN_SAVE_META_PREFIX,
                 operation.key,
             );
-            persistent.set(valueKey, JSON.parse(new TextDecoder().decode(operation.valueBytes)));
+            persistent.set(valueKey, decodePluginStorageValueBytes(operation.valueBytes));
             persistent.set(metaKey, { plugin: operation.owner, updatedAt: 1 });
             installOwnershipManifest(generation, [valueKey], [metaKey]);
             return {
@@ -2892,7 +2897,9 @@ describe("plugin save storage transport", () => {
             pageCount: 2,
             total: 2,
             totalBytes: Object.values(database.pluginCustomStorage ?? {}).reduce(
-                (sum, value) => sum + new TextEncoder().encode(JSON.stringify(value)).byteLength,
+                (sum: number, value: unknown) => (
+                    sum + new TextEncoder().encode(JSON.stringify(value)).byteLength
+                ),
                 0,
             ),
             ownerFacets: [
@@ -3222,13 +3229,20 @@ describe("plugin save storage transport", () => {
             "Compatibility Test",
         )).resolves.toBeUndefined();
 
-        expect(persistent.get(encoded(PLUGIN_SAVE_PREFIX, "converted"))).toEqual({
+        const expectedSparse = new Array(3);
+        expectedSparse[1] = undefined;
+        expectedSparse[2] = null;
+        const stored = persistent.get(encoded(PLUGIN_SAVE_PREFIX, "converted")) as any;
+        expect(stored).toEqual({
             date: "2026-01-02T03:04:05.000Z",
             map: [["1", ["a", "b"]]],
             bigint: "-42",
-            missing: null,
-            sparse: [null, null, null],
+            missing: undefined,
+            sparse: expectedSparse,
         });
+        expect(Object.prototype.hasOwnProperty.call(stored, "missing")).toBe(true);
+        expect(0 in stored.sparse).toBe(false);
+        expect(1 in stored.sparse).toBe(true);
     });
 
     test("automatic conversion still rejects functions and circular references", async () => {
@@ -3910,7 +3924,7 @@ describe("boot plugin storage reconciliation recovery", () => {
             pluginStorageGeneration: generation,
             pluginCustomStorage: {},
         };
-        persistent.set(valueKey, { selected: true });
+        persistent.set(valueKey, { selected: true, path: undefined });
         persistent.set(metaKey, { plugin: "Selected", updatedAt: 1 });
         const recordRead = vi.fn();
         async function readPersistentJsonRow<T>(
@@ -3933,6 +3947,10 @@ describe("boot plugin storage reconciliation recovery", () => {
         });
 
         expect(result).toEqual({ direction: "none", values: 0, meta: 0, issues: [] });
+        expect(Object.prototype.hasOwnProperty.call(
+            persistent.get(valueKey) as object,
+            "path",
+        )).toBe(true);
         expect(recordRead).toHaveBeenCalledWith(valueKey, {
             cached: true,
             pluginStorageGeneration: generation,

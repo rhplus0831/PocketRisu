@@ -1425,6 +1425,17 @@ describe('NodeStorage AA3 versioned state response', () => {
         expect(cache.sha256OwnedBytes).toHaveBeenCalledOnce()
         expect((present as any).authFetch.mock.calls[0][0])
             .toBe('/api/plugin-storage/state/raw')
+
+        const lossless = new NodeStorage()
+        ;(lossless as any).authFetch = vi.fn(async () => binaryStateResponse(valueBytes, {
+            'content-type': 'application/octet-stream',
+            'x-plugin-storage-codec': 'lossless-json-v1',
+        }))
+        await expect(lossless.getPluginStorageState(valueKey)).resolves.toMatchObject({
+            missing: false,
+            contentType: 'application/octet-stream',
+            codec: 'lossless-json-v1',
+        })
     })
 
     test('pins state reads to the selected BR2 publication generation', async () => {

@@ -9,6 +9,10 @@ const {
 
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 const PLUGIN_STORAGE_OWNER_CAPTURE_MAX_BYTES = 64 * 1024;
+const PLUGIN_STORAGE_JSON_CODEC = 'json-v1';
+const PLUGIN_STORAGE_LOSSLESS_CODEC = 'lossless-json-v1';
+const PLUGIN_STORAGE_LOSSLESS_MAGIC = Buffer.from('PRISUL01', 'ascii');
+const LOSSLESS_HOLE = Symbol('pocketrisu-plugin-storage-array-hole');
 
 class PluginStorageValidationError extends Error {
     constructor(encodedKey) {
@@ -297,6 +301,152 @@ function stringifyPluginStorageJson(value) {
     return serialized;
 }
 
+function pluginStorageCodecForBuffer(value) {
+    const bytes = value instanceof Uint8Array ? value : Buffer.from(value);
+    return bytes.byteLength >= PLUGIN_STORAGE_LOSSLESS_MAGIC.byteLength
+        && Buffer.from(
+            bytes.buffer,
+            bytes.byteOffset,
+            PLUGIN_STORAGE_LOSSLESS_MAGIC.byteLength,
+        ).equals(PLUGIN_STORAGE_LOSSLESS_MAGIC)
+        ? PLUGIN_STORAGE_LOSSLESS_CODEC
+        : PLUGIN_STORAGE_JSON_CODEC;
+}
+
+function encodeLosslessPluginStorageNode(value, path = '$', visiting = new Set()) {
+    if (value === undefined) return ['u'];
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+        return value;
+    }
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) {
+            throw new TypeError(`Lossless plugin storage requires a finite number at ${path}`);
+        }
+        return Object.is(value, -0) ? 0 : value;
+    }
+    if (typeof value !== 'object' || visiting.has(value)) {
+        throw new TypeError(`Lossless plugin storage cannot represent data at ${path}`);
+    }
+    const isArray = Array.isArray(value);
+    const prototype = Reflect.getPrototypeOf(value);
+    if (!isArray && prototype !== Object.prototype && prototype !== null) {
+        throw new TypeError(`Lossless plugin storage requires plain objects at ${path}`);
+    }
+
+    visiting.add(value);
+    try {
+        if (isArray) {
+            for (const key of Reflect.ownKeys(value)) {
+                if (key === 'length') continue;
+                if (typeof key !== 'string') {
+                    throw new TypeError(`Lossless plugin storage rejects symbol keys at ${path}`);
+                }
+                const index = Number(key);
+                if (!Number.isInteger(index)
+                    || index < 0
+                    || index >= value.length
+                    || String(index) !== key) {
+                    throw new TypeError(`Lossless plugin storage rejects extra array properties at ${path}`);
+                }
+            }
+            const items = new Array(value.length);
+            for (let index = 0; index < value.length; index += 1) {
+                const descriptor = Reflect.getOwnPropertyDescriptor(value, String(index));
+                if (!descriptor) {
+                    items[index] = ['h'];
+                } else if (!('value' in descriptor) || !descriptor.enumerable) {
+                    throw new TypeError(`Lossless plugin storage requires enumerable array data at ${path}`);
+                } else {
+                    items[index] = encodeLosslessPluginStorageNode(
+                        descriptor.value,
+                        `${path}[${index}]`,
+                        visiting,
+                    );
+                }
+            }
+            return ['a', items];
+        }
+
+        const entries = [];
+        for (const key of Reflect.ownKeys(value)) {
+            if (typeof key !== 'string') {
+                throw new TypeError(`Lossless plugin storage rejects symbol keys at ${path}`);
+            }
+            const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+            if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) {
+                throw new TypeError(`Lossless plugin storage requires enumerable data at ${path}`);
+            }
+            entries.push([
+                key,
+                encodeLosslessPluginStorageNode(descriptor.value, `${path}.${key}`, visiting),
+            ]);
+        }
+        return ['o', entries];
+    } finally {
+        visiting.delete(value);
+    }
+}
+
+function serializeLosslessPluginStorageRow(storageKey, value) {
+    try {
+        const body = Buffer.from(stringifyPluginStorageJson(
+            encodeLosslessPluginStorageNode(value),
+        ), 'utf-8');
+        return Buffer.concat([PLUGIN_STORAGE_LOSSLESS_MAGIC, body]);
+    } catch {
+        throw new PluginStorageValidationError(storageKey);
+    }
+}
+
+function invalidLosslessPluginStorageValue() {
+    throw new TypeError('Invalid lossless plugin storage value');
+}
+
+function decodeLosslessPluginStorageNode(encoded, allowHole = false, depth = 0) {
+    if (depth > 1024) invalidLosslessPluginStorageValue();
+    if (encoded === null || typeof encoded === 'string' || typeof encoded === 'boolean') {
+        return encoded;
+    }
+    if (typeof encoded === 'number') {
+        if (!Number.isFinite(encoded)) invalidLosslessPluginStorageValue();
+        return Object.is(encoded, -0) ? 0 : encoded;
+    }
+    if (!Array.isArray(encoded) || typeof encoded[0] !== 'string') {
+        return invalidLosslessPluginStorageValue();
+    }
+    if (encoded[0] === 'u' && encoded.length === 1) return undefined;
+    if (encoded[0] === 'h' && encoded.length === 1 && allowHole) return LOSSLESS_HOLE;
+    if (encoded[0] === 'a' && encoded.length === 2 && Array.isArray(encoded[1])) {
+        const result = new Array(encoded[1].length);
+        for (let index = 0; index < encoded[1].length; index += 1) {
+            const item = decodeLosslessPluginStorageNode(encoded[1][index], true, depth + 1);
+            if (item !== LOSSLESS_HOLE) result[index] = item;
+        }
+        return result;
+    }
+    if (encoded[0] === 'o' && encoded.length === 2 && Array.isArray(encoded[1])) {
+        const result = Object.create(null);
+        const seen = new Set();
+        for (const entry of encoded[1]) {
+            if (!Array.isArray(entry)
+                || entry.length !== 2
+                || typeof entry[0] !== 'string'
+                || seen.has(entry[0])) invalidLosslessPluginStorageValue();
+            const value = decodeLosslessPluginStorageNode(entry[1], false, depth + 1);
+            if (value === LOSSLESS_HOLE) invalidLosslessPluginStorageValue();
+            seen.add(entry[0]);
+            Object.defineProperty(result, entry[0], {
+                configurable: true,
+                enumerable: true,
+                value,
+                writable: true,
+            });
+        }
+        return result;
+    }
+    return invalidLosslessPluginStorageValue();
+}
+
 const dateGetTime = Date.prototype.getTime;
 const dateToISOString = Date.prototype.toISOString;
 const mapForEach = Map.prototype.forEach;
@@ -325,7 +475,7 @@ function convertCompatiblePluginStorageJson(input) {
             return Object.is(value, -0) ? 0 : value;
         }
         if (typeof value === 'bigint') return Reflect.apply(bigintToString, value, []);
-        if (value === undefined) return null;
+        if (value === undefined) return undefined;
         if (typeof value !== 'object' || visiting.has(value)) {
             throw new TypeError('Automatic plugin storage conversion cannot represent this value');
         }
@@ -350,7 +500,7 @@ function convertCompatiblePluginStorageJson(input) {
                 for (let index = 0; index < value.length; index += 1) {
                     const descriptor = Reflect.getOwnPropertyDescriptor(value, String(index));
                     if (!descriptor) {
-                        result[index] = null;
+                        continue;
                     } else if (!('value' in descriptor) || !descriptor.enumerable) {
                         throw new TypeError('Automatic plugin storage conversion requires enumerable array data');
                     } else {
@@ -428,7 +578,7 @@ function convertCompatiblePluginStorageJson(input) {
             visiting.delete(value);
         }
     };
-    return snapshotPluginStorageJson(convert(input));
+    return convert(input);
 }
 
 function encodeValidatedPluginStorageKey(rawKey, prefix) {
@@ -511,6 +661,19 @@ function decodePluginStorageJsonBuffer(value) {
     }
 }
 
+function decodeLosslessPluginStorageBuffer(value) {
+    const bytes = value instanceof Uint8Array ? value : Buffer.from(value);
+    if (pluginStorageCodecForBuffer(bytes) !== PLUGIN_STORAGE_LOSSLESS_CODEC) {
+        throw new SyntaxError('Invalid lossless plugin storage row');
+    }
+    const encoded = decodePluginStorageJsonBuffer(
+        bytes.subarray(PLUGIN_STORAGE_LOSSLESS_MAGIC.byteLength),
+    );
+    const decoded = decodeLosslessPluginStorageNode(encoded, false, 0);
+    if (decoded === LOSSLESS_HOLE) invalidLosslessPluginStorageValue();
+    return decoded;
+}
+
 function assertPluginStorageJson(value, visiting = new Set()) {
     if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
     if (typeof value === 'number') {
@@ -553,10 +716,17 @@ function assertPluginStorageJson(value, visiting = new Set()) {
 }
 
 function assertPluginStorageJsonBuffer(value) {
+    if (pluginStorageCodecForBuffer(value) === PLUGIN_STORAGE_LOSSLESS_CODEC) {
+        decodeLosslessPluginStorageBuffer(value);
+        return;
+    }
     assertPluginStorageJson(decodePluginStorageJsonBuffer(value));
 }
 
 function parsePluginStorageJsonBuffer(value, storageKey = 'plugin storage row') {
+    if (pluginStorageCodecForBuffer(value) === PLUGIN_STORAGE_LOSSLESS_CODEC) {
+        return decodeLosslessPluginStorageBuffer(value);
+    }
     return snapshotPluginStorageJson(decodePluginStorageJsonBuffer(value));
 }
 
@@ -573,6 +743,10 @@ function validatePluginStorageRow(storageKey, value) {
         decodeValidatedPluginStorageKey(storageKey, prefix);
     }
     try {
+        if (prefix === PLUGIN_SAVE_META_PREFIX
+            && pluginStorageCodecForBuffer(value) === PLUGIN_STORAGE_LOSSLESS_CODEC) {
+            throw new TypeError('Plugin storage metadata requires strict JSON');
+        }
         return parsePluginStorageJsonBuffer(value, storageKey);
     } catch {
         throw new PluginStorageValidationError(storageKey);
@@ -586,6 +760,10 @@ function assertPluginStorageRow(storageKey, value) {
         decodeValidatedPluginStorageKey(storageKey, prefix);
     }
     try {
+        if (prefix === PLUGIN_SAVE_META_PREFIX
+            && pluginStorageCodecForBuffer(value) === PLUGIN_STORAGE_LOSSLESS_CODEC) {
+            throw new TypeError('Plugin storage metadata requires strict JSON');
+        }
         assertPluginStorageJsonBuffer(value);
     } catch {
         throw new PluginStorageValidationError(storageKey);
@@ -605,16 +783,21 @@ module.exports = {
     PluginStorageValidationError,
     createPluginStorageOwnerScanner,
     convertCompatiblePluginStorageJson,
+    PLUGIN_STORAGE_JSON_CODEC,
+    PLUGIN_STORAGE_LOSSLESS_CODEC,
+    PLUGIN_STORAGE_LOSSLESS_MAGIC,
     assertPluginStorageJsonBuffer,
     assertPluginStorageRow,
     decodeValidatedPluginStorageKey,
     encodeValidatedPluginStorageKey,
     isPluginStorageValidationError,
     parsePluginStorageJsonBuffer,
+    pluginStorageCodecForBuffer,
     pluginStoragePrefixForKey,
     snapshotPluginStorageJson,
     snapshotPluginStorageRecord,
     serializePluginStorageRow,
+    serializeLosslessPluginStorageRow,
     stringifyPluginStorageJson,
     validatePluginStorageRow,
 };

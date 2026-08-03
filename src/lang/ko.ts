@@ -1836,7 +1836,7 @@ export const languageKorean = {
     "이 옵션을 비활성화하면 거의 모든 플러그인과의 호환성이 손상됩니다. 비활성화하지 않는 것이 좋습니다.",
   autoConvertPluginStorageValues: "호환 가능한 플러그인 값 자동 변환",
   autoConvertPluginStorageValuesDesc:
-    "최적화 저장 값 또는 저장 모드 마이그레이션 값이 JSON과 호환되지 않으면 Date는 ISO 문자열, Map은 항목 배열, Set은 배열, BigInt는 10진수 문자열로 변환하고 undefined, 유한하지 않은 숫자, 배열의 빈 항목은 null로 변환합니다. 함수와 순환 참조는 계속 거부됩니다.",
+    "최적화 저장 값 또는 저장 모드 마이그레이션 값이 JSON과 호환되지 않으면 Date는 ISO 문자열, Map은 항목 배열, Set은 배열, BigInt는 10진수 문자열로 변환합니다. undefined 값과 직접 확인된 배열의 빈 항목은 버전이 지정된 무손실 코덱으로 보존하고, 유한하지 않은 숫자는 null로 변환합니다. 함수와 순환 참조는 계속 거부됩니다.",
   legacyPluginCompatibility: "레거시 플러그인 호환성",
   legacyPluginCompatibilityDesc:
     "업스트림 V3의 사용자 지정 데이터베이스 키 대체 동작을 유지하고, 레거시 플러그인에 더 긴 종료 시간을 제공하며, onUnload 중 상태, UI, 네트워크, 에셋 및 저장소의 제한된 마무리 작업을 허용하고, 종료 단계만 실패한 경우 경고 후 계속합니다. 데이터베이스 키 대체 동작은 브라우저 개발자 콘솔에만 알림을 표시합니다. 새 등록, 모델/채팅 작업, 플러그인 교체 및 비어 있지 않은 UI 생성은 계속 차단됩니다.",

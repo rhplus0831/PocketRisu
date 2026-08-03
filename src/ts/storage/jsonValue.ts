@@ -454,7 +454,10 @@ export function convertCompatibleJsonValue(input: unknown): unknown {
         if (typeof value === "bigint") {
             return Reflect.apply(bigintToString, value, []);
         }
-        if (value === undefined) return null;
+        // Optimized plugin storage can wrap this converted graph in its
+        // versioned lossless codec. Keep the structured-clone distinction
+        // instead of collapsing it to JSON null.
+        if (value === undefined) return undefined;
         if (typeof value !== "object") {
             throw new TypeError("Automatic JSON conversion cannot represent data at " + path + ".");
         }
@@ -499,7 +502,8 @@ export function convertCompatibleJsonValue(input: unknown): unknown {
                 for (let index = 0; index < length; index += 1) {
                     const descriptor = Reflect.getOwnPropertyDescriptor(value, String(index));
                     if (!descriptor) {
-                        result[index] = null;
+                        // Leave a real sparse hole. A dense `undefined` entry
+                        // is assigned below and remains observably distinct.
                         continue;
                     }
                     if (!("value" in descriptor) || !descriptor.enumerable) {
@@ -602,7 +606,10 @@ export function convertCompatibleJsonValue(input: unknown): unknown {
         }
     };
 
-    return snapshotJsonValue(convert(input, "$"));
+    // `convert()` already constructs a detached descriptor-only graph. The
+    // strict snapshot intentionally rejects the undefined values and holes
+    // that the plugin-value codec preserves.
+    return convert(input, "$");
 }
 
 export function stringifyJsonValue(value: unknown): string {

@@ -28,6 +28,10 @@ import type {
 } from "./nodeStorage";
 import type { PluginStorageBulkTransitionRequest } from "./pluginStorageTransitionBulk";
 import { encodeUtf8Base64Url } from "./base64Url";
+import {
+    decodePluginStorageValueBytes,
+    encodeLosslessPluginStorageValueToUtf8,
+} from "./pluginStorageValueCodec";
 
 export { hasNativeStringWellFormed } from "./unicodeWellFormed";
 
@@ -91,7 +95,9 @@ export async function readPersistentJsonRow<T>(
     }
     return {
         kind: "value",
-        value: JSON.parse(decoder.decode(data)) as T,
+        value: storageKey.startsWith("pluginsave/")
+            ? decodePluginStorageValueBytes<T>(data)
+            : JSON.parse(decoder.decode(data)) as T,
     };
 }
 
@@ -220,7 +226,12 @@ export async function restorePersistentPluginStoragePair<T>(
     signal?: AbortSignal | null,
 ): Promise<PluginStorageMutationResult> {
     throwIfAborted(signal);
-    const valueBytes = preparePersistentJson(value).bytes;
+    let valueBytes: Uint8Array;
+    try {
+        valueBytes = preparePersistentJson(value).bytes;
+    } catch {
+        valueBytes = encodeLosslessPluginStorageValueToUtf8(value);
+    }
     const ownerRecordBytes = ownerRecord === undefined
         ? undefined
         : encoder.encode(stringifyJsonValue(ownerRecord));
@@ -349,7 +360,7 @@ export async function readPersistentPluginStorageState<T>(
     }
     return {
         status: "value",
-        value: JSON.parse(decoder.decode(state.valueBytes)) as T,
+        value: decodePluginStorageValueBytes<T>(state.valueBytes, state.codec),
         revision: state.revision,
         generation: state.generation,
         publicationGeneration: state.publicationGeneration,

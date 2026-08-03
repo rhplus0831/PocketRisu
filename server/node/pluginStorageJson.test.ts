@@ -8,6 +8,8 @@ const {
     createPluginStorageOwnerScanner,
     encodeValidatedPluginStorageKey,
     parsePluginStorageJsonBuffer,
+    pluginStorageCodecForBuffer,
+    serializeLosslessPluginStorageRow,
     snapshotPluginStorageRecord,
     snapshotPluginStorageJson,
     stringifyPluginStorageJson,
@@ -24,6 +26,8 @@ const {
     }
     encodeValidatedPluginStorageKey: (rawKey: string, prefix: string) => string
     parsePluginStorageJsonBuffer: (value: Uint8Array, key?: string) => unknown
+    pluginStorageCodecForBuffer: (value: Uint8Array) => string
+    serializeLosslessPluginStorageRow: (key: string, value: unknown) => Buffer
     snapshotPluginStorageRecord: (
         value: unknown,
         fieldName: string,
@@ -145,6 +149,8 @@ describe('plugin storage JSON server boundary', () => {
     it('converts the documented rich-value subset on the server', () => {
         const sparse = new Array(3)
         sparse[1] = Number.NaN
+        const convertedSparse = new Array(3)
+        convertedSparse[1] = null
         expect(convertCompatiblePluginStorageJson({
             date: new Date('2026-01-02T03:04:05.000Z'),
             map: new Map([[1n, new Set(['a', 'b'])]]),
@@ -155,9 +161,50 @@ describe('plugin storage JSON server boundary', () => {
             date: '2026-01-02T03:04:05.000Z',
             map: [['1', ['a', 'b']]],
             bigint: '-42',
-            missing: null,
-            sparse: [null, null, null],
+            missing: undefined,
+            sparse: convertedSparse,
         })
+    })
+
+    it('round-trips undefined and holes through a collision-safe lossless row', () => {
+        const sparse = new Array(4)
+        sparse[1] = undefined
+        sparse[3] = { missing: undefined }
+        const source = {
+            literal: '**POCKET_UNDEFINED**',
+            undefinedTag: ['u'],
+            ownUndefined: undefined,
+            sparse,
+        }
+        const key = encoded('lossless')
+        const bytes = serializeLosslessPluginStorageRow(key, source)
+
+        expect(pluginStorageCodecForBuffer(bytes)).toBe('lossless-json-v1')
+        const decoded = validatePluginStorageRow(key, bytes) as typeof source
+        expect(decoded.literal).toBe(source.literal)
+        expect(decoded.undefinedTag).toEqual(['u'])
+        expect(Object.prototype.hasOwnProperty.call(decoded, 'ownUndefined')).toBe(true)
+        expect(decoded.ownUndefined).toBeUndefined()
+        expect(0 in decoded.sparse).toBe(false)
+        expect(1 in decoded.sparse).toBe(true)
+        expect(2 in decoded.sparse).toBe(false)
+        expect(Object.prototype.hasOwnProperty.call(decoded.sparse[3], 'missing')).toBe(true)
+    })
+
+    it('rejects malformed lossless tags and lossless owner metadata', () => {
+        const valueKey = encoded('malformed-lossless')
+        const malformed = Buffer.from('PRISUL01["u","extra"]', 'utf-8')
+        expect(() => validatePluginStorageRow(valueKey, malformed)).toThrow(
+            expect.objectContaining({ code: 'INVALID_PLUGIN_STORAGE_ROW' }),
+        )
+
+        const ownerKey = valueKey.replace('pluginsave/', 'pluginsave-meta/')
+        const encodedOwner = serializeLosslessPluginStorageRow(ownerKey, {
+            plugin: undefined,
+        })
+        expect(() => validatePluginStorageRow(ownerKey, encodedOwner)).toThrow(
+            expect.objectContaining({ code: 'INVALID_PLUGIN_STORAGE_ROW' }),
+        )
     })
 
     it('keeps functions and circular references outside automatic conversion', () => {

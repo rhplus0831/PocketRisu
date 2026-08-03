@@ -16,7 +16,7 @@ function pluginStorageViewerDisplaySize(value) {
 function pluginStorageViewerDisplaySizeFromMetadata(metadata) {
     const size = metadata?.type === 'string'
         ? metadata.length
-        : metadata?.type === 'null'
+        : metadata?.type === 'null' || metadata?.type === 'undefined'
             ? 0
             : metadata?.jsonSize;
     if (!Number.isSafeInteger(size) || size < 0) {

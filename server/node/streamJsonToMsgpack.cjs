@@ -5,6 +5,9 @@ const crypto = require('crypto');
 const { TextDecoder } = require('util');
 const { Packr } = require('msgpackr');
 const { Unpackr } = require('msgpackr');
+const {
+    PLUGIN_STORAGE_LOSSLESS_MAGIC,
+} = require('./pluginStorageJson.cjs');
 
 const PAGE_BYTES = 64 * 1024;
 const MAX_JSON_DEPTH = 1024;
@@ -565,6 +568,142 @@ async function writeJsonValue(reader, writer, depth) {
     throw new SyntaxError('Invalid plugin storage JSON value');
 }
 
+async function losslessCollectionSeparator(reader, closingByte, label) {
+    await skipWhitespace(reader);
+    const separator = await reader.read();
+    if (separator === closingByte) return false;
+    if (separator !== 0x2c) throw new SyntaxError(`Invalid lossless plugin storage ${label}`);
+    return true;
+}
+
+async function writeLosslessPluginStorageNode(
+    reader,
+    writer,
+    depth,
+    { allowHole = false } = {},
+) {
+    if (depth > MAX_JSON_DEPTH) {
+        throw new SyntaxError('Lossless plugin storage nesting is too deep');
+    }
+    await skipWhitespace(reader);
+    if (await reader.peek() !== 0x5b) {
+        const byte = await reader.peek();
+        if (byte === 0x7b) {
+            throw new SyntaxError('Invalid lossless plugin storage node');
+        }
+        return writeJsonValue(reader, writer, depth);
+    }
+
+    await expectByte(reader, 0x5b);
+    await skipWhitespace(reader);
+    const tag = await readBoundedJsonString(reader);
+    if (tag === 'u' || tag === 'h') {
+        if (tag === 'h' && !allowHole) {
+            throw new SyntaxError('Lossless plugin storage hole is outside an array');
+        }
+        await skipWhitespace(reader);
+        await expectByte(reader, 0x5d);
+        await writer.write(encodedScalar(undefined));
+        return { type: tag === 'h' ? 'hole' : 'undefined', truthy: false, jsonSize: 0 };
+    }
+
+    await skipWhitespace(reader);
+    await expectByte(reader, 0x2c);
+    await skipWhitespace(reader);
+    await expectByte(reader, 0x5b);
+
+    if (tag === 'a') {
+        const headerOffset = writer.position;
+        await writer.write(Buffer.from([0xdd, 0, 0, 0, 0]));
+        let count = 0;
+        let jsonSize = 2;
+        await skipWhitespace(reader);
+        if (await reader.peek() !== 0x5d) {
+            for (;;) {
+                const item = await writeLosslessPluginStorageNode(
+                    reader,
+                    writer,
+                    depth + 1,
+                    { allowHole: true },
+                );
+                jsonSize += item.type === 'undefined' || item.type === 'hole'
+                    ? 4
+                    : item.jsonSize;
+                if (++count > 0xffffffff) {
+                    throw new RangeError('Lossless plugin storage array is too large');
+                }
+                if (count > 1) jsonSize += 1;
+                if (!await losslessCollectionSeparator(reader, 0x5d, 'array')) break;
+            }
+        } else {
+            await reader.read();
+        }
+        await skipWhitespace(reader);
+        await expectByte(reader, 0x5d);
+        const header = Buffer.allocUnsafe(5);
+        header[0] = 0xdd;
+        header.writeUInt32BE(count, 1);
+        await writer.patch(headerOffset, header);
+        return { type: 'array', truthy: true, count, jsonSize };
+    }
+
+    if (tag === 'o') {
+        const headerOffset = writer.position;
+        await writer.write(Buffer.from([0xdf, 0, 0, 0, 0]));
+        let count = 0;
+        let visibleCount = 0;
+        let jsonSize = 2;
+        const seen = new Set();
+        await skipWhitespace(reader);
+        if (await reader.peek() !== 0x5d) {
+            for (;;) {
+                await skipWhitespace(reader);
+                await expectByte(reader, 0x5b);
+                await skipWhitespace(reader);
+                const key = await writeJsonString(reader, writer, true);
+                if (seen.has(key.identity)) {
+                    throw new SyntaxError('Lossless plugin storage object repeats a key');
+                }
+                seen.add(key.identity);
+                await skipWhitespace(reader);
+                await expectByte(reader, 0x2c);
+                const item = await writeLosslessPluginStorageNode(
+                    reader,
+                    writer,
+                    depth + 1,
+                );
+                await skipWhitespace(reader);
+                await expectByte(reader, 0x5d);
+                if (item.type !== 'undefined') {
+                    jsonSize += key.jsonSize + 1 + item.jsonSize;
+                    if (++visibleCount > 1) jsonSize += 1;
+                }
+                if (++count > 0xffffffff) {
+                    throw new RangeError('Lossless plugin storage object is too large');
+                }
+                if (!await losslessCollectionSeparator(reader, 0x5d, 'object')) break;
+            }
+        } else {
+            await reader.read();
+        }
+        await skipWhitespace(reader);
+        await expectByte(reader, 0x5d);
+        const header = Buffer.allocUnsafe(5);
+        header[0] = 0xdf;
+        header.writeUInt32BE(count, 1);
+        await writer.patch(headerOffset, header);
+        return { type: 'object', truthy: true, count, jsonSize };
+    }
+
+    throw new SyntaxError('Invalid lossless plugin storage tag');
+}
+
+async function consumeLosslessPluginStorageMagic(reader) {
+    for (const expected of PLUGIN_STORAGE_LOSSLESS_MAGIC) {
+        await expectByte(reader, expected);
+    }
+}
+
 async function withJsonReader(source, options, callback) {
     const handle = await fs.open(source.filePath, 'r');
     const shouldAbort = () => options.signal?.aborted === true || options.shouldAbort?.() === true;
@@ -588,6 +727,11 @@ async function withJsonReader(source, options, callback) {
 
 async function streamJsonFileToMessagePack(source, writer, options = {}) {
     return withJsonReader(source, options, async (reader) => {
+        await skipWhitespace(reader);
+        if (await reader.peek() === PLUGIN_STORAGE_LOSSLESS_MAGIC[0]) {
+            await consumeLosslessPluginStorageMagic(reader);
+            return writeLosslessPluginStorageNode(reader, writer, 0);
+        }
         return writeJsonValue(reader, writer, 0);
     });
 }

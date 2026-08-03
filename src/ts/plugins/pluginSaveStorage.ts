@@ -34,6 +34,11 @@ import {
     stringifyJsonValue,
 } from "../storage/jsonValue";
 import {
+    decodePluginStorageValueBytes,
+    encodeLosslessPluginStorageValueToUtf8,
+    snapshotLosslessPluginStorageValue,
+} from "../storage/pluginStorageValueCodec";
+import {
     assertWellFormedUnicode,
     isWellFormedUnicode,
 } from "../storage/unicodeWellFormed";
@@ -1762,7 +1767,12 @@ function prepareOptimizedPluginStorageValue(
         if (autoConvert) {
             try {
                 const snapshot = convertCompatibleJsonValue(value);
-                prepared = preparePersistentJson(snapshot);
+                try {
+                    prepared = preparePersistentJson(snapshot);
+                } catch {
+                    const bytes = encodeLosslessPluginStorageValueToUtf8(snapshot);
+                    prepared = { bytes, byteLength: bytes.byteLength };
+                }
                 converted = true;
             } catch (conversionError) {
                 cause = conversionError;
@@ -5129,7 +5139,9 @@ async function applyStagedPluginStorageTransition(
                         operation: "transition",
                     });
                 }
-                const value = JSON.parse(new TextDecoder().decode(bytes));
+                const value = prefix === PLUGIN_SAVE_PREFIX
+                    ? decodePluginStorageValueBytes(bytes)
+                    : JSON.parse(new TextDecoder().decode(bytes));
                 if (prefix === PLUGIN_SAVE_PREFIX) {
                     definePluginStorageRecordValue(nextValues, rawKey, value);
                 } else {
@@ -5197,7 +5209,9 @@ async function applyStagedPluginStorageTransition(
                         transitionId,
                         entry.storageKey,
                     );
-                    const value = JSON.parse(new TextDecoder().decode(bytes));
+                    const value = entry.prefix === PLUGIN_SAVE_PREFIX
+                        ? decodePluginStorageValueBytes(bytes)
+                        : JSON.parse(new TextDecoder().decode(bytes));
                     if (entry.prefix === PLUGIN_SAVE_PREFIX) {
                         definePluginStorageRecordValue(db.pluginCustomStorage, entry.rawKey, value);
                     } else {
@@ -5374,7 +5388,9 @@ function collectBootInlineEntries(
             entries.push({
                 key,
                 storageKey,
-                value: snapshotJsonValue(descriptor.value),
+                value: prefix === PLUGIN_SAVE_PREFIX
+                    ? snapshotLosslessPluginStorageValue(descriptor.value)
+                    : snapshotJsonValue(descriptor.value),
             });
         } catch (error) {
             issues.push(bootRecoveryIssue(error, storageKey, "read-failed"));
@@ -5440,7 +5456,9 @@ async function readBootStorageRows(
                 issues.push({ code: "read-failed", encodedKey: storageKey });
                 continue;
             }
-            const value = snapshotJsonValue(row.value);
+            const value = prefix === PLUGIN_SAVE_PREFIX
+                ? snapshotLosslessPluginStorageValue(row.value)
+                : snapshotJsonValue(row.value);
             rows.push({ key, storageKey, value });
         } catch (error) {
             throwIfAborted(signal);
@@ -5451,7 +5469,32 @@ async function readBootStorageRows(
 }
 
 function bootJsonValuesEqual(left: unknown, right: unknown): boolean {
-    return stringifyJsonValue(left) === stringifyJsonValue(right);
+    try {
+        return stringifyJsonValue(left) === stringifyJsonValue(right);
+    } catch {
+        try {
+            const leftBytes = encodeLosslessPluginStorageValueToUtf8(left);
+            const rightBytes = encodeLosslessPluginStorageValueToUtf8(right);
+            return leftBytes.byteLength === rightBytes.byteLength
+                && leftBytes.every((byte, index) => byte === rightBytes[index]);
+        } catch {
+            return false;
+        }
+    }
+}
+
+function prepareBootStorageEntry(entry: PreparedStorageEntry): ReturnType<
+    typeof preparePersistentJson
+> {
+    try {
+        return preparePersistentJson(entry.value);
+    } catch {
+        if (!entry.storageKey.startsWith(PLUGIN_SAVE_PREFIX)) throw new TypeError(
+            "Plugin storage metadata must remain strict JSON during boot recovery.",
+        );
+        const bytes = encodeLosslessPluginStorageValueToUtf8(entry.value);
+        return { bytes, byteLength: bytes.byteLength };
+    }
 }
 
 function restoreBootInlineRecords(
@@ -5653,7 +5696,7 @@ export async function reconcilePluginStorageModeForBoot(
                     nextManifest,
                     writes: [entry, ...(metaEntry ? [metaEntry] : [])].map(row => ({
                         storageKey: row.storageKey,
-                        valueBytes: preparePersistentJson(row.value).bytes,
+                        valueBytes: prepareBootStorageEntry(row).bytes,
                     })),
                     deletes: [],
                 }, signal);

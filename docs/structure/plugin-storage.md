@@ -27,9 +27,10 @@ surface those legacy rows for guarded migration or removal, but optimized storag
 versioned/compound replacement values require detached, strict JSON.
 `Database.autoConvertPluginStorageValues` is an independent compatibility setting, not
 part of the optimization toggle. When an ordinary optimized write or externalization
-cannot be represented as strict JSON, it may convert `Date`, `Map`, `Set`, `BigInt`,
-`undefined`, non-finite numbers, and sparse-array holes into documented JSON-compatible
-forms. It does not change inline values or relax versioned/compound replacement APIs;
+cannot be represented as strict JSON, it converts `Date`, `Map`, `Set`, `BigInt`, and
+non-finite numbers into documented JSON-compatible forms and preserves `undefined` plus
+directly observed sparse-array holes with a versioned lossless optimized-row codec. It
+does not change inline values or relax versioned/compound replacement APIs;
 functions, circular references, accessors, symbols, and custom classes still fail.
 
 Optimized authority is not “every row under the prefix.” The manifest names the exact
@@ -172,11 +173,12 @@ blindly. Re-read authoritative state, or reload when a generation/transition out
 cannot be proven.
 
 Current optimized versioned reads use `/api/plugin-storage/state/raw`. A present row is
-the exact stored byte sequence; headers carry `json-v1` plus its content type, byte
-length, SHA-256 content digest, opaque row revision/generation, and selected publication
-generation/manifest revision. A proven absence is `204` with the publication identity
-and no row metadata. The browser verifies the header-bound length/digest and parses the
-stored JSON bytes directly. A valid same-generation publication identity also refreshes
+the exact stored byte sequence; headers carry either `json-v1` or `lossless-json-v1`
+plus its content type, byte length, SHA-256 content digest, opaque row
+revision/generation, and selected publication generation/manifest revision. A proven
+absence is `204` with the publication identity and no row metadata. The browser verifies
+the header-bound length/digest before decoding the selected codec. A valid
+same-generation publication identity also refreshes
 the browser's manifest-revision token and invalidates a differently stamped ownership
 snapshot without eagerly refetching it. A generation-pinned raw read requires a paired,
 well-formed publication identity for that generation; missing, malformed, or mismatched
@@ -301,9 +303,13 @@ externalization sends one framed request containing transition metadata and the 
 inline plugin snapshot as structured-clone MessagePack rows. Internalization sends no
 row bodies; the server reads the selected optimized publication itself. The server owns
 validation and, when `Database.autoConvertPluginStorageValues` is enabled, compatible
-rich-value conversion while writing an unpublished private stage. The client does not
-JSON-validate individual externalization values first. Servers that do not advertise
-the bulk capability retain the earlier staged row protocol.
+rich-value conversion while writing an unpublished private stage. Converted values that
+contain `undefined` or directly observed sparse-array holes use the self-identifying
+`lossless-json-v1` row codec; legacy and fully strict rows remain `json-v1`. The codec's
+non-JSON magic prefix prevents collisions with plugin strings or objects, while hashes,
+CAS revisions, quotas, caches, and backups continue to bind the exact stored bytes. The
+client does not JSON-validate individual externalization values first. Servers that do
+not advertise the bulk capability retain the earlier staged row protocol.
 
 The legacy non-bulk `POST /api/plugin-storage/transition` protocol is retired. Its route
 remains registered only to reject residual callers before body parsing with the structured

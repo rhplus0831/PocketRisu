@@ -10,6 +10,11 @@ import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
 const { encodePluginSaveStorageKey } = pluginSaveKeysPkg as {
   encodePluginSaveStorageKey: (rawKey: string, prefix: string) => string
 }
+import pluginStorageJsonPkg from '../../server/node/pluginStorageJson.cjs'
+
+const { parsePluginStorageJsonBuffer } = pluginStorageJsonPkg as {
+  parsePluginStorageJsonBuffer: (value: Uint8Array) => unknown
+}
 
 const servers: ServerHandle[] = []
 addExtension({
@@ -111,13 +116,49 @@ describe('bulk plugin storage transitions (real server)', () => {
       },
     })
     expect(valueResponse.status).toBe(200)
-    expect(JSON.parse(Buffer.from(await valueResponse.arrayBuffer()).toString('utf8'))).toEqual({
+    const optimizedBytes = Buffer.from(await valueResponse.arrayBuffer())
+    const optimizedValue = parsePluginStorageJsonBuffer(optimizedBytes) as any
+    expect(optimizedValue).toEqual({
       date: '2026-01-02T03:04:05.000Z',
       map: [['1', ['a', 'b']]],
       bigint: '-42',
-      missing: null,
-      sparse: [null, null, null],
+      missing: undefined,
+      sparse: [undefined, null, undefined],
     })
+    expect(Object.prototype.hasOwnProperty.call(optimizedValue, 'missing')).toBe(true)
+    expect(0 in optimizedValue.sparse).toBe(true)
+    expect(1 in optimizedValue.sparse).toBe(true)
+    expect(2 in optimizedValue.sparse).toBe(true)
+
+    const rawState = await client.fetch('/api/plugin-storage/state/raw', {
+      headers: {
+        'file-path': filePathHeader(value.descriptor.storageKey),
+        'x-plugin-storage-generation': externalGeneration,
+      },
+    })
+    expect(rawState.status).toBe(200)
+    expect(rawState.headers.get('x-plugin-storage-codec')).toBe('lossless-json-v1')
+    expect(rawState.headers.get('content-type')).toContain('application/octet-stream')
+    expect(Buffer.from(await rawState.arrayBuffer())).toEqual(optimizedBytes)
+
+    const backup = await client.exportBackup()
+    const restoredServer = await spawnServer()
+    servers.push(restoredServer)
+    const restoredClient = await createClient(restoredServer.port, restoredServer.password)
+    expect((await restoredClient.importBackup(backup)).ok).toBe(true)
+    const restoredState = await restoredClient.fetch('/api/plugin-storage/state/raw', {
+      headers: {
+        'file-path': filePathHeader(value.descriptor.storageKey),
+        'x-plugin-storage-generation': externalGeneration,
+      },
+    })
+    expect(restoredState.status).toBe(200)
+    expect(restoredState.headers.get('x-plugin-storage-codec')).toBe('lossless-json-v1')
+    const restoredValue = parsePluginStorageJsonBuffer(
+      Buffer.from(await restoredState.arrayBuffer()),
+    ) as any
+    expect(Object.prototype.hasOwnProperty.call(restoredValue, 'missing')).toBe(true)
+    expect(restoredValue.missing).toBeUndefined()
 
     const manifestResponse = await client.fetch('/api/plugin-storage/manifest', {
       headers: { 'x-plugin-storage-generation': externalGeneration },
@@ -166,7 +207,7 @@ describe('bulk plugin storage transitions (real server)', () => {
       date: '2026-01-02T03:04:05.000Z',
       map: [['1', ['a', 'b']]],
       bigint: '-42',
-      missing: null,
+      missing: undefined,
       sparse: [null, null, null],
     })
     expect(database.pluginStorageMeta.rich).toMatchObject({

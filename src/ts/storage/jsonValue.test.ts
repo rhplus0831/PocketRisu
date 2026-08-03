@@ -120,13 +120,22 @@ describe("persistent JSON values", () => {
             sparse,
         };
 
-        expect(convertCompatibleJsonValue(input)).toEqual({
+        const converted = convertCompatibleJsonValue(input) as typeof input;
+        const expectedSparse = new Array(3);
+        expectedSparse[1] = undefined;
+        expectedSparse[2] = null;
+        expect(converted).toEqual({
             date: "2026-01-02T03:04:05.000Z",
             map: [["1", ["a", "b"]]],
             bigint: "-42",
-            missing: null,
-            sparse: [null, null, null],
+            missing: undefined,
+            sparse: expectedSparse,
         });
+        expect(Object.prototype.hasOwnProperty.call(converted, "missing")).toBe(true);
+        expect(0 in converted.sparse).toBe(false);
+        expect(1 in converted.sparse).toBe(true);
+        expect(2 in converted.sparse).toBe(true);
+        expect(converted.sparse[2]).toBeNull();
     });
 
     it("still rejects values that cannot be converted safely", () => {

@@ -240,12 +240,16 @@ const {
 const { createBackupImportIndex } = require('./backupImportIndex.cjs');
 const {
     PluginStorageValidationError,
+    PLUGIN_STORAGE_LOSSLESS_CODEC,
+    PLUGIN_STORAGE_LOSSLESS_MAGIC,
     assertPluginStorageRow,
     convertCompatiblePluginStorageJson,
     createPluginStorageOwnerScanner,
     decodeValidatedPluginStorageKey,
     encodeValidatedPluginStorageKey,
     isPluginStorageValidationError,
+    pluginStorageCodecForBuffer,
+    serializeLosslessPluginStorageRow,
     serializePluginStorageRow,
     snapshotPluginStorageRecord,
     validatePluginStorageRow,
@@ -4489,11 +4493,34 @@ async function validateAndImportPluginValueFile(
     const valueMaxBytes = Math.min(maxBytes, PLUGIN_VALUE_MAX_BYTES);
     let displayMetadata;
     try {
-        await validateJsonFileStreaming(source.filePath, {
-            size: source.size,
-            maxBytes: valueMaxBytes,
-            signal,
-        });
+        if (source.size > valueMaxBytes) {
+            throw new PluginStorageLimitError(
+                `Plugin storage value exceeds the ${valueMaxBytes}-byte import limit.`,
+                {
+                    code: 'PLUGIN_VALUE_TOO_LARGE',
+                    limit: valueMaxBytes,
+                    actual: source.size,
+                },
+            );
+        }
+        const prefixHandle = await fs.open(source.filePath, 'r');
+        let prefix;
+        try {
+            prefix = Buffer.alloc(Math.min(PLUGIN_STORAGE_LOSSLESS_MAGIC.length, source.size));
+            const read = await prefixHandle.read(prefix, 0, prefix.length, 0);
+            if (read.bytesRead !== prefix.length) {
+                throw new PluginStorageValidationError(key);
+            }
+        } finally {
+            await prefixHandle.close();
+        }
+        if (pluginStorageCodecForBuffer(prefix) !== PLUGIN_STORAGE_LOSSLESS_CODEC) {
+            await validateJsonFileStreaming(source.filePath, {
+                size: source.size,
+                maxBytes: valueMaxBytes,
+                signal,
+            });
+        }
         displayMetadata = await validateJsonSource({
             filePath: source.filePath,
             size: source.size,
@@ -10821,7 +10848,7 @@ app.get('/api/list', async (req, res, next) => {
 });
 
 const PLUGIN_STORAGE_JSON_CONTENT_TYPE = 'application/json';
-const PLUGIN_STORAGE_JSON_CODEC = 'json-v1';
+const PLUGIN_STORAGE_LOSSLESS_CONTENT_TYPE = 'application/octet-stream';
 
 async function readAuthoritativePluginStorageState(req, valueKey, requestedGeneration) {
     const ownerKey = `${PLUGIN_SAVE_META_PREFIX}${valueKey.slice(PLUGIN_SAVE_PREFIX.length)}`;
@@ -10982,9 +11009,15 @@ function handlePluginStorageStateRead({ binary }) {
                 );
                 if (state.valueBytes === null) return res.status(204).end();
 
-                res.setHeader('Content-Type', PLUGIN_STORAGE_JSON_CONTENT_TYPE);
+                const codec = pluginStorageCodecForBuffer(state.valueBytes);
+                res.setHeader(
+                    'Content-Type',
+                    codec === PLUGIN_STORAGE_LOSSLESS_CODEC
+                        ? PLUGIN_STORAGE_LOSSLESS_CONTENT_TYPE
+                        : PLUGIN_STORAGE_JSON_CONTENT_TYPE,
+                );
                 res.setHeader('Content-Length', String(state.valueBytes.byteLength));
-                res.setHeader('x-plugin-storage-codec', PLUGIN_STORAGE_JSON_CODEC);
+                res.setHeader('x-plugin-storage-codec', codec);
                 res.setHeader(
                     'x-plugin-storage-byte-length',
                     String(state.valueBytes.byteLength),
@@ -14720,7 +14753,14 @@ async function receiveBulkPluginStorageTransition(req) {
                 }
                 try {
                     jsonValue = convertCompatiblePluginStorageJson(richValue);
-                    jsonBytes = serializePluginStorageRow(descriptor.storageKey, jsonValue);
+                    try {
+                        jsonBytes = serializePluginStorageRow(descriptor.storageKey, jsonValue);
+                    } catch {
+                        jsonBytes = serializeLosslessPluginStorageRow(
+                            descriptor.storageKey,
+                            jsonValue,
+                        );
+                    }
                 } catch {
                     throw strictError;
                 }
