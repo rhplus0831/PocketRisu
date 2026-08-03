@@ -81,10 +81,10 @@ browser heap instrumentation was added.
 - **Optimized-map emptiness is not enforced by `setDatabase()`.** The function
   unconditionally copies whatever `pluginCustomStorage`/`pluginStorageMeta`
   records it is given (`copyDatabasePluginStorageRecord()` in
-  `src/ts/plugins/pluginStorageRecord.ts`). The empty-map invariant is
+  `../../src/ts/plugins/pluginStorageRecord.ts`). The empty-map invariant is
   actually established by transition commit
   (`applyBulkPluginStorageTransition()`) and boot reconciliation in
-  `src/ts/plugins/pluginSaveStorage.ts`. Remediation that relies on the
+  `../../src/ts/plugins/pluginSaveStorage.ts`. Remediation that relies on the
   invariant must guard those paths, not `setDatabase()`.
 - **The "approximately 4×" multiplier is a workload model, not a guarantee.**
   It holds for the sampled flat-string fixture. UTF-8 versus UTF-16
@@ -112,8 +112,8 @@ browser heap instrumentation was added.
   post-internalization retained-representation multiplier. The other listed
   coverage gaps are real.
 - Minor: the `saveDb()` full-assembly and patch orchestration described by the
-  report lives in `src/ts/globalApi.svelte.ts` (`persistTrackedChanges`), not
-  `src/ts/storage/databaseSave.ts`, which holds the coordinator/pause fencing.
+  report lives in `../../src/ts/globalApi.svelte.ts` (`persistTrackedChanges`), not
+  `../../src/ts/storage/databaseSave.ts`, which holds the coordinator/pause fencing.
 
 The report's measurements, root-cause ranking, and recommended remediation
 remain trustworthy with these corrections applied.
@@ -142,7 +142,7 @@ impact at realistic sizes (databases 50–500 MiB, chats 1–50 MiB).
 | C15 | Low | Raw msgpackr configuration cliffs: map16 sizing, no records, binary subarray aliasing |
 
 - **C1.** For block-format (RISUSAVE) inputs, `RisuSaveDecoder.decode()` in
-  `src/ts/storage/risuSave.ts` retains every block as a decoded `content`
+  `../../src/ts/storage/risuSave.ts` retains every block as a decoded `content`
   string, and strict mode validates each known JSON block with a `JSON.parse`
   whose result is discarded before the type switch parses blocks it consumes
   a second time (CONFIG/LOADOUTS are validated once and ignored). Which paths
@@ -152,18 +152,18 @@ impact at realistic sizes (databases 50–500 MiB, chats 1–50 MiB).
   decode directly via `Unpackr` instead. Where it applies, input bytes, all
   block strings, a transient validation graph, and the final graph overlap on
   the main thread with parse work done twice.
-- **C2.** The active-chat `$effect` in `src/ts/globalApi.svelte.ts` calls
+- **C2.** The active-chat `$effect` in `../../src/ts/globalApi.svelte.ts` calls
   `deepTouch(activeChat)`; each affected flush re-traverses every message and
   nested property of the hydrated chat. Streaming or editing a long chat pays
   O(total chat graph) main-thread work per flush and grows with history.
 - **C3.** `prepareChatPersistStage()` checkpoints roughly every 20 seconds
-  during generation, and `saveChatContent()` in `src/ts/storage/nodeStorage.ts`
+  during generation, and `saveChatContent()` in `../../src/ts/storage/nodeStorage.ts`
   runs `encodeRisuSaveLegacy(chat)` — full MessagePack encode plus a
   header-prefixed copy — and uploads the whole row each time. With the
   resource cache enabled the same bytes are copied and hashed up to twice
   more, subject to acknowledgement/hash matching and the 32 MiB entry limit.
 - **C4.** The cache-enabled boot path (`readDatabaseForBoot()` with
-  `src/ts/storage/dbCachedRead.ts`) copies and hashes every miss segment,
+  `../../src/ts/storage/dbCachedRead.ts`) copies and hashes every miss segment,
   retains all miss bytes, and copies eligible entries again in
   `prepareManifestUpdates()`; only the 32 MiB per-entry limit gates admission
   before the IndexedDB write, while the 64 MiB aggregate budget is enforced by
@@ -171,7 +171,7 @@ impact at realistic sizes (databases 50–500 MiB, chats 1–50 MiB).
   budget at peak, and the database is not returned until persistence completes.
 - **C5.** `rebaseTrackedLocalChangesOnLatestServerDb()` decodes the latest
   server database, clones it, clones the local graph
-  (`mergeTrackedDatabaseOnConflict()` in `src/ts/storage/databaseClone.ts`),
+  (`mergeTrackedDatabaseOnConflict()` in `../../src/ts/storage/databaseClone.ts`),
   and initializes replacement encoder and patcher instances while the old
   instances remain referenced. A conflict on a large database can hold on the
   order of six payload-sized graphs at once.
@@ -244,7 +244,7 @@ impact at realistic sizes (databases 50–500 MiB, chats 1–50 MiB).
 | S14 | Low | Plugin session-read state and generation memos have no lifetime bound |
 | S15 | Low | Staged transition downloads read each large file twice |
 
-- **S1.** `chunkStore.getValue()` (`server/node/chunkStore.cjs`) loads every
+- **S1.** `chunkStore.getValue()` (`../../server/node/chunkStore.cjs`) loads every
   chunk into a retained array, recomputes each chunk's SHA-256 plus the
   logical SHA-256 on every read, and returns `Buffer.concat(parts)` — roughly
   2× payload plus full crypto per ordinary `kvGet()` of a protected chunked
@@ -572,5 +572,5 @@ This audit extends and supersedes the scope of
 [plugin-storage-inline-memory-performance.md](plugin-storage-inline-memory-performance.md)
 without replacing it: that report remains the detailed reference for the
 inline plugin-storage pipeline, with the corrections in Part 1 applied.
-Historical risk reports under `docs/findings/audit/` are unrelated point-in-time
+Historical risk reports under `../../docs/findings/audit` are unrelated point-in-time
 data-loss audits.

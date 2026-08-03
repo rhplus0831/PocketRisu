@@ -40,7 +40,7 @@ the client/server object and save pipelines.
 ## Scope and terminology
 
 This report concerns save-backed plugin values described in
-[the plugin-storage structure guide](structure/plugin-storage.md).
+[the plugin-storage structure guide](../../docs/structure/plugin-storage.md).
 
 - **Optimized mode** means `Database.optimizePluginMemory === true`. Plugin values and
   owner records are authoritative in manifest-owned `pluginsave/` and
@@ -49,10 +49,10 @@ This report concerns save-backed plugin values described in
   fields of the authoritative database object and are encoded inside
   `database/database.bin`.
 - **Server `dbCache`** is the decoded JavaScript object retained by
-  `server/node/server.cjs` for JSON Patch synchronization. It is not a byte cache and
+  `../../server/node/server.cjs` for JSON Patch synchronization. It is not a byte cache and
   is not the browser resource cache.
 - **Browser resource cache** is the optional IndexedDB-backed, content-addressed cache
-  implemented by `src/ts/storage/resourceCache.ts` and the `/api/db/read-cached`
+  implemented by `../../src/ts/storage/resourceCache.ts` and the `/api/db/read-cached`
   protocol.
 
 The reported browser figures—about 500 MiB optimized, about 2 GiB inline, and a
@@ -111,11 +111,11 @@ plugin-storage block.
 
 Relevant implementation:
 
-- `src/ts/plugins/pluginSaveStorage.ts`: `getPluginSaveStorageItem()`,
+- `../../src/ts/plugins/pluginSaveStorage.ts`: `getPluginSaveStorageItem()`,
   `setPluginSaveStorageItem()`, and `commitOptimizedStorageMutation()`.
-- `src/ts/storage/database.svelte.ts`: `setDatabase()` documents that optimized mode
+- `../../src/ts/storage/database.svelte.ts`: `setDatabase()` documents that optimized mode
   retains only the empty compatibility map.
-- `src/ts/storage/risuSave.ts`: `RisuSaveEncoder.init()` retains the format-compatible
+- `../../src/ts/storage/risuSave.ts`: `RisuSaveEncoder.init()` retains the format-compatible
   plugin block, but it is small when the reconciler has cleared the inline map.
 
 The approximately 500 MiB optimized measurement is therefore primarily base
@@ -192,7 +192,7 @@ encoded block remain reachable. During initialization, the `TextEncoder` result 
 similar temporary allocation.
 
 The relevant symbols are `RisuSaveEncoder.init()`, `encodeRawBlock()`, and
-`risuSaveCacheMap` in `src/ts/storage/risuSave.ts`.
+`risuSaveCacheMap` in `../../src/ts/storage/risuSave.ts`.
 
 ### Patcher JSON baseline
 
@@ -237,7 +237,7 @@ change the root cause or the observed measurements.
 
 ### Purpose
 
-`dbCache` is declared in `server/node/server.cjs` as an object keyed by the hex-encoded
+`dbCache` is declared in `../../server/node/server.cjs` as an object keyed by the hex-encoded
 storage path. For `database/database.bin`, it retains the decoded stubs-only database
 used by `/api/patch`.
 
@@ -376,7 +376,7 @@ most expensive segment cannot become a useful cache hit on later boots.
 
 ### Streaming support does not make inline state lazy
 
-`server/node/streamRisuLoad.cjs` contains bounded format inspection and streaming
+`../../server/node/streamRisuLoad.cjs` contains bounded format inspection and streaming
 walkers capable of visiting plugin entries one at a time. Those paths are effective
 when externalizing plugin storage because the destination remains row-oriented.
 
@@ -485,8 +485,8 @@ does not treat the size multiplier itself as a failure. It also does not measure
 - a resource-cache root segment larger than its 32 MiB entry limit.
 
 Relevant files are
-`test/performance/plugin-storage-transition-memory.test.ts` and
-`scripts/run-performance-extreme-tests.mjs`.
+`../../test/performance/plugin-storage-transition-memory.test.ts` and
+`../../scripts/run-performance-extreme-tests.mjs`.
 
 ## Root-cause ranking
 
