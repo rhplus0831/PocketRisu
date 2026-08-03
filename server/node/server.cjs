@@ -18792,6 +18792,48 @@ app.get('/api/db/stats', async (req, res, next) => {
             kvRowSize: chatKvRowSize,
             chunkBytes: chatChunkBytes,
         };
+
+        // Optimized plugin storage is one physical category made up of value
+        // rows, owner sidecars, and the publication manifest. Keep its logical
+        // payload total separate from its SQLite footprint: chunked rows leave
+        // only a small marker in kv and store their bodies in chunks.
+        const pluginStorageEntries = [
+            ...kvListWithSizes(PLUGIN_SAVE_PREFIX),
+            ...kvListWithSizes(PLUGIN_SAVE_META_PREFIX),
+            ...kvListSelectedWithSizes([PLUGIN_STORAGE_MANIFEST_KEY]),
+        ];
+        const pluginStorageTotalSize = pluginStorageEntries
+            .reduce((total, entry) => total + entry.size, 0);
+        const pluginStorageKv = sqliteDb.prepare(
+            `SELECT COUNT(*) AS c, COALESCE(SUM(LENGTH(value)), 0) AS b
+             FROM kv
+             WHERE key LIKE 'pluginsave/%'
+                OR key LIKE 'pluginsave-meta/%'
+                OR key = @manifestKey`
+        ).get({ manifestKey: PLUGIN_STORAGE_MANIFEST_KEY });
+        // Attribute a shared chunk to chats first so dashboard categories stay
+        // disjoint. Chunks shared with database snapshots but not chats belong
+        // to plugin storage; every remaining chunk stays in the database slice.
+        const pluginStorageChunkBytes = sqliteDb.prepare(
+            `SELECT COALESCE(SUM(LENGTH(data)), 0) AS b
+             FROM chunks
+             WHERE hash IN (
+                 SELECT hash FROM manifest_chunks
+                 WHERE manifest_key LIKE 'pluginsave/%'
+                    OR manifest_key LIKE 'pluginsave-meta/%'
+                    OR manifest_key = @manifestKey
+             )
+               AND hash NOT IN (
+                 SELECT hash FROM manifest_chunks WHERE manifest_key LIKE 'chats/%'
+             )`
+        ).get({ manifestKey: PLUGIN_STORAGE_MANIFEST_KEY }).b;
+        const pluginStorage = {
+            count: pluginStorageKv.c,
+            totalSize: pluginStorageTotalSize,
+            kvRowSize: pluginStorageKv.b,
+            chunkBytes: pluginStorageChunkBytes,
+            physicalSize: pluginStorageKv.b + pluginStorageChunkBytes,
+        };
         for (const p of ASSET_PREFIXES) {
             const items = p === 'assets/'
                 ? listAssetEntriesWithSizes()
@@ -18873,6 +18915,7 @@ app.get('/api/db/stats', async (req, res, next) => {
             sqlite: { pageSize, pageCount, freelistCount, reclaimable, journalMode, synchronous, autoVacuum },
             chunks: { count: chunkStat.c, bytes: chunkStat.b, orphanBytes: orphanChunkBytes, liveChunked },
             prefixes,
+            pluginStorage,
             kvRows,
             kvTotalBytes,
             ...(typeof estimatedBackupSize === 'number' ? { estimatedBackupSize } : {}),

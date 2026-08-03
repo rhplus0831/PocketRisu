@@ -2091,6 +2091,8 @@ export const languageEnglish = {
     storageRowKvDatabaseDesc: "The stubs-only database row containing character metadata, chat references, and settings.",
     storageRowKvChats: "Chats",
     storageRowKvChatsDesc: "Full chat bodies stored as individual chats/{character}/{chat} rows.",
+    storageRowKvPlugins: "Plugin data",
+    storageRowKvPluginsDesc: "Data stored outside database.bin when plugin memory optimization is enabled, including ownership metadata and the publication manifest.",
     storageRowKvDbBackups: "In-process DB backups",
     storageRowKvDbBackupsDesc: "Automatic snapshots of database.bin kept inside risuai.db. Rotated to fit within ~500 MB.",
     storageRowKvAssets: "Character assets",

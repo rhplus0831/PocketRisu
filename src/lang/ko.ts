@@ -2295,6 +2295,9 @@ export const languageKorean = {
   storageRowKvChats: "채팅",
   storageRowKvChatsDesc:
     "전체 채팅 본문을 chats/{캐릭터}/{채팅} 개별 행으로 저장합니다.",
+  storageRowKvPlugins: "플러그인 데이터",
+  storageRowKvPluginsDesc:
+    "플러그인 메모리 최적화가 켜져 있을 때 database.bin 외부에 저장되는 데이터입니다. 소유권 메타데이터와 게시 매니페스트를 포함합니다.",
   storageRowKvDbBackups: "DB 백업 (인프로세스)",
   storageRowKvDbBackupsDesc:
     "risuai.db 내부에 자동으로 보관되는 database.bin 스냅샷. 약 500 MB 한도로 자동 로테이션.",

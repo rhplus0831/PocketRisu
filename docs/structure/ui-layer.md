@@ -169,6 +169,11 @@ large bodies only when expanded, while `UsageStats` aggregates LLM token data. T
 Storage viewer switches among save/local/IDB backends and treats conflicts or unknown
 mutation outcomes as reread conditions.
 
+The dashboard gives externalized optimized-plugin values, owner metadata, and their
+publication manifest a dedicated Plugin data slice. Its byte reconciliation keeps KV-row
+markers separate from chunk bodies; only genuinely unrecognized KV rows remain in Other
+data.
+
 Plugin storage mode and value conversion are configured in `PluginSettings`, not in the
 viewer. A mode transition waits for plugin lifecycle idle, exposes cancel/progress state,
 and handles large inline transitions explicitly. If boot reconciliation leaves diagnostic

@@ -133,6 +133,22 @@ describe('optimized plugin large-value capacity (real server)', () => {
     expect(manifestCount.n).toBeGreaterThan(0)
     sqlite.close()
 
+    const statsResponse = await client.fetch('/api/db/stats')
+    expect(statsResponse.status).toBe(200)
+    const stats = await statsResponse.json() as Record<string, any>
+    expect(stats.pluginStorage).toMatchObject({
+      count: expect.any(Number),
+      totalSize: expect.any(Number),
+      kvRowSize: expect.any(Number),
+      chunkBytes: expect.any(Number),
+      physicalSize: expect.any(Number),
+    })
+    expect(stats.pluginStorage.count).toBeGreaterThanOrEqual(rows.size)
+    expect(stats.pluginStorage.chunkBytes).toBeGreaterThan(0)
+    expect(stats.pluginStorage.physicalSize).toBe(
+      stats.pluginStorage.kvRowSize + stats.pluginStorage.chunkBytes,
+    )
+
   })
 
   test('enforces per-value and aggregate limits atomically on streaming and legacy writes', async () => {

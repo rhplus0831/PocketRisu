@@ -726,10 +726,12 @@ callers may explicitly include usage deletion.
   publication, or referenced chunk rows invalidate that proof. Size listings fall back
   through one grouped aggregate query rather than one COUNT/SUM pair per value.
 
-- Chat dashboard totals are chunk-aware. The `chats/` prefix total comes from one
-  revision-verified size inventory; `LENGTH(kv.value)` would report only the 13-byte
-  marker for a chunked chat. The stats response also separates chat KV-row and referenced-chunk bytes so the
-  dashboard can allocate physical storage without double-counting the shared chunk table.
+- Chat and optimized-plugin dashboard totals are chunk-aware. Logical totals come from
+  revision-verified size inventories; `LENGTH(kv.value)` would report only the 13-byte
+  marker for a chunked value. The stats response separately reports physical KV-row and
+  referenced-chunk bytes. Shared chunks are attributed to chats first, then plugin
+  storage, leaving the remainder in the database slice so the dashboard categories do
+  not double-count the chunk table.
 
 - Chunk GC is deliberately off the save hot path. Replaced chunks become orphans and are
   reclaimed during `/api/db/optimize`.

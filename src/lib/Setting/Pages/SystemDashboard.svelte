@@ -35,6 +35,10 @@
         type ResourceCacheStats,
     } from 'src/ts/storage/resourceCache'
     import { clientBuildFetch } from 'src/ts/storage/clientBuildHandshake'
+    import {
+        calculateStorageDashboardUsage,
+        type OptimizedPluginStorageStats,
+    } from 'src/ts/storage/storageDashboardUsage'
 
     // ── Types ────────────────────────────────────────────────────────────────
     interface PrefixInfo {
@@ -55,6 +59,7 @@
         }
         chunks?: { count: number; bytes: number; orphanBytes: number; liveChunked: boolean }
         prefixes: Record<string, PrefixInfo>
+        pluginStorage?: OptimizedPluginStorageStats
         kvRows: number
         kvTotalBytes: number
         assetFsBytes?: number
@@ -366,59 +371,18 @@
 
     const diskRows = $derived.by<DiskRow[]>(() => {
         if (!stats) return []
-        const p = stats.prefixes
-        const get = (k: string) => p[k]?.totalSize ?? 0
-        // assets/ is a merged logical total; subtract filesystem bytes when
-        // reconciling against SQLite's kvTotalBytes.
-        const assetFsBytes = stats.assetFsBytes ?? 0
-        const assetTotal = get('assets/')
-        const assetKvTotal = Math.max(0, assetTotal - assetFsBytes)
-        const chatTotal = get('chats/')
-        const chatPhysical = p['chats/']?.physicalSize ?? chatTotal
-        const chatKvRowSize = p['chats/']?.kvRowSize ?? chatTotal
-        const chatChunkBytes = p['chats/']?.chunkBytes ?? 0
-        // Two separate quantities for inlay:
-        //  - inlayKvTotal: bytes inside the SQLite kv table (counts against
-        //    kvTotalBytes for uncategorized accounting).
-        //  - inlayTotal:   what we display in the chart, includes fs payload
-        //    that lives in save/inlays/ post-migration.
-        const inlayKvTotal = get('inlay/') + get('inlay_thumb/') + get('inlay_meta/') + get('inlay_info/')
-        const inlayFsBytes = stats.inlayFsBytes ?? 0
-        const inlayTotal = inlayKvTotal + inlayFsBytes
-        // The DB blob is chunked: its bytes (and those of every snapshot, which
-        // share chunks) live in the `chunks` table, not in kv. kv holds only a
-        // tiny marker, so the chart counts the chunk table's physical size here
-        // and excludes database.bin / dbbackup from kv accounting.
-        const chunkedDbBytes = stats.chunks?.bytes ?? 0
-        // A small DB (≤ chunk threshold) stays a raw kv value rather than chunks,
-        // so count it here — otherwise the database row reads 0 and its bytes get
-        // mislabeled as "uncategorized". Keyed on whether the *live* blob is
-        // chunked (not whether any chunks exist — snapshots may be chunked while a
-        // shrunken live DB is raw).
-        const rawDbBlob = stats.chunks?.liveChunked ? 0 : get('database/database.bin')
-        const dbRowSize = Math.max(0, chunkedDbBytes - chatChunkBytes) + rawDbBlob
-        // Known kv prefixes I track explicitly — kv-side only. If anything
-        // else lives in kv (test keys, migration leftovers), it shows up
-        // under "uncategorized" so the bar always sums correctly.
-        const knownKv =
-            assetKvTotal + chatKvRowSize + inlayKvTotal
-            + get('remotes/') + get('coldstorage/') + rawDbBlob
-        const uncategorizedKv = Math.max(0, stats.kvTotalBytes - knownKv)
-        // SQLite overhead splits into "structural" (always present — indexes,
-        // page headers, alignment) and "reclaimable" (the freelist, removable
-        // by VACUUM). Subtract the chunk table too — it lives in the file but
-        // not in kvTotalBytes, otherwise it would inflate "overhead".
+        const usage = calculateStorageDashboardUsage(stats)
         const reclaimable = stats.sqlite.reclaimable
-        const structuralOverhead = Math.max(0, stats.files.db - stats.kvTotalBytes - chunkedDbBytes - reclaimable)
         const rows: DiskRow[] = [
-            { id: 'kv-database',     label: language.storageRowKvDatabase,     desc: language.storageRowKvDatabaseDesc,     size: dbRowSize,                     color: 'bg-rose-500' },
-            { id: 'kv-chats',        label: language.storageRowKvChats,        desc: language.storageRowKvChatsDesc,        size: chatPhysical,                   color: 'bg-violet-500' },
-            { id: 'kv-assets',       label: language.storageRowKvAssets,       desc: language.storageRowKvAssetsDesc,       size: assetTotal,                    color: 'bg-amber-500' },
-            { id: 'kv-inlay',        label: language.storageRowKvInlay,        desc: language.storageRowKvInlayDesc,        size: inlayTotal,                    color: 'bg-emerald-500' },
-            { id: 'kv-remotes',      label: language.storageRowKvRemotes,      desc: language.storageRowKvRemotesDesc,      size: get('remotes/'),               color: 'bg-cyan-500' },
-            { id: 'kv-cold',         label: language.storageRowKvColdStorage,  desc: language.storageRowKvColdStorageDesc,  size: get('coldstorage/'),           color: 'bg-stone-500' },
-            { id: 'kv-uncat',        label: language.storageRowKvUncategorized, desc: language.storageRowKvUncategorizedDesc, size: uncategorizedKv,             color: 'bg-stone-600' },
-            { id: 'overhead',        label: language.storageRowSqliteOverhead, desc: language.storageRowSqliteOverheadDesc, size: structuralOverhead,            color: 'bg-zinc-500' },
+            { id: 'kv-database',     label: language.storageRowKvDatabase,     desc: language.storageRowKvDatabaseDesc,     size: usage.databasePhysical,        color: 'bg-rose-500' },
+            { id: 'kv-chats',        label: language.storageRowKvChats,        desc: language.storageRowKvChatsDesc,        size: usage.chatPhysical,            color: 'bg-violet-500' },
+            { id: 'kv-plugins',      label: language.storageRowKvPlugins,      desc: language.storageRowKvPluginsDesc,      size: usage.pluginStoragePhysical,   color: 'bg-pink-500' },
+            { id: 'kv-assets',       label: language.storageRowKvAssets,       desc: language.storageRowKvAssetsDesc,       size: usage.assetTotal,              color: 'bg-amber-500' },
+            { id: 'kv-inlay',        label: language.storageRowKvInlay,        desc: language.storageRowKvInlayDesc,        size: usage.inlayTotal,              color: 'bg-emerald-500' },
+            { id: 'kv-remotes',      label: language.storageRowKvRemotes,      desc: language.storageRowKvRemotesDesc,      size: usage.remoteTotal,             color: 'bg-cyan-500' },
+            { id: 'kv-cold',         label: language.storageRowKvColdStorage,  desc: language.storageRowKvColdStorageDesc,  size: usage.coldStorageTotal,        color: 'bg-stone-500' },
+            { id: 'kv-uncat',        label: language.storageRowKvUncategorized, desc: language.storageRowKvUncategorizedDesc, size: usage.uncategorizedKv,       color: 'bg-stone-600' },
+            { id: 'overhead',        label: language.storageRowSqliteOverhead, desc: language.storageRowSqliteOverheadDesc, size: usage.structuralOverhead,      color: 'bg-zinc-500' },
             { id: 'reclaimable',     label: language.storageRowReclaimablePages, desc: language.storageRowReclaimablePagesDesc, size: reclaimable,               color: 'bg-yellow-500' },
             { id: 'wal',             label: language.storageRowWal,            desc: language.storageRowWalDesc,            size: stats.files.wal,               color: 'bg-sky-500' },
             { id: 'shm',             label: language.storageRowShm,            desc: language.storageRowShmDesc,            size: stats.files.shm,               color: 'bg-lime-500' },
