@@ -1658,8 +1658,8 @@ export interface Database{
     nodeOnlyHideRecentChats?:boolean
     // Route main-chat model-preset requests through server-side jobs
     // (/api/model-jobs) so generation survives client disconnects.
-    // Default OFF (undefined is falsy) — no migration needed. Toggled in
-    // advanced settings (advancedSettingsData.ts).
+    // Default ON via the loader initializer (`??= true`, 2026-07-28 decision).
+    // Toggled in model-preset options (modelPresetOptionsData.ts).
     nodeOnlyServerSideRequests?:boolean
     seperateParametersByModel?:boolean
     disableSeperateParameterChangeOnPresetChange?:boolean
