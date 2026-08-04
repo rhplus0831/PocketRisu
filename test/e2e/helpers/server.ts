@@ -127,6 +127,24 @@ export async function launchServer(dir: string, env: Record<string, string> = {}
   const stopProcess = async () => {
     const active = child
     if (!active || active.exitCode !== null) return
+    // With queue diagnostics on (POCKETRISU_QUEUE_DIAG=true reaches the
+    // spawned server via env spread), harvest the wait/hold aggregate into
+    // test-results/queue-diag.ndjson before shutdown. Best-effort only.
+    if (process.env.POCKETRISU_QUEUE_DIAG === 'true') {
+      try {
+        const { createE2eApiClient } = await import('./apiClient.js')
+        const client = await createE2eApiClient(handle.port, E2E_PASSWORD_DIGEST)
+        const diag = await (await client.fetch('/api/debug/queue-diag')).json()
+        const { appendFile, mkdir } = await import('node:fs/promises')
+        const outDir = path.join(PROJECT_ROOT, 'test-results')
+        await mkdir(outDir, { recursive: true })
+        await appendFile(
+          path.join(outDir, 'queue-diag.ndjson'),
+          JSON.stringify({ instance: path.basename(dir), diag }) + '\n',
+          'utf-8',
+        )
+      } catch { /* diagnostics harvest must never affect scenarios */ }
+    }
     active.kill('SIGTERM')
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {

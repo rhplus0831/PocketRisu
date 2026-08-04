@@ -7,6 +7,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { bootAndLogin, chatInput, sidebarCharacter } from '../helpers/app.js'
+import { assertPhaseBudget } from '../helpers/budgets.js'
 import { NetTrace, formatPhaseSummaries } from '../helpers/netTrace.js'
 import { launchServer, prepareInstanceDir } from '../helpers/server.js'
 
@@ -27,6 +28,7 @@ test('open a large chat (hydration)', async ({ page }, testInfo) => {
     console.log(formatPhaseSummaries(report))
     const open = report.phases['open-chat']
     expect(open.apiRequests).toBeGreaterThan(0)
+    assertPhaseBudget(report, 'open-chat')
   } finally {
     await server.stop()
   }
@@ -59,6 +61,8 @@ test('type a message and let the save loop persist it', async ({ page }, testInf
     console.log(formatPhaseSummaries(report))
     const send = report.phases['send-and-save']
     expect(send.apiRequests).toBeGreaterThan(0)
+    assertPhaseBudget(report, 'open-chat')
+    assertPhaseBudget(report, 'send-and-save')
   } finally {
     await server.stop()
   }

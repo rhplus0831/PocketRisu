@@ -7,6 +7,7 @@
 import { test, expect } from '@playwright/test'
 import { bootAndLogin, chatInput, sidebarCharacter } from '../helpers/app.js'
 import { startMockProvider } from '../helpers/mockProvider.js'
+import { assertPhaseBudget } from '../helpers/budgets.js'
 import { NetTrace, formatPhaseSummaries } from '../helpers/netTrace.js'
 import { launchServer, prepareInstanceDir } from '../helpers/server.js'
 
@@ -37,6 +38,8 @@ test('send a message with a streaming mock provider', async ({ page }, testInfo)
     expect(provider.requests.length).toBeGreaterThan(0)
     const phase = report.phases['send-generate-save']
     expect(phase.apiRequests).toBeGreaterThan(0)
+    assertPhaseBudget(report, 'open-chat')
+    assertPhaseBudget(report, 'send-generate-save')
   } finally {
     await server.stop()
     await provider.close()

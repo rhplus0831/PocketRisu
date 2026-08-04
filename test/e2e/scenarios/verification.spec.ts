@@ -116,6 +116,16 @@ test(`PF-05: cached boot crossover (${template})`, async ({ browser }, testInfo)
     })
     expect(sizes['raw-read-rx']).toBeGreaterThan(0)
     expect(sizes['warm-boot-rx']).toBeGreaterThan(0)
+    // Steady-state cache effectiveness invariants (PF-05): once warm, the
+    // cached read must stay cheap in absolute terms (small DB) and must beat
+    // the raw read by a wide margin (large DB).
+    const steadyTotal = sizes['warm-boot-2-rx'] + sizes['warm-boot-2-tx']
+    if (template === 'medium') {
+      expect(steadyTotal).toBeLessThanOrEqual(6_000)
+    } else {
+      expect(steadyTotal).toBeLessThanOrEqual(64_000)
+      expect(sizes['warm-boot-2-rx']).toBeLessThanOrEqual(sizes['raw-read-rx'] / 10)
+    }
   } finally {
     await server.stop()
   }
