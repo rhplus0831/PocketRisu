@@ -1717,7 +1717,7 @@ describe('NodeStorage plugin viewer pages', () => {
         const pageTokenEntries: string[][] = []
         const lines = [JSON.stringify({
             event: 'meta',
-            version: 1,
+            version: 2,
             generation,
             manifestRevision: revision,
             databaseRevision,
@@ -1736,12 +1736,16 @@ describe('NodeStorage plugin viewer pages', () => {
             const key = keys?.[index] ?? `key-${index.toString().padStart(5, '0')}`
             const owner = index % 2 === 0 ? 'Owner' : null
             const size = new TextEncoder().encode(text).byteLength
+            const editor = { codec: 'json-v1', kind: 'json', text }
             const contentHash = `sha256:${createHash('sha256').update(JSON.stringify([
                 key,
                 owner,
                 text,
                 size,
                 'object',
+                editor.codec,
+                editor.kind,
+                editor.text,
                 entryRevision,
             ])).digest('hex')}`
             pageTokenEntries.push([key, contentHash])
@@ -1752,12 +1756,13 @@ describe('NodeStorage plugin viewer pages', () => {
                 text,
                 size,
                 valueType: 'object',
+                editor,
                 revision: entryRevision,
                 contentHash,
             }))
         }
         const pageTokenMaterial = JSON.stringify([
-            'pocketrisu-plugin-storage-viewer-page-v2',
+            'pocketrisu-plugin-storage-viewer-page-v3',
             generation,
             revision,
             databaseRevision,

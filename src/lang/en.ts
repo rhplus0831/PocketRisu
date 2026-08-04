@@ -1987,6 +1987,7 @@ export const languageEnglish = {
     pluginStorageBulkDeleted: (n: number) => `Deleted ${n} item(s)`,
     pluginStorageViewerStale: "Plugin storage changed after this page loaded. The latest value has been reloaded; review it before trying again.",
     pluginStorageViewerOutcomeUnknown: "The server may have applied this plugin-storage change. The authoritative value has been reloaded; do not retry automatically.",
+    pluginStorageViewerReadOnly: "This value uses a lossless or non-JSON representation and cannot be edited safely here.",
     systemLogsFilters: "Filters",
     systemLogsFilterLevel: "Level",
     systemLogsFilterOrigin: "Origin",

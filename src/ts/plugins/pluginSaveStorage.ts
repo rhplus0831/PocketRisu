@@ -103,6 +103,7 @@ import {
 import {
     detectPluginStorageViewerType,
     valueToPluginStorageViewerText,
+    valueToPluginStorageViewerEditor,
     type PluginStorageViewerEntry,
 } from "./pluginStorageViewerPage";
 import {
@@ -3606,6 +3607,7 @@ export async function getPluginSaveStorageViewerPage(
                     text: entry.text,
                     size: entry.size,
                     type: entry.valueType,
+                    editor: entry.editor,
                     revision: entry.revision,
                 })),
             };
@@ -3679,6 +3681,7 @@ export async function getPluginSaveStorageViewerPage(
                 text,
                 size: new TextEncoder().encode(text).byteLength,
                 type: detectPluginStorageViewerType(source.value, text),
+                editor: valueToPluginStorageViewerEditor(source.value),
                 revision: await inlinePluginStorageRevision(
                     source.value,
                     source.ownerRecord,
@@ -3705,6 +3708,9 @@ export async function getPluginSaveStorageViewerPage(
                     entry.text,
                     entry.size,
                     entry.type,
+                    entry.editor.codec,
+                    entry.editor.kind,
+                    entry.editor.text,
                     entry.revision,
                 ]),
             ]),

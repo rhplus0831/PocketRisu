@@ -2176,6 +2176,7 @@ export const languageKorean = {
   pluginStorageBulkDeleted: (n: number) => `${n}개 항목을 삭제했습니다`,
   pluginStorageViewerStale: "이 페이지를 불러온 뒤 플러그인 저장소가 변경되었습니다. 최신 값을 다시 불러왔으니 재시도 전에 확인하세요.",
   pluginStorageViewerOutcomeUnknown: "서버가 이 플러그인 저장소 변경을 적용했을 수 있습니다. 자동 재시도하지 않고 최신 값을 다시 불러왔습니다.",
+  pluginStorageViewerReadOnly: "이 값은 무손실 또는 비 JSON 표현을 사용하므로 여기에서 안전하게 편집할 수 없습니다.",
   systemLogsFilters: "필터",
   systemLogsFilterLevel: "레벨",
   systemLogsFilterOrigin: "오리진",

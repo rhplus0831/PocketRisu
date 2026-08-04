@@ -2799,6 +2799,11 @@ describe("plugin save storage transport", () => {
                 text: JSON.stringify({ index }),
                 size: 16,
                 valueType: "object",
+                editor: {
+                    codec: "json-v1",
+                    kind: "json",
+                    text: JSON.stringify({ index }),
+                },
                 revision: `sha256:${index.toString(16).padStart(64, "0")}`,
                 contentHash: `sha256:${(index + 1).toString(16).padStart(64, "0")}`,
             })),

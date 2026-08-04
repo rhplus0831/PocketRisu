@@ -9,12 +9,16 @@ import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { encodeBackup } from './helpers/encode.js'
 import utilsPkg from '../../server/node/utils.cjs'
 import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
+import pluginStorageJsonPkg from '../../server/node/pluginStorageJson.cjs'
 
 const { encodeRisuSaveLegacy } = utilsPkg as {
   encodeRisuSaveLegacy: (value: unknown) => Uint8Array
 }
 const { encodePluginSaveStorageKey } = pluginSaveKeysPkg as {
   encodePluginSaveStorageKey: (key: string, prefix: string) => string
+}
+const { serializeLosslessPluginStorageRow } = pluginStorageJsonPkg as {
+  serializeLosslessPluginStorageRow: (storageKey: string, value: unknown) => Buffer
 }
 
 const servers: ServerHandle[] = []
@@ -188,7 +192,7 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
     const result = await readViewer(await viewer(client, '?page=123'))
 
     expect(result.meta).toMatchObject({
-      version: 1,
+      version: 2,
       generation: GENERATION,
       page: 123,
       pageSize: 50,
@@ -301,6 +305,91 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
       expected - Buffer.byteLength('한글') + replacementSize,
     )
     expect(second.done.metrics.sizeValueReads).toBe(0)
+  })
+
+  test('serves faithful typed editor sources without changing lossy display projections', async () => {
+    const keys = [
+      'string-true',
+      'string-object',
+      'null',
+      'boolean',
+      'number',
+      'undefined',
+      'undefined-property',
+      'sparse-array',
+    ]
+    const sparse = new Array(2)
+    sparse[1] = 'kept'
+    const rows = new Map<string, Buffer>([
+      ['string-true', Buffer.from(JSON.stringify('true'))],
+      ['string-object', Buffer.from(JSON.stringify('{"a":1}'))],
+      ['null', Buffer.from('null')],
+      ['boolean', Buffer.from('true')],
+      ['number', Buffer.from('42')],
+      ['undefined', serializeLosslessPluginStorageRow(valueKey('undefined'), undefined)],
+      ['undefined-property', serializeLosslessPluginStorageRow(
+        valueKey('undefined-property'),
+        { kept: 1, missing: undefined },
+      )],
+      ['sparse-array', serializeLosslessPluginStorageRow(valueKey('sparse-array'), sparse)],
+    ])
+    const server = await spawnServer({
+      seedSave: async saveDir => {
+        seedViewer(saveDir, keys.length, { keys })
+        const db = new Database(path.join(saveDir, 'risuai.db'))
+        const update = db.prepare('UPDATE kv SET value = ? WHERE key = ?')
+        db.transaction(() => {
+          for (const [key, bytes] of rows) update.run(bytes, valueKey(key))
+        })()
+        db.close()
+      },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+
+    const result = await readViewer(await viewer(client))
+    const entries = new Map(result.entries.map(entry => [entry.key, entry]))
+    const expected = new Map<string, { text: string; editor: Record<string, unknown> }>([
+      ['string-true', {
+        text: 'true',
+        editor: { codec: 'json-v1', kind: 'string', text: '"true"' },
+      }],
+      ['string-object', {
+        text: '{"a":1}',
+        editor: { codec: 'json-v1', kind: 'string', text: '"{\\"a\\":1}"' },
+      }],
+      ['null', {
+        text: '',
+        editor: { codec: 'json-v1', kind: 'json', text: 'null' },
+      }],
+      ['boolean', {
+        text: 'true',
+        editor: { codec: 'json-v1', kind: 'json', text: 'true' },
+      }],
+      ['number', {
+        text: '42',
+        editor: { codec: 'json-v1', kind: 'json', text: '42' },
+      }],
+      ['undefined', {
+        text: '',
+        editor: { codec: 'lossless-json-v1', kind: 'readonly', text: null },
+      }],
+      ['undefined-property', {
+        text: '{"kept":1}',
+        editor: { codec: 'lossless-json-v1', kind: 'readonly', text: null },
+      }],
+      ['sparse-array', {
+        text: '[null,"kept"]',
+        editor: { codec: 'lossless-json-v1', kind: 'readonly', text: null },
+      }],
+    ])
+    for (const [key, projection] of expected) {
+      expect(entries.get(key)).toMatchObject(projection)
+      expect(entries.get(key).size).toBe(Buffer.byteLength(projection.text))
+    }
+    expect(result.meta.totalBytes).toBe(
+      [...expected.values()].reduce((sum, entry) => sum + Buffer.byteLength(entry.text), 0),
+    )
   })
 
   test('cold and indexed pages are response-identical and the cold page reuses backfill values', async () => {

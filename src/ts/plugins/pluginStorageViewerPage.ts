@@ -1,3 +1,10 @@
+import {
+    encodeLosslessPluginStorageValueToUtf8,
+    PLUGIN_STORAGE_JSON_CODEC,
+    PLUGIN_STORAGE_LOSSLESS_CODEC,
+} from '../storage/pluginStorageValueCodec'
+import { stringifyJsonValue } from '../storage/jsonValue'
+
 export const PLUGIN_STORAGE_VIEWER_PAGE_SIZE = 50
 
 export interface PluginStorageViewerKey {
@@ -10,9 +17,23 @@ export interface PluginStorageViewerEntry extends PluginStorageViewerKey {
     text: string
     size: number
     type: string
+    /** Faithful editor source, kept separate from the lossy display projection. */
+    editor: PluginStorageViewerEditor
     /** Exact save-publication CAS token; absent for device-local backends. */
     revision?: string
 }
+
+export type PluginStorageViewerEditor =
+    | {
+        codec: typeof PLUGIN_STORAGE_JSON_CODEC
+        kind: 'json' | 'string'
+        text: string
+    }
+    | {
+        codec: typeof PLUGIN_STORAGE_LOSSLESS_CODEC | 'unsupported'
+        kind: 'readonly'
+        text: null
+    }
 
 export class PluginStorageViewerLoadCancelled extends Error {
     constructor() {
@@ -69,6 +90,29 @@ export function detectPluginStorageViewerType(value: unknown, text: string): str
     return typeof value
 }
 
+export function valueToPluginStorageViewerEditor(value: unknown): PluginStorageViewerEditor {
+    try {
+        return {
+            codec: PLUGIN_STORAGE_JSON_CODEC,
+            kind: typeof value === 'string' ? 'string' : 'json',
+            text: stringifyJsonValue(value),
+        }
+    } catch {
+        try {
+            // Classify values covered by the canonical lossless codec without
+            // exposing that envelope as editable plain JSON.
+            encodeLosslessPluginStorageValueToUtf8(value)
+            return {
+                codec: PLUGIN_STORAGE_LOSSLESS_CODEC,
+                kind: 'readonly',
+                text: null,
+            }
+        } catch {
+            return { codec: 'unsupported', kind: 'readonly', text: null }
+        }
+    }
+}
+
 /**
  * Read exactly one viewer page, serially. Callers replace the previous page
  * with the result, so at most pageSize value bodies and one in-flight body are
@@ -122,6 +166,7 @@ export async function loadPluginStorageViewerPage({
                 text,
                 size: encoder.encode(text).byteLength,
                 type: detectPluginStorageViewerType(value, text),
+                editor: valueToPluginStorageViewerEditor(value),
             })
             onProgress?.(entries.length, pageKeys.length)
         }

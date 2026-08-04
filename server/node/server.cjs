@@ -249,6 +249,7 @@ const {
 const { createBackupImportIndex } = require('./backupImportIndex.cjs');
 const {
     PluginStorageValidationError,
+    PLUGIN_STORAGE_JSON_CODEC,
     PLUGIN_STORAGE_LOSSLESS_CODEC,
     PLUGIN_STORAGE_LOSSLESS_MAGIC,
     assertPluginStorageRow,
@@ -11946,6 +11947,18 @@ function pluginStorageViewerEntry(context, descriptor, valueBytes, value, ownerB
             : Array.isArray(value)
                 ? 'array'
                 : typeof value;
+    const codec = pluginStorageCodecForBuffer(valueBytes);
+    const editor = codec === PLUGIN_STORAGE_JSON_CODEC
+        ? {
+            codec,
+            kind: typeof value === 'string' ? 'string' : 'json',
+            // JSON-v1 is already the canonical faithful representation. The
+            // display text deliberately remains unchanged for facets/search.
+            text: typeof value === 'string'
+                ? JSON.stringify(value)
+                : value === null ? 'null' : text,
+        }
+        : { codec, kind: 'readonly', text: null };
     const revision = pluginStorageRevision(valueBytes, ownerBytes);
     const size = Buffer.byteLength(text, 'utf-8');
     const contentHash = `sha256:${sha256Hex(Buffer.from(JSON.stringify([
@@ -11954,6 +11967,9 @@ function pluginStorageViewerEntry(context, descriptor, valueBytes, value, ownerB
         text,
         size,
         valueType,
+        editor.codec,
+        editor.kind,
+        editor.text,
         revision,
     ]), 'utf-8'))}`;
     return {
@@ -11963,6 +11979,7 @@ function pluginStorageViewerEntry(context, descriptor, valueBytes, value, ownerB
         text,
         size,
         valueType,
+        editor,
         revision,
         contentHash,
     };
@@ -12021,7 +12038,7 @@ async function assemblePluginStorageViewerEntries(
 function finalizePluginStorageViewerAssembly(context, options, selection, totalBytes, entries) {
     const pageTokenEntries = entries.map((entry) => [entry.key, entry.contentHash]);
     const pageTokenMaterial = JSON.stringify([
-        'pocketrisu-plugin-storage-viewer-page-v2',
+        'pocketrisu-plugin-storage-viewer-page-v3',
         context.generation,
         context.manifestState.revision,
         context.databaseRevision,
@@ -12037,7 +12054,7 @@ function finalizePluginStorageViewerAssembly(context, options, selection, totalB
     return {
         meta: {
             event: 'meta',
-            version: 1,
+            version: 2,
             generation: context.generation,
             manifestRevision: context.manifestState.revision,
             databaseRevision: context.databaseRevision,

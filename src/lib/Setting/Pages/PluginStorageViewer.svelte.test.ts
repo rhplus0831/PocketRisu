@@ -8,6 +8,10 @@ const clearStorage = vi.hoisted(() => vi.fn())
 const confirmMutation = vi.hoisted(() => vi.fn(async () => false))
 const mutationError = vi.hoisted(() => vi.fn())
 const mutationSuccess = vi.hoisted(() => vi.fn())
+const localValues = vi.hoisted(() => new Map<string, string>())
+const localSetItem = vi.hoisted(() => vi.fn((key: string, value: string) => {
+    localValues.set(key, value)
+}))
 
 vi.mock('src/lang', () => ({
     language: {
@@ -52,6 +56,7 @@ vi.mock('src/lang', () => ({
         pluginStorageSaved: (key: string) => `Saved ${key}`,
         pluginStorageViewerStale: 'Storage changed; reloaded.',
         pluginStorageViewerOutcomeUnknown: 'Storage may have changed; reloaded.',
+        pluginStorageViewerReadOnly: 'This value cannot be edited safely.',
     },
 }))
 
@@ -75,10 +80,10 @@ vi.mock('src/ts/plugins/pluginStorageMeta', () => ({
 
 vi.mock('src/ts/plugins/pluginSafeClass', () => ({
     SafeLocalStorage: class {
-        keys() { return [] }
-        getItem() { return null }
-        setItem() {}
-        removeItem() {}
+        keys() { return [...localValues.keys()] }
+        getItem(key: string) { return localValues.get(key) ?? null }
+        setItem(key: string, value: string) { localSetItem(key, value) }
+        removeItem(key: string) { localValues.delete(key) }
     },
     SafeLocalPluginStorage: class {
         async keys() { return [] }
@@ -108,7 +113,12 @@ function pageResult(key: string, extraEntries: Array<Record<string, unknown>> = 
             owner: 'Plugin Owner',
             text: `value:${key}`,
             size: key.length,
-            type: 'string',
+            type: 'object',
+            editor: {
+                codec: 'json-v1',
+                kind: 'json',
+                text: JSON.stringify({ value: key }),
+            },
             revision: `sha256:${'d'.repeat(64)}`,
         }, ...extraEntries],
         generation: 'viewer-generation',
@@ -131,6 +141,14 @@ function pageResult(key: string, extraEntries: Array<Record<string, unknown>> = 
             maxRowParses: 1,
         },
     }
+}
+
+function pageWithEntry(entry: Record<string, unknown>) {
+    const result = pageResult(entry.key as string)
+    result.entries = [entry as (typeof result.entries)[number]]
+    result.total = 1
+    result.ownerFacetTotal = 1
+    return result
 }
 
 async function waitFor(assertion: () => void, timeoutMs = 2_000): Promise<void> {
@@ -174,6 +192,8 @@ afterEach(() => {
     confirmMutation.mockResolvedValue(false)
     mutationError.mockReset()
     mutationSuccess.mockReset()
+    localValues.clear()
+    localSetItem.mockClear()
     document.body.replaceChildren()
 })
 
@@ -226,6 +246,178 @@ describe('PluginStorageViewer component cancellation', () => {
 })
 
 describe('PluginStorageViewer save snapshot mutations', () => {
+    test.each([
+        {
+            label: 'JSON-looking true string',
+            entry: {
+                key: 'string-true', owner: 'Plugin Owner', text: 'true', size: 4,
+                type: 'string',
+                editor: { codec: 'json-v1', kind: 'string', text: '"true"' },
+            },
+            editorText: '"true"',
+        },
+        {
+            label: 'JSON-looking object string',
+            entry: {
+                key: 'string-object', owner: 'Plugin Owner', text: '{"a":1}', size: 7,
+                type: 'string',
+                editor: { codec: 'json-v1', kind: 'string', text: '"{\\"a\\":1}"' },
+            },
+            editorText: '"{\\"a\\":1}"',
+        },
+        {
+            label: 'null',
+            entry: {
+                key: 'null', owner: 'Plugin Owner', text: '', size: 0, type: 'object',
+                editor: { codec: 'json-v1', kind: 'json', text: 'null' },
+            },
+            editorText: 'null',
+        },
+        {
+            label: 'boolean',
+            entry: {
+                key: 'boolean', owner: 'Plugin Owner', text: 'true', size: 4, type: 'boolean',
+                editor: { codec: 'json-v1', kind: 'json', text: 'true' },
+            },
+            editorText: 'true',
+        },
+        {
+            label: 'number',
+            entry: {
+                key: 'number', owner: 'Plugin Owner', text: '42', size: 2, type: 'number',
+                editor: { codec: 'json-v1', kind: 'json', text: '42' },
+            },
+            editorText: '42',
+        },
+    ])('unchanged $label saves are exact no-ops', async ({ entry, editorText }) => {
+        viewerPage.mockResolvedValue(pageWithEntry({
+            ...entry,
+            revision: `sha256:${'d'.repeat(64)}`,
+        }))
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginStorageViewer, { target })
+        await waitFor(() => expect(target.textContent).toContain(entry.key))
+
+        openEntry(target, entry.key)
+        await waitFor(() => expect(document.body.textContent).toContain('Edit'))
+        click(buttonWithText('Edit'))
+        await tick()
+        expect(document.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe(editorText)
+        click(buttonWithText('Save'))
+        await tick()
+
+        expect(rewriteItem).not.toHaveBeenCalled()
+        expect(mutationSuccess).not.toHaveBeenCalled()
+        await unmount(component)
+    })
+
+    test('intentional edits cannot retype a top-level string', async () => {
+        viewerPage.mockResolvedValue(pageWithEntry({
+            key: 'typed-string', owner: 'Plugin Owner', text: 'true', size: 4,
+            type: 'string',
+            editor: { codec: 'json-v1', kind: 'string', text: '"true"' },
+            revision: `sha256:${'d'.repeat(64)}`,
+        }))
+        rewriteItem.mockResolvedValue({ committed: true, revisions: [] })
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginStorageViewer, { target })
+        await waitFor(() => expect(target.textContent).toContain('typed-string'))
+
+        openEntry(target, 'typed-string')
+        await waitFor(() => expect(document.body.textContent).toContain('Edit'))
+        click(buttonWithText('Edit'))
+        await tick()
+        const textarea = document.querySelector<HTMLTextAreaElement>('textarea')!
+        textarea.value = 'false'
+        textarea.dispatchEvent(new Event('input', { bubbles: true }))
+        click(buttonWithText('Save'))
+
+        await waitFor(() => expect(rewriteItem).toHaveBeenCalledOnce())
+        expect(rewriteItem).toHaveBeenCalledWith(
+            'typed-string',
+            'false',
+            'Plugin Owner',
+            `sha256:${'d'.repeat(64)}`,
+        )
+        await unmount(component)
+    })
+
+    test.each([
+        {
+            label: 'top-level undefined',
+            entry: {
+                key: 'undefined', owner: 'Plugin Owner', text: '', size: 0,
+                type: 'empty',
+                editor: { codec: 'lossless-json-v1', kind: 'readonly', text: null },
+            },
+        },
+        {
+            label: 'object with an undefined property',
+            entry: {
+                key: 'undefined-property', owner: 'Plugin Owner', text: '{"kept":1}', size: 10,
+                type: 'object',
+                editor: { codec: 'lossless-json-v1', kind: 'readonly', text: null },
+            },
+        },
+        {
+            label: 'sparse array',
+            entry: {
+                key: 'sparse-array', owner: 'Plugin Owner', text: '[null,"kept"]', size: 13,
+                type: 'array',
+                editor: { codec: 'lossless-json-v1', kind: 'readonly', text: null },
+            },
+        },
+    ])('$label is read-only and refuses editing', async ({ entry }) => {
+        viewerPage.mockResolvedValue(pageWithEntry({
+            ...entry,
+            revision: `sha256:${'d'.repeat(64)}`,
+        }))
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginStorageViewer, { target })
+        await waitFor(() => expect(target.textContent).toContain(entry.key))
+
+        openEntry(target, entry.key)
+        await waitFor(() => {
+            expect(document.body.textContent).toContain('This value cannot be edited safely.')
+        })
+        const edit = buttonWithText('Edit')
+        expect(edit.disabled).toBe(true)
+        click(edit)
+        await tick()
+        expect(document.querySelector('textarea')).toBeNull()
+        expect(rewriteItem).not.toHaveBeenCalled()
+
+        await unmount(component)
+    })
+
+    test('unchanged localStorage JSON-like strings remain byte-exact', async () => {
+        const original = '{  "a" : 1  }'
+        localValues.set('local-json', original)
+        viewerPage.mockResolvedValue(pageResult('unused'))
+        const target = document.createElement('div')
+        document.body.append(target)
+        const component = mount(PluginStorageViewer, { target })
+        await waitFor(() => expect(target.textContent).toContain('unused'))
+
+        click(buttonWithText('Local'))
+        await waitFor(() => expect(target.textContent).toContain('local-json'))
+        openEntry(target, 'local-json')
+        await waitFor(() => expect(document.body.textContent).toContain('Edit'))
+        click(buttonWithText('Edit'))
+        await tick()
+        expect(document.querySelector<HTMLTextAreaElement>('textarea')?.value)
+            .toBe('{\n  "a": 1\n}')
+        click(buttonWithText('Save'))
+        await tick()
+
+        expect(localSetItem).not.toHaveBeenCalled()
+        expect(localValues.get('local-json')).toBe(original)
+        await unmount(component)
+    })
+
     test('edit and single delete carry the exact page revision', async () => {
         viewerPage.mockResolvedValue(pageResult('guarded'))
         rewriteItem.mockResolvedValue({
@@ -282,6 +474,7 @@ describe('PluginStorageViewer save snapshot mutations', () => {
             text: 'value:second',
             size: 6,
             type: 'string',
+            editor: { codec: 'json-v1', kind: 'string', text: '"value:second"' },
             revision: `sha256:${'e'.repeat(64)}`,
         }]))
         atomicBatch.mockResolvedValue({
@@ -345,6 +538,10 @@ describe('PluginStorageViewer save snapshot mutations', () => {
         await waitFor(() => expect(document.body.textContent).toContain('Edit'))
         click(buttonWithText('Edit'))
         await tick()
+        const textarea = document.querySelector<HTMLTextAreaElement>('textarea')
+        expect(textarea).not.toBeNull()
+        textarea!.value = '{"changed":true}'
+        textarea!.dispatchEvent(new Event('input', { bubbles: true }))
         click(buttonWithText('Save'))
 
         await waitFor(() => expect(mutationError).toHaveBeenCalledWith(message))

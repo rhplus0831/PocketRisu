@@ -3,6 +3,7 @@ import {
     loadPluginStorageViewerPage,
     PluginStorageViewerLoadCoordinator,
     PluginStorageViewerLoadCancelled,
+    valueToPluginStorageViewerEditor,
 } from './pluginStorageViewerPage'
 import {
     comparePluginStorageKeys,
@@ -32,6 +33,30 @@ describe('plugin storage ordering', () => {
 })
 
 describe('loadPluginStorageViewerPage', () => {
+    test('keeps faithful strict JSON editor text and marks lossless values read-only', () => {
+        const sparse = new Array(2)
+        sparse[1] = 'kept'
+        expect([
+            valueToPluginStorageViewerEditor('true'),
+            valueToPluginStorageViewerEditor('{"a":1}'),
+            valueToPluginStorageViewerEditor(null),
+            valueToPluginStorageViewerEditor(true),
+            valueToPluginStorageViewerEditor(42),
+            valueToPluginStorageViewerEditor(undefined),
+            valueToPluginStorageViewerEditor({ kept: 1, missing: undefined }),
+            valueToPluginStorageViewerEditor(sparse),
+        ]).toEqual([
+            { codec: 'json-v1', kind: 'string', text: '"true"' },
+            { codec: 'json-v1', kind: 'string', text: '"{\\"a\\":1}"' },
+            { codec: 'json-v1', kind: 'json', text: 'null' },
+            { codec: 'json-v1', kind: 'json', text: 'true' },
+            { codec: 'json-v1', kind: 'json', text: '42' },
+            { codec: 'lossless-json-v1', kind: 'readonly', text: null },
+            { codec: 'lossless-json-v1', kind: 'readonly', text: null },
+            { codec: 'lossless-json-v1', kind: 'readonly', text: null },
+        ])
+    })
+
     test('high-cardinality repositories retain and read only the requested page', async () => {
         const keys = Array.from({ length: 10_000 }, (_, index) => ({
             key: `key-${index.toString().padStart(5, '0')}`,

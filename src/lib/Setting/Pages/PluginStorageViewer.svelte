@@ -93,6 +93,7 @@
     let selected = $state<Entry | null>(null)
     let editing = $state(false)
     let editText = $state('')
+    let initialEditText = $state('')
     let saving = $state(false)
 
     const filteredKeys = $derived.by(() => {
@@ -360,13 +361,33 @@
     function openDetail(entry: Entry) {
         selected = entry
         editing = false
-        editText = prettyPrint(entry.text)
+        editText = entryEditorText(entry)
+        initialEditText = editText
         detailOpen = true
+    }
+
+    function isReadOnly(entry: Entry): boolean {
+        return backend !== 'local' && entry.editor.kind === 'readonly'
+    }
+
+    function entryEditorText(entry: Entry): string {
+        // Preserve the established localStorage editor: raw strings are
+        // pretty-printed when they happen to contain JSON.
+        if (backend === 'local') return prettyPrint(entry.text)
+        if (entry.editor.text === null) return ''
+        // A stored string seeds byte-exact: pretty-printing would silently
+        // normalize its internal whitespace on the next intentional edit.
+        return entry.editor.kind === 'json' ? prettyPrint(entry.editor.text) : entry.editor.text
     }
 
     function startEdit() {
         if (!selected) return
-        editText = prettyPrint(selected.text)
+        if (isReadOnly(selected)) {
+            notifyError(language.pluginStorageViewerReadOnly)
+            return
+        }
+        editText = entryEditorText(selected)
+        initialEditText = editText
         editing = true
     }
 
@@ -380,6 +401,17 @@
 
     async function saveEdit() {
         if (!selected) return
+        if (isReadOnly(selected)) {
+            notifyError(language.pluginStorageViewerReadOnly)
+            return
+        }
+        // Do not send a revision-checked rewrite when the faithful editor
+        // source has not changed. Besides avoiding needless publication
+        // churn, this keeps localStorage strings byte-exact too.
+        if (editText === initialEditText) {
+            editing = false
+            return
+        }
         saving = true
         try {
             let saveValue: unknown
@@ -389,6 +421,15 @@
                 try {
                     saveValue = JSON.stringify(JSON.parse(editText))
                 } catch {}
+            } else if (selected.editor.kind === 'string') {
+                // Top-level strings remain strings even when the edited text
+                // itself is valid JSON such as true or {"a":1}.
+                try {
+                    const parsed = JSON.parse(editText)
+                    saveValue = typeof parsed === 'string' ? parsed : editText
+                } catch {
+                    saveValue = editText
+                }
             } else {
                 // save/idb keep parsed JSON when possible, raw string otherwise.
                 try {
@@ -651,6 +692,11 @@
         {:else}
             <pre class="w-full h-[50vh] overflow-auto rounded-md border border-darkborderc bg-black/40 p-3 font-mono text-xs leading-relaxed text-textcolor2 whitespace-pre-wrap break-all">{prettyPrint(selected.text)}</pre>
         {/if}
+        {#if isReadOnly(selected)}
+            <p class="mt-3 text-sm text-textcolor2" role="note">
+                {language.pluginStorageViewerReadOnly}
+            </p>
+        {/if}
     {/if}
     {#snippet footer()}
         <div class="flex justify-end gap-2">
@@ -674,7 +720,7 @@
                 <ShButton variant="outline" onclick={() => (detailOpen = false)}>
                     {language.close}
                 </ShButton>
-                <ShButton variant="primary" onclick={startEdit}>
+                <ShButton variant="primary" onclick={startEdit} disabled={isReadOnly(selected)}>
                     <PencilIcon size={14} />
                     {language.edit}
                 </ShButton>

@@ -912,9 +912,22 @@ export interface PluginStorageViewerEntryTransport {
     text: string
     size: number
     valueType: string
+    editor: PluginStorageViewerEditorTransport
     revision: string
     contentHash: string
 }
+
+export type PluginStorageViewerEditorTransport =
+    | {
+        codec: typeof PLUGIN_STORAGE_JSON_CODEC
+        kind: 'json' | 'string'
+        text: string
+    }
+    | {
+        codec: typeof PLUGIN_STORAGE_LOSSLESS_CODEC
+        kind: 'readonly'
+        text: null
+    }
 
 export interface PluginStorageViewerPageTransport {
     generation: string
@@ -3854,7 +3867,7 @@ export class NodeStorage{
                     'page', 'pageSize', 'pageCount', 'total', 'ownerFacets',
                     'totalBytes', 'unknownOwnerCount', 'ownerFacetTotal',
                 ])
-                    || record.version !== 1
+                    || record.version !== 2
                     || record.generation !== generation
                     || typeof record.manifestRevision !== 'string'
                     || !/^sha256:[0-9a-f]{64}$/.test(record.manifestRevision)
@@ -3904,8 +3917,34 @@ export class NodeStorage{
                 return
             }
             if (record.event === 'entry') {
+                const editor = record.editor as Record<string, unknown> | undefined
+                let parsedEditorValue: unknown
+                let validEditor = !!editor
+                    && !Array.isArray(editor)
+                    && exactKeys(editor, ['codec', 'kind', 'text'])
+                if (validEditor && editor!.codec === PLUGIN_STORAGE_JSON_CODEC
+                    && (editor!.kind === 'json' || editor!.kind === 'string')
+                    && typeof editor!.text === 'string') {
+                    try {
+                        parsedEditorValue = JSON.parse(editor!.text)
+                    } catch {
+                        validEditor = false
+                    }
+                    if (validEditor && editor!.kind === 'string') {
+                        validEditor = typeof parsedEditorValue === 'string'
+                            && parsedEditorValue === record.text
+                    } else if (validEditor) {
+                        validEditor = typeof parsedEditorValue !== 'string'
+                    }
+                } else if (!(validEditor
+                    && editor!.codec === PLUGIN_STORAGE_LOSSLESS_CODEC
+                    && editor!.kind === 'readonly'
+                    && editor!.text === null)) {
+                    validEditor = false
+                }
                 if (!meta || done || !exactKeys(record, [
-                    'event', 'key', 'owner', 'text', 'size', 'valueType', 'revision', 'contentHash',
+                    'event', 'key', 'owner', 'text', 'size', 'valueType', 'editor',
+                    'revision', 'contentHash',
                 ])
                     || typeof record.key !== 'string'
                     || (record.owner !== null
@@ -3917,6 +3956,7 @@ export class NodeStorage{
                     || textEncoder.encode(record.text as string).byteLength !== record.size
                     || typeof record.valueType !== 'string'
                     || !['object', 'array', 'string', 'number', 'boolean', 'empty'].includes(record.valueType)
+                    || !validEditor
                     || typeof record.revision !== 'string'
                     || !/^sha256:[0-9a-f]{64}$/.test(record.revision)
                     || typeof record.contentHash !== 'string'
@@ -3938,6 +3978,17 @@ export class NodeStorage{
                     text: record.text,
                     size: record.size as number,
                     valueType: record.valueType,
+                    editor: editor!.codec === PLUGIN_STORAGE_JSON_CODEC
+                        ? {
+                            codec: PLUGIN_STORAGE_JSON_CODEC,
+                            kind: editor!.kind as 'json' | 'string',
+                            text: editor!.text as string,
+                        }
+                        : {
+                            codec: PLUGIN_STORAGE_LOSSLESS_CODEC,
+                            kind: 'readonly',
+                            text: null,
+                        },
                     revision: record.revision,
                     contentHash: record.contentHash,
                 })
@@ -4026,6 +4077,9 @@ export class NodeStorage{
                     entry.text,
                     entry.size,
                     entry.valueType,
+                    entry.editor.codec,
+                    entry.editor.kind,
+                    entry.editor.text,
                     entry.revision,
                 ])),
             )}`
@@ -4036,7 +4090,7 @@ export class NodeStorage{
         // Canonical JSON arrays preserve string boundaries even when a key or
         // owner filter contains U+0000; delimiter concatenation cannot.
         const pageTokenMaterial = JSON.stringify([
-            'pocketrisu-plugin-storage-viewer-page-v2',
+            'pocketrisu-plugin-storage-viewer-page-v3',
             generation,
             meta.manifestRevision,
             meta.databaseRevision,
