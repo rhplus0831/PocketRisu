@@ -4,6 +4,8 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import defaultsPolicy from '../../shared/character-defaults-policy.json'
 import utilsPkg from '../../server/node/utils.cjs'
+import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
+import pluginStorageJsonPkg from '../../server/node/pluginStorageJson.cjs'
 import { createClient } from './helpers/client.js'
 import { encodeBackup } from './helpers/encode.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
@@ -15,8 +17,17 @@ const {
   decodeAuthoritativeRisuSave: (value: Uint8Array) => Promise<any>
   encodeRisuSaveLegacy: (value: unknown) => Uint8Array
 }
+const { encodePluginSaveStorageKey } = pluginSaveKeysPkg as {
+  encodePluginSaveStorageKey: (rawKey: string, prefix: string) => string
+}
+const { validatePluginStorageRow } = pluginStorageJsonPkg as {
+  validatePluginStorageRow: (storageKey: string, value: Uint8Array) => unknown
+}
 
 const DB_KEY = 'database/database.bin'
+const PLUGIN_MANIFEST_KEY = 'plugin-storage/manifest.json'
+const PLUGIN_VALUE_PREFIX = 'pluginsave/'
+const PLUGIN_META_PREFIX = 'pluginsave-meta/'
 const CHAT_MARKER_KEY = 'migration/chats-externalized'
 const DEFAULTS_MARKER_KEY = 'migration/character-defaults-normalized'
 const DEFAULTS_BACKUP_PREFIX = 'migration-backup/pre-character-defaults-'
@@ -60,6 +71,21 @@ function listKv(cwd: string, prefix: string): Array<{ key: string; value: Buffer
   } finally {
     sqlite.close()
   }
+}
+
+function readPluginRecord(
+  cwd: string,
+  prefix: string,
+  rawKeys: string[],
+): Record<string, unknown> {
+  const record: Record<string, unknown> = {}
+  for (const rawKey of rawKeys) {
+    const storageKey = encodePluginSaveStorageKey(rawKey, prefix)
+    const row = readKv(cwd, storageKey)
+    if (row === null) throw new Error(`Missing external plugin row: ${storageKey}`)
+    withOwn(record, rawKey, validatePluginStorageRow(storageKey, row))
+  }
+  return record
 }
 
 function missingCharacterIdBackup(): Buffer {
@@ -216,6 +242,92 @@ describe.each([
     expect(secondRead.headers.get('x-db-etag')).toBe(migratedEtag)
     await secondRead.arrayBuffer()
     expect(readKv(server.cwd, DB_KEY)).toEqual(migratedBytes)
+    expect(listKv(server.cwd, DEFAULTS_BACKUP_PREFIX)).toHaveLength(1)
+  })
+
+  test('preserves folded optimized plugin storage through the boot migration', async () => {
+    const pluginValues = withOwn<Record<string, unknown>>(
+      {
+        ordinary: { value: 1, nested: ['kept', true] },
+        '\uD800': { malformed: true },
+      },
+      '__proto__',
+      { own: true },
+    )
+    const pluginMeta = withOwn<Record<string, unknown>>(
+      {
+        ordinary: { plugin: 'Ordinary plugin', updatedAt: 1 },
+        '\uD800': { plugin: 'Malformed-key plugin', updatedAt: 2 },
+      },
+      '__proto__',
+      { plugin: 'Prototype-key plugin', updatedAt: 3 },
+    )
+    const generation = 'folded-character-defaults-migration'
+    const sourceDatabase = {
+      characters: [{ chaId: 'folded-migration-character', chats: [] }],
+      personas: [{ id: 'folded-migration-persona' }],
+      botPresets: [{ id: 'folded-migration-preset', name: 'Preset' }],
+      optimizePluginMemory: true,
+      pluginStorageFolded: true,
+      pluginStorageGeneration: generation,
+      pluginCustomStorage: pluginValues,
+      pluginStorageMeta: pluginMeta,
+    }
+    const sourceBytes = Buffer.from(encodeRisuSaveLegacy(sourceDatabase))
+    const sourceEtag = createHash('md5').update(sourceBytes).digest('hex')
+    const server = await spawnServer({
+      env,
+      seedSave: async saveDir => seedExistingDatabase(saveDir, sourceBytes),
+    })
+    servers.push(server)
+    let client = await createClient(server.port, server.password)
+
+    const migratedBytes = readKv(server.cwd, DB_KEY)!
+    const migratedEtag = createHash('md5').update(migratedBytes).digest('hex')
+    expect(migratedEtag).not.toBe(sourceEtag)
+    expect(readKv(server.cwd, DEFAULTS_MARKER_KEY)?.toString()).toBe('done')
+    const backups = listKv(server.cwd, DEFAULTS_BACKUP_PREFIX)
+    expect(backups).toHaveLength(1)
+    expect(backups[0].value).toEqual(sourceBytes)
+
+    const migrated = await decodeAuthoritativeRisuSave(migratedBytes)
+    expect(migrated).toMatchObject({
+      optimizePluginMemory: true,
+      pluginStorageGeneration: generation,
+      pluginCustomStorage: {},
+    })
+    expect(migrated.pluginStorageFolded).toBeUndefined()
+    expect(migrated.pluginStorageMeta).toBeUndefined()
+    expect(migrated.characters[0]).toMatchObject({
+      chaId: 'folded-migration-character',
+      ...defaultsPolicy.characterDefaults,
+      ...defaultsPolicy.characterTypeDefaults,
+    })
+
+    const rawKeys = Object.keys(pluginValues)
+    expect(rawKeys).toEqual(['ordinary', '\uD800', '__proto__'])
+    const valueKeys = rawKeys.map(key => encodePluginSaveStorageKey(key, PLUGIN_VALUE_PREFIX))
+    const metaKeys = rawKeys.map(key => encodePluginSaveStorageKey(key, PLUGIN_META_PREFIX))
+    expect(valueKeys).toContain('pluginsave/utf16-v1.2AA.json')
+    expect(valueKeys).toContain('pluginsave/X19wcm90b19f.json')
+
+    const manifest = JSON.parse(readKv(server.cwd, PLUGIN_MANIFEST_KEY)!.toString('utf8'))
+    expect(manifest).toMatchObject({ generation, valueKeys, metaKeys })
+    const migratedValues = readPluginRecord(server.cwd, PLUGIN_VALUE_PREFIX, rawKeys)
+    const migratedMeta = readPluginRecord(server.cwd, PLUGIN_META_PREFIX, rawKeys)
+    expect(Object.hasOwn(migratedValues, '__proto__')).toBe(true)
+    expect(Object.hasOwn(migratedMeta, '__proto__')).toBe(true)
+    expect(migratedValues).toEqual(pluginValues)
+    expect(migratedMeta).toEqual(pluginMeta)
+
+    await server.restart(env)
+    client = await createClient(server.port, server.password)
+    const secondRead = await client.fetch('/api/db/read-raw-for-boot')
+    expect(secondRead.headers.get('x-db-etag')).toBe(migratedEtag)
+    await secondRead.arrayBuffer()
+    expect(readKv(server.cwd, DB_KEY)).toEqual(migratedBytes)
+    expect(readPluginRecord(server.cwd, PLUGIN_VALUE_PREFIX, rawKeys)).toEqual(pluginValues)
+    expect(readPluginRecord(server.cwd, PLUGIN_META_PREFIX, rawKeys)).toEqual(pluginMeta)
     expect(listKv(server.cwd, DEFAULTS_BACKUP_PREFIX)).toHaveLength(1)
   })
 })

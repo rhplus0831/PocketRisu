@@ -2405,8 +2405,14 @@ async function migrateCharacterDefaultsIfNeeded() {
         return;
     }
 
-    const decoded = normalizeJSON(await decodeAuthoritativeDatabase(raw));
+    const rawDecoded = await decodeAuthoritativeDatabase(raw);
+    const strictPluginStorage = snapshotOptimizedPluginStorageFields(rawDecoded);
+    const decoded = normalizeJSON(rawDecoded);
     validateDatabaseShape(decoded);
+    if (strictPluginStorage) {
+        decoded.pluginCustomStorage = strictPluginStorage.values;
+        if (strictPluginStorage.hasMeta) decoded.pluginStorageMeta = strictPluginStorage.meta;
+    }
     applyDatabaseCharacterDefaults(decoded, nodeCrypto.randomUUID);
     const reEncoded = Buffer.from(encodeRisuSaveLegacy(decoded));
     const backupKey = `migration-backup/pre-character-defaults-${Date.now()}.bin`;
