@@ -108,9 +108,11 @@ Structural/versioned migrations that need broader context live separately in `bo
    reloads once; a page with dirty or indeterminate local state enters writer recovery.
    Then call `readDatabaseForBoot()`. A server advertising
    `database.rawBootRead` uses the segmented root/characters/botPresets/modules/personas
-   read when the resource cache is enabled and otherwise uses
-   `/api/db/read-raw-for-boot`, so corrupt authoritative bytes can enter recovery without
-   being hidden by server decoding. The segmented route returns the canonical normalized
+   read when the resource cache is enabled and the advisory raw database size is at least
+   128 KiB (or unknown); smaller databases bypass IndexedDB inventory verification and use
+   `/api/db/read-raw-for-boot`. The raw route is also used when the cache is disabled, so
+   corrupt authoritative bytes can enter recovery without being hidden by server decoding.
+   The segmented route returns the canonical normalized
    legacy-view ETag used by `/api/read`; the raw route returns MD5 over the verbatim row
    bytes. A server without the capability uses legacy `/api/read`; an empty legacy
    response is accepted as missing only when an uncached `/api/list` also proves that

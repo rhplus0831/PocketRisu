@@ -378,6 +378,22 @@ let preserveDbHashMemoOnCacheMutation = false;
 let dbCompositionalHashMemo = new WeakMap();
 const DB_BLOB_KEY = 'database/database.bin';
 const DB_HEX_KEY = Buffer.from(DB_BLOB_KEY, 'utf-8').toString('hex');
+const rawBootByteLengthStatement = (() => {
+    try {
+        return sqliteDb.prepare('SELECT LENGTH(value) AS byte_length FROM kv WHERE key = ?');
+    } catch {
+        return null;
+    }
+})();
+
+function readRawBootByteLengthHint() {
+    try {
+        const byteLength = rawBootByteLengthStatement?.get(DB_BLOB_KEY)?.byte_length;
+        return Number.isSafeInteger(byteLength) && byteLength >= 0 ? byteLength : null;
+    } catch {
+        return null;
+    }
+}
 // A successful patch needs the same canonical bytes twice: immediately for its
 // ETag and later for the debounced write. Keep exactly one generation-bound
 // copy, then release it on persist completion or any cache invalidation.
@@ -10635,6 +10651,7 @@ app.post('/api/session', async (req, res) => {
                 rawBootRead: true,
                 atomicCreate: true,
                 optimizedPluginStorageBootReconcile: true,
+                rawBootByteLength: readRawBootByteLengthHint(),
             },
         },
     })

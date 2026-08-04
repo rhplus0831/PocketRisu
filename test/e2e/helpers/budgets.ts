@@ -28,8 +28,8 @@ export const PHASE_BUDGETS: Record<string, PhaseBudget> = {
   'cold-boot-cache-on': { maxApiRequests: 24, maxApiTxBytes: 64_000 },
   // Baseline 15 req / 302 KB — normalization patch scales with characters (PF-04).
   'xl-cold-boot': { maxApiRequests: 22, maxApiTxBytes: 420_000 },
-  // Baseline 13 req / 8.6 KB.
-  'warm-boot': { maxApiRequests: 20, maxApiTxBytes: 24_000 },
+  // T3 measured 13 req / 8.5 KB after the small-DB raw bypass.
+  'warm-boot': { maxApiRequests: 18, maxApiTxBytes: 12_000 },
   // Baseline 3 req / 3.8 KB — hydration of one chat row.
   'open-chat': { maxApiRequests: 8, maxApiTxBytes: 16_000 },
   // Baseline up to ~872 KB: full-row checkpoint + final saves (PF-01/PF-02).

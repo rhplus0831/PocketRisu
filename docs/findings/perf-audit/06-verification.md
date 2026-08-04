@@ -78,6 +78,16 @@ Two amendments to the original A2 story:
    irrelevant at megabyte scale. Fix shape: a size-aware bypass (serve raw
    below a threshold) and/or coarser segments for small groups; fallback and
    hash verification must remain intact.
+3. **(2026-08-04, T3 landing.)** The medium raw reference above (846 B) was
+   captured on a fresh fixture's first boot — before the one-time PF-04
+   normalization patch grew the row (trap 1 of the handover). The same
+   database's steady-state raw read is ≈6.7 KB rx (7,390 B tx+rx), so at
+   medium scale the segmented path was already byte-cheaper at steady state
+   and the "~3.5× raw" verdict does not hold there. The small-DB byte penalty
+   is confined to genuinely tiny databases; the medium-scale motivation for
+   the T3 bypass (raw boot below a 128 KiB row-length hint from
+   `/api/session`) is eliminating the pre-network IndexedDB SHA-256
+   verification and inventory upload, not wire bytes.
 
 ## Spot verifications (one representative per group)
 

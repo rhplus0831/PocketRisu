@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
+import Database from 'better-sqlite3'
+import path from 'node:path'
 import utilsPkg from '../../server/node/utils.cjs'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { createClient, type RisuClient } from './helpers/client.js'
@@ -46,12 +48,13 @@ describe('boot database protocol negotiation', () => {
       headers: writerHeaders(),
     })
     expect(session.status).toBe(200)
-    await expect(session.json()).resolves.toMatchObject({
+    expect(await session.json()).toMatchObject({
       ok: true,
       capabilities: {
         database: {
           rawBootRead: true,
           atomicCreate: true,
+          rawBootByteLength: null,
         },
       },
     })
@@ -87,7 +90,22 @@ describe('boot database protocol negotiation', () => {
     const live = await rawRead()
     expect(live.status).toBe(200)
     expect(live.headers.get('x-db-etag')).toBe(created.etag)
-    expect(await decodeRisuSave(new Uint8Array(await live.arrayBuffer()))).toEqual({})
+    const liveBytes = new Uint8Array(await live.arrayBuffer())
+    expect(await decodeRisuSave(liveBytes)).toEqual({})
+
+    const registeredWithDatabase = await client.fetch('/api/session', {
+      method: 'POST',
+      headers: writerHeaders(),
+    })
+    expect(registeredWithDatabase.status).toBe(200)
+    await expect(registeredWithDatabase.json()).resolves.toMatchObject({
+      ok: true,
+      capabilities: {
+        database: {
+          rawBootByteLength: liveBytes.byteLength,
+        },
+      },
+    })
 
     const ordinary = await client.fetch('/api/read', {
       headers: { 'file-path': DB_PATH_HEX },
@@ -128,5 +146,38 @@ describe('boot database protocol negotiation', () => {
     const afterBytes = Buffer.from(await after.arrayBuffer())
     expect(afterBytes).toEqual(beforeBytes)
     expect(await decodeRisuSave(afterBytes)).toMatchObject(sentinel)
+  })
+
+  test('keeps session registration available when the size query fails', async () => {
+    const storageErrorServer = await spawnServer()
+    try {
+      const storageErrorClient = await createClient(
+        storageErrorServer.port,
+        storageErrorServer.password,
+      )
+      const sqlite = new Database(path.join(storageErrorServer.cwd, 'save', 'risuai.db'))
+      try {
+        sqlite.exec('DROP TABLE kv')
+      } finally {
+        sqlite.close()
+      }
+
+      const response = await storageErrorClient.fetch('/api/session', {
+        method: 'POST',
+        headers: { 'x-session-id': 'storage-error-session' },
+      })
+      expect(response.status).toBe(200)
+      await expect(response.json()).resolves.toMatchObject({
+        ok: true,
+        capabilities: {
+          database: {
+            rawBootRead: true,
+            rawBootByteLength: null,
+          },
+        },
+      })
+    } finally {
+      await storageErrorServer.cleanup()
+    }
   })
 })

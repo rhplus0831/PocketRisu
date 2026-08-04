@@ -103,10 +103,16 @@ test(`PF-05: cached boot crossover (${template})`, async ({ browser }, testInfo)
     await loginAfterReload(cachePage)
     await cachePage.waitForTimeout(4000)
     const cacheReport = await cacheTrace.attach(testInfo, 'net-trace-cached')
+    const expectedWarmPath = template === 'medium'
+      ? '/api/db/read-raw-for-boot'
+      : '/api/db/read-cached'
     for (const phase of ['warm-boot', 'warm-boot-2']) {
-      const warm = cacheReport.phases[phase].byPath['/api/db/read-cached']
+      const byPath = cacheReport.phases[phase].byPath
+      const warm = byPath[expectedWarmPath]
       sizes[`${phase}-rx`] = warm?.resBytes ?? -1
       sizes[`${phase}-tx`] = warm?.reqBytes ?? -1
+      sizes[`${phase}-raw-count`] = byPath['/api/db/read-raw-for-boot']?.count ?? 0
+      sizes[`${phase}-cached-count`] = byPath['/api/db/read-cached']?.count ?? 0
     }
     await cacheContext.close()
 
@@ -121,8 +127,18 @@ test(`PF-05: cached boot crossover (${template})`, async ({ browser }, testInfo)
     // the raw read by a wide margin (large DB).
     const steadyTotal = sizes['warm-boot-2-rx'] + sizes['warm-boot-2-tx']
     if (template === 'medium') {
-      expect(steadyTotal).toBeLessThanOrEqual(6_000)
+      for (const phase of ['warm-boot', 'warm-boot-2']) {
+        expect(sizes[`${phase}-cached-count`]).toBe(0)
+        expect(sizes[`${phase}-raw-count`]).toBe(1)
+      }
+      // The cache-enabled boot persists normalization before these reloads;
+      // measured raw-route steady state is 7,389 B including headers.
+      expect(steadyTotal).toBeLessThanOrEqual(8_500)
     } else {
+      for (const phase of ['warm-boot', 'warm-boot-2']) {
+        expect(sizes[`${phase}-cached-count`]).toBe(1)
+        expect(sizes[`${phase}-raw-count`]).toBe(0)
+      }
       expect(steadyTotal).toBeLessThanOrEqual(64_000)
       expect(sizes['warm-boot-2-rx']).toBeLessThanOrEqual(sizes['raw-read-rx'] / 10)
     }

@@ -343,9 +343,11 @@ plan.
 - `AutoStorage` always selects `NodeStorage` at `src/ts/storage/autoStorage.ts:35`.
 - `/api/session` advertises `database.rawBootRead` and `database.atomicCreate`. Current clients use the raw boot endpoint when the first capability is present; an older server with no capability response falls back to authenticated `GET /api/read` and confirms an empty response against an uncached `GET /api/list` before classifying the database as missing.
 - With the browser resource cache disabled, a capable server uses
-  `GET /api/db/read-raw-for-boot`. With it enabled, the client verifies resident IndexedDB
-  segments, advertises up to 8,192 hashes grouped as
-  root/characters/botPresets/modules/personas, and calls `POST /api/db/read-cached`. The raw
+  `GET /api/db/read-raw-for-boot`. With it enabled, `/api/session` advertises the raw KV row
+  byte length; the client bypasses cache inventory work below 128 KiB and otherwise verifies
+  resident IndexedDB segments, advertises up to 8,192 hashes grouped as
+  root/characters/botPresets/modules/personas, and calls `POST /api/db/read-cached`. An absent
+  or invalid size hint preserves the cached path for compatibility with older servers. The raw
   route waits for the import barrier, returns verbatim bytes plus their raw MD5 for
   recovery, uses HTTP 204 only for explicit absence, and never uses a route-ambiguous 404.
 - The cached-read endpoint flushes pending writes, prepares the same normalized stubs-only

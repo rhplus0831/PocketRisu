@@ -644,30 +644,46 @@ export type DatabaseCreateIfAbsentResult =
     | { kind: 'created', etag: string | null }
     | { kind: 'already-present' }
 
-interface DatabaseStorageCapabilities {
+export interface DatabaseStorageCapabilities {
     rawBootRead: boolean
     atomicCreate: boolean
     optimizedPluginStorageBootReconcile: boolean
+    rawBootByteLength: number | null
 }
 
 const LEGACY_DATABASE_STORAGE_CAPABILITIES: DatabaseStorageCapabilities = {
     rawBootRead: false,
     atomicCreate: false,
     optimizedPluginStorageBootReconcile: false,
+    rawBootByteLength: null,
 }
 
-function parseDatabaseStorageCapabilities(value: unknown): DatabaseStorageCapabilities {
+export function parseDatabaseStorageCapabilities(value: unknown): DatabaseStorageCapabilities {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
         return { ...LEGACY_DATABASE_STORAGE_CAPABILITIES }
     }
     const candidate = value as Record<string, unknown>
+    const rawBootByteLength = candidate.rawBootByteLength
     return {
         rawBootRead: candidate.rawBootRead === true,
         atomicCreate: candidate.atomicCreate === true,
         optimizedPluginStorageBootReconcile:
             candidate.optimizedPluginStorageBootReconcile === true,
+        rawBootByteLength: Number.isSafeInteger(rawBootByteLength)
+            && (rawBootByteLength as number) >= 0
+            ? rawBootByteLength as number
+            : null,
     }
 }
+
+// Compared against the *uncompressed* KV row length advertised by
+// /api/session. Below this size both boot paths cost single-digit KB on the
+// wire (medium fixture steady state: 2,958 B segmented vs 7,390 B raw,
+// gzip-dependent), so the byte difference is noise; the bypass instead removes
+// the pre-network cost the segmented path always pays — SHA-256 verification
+// of every resident IndexedDB manifest entry plus the inventory upload. At
+// 1.2 MB stubs the segmented read saves 96.5% and must stay selected.
+export const DB_CACHED_BOOT_MIN_RAW_BYTES = 128 * 1024
 
 export interface StorageReadOptions {
     pluginStorageGeneration?: string
@@ -4410,6 +4426,14 @@ export class NodeStorage{
             return this.readLegacyDatabaseForBoot()
         }
         if (!isResourceCacheEnabled()) {
+            return this.readRawDatabaseForBoot()
+        }
+        const rawBootByteLength
+            = NodeStorage.databaseStorageCapabilities.rawBootByteLength
+        if (
+            rawBootByteLength !== null
+            && rawBootByteLength < DB_CACHED_BOOT_MIN_RAW_BYTES
+        ) {
             return this.readRawDatabaseForBoot()
         }
 

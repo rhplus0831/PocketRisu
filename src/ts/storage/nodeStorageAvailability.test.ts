@@ -73,8 +73,10 @@ const {
     AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS,
     AUTHORITATIVE_STORAGE_IO_TIMEOUT_MS,
     AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS,
+    DB_CACHED_BOOT_MIN_RAW_BYTES,
     NodeStorage,
     authoritativeStoragePayloadTimeoutMs,
+    parseDatabaseStorageCapabilities,
 } = await import('./nodeStorage')
 const { StorageError } = await import('./storageError')
 const { encodeRisuSaveLegacy } = await import('./risuSave')
@@ -107,6 +109,7 @@ beforeEach(() => {
         rawBootRead: false,
         atomicCreate: false,
         optimizedPluginStorageBootReconcile: false,
+        rawBootByteLength: null,
     }
     cache.enabled = true
     cache.getManifestHashes.mockResolvedValue([])
@@ -138,7 +141,120 @@ afterEach(() => {
     vi.unstubAllGlobals()
 })
 
+describe('database storage capability parsing', () => {
+    it.each([
+        ['absent field', {}, null],
+        ['explicit null', { rawBootByteLength: null }, null],
+        ['negative number', { rawBootByteLength: -1 }, null],
+        ['non-integer number', { rawBootByteLength: 1.5 }, null],
+        ['non-finite number', { rawBootByteLength: Number.POSITIVE_INFINITY }, null],
+        ['wrong type', { rawBootByteLength: '1024' }, null],
+        ['zero', { rawBootByteLength: 0 }, 0],
+        ['valid number', { rawBootByteLength: 1024 }, 1024],
+    ])('handles a %s', (_label, value, expected) => {
+        expect(parseDatabaseStorageCapabilities(value).rawBootByteLength).toBe(expected)
+    })
+
+    it('uses legacy defaults when the database capability object is absent', () => {
+        expect(parseDatabaseStorageCapabilities(undefined)).toMatchObject({
+            rawBootRead: false,
+            atomicCreate: false,
+            optimizedPluginStorageBootReconcile: false,
+            rawBootByteLength: null,
+        })
+    })
+})
+
 describe('NodeStorage availability bounds', () => {
+    it('bypasses cache inventory verification below the raw byte threshold', async () => {
+        cache.getVerifiedManifestSnapshot.mockRejectedValue(
+            new Error('cache inventory must not be touched'),
+        )
+        const authoritativeBytes = new Uint8Array([8, 4, 6])
+        const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+            if (String(input) === '/api/db/read-raw-for-boot') {
+                return new Response(authoritativeBytes as unknown as BodyInit, {
+                    status: 200,
+                    headers: { 'x-db-etag': 'a'.repeat(32) },
+                })
+            }
+            throw new Error(`Unexpected request: ${String(input)}`)
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        ;(NodeStorage as any).databaseStorageCapabilities = {
+            rawBootRead: true,
+            atomicCreate: true,
+            optimizedPluginStorageBootReconcile: true,
+            rawBootByteLength: DB_CACHED_BOOT_MIN_RAW_BYTES - 1,
+        }
+
+        await expect(readyStorage().readDatabaseForBoot()).resolves.toEqual({
+            kind: 'bytes',
+            bytes: Buffer.from(authoritativeBytes),
+        })
+        expect(cache.getVerifiedManifestSnapshot).not.toHaveBeenCalled()
+        expect(cache.persistResourceCacheManifests).not.toHaveBeenCalled()
+        expect(fetchMock).toHaveBeenCalledOnce()
+        expect(fetchMock).toHaveBeenCalledWith(
+            '/api/db/read-raw-for-boot',
+            expect.objectContaining({ method: 'GET' }),
+        )
+    })
+
+    it.each([
+        ['at the threshold', DB_CACHED_BOOT_MIN_RAW_BYTES],
+        ['above the threshold', DB_CACHED_BOOT_MIN_RAW_BYTES + 1],
+        ['without a size hint', null],
+    ])('keeps the cached boot path %s', async (_label, rawBootByteLength) => {
+        cache.getVerifiedManifestSnapshot.mockResolvedValue({
+            hashes: [],
+            bytesByHash: new Map(),
+        })
+        const etag = 'f'.repeat(32)
+        const encodedEnvelope = encodeOwnedRawMsgpack({
+            version: 1,
+            etag,
+            root: { bytes: encodeOwnedRawMsgpack({ name: 'threshold-cached-boot' }) },
+            characters: [],
+            botPresets: [],
+            modules: [],
+            personas: [],
+        })
+        const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+            if (String(input) === '/api/db/read-cached') {
+                return new Response(encodedEnvelope as unknown as BodyInit, {
+                    status: 200,
+                    headers: { 'x-db-etag': etag },
+                })
+            }
+            throw new Error(`Unexpected request: ${String(input)}`)
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        ;(NodeStorage as any).databaseStorageCapabilities = {
+            rawBootRead: true,
+            atomicCreate: true,
+            optimizedPluginStorageBootReconcile: true,
+            rawBootByteLength,
+        }
+
+        await expect(readyStorage().readDatabaseForBoot()).resolves.toEqual({
+            kind: 'decoded',
+            database: {
+                name: 'threshold-cached-boot',
+                characters: [],
+                botPresets: [],
+                modules: [],
+                personas: [],
+            },
+        })
+        expect(cache.getVerifiedManifestSnapshot).toHaveBeenCalledTimes(5)
+        expect(fetchMock).toHaveBeenCalledOnce()
+        expect(fetchMock).toHaveBeenCalledWith(
+            '/api/db/read-cached',
+            expect.objectContaining({ method: 'POST' }),
+        )
+    })
+
     it('returns a verified cached database without awaiting best-effort persistence', async () => {
         const persistence = Promise.withResolvers<void>()
         cache.getVerifiedManifestSnapshot.mockResolvedValue({
@@ -167,6 +283,7 @@ describe('NodeStorage availability bounds', () => {
             rawBootRead: true,
             atomicCreate: true,
             optimizedPluginStorageBootReconcile: true,
+            rawBootByteLength: null,
         }
         const storage = readyStorage()
         let result: Awaited<ReturnType<typeof storage.readDatabaseForBoot>> | undefined
