@@ -16,11 +16,18 @@ const XL_SPEC: E2eSeedSpec = { characterCount: 300, chatsPerCharacter: 2, messag
 /** Large-chat data plus classic model config aimed at the mock provider. */
 const PROVIDER_SPEC: E2eSeedSpec = { ...LARGE_CHAT_SPEC, databaseFields: mockProviderDatabaseFields }
 
+/** PF-05 crossover fixture: stubs DB > 1 MB via 4 KB character descriptions. */
+const XXL_DESC_SPEC: E2eSeedSpec = {
+  characterCount: 300, chatsPerCharacter: 1, messagesPerChat: 4,
+  messageBytes: 200, characterDescBytes: 4096,
+}
+
 const TEMPLATES: ReadonlyArray<readonly [string, E2eSeedSpec]> = [
   ['medium', MEDIUM_SPEC],
   ['large-chat', LARGE_CHAT_SPEC],
   ['xl', XL_SPEC],
   ['provider', PROVIDER_SPEC],
+  ['xxl-desc', XXL_DESC_SPEC],
 ]
 
 export default async function globalSetup(): Promise<void> {

@@ -48,6 +48,8 @@ export interface E2eSeedSpec {
   messagesPerChat: number
   /** Approximate byte length of each message body. */
   messageBytes: number
+  /** Byte length of each character description (stubs-DB scaling); default small. */
+  characterDescBytes?: number
   /** PRNG seed; change to force different bodies. */
   seed?: number
   /** Extra root database fields (model config, flags…). */
@@ -59,7 +61,9 @@ export function createE2eSeedBackup(spec: E2eSeedSpec): Buffer {
   const characters = Array.from({ length: spec.characterCount }, (_, ci) => ({
     name: `E2E Character ${ci}`,
     chaId: `e2e-char-${ci}`,
-    desc: `End-to-end fixture character ${ci}`,
+    desc: spec.characterDescBytes
+      ? randomBody(rng, `E2E fixture character ${ci} `, spec.characterDescBytes)
+      : `End-to-end fixture character ${ci}`,
     firstMessage: 'Hello from the E2E fixture!',
     chats: Array.from({ length: spec.chatsPerCharacter }, (_, chatIdx) => ({
       id: `e2e-chat-${ci}-${chatIdx}`,
