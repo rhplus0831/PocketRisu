@@ -50,6 +50,7 @@ const { kvGet, kvGetAsync, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList,
         isLegacyHexMigrationComplete, markLegacyHexMigrationComplete,
         publishLegacyHexMigrationMarker,
         db: sqliteDb } = require('./db.cjs');
+const { CHUNK_MARKER } = require('./chunkStore.cjs');
 const { buildListResponse } = require('./listDelta.cjs');
 const {
     assetDir,
@@ -394,7 +395,12 @@ const rawBootByteLengthStatement = (() => {
 function readRawBootByteLengthHint() {
     try {
         const byteLength = rawBootByteLengthStatement?.get(DB_BLOB_KEY)?.byte_length;
-        return Number.isSafeInteger(byteLength) && byteLength >= 0 ? byteLength : null;
+        if (!Number.isSafeInteger(byteLength) || byteLength < 0) return null;
+        if (byteLength !== CHUNK_MARKER.length || !isDbBlobChunked()) return byteLength;
+        const logicalByteLength = kvSize(DB_BLOB_KEY);
+        return Number.isSafeInteger(logicalByteLength) && logicalByteLength >= 0
+            ? logicalByteLength
+            : null;
     } catch {
         return null;
     }

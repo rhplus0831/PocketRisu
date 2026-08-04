@@ -105,7 +105,9 @@ Two amendments to the original A2 story:
    is confined to genuinely tiny databases; the medium-scale motivation for
    the T3 bypass (raw boot below a 128 KiB row-length hint from
    `/api/session`) is eliminating the pre-network IndexedDB SHA-256
-   verification and inventory upload, not wire bytes.
+   verification and inventory upload, not wire bytes. A later fix made that
+   hint chunk-aware after finding that chunked rows advertised the 13-byte
+   storage marker instead of the logical database length.
 
 ## Spot verifications (one representative per group)
 

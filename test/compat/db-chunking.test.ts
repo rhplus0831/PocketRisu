@@ -53,7 +53,7 @@ function oversizedSeed(): Buffer {
 const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
 const packr = new Packr({ useRecords: false })
 // salt makes two blobs differ so a snapshot of one has chunks the other lacks.
-function bigDbBlob(salt = ''): Buffer {
+function bigDbBlob(salt = '', rootPaddingBytes = 0): Buffer {
   const characters = Array.from({ length: 5 }, (_, ci) => ({
     name: `Char${ci}`, chaId: `c${ci}`, type: 'character', chatPage: 0, image: '', desc: 'x', firstMessage: 'hi',
     chats: [{
@@ -61,7 +61,15 @@ function bigDbBlob(salt = ''): Buffer {
       message: Array.from({ length: 2000 }, (_, mi) => ({ role: mi % 2 ? 'char' : 'user', data: `msg ${mi} of char ${ci} ${salt} ${'x'.repeat(20)}` })),
     }],
   }))
-  const database = { characters, apiType: 'openai', personas: [{ name: 'D', icon: '', personaPrompt: '' }], botPresets: [], botPresetsId: 0, selectedCharacter: 0 }
+  const database = {
+    characters,
+    apiType: 'openai',
+    personas: [{ name: 'D', icon: '', personaPrompt: '' }],
+    botPresets: [],
+    botPresetsId: 0,
+    selectedCharacter: 0,
+    ...(rootPaddingBytes > 0 ? { bootHintPadding: 'p'.repeat(rootPaddingBytes) } : {}),
+  }
   return Buffer.concat([MAGIC_RAW, packr.encode(database)])
 }
 function hugeChatDbBlob(): Buffer {
@@ -122,6 +130,26 @@ function getStorageLayout(srv: ServerHandle): {
 }
 
 describe('chunking lifecycle (real server, low threshold)', () => {
+  test('session reports the logical raw boot size for a chunked database row', async () => {
+    const { client, srv } = await boot()
+    expect((await uploadZip(client, bigDbBlob('BOOT-HINT', 16 * 1024))).status).toBe(200)
+    expect(getStorageLayout(srv).liveChunked).toBe(true)
+
+    const rawRead = await client.fetch('/api/db/read-raw-for-boot')
+    expect(rawRead.status).toBe(200)
+    const rawByteLength = (await rawRead.arrayBuffer()).byteLength
+    expect(rawByteLength).toBeGreaterThan(CHUNK_MARKER.length)
+
+    const session = await client.fetch('/api/session', {
+      method: 'POST',
+      headers: { 'x-session-id': 'chunked-raw-boot-size-test' },
+    })
+    expect(session.status).toBe(200)
+    const sessionBody = await session.json() as any
+    expect(sessionBody.capabilities.database.rawBootByteLength).not.toBe(CHUNK_MARKER.length)
+    expect(sessionBody.capabilities.database.rawBootByteLength).toBe(rawByteLength)
+  })
+
   test('character and module stats reuse the revision-bound decoded database', async () => {
     const { client } = await boot()
     const module = {

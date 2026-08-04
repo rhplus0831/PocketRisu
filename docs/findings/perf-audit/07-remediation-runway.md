@@ -57,7 +57,9 @@ coarsen segmentation for small groups and make IDB verification budget-aware
 is inherent to popup ordering — document it; a "prefetch after enabling"
 follow-up is optional polish. Regression: PF-05 steady-state invariants
 already assert both ends; add a small-DB assertion that the cached path is
-chosen only above the threshold once implemented.
+chosen only above the threshold once implemented. The chunked-row hint defect
+that exposed the 13-byte storage marker instead of the logical database length
+was found and fixed after landing.
 
 ## T4 — Plugin-storage protocol adoption (PF-06..PF-12)
 
@@ -146,7 +148,7 @@ T4/T6 regression proofs, not for their design work.
 |---|---|---|---|
 | T1 chat deltas | PF-01, PF-02 | Phase 1 landed (PF-01 client-only projection per [08-t1-chat-row-projection-design.md](08-t1-chat-row-projection-design.md)); Phase 2 durable-path delta admission and PF-02 checkpoint/final coalescing deferred pending post-landing measurement | PF-01 verification flip and send budgets; Phase 2 requires a durable-churn fixture |
 | T2 boot normalization | PF-03, PF-04 | PF-04 landed per [09-t2-boot-normalization-design.md](09-t2-boot-normalization-design.md). PF-03 attributed (09 §3-A): a non-converging 409 conflict loop from create-if-absent's `{}` vs the patcher's implicit `{characters: []}` baseline — consolidation refuted; fix = normalized fresh-database publication at the create boundary (projected 14 req / ~8.3 KB, meets both targets) | PF-03 implementable (creation/baseline alignment); severity upgraded — the storm persists while a fresh instance idles |
-| T3 size-aware cached boot | PF-05 | Landed (128 KiB raw bypass; segmentation coarsening and budget-aware IDB verification deferred) | PF-05 small-raw/large-cached route regression |
+| T3 size-aware cached boot | PF-05 | Landed (128 KiB raw bypass; chunked-row hint now reports logical bytes instead of the 13-byte marker; segmentation coarsening and budget-aware IDB verification deferred) | PF-05 small-raw/large-cached route regression |
 | T4 plugin protocol | PF-06..12 | Open | Items 5–6 design-gated |
 | T5 materialization | PF-13..20 | Landed-contained (PF-13/PF-15/PF-16); PF-14 BLOCKED-NEEDS-DESIGN per the separate 06 amendment; PF-17..20 Open | PF-14 design note; PF-17..20 design-gated |
 | T6 FIFO holds | PF-21..27 | Open (blocked: measurement) | `POCKETRISU_QUEUE_DIAG` data |
