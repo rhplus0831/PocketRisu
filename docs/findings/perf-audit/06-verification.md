@@ -35,13 +35,31 @@ generation outlasts the first save; both writes are full rows because of
 PF-01. Fixing PF-01 collapses the cost (two ~1 KB deltas); write-count
 coalescing is a separate, durability-sensitive question.
 
-## PF-03 — first-run initialization churn: **CONFIRMED**
+## PF-03 — first-run initialization churn: **CONFIRMED, reattributed 2026-08-04**
 
 Fresh empty instance: 7× `/api/patch` totaling 204,932 B, 7× `/api/read`,
 6× `/api/logs` before any user action. Successive startup phases each run
 their own save/re-read cycle. (An imported instance shows a single
 consolidated patch instead — see PF-04 — so the 7-cycle shape is specific to
 first-run defaults construction.)
+
+**Reattribution (see 09 §3-A for the full measurement):** the
+"successive startup phases" explanation above is **wrong**. Instrumented
+runs show ONE valid 296-op startup defaults proposal stuck in a
+non-converging `409 DATABASE_PATCH_CONFLICT` loop: the patcher baseline
+implicitly gains `characters: []` (`risuSave.ts:1322-1328`) while
+create-if-absent persisted literal `{}`, the hashes can never match, and
+the identical 28,417 B patch replays every ~640 ms — an 8-second probe
+reached 16 conflicts and was still looping. "7 cycles" was the capture
+cutoff (current runs measure 6–7). The reads are conflict-recovery
+`readDatabaseCandidate()` calls; the logs are the batched conflict
+warnings (N patches / N reads / N−1 logs). Severity is therefore
+**higher than priced**: the storm is not a one-time boot cost — it
+continues while a fresh instance sits idle, until some later full write
+converges the baselines. Fix direction: align fresh creation with the
+patch baseline (normalized fresh-database publication at the create
+boundary), not save consolidation — no independent producers exist to
+consolidate.
 
 ## PF-04 — post-import normalization patch: **CONFIRMED + decomposed**
 

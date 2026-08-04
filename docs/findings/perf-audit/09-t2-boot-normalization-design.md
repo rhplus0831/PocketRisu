@@ -176,6 +176,147 @@ Plan, measurement-first (T6 discipline):
 PF-03 budget targets are contingent on attribution; do not promise
 ≤15 req / ≤32 KB until the producers are known.
 
+## 3-A. PF-03 attribution results (2026-08-04, post-PF-04 baseline)
+
+Measured at `208fc56a` on `serve`. The attribution sample is five isolated
+empty-instance runs with the scenario's existing two-second post-ready phase;
+seven uninstrumented validation runs checked the phase totals, and a separate
+eight-second probe tested whether the sequence stops. Temporary tracing recorded
+the scheduling stack, tracked/revision snapshot, patch body and response, and the
+complete request list. Source-map symbolization and the op paths were then checked
+against the cited source. All tracing was removed before this addendum.
+
+**Result: the audit's “7 cycles” are not seven boot producers or seven completed
+phases.** They are a cutoff-sized sample of one valid startup proposal stuck in a
+non-converging `409 DATABASE_PATCH_CONFLICT` loop. The eight-second probe reached
+16 same-size, same-op-set conflicts (454,672 body B / 468,416 wire-request B), 16 database
+rereads, and 15 warning flushes and was still running when the phase ended.
+
+### Measured patch sequence
+
+Offsets below are min–max from navigation start across the five comparable runs.
+“Window” names the scheduling window that led to the request, not a distinct data
+producer.
+
+| Patch | Offset | Body B | Op-path summary | Producer / scheduling path | Window and mergeability | Confidence | Stability |
+|---:|---:|---:|---|---|---|---|---|
+| 1 | 1,276–1,423 ms | 28,417 | 296 top-level ops: 295 `add /<root-key>` + 1 `replace /botPresets`; no nested or `/characters` op | The single pre-tracking startup diff: `setDatabase()` defaults (`src/ts/storage/database.svelte.ts:43-798`), fresh theme/language (`src/ts/bootstrap.ts:305-330`), `checkNewFormat()` + final `setDatabase()` (`src/ts/bootstrap.ts:561-718`), and `didFirstSetup` (`src/ts/bootstrap.ts:371-374`), collected by `startupProposal` (`src/ts/globalApi.svelte.ts:497-526`) | W0, immediate save-loop wake; no 500 ms debounce and no earlier neighbor | High | Same op set, size, expected hash, and 409 in 5/5 |
+| 2 | 1,929–2,078 ms | 28,417 | Same 296-op set | No new boot producer: conflict rebase rereads `{}`, installs it with `setDatabase()`, requeues the same dirty branches (`src/ts/globalApi.svelte.ts:741-814`), and retries after the conflict backoff (`:1060-1064`) | W1, the 500 ms root-watcher debounce overlaps the 500 ms conflict sleep; both already merge into this one retry | High | 5/5 |
+| 3 | 2,570–2,722 ms | 28,417 | Same 296-op set | Same conflict-rebase replay as patch 2 | W2, causally created only after patch 2 fails; cannot merge forward | High | 5/5 |
+| 4 | 3,210–3,363 ms | 28,417 | Same 296-op set | Same conflict-rebase replay as patch 2 | W3; cannot merge with W2/W4 because the next graph replacement does not exist until this request returns 409 | High | 5/5 |
+| 5 | 3,857–4,002 ms | 28,417 | Same 296-op set | Same conflict-rebase replay as patch 2 | W4; same causal boundary | High | 5/5 |
+| 6 | 4,488–4,642 ms | 28,417 | Same 296-op set | Same conflict-rebase replay as patch 2 | W5; same causal boundary | High | 5/5 |
+| 7 | 5,124–5,279 ms | 28,417 | Same 296-op set | Same conflict-rebase replay as patch 2 | W6; same causal boundary; “last” only because the test phase ends | High | 5/5 traced; outside the cutoff in 1/7 stock validations |
+
+Every body used `expectedHash: "0"`; every response was 409; none of the
+198,919 request-body bytes in a seven-cycle capture committed. Including request
+headers, those seven patches were **204,932 B**, exactly the audit baseline. Six
+of seven uninstrumented current runs reproduced the whole-phase baseline, **34
+API requests / 225,348 B uploaded**. One captured only six cycles before the
+phase cutoff: **31 API requests / 194,186 B**. Its 31,162-B delta is exactly one
+29,276-B wire patch, one 793-B database reread, and one 1,093-B warning flush.
+
+PF-04 therefore did not change the underlying empty-instance PF-03 storm (as
+expected: its character-default ingest has no character to normalize here), but
+the audit's exact cutoff count is not invariant: it is currently **6–7 patches /
+170,502–198,919 body B**. Within the five traced attribution runs, timing varied
+by roughly 147–155 ms at each patch index while counts, bytes, op sets, response
+codes, and attribution were stable; the stack-heavy tracing was enough to keep
+patch 7 inside all five capture windows.
+
+### Why it cannot converge
+
+The fresh client and server start from different hash-domain graphs:
+
+1. Bootstrap encodes `{}` and calls create-if-absent (`src/ts/bootstrap.ts:164-169`).
+   The current client route sends no body (`src/ts/storage/nodeStorage.ts:2736-2808`),
+   and the server creates, caches, and persists the literal `{}`
+   (`server/node/server.cjs:11140-11182`). Its compositional object hash is the
+   object seed, decimal 17 / hex `"11"` (`server/node/utils.cjs:1027-1058`).
+2. The client correctly captured decoded `{}` as its untouched boot baseline
+   (`src/ts/bootstrap.ts:181-188`), but `RisuSavePatcher.initializeBaseline()`
+   then inserts `characters: []` into that private baseline
+   (`src/ts/storage/risuSave.ts:1322-1328`). The empty compositional patcher
+   baseline produces the observed `expectedHash: "0"` (`:1299-1310`, `:1543`).
+   Because the patcher treats `/characters` as already present, the 296-op patch
+   contains no operation that can make the server's `{}` match that preimage.
+3. The server rejects the mismatch (`server/node/server.cjs:16927-16940`). The
+   client rereads the still-authoritative `{}`, creates another patcher that
+   again inserts `characters: []`, overlays/requeues the same root defaults, and
+   repeats. The dirty callbacks describe the replayed domains; they are not new
+   producers.
+
+This directly contradicts the old PF-03 wording in `06-verification.md` that
+“successive startup phases each run their own save/re-read cycle,” and it refutes
+§3's remaining hypothesis that separate reactive/mount producers likely explain
+the seven requests. There is one startup producer set and an unbounded protocol
+retry.
+
+### `/api/read` and `/api/logs` attribution
+
+- All seven `/api/read` requests in a seven-cycle capture were `GET` with `file-path` decoding to
+  `database/database.bin`, each immediately after its corresponding 409. They
+  come from conflict recovery's `readDatabaseCandidate()` call
+  (`src/ts/globalApi.svelte.ts:741-747` →
+  `src/ts/storage/nodeStorage.ts:4277-4303`), not plugin storage, cache selection,
+  or an independent boot phase. The initial capable-server missing-database probe
+  is the separate `/api/db/read-raw-for-boot` route and is not one of these seven.
+- Each of the six in-phase `/api/logs` bodies contained exactly one entry:
+  source `console`, level `warning`, message “`[Save] Patch conflict detected,
+  rebasing tracked local changes on latest server DB...`”. The warning is emitted
+  at `src/ts/globalApi.svelte.ts:1060-1063`, captured by
+  `src/ts/log-capture.ts:45-61`, and flushed after 500 ms by
+  `src/ts/log.ts:72-129`. Six rather than seven is just the phase boundary: the
+  seventh warning's flush falls after capture. The six-cycle stock capture's
+  exact byte delta and the long probe's 16 patches / 16 reads / 15 log POSTs
+  confirmed the same **N patches / N reads / N−1 log POSTs** cutoff shape.
+
+### Recommendation and budget consequence
+
+Do **not** add a PF-03 boot suppression/consolidation barrier on this evidence.
+Patch 1 already consolidates all known synchronous first-run mutations before
+tracking starts; patches 2+ have no independent producer to consolidate. A
+longer debounce or a `triggerSave` barrier merely delays the same invalid patch.
+
+The first remediation must align fresh creation, stored/cache state, and the
+client patch baseline. At minimum, `{}` versus `{ characters: [] }` must hash the
+same graph by making fresh creation include the branch or by keeping the patcher
+baseline exact and emitting the missing op. That turns the measured sequence
+into one successful 28,417-B body / 29,276-B wire patch and removes all seven
+conflict rereads and six warning uploads in the audit window. Projected from the
+unchanged baseline, that is **15 requests / about 37,583 wire-upload B**: the
+request target is met exactly, but the **≤32 KB byte target is not** (short by
+about 5.6 KB).
+
+To meet both runway targets, fresh creation must publish the already-normalized
+first-run graph atomically (for example, a shared fresh-database factory at the
+create boundary, with any browser-specific language/theme inputs explicitly
+represented) so the 296-op defaults patch is also absent. If the server can
+construct the same graph without uploading it, the measured projection is
+**14 requests / about 8,307 wire-upload B**. If the design instead sends a
+client-built seed body to create-if-absent, remeasure its encoding before claiming
+≤32 KB. This is creation/normalization work, not debounce consolidation.
+
+The §3 interception constraints remain valid if a broader boot barrier is ever
+justified by different data: interception belongs at `triggerSave`; queued
+`requestImmediateSave()` calls must resolve only after a real commit; boot plugin
+reconciliation's direct fenced write remains exempt; pagehide must retain its
+immediate/force-chat-persist escape; and post-interactivity ID references require
+queue-and-commit rather than early success. This measurement simply shows that
+such a barrier would intercept no mergeable PF-03 producer windows today.
+
+A small permanent **test-only** trace hook is worth proposing, but was not kept:
+emit monotonic `startup-proposal`, `triggerSave`, patch op-count/hash, response
+status/code, and dirty-target snapshots to an injected E2E sink. Do not retain
+stack capture (it is expensive and effect stacks usually stop at the observer).
+Pair it with a first-run assertion that no patch receives 409 and a short
+post-ready quiet-period assertion; that would have identified this conflict
+storm directly instead of fossilizing the cutoff count.
+
+Final tree hygiene after removing the temporary client/spec tracing:
+`git diff --stat` contains only this documentation file (`1 file changed, 141
+insertions(+)`). No production behavior or E2E instrumentation remains.
+
 ## 4. Contract check (STRUCTURE.md)
 
 - *Patch normalization/hashing*: untouched — persisted defaults are
