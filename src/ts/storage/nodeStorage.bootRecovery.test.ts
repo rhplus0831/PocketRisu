@@ -49,6 +49,7 @@ vi.mock('./risuSave', () => ({
 
 const { REPLACEMENT_ACTIVITY_TIMEOUT_MS, NodeStorage } = await import('./nodeStorage')
 const { StorageError } = await import('./storageError')
+const { resetClientBuildHandshakeForTests } = await import('./clientBuildHandshake')
 const { recoverDatabaseFromInternalSnapshots } = await import('./bootSnapshotRecovery')
 const { runInternalSnapshotRestoreUi } = await import('./snapshotRestoreUi')
 const resourceCache = await import('./resourceCache')
@@ -282,6 +283,7 @@ function encodeBlockSnapshot(blocks: Array<{ type: number; name: string; body: s
 
 beforeEach(() => {
     vi.clearAllMocks()
+    resetClientBuildHandshakeForTests()
     ;(NodeStorage as any).sessionInitialized = false
     ;(NodeStorage as any).sessionPending = null
     ;(NodeStorage as any).databaseStorageCapabilities = {
@@ -293,6 +295,7 @@ beforeEach(() => {
 
 afterEach(() => {
     vi.unstubAllGlobals()
+    resetClientBuildHandshakeForTests()
 })
 
 describe('NodeStorage boot snapshot recovery', () => {

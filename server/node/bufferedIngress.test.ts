@@ -211,7 +211,13 @@ describe('buffered ingress admission', () => {
     const result = await dispatch(admission.run)
 
     expect(result.res.statusCode).toBe(423)
-    expect(result.res.body).toEqual({ error: 'Session deactivated' })
+    expect(result.res.body).toEqual({
+      error: 'Session deactivated',
+      code: 'SESSION_DEACTIVATED',
+      retryable: false,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+    })
     expect(writerState).toHaveBeenCalledOnce()
     expect(admission.budget.snapshot().usedBytes).toBe(0)
   })

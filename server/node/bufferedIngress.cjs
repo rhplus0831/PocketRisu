@@ -425,7 +425,13 @@ function createBufferedIngressMiddleware({
 
             if (policy.writer && writerState(req) === 'stale') {
                 res.setHeader('Connection', 'close');
-                res.status(423).json({ error: 'Session deactivated' });
+                res.status(423).json({
+                    error: 'Session deactivated',
+                    code: 'SESSION_DEACTIVATED',
+                    retryable: false,
+                    commitOutcome: 'not-committed',
+                    commitOutcomeUnknown: false,
+                });
                 return;
             }
 

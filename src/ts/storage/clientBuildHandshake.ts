@@ -8,22 +8,29 @@ import {
 
 export const CLIENT_UPGRADE_REQUIRED_STATUS = 426
 export const CLIENT_UPGRADE_REQUIRED_CODE = 'CLIENT_UPGRADE_REQUIRED'
+export const WRITER_EPOCH_HEADER = 'x-writer-epoch'
 export { CLIENT_BUILD_HEADER, clientBuildStamp, withClientBuildHeader }
 
 const RELOAD_GUARD_KEY = 'risu-client-build-reload'
+const WRITER_EPOCH_RELOAD_GUARD_KEY = 'risu-writer-epoch-reload'
 
 export interface ExpectedClientBuild {
     version: string
     stamp: string
 }
 
-export interface ClientUpgradeRequiredDetail {
+export type ClientUpgradeRequiredDetail = {
     reason: 'server-upgrade'
     expectedBuild: ExpectedClientBuild
+} | {
+    reason: 'server-restart'
+    writerEpoch: string
 }
 
 let hasUnsavedDirtyState = () => false
 let reloadRequested = false
+let acceptedWriterEpoch: string | null = null
+let writerEpochInvalidated = false
 
 export function setClientBuildDirtyStateProbe(probe: () => boolean): void {
     hasUnsavedDirtyState = probe
@@ -44,11 +51,13 @@ function reloadGuardValue(expectedBuild: ExpectedClientBuild): string {
     })
 }
 
-function armReloadGuard(expectedBuild: ExpectedClientBuild): 'armed' | 'already-armed' | 'unavailable' {
+function armReloadGuard(
+    key: string,
+    value: string,
+): 'armed' | 'already-armed' | 'unavailable' {
     try {
-        const value = reloadGuardValue(expectedBuild)
-        if (sessionStorage.getItem(RELOAD_GUARD_KEY) === value) return 'already-armed'
-        sessionStorage.setItem(RELOAD_GUARD_KEY, value)
+        if (sessionStorage.getItem(key) === value) return 'already-armed'
+        sessionStorage.setItem(key, value)
         return 'armed'
     } catch {
         return 'unavailable'
@@ -79,7 +88,7 @@ export function handleClientUpgradeRequired(
         return 'blocked'
     }
 
-    const guard = armReloadGuard(expectedBuild)
+    const guard = armReloadGuard(RELOAD_GUARD_KEY, reloadGuardValue(expectedBuild))
     let dirty = true
     try {
         dirty = hasUnsavedDirtyState()
@@ -100,7 +109,7 @@ export function handleClientUpgradeRequired(
         return 'recovery'
     }
 
-    if (guard === 'already-armed' && reloadRequested) return 'reload'
+    if (reloadRequested) return 'reload'
     if (guard !== 'armed' || typeof globalThis.location?.reload !== 'function') {
         surfaceReloadFailure(expectedBuild)
         return 'blocked'
@@ -108,6 +117,93 @@ export function handleClientUpgradeRequired(
     reloadRequested = true
     globalThis.location.reload()
     return 'reload'
+}
+
+function parseWriterEpoch(value: unknown): string | null {
+    return typeof value === 'string' && value.length > 0 && value.length <= 256
+        ? value
+        : null
+}
+
+/**
+ * A changed server-process epoch invalidates the page's boot-time storage
+ * baseline. Reuse the build-upgrade safety split: clean pages reload, while
+ * dirty or indeterminate pages enter the existing frozen recovery flow.
+ */
+export function handleWriterEpochChange(
+    writerEpochValue: unknown,
+): 'reload' | 'recovery' | 'blocked' {
+    const writerEpoch = parseWriterEpoch(writerEpochValue)
+    if (!writerEpoch) return 'blocked'
+
+    const guard = armReloadGuard(WRITER_EPOCH_RELOAD_GUARD_KEY, writerEpoch)
+    let dirty = true
+    try {
+        dirty = hasUnsavedDirtyState()
+    } catch {
+        // Preserve the page when dirty-state inspection is unavailable.
+    }
+    if (dirty) {
+        window.dispatchEvent(new CustomEvent<ClientUpgradeRequiredDetail>(
+            'risu-session-deactivated',
+            {
+                detail: {
+                    reason: 'server-restart',
+                    writerEpoch,
+                },
+            },
+        ))
+        return 'recovery'
+    }
+
+    if (reloadRequested) return 'reload'
+    if (guard !== 'armed' || typeof globalThis.location?.reload !== 'function') {
+        surfaceUpgradeMessage(language.clientUpgradeReloadFailed)
+        return 'blocked'
+    }
+    reloadRequested = true
+    globalThis.location.reload()
+    return 'reload'
+}
+
+/** Observe an optional server epoch. Returns true only for an epoch change. */
+export function observeWriterEpoch(writerEpochValue: unknown): boolean {
+    const writerEpoch = parseWriterEpoch(writerEpochValue)
+    if (!writerEpoch) return false
+    if (acceptedWriterEpoch === null) {
+        acceptedWriterEpoch = writerEpoch
+        return false
+    }
+    if (writerEpoch === acceptedWriterEpoch) return false
+    if (!writerEpochInvalidated) {
+        writerEpochInvalidated = true
+        handleWriterEpochChange(writerEpoch)
+    }
+    return true
+}
+
+export function observeWriterEpochResponse(
+    response: Response,
+    bodyWriterEpoch?: unknown,
+): boolean {
+    const headerEpoch = parseWriterEpoch(response.headers.get(WRITER_EPOCH_HEADER))
+    return observeWriterEpoch(headerEpoch ?? bodyWriterEpoch)
+}
+
+export function handleWriterEpochXhr(xhr: XMLHttpRequest): boolean {
+    // Minimal XHR-compatible shims (including embedded webviews) may omit
+    // response-header access. That is the same compatibility path as a server
+    // that does not advertise epochs yet.
+    if (typeof xhr.getResponseHeader !== 'function') return false
+    return observeWriterEpoch(xhr.getResponseHeader(WRITER_EPOCH_HEADER))
+}
+
+export function withWriterEpochHeader(init?: HeadersInit): Headers {
+    const headers = new Headers(init)
+    if (acceptedWriterEpoch !== null) {
+        headers.set(WRITER_EPOCH_HEADER, acceptedWriterEpoch)
+    }
+    return headers
 }
 
 export function acceptMatchingClientBuild(expectedBuildValue: unknown): void {
@@ -151,8 +247,9 @@ export async function clientBuildFetch(
 ): Promise<Response> {
     const response = await fetch(input, {
         ...init,
-        headers: withClientBuildHeader(init.headers),
+        headers: withWriterEpochHeader(withClientBuildHeader(init.headers)),
     })
+    observeWriterEpochResponse(response)
     if (response.status === CLIENT_UPGRADE_REQUIRED_STATUS) {
         await handleClientBuildResponse(response)
     }
@@ -165,9 +262,12 @@ export function resetClientBuildHandshakeForTests(options: {
 } = {}): void {
     hasUnsavedDirtyState = () => false
     reloadRequested = false
+    acceptedWriterEpoch = null
+    writerEpochInvalidated = false
     if (options.preserveReloadGuard) return
     try {
         sessionStorage.removeItem(RELOAD_GUARD_KEY)
+        sessionStorage.removeItem(WRITER_EPOCH_RELOAD_GUARD_KEY)
     } catch {
         // noop
     }

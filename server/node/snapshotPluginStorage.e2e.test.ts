@@ -4034,7 +4034,11 @@ describe('corrupt database boot snapshot recovery', () => {
             body: JSON.stringify({ key: snapshotKey }),
         })
         expect(locked.status).toBe(423)
-        await expect(locked.json()).resolves.toEqual({ error: 'Session deactivated' })
+        await expect(locked.json()).resolves.toMatchObject({
+            code: 'SESSION_DEACTIVATED',
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        })
         const unchanged = await fetch(`${server.origin}/api/db/read-raw-for-boot`, {
             headers: active,
         })

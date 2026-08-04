@@ -515,9 +515,18 @@ describe('chat content row serving', () => {
     const client = await createClient(server.port, server.password)
     const base = { id: 'fallback-chat', message: [{ data: 'base' }] }
     const fallback = { id: 'fallback-chat', message: [{ data: 'full fallback' }] }
+    const legacyReplacement = {
+      id: 'fallback-chat',
+      message: [{ data: 'legacy headerless replacement' }],
+    }
     const baseBytes = encodeRisuDat(base)
     const fallbackBytes = encodeRisuDat(fallback)
+    const legacyReplacementBytes = encodeRisuDat(legacyReplacement)
+    const baseHash = createHash('sha256').update(baseBytes).digest('hex')
     const fallbackHash = createHash('sha256').update(fallbackBytes).digest('hex')
+    const legacyReplacementHash = createHash('sha256')
+      .update(legacyReplacementBytes)
+      .digest('hex')
     await client.fetch('/api/chat-content/fallback-char/0', {
       method: 'POST',
       headers: { 'content-type': 'application/octet-stream', 'x-chat-id': 'fallback-chat' },
@@ -557,17 +566,54 @@ describe('chat content row serving', () => {
       commitOutcomeUnknown: false,
     })
 
+    const staleFullResponse = await client.fetch('/api/chat-content/fallback-char/0', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-chat-id': 'fallback-chat',
+        'x-chat-base-hash': '0'.repeat(64),
+      },
+      body: new Uint8Array(fallbackBytes),
+    })
+    expect(staleFullResponse.status).toBe(409)
+    expect(await staleFullResponse.json()).toMatchObject({
+      success: false,
+      code: 'CHAT_ROW_BASE_MISMATCH',
+      retryable: false,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+      currentHash: baseHash,
+    })
+    const afterStaleFull = await client.fetch('/api/chat-content/fallback-char/0', {
+      headers: { 'x-chat-id': 'fallback-chat' },
+    })
+    expect(Buffer.from(await afterStaleFull.arrayBuffer())).toEqual(baseBytes)
+
     const fallbackResponse = await client.fetch('/api/chat-content/fallback-char/0', {
       method: 'POST',
-      headers: { 'content-type': 'application/octet-stream', 'x-chat-id': 'fallback-chat' },
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-chat-id': 'fallback-chat',
+        'x-chat-base-hash': baseHash,
+      },
       body: new Uint8Array(fallbackBytes),
     })
     expect(await fallbackResponse.json()).toEqual({ success: true, hash: fallbackHash })
     expect(operationLog(server.cwd, 'chats/fallback-char/fallback-chat')).toEqual([])
+
+    const legacyResponse = await client.fetch('/api/chat-content/fallback-char/0', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream', 'x-chat-id': 'fallback-chat' },
+      body: new Uint8Array(legacyReplacementBytes),
+    })
+    expect(await legacyResponse.json()).toEqual({
+      success: true,
+      hash: legacyReplacementHash,
+    })
     const get = await client.fetch('/api/chat-content/fallback-char/0', {
       headers: { 'x-chat-id': 'fallback-chat' },
     })
-    expect(Buffer.from(await get.arrayBuffer())).toEqual(fallbackBytes)
+    expect(Buffer.from(await get.arrayBuffer())).toEqual(legacyReplacementBytes)
   })
 
   test('queued threshold compaction atomically retains the logical row and clears applied entries', async () => {

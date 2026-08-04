@@ -110,6 +110,9 @@ import {
     handleClientBuildResponse,
     handleClientBuildXhr,
     handleClientUpgradeRequired,
+    handleWriterEpochXhr,
+    observeWriterEpochResponse,
+    withWriterEpochHeader,
 } from "./clientBuildHandshake"
 import { CLIENT_BUILD_HEADER, clientBuildStamp } from "./clientBuild"
 
@@ -1691,11 +1694,11 @@ export class NodeStorage{
             throwIfAborted(signal)
             const res = await fetch('/api/session', {
                 method: 'POST',
-                headers: {
+                headers: withWriterEpochHeader({
                     'risu-auth': await this.createAuth(signal),
                     'x-session-id': NodeStorage.sessionId,
                     [CLIENT_BUILD_HEADER]: clientBuildStamp,
-                },
+                }),
                 signal,
             })
             const responseBytes = await awaitWithAbort(res.arrayBuffer(), signal)
@@ -1711,6 +1714,7 @@ export class NodeStorage{
                 const sessionResponse = response && typeof response === 'object'
                     ? (response as {
                         build?: unknown
+                        writerEpoch?: unknown
                         capabilities?: {
                             pluginStorage?: unknown
                             pluginStorageBatch?: unknown
@@ -1719,6 +1723,7 @@ export class NodeStorage{
                         }
                     })
                     : null
+                observeWriterEpochResponse(res, sessionResponse?.writerEpoch)
                 const capabilities = sessionResponse?.capabilities
                 NodeStorage.pluginStorageBatchCapabilities
                     = parsePluginStorageBatchStreamCapabilities(
@@ -1901,6 +1906,7 @@ export class NodeStorage{
             headers.set('x-session-id', NodeStorage.sessionId)
             headers.set(CLIENT_BUILD_HEADER, clientBuildStamp)
             if (isUserActive()) headers.set('x-user-active', '1')
+            const writerHeaders = withWriterEpochHeader(headers)
             throwIfAborted(signal)
             beforeDispatch?.()
             outcome.markRequestDispatched()
@@ -1909,7 +1915,7 @@ export class NodeStorage{
             try {
                 response = await fetch(input, {
                     ...init,
-                    headers,
+                    headers: writerHeaders,
                     signal,
                 })
             } catch (error) {
@@ -1919,6 +1925,7 @@ export class NodeStorage{
             }
             outcome.markDefinitiveResponse()
             mutationOutcome?.markDefinitiveResponse()
+            observeWriterEpochResponse(response)
             if (response.status === CLIENT_UPGRADE_REQUIRED_STATUS) {
                 await handleClientBuildResponse(response)
             }
@@ -5321,6 +5328,7 @@ export class NodeStorage{
         try {
             const res = await this.authFetch('/api/session/lock-status')
             if (!res.ok) return 'unknown'
+            if (observeWriterEpochResponse(res)) return 'unknown'
             const data = await res.json()
             return data?.state ?? 'unknown'
         } catch {
@@ -5665,6 +5673,9 @@ export class NodeStorage{
             xhr.setRequestHeader('risu-auth', authHeader)
             xhr.setRequestHeader('x-session-id', NodeStorage.sessionId)
             xhr.setRequestHeader(CLIENT_BUILD_HEADER, clientBuildStamp)
+            for (const [name, value] of withWriterEpochHeader()) {
+                xhr.setRequestHeader(name, value)
+            }
             if (allowLargeRestore) xhr.setRequestHeader('x-risu-large-restore', '1')
             if (isUserActive()) xhr.setRequestHeader('x-user-active', '1')
             // Opt into NDJSON streaming so the server keeps the response socket
@@ -5782,6 +5793,7 @@ export class NodeStorage{
             )
             xhr.onload = () => {
                 if (settled) return
+                handleWriterEpochXhr(xhr)
                 handleClientBuildXhr(xhr)
                 if (xhr.status === 0) {
                     settleFromTerminalOrUnknown(
@@ -6155,6 +6167,7 @@ export class NodeStorage{
         contentType: string,
         byteLength: number,
         backupReason?: string,
+        baseHash?: string,
     ): Promise<{ hash?: string }> {
         const headers: Record<string, string> = {
             'content-type': contentType,
@@ -6162,6 +6175,9 @@ export class NodeStorage{
         }
         if (backupReason !== undefined) {
             headers['x-chat-backup-reason'] = backupReason
+        }
+        if (baseHash !== undefined) {
+            headers['x-chat-base-hash'] = baseHash
         }
         return runBoundedAuthoritativeStorageOperation(
             async (signal, outcome) => {
@@ -6265,15 +6281,29 @@ export class NodeStorage{
         }
 
         if (!response) {
-            response = await this.postChatContent(
-                chaId,
-                chatIndex,
-                chatId,
-                encoded as unknown as BodyInit,
-                'application/octet-stream',
-                encoded.byteLength,
-                backupReason,
-            )
+            try {
+                response = await this.postChatContent(
+                    chaId,
+                    chatIndex,
+                    chatId,
+                    encoded as unknown as BodyInit,
+                    'application/octet-stream',
+                    encoded.byteLength,
+                    backupReason,
+                    previous?.hash,
+                )
+            } catch (error) {
+                if (error instanceof StorageError
+                    && error.code === 'CHAT_ROW_BASE_MISMATCH'
+                    && error.commitOutcomeUnknown === false
+                    && error.commitOutcome === 'not-committed') {
+                    // The authoritative chat advanced beyond our acknowledged
+                    // base. Freeze this dirty page through the established
+                    // writer recovery flow instead of replaying the full row.
+                    window.dispatchEvent(new CustomEvent('risu-session-deactivated'))
+                }
+                throw error
+            }
         }
 
         if (response.hash === requestHash && requestHash) {
@@ -6455,6 +6485,9 @@ export class NodeStorage{
                 xhr.setRequestHeader('risu-auth', authHeader)
                 xhr.setRequestHeader('x-session-id', NodeStorage.sessionId)
                 xhr.setRequestHeader(CLIENT_BUILD_HEADER, clientBuildStamp)
+                for (const [name, value] of withWriterEpochHeader()) {
+                    xhr.setRequestHeader(name, value)
+                }
                 if (isUserActive()) xhr.setRequestHeader('x-user-active', '1')
                 xhr.setRequestHeader('accept', 'application/x-ndjson')
                 xhr.setRequestHeader('x-risu-replacement-id', operationId)
@@ -6593,6 +6626,7 @@ export class NodeStorage{
                 false,
             )
             xhr.onload = () => {
+                handleWriterEpochXhr(xhr)
                 handleClientBuildXhr(xhr)
                 // XHR status 0 means no authoritative HTTP response exists.
                 // Ignore even an exact-looking cached/proxy body: after send()

@@ -61,10 +61,14 @@ describe('NodeStorage client build headers', () => {
                 return new Response(JSON.stringify({
                     ok: true,
                     build: { version: '1.9.0', stamp: clientBuildStamp },
+                    writerEpoch: 'writer-epoch-one',
                     capabilities: {},
                 }), {
                     status: 200,
-                    headers: { 'content-type': 'application/json' },
+                    headers: {
+                        'content-type': 'application/json',
+                        'x-writer-epoch': 'writer-epoch-one',
+                    },
                 })
             }
             return new Response(JSON.stringify({ success: true }), {
@@ -93,5 +97,59 @@ describe('NodeStorage client build headers', () => {
             expect(request.headers.get('x-session-id')).toBeTruthy()
             expect(request.headers.get('x-client-build')).toBe(clientBuildStamp)
         }
+        expect(requests[0].headers.get('x-writer-epoch')).toBeNull()
+        expect(requests[1].headers.get('x-writer-epoch')).toBe('writer-epoch-one')
+    })
+
+    it('detects a changed epoch on foreground status despite the initialized-session short circuit', async () => {
+        const reload = vi.fn()
+        vi.stubGlobal('location', { reload })
+        const requests: Array<{ path: string; headers: Headers }> = []
+        vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const path = String(input)
+            requests.push({ path, headers: new Headers(init?.headers) })
+            if (path === '/api/session') {
+                return new Response(JSON.stringify({
+                    ok: true,
+                    build: { version: '1.9.0', stamp: clientBuildStamp },
+                    writerEpoch: 'writer-epoch-before-restart',
+                    capabilities: {},
+                }), {
+                    status: 200,
+                    headers: {
+                        'content-type': 'application/json',
+                        'x-writer-epoch': 'writer-epoch-before-restart',
+                    },
+                })
+            }
+            return new Response(JSON.stringify({
+                state: 'stale',
+                writerEpoch: 'writer-epoch-after-restart',
+            }), {
+                status: 200,
+                headers: {
+                    'content-type': 'application/json',
+                    'x-writer-epoch': 'writer-epoch-after-restart',
+                },
+            })
+        }))
+
+        const storage = new NodeStorage()
+        storage.authChecked = true
+        ;(storage as any).cachedJwt = {
+            token: 'cached-token',
+            expiresAt: Date.now() + 300_000,
+        }
+
+        await (storage as any).initSession()
+        await expect(storage.getWriterLockState()).resolves.toBe('unknown')
+
+        expect(requests.map(request => request.path)).toEqual([
+            '/api/session',
+            '/api/session/lock-status',
+        ])
+        expect(requests[1].headers.get('x-writer-epoch'))
+            .toBe('writer-epoch-before-restart')
+        expect(reload).toHaveBeenCalledOnce()
     })
 })

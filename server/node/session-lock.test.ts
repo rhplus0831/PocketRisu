@@ -2,18 +2,29 @@ import { describe, it, expect } from 'vitest'
 import pkg from './session-lock.cjs'
 
 const { createSessionLock } = pkg as {
-    createSessionLock: (opts?: { now?: () => number }) => {
+    createSessionLock: (opts?: { now?: () => number, epoch?: string }) => {
         register: (id: string) => void
-        checkWrite: (id: string, userActive?: boolean) => { ok: boolean, tookOver?: boolean, passive?: boolean }
+        checkWrite: (
+            id: string,
+            userActive?: boolean,
+            clientEpoch?: string,
+        ) => {
+            ok: boolean
+            tookOver?: boolean
+            passive?: boolean
+            reason?: 'epoch-mismatch'
+        }
+        peek: (id: string, clientEpoch?: string) => 'free' | 'active' | 'fresh' | 'stale'
         activeId: () => string | null
+        epoch: () => string
     }
 }
 
 // Injected clock: each call advances 1ms so "booted after the last write"
 // comparisons are deterministic without sleeping.
-function makeLock() {
+function makeLock(epoch = 'epoch-one') {
     let t = 1000
-    const lock = createSessionLock({ now: () => ++t })
+    const lock = createSessionLock({ now: () => ++t, epoch })
     return { lock, tick: () => ++t }
 }
 
@@ -37,6 +48,42 @@ describe('session-lock', () => {
         const { lock } = makeLock()
         expect(lock.checkWrite('pc').ok).toBe(true)
         expect(lock.activeId()).toBe('pc')
+    })
+
+    it('rejects a pre-restart epoch before adoption and accepts a fresh post-restart session', () => {
+        const { lock: beforeRestart } = makeLock('epoch-before-restart')
+        beforeRestart.register('old-tab')
+        expect(beforeRestart.checkWrite(
+            'old-tab',
+            false,
+            beforeRestart.epoch(),
+        ).ok).toBe(true)
+
+        const { lock: afterRestart } = makeLock('epoch-after-restart')
+        expect(afterRestart.checkWrite(
+            'old-tab',
+            true,
+            beforeRestart.epoch(),
+        )).toEqual({ ok: false, reason: 'epoch-mismatch' })
+        expect(afterRestart.activeId()).toBeNull()
+        expect(afterRestart.peek('old-tab', beforeRestart.epoch())).toBe('stale')
+
+        afterRestart.register('fresh-tab')
+        expect(afterRestart.checkWrite(
+            'fresh-tab',
+            false,
+            afterRestart.epoch(),
+        )).toEqual({ ok: true })
+        expect(afterRestart.activeId()).toBe('fresh-tab')
+    })
+
+    it('keeps legacy epoch-less writers on the compatibility path', () => {
+        const { lock: beforeRestart } = makeLock('epoch-before-restart')
+        const { lock: afterRestart } = makeLock('epoch-after-restart')
+        beforeRestart.register('legacy-tab')
+
+        expect(afterRestart.checkWrite('legacy-tab')).toEqual({ ok: true })
+        expect(afterRestart.activeId()).toBe('legacy-tab')
     })
 
     it('a freshly-booted session takes over on its first WRITE, then the old one is rejected', () => {

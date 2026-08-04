@@ -21,7 +21,7 @@ let writerAccessLost = false
 let offlineFreezeObserver: MutationObserver | null = null
 let removeInteractionGuards: (() => void) | null = null
 
-export type WriterTakeoverReason = 'session-takeover' | 'server-upgrade'
+export type WriterTakeoverReason = 'session-takeover' | 'server-upgrade' | 'server-restart'
 
 export type WriterLockState = 'free' | 'active' | 'fresh' | 'stale' | 'unknown'
 
@@ -73,9 +73,9 @@ async function runWriterTakeoverFlow(reason: WriterTakeoverReason): Promise<void
     try {
         selection = await alertSelect(
             [language.writerTakeoverStayOffline, language.writerTakeoverReload],
-            reason === 'server-upgrade'
-                ? language.clientUpgradeDirtyBody
-                : language.writerTakeoverBody,
+            reason === 'session-takeover'
+                ? language.writerTakeoverBody
+                : language.clientUpgradeDirtyBody,
         )
     } catch (error) {
         console.error('[Writer] Failed to show takeover dialog:', error)
@@ -107,9 +107,9 @@ function enterFrozenOfflineState(reason: WriterTakeoverReason): void {
         banner.setAttribute('aria-live', 'polite')
 
         const message = document.createElement('span')
-        message.textContent = reason === 'server-upgrade'
-            ? language.clientUpgradeOfflineBanner
-            : language.writerOfflineBanner
+        message.textContent = reason === 'session-takeover'
+            ? language.writerOfflineBanner
+            : language.clientUpgradeOfflineBanner
         banner.appendChild(message)
 
         const reload = document.createElement('button')

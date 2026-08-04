@@ -448,8 +448,8 @@ export async function saveDb() {
         if (claimWriterAccessLoss()) {
             const detail = (event as CustomEvent<ClientUpgradeRequiredDetail>).detail
             enterWriterTakeoverFlow(
-                detail?.reason === 'server-upgrade'
-                    ? 'server-upgrade'
+                detail?.reason === 'server-upgrade' || detail?.reason === 'server-restart'
+                    ? detail.reason
                     : 'session-takeover',
             )
         }

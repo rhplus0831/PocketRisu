@@ -99,7 +99,13 @@ describe('buffered ingress admission', () => {
     })
     await expect(stale.response).resolves.toEqual({
       status: 423,
-      body: { error: 'Session deactivated' },
+      body: {
+        error: 'Session deactivated',
+        code: 'SESSION_DEACTIVATED',
+        retryable: false,
+        commitOutcome: 'not-committed',
+        commitOutcomeUnknown: false,
+      },
     })
     stale.request.destroy()
   })

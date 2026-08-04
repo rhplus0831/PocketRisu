@@ -23,11 +23,14 @@ const {
 } = fsSync;
 const fs = require('fs/promises')
 const nodeCrypto = require('crypto')
+const { createSessionLock } = require('./session-lock.cjs')
 const zlib = require('zlib')
 const v8 = require('v8')
 const rateLimit = require('express-rate-limit')
 const { WebSocketServer } = require('ws')
 const { fetch: undiciFetch } = require('undici')
+const WRITER_EPOCH_HEADER = 'x-writer-epoch'
+const sessionLock = createSessionLock()
 const Vips = require('wasm-vips')
 let _vipsPromise = null
 const getVips = () => {
@@ -2757,6 +2760,12 @@ const bufferedIngressLimits = createBufferedIngressLimits({
     pluginBatchMaxBytes: PLUGIN_STORAGE_BATCH_MAX_BODY_BYTES,
 });
 const bufferedIngressBudget = createInFlightByteBudget(bufferedIngressLimits.global);
+app.use((req, res, next) => {
+    if (req.path.startsWith('/api/')) {
+        res.setHeader(WRITER_EPOCH_HEADER, sessionLock.epoch());
+    }
+    next();
+});
 app.use(createBufferedIngressMiddleware({
     resolvePolicy: createRoutePolicyResolver(bufferedIngressLimits),
     budget: bufferedIngressBudget,
@@ -2770,6 +2779,9 @@ app.use(createBufferedIngressMiddleware({
     writerState: (req) => sessionLock.peek(
         typeof req.headers['x-session-id'] === 'string'
             ? req.headers['x-session-id']
+            : '',
+        typeof req.headers[WRITER_EPOCH_HEADER] === 'string'
+            ? req.headers[WRITER_EPOCH_HEADER]
             : '',
     ),
     expectedClientBuild,
@@ -4963,9 +4975,7 @@ async function checkDiskSpace(requiredBytes, targetPath = path.join(process.cwd(
 // Mirrors the BroadcastChannel-based tab lock on the server side so that the
 // same protection extends across devices. Page loads register without stealing
 // the lock; a recent user gesture allows a freshly booted session to take over.
-const { createSessionLock } = require('./session-lock.cjs');
 const { createBoundedSessionState } = require('./boundedSessionState.cjs');
-const sessionLock = createSessionLock();
 const PLUGIN_STORAGE_READ_SESSION_MAX_ENTRIES = 50;
 const pluginStorageReadStateStatsPath = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_PLUGIN_READ_STATE_STATS_PATH ?? '').trim() || null
@@ -5005,16 +5015,24 @@ function sessionPluginStorageReadState(req) {
 
 function checkActiveSession(req, res) {
     const clientSessionId = req.headers['x-session-id']
+    const clientWriterEpoch = req.headers[WRITER_EPOCH_HEADER]
     const userActive = req.headers['x-user-active'] === '1'
     const result = sessionLock.checkWrite(
         typeof clientSessionId === 'string' ? clientSessionId : '',
         userActive,
+        typeof clientWriterEpoch === 'string' ? clientWriterEpoch : '',
     )
     if (result.tookOver) {
         console.log('[Session] Write lock taken over by a freshly-booted session')
     }
     if (result.ok) return true
-    res.status(423).json({ error: 'Session deactivated' })
+    res.status(423).json({
+        error: 'Session deactivated',
+        code: 'SESSION_DEACTIVATED',
+        retryable: false,
+        commitOutcome: 'not-committed',
+        commitOutcomeUnknown: false,
+    })
     return false
 }
 
@@ -10650,7 +10668,14 @@ app.post('/api/token/refresh', async (req, res) => {
 app.get('/api/session/lock-status', async (req, res) => {
     if (!await checkAuth(req, res)) return
     const id = req.headers['x-session-id']
-    res.json({ state: sessionLock.peek(typeof id === 'string' ? id : '') })
+    const clientWriterEpoch = req.headers[WRITER_EPOCH_HEADER]
+    res.json({
+        state: sessionLock.peek(
+            typeof id === 'string' ? id : '',
+            typeof clientWriterEpoch === 'string' ? clientWriterEpoch : '',
+        ),
+        writerEpoch: sessionLock.epoch(),
+    })
 })
 
 // ── Session cookie issuance (F-0) ──────────────────────────────────────────
@@ -10676,6 +10701,7 @@ app.post('/api/session', async (req, res) => {
     res.json({
         ok: true,
         build: expectedClientBuild,
+        writerEpoch: sessionLock.epoch(),
         capabilities: {
             pluginStorage: {
                 maxValueBytes: PLUGIN_VALUE_MAX_BYTES,
@@ -18435,6 +18461,38 @@ function sendChatDeltaRefusal(res, result, status = 409) {
     });
 }
 
+const CHAT_ROW_BASE_HASH_HEADER = 'x-chat-base-hash';
+
+function checkChatRowBasePrecondition(req, res, chaId, chatId) {
+    const expectedBaseHash = req.headers[CHAT_ROW_BASE_HASH_HEADER];
+    if (expectedBaseHash === undefined) return true;
+    if (typeof expectedBaseHash !== 'string'
+        || !/^[0-9a-f]{64}$/.test(expectedBaseHash)) {
+        res.status(400).json({
+            success: false,
+            error: 'The full chat row base hash is invalid.',
+            code: 'CHAT_ROW_BASE_INVALID',
+            retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        });
+        return false;
+    }
+
+    const currentRow = chatRowStore.readChatRowRawWithMetadata(chaId, chatId);
+    if (currentRow?.contentHash === expectedBaseHash) return true;
+    res.status(409).json({
+        success: false,
+        error: 'The chat row changed since the acknowledged base.',
+        code: 'CHAT_ROW_BASE_MISMATCH',
+        retryable: false,
+        commitOutcome: 'not-committed',
+        commitOutcomeUnknown: false,
+        ...(currentRow?.contentHash ? { currentHash: currentRow.contentHash } : {}),
+    });
+    return false;
+}
+
 function scheduleChatDeltaCompaction(chaId, chatId) {
     const key = chatRowKey(chaId, chatId);
     if (pendingChatDeltaCompactions.has(key)) return;
@@ -18556,6 +18614,7 @@ async function handleSpooledChatWrite(req, res, next, spool) {
             if (!prepared.chatData || !expectedChatId) {
                 return res.status(400).json({ error: 'Chat data and x-chat-id required' });
             }
+            if (!checkChatRowBasePrecondition(req, res, chaId, expectedChatId)) return;
             // Keep the exact old ordering: the prior authoritative row is
             // captured after queue admission and immediately before publish.
             await chatBackupStore.captureChatPreImage({
@@ -18659,6 +18718,8 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                 delete chatData._stub;
                 healedHybrid = true;
             }
+
+            if (!checkChatRowBasePrecondition(req, res, chaId, expectedChatId)) return;
 
             // This must remain immediately before the row write: every version
             // is the exact state the incoming save was about to replace.

@@ -27,6 +27,7 @@ import {
     clientBuildStamp,
     handleClientBuildResponse,
     handleClientUpgradeRequired,
+    handleWriterEpochChange,
     resetClientBuildHandshakeForTests,
     setClientBuildDirtyStateProbe,
 } from './clientBuildHandshake'
@@ -112,6 +113,39 @@ describe('client build upgrade recovery', () => {
         )).toBe(true)
         expect(document.getElementById('risu-writer-offline-banner')?.textContent)
             .toContain('copy changes before reloading the update')
+
+        window.removeEventListener('risu-session-deactivated', onDeactivated)
+    })
+
+    it('reloads a clean page after observing a new server writer epoch', () => {
+        expect(handleWriterEpochChange('writer-epoch-after-restart')).toBe('reload')
+        expect(reload).toHaveBeenCalledOnce()
+        expect(mocks.alertSelect).not.toHaveBeenCalled()
+    })
+
+    it('takes dirty state through the existing recovery prompt after an epoch change', async () => {
+        setClientBuildDirtyStateProbe(() => true)
+        mocks.alertSelect.mockResolvedValue('0')
+        const onDeactivated = (event: Event) => {
+            const detail = (event as CustomEvent).detail
+            if (detail?.reason === 'server-restart') {
+                enterWriterTakeoverFlow('server-restart')
+            }
+        }
+        window.addEventListener('risu-session-deactivated', onDeactivated)
+
+        expect(handleWriterEpochChange('writer-epoch-after-restart')).toBe('recovery')
+
+        await vi.waitFor(() => {
+            expect(mocks.alertSelect).toHaveBeenCalledWith(
+                ['stay read-only', 'discard and reload'],
+                'server update requires reload',
+            )
+        })
+        expect(reload).not.toHaveBeenCalled()
+        expect(document.getElementById('app')?.classList.contains(
+            'risu-writer-offline-frozen',
+        )).toBe(true)
 
         window.removeEventListener('risu-session-deactivated', onDeactivated)
     })

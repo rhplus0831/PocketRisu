@@ -79,6 +79,7 @@ const {
     parseDatabaseStorageCapabilities,
 } = await import('./nodeStorage')
 const { StorageError } = await import('./storageError')
+const { resetClientBuildHandshakeForTests } = await import('./clientBuildHandshake')
 const { decodeRisuSave, encodeRisuSaveLegacy } = await import('./risuSave')
 const { encodeRawMsgpack } = await import('./rawMsgpack')
 
@@ -100,6 +101,7 @@ function readyStorage(): InstanceType<typeof NodeStorage> {
 
 beforeEach(() => {
     vi.clearAllMocks()
+    resetClientBuildHandshakeForTests()
     ;(NodeStorage as any).sessionInitialized = false
     ;(NodeStorage as any).sessionPending = null
     ;(NodeStorage as any).pluginStorageCapabilities = {
@@ -139,6 +141,7 @@ beforeEach(() => {
 afterEach(() => {
     vi.useRealTimers()
     vi.unstubAllGlobals()
+    resetClientBuildHandshakeForTests()
 })
 
 describe('database storage capability parsing', () => {
@@ -1198,7 +1201,72 @@ describe('NodeStorage availability bounds', () => {
             .toBe('application/vnd.pocketrisu.chat-delta+json')
         expect(new Headers(requests[2].headers).get('content-type'))
             .toBe('application/octet-stream')
+        expect(new Headers(requests[2].headers).get('x-chat-base-hash'))
+            .toBe(baseHash)
         expect(requests[2].body).toBe(fullBytes)
+    })
+
+    it('routes a stale full-row fallback into writer recovery without retrying it', async () => {
+        cache.enabled = false
+        const baseHash = 'a'.repeat(64)
+        const resultHash = 'b'.repeat(64)
+        const base = { message: [{ data: 'base' }] }
+        const result = { message: [{ data: 'edited' }] }
+        const fullBytes = new Uint8Array(2_048)
+        codec.prepareChatRowCheckpoint
+            .mockResolvedValueOnce({
+                bytes: fullBytes,
+                hash: baseHash,
+                patch: null,
+                snapshot: base,
+            })
+            .mockResolvedValueOnce({
+                bytes: fullBytes,
+                hash: resultHash,
+                patch: [{ op: 'replace', path: '/message/0', value: result.message[0] }],
+                snapshot: result,
+            })
+        const requests: RequestInit[] = []
+        vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+            requests.push(init ?? {})
+            if (requests.length === 1) {
+                return new Response(JSON.stringify({ success: true, hash: baseHash }), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' },
+                })
+            }
+            const code = requests.length === 2
+                ? 'CHAT_DELTA_BASE_MISMATCH'
+                : 'CHAT_ROW_BASE_MISMATCH'
+            return new Response(JSON.stringify({
+                success: false,
+                error: 'stale base',
+                code,
+                retryable: false,
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            }), {
+                status: 409,
+                headers: { 'content-type': 'application/json' },
+            })
+        }))
+        const storage = readyStorage()
+        const onDeactivated = vi.fn()
+        window.addEventListener('risu-session-deactivated', onDeactivated)
+
+        await storage.saveChatContent('character', 0, 'chat', base)
+        await expect(storage.saveChatContent('character', 0, 'chat', result))
+            .rejects.toMatchObject({
+                code: 'CHAT_ROW_BASE_MISMATCH',
+                commitOutcome: 'not-committed',
+                commitOutcomeUnknown: false,
+            })
+
+        expect(requests).toHaveLength(3)
+        expect(new Headers(requests[2].headers).get('x-chat-base-hash'))
+            .toBe(baseHash)
+        expect(onDeactivated).toHaveBeenCalledOnce()
+        window.removeEventListener('risu-session-deactivated', onDeactivated)
     })
 
     it('retries the full row when a successful delta acknowledgement has the wrong digest', async () => {

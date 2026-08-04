@@ -1,5 +1,7 @@
 'use strict';
 
+const nodeCrypto = require('node:crypto');
+
 // Cross-device single-writer session lock.
 //
 // The app's data model allows exactly one writing client (the in-memory DB is
@@ -37,9 +39,13 @@
 // first action takes the lock. A only ever sees a 423 if it writes again
 // afterwards — the one genuinely necessary kick.
 //
-// State is in-memory: a server restart clears it and the first write adopts.
+// State is in-memory. The random epoch fences epoch-aware tabs across a server
+// restart even though the active-session map itself is intentionally reset.
 function createSessionLock(opts = {}) {
     const now = opts.now || Date.now;
+    const writerEpoch = typeof opts.epoch === 'string' && opts.epoch.length > 0
+        ? opts.epoch
+        : nodeCrypto.randomBytes(32).toString('hex');
     const MAX_TRACKED_BOOTS = 50;
 
     let active = null; // { id, lastWriteAt } | null
@@ -61,7 +67,18 @@ function createSessionLock(opts = {}) {
         // restore, with the client persisting its id) keeps the lock as-is.
     }
 
-    function checkWrite(id, userActive = false) {
+    function hasEpochMismatch(clientEpoch) {
+        // Missing epochs preserve compatibility with older builds. Those
+        // callers retain the pre-epoch restart gap until they are upgraded.
+        return typeof clientEpoch === 'string'
+            && clientEpoch.length > 0
+            && clientEpoch !== writerEpoch;
+    }
+
+    function checkWrite(id, userActive = false, clientEpoch = '') {
+        if (hasEpochMismatch(clientEpoch)) {
+            return { ok: false, reason: 'epoch-mismatch' };
+        }
         if (typeof id !== 'string' || id === '') {
             return { ok: true }; // client without session support
         }
@@ -96,7 +113,8 @@ function createSessionLock(opts = {}) {
     // so this one's in-memory copy is outdated and must not write again.
     // 'fresh' needs nothing — the copy includes every accepted write, and the
     // next user action simply takes the lock over.
-    function peek(id) {
+    function peek(id, clientEpoch = '') {
+        if (hasEpochMismatch(clientEpoch)) return 'stale';
         if (typeof id !== 'string' || id === '') return 'active';
         if (!active) return 'free';
         if (active.id === id) return 'active';
@@ -105,7 +123,11 @@ function createSessionLock(opts = {}) {
         return 'stale';
     }
 
-    return { register, checkWrite, peek, activeId };
+    function epoch() {
+        return writerEpoch;
+    }
+
+    return { register, checkWrite, peek, activeId, epoch };
 }
 
 module.exports = { createSessionLock };
