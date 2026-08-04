@@ -1304,12 +1304,12 @@ function createChunkStore(db, opts = {}) {
     // Atomic: clearing the old manifest, inserting new chunks, and writing the
     // marker all commit together. Orphaned chunks from a prior version are left
     // for GC (a later layer) — never deleted here.
-    const putValueTransaction = db.transaction((key, value) => {
+    const putValueTransaction = db.transaction((key, value, updatedAt) => {
         delManifestPublication.run(key);
         delManifest.run(key);
         delManifestMeta.run(key);
         if (value.length <= threshold) {
-            kvSet.run(key, value, Date.now());
+            kvSet.run(key, value, updatedAt);
             deleteInventoryRevision.run(key);
             return { verifiedRevision: null, sha256: null, size: value.length, chunked: false };
         }
@@ -1334,7 +1334,7 @@ function createChunkStore(db, opts = {}) {
             sha256,
         );
         insManifestPublication.run(key);
-        kvSet.run(key, CHUNK_MARKER, Date.now());
+        kvSet.run(key, CHUNK_MARKER, updatedAt);
         return {
             verifiedRevision: markCurrentContentVerified(key),
             sha256,
@@ -1343,8 +1343,8 @@ function createChunkStore(db, opts = {}) {
         };
     });
 
-    function putValue(key, value) {
-        const result = putValueTransaction(key, value);
+    function putValue(key, value, options = {}) {
+        const result = putValueTransaction(key, value, options.updatedAt ?? Date.now());
         if (Number.isSafeInteger(result.verifiedRevision)) {
             contentVerificationMemo.remember(key, result.verifiedRevision);
         } else {
@@ -1416,7 +1416,12 @@ function createChunkStore(db, opts = {}) {
         return stored;
     }
 
-    const putValueFromFileTransaction = db.transaction((key, filePath, preparedPlan = null) => {
+    const putValueFromFileTransaction = db.transaction((
+        key,
+        filePath,
+        preparedPlan = null,
+        updatedAt = Date.now(),
+    ) => {
         const fd = fs.openSync(filePath, 'r');
         try {
             const stat = fs.fstatSync(fd);
@@ -1427,7 +1432,7 @@ function createChunkStore(db, opts = {}) {
             delManifestMeta.run(key);
             if (size <= threshold) {
                 const value = readFileRange(fd, size, 0);
-                kvSet.run(key, value, Date.now());
+                kvSet.run(key, value, updatedAt);
                 deleteInventoryRevision.run(key);
                 return {
                     verifiedRevision: null,
@@ -1479,7 +1484,7 @@ function createChunkStore(db, opts = {}) {
             }
             insManifestMeta.run(key, sequence, size, sha256);
             insManifestPublication.run(key);
-            kvSet.run(key, CHUNK_MARKER, Date.now());
+            kvSet.run(key, CHUNK_MARKER, updatedAt);
             return {
                 verifiedRevision: markCurrentContentVerified(key),
                 sha256,
@@ -1492,7 +1497,12 @@ function createChunkStore(db, opts = {}) {
     });
 
     function putValueFromFile(key, filePath, options = {}) {
-        const result = putValueFromFileTransaction(key, filePath, options.chunkPlan ?? null);
+        const result = putValueFromFileTransaction(
+            key,
+            filePath,
+            options.chunkPlan ?? null,
+            options.updatedAt ?? Date.now(),
+        );
         if (Number.isSafeInteger(result.verifiedRevision)) {
             contentVerificationMemo.remember(key, result.verifiedRevision);
         } else {
@@ -2003,7 +2013,7 @@ function createChunkStore(db, opts = {}) {
     // Copy src's value to dst. For a chunked src, only the manifest (list of
     // chunk hashes) is copied — chunks stay shared, so a snapshot costs ~nothing
     // and never duplicates bytes. Mirrors kvCopyValue: missing src is a no-op.
-    const snapshotValueTransaction = db.transaction((srcKey, dstKey) => {
+    const snapshotValueTransaction = db.transaction((srcKey, dstKey, updatedAt) => {
         const row = kvGet.get(srcKey);
         if (!row) return;
         const state = publicationState(srcKey, isChunked(row.value));
@@ -2017,15 +2027,15 @@ function createChunkStore(db, opts = {}) {
             copyManifest.run(dstKey, srcKey);
             copyManifestMeta.run(dstKey, srcKey);
             copyManifestPublication.run(dstKey, srcKey);
-            kvSet.run(dstKey, CHUNK_MARKER, Date.now());
+            kvSet.run(dstKey, CHUNK_MARKER, updatedAt);
         } else {
-            kvSet.run(dstKey, row.value, Date.now());
+            kvSet.run(dstKey, row.value, updatedAt);
             deleteInventoryRevision.run(dstKey);
         }
     });
 
-    function snapshotValue(srcKey, dstKey) {
-        snapshotValueTransaction(srcKey, dstKey);
+    function snapshotValue(srcKey, dstKey, options = {}) {
+        snapshotValueTransaction(srcKey, dstKey, options.updatedAt ?? Date.now());
         // Manifest copies do not hash their exact stored bytes. A destination
         // therefore stays cold even when its source happened to be warm.
         contentVerificationMemo.forget(dstKey);

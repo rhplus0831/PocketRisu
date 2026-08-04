@@ -108,6 +108,34 @@ Two amendments to the original A2 story:
 - **PF-28** (`kvCleanupOldDeletions` outside the FIFO): affirmatively cleared
   in Phase 2; unchanged.
 
+## T5-contained re-verification (2026-08-04, pre-implementation per charter §5)
+
+- **PF-13**: re-CONFIRMED against current code. Both `/api/db/stats/characters`
+  and `/api/db/stats/modules` `kvGet` + `decodeAuthoritativeDatabase` per
+  request with no queue wrapper and no flush. Stripped-form deltas checked:
+  neither route reads the fields normalization removes, and `stats/characters`
+  already discards `chats` before sizing.
+- **PF-14**: **reclassified BLOCKED-NEEDS-DESIGN — the prescribed contained
+  fix is refuted.** `inspectOptimizedPluginStorageRecoveryManagement()` binds
+  its action token to `sha256Hex(rawDatabase)` (the verbatim row bytes) and
+  builds inline recovery candidates from `liveDb.pluginCustomStorage` /
+  `pluginStorageMeta` — fields `prepareLiveDatabaseRead()`'s stripped form
+  empties. The full decode is load-bearing for the recovery token protocol
+  (charter §5 step 5). The route already runs behind
+  `queueStorageReadAfterImports` + explicit flush and is cold operator
+  tooling; any re-pricing needs a design note covering token identity, not a
+  cache switch.
+- **PF-15**: CONFIRMED, edge-only. All current clients send `x-chat-id`; the
+  header-less fallback prefers the dirty revision cache (`allowDirty: true`)
+  and pays a one-off `loadStrippedDatabase` full decode only on a cold cache.
+  Fix must keep the dirty-cache preference and the untouched hot path.
+- **PF-16**: CONFIRMED with a premise correction: the "verified logical-size
+  metadata" (`chunkStore` `logical_size`, `chatRows` `content_size`) measures
+  STORED (gzipped) bytes, not the re-stringified JSON the backup emits —
+  substituting it would systematically underestimate and could suppress the
+  boot low-space warning. Fix shape is memoization of the per-row output size
+  keyed by a cheap change signal, preserving current output semantics.
+
 ## Still open
 
 - PF-21–PF-27 hold-shape verification needs server-side queue-wait timing

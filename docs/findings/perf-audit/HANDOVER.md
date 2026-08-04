@@ -77,7 +77,7 @@ drafting the T1/T2 design notes; then T1 (the big win), T2, T4, T6, remainder.
 | Track | Start at | First move |
 |---|---|---|
 | T3 cached-boot sizing | `server/node/dbCachedRead.cjs`, client `src/ts/storage/nodeStorage.ts` (segmented boot ~`:4412`) | Size/segment-count threshold negotiated at boot; below it, raw read |
-| T5 contained | `server.cjs` `/api/db/stats/characters` (~`:19620`), `/modules`, recovery inspect (~`:6498`) | Route through `prepareLiveDatabaseRead()` like their siblings |
+| T5 contained | `server.cjs` `/api/db/stats/characters` (~`:19620`), `/modules`, header-less chat-content fallback | Route through `prepareLiveDatabaseRead()` like their siblings. Recovery inspect (PF-14) was reclassified needs-design on re-verification — its raw-byte token binding forbids the cache switch (06 §T5) |
 | T7 quick wins | `src/ts/characterPackage.ts:605` (per-inlay meta), `src/ts/translator/translator.ts:618`, `src/ts/globalApi.svelte.ts:218` (`readImage`) | Use the existing batch/cached siblings named in PF-29/30/33 |
 | T1 design note | `Chat` type + row encode path (`src/ts/storage/payloadCodec*`, `chatStorage.ts:230` context) | Persisted-row projection stripping runtime fields; hash-domain change ⇒ client/server lockstep behind the build stamp |
 | T2 design note | `src/ts/bootstrap.ts:157`, `src/ts/storage/database.svelte.ts:42` | Baseline capture after idempotent normalization, or server-side normalize at import |

@@ -281,7 +281,9 @@ function migrateFromSaveDir() {
             if (exists.get(key)) continue;
             // Every namespace uses the file-backed chunk gate. Unknown legacy
             // keys are just as entitled to a bounded migration as built-ins.
-            chunkStore.putValueFromFile(key, path.join(savePath, hexFiles[i]));
+            chunkStore.putValueFromFile(key, path.join(savePath, hexFiles[i]), {
+                updatedAt: kvMutationUpdatedAt(key),
+            });
             stmtRemoveDeletion.run(key);
         }
         // This is the authoritative completion signal. A crash can expose
@@ -343,6 +345,7 @@ const stmtManifestMetaDelPrefix = db.prepare(`DELETE FROM chunk_manifest_meta WH
 const stmtManifestPublicationDelPrefix = db.prepare(`DELETE FROM chunk_manifest_publications WHERE manifest_key LIKE ? ESCAPE '\\'`);
 const stmtManifestInventoryDelPrefix = db.prepare(`DELETE FROM chunk_manifest_inventory_revision WHERE manifest_key LIKE ? ESCAPE '\\'`);
 const stmtKvUpdatedAt = db.prepare(`SELECT updated_at FROM kv WHERE key = ?`);
+const stmtKvDeletedAt = db.prepare(`SELECT deleted_at FROM deleted_keys WHERE key = ?`);
 const stmtRecordDeletion = db.prepare(`INSERT OR REPLACE INTO deleted_keys (key, deleted_at) VALUES (?, ?)`);
 const stmtRemoveDeletion = db.prepare(`DELETE FROM deleted_keys WHERE key = ?`);
 const stmtDeletedSince = db.prepare(`SELECT key FROM deleted_keys WHERE deleted_at >= ?`);
@@ -356,7 +359,15 @@ const stmtModifiedSincePrefix = db.prepare(
 );
 const stmtCleanupDeletions = db.prepare(`DELETE FROM deleted_keys WHERE deleted_at < ?`);
 const stmtRecordDeletionBulk = db.prepare(
-    `INSERT OR REPLACE INTO deleted_keys (key, deleted_at) SELECT key, ? FROM kv WHERE key LIKE ? ESCAPE '\\'`
+    `INSERT OR REPLACE INTO deleted_keys (key, deleted_at)
+     SELECT key,
+            CASE WHEN key LIKE 'coldstorage/%'
+                       AND updated_at >= @deletedAt
+                       AND updated_at < 9007199254740991
+                 THEN updated_at + 1
+                 ELSE @deletedAt
+            END
+       FROM kv WHERE key LIKE @pattern ESCAPE '\\'`
 );
 const stmtGetListEpoch = db.prepare(`SELECT list_epoch FROM sync_meta WHERE id = 1`);
 const stmtSetListEpoch = db.prepare(`UPDATE sync_meta SET list_epoch = ? WHERE id = 1`);
@@ -543,6 +554,22 @@ function consumePluginStorageQuotaPlan(key, nextSize) {
     return true;
 }
 
+function kvMutationUpdatedAt(key) {
+    const now = Date.now();
+    if (!key.startsWith('coldstorage/')) return now;
+    // The cold backup-size memo treats updated_at as a row token. Include the
+    // deletion journal so delete/reinsert and same-millisecond rewrites advance.
+    const previous = Math.max(
+        stmtKvUpdatedAt.get(key)?.updated_at ?? -1,
+        stmtKvDeletedAt.get(key)?.deleted_at ?? -1,
+    );
+    return Number.isSafeInteger(previous)
+        && previous >= now
+        && previous < Number.MAX_SAFE_INTEGER
+        ? previous + 1
+        : now;
+}
+
 const runKvSet = db.transaction((key, value, displaySizeProvided, providedDisplaySize) => {
     if (typeof key !== 'string') throw new TypeError('KV key must be a string');
     const facetsWereCurrent = pluginStorageViewerFacets.state().current;
@@ -566,7 +593,7 @@ const runKvSet = db.transaction((key, value, displaySizeProvided, providedDispla
     const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
     const quotaPlanned = consumePluginStorageQuotaPlan(key, value.length);
     if (!quotaPlanned) assertPluginWriteWithinLimits(key, value.length, previousSize);
-    chunkStore.putValue(key, value);
+    chunkStore.putValue(key, value, { updatedAt: kvMutationUpdatedAt(key) });
     notePluginStorageMutation(key);
     if (!quotaPlanned) updatePluginStorageUsageForWrite(key, value.length, previousSize);
     updatePluginStorageOwnerIndex(key, value);
@@ -593,6 +620,7 @@ const runKvSetFromFile = db.transaction((
     if (!quotaPlanned) assertPluginWriteWithinLimits(key, size, previousSize);
     const writeResult = chunkStore.putValueFromFile(key, filePath, {
         chunkPlan,
+        updatedAt: kvMutationUpdatedAt(key),
     });
     notePluginStorageMutation(key);
     if (!quotaPlanned) updatePluginStorageUsageForWrite(key, size, previousSize);
@@ -620,6 +648,7 @@ const runKvDel = db.transaction((key) => {
     const facetsWereCurrent = pluginStorageViewerFacets.state().current;
     const previousSize = isPluginValueKey(key) ? (chunkStore.sizeValue(key) ?? 0) : 0;
     const quotaPlanned = consumePluginStorageQuotaPlan(key, 0);
+    const deletedAt = kvMutationUpdatedAt(key);
     chunkStore.dropValue(key);
     notePluginStorageMutation(key);
     if (key.startsWith(PLUGIN_STORAGE_META_PREFIX)) stmtDeletePluginStorageOwner.run(key);
@@ -627,7 +656,7 @@ const runKvDel = db.transaction((key) => {
     if (!quotaPlanned && previousSize > 0) {
         stmtSetPluginStorageUsage.run(Math.max(0, getPluginStorageUsage() - previousSize));
     }
-    stmtRecordDeletion.run(key, Date.now());
+    stmtRecordDeletion.run(key, deletedAt);
     pluginStorageViewerFacets.finishMaintainedMutation(facetsWereCurrent);
 });
 
@@ -640,7 +669,7 @@ const runKvDelPrefix = db.transaction((prefix, pattern) => {
             .filter((entry) => entry.key.startsWith(prefix))
             .reduce((sum, entry) => sum + entry.size, 0)
         : 0;
-    stmtRecordDeletionBulk.run(Date.now(), pattern);
+    stmtRecordDeletionBulk.run({ deletedAt: Date.now(), pattern });
     stmtManifestPublicationDelPrefix.run(pattern);
     stmtManifestDelPrefix.run(pattern);
     stmtManifestMetaDelPrefix.run(pattern);
@@ -848,7 +877,7 @@ const runKvCopyValue = db.transaction((srcKey, dstKey) => {
     assertPluginWriteWithinLimits(dstKey, sourceSize, previousSize);
     // Chunked src copies only its manifest (chunks stay shared); raw src copies
     // the value. Used for snapshots — keeps them near-free and byte-identical.
-    chunkStore.snapshotValue(srcKey, dstKey);
+    chunkStore.snapshotValue(srcKey, dstKey, { updatedAt: kvMutationUpdatedAt(dstKey) });
     notePluginStorageMutation(dstKey);
     updatePluginStorageUsageForWrite(dstKey, sourceSize, previousSize);
     if (stmtKvUpdatedAt.get(dstKey)) stmtRemoveDeletion.run(dstKey);

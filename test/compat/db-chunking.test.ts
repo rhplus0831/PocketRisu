@@ -122,6 +122,65 @@ function getStorageLayout(srv: ServerHandle): {
 }
 
 describe('chunking lifecycle (real server, low threshold)', () => {
+  test('character and module stats reuse the revision-bound decoded database', async () => {
+    const { client } = await boot()
+    const module = {
+      id: 'stats-module',
+      name: 'Stats module',
+      description: 'module body',
+      assets: [],
+    }
+    expect((await client.importBackup(createSeedBackup({
+      databaseFields: { modules: [module] },
+    }))).ok).toBe(true)
+
+    const firstCharacters = await client.fetch('/api/db/stats/characters')
+    expect(firstCharacters.status).toBe(200)
+    const characters = await firstCharacters.json() as Record<string, any>
+    expect(characters).toMatchObject({
+      characters: [expect.objectContaining({
+        chaId: 'test-char-0',
+        name: 'TestCharacter0',
+        image: '',
+        trashed: false,
+        cardBytes: expect.any(Number),
+        imgBytes: 0,
+        chatBytes: expect.any(Number),
+        totalBytes: expect.any(Number),
+      })],
+      orphan: { count: 0, totalSize: 0 },
+      chatBytesNote: 'JSON.stringify estimate; on-disk msgpack ~0.6×',
+      etag: expect.any(String),
+    })
+    const secondCharacters = await client.fetch('/api/db/stats/characters')
+    expect(secondCharacters.status).toBe(200)
+    expect(secondCharacters.headers.get('x-pocketrisu-test-db-cache')).toBe('hit')
+    await expect(secondCharacters.json()).resolves.toEqual(characters)
+
+    const firstModules = await client.fetch('/api/db/stats/modules')
+    expect(firstModules.status).toBe(200)
+    const modules = await firstModules.json() as Record<string, any>
+    const bodyBytes = JSON.stringify({
+      id: module.id,
+      name: module.name,
+      description: module.description,
+    }).length
+    expect(modules).toEqual({
+      modules: [{
+        id: module.id,
+        name: module.name,
+        bodyBytes,
+        assetBytes: 0,
+        totalBytes: bodyBytes,
+      }],
+      etag: expect.any(String),
+    })
+    const secondModules = await client.fetch('/api/db/stats/modules')
+    expect(secondModules.status).toBe(200)
+    expect(secondModules.headers.get('x-pocketrisu-test-db-cache')).toBe('hit')
+    await expect(secondModules.json()).resolves.toEqual(modules)
+  })
+
   test('importing an oversized DB externalizes and chunks its large chat rows', async () => {
     const { client, srv } = await boot()
     const r = await client.importBackup(oversizedSeed())

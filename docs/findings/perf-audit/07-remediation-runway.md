@@ -148,7 +148,7 @@ T4/T6 regression proofs, not for their design work.
 | T2 boot normalization | PF-03, PF-04 | Open | Design note (baseline capture) |
 | T3 size-aware cached boot | PF-05 | Landed (128 KiB raw bypass; segmentation coarsening and budget-aware IDB verification deferred) | PF-05 small-raw/large-cached route regression |
 | T4 plugin protocol | PF-06..12 | Open | Items 5–6 design-gated |
-| T5 materialization | PF-13..20 | Open | Items PF-17..20 design-gated |
+| T5 materialization | PF-13..20 | Landed-contained (PF-13/PF-15/PF-16); PF-14 BLOCKED-NEEDS-DESIGN per the separate 06 amendment; PF-17..20 Open | PF-14 design note; PF-17..20 design-gated |
 | T6 FIFO holds | PF-21..27 | Open (blocked: measurement) | `POCKETRISU_QUEUE_DIAG` data |
 | T7 client N+1/caches | PF-29..36 | Open | PF-34/35/32/36 design-gated |
 | T8 harness follow-ups | — | Open | None |

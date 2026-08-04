@@ -18286,11 +18286,25 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 
             // Header-less legacy callers resolve index→id through the stripped DB.
             // A failed id lookup also keeps the historical shifted-index 409 check.
+            let fallbackCacheStatus = null;
             if (!row) {
-                const raw = await kvGetAsync('database/database.bin');
-                if (!raw) return { status: 404, error: 'Database not found' };
-                const strippedDb = getCurrentDatabaseCacheValue(DB_HEX_KEY, { allowDirty: true })
-                    || await loadStrippedDatabase(raw, 'ChatContent');
+                let strippedDb = getCurrentDatabaseCacheValue(
+                    DB_HEX_KEY,
+                    { allowDirty: true },
+                );
+                if (strippedDb) {
+                    fallbackCacheStatus = 'hit';
+                } else {
+                    const prepared = await queueStorageReadAfterImports(async () => {
+                        await flushPendingDb();
+                        return prepareLiveDatabaseRead('ChatContentFallback', {
+                            includeFullBlob: false,
+                        });
+                    });
+                    if (!prepared) return { status: 404, error: 'Database not found' };
+                    strippedDb = prepared.strippedDatabase;
+                    fallbackCacheStatus = prepared.cacheStatus;
+                }
                 const char = strippedDb.characters?.find(c => c?.chaId === chaId);
                 const stub = char?.chats?.[chatIndex];
                 if (!stub) return { status: 404, error: 'Chat not found' };
@@ -18333,10 +18347,13 @@ app.get('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                     contentHash = storedHash ?? sha256Hex(encoded);
                 }
             }
-            return { status: 200, encoded, contentHash };
+            return { status: 200, encoded, contentHash, fallbackCacheStatus };
         })();
         if (result.error) return res.status(result.status).json({ error: result.error });
-        const { encoded, contentHash } = result;
+        const { encoded, contentHash, fallbackCacheStatus } = result;
+        if (DB_CACHE_TEST_DIAGNOSTICS && fallbackCacheStatus) {
+            res.setHeader('x-pocketrisu-test-db-cache', fallbackCacheStatus);
+        }
         res.setHeader('x-content-hash', contentHash);
         const cachedHashes = parseCachedHashesHeader(req.headers['x-cached-hashes']);
         if (cachedHashes.includes(contentHash)) {
@@ -19478,6 +19495,76 @@ async function sumDirectoryFsBytes(directory) {
     return sizes.reduce((total, size) => total + size, 0);
 }
 
+const coldStorageBackupSizeMemo = new Map();
+
+function estimateColdStorageBackupSize() {
+    const storedRows = kvListWithSizes('coldstorage/');
+    const storedSizeByKey = new Map(storedRows.map((row) => [row.key, row.size]));
+    const canonicalKeys = Array.from(new Set(
+        storedRows.map((row) => normalizeColdStorageStorageKey(row.key)),
+    )).sort((a, b) => a.localeCompare(b));
+    const liveCanonicalKeys = new Set(canonicalKeys);
+    for (const key of coldStorageBackupSizeMemo.keys()) {
+        if (!liveCanonicalKeys.has(key)) coldStorageBackupSizeMemo.delete(key);
+    }
+
+    let size = 0;
+    let recomputed = 0;
+    for (const canonicalKey of canonicalKeys) {
+        const legacyKey = `${canonicalKey}.json`;
+        const storageKey = storedSizeByKey.has(canonicalKey) ? canonicalKey : legacyKey;
+        const storedSize = storedSizeByKey.get(storageKey);
+        const updatedAt = kvGetUpdatedAt(storageKey);
+        const signalIsUsable = Number.isSafeInteger(updatedAt)
+            && updatedAt >= 0
+            && Number.isSafeInteger(storedSize)
+            && storedSize >= 0;
+        const memo = signalIsUsable ? coldStorageBackupSizeMemo.get(canonicalKey) : null;
+        if (memo
+            && memo.storageKey === storageKey
+            && memo.updatedAt === updatedAt
+            && memo.storedSize === storedSize) {
+            size += memo.outputSize;
+            continue;
+        }
+
+        const entry = readColdStorageJsonEntry(canonicalKey, {
+            migrateLegacy: true,
+            allowPlainJsonFallback: true,
+        });
+        if (!entry) {
+            throw new Error(`[ColdStorage] missing cold storage entry while exporting: ${canonicalKey}`);
+        }
+        // Backup output is the re-stringified JSON, not the stored gzip payload.
+        const outputSize = Buffer.from(JSON.stringify(entry.coldData), 'utf-8').length;
+        size += outputSize;
+        recomputed++;
+
+        let finalStorageKey = storageKey;
+        let finalStoredSize = storedSize;
+        let finalUpdatedAt = updatedAt;
+        if (entry.storageKey !== entry.canonicalKey || entry.format !== 'gzip') {
+            finalStorageKey = entry.canonicalKey;
+            finalStoredSize = kvSize(finalStorageKey);
+            finalUpdatedAt = kvGetUpdatedAt(finalStorageKey);
+        }
+        if (Number.isSafeInteger(finalUpdatedAt)
+            && finalUpdatedAt >= 0
+            && Number.isSafeInteger(finalStoredSize)
+            && finalStoredSize >= 0) {
+            coldStorageBackupSizeMemo.set(canonicalKey, {
+                storageKey: finalStorageKey,
+                updatedAt: finalUpdatedAt,
+                storedSize: finalStoredSize,
+                outputSize,
+            });
+        } else {
+            coldStorageBackupSizeMemo.delete(canonicalKey);
+        }
+    }
+    return { size, recomputed };
+}
+
 // Estimated server-backup size — mirrors the enumeration in
 // /api/backup/server/save without writing anything. Inlay files live on the
 // filesystem (post-migration), so we have to fs.stat them rather than read
@@ -19495,11 +19582,18 @@ async function estimateServerBackupSize(reader = null) {
     for (const it of listDraftBackupEntries(sizeReader)) total += it.size;
     for (const it of listAssetEntriesWithSizes(sizeReader)) total += it.size;
     for (const it of sizeReader.kvListWithSizes('inlay_meta/')) total += it.size;
-    for (const e of reader
-        ? listColdStorageBackupEntries({ reader, migrateLegacy: false })
-        : listColdStorageBackupEntries()) total += e.size;
+    let coldRowsRecomputed;
+    if (reader) {
+        const coldEntries = listColdStorageBackupEntries({ reader, migrateLegacy: false });
+        for (const entry of coldEntries) total += entry.size;
+        coldRowsRecomputed = coldEntries.length;
+    } else {
+        const coldEstimate = estimateColdStorageBackupSize();
+        total += coldEstimate.size;
+        coldRowsRecomputed = coldEstimate.recomputed;
+    }
     total += await sumInlayFsBytes();
-    return total;
+    return { size: total, coldRowsRecomputed };
 }
 
 if (STORAGE_QUEUE_DIAG_ENABLED) {
@@ -19702,9 +19796,13 @@ app.get('/api/db/stats', async (req, res, next) => {
             orphan.available = true;
         }
 
-        const estimatedBackupSize = HUB_HOSTING_MODE
-            ? undefined
-            : await estimateServerBackupSize();
+        let estimatedBackupSize;
+        let coldRowsRecomputed = 0;
+        if (!HUB_HOSTING_MODE) {
+            const estimate = await estimateServerBackupSize();
+            estimatedBackupSize = estimate.size;
+            coldRowsRecomputed = estimate.coldRowsRecomputed;
+        }
         // Inlay payload now lives on the filesystem (post-migration) rather
         // than in kv `inlay/*` prefixes. Surface explicitly so the dashboard
         // chart can include it in the inlay slice instead of underreporting.
@@ -19721,6 +19819,12 @@ app.get('/api/db/stats', async (req, res, next) => {
             chatBackupSameAsSaveDir = !relative.startsWith('..') && !path.isAbsolute(relative);
         }
 
+        if (DB_CACHE_TEST_DIAGNOSTICS) {
+            res.setHeader(
+                'x-pocketrisu-test-cold-rows-recomputed',
+                String(coldRowsRecomputed),
+            );
+        }
         res.json({
             hubHosting: HUB_HOSTING_MODE,
             files,
@@ -19751,12 +19855,17 @@ app.get('/api/db/stats', async (req, res, next) => {
 app.get('/api/db/stats/characters', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
-        const raw = kvGet(DB_BLOB_KEY);
-        if (!raw) {
+        const prepared = await queueStorageReadAfterImports(async () => {
+            await flushPendingDb();
+            return prepareLiveDatabaseRead('StatsCharacters', {
+                includeFullBlob: false,
+            });
+        });
+        if (!prepared) {
             res.json({ characters: [], orphan: { count: 0, totalSize: 0 }, chatBytesNote: 'estimate' });
             return;
         }
-        const dbObj = await decodeAuthoritativeDatabase(raw);
+        const dbObj = prepared.strippedDatabase;
 
         const assetSize = new Map();
         for (const it of listAssetEntriesWithSizes()) {
@@ -19827,11 +19936,14 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
         }
 
         characters.sort((a, b) => b.totalBytes - a.totalBytes);
+        if (DB_CACHE_TEST_DIAGNOSTICS) {
+            res.setHeader('x-pocketrisu-test-db-cache', prepared.cacheStatus);
+        }
         res.json({
             characters,
             orphan: { count: orphanCount, totalSize: orphanTotal },
             chatBytesNote: 'JSON.stringify estimate; on-disk msgpack ~0.6×',
-            etag: dbEtag,
+            etag: prepared.etag,
         });
     } catch (err) { next(err); }
 });
@@ -19843,12 +19955,17 @@ app.get('/api/db/stats/characters', async (req, res, next) => {
 app.get('/api/db/stats/modules', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
     try {
-        const raw = kvGet(DB_BLOB_KEY);
-        if (!raw) {
+        const prepared = await queueStorageReadAfterImports(async () => {
+            await flushPendingDb();
+            return prepareLiveDatabaseRead('StatsModules', {
+                includeFullBlob: false,
+            });
+        });
+        if (!prepared) {
             res.json({ modules: [] });
             return;
         }
-        const dbObj = await decodeAuthoritativeDatabase(raw);
+        const dbObj = prepared.strippedDatabase;
         const list = Array.isArray(dbObj.modules) ? dbObj.modules : [];
 
         const assetSize = new Map();
@@ -19888,7 +20005,10 @@ app.get('/api/db/stats/modules', async (req, res, next) => {
         }
 
         modules.sort((a, b) => b.totalBytes - a.totalBytes);
-        res.json({ modules, etag: dbEtag });
+        if (DB_CACHE_TEST_DIAGNOSTICS) {
+            res.setHeader('x-pocketrisu-test-db-cache', prepared.cacheStatus);
+        }
+        res.json({ modules, etag: prepared.etag });
     } catch (err) { next(err); }
 });
 

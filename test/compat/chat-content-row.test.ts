@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { Packr } from 'msgpackr'
@@ -12,6 +13,7 @@ import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
 const CHAT_DELTA_CONTENT_TYPE = 'application/vnd.pocketrisu.chat-delta+json'
 const COLD_STORAGE_HEADER = '\uEF01COLDSTORAGE\uEF01'
+const DB_BLOB_HEX = Buffer.from('database/database.bin', 'utf-8').toString('hex')
 const packr = new Packr({ useRecords: false, variableMapSize: true })
 const servers: ServerHandle[] = []
 
@@ -171,6 +173,39 @@ async function getChat(
 }
 
 describe('chat content row serving', () => {
+  test('header-less fallback installs and reuses the revision-bound database cache', async () => {
+    const fixture = buildChatBackup('fallback-cache')
+    const database = {
+      characters: [{
+        chaId: 'chat-content-char',
+        name: 'Chat content character',
+        chats: [fixture.warm],
+        chatPage: 0,
+      }],
+      apiType: 'openai',
+      personas: [],
+      botPresets: [],
+      botPresetsId: 0,
+      selectedCharacter: 0,
+    }
+    const server = await spawnServer({
+      seedSave: saveDir => writeFile(path.join(saveDir, DB_BLOB_HEX), encodeRisuDat(database)),
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+
+    const expected = encodeRisuDat(fixture.warm)
+    const first = await client.fetch('/api/chat-content/chat-content-char/0')
+    expect(first.status).toBe(200)
+    expect(first.headers.get('x-pocketrisu-test-db-cache')).toBe('miss')
+    expect(Buffer.from(await first.arrayBuffer())).toEqual(expected)
+
+    const second = await client.fetch('/api/chat-content/chat-content-char/0')
+    expect(second.status).toBe(200)
+    expect(second.headers.get('x-pocketrisu-test-db-cache')).toBe('hit')
+    expect(Buffer.from(await second.arrayBuffer())).toEqual(expected)
+  })
+
   test('warm, cold, and missing-metadata rows preserve bytes and repair lazily after restore', async () => {
     const server = await spawnServer()
     servers.push(server)

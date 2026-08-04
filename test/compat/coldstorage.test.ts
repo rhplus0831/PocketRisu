@@ -5,8 +5,9 @@
  * characters → NodeOnly import → characters restored inline.
  */
 import { describe, test, expect, afterAll } from 'vitest'
+import { gzipSync } from 'node:zlib'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
-import { createClient } from './helpers/client.js'
+import { createClient, type RisuClient } from './helpers/client.js'
 import { createSeedBackup } from './helpers/seed.js'
 import { normalizeBackup } from './helpers/normalize.js'
 
@@ -14,6 +15,29 @@ const servers: ServerHandle[] = []
 afterAll(async () => {
   await Promise.allSettled(servers.map(s => s.cleanup()))
 })
+
+async function writeColdRow(client: RisuClient, key: string, coldData: unknown): Promise<Buffer> {
+  const stored = gzipSync(Buffer.from(JSON.stringify(coldData), 'utf-8'))
+  const response = await client.fetch('/api/write', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'file-path': Buffer.from(`coldstorage/${key}`, 'utf-8').toString('hex'),
+    },
+    body: new Uint8Array(stored),
+  })
+  expect(response.status).toBe(200)
+  return stored
+}
+
+async function fetchStats(client: RisuClient): Promise<{
+  response: Response
+  body: Record<string, any>
+}> {
+  const response = await client.fetch('/api/db/stats')
+  expect(response.status).toBe(200)
+  return { response, body: await response.json() as Record<string, any> }
+}
 
 describe('character cold storage migration', () => {
 
@@ -161,5 +185,52 @@ describe('character cold storage migration', () => {
     expect(charB).toBeDefined()
     expect(charA!.name).toBe(charB!.name)
     expect(charA!.firstMessages).toEqual(charB!.firstMessages)
+  })
+
+  test('backup-size stats only reparse changed cold-storage rows', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    expect((await client.importBackup(createSeedBackup())).ok).toBe(true)
+    const baseline = await fetchStats(client)
+    const baselineEstimate = baseline.body.estimatedBackupSize as number
+    expect(baseline.response.headers.get('x-pocketrisu-test-cold-rows-recomputed')).toBe('0')
+
+    const alpha = { messages: ['alpha'] }
+    const bravo = { messages: ['bravo'] }
+    const beta = { character: { name: 'Cold beta', desc: 'memoized row' } }
+    const alphaStored = await writeColdRow(client, 'alpha', alpha)
+    const betaStored = await writeColdRow(client, 'beta', beta)
+
+    const first = await fetchStats(client)
+    const initialColdOutputSize = Buffer.byteLength(JSON.stringify(alpha))
+      + Buffer.byteLength(JSON.stringify(beta))
+    expect(first.response.headers.get('x-pocketrisu-test-cold-rows-recomputed')).toBe('2')
+    expect(first.body.estimatedBackupSize).toBe(baselineEstimate + initialColdOutputSize)
+
+    const second = await fetchStats(client)
+    expect(second.response.headers.get('x-pocketrisu-test-cold-rows-recomputed')).toBe('0')
+    expect(second.body.estimatedBackupSize).toBe(baselineEstimate + initialColdOutputSize)
+
+    const bravoStored = await writeColdRow(client, 'alpha', bravo)
+    expect(bravoStored.length).toBe(alphaStored.length)
+    const sameSizeRewrite = await fetchStats(client)
+    expect(sameSizeRewrite.response.headers.get('x-pocketrisu-test-cold-rows-recomputed')).toBe('1')
+    expect(sameSizeRewrite.body.estimatedBackupSize).toBe(
+      baselineEstimate
+        + Buffer.byteLength(JSON.stringify(bravo))
+        + Buffer.byteLength(JSON.stringify(beta)),
+    )
+
+    const expanded = { messages: ['expanded cold row '.repeat(20)] }
+    await writeColdRow(client, 'alpha', expanded)
+    const changedOutput = await fetchStats(client)
+    expect(changedOutput.response.headers.get('x-pocketrisu-test-cold-rows-recomputed')).toBe('1')
+    expect(changedOutput.body.estimatedBackupSize).toBe(
+      baselineEstimate
+        + Buffer.byteLength(JSON.stringify(expanded))
+        + Buffer.byteLength(JSON.stringify(beta)),
+    )
+    expect(betaStored.length).toBeGreaterThan(0)
   })
 })
