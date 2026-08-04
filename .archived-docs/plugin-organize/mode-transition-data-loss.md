@@ -51,8 +51,8 @@ The unit test for a failed internalizing save injects a callback that rejects
 and asserts no rows are removed
 (`src/ts/plugins/pluginSaveStorage.test.ts:453-475`). It does not model the
 production save layer swallowing/retrying failures or joining an older save;
-the contrary conclusion in
-[`../../docs/audit/v3/appendix/plugin-api-serialization-sweep.md`](../../docs/audit/v3/appendix/plugin-api-serialization-sweep.md)
+the contrary conclusion in the consolidated v3 appendix
+`plugin-api-serialization-sweep.md`
 holds only for that injected dependency.
 
 ### Required correction

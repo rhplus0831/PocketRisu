@@ -111,7 +111,8 @@ Browser client (src/)                         Node server (server/node/)
 | `server/hono/` | Incomplete multi-runtime scaffold |
 | `shared/` | Contracts consumed by both client and server, currently plugin key policy |
 | `docs/structure/` | This architecture guide's subsystem references |
-| `docs/findings/`, `.archived-docs/` | Point-in-time risk and compatibility reports, plus their indexes; historical material, not canonical architecture |
+| `docs/findings/` | Current owner-grouped findings, accepted decisions, and active remediation programs; start at `docs/findings/README.md` |
+| `.archived-docs/` | Completed audit programs, fixed reports, and superseded source evidence; start at `.archived-docs/README.md` |
 | `test/compat/` | Real-server integration and storage/interchange regressions |
 | `test/performance/` | Resource-cache and storage performance scenarios |
 | `scripts/` | Portable/Termux build helpers, updater, and verification scripts |
@@ -253,6 +254,7 @@ export process chat JSON incrementally instead of materializing every chat row a
 
 Approximate file sizes were removed from the root map because fast-moving storage and
 plugin modules made them misleading. When code moves, prefer updating symbol ownership
-and change maps over refreshing every line number. Treat `docs/findings/` (including
-`docs/findings/audit/`) and `.archived-docs/` as historical evidence whose resolution
-must be checked against current code.
+and change maps over refreshing every line number. Treat `docs/findings/` and
+`.archived-docs/` as point-in-time evidence whose resolution must be checked against
+current code. `docs/findings/WORK-INDEX.md` is the current status catalog; source-specific
+audit indexes live in `.archived-docs/` and must not be used as live status tables.

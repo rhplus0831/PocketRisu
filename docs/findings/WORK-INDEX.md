@@ -1,174 +1,126 @@
-# Unified work-priority index
+# Findings work index
 
-Generated 2026-07-31 from the 60 findings in [AUDIT-INDEX.md](AUDIT-INDEX.md) and the 46 reports in [compatibility/README.md](compatibility/README.md). The 106 source reports resolve to **103 unique work items** after merging **3 duplicate pairs**: **32** items are assigned to tiers, **2** are other open issues, **2** are coverage gaps, **4** are intentional compatibility changes, **1** is an intentional documented limitation, **1** is deferred for future work, and **61** fixed findings appear in the appendix. All `Open` statuses were revalidated on 2026-07-31 against `61a8c511`; every remaining open failure path is still present in that codebase. The source documents remain the detailed evidence. Findings are historical evidence and must be verified against current code before work begins.
+Generated from the machine-readable headers in `open/` and `decisions/`.
+Run `pnpm check:docs` after changing a finding, status, path, or link.
+These are point-in-time reports; revalidate their evidence against current code
+before implementation.
 
-## Priority rules
+Current catalog: **47 open**, **2 deferred**, and **5 accepted decisions**.
 
-| Tier | Meaning |
-|---|---|
-| Tier 0 | The issue may cause **all user data** to be lost during normal daily use. |
-| Tier 1 | The issue prevents functionality that worked in previous versions of PocketRisu from working correctly during normal daily use. |
-| Tier 2 | The issue has a low probability of preventing functionality that worked in previous versions of PocketRisu from working correctly. |
-| Tier 3 | The issue may cause the loss of unsaved data from the last N seconds, or the loss of part of the user's data, during normal daily use. |
-| Tier 4 | The issue may intermittently cause **all user data** to be lost. |
-| Tier 5 | The issue may intermittently cause the loss of unsaved data from the last N seconds, or the loss of part of the user's data. |
+## Active work by owner
 
-Data-loss risks are deliberately demoted because the Hub deployment maintains a separate external data backup system. Tier 3 therefore ranks above tier 4: for data loss below tier 0, likelihood outranks scope. Classification follows the dominant harm: destructive loss uses the data-loss axis even when its trigger is also a regression; non-destructive breakage uses the regression axis only when the behavior worked in the previous PocketRisu version.
+### backup and recovery
 
-## Tier 0
+| ID | Finding | Status | Source |
+|---|---|---|---|
+| `FND-best-effort-path-markers-let-updaters-delete-recovery-directories` | [Best-effort path markers let updaters delete recovery directories](open/backup-recovery/best-effort-path-markers-let-updaters-delete-recovery-directories.md) | Open | 2026-07 data-loss audit |
+| `FND-changing-chat-backup-root-hides-all-existing-version-history` | [Changing the chat-backup root hides all existing version history](open/backup-recovery/changing-chat-backup-root-hides-all-existing-version-history.md) | Open | 2026-07 data-loss audit |
+| `FND-chat-version-backups-do-not-keep-referenced-inlays-live` | [Chat-version backups do not keep referenced inlays live](open/backup-recovery/chat-version-backups-do-not-keep-referenced-inlays-live.md) | Open | 2026-07 data-loss audit |
+| `FND-chat-version-import-acknowledges-before-save` | [Chat-version import reports success before anything is persisted](open/backup-recovery/chat-version-import-acknowledges-before-save.md) | Open | 2026-07 data-loss audit |
+| `FND-direct-flush-callers-bypass-automatic-snapshot-serialization` | [Direct flush callers bypass automatic-snapshot serialization](open/backup-recovery/direct-flush-callers-bypass-automatic-snapshot-serialization.md) | Open | 2026-07 data-loss audit |
+| `FND-html-chat-round-trip-rejects-the-default-empty-note` | [HTML chat round trip rejects the default empty note](open/backup-recovery/html-chat-round-trip-rejects-the-default-empty-note.md) | Open | 2026-07 data-loss audit |
+| `FND-unmigrated-kv-inlays-are-omitted-from-backups` | [Inlays still served from KV fallback are omitted from backups and cleared on restore](open/backup-recovery/unmigrated-kv-inlays-are-omitted-from-backups.md) | Open | 2026-07 data-loss audit |
+| `FND-server-backup-published-without-fsync` | [Server backups are acknowledged before reaching stable storage](open/backup-recovery/server-backup-published-without-fsync.md) | Open | 2026-07 data-loss audit |
+| `FND-upstream-compatible-backup-drops-live-inlays-but-keeps-their-chat-references` | [Upstream-compatible backup drops live inlays but keeps their chat references](open/backup-recovery/upstream-compatible-backup-drops-live-inlays-but-keeps-their-chat-references.md) | Open | 2026-07 data-loss audit |
+| `FND-wall-clock-rollback-disables-chat-preimage-capture` | [Wall-clock rollback disables chat pre-image capture](open/backup-recovery/wall-clock-rollback-disables-chat-preimage-capture.md) | Open | 2026-07 data-loss audit |
 
-None currently open.
+### characters and personas
 
-## Tier 1
+| ID | Finding | Status | Source |
+|---|---|---|---|
+| `FND-ccv2-export-drops-regex-lore-semantics` | [CCv2 export drops regex lore semantics](open/characters-personas/ccv2-export-drops-regex-lore-semantics.md) | Open | 2026-07 data-loss audit |
+| `FND-character-package-remaps-chat-ids-without-remapping-inlay-metadata` | [Character package remaps chat IDs without remapping inlay metadata](open/characters-personas/character-package-remaps-chat-ids-without-remapping-inlay-metadata.md) | Open | 2026-07 data-loss audit |
+| `FND-charx-importer-mistakes-json-assets-for-metadata` | [CharX importer mistakes JSON assets for metadata](open/characters-personas/charx-importer-mistakes-json-assets-for-metadata.md) | Open | 2026-07 data-loss audit |
+| `FND-module-charx-export-drops-namespace-and-cjs` | [Module CharX export drops `namespace` and `cjs`](open/characters-personas/module-charx-export-drops-namespace-and-cjs.md) | Open | 2026-07 data-loss audit |
+| `FND-persona-exports-drop-advanced-fields` | [Persona exports silently drop advanced persona data](open/characters-personas/persona-exports-drop-advanced-fields.md) | Open | 2026-07 data-loss audit |
 
-None currently open.
+### chat pipeline
 
-## Tier 2
+| ID | Finding | Status | Source |
+|---|---|---|---|
+| `FND-model-job-claim-precedes-chat-durability` | [Live model-job claim precedes chat-row durability](open/chat-pipeline/model-job-claim-precedes-chat-durability.md) | Open | delta audit DA-5 |
+| `FND-reroll-discards-the-only-copy-within-preimage-cooldown` | [Reroll can leave no durable copy of the discarded response](open/chat-pipeline/reroll-discards-the-only-copy-within-preimage-cooldown.md) | Open | 2026-07 data-loss audit |
+| `FND-streaming-checkpoint-rearm-can-absorb-unsaved-tokens` | [Streaming checkpoint re-arm can absorb unsaved tokens](open/chat-pipeline/streaming-checkpoint-rearm-can-absorb-unsaved-tokens.md) | Open | delta audit DA-8 |
+| `FND-terminal-job-recovery-uses-stale-message-index` | [Terminal job recovery can overwrite a newer generation by stale index](open/chat-pipeline/terminal-job-recovery-uses-stale-message-index.md) | Open | delta audit DA-6 |
 
-None currently open.
+### client storage
 
-## Tier 3
+| ID | Finding | Status | Source |
+|---|---|---|---|
+| `FND-acknowledged-patches-are-not-durable` | [Acknowledged database patches are not durable for up to five seconds](open/client-storage/acknowledged-patches-are-not-durable.md) | Deferred | 2026-07 data-loss audit |
+| `FND-build-mismatch-reload-can-discard-composer-draft` | [Build-mismatch reload can discard an undurable composer draft](open/client-storage/build-mismatch-reload-can-discard-composer-draft.md) | Open | delta audit DA-12 |
+| `FND-draft-save-failures-have-no-retry-or-signal` | [Draft-save failures have no retry or user signal](open/client-storage/draft-save-failures-have-no-retry-or-signal.md) | Open | delta audit DA-9 |
+| `FND-pre-tracking-baseline-capture-still-omits-six-save-domains` | [Pre-tracking baseline capture still omits six save domains](open/client-storage/pre-tracking-baseline-capture-still-omits-six-save-domains.md) | Deferred | 2026-07 data-loss audit |
+| `FND-save-loop-idles-after-five-failures` | [The save loop stops retrying after five consecutive failures](open/client-storage/save-loop-idles-after-five-failures.md) | Open | 2026-07 data-loss audit |
 
-None currently open.
+### media and translation
 
-## Tier 4
+| ID | Finding | Status | Source |
+|---|---|---|---|
+| `FND-interrupted-inlay-migration-discards-the-source-row` | [A crash during inlay migration can discard the valid KV source](open/media-translation/interrupted-inlay-migration-discards-the-source-row.md) | Open | 2026-07 data-loss audit |
+| `FND-portable-asset-filename-mapping` | [Asset filename mapping is not portable across filesystems](open/media-translation/portable-asset-filename-mapping.md) | Open | data-loss audit, compatibility investigation |
+| `FND-external-dedup-can-strand-or-overwrite-a-live-asset` | [External dedup can strand or overwrite a live asset](open/media-translation/external-dedup-can-strand-or-overwrite-a-live-asset.md) | Open | 2026-07 data-loss audit |
+| `FND-inlay-filename-mapping-is-not-injective` | [Inlay filename mapping is not injective](open/media-translation/inlay-filename-mapping-is-not-injective.md) | Open | 2026-07 data-loss audit |
+| `FND-preferred-jdupes-merges-cross-instance-ownership` | [Preferred jdupes merges cross-instance ownership](open/media-translation/preferred-jdupes-merges-cross-instance-ownership.md) | Open | 2026-07 data-loss audit |
 
-None currently open.
+### model providers
 
-## Tier 5
+| ID | Finding | Status | Source |
+|---|---|---|---|
+| `FND-gemini-streaming-signature-save-is-fire-and-forget` | [Gemini streaming signature saves are fire-and-forget](open/model-providers/gemini-streaming-signature-save-is-fire-and-forget.md) | Open | delta audit DA-11 |
 
-| Work item | Source | Status | Impact | Trigger / likelihood |
-|---|---|---|---|---|
-| [Chat-row staging is not bound to the stub snapshot](audit/chat-row-stage-is-not-bound-to-the-committed-stub-snapshot.md) | audit | Open | A whole chat can become a rowless stub or an orphaned row that is later swept. | Requires a chat-creation race during a slow row POST, or client loss after a partial publication. |
-| [Card triggers can bulk-delete history](audit/card-triggers-can-bulk-delete-history-without-consent.md) | audit | Open | An entire chat history or lorebook can be wiped without a recoverable pre-image. | Requires a malicious or buggy imported card and a cooldown-skipped pre-image. |
-| [The save loop idles after five failures](audit/save-loop-idles-after-five-failures.md) | audit | Open | All queued unsaved edits can be lost. | Five consecutive save failures followed by connectivity recovery and tab close without another edit. |
-| [Acknowledged patches are not durable](audit/acknowledged-patches-are-not-durable.md) | audit | Deferred | Up to five seconds of metadata, or in the sharpest case a whole new chat, can be lost. | A process/host crash inside the deferred flush window; graceful shutdown is safe. |
-| [Reroll can discard the only response copy](audit/reroll-discards-the-only-copy-within-preimage-cooldown.md) | audit | Open | The prior response and all swipe history can be lost. | Reroll within the normal cooldown plus tab loss, crash, abort, or failed completion before restoration. |
-| [Asset filename mapping is not portable](audit/asset-filenames-collide-on-case-insensitive-filesystems.md) / [compat report](compatibility/asset-filename-migration-not-portable.md) | both | Open | Case-colliding or host-reserved assets can overwrite one another and their source rows can be deleted. | Requires historical/custom names plus migration or restore on a normalizing filesystem such as default macOS/Windows. |
-| [External dedup can strand or overwrite an asset](audit/external-dedup-can-strand-or-overwrite-a-live-asset.md) | audit | Open | A canonical asset can disappear or a live inode can be replaced. | Crash during link publication or a race between the external tool and a live server/import. |
-| [Inlay filename mapping is not injective](audit/inlay-filename-mapping-is-not-injective.md) | audit | Open | An unrelated inlay payload can be overwritten or unlinked. | Requires dotted IDs, a reserved-suffix alias, or an ambiguous prefix fallback. |
-| [Interrupted inlay migration discards its source](audit/interrupted-inlay-migration-discards-the-source-row.md) | audit | Open | One valid inlay is replaced by a torn or zero-length file. | Process crash inside the one-time migration followed by ordinary restart. |
-| [Unmigrated KV inlays are omitted from backups](audit/unmigrated-kv-inlays-are-omitted-from-backups.md) | audit | Open | A fallback inlay is absent from the archive and its live row is deleted on restore. | A prior skipped/failed migration entry followed by a later backup restore. |
-| [`jdupes` can merge cross-instance ownership](audit/preferred-jdupes-merges-cross-instance-ownership.md) | audit | Open | One instance's assets can become unreadable or unexportable. | Requires a root dedup job spanning instances with different owners or modes. |
-| [Full-write ETag excludes chat rows](audit/full-write-etag-does-not-cover-chat-rows.md) | audit | Open | A newer chat row can be overwritten without a pre-image. | Requires a stale, headerless legacy/external full-write caller; current clients are unaffected. |
-| [Whole-chat patches partially commit rows](audit/whole-chat-patches-half-apply-external-rows.md) / [compat report](compatibility/whole-chat-patch-partially-commits-rows.md) | both | Open | Durable chat rows can mix generations and overwritten rows lack pre-images. | A compatibility-shaped multi-chat patch fails mid-row publication or its later debounced database commit fails. |
-| [Bulk filesystem writes partially commit](audit/bulk-write-commits-a-partial-filesystem-prefix.md) / [compat report](compatibility/bulk-asset-write-partially-commits-files.md) | both | Open | Earlier files are irreversibly replaced while later files remain old and callers cannot identify the committed prefix. | A mid-batch ENOSPC or injected failure; no current production caller uses the endpoint. |
-| [Non-canonical hex splits the patch cache](audit/noncanonical-hex-path-splits-the-patch-cache.md) | audit | Open | A later cache flush can overwrite an acknowledged edit. | Requires mixed-case hex from an unofficial compatibility caller. |
-| [Inline plugin storage acknowledges before persistence](audit/nonoptimized-save-storage-acks-before-persistence.md) | audit | Open | Acknowledged plugin state reverts after refresh. | Page loss or a destructive follow-up inside the normal save-delay window. |
-| [Character packages do not remap inlay ownership](audit/character-package-remaps-chat-ids-without-remapping-inlay-metadata.md) | audit | Open | Imported media is misclassified as orphaned and can later be deleted. | Package import plus a later gallery cleanup based on the stale chat ID. |
-| [V2 storage detaches caller aliases](compatibility/v2-plugin-storage-live-aliases.md) | compat | Open | Later retained-reference mutations can silently save stale plugin state. | Only timing-dependent main/upstream alias-observation patterns are affected. |
-| [Upstream-compatible backups drop inlays](audit/upstream-compatible-backup-drops-live-inlays-but-keeps-their-chat-references.md) | audit | Open | All inlay media and metadata are omitted while chat references remain dangling. | Every upstream-target export with inlays; loss becomes permanent when the export is the migration vehicle. |
-| [CharX import mistakes JSON assets for metadata](audit/charx-importer-mistakes-json-assets-for-metadata.md) | audit | Open | A supported character export cannot be imported, including through character packages. | Every exported character containing a JSON asset; the original survives unless this is the migration copy. |
-| [Upstream export can emit a PocketRisu-only header](compatibility/upstream-export-plugin-proto-header.md) | compat | Open | An archive explicitly targeting upstream fails to open there. | Requires a legal `__proto__` plugin-storage key and reliance on the export for migration. |
-| [CCv2 export drops regex lore semantics](audit/ccv2-export-drops-regex-lore-semantics.md) | audit | Open | Regex lore silently becomes literal matching after migration. | Every CCv2 export containing regex lore; the source survives unless the export is the migration copy. |
-| [Persona exports drop advanced fields](audit/persona-exports-drop-advanced-fields.md) | audit | Open | Portrait and embedded lore, regex, triggers, and assets are omitted. | Every affected persona or character-package export used as a migration copy. |
-| [Module CharX export drops namespace and CJS](audit/module-charx-export-drops-namespace-and-cjs.md) | audit | Open | Namespace activation and the CJS payload are lost after re-import. | Every affected Share export used as the migration vehicle. |
-| [Path-marker failures expose recovery directories](audit/best-effort-path-markers-let-updaters-delete-recovery-directories.md) | audit | Open | Recovery copies only; live data survives — all archives under a custom root can be erased. | Silent marker write/read failure must coincide with a later updater run. |
-| [Wall-clock rollback disables pre-images](audit/wall-clock-rollback-disables-chat-preimage-capture.md) | audit | Open | Recovery copies only; live data survives — chat version history can remain frozen for years. | Requires a bad RTC, future-dated version, or large backward clock correction. |
-| [Changing the chat-backup root hides history](audit/changing-chat-backup-root-hides-all-existing-version-history.md) | audit | Open | Recovery copies only; live data survives — prior versions disappear and may later be deleted with the old volume. | A root change followed by an operator detaching or cleaning the apparently obsolete location. |
-| [Chat versions do not keep inlays live](audit/chat-version-backups-do-not-keep-referenced-inlays-live.md) | audit | Open | Recovery copies only; live data survives — restoring a retained version yields dangling inlay tokens. | Delete the live chat, clean the now-apparent orphan, then restore its version. |
-| [Direct flush can publish a mixed snapshot](audit/direct-flush-callers-bypass-automatic-snapshot-serialization.md) | audit | Open | Recovery copies only; live data survives — a bare-stub or mixed-generation snapshot is published as valid. | Graceful shutdown or self-update must race a concurrent storage mutation. |
-| [Boot spool sweep can unlink an active snapshot](audit/boot-spool-sweep-can-unlink-another-instances-active-file.md) | audit | Open | Recovery copies only; live data survives — another instance silently loses its automatic snapshot. | Shared spool volume plus one instance starting during another's active snapshot. |
-| [Server backup is published without `fsync`](audit/server-backup-published-without-fsync.md) | audit | Open | Recovery copies only; live data survives — the acknowledged backup can be absent, empty, or truncated. | Host power loss shortly after the backup reports `done`. |
-| [Chat-version import acknowledges before save](audit/chat-version-import-acknowledges-before-save.md) | audit | Open | Recovery copies only; live data survives — the imported chat can vanish, becoming permanent if the user then deletes its source version. | Page loss before polling save plus reliance on the premature success toast. |
+### operations and coverage
 
-## Other open issues
+| ID | Finding | Status | Source |
+|---|---|---|---|
+| `FND-compatibility-suites-not-run-in-ci` | [Compatibility and server suites are not run in CI](open/operations-coverage/compatibility-suites-not-run-in-ci.md) | Open | 2026-07 compatibility investigation |
+| `FND-real-upstream-backup-fixture-skipped` | [Real upstream backup tests silently skip without a local fixture](open/operations-coverage/real-upstream-backup-fixture-skipped.md) | Open | 2026-07 compatibility investigation |
 
-| Work item | Source | Status | Impact | Trigger / likelihood |
-|---|---|---|---|---|
-| [Callback bridge skips stream and remote-class serialization](audit/callback-bridge-skips-stream-transfer-and-remote-class-serialization.md) | audit | Open | V3 callback promises hang, paid output is stranded, and mutation observers receive stripped objects. | Nested streams or remote wrappers; the implementation is unchanged from main, so the regression axis does not apply. |
-| [Decoded stream spools bypass cleanup](audit/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md) | audit | Open | Orphaned decompression files can fill the save volume, but this report establishes no direct data loss. | Repeated killed or failed compressed imports; a serve-only operational defect rather than a main regression. |
+### plugin storage
 
-## Coverage gaps
+| ID | Finding | Status | Source |
+|---|---|---|---|
+| `FND-nonoptimized-save-storage-acks-before-persistence` | [Non-optimized plugin save storage acknowledges before persistence](open/plugin-storage/nonoptimized-save-storage-acks-before-persistence.md) | Open | 2026-07 data-loss audit |
+| `FND-recovery-use-inline-cannot-serialize-lossless-values` | [Plugin recovery offers an inline repair it cannot serialize](open/plugin-storage/recovery-use-inline-cannot-serialize-lossless-values.md) | Open | delta audit DA-15 |
+| `FND-queued-recovery-actions-ignore-writer-epoch` | [Queued plugin-recovery actions are not bound to the writer epoch](open/plugin-storage/queued-recovery-actions-ignore-writer-epoch.md) | Open | delta audit DA-16 |
+| `FND-sparse-array-holes-densified` | [Sparse-array holes are densified in plugin-storage transitions and snapshots](open/plugin-storage/sparse-array-holes-densified.md) | Open | delta audit DA-14 |
+| `FND-upstream-export-plugin-proto-header` | [Upstream-target export can emit a PocketRisu-only magic version byte](open/plugin-storage/upstream-export-plugin-proto-header.md) | Open | 2026-07 compatibility investigation |
+| `FND-v2-plugin-storage-live-aliases` | [V2 storage assignments now always detach caller aliases](open/plugin-storage/v2-plugin-storage-live-aliases.md) | Open | 2026-07 compatibility investigation |
 
-| Work item | Source | Status | Impact | Trigger / likelihood |
-|---|---|---|---|---|
-| [Compatibility suites are absent from CI](compatibility/compatibility-suites-not-run-in-ci.md) | compat | Open | Build and release workflows provide no regression gate for client, server, or compatibility suites. | Every CI run; the gap is pre-existing rather than a runtime regression. |
-| [Real upstream fixture tests silently skip](compatibility/real-upstream-backup-fixture-skipped.md) | compat | Open | Synthetic fixtures can miss mistakes in archives emitted by real upstream RisuAI. | Every environment without the ignored local fixture, including CI. |
+### scripting and extensions
 
-## Intentional compatibility changes
+| ID | Finding | Status | Source |
+|---|---|---|---|
+| `FND-callback-bridge-skips-stream-transfer-and-remote-class-serialization` | [Callback bridge skips stream transfer and remote-class serialization](open/scripting-extensions/callback-bridge-skips-stream-transfer-and-remote-class-serialization.md) | Open | 2026-07 data-loss audit |
+| `FND-card-triggers-can-bulk-delete-history-without-consent` | [Imported card triggers can bulk-delete chat history without the low-level-access consent](open/scripting-extensions/card-triggers-can-bulk-delete-history-without-consent.md) | Open | 2026-07 data-loss audit |
+| `FND-lua-local-lore-upsert-is-discarded` | [Lua local-lore upserts are discarded in non-display trigger modes](open/scripting-extensions/lua-local-lore-upsert-is-discarded.md) | Open | delta audit DA-10 |
 
-| Work item | Source | Status | Impact | Trigger / likelihood |
-|---|---|---|---|---|
-| [Remote plain HTTP no longer boots](compatibility/remote-http-deployments-no-longer-boot.md) | compat | Intentional | Existing remote-HTTP deployments cannot reach authentication or storage. | Deterministic after upgrade for non-loopback HTTP unless the operator enables the explicit override. |
-| [Cloudflare Quick Tunnel was removed](compatibility/cloudflare-quick-tunnel-removed.md) | compat | Intentional | Deployments using the bundled tunnel lose remote access and the old API returns 404. | Deterministic after update or container rebuild for Quick Tunnel users. |
-| [Custom hub proxy targets are rejected](compatibility/hub-proxy-custom-targets-rejected.md) | compat | Intentional | Custom hubs and external clients lose their relay route. | Deterministic for any non-official target sent to `/hub-proxy`. |
-| [Generic `HOST` changes the listen address](compatibility/generic-host-env-changes-listen-address.md) | compat | Intentional | The server can bind the wrong interface or fail startup. | Requires an existing process manager or PaaS to set the generic variable for another purpose. |
+### server backend
 
-## Intentional documented limitations
+| ID | Finding | Status | Source |
+|---|---|---|---|
+| `FND-boot-spool-sweep-can-unlink-another-instances-active-file` | [Boot spool sweep can unlink another instance's active file](open/server-backend/boot-spool-sweep-can-unlink-another-instances-active-file.md) | Open | 2026-07 data-loss audit |
+| `FND-bulk-filesystem-writes-partially-commit` | [Bulk filesystem writes can commit a partial prefix](open/server-backend/bulk-filesystem-writes-partially-commit.md) | Open | data-loss audit, compatibility investigation |
+| `FND-chat-row-stage-is-not-bound-to-the-committed-stub-snapshot` | [Chat-row staging is not bound to the committed stub snapshot](open/server-backend/chat-row-stage-is-not-bound-to-the-committed-stub-snapshot.md) | Open | 2026-07 data-loss audit |
+| `FND-decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep` | [Decoded stream-load spools bypass the configured spool and orphan sweep](open/server-backend/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md) | Open | 2026-07 data-loss audit |
+| `FND-noncanonical-hex-path-splits-the-patch-cache` | [Non-canonical hex path headers split the patch cache](open/server-backend/noncanonical-hex-path-splits-the-patch-cache.md) | Open | 2026-07 data-loss audit |
+| `FND-sidecar-databases-use-normal-wal-without-shutdown-drain` | [Sidecar databases use NORMAL WAL without a shutdown drain](open/server-backend/sidecar-databases-use-normal-wal-without-shutdown-drain.md) | Open | delta audit DA-7 |
+| `FND-full-write-etag-does-not-cover-chat-rows` | [The full-write ETag does not cover externalized chat rows](open/server-backend/full-write-etag-does-not-cover-chat-rows.md) | Open | 2026-07 data-loss audit |
+| `FND-whole-chat-patches-partially-commit-rows` | [Whole-chat patches can partially commit external rows](open/server-backend/whole-chat-patches-partially-commit-rows.md) | Open | data-loss audit, compatibility investigation |
 
-| Work item | Source | Status | Impact | Trigger / likelihood |
-|---|---|---|---|---|
-| [DB-only snapshots do not preserve assets](audit/snapshots-reference-assets-the-gc-can-delete.md) | audit | Intentional documented limitation | Restoring a snapshot can leave dangling references to assets that are no longer present; the live state before restore is unaffected. | Automatic snapshots are explicitly scoped to database recovery and exclude character assets and inlays; use a full server/local backup when media recovery is required. |
+## Accepted decisions and limitations
 
-## Deferred work
-
-| Work item | Source | Status | Impact | Trigger / likelihood |
-|---|---|---|---|---|
-| [Pre-tracking capture omits six save domains](audit/pre-tracking-baseline-capture-still-omits-six-save-domains.md) | audit | Deferred | Boot migrations, repairs, imports, and defaults can remain memory-only and vanish. | Affected bootstrap mutations are absorbed as the clean baseline on an ordinary boot. |
-
-## Appendix — Fixed findings
-
-| Finding | Former harm | Note |
+| Decision | Owner | Source |
 |---|---|---|
-| [Asset externalization broke rollback to main](compatibility/asset-externalization-breaks-main-rollback.md) | Migrated images and media became invisible after a direct rollback and could be omitted from later downgraded backups even though their filesystem bytes initially remained recoverable. | Fixed 2026-07-31 with the non-destructive `target=main` export, which reads the merged filesystem/SQLite asset inventory from a pinned full-state cut, emits byte-exact main-readable archive entries, and is exposed with explicit fresh-directory guidance; raw rollback against the externalized live directory remains unsupported. |
-| [Chat-row migration broke rollback to main](compatibility/chat-row-migration-breaks-main-rollback.md) | Every externalized chat message became inaccessible after a direct rollback, and downgraded writes or backups could cement the incomplete stub view. | Fixed 2026-07-31 with a non-destructive `target=main` export that pins one full-state cut, folds chats and owned plugin rows into a main-readable version-7 database, retains main-compatible assets/inlays, rejects missing rows and newer escape headers before publication, and is exposed with explicit omission/fresh-directory warnings plus main → serve → main contract coverage. |
-| [Partial block decode became authoritative](audit/partial-block-decode-becomes-authoritative.md) | One corrupt block could be silently skipped, after which the partial database was cached and re-encoded over still-intact source blocks. | Fixed 2026-07-31 with strict authoritative framing/JSON/directory/REMOTE validation across browser boot, server boot/live reads, bounded restore, and large streamed conversion; corrupt bytes now enter existing snapshot recovery, while explicit compatibility decoding remains permissive. |
-| [The legacy migration marker could outlive the WAL commit](audit/legacy-kv-migration-marker-can-outlive-the-wal-commit.md) | A power loss could leave the completion marker while rolling back the SQLite copy, causing later boots to hide the entire preserved legacy database. | Fixed 2026-07-31 with transactional SQLite migration metadata, old-marker reconciliation, atomic synced compatibility-marker publication, state-based cleanup authorization, and regressions for both crash-boundary states plus explicit-import marker failure. |
-| [A boot-route 404 could overwrite the server database](compatibility/boot-raw-read-404-overwrites-older-server-database.md) | A mixed-version frontend could classify an unsupported boot route as a missing database and replace the entire valid dataset with an empty save. | Fixed 2026-07-31 with session capability negotiation, legacy read/list proof of absence, explicit 204 raw absence, fail-closed ambiguous responses, an atomic create-if-absent endpoint, winner reread, and mixed-version plus concurrent real-server coverage. |
-| [Chat-version cap collapsed to 100](audit/chat-version-cap-collapses-from-125-to-100.md) | Recovery copies only; the oldest 20% of the advertised history disappeared at the 125-version boundary. | Fixed 2026-07-31 with a direct 125-version cap, crash-safe partial-bundle rewriting, exact 125/126 byte-read coverage, and configurable rollover, idempotence, and injected-withdrawal regressions. |
-| [Global chat budget evicted newer bundles first](audit/global-chat-budget-evicts-newer-bundles-before-older-loose-versions.md) | A small byte-cap overage could destroy 25 newer chat recovery versions even though removing one older loose version would have sufficed. | Fixed 2026-07-31 with one globally age-ordered set of indivisible eviction units, newest-member bundle aging, per-chat newest protection, and an exact cross-chat small-overage regression. |
-| [`update.sh` wiped custom backup roots](audit/update-script-wipes-custom-in-tree-backup-roots.md) | Every source update erased all recovery archives under a permitted custom in-tree root such as `data/backups`, while the surviving live database silently recreated the directory empty. | Fixed 2026-07-31 by normalizing both updater-visible recovery markers into exact top-level keep entries, failing closed for managed-code targets, and covering full temporary source updates for default, custom server, and custom chat backup roots. |
-| [Docker server backups were ephemeral](audit/docker-server-backups-are-ephemeral.md) | Every server-side `.bin` recovery archive disappeared on a normal image update or container recreation, while the live save volume survived and hid the loss. | Fixed 2026-07-31 by mounting a stable named volume at `/app/backups`, documenting the pre-recreation copy migration and custom-path caveat in every install guide, and locking both Docker persistence mounts and explicit volume names with compatibility coverage. |
-| [Denied V3 database writes reported success](compatibility/v3-database-setter-permission.md) | A plugin could discard an unsaved retry buffer after a denied write resolved even though no state was committed. | Fixed 2026-07-31 by rejecting both setters with the RPC-stable `PluginPermissionError` / `PLUGIN_PERMISSION_DENIED` contract while retaining the permission boundary, with ask, grant, persisted-denial, write-only, and real guest-bridge coverage. |
-| [Legacy storage getters conflated valid values with missing](audit/legacy-storage-getters-conflate-valid-values-with-missing.md) | A plugin could reset persisted configuration or fail to enumerate a valid empty-string key after falsey reads were reported as missing. | Fixed 2026-07-31 with exact own-presence and indexed-key checks, bound V3 local-storage wrappers, and false, zero, empty string, null, missing, and empty-key parity coverage across V2 and V3-facing storage facades. |
-| [RISUP export mutated the live preset](audit/risup-export-deletes-auto-suggest-prefix-and-clean-policy.md) | Two live auto-suggest policy fields were deleted and also omitted from the archive. | Fixed 2026-07-31 with a shared pure preset snapshot, non-mutating active and inactive exports, complete auto-suggest field capture, and field-exhaustive binary round-trip coverage. |
-| [Young-chat deletion had no pre-image](audit/chat-deletion-has-no-preimage-history.md) | A chat created, saved once, and accidentally deleted before a full snapshot could have no recovery copy anywhere. | Fixed 2026-07-31 with forced cooldown-exempt pre-images before structural row deletion, fail-closed database publication, cache-backed full-write/transition coverage, and byte-exact first-save deletion plus rollback tests. |
-| [Backups omitted drafts and imports deleted them](audit/backups-omit-drafts-and-imports-delete-them.md) | Every full backup restore/import permanently deleted all persistent unsent composer drafts. | Fixed 2026-07-31 with pinned graph-referenced draft entries in Node full/server/partial archives, post-normalization exact-key restoration, stale/orphan filtering, upstream omission, and archive/save-folder round-trip coverage. |
-| [Plugin updates discarded configured arguments](audit/plugin-updates-discard-configured-arguments.md) | Ordinary updates and confirmed duplicate imports reset persisted API keys, endpoints, models, prompts, and enablement. | Fixed 2026-07-31 by merging live values for retained argument names, defaulting only new arguments, preserving compatible enablement, confirming removals outside the lifecycle lock, rechecking before commit, and covering update/import schema changes plus durability. |
-| [Inactive character and chat writes were not scheduled](audit/non-selected-character-and-chat-writes-have-no-save-scheduler.md) | Acknowledged edits to non-selected characters, inactive chat rows, and per-chat module metadata could revert on refresh. | Fixed 2026-07-31 with startup-safe character/chat dirty bridges, target-aware V3 index and database replacement diffs, MCP and backup/package-import wiring, placeholder-safe row selection, complete stub metadata tracking, and inactive-target persistence coverage. |
-| [HTML chat import reused the authoritative row ID](audit/html-chat-import-reuses-the-authoritative-row-id.md) | Importing an HTML export into its source character created two visible chats backed by one row, so edits could disappear or replace the other chat after reload. | Fixed 2026-07-31 with shared fresh-ID import normalization, client row-before-stub duplicate rejection, server patch/full-write integrity guards for full and cold chats, and HTML import/edit/save/reload plus atomic rejection coverage. |
-| [HTML round trip rejected the default empty note](audit/html-chat-round-trip-rejects-the-default-empty-note.md) | An ordinary HTML chat recovery copy with default empty fields could not be imported. | Fixed 2026-07-31 by the shared chat-import normalization: HTML payload validation now accepts empty string boundary values, validates array and string shapes, and regression coverage round-trips the default empty name, note, and local lore with a fresh chat ID. |
-| [Live startup state could misclassify a new chat](audit/live-startup-state-can-classify-a-new-chat-as-durable.md) | A startup-created or reidentified chat could be committed as a stub without an authoritative row, losing all of its messages on refresh. | Fixed 2026-07-31 by deriving known chat IDs from the persisted baseline and reconciling startup full chats after reactive tracking initializes, with row-before-stub, ID-repair, replacement, and reload-resolvability coverage. |
-| [Recovery copies omitted MCP tool-call payloads](audit/recovery-copies-omit-mcp-tool-call-payloads.md) | Fresh-instance restores kept opaque chat markers but permanently lost remembered tool arguments and responses. | Fixed 2026-07-31 with point-in-time reference-aware Node/server/partial archive entries, a bounded folded snapshot envelope, strict namespace replacement and key validation, and fresh-server plus snapshot round-trip coverage. |
-| [Inlay replacement unlinked before publish](audit/inlay-replacement-unlinks-before-publish.md) | A failed overwrite could destroy an image, while compression converted publication failures into successful skips. | Fixed 2026-07-31 with staged and fsynced payload/sidecar files, ordered atomic renames, post-commit old-extension cleanup, startup temp cleanup, terminal compression errors, and injected-failure plus `SIGKILL` restart coverage. |
-| [The storage viewer required `String.isWellFormed`](compatibility/plugin-storage-viewer-requires-string-iswellformed.md) | Optimized or owner-filtered viewer pages threw instead of rendering in browsers missing the method. | Fixed 2026-07-31 by routing viewer filters and streamed owner/error validation through the existing portable Unicode helper, with optimized and inline fallback coverage. |
-| [Optimized storage limited key length](compatibility/optimized-plugin-storage-key-length-limit.md) | Optimization or later writes rejected a logical key that inline storage accepted. | Fixed 2026-07-31 with fixed-size domain-separated physical identifiers, exact manifest-v3 logical mappings, atomic mutation/removal, and transition/viewer/backup coverage while preserving existing short names. |
-| [The plugin bridge retained a 30-minute deadline](compatibility/plugin-bridge-residual-30-minute-deadline.md) | Long model/chat/storage calls rejected while non-abortable host work could continue. | Fixed 2026-07-31 by restoring unbounded live RPC/initialization waits, cancelling on guest/host lifecycle loss, propagating cancellation through model/chat work, and making storage-update deadlines explicit-only. |
-| [Plugin timeout tests were self-referential](compatibility/plugin-timeout-regression-test-is-self-referential.md) | The timeout regression could return without a failing test. | Fixed 2026-07-31 with independent former-boundary assertions for RPCs, initialization, storage outcomes, page disappearance, and model/chat cancellation. |
-| [Legacy hash-looking assets became unwritable](compatibility/legacy-hash-named-assets-become-unwritable.md) | A readable migrated asset could not be rewritten or included in partial exports. | Fixed 2026-07-31 with durable per-asset legacy identity, one-time backfill for already-migrated files, strict canonicalization, and migration/read/rewrite/bulk/partial/full-export coverage. |
-| [Ill-formed legacy plugin keys poisoned storage](compatibility/legacy-plugin-storage-key-compatibility.md) | One historical lone-surrogate key could block unrelated V3 operations and could not survive optimized storage or backup boundaries losslessly. | Fixed 2026-07-30 with a tagged UTF-16-code-unit row codec, a backward-compatible MessagePack escape envelope, isolated inline operations, and end-to-end mutation/viewer/transition/backup coverage. |
-| [Inline rich values broke enumeration](compatibility/inline-plugin-storage-enumeration-rich-values.md) | One accepted value could poison `keys`, `key`, `length`, versioned reads, or viewer pages. | Fixed 2026-07-30 with value-independent key enumeration, structured-clone viewer/versioned snapshots, rich-value revision tokens, and full API-matrix coverage. |
-| [Large opaque save rows were rejected](compatibility/save-folder-opaque-row-32mib-cap.md) | Valid save folders with a generic or plugin-metadata row above 32 MiB could not be restored. | Fixed 2026-07-30 with namespace-independent protected chunk storage, file-backed opaque publication, streaming plugin-metadata validation/owner indexing, and 32 MiB+1 ZIP/directory restart coverage. |
-| [Large RISUSAVE block databases were rejected](compatibility/legacy-risusave-64mib-import-cap.md) | A retained main/upstream save or archive could not be imported when its block database exceeded 64 MiB. | Fixed 2026-07-30 with bounded disk-backed block conversion, file-spooled REMOTE resolution, streaming database ingestion, and exact 64 MiB + 1 archive/save-folder coverage. |
-| [Default exports could exceed import limits](compatibility/backup-export-import-limit-mismatch.md) | A default server-produced backup could be refused by a default fresh installation only when restore was needed. | Fixed 2026-07-30 with an explicit resource-checked large-restore path, disk-backed batched entry metadata, file-backed category streaming/chunking, trusted server-file recovery, and self-round-trip coverage. |
-| [Configured plugin value limits disagreed with the client](compatibility/plugin-storage-configured-limit-client-mismatch.md) | Raising the documented server limit did not expand browser writes, while lowering it caused avoidable rejected uploads. | Fixed 2026-07-30 with an authenticated generic value-limit capability, transport-boundary preflight, a legacy-server fallback, and unequal-limit coverage. |
-| [Safe plugin updates had a smaller value limit](compatibility/plugin-storage-batch-size-mismatch.md) | CAS, rewrite, update, and batch APIs could not modify values accepted by `setItem`. | Fixed 2026-07-30 with negotiated raw-value framing, bounded staging, file-backed atomic publication, legacy fallback, and above-ceiling coverage. |
-| [Install script could delete the only data copy](audit/install-script-can-delete-the-only-data-copy.md) | An overwrite-install failure could erase the entire dataset and all backups. | Fixed 2026-07-27 with same-filesystem staging, rollback, and failure coverage. |
-| [Patch conflict promoted a stale ETag](audit/patch-conflict-etag-promotion-enables-stale-full-write.md) | Ordinary concurrent clients could replace the whole database with stale state. | Fixed 2026-07-28 by treating conflict ETags as provisional and rebasing first. |
-| [SQLite NORMAL WAL acknowledged before durability](audit/sqlite-normal-wal-acknowledges-before-power-loss-durability.md) | Power loss could roll back acknowledged database, chat, and plugin transactions. | Fixed 2026-07-28 with a `FULL` default and verified durable flush boundary. |
-| [Inlay orphan scan marked referenced media deletable](audit/inlay-orphan-scan-classifies-referenced-inlays-as-deletable.md) | Normal gallery cleanup could delete bulk chat-referenced media. | Fixed 2026-07-28 with authoritative scanning and queued delete revalidation. |
-| [Boot asset GC deleted plugin-owned assets](audit/boot-asset-gc-deletes-plugin-owned-assets.md) | Every plugin-owned asset could be deleted after boot. | Fixed 2026-07-29 with server-owned reachability and a persisted grace interval. |
-| [Boot asset GC raced publication](audit/boot-asset-gc-races-concurrent-publication.md) | A concurrently uploaded asset could be deleted before its reference propagated. | Fixed 2026-07-29 by serializing writes/cleanup and requiring a later grace-qualified pass. |
-| [Send-input race overwrote another chat](audit/send-input-race-replaces-another-chats-history.md) | Switching chats during input hooks could replace an entire chat history. | Fixed 2026-07-29 by binding the send flow to durable character/chat IDs. |
-| [Reroll failure restored into the current chat](audit/reroll-failure-restores-into-the-current-chat.md) | Switching chats during reroll could corrupt both chat histories. | Fixed 2026-07-29 by resolving settlement against the initiating IDs. |
-| [Rebase promoted the ETag too early](audit/rebase-promotes-etag-before-authoritative-state-is-installed.md) | A failed rebase could authorize a later stale full write and delete newer rows. | Fixed 2026-07-28 by publishing the candidate ETag only after full installation. |
-| [V3 top-level completion blocked startup](compatibility/v3-top-level-startup-barrier.md) | Long-lived plugin work could hold the application at Loading Plugins and retain the lifecycle queue. | Fixed 2026-07-29 by separating bounded readiness from plugin lifetime and observing late failures in the background. |
-| [Chat saves waited for a full snapshot](compatibility/chat-save-blocked-by-synchronous-snapshot.md) | Snapshot assembly could delay acknowledgement until after the client timed out on an already-committed chat row. | Fixed 2026-07-30 by acknowledging row durability before scheduling the coalesced automatic snapshot. |
-| [Authoritative storage had a 15-second deadline](compatibility/authoritative-storage-15-second-deadline.md) | Slow valid storage, asset, chat, plugin, and backup operations could fail or return a wrongly retryable outcome. | Fixed 2026-07-30 with operation-aware metadata, payload, and job budgets plus post-dispatch mutation classification. |
-| [An unrelated plugin failure poisoned installation](compatibility/unrelated-plugin-failure-poisons-install.md) | A pre-existing V3 startup failure could roll back a healthy plugin import or enable. | Fixed 2026-07-30 with per-plugin startup outcomes and target-aware rollback decisions. |
-| [Raw boot did not pin the plugin generation](compatibility/raw-boot-plugin-generation-not-pinned.md) | Optimized boot reconciliation reported false recovery failures and could not read the selected rows. | Fixed 2026-07-30 by forwarding the decoded database generation through boot reconciliation reads. |
-| [V2 rich storage values were rejected](compatibility/v2-plugin-storage-rich-values.md) | Existing plugin values could fail to read and new writes could prevent provider or hook registration. | Fixed 2026-07-30 with descriptor-safe structured-clone snapshots and persisted rich-value upgrade coverage. |
-| [Local plugin storage rejected JSON-compatible values](compatibility/local-plugin-storage-strict-json.md) | Plugins could no longer persist values that main accepted through `JSON.stringify`. | Fixed 2026-07-30 with compatibility normalization on both sides of the V3 iframe bridge. |
-| [V2 storage no longer behaved like an ordinary object](compatibility/v2-plugin-storage-object-prototype.md) | Common operations such as `hasOwnProperty`, `instanceof`, and string conversion failed or changed result. | Fixed 2026-07-30 by restoring ordinary prototype observations while retaining safe special-key traps. |
-| [Legacy V3 unload exposed only part of the API](compatibility/v3-onunload-api-allowlist.md) | Plugins could fail to flush database-backed state, notify remote services, save final assets, or restore global UI during disable, removal, or reload. | Fixed 2026-07-30 with a signal-authorized bounded finalization contract plus compatible no-signal legacy calls, while keeping new lifetime work closed. |
-| [Input hooks could not call `sendChat`](compatibility/input-hooks-cannot-call-sendchat.md) | The nested call failed and could also abort the user's outer send. | Fixed 2026-07-30 with a target-bound outer transaction, scoped sequential child turns, and input-hook error isolation. |
-| [V3 hook removal lost callback identity](compatibility/v3-hook-callback-identity.md) | Removal silently failed and duplicate registrations executed handlers or replacers more than once. | Fixed 2026-07-30 with lifecycle- and mode-scoped guarded-callback mappings used consistently by registration and removal. |
-| [`loadPlugins()` no longer meant completion](compatibility/plugin-loadplugins-readiness.md) | Plugin callers raced teardown/reload and could not observe lifecycle failure. | Fixed 2026-07-30 by returning the shared deferred drain outside lifecycle callbacks while retaining deadlock-safe acknowledgement inside them. |
-| [V3 database custom-key fallback was removed](compatibility/v3-database-custom-key-fallback.md) | Plugins using the inherited custom-field convention threw before mutation. | Fixed 2026-07-30 by routing unsupported fields through authoritative plugin storage in legacy compatibility mode, with a developer-console-only notice; strict mode still rejects them. |
-| [Plugin permissions could not be reset to Ask](compatibility/permission-editor-cannot-reset-to-ask.md) | Ordinary users could not restore prompt-on-next-use behavior after granting or denying a permission. | Fixed 2026-07-30 by exposing the existing per-plugin reset in the normal permission editor with confirmation, immediate state refresh, and rendered-component coverage. |
-| [Plugin storage enumeration order changed](compatibility/plugin-storage-enumeration-order.md) | Cursor, append-order, priority, and first/last conventions could process records differently. | Fixed 2026-07-30 with legacy `Object.keys()` ordering, authoritative version-2 manifest order, version-1 migration, and a separate `sortedKeys()` API. |
-| [Save-folder restores had a fixed deadline](compatibility/save-folder-restore-fixed-deadline.md) | A valid long-running restore could abort or leave the client unable to distinguish rollback from commit. | Fixed 2026-07-30 with activity-reset NDJSON progress, no total deadline, and durable transaction-bound operation-status reconciliation. |
-| [A V2 unload could wedge plugin lifecycle](compatibility/v2-unload-can-wedge-plugin-lifecycle.md) | One never-settling V2 callback could queue every plugin operation forever and leave disable/removal persistence timing-dependent. | Fixed 2026-07-30 with a five-second generation grace, revocable V2 host facades, pre-cleanup durability, and hanging/late-resolution coverage. |
-| [Bulk inlay deletion exceeded its request limit](compatibility/bulk-inlay-deletion-limit.md) | Selecting more than 1,000 valid orphaned inlays made the UI's entire deletion request fail. | Fixed 2026-07-30 by chunking the shared gallery/playground helper into guarded requests of at most 1,000 IDs and aggregating their results. |
-| [Optimized storage could lock in its mode](compatibility/optimized-plugin-storage-transition-lock-in.md) | Users could not turn optimization off after storing otherwise legal data. | Fixed 2026-07-30 with quota-aligned, page-bounded reverse staging and an exact-preflight browser-memory confirmation for large inline conversions. |
+| [Cloudflare Quick Tunnel UI and API were removed](decisions/cloudflare-quick-tunnel-removed.md) | server backend | 2026-07 compatibility investigation |
+| [Custom hub proxy targets are now rejected](decisions/hub-proxy-custom-targets-rejected.md) | server backend | 2026-07 compatibility investigation |
+| [DB-only snapshots do not preserve assets](decisions/db-only-snapshots-exclude-assets.md) | backup and recovery | 2026-07 data-loss audit |
+| [Remote plain-HTTP deployments no longer boot](decisions/remote-http-requires-explicit-override.md) | server backend | 2026-07 compatibility investigation |
+| [The generic HOST environment variable now changes server binding](decisions/generic-host-controls-listen-address.md) | server backend | 2026-07 compatibility investigation |
+
+## Active audit and remediation programs
+
+- [2026-08 performance remediation](programs/performance-2026-08/README.md)
+
+Completed programs and source reports are indexed in
+[`.archived-docs/`](../../.archived-docs/README.md).

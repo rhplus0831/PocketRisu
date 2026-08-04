@@ -100,8 +100,9 @@ optimized-to-inline transition, the client saves the now-false inline database
 before deleting external rows; a snapshot in that window folds those rows
 without the marker. Restoring it over newer external rows does not clear the
 newer prefix, so boot internalization can overlay newer state onto the
-requested older snapshot. Documented in
-[`../../docs/audit/v3/warning/disabled-mode-snapshots-retain-newer-external-plugin-rows-on-restore.md`](../../docs/audit/v3/warning/disabled-mode-snapshots-retain-newer-external-plugin-rows-on-restore.md).
+requested older snapshot. The original v3 source report was
+`disabled-mode-snapshots-retain-newer-external-plugin-rows-on-restore.md`; it
+was consolidated and is no longer retained as a standalone document.
 
 More generally, the inline and external copies carry no migration generation
 or ownership epoch. Enabling returns `direction: "none"` when the inline maps

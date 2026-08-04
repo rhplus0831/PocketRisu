@@ -91,8 +91,9 @@ server and compatibility suites, `pnpm check`, and a production build.
 through unbounded `Promise.all` (`src/ts/storage/persistentKv.ts:65-73`). If
 one delete fails, the successful deletes remain durable, the call rejects, and
 owner cleanup is never started. Inline clear is a single map replacement, so
-failure/atomicity behavior changes with the setting. See also
-[`../../docs/audit/v3/warning/optimized-clear-can-partially-destroy-a-store.md`](../../docs/audit/v3/warning/optimized-clear-can-partially-destroy-a-store.md).
+failure/atomicity behavior changes with the setting. The original v3 source
+report was `optimized-clear-can-partially-destroy-a-store.md`; it was
+consolidated and is no longer retained as a standalone document.
 Even plugins that never call `clear()` are exposed through bulk cleanup in the
 built-in storage viewer.
 

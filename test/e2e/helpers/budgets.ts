@@ -2,7 +2,8 @@
  * Per-phase network budgets — the audit's regression net.
  *
  * Values are ceilings with ~30-40% headroom over the 2026-08-04 baselines
- * (docs/findings/perf-audit/03-trace-baselines.md, commit 12e90fa9), so they
+ * (.archived-docs/findings/2026-08-performance-evidence/03-trace-baselines.md,
+ * commit 12e90fa9), so they
  * catch structural regressions (a new N+1 loop, a lost cache, an extra full
  * write) without flaking on run-to-run noise. When a remediation track lands
  * (PF-01/02 send deltas, PF-03/04 boot normalization, PF-05 size-aware cache),

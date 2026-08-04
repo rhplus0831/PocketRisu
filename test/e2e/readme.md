@@ -2,7 +2,7 @@
 
 Playwright scenarios that drive the real built app against real isolated
 server instances, measuring API request counts and bytes per scenario phase.
-Built for the 2026-08 performance audit (`docs/findings/perf-audit/`); the
+Built for the [2026-08 performance audit](../../.archived-docs/findings/2026-08-performance-evidence/README.md); the
 scenario reports are the audit's empirical baselines and later become budget
 regression assertions.
 

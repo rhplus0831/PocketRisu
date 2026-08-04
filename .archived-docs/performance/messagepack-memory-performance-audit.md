@@ -572,5 +572,5 @@ This audit extends and supersedes the scope of
 [plugin-storage-inline-memory-performance.md](plugin-storage-inline-memory-performance.md)
 without replacing it: that report remains the detailed reference for the
 inline plugin-storage pipeline, with the corrections in Part 1 applied.
-Historical risk reports under `../../docs/findings/audit` are unrelated point-in-time
+Historical risk reports now indexed under `../../docs/findings/WORK-INDEX.md` are unrelated point-in-time
 data-loss audits.

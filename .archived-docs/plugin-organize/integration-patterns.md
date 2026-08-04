@@ -211,7 +211,7 @@ value. The result also retains the original mutation outcome, so callers can
 distinguish an acknowledged delete from absence confirmed after a lost
 acknowledgement.
 
-The public types and [safe mutation workflow guide](../../docs/plugin-storage-mutation-outcomes.md)
+The public types and [safe mutation workflow guide](../plugin-storage-mutation-outcomes.md)
 show plugin authors how to publish cache entries only after confirmed SET,
 retain dirty edits after known refusal, evict and re-read after an unknown
 outcome, clear deletion dirtiness only after authoritative absence, and derive
