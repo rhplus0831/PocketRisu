@@ -4,15 +4,23 @@ import * as fflate from 'fflate'
 const mocks = vi.hoisted(() => ({
     uuid: vi.fn(),
     saveChatToServer: vi.fn(),
+    alertConfirm: vi.fn(),
+    alertError: vi.fn(),
+    notifySuccess: vi.fn(),
+    selectFileByDom: vi.fn(),
+    getDatabase: vi.fn(),
+    setDatabase: vi.fn(),
+    createBlankChar: vi.fn(),
+    markCharacterDirty: vi.fn(),
 }))
 
 vi.mock('uuid', () => ({ v4: mocks.uuid }))
 vi.mock('./alert', () => ({
-    alertConfirm: vi.fn(),
-    alertError: vi.fn(),
+    alertConfirm: mocks.alertConfirm,
+    alertError: mocks.alertError,
     alertStore: { set: vi.fn() },
     alertWait: vi.fn(),
-    notifySuccess: vi.fn(),
+    notifySuccess: mocks.notifySuccess,
 }))
 vi.mock('./characterCards', () => ({
     exportCharacterCard: vi.fn(),
@@ -20,17 +28,30 @@ vi.mock('./characterCards', () => ({
 }))
 vi.mock('./globalApi.svelte', () => ({
     LocalWriter: class {},
-    markCharacterDirty: vi.fn(),
+    markCharacterDirty: mocks.markCharacterDirty,
     readImage: vi.fn(),
     checkCharOrder: vi.fn(),
 }))
 vi.mock('src/lang', () => ({
-    language: { characterPackageProgressImportChats: 'Importing chats' },
+    language: {
+        characterPackageProgressImportChats: 'Importing chats',
+        characterPackageProgressImportChar: 'Importing character',
+        characterPackageProgressReading: 'Reading package',
+        characterPackageImportSummary: 'Package Contents',
+        characterPackageCharacter: 'Character',
+        characterPackageChats: 'Chats',
+        characterPackageChatCount: '',
+        characterPackageEmpty: 'empty shell',
+        characterPackageEmptyWarning: 'Character data is empty. Import anyway?',
+        characterPackageImport: 'Import Character Package',
+        characterPackageImportToChar: 'Import Package to Character',
+        characterPackageImportSuccess: 'Character package imported successfully.',
+    },
 }))
 vi.mock('./storage/database.svelte', () => ({
     getCharacterInterchangeSnapshot: vi.fn(),
-    getDatabase: vi.fn(() => ({ personas: [] })),
-    setDatabase: vi.fn(),
+    getDatabase: mocks.getDatabase,
+    setDatabase: mocks.setDatabase,
     saveImage: vi.fn(),
     normalizeChat: (chat: any) => ({
         ...chat,
@@ -59,8 +80,8 @@ vi.mock('./storage/chatStorage', () => ({
         _placeholder: true,
     }),
 }))
-vi.mock('./util', () => ({ selectFileByDom: vi.fn() }))
-vi.mock('./characters', () => ({ createBlankChar: vi.fn() }))
+vi.mock('./util', () => ({ selectFileByDom: mocks.selectFileByDom }))
+vi.mock('./characters', () => ({ createBlankChar: mocks.createBlankChar }))
 vi.mock('./process/processzip', () => ({ CharXWriter: class {} }))
 vi.mock('./process/files/inlays', () => ({
     getInlayAsset: vi.fn(),
@@ -74,11 +95,46 @@ vi.mock('./process/files/inlayMeta', () => ({
 }))
 vi.mock('./pngChunk', () => ({ PngChunk: {} }))
 
-const { importChatsToCharacter } = await import('./characterPackage')
+const {
+    importCharacterPackage,
+    importChatsToCharacter,
+    importPackageToCharacter,
+} = await import('./characterPackage')
+
+function buildPackageFile(
+    manifest: Record<string, unknown>,
+    chatEntry?: { file: string, rows: unknown[] },
+): File {
+    const entries: Record<string, Uint8Array> = {
+        'manifest.json': fflate.strToU8(JSON.stringify(manifest)),
+    }
+    if (chatEntry) {
+        entries[chatEntry.file] = fflate.strToU8(JSON.stringify({
+            type: 'risuAllChats',
+            ver: 2,
+            data: chatEntry.rows,
+            folders: [],
+        }))
+    }
+    const archive = fflate.zipSync(entries)
+    return new File([archive as unknown as BlobPart], 'package.zip', { type: 'application/zip' })
+}
+
+function baseManifest(): Record<string, unknown> {
+    return {
+        type: 'risuCharacterPackage',
+        version: 1,
+        createdAt: '2026-08-04T00:00:00.000Z',
+        character: { name: 'Fixture', file: '', isEmpty: true },
+    }
+}
 
 describe('streamed package chat row import', () => {
     beforeEach(() => {
         vi.clearAllMocks()
+        mocks.alertConfirm.mockResolvedValue(true)
+        mocks.saveChatToServer.mockResolvedValue(undefined)
+        mocks.getDatabase.mockReturnValue({ characters: [], personas: [] })
     })
 
     test('old whole-entry chats import in order through per-row storage', async () => {
@@ -148,7 +204,7 @@ describe('streamed package chat row import', () => {
             { 'old-persona': 'new-persona' },
             progress,
             'append',
-        )).resolves.toBe(2)
+        )).resolves.toEqual({ status: 'imported', count: 2 })
 
         expect(progress).toHaveBeenCalledOnce()
         expect(mocks.saveChatToServer.mock.calls.map(call => call.slice(0, 3))).toEqual([
@@ -179,5 +235,68 @@ describe('streamed package chat row import', () => {
             { id: 'remapped-folder', name: 'Imported', folded: false },
             { id: 'folder-a', name: 'Existing', folded: false },
         ])
+    })
+
+    test('append import reports a missing declared chats entry as failure', async () => {
+        const target = {
+            chaId: 'target-character',
+            name: 'Fixture',
+            chats: [{ id: 'existing-chat', name: 'Existing', message: [] }],
+        } as any
+        const db = { characters: [target], personas: [] }
+        mocks.getDatabase.mockReturnValue(db)
+        mocks.selectFileByDom.mockResolvedValue([buildPackageFile({
+            ...baseManifest(),
+            chats: { count: 1, file: 'chats/missing.json' },
+        })])
+
+        await importPackageToCharacter(0)
+
+        expect(mocks.alertError).toHaveBeenCalledOnce()
+        expect((mocks.alertError.mock.calls[0][0] as Error).message).toContain('is missing from the package')
+        expect(mocks.notifySuccess).not.toHaveBeenCalled()
+        expect(mocks.saveChatToServer).not.toHaveBeenCalled()
+        expect(mocks.markCharacterDirty).not.toHaveBeenCalled()
+        expect(target.chats).toEqual([{ id: 'existing-chat', name: 'Existing', message: [] }])
+    })
+
+    test('new-character import fails before writes when the chat entry is shorter than declared', async () => {
+        const db = { characters: [] as any[], personas: [] }
+        const blankCharacter = { chaId: 'new-character', name: '', chats: [] }
+        mocks.getDatabase.mockReturnValue(db)
+        mocks.createBlankChar.mockReturnValue(blankCharacter)
+        mocks.selectFileByDom.mockResolvedValue([buildPackageFile({
+            ...baseManifest(),
+            chats: { count: 2, file: 'chats/chats.json' },
+        }, {
+            file: 'chats/chats.json',
+            rows: [{ id: 'only-chat', name: 'Only', message: [] }],
+        })])
+
+        await importCharacterPackage()
+
+        expect(mocks.alertError).toHaveBeenCalledOnce()
+        expect((mocks.alertError.mock.calls[0][0] as Error).message)
+            .toContain('contains 1 chat rows, but the manifest declares 2')
+        expect(mocks.notifySuccess).not.toHaveBeenCalled()
+        expect(mocks.saveChatToServer).not.toHaveBeenCalled()
+        expect(mocks.markCharacterDirty).not.toHaveBeenCalled()
+        expect(db.characters).toEqual([])
+    })
+
+    test('new-character package with no chats section still succeeds', async () => {
+        const db = { characters: [] as any[], personas: [] }
+        const blankCharacter = { chaId: 'new-character', name: '', chats: [] }
+        mocks.getDatabase.mockReturnValue(db)
+        mocks.createBlankChar.mockReturnValue(blankCharacter)
+        mocks.selectFileByDom.mockResolvedValue([buildPackageFile(baseManifest())])
+
+        await importCharacterPackage()
+
+        expect(mocks.alertError).not.toHaveBeenCalled()
+        expect(mocks.notifySuccess).toHaveBeenCalledWith('Character package imported successfully.')
+        expect(mocks.saveChatToServer).not.toHaveBeenCalled()
+        expect(mocks.markCharacterDirty).toHaveBeenCalledWith('new-character')
+        expect(db.characters).toEqual([{ ...blankCharacter, name: 'Fixture' }])
     })
 })

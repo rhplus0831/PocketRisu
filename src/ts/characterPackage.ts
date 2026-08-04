@@ -287,17 +287,22 @@ async function readPackageChatsMetadata(
 ): Promise<ParsedPackageChats | null> {
     let metadata: ParsedPackageChats | null = null
     const found = await consumeZipEntry(source, fileName, async stream => {
-        try {
-            metadata = await parsePackageChatsJson(stream, () => {})
-        } catch (error) {
-            if (error instanceof TypeError && error.message === 'Unsupported chat package format') {
-                metadata = null
-                return
-            }
-            throw error
-        }
+        metadata = await parsePackageChatsJson(stream, () => {})
     })
     return found ? metadata : null
+}
+
+export type PackageChatImportResult =
+    | { status: 'not-declared', count: 0 }
+    | { status: 'imported', count: number }
+    | { status: 'failed', reason: string }
+
+function describePackageChatError(error: unknown): string {
+    return error instanceof Error ? error.message : String(error)
+}
+
+function packageChatFailure(reason: string): PackageChatImportResult {
+    return { status: 'failed', reason }
 }
 
 export async function importChatsToCharacter(
@@ -307,12 +312,30 @@ export async function importChatsToCharacter(
     personaIdMap: Record<string, string>,
     progress: ProgressFn,
     mode: 'replace' | 'append' = 'replace'
-): Promise<number | null> {
-    if (!manifest.chats) return null
+): Promise<PackageChatImportResult> {
+    if (!manifest.chats) return { status: 'not-declared', count: 0 }
 
     progress(language.characterPackageProgressImportChats)
-    const chatsMetadata = await readPackageChatsMetadata(source, manifest.chats.file)
-    if (!chatsMetadata) return null
+    const declaredChats = manifest.chats
+    let chatsMetadata: ParsedPackageChats | null
+    try {
+        chatsMetadata = await readPackageChatsMetadata(source, declaredChats.file)
+    } catch (error) {
+        return packageChatFailure(
+            `Declared chats entry "${declaredChats.file}" is invalid or unreadable: ${describePackageChatError(error)}`,
+        )
+    }
+    if (!chatsMetadata) {
+        return packageChatFailure(`Declared chats entry "${declaredChats.file}" is missing from the package.`)
+    }
+    if (!Number.isSafeInteger(declaredChats.count) || declaredChats.count < 0) {
+        return packageChatFailure(`Manifest declares an invalid chat count: ${String(declaredChats.count)}.`)
+    }
+    if (chatsMetadata.count !== declaredChats.count) {
+        return packageChatFailure(
+            `Declared chats entry "${declaredChats.file}" contains ${chatsMetadata.count} chat rows, but the manifest declares ${declaredChats.count}.`,
+        )
+    }
 
     type ImportedFolder = { id: string, name?: string, color?: string, folded: boolean }
     const importedFolders = Array.isArray(chatsMetadata.folders)
@@ -338,23 +361,39 @@ export async function importChatsToCharacter(
 
     const placeholders: Chat[] = []
     let parsedCount = 0
-    const found = await consumeZipEntry(source, manifest.chats.file, async stream => {
-        await parsePackageChatsJson(stream, async rawChat => {
-            const chat = rawChat as Chat
-            if (chat.bindedPersona && personaIdMap[chat.bindedPersona]) {
-                chat.bindedPersona = personaIdMap[chat.bindedPersona]
-            }
-            if (chat.folderId && folderIdMap[chat.folderId]) {
-                chat.folderId = folderIdMap[chat.folderId]
-            }
-            chat.id = v4()
-            const normalized = normalizeChat(chat)
-            await saveChatToServer(targetChar.chaId, parsedCount, chat.id, normalized)
-            placeholders.push(stubToPlaceholder(chatToStub(normalized)))
-            parsedCount++
+    let importedMetadataCount: number | null = null
+    let found = false
+    try {
+        found = await consumeZipEntry(source, declaredChats.file, async stream => {
+            const importedMetadata = await parsePackageChatsJson(stream, async rawChat => {
+                const chat = rawChat as Chat
+                if (chat.bindedPersona && personaIdMap[chat.bindedPersona]) {
+                    chat.bindedPersona = personaIdMap[chat.bindedPersona]
+                }
+                if (chat.folderId && folderIdMap[chat.folderId]) {
+                    chat.folderId = folderIdMap[chat.folderId]
+                }
+                chat.id = v4()
+                const normalized = normalizeChat(chat)
+                await saveChatToServer(targetChar.chaId, parsedCount, chat.id, normalized)
+                placeholders.push(stubToPlaceholder(chatToStub(normalized)))
+                parsedCount++
+            })
+            importedMetadataCount = importedMetadata.count
         })
-    })
-    if (!found) return null
+    } catch (error) {
+        return packageChatFailure(
+            `Declared chats entry "${declaredChats.file}" could not be imported: ${describePackageChatError(error)}`,
+        )
+    }
+    if (!found) {
+        return packageChatFailure(`Declared chats entry "${declaredChats.file}" is missing from the package.`)
+    }
+    if (importedMetadataCount !== declaredChats.count || parsedCount !== declaredChats.count) {
+        return packageChatFailure(
+            `Declared chats entry "${declaredChats.file}" contains ${parsedCount} imported chat rows, but the manifest declares ${declaredChats.count}.`,
+        )
+    }
 
     if (mode === 'append') {
         targetChar.chats = [...placeholders, ...(targetChar.chats ?? [])]
@@ -366,7 +405,7 @@ export async function importChatsToCharacter(
         if (importedFolders) targetChar.chatFolders = importedFolders
         targetChar.chatPage = 0
     }
-    return parsedCount
+    return { status: 'imported', count: parsedCount }
 }
 
 async function importInlays(
@@ -746,7 +785,8 @@ export async function importCharacterPackage(): Promise<void> {
             const newChar = db.characters[newCharIndex] as character
 
             const personaIdMap = await importPersonas(manifest, source, importProgress)
-            await importChatsToCharacter(manifest, source, newChar, personaIdMap, importProgress)
+            const chatImport = await importChatsToCharacter(manifest, source, newChar, personaIdMap, importProgress)
+            if (chatImport.status === 'failed') throw new Error(chatImport.reason)
             // A new character can be imported while the home screen or another
             // character is selected. Chat rows were already routed through the
             // per-row storage API; explicitly publish their placeholder block.
@@ -815,7 +855,7 @@ export async function importPackageToCharacter(charIndex: number): Promise<void>
         }
 
         const personaIdMap = await importPersonas(manifest, source, importProgress)
-        await importChatsToCharacter(
+        const chatImport = await importChatsToCharacter(
             manifest,
             source,
             targetChar,
@@ -823,6 +863,7 @@ export async function importPackageToCharacter(charIndex: number): Promise<void>
             importProgress,
             'append',
         )
+        if (chatImport.status === 'failed') throw new Error(chatImport.reason)
         markCharacterDirty(targetChar.chaId)
         await importInlays(manifest, source, targetChar.chaId, importCurrentStep, importTotalSteps, progressLabel)
 
