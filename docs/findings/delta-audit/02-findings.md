@@ -10,6 +10,13 @@ audit coordinator before inclusion. Severity uses the audit corpus
 convention (fatal = realistic live-data loss; warning = bounded/conditional
 loss or fidelity harm).
 
+**Remediation status (2026-08-05):** DA-2 fixed `3d820335`; DA-4 fixed
+`d8e68f05`; DA-3 fixed `7dd00712` (epoch fence + base-hash precondition;
+legacy/headerless callers retain prior behavior by design); DA-13 fixed
+`b2bd0ef2`. DA-1 closes when the branch is pushed. The warnings
+(DA-5..DA-12, DA-14..DA-16) remain open and should be folded into
+`WORK-INDEX.md` at the next indexing pass.
+
 ## Fatal
 
 ### DA-1. Push gap: remote tip runs the strict-storage-detaching migration (M1)

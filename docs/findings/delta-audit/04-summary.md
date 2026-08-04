@@ -50,17 +50,16 @@ real gap is measurement coverage: ten subsystems have no trace
 instrumentation ([03-perf-coverage.md](03-perf-coverage.md)); fold
 per-message scripting and large-chat rendering into T8 first.
 
-## Actions, in order
+## Actions, in order (status 2026-08-05)
 
-1. **Push `732c8cde` + `9b589e0e` now** (closes DA-1); if any instance
+1. **Push the branch** (closes DA-1) — DONE once pushed; the local branch
+   now also carries the four fatal-finding fixes below. If any instance
    already booted on `208fc56a`, audit plugin storage and restore from the
    `migration-backup/pre-character-defaults-*` copy.
-2. Fix DA-2 (rebase overlay must union post-capture dirty revisions) and
-   DA-13 (typed viewer editing) — both are silent-corruption paths in
-   ordinary flows.
-3. Fix DA-3 with a persistent writer-lock boot epoch + base-hash on the
-   full-row fallback; DA-4 with fail-closed import counts.
-4. Batch the remaining warnings into the normal work queue; fold all DA
-   findings into `WORK-INDEX.md` at the next indexing pass.
-5. Delete dormant `loadInternalBackup()`; triage the Python-worker
+2. ~~Fix DA-2~~ fixed `3d820335`; ~~DA-13~~ fixed `b2bd0ef2`.
+3. ~~Fix DA-3~~ fixed `7dd00712`; ~~DA-4~~ fixed `d8e68f05`.
+4. OPEN: batch the remaining warnings (DA-5..DA-12, DA-14..DA-16) into the
+   normal work queue; fold all DA findings into `WORK-INDEX.md` at the
+   next indexing pass.
+5. OPEN: delete dormant `loadInternalBackup()`; triage the Python-worker
    protocol naming mismatch separately.
