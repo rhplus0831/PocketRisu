@@ -1,116 +1,156 @@
 # Remediation handover
 
-For the agent starting remediation of the 2026-08 performance audit. The audit
-(phases 0–4) is complete as of 2026-08-04, commit `c2354905` on `serve`; your
-job is executing the runway in [07-remediation-runway.md](07-remediation-runway.md).
-This file is the entry point — it tells you what to read, the rules that bind
-every change, how to verify, and where each track starts. It duplicates
+For the agent continuing remediation of the 2026-08 performance audit.
+Rewritten 2026-08-04 at `cbd13754`: the audit (phases 0–4) is complete, and
+the first remediation wave has landed and been pushed through `208fc56a`.
+Your job is the remainder of the runway in
+[07-remediation-runway.md](07-remediation-runway.md) — the work index there
+is the live status table. This file tells you what to read, what already
+landed, the rules, and where each remaining item starts. It duplicates
 nothing; follow the links.
 
 ## Read first, in this order
 
 1. `STRUCTURE.md` (repo root) — architecture, run/verify commands, and the
-   **cross-cutting contracts** section; the contracts are inviolable.
-2. [00-charter.md](00-charter.md) — the concurrency model and cost rules. The
-   one-line version: this is a single-active-writer system, but the server
-   process still interleaves a storage FIFO, background schedulers, and worker
-   threads (hazard H4), so **every guard you will meet is load-bearing — your
-   findings are priced wrong, not wrong to exist. Re-price; never remove.**
-3. [04-candidate-findings.md](04-candidate-findings.md) + [06-verification.md](06-verification.md)
-   — the findings register (PF-01..PF-37) and which are CONFIRMED vs
-   static-only. **Anything not CONFIRMED must be re-verified against current
-   code before you implement it** (charter §5 procedure).
-4. [07-remediation-runway.md](07-remediation-runway.md) — tracks T1–T8, per-track
-   fix directions, design gates, regression proofs, and the work index you
-   keep updated.
+   **cross-cutting contracts**; the contracts are inviolable.
+2. [00-charter.md](00-charter.md) — concurrency model, cost rules, and the
+   §5 guard rubric. One line: every guard you meet is load-bearing — re-price,
+   never remove. Re-verify anything not CONFIRMED before implementing.
+3. [04-candidate-findings.md](04-candidate-findings.md) +
+   [06-verification.md](06-verification.md) — the findings register and
+   verdicts. 06 now also carries the T5-contained and T7 pre-implementation
+   re-verifications and the **PF-03 reattribution** (see traps below).
+4. [07-remediation-runway.md](07-remediation-runway.md) — tracks, fix
+   directions, gates, and the work index you keep updated.
+5. The design notes — both survived adversarial review and contain binding
+   invariants their implementations (and future changes) must preserve:
+   - [08-t1-chat-row-projection-design.md](08-t1-chat-row-projection-design.md)
+     (T1; §3 invariant: project only the current wire-bound row, never
+     acknowledged bases)
+   - [09-t2-boot-normalization-design.md](09-t2-boot-normalization-design.md)
+     (T2; §2.2 ingest ID-ordering invariant; §3-A is the measured PF-03
+     attribution and the spec for its fix)
 
-Supporting: [03-trace-baselines.md](03-trace-baselines.md) (measured numbers and
-what they mean), [01-](01-evidence-concurrency.md)/[02-](02-capability-inventory.md)/[05-](05-lens-evidence.md)
-(evidence appendices with file:line citations — line hints drift; re-`rg`).
+Supporting: [03-trace-baselines.md](03-trace-baselines.md) (pre-remediation
+numbers), [01](01-evidence-concurrency.md)/[02](02-capability-inventory.md)/
+[05](05-lens-evidence.md) (evidence appendices; line hints drift — re-`rg`).
 
-## Binding rules
+## What has landed (pushed through `208fc56a`)
 
-- **Design gates are real.** Items marked BLOCKED-NEEDS-DESIGN touch
-  serialization identity, publication atomicity, commit-outcome protocols, or
-  never-replay rules. Write a short design note and check it against the
-  STRUCTURE.md contracts before coding. No quick fixes across those lines.
-- **The budget ritual.** Every landed fix tightens its ceiling in
-  `test/e2e/helpers/budgets.ts` (or flips a `verification.spec.ts` assertion)
-  in the same commit. A win that isn't locked in doesn't count.
-- **Track status lives in the 07 work index.** Update it as you go, the way
-  the MessagePack runway's work index was maintained.
-- Project conventions (`CLAUDE.local.md`): conventional commit prefixes; use
-  Codex for broad/app-logic work and add the `Codex <noreply@openai.com>`
-  co-author trailer when it contributed; `parallel-luna-research` for broad
-  read-only exploration; `pnpm` only.
+| Commit | What | Key regression lock |
+|---|---|---|
+| `8b17bb4d` | T3: size-aware cached-boot bypass (≤128 KiB raw hint via `/api/session`) | PF-05 spec asserts route choice both ways |
+| `90f903e7` | T5-contained: stats routes + chat-content fallback through `prepareLiveDatabaseRead()`; cold-storage stats memo (`coldstorage/` `updated_at` now monotonic) | `NODE_ENV=test` cache-hit / recompute-counter assertions |
+| `053944f3` | T7 quick wins: `getInlayMetasBatch` in export, `readPersistentJsonBulk`, `readImage`/`loadAsset` → `getItemCached` | unit call-count assertions |
+| `c158794d` | T1 design note (08) | — |
+| `16236817` | T1 Phase 1: runtime-field projection; **sends are now sub-KB deltas** | PF-01 spec flipped: post-warm-up saves must be `chat-delta`, no `isStreaming`, ≤64 KB/post |
+| `e1d6fbbd` | T2 design note (09) | — |
+| `208fc56a` | T2 PF-04: shared defaults contract + ingest normalization + marker migration; **xl import patch 292 KB → 26 KB** | xl decomposition ceiling 320 ops / 32 KB; `xl-cold-boot` 64 KB |
+| `cbd13754` | PF-03 attribution (docs; unpushed at rewrite time) | — |
+
+Reclassifications the register now records: **PF-14** BLOCKED-NEEDS-DESIGN
+(recovery-inspect decode is load-bearing for its token protocol — the fix
+this file originally prescribed was wrong), **PF-31** refuted (no production
+caller), **PF-05 medium verdict** amended (the audit's raw reference was
+pre-normalization), **PF-03** reattributed (see below).
+
+## Binding rules (unchanged)
+
+- Design gates are real; BLOCKED-NEEDS-DESIGN items get a design note checked
+  against the STRUCTURE.md contracts, then an adversarial review round —
+  both T1 and T2 notes were materially corrected by review; budget for it.
+- The budget ritual: every landed fix tightens its ceiling in
+  `test/e2e/helpers/budgets.ts` or flips/tightens a `verification.spec.ts`
+  assertion in the same commit.
+- Track status lives in the 07 work index; update as you go.
+- Project conventions (`CLAUDE.local.md`): conventional commit prefixes;
+  Codex for broad/app-logic work with the `Codex <noreply@openai.com>`
+  co-author trailer; `parallel-luna-research` for broad read-only
+  exploration; `pnpm` only.
 
 ## Verifying your work
 
 ```bash
-pnpm build                 # REQUIRED before E2E: server serves dist/ and
-                           # rejects mutations from mismatched build stamps (426)
-pnpm test:e2e              # 14 scenarios incl. budget ceilings + verification specs
-pnpm test:server           # server unit suite
-pnpm test:compat           # storage/interchange integration (run for storage changes)
-POCKETRISU_QUEUE_DIAG=true pnpm test:e2e   # harvests per-label queue wait/hold
-                           # histograms into test-results/queue-diag.ndjson
+pnpm build                 # REQUIRED before E2E (426 on stamp mismatch)
+pnpm test                  # client (~2,137) + server (547) suites
+pnpm test:e2e              # 14/14; specs now encode FIXED behavior — never
+                           # loosen a flipped assertion to make a change pass
+pnpm test:compat           # storage/interchange; run for storage changes
+POCKETRISU_QUEUE_DIAG=true pnpm test:e2e   # queue wait/hold histograms →
+                           # test-results/queue-diag.ndjson
 ```
 
-Harness facts you'll need (details in `test/e2e/readme.md`):
+Harness facts (details in `test/e2e/readme.md`):
 
-- Fixture templates cache under `test/e2e/.templates/` — delete the directory
-  (or change a spec string in `global-setup.ts`) to force a rebuild.
-- Programmatic API calls against an E2E instance must send `x-client-build`
-  from `dist/build-stamp.json` (see `test/e2e/helpers/apiClient.ts`).
-- The mock model provider uses fixed port 46791; only `provider.spec.ts` and
-  `verification.spec.ts` bind it, one worker at a time.
-- `verification.spec.ts` assertions encode **current broken behavior** for
-  PF-01 (no delta content type, `isStreaming` present in row bytes). When T1
-  lands, flip them as described in the spec comments — that flip is the
-  regression proof.
+- Fixture templates cache under `test/e2e/.templates/` — **delete the
+  directory whenever a change affects imported state** (server ingest,
+  seed shape); stale templates silently mask ingest changes.
+- `test:compat` full runs currently flake under memory pressure
+  (`full-export-import-race` RSS caps, occasional `EADDRINUSE`,
+  `admitted-write-spool` timeout). Known issue, fix deferred by the owner:
+  if those are the only failures, rerun the files in isolation and report.
+- Programmatic API calls need `x-client-build` from `dist/build-stamp.json`.
+- The mock model provider uses fixed port 46791 (provider + verification
+  specs only, one worker at a time).
 
-## Where to start
+## Where to start: the remaining work
 
-Suggested order (rationale in 07): **T3 → T5-contained → T7 quick wins** while
-drafting the T1/T2 design notes; then T1 (the big win), T2, T4, T6, remainder.
-
-| Track | Start at | First move |
+| Item | Status / gate | Start at |
 |---|---|---|
-| T3 cached-boot sizing | `server/node/dbCachedRead.cjs`, client `src/ts/storage/nodeStorage.ts` (segmented boot ~`:4412`) | Size/segment-count threshold negotiated at boot; below it, raw read |
-| T5 contained | `server.cjs` `/api/db/stats/characters` (~`:19620`), `/modules`, header-less chat-content fallback | Route through `prepareLiveDatabaseRead()` like their siblings. Recovery inspect (PF-14) was reclassified needs-design on re-verification — its raw-byte token binding forbids the cache switch (06 §T5) |
-| T7 quick wins | `src/ts/characterPackage.ts:605` (per-inlay meta), `src/ts/translator/translator.ts:618`, `src/ts/globalApi.svelte.ts:218` (`readImage`) | Use the existing batch/cached siblings named in PF-29/30/33 |
-| T1 design note | `Chat` type + row encode path (`src/ts/storage/payloadCodec*`, `chatStorage.ts:230` context) | Persisted-row projection stripping runtime fields; hash-domain change ⇒ client/server lockstep behind the build stamp |
-| T2 design note | `src/ts/bootstrap.ts:157`, `src/ts/storage/database.svelte.ts:42` | Baseline capture after idempotent normalization, or server-side normalize at import |
-| T6 (blocked) | `queueStorageOperation` labels in `server.cjs` | Label the *unlabeled* 65 ms hold first; add contention + production-scale capture before ordering |
+| **PF-03 fix** (recommended next — also fixes a live idle-traffic bug) | Implementable; spec is 09 §3-A | Fresh creation publishes the normalized first-run graph atomically at the create boundary (shared fresh-database factory; browser-specific language/theme inputs explicitly represented). Touch points: client `bootstrap.ts` create-if-absent call (~`:164`), server `/api/db/create-if-absent` (`server.cjs` ~`:11140`), `RisuSavePatcher.initializeBaseline()` implicit `characters: []` (`risuSave.ts` ~`:1322`). Server-constructed graph projects 14 req / ~8.3 KB (meets both targets); a client-seeded body must be re-measured before claiming ≤32 KB. Regression: `first-run-boot` budget drops from 45 / 320 KB, plus a **no-409-on-first-run assertion** |
+| **T6 FIFO re-pricing** | Blocked on measurement | Label the *unlabeled* 65 ms hold in `queueStorageOperation` call sites first; then a contention scenario + production-scale fixture capture; ordering in 07 §T6 |
+| **T4 plugin protocol** | Ordered list in 07 §T4 | PF-09 manifest-cache revision split (server-contained) → PF-12 → PF-07 → PF-08; PF-06/PF-10 design-gated; PF-11 last. Regression needs the T8 plugin scenario |
+| **T5 remainder** | PF-17..20 design-gated; PF-14 needs its own design note | 07 §T5; PF-14's note must handle the raw-byte token binding (06 §T5 re-verification explains why the cache switch is forbidden) |
+| **T8 harness** | Prerequisite for T4/T6 proofs + new items | `test/e2e/readme.md` list, plus from this wave: the PF-03 test-only trace hook + first-run quiet-period assertion (09 §3-A proposal), and a durable-churn fixture (scriptstate/HypaV3) for T1 Phase 2 |
+| **T1 Phase 2 + PF-02** | Deferred pending measurement | 08 §6/§7; needs the durable-churn fixture to justify; PF-02 only if post-Phase-1 measurement still shows waste |
 
-## Traps discovered during the audit (do not rediscover them)
+## Traps (updated — do not rediscover)
 
-1. **First boot after any import/restore uploads a DB-scaled normalization
-   patch** (PF-04, one-time). Any boot measurement on a fresh fixture copy
-   includes it; the two-cold-boots scenario separates it.
-2. **The first cache-enabled boot cannot hit the resource cache** — the
-   opt-in popup is answered after that boot's DB read. Steady state begins at
-   the third boot. Don't "fix" this as a donation bug; it's ordering.
-3. **Response bytes are gzip-dependent** — budgets deliberately assert request
-   counts and upload bytes only. Don't add rx budgets without incompressible
-   fixtures (`helpers/seedData.ts` bodies are already incompressible).
-4. **PF-01's fix changes row bytes** — hash acknowledgements, resource-cache
-   seeding, chat-backup pre-images, and delta replay-exactness all key on
-   those bytes. That's why it's design-gated; budget for a lockstep deploy.
-5. **The send-path double write is timing-dependent** (~445 KB vs ~872 KB per
-   exchange). Measure send scenarios several times before drawing conclusions.
-6. **Point-in-time reads that bypass caches are sometimes intentional**
-   (import proofs, pinned snapshots, mutation-fresh validation). The charter's
-   §5 decision procedure tells you which; when in doubt it's INTENTIONAL?
-   until proven otherwise.
+1. **Fresh instances are in a 409 patch storm until the PF-03 fix lands**
+   (09 §3-A): one 296-op / 28.4 KB proposal replays every ~640 ms
+   indefinitely — `{}` vs the patcher's implicit `{characters: []}` can
+   never hash-match. Any measurement on an empty instance includes this
+   storm; the audit's "7 cycles" was just the capture window. Do not
+   interpret fresh-instance patch counts as producers.
+2. **The 08 §3 invariant is how T1 corrupts data if violated**: projection
+   applies only to the current wire-bound row; a projected acknowledged
+   base paired with an old-bytes hash makes the server accept a delta it
+   later fails to materialize (`CHAT_DELTA_LOG_CORRUPT`). Unit + compat
+   tests enforce it; keep them.
+3. **The 09 §2.2 invariant is how T2 loses data if violated**: no chat row
+   before its character's `chaId` exists. Assignment points are named in
+   the note; the `chats/undefined/*` write-then-sweep loss is what a naive
+   refactor reintroduces. The missing-`chaId` compat fixture enforces it.
+4. **First cache-enabled boot cannot hit the resource cache** (popup answers
+   after that boot's read). Steady state begins at the third boot. Ordering,
+   not a donation bug.
+5. **Response bytes are gzip-dependent** — budgets assert request counts and
+   upload bytes only. The PF-05 medium "3.5× penalty" verdict was an artifact
+   of a pre-normalization raw reference; per-post spec assertions, not rx
+   budgets, are the byte locks.
+6. **The send budgets (960 KB / 500 KB) deliberately include a legitimate
+   one-time full-row save** (chatId backfill on imported fixtures). The
+   steady-state protection is the per-post ≤64 KB delta assertion in the
+   PF-01 spec. Don't "fix" the budgets downward without restructuring the
+   scenario's warm-up.
+7. **Point-in-time reads that bypass caches are sometimes intentional** —
+   PF-14 is the canonical example now (token binds sha256 of raw bytes).
+   Charter §5 step 5; when in doubt it's INTENTIONAL until proven otherwise.
+8. **Cold-storage rows now rely on monotonic `updated_at`** (T5 PF-16 memo):
+   same-millisecond rewrites get +1 ms and the deletion journal is
+   consulted. Namespace-scoped to `coldstorage/`; don't generalize it, and
+   don't bypass `kvMutationUpdatedAt` when adding cold-row writers.
+9. **Adversarial review earns its cost** — every design note this wave was
+   materially corrected by refutation (T1 once, T2 twice). Run one before
+   implementing any gated item.
 
-## State at handover
+## State at rewrite
 
-- Branch `serve`; audit commits `ebc7ec88..c2354905` (6) **unpushed** at the
-  time of writing.
-- All tracks Open; no remediation has been implemented.
-- Known-good: `pnpm test:e2e` 13/13 (14 tests incl. parametrized PF-05),
-  `pnpm test:server` 542/542 at `c2354905`.
-- Deferred harness work (T8) is listed in `test/e2e/readme.md` — the
-  optimized-plugin and backup/import scenarios are prerequisites for T4/T6
-  regression proofs, not for design work.
+- Branch `serve` pushed through `208fc56a`; `cbd13754` (PF-03 attribution
+  docs) plus this rewrite are the only unpushed work at the time of writing.
+- Known-good: `pnpm test` client 2,137 + server 547, `pnpm test:e2e` 14/14,
+  `pnpm check` clean at `cbd13754`.
+- Wins locked so far: sends ~870 KB → sub-KB deltas; xl import boot patch
+  292 KB → 26 KB; small-DB boots skip IDB verification; stats/chat-content/
+  cold-storage request paths stopped re-decoding the world; client N+1s
+  batched and asset reads cache-routed.
