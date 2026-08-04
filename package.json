@@ -15,6 +15,7 @@
     "check:help": "node scripts/check-help-keys.mjs",
     "test": "vitest run && vitest run --config vitest.config.server.ts",
     "test:compat": "vitest run --config vitest.config.compat.ts",
+    "test:e2e": "playwright test -c test/e2e/playwright.config.ts",
     "test:performance": "node scripts/run-performance-tests.mjs",
     "test:performance:extreme": "node scripts/run-performance-extreme-tests.mjs",
     "test:server": "vitest run --config vitest.config.server.ts",
@@ -91,6 +92,7 @@
     "ws": "^8.18.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@rollup/plugin-strip": "^3.0.4",
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "@swc/core": "1.5.7",
