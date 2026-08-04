@@ -10,6 +10,11 @@ const {
 } = require('./utils.cjs');
 const { walkRisuSave } = require('./streamRisuLoad.cjs');
 const {
+    CHARACTER_DEFAULTS_MARKER_KEY,
+    CHARACTER_DEFAULTS_MARKER_VALUE,
+    applyDatabaseCharacterDefaults,
+} = require('./characterDefaults.cjs');
+const {
     CHAT_DELTA_FORMAT,
     CHAT_DELTA_PATCH_CONTENT_TYPE,
     applyValidatedChatDelta,
@@ -1221,6 +1226,7 @@ function createChatRowStore(options) {
             restoreResult = await opts.restoreColdStorageCharacters(dbObj);
         }
 
+        applyDatabaseCharacterDefaults(dbObj, randomUUID);
         const dedupeResult = dedupeCharacterIds(dbObj, randomUUID);
         const stubRowCopies = collectReassignedStubRowCopies(dedupeResult.reassignments);
         const normalizedOrphanFolderIds = normalizeOrphanFolderIds(dbObj);
@@ -1240,6 +1246,7 @@ function createChatRowStore(options) {
             }
             for (const key of staleKeys) kvDel(key);
             kvSet(EXTERNALIZATION_MARKER_KEY, EXTERNALIZATION_MARKER_VALUE);
+            kvSet(CHARACTER_DEFAULTS_MARKER_KEY, CHARACTER_DEFAULTS_MARKER_VALUE);
         });
         persist();
 
@@ -1380,6 +1387,7 @@ function createChatRowStore(options) {
             // their streamed state before the shared post-walk sweep.
             for (const character of dbObj.characters ?? []) {
                 if (!Array.isArray(character?.chats) || character.chats.length === 0) continue;
+                if (!character.chaId) continue;
                 seenCharacters.add(character);
                 streamedCharacterChaIds.set(character, character.chaId);
                 const reassignment = reassignmentsByNewChaId.get(character.chaId);
@@ -1406,6 +1414,10 @@ function createChatRowStore(options) {
             for (const reassignment of reassignments) {
                 reassignment.character.chaId = reassignment.newChaId;
             }
+            // Missing-ID characters deliberately stayed inline during the
+            // walk. Assign only on the restored remainder so the final shared
+            // extraction can never publish chats/undefined/* rows.
+            applyDatabaseCharacterDefaults(dbObj, randomUUID);
             // Characters without chats are first observed here, so streaming
             // cannot always preserve array-order ownership of a duplicate ID.
             const sweepResult = dedupeCharacterIds(
@@ -1441,6 +1453,7 @@ function createChatRowStore(options) {
             kvSet(DB_BLOB_KEY, Buffer.from(encodeRisuSaveLegacy(dbObj)));
             for (const key of staleKeys) kvDel(key);
             kvSet(EXTERNALIZATION_MARKER_KEY, EXTERNALIZATION_MARKER_VALUE);
+            kvSet(CHARACTER_DEFAULTS_MARKER_KEY, CHARACTER_DEFAULTS_MARKER_VALUE);
 
             if (ownsTransaction) db.exec('COMMIT');
             return {

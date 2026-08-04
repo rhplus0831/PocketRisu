@@ -177,6 +177,19 @@ async function decodedState(values: Map<string, Buffer>) {
   return Promise.all(keys.map(async key => [key, await decodeRisuSave(values.get(key)!)]))
 }
 
+function canonicalizeGeneratedIds(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.replace(/deterministic-id-\d+/g, '<generated-id>')
+  }
+  if (Array.isArray(value)) return value.map(canonicalizeGeneratedIds)
+  if (value && typeof value === 'object' && !Buffer.isBuffer(value) && !(value instanceof Date)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, canonicalizeGeneratedIds(entry)]),
+    )
+  }
+  return value
+}
+
 describe('disk-backed streaming Risu ingest', () => {
   test('skips every standard MessagePack marker, including 32-bit collections and extensions', async () => {
     const values = [
@@ -252,10 +265,13 @@ describe('disk-backed streaming Risu ingest', () => {
       const oldResult = await legacy.store.ingestFullDatabase(variant.oldBytes)
       const newResult = await streaming.store.ingestStreamingDatabase(variant.streamingSource)
 
-      expect(newResult.strippedDb, variant.name).toEqual(oldResult.strippedDb)
+      // Streaming must delay a missing character ID until after its walk, so
+      // generated IDs can be allocated in a different order while remaining opaque.
+      expect(canonicalizeGeneratedIds(newResult.strippedDb), variant.name)
+        .toEqual(canonicalizeGeneratedIds(oldResult.strippedDb))
       expect(newResult.stats, variant.name).toEqual(oldResult.stats)
-      expect(await decodedState(streaming.values), variant.name)
-        .toEqual(await decodedState(legacy.values))
+      expect(canonicalizeGeneratedIds(await decodedState(streaming.values)), variant.name)
+        .toEqual(canonicalizeGeneratedIds(await decodedState(legacy.values)))
     }
   })
 

@@ -8,30 +8,46 @@ import { assertPhaseBudget } from '../helpers/budgets.js'
 import { NetTrace, formatPhaseSummaries } from '../helpers/netTrace.js'
 import { launchServer, prepareInstanceDir } from '../helpers/server.js'
 
-test('two fresh-context cold boots – is the boot patch one-time?', async ({ browser }, testInfo) => {
-  const server = await launchServer(await prepareInstanceDir('medium'))
-  try {
-    const reports: Record<string, number> = {}
-    for (const label of ['first-cold-boot', 'second-cold-boot']) {
-      const context = await browser.newContext()
-      const page = await context.newPage()
-      const trace = NetTrace.start(page)
-      trace.phase(label)
-      await bootAndLogin(page, server.baseURL, { resourceCache: 'decline' })
-      await page.waitForTimeout(4000)
-      const report = await trace.attach(testInfo, `net-trace-${label}`)
-      console.log(formatPhaseSummaries(report))
-      const patch = report.phases[label].byPath['/api/patch']
-      reports[label] = patch ? patch.reqBytes : 0
-      await context.close()
+for (const template of ['medium', 'xl'] as const) {
+  test(`two fresh-context cold boots – imported ${template} normalization stays bounded`, async ({ browser }, testInfo) => {
+    const server = await launchServer(await prepareInstanceDir(template))
+    try {
+      const reports: Record<string, number> = {}
+      const patchBodies: Record<string, number> = {}
+      for (const label of ['first-cold-boot', 'second-cold-boot']) {
+        const context = await browser.newContext()
+        const page = await context.newPage()
+        let patchBodyBytes = 0
+        page.on('request', request => {
+          if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/patch') {
+            patchBodyBytes += request.postDataBuffer()?.byteLength ?? 0
+          }
+        })
+        const trace = NetTrace.start(page)
+        trace.phase(label)
+        await bootAndLogin(page, server.baseURL, { resourceCache: 'decline' })
+        await page.waitForTimeout(4000)
+        const report = await trace.attach(testInfo, `net-trace-${label}`)
+        console.log(formatPhaseSummaries(report))
+        const patch = report.phases[label].byPath['/api/patch']
+        reports[label] = patch ? patch.reqBytes : 0
+        patchBodies[label] = patchBodyBytes
+        await context.close()
+      }
+      console.log(
+        `${template} boot patch bytes: first-body=${patchBodies['first-cold-boot']} `
+        + `first-wire=${reports['first-cold-boot']} second-body=${patchBodies['second-cold-boot']}`,
+      )
+      // PF-04 leaves only bounded root migrations on a freshly imported DB;
+      // measured baselines: medium 22,983 B and xl 27,243 B including headers.
+      expect(reports['first-cold-boot']).toBeLessThanOrEqual(32_000)
+      expect(reports['second-cold-boot']).toBe(0)
+      expect(patchBodies['second-cold-boot']).toBe(0)
+    } finally {
+      await server.stop()
     }
-    console.log(`boot patch bytes: first=${reports['first-cold-boot']} second=${reports['second-cold-boot']}`)
-    // PF-04 invariant: normalization must stay one-time per instance.
-    expect(reports['second-cold-boot']).toBe(0)
-  } finally {
-    await server.stop()
-  }
-})
+  })
+}
 
 test('cold boot – first run on an empty instance', async ({ page }, testInfo) => {
   const server = await launchServer(await prepareInstanceDir())

@@ -130,6 +130,11 @@ const {
     validateDatabaseShape,
 } = require('./chatRows.cjs');
 const {
+    CHARACTER_DEFAULTS_MARKER_KEY,
+    CHARACTER_DEFAULTS_MARKER_VALUE,
+    applyDatabaseCharacterDefaults,
+} = require('./characterDefaults.cjs');
+const {
     CHAT_DELTA_CONTENT_TYPE,
     ChatDeltaValidationError,
 } = require('./chatDelta.cjs');
@@ -2383,6 +2388,35 @@ async function migrateChatsToRowsIfNeeded() {
         `[Migration] Chat externalization complete: ${result.stats.chats} chat row(s), `
         + `${result.stats.deletedStale} stale row(s) removed`
     );
+}
+
+async function migrateCharacterDefaultsIfNeeded() {
+    if (kvGet(CHARACTER_DEFAULTS_MARKER_KEY) !== null) return;
+    const raw = kvGet('database/database.bin');
+    if (!raw) {
+        kvSet(CHARACTER_DEFAULTS_MARKER_KEY, CHARACTER_DEFAULTS_MARKER_VALUE);
+        logger.info('[Migration] Character-defaults marker initialized (no database present)');
+        return;
+    }
+
+    const decoded = normalizeJSON(await decodeAuthoritativeDatabase(raw));
+    validateDatabaseShape(decoded);
+    applyDatabaseCharacterDefaults(decoded, nodeCrypto.randomUUID);
+    const reEncoded = Buffer.from(encodeRisuSaveLegacy(decoded));
+    const backupKey = `migration-backup/pre-character-defaults-${Date.now()}.bin`;
+
+    sqliteDb.transaction(() => {
+        kvCopyValue('database/database.bin', backupKey);
+        kvSet('database/database.bin', reEncoded);
+        kvSet(CHARACTER_DEFAULTS_MARKER_KEY, CHARACTER_DEFAULTS_MARKER_VALUE);
+    })();
+
+    // The authoritative re-encode can change RisuSave framing, raw ETag, and
+    // stored size while preserving the logical database. Readers revalidate
+    // those byte-derived values on their next request.
+    invalidateDbCache();
+    dbEtag = null;
+    logger.info(`[Migration] Character defaults persisted; safety backup at ${backupKey}`);
 }
 
 // Stub metadata fields a JSON Patch may legitimately touch on a `chats[i]`
@@ -9653,6 +9687,7 @@ async function importBackupFromSource(dataSource, {
         // format only — but a fresh import is a clear "data changed" signal.)
         kvDel(REMOTE_MIGRATION_MARKER_KEY);
         kvDel(CHAT_EXTERNALIZATION_MARKER_KEY);
+        kvDel(CHARACTER_DEFAULTS_MARKER_KEY);
         clearEntities();
 
         let pending = Buffer.alloc(0);
@@ -18708,6 +18743,7 @@ function clearExistingData() {
     // to re-evaluate against the new contents during post-import ingest.
     kvDel(REMOTE_MIGRATION_MARKER_KEY);
     kvDel(CHAT_EXTERNALIZATION_MARKER_KEY);
+    kvDel(CHARACTER_DEFAULTS_MARKER_KEY);
     clearEntities();
 }
 
@@ -21361,6 +21397,7 @@ async function startServer() {
             migrateAssetsToFilesystem();
             await migrateInlaysToFilesystem();
             await migrateChatsToRowsIfNeeded();
+            await migrateCharacterDefaultsIfNeeded();
             // The chat marker can already exist on databases restored by older
             // Node-only versions, so independently inspect the steady-state stub
             // for folded optimized plugin storage before accepting clients.

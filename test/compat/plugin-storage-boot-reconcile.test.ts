@@ -24,6 +24,7 @@ const VALUE_PREFIX = 'pluginsave/'
 const META_PREFIX = 'pluginsave-meta/'
 const CHAT_MIGRATION_KEY = 'migration/chats-externalized'
 const REMOTE_MIGRATION_KEY = 'migration/disable-remote-saving'
+const CHARACTER_DEFAULTS_MIGRATION_KEY = 'migration/character-defaults-normalized'
 
 const servers = new Set<ServerHandle>()
 
@@ -97,6 +98,7 @@ function seedOptimizedPublication(saveDir: string, seed: Seed): void {
     insert.run(DATABASE_KEY, databaseBytes, now)
     insert.run(CHAT_MIGRATION_KEY, Buffer.from('done'), now)
     insert.run(REMOTE_MIGRATION_KEY, Buffer.from('done'), now)
+    insert.run(CHARACTER_DEFAULTS_MIGRATION_KEY, Buffer.from('done'), now)
     insert.run(MANIFEST_KEY, Buffer.from(JSON.stringify({
       version: 2,
       generation: seed.generation,

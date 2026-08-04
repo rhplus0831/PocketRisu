@@ -1,0 +1,37 @@
+{
+  "characterDefaults": {
+    "type": "character",
+    "chatPage": 0,
+    "chats": [],
+    "customscript": [],
+    "firstMessage": "",
+    "globalLore": [],
+    "name": "",
+    "viewScreen": "none",
+    "emotionImages": []
+  },
+  "characterTypeDefaults": {
+    "bias": [],
+    "characterVersion": "",
+    "creator": "",
+    "desc": "",
+    "utilityBot": false,
+    "tags": [],
+    "systemPrompt": "",
+    "scenario": ""
+  },
+  "idAssignments": {
+    "character": {
+      "field": "chaId",
+      "missing": "falsy"
+    },
+    "persona": {
+      "field": "id",
+      "missing": "nullish"
+    },
+    "botPreset": {
+      "field": "id",
+      "missing": "falsy"
+    }
+  }
+}

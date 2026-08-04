@@ -43,6 +43,11 @@ import {
     setResourceCacheEnabled,
 } from "./storage/resourceCache";
 import { recoverDatabaseFromInternalSnapshots } from "./storage/bootSnapshotRecovery";
+import {
+    assignCharacterId,
+    assignPersonaId,
+    fillCharacterDefaults,
+} from "./storage/characterDefaults";
 
 const RESOURCE_CACHE_ANNOUNCED_KEY = 'pocketrisu-resource-cache-announced'
 
@@ -562,26 +567,7 @@ async function checkNewFormat(): Promise<void> {
             return null;
         }
         v.chaId ??= uuidv4();
-        v.type ??= 'character';
-        v.chatPage ??= 0;
-        v.chats ??= [];
-        v.customscript ??= [];
-        v.firstMessage ??= '';
-        v.globalLore ??= [];
-        v.name ??= '';
-        v.viewScreen ??= 'none';
-        v.emotionImages = v.emotionImages ?? [];
-
-        if (v.type === 'character') {
-            v.bias ??= [];
-            v.characterVersion ??= '';
-            v.creator ??= '';
-            v.desc ??= '';
-            v.utilityBot ??= false;
-            v.tags ??= [];
-            v.systemPrompt ??= '';
-            v.scenario ??= '';
-        }
+        fillCharacterDefaults(v);
         return v;
     }).filter((v) => {
         return v !== null;
@@ -650,7 +636,7 @@ async function checkNewFormat(): Promise<void> {
     });
 
     db.personas = (db.personas ?? []).map((v) => {
-        v.id ??= uuidv4()
+        assignPersonaId(v, uuidv4)
         return v
     }).filter((v) => {
         return v !== null && v !== undefined;
@@ -801,9 +787,7 @@ function assignIds() {
     const assignedCharacterIds = new Set<string>()
     for (let i = 0; i < DBState.db.characters.length; i++) {
         const cha = DBState.db.characters[i]
-        if (!cha.chaId) {
-            cha.chaId = uuidv4()
-        }
+        assignCharacterId(cha, uuidv4)
         if (assignedCharacterIds.has(cha.chaId)) {
             console.warn(`Duplicate chaId found: ${cha.chaId}. Assigning new ID.`);
             cha.chaId = uuidv4();

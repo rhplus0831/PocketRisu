@@ -22,6 +22,7 @@ const { calculateHash, encodeRisuSaveLegacy, normalizeJSON } = require('../../se
 const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
 const packr = new Packr({ useRecords: false })
 const DB_KEY = 'database/database.bin'
+const CHARACTER_DEFAULTS_MIGRATION_KEY = 'migration/character-defaults-normalized'
 const DB_PATH_HEX = Buffer.from(DB_KEY, 'utf-8').toString('hex')
 const DB_ENCODING_STATS_PATH = 'save/db-canonical-encoding-stats.json'
 const CANONICAL_ETAG_FIXTURE = {
@@ -135,6 +136,7 @@ function makeExternalizedSeed(): {
   rows.set(DB_KEY, encodeRisuDat(strippedDb))
   rows.set('migration/chats-externalized', Buffer.from('done'))
   rows.set('migration/disable-remote-saving', Buffer.from('done'))
+  rows.set(CHARACTER_DEFAULTS_MIGRATION_KEY, Buffer.from('done'))
   return { strippedDb, rows }
 }
 
@@ -249,6 +251,7 @@ async function bootCanonicalEtagFixture(options: {
         insert.run(DB_KEY, Buffer.from(CANONICAL_ETAG_FIXTURE_HEX, 'hex'), now)
         insert.run('migration/chats-externalized', Buffer.from('done'), now)
         insert.run('migration/disable-remote-saving', Buffer.from('done'), now)
+        insert.run(CHARACTER_DEFAULTS_MIGRATION_KEY, Buffer.from('done'), now)
       } finally {
         database.close()
       }

@@ -145,8 +145,8 @@ test(`PF-05: cached boot crossover (${template})`, async ({ browser }, testInfo)
         expect(sizes[`${phase}-cached-count`]).toBe(0)
         expect(sizes[`${phase}-raw-count`]).toBe(1)
       }
-      // The cache-enabled boot persists normalization before these reloads;
-      // measured raw-route steady state is 7,389 B including headers.
+      // Server ingest already persisted character normalization in the
+      // template; measured raw-route steady state is 7,389 B including headers.
       expect(steadyTotal).toBeLessThanOrEqual(8_500)
     } else {
       for (const phase of ['warm-boot', 'warm-boot-2']) {
@@ -162,13 +162,14 @@ test(`PF-05: cached boot crossover (${template})`, async ({ browser }, testInfo)
 })
 }
 
-test('PF-03/PF-04: decompose the first-boot normalization patches', async ({ page }, testInfo) => {
+test('PF-03/PF-04: imported xl boot has no character-default patch', async ({ page }, testInfo) => {
   const server = await launchServer(await prepareInstanceDir('xl'))
   const patches: Array<{ ops: number; bytes: number; topPaths: Record<string, number> }> = []
   try {
     await page.route('**/api/patch', async (route) => {
       if (route.request().method() === 'POST') {
         const raw = route.request().postData()
+        const rawBytes = route.request().postDataBuffer()?.byteLength ?? 0
         if (raw) {
           try {
             const parsed = JSON.parse(raw)
@@ -178,9 +179,9 @@ test('PF-03/PF-04: decompose the first-boot normalization patches', async ({ pag
               const top = '/' + (String(op.path ?? '').split('/')[1] ?? '')
               topPaths[top] = (topPaths[top] ?? 0) + 1
             }
-            patches.push({ ops: ops.length, bytes: raw.length, topPaths })
+            patches.push({ ops: ops.length, bytes: rawBytes, topPaths })
           } catch {
-            patches.push({ ops: -1, bytes: raw.length, topPaths: {} })
+            patches.push({ ops: -1, bytes: rawBytes, topPaths: {} })
           }
         }
       }
@@ -198,6 +199,11 @@ test('PF-03/PF-04: decompose the first-boot normalization patches', async ({ pag
       top: Object.entries(p.topPaths).sort((a, b) => b[1] - a[1]).slice(0, 5),
     }))))
     expect(patches.length).toBeGreaterThan(0)
+    // PF-04 measured 269 ops / 26,384 B, down from 3,870 / 292,736 B.
+    expect(patches.reduce((sum, patch) => sum + patch.ops, 0)).toBeLessThanOrEqual(320)
+    expect(patches.reduce((sum, patch) => sum + patch.bytes, 0)).toBeLessThanOrEqual(32_000)
+    expect(patches.reduce((sum, patch) => sum + (patch.topPaths['/characters'] ?? 0), 0))
+      .toBe(0)
   } finally {
     await server.stop()
   }

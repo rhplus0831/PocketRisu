@@ -145,7 +145,7 @@ T4/T6 regression proofs, not for their design work.
 | Track | Findings | Status | Gate |
 |---|---|---|---|
 | T1 chat deltas | PF-01, PF-02 | Phase 1 landed (PF-01 client-only projection per [08-t1-chat-row-projection-design.md](08-t1-chat-row-projection-design.md)); Phase 2 durable-path delta admission and PF-02 checkpoint/final coalescing deferred pending post-landing measurement | PF-01 verification flip and send budgets; Phase 2 requires a durable-churn fixture |
-| T2 boot normalization | PF-03, PF-04 | Design note done: [09-t2-boot-normalization-design.md](09-t2-boot-normalization-design.md) (PF-04: server-persisted defaults at ingest + marker migration; PF-03: attribution-first). Survived two adversarial review rounds | PF-04 implementable; PF-03 blocked on producer attribution |
+| T2 boot normalization | PF-03, PF-04 | PF-04 landed per [09-t2-boot-normalization-design.md](09-t2-boot-normalization-design.md): shared defaults, server-persisted ingest normalization, and marker-gated boot migration. PF-03 remains attribution-first | PF-03 blocked on producer attribution |
 | T3 size-aware cached boot | PF-05 | Landed (128 KiB raw bypass; segmentation coarsening and budget-aware IDB verification deferred) | PF-05 small-raw/large-cached route regression |
 | T4 plugin protocol | PF-06..12 | Open | Items 5–6 design-gated |
 | T5 materialization | PF-13..20 | Landed-contained (PF-13/PF-15/PF-16); PF-14 BLOCKED-NEEDS-DESIGN per the separate 06 amendment; PF-17..20 Open | PF-14 design note; PF-17..20 design-gated |

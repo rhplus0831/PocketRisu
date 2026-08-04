@@ -21,6 +21,7 @@ import type { ApiKeyPoolEntry, ModelBindingFields, ModelBindingSet, ModelPreset,
 import { emptyModelBinding } from '../preset/types';
 import { copyDatabasePluginStorageRecord } from '../plugins/pluginStorageRecord';
 import { isChatStub } from './chatStub';
+import { assignBotPresetId } from './characterDefaults';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
 export let appVer = "2026.2.291" //<APP_VERSION_POINT>
@@ -195,9 +196,7 @@ export function setDatabase(data:Database){
     // (db.botPresetsId index) remains the source of truth for active preset.
     if (Array.isArray(data.botPresets)) {
         for (const preset of data.botPresets) {
-            if (preset && !preset.id) {
-                preset.id = uuidv4()
-            }
+            if (preset) assignBotPresetId(preset, uuidv4)
         }
     }
     if(checkNullish(data.botPresetsId)){

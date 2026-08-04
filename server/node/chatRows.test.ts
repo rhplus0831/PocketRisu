@@ -1015,9 +1015,30 @@ describe('ingestFullDatabase', () => {
         expect(await store.readChatRow('char', 'stale')).toBeNull()
         expect(await store.readChatRow('char', 'new')).toMatchObject({ id: 'new' })
         expect(kvGet('migration/chats-externalized')?.toString()).toBe('done')
+        expect(kvGet('migration/character-defaults-normalized')?.toString()).toBe('done')
         expect(
             normalizeJSON(await decodeRisuSave(kvGet('database/database.bin') as Buffer)),
         ).toEqual(result.strippedDb)
+    })
+
+    it('assigns a missing character id before writing and preserves its hydratable chats', async () => {
+        const { store } = makeHarness({ randomUUID: () => 'full-character-id' })
+        const result = await store.ingestFullDatabase({
+            characters: [{
+                chaId: '',
+                chats: [{ id: 'full-chat', name: 'Full', message: [{ data: 'kept' }] }],
+            }],
+        })
+
+        const character = result.strippedDb.characters[0]
+        expect(character.chaId).toBe('full-character-id')
+        expect(store.listAllChatRowKeys()).toEqual([
+            store.chatRowKey('full-character-id', 'full-chat'),
+        ])
+        expect(store.listAllChatRowKeys().some(key => key.startsWith('chats/undefined/')))
+            .toBe(false)
+        const assembled = await store.assembleFullDb(result.strippedDb)
+        expect(assembled.characters[0].chats[0].message).toEqual([{ data: 'kept' }])
     })
 
     it('uses fresh Buffer input from beforeDecode and invokes hooks in order', async () => {
@@ -1181,5 +1202,34 @@ describe('ingestStreamingDatabase', () => {
         expect(result.stats.reassignedDuplicateChaIds).toBe(1)
         const assembled = await store.assembleFullDb(result.strippedDb)
         expect(assembled.characters[1].chats[0].message).toEqual([{ data: 'kept' }])
+    })
+
+    it('keeps a missing-id character inline until the restored remainder can be assigned safely', async () => {
+        const { store, kvGet } = makeHarness({ randomUUID: () => 'stream-character-id' })
+        const source = Buffer.from(encodeRisuSaveLegacy({
+            characters: [{
+                chaId: '',
+                chats: [{ id: 'stream-chat', name: 'Stream', message: [{ data: 'kept' }] }],
+            }],
+        }))
+
+        const result = await store.ingestStreamingDatabase(source, {
+            restoreColdStorageCharacters: (dbObj: any) => {
+                expect(store.listAllChatRowKeys()).toEqual([])
+                dbObj.characters[0].chaId = ''
+                return { restored: 1, failed: 0, failedNames: [] }
+            },
+        })
+
+        const character = result.strippedDb.characters[0]
+        expect(character.chaId).toBe('stream-character-id')
+        expect(store.listAllChatRowKeys()).toEqual([
+            store.chatRowKey('stream-character-id', 'stream-chat'),
+        ])
+        expect(store.listAllChatRowKeys().some(key => key.startsWith('chats/undefined/')))
+            .toBe(false)
+        expect(kvGet('migration/character-defaults-normalized')?.toString()).toBe('done')
+        const assembled = await store.assembleFullDb(result.strippedDb)
+        expect(assembled.characters[0].chats[0].message).toEqual([{ data: 'kept' }])
     })
 })

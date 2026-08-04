@@ -80,6 +80,8 @@ export function createE2eSeedBackup(spec: E2eSeedSpec): Buffer {
     })),
     chatPage: 0,
     image: '',
+    // Keep the performance fixture focused on the shared ingest defaults.
+    sdData: [],
     type: 'character',
   }))
 
