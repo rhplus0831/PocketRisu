@@ -1452,7 +1452,9 @@ function createChatBackupStore(options) {
     function reconcileChatBackups() {
         const operation = () => reconcileOnDisk();
         if (typeof runStorageOperation === 'function') {
-            return Promise.resolve().then(() => runStorageOperation(operation));
+            return Promise.resolve().then(() => (
+                runStorageOperation(operation, 'chat-backup-reconcile')
+            ));
         }
         const run = localReconcileQueue.then(operation, operation);
         localReconcileQueue = run.catch(() => {});

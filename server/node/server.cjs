@@ -642,9 +642,114 @@ function seedDbCacheEtag(filePath, etag) {
     dbDerivedValueMemo.seed(filePath, 'etag', etag);
 }
 
+const STORAGE_QUEUE_DIAG_ENABLED = process.env.POCKETRISU_QUEUE_DIAG === 'true';
+const STORAGE_QUEUE_DIAG_SAMPLE_LIMIT = 512;
+const storageQueueDiagByLabel = STORAGE_QUEUE_DIAG_ENABLED ? new Map() : null;
+
+function recordStorageQueueDiag(label, waitMs, holdMs) {
+    let stats = storageQueueDiagByLabel.get(label);
+    if (!stats) {
+        stats = {
+            count: 0,
+            waitTotalMs: 0,
+            waitMaxMs: 0,
+            holdTotalMs: 0,
+            holdMaxMs: 0,
+            samples: [],
+        };
+        storageQueueDiagByLabel.set(label, stats);
+    }
+    stats.count++;
+    stats.waitTotalMs += waitMs;
+    stats.waitMaxMs = Math.max(stats.waitMaxMs, waitMs);
+    stats.holdTotalMs += holdMs;
+    stats.holdMaxMs = Math.max(stats.holdMaxMs, holdMs);
+    const sample = { waitMs, holdMs };
+    if (stats.samples.length < STORAGE_QUEUE_DIAG_SAMPLE_LIMIT) {
+        stats.samples.push(sample);
+    } else {
+        const replacement = Math.floor(Math.random() * stats.count);
+        if (replacement < STORAGE_QUEUE_DIAG_SAMPLE_LIMIT) {
+            stats.samples[replacement] = sample;
+        }
+    }
+}
+
+function storageQueueDiagPercentile(sortedValues, percentile) {
+    if (sortedValues.length === 0) return 0;
+    const index = Math.min(
+        sortedValues.length - 1,
+        Math.max(0, Math.ceil(sortedValues.length * percentile) - 1),
+    );
+    return sortedValues[index];
+}
+
+function storageQueueDiagSnapshot() {
+    const labels = Object.create(null);
+    for (const [label, stats] of [...storageQueueDiagByLabel.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))) {
+        const waitSample = stats.samples.map(sample => sample.waitMs).sort((a, b) => a - b);
+        const holdSample = stats.samples.map(sample => sample.holdMs).sort((a, b) => a - b);
+        labels[label] = {
+            count: stats.count,
+            sampleCount: stats.samples.length,
+            waitMs: {
+                total: stats.waitTotalMs,
+                max: stats.waitMaxMs,
+                p50: storageQueueDiagPercentile(waitSample, 0.5),
+                p95: storageQueueDiagPercentile(waitSample, 0.95),
+            },
+            holdMs: {
+                total: stats.holdTotalMs,
+                max: stats.holdMaxMs,
+                p50: storageQueueDiagPercentile(holdSample, 0.5),
+                p95: storageQueueDiagPercentile(holdSample, 0.95),
+            },
+        };
+    }
+    return {
+        enabled: true,
+        sampleLimit: STORAGE_QUEUE_DIAG_SAMPLE_LIMIT,
+        labels,
+    };
+}
+
+function logStorageQueueDiagSummary() {
+    const { labels } = storageQueueDiagSnapshot();
+    for (const [label, stats] of Object.entries(labels)) {
+        const wait = stats.waitMs;
+        const hold = stats.holdMs;
+        console.log(
+            `[QueueDiag] ${label} count=${stats.count} `
+            + `wait_ms(total=${wait.total.toFixed(3)},max=${wait.max.toFixed(3)},p50=${wait.p50.toFixed(3)},p95=${wait.p95.toFixed(3)}) `
+            + `hold_ms(total=${hold.total.toFixed(3)},max=${hold.max.toFixed(3)},p50=${hold.p50.toFixed(3)},p95=${hold.p95.toFixed(3)})`,
+        );
+    }
+}
+
 let storageOperationQueue = Promise.resolve();
-function queueStorageOperation(operation) {
-    const operationRun = storageOperationQueue.then(operation, operation);
+function queueStorageOperation(operation, label = 'unlabeled') {
+    // Preserve the original callback and promise chain when diagnostics are off.
+    if (!STORAGE_QUEUE_DIAG_ENABLED) {
+        const operationRun = storageOperationQueue.then(operation, operation);
+        storageOperationQueue = operationRun.catch(() => {});
+        return operationRun;
+    }
+    const enqueuedAt = performance.now();
+    const diagLabel = typeof label === 'string' && label.length > 0 ? label : 'unlabeled';
+    const timedOperation = async (value) => {
+        const startedAt = performance.now();
+        try {
+            return await operation(value);
+        } finally {
+            recordStorageQueueDiag(
+                diagLabel,
+                startedAt - enqueuedAt,
+                performance.now() - startedAt,
+            );
+        }
+    };
+    const operationRun = storageOperationQueue.then(timedOperation, timedOperation);
     storageOperationQueue = operationRun.catch(() => {});
     return operationRun;
 }
@@ -699,11 +804,11 @@ class ImportInProgressError extends Error {
 // Every KV/chat-row/asset mutation must run through this, not through
 // queueStorageOperation directly. The barrier check has to happen inside the
 // queued callback: the serial FIFO order is what makes the boundary airtight.
-function queueStorageMutation(operation) {
+function queueStorageMutation(operation, label = 'unlabeled') {
     return queueStorageOperation(() => {
         if (importBarrier.isHeld()) throw new ImportInProgressError();
         return operation();
-    });
+    }, label);
 }
 
 // ─── SQLite durability policy ───────────────────────────────────────────────
@@ -1497,8 +1602,8 @@ function snapshotSourceTokensEqual(left, right) {
     return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function runAutomaticSnapshotStoragePhase(storageAlreadyExclusive, operation) {
-    return storageAlreadyExclusive ? operation() : queueStorageMutation(operation);
+function runAutomaticSnapshotStoragePhase(storageAlreadyExclusive, operation, label) {
+    return storageAlreadyExclusive ? operation() : queueStorageMutation(operation, label);
 }
 
 async function captureAutomaticSnapshotSource(storageAlreadyExclusive) {
@@ -1521,7 +1626,7 @@ async function captureAutomaticSnapshotSource(storageAlreadyExclusive) {
             snapshot.close();
             throw error;
         }
-    });
+    }, 'snapshot-capture');
 }
 
 async function assembleAutomaticSnapshotSource(captured) {
@@ -1630,7 +1735,7 @@ async function publishAutomaticSnapshot(
         snapshotTestStats.publications += 1;
         publishSnapshotTestStats();
         return { published: true, mismatch: false };
-    });
+    }, 'snapshot-publish');
 }
 
 async function publishAutomaticSnapshotAfterImports(
@@ -6423,7 +6528,7 @@ async function reconcileOptimizedPluginStorageForBoot(req, expectedEtag) {
             databaseChanged: cleanup.databaseChanged,
             storageChanged: copiedRows,
         };
-    });
+    }, 'plugin-boot-reconcile');
     if (copiedRows || result.databaseChanged) schedulePluginRecoverySnapshot();
     return result;
 }
@@ -7279,7 +7384,7 @@ async function runServerAssetCleanup({ now = Date.now(), source = 'manual' } = {
             + `${result.deleted} deleted`,
         );
         return result;
-    });
+    }, 'asset-gc');
 }
 
 let assetGcTimer = null;
@@ -7528,7 +7633,7 @@ async function buildSelfContainedBackupDatabase({
             snapshot = await queueStorageOperation(async () => {
                 await flushPendingDb();
                 return createKvSnapshot();
-            });
+            }, 'snapshot-capture');
             ownsSnapshot = true;
         }
         if (databaseSource) {
@@ -16225,7 +16330,7 @@ async function handleSpooledKvWrite(req, res, next, {
                     ? (prepared.chunkPlan?.sha256 ?? writeResult?.sha256)
                     : undefined,
             });
-        });
+        }, 'api-write-publish');
         if (shouldCreateBackup) scheduleBackupAndRotate();
     } catch (error) {
         if (isImportInProgressError(error)) return sendImportBusy(res);
@@ -16564,7 +16669,7 @@ app.post('/api/write', async (req, res, next) => {
                 etag: key === 'database/database.bin' ? dbEtag : undefined,
                 hash: key.startsWith(PLUGIN_SAVE_PREFIX) ? sha256Hex(fileContent) : undefined,
             });
-        });
+        }, 'api-write-publish');
         if (shouldCreateBackup) scheduleBackupAndRotate();
     } catch (error) {
         if (isImportInProgressError(error)) return sendImportBusy(res);
@@ -16870,7 +16975,7 @@ app.post('/api/patch', async (req, res, next) => {
                     } finally {
                         if (saveTimers[filePath] === saveTimer) delete saveTimers[filePath];
                     }
-                }).catch((error) => {
+                }, 'patch-persist').catch((error) => {
                     if (saveTimers[filePath] === saveTimer) delete saveTimers[filePath];
                     if (isImportInProgressError(error)) {
                         // The import replaces this key wholesale and drops dbCache,
@@ -18254,7 +18359,10 @@ function scheduleChatDeltaCompaction(chaId, chatId) {
     if (pendingChatDeltaCompactions.has(key)) return;
     pendingChatDeltaCompactions.add(key);
     setImmediate(() => {
-        queueStorageMutation(() => chatRowStore.compactChatRow(chaId, chatId))
+        queueStorageMutation(
+            () => chatRowStore.compactChatRow(chaId, chatId),
+            'chat-log-compact',
+        )
             .catch(error => {
                 logger.error(`[ChatDelta] Compaction failed for ${key}:`, error);
             })
@@ -18324,7 +18432,7 @@ async function handleChatDeltaWrite(req, res, next) {
                 size: result.size,
                 log: { count: result.logCount, bytes: result.logBytes },
             });
-        });
+        }, 'chat-preimage+write');
         if (shouldCreateBackup) scheduleBackupAndRotate();
         if (shouldCompact) {
             scheduleChatDeltaCompaction(req.params.chaId, req.headers['x-chat-id']);
@@ -18388,7 +18496,7 @@ async function handleSpooledChatWrite(req, res, next, spool) {
             );
             shouldCreateBackup = true;
             res.json({ success: true, hash });
-        });
+        }, 'chat-preimage+write');
         if (shouldCreateBackup) scheduleBackupAndRotate();
     } catch (error) {
         if (isImportInProgressError(error)) return sendImportBusy(res);
@@ -18493,7 +18601,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
             // large store cannot turn this acknowledgement into a timeout.
             shouldCreateBackup = true;
             res.json({ success: true, hash });
-        });
+        }, 'chat-preimage+write');
         if (shouldCreateBackup) scheduleBackupAndRotate();
     } catch (error) {
         if (isImportInProgressError(error)) return sendImportBusy(res);
@@ -19375,6 +19483,13 @@ async function estimateServerBackupSize(reader = null) {
         : listColdStorageBackupEntries()) total += e.size;
     total += await sumInlayFsBytes();
     return total;
+}
+
+if (STORAGE_QUEUE_DIAG_ENABLED) {
+    app.get('/api/debug/queue-diag', async (req, res) => {
+        if (!await checkAuth(req, res)) return;
+        res.json(storageQueueDiagSnapshot());
+    });
 }
 
 app.get('/api/db/stats', async (req, res, next) => {
@@ -21171,6 +21286,9 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
         try {
             await runTrackedWalCheckpointWithBusyRetry('TRUNCATE', 'graceful-shutdown');
         } catch { /* non-fatal */ }
+        if (sig === 'SIGTERM' && STORAGE_QUEUE_DIAG_ENABLED) {
+            logStorageQueueDiagSummary();
+        }
         try { modelJobs.close(); } catch (e) { logger.error('[ModelJobs] Close error:', e); }
         try { requestLogs.close(); } catch (e) { logger.error('[RequestLogs] Close error:', e); }
         process.exit(0);
