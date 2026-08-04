@@ -6,6 +6,7 @@
 - Severity: High
 - Area: server persistence core
 - Affected code: `server/node/server.cjs:139` (`SAVE_INTERVAL` = 5 s), `server/node/server.cjs:4475-4553` (patch applied to `dbCache`, persistence deferred, success returned), `server/node/server.cjs:753-804` (`persistDbCache` commits later), `server/node/logs.cjs:323-356` (uncaught-exception/unhandled-rejection handlers `process.exit(1)` without flushing), `src/ts/globalApi.svelte.ts:1043-1057` (client clears dirty tracking on ack)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

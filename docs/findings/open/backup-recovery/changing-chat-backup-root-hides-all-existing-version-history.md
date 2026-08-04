@@ -7,6 +7,7 @@
 - Lens: L3, D3, D5
 - Area: Area 8 — mode matrix and round trips
 - Affected code: `server/node/chatBackups.cjs:67`, `server/node/server.cjs:932`, `server/node/server.cjs:976`, `server/node/server.cjs:985`, `server/node/chatBackups.cjs:391`, `server/node/chatBackups.cjs:1007`
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

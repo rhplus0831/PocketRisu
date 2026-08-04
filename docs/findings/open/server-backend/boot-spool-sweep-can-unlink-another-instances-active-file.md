@@ -7,13 +7,15 @@
 - Lens: D5, L3
 - Area: Area 5 — server KV core and chat rows
 - Affected code: `server/node/server.cjs:872-899`, `server/node/server.cjs:2500-2504`, `server/node/server.cjs:355-390`
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 
 Startup removes every regular file beginning `.database-risudat-` in the
 configured spool directory. Generated names contain a PID and UUID, but the
-sweep checks no owner, liveness, age, or lock. Shared spool volumes are plausible
-for the multi-instance hub roadmap.
+sweep checks no owner, liveness, age, or lock; revalidation found it now also
+unlinks additional unowned spool prefixes, slightly widening the exposure.
+Shared spool volumes are plausible for the multi-instance hub roadmap.
 
 Starting instance B can unlink instance A's active snapshot spool. On POSIX the
 open writer continues into an unlinked inode, but A's later pathname-based ingest

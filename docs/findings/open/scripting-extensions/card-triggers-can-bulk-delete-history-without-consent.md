@@ -6,6 +6,7 @@
 - Severity: Medium
 - Area: scripting / trust boundaries (upstream-inherited surface)
 - Affected code: `src/ts/characterCards.ts:830-835` (import consent gate checks only `risuext.lowLevelAccess`), `src/ts/process/triggers.ts:1798-1809` (`v2CutChat` = unrestricted `message.slice`), `src/ts/process/scriptings.ts:167-260` (Lua `cutChat`/`removeChat`/`setFullChat` outside low-level gating), `src/lib/ChatScreens/DefaultChatScreen.svelte:368-394` (input triggers run automatically on send)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

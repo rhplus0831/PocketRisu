@@ -6,6 +6,7 @@
 - Severity: Low
 - Area: server persistence core (compatibility path)
 - Affected code: `server/node/dbCachedRead.cjs:66-72`, `server/node/server.cjs:154-156` (ETag = stub database only), `server/node/server.cjs:5524-5577` (`/api/chat-content` never changes `dbEtag`), `server/node/server.cjs:4311-4335` (compat full write commits payload chat rows without pre-image capture), `server/node/server.cjs:1690-1694` (headerless clients bypass the writer lock)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

@@ -4,6 +4,7 @@
 - Severity: Warning
 - Owner: scripting and extensions
 - Source: [delta audit DA-10](../../../../.archived-docs/findings/2026-08-delta-audit/02-findings.md#da-10-lua-upsertlocallorebook-edits-are-discarded-in-non-display-trigger-modes-s)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 `upsertLocalLoreBook` mutates a cloned character, while non-display trigger
 execution writes back only selected fields and omits `chats[].localLore`. The

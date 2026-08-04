@@ -4,6 +4,7 @@
 - Severity: Warning
 - Owner: plugin storage
 - Source: [delta audit DA-16](../../../../.archived-docs/findings/2026-08-delta-audit/02-findings.md#da-16-queued-recovery-actions-are-not-re-bound-to-the-writer-epoch-c-f4)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 Destructive recovery checks the session before queueing, but the queued
 callback does not revalidate ownership and the recovery HMAC binds no writer

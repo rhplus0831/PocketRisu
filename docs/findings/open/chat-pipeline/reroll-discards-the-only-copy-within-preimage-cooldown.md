@@ -6,6 +6,7 @@
 - Severity: High
 - Area: chat pipeline / chat version backups
 - Affected code: `src/lib/ChatScreens/DefaultChatScreen.svelte:453-459` (old response and swipes held only in local variables), `src/lib/ChatScreens/DefaultChatScreen.svelte:481-483` (reason tag + truncation committed before generation), `server/node/chatBackups.cjs:606-613` (cooldown skips capture regardless of reason), `src/ts/storage/chatPersistStage.ts:144-180` (first generation checkpoint persists unconditionally), `server/node/server.cjs:284-287` (5-minute snapshot cooldown)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

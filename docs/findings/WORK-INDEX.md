@@ -5,7 +5,7 @@ Run `pnpm check:docs` after changing a finding, status, path, or link.
 These are point-in-time reports; revalidate their evidence against current code
 before implementation.
 
-Current catalog: **47 open**, **2 deferred**, and **5 accepted decisions**.
+Current catalog: **44 open**, **1 deferred**, and **5 accepted decisions**.
 
 ## Active work by owner
 
@@ -17,10 +17,8 @@ Current catalog: **47 open**, **2 deferred**, and **5 accepted decisions**.
 | `FND-changing-chat-backup-root-hides-all-existing-version-history` | [Changing the chat-backup root hides all existing version history](open/backup-recovery/changing-chat-backup-root-hides-all-existing-version-history.md) | Open | 2026-07 data-loss audit |
 | `FND-chat-version-backups-do-not-keep-referenced-inlays-live` | [Chat-version backups do not keep referenced inlays live](open/backup-recovery/chat-version-backups-do-not-keep-referenced-inlays-live.md) | Open | 2026-07 data-loss audit |
 | `FND-chat-version-import-acknowledges-before-save` | [Chat-version import reports success before anything is persisted](open/backup-recovery/chat-version-import-acknowledges-before-save.md) | Open | 2026-07 data-loss audit |
-| `FND-direct-flush-callers-bypass-automatic-snapshot-serialization` | [Direct flush callers bypass automatic-snapshot serialization](open/backup-recovery/direct-flush-callers-bypass-automatic-snapshot-serialization.md) | Open | 2026-07 data-loss audit |
-| `FND-html-chat-round-trip-rejects-the-default-empty-note` | [HTML chat round trip rejects the default empty note](open/backup-recovery/html-chat-round-trip-rejects-the-default-empty-note.md) | Open | 2026-07 data-loss audit |
 | `FND-unmigrated-kv-inlays-are-omitted-from-backups` | [Inlays still served from KV fallback are omitted from backups and cleared on restore](open/backup-recovery/unmigrated-kv-inlays-are-omitted-from-backups.md) | Open | 2026-07 data-loss audit |
-| `FND-server-backup-published-without-fsync` | [Server backups are acknowledged before reaching stable storage](open/backup-recovery/server-backup-published-without-fsync.md) | Open | 2026-07 data-loss audit |
+| `FND-server-backup-published-without-fsync` | [Server backups are acknowledged before the directory entry is durable](open/backup-recovery/server-backup-published-without-fsync.md) | Open | 2026-07 data-loss audit |
 | `FND-upstream-compatible-backup-drops-live-inlays-but-keeps-their-chat-references` | [Upstream-compatible backup drops live inlays but keeps their chat references](open/backup-recovery/upstream-compatible-backup-drops-live-inlays-but-keeps-their-chat-references.md) | Open | 2026-07 data-loss audit |
 | `FND-wall-clock-rollback-disables-chat-preimage-capture` | [Wall-clock rollback disables chat pre-image capture](open/backup-recovery/wall-clock-rollback-disables-chat-preimage-capture.md) | Open | 2026-07 data-loss audit |
 
@@ -50,14 +48,13 @@ Current catalog: **47 open**, **2 deferred**, and **5 accepted decisions**.
 | `FND-acknowledged-patches-are-not-durable` | [Acknowledged database patches are not durable for up to five seconds](open/client-storage/acknowledged-patches-are-not-durable.md) | Deferred | 2026-07 data-loss audit |
 | `FND-build-mismatch-reload-can-discard-composer-draft` | [Build-mismatch reload can discard an undurable composer draft](open/client-storage/build-mismatch-reload-can-discard-composer-draft.md) | Open | delta audit DA-12 |
 | `FND-draft-save-failures-have-no-retry-or-signal` | [Draft-save failures have no retry or user signal](open/client-storage/draft-save-failures-have-no-retry-or-signal.md) | Open | delta audit DA-9 |
-| `FND-pre-tracking-baseline-capture-still-omits-six-save-domains` | [Pre-tracking baseline capture still omits six save domains](open/client-storage/pre-tracking-baseline-capture-still-omits-six-save-domains.md) | Deferred | 2026-07 data-loss audit |
 | `FND-save-loop-idles-after-five-failures` | [The save loop stops retrying after five consecutive failures](open/client-storage/save-loop-idles-after-five-failures.md) | Open | 2026-07 data-loss audit |
 
 ### media and translation
 
 | ID | Finding | Status | Source |
 |---|---|---|---|
-| `FND-interrupted-inlay-migration-discards-the-source-row` | [A crash during inlay migration can discard the valid KV source](open/media-translation/interrupted-inlay-migration-discards-the-source-row.md) | Open | 2026-07 data-loss audit |
+| `FND-interrupted-inlay-migration-discards-the-source-row` | [A crash during inlay migration can discard inlay metadata](open/media-translation/interrupted-inlay-migration-discards-the-source-row.md) | Open | 2026-07 data-loss audit |
 | `FND-portable-asset-filename-mapping` | [Asset filename mapping is not portable across filesystems](open/media-translation/portable-asset-filename-mapping.md) | Open | data-loss audit, compatibility investigation |
 | `FND-external-dedup-can-strand-or-overwrite-a-live-asset` | [External dedup can strand or overwrite a live asset](open/media-translation/external-dedup-can-strand-or-overwrite-a-live-asset.md) | Open | 2026-07 data-loss audit |
 | `FND-inlay-filename-mapping-is-not-injective` | [Inlay filename mapping is not injective](open/media-translation/inlay-filename-mapping-is-not-injective.md) | Open | 2026-07 data-loss audit |
@@ -67,14 +64,14 @@ Current catalog: **47 open**, **2 deferred**, and **5 accepted decisions**.
 
 | ID | Finding | Status | Source |
 |---|---|---|---|
-| `FND-gemini-streaming-signature-save-is-fire-and-forget` | [Gemini streaming signature saves are fire-and-forget](open/model-providers/gemini-streaming-signature-save-is-fire-and-forget.md) | Open | delta audit DA-11 |
+| `FND-gemini-streaming-signature-save-is-fire-and-forget` | [Gemini cross-turn signature persistence is disconnected](open/model-providers/gemini-streaming-signature-save-is-fire-and-forget.md) | Open | delta audit DA-11 |
 
 ### operations and coverage
 
 | ID | Finding | Status | Source |
 |---|---|---|---|
-| `FND-compatibility-suites-not-run-in-ci` | [Compatibility and server suites are not run in CI](open/operations-coverage/compatibility-suites-not-run-in-ci.md) | Open | 2026-07 compatibility investigation |
 | `FND-real-upstream-backup-fixture-skipped` | [Real upstream backup tests silently skip without a local fixture](open/operations-coverage/real-upstream-backup-fixture-skipped.md) | Open | 2026-07 compatibility investigation |
+| `FND-compatibility-suites-not-run-in-ci` | [Serve pushes and releases are not gated by the test suites](open/operations-coverage/compatibility-suites-not-run-in-ci.md) | Open | 2026-07 compatibility investigation |
 
 ### plugin storage
 
@@ -91,7 +88,7 @@ Current catalog: **47 open**, **2 deferred**, and **5 accepted decisions**.
 
 | ID | Finding | Status | Source |
 |---|---|---|---|
-| `FND-callback-bridge-skips-stream-transfer-and-remote-class-serialization` | [Callback bridge skips stream transfer and remote-class serialization](open/scripting-extensions/callback-bridge-skips-stream-transfer-and-remote-class-serialization.md) | Open | 2026-07 data-loss audit |
+| `FND-callback-bridge-skips-stream-transfer-and-remote-class-serialization` | [Callback bridge skips deep stream transfer and remote-class serialization](open/scripting-extensions/callback-bridge-skips-stream-transfer-and-remote-class-serialization.md) | Open | 2026-07 data-loss audit |
 | `FND-card-triggers-can-bulk-delete-history-without-consent` | [Imported card triggers can bulk-delete chat history without the low-level-access consent](open/scripting-extensions/card-triggers-can-bulk-delete-history-without-consent.md) | Open | 2026-07 data-loss audit |
 | `FND-lua-local-lore-upsert-is-discarded` | [Lua local-lore upserts are discarded in non-display trigger modes](open/scripting-extensions/lua-local-lore-upsert-is-discarded.md) | Open | delta audit DA-10 |
 
@@ -103,7 +100,6 @@ Current catalog: **47 open**, **2 deferred**, and **5 accepted decisions**.
 | `FND-bulk-filesystem-writes-partially-commit` | [Bulk filesystem writes can commit a partial prefix](open/server-backend/bulk-filesystem-writes-partially-commit.md) | Open | data-loss audit, compatibility investigation |
 | `FND-chat-row-stage-is-not-bound-to-the-committed-stub-snapshot` | [Chat-row staging is not bound to the committed stub snapshot](open/server-backend/chat-row-stage-is-not-bound-to-the-committed-stub-snapshot.md) | Open | 2026-07 data-loss audit |
 | `FND-decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep` | [Decoded stream-load spools bypass the configured spool and orphan sweep](open/server-backend/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md) | Open | 2026-07 data-loss audit |
-| `FND-noncanonical-hex-path-splits-the-patch-cache` | [Non-canonical hex path headers split the patch cache](open/server-backend/noncanonical-hex-path-splits-the-patch-cache.md) | Open | 2026-07 data-loss audit |
 | `FND-sidecar-databases-use-normal-wal-without-shutdown-drain` | [Sidecar databases use NORMAL WAL without a shutdown drain](open/server-backend/sidecar-databases-use-normal-wal-without-shutdown-drain.md) | Open | delta audit DA-7 |
 | `FND-full-write-etag-does-not-cover-chat-rows` | [The full-write ETag does not cover externalized chat rows](open/server-backend/full-write-etag-does-not-cover-chat-rows.md) | Open | 2026-07 data-loss audit |
 | `FND-whole-chat-patches-partially-commit-rows` | [Whole-chat patches can partially commit external rows](open/server-backend/whole-chat-patches-partially-commit-rows.md) | Open | data-loss audit, compatibility investigation |

@@ -6,24 +6,33 @@
 - Severity: Medium
 - Lens: L3, L4, D2
 - Area: Area 2 — client/plugin boundary
-- Affected code: `src/ts/plugins/pluginSaveStorage.ts:87`, `src/ts/plugins/pluginSaveStorage.ts:90`, `src/ts/plugins/pluginSaveStorage.ts:95`, `src/ts/plugins/pluginSaveStorage.ts:99`, `src/ts/plugins/pluginSaveStorage.ts:110`, `src/ts/plugins/apiV3/v3.svelte.ts:1325`, `src/ts/plugins/apiV3/v3.svelte.ts:1328`, `src/ts/plugins/apiV3/v3.svelte.ts:1332`, `src/ts/plugins/apiV3/v3.svelte.ts:1336`, `src/lib/Setting/Pages/PluginStorageViewer.svelte:271`, `src/lib/Setting/Pages/PluginStorageViewer.svelte:277`
+- Affected code: `src/ts/plugins/pluginSaveStorage.ts:2315-2326`, `src/ts/plugins/pluginSaveStorage.ts:2481-2505`, `src/ts/plugins/pluginSaveStorage.ts:3392-3401` (inline in-memory publication), outcome APIs (`setItemWithOutcome`), guarded batches, and viewer CAS rewrites over the same gap
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 
-Optimized plugin storage awaits its KV write or deletion. In the default inline
-mode, the same APIs mutate the reactive map and resolve before the later database
-save, so they cannot report its failure. The viewer likewise announces success
-as soon as the memory-only mutation completes.
+Optimized plugin storage awaits its transactional server publication. In the
+default inline mode, the same APIs mutate the reactive map and resolve as soon
+as the in-memory publication completes; the actual database write is scheduled
+later by the ordinary reactive save loop.
 
-A plugin may await a protective state write and then reload or make a destructive
-decision, yet the old value returns after refresh. This acknowledgement occurs
-before any patch or full write is attempted and therefore precedes the separate
-v2 server acknowledgement window; API durability also changes with mode.
+The module has been rebuilt since the original report (per-key queues, an
+inline publish mutex, revision hashing) and the surface has broadened: guarded
+batches, the outcome APIs, and viewer CAS rewrites can now all report a
+committed result — `setItemWithOutcome` literally returns outcome
+`'committed'` — for a memory-only inline publication. That terminology
+collides with the repository's committed-save contract, under which
+"committed" is supposed to prove durability. A page unload or a later save
+failure inside the window silently reverts an acknowledged plugin write, and
+the viewer's inline save success has the same gap. API durability still
+changes with the storage mode.
 
 ## Required fix and coverage
 
-Give inline V3 and viewer mutations a durability-aware commit path. Do not resolve
-or show success until it completes, or expose explicit staged-versus-persisted
-transaction semantics.
+Give inline V3, batch, outcome, and viewer mutations a durability-aware commit
+path — do not resolve or report `committed` until the database save settles —
+or expose explicit staged-versus-persisted semantics and stop using committed
+terminology for staged publications.
 
-Test identical write, remove, and clear failures in both optimization modes.
+Test identical write, remove, and clear failures in both optimization modes,
+including the outcome APIs.

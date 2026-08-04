@@ -1,14 +1,21 @@
 # Direct flush callers bypass automatic-snapshot serialization
 
-- Status: Open
+- Status: Fixed (2026-08-05 revalidation)
 - Owner: backup and recovery
-- Source: [2026-07 data-loss audit](../../../../.archived-docs/findings/2026-07-data-loss-audit/PRIORITY-INDEX.md)
-- Severity: Medium
+- Source: [2026-07 data-loss audit](../../2026-07-data-loss-audit/PRIORITY-INDEX.md)
+- Severity: Medium (at fix time)
+- Resolution: `3e758f9a` — snapshots assemble from pinned sources outside the
+  mutation queue (pinned WAL capture with source-token-gated publication), and
+  the shutdown/self-update flush paths now queue through the storage-operation
+  serialization instead of reading live KV mid-write.
+- Regression coverage: `test/compat/snapshot-spool.test.ts` — snapshot spool
+  isolation, chat-save acknowledgement ordering, and a delta append racing
+  pinned assembly invalidating the older lock.
+- Canonical architecture: [backup and recovery](../../../../docs/structure/backup-recovery.md)
 - Lens: D1, D3
 - Area: Area 6 — server recovery
-- Affected code: `server/node/server.cjs:355-402`, `server/node/server.cjs:2490-2531`, `server/node/server.cjs:4703-4724`, `server/node/server.cjs:4970-4988`, `server/node/server.cjs:7142-7150`, `server/node/server.cjs:7343-7349`
 
-## Risk
+## Original risk (historical)
 
 Normal persistence and explicit exports serialize through the storage-operation
 queue, and exports use a pinned KV snapshot. Graceful signal handling and the
@@ -20,7 +27,7 @@ snapshot is assembling. A referenced chat row can disappear after the stub graph
 is written, yet automatic snapshot logic preserves the bare stub and publishes a
 mixed recovery point. Plugin rows can similarly come from different instants.
 
-## Required fix and coverage
+## Original required fix (historical)
 
 Stop admission and drain/run shutdown flush through `queueStorageOperation()`,
 or give every automatic snapshot a pinned `createKvSnapshot()` reader.

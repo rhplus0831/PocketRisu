@@ -7,6 +7,7 @@
 - Lens: D4, D6
 - Area: Area 7 — server file stores
 - Affected code: `server/node/server.cjs:1111-1145`, `server/node/server.cjs:1198-1213`, `server/node/server.cjs:1257-1278`, `server/node/server.cjs:1305-1323`, `server/node/server.cjs:4074-4084`
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

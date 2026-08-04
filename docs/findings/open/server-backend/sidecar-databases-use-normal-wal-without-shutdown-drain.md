@@ -4,6 +4,7 @@
 - Severity: Warning
 - Owner: server backend
 - Source: [delta audit DA-7](../../../../.archived-docs/findings/2026-08-delta-audit/02-findings.md#da-7-sidecar-dbs-reintroduce-normal-wal-rollback-shutdown-does-not-drain-d-f5)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 `model-jobs.db` and `request-logs.db` use `synchronous=NORMAL`, reintroducing
 the rollback class removed from the primary database. Shutdown closes the store

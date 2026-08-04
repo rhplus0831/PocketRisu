@@ -4,6 +4,7 @@
 - Severity: Medium
 - Owner: server backend
 - Source reports: [data-loss audit](../../../../.archived-docs/findings/2026-07-data-loss-audit/reports/bulk-write-commits-a-partial-filesystem-prefix.md), [compatibility investigation](../../../../.archived-docs/findings/2026-07-compatibility/reports/bulk-asset-write-partially-commits-files.md)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

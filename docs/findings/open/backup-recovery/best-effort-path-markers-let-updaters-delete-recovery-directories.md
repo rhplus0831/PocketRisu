@@ -7,6 +7,7 @@
 - Lens: D2, D5, L4
 - Area: Area 6 — server recovery
 - Affected code: `server/node/server.cjs:901-938`, `server/node/server.cjs:970-983`, `server/node/server.cjs:6745-6767`, `server/node/server.cjs:7052-7072`, `server/node/server.cjs:7135-7140`, `scripts/updater.cjs:41-63`, `scripts/updater.cjs:267-288`, `scripts/updater.cjs:368-373`
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

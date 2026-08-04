@@ -1,32 +1,31 @@
-# Compatibility and server suites are not run in CI
+# Serve pushes and releases are not gated by the test suites
 
 - Status: Open
 - Owner: operations and coverage
 - Source: [2026-07 compatibility investigation](../../../../.archived-docs/findings/2026-07-compatibility/SOURCE-INDEX.md)
 - Severity: Informational process risk
 - Confidence: High
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Evidence
 
-vitest.config.ts limits pnpm test to src/**/*.test.ts. The server and
-compatibility suites require pnpm test:server and pnpm test:compat. Current
-release/build workflows do not invoke any of the three commands. This workflow
-gap is identical on main and serve; it is recorded as audit context, not a
-branch regression.
-
-At this HEAD the suites pass independently:
-
-- Client: 99 files, 1,625 passed, 3 skipped.
-- Server: 25 files, 344 passed.
-- Compatibility: 35 files passed, 1 skipped; 281 tests passed, 5 skipped.
+The original "no workflow invokes any suite" claim is no longer true: commit
+`97634b0c` added `.github/workflows/pr-check.yml`, and `pnpm test` now chains
+the client and server suites. The narrowed gap is real, though. The CI gate
+applies only to pull requests into `main`; direct pushes to `serve` — the
+branch this fork develops and deploys from — and the tag-driven portable and
+Docker release workflows run zero tests. The compat suite's upstream-fixture
+cases also always skip in CI because `test/fixtures/` is gitignored, and
+nothing fails on unexpected skips.
 
 ## Risk
 
-Green build/package workflows provide no regression gate for the surfaces this
-audit examines. Many current tests intentionally codify new bounds without
-comparing the former contract.
+Green release/package workflows still provide no regression gate for the
+persistence and interchange surfaces the audits examine, and fixture-dependent
+compatibility cases silently skip everywhere but a prepared local machine.
 
 ## Recommendation
 
-Add one required CI job running all three commands with pnpm, publish reports,
-and fail releases if any required suite is skipped unexpectedly.
+Run all three suites (`pnpm test`, `pnpm test:server`, `pnpm test:compat`) in
+the release and serve-push paths, publish reports, and fail on unexpected
+skips of required cases.

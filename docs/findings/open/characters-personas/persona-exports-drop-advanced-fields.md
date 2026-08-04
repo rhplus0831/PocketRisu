@@ -6,6 +6,7 @@
 - Severity: Low
 - Area: import/export round-trips
 - Affected code: `src/ts/persona.ts:50-101` (export card = name/prompt/note only), `src/ts/characterPackage.ts:103-129`, `src/ts/characterPackage.ts:229-255`, `src/ts/characterPackage.ts:518-542` (package path also omits `embeddedModule`; `largePortrait` recorded but never applied), `src/ts/storage/database.svelte.ts` (`RisuPersona` defines `largePortrait`, `embeddedModule`)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

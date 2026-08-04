@@ -7,6 +7,7 @@
 - Lens: D5
 - Area: Area 7 — server file stores
 - Affected code: `scripts/dedup-assets.sh:18-19`, `scripts/dedup-assets.sh:44-55`, `server/node/assetStore.cjs:25-76`, `server/node/assetStore.cjs:117-160`
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

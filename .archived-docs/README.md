@@ -11,6 +11,7 @@ current work queue; verify every claim against current code before reuse.
 - [2026-07 unified work-priority snapshot](findings/2026-07-unified-work-index.md)
 - [2026-08 delta audit](findings/2026-08-delta-audit/README.md)
 - [2026-08 performance evidence](findings/2026-08-performance-evidence/README.md)
+- [2026-08 findings revalidation](findings/2026-08-revalidation/README.md)
 
 ## Earlier programs and standalone reports
 

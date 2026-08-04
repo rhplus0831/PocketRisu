@@ -4,6 +4,7 @@
 - Severity: High
 - Owner: server backend
 - Source reports: [data-loss audit](../../../../.archived-docs/findings/2026-07-data-loss-audit/reports/whole-chat-patches-half-apply-external-rows.md), [compatibility investigation](../../../../.archived-docs/findings/2026-07-compatibility/reports/whole-chat-patch-partially-commits-rows.md)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 
@@ -15,7 +16,10 @@ also leave old stubs resolving to newly overwritten rows. Those overwritten rows
 do not receive the pre-images captured by `/api/chat-content`.
 
 The official client normally sends stubs and separate row writes, so the risk is
-limited to retained legacy or external callers.
+limited to retained legacy or external callers. The post-audit `x-client-build`
+admission gate (`3e65d76e`) adds friction for casual callers but is not a
+barrier: the 426 response echoes the expected build, so a deliberate caller
+still passes.
 
 ## Required fix and coverage
 

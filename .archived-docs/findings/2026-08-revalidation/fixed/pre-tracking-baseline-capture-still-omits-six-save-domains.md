@@ -1,14 +1,26 @@
 # Pre-tracking baseline capture still omits six save domains
 
-- Status: Deferred
+- Status: Fixed (2026-08-05 revalidation)
 - Owner: client storage
-- Source: [2026-07 data-loss audit](../../../../.archived-docs/findings/2026-07-data-loss-audit/PRIORITY-INDEX.md)
-- Severity: Medium
+- Source: [2026-07 data-loss audit](../../2026-07-data-loss-audit/PRIORITY-INDEX.md)
+- Severity: Medium (at fix time; formerly Deferred)
+- Resolution: `e2ca4ddd` — the startup equality preflight in
+  `src/ts/globalApi.svelte.ts` diffs the live graph against the server-read
+  baseline across all six domains before trusting a clean skip, and the
+  pre-watermark chat-row capture in `src/ts/storage/chatPersistStage.ts`
+  covers startup-created chats.
+- Regression coverage: `src/ts/storage/chatPersistStage.test.ts`
+  (startup-created, repaired-ID, and replaced-chat cases);
+  `test/e2e/scenarios/boot.spec.ts` (two fresh-context cold boots require zero
+  second-boot patch bytes); the client suite's dual-run `verifyDirtyRevisions`
+  mode re-checks equality behind every trusted-clean skip. Known gap: no
+  single all-six-domain boot-mutation matrix asserts each domain survives an
+  idle refresh.
+- Canonical architecture: [client storage](../../../../docs/structure/client-storage.md)
 - Lens: L1, L3
 - Area: Area 1 — client change detection and save scheduling
-- Affected code: `src/ts/plugins/pluginStorageTracking.ts:5`, `src/ts/globalApi.svelte.ts:421`, `src/ts/globalApi.svelte.ts:447`, `src/ts/storage/database.svelte.ts:183`, `src/ts/bootstrap.ts:185`, `src/ts/bootstrap.ts:433`, `src/ts/bootstrap.ts:681`, `src/ts/storage/risuSave.ts:1016`
 
-## Risk
+## Original risk (historical)
 
 The pre-tracking comparison is typed and implemented only for
 `pluginCustomStorage` and `pluginStorageMeta`. Root settings, bot presets,
@@ -21,7 +33,7 @@ changes can be absorbed as the clean baseline. Bot presets and modules are
 especially sharp because unrelated root saves do not patch them without their
 dedicated flags, leaving repaired IDs or imported modules memory-only.
 
-## Required fix and coverage
+## Original required fix (historical)
 
 Replace the plugin-specific helper with a stub-normalized, block-by-block
 comparison against the persisted baseline and set every affected save flag.

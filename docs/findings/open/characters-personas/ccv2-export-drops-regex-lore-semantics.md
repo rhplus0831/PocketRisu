@@ -7,6 +7,7 @@
 - Lens: L2, D3
 - Area: Area 8 — mode matrix and round trips
 - Affected code: `src/ts/characterCards.ts:1034`, `src/ts/characterCards.ts:1060`, `src/ts/characterCards.ts:1077`, `src/ts/characterCards.ts:1192`, `src/ts/characterCards.ts:1496`
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

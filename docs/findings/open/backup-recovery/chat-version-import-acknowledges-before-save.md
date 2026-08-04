@@ -6,6 +6,7 @@
 - Severity: Low
 - Area: client recovery UI
 - Affected code: `src/lib/Setting/ChatBackupList.svelte:149-150` (success toast right after in-memory import), `src/ts/storage/chatStorage.ts:137-166` (`importChatBackup` appends in memory and marks dirty only)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

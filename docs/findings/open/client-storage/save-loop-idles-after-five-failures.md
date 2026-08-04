@@ -6,6 +6,7 @@
 - Severity: Medium
 - Area: client save loop
 - Affected code: `src/ts/globalApi.svelte.ts:1058-1069` (fifth failure alerts and resets the counter without setting `changed`), `src/ts/globalApi.svelte.ts:1093-1110` (permanent loop idles while `changed` is false)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

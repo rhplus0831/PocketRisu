@@ -7,6 +7,7 @@
 - Lens: L4
 - Area: Area 6 — server recovery
 - Affected code: `server/node/chatBackups.cjs:540-568`, `server/node/chatBackups.cjs:583-625`, `server/node/chatBackups.test.ts:441-492`
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

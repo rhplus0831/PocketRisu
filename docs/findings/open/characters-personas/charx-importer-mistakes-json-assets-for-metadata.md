@@ -7,6 +7,7 @@
 - Lens: L3, L4, D3
 - Area: Area 8 — mode matrix and round trips
 - Affected code: `src/ts/util.ts:121`, `src/lib/SideBars/CharConfig.svelte:505`, `src/ts/characterCards.ts:1271`, `src/ts/characterCards.ts:1347`, `src/ts/process/processzip.ts:368`, `src/ts/characterCards.ts:780`
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

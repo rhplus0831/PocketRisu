@@ -6,6 +6,7 @@
 - Severity: Low
 - Area: import/export round-trips
 - Affected code: `src/ts/interchangeability.ts:6-53` (`convertModuleToCharacter` omits `namespace`/`cjs`), `src/ts/interchangeability.ts:55-68` (reverse conversion cannot restore them), `src/ts/process/modules.ts:37-55` (the normal Share action uses this path), `src/ts/process/modules.ts:380-386` (runtime resolution matches on namespace)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

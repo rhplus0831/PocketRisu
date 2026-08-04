@@ -6,6 +6,7 @@
 - Severity: Medium
 - Area: server recovery (backup completeness)
 - Affected code: `server/node/server.cjs:1397-1443` (migration writes the global marker despite per-entry skips), `server/node/server.cjs:3965-3975` (reads fall back to KV), `server/node/server.cjs:4715-4776`, `server/node/server.cjs:5012-5035` (backups enumerate filesystem inlays + `inlay_meta/` only), `server/node/server.cjs:2800-2804` (import clears `inlay/` prefixes)
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 

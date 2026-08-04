@@ -8,6 +8,7 @@
 - Area: Area 4 — client/server sync protocol
 - Extends: [Acknowledged database patches are not durable for up to five seconds](../client-storage/acknowledged-patches-are-not-durable.md)
 - Affected code: `src/ts/storage/chatPersistStage.ts:139-143`, `src/ts/storage/chatPersistStage.ts:155-190`, `src/ts/globalApi.svelte.ts:800-827`, `src/ts/globalApi.svelte.ts:994-1041`, `src/ts/globalApi.svelte.ts:1072-1083`, `src/ts/storage/nodeStorage.ts:977-995`, `server/node/chatRows.cjs:321-342`
+- Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 
