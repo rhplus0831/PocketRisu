@@ -11,6 +11,21 @@ import type { ChatDeltaOperation } from './chatDelta'
 
 let payloadCodecService = new PayloadCodecService()
 
+const CHAT_ROW_RUNTIME_FIELDS = [
+    'isStreaming',
+    'activeStreamingDisplayOptimizationMode',
+    '_placeholder',
+] as const
+
+function snapshotCurrentChatRow(chat: unknown): unknown {
+    const snapshot = snapshotPayload(chat)
+    if (snapshot !== null && typeof snapshot === 'object') {
+        const row = snapshot as Record<string, unknown>
+        for (const field of CHAT_ROW_RUNTIME_FIELDS) delete row[field]
+    }
+    return snapshot
+}
+
 export function setPayloadCodecServiceForTests(service: PayloadCodecService | null): void {
     payloadCodecService.dispose()
     payloadCodecService = service ?? new PayloadCodecService()
@@ -22,7 +37,7 @@ export async function encodeChatRowPayload(
 ): Promise<{ bytes: Uint8Array; hash: string | null }> {
     // Live Svelte proxies are not structured-cloneable. Capture the same graph
     // synchronously at the old encode point, before any awaited worker work.
-    const snapshot = snapshotPayload(chat)
+    const snapshot = snapshotCurrentChatRow(chat)
     return payloadCodecService.encodeChat(snapshot, hash)
 }
 
@@ -39,7 +54,7 @@ export async function prepareChatRowCheckpoint(
     // snapshot becomes the next acknowledged baseline only after an exact hash
     // acknowledgement; failed/refused requests retain the previous baseline.
     const previousSnapshot = previousChat === null ? null : snapshotPayload(previousChat)
-    const snapshot = snapshotPayload(chat)
+    const snapshot = snapshotCurrentChatRow(chat)
     const result = await payloadCodecService.prepareChatCheckpoint(
         previousSnapshot,
         snapshot,

@@ -32,9 +32,12 @@ export const PHASE_BUDGETS: Record<string, PhaseBudget> = {
   'warm-boot': { maxApiRequests: 18, maxApiTxBytes: 12_000 },
   // Baseline 3 req / 3.8 KB — hydration of one chat row.
   'open-chat': { maxApiRequests: 8, maxApiTxBytes: 16_000 },
-  // Baseline up to ~872 KB: full-row checkpoint + final saves (PF-01/PF-02).
-  'send-and-save': { maxApiRequests: 18, maxApiTxBytes: 1_100_000 },
-  'send-generate-save': { maxApiRequests: 16, maxApiTxBytes: 1_100_000 },
+  // T1 Phase 1 measured 871,452 B max over 3 runs: the imported fixture's
+  // first durable chatId fill can still take two full-row save stages.
+  'send-and-save': { maxApiRequests: 18, maxApiTxBytes: 960_000 },
+  // T1 Phase 1 measured 444,783 B max over 3 runs: one fresh-row chatId
+  // self-heal stays full; later generations are covered by the PF-01 delta spec.
+  'send-generate-save': { maxApiRequests: 16, maxApiTxBytes: 500_000 },
 }
 
 export function assertPhaseBudget(report: NetReport, phase: string): void {

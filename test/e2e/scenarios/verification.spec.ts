@@ -20,7 +20,7 @@ function readMsgpackBoolAfterKey(body: Buffer, key: string): 'true' | 'false' | 
   return 'other'
 }
 
-test('PF-01: chat-row saves around a generation carry runtime streaming flags', async ({ page }, testInfo) => {
+test('PF-01: post-generation chat-row saves use projected deltas', async ({ page }, testInfo) => {
   const provider = await startMockProvider({ chunkCount: 24, chunkDelayMs: 250 })
   const server = await launchServer(await prepareInstanceDir('provider'))
   const rowPosts: Array<{ contentType: string; bytes: number; isStreaming: string }> = []
@@ -44,9 +44,22 @@ test('PF-01: chat-row saves around a generation carry runtime streaming flags', 
     await expect(page.getByText('E2EMSG').first()).toBeVisible({ timeout: 30_000 })
     await page.waitForTimeout(2000)
 
-    await chatInput(page).fill('PF-01 verification probe.')
+    // Imported E2E messages intentionally omit durable chatId values. Their
+    // first save is therefore a legitimate full-row self-heal; establish its
+    // acknowledged projected base before measuring the steady-state send.
+    await chatInput(page).fill('PF-01 transition warm-up.')
     await chatInput(page).press('Enter')
     await expect(page.getByText('MOCKGEN').first()).toBeVisible({ timeout: 45_000 })
+    await page.waitForTimeout(10_000)
+    rowPosts.length = 0
+
+    const generatedMessageCount = await page.getByText('MOCKGEN').count()
+    await chatInput(page).fill('PF-01 verification probe.')
+    await chatInput(page).press('Enter')
+    await expect.poll(
+      () => page.getByText('MOCKGEN').count(),
+      { timeout: 45_000 },
+    ).toBeGreaterThan(generatedMessageCount)
     await page.waitForTimeout(10_000)
 
     await testInfo.attach('pf01-row-posts', {
@@ -55,13 +68,14 @@ test('PF-01: chat-row saves around a generation carry runtime streaming flags', 
     console.log('PF-01 row POSTs:', JSON.stringify(rowPosts))
 
     expect(rowPosts.length).toBeGreaterThan(0)
-    // Current behavior (finding CONFIRMED): every save is a full row carrying
-    // the isStreaming key; no delta content type appears. When PF-01 is
-    // fixed, flip these assertions: post-generation saves should be
-    // application/vnd.pocketrisu.chat-delta+json.
+    // PF-01 regression proof: post-generation saves use the chat-delta
+    // content type, the encoded request bodies omit the runtime-only key,
+    // and each delta stays within the runway's per-save ceiling (observed
+    // 374-960 B; a bloated delta is a regression even with the right type).
     for (const post of rowPosts) {
-      expect(post.contentType).not.toContain('chat-delta')
-      expect(post.isStreaming).not.toBe('absent')
+      expect(post.contentType).toContain('chat-delta')
+      expect(post.isStreaming).toBe('absent')
+      expect(post.bytes).toBeLessThanOrEqual(64_000)
     }
   } finally {
     await server.stop()

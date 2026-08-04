@@ -144,7 +144,7 @@ T4/T6 regression proofs, not for their design work.
 
 | Track | Findings | Status | Gate |
 |---|---|---|---|
-| T1 chat deltas | PF-01, PF-02 | Design note drafted: [08-t1-chat-row-projection-design.md](08-t1-chat-row-projection-design.md) (Phase 1 client-only projection; Phase 2 durable-path delta admission is the lockstep part) | Design note under adversarial review; implementation next |
+| T1 chat deltas | PF-01, PF-02 | Phase 1 landed (PF-01 client-only projection per [08-t1-chat-row-projection-design.md](08-t1-chat-row-projection-design.md)); Phase 2 durable-path delta admission and PF-02 checkpoint/final coalescing deferred pending post-landing measurement | PF-01 verification flip and send budgets; Phase 2 requires a durable-churn fixture |
 | T2 boot normalization | PF-03, PF-04 | Open | Design note (baseline capture) |
 | T3 size-aware cached boot | PF-05 | Landed (128 KiB raw bypass; segmentation coarsening and budget-aware IDB verification deferred) | PF-05 small-raw/large-cached route regression |
 | T4 plugin protocol | PF-06..12 | Open | Items 5–6 design-gated |

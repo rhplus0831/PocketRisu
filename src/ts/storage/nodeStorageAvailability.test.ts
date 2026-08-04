@@ -79,7 +79,7 @@ const {
     parseDatabaseStorageCapabilities,
 } = await import('./nodeStorage')
 const { StorageError } = await import('./storageError')
-const { encodeRisuSaveLegacy } = await import('./risuSave')
+const { decodeRisuSave, encodeRisuSaveLegacy } = await import('./risuSave')
 const { encodeRawMsgpack } = await import('./rawMsgpack')
 
 function encodeOwnedRawMsgpack(value: unknown): Uint8Array {
@@ -1039,6 +1039,106 @@ describe('NodeStorage availability bounds', () => {
             patch: [{ op: 'replace', path: '/message/0', value: result.message[0] }],
         })
         expect(codec.prepareChatRowCheckpoint).toHaveBeenNthCalledWith(2, base, result)
+    })
+
+    it('never pairs a projected acknowledged base with the hash of old-format bytes', async () => {
+        cache.enabled = false
+        const oldHash = '1'.repeat(64)
+        const firstHash = '2'.repeat(64)
+        const secondHash = '3'.repeat(64)
+        const oldBytes = new Uint8Array([9, 8, 7])
+        const oldBase = {
+            id: 'chat',
+            message: [{ data: 'old-format' }],
+            isStreaming: true,
+            activeStreamingDisplayOptimizationMode: 'streaming',
+        }
+        const firstLive = {
+            ...oldBase,
+            message: [{ data: 'checkpoint' }],
+            isStreaming: false,
+        }
+        const firstProjected = {
+            id: 'chat',
+            message: [{ data: 'checkpoint' }],
+        }
+        const secondLive = {
+            ...firstLive,
+            message: [{ data: 'final' }],
+        }
+        const secondProjected = {
+            id: 'chat',
+            message: [{ data: 'final' }],
+        }
+        cache.sha256Bytes.mockResolvedValueOnce(oldHash)
+        vi.mocked(decodeRisuSave).mockResolvedValueOnce(structuredClone(oldBase) as any)
+        codec.prepareChatRowCheckpoint
+            .mockResolvedValueOnce({
+                bytes: new Uint8Array(2_048),
+                hash: firstHash,
+                patch: null,
+                snapshot: firstProjected,
+            })
+            .mockResolvedValueOnce({
+                bytes: new Uint8Array(2_048),
+                hash: secondHash,
+                patch: [{
+                    op: 'replace',
+                    path: '/message/0',
+                    value: secondProjected.message[0],
+                }],
+                snapshot: secondProjected,
+            })
+        const posts: RequestInit[] = []
+        vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+            if (!init?.method || init.method === 'GET') {
+                return new Response(oldBytes as unknown as BodyInit, {
+                    status: 200,
+                    headers: { 'x-content-hash': oldHash },
+                })
+            }
+            posts.push(init)
+            const hash = posts.length === 1 ? firstHash : secondHash
+            return new Response(JSON.stringify({ success: true, hash }), {
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+            })
+        }))
+        const storage = readyStorage()
+        const acknowledgementKey = JSON.stringify(['character', 'chat'])
+
+        await expect(storage.fetchChatContent('character', 0, 'chat'))
+            .resolves.toEqual(oldBase)
+        expect((storage as any).acknowledgedChatRows.get(acknowledgementKey)).toEqual({
+            hash: oldHash,
+            chat: oldBase,
+        })
+
+        await storage.saveChatContent('character', 0, 'chat', firstLive)
+        expect(codec.prepareChatRowCheckpoint).toHaveBeenNthCalledWith(1, oldBase, firstLive)
+        expect(new Headers(posts[0].headers).get('content-type'))
+            .toBe('application/octet-stream')
+        expect((storage as any).acknowledgedChatRows.get(acknowledgementKey)).toEqual({
+            hash: firstHash,
+            chat: firstProjected,
+        })
+
+        await storage.saveChatContent('character', 0, 'chat', secondLive)
+        expect(codec.prepareChatRowCheckpoint).toHaveBeenNthCalledWith(
+            2,
+            firstProjected,
+            secondLive,
+        )
+        expect(new Headers(posts[1].headers).get('content-type'))
+            .toBe('application/vnd.pocketrisu.chat-delta+json')
+        expect(JSON.parse(posts[1].body as string)).toMatchObject({
+            baseHash: firstHash,
+            resultHash: secondHash,
+        })
+        expect((storage as any).acknowledgedChatRows.get(acknowledgementKey)).toEqual({
+            hash: secondHash,
+            chat: secondProjected,
+        })
     })
 
     it('retries the prepared full row after a definitive delta refusal', async () => {

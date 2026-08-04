@@ -395,6 +395,120 @@ describe('chat content row serving', () => {
     expect(Buffer.from(await preImageResponse.arrayBuffer())).toEqual(baseBytes)
   })
 
+  test('old-format rows heal through a full save before a materializable delta', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const durableNote = 'durable-padding-'.repeat(256)
+    const oldFormat = {
+      id: 'projection-transition-chat',
+      name: 'Projection transition',
+      message: [{ role: 'char', data: 'old-format bytes' }],
+      note: durableNote,
+      localLore: [],
+      scriptstate: { durable: true },
+      isStreaming: true,
+      activeStreamingDisplayOptimizationMode: 'streaming',
+      _placeholder: true,
+    }
+    const firstProjected = {
+      id: oldFormat.id,
+      name: oldFormat.name,
+      message: [{ role: 'char', data: 'first post-upgrade checkpoint' }],
+      note: durableNote,
+      localLore: [],
+      scriptstate: { durable: true },
+    }
+    const secondProjected = {
+      ...firstProjected,
+      message: [{ role: 'char', data: 'second post-upgrade final' }],
+    }
+    const oldBytes = encodeRisuDat(oldFormat)
+    const firstBytes = encodeRisuDat(firstProjected)
+    const secondBytes = encodeRisuDat(secondProjected)
+    const oldHash = createHash('sha256').update(oldBytes).digest('hex')
+    const firstHash = createHash('sha256').update(firstBytes).digest('hex')
+    const secondHash = createHash('sha256').update(secondBytes).digest('hex')
+    const rowKey = 'chats/projection-transition-char/projection-transition-chat'
+
+    const seedResponse = await client.fetch('/api/chat-content/projection-transition-char/0', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-chat-id': oldFormat.id,
+      },
+      body: new Uint8Array(oldBytes),
+    })
+    expect(seedResponse.status).toBe(200)
+    expect(await seedResponse.json()).toEqual({ success: true, hash: oldHash })
+
+    // The current row is projected, but its acknowledged base still names the
+    // exact old-format bytes. The first post-upgrade request must therefore be
+    // a full row; pairing a projected base with oldHash would corrupt replay.
+    const firstSaveResponse = await client.fetch(
+      '/api/chat-content/projection-transition-char/0',
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-chat-id': oldFormat.id,
+        },
+        body: new Uint8Array(firstBytes),
+      },
+    )
+    expect(firstSaveResponse.status).toBe(200)
+    expect(await firstSaveResponse.json()).toEqual({ success: true, hash: firstHash })
+    expect(rawKvRow(server.cwd, rowKey)).toEqual(firstBytes)
+    expect(operationLog(server.cwd, rowKey)).toEqual([])
+
+    const patch = [{
+      op: 'replace',
+      path: '/message/0',
+      value: secondProjected.message[0],
+    }]
+    const deltaBody = JSON.stringify({
+      version: 1,
+      baseHash: firstHash,
+      resultHash: secondHash,
+      resultSize: secondBytes.length,
+      patch,
+    })
+    expect(Buffer.byteLength(deltaBody)).toBeLessThan(secondBytes.length)
+    const secondSaveResponse = await client.fetch(
+      '/api/chat-content/projection-transition-char/0',
+      {
+        method: 'POST',
+        headers: {
+          'content-type': CHAT_DELTA_CONTENT_TYPE,
+          'x-chat-id': oldFormat.id,
+        },
+        body: deltaBody,
+      },
+    )
+    expect(secondSaveResponse.status).toBe(200)
+    expect(await secondSaveResponse.json()).toMatchObject({
+      success: true,
+      hash: secondHash,
+      size: secondBytes.length,
+    })
+    expect(rawKvRow(server.cwd, rowKey)).toEqual(firstBytes)
+    expect(operationLog(server.cwd, rowKey)).toEqual([{
+      sequence: 1,
+      baseHash: firstHash,
+      resultHash: secondHash,
+      patch,
+    }])
+
+    const materialized = await client.fetch('/api/chat-content/projection-transition-char/0', {
+      headers: { 'x-chat-id': oldFormat.id },
+    })
+    expect(materialized.status).toBe(200)
+    expect(materialized.headers.get('x-content-hash')).toBe(secondHash)
+    const materializedBytes = Buffer.from(await materialized.arrayBuffer())
+    expect(materializedBytes).toEqual(secondBytes)
+    expect(decodeRisuDat(materializedBytes)).toEqual(secondProjected)
+  })
+
   test('delta refusal envelopes are definitive and a full-row fallback remains byte-identical', async () => {
     const server = await spawnServer()
     servers.push(server)

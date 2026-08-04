@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { applyPatch } from 'fast-json-patch'
 import { encodeRisuSaveLegacy } from './legacyRisuSaveCodec'
 import { runPayloadCodecOperation, type PayloadCodecOperation } from './payloadCodecOperations'
 import {
@@ -62,6 +63,54 @@ afterEach(() => {
 })
 
 describe('payload codec client integration', () => {
+    it('deletes exactly the three runtime-only fields from current inline row snapshots', async () => {
+        setPayloadCodecServiceForTests(new PayloadCodecService({
+            supportsWorker: () => false,
+            idleMs: -1,
+        }))
+        const live = {
+            id: 'chat-projection',
+            name: 'projection',
+            note: 'durable note',
+            localLore: [{ key: 'durable', content: 'keep me' }],
+            message: [{
+                role: 'user',
+                data: 'hello',
+                otherUser: 'durable-message-field',
+                isStreaming: 'nested-field-is-not-a-chat-runtime-flag',
+            }],
+            scriptstate: { count: 1 },
+            hypaV3Data: { memory: 'durable' },
+            supaMemory: { memory: 'durable' },
+            suggestMessages: ['durable'],
+            sdData: { legacy: 'ambiguous-and-preserved' },
+            otherUser: 'preserved-top-level-unknown',
+            isStreaming: false,
+            activeStreamingDisplayOptimizationMode: 'streaming',
+            _placeholder: true,
+        }
+        const original = structuredClone(live)
+        const expected = structuredClone(live) as Record<string, unknown>
+        delete expected.isStreaming
+        delete expected.activeStreamingDisplayOptimizationMode
+        delete expected._placeholder
+
+        const encoded = await encodeChatRowPayload(live, false)
+        const checkpoint = await prepareChatRowCheckpoint(null, live)
+
+        expect(encoded).toEqual({ bytes: encodeRisuSaveLegacy(expected), hash: null })
+        expect(checkpoint.bytes).toEqual(encodeRisuSaveLegacy(expected))
+        expect(checkpoint.snapshot).toEqual(expected)
+        for (const field of [
+            'isStreaming',
+            'activeStreamingDisplayOptimizationMode',
+            '_placeholder',
+        ]) {
+            expect(Object.prototype.hasOwnProperty.call(checkpoint.snapshot, field)).toBe(false)
+        }
+        expect(live).toEqual(original)
+    })
+
     it('snapshots a live proxy at the original synchronous encode point', async () => {
         setPayloadCodecServiceForTests(new PayloadCodecService({
             supportsWorker: () => false,
@@ -110,6 +159,91 @@ describe('payload codec client integration', () => {
             patch: [{ op: 'replace', path: '/message/0', value: current.message[0] }],
             snapshot: current,
         })
+    })
+
+    it('keeps an old-format base exact, heals with a full row, then proves a byte-exact worker delta', async () => {
+        const operations: PayloadCodecOperation[] = []
+        const transport: PayloadCodecWorkerTransport = {
+            start: async () => undefined,
+            execute: async (operation: PayloadCodecOperation, transfer = []) => {
+                const cloned = structuredClone(operation, { transfer })
+                operations.push(structuredClone(cloned))
+                return runPayloadCodecOperation(cloned)
+            },
+            terminate: vi.fn(),
+        }
+        setPayloadCodecServiceForTests(new PayloadCodecService({
+            supportsWorker: () => true,
+            createTransport: () => transport,
+            idleMs: -1,
+        }))
+        const oldBase = {
+            id: 'old-format-chat',
+            name: 'transition',
+            message: [{ role: 'char', data: 'old bytes' }],
+            scriptstate: { durable: true },
+            isStreaming: true,
+            activeStreamingDisplayOptimizationMode: 'streaming',
+            _placeholder: true,
+        }
+        const checkpointLive = {
+            ...oldBase,
+            message: [{ role: 'char', data: 'checkpoint' }],
+        }
+
+        const checkpoint = await prepareChatRowCheckpoint(oldBase, checkpointLive)
+
+        expect(checkpoint.patch).toBeNull()
+        expect(checkpoint.snapshot).toEqual({
+            id: 'old-format-chat',
+            name: 'transition',
+            message: [{ role: 'char', data: 'checkpoint' }],
+            scriptstate: { durable: true },
+        })
+        expect(oldBase).toMatchObject({
+            isStreaming: true,
+            activeStreamingDisplayOptimizationMode: 'streaming',
+            _placeholder: true,
+        })
+        expect(operations[0]).toMatchObject({
+            kind: 'prepare-chat-checkpoint',
+            previousChat: oldBase,
+            chat: checkpoint.snapshot,
+        })
+
+        const finalLive = {
+            ...checkpointLive,
+            message: [{ role: 'char', data: 'final' }],
+            isStreaming: false,
+            activeStreamingDisplayOptimizationMode: undefined,
+            _placeholder: false,
+        }
+        const final = await prepareChatRowCheckpoint(checkpoint.snapshot, finalLive)
+
+        expect(final.patch).toEqual([{
+            op: 'replace',
+            path: '/message/0',
+            value: { role: 'char', data: 'final' },
+        }])
+        expect(final.snapshot).toEqual({
+            id: 'old-format-chat',
+            name: 'transition',
+            message: [{ role: 'char', data: 'final' }],
+            scriptstate: { durable: true },
+        })
+        expect(operations[1]).toMatchObject({
+            kind: 'prepare-chat-checkpoint',
+            previousChat: checkpoint.snapshot,
+            chat: final.snapshot,
+        })
+        const replayed = applyPatch(
+            structuredClone(checkpoint.snapshot),
+            final.patch!,
+            true,
+            false,
+            true,
+        ).newDocument
+        expect(encodeRisuSaveLegacy(replayed)).toEqual(final.bytes)
     })
 
     it('offloads eligible strict block databases and applies the same bot-preset default', async () => {
