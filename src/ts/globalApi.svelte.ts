@@ -216,7 +216,7 @@ export async function getFileSrc(loc: string) {
  * @returns {Promise<Uint8Array>} - A promise that resolves to the data of the image file.
  */
 export async function readImage(data: string) {
-    return (await forageStorage.getItem(data) as unknown as Uint8Array)
+    return (await forageStorage.getItemCached(data) as unknown as Uint8Array)
 }
 
 /**
@@ -260,7 +260,7 @@ export async function saveAsset(data: Uint8Array, customId: string = '', fileNam
  * @returns {Promise<Uint8Array>} - A promise that resolves to the data of the loaded asset file.
  */
 export async function loadAsset(id: string) {
-    return await forageStorage.getItem(id) as unknown as Uint8Array
+    return await forageStorage.getItemCached(id) as unknown as Uint8Array
 }
 
 let lastSave = ''

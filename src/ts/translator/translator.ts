@@ -12,7 +12,7 @@ import { requestChatData } from "../process/request/request"
 import { doingChat, type OpenAIChat } from "../process/index.svelte"
 import { applyMarkdownToNode, type simpleCharacterArgument } from "../parser/parser.svelte"
 import { selectedCharID } from "../stores.svelte"
-import { clearPersistentPrefix, listPersistentKeys, makeHashedStorageKey, readPersistentJson, writePersistentJson } from "../storage/persistentKv"
+import { clearPersistentPrefix, listPersistentKeys, makeHashedStorageKey, readPersistentJson, readPersistentJsonBulk, writePersistentJson } from "../storage/persistentKv"
 import { getModuleRegexScripts } from "../process/modules"
 import { getNodetextToSentence, sleep } from "../util"
 import { processScriptFull } from "../process/scripts"
@@ -623,8 +623,8 @@ export async function searchLLMCache(partialKey:string):Promise<{key: string, va
         }
     }
     const storageKeys = await listPersistentKeys(llmTranslateCachePrefix)
-    for (const storageKey of storageKeys) {
-        const payload = await readPersistentJson<{ key: string, value: string }>(storageKey)
+    const payloads = await readPersistentJsonBulk<{ key: string, value: string }>(storageKeys)
+    for (const payload of payloads) {
         if (!payload || !payload.key.includes(partialKey)) {
             continue
         }
@@ -648,8 +648,8 @@ export async function exportLLMCacheAsJSON():Promise<Record<string, string>>{
         result[key] = value
     }
     const storageKeys = await listPersistentKeys(llmTranslateCachePrefix)
-    for (const storageKey of storageKeys) {
-        const payload = await readPersistentJson<{ key: string, value: string }>(storageKey)
+    const payloads = await readPersistentJsonBulk<{ key: string, value: string }>(storageKeys)
+    for (const payload of payloads) {
         if (payload && !(payload.key in result)) {
             result[payload.key] = payload.value
         }

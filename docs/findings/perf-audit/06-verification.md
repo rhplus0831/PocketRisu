@@ -136,6 +136,37 @@ Two amendments to the original A2 story:
   boot low-space warning. Fix shape is memoization of the per-row output size
   keyed by a cheap change signal, preserving current output semantics.
 
+## T7 quick-win re-verification (2026-08-04, pre-implementation per charter §5)
+
+- **PF-29**: re-CONFIRMED. The export's per-inlay `getInlayMeta` loop sits
+  beside `getInlayInfosBatch`; the exact metadata sibling is
+  `getInlayMetasBatch` (`inlayMeta.ts`), which returns precisely the four
+  fields the export consumes with matching missing-row semantics. The two
+  single-id `getInlayMeta` uses in `inlays.ts` are read-modify-write and stay.
+- **PF-30**: CONFIRMED, reframed cold-path. The per-key loops serve only the
+  V3 plugin `searchTranslationCache` API and the user-triggered settings
+  export — not per-message translation, which does a single exact lookup.
+  Key count is unbounded (one row per persisted LLM translation), so the
+  N+1 is still worth fixing. The bulk sibling is the generic
+  `getItems` → `POST /api/assets/bulk-read` path, which reads arbitrary KV
+  keys server-side; the fix is a persistent-KV bulk JSON helper on top of it.
+- **PF-31**: **refuted as priced — no production caller.**
+  `listInlayAssets()` is invoked only by its own unit tests; the settings
+  gallery, Playground explorer, and parser all use the lightweight
+  `listInlayExplorerItems()` (info/meta sidecars, bodies on demand), and
+  package export reads bodies per-id separately. There is also no bulk
+  inlay-body route to batch onto. No code change; the function is a
+  dead-code-removal candidate, tracked outside the runway.
+- **PF-33**: re-CONFIRMED. `readImage`/`loadAsset` use plain
+  `forageStorage.getItem`; `AutoStorage.getItemCached` →
+  `getItemCachedAuthoritative` already exists with cache-off fallback, and
+  its 204 protocol validates the server-confirmed hash against the local
+  manifest before serving cached bytes, so the switch is safe even for
+  non-hash-named keys. Normal assets are content-hash-named by `saveAsset`.
+  On Node, avatar/background renders use `getFileSrc` direct URLs and never
+  hit `readImage`; the winners are export, multimodal prompt assembly,
+  plugin, and TTS reads.
+
 ## Still open
 
 - PF-21–PF-27 hold-shape verification needs server-side queue-wait timing

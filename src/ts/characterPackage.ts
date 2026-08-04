@@ -11,7 +11,7 @@ import { createBlankChar } from './characters'
 import { CharXWriter } from './process/processzip'
 import { checkCharOrder } from './globalApi.svelte'
 import { getInlayAsset, setInlayAsset, getInlayInfosBatch, type InlayAsset } from './process/files/inlays'
-import { getInlayMeta, setInlayMeta, type InlayAssetMeta } from './process/files/inlayMeta'
+import { getInlayMetasBatch, setInlayMeta } from './process/files/inlayMeta'
 import { PngChunk } from './pngChunk'
 import { reencodeImage } from './process/files/inlays'
 import { MissingInterchangeChatError, streamCharacterChats } from './storage/interchangeChatStream'
@@ -611,9 +611,7 @@ export async function exportCharacterPackage(
 
             const [infos, metas] = await Promise.all([
                 getInlayInfosBatch(ids),
-                Promise.all(ids.map(async id => [id, await getInlayMeta(id)] as const)).then(
-                    entries => Object.fromEntries(entries.filter(([, v]) => v !== null)) as Record<string, InlayAssetMeta>
-                )
+                getInlayMetasBatch(ids),
             ])
 
             for (const id of ids) {

@@ -18,6 +18,9 @@ const storage = vi.hoisted(() => ({
     listEntriesWithSizes: vi.fn(async () => [{ key: 'pluginsave/a.json', size: 17 }]),
     getItem: vi.fn(async () => new TextEncoder().encode('{"source":"plain"}')),
     getItemCached: vi.fn(async () => new TextEncoder().encode('{"source":"cached"}')),
+    getItems: vi.fn<(keys: string[]) => Promise<{ key: string, value: Uint8Array }[]>>(
+        async () => [],
+    ),
     mutatePluginStorage,
     setItem: vi.fn(async (_key: string, _value: Uint8Array) => undefined),
     clearPluginSaveStorage: vi.fn(async () => 'committed' as const),
@@ -46,6 +49,7 @@ const {
     preparePersistentJson,
     restorePersistentPluginStoragePair,
     readPersistentJson,
+    readPersistentJsonBulk,
     readPersistentJsonRow,
     writePersistentJson,
 } = await import('./persistentKv')
@@ -70,6 +74,7 @@ afterAll(() => {
 beforeEach(() => {
     storage.getItem.mockClear()
     storage.getItemCached.mockClear()
+    storage.getItems.mockClear()
     storage.setItem.mockClear()
     storage.clearPluginSaveStorage.mockClear()
     storage.mutatePluginStorage.mockClear()
@@ -138,6 +143,44 @@ describe('persistent JSON read transport', () => {
         await expect(readPersistentJsonRow('pluginsave/missing.json')).resolves.toEqual({
             kind: 'missing',
         })
+    })
+
+    it('maps bulk hits and omitted rows to scalar values and nulls in key order', async () => {
+        const keys = ['cache/first.json', 'cache/missing.json', 'cache/second.json']
+        storage.getItems.mockResolvedValueOnce([
+            { key: keys[2], value: new TextEncoder().encode('{"value":"second"}') },
+            { key: keys[0], value: new TextEncoder().encode('{"value":"first"}') },
+        ])
+
+        await expect(readPersistentJsonBulk<{ value: string }>(keys)).resolves.toEqual([
+            { value: 'first' },
+            null,
+            { value: 'second' },
+        ])
+        expect(storage.getItems).toHaveBeenCalledOnce()
+        expect(storage.getItems).toHaveBeenCalledWith(keys)
+        expect(storage.getItem).not.toHaveBeenCalled()
+    })
+
+    it('rejects the same corrupt JSON bytes in scalar and bulk reads', async () => {
+        const key = 'cache/poisoned.json'
+        const corrupt = new TextEncoder().encode('')
+        storage.getItem.mockResolvedValueOnce(corrupt)
+        storage.getItems.mockResolvedValueOnce([{ key, value: corrupt }])
+
+        await expect(readPersistentJson(key)).rejects.toThrow(SyntaxError)
+        await expect(readPersistentJsonBulk([key])).rejects.toThrow(SyntaxError)
+    })
+
+    it('chunks unusually large bulk key lists into bounded requests', async () => {
+        const keys = Array.from({ length: 5_001 }, (_, index) => `cache/${index}.json`)
+
+        await expect(readPersistentJsonBulk(keys)).resolves.toEqual(
+            Array.from({ length: keys.length }, () => null),
+        )
+        expect(storage.getItems).toHaveBeenCalledTimes(2)
+        expect(storage.getItems.mock.calls[0][0]).toEqual(keys.slice(0, 5_000))
+        expect(storage.getItems.mock.calls[1][0]).toEqual(keys.slice(5_000))
     })
 })
 

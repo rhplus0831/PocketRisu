@@ -37,6 +37,9 @@ export { hasNativeStringWellFormed } from "./unicodeWellFormed";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+// The bulk-read route has an 8 MiB control-JSON cap; 5,000 hashed cache keys
+// keep each request below 0.5 MiB with ample encoding headroom.
+const PERSISTENT_JSON_BULK_READ_CHUNK_SIZE = 5_000;
 
 let initPromise: Promise<void> | null = null;
 
@@ -71,6 +74,21 @@ export type PersistentJsonRow<T> =
     | { kind: "missing" }
     | { kind: "value"; value: T };
 
+function decodePersistentJsonRow<T>(
+    storageKey: string,
+    data: Uint8Array | null | undefined,
+): PersistentJsonRow<T> {
+    if (data === null || data === undefined) {
+        return { kind: "missing" };
+    }
+    return {
+        kind: "value",
+        value: storageKey.startsWith("pluginsave/")
+            ? decodePluginStorageValueBytes<T>(data)
+            : JSON.parse(decoder.decode(data)) as T,
+    };
+}
+
 export async function readPersistentJsonRow<T>(
     storageKey: string,
     options: PersistentJsonReadOptions = {},
@@ -90,15 +108,7 @@ export async function readPersistentJsonRow<T>(
         : hasStorageOptions
             ? await forageStorage.getItem(storageKey, storageOptions)
             : await forageStorage.getItem(storageKey);
-    if (data === null || data === undefined) {
-        return { kind: "missing" };
-    }
-    return {
-        kind: "value",
-        value: storageKey.startsWith("pluginsave/")
-            ? decodePluginStorageValueBytes<T>(data)
-            : JSON.parse(decoder.decode(data)) as T,
-    };
+    return decodePersistentJsonRow<T>(storageKey, data);
 }
 
 export interface PreparedPersistentJson {
@@ -122,6 +132,23 @@ export async function readPersistentJson<T>(
 ): Promise<T | null> {
     const row = await readPersistentJsonRow<T>(storageKey, options);
     return row.kind === "missing" ? null : row.value;
+}
+
+export async function readPersistentJsonBulk<T>(
+    storageKeys: string[],
+): Promise<(T | null)[]> {
+    await ensureStorageReady();
+    const values: (T | null)[] = [];
+    for (let offset = 0; offset < storageKeys.length; offset += PERSISTENT_JSON_BULK_READ_CHUNK_SIZE) {
+        const chunk = storageKeys.slice(offset, offset + PERSISTENT_JSON_BULK_READ_CHUNK_SIZE);
+        const rows = await forageStorage.getItems(chunk);
+        const bytesByKey = new Map(rows.map((row) => [row.key, row.value]));
+        for (const storageKey of chunk) {
+            const row = decodePersistentJsonRow<T>(storageKey, bytesByKey.get(storageKey));
+            values.push(row.kind === "missing" ? null : row.value);
+        }
+    }
+    return values;
 }
 
 export async function writePersistentJson<T>(
