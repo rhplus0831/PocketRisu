@@ -738,7 +738,11 @@ export async function saveDb() {
         changeTracker.root = changeTracker.root || toSave.root
     }
 
-    async function rebaseTrackedLocalChangesOnLatestServerDb(db: Database, toSave: toSaveType) {
+    async function rebaseTrackedLocalChangesOnLatestServerDb(
+        db: Database,
+        toSave: toSaveType,
+        revisionProposal: RisuSaveDirtyRevisions | undefined,
+    ) {
         // The replacement patcher is based on the authoritative candidate,
         // while the installed live graph includes local overlays. Require one
         // full equality run before clean revisions become authoritative again.
@@ -782,11 +786,31 @@ export async function saveDb() {
                 "replacement-patcher-baseline",
             ],
         })
+        // Flush reactive dirtiness created during either network await, then
+        // peek at revisions newer than this save proposal. The live tracker is
+        // deliberately left untouched so these branches remain queued for the
+        // retry after their current values are overlaid below.
+        await tick()
+        const lateRevisions = revisionProposal
+            ? databaseDirtyRevisionTracker?.ledger.captureAfter(revisionProposal)
+            : undefined
+        const lateDirty: toSaveType = {
+            character: [...(lateRevisions?.characters ?? [])],
+            chat: safeStructuredClone(changeTracker.chat),
+            root: (lateRevisions?.rootKeys.size ?? 0) > 0,
+            rootKeys: [...(lateRevisions?.rootKeys ?? [])],
+            botPreset: lateRevisions?.botPreset ?? false,
+            modules: (lateRevisions?.modules.size ?? 0) > 0
+                || lateRevisions?.modulesStructural === true,
+            plugins: lateRevisions?.plugins ?? false,
+            pluginCustomStorage: lateRevisions?.pluginCustomStorage ?? false,
+        }
         const mergedDb = mergeTrackedDatabaseOnConflict(
             latestDb,
             db,
             toSave,
             knownChatIdsByCharacter,
+            lateDirty,
         )
         for (const character of mergedDb.characters ?? []) {
             character.chats = convertStubsToPlaceholders(character.chats ?? [])
@@ -817,6 +841,7 @@ export async function saveDb() {
     async function persistTrackedChanges(
         toSave: toSaveType,
         dirtyRevisions: RisuSaveDirtyRevisions | undefined,
+        revisionProposal: RisuSaveDirtyRevisions | undefined,
         options?: {
             forceFullWrite?: boolean
             skipBroadcast?: boolean
@@ -1059,7 +1084,11 @@ export async function saveDb() {
                 }
                 if (patchResult.conflict) {
                     console.warn('[Save] Patch conflict detected, rebasing tracked local changes on latest server DB...')
-                    await rebaseTrackedLocalChangesOnLatestServerDb(db, conflictRebaseToSave)
+                    await rebaseTrackedLocalChangesOnLatestServerDb(
+                        db,
+                        conflictRebaseToSave,
+                        revisionProposal,
+                    )
                     await sleep(Math.min(500 * (savetrys + 1), 3000))
                     return chatPersistStage.completeStubCommit({ committed: false, result: 'retry' })
                 }
@@ -1099,7 +1128,11 @@ export async function saveDb() {
                         activePatcher.discard(dirtyProposal)
                     }
                     console.warn('[Save] Full-write conflict detected, rebasing tracked local changes on latest server DB...')
-                    await rebaseTrackedLocalChangesOnLatestServerDb(db, conflictRebaseToSave)
+                    await rebaseTrackedLocalChangesOnLatestServerDb(
+                        db,
+                        conflictRebaseToSave,
+                        revisionProposal,
+                    )
                     await sleep(Math.min(500 * (savetrys + 1), 3000))
                     return chatPersistStage.completeStubCommit({ committed: false, result: 'retry' })
                 }
@@ -1132,6 +1165,9 @@ export async function saveDb() {
         return saveCoordinator.run(async () => {
             const toSave = takeTrackedChanges()
             const revisionProposal = databaseDirtyRevisionTracker?.ledger.capture()
+            if (revisionProposal && revisionProposal.rootKeys.size > 0) {
+                toSave.rootKeys = [...revisionProposal.rootKeys.keys()]
+            }
             const hasDirtyRevisions = revisionProposal
                 ? databaseDirtyRevisionTracker?.ledger.hasDirty(revisionProposal) === true
                 : false
@@ -1144,6 +1180,7 @@ export async function saveDb() {
                 const result = await persistTrackedChanges(
                     toSave,
                     revisionTrustReady ? revisionProposal : undefined,
+                    revisionProposal,
                     options,
                 )
                 if (result === 'saved') {

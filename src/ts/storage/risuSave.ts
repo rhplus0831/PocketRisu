@@ -48,6 +48,8 @@ export type toSaveType = {
     character: string[];
     chat: [string, string][];
     root: boolean;
+    /** Exact generic-root identities used only by conflict overlays. */
+    rootKeys?: string[];
     botPreset: boolean;
     modules: boolean;
     plugins: boolean;
@@ -1444,12 +1446,14 @@ export class RisuSavePatcher {
             character: [...tracked.character],
             chat: tracked.chat.map(([chaId, chatId]) => [chaId, chatId]),
             root: tracked.root,
+            rootKeys: tracked.rootKeys ? [...tracked.rootKeys] : undefined,
             botPreset: tracked.botPreset,
             modules: tracked.modules,
             plugins: tracked.plugins,
             pluginCustomStorage: tracked.pluginCustomStorage,
         };
         const characterIds = new Set(dirty.character.filter(Boolean));
+        const rootKeys = new Set(dirty.rootKeys ?? []);
         const baselineCharacters = Array.isArray(this.lastSyncedDb.characters)
             ? this.lastSyncedDb.characters
             : [];
@@ -1484,9 +1488,11 @@ export class RisuSavePatcher {
                 dirty.pluginCustomStorage = true;
             } else if (root && !publicationControls.has(root)) {
                 dirty.root = true;
+                rootKeys.add(root);
             }
         }
         dirty.character = [...characterIds];
+        if (rootKeys.size > 0) dirty.rootKeys = [...rootKeys];
         return dirty;
     }
 
@@ -1502,6 +1508,9 @@ export class RisuSavePatcher {
             chat: pending.conflictDirtyBranches.chat.map(
                 ([chaId, chatId]) => [chaId, chatId],
             ),
+            rootKeys: pending.conflictDirtyBranches.rootKeys
+                ? [...pending.conflictDirtyBranches.rootKeys]
+                : undefined,
         };
     }
 

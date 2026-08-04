@@ -1,6 +1,7 @@
 import { flushSync } from 'svelte'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { deepTouch } from '../gui/deepTouch.svelte'
+import { mergeTrackedDatabaseOnConflict } from './databaseClone'
 import { watchActiveChatDirty } from './activeChatDirtyTracker.svelte'
 
 interface TestChat {
@@ -203,5 +204,81 @@ describe('watchActiveChatDirty', () => {
         vi.runAllTimers()
         flushSync()
         expect(harness.touches()).toBe(1)
+    })
+
+    test('409 rebase overlays only a late-dirty chat identity and keeps it queued', () => {
+        const state = $state<{ db: any }>({
+            db: {
+                username: 'local stale root',
+                characters: [
+                    {
+                        chaId: 'char-a',
+                        name: 'A',
+                        desc: 'frozen local A',
+                        chats: [],
+                    },
+                    {
+                        chaId: 'char-b',
+                        name: 'B',
+                        chats: [
+                            { id: 'chat-b', name: 'B', message: [{ data: 'before' }] },
+                            { id: 'chat-c', name: 'C', message: [{ data: 'local stale C' }] },
+                        ],
+                    },
+                ],
+            },
+        })
+        const queued: Array<[string, string]> = []
+        const tracker = watchActiveChatDirty({
+            select: () => ({
+                chaId: 'char-b',
+                chatId: 'chat-b',
+                chat: state.db.characters[1].chats[0],
+            }),
+            onDirty: (chaId, chatId) => queued.push([chaId, chatId]),
+            retouchDelayMs: 500,
+        })
+        flushSync()
+
+        state.db.characters[1].chats[0].message[0].data = 'late local chat B'
+        flushSync()
+        expect(queued).toEqual([['char-b', 'chat-b']])
+
+        const latest = JSON.parse(JSON.stringify(state.db))
+        latest.username = 'server root adopted'
+        latest.characters[1].chats[0].message[0].data = 'server chat B loses LWW'
+        latest.characters[1].chats[1].message[0].data = 'server chat C adopted'
+        const merged = mergeTrackedDatabaseOnConflict(
+            latest as any,
+            state.db as any,
+            {
+                character: ['char-a'],
+                chat: [],
+                root: false,
+                botPreset: false,
+                modules: false,
+                plugins: false,
+                pluginCustomStorage: false,
+            },
+            undefined,
+            {
+                character: [],
+                chat: queued,
+                root: false,
+                rootKeys: [],
+                botPreset: false,
+                modules: false,
+                plugins: false,
+                pluginCustomStorage: false,
+            },
+        )
+        state.db = merged
+        flushSync()
+
+        expect(state.db.username).toBe('server root adopted')
+        expect(state.db.characters[1].chats[0].message[0].data).toBe('late local chat B')
+        expect(state.db.characters[1].chats[1].message[0].data).toBe('server chat C adopted')
+        expect(queued).toContainEqual(['char-b', 'chat-b'])
+        tracker.stop()
     })
 })

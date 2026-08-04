@@ -20,6 +20,17 @@ export interface RisuSaveDirtyRevisions {
     isBranchTrusted(branch: RisuSaveRevisionBranch): boolean
 }
 
+export interface RisuSaveDirtyRevisionDelta {
+    readonly rootKeys: ReadonlySet<string>
+    readonly characters: ReadonlySet<string>
+    readonly modules: ReadonlySet<string>
+    readonly botPreset: boolean
+    readonly charactersStructural: boolean
+    readonly modulesStructural: boolean
+    readonly plugins: boolean
+    readonly pluginCustomStorage: boolean
+}
+
 interface OwnedDirtyRevisions extends RisuSaveDirtyRevisions {
     readonly owner: symbol
 }
@@ -135,6 +146,33 @@ export class DatabaseDirtyRevisionLedger {
         } as OwnedDirtyRevisions
     }
 
+    /**
+     * Peek at branches dirtied after an earlier capture. This does not
+     * acknowledge or otherwise mutate either the capture or the live ledger.
+     */
+    captureAfter(snapshot: RisuSaveDirtyRevisions): RisuSaveDirtyRevisionDelta {
+        const owned = this.assertOwned(snapshot)
+        return {
+            rootKeys: this.keysAfter(this.dirtyRootKeys, owned.rootKeys),
+            characters: this.keysAfter(this.dirtyCharacters, owned.characters),
+            modules: this.keysAfter(this.dirtyModules, owned.modules),
+            botPreset: this.revisionAfter(this.dirtyBotPreset, owned.botPreset),
+            charactersStructural: this.revisionAfter(
+                this.dirtyCharactersStructural,
+                owned.charactersStructural,
+            ),
+            modulesStructural: this.revisionAfter(
+                this.dirtyModulesStructural,
+                owned.modulesStructural,
+            ),
+            plugins: this.revisionAfter(this.dirtyPlugins, owned.plugins),
+            pluginCustomStorage: this.revisionAfter(
+                this.dirtyPluginCustomStorage,
+                owned.pluginCustomStorage,
+            ),
+        }
+    }
+
     hasDirty(snapshot: RisuSaveDirtyRevisions = this.capture()): boolean {
         return snapshot.rootKeys.size > 0
             || snapshot.characters.size > 0
@@ -181,6 +219,21 @@ export class DatabaseDirtyRevisionLedger {
         for (const [key, revision] of captured) {
             if (dirty.get(key) === revision) dirty.delete(key)
         }
+    }
+
+    private keysAfter(
+        dirty: ReadonlyMap<string, number>,
+        captured: ReadonlyMap<string, number>,
+    ): ReadonlySet<string> {
+        const keys = new Set<string>()
+        for (const [key, revision] of dirty) {
+            if (revision > (captured.get(key) ?? 0)) keys.add(key)
+        }
+        return keys
+    }
+
+    private revisionAfter(current: number | null, captured: number | null): boolean {
+        return current !== null && current > (captured ?? 0)
     }
 }
 

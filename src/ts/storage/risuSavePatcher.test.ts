@@ -370,13 +370,17 @@ describe('RisuSavePatcher acknowledgement boundary', () => {
 
     test('unions tracked branches with baseline-proven changes conservatively', async () => {
         const baseline = dbWith([chr('a'), chr('b')])
+        baseline.username = 'server'
         const changed = clone(baseline)
         changed.characters[1].desc = 'changed outside the tracker hint'
+        changed.username = 'local'
         const patcher = new RisuSavePatcher()
         await patcher.init(baseline)
 
         const proposal = await patcher.set(changed, emptyToSave())
-        expect(patcher.conflictDirtyBranches(proposal).character).toContain('b')
+        const conflictBranches = patcher.conflictDirtyBranches(proposal)
+        expect(conflictBranches.character).toContain('b')
+        expect(conflictBranches.rootKeys).toContain('username')
         patcher.discard(proposal)
 
         changed.characters.push(chr('c'))

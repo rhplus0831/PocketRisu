@@ -1,7 +1,9 @@
 import { flushSync } from 'svelte'
 import { describe, expect, test, vi } from 'vitest'
+import { mergeTrackedDatabaseOnConflict } from './databaseClone'
 import { DatabaseDirtyRevisionLedger } from './databaseDirtyRevisions'
 import { watchDatabaseDirtyRevisions } from './databaseDirtyRevisionTracker.svelte'
+import type { toSaveType } from './risuSave'
 
 function makeDatabase() {
     return {
@@ -37,8 +39,8 @@ function makeDatabase() {
     }
 }
 
-function createHarness() {
-    const state = $state({ db: makeDatabase() })
+function createHarness(database = makeDatabase()) {
+    const state = $state({ db: database })
     const callbacks = {
         rootKey: vi.fn(),
         character: vi.fn(),
@@ -78,6 +80,28 @@ describe('DatabaseDirtyRevisionLedger acknowledgement lifecycle', () => {
         const first = new DatabaseDirtyRevisionLedger()
         const second = new DatabaseDirtyRevisionLedger()
         expect(() => first.commit(second.capture())).toThrow(/foreign database dirty revisions/)
+    })
+
+    test('captureAfter peeks only revisions created after proposal capture', () => {
+        const ledger = new DatabaseDirtyRevisionLedger()
+        ledger.markCharacter('char-a')
+        ledger.markRootKey('username')
+        const proposal = ledger.capture()
+
+        ledger.markCharacter('char-b')
+        ledger.markCharacter('char-a')
+        ledger.markRootKey('temperature')
+        ledger.markBranch('plugins')
+
+        const late = ledger.captureAfter(proposal)
+        expect([...late.characters]).toEqual(['char-a', 'char-b'])
+        expect([...late.rootKeys]).toEqual(['temperature'])
+        expect(late.plugins).toBe(true)
+
+        const stillDirty = ledger.capture()
+        expect([...stillDirty.characters.keys()]).toEqual(['char-a', 'char-b'])
+        expect([...stillDirty.rootKeys.keys()]).toEqual(['username', 'temperature'])
+        expect(stillDirty.plugins).not.toBeNull()
     })
 })
 
@@ -145,6 +169,67 @@ describe('watchDatabaseDirtyRevisions state-layer coverage', () => {
         const revisions = harness.tracker.ledger.capture()
         expect(revisions.plugins).not.toBeNull()
         expect([...revisions.characters.keys()]).toEqual(['char-a'])
+        harness.tracker.stop()
+    })
+
+    test('409 rebase preserves late proxy character and root edits without hiding their dirtiness', () => {
+        const initial = makeDatabase()
+        initial.characters.push({
+            chaId: 'char-c',
+            name: 'C',
+            desc: 'initial-c',
+            chats: [],
+        })
+        const harness = createHarness(initial)
+        harness.state.db.characters[0].desc = 'frozen local A'
+        flushSync()
+        const proposal = harness.tracker.ledger.capture()
+        const frozen: toSaveType = {
+            character: ['char-a'],
+            chat: [],
+            root: false,
+            botPreset: false,
+            modules: false,
+            plugins: false,
+            pluginCustomStorage: false,
+        }
+
+        // This mutation represents work acknowledged by the UI while the
+        // frozen save proposal is awaiting its 409 response.
+        harness.state.db.characters[1].desc = 'late local B'
+        harness.state.db.temperature = 71
+        flushSync()
+
+        const lateRevisions = harness.tracker.ledger.captureAfter(proposal)
+        const latest = structuredClone(initial)
+        latest.username = 'server root adopted'
+        latest.characters[2].desc = 'server C adopted'
+        const merged = mergeTrackedDatabaseOnConflict(
+            latest as any,
+            harness.state.db as any,
+            frozen,
+            undefined,
+            {
+                character: [...lateRevisions.characters],
+                chat: [],
+                root: lateRevisions.rootKeys.size > 0,
+                rootKeys: [...lateRevisions.rootKeys],
+                botPreset: lateRevisions.botPreset,
+                modules: lateRevisions.modules.size > 0 || lateRevisions.modulesStructural,
+                plugins: lateRevisions.plugins,
+                pluginCustomStorage: lateRevisions.pluginCustomStorage,
+            },
+        )
+        harness.state.db = merged as unknown as ReturnType<typeof makeDatabase>
+        flushSync()
+
+        expect(harness.state.db.characters[1].desc).toBe('late local B')
+        expect(harness.state.db.characters[2].desc).toBe('server C adopted')
+        expect(harness.state.db.temperature).toBe(71)
+        expect(harness.state.db.username).toBe('server root adopted')
+        const afterRebase = harness.tracker.ledger.capture()
+        expect(afterRebase.characters.has('char-b')).toBe(true)
+        expect(afterRebase.rootKeys.has('temperature')).toBe(true)
         harness.tracker.stop()
     })
 

@@ -234,22 +234,35 @@ export function mergeTrackedDatabaseOnConflict(
     local: Database,
     toSave: toSaveType,
     knownChatIdsByCharacter?: ReadonlyMap<string, ReadonlySet<string>>,
+    lateDirty?: toSaveType,
 ): Database {
-    if (toSave.root) {
+    const broadRootOverlay = (toSave.root && toSave.rootKeys === undefined)
+        || (lateDirty?.root === true && lateDirty.rootKeys === undefined);
+    const trackedRootKeys = new Set([
+        ...(toSave.rootKeys ?? []),
+        ...(lateDirty?.rootKeys ?? []),
+    ]);
+    if (broadRootOverlay) {
         for (const key in local) {
             if (!GENERIC_ROOT_MERGE_EXCLUSIONS.has(key)) {
                 latest[key] = cloneDatabaseField(key, local[key]);
             }
         }
+    } else {
+        for (const key of trackedRootKeys) {
+            if (GENERIC_ROOT_MERGE_EXCLUSIONS.has(key)) continue;
+            if (Object.hasOwn(local, key)) latest[key] = cloneDatabaseField(key, local[key]);
+            else delete latest[key];
+        }
     }
 
-    if (toSave.botPreset) {
+    if (toSave.botPreset || lateDirty?.botPreset) {
         latest.botPresets = safeStructuredClone(local.botPresets);
         latest.botPresetsId = local.botPresetsId;
     }
-    if (toSave.modules) latest.modules = safeStructuredClone(local.modules);
-    if (toSave.plugins) latest.plugins = safeStructuredClone(local.plugins);
-    if (toSave.pluginCustomStorage) {
+    if (toSave.modules || lateDirty?.modules) latest.modules = safeStructuredClone(local.modules);
+    if (toSave.plugins || lateDirty?.plugins) latest.plugins = safeStructuredClone(local.plugins);
+    if (toSave.pluginCustomStorage || lateDirty?.pluginCustomStorage) {
         latest.pluginCustomStorage = cloneDatabasePluginStorageRecord(
             local.pluginCustomStorage,
         );
@@ -263,9 +276,12 @@ export function mergeTrackedDatabaseOnConflict(
         }
     }
 
-    const trackedCharIds = new Set<string>(toSave.character.filter(Boolean));
+    const trackedCharIds = new Set<string>([
+        ...toSave.character,
+        ...(lateDirty?.character ?? []),
+    ].filter(Boolean));
     const trackedChatIdsByCharacter = new Map<string, Set<string>>();
-    for (const trackedChat of toSave.chat) {
+    for (const trackedChat of [...toSave.chat, ...(lateDirty?.chat ?? [])]) {
         const [chaId, chatId] = trackedChat ?? [];
         if (!chaId || !chatId) continue;
         const trackedIds = trackedChatIdsByCharacter.get(chaId) ?? new Set<string>();
