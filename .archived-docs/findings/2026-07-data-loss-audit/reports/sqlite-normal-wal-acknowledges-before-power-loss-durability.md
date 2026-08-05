@@ -4,7 +4,7 @@
 - Severity: High
 - Lens: D2
 - Area: Area 5 — server KV core and chat rows
-- Extends: [Acknowledged database patches are not durable for up to five seconds](../../../../docs/findings/open/client-storage/acknowledged-patches-are-not-durable.md)
+- Extends: [Acknowledged database patches are not durable for up to five seconds](../../2026-08-remediation/fixed/acknowledged-patches-are-not-durable.md)
 - Affected code: `server/node/db.cjs:16-18`, `server/node/server.cjs:4324-4361`, `server/node/server.cjs:4369-4378`, `server/node/server.cjs:5566-5577`, `server/node/server.cjs:7386-7392`
 
 ## Risk

@@ -15,48 +15,48 @@ re-rank freely as priorities change.
 
 ## Pending
 
-1. [Acknowledged database patches are not durable for up to five seconds](open/client-storage/acknowledged-patches-are-not-durable.md) — High — reopened from Deferred 2026-08-05 with the staged/durable-ack protocol decided; same client-storage save-loop surface as the next item.
-2. [The save loop stops retrying after five consecutive failures](open/client-storage/save-loop-idles-after-five-failures.md) — Medium
-3. [Non-optimized plugin save storage acknowledges before persistence](open/plugin-storage/nonoptimized-save-storage-acks-before-persistence.md) — Medium
-4. [Bulk filesystem writes can commit a partial prefix](open/server-backend/bulk-filesystem-writes-partially-commit.md) — Medium
-5. [Boot spool sweep can unlink another instance's active file](open/server-backend/boot-spool-sweep-can-unlink-another-instances-active-file.md) — Medium
-6. [Decoded stream-load spools bypass the configured spool and orphan sweep](open/server-backend/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md) — Medium — same spool/sweep surface as the previous item.
-7. [Wall-clock rollback disables chat pre-image capture](open/backup-recovery/wall-clock-rollback-disables-chat-preimage-capture.md) — Medium
-8. [Best-effort path markers let updaters delete recovery directories](open/backup-recovery/best-effort-path-markers-let-updaters-delete-recovery-directories.md) — Medium
-9. [Changing the chat-backup root hides all existing version history](open/backup-recovery/changing-chat-backup-root-hides-all-existing-version-history.md) — Medium
-10. [Chat-version backups do not keep referenced inlays live](open/backup-recovery/chat-version-backups-do-not-keep-referenced-inlays-live.md) — Medium
-11. [Inlays still served from KV fallback are omitted from backups and cleared on restore](open/backup-recovery/unmigrated-kv-inlays-are-omitted-from-backups.md) — Medium
-12. [Runtime asset writes can replace a case-colliding asset on case-insensitive volumes](open/media-translation/runtime-asset-writes-can-case-fold-clobber.md) — Medium — residual carved out of the fixed migration/import portability finding; same assets surface as the next three items.
-13. [External dedup can strand or overwrite a live asset](open/media-translation/external-dedup-can-strand-or-overwrite-a-live-asset.md) — Medium
-14. [Inlay filename mapping is not injective](open/media-translation/inlay-filename-mapping-is-not-injective.md) — Medium
-15. [Preferred jdupes merges cross-instance ownership](open/media-translation/preferred-jdupes-merges-cross-instance-ownership.md) — Medium — same dedup surface as the previous two items.
-16. [Imported card triggers can bulk-delete chat history without the low-level-access consent](open/scripting-extensions/card-triggers-can-bulk-delete-history-without-consent.md) — Medium
-17. [CCv2 export drops regex lore semantics](open/characters-personas/ccv2-export-drops-regex-lore-semantics.md) — Medium
-18. [CharX importer mistakes JSON assets for metadata](open/characters-personas/charx-importer-mistakes-json-assets-for-metadata.md) — Medium
-19. [Live model-job claim precedes chat-row durability](open/chat-pipeline/model-job-claim-precedes-chat-durability.md) — Warning
-20. [Terminal job recovery can overwrite a newer generation by stale index](open/chat-pipeline/terminal-job-recovery-uses-stale-message-index.md) — Warning — same job-recovery surface as the previous item.
-21. [Streaming checkpoint re-arm can absorb unsaved tokens](open/chat-pipeline/streaming-checkpoint-rearm-can-absorb-unsaved-tokens.md) — Warning
-22. [Draft-save failures have no retry or user signal](open/client-storage/draft-save-failures-have-no-retry-or-signal.md) — Warning
-23. [Build-mismatch reload can discard an undurable composer draft](open/client-storage/build-mismatch-reload-can-discard-composer-draft.md) — Warning — same draft-durability surface as the previous item; also covers the widened writer-epoch reload trigger.
-24. [Sidecar databases use NORMAL WAL without a shutdown drain](open/server-backend/sidecar-databases-use-normal-wal-without-shutdown-drain.md) — Warning
-25. [Plugin recovery offers an inline repair it cannot serialize](open/plugin-storage/recovery-use-inline-cannot-serialize-lossless-values.md) — Warning
-26. [Sparse-array holes are densified in plugin-storage transitions and snapshots](open/plugin-storage/sparse-array-holes-densified.md) — Warning
-27. [Lua local-lore upserts are discarded in non-display trigger modes](open/scripting-extensions/lua-local-lore-upsert-is-discarded.md) — Warning
-28. [Gemini cross-turn signature persistence is disconnected](open/model-providers/gemini-streaming-signature-save-is-fire-and-forget.md) — Warning — product decision first: wire the dormant gate or remove it.
-29. [Chat-version import reports success before anything is persisted](open/backup-recovery/chat-version-import-acknowledges-before-save.md) — Low
-30. [Server backups are acknowledged before the directory entry is durable](open/backup-recovery/server-backup-published-without-fsync.md) — Low
-31. [Upstream-compatible backup drops live inlays but keeps their chat references](open/backup-recovery/upstream-compatible-backup-drops-live-inlays-but-keeps-their-chat-references.md) — Low
-32. [A crash during inlay migration can discard inlay metadata](open/media-translation/interrupted-inlay-migration-discards-the-source-row.md) — Low
-33. [Character package remaps chat IDs without remapping inlay metadata](open/characters-personas/character-package-remaps-chat-ids-without-remapping-inlay-metadata.md) — Low
-34. [Module CharX export drops `namespace` and `cjs`](open/characters-personas/module-charx-export-drops-namespace-and-cjs.md) — Low
-35. [Persona exports silently drop advanced persona data](open/characters-personas/persona-exports-drop-advanced-fields.md) — Low
-36. [The full-write ETag does not cover chat rows](open/server-backend/full-write-etag-does-not-cover-chat-rows.md) — Low
-37. [V2 storage assignments now always detach caller aliases](open/plugin-storage/v2-plugin-storage-live-aliases.md) — Low
-38. [Callback bridge skips deep stream transfer and remote-class serialization](open/scripting-extensions/callback-bridge-skips-stream-transfer-and-remote-class-serialization.md) — Low
-39. [Real upstream backup tests silently skip without a local fixture](open/operations-coverage/real-upstream-backup-fixture-skipped.md) — Informational
+1. [The save loop stops retrying after five consecutive failures](open/client-storage/save-loop-idles-after-five-failures.md) — Medium
+2. [Non-optimized plugin save storage acknowledges before persistence](open/plugin-storage/nonoptimized-save-storage-acks-before-persistence.md) — Medium
+3. [Bulk filesystem writes can commit a partial prefix](open/server-backend/bulk-filesystem-writes-partially-commit.md) — Medium
+4. [Boot spool sweep can unlink another instance's active file](open/server-backend/boot-spool-sweep-can-unlink-another-instances-active-file.md) — Medium
+5. [Decoded stream-load spools bypass the configured spool and orphan sweep](open/server-backend/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md) — Medium — same spool/sweep surface as the previous item.
+6. [Wall-clock rollback disables chat pre-image capture](open/backup-recovery/wall-clock-rollback-disables-chat-preimage-capture.md) — Medium
+7. [Best-effort path markers let updaters delete recovery directories](open/backup-recovery/best-effort-path-markers-let-updaters-delete-recovery-directories.md) — Medium
+8. [Changing the chat-backup root hides all existing version history](open/backup-recovery/changing-chat-backup-root-hides-all-existing-version-history.md) — Medium
+9. [Chat-version backups do not keep referenced inlays live](open/backup-recovery/chat-version-backups-do-not-keep-referenced-inlays-live.md) — Medium
+10. [Inlays still served from KV fallback are omitted from backups and cleared on restore](open/backup-recovery/unmigrated-kv-inlays-are-omitted-from-backups.md) — Medium
+11. [Runtime asset writes can replace a case-colliding asset on case-insensitive volumes](open/media-translation/runtime-asset-writes-can-case-fold-clobber.md) — Medium — residual carved out of the fixed migration/import portability finding; same assets surface as the next three items.
+12. [External dedup can strand or overwrite a live asset](open/media-translation/external-dedup-can-strand-or-overwrite-a-live-asset.md) — Medium
+13. [Inlay filename mapping is not injective](open/media-translation/inlay-filename-mapping-is-not-injective.md) — Medium
+14. [Preferred jdupes merges cross-instance ownership](open/media-translation/preferred-jdupes-merges-cross-instance-ownership.md) — Medium — same dedup surface as the previous two items.
+15. [Imported card triggers can bulk-delete chat history without the low-level-access consent](open/scripting-extensions/card-triggers-can-bulk-delete-history-without-consent.md) — Medium
+16. [CCv2 export drops regex lore semantics](open/characters-personas/ccv2-export-drops-regex-lore-semantics.md) — Medium
+17. [CharX importer mistakes JSON assets for metadata](open/characters-personas/charx-importer-mistakes-json-assets-for-metadata.md) — Medium
+18. [Live model-job claim precedes chat-row durability](open/chat-pipeline/model-job-claim-precedes-chat-durability.md) — Warning
+19. [Terminal job recovery can overwrite a newer generation by stale index](open/chat-pipeline/terminal-job-recovery-uses-stale-message-index.md) — Warning — same job-recovery surface as the previous item.
+20. [Streaming checkpoint re-arm can absorb unsaved tokens](open/chat-pipeline/streaming-checkpoint-rearm-can-absorb-unsaved-tokens.md) — Warning
+21. [Draft-save failures have no retry or user signal](open/client-storage/draft-save-failures-have-no-retry-or-signal.md) — Warning
+22. [Build-mismatch reload can discard an undurable composer draft](open/client-storage/build-mismatch-reload-can-discard-composer-draft.md) — Warning — same draft-durability surface as the previous item; also covers the widened writer-epoch reload trigger.
+23. [Sidecar databases use NORMAL WAL without a shutdown drain](open/server-backend/sidecar-databases-use-normal-wal-without-shutdown-drain.md) — Warning
+24. [Plugin recovery offers an inline repair it cannot serialize](open/plugin-storage/recovery-use-inline-cannot-serialize-lossless-values.md) — Warning
+25. [Sparse-array holes are densified in plugin-storage transitions and snapshots](open/plugin-storage/sparse-array-holes-densified.md) — Warning
+26. [Lua local-lore upserts are discarded in non-display trigger modes](open/scripting-extensions/lua-local-lore-upsert-is-discarded.md) — Warning
+27. [Gemini cross-turn signature persistence is disconnected](open/model-providers/gemini-streaming-signature-save-is-fire-and-forget.md) — Warning — product decision first: wire the dormant gate or remove it.
+28. [Chat-version import reports success before anything is persisted](open/backup-recovery/chat-version-import-acknowledges-before-save.md) — Low
+29. [Server backups are acknowledged before the directory entry is durable](open/backup-recovery/server-backup-published-without-fsync.md) — Low
+30. [Upstream-compatible backup drops live inlays but keeps their chat references](open/backup-recovery/upstream-compatible-backup-drops-live-inlays-but-keeps-their-chat-references.md) — Low
+31. [A crash during inlay migration can discard inlay metadata](open/media-translation/interrupted-inlay-migration-discards-the-source-row.md) — Low
+32. [Character package remaps chat IDs without remapping inlay metadata](open/characters-personas/character-package-remaps-chat-ids-without-remapping-inlay-metadata.md) — Low
+33. [Module CharX export drops `namespace` and `cjs`](open/characters-personas/module-charx-export-drops-namespace-and-cjs.md) — Low
+34. [Persona exports silently drop advanced persona data](open/characters-personas/persona-exports-drop-advanced-fields.md) — Low
+35. [The full-write ETag does not cover chat rows](open/server-backend/full-write-etag-does-not-cover-chat-rows.md) — Low
+36. [V2 storage assignments now always detach caller aliases](open/plugin-storage/v2-plugin-storage-live-aliases.md) — Low
+37. [Callback bridge skips deep stream transfer and remote-class serialization](open/scripting-extensions/callback-bridge-skips-stream-transfer-and-remote-class-serialization.md) — Low
+38. [Real upstream backup tests silently skip without a local fixture](open/operations-coverage/real-upstream-backup-fixture-skipped.md) — Informational
 
 ## Completed
 
+- [Acknowledged database patches are not durable for up to five seconds](../../.archived-docs/findings/2026-08-remediation/fixed/acknowledged-patches-are-not-durable.md) — fixed by `e526398e` (2026-08-05)
 - [Queued plugin-recovery actions are not bound to the writer epoch](../../.archived-docs/findings/2026-08-remediation/fixed/queued-recovery-actions-ignore-writer-epoch.md) — fixed by `3d7e7fb6` (2026-08-05)
 - [Serve pushes and releases are not gated by the test suites](../../.archived-docs/findings/2026-08-remediation/fixed/compatibility-suites-not-run-in-ci.md) — fixed by `f519771d` + `ee924ac6` (2026-08-05)
 - [Reroll can leave no durable copy of the discarded response](../../.archived-docs/findings/2026-08-remediation/fixed/reroll-discards-the-only-copy-within-preimage-cooldown.md) — fixed by `a772b134` (2026-08-05)

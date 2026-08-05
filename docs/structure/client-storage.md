@@ -23,6 +23,7 @@ The client-storage subsystem owns PocketRisu’s canonical `Database` model, its
 | `src/ts/storage/chatPersistStage.ts` | Testable row-persistence stage used by `saveDb()`. `prepareChatPersistStage()` discovers changed/new chats, requires authoritative row writes before stub commit, checkpoints a generating chat at most once per 20 seconds, requeues it for the final post-generation save, and updates the known-chat baseline only after a committed stub database. |
 | `src/ts/storage/activeChatDirtyTracker.svelte.ts` | Batches the active chat's deep reactive subscription without weakening mutation coverage. The first nested mutation queues the live chat and drops the expensive nested dependencies; a revision timer re-arms them once per ordinary save window or generation checkpoint interval. Selection and hydration remain explicit clean-baseline cases. |
 | `src/ts/storage/databaseDirtyRevisions.ts`, `databaseDirtyRevisionTracker.svelte.ts` | Own acknowledgement-scoped dirty revisions and state-layer observation for root keys, every character's database/stub projection, modules, presets, plugins, and plugin-storage metadata. Independent deep-proxy effects avoid waking untouched branches; discarded/failed saves retain revisions, while commits clear only the exact acknowledged revision. |
+| `src/ts/storage/stagedAckTracker.ts` | Holds each staged (`durable: false`) patch acknowledgement's ledger proposal and tracked targets behind commit/replay callbacks until a durable confirmation. Confirmation is an ETag watermark from `flushDatabase()`, debounced 6.5 s past the server's coalescing window with exponential retry; durable full writes or `durable: true` patch acks confirm the whole buffer, while conflicts, displacement, or repeated unknown-ETag verdicts replay entries into dirty tracking. |
 | `src/ts/chatLoadPages.ts` | Validates message-render limits. Defaults are 30 initially and 15 additionally (`:1-2`); normalization is at `:4`; database-facing getters are at `:17` and `:21`. Despite the names, these values count messages, not server pages. |
 | `src/ts/storage/chatDraft.ts` | Stores per-chat unsent composer text outside `Chat`. `ChatDraftSession` distinguishes loading, ready, error, and closed states so a temporary empty composer cannot delete an unread draft after a failed or in-flight load. |
 | `src/ts/storage/persistentKv.ts` | JSON/KV primitives plus structured plugin mutation, version, batch, generation, and commit-outcome helpers. Reads can opt into verified resource caching; hashed and reversible key builders remain common plugin/MCP primitives. |
@@ -52,6 +53,7 @@ Relevant regression coverage:
 - `src/ts/storage/normalizeJSON.test.ts` checks path-based circular-reference handling (`:11`).
 - `src/ts/storage/chatDraft.test.ts` covers write ordering, orphan cleanup, and round trips (`:48`, `:78`, `:90`).
 - `src/ts/storage/chatPersistStage.test.ts` covers row-before-stub ordering, failed-row rejection, generation throttling, forced/final saves, durable known-chat promotion, and placeholder handling.
+- `src/ts/storage/stagedAckTracker.test.ts` covers staged-ack retention without a flush confirmation (the replay protocol case), the ETag watermark, retry backoff, displacement stop, and `confirmNow` coalescing; `test/compat/staged-patch-durability.test.ts` covers the server-side structural commit-before-ack under SIGKILL and the staged/flush semantics.
 - `src/ts/storage/activeChatDirtyTracker.svelte.test.ts` covers bounded re-walk frequency on a 1,000-message chat, new graph nodes, selection, same-ID replacement, hydration suppression, generation cadence, forced re-arm, and cleanup.
 - `src/ts/drive/backuplocal.test.ts` verifies server-owned partial export, cancellation, missing-asset reporting, sink cleanup, and destructive replacement outcomes.
 - `src/ts/chatLoadPages.test.ts` covers normalization and defaults (`:10`).
@@ -183,7 +185,11 @@ no longer exist.
 8. `requestImmediateSave()` queues behind older in-flight work and returns a
    `DatabaseSaveOutcome`. Callers that need durability must require
    `outcome.status === 'committed'` or use `requireCommittedDatabaseSave()`; merely
-   awaiting the promise is not a durability proof. The coordinator can pause saves during
+   awaiting the promise is not a durability proof. `requestImmediateSave()` sets
+   `requireDurable`, so a staged patch acknowledgement (and any earlier staged
+   backlog) is confirmed through an immediate `flushDatabase()` before `committed`
+   is returned; a failed confirmation replays the staged state and returns `retry`.
+   The coordinator can pause saves during
    staged publication. `blockDatabaseSavesUntilReload()` is the explicit fence used when
    a specialized atomic transition has an unresolved outcome; the ordinary database save
    loop requeues failed or ambiguous attempts rather than installing that fence itself.
@@ -227,7 +233,7 @@ When `supportsPatchSync` is enabled (`src/ts/platform.ts:18`):
 
 - `RisuSavePatcher.set()` generates an RFC 6902 patch and expected compositional hash against the captured stub-only baseline as an uncommitted proposal. The save loop calls `commit()` only after a successful server acknowledgement and `discard()` on rejection or transport failure.
 - `findDangerousChatOps()` rejects field-level operations outside the stub metadata allowlist before they leave the browser.
-- `/api/patch` applies the patch to the server's stripped cache; its response updates the cached ETag and may surface a deferred persistence warning.
+- `/api/patch` applies the patch to the server's stripped cache; its response updates the cached ETag, reports whether the acknowledgement is durable or staged, and may surface a deferred persistence warning.
 - A patch-hash conflict never promotes the rejected response's ETag. The client reads the
   authoritative database and ETag as one provisional candidate, retires the old codec
   generation, initializes a patch baseline from that authoritative graph, overlays dirty
@@ -244,14 +250,27 @@ When `supportsPatchSync` is enabled (`src/ts/platform.ts:18`):
 
 #### Flush and commit boundary
 
-The server acknowledges a patch before SQLite persistence: it debounces the stubs-only
-database write by five seconds. Chat-body POSTs are write-through. At the debounce
+A patch acknowledgement is staged or durable, reported by the response's `durable`
+field. Structural patches — any change to the referenced chat-row key set — are
+persisted by the server inside the request and acknowledged `durable: true`, so a
+new chat's stub is never less durable than its write-through row. Metadata-only
+patches are acknowledged `durable: false` while the server debounces the
+stubs-only database write by five seconds; the client keeps their ledger
+proposals and tracked targets in `stagedAckTracker.ts` (the patcher baseline
+still advances, and the dirty-state probe counts staged entries) until a durable
+confirmation arrives — a `durable: true` flush whose ETag matches a staged entry,
+a durable patch, or a full write. Failed or displaced confirmations replay the
+staged state into dirty tracking instead of dropping it; after a server rollback
+the conflict rebase's baseline diff re-proves the same changes. Chat-body POSTs
+are write-through. At the debounce
 boundary, the server commits the new stubs-only row and any now-unreferenced chat-row
 deletions in one SQLite transaction; a full `/api/write` likewise commits payload rows,
 plugin rows, `database.bin`, and targeted chat deletions atomically. Reads flush pending
 work first. `POST /api/db/flush` drains that pending work and returns success only after
 SQLite reports a complete `FULL` checkpoint, including when the operator selected a
-`NORMAL`-synchronous mode. Page-hide transport is still best-effort because the browser
+`NORMAL`-synchronous mode; the fatal-exception handlers additionally run a guarded
+synchronous emergency persist before exiting. Page-hide transport is still
+best-effort because the browser
 does not await the keepalive response.
 
 `visibilitychange` and `pagehide` request an immediate, non-broadcast save with
@@ -553,6 +572,11 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
 
 - To change patch/full-write conflict behavior, inspect
   `rebaseTrackedLocalChangesOnLatestServerDb()` and `persistTrackedChanges()`.
+
+- To change staged-acknowledgement retention, durable confirmation timing, or
+  replay policy, start at `stagedAckTracker.ts` and its `triggerSave()`
+  integration; the server's structural/staged split lives in `/api/patch` and
+  `server/node/dbCachePersistence.cjs`.
 
 - To change structural array diffing for modules or presets, start at
   `diffArrayWithIdGuard()` and `risuSavePatcher.test.ts`.
