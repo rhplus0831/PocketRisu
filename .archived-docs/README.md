@@ -12,6 +12,7 @@ current work queue; verify every claim against current code before reuse.
 - [2026-08 delta audit](findings/2026-08-delta-audit/README.md)
 - [2026-08 performance evidence](findings/2026-08-performance-evidence/README.md)
 - [2026-08 findings revalidation](findings/2026-08-revalidation/README.md)
+- [2026-08 remediation queue](findings/2026-08-remediation/README.md)
 
 ## Earlier programs and standalone reports
 

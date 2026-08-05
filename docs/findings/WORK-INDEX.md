@@ -5,7 +5,7 @@ Run `pnpm check:docs` after changing a finding, status, path, or link.
 These are point-in-time reports; revalidate their evidence against current code
 before implementation.
 
-Current catalog: **45 open**, **0 deferred**, and **5 accepted decisions**.
+Current catalog: **44 open**, **0 deferred**, and **5 accepted decisions**.
 
 ## Active work by owner
 
@@ -79,7 +79,6 @@ Current catalog: **45 open**, **0 deferred**, and **5 accepted decisions**.
 |---|---|---|---|
 | `FND-nonoptimized-save-storage-acks-before-persistence` | [Non-optimized plugin save storage acknowledges before persistence](open/plugin-storage/nonoptimized-save-storage-acks-before-persistence.md) | Open | 2026-07 data-loss audit |
 | `FND-recovery-use-inline-cannot-serialize-lossless-values` | [Plugin recovery offers an inline repair it cannot serialize](open/plugin-storage/recovery-use-inline-cannot-serialize-lossless-values.md) | Open | delta audit DA-15 |
-| `FND-queued-recovery-actions-ignore-writer-epoch` | [Queued plugin-recovery actions are not bound to the writer epoch](open/plugin-storage/queued-recovery-actions-ignore-writer-epoch.md) | Open | delta audit DA-16 |
 | `FND-sparse-array-holes-densified` | [Sparse-array holes are densified in plugin-storage transitions and snapshots](open/plugin-storage/sparse-array-holes-densified.md) | Open | delta audit DA-14 |
 | `FND-upstream-export-plugin-proto-header` | [Upstream-target export can emit a PocketRisu-only magic version byte](open/plugin-storage/upstream-export-plugin-proto-header.md) | Open | 2026-07 compatibility investigation |
 | `FND-v2-plugin-storage-live-aliases` | [V2 storage assignments now always detach caller aliases](open/plugin-storage/v2-plugin-storage-live-aliases.md) | Open | 2026-07 compatibility investigation |
