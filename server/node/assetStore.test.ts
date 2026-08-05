@@ -9,19 +9,34 @@ const {
     ASSET_TEMP_PREFIX,
     HASH_NAME_RE,
     createAssetStore,
+    portableAssetNameKey,
+    isPortableAssetName,
     migrateAssetRowsToFilesystem,
     verifyAssetHash,
 } = pkg as {
     ASSET_TEMP_PREFIX: string
     HASH_NAME_RE: RegExp
     createAssetStore: (options: { assetDir: string; fs?: typeof fs }) => AssetStore
+    portableAssetNameKey: (name: string) => string
+    isPortableAssetName: (name: unknown) => boolean
     migrateAssetRowsToFilesystem: (options: {
         keys: string[]
+        existingAssetNames?: string[]
         getValue: (key: string) => Buffer | null
         deleteValue: (key: string) => void
         store: AssetStore
         onProgress?: (progress: unknown) => void
-    }) => { migrated: number; skippedUnsafe: number }
+        onSkipped?: (skipped: {
+            key: string
+            name: string
+            reason: 'non-portable' | 'collision'
+        }) => void
+    }) => {
+        migrated: number
+        skippedUnsafe: number
+        skippedNonPortable: number
+        skippedCollision: number
+    }
     verifyAssetHash: (
         key: string,
         value: Buffer,
@@ -35,6 +50,8 @@ interface AssetStore {
     legacyHashMarkerDir: string
     ensureAssetDir: () => void
     isSafeAssetName: (name: unknown) => boolean
+    portableAssetNameKey: (name: string) => string
+    isPortableAssetName: (name: unknown) => boolean
     isHashShapedAssetName: (name: unknown) => boolean
     assetPathFor: (name: string) => string
     legacyHashMarkerPathFor: (name: string) => string
@@ -69,6 +86,48 @@ function makeStore(fsImpl: typeof fs = fs): AssetStore {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-assets-'))
     tempDirs.push(root)
     return createAssetStore({ assetDir: path.join(root, 'save', 'assets'), fs: fsImpl })
+}
+
+function makeCaseInsensitiveStore(): AssetStore {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-assets-'))
+    tempDirs.push(root)
+    const assetDir = path.join(root, 'save', 'assets')
+    const fsImpl = Object.create(fs) as typeof fs
+    const foldPath = (filePath: fs.PathLike): fs.PathLike => {
+        if (typeof filePath !== 'string') return filePath
+        const relative = path.relative(assetDir, filePath)
+        if (relative === '' || relative === '..' || relative.startsWith(`..${path.sep}`)
+            || path.isAbsolute(relative)) return filePath
+        return path.join(path.dirname(filePath), path.basename(filePath).toLowerCase())
+    }
+    fsImpl.openSync = ((filePath: fs.PathLike, ...args: unknown[]) => (
+        Reflect.apply(fs.openSync, fs, [foldPath(filePath), ...args])
+    )) as typeof fs.openSync
+    fsImpl.renameSync = ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+        fs.renameSync(foldPath(oldPath), foldPath(newPath))
+    }) as typeof fs.renameSync
+    fsImpl.lstatSync = ((filePath: fs.PathLike, ...args: unknown[]) => (
+        Reflect.apply(fs.lstatSync, fs, [foldPath(filePath), ...args])
+    )) as typeof fs.lstatSync
+    fsImpl.statSync = ((filePath: fs.PathLike, ...args: unknown[]) => (
+        Reflect.apply(fs.statSync, fs, [foldPath(filePath), ...args])
+    )) as typeof fs.statSync
+    fsImpl.readFileSync = ((filePath: fs.PathOrFileDescriptor, ...args: unknown[]) => (
+        Reflect.apply(fs.readFileSync, fs, [
+            typeof filePath === 'number' ? filePath : foldPath(filePath),
+            ...args,
+        ])
+    )) as typeof fs.readFileSync
+    fsImpl.unlinkSync = ((filePath: fs.PathLike) => {
+        fs.unlinkSync(foldPath(filePath))
+    }) as typeof fs.unlinkSync
+    fsImpl.writeFileSync = ((filePath: fs.PathOrFileDescriptor, ...args: unknown[]) => (
+        Reflect.apply(fs.writeFileSync, fs, [
+            typeof filePath === 'number' ? filePath : foldPath(filePath),
+            ...args,
+        ])
+    )) as typeof fs.writeFileSync
+    return createAssetStore({ assetDir, fs: fsImpl })
 }
 
 afterEach(() => {
@@ -107,6 +166,35 @@ describe('asset filename safety', () => {
         const store = makeStore()
         expect(store.assetPathFor('safe.png')).toBe(path.join(store.assetDir, 'safe.png'))
         expect(() => store.assetPathFor('../escape')).toThrow('Invalid asset name')
+    })
+
+    it('identifies names that remain distinct on every supported filesystem', () => {
+        for (const name of [
+            'CON',
+            'con.png',
+            'NUL',
+            'COM7.tar.gz',
+            'lpt9',
+            'trailing.',
+            'trailing..',
+        ]) {
+            expect(isPortableAssetName(name)).toBe(false)
+        }
+        for (const name of [
+            'console.png',
+            'com10.png',
+            'com.png',
+            'nul0.png',
+            'MiXeD-Ordinary_Name.WEBP',
+        ]) {
+            expect(isPortableAssetName(name)).toBe(true)
+        }
+    })
+
+    it('folds ASCII case and strips trailing dots for portable identity', () => {
+        expect(portableAssetNameKey('Foo.PNG')).toBe('foo.png')
+        expect(portableAssetNameKey('Mixed.Name...')).toBe('mixed.name')
+        expect(portableAssetNameKey('already-portable')).toBe('already-portable')
     })
 })
 
@@ -388,6 +476,7 @@ describe('asset row migration core', () => {
 
         const result = migrateAssetRowsToFilesystem({
             keys: [...rows.keys()],
+            existingAssetNames: store.listAssetFiles().map(entry => entry.name),
             getValue: (key) => rows.get(key) ?? null,
             deleteValue: (key) => {
                 deleted.push(key)
@@ -396,7 +485,12 @@ describe('asset row migration core', () => {
             store,
         })
 
-        expect(result).toEqual({ migrated: 3, skippedUnsafe: 1 })
+        expect(result).toEqual({
+            migrated: 3,
+            skippedUnsafe: 1,
+            skippedNonPortable: 0,
+            skippedCollision: 0,
+        })
         expect(store.readAssetFile('new.png')).toEqual(Buffer.from('new value'))
         expect(store.readAssetFile('identical.bin')).toEqual(Buffer.from('same'))
         expect(store.assetFileMtimeMs('identical.bin')).toBe(beforeMtime)
@@ -404,5 +498,103 @@ describe('asset row migration core', () => {
         expect(store.readAssetFile('stale.bin')).toEqual(Buffer.from('true'))
         expect(deleted).toEqual(['assets/new.png', 'assets/identical.bin', 'assets/stale.bin'])
         expect(rows.has('assets/unsafe name.png')).toBe(true)
+    })
+
+    it('preflights case collisions and non-portable names before writing rows', () => {
+        const store = makeStore()
+        const existingValue = Buffer.from('existing disk value')
+        store.writeAssetFile('Existing.png', existingValue)
+        store.writeAssetFile('exact.bin', Buffer.from('same bytes'))
+        const rows = new Map<string, Buffer>([
+            ['assets/Foo.png', Buffer.from('upper value')],
+            ['assets/foo.png', Buffer.from('lower value')],
+            ['assets/existing.png', Buffer.from('must not overwrite disk')],
+            ['assets/exact.bin', Buffer.from('same bytes')],
+            ['assets/CON.png', Buffer.from('reserved')],
+            ['assets/trailing.', Buffer.from('one trailing dot')],
+            ['assets/trailing..', Buffer.from('two trailing dots')],
+            ['assets/unsafe name.png', Buffer.from('unsafe')],
+            ['assets/unique.png', Buffer.from('unique')],
+        ])
+        const skipped: Array<{ key: string; reason: string }> = []
+
+        const result = migrateAssetRowsToFilesystem({
+            keys: [...rows.keys()],
+            existingAssetNames: store.listAssetFiles().map(entry => entry.name),
+            getValue: (key) => rows.get(key) ?? null,
+            deleteValue: (key) => rows.delete(key),
+            store,
+            onSkipped: ({ key, reason }) => skipped.push({ key, reason }),
+        })
+
+        expect(result).toEqual({
+            migrated: 2,
+            skippedUnsafe: 1,
+            skippedNonPortable: 3,
+            skippedCollision: 3,
+        })
+        expect(store.readAssetFile('Foo.png')).toBeNull()
+        expect(store.readAssetFile('foo.png')).toBeNull()
+        expect(store.readAssetFile('Existing.png')).toEqual(existingValue)
+        expect(store.readAssetFile('existing.png')).toBeNull()
+        expect(store.readAssetFile('exact.bin')).toEqual(Buffer.from('same bytes'))
+        expect(store.readAssetFile('unique.png')).toEqual(Buffer.from('unique'))
+        expect([...rows.keys()].sort()).toEqual([
+            'assets/CON.png',
+            'assets/Foo.png',
+            'assets/existing.png',
+            'assets/foo.png',
+            'assets/trailing.',
+            'assets/trailing..',
+            'assets/unsafe name.png',
+        ].sort())
+        expect(skipped).toHaveLength(6)
+        expect(skipped.filter(entry => entry.reason === 'collision')).toHaveLength(3)
+        expect(skipped.filter(entry => entry.reason === 'non-portable')).toHaveLength(3)
+    })
+
+    it('preflights collisions before touching a case-insensitive filesystem', () => {
+        const store = makeCaseInsensitiveStore()
+        const rows = new Map<string, Buffer>([
+            ['assets/Foo.png', Buffer.from('A')],
+            ['assets/foo.png', Buffer.from('B')],
+        ])
+
+        const collisionResult = migrateAssetRowsToFilesystem({
+            keys: [...rows.keys()],
+            existingAssetNames: store.listAssetFiles().map(entry => entry.name),
+            getValue: (key) => rows.get(key) ?? null,
+            deleteValue: (key) => rows.delete(key),
+            store,
+        })
+
+        expect(collisionResult).toEqual({
+            migrated: 0,
+            skippedUnsafe: 0,
+            skippedNonPortable: 0,
+            skippedCollision: 2,
+        })
+        expect(rows.get('assets/Foo.png')).toEqual(Buffer.from('A'))
+        expect(rows.get('assets/foo.png')).toEqual(Buffer.from('B'))
+        expect(store.listAssetFiles()).toEqual([])
+
+        const mixedRows = new Map([['assets/MiXeD.png', Buffer.from('mixed value')]])
+        const mixedResult = migrateAssetRowsToFilesystem({
+            keys: [...mixedRows.keys()],
+            existingAssetNames: store.listAssetFiles().map(entry => entry.name),
+            getValue: (key) => mixedRows.get(key) ?? null,
+            deleteValue: (key) => mixedRows.delete(key),
+            store,
+        })
+
+        expect(mixedResult).toEqual({
+            migrated: 1,
+            skippedUnsafe: 0,
+            skippedNonPortable: 0,
+            skippedCollision: 0,
+        })
+        expect(mixedRows.size).toBe(0)
+        expect(fs.readdirSync(store.assetDir)).toContain('mixed.png')
+        expect(store.readAssetFile('MiXeD.png')).toEqual(Buffer.from('mixed value'))
     })
 })

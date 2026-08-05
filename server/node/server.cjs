@@ -62,6 +62,8 @@ const {
     createAssetStore,
     ensureAssetDir,
     isSafeAssetName,
+    portableAssetNameKey,
+    isPortableAssetName,
     assetPathFor,
     isLegacyHashAsset,
     markLegacyHashAsset,
@@ -4598,6 +4600,7 @@ function listAssetEntriesWithSizes(reader = { kvListWithSizes, kvGetUpdatedAt })
 
 const assetImportStagingDir = path.join(savePath, 'assets_import_staging');
 const assetImportBackupDir = path.join(savePath, 'assets_import_backup');
+const DEMOTED_PORTABLE_ASSET_NAME = Symbol('demoted-portable-asset-name');
 
 async function prepareAssetImportStage() {
     recoverPendingImportSwap('Asset import preparation');
@@ -4607,7 +4610,7 @@ async function prepareAssetImportStage() {
     store.ensureAssetDir();
     writeFileSync(store.migrationMarkerPath, new Date().toISOString(), 'utf-8');
     store.reconcileLegacyHashAssetIdentity({ discover: true });
-    return { store };
+    return { store, stagedPortableNames: new Map() };
 }
 
 function warnImportedAssetHashVerification(key, verification, source) {
@@ -4625,19 +4628,6 @@ function warnImportedAssetHashMismatch(key, value, source) {
     return verification;
 }
 
-function writeImportedAsset(assetStage, key, value, source, writeKv = kvSet) {
-    const verification = warnImportedAssetHashMismatch(key, value, source);
-    const name = assetNameForKey(key);
-    if (name !== null && isSafeAssetName(name)) {
-        if (!verification.ok) assetStage.store.markLegacyHashAsset(name);
-        assetStage.store.writeAssetFile(name, value);
-        kvClearDeletion(key);
-        return 'fs';
-    }
-    writeKv(key, value);
-    return 'kv';
-}
-
 async function writeImportedAssetFromFile(
     assetStage,
     key,
@@ -4646,21 +4636,49 @@ async function writeImportedAssetFromFile(
     label,
     { maxBytes = BACKUP_IMPORT_MAX_BYTES } = {},
 ) {
+    const sourceLabel = label || 'Legacy import';
     const name = assetNameForKey(key);
-    if (name !== null && isSafeAssetName(name)) {
-        await copyFileToSpool(source.filePath, assetStage.store.assetPathFor(name), {
-            maxBytes,
-            signal,
-        });
-        const verification = assetStage.store.verifyStoredAssetHash(name);
-        warnImportedAssetHashVerification(key, verification, label || 'Legacy import');
-        if (!verification.ok) assetStage.store.markLegacyHashAsset(name);
-        kvClearDeletion(key);
-        return 'fs';
+    if (name === null || !isSafeAssetName(name)) {
+        kvSetFromFile(key, source.filePath);
+        logger.warn(`[AssetFS] ${sourceLabel} retained unsafe asset key ${key} in SQLite`);
+        return 'kv';
     }
-    kvSetFromFile(key, source.filePath);
-    logger.warn(`[AssetFS] ${label} retained unsafe asset key ${key} in SQLite`);
-    return 'kv';
+    if (!isPortableAssetName(name)) {
+        kvSetFromFile(key, source.filePath);
+        logger.warn(`[AssetFS] ${sourceLabel} retained non-portable asset key ${key} in SQLite`);
+        return 'kv';
+    }
+
+    const portableKey = portableAssetNameKey(name);
+    const stagedName = assetStage.stagedPortableNames.get(portableKey);
+    if (stagedName === DEMOTED_PORTABLE_ASSET_NAME) {
+        kvSetFromFile(key, source.filePath);
+        return 'kv';
+    }
+    if (stagedName !== undefined && stagedName !== name) {
+        const stagedKey = `assets/${stagedName}`;
+        kvSetFromFile(stagedKey, assetStage.store.assetPathFor(stagedName));
+        assetStage.store.deleteAssetFile(stagedName);
+        assetStage.stagedPortableNames.set(portableKey, DEMOTED_PORTABLE_ASSET_NAME);
+        kvSetFromFile(key, source.filePath);
+        logger.warn(
+            `[AssetFS] ${sourceLabel} retained colliding asset keys ${stagedKey} and ${key} in SQLite`,
+        );
+        return 'kv';
+    }
+
+    await copyFileToSpool(source.filePath, assetStage.store.assetPathFor(name), {
+        maxBytes,
+        signal,
+    });
+    const verification = assetStage.store.verifyStoredAssetHash(name);
+    warnImportedAssetHashVerification(key, verification, sourceLabel);
+    if (!verification.ok) assetStage.store.markLegacyHashAsset(name);
+    kvClearDeletion(key);
+    if (stagedName === undefined) {
+        assetStage.stagedPortableNames.set(portableKey, name);
+    }
+    return 'fs';
 }
 
 async function validateAndImportPluginValueFile(
@@ -4816,6 +4834,7 @@ function migrateAssetsToFilesystem() {
         }
         const result = migrateAssetRowsToFilesystem({
             keys,
+            existingAssetNames: listAssetFiles().map((entry) => entry.name),
             getValue: (key) => {
                 const value = kvGet(key);
                 if (value !== null) {
@@ -4829,7 +4848,15 @@ function migrateAssetsToFilesystem() {
             },
             store: {
                 isSafeAssetName,
+                portableAssetNameKey,
+                isPortableAssetName,
                 writeAssetFileIfChanged,
+            },
+            onSkipped: ({ key, reason }) => {
+                const description = reason === 'collision'
+                    ? 'its portable filename collides with another asset'
+                    : 'its filename is not portable';
+                logger.warn(`[AssetFS] Startup migration retained ${key} in SQLite because ${description}`);
             },
             onProgress: ({ index, total, migrated }) => {
                 if (migrated % 100 === 0 || index === total - 1) {
@@ -4842,7 +4869,9 @@ function migrateAssetsToFilesystem() {
         if (keys.length > 0) {
             console.log(
                 `[AssetFS] Migration complete. ${result.migrated} moved, `
-                + `${result.skippedUnsafe} unsafe name(s) kept in SQLite.`
+                + `${result.skippedUnsafe} unsafe, `
+                + `${result.skippedNonPortable} non-portable, and `
+                + `${result.skippedCollision} colliding name(s) kept in SQLite.`
             );
         }
     }

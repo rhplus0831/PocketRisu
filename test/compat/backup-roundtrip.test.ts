@@ -10,7 +10,7 @@
 import { describe, test, expect, afterAll } from 'vitest'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
-import { link, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { link, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import Database from 'better-sqlite3'
 import { zipSync } from 'fflate'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
@@ -299,6 +299,104 @@ describe('asset round-trip', () => {
     const entriesB = new Map(decodeBackup(await clientB.exportBackup()).map((entry) => [entry.name, entry.data]))
     expect(entriesB.get(hashedName)).toEqual(hashedValue)
     expect(entriesB.get(unsafeName)).toEqual(unsafeValue)
+  })
+
+  test('startup migration retains portable collisions and non-portable names in SQLite', async () => {
+    const databaseValue = decodeBackup(createSeedBackup({ characterCount: 1 }))
+      .find(entry => entry.name === 'database.risudat')!.data
+    const values = new Map<string, Buffer>([
+      ['assets/Foo.png', Buffer.from('startup upper bytes')],
+      ['assets/foo.png', Buffer.from('startup lower bytes')],
+      ['assets/CON.png', Buffer.from('startup reserved bytes')],
+      ['assets/trailing.', Buffer.from('startup trailing-dot bytes')],
+      ['assets/unique.png', Buffer.from('startup unique bytes')],
+    ])
+    const srv = await spawnServer({
+      seedSave: async (saveDir) => {
+        const database = new Database(path.join(saveDir, 'risuai.db'))
+        try {
+          database.exec(`
+            CREATE TABLE kv (
+              key TEXT PRIMARY KEY,
+              value BLOB NOT NULL,
+              updated_at INTEGER NOT NULL
+            )
+          `)
+          const insert = database.prepare(
+            'INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)',
+          )
+          insert.run('database/database.bin', databaseValue, Date.now())
+          for (const [key, value] of values) insert.run(key, value, Date.now())
+        } finally {
+          database.close()
+        }
+      },
+    })
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+
+    const uniqueValue = values.get('assets/unique.png')!
+    expect(await readFile(path.join(srv.cwd, 'save', 'assets', 'unique.png')))
+      .toEqual(uniqueValue)
+    expect(readKvValue(srv.cwd, 'assets/unique.png')).toBeNull()
+
+    const retainedNames = ['Foo.png', 'foo.png', 'CON.png', 'trailing.']
+    const assetFiles = await readdir(path.join(srv.cwd, 'save', 'assets'))
+    for (const name of retainedNames) {
+      expect(assetFiles).not.toContain(name)
+      expect(readKvValue(srv.cwd, `assets/${name}`)).toEqual(values.get(`assets/${name}`))
+    }
+
+    for (const [key, value] of values) {
+      const response = await client.fetch('/api/read', {
+        headers: { 'file-path': Buffer.from(key, 'utf-8').toString('hex') },
+      })
+      expect(response.status).toBe(200)
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(value)
+    }
+  })
+
+  test('backup import demotes portable collisions and retains reserved names in SQLite', async () => {
+    const values = new Map<string, Buffer>([
+      ['Foo.png', Buffer.from('import upper bytes')],
+      ['foo.png', Buffer.from('import lower bytes')],
+      ['CON.png', Buffer.from('import reserved bytes')],
+      ['unique-portable.png', Buffer.from('import unique bytes')],
+    ])
+    const backup = Buffer.concat([
+      createSeedBackup({ characterCount: 1 }),
+      encodeBackup([...values].map(([name, data]) => ({ name, data }))),
+    ])
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+
+    expect((await client.importBackup(backup)).ok).toBe(true)
+
+    const uniqueValue = values.get('unique-portable.png')!
+    expect(await readFile(path.join(
+      srv.cwd,
+      'save',
+      'assets',
+      'unique-portable.png',
+    ))).toEqual(uniqueValue)
+    expect(readKvValue(srv.cwd, 'assets/unique-portable.png')).toBeNull()
+
+    const retainedNames = ['Foo.png', 'foo.png', 'CON.png']
+    const assetFiles = await readdir(path.join(srv.cwd, 'save', 'assets'))
+    for (const name of retainedNames) {
+      expect(assetFiles).not.toContain(name)
+      expect(readKvValue(srv.cwd, `assets/${name}`)).toEqual(values.get(name))
+    }
+
+    for (const [name, value] of values) {
+      const key = `assets/${name}`
+      const response = await client.fetch('/api/read', {
+        headers: { 'file-path': Buffer.from(key, 'utf-8').toString('hex') },
+      })
+      expect(response.status).toBe(200)
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(value)
+    }
   })
 
   test('legacy directory and ZIP imports stage safe assets and keep unsafe names in KV', async () => {

@@ -11,6 +11,24 @@ const LEGACY_HASH_MARKER_DIR = '.legacy-hash-assets';
 const LEGACY_HASH_MARKER_VALUE = 'legacy-hash-asset-v1\n';
 const SAFE_ASSET_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const HASH_NAME_RE = /^assets\/([0-9a-f]{64})\.[A-Za-z0-9]{1,10}$/;
+const WINDOWS_RESERVED_ASSET_BASENAME_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
+
+function isSafeAssetName(name) {
+    return typeof name === 'string'
+        && SAFE_ASSET_NAME_RE.test(name)
+        && name !== ASSET_MIGRATION_MARKER
+        && !name.startsWith(ASSET_TEMP_PREFIX);
+}
+
+function portableAssetNameKey(name) {
+    return name.toLowerCase().replace(/\.+$/, '');
+}
+
+function isPortableAssetName(name) {
+    if (!isSafeAssetName(name) || name.endsWith('.')) return false;
+    const basename = name.split('.', 1)[0].toLowerCase();
+    return !WINDOWS_RESERVED_ASSET_BASENAME_RE.test(basename);
+}
 
 function verifyAssetHash(key, buffer) {
     const match = typeof key === 'string' ? key.match(HASH_NAME_RE) : null;
@@ -88,13 +106,6 @@ function createAssetStore(options = {}) {
 
     function ensureAssetDir() {
         fsOps.mkdirSync(assetDir, { recursive: true });
-    }
-
-    function isSafeAssetName(name) {
-        return typeof name === 'string'
-            && SAFE_ASSET_NAME_RE.test(name)
-            && name !== ASSET_MIGRATION_MARKER
-            && !name.startsWith(ASSET_TEMP_PREFIX);
     }
 
     function assetPathFor(name) {
@@ -498,6 +509,8 @@ function createAssetStore(options = {}) {
         legacyHashMarkerDir,
         ensureAssetDir,
         isSafeAssetName,
+        portableAssetNameKey,
+        isPortableAssetName,
         isHashShapedAssetName,
         assetPathFor,
         legacyHashMarkerPathFor,
@@ -527,10 +540,17 @@ function migrateAssetRowsToFilesystem(options) {
         getValue,
         deleteValue,
         store,
+        existingAssetNames = [],
         onProgress = null,
+        onSkipped = null,
     } = options;
     let migrated = 0;
     let skippedUnsafe = 0;
+    let skippedNonPortable = 0;
+    let skippedCollision = 0;
+    const candidates = [];
+    const candidateNamesByPortableKey = new Map();
+    const existingNamesByPortableKey = new Map();
 
     for (let index = 0; index < keys.length; index++) {
         const key = keys[index];
@@ -539,6 +559,47 @@ function migrateAssetRowsToFilesystem(options) {
             skippedUnsafe++;
             continue;
         }
+        if (!store.isPortableAssetName(name)) {
+            skippedNonPortable++;
+            if (onSkipped) onSkipped({ key, name, reason: 'non-portable' });
+            continue;
+        }
+        const portableKey = store.portableAssetNameKey(name);
+        const candidateNames = candidateNamesByPortableKey.get(portableKey) || new Set();
+        candidateNames.add(name);
+        candidateNamesByPortableKey.set(portableKey, candidateNames);
+        candidates.push({ index, key, name, portableKey });
+    }
+
+    for (const name of existingAssetNames) {
+        const portableKey = store.portableAssetNameKey(name);
+        const existingNames = existingNamesByPortableKey.get(portableKey) || new Set();
+        existingNames.add(name);
+        existingNamesByPortableKey.set(portableKey, existingNames);
+    }
+
+    for (const candidate of candidates) {
+        const candidateNames = candidateNamesByPortableKey.get(candidate.portableKey);
+        const existingNames = existingNamesByPortableKey.get(candidate.portableKey);
+        const collidesWithCandidate = candidateNames.size > 1;
+        const collidesWithExisting = existingNames
+            && [...existingNames].some((name) => name !== candidate.name);
+        if (collidesWithCandidate || collidesWithExisting) {
+            candidate.blocked = true;
+            skippedCollision++;
+            if (onSkipped) {
+                onSkipped({
+                    key: candidate.key,
+                    name: candidate.name,
+                    reason: 'collision',
+                });
+            }
+        }
+    }
+
+    for (const candidate of candidates) {
+        if (candidate.blocked) continue;
+        const { index, key, name } = candidate;
         const value = getValue(key);
         if (value === null) continue;
         // Safe to drop the row afterwards: writeAssetFileIfChanged either
@@ -549,7 +610,7 @@ function migrateAssetRowsToFilesystem(options) {
         if (onProgress) onProgress({ index, total: keys.length, key, migrated });
     }
 
-    return { migrated, skippedUnsafe };
+    return { migrated, skippedUnsafe, skippedNonPortable, skippedCollision };
 }
 
 const defaultStore = createAssetStore();
@@ -562,6 +623,9 @@ module.exports = {
     LEGACY_HASH_MARKER_VALUE,
     SAFE_ASSET_NAME_RE,
     HASH_NAME_RE,
+    isSafeAssetName,
+    portableAssetNameKey,
+    isPortableAssetName,
     createAssetStore,
     verifyAssetHash,
     swapDirectoryFromStaging,
