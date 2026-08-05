@@ -15,6 +15,8 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Packr } from 'msgpackr'
 import { createHash } from 'node:crypto'
+import { gzipSync } from 'node:zlib'
+import Database from 'better-sqlite3'
 import utilsPkg from '../../server/node/utils.cjs'
 import { createClient, type RisuClient } from './helpers/client.js'
 import { encodeBackup } from './helpers/encode.js'
@@ -25,7 +27,7 @@ const packr = new Packr({ useRecords: false })
 const { calculateHash, decodeRisuSave, encodeRisuSaveLegacy, normalizeJSON } = utilsPkg as {
   calculateHash: (value: unknown) => number
   decodeRisuSave: (value: Buffer) => Promise<any>
-  encodeRisuSaveLegacy: (value: unknown) => Uint8Array
+  encodeRisuSaveLegacy: (value: unknown, format?: string) => Uint8Array
   normalizeJSON: (value: unknown) => any
 }
 const DB_BLOB_HEX = Buffer.from('database/database.bin', 'utf-8').toString('hex')
@@ -55,6 +57,20 @@ function databaseValue(revision: string, characters: unknown[] = []): Record<str
 
 function encodeDatabase(revision: string, characters: unknown[] = []): Buffer {
   return encodeRisuDat(databaseValue(revision, characters))
+}
+
+function installBootMigrationSource(cwd: string, value: Buffer): void {
+  const database = new Database(path.join(cwd, 'save', 'risuai.db'))
+  try {
+    const now = Date.now()
+    database.prepare(`
+      INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `).run('database/database.bin', value, now)
+    database.prepare("DELETE FROM kv WHERE key = 'migration/chats-externalized'").run()
+  } finally {
+    database.close()
+  }
 }
 
 function spoolNamespacePath(spoolRoot: string, ownerId: string): string {
@@ -543,8 +559,9 @@ describe('database snapshot spool isolation', () => {
     const instanceId = '70b9f079-0a1c-4a64-972d-8ef8a8934202'
     const spoolOwnerId = 'a680b3a2-6de0-4a84-912a-2ec5f38b4977'
     const orphanName = '.database-risudat-crash-orphan.tmp'
-    const decodedOrphanName = `${orphanName}.decoded-crash.tmp`
-    const blockOrphanName = `${orphanName}.block-decoded-crash.tmp`
+    const decodedOrphanName = '.risu-stream-load-123.decoded-crash.tmp'
+    const legacyOrphanName = '.risu-legacy-load-123.decoded-crash.tmp'
+    const blockOrphanName = '.risu-legacy-block-123.block-decoded-crash.tmp'
     const server = await spawnServer({
       createBackupsDir: false,
       env: {
@@ -558,6 +575,7 @@ describe('database snapshot spool isolation', () => {
         await mkdir(spoolDir, { recursive: true })
         await writeFile(path.join(spoolDir, orphanName), 'orphan')
         await writeFile(path.join(spoolDir, decodedOrphanName), 'decoded orphan')
+        await writeFile(path.join(spoolDir, legacyOrphanName), 'legacy decoded orphan')
         await writeFile(path.join(spoolDir, blockOrphanName), 'block orphan')
       },
     })
@@ -572,11 +590,88 @@ describe('database snapshot spool isolation', () => {
     expect(existsSync(path.join(server.cwd, 'save', '.spool'))).toBe(true)
     expect(existsSync(path.join(spoolDir, orphanName))).toBe(false)
     expect(existsSync(path.join(spoolDir, decodedOrphanName))).toBe(false)
+    expect(existsSync(path.join(spoolDir, legacyOrphanName))).toBe(false)
     expect(existsSync(path.join(spoolDir, blockOrphanName))).toBe(false)
 
     expect((await writeDatabase(client, 'hub-write')).status).toBe(200)
     await waitForSnapshotCount(client, 1)
     expect(existsSync(path.join(server.cwd, 'backups'))).toBe(false)
+  })
+
+  test.each([
+    ['default spool after inflation', 'decoded', {}],
+    ['custom spool during traversal', 'traversal', {
+      POCKETRISU_SPOOL_DIR: 'custom-stream-load-spool',
+    }],
+  ] as const)('restart sweeps a killed boot-migration decode in the %s', async (
+    _case,
+    phase,
+    spoolEnv,
+  ) => {
+    const gateName = `stream-load-${phase}-gate`
+    const server = await spawnServer({
+      env: {
+        ...spoolEnv,
+        RISU_STREAM_INGEST_MIN_BYTES: '1',
+        POCKETRISU_BACKUP_INTERVAL_MS: '3600000',
+        POCKETRISU_STREAM_LOAD_TEST_GATE_DIR: gateName,
+        POCKETRISU_STREAM_LOAD_TEST_GATE_PHASE: phase,
+      },
+    })
+    servers.push(server)
+    const source = Buffer.from(encodeRisuSaveLegacy({
+      ...databaseValue(`boot-${phase}`, [{
+        chaId: `boot-${phase}-character`,
+        name: 'Boot migration character',
+        chats: [{
+          id: `boot-${phase}-chat`,
+          name: 'Boot migration chat',
+          message: [{ role: 'user', data: 'survives restart cleanup' }],
+          note: '',
+          localLore: [],
+        }],
+      }]),
+      padding: 'decoded-spool-'.repeat(16 * 1024),
+    }, 'compression'))
+
+    await server.crash()
+    installBootMigrationSource(server.cwd, source)
+    const gateDir = path.join(server.cwd, gateName)
+    await mkdir(gateDir, { recursive: true })
+    await writeFile(path.join(gateDir, 'hold'), '')
+
+    const blockedBoot = server.restart().then(
+      () => null,
+      error => error,
+    )
+    await waitForFile(path.join(gateDir, 'entered'), 10_000)
+    expect(await readFile(path.join(gateDir, 'entered'), 'utf8')).toBe(phase)
+    const activeDecoded = await findSpoolFilesRecursively(
+      server.spoolDir,
+      '.risu-stream-load-',
+    )
+    expect(activeDecoded).toHaveLength(1)
+    expect(path.dirname(activeDecoded[0])).toBe(server.spoolDir)
+    expect((await readdir(path.join(server.cwd, 'save')))
+      .some(name => name.startsWith('.risu-stream-load-'))).toBe(false)
+
+    await server.crash()
+    expect(await blockedBoot).toBeInstanceOf(Error)
+    await writeFile(
+      path.join(server.spoolDir, '.risu-legacy-load-crash.decoded-orphan.tmp'),
+      'legacy orphan',
+    )
+    await writeFile(
+      path.join(server.spoolDir, '.risu-legacy-block-crash.block-decoded-orphan.tmp'),
+      'legacy block orphan',
+    )
+    await rm(path.join(gateDir, 'hold'))
+    await rm(path.join(gateDir, 'entered'))
+    await server.restart({ POCKETRISU_STREAM_LOAD_TEST_GATE_PHASE: '' })
+
+    expect(await findSpoolFilesRecursively(server.spoolDir, '.risu-stream-load-')).toEqual([])
+    expect(await findSpoolFilesRecursively(server.spoolDir, '.risu-legacy-load-')).toEqual([])
+    expect(await findSpoolFilesRecursively(server.spoolDir, '.risu-legacy-block-')).toEqual([])
   })
 
   test('boot replaces an owned-child symlink without sweeping its outside victim', async () => {
@@ -883,6 +978,40 @@ describe('database snapshot spool isolation', () => {
 
     expect((await writeDatabase(client, 'blocked')).status).toBe(200)
     expect(await listSnapshots(client)).toHaveLength(0)
+
+    // The legacy manifest boundary is buffered rather than admitted-spooled.
+    // It must still fail closed on the configured owned spool instead of
+    // silently using the standalone loader's os.tmpdir() fallback.
+    const processTempPrefix = `.risu-legacy-load-${server.pid}.`
+    const osTempBefore = (await readdir(tmpdir()))
+      .filter(name => name.startsWith(processTempPrefix))
+    const compressedPlan = gzipSync(Buffer.from(packr.encode({
+      version: 1,
+      generation: 'blocked-spool-generation',
+      expectedManifest: {
+        version: 1,
+        generation: 'blocked-spool-generation',
+        valueKeys: [],
+        metaKeys: [],
+      },
+      nextManifest: {
+        version: 1,
+        generation: 'blocked-spool-generation',
+        valueKeys: [],
+        metaKeys: [],
+      },
+      writes: [],
+      deletes: [],
+    })))
+    const blockedManifest = await client.fetch('/api/plugin-storage/mutate', {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: new Uint8Array(compressedPlan),
+    })
+    expect(blockedManifest.status).toBe(500)
+    expect(await blockedManifest.text()).toContain('configured database spool is unavailable')
+    expect((await readdir(tmpdir())).filter(name => name.startsWith(processTempPrefix)))
+      .toEqual(osTempBefore)
 
     const failedExport = await client.fetch('/api/backup/export')
     expect(failedExport.status).toBe(500)

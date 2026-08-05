@@ -1354,6 +1354,8 @@ function createChatRowStore(options) {
                 diskHeadroomBytes: opts.diskHeadroomBytes,
                 availableDiskBytes: opts.availableDiskBytes,
                 onDecodedChunk: opts.onDecodedChunk,
+                onDecodedSourcePrepared: opts.onDecodedSourcePrepared,
+                onTraversalProgress: opts.onTraversalProgress,
                 externalizePluginStorage: typeof opts.onPluginStorageEntry === 'function',
                 externalizeMcpToolCalls: typeof opts.onMcpToolCallEntry === 'function',
                 onPluginStorageEntry: opts.onPluginStorageEntry,

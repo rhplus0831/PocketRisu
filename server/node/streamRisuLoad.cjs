@@ -48,6 +48,14 @@ const TOP_LEVEL_METADATA_MAX_BYTES = 64 * 1024;
 const DEFAULT_MAX_DECODED_BYTES = 4 * 1024 * 1024 * 1024;
 const DEFAULT_DECODE_DISK_HEADROOM_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_LEGACY_RESTORE_BYTES = 64 * 1024 * 1024;
+const STREAM_LOAD_SPOOL_FILE_PREFIX = '.risu-stream-load-';
+const LEGACY_LOAD_SPOOL_FILE_PREFIX = '.risu-legacy-load-';
+const LEGACY_BLOCK_SPOOL_FILE_PREFIX = '.risu-legacy-block-';
+const DECODED_SPOOL_FILE_PREFIXES = Object.freeze([
+    STREAM_LOAD_SPOOL_FILE_PREFIX,
+    LEGACY_LOAD_SPOOL_FILE_PREFIX,
+    LEGACY_BLOCK_SPOOL_FILE_PREFIX,
+]);
 const unpackr = new Unpackr({ int64AsType: 'number', useRecords: false });
 const streamingCallbackErrors = new WeakSet();
 const JSON_RISU_SAVE_TYPES = new Set(Object.values(RisuSaveType));
@@ -153,6 +161,13 @@ function configuredStreamIngestMinBytes() {
     return Number.isFinite(parsed) && parsed >= 0
         ? Math.floor(parsed)
         : DEFAULT_STREAM_INGEST_MIN_BYTES;
+}
+
+function decodedSpoolPath(tempDir, prefix, marker = 'decoded') {
+    return path.join(
+        tempDir ?? os.tmpdir(),
+        `${prefix}${process.pid}.${marker}-${nodeCrypto.randomUUID()}.tmp`,
+    );
 }
 
 function normalizeInput(input) {
@@ -928,6 +943,7 @@ async function decompressToBoundedFile({
     });
     const output = createWriteStream(tempPath, {
         flags: 'wx',
+        mode: 0o600,
         highWaterMark: DECODE_OUTPUT_CHUNK_BYTES,
     });
     try {
@@ -980,10 +996,7 @@ async function prepareMessagePackSource(
         };
     }
 
-    const tempBase = inspection.filePath
-        ? inspection.filePath
-        : path.join(tempDir ?? os.tmpdir(), `.risu-stream-load-${process.pid}`);
-    const tempPath = `${tempBase}.decoded-${nodeCrypto.randomUUID()}.tmp`;
+    const tempPath = decodedSpoolPath(tempDir, STREAM_LOAD_SPOOL_FILE_PREFIX);
     try {
         await decompressToBoundedFile({
             inspection,
@@ -995,6 +1008,9 @@ async function prepareMessagePackSource(
             availableDiskBytes: options.availableDiskBytes,
             onDecodedChunk: options.onDecodedChunk,
         });
+        if (options.onDecodedSourcePrepared) {
+            await options.onDecodedSourcePrepared({ filePath: tempPath });
+        }
     } catch (error) {
         await fs.unlink(tempPath).catch(() => {});
         throw error;
@@ -1085,10 +1101,11 @@ async function verifyRisuSaveBlocksBounded(input, inspection, options) {
             let body;
             if (compressed) {
                 const compressedBody = await source.readRange(bodyOffset, length);
-                const tempBase = inspection.filePath
-                    ? inspection.filePath
-                    : path.join(options.tempDir ?? os.tmpdir(), `.risu-legacy-block-${process.pid}`);
-                const tempPath = `${tempBase}.block-decoded-${nodeCrypto.randomUUID()}.tmp`;
+                const tempPath = decodedSpoolPath(
+                    options.tempDir,
+                    LEGACY_BLOCK_SPOOL_FILE_PREFIX,
+                    'block-decoded',
+                );
                 const remaining = maxDecodedBytes - decodedBytes;
                 if (remaining <= 0) throw legacySourceLimitError(maxDecodedBytes, decodedBytes + 1);
                 try {
@@ -1106,6 +1123,9 @@ async function verifyRisuSaveBlocksBounded(input, inspection, options) {
                         availableDiskBytes: options.availableDiskBytes,
                         onDecodedChunk: options.onDecodedChunk,
                     });
+                    if (options.onDecodedSourcePrepared) {
+                        await options.onDecodedSourcePrepared({ filePath: tempPath });
+                    }
                     body = await fs.readFile(tempPath);
                 } finally {
                     await fs.unlink(tempPath).catch(() => {});
@@ -1266,10 +1286,7 @@ async function decodeBoundedLegacyRisuSave(input, options = {}) {
     if (inspection.format === 'legacy-compressed'
         || ((inspection.format === 'compressed' || inspection.format === 'stream')
             && !inspection.supported)) {
-        const tempBase = inspection.filePath
-            ? inspection.filePath
-            : path.join(options.tempDir ?? os.tmpdir(), `.risu-legacy-load-${process.pid}`);
-        const tempPath = `${tempBase}.decoded-${nodeCrypto.randomUUID()}.tmp`;
+        const tempPath = decodedSpoolPath(options.tempDir, LEGACY_LOAD_SPOOL_FILE_PREFIX);
         try {
             await decompressToBoundedFile({
                 inspection: inspection.compression
@@ -1286,6 +1303,9 @@ async function decodeBoundedLegacyRisuSave(input, options = {}) {
                 availableDiskBytes: options.availableDiskBytes,
                 onDecodedChunk: options.onDecodedChunk,
             });
+            if (options.onDecodedSourcePrepared) {
+                await options.onDecodedSourcePrepared({ filePath: tempPath });
+            }
             const stat = await fs.stat(tempPath);
             if (stat.size > maxLegacyBytes) throw legacySourceLimitError(maxLegacyBytes, stat.size);
             return decodePreparedLegacyPayload(
@@ -1301,10 +1321,7 @@ async function decodeBoundedLegacyRisuSave(input, options = {}) {
         // The old catch-fallback also accepted raw-deflate JSON/MessagePack.
         // Probe it through the bounded meter; a normal unknown/corrupt source
         // falls back to the explicitly capped compatibility decoder.
-        const tempBase = inspection.filePath
-            ? inspection.filePath
-            : path.join(options.tempDir ?? os.tmpdir(), `.risu-legacy-load-${process.pid}`);
-        const tempPath = `${tempBase}.decoded-${nodeCrypto.randomUUID()}.tmp`;
+        const tempPath = decodedSpoolPath(options.tempDir, LEGACY_LOAD_SPOOL_FILE_PREFIX);
         try {
             try {
                 await decompressToBoundedFile({
@@ -1320,6 +1337,9 @@ async function decodeBoundedLegacyRisuSave(input, options = {}) {
                     availableDiskBytes: options.availableDiskBytes,
                     onDecodedChunk: options.onDecodedChunk,
                 });
+                if (options.onDecodedSourcePrepared) {
+                    await options.onDecodedSourcePrepared({ filePath: tempPath });
+                }
                 return decodePreparedLegacyPayload(await fs.readFile(tempPath));
             } catch (error) {
                 if (error?.risuSavePreparationLimit
@@ -1397,6 +1417,7 @@ async function walkRisuSave(input, options = {}) {
         ...options,
         onMissingChatId: guardStreamingCallback(options.onMissingChatId),
         onChat: guardStreamingCallback(options.onChat),
+        onTraversalProgress: guardStreamingCallback(options.onTraversalProgress),
         onPluginStorageEntry: guardStreamingCallback(options.onPluginStorageEntry),
         onPluginStorageFolded: guardStreamingCallback(options.onPluginStorageFolded),
         onMcpToolCallEntry: guardStreamingCallback(options.onMcpToolCallEntry),
@@ -1415,6 +1436,7 @@ async function walkRisuSave(input, options = {}) {
             diskHeadroomBytes: options.diskHeadroomBytes,
             availableDiskBytes: options.availableDiskBytes,
             onDecodedChunk: options.onDecodedChunk,
+            onDecodedSourcePrepared: options.onDecodedSourcePrepared,
         },
     );
     try {
@@ -1439,6 +1461,9 @@ async function walkRisuSave(input, options = {}) {
         }
         if (rootCursor.position !== source.size) {
             throw new Error(`Trailing bytes after MessagePack root at byte ${rootCursor.position}`);
+        }
+        if (options.onTraversalProgress) {
+            await options.onTraversalProgress({ phase: 'root-indexed', rootCount });
         }
 
         const byKey = new Map(rootEntries.map(entry => [entry.key, entry]));
@@ -1727,6 +1752,7 @@ async function readRisuSaveTopLevelFields(input, requestedKeys, options = {}) {
             diskHeadroomBytes: options.diskHeadroomBytes,
             availableDiskBytes: options.availableDiskBytes,
             onDecodedChunk: options.onDecodedChunk,
+            onDecodedSourcePrepared: options.onDecodedSourcePrepared,
         },
     );
     try {
@@ -1788,6 +1814,10 @@ module.exports = {
     DEFAULT_DECODE_DISK_HEADROOM_BYTES,
     DEFAULT_MAX_LEGACY_RESTORE_BYTES,
     DEFAULT_STREAM_INGEST_MIN_BYTES,
+    DECODED_SPOOL_FILE_PREFIXES,
+    LEGACY_BLOCK_SPOOL_FILE_PREFIX,
+    LEGACY_LOAD_SPOOL_FILE_PREFIX,
+    STREAM_LOAD_SPOOL_FILE_PREFIX,
     RisuSavePreparationError,
     RisuSavePreparationLimitError,
     configuredMaxDecodedBytes,

@@ -172,6 +172,7 @@ const {
     streamBackupRisuSaveToFile,
 } = require('./streamBackupRisuSave.cjs');
 const {
+    DECODED_SPOOL_FILE_PREFIXES,
     RisuSavePreparationError,
     configuredMaxDecodedBytes,
     decodeBoundedLegacyRisuSave,
@@ -1216,6 +1217,12 @@ const SNAPSHOT_RESTORE_TEST_GATE_DIR = process.env.NODE_ENV === 'test'
 const SNAPSHOT_RESTORE_DECODE_TEST_GATE_DIR = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_SNAPSHOT_RESTORE_DECODE_TEST_GATE_DIR ?? '').trim() || null
     : null;
+const STREAM_LOAD_TEST_GATE_DIR = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_STREAM_LOAD_TEST_GATE_DIR ?? '').trim() || null
+    : null;
+const STREAM_LOAD_TEST_GATE_PHASE = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_STREAM_LOAD_TEST_GATE_PHASE ?? '').trim() || null
+    : null;
 const BACKUP_IMPORT_TEST_GATE_DIR = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_BACKUP_IMPORT_TEST_GATE_DIR ?? '').trim() || null
     : null;
@@ -1274,6 +1281,26 @@ async function waitAtSnapshotRestoreDecodeTestGate(signal) {
     const releasePath = path.join(SNAPSHOT_RESTORE_DECODE_TEST_GATE_DIR, 'release');
     while (!signal?.aborted && existsSync(holdPath) && !existsSync(releasePath)) {
         await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+}
+
+let streamLoadTestGateEntered = false;
+async function waitAtStreamLoadTestGate(phase) {
+    if (!STREAM_LOAD_TEST_GATE_DIR
+        || STREAM_LOAD_TEST_GATE_PHASE !== phase
+        || streamLoadTestGateEntered) return;
+    const holdPath = path.join(STREAM_LOAD_TEST_GATE_DIR, 'hold');
+    if (!existsSync(holdPath)) return;
+    streamLoadTestGateEntered = true;
+    await fs.mkdir(STREAM_LOAD_TEST_GATE_DIR, { recursive: true });
+    await fs.writeFile(
+        path.join(STREAM_LOAD_TEST_GATE_DIR, 'entered'),
+        phase,
+        'utf-8',
+    );
+    const releasePath = path.join(STREAM_LOAD_TEST_GATE_DIR, 'release');
+    while (existsSync(holdPath) && !existsSync(releasePath)) {
+        await new Promise(resolve => setTimeout(resolve, 10));
     }
 }
 
@@ -1774,7 +1801,7 @@ async function assembleAutomaticSnapshotSource(captured) {
             databaseSource,
             ['optimizePluginMemory', PLUGIN_STORAGE_GENERATION_FIELD],
             {
-                tempDir: databaseSpoolDir,
+                tempDir: requireDatabaseSpoolDirSync(),
                 readRemoteRowSize: (name) => snapshot.kvSize(
                     `remotes/${name}.local.bin`,
                 ),
@@ -1812,7 +1839,7 @@ async function assembleAutomaticSnapshotSource(captured) {
             mcpToolCalls,
             markPluginStorageFolded: true,
             canonicalJsonEncoding: true,
-            tempDir: databaseSpoolDir,
+            tempDir: requireDatabaseSpoolDirSync(),
             onMissingChatRow: (chaId, chatId) => {
                 warnAndPreserveMissingChatRow('Snapshot', chaId, chatId);
             },
@@ -2255,13 +2282,15 @@ async function ingestDatabaseStreaming(source, {
     let foldedPluginStorage = false;
     const result = await chatRowStore.ingestStreamingDatabase(source, {
         inspection: inspection ?? await inspectRisuSaveSource(source),
-        tempDir: savePath,
+        tempDir: requireDatabaseSpoolDirSync(),
         shouldAbort,
         signal,
         maxDecodedBytes,
         diskHeadroomBytes,
         availableDiskBytes,
         onDecodedChunk,
+        onDecodedSourcePrepared: () => waitAtStreamLoadTestGate('decoded'),
+        onTraversalProgress: () => waitAtStreamLoadTestGate('traversal'),
         onPluginStorageFolded: async () => {
             foldedPluginStorage = true;
             // The marker is decoded before the walker emits any target rows.
@@ -3145,6 +3174,7 @@ function sweepDatabaseSpoolDirectory(sweepDir) {
             || entry.name.startsWith(PLUGIN_BATCH_VALUE_SPOOL_FILE_PREFIX)
             || entry.name.startsWith(PLUGIN_RECOVERY_DOWNLOAD_SPOOL_FILE_PREFIX)
             || entry.name.startsWith(ADMITTED_INGRESS_SPOOL_PREFIX)
+            || DECODED_SPOOL_FILE_PREFIXES.some(prefix => entry.name.startsWith(prefix))
         )) continue;
         try {
             unlinkSync(path.join(sweepDir, entry.name));
@@ -7939,7 +7969,7 @@ async function buildSelfContainedBackupDatabase({
                         : null,
                     shouldAbort,
                     signal,
-                    tempDir: databaseSpoolDir,
+                    tempDir: requireDatabaseSpoolDirSync(),
                     onMissingChatRow,
                 });
             } catch (error) {
@@ -8914,7 +8944,7 @@ async function validateFullBackupDatabase(snapshot, key, size, signal) {
             databaseSource,
             ['optimizePluginMemory', PLUGIN_STORAGE_GENERATION_FIELD],
             {
-                tempDir: databaseSpoolDir,
+                tempDir: requireDatabaseSpoolDirSync(),
                 signal,
                 shouldAbort: () => signal?.aborted,
                 readRemoteRowSize: (name) => snapshot.kvSize(
@@ -10076,7 +10106,7 @@ async function importBackupFromSource(dataSource, {
             );
             const decoded = await decodeBoundedLegacyRisuSave(databaseSource, {
                 inspection: databaseInspection,
-                tempDir: databaseSpoolDir,
+                tempDir: requireDatabaseSpoolDirSync(),
                 maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
                 shouldAbort: () => signal?.aborted === true,
                 signal,
@@ -14148,6 +14178,12 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 });
             }
 
+            // kvSetFromFile has consumed the private upload by this known-commit
+            // boundary. Remove it before acknowledging success so callers never
+            // observe a committed response while its normal-path spool remains.
+            try { if (valueFilePath) unlinkSync(valueFilePath); } catch {}
+            valueFilePath = null;
+
             // Schedule from the known-commit boundary before a deliberately
             // lost acknowledgement can return control.
             schedulePluginRecoverySnapshot();
@@ -14280,7 +14316,7 @@ async function handlePluginStorageManifestMutation(req, res, next) {
             ? await decodeRisuSave(req.body)
             : await decodeBoundedLegacyRisuSave(req.body, {
                 inspection,
-                tempDir: databaseSpoolDir,
+                tempDir: requireDatabaseSpoolDirSync(),
                 maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
             });
         await queueStorageMutation(async () => {
@@ -16142,7 +16178,7 @@ async function decodeDatabaseSpoolForWrite(spool, stageDir, chatRows) {
         // before the bounded compatibility decoder materializes them.
         return decodeBoundedLegacyRisuSave(source, {
             inspection,
-            tempDir: databaseSpoolDir,
+            tempDir: requireDatabaseSpoolDirSync(),
             maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
             resolveRemoteSize: async (name) => kvSize(`remotes/${name}.local.bin`),
             resolveRemote: async (name) => kvGet(`remotes/${name}.local.bin`),
@@ -16152,7 +16188,7 @@ async function decodeDatabaseSpoolForWrite(spool, stageDir, chatRows) {
     const streamedPluginMeta = Object.create(null);
     const walked = await walkRisuSave(source, {
         inspection,
-        tempDir: databaseSpoolDir,
+        tempDir: requireDatabaseSpoolDirSync(),
         externalizePluginStorage: true,
         onPluginStorageFolded: async () => {},
         onPluginStorageEntry: async ({ field, key, value }) => {
@@ -16349,10 +16385,13 @@ async function prepareSpooledChatWrite(spool) {
                 const inspection = await inspectRisuSaveSource(source);
                 logSupported = inspection.format === 'raw';
                 chatData = inspection.supported
-                    ? (await walkRisuSave(source, { inspection, tempDir: databaseSpoolDir })).remainder
+                    ? (await walkRisuSave(source, {
+                        inspection,
+                        tempDir: requireDatabaseSpoolDirSync(),
+                    })).remainder
                     : await decodeBoundedLegacyRisuSave(source, {
                         inspection,
-                        tempDir: databaseSpoolDir,
+                        tempDir: requireDatabaseSpoolDirSync(),
                         maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
                     });
             } catch (error) {
@@ -16823,7 +16862,7 @@ app.post('/api/write', async (req, res, next) => {
                         ? await decodeAuthoritativeDatabase(fileContent)
                         : await decodeBoundedLegacyRisuSave(fileContent, {
                             inspection: incomingInspection,
-                            tempDir: databaseSpoolDir,
+                            tempDir: requireDatabaseSpoolDirSync(),
                             maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
                             resolveRemoteSize: async (name) => kvSize(`remotes/${name}.local.bin`),
                             resolveRemote: async (name) => kvGet(`remotes/${name}.local.bin`),
@@ -19147,7 +19186,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
                         ? await decodeRisuSave(req.body)
                         : await decodeBoundedLegacyRisuSave(req.body, {
                             inspection,
-                            tempDir: databaseSpoolDir,
+                            tempDir: requireDatabaseSpoolDirSync(),
                             maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
                         });
                 } catch (e) {
@@ -19369,7 +19408,7 @@ async function importLegacySaveEntries(
         } else {
             const decoded = await decodeBoundedLegacyRisuSave(databaseSource, {
                 inspection: databaseInspection,
-                tempDir: databaseSpoolDir,
+                tempDir: requireDatabaseSpoolDirSync(),
                 maxLegacyBytes: LEGACY_DATABASE_IMPORT_MAX_BYTES,
                 shouldAbort: () => signal?.aborted === true,
                 signal,
@@ -20964,7 +21003,7 @@ app.post('/api/db/snapshots/restore', async (req, res, next) => {
                         invalidateAllDbCaches();
                         const decoded = await decodeBoundedLegacyRisuSave(source, {
                             inspection,
-                            tempDir: savePath,
+                            tempDir: requireDatabaseSpoolDirSync(),
                             shouldAbort: () => restoreAbortController.signal.aborted,
                             signal: restoreAbortController.signal,
                             onDecodedChunk: () => waitAtSnapshotRestoreDecodeTestGate(

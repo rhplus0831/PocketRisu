@@ -1,7 +1,7 @@
 import path from 'node:path'
 import os from 'node:os'
 import { gzipSync } from 'node:zlib'
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { afterEach, describe, expect, test } from 'vitest'
 import { Packr } from 'msgpackr'
@@ -103,11 +103,19 @@ describe('bounded legacy MessagePack top-level metadata preflight', () => {
         compressed,
         `risu-top-field-${requestedKey}-`,
       )
+      const spoolDir = await mkdtemp(path.join(os.tmpdir(), 'risu-top-field-spool-'))
+      dirs.push(spoolDir)
+      let preparedPath = ''
+      let preparedMode = 0
 
       await expect(readRisuSaveTopLevelFields(source, [requestedKey], {
-        tempDir: dir,
+        tempDir: spoolDir,
         diskHeadroomBytes: 0,
         availableDiskBytes: payload.length * 4,
+        onDecodedSourcePrepared: async ({ filePath: decodedPath }: { filePath: string }) => {
+          preparedPath = decodedPath
+          preparedMode = (await stat(decodedPath)).mode & 0o777
+        },
       })).rejects.toMatchObject({
         code: 'RISU_SAVE_METADATA_TOO_LARGE',
         status: 413,
@@ -116,6 +124,11 @@ describe('bounded legacy MessagePack top-level metadata preflight', () => {
         retryable: false,
         commitOutcome: 'not-committed',
       })
+      expect(path.dirname(preparedPath)).toBe(spoolDir)
+      expect(path.basename(preparedPath)).toMatch(/^\.risu-stream-load-.*\.decoded-.*\.tmp$/)
+      expect(preparedMode).toBe(0o600)
+      expect((await stat(preparedPath).catch(() => null))).toBeNull()
+      expect(await readdir(spoolDir)).toEqual([])
       expect(await readdir(dir)).toEqual([path.basename(filePath)])
     },
   )
