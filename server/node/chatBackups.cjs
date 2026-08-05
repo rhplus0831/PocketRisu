@@ -878,8 +878,11 @@ function createChatBackupStore(options) {
                 newest = newestTimestampOnDisk(chatDir);
                 newestByChatDir.set(chatDir, newest);
             }
-            if (!force && newest !== null && currentTime - newest < Math.max(0, cooldownMs)) {
-                return 'skipped-cooldown';
+            if (!force && newest !== null) {
+                const elapsed = currentTime - newest;
+                if (elapsed >= 0 && elapsed < Math.max(0, cooldownMs)) {
+                    return 'skipped-cooldown';
+                }
             }
 
             fs.mkdirSync(chatDir, { recursive: true });

@@ -537,6 +537,37 @@ describe('chat backup capture', () => {
         expect(harness.store.listChatBackups('char', 'chat')).toHaveLength(2)
     })
 
+    it('captures after an in-process wall-clock rollback', async () => {
+        const harness = makeHarness({ now: 500_000, cooldownMs: 45_000 })
+        const beforeRollback = rawChat(10, 'before rollback')
+        const afterRollback = rawChat(11, 'after rollback')
+        harness.setRow('char', 'chat', beforeRollback)
+
+        expect(await harness.store.captureChatPreImage({
+            chaId: 'char',
+            chatId: 'chat',
+            reason: 'save',
+        })).toBe('captured')
+        harness.setRow('char', 'chat', afterRollback)
+        harness.setNow(499_999)
+
+        expect(await harness.store.captureChatPreImage({
+            chaId: 'char',
+            chatId: 'chat',
+            reason: 'save',
+        })).toBe('captured')
+        const versions = harness.store.listChatBackups('char', 'chat')
+        expect(versions.map(version => version.versionId)).toEqual([
+            'v-500000-0-save',
+            'v-499999-0-save',
+        ])
+        expect((await harness.store.readChatBackup(
+            'char',
+            'chat',
+            'v-499999-0-save',
+        ))?.equals(afterRollback)).toBe(true)
+    })
+
     it('forces a deletion pre-image through cooldown and cold-storage filtering', async () => {
         const harness = makeHarness({ cooldownMs: 45_000 })
         const first = rawChat(1)
@@ -593,6 +624,79 @@ describe('chat backup capture', () => {
             chatId: 'chat',
         })).toBe('skipped-cooldown')
         expect(restarted.listChatBackups('char', 'chat')).toHaveLength(1)
+    })
+
+    it('recovers from a future disk timestamp and resets the cooldown baseline', async () => {
+        const harness = makeHarness({ now: 200_000, cooldownMs: 45_000 })
+        const futurePreImage = rawChat(20, 'future timestamp')
+        const rollbackPreImage = rawChat(21, 'rollback recovery point')
+        const expiryPreImage = rawChat(22, 'expiry boundary')
+        harness.setRow('char', 'chat', futurePreImage)
+        expect(await harness.store.captureChatPreImage({
+            chaId: 'char',
+            chatId: 'chat',
+            reason: 'save',
+        })).toBe('captured')
+        harness.store.close()
+
+        harness.setRow('char', 'chat', rollbackPreImage)
+        let restartedClock = 100_000
+        const restarted = createChatBackupStore({
+            getChatBackupsRoot: () => path.join(harness.root, 'chat-backups'),
+            readChatRowRaw: (chaId: string, chatId: string) => (
+                harness.rows.get(rowKey(chaId, chatId)) ?? null
+            ),
+            now: () => restartedClock,
+            cooldownMs: 45_000,
+            getByteBudget: () => 100 * 1024 * 1024,
+            autoReconcile: false,
+        }) as ChatBackupStore
+        stores.push(restarted)
+
+        expect(await restarted.captureChatPreImage({
+            chaId: 'char',
+            chatId: 'chat',
+            reason: 'save',
+        })).toBe('captured')
+        expect(restarted.listChatBackups('char', 'chat').map(version => version.versionId))
+            .toEqual([
+                'v-200000-0-save',
+                'v-100000-0-save',
+            ])
+        expect((await restarted.readChatBackup(
+            'char',
+            'chat',
+            'v-200000-0-save',
+        ))?.equals(futurePreImage)).toBe(true)
+        expect((await restarted.readChatBackup(
+            'char',
+            'chat',
+            'v-100000-0-save',
+        ))?.equals(rollbackPreImage)).toBe(true)
+
+        harness.setRow('char', 'chat', expiryPreImage)
+        expect(await restarted.captureChatPreImage({
+            chaId: 'char',
+            chatId: 'chat',
+            reason: 'save',
+        })).toBe('skipped-cooldown')
+        restartedClock = 144_999
+        expect(await restarted.captureChatPreImage({
+            chaId: 'char',
+            chatId: 'chat',
+            reason: 'save',
+        })).toBe('skipped-cooldown')
+        restartedClock = 145_000
+        expect(await restarted.captureChatPreImage({
+            chaId: 'char',
+            chatId: 'chat',
+            reason: 'save',
+        })).toBe('captured')
+        expect((await restarted.readChatBackup(
+            'char',
+            'chat',
+            'v-145000-0-save',
+        ))?.equals(expiryPreImage)).toBe(true)
     })
 
     it('sanitizes reasons, defaults empty reasons, and increments seq on timestamp collisions', async () => {
