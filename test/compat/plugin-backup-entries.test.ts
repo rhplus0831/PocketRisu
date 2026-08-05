@@ -33,6 +33,21 @@ afterAll(async () => {
   await Promise.allSettled(servers.map(server => server.cleanup()))
 })
 
+function upstreamV190AcceptsRisuSaveHeader(bytes: Uint8Array): boolean {
+  const legacyMagic = [0, 82, 73, 83, 85, 83, 65, 86, 69, 0]
+  const blockMagic = [82, 73, 83, 85, 83, 65, 86, 69, 0]
+  return (
+    bytes.length >= legacyMagic.length + 1
+    && legacyMagic.every((byte, index) => bytes[index] === byte)
+    && (bytes[legacyMagic.length] === 7
+      || bytes[legacyMagic.length] === 8
+      || bytes[legacyMagic.length] === 9)
+  ) || (
+    bytes.length >= blockMagic.length
+    && blockMagic.every((byte, index) => bytes[index] === byte)
+  )
+}
+
 function pluginStorageKey(prefix: 'pluginsave/' | 'pluginsave-meta/', rawKey: string): string {
   // Some boundary tests intentionally construct an oversized legacy physical
   // row that the canonical writer must reject. Only malformed UTF-16 keys need
@@ -519,9 +534,9 @@ describe('external plugin rows in backup archives', () => {
     expect(upstreamEntries.some(entry => entry.name.startsWith('pluginsave/'))).toBe(false)
     expect(upstreamEntries.some(entry => entry.name.startsWith('pluginsave-meta/'))).toBe(false)
     expect(upstreamEntries.some(entry => entry.name === PLUGIN_STORAGE_MANIFEST_KEY)).toBe(false)
-    const upstreamDatabase = decodeRisuDat(
-      upstreamEntries.find(entry => entry.name === 'database.risudat')!.data,
-    )
+    const upstreamDatabaseEntry = upstreamEntries.find(entry => entry.name === 'database.risudat')!
+    expect(upstreamV190AcceptsRisuSaveHeader(upstreamDatabaseEntry.data)).toBe(true)
+    const upstreamDatabase = decodeRisuDat(upstreamDatabaseEntry.data)
     expect(upstreamDatabase.pluginCustomStorage).toEqual({
       'plain/key': { value: 1 },
       '유니코드 키': ['alpha', 2],
@@ -784,28 +799,11 @@ describe('external plugin rows in backup archives', () => {
     await rawProtoMutation.text()
 
     const fullUpstreamResponse = await sourceClient.fetch('/api/backup/export?target=upstream')
-    expect(fullUpstreamResponse.status).toBe(200)
-    const fullUpstream = entriesByName(Buffer.from(await fullUpstreamResponse.arrayBuffer()))
-    const fullFolded = await decodeRisuSave(fullUpstream.get('database.risudat')!)
-    expect(fullFolded.__pocketRisuPluginStorageEscapesV1).toMatchObject({
-      user: 'reserved-field-collision',
-      nested: ['must', 'survive'],
-    })
-    expect(fullFolded.__pocketRisuPluginStorageEscapesV1.body).toHaveLength(5 * 1024 * 1024)
-    expect(Object.hasOwn(fullFolded.pluginCustomStorage, '__proto__')).toBe(true)
-    expect(Object.hasOwn(fullFolded.pluginStorageMeta, '__proto__')).toBe(true)
-    expect(fullFolded.pluginCustomStorage.__proto__.body).toHaveLength(3 * 1024 * 1024)
-    expect(fullFolded.pluginCustomStorage.__proto__.negativeZero).toBe(0)
-    expect(Object.is(fullFolded.pluginCustomStorage.__proto__.negativeZero, -0)).toBe(false)
-    expect(fullFolded.pluginStorageMeta.__proto__.body).toHaveLength(2 * 1024 * 1024)
-    expect(fullFolded.pluginCustomStorage['\uD800']).toEqual({
-      kind: 'pinned-high-surrogate-0',
-    })
-    expect(fullFolded.pluginCustomStorage['�']).toEqual({
-      kind: 'pinned-replacement-character',
-    })
-    expect(fullFolded.pluginCustomStorage['\uD801']).toEqual({
-      kind: 'pinned-high-surrogate-1',
+    expect(fullUpstreamResponse.status).toBe(409)
+    expect(fullUpstreamResponse.headers.get('content-disposition')).toBeNull()
+    expect(fullUpstreamResponse.headers.get('x-risu-backup-target')).toBeNull()
+    await expect(fullUpstreamResponse.json()).resolves.toMatchObject({
+      code: 'BACKUP_UPSTREAM_UNSUPPORTED_PLUGIN_KEYS',
     })
 
     const mainResponse = await sourceClient.fetch('/api/backup/export?target=main')

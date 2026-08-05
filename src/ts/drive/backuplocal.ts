@@ -114,7 +114,7 @@ export async function SaveLocalBackupForUpstream(){
         notifySuccess('Success')
     } catch (error) {
         console.error(error)
-        alertError('Failed')
+        alertError(error instanceof Error ? error.message : 'Failed')
     }
 }
 

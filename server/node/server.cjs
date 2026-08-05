@@ -7826,10 +7826,17 @@ async function buildSelfContainedBackupDatabase({
     }
 }
 
-async function requireMainCompatibleBackupDatabase(databaseSpool) {
+async function requireTargetCompatibleBackupDatabase(databaseSpool, target) {
+    if (target !== 'main' && target !== 'upstream') {
+        throw new Error(`Unsupported backup compatibility target: ${target}`);
+    }
     if (!databaseSpool?.filePath || databaseSpool.size < magicHeader.length) {
-        const error = new Error('The main-compatible database export is incomplete');
-        error.code = 'BACKUP_MAIN_DATABASE_INCOMPLETE';
+        const error = new Error(target === 'main'
+            ? 'The main-compatible database export is incomplete'
+            : 'The upstream-compatible database export is incomplete');
+        error.code = target === 'main'
+            ? 'BACKUP_MAIN_DATABASE_INCOMPLETE'
+            : 'BACKUP_UPSTREAM_DATABASE_INCOMPLETE';
         error.statusCode = 500;
         throw error;
     }
@@ -7843,14 +7850,19 @@ async function requireMainCompatibleBackupDatabase(databaseSpool) {
         await handle.close();
     }
 
-    // PocketRisu's escape envelope uses save headers that the rollback branch
-    // predates. Never label that output as main-compatible: the older decoder
-    // would reject the complete archive even though all chat rows were folded.
-    const error = new Error(
-        'Cannot export for main because plugin storage contains keys that its save format cannot represent. '
-        + 'Rename or remove __proto__ and ill-formed Unicode plugin keys, then retry.',
-    );
-    error.code = 'BACKUP_MAIN_UNSUPPORTED_PLUGIN_KEYS';
+    // PocketRisu's escape envelope uses version byte 10, which the main rollback
+    // branch predates. Upstream recognizes only legacy bytes 7/8/9 and RISUSAVE\0
+    // block headers; byte 10 falls through to raw msgpack and decodes as garbage.
+    // Re-encoding as 7/8/9 is not faithful: upstream's msgpackr renames __proto__
+    // to __proto_ on decode, and ill-formed Unicode keys cannot round-trip via UTF-8.
+    const error = new Error(target === 'main'
+        ? 'Cannot export for main because plugin storage contains keys that its save format cannot represent. '
+            + 'Rename or remove __proto__ and ill-formed Unicode plugin keys, then retry.'
+        : 'Cannot export for upstream RisuAI because plugin storage contains keys that its save format cannot represent. '
+            + 'Rename or remove __proto__ and ill-formed Unicode plugin keys, then retry.');
+    error.code = target === 'main'
+        ? 'BACKUP_MAIN_UNSUPPORTED_PLUGIN_KEYS'
+        : 'BACKUP_UPSTREAM_UNSUPPORTED_PLUGIN_KEYS';
     error.statusCode = 409;
     throw error;
 }
@@ -17645,8 +17657,8 @@ app.get('/api/backup/export', async (req, res, next) => {
             databaseState: pinnedState.databaseState,
             signal: abortTracker.signal,
         });
-        if (target === 'main') {
-            await requireMainCompatibleBackupDatabase(backupDbSpool);
+        if (target === 'main' || target === 'upstream') {
+            await requireTargetCompatibleBackupDatabase(backupDbSpool, target);
         }
         throwIfBackupExportAborted(abortTracker.signal);
         const namespacedEntries = target === 'nodeonly'
