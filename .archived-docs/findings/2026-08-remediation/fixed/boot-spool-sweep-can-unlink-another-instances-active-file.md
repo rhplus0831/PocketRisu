@@ -7,7 +7,7 @@
 - Lens: D5, L3
 - Area: Area 5 — server KV core and chat rows
 - Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../2026-08-revalidation/README.md)
-- Resolution: `PENDING` — the configured spool path is now a shared root,
+- Resolution: `f4432368` — the configured spool path is now a shared root,
   while every installation writes and boot-sweeps only a stable
   `.instance-<sha256(__spool_owner_id)>/` child. A private sibling claim binds
   the dedicated owner UUID to the canonical save root; a clone at another path

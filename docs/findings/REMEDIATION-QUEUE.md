@@ -52,7 +52,7 @@ re-rank freely as priorities change.
 
 ## Completed
 
-- [Boot spool sweep can unlink another instance's active file](../../.archived-docs/findings/2026-08-remediation/fixed/boot-spool-sweep-can-unlink-another-instances-active-file.md) — fixed by `PENDING` (2026-08-06)
+- [Boot spool sweep can unlink another instance's active file](../../.archived-docs/findings/2026-08-remediation/fixed/boot-spool-sweep-can-unlink-another-instances-active-file.md) — fixed by `f4432368` (2026-08-06)
 - [Bulk filesystem writes can commit a partial prefix](../../.archived-docs/findings/2026-08-remediation/fixed/bulk-filesystem-writes-partially-commit.md) — fixed by `64042a36` (2026-08-06)
 - [Non-optimized plugin save storage acknowledges before persistence](../../.archived-docs/findings/2026-08-remediation/fixed/nonoptimized-save-storage-acks-before-persistence.md) — fixed by `67f9eb96` (2026-08-06)
 - [The save loop stops retrying after five consecutive failures](../../.archived-docs/findings/2026-08-remediation/fixed/save-loop-idles-after-five-failures.md) — fixed by `5e329fb6` (2026-08-05)
