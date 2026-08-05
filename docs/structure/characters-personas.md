@@ -158,7 +158,7 @@ Character metadata lives inside the main database object, while image and other 
   - `saveAsset()` hashes bytes and stores them under `assets/<hash>.<extension>` at `src/ts/globalApi.svelte.ts:203`.
   - Ordinary-asset cleanup is server-owned. `collectDatabaseAssetReferences()` scans the complete stripped database plus the active optimized plugin publication, so character/persona/module fields do not require a parallel client allowlist.
 
-- `server/node/db.cjs` stores unsafe asset keys as BLOBs in `save/risuai.db`; safe-named legacy hash mismatches remain filesystem-backed with explicit identity markers. Database creation and the `kv` table are at `server/node/db.cjs:9-14` and `server/node/db.cjs:29`.
+- `server/node/db.cjs` stores unsafe, non-portable, and host-case-colliding asset keys as BLOBs in `save/risuai.db`; safe-named legacy hash mismatches remain filesystem-backed with explicit identity markers. Database creation and the `kv` table are at `server/node/db.cjs:9-14` and `server/node/db.cjs:29`.
 
 - `server/node/server.cjs` serves asset keys through the authenticated direct-asset endpoint at `server/node/server.cjs:3747` and proxies `/hub-proxy/*` to `https://sv.risuai.xyz` at `server/node/server.cjs:3436-3546`.
 

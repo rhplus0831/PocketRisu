@@ -11,9 +11,9 @@ services, an auxiliary LLM, and browser-local Bergamot models; TTS supports brow
 speech plus several hosted/self-hosted providers and plugin hooks. Inlays give images,
 audio, video, and model signatures stable IDs outside chat records. On Node, safe-named
 ordinary assets and current inlay payloads live as files; historical hash-shaped
-mismatches have explicit filesystem identity markers, unsafe asset names and ownership
-metadata remain in SQLite, and inlay display metadata is published in filesystem
-sidecars.
+mismatches have explicit filesystem identity markers, unsafe or non-portable asset
+names and ownership metadata remain in SQLite, and inlay display metadata is published
+in filesystem sidecars.
 
 ## 2. Key files
 
@@ -444,7 +444,7 @@ network call.
 - For extension-changing replacement, the sidecar is the commit pointer. Do not delete
   the old payload before its rename, and keep startup cleanup for abandoned
   `.inlay-publish-*` files. Same-extension payload replacement relies on atomic rename.
-- Safe-named `assets/*` values are filesystem-backed. Historical `assets/<content-hash>.<ext>` mismatches are tracked by private legacy-identity markers, while unsafe names retain the SQLite fallback, so code must use the storage helpers instead of assuming one physical backend for every asset key.
+- Safe-named `assets/*` values are filesystem-backed. Historical `assets/<content-hash>.<ext>` mismatches are tracked by private legacy-identity markers, while unsafe, non-portable (Windows-reserved or trailing-dot), and host-case-colliding names retain the SQLite fallback, so code must use the storage helpers instead of assuming one physical backend for every asset key.
 - The server still reads and migrates legacy SQLite `inlay/<id>` JSON records in
   `migrateInlaysToFilesystem()`. Preserve this fallback when changing storage format.
 - Direct asset URLs use one-year `immutable` caching. Reusing and overwriting an explicit

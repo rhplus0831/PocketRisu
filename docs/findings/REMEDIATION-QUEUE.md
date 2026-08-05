@@ -15,19 +15,19 @@ re-rank freely as priorities change.
 
 ## Pending
 
-1. [Asset filename mapping is not portable across filesystems](open/media-translation/portable-asset-filename-mapping.md) — High — the startup-migration overwrite is the live half; restores already abort.
-2. [Upstream-target export can emit a PocketRisu-only magic version byte](open/plugin-storage/upstream-export-plugin-proto-header.md) — High
-3. [Acknowledged database patches are not durable for up to five seconds](open/client-storage/acknowledged-patches-are-not-durable.md) — High — reopened from Deferred 2026-08-05 with the staged/durable-ack protocol decided; same client-storage save-loop surface as the next item.
-4. [The save loop stops retrying after five consecutive failures](open/client-storage/save-loop-idles-after-five-failures.md) — Medium
-5. [Non-optimized plugin save storage acknowledges before persistence](open/plugin-storage/nonoptimized-save-storage-acks-before-persistence.md) — Medium
-6. [Bulk filesystem writes can commit a partial prefix](open/server-backend/bulk-filesystem-writes-partially-commit.md) — Medium
-7. [Boot spool sweep can unlink another instance's active file](open/server-backend/boot-spool-sweep-can-unlink-another-instances-active-file.md) — Medium
-8. [Decoded stream-load spools bypass the configured spool and orphan sweep](open/server-backend/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md) — Medium — same spool/sweep surface as the previous item.
-9. [Wall-clock rollback disables chat pre-image capture](open/backup-recovery/wall-clock-rollback-disables-chat-preimage-capture.md) — Medium
-10. [Best-effort path markers let updaters delete recovery directories](open/backup-recovery/best-effort-path-markers-let-updaters-delete-recovery-directories.md) — Medium
-11. [Changing the chat-backup root hides all existing version history](open/backup-recovery/changing-chat-backup-root-hides-all-existing-version-history.md) — Medium
-12. [Chat-version backups do not keep referenced inlays live](open/backup-recovery/chat-version-backups-do-not-keep-referenced-inlays-live.md) — Medium
-13. [Inlays still served from KV fallback are omitted from backups and cleared on restore](open/backup-recovery/unmigrated-kv-inlays-are-omitted-from-backups.md) — Medium
+1. [Upstream-target export can emit a PocketRisu-only magic version byte](open/plugin-storage/upstream-export-plugin-proto-header.md) — High
+2. [Acknowledged database patches are not durable for up to five seconds](open/client-storage/acknowledged-patches-are-not-durable.md) — High — reopened from Deferred 2026-08-05 with the staged/durable-ack protocol decided; same client-storage save-loop surface as the next item.
+3. [The save loop stops retrying after five consecutive failures](open/client-storage/save-loop-idles-after-five-failures.md) — Medium
+4. [Non-optimized plugin save storage acknowledges before persistence](open/plugin-storage/nonoptimized-save-storage-acks-before-persistence.md) — Medium
+5. [Bulk filesystem writes can commit a partial prefix](open/server-backend/bulk-filesystem-writes-partially-commit.md) — Medium
+6. [Boot spool sweep can unlink another instance's active file](open/server-backend/boot-spool-sweep-can-unlink-another-instances-active-file.md) — Medium
+7. [Decoded stream-load spools bypass the configured spool and orphan sweep](open/server-backend/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md) — Medium — same spool/sweep surface as the previous item.
+8. [Wall-clock rollback disables chat pre-image capture](open/backup-recovery/wall-clock-rollback-disables-chat-preimage-capture.md) — Medium
+9. [Best-effort path markers let updaters delete recovery directories](open/backup-recovery/best-effort-path-markers-let-updaters-delete-recovery-directories.md) — Medium
+10. [Changing the chat-backup root hides all existing version history](open/backup-recovery/changing-chat-backup-root-hides-all-existing-version-history.md) — Medium
+11. [Chat-version backups do not keep referenced inlays live](open/backup-recovery/chat-version-backups-do-not-keep-referenced-inlays-live.md) — Medium
+12. [Inlays still served from KV fallback are omitted from backups and cleared on restore](open/backup-recovery/unmigrated-kv-inlays-are-omitted-from-backups.md) — Medium
+13. [Runtime asset writes can replace a case-colliding asset on case-insensitive volumes](open/media-translation/runtime-asset-writes-can-case-fold-clobber.md) — Medium — residual carved out of the fixed migration/import portability finding; same assets surface as the next three items.
 14. [External dedup can strand or overwrite a live asset](open/media-translation/external-dedup-can-strand-or-overwrite-a-live-asset.md) — Medium
 15. [Inlay filename mapping is not injective](open/media-translation/inlay-filename-mapping-is-not-injective.md) — Medium
 16. [Preferred jdupes merges cross-instance ownership](open/media-translation/preferred-jdupes-merges-cross-instance-ownership.md) — Medium — same dedup surface as the previous two items.
@@ -63,6 +63,7 @@ re-rank freely as priorities change.
 - [Reroll can leave no durable copy of the discarded response](../../.archived-docs/findings/2026-08-remediation/fixed/reroll-discards-the-only-copy-within-preimage-cooldown.md) — fixed by `a772b134` (2026-08-05)
 - [Chat-row staging is not bound to the committed stub snapshot](../../.archived-docs/findings/2026-08-remediation/fixed/chat-row-stage-is-not-bound-to-the-committed-stub-snapshot.md) — fixed by `73d5c87e` (2026-08-05)
 - [Whole-chat patches can partially commit external rows](../../.archived-docs/findings/2026-08-remediation/fixed/whole-chat-patches-partially-commit-rows.md) — fixed by `6e6725e2` (2026-08-05)
+- [Asset filename mapping is not portable across filesystems](../../.archived-docs/findings/2026-08-remediation/fixed/portable-asset-filename-mapping.md) — fixed by `f3e8aa11` (2026-08-05); runtime-write residual re-filed as Pending #13
 
 Closed by the 2026-08-05 revalidation (predates this queue):
 
