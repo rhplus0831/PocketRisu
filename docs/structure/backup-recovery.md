@@ -506,14 +506,12 @@ the owned database-spool child. Full and partial exports keep verified filesyste
 partial archives under the partial-export spool. These roots have separate disk-headroom
 checks because an operator may place them on different volumes.
 
-The open [decoded stream-load spool finding](../findings/open/server-backend/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md)
-is the explicit current exception. The confirmed buffer-backed boot-migration
-ingestion path still passes `save/` as its decode `tempDir`, so its `.risu-stream-load-*`
-or legacy decoded temporary can sit outside the configured root. Snapshot restore also
-supplies that fallback, but its source is file-backed and the loader prefers the source
-path in the owned spool. Independently, the boot sweep does not recognize the decoded-name
-family, including decoded artifacts created beside a swept spool source. Pending #1 covers
-both the one confirmed save-root path and that unswept name family.
+Decoded stream loads now use shared canonical and legacy name families under the
+configured, installation-owned spool child. Production decode boundaries require its
+pinned directory and fail closed when it is unavailable; they never fall back to `save/`
+or the OS temporary directory. Normal paths retain `finally` cleanup, while boot cleanup
+recognizes every decoded family and reaps termination orphans only inside the persistent
+owner namespace. See the [fixed decoded-spool finding](../../.archived-docs/findings/2026-08-remediation/fixed/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md).
 
 Admitted-write files use create-only randomized `.admitted-ingress-*` names and private
 `.admitted-write-stage-*` directories. Normal response/failure cleanup removes both;

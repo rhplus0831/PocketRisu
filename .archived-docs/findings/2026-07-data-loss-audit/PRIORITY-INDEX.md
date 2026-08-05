@@ -90,7 +90,7 @@ resolution against current code before acting on it.
 | [Full-write ETag does not cover chat rows](../../../docs/findings/open/server-backend/full-write-etag-does-not-cover-chat-rows.md) | Open | Low | A newer chat row overwritten with no pre-image captured | Headerless legacy/external compatibility callers only; current clients unaffected |
 | [Whole-chat patches half-apply external rows](reports/whole-chat-patches-half-apply-external-rows.md) | Open | Low | Mixed old/new rows after a failed multi-chat patch; overwritten rows lack pre-images | Compatibility-shaped payload-bearing patches only |
 | [Non-canonical hex path splits the patch cache](../2026-08-revalidation/fixed/noncanonical-hex-path-splits-the-patch-cache.md) | Open | Low | An acknowledged edit overwritten by the parallel-cased cache's later flush | Mixed-case hex from a non-official caller only |
-| [Decoded stream-load spools bypass configured spool and orphan sweep](../../../docs/findings/open/server-backend/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md) | Open | Medium | No direct loss — orphaned decompression spools can fill the save volume, and ENOSPC is the trigger condition for other destructive findings (e.g. inlay compression) | Killed/failed compressed imports, repeatedly |
+| [Decoded stream-load spools bypass configured spool and orphan sweep](../2026-08-remediation/fixed/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md) | Fixed | Medium | No direct loss — orphaned decompression spools can fill the save volume, and ENOSPC is the trigger condition for other destructive findings (e.g. inlay compression) | Killed/failed compressed imports, repeatedly |
 
 ## P4 — Loss of recovery copies and safety nets
 

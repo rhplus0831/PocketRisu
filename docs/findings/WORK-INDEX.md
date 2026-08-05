@@ -5,7 +5,7 @@ Run `pnpm check:docs` after changing a finding, status, path, or link.
 These are point-in-time reports; revalidate their evidence against current code
 before implementation.
 
-Current catalog: **34 open**, **0 deferred**, and **5 accepted decisions**.
+Current catalog: **33 open**, **0 deferred**, and **5 accepted decisions**.
 
 ## Active work by owner
 
@@ -89,7 +89,6 @@ Current catalog: **34 open**, **0 deferred**, and **5 accepted decisions**.
 
 | ID | Finding | Status | Source |
 |---|---|---|---|
-| `FND-decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep` | [Decoded stream-load spools bypass the configured spool and orphan sweep](open/server-backend/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md) | Open | 2026-07 data-loss audit |
 | `FND-sidecar-databases-use-normal-wal-without-shutdown-drain` | [Sidecar databases use NORMAL WAL without a shutdown drain](open/server-backend/sidecar-databases-use-normal-wal-without-shutdown-drain.md) | Open | delta audit DA-7 |
 | `FND-full-write-etag-does-not-cover-chat-rows` | [The full-write ETag does not cover externalized chat rows](open/server-backend/full-write-etag-does-not-cover-chat-rows.md) | Open | 2026-07 data-loss audit |
 

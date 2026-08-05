@@ -77,7 +77,7 @@ None currently open.
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
 | [Callback bridge skips stream and remote-class serialization](../../docs/findings/open/scripting-extensions/callback-bridge-skips-stream-transfer-and-remote-class-serialization.md) | audit | Open | V3 callback promises hang, paid output is stranded, and mutation observers receive stripped objects. | Nested streams or remote wrappers; the implementation is unchanged from main, so the regression axis does not apply. |
-| [Decoded stream spools bypass cleanup](../../docs/findings/open/server-backend/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md) | audit | Open | Orphaned decompression files can fill the save volume, but this report establishes no direct data loss. | Repeated killed or failed compressed imports; a serve-only operational defect rather than a main regression. |
+| [Decoded stream spools bypass cleanup](2026-08-remediation/fixed/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md) | audit | Fixed | Orphaned decompression files can fill the save volume, but this report establishes no direct data loss. | Repeated killed or failed compressed imports; a serve-only operational defect rather than a main regression. |
 
 ## Coverage gaps
 
