@@ -51,6 +51,7 @@ dist.zip
 !/scripts/termux/
 !/scripts/check-help-keys.mjs
 !/scripts/check-docs.mjs
+!/scripts/check-compat-skips.mjs
 !/scripts/dedup-assets.sh
 !/scripts/run-performance-tests.mjs
 !/scripts/run-performance-extreme-tests.mjs
@@ -62,6 +63,7 @@ dist.zip
 # Due to Cargo.lock makes the project build fail, we ignore it
 Cargo.lock
 test/fixtures/
+reports/
 
 CLAUDE.local.md
 AGENTS.override.md

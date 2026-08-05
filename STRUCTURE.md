@@ -42,6 +42,11 @@ Use pnpm 10.34.1 and Node 22.12 or newer; Node 24 is recommended and used by cur
 Docker/release builds. There is no aggregate `test:all` command. `pnpm test` runs the
 client suite followed by the server suite; `test:server` reruns only the latter.
 
+Pushes to `serve`, pull requests into `main`, and the tag-driven release and Docker
+workflows all run the same CI gate (`.github/workflows/tests.yml`): svelte-check,
+build, both unit suites, and the compatibility suite. The gate fails on compat cases
+skipped outside the known fixture-gated allowlist in `scripts/check-compat-skips.mjs`.
+
 | Command | Purpose |
 |---|---|
 | `pnpm dev` | Frontend-only Vite server on `0.0.0.0:5174` with a strict port; no `/api` proxy |

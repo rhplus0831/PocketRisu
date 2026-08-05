@@ -11,7 +11,13 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests.yml
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
