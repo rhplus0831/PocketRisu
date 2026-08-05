@@ -5014,14 +5014,21 @@ function sessionPluginStorageReadState(req) {
         : null;
 }
 
-function checkActiveSession(req, res) {
+function captureActiveSessionWriteRequest(req) {
     const clientSessionId = req.headers['x-session-id']
     const clientWriterEpoch = req.headers[WRITER_EPOCH_HEADER]
-    const userActive = req.headers['x-user-active'] === '1'
+    return {
+        sessionId: typeof clientSessionId === 'string' ? clientSessionId : '',
+        userActive: req.headers['x-user-active'] === '1',
+        writerEpoch: typeof clientWriterEpoch === 'string' ? clientWriterEpoch : '',
+    }
+}
+
+function checkActiveSessionWrite(writeRequest, res) {
     const result = sessionLock.checkWrite(
-        typeof clientSessionId === 'string' ? clientSessionId : '',
-        userActive,
-        typeof clientWriterEpoch === 'string' ? clientWriterEpoch : '',
+        writeRequest.sessionId,
+        writeRequest.userActive,
+        writeRequest.writerEpoch,
     )
     if (result.tookOver) {
         console.log('[Session] Write lock taken over by a freshly-booted session')
@@ -5035,6 +5042,10 @@ function checkActiveSession(req, res) {
         commitOutcomeUnknown: false,
     })
     return false
+}
+
+function checkActiveSession(req, res) {
+    return checkActiveSessionWrite(captureActiveSessionWriteRequest(req), res)
 }
 
 // --- Proxy Stream Job constants ---
@@ -6628,6 +6639,7 @@ function pluginStorageRecoveryManagementToken(context, issue) {
         .update(JSON.stringify([
             issue.code,
             issue.encodedKey,
+            sessionLock.epoch(),
             context.databaseRevision,
             context.generation ?? '',
             context.manifestRevision ?? '',
@@ -12724,7 +12736,8 @@ app.get('/api/plugin-storage/recovery/download', async (req, res, next) => {
 
 app.post('/api/plugin-storage/recovery/resolve', async (req, res, next) => {
     if (!await checkAuth(req, res)) return;
-    if (!checkActiveSession(req, res)) return;
+    const writeRequest = captureActiveSessionWriteRequest(req);
+    if (!checkActiveSessionWrite(writeRequest, res)) return;
     const body = req.body;
     if (!body || typeof body !== 'object' || Array.isArray(body)
         || Object.keys(body).length !== 3
@@ -12755,6 +12768,10 @@ app.post('/api/plugin-storage/recovery/resolve', async (req, res, next) => {
                 || (body.action === 'delete' && !issue.canDelete)) {
                 return { unavailable: true };
             }
+            // Inspection yields; recheck the admitted writer after its last await.
+            if (!checkActiveSessionWrite(writeRequest, res)) {
+                return { sessionDeactivated: true };
+            }
             try {
                 resolveOptimizedPluginStorageRecoveryIssue(inspection, issue, body.action);
             } catch (error) {
@@ -12763,6 +12780,7 @@ app.post('/api/plugin-storage/recovery/resolve', async (req, res, next) => {
             }
             return { committed: true };
         });
+        if (result.sessionDeactivated) return;
         if (result.stale) {
             return res.status(409).json({
                 success: false,

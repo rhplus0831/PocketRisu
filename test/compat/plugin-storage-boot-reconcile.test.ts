@@ -1,6 +1,8 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import path from 'node:path'
+import { access, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import Database from 'better-sqlite3'
+import { Client as UndiciClient } from 'undici'
 import utilsPkg from '../../server/node/utils.cjs'
 import pluginStorageJsonPkg from '../../server/node/pluginStorageJson.cjs'
 import { createClient, type RisuClient } from './helpers/client.js'
@@ -116,10 +118,16 @@ function seedOptimizedPublication(saveDir: string, seed: Seed): void {
   sqlite.close()
 }
 
-async function trackedServer(seed: Seed): Promise<ServerHandle> {
+async function trackedServer(
+  seed: Seed,
+  env: Record<string, string> = {},
+): Promise<ServerHandle> {
   const server = await spawnServer({
     seedSave: async saveDir => seedOptimizedPublication(saveDir, seed),
-    env: { POCKETRISU_BACKUP_INTERVAL_MS: '3600000' },
+    env: {
+      POCKETRISU_BACKUP_INTERVAL_MS: '3600000',
+      ...env,
+    },
   })
   servers.add(server)
   return server
@@ -248,13 +256,19 @@ async function resolveRecovery(
   client: RisuClient,
   issue: Record<string, any>,
   action: 'use-inline' | 'delete',
+  options: {
+    sessionId?: string
+    writerEpoch?: string
+    userActive?: boolean
+  } = {},
 ): Promise<{ response: Response, body: Record<string, any> }> {
   const response = await client.fetch('/api/plugin-storage/recovery/resolve', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-session-id': 'plugin-storage-recovery-test',
-      'x-user-active': '1',
+      'x-session-id': options.sessionId ?? 'plugin-storage-recovery-test',
+      ...(options.writerEpoch ? { 'x-writer-epoch': options.writerEpoch } : {}),
+      ...(options.userActive === false ? {} : { 'x-user-active': '1' }),
     },
     body: JSON.stringify({
       encodedKey: issue.encodedKey,
@@ -266,6 +280,75 @@ async function resolveRecovery(
     response,
     body: await response.json() as Record<string, any>,
   }
+}
+
+async function registerSession(
+  client: RisuClient,
+  sessionId: string,
+): Promise<string> {
+  const response = await client.fetch('/api/session', {
+    method: 'POST',
+    headers: { 'x-session-id': sessionId },
+  })
+  expect(response.status).toBe(200)
+  const body = await response.json() as { writerEpoch?: unknown }
+  expect(typeof body.writerEpoch).toBe('string')
+  expect(response.headers.get('x-writer-epoch')).toBe(body.writerEpoch)
+  return body.writerEpoch as string
+}
+
+async function waitForFile(filePath: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      await access(filePath)
+      return
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Timed out waiting for ${filePath}`)
+}
+
+async function waitForSessionCount(
+  server: ServerHandle,
+  expected: number,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const sessionPath = path.join(server.cwd, 'save', '__sessions')
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const sessions = JSON.parse(await readFile(sessionPath, 'utf8')) as unknown[]
+      if (sessions.length >= expected) return
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Timed out waiting for ${expected} registered HTTP sessions`)
+}
+
+function holdStorageQueueWithInlayWrite(
+  client: RisuClient,
+  sessionId: string,
+  writerEpoch: string,
+): Promise<Response> {
+  const id = 'plugin-recovery-queue-holder'
+  return client.fetch('/api/write', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'file-path': Buffer.from(`inlay/${id}`, 'utf8').toString('hex'),
+      'x-session-id': sessionId,
+      'x-writer-epoch': writerEpoch,
+    },
+    body: new Uint8Array(Buffer.from(JSON.stringify({
+      data: 'data:image/png;base64,AA==',
+      ext: 'png',
+      name: `${id}.png`,
+      type: 'image',
+      width: 1,
+      height: 1,
+    }))),
+  })
 }
 
 describe('server-side optimized plugin storage boot reconciliation', () => {
@@ -708,6 +791,190 @@ describe('server-side optimized plugin storage boot reconciliation', () => {
       await disposeServer(server)
     }
   }, 30_000)
+
+  test('rejects a stale writer epoch before resolving and accepts the current epoch', async () => {
+    const generation = '56565656-5656-4656-8656-565656565656'
+    const invalidEncodedKey = `${VALUE_PREFIX}stale+epoch.json`
+    const original = Buffer.from(JSON.stringify({ stranded: 'stale-epoch-row' }))
+    const server = await trackedServer({
+      generation,
+      valueKeys: [],
+      rows: [{ key: invalidEncodedKey, value: original }],
+    })
+    try {
+      const client = await createClient(server.port, server.password)
+      const sessionId = 'plugin-storage-recovery-current-epoch'
+      const writerEpoch = await registerSession(client, sessionId)
+      const inspection = await inspectRecovery(client)
+      const issue = inspection.body.issues.find(
+        (candidate: Record<string, any>) => candidate.encodedKey === invalidEncodedKey,
+      ) as Record<string, any>
+      expect(issue).toMatchObject({
+        code: 'invalid-encoded-key',
+        actions: { delete: true },
+      })
+
+      const staleWriterEpoch = `${writerEpoch.slice(0, -1)}${writerEpoch.endsWith('0') ? '1' : '0'}`
+      const rejected = await resolveRecovery(client, issue, 'delete', {
+        sessionId,
+        writerEpoch: staleWriterEpoch,
+      })
+      expect(rejected.response.status).toBe(423)
+      expect(rejected.body).toEqual({
+        error: 'Session deactivated',
+        code: 'SESSION_DEACTIVATED',
+        retryable: false,
+        commitOutcome: 'not-committed',
+        commitOutcomeUnknown: false,
+      })
+      expect(readSqliteBytes(server, invalidEncodedKey)).toEqual(original)
+
+      const resolved = await resolveRecovery(client, issue, 'delete', {
+        sessionId,
+        writerEpoch,
+      })
+      expect(resolved.response.status, JSON.stringify(resolved.body)).toBe(200)
+      expect(resolved.body).toMatchObject({
+        success: true,
+        commitOutcome: 'committed',
+        commitOutcomeUnknown: false,
+        action: 'delete',
+        encodedKey: invalidEncodedKey,
+      })
+      expect(readSqliteBytes(server, invalidEncodedKey)).toBeNull()
+    } finally {
+      await disposeServer(server)
+    }
+  }, 30_000)
+
+  test('rejects a queued recovery resolve when another session takes over', async () => {
+    const generation = '57575757-5757-4757-8757-575757575757'
+    const invalidEncodedKey = `${VALUE_PREFIX}queued+takeover.json`
+    const original = Buffer.from(JSON.stringify({ stranded: 'queued-recovery-row' }))
+    const gateName = 'plugin-recovery-queue-gate'
+    const server = await trackedServer({
+      generation,
+      valueKeys: [],
+      rows: [{ key: invalidEncodedKey, value: original }],
+    }, {
+      POCKETRISU_TEST_INLAY_PUBLISH_GATE_DIR: gateName,
+      POCKETRISU_TEST_INLAY_PUBLISH_GATE_STAGE: 'before-payload-publish',
+    })
+    const gateDir = path.join(server.cwd, gateName)
+    const releasePath = path.join(gateDir, 'release')
+    const pipeline = new UndiciClient(`http://127.0.0.1:${server.port}`, { pipelining: 2 })
+    let queueHolder: Promise<Response> | null = null
+    try {
+      const sessionA = 'plugin-recovery-queued-session-a'
+      const sessionB = 'plugin-recovery-queued-session-b'
+      const clientA = await createClient(server.port, server.password)
+      const clientB = await createClient(server.port, server.password)
+      const writerEpoch = await registerSession(clientA, sessionA)
+      const inspection = await inspectRecovery(clientA)
+      const issue = inspection.body.issues.find(
+        (candidate: Record<string, any>) => candidate.encodedKey === invalidEncodedKey,
+      ) as Record<string, any>
+      expect(issue).toMatchObject({
+        code: 'invalid-encoded-key',
+        actions: { delete: true },
+      })
+
+      await mkdir(gateDir, { recursive: true })
+      await writeFile(path.join(gateDir, 'hold'), 'hold')
+      queueHolder = holdStorageQueueWithInlayWrite(clientA, sessionA, writerEpoch)
+      await waitForFile(path.join(gateDir, 'entered'))
+
+      const resolveBody = JSON.stringify({
+        encodedKey: issue.encodedKey,
+        token: issue.token,
+        action: 'delete',
+      })
+      // One HTTP/1 pipeline fixes admission order without a timing race: A's
+      // resolve reaches checkActiveSession before B's session boot is recorded.
+      const queuedResolve = pipeline.request({
+        path: '/api/plugin-storage/recovery/resolve',
+        method: 'POST',
+        idempotent: true,
+        blocking: false,
+        headers: {
+          'risu-auth': clientA.token,
+          'content-type': 'application/json',
+          'x-session-id': sessionA,
+          'x-writer-epoch': writerEpoch,
+          'x-user-active': '1',
+        },
+        body: resolveBody,
+      })
+      let resolveSettled = false
+      void queuedResolve.then(
+        () => { resolveSettled = true },
+        () => { resolveSettled = true },
+      )
+      const pipelinedBoot = pipeline.request({
+        path: '/api/session',
+        method: 'POST',
+        idempotent: true,
+        blocking: false,
+        headers: {
+          'risu-auth': clientB.token,
+          'x-session-id': sessionB,
+        },
+        body: '',
+      })
+      void pipelinedBoot.catch(() => {})
+
+      await waitForSessionCount(server, 2)
+      expect(resolveSettled).toBe(false)
+
+      const sessionFile = path.join(server.cwd, 'save', '__sessions')
+      const sessionFileStat = await stat(sessionFile)
+      while (Date.now() <= Math.ceil(sessionFileStat.mtimeMs)) {
+        await new Promise(resolve => setTimeout(resolve, 1))
+      }
+      expect(await registerSession(clientB, sessionB)).toBe(writerEpoch)
+      const takeover = await clientB.fetch('/api/plugin-storage/recovery/resolve', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-session-id': sessionB,
+          'x-writer-epoch': writerEpoch,
+          'x-user-active': '1',
+        },
+        body: '{}',
+      })
+      expect(takeover.status).toBe(400)
+      await expect(takeover.json()).resolves.toMatchObject({
+        code: 'INVALID_PLUGIN_STORAGE_RECOVERY_REQUEST',
+        commitOutcome: 'not-committed',
+      })
+      expect(resolveSettled).toBe(false)
+
+      await writeFile(releasePath, 'release')
+      const holderResponse = await queueHolder
+      expect(holderResponse.status).toBe(200)
+      await holderResponse.arrayBuffer()
+
+      const rejected = await queuedResolve
+      expect(rejected.statusCode).toBe(423)
+      await expect(rejected.body.json()).resolves.toEqual({
+        error: 'Session deactivated',
+        code: 'SESSION_DEACTIVATED',
+        retryable: false,
+        commitOutcome: 'not-committed',
+        commitOutcomeUnknown: false,
+      })
+      const bootResponse = await pipelinedBoot
+      expect(bootResponse.statusCode).toBe(200)
+      await bootResponse.body.dump()
+      expect(readSqliteBytes(server, invalidEncodedKey)).toEqual(original)
+      await pipeline.close()
+    } finally {
+      await writeFile(releasePath, 'release').catch(() => {})
+      await queueHolder?.then(response => response.arrayBuffer()).catch(() => {})
+      await pipeline.destroy().catch(() => {})
+      await disposeServer(server)
+    }
+  }, 60_000)
 
   test('rejects stale destructive tokens and deletes an unrecoverable value with its owner', async () => {
     const generation = '66666666-6666-4666-8666-666666666666'
