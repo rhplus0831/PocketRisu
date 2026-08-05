@@ -66,9 +66,7 @@ async function expectNoFullExportArtifacts(server: ServerHandle): Promise<void> 
     const pinEntries = await readdir(
       path.join(server.cwd, 'save', '.partial-export-spool'),
     ).catch(() => [])
-    const databaseSpools = await readdir(
-      path.join(server.cwd, 'save', '.spool'),
-    ).catch(() => [])
+    const databaseSpools = await readdir(server.spoolDir).catch(() => [])
     const backups = await readdir(path.join(server.cwd, 'backups')).catch(() => [])
     artifacts = [
       ...pinEntries.filter(name => name.startsWith('.full-export-')),

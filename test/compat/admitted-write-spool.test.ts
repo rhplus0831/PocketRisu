@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { gzipSync } from 'node:zlib'
 import path from 'node:path'
 import { createRequire } from 'node:module'
@@ -62,11 +62,15 @@ async function responseSnapshot(response: Response) {
 }
 
 async function admittedArtifacts(server: ServerHandle): Promise<string[]> {
-  const entries = await readdir(path.join(server.cwd, 'save', '.spool')).catch(() => [])
+  const entries = await readdir(await databaseSpoolDir(server)).catch(() => [])
   return entries.filter(name => (
     name.startsWith('.admitted-ingress-')
     || name.startsWith('.admitted-write-stage-')
   ))
+}
+
+async function databaseSpoolDir(server: ServerHandle): Promise<string> {
+  return server.spoolDir
 }
 
 async function waitFor(pathname: string) {
@@ -196,10 +200,11 @@ describe('admitted database/chat/KV write spooling', () => {
     const racingWrite = writeDatabase(client, { ...baseline, marker: 'stale-spool' }, baselineBody.etag)
     await waitFor(path.join(gateDir, 'entered'))
 
-    const spools = (await readdir(path.join(server.cwd, 'save', '.spool')))
+    const spoolDir = await databaseSpoolDir(server)
+    const spools = (await readdir(spoolDir))
       .filter(name => name.startsWith('.admitted-ingress-'))
     expect(spools).toHaveLength(1)
-    expect((await stat(path.join(server.cwd, 'save', '.spool', spools[0]))).size)
+    expect((await stat(path.join(spoolDir, spools[0]))).size)
       .toBe(encode({ ...baseline, marker: 'stale-spool' }).length)
 
     const patchedState = { ...baseline, patched: true }
@@ -231,9 +236,12 @@ describe('admitted database/chat/KV write spooling', () => {
   })
 
   test('startup removes only admitted-write stale artifacts', async () => {
+    const spoolOwnerId = 'd5f57d6a-24ea-4be8-a2cc-853bb8ed7a4e'
     const server = await spawnServer({
       seedSave: async (saveDir) => {
-        const spoolDir = path.join(saveDir, '.spool')
+        await writeFile(path.join(saveDir, '__spool_owner_id'), spoolOwnerId, 'utf8')
+        const owner = createHash('sha256').update(spoolOwnerId).digest('hex')
+        const spoolDir = path.join(saveDir, '.spool', `.instance-${owner}`)
         await mkdir(path.join(spoolDir, '.admitted-write-stage-orphan'), { recursive: true })
         await writeFile(path.join(spoolDir, '.admitted-write-stage-orphan', 'row'), 'orphan')
         await writeFile(path.join(spoolDir, '.admitted-ingress-orphan.tmp'), 'orphan')
@@ -241,7 +249,7 @@ describe('admitted database/chat/KV write spooling', () => {
       },
     })
     servers.push(server)
-    const entries = await readdir(path.join(server.cwd, 'save', '.spool'))
+    const entries = await readdir(await databaseSpoolDir(server))
     expect(entries).not.toContain('.admitted-write-stage-orphan')
     expect(entries).not.toContain('.admitted-ingress-orphan.tmp')
     expect(entries).toContain('unrelated.keep')
@@ -328,10 +336,11 @@ describe('admitted database/chat/KV write spooling', () => {
       body: new Uint8Array(body),
     })
     await waitFor(path.join(gateDir, 'entered'))
-    const ingressSpools = (await readdir(path.join(server.cwd, 'save', '.spool')))
+    const spoolDir = await databaseSpoolDir(server)
+    const ingressSpools = (await readdir(spoolDir))
       .filter(name => name.startsWith('.admitted-ingress-'))
     expect(ingressSpools).toHaveLength(1)
-    expect((await stat(path.join(server.cwd, 'save', '.spool', ingressSpools[0]))).size)
+    expect((await stat(path.join(spoolDir, ingressSpools[0]))).size)
       .toBe(body.length)
     await writeFile(path.join(gateDir, 'release'), 'release')
 

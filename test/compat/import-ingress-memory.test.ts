@@ -161,7 +161,7 @@ function spoolArtifacts(files: string[]): string[] {
 }
 
 async function waitForNoImportSpools(server: ServerHandle): Promise<void> {
-  const spoolDir = path.join(server.cwd, 'save', '.spool')
+  const spoolDir = server.spoolDir
   const deadline = Date.now() + 10_000
   while (Date.now() < deadline) {
     const files = await readdir(spoolDir).catch(() => [] as string[])
@@ -697,7 +697,7 @@ describe('bounded archive and save-folder ingress (real server)', () => {
     await waitForNoImportSpools(server)
     await expectNote(client, 'before-abort')
 
-    const spoolDir = path.join(server.cwd, 'save', '.spool')
+    const spoolDir = server.spoolDir
     await mkdir(path.join(spoolDir, '.save-folder-import-orphan'), { recursive: true })
     await mkdir(path.join(spoolDir, '.backup-entry-stage-orphan'), { recursive: true })
     await writeFile(path.join(spoolDir, '.save-folder-import-orphan', 'row'), 'orphan')

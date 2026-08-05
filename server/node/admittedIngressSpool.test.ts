@@ -130,4 +130,27 @@ describe('admitted ingress disk spool', () => {
       commitOutcomeUnknown: false,
     })
   })
+
+  test('maps a pinned spool resolver failure to the same retryable refusal', async () => {
+    const policySymbol = Symbol('policy')
+    const req = request(Buffer.from('payload'), policySymbol)
+    const res = new FakeResponse()
+    const next = vi.fn()
+    const middleware = createAdmittedIngressSpoolMiddleware({
+      policySymbol,
+      spoolDir: () => { throw new Error('descriptor-relative spool unavailable') },
+      globalBudgetBytes: 512,
+    })
+
+    await middleware(req, res, next)
+
+    expect(next).not.toHaveBeenCalled()
+    expect(res.statusCode).toBe(503)
+    expect(res.headers.get('retry-after')).toBe('1')
+    expect(res.body).toMatchObject({
+      code: 'BUFFERED_INGRESS_BUSY',
+      retryable: true,
+      commitOutcome: 'not-committed',
+    })
+  })
 })

@@ -8,9 +8,13 @@ import os from 'node:os'
 import path from 'node:path'
 import { Packr } from 'msgpackr'
 import { zipSync } from 'fflate'
+import spoolOwnershipPkg from './spoolOwnership.cjs'
 
 const serverEntry = path.resolve(process.cwd(), 'server/node/server.cjs')
 const testPasswordDigest = crypto.createHash('sha256').update('list-delta-test').digest('hex')
+const { resolveOwnedSpoolDirFromSave } = spoolOwnershipPkg as {
+    resolveOwnedSpoolDirFromSave: (savePath: string, spoolRoot?: string) => string
+}
 
 interface RunningServer {
     child: ChildProcessWithoutNullStreams
@@ -326,8 +330,12 @@ function validSaveFolderZip(note = 'candidate'): Buffer {
     }, { level: 0 }))
 }
 
+function databaseSpoolDir(cwd: string): string {
+    return resolveOwnedSpoolDirFromSave(path.join(cwd, 'save'))
+}
+
 function importSpoolArtifacts(cwd: string): string[] {
-    const spoolDir = path.join(cwd, 'save', '.spool')
+    const spoolDir = databaseSpoolDir(cwd)
     return fs.readdirSync(spoolDir, { withFileTypes: true })
         .map(entry => entry.name)
         .filter(name => name.startsWith('.backup-import-')
@@ -337,7 +345,7 @@ function importSpoolArtifacts(cwd: string): string[] {
 }
 
 function snapshotRestoreSpoolArtifacts(cwd: string): string[] {
-    const spoolDir = path.join(cwd, 'save', '.spool')
+    const spoolDir = databaseSpoolDir(cwd)
     return fs.readdirSync(spoolDir, { withFileTypes: true })
         .map(entry => entry.name)
         .filter(name => name.includes('snapshot-restore'))

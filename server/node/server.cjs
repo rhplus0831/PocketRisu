@@ -301,6 +301,15 @@ const {
 const { prepareFileChunkPlan } = require('./chunkPlan.cjs');
 const { readClientBuildStamp } = require('./buildStamp.cjs');
 const {
+    SPOOL_OWNER_ID_FILENAME,
+    readOrCreatePersistentUuid,
+    resolveOwnedSpoolDir,
+    claimOwnedSpoolNamespaceSync,
+    ensureOwnedSpoolDirSync,
+    openPinnedOwnedSpoolDirSync,
+    withQuarantinedOwnedSpoolDirSync,
+} = require('./spoolOwnership.cjs');
+const {
     CHAT_BACKUP_DIRNAME,
     createChatBackupStore,
     migrateLegacyChatBackups,
@@ -2833,9 +2842,17 @@ app.use(createBufferedIngressMiddleware({
     ),
     expectedClientBuild,
 }));
+// Revalidate or lazily establish the process-pinned installation spool on every
+// request. This is intentionally non-blocking for routes that do not need it;
+// spool consumers retain their retryable failure contracts, while a repaired
+// custom root becomes usable without restarting the process.
+app.use((_req, _res, next) => {
+    ensureDatabaseSpoolDirSync();
+    next();
+});
 app.use(createAdmittedIngressSpoolMiddleware({
     policySymbol: BUFFERED_INGRESS_POLICY,
-    spoolDir: () => databaseSpoolDir,
+    spoolDir: () => requireDatabaseSpoolDirSync(),
     disabled: process.env.NODE_ENV === 'test'
         && process.env.POCKETRISU_TEST_DISABLE_ADMITTED_SPOOL === '1',
     globalBudgetBytes: bufferedIngressLimits.global,
@@ -2942,6 +2959,16 @@ if(!existsSync(savePath)){
     mkdirSync(savePath)
 }
 
+// Keep analytics identity valid, but do not use it for filesystem ownership:
+// it is routinely copied with operator templates and cloned save directories.
+const instanceIdPath = path.join(savePath, '__instance_id')
+const instanceId = readOrCreatePersistentUuid(instanceIdPath)
+// The spool owner is a separate, atomically initialized installation token.
+// Restarts reuse it for own-orphan cleanup; copied analytics ids do not collide.
+let databaseSpoolOwnerId = readOrCreatePersistentUuid(
+    path.join(savePath, SPOOL_OWNER_ID_FILENAME),
+)
+
 const DATABASE_SPOOL_FILE_PREFIX = '.database-risudat-';
 const BACKUP_IMPORT_SPOOL_FILE_PREFIX = '.backup-import-';
 const BACKUP_ENTRY_STAGE_PREFIX = '.backup-entry-stage-';
@@ -2989,24 +3016,77 @@ const PLUGIN_TRANSITION_MAX_ROW_BYTES = Math.max(
     32 * 1024 * 1024,
     PLUGIN_VALUE_MAX_BYTES,
 );
-// POCKETRISU_SPOOL_DIR may relocate temporary database assembly. The default
-// remains on the writable save volume and is independent of server backups.
+// POCKETRISU_SPOOL_DIR relocates the shared spool root. Each installation gets
+// a stable child namespace so boot cleanup can prove ownership without an
+// unsafe age heuristic or touching another live instance's files.
 const configuredDatabaseSpoolDir = String(process.env.POCKETRISU_SPOOL_DIR ?? '').trim();
-const databaseSpoolDir = configuredDatabaseSpoolDir
+const databaseSpoolRootDir = configuredDatabaseSpoolDir
     ? path.resolve(configuredDatabaseSpoolDir)
     : path.join(savePath, '.spool');
+let databaseSpoolOwnedPath = resolveOwnedSpoolDir(databaseSpoolRootDir, databaseSpoolOwnerId);
+let databaseSpoolDir = null;
 // Filesystem asset pins stay on the save volume so an export can take one
 // coherent SQLite/filesystem cut without relying on cross-device links.
 const partialExportSpoolDir = path.join(savePath, '.partial-export-spool');
-let databaseSpoolReady = true;
+let databaseSpoolReady = false;
+let databaseSpoolNamespaceClaimed = false;
+let databaseSpoolHandle = null;
 const pluginTransitionStageDir = path.join(savePath, '.plugin-transition-staging');
+function ensureDatabaseSpoolDirSync() {
+    try {
+        if (databaseSpoolHandle) {
+            if (!fsSync.fstatSync(databaseSpoolHandle.descriptor).isDirectory()) {
+                throw new Error('Pinned database spool descriptor is no longer a directory');
+            }
+            databaseSpoolReady = true;
+            return true;
+        }
+        if (!databaseSpoolNamespaceClaimed) {
+            const claimed = claimOwnedSpoolNamespaceSync(savePath, databaseSpoolRootDir);
+            databaseSpoolOwnerId = claimed.ownerId;
+            databaseSpoolOwnedPath = claimed.spoolDir;
+            databaseSpoolNamespaceClaimed = true;
+        }
+        ensureOwnedSpoolDirSync(databaseSpoolRootDir, databaseSpoolOwnedPath);
+        const opened = openPinnedOwnedSpoolDirSync(databaseSpoolOwnedPath);
+        if (!opened) {
+            const error = new Error('Descriptor-relative database spool access is unavailable');
+            error.code = 'ENOTSUP';
+            throw error;
+        }
+        databaseSpoolHandle = opened;
+        databaseSpoolDir = opened.pinnedPath;
+        databaseSpoolReady = true;
+        return true;
+    } catch {
+        databaseSpoolReady = false;
+        return false;
+    }
+}
+function requireDatabaseSpoolDirSync() {
+    if (ensureDatabaseSpoolDirSync()) return databaseSpoolDir;
+    const error = new Error(`The configured database spool is unavailable: ${databaseSpoolOwnedPath}`);
+    error.code = 'ENOENT';
+    throw error;
+}
 try {
-    mkdirSync(databaseSpoolDir, { recursive: true });
-    mkdirSync(partialExportSpoolDir, { recursive: true, mode: 0o700 });
-    mkdirSync(pluginTransitionStageDir, { recursive: true, mode: 0o700 });
+    const claimed = claimOwnedSpoolNamespaceSync(savePath, databaseSpoolRootDir);
+    databaseSpoolOwnerId = claimed.ownerId;
+    databaseSpoolOwnedPath = claimed.spoolDir;
+    databaseSpoolNamespaceClaimed = true;
 } catch (error) {
     databaseSpoolReady = false;
-    logger.error(`[Backup] Could not create database spool directory ${databaseSpoolDir}:`, error);
+    logger.error(`[Backup] Could not claim database spool namespace ${databaseSpoolOwnedPath}:`, error);
+}
+try {
+    mkdirSync(partialExportSpoolDir, { recursive: true, mode: 0o700 });
+} catch (error) {
+    logger.error(`[Backup] Could not create partial export spool directory ${partialExportSpoolDir}:`, error);
+}
+try {
+    mkdirSync(pluginTransitionStageDir, { recursive: true, mode: 0o700 });
+} catch (error) {
+    logger.error(`[PluginStorage] Could not create transition stage directory ${pluginTransitionStageDir}:`, error);
 }
 try {
     for (const entry of readdirSync(partialExportSpoolDir, { withFileTypes: true })) {
@@ -3020,74 +3100,84 @@ try {
 } catch (error) {
     logger.warn('[Backup] Could not sweep partial export spool directory:', error);
 }
-if (databaseSpoolReady) {
-    try {
-        for (const entry of readdirSync(databaseSpoolDir, { withFileTypes: true })) {
-            if (
-                entry.name.startsWith(PARTIAL_EXPORT_JOB_PREFIX)
-                && entry.name !== path.basename(partialExportSpoolDir)
-            ) {
-                try {
-                    fsSync.rmSync(path.join(databaseSpoolDir, entry.name), {
-                        recursive: true,
-                        force: true,
-                    });
-                } catch (error) {
-                    logger.warn(`[Backup] Could not remove orphaned partial export ${entry.name}:`, error);
-                }
-                continue;
-            }
-            if (entry.isDirectory() && entry.name.startsWith(SAVE_FOLDER_IMPORT_STAGE_PREFIX)) {
-                try {
-                    fsSync.rmSync(path.join(databaseSpoolDir, entry.name), {
-                        recursive: true,
-                        force: true,
-                    });
-                } catch (error) {
-                    logger.warn(`[Backup] Could not remove orphaned save-folder import ${entry.name}:`, error);
-                }
-                continue;
-            }
-            if (entry.isDirectory() && entry.name.startsWith(BACKUP_ENTRY_STAGE_PREFIX)) {
-                try {
-                    fsSync.rmSync(path.join(databaseSpoolDir, entry.name), {
-                        recursive: true,
-                        force: true,
-                    });
-                } catch (error) {
-                    logger.warn(`[Backup] Could not remove orphaned backup-entry stage ${entry.name}:`, error);
-                }
-                continue;
-            }
-            if (!entry.isFile() || !(
-                entry.name.startsWith(DATABASE_SPOOL_FILE_PREFIX)
-                || entry.name.startsWith(BACKUP_IMPORT_SPOOL_FILE_PREFIX)
-                || entry.name.startsWith(PLUGIN_VALUE_SPOOL_FILE_PREFIX)
-                || entry.name.startsWith(PLUGIN_BATCH_VALUE_SPOOL_FILE_PREFIX)
-                || entry.name.startsWith(PLUGIN_RECOVERY_DOWNLOAD_SPOOL_FILE_PREFIX)
-                || entry.name.startsWith(ADMITTED_INGRESS_SPOOL_PREFIX)
-            )) continue;
+function sweepDatabaseSpoolDirectory(sweepDir) {
+    for (const entry of readdirSync(sweepDir, { withFileTypes: true })) {
+        if (
+            entry.name.startsWith(PARTIAL_EXPORT_JOB_PREFIX)
+            && entry.name !== path.basename(partialExportSpoolDir)
+        ) {
             try {
-                unlinkSync(path.join(databaseSpoolDir, entry.name));
-            } catch (error) {
-                logger.warn(`[Backup] Could not remove orphaned spool file ${entry.name}:`, error);
-            }
-        }
-        for (const entry of readdirSync(databaseSpoolDir, { withFileTypes: true })) {
-            if (!entry.isDirectory() || !entry.name.startsWith(ADMITTED_WRITE_STAGE_PREFIX)) {
-                continue;
-            }
-            try {
-                fsSync.rmSync(path.join(databaseSpoolDir, entry.name), {
+                fsSync.rmSync(path.join(sweepDir, entry.name), {
                     recursive: true,
                     force: true,
                 });
             } catch (error) {
-                logger.warn(`[Backup] Could not remove orphaned admitted-write stage ${entry.name}:`, error);
+                logger.warn(`[Backup] Could not remove orphaned partial export ${entry.name}:`, error);
             }
+            continue;
         }
+        if (entry.isDirectory() && entry.name.startsWith(SAVE_FOLDER_IMPORT_STAGE_PREFIX)) {
+            try {
+                fsSync.rmSync(path.join(sweepDir, entry.name), {
+                    recursive: true,
+                    force: true,
+                });
+            } catch (error) {
+                logger.warn(`[Backup] Could not remove orphaned save-folder import ${entry.name}:`, error);
+            }
+            continue;
+        }
+        if (entry.isDirectory() && entry.name.startsWith(BACKUP_ENTRY_STAGE_PREFIX)) {
+            try {
+                fsSync.rmSync(path.join(sweepDir, entry.name), {
+                    recursive: true,
+                    force: true,
+                });
+            } catch (error) {
+                logger.warn(`[Backup] Could not remove orphaned backup-entry stage ${entry.name}:`, error);
+            }
+            continue;
+        }
+        if (!entry.isFile() || !(
+            entry.name.startsWith(DATABASE_SPOOL_FILE_PREFIX)
+            || entry.name.startsWith(BACKUP_IMPORT_SPOOL_FILE_PREFIX)
+            || entry.name.startsWith(PLUGIN_VALUE_SPOOL_FILE_PREFIX)
+            || entry.name.startsWith(PLUGIN_BATCH_VALUE_SPOOL_FILE_PREFIX)
+            || entry.name.startsWith(PLUGIN_RECOVERY_DOWNLOAD_SPOOL_FILE_PREFIX)
+            || entry.name.startsWith(ADMITTED_INGRESS_SPOOL_PREFIX)
+        )) continue;
+        try {
+            unlinkSync(path.join(sweepDir, entry.name));
+        } catch (error) {
+            logger.warn(`[Backup] Could not remove orphaned spool file ${entry.name}:`, error);
+        }
+    }
+    for (const entry of readdirSync(sweepDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !entry.name.startsWith(ADMITTED_WRITE_STAGE_PREFIX)) {
+            continue;
+        }
+        try {
+            fsSync.rmSync(path.join(sweepDir, entry.name), {
+                recursive: true,
+                force: true,
+            });
+        } catch (error) {
+            logger.warn(`[Backup] Could not remove orphaned admitted-write stage ${entry.name}:`, error);
+        }
+    }
+}
+
+if (databaseSpoolNamespaceClaimed) {
+    try {
+        withQuarantinedOwnedSpoolDirSync(
+            databaseSpoolRootDir,
+            databaseSpoolOwnedPath,
+            sweepDatabaseSpoolDirectory,
+        );
+        databaseSpoolReady = ensureDatabaseSpoolDirSync();
     } catch (error) {
-        logger.warn(`[Backup] Could not sweep database spool directory ${databaseSpoolDir}:`, error);
+        databaseSpoolReady = false;
+        logger.warn(`[Backup] Could not sweep database spool directory ${databaseSpoolOwnedPath}:`, error);
     }
 }
 
@@ -3215,7 +3305,7 @@ async function findActivePluginTransition(req, excludeTransitionId = null) {
 }
 
 function sweepStalePluginTransitionStages() {
-    if (!databaseSpoolReady) return;
+    if (!ensureDatabaseSpoolDirSync()) return;
     try {
         const now = Date.now();
         for (const entry of readdirSync(pluginTransitionStageDir, { withFileTypes: true })) {
@@ -3379,16 +3469,6 @@ if (existsSync(jwtSecretPath)) {
 } else {
     jwtSecret = nodeCrypto.randomBytes(64).toString('hex')
     writeFileSync(jwtSecretPath, jwtSecret, 'utf-8')
-}
-
-// ── Instance ID for anonymous usage analytics ────────────────────────────────
-const instanceIdPath = path.join(savePath, '__instance_id')
-let instanceId
-if (existsSync(instanceIdPath)) {
-    instanceId = readFileSync(instanceIdPath, 'utf-8').trim()
-} else {
-    instanceId = nodeCrypto.randomUUID()
-    writeFileSync(instanceIdPath, instanceId, 'utf-8')
 }
 
 const authCodePath = path.join(process.cwd(), 'save', '__authcode')
@@ -3743,6 +3823,7 @@ function backupImportLimits({ allowLargeRestore = false } = {}) {
 }
 
 async function assertImportDiskSpace(sourceBytes, targetPath = databaseSpoolDir) {
+    if (targetPath === databaseSpoolDir) requireDatabaseSpoolDirSync();
     const required = sourceBytes * BACKUP_DISK_HEADROOM;
     if (!Number.isSafeInteger(required)) {
         throw importFormatError('Import disk requirement is not a safe byte count', 'INVALID_IMPORT_SIZE');
@@ -6460,7 +6541,7 @@ function publishOptimizedBootRecoveryRows(entries, generation, manifest) {
 }
 
 async function persistOptimizedBootInlineCleanup(req, liveDb) {
-    if (!databaseSpoolReady) {
+    if (!ensureDatabaseSpoolDirSync()) {
         throw new Error('The database spool is unavailable');
     }
     const targetDb = {
@@ -7597,6 +7678,7 @@ async function spoolSelfContainedBackupDatabase(
         onMissingChatRow,
     } = {}
 ) {
+    requireDatabaseSpoolDirSync();
     const finalPath = path.join(
         databaseSpoolDir,
         `${DATABASE_SPOOL_FILE_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}`
@@ -7637,6 +7719,7 @@ async function spoolBackupSnapshotRow(snapshot, key, {
     shouldAbort,
     onChunk,
 } = {}) {
+    requireDatabaseSpoolDirSync();
     const size = snapshot.kvSize(key);
     if (!Number.isSafeInteger(size) || size < 0) return null;
     const rowPath = path.join(
@@ -7664,6 +7747,7 @@ async function spoolBackupSnapshotRow(snapshot, key, {
 }
 
 async function spoolLogicalChatSnapshotRow(snapshot, key, options = {}) {
+    requireDatabaseSpoolDirSync();
     const metadata = typeof snapshot.chatRowMetadata === 'function'
         ? snapshot.chatRowMetadata(key)
         : null;
@@ -8808,6 +8892,7 @@ function fullBackupDatabaseUnavailableError(cause = null) {
 }
 
 async function validateFullBackupDatabase(snapshot, key, size, signal) {
+    requireDatabaseSpoolDirSync();
     if (!Number.isSafeInteger(size) || size <= 0) {
         throw fullBackupDatabaseUnavailableError();
     }
@@ -12760,7 +12845,7 @@ app.get('/api/plugin-storage/recovery/download', async (req, res, next) => {
             retryable: false,
         });
     }
-    if (!databaseSpoolReady) {
+    if (!ensureDatabaseSpoolDirSync()) {
         return res.status(503).json({
             success: false,
             code: 'PLUGIN_STORAGE_RECOVERY_DOWNLOAD_UNAVAILABLE',
@@ -13166,7 +13251,7 @@ function createPluginStorageBatchRequestReader(req) {
 }
 
 async function receiveStreamedPluginStorageBatch(req, res) {
-    if (!databaseSpoolReady) {
+    if (!ensureDatabaseSpoolDirSync()) {
         const error = new Error('The server upload spool is unavailable; check the save volume permissions.');
         error.code = 'PLUGIN_STORAGE_SPOOL_UNAVAILABLE';
         error.status = 503;
@@ -13833,7 +13918,7 @@ app.post('/api/plugin-storage/mutate', async (req, res, next) => {
                 { code: 'PLUGIN_VALUE_TOO_LARGE', limit: PLUGIN_VALUE_MAX_BYTES, actual: expectedLength },
             ));
         }
-        if (!databaseSpoolReady) {
+        if (!ensureDatabaseSpoolDirSync()) {
             return res.status(503).json({
                 success: false,
                 outcome: 'not-committed',
@@ -14397,7 +14482,7 @@ async function refreshPluginTransitionStageState(stage) {
  * untouched until the database is repaired.
  */
 async function reconcilePluginTransitionStagesAtStartup() {
-    if (!databaseSpoolReady) return;
+    if (!ensureDatabaseSpoolDirSync()) return;
     // Keep the early module load read-only with respect to private transition
     // receipts. Startup calls this only after database preflight, so corrupt
     // recovery boots cannot discard a staged authoritative source.
@@ -15555,7 +15640,7 @@ const richPluginTransitionUnpackr = new Unpackr({
 });
 
 async function receiveBulkPluginStorageTransition(req) {
-    if (!databaseSpoolReady) {
+    if (!ensureDatabaseSpoolDirSync()) {
         const error = new PluginStorageTransitionRequestError(
             503,
             'The server transition spool is unavailable; check the save volume permissions.',
@@ -19424,6 +19509,7 @@ async function importLegacySaveEntries(
 }
 
 function createSaveFolderImportStage() {
+    requireDatabaseSpoolDirSync();
     const stageDir = path.join(
         databaseSpoolDir,
         `${SAVE_FOLDER_IMPORT_STAGE_PREFIX}${process.pid}-${nodeCrypto.randomUUID()}`,

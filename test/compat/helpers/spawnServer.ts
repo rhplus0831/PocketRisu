@@ -6,7 +6,8 @@
  * __dirname, so no symlinks or copies are needed.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -21,6 +22,8 @@ export interface ServerHandle {
   pid: number
   password: string
   cwd: string
+  /** Installation-owned child of the configured spool root. */
+  spoolDir: string
   /** Restart the same save directory on a fresh port. */
   restart: (env?: Record<string, string>) => Promise<void>
   /** Abruptly kill the active process without deleting its save directory. */
@@ -79,6 +82,7 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Server
     pid: 0,
     password: TEST_PASSWORD,
     cwd: tempDir,
+    spoolDir: '',
   } as ServerHandle
 
   const launch = async (extraEnv: Record<string, string> = {}) => {
@@ -99,18 +103,19 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Server
   const launchOnce = async (extraEnv: Record<string, string> = {}) => {
     handle.port = await getFreePort()
     let stderrBuf = ''
+    const launchEnv = { ...opts.env, ...extraEnv }
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      PORT: String(handle.port),
+      NODE_ENV: 'test',
+      ...launchEnv,
+    }
     const launched = spawn(
       process.execPath,
       [SERVER_SCRIPT],
       {
         cwd: tempDir,
-        env: {
-          ...process.env,
-          PORT: String(handle.port),
-          NODE_ENV: 'test',
-          ...opts.env,
-          ...extraEnv,
-        },
+        env: childEnv,
         stdio: ['ignore', 'pipe', 'pipe'],
       },
     )
@@ -134,7 +139,26 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Server
           && chunk.toString().includes('server is running')) {
           settled = true
           clearTimeout(timeout)
-          resolve()
+          const configuredSpoolRoot = String(
+            childEnv['POCKETRISU_SPOOL_DIR'] ?? '',
+          ).trim()
+          const spoolRoot = configuredSpoolRoot
+            ? path.resolve(tempDir, configuredSpoolRoot)
+            : path.join(tempDir, 'save', '.spool')
+          void readFile(path.join(tempDir, 'save', '__spool_owner_id'), 'utf8').then(ownerId => {
+            const owner = createHash('sha256').update(ownerId.trim().toLowerCase()).digest('hex')
+            handle.spoolDir = path.join(spoolRoot, `.instance-${owner}`)
+            resolve()
+          }, error => {
+            // Keep the harness behaviorally useful against pre-ownership
+            // servers: their active files live directly in the configured root.
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+              handle.spoolDir = spoolRoot
+              resolve()
+              return
+            }
+            reject(error)
+          })
         }
       })
       launched.on('error', (err) => {

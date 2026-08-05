@@ -585,7 +585,7 @@ describe('AA3 atomic plugin storage batch', () => {
     expect(read.missing).toBe(false)
     expect(createHash('sha256').update(Buffer.from(read.value, 'base64')).digest('hex'))
       .toBe(createHash('sha256').update(value).digest('hex'))
-    const spool = await readdir(path.join(server.cwd, 'save', '.spool'))
+    const spool = await readdir(server.spoolDir)
     expect(spool.filter(name => name.startsWith('.plugin-batch-value-'))).toEqual([])
   }, 90_000)
 
@@ -609,7 +609,7 @@ describe('AA3 atomic plugin storage batch', () => {
       code: 'INVALID_PLUGIN_STORAGE_BATCH',
     })
     await expect(readState(client, key)).resolves.toMatchObject({ missing: true })
-    const spool = await readdir(path.join(server.cwd, 'save', '.spool'))
+    const spool = await readdir(server.spoolDir)
     expect(spool.filter(name => name.startsWith('.plugin-batch-value-'))).toEqual([])
   })
 
@@ -634,7 +634,7 @@ describe('AA3 atomic plugin storage batch', () => {
       code: 'PLUGIN_STORAGE_REVISION_CONFLICT',
     })
     expect(readPhysicalPair(server.cwd, key)).toEqual(before)
-    const spool = await readdir(path.join(server.cwd, 'save', '.spool'))
+    const spool = await readdir(server.spoolDir)
     expect(spool.filter(name => name.startsWith('.plugin-batch-value-'))).toEqual([])
   })
 
@@ -659,7 +659,7 @@ describe('AA3 atomic plugin storage batch', () => {
       code: 'PLUGIN_STORAGE_BATCH_ROLLED_BACK',
     })
     expect(readPhysicalPair(server.cwd, key)).toEqual(before)
-    const spool = await readdir(path.join(server.cwd, 'save', '.spool'))
+    const spool = await readdir(server.spoolDir)
     expect(spool.filter(name => name.startsWith('.plugin-batch-value-'))).toEqual([])
   })
 

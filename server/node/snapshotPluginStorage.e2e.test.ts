@@ -12,6 +12,7 @@ import { Packr } from 'msgpackr'
 import utilsPkg from './utils.cjs'
 import pluginSaveKeysPkg from './pluginSaveKeys.cjs'
 import streamLoadPkg from './streamRisuLoad.cjs'
+import spoolOwnershipPkg from './spoolOwnership.cjs'
 import { encodeBackup } from '../../test/compat/helpers/encode.js'
 
 const {
@@ -50,6 +51,9 @@ const pluginTransitionPackr = new Packr({ structuredClone: true, useRecords: tru
 const pluginRecoveryDirtyKey = 'config/plugin-storage-recovery-dirty'
 const pluginTransitionMagic = Buffer.from('PRISUT01', 'ascii')
 const pluginTransitionPrefixBytes = 12
+const { resolveOwnedSpoolDirFromSave } = spoolOwnershipPkg as {
+    resolveOwnedSpoolDirFromSave: (savePath: string, spoolRoot?: string) => string
+}
 
 interface RunningServer {
     child: ChildProcessWithoutNullStreams
@@ -186,6 +190,10 @@ function makeWorkDir(): string {
     fs.mkdirSync(saveDir)
     fs.writeFileSync(path.join(saveDir, '__password'), testPasswordDigest)
     return cwd
+}
+
+function databaseSpoolDir(cwd: string): string {
+    return resolveOwnedSpoolDirFromSave(path.join(cwd, 'save'))
 }
 
 function openFixtureDatabase(cwd: string) {
@@ -3005,7 +3013,7 @@ describe('automatic snapshots × optimized plugin storage', () => {
         expect(response.status).toBe(status)
         await expect(response.json()).resolves.toEqual(expected)
         expect(await readKey(server, auth, 'database/database.bin')).toEqual(liveDatabase)
-        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+        expect(fs.readdirSync(databaseSpoolDir(cwd)).filter(
             name => name.includes('snapshot-restore'),
         )).toEqual([])
 
@@ -3014,7 +3022,7 @@ describe('automatic snapshots × optimized plugin storage', () => {
         server = await startServer(cwd, { POCKETRISU_BACKUP_INTERVAL_MS: '0' })
         auth = await authenticate(server)
         expect(await readKey(server, auth, 'database/database.bin')).toEqual(liveDatabase)
-        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+        expect(fs.readdirSync(databaseSpoolDir(cwd)).filter(
             name => name.includes('snapshot-restore'),
         )).toEqual([])
     }, 30_000)
@@ -3293,7 +3301,7 @@ describe('automatic snapshots × optimized plugin storage', () => {
             valueRowKey(`record/${rowCount - 1}`),
         )).toString('utf-8'))
         expect(restored.body).toHaveLength(4 * 1024 * 1024)
-        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+        expect(fs.readdirSync(databaseSpoolDir(cwd)).filter(
             name => name.includes('snapshot-restore'),
         )).toEqual([])
     })
@@ -3363,7 +3371,7 @@ describe('automatic snapshots × optimized plugin storage', () => {
             valueRowKey('current-only'),
             generation,
         )).toString('utf-8'))).toBe('must-survive')
-        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+        expect(fs.readdirSync(databaseSpoolDir(cwd)).filter(
             name => name.includes('snapshot-restore'),
         )).toEqual([])
 
@@ -3429,7 +3437,7 @@ describe('automatic snapshots × optimized plugin storage', () => {
             body: JSON.stringify({ key: snapshotKey }),
             signal: controller.signal,
         })
-        const spoolDir = path.join(cwd, 'save', '.spool')
+        const spoolDir = databaseSpoolDir(cwd)
         let observedPartialBytes = 0
         await waitFor(async () => {
             const name = fs.readdirSync(spoolDir).find((entry) => entry.includes('snapshot-restore'))
@@ -3553,7 +3561,7 @@ describe('automatic snapshots × optimized plugin storage', () => {
             valueRowKey('retained'),
             currentGeneration,
         )).toEqual(currentValue)
-        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+        expect(fs.readdirSync(databaseSpoolDir(cwd)).filter(
             (name) => name.includes('snapshot-restore'),
         )).toEqual([])
 
@@ -3692,7 +3700,7 @@ describe('automatic snapshots × optimized plugin storage', () => {
         })
         expect(await readKey(server, auth, 'database/database.bin')).toEqual(currentDb)
         expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(currentManifest)
-        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+        expect(fs.readdirSync(databaseSpoolDir(cwd)).filter(
             name => name.includes('snapshot-restore'),
         )).toEqual([])
 
@@ -3747,7 +3755,7 @@ describe('automatic snapshots × optimized plugin storage', () => {
 
         expect(await readKey(server, auth, 'database/database.bin')).toEqual(currentDb)
         expect(await readKey(server, auth, PLUGIN_STORAGE_MANIFEST_KEY)).toEqual(currentManifest)
-        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+        expect(fs.readdirSync(databaseSpoolDir(cwd)).filter(
             name => name.includes('snapshot-restore'),
         )).toEqual([])
 
@@ -4325,7 +4333,7 @@ describe('corrupt database boot snapshot recovery', () => {
             code: 'INVALID_PLUGIN_STORAGE_ROW',
             encodedKey: malformedLastKey,
         })
-        expect(fs.readdirSync(path.join(cwd, 'save', '.spool')).filter(
+        expect(fs.readdirSync(databaseSpoolDir(cwd)).filter(
             name => name.includes('snapshot-restore'),
         )).toEqual([])
 

@@ -217,7 +217,7 @@ describe('optimized plugin large-value capacity (real server)', () => {
     expect(storedCandidates.n).toBe(1)
     expect(await readValue(client, seedKey)).toEqual(Buffer.from(exactJsonBytes(7_000)))
 
-    const spoolEntries = await readdir(path.join(server.cwd, 'save', '.spool'))
+    const spoolEntries = await readdir(server.spoolDir)
     expect(spoolEntries.filter(name => name.startsWith('.plugin-value-'))).toEqual([])
   })
 })

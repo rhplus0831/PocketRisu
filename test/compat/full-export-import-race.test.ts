@@ -78,8 +78,11 @@ async function waitForFullExportPin(cwd: string, timeoutMs = 10_000): Promise<vo
   throw new Error('Full backup export pin was not created')
 }
 
-async function waitForNoDatabaseSpools(cwd: string, timeoutMs = 10_000): Promise<void> {
-  const spoolDir = path.join(cwd, 'save', '.spool')
+async function waitForNoDatabaseSpools(
+  server: ServerHandle,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const spoolDir = server.spoolDir
   const deadline = Date.now() + timeoutMs
   let lastEntries: string[] = []
   while (Date.now() < deadline) {
@@ -980,7 +983,7 @@ describe('full backup point-in-time filesystem pins', () => {
     transcodeSocket.destroy()
     await transcodeSocketClosed
     await waitForNoFullExportPins(server.cwd)
-    await waitForNoDatabaseSpools(server.cwd)
+    await waitForNoDatabaseSpools(server)
     expect((await client.fetch('/api/db/stats')).status).toBe(200)
 
     const destination = await spawnServer({

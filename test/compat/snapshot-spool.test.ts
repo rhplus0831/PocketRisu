@@ -1,6 +1,17 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Packr } from 'msgpackr'
 import { createHash } from 'node:crypto'
@@ -19,6 +30,7 @@ const { calculateHash, decodeRisuSave, encodeRisuSaveLegacy, normalizeJSON } = u
 }
 const DB_BLOB_HEX = Buffer.from('database/database.bin', 'utf-8').toString('hex')
 const CHAT_DELTA_CONTENT_TYPE = 'application/vnd.pocketrisu.chat-delta+json'
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const servers: ServerHandle[] = []
 
 afterAll(async () => {
@@ -43,6 +55,27 @@ function databaseValue(revision: string, characters: unknown[] = []): Record<str
 
 function encodeDatabase(revision: string, characters: unknown[] = []): Buffer {
   return encodeRisuDat(databaseValue(revision, characters))
+}
+
+function spoolNamespacePath(spoolRoot: string, ownerId: string): string {
+  const owner = createHash('sha256').update(ownerId.toLowerCase()).digest('hex')
+  return path.join(spoolRoot, `.instance-${owner}`)
+}
+
+async function findSpoolFilesRecursively(
+  root: string,
+  prefix: string,
+): Promise<string[]> {
+  const found: string[] = []
+  const visit = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name)
+      if (entry.isDirectory()) await visit(entryPath)
+      else if (entry.isFile() && entry.name.startsWith(prefix)) found.push(entryPath)
+    }
+  }
+  await visit(root)
+  return found
 }
 
 function writeDatabase(
@@ -507,6 +540,8 @@ describe('database snapshot spool isolation', () => {
   })
 
   test('hub writes snapshot through save/.spool without a backups directory', async () => {
+    const instanceId = '70b9f079-0a1c-4a64-972d-8ef8a8934202'
+    const spoolOwnerId = 'a680b3a2-6de0-4a84-912a-2ec5f38b4977'
     const orphanName = '.database-risudat-crash-orphan.tmp'
     const decodedOrphanName = `${orphanName}.decoded-crash.tmp`
     const blockOrphanName = `${orphanName}.block-decoded-crash.tmp`
@@ -517,7 +552,9 @@ describe('database snapshot spool isolation', () => {
         POCKETRISU_BACKUP_INTERVAL_MS: '0',
       },
       seedSave: async (saveDir) => {
-        const spoolDir = path.join(saveDir, '.spool')
+        await writeFile(path.join(saveDir, '__instance_id'), instanceId, 'utf8')
+        await writeFile(path.join(saveDir, '__spool_owner_id'), spoolOwnerId, 'utf8')
+        const spoolDir = spoolNamespacePath(path.join(saveDir, '.spool'), spoolOwnerId)
         await mkdir(spoolDir, { recursive: true })
         await writeFile(path.join(spoolDir, orphanName), 'orphan')
         await writeFile(path.join(spoolDir, decodedOrphanName), 'decoded orphan')
@@ -526,16 +563,304 @@ describe('database snapshot spool isolation', () => {
     })
     servers.push(server)
     const client = await createClient(server.port, server.password)
+    const spoolDir = spoolNamespacePath(
+      path.join(server.cwd, 'save', '.spool'),
+      spoolOwnerId,
+    )
 
     expect(existsSync(path.join(server.cwd, 'backups'))).toBe(false)
     expect(existsSync(path.join(server.cwd, 'save', '.spool'))).toBe(true)
-    expect(existsSync(path.join(server.cwd, 'save', '.spool', orphanName))).toBe(false)
-    expect(existsSync(path.join(server.cwd, 'save', '.spool', decodedOrphanName))).toBe(false)
-    expect(existsSync(path.join(server.cwd, 'save', '.spool', blockOrphanName))).toBe(false)
+    expect(existsSync(path.join(spoolDir, orphanName))).toBe(false)
+    expect(existsSync(path.join(spoolDir, decodedOrphanName))).toBe(false)
+    expect(existsSync(path.join(spoolDir, blockOrphanName))).toBe(false)
 
     expect((await writeDatabase(client, 'hub-write')).status).toBe(200)
     await waitForSnapshotCount(client, 1)
     expect(existsSync(path.join(server.cwd, 'backups'))).toBe(false)
+  })
+
+  test('boot replaces an owned-child symlink without sweeping its outside victim', async () => {
+    const victimDir = await mkdtemp(path.join(tmpdir(), 'risu-spool-symlink-victim-'))
+    const victimSpool = path.join(victimDir, '.database-risudat-victim.tmp')
+    const ownerId = 'c9ba6483-1a20-4078-aa74-dcde3c7e5764'
+    await writeFile(victimSpool, 'must survive boot cleanup')
+    try {
+      const server = await spawnServer({
+        env: { POCKETRISU_BACKUP_INTERVAL_MS: '0' },
+        seedSave: async saveDir => {
+          await writeFile(path.join(saveDir, '__spool_owner_id'), ownerId, 'utf8')
+          const spoolRoot = path.join(saveDir, '.spool')
+          await mkdir(spoolRoot)
+          await symlink(victimDir, spoolNamespacePath(spoolRoot, ownerId), 'dir')
+        },
+      })
+      servers.push(server)
+
+      expect(await readFile(victimSpool, 'utf8')).toBe('must survive boot cleanup')
+      const accepted = await lstat(server.spoolDir)
+      expect(accepted.isDirectory()).toBe(true)
+      expect(accepted.isSymbolicLink()).toBe(false)
+      expect(accepted.mode & 0o777).toBe(0o700)
+    } finally {
+      await rm(victimDir, { recursive: true, force: true })
+    }
+  })
+
+  test('runtime spooling stays pinned after the owned child is replaced by a symlink', async () => {
+    const victimDir = await mkdtemp(path.join(tmpdir(), 'risu-runtime-spool-victim-'))
+    const victimFile = path.join(victimDir, '.database-risudat-victim.tmp')
+    const gateName = 'runtime-owned-path-swap-gate'
+    await writeFile(victimFile, 'must survive runtime activity')
+    try {
+      const server = await spawnServer({
+        env: {
+          POCKETRISU_BACKUP_INTERVAL_MS: '0',
+          POCKETRISU_SNAPSHOT_ASSEMBLY_TEST_GATE_DIR: gateName,
+        },
+      })
+      servers.push(server)
+      const parked = `${server.spoolDir}.runtime-parked`
+      await rename(server.spoolDir, parked)
+      await symlink(victimDir, server.spoolDir, 'dir')
+      const gateDir = path.join(server.cwd, gateName)
+      await mkdir(gateDir, { recursive: true })
+      await writeFile(path.join(gateDir, 'hold'), '')
+      const client = await createClient(server.port, server.password)
+
+      expect((await writeDatabase(client, 'runtime-path-pinned')).status).toBe(200)
+      await waitForFile(path.join(gateDir, 'entered'))
+      expect((await findSpoolFilesRecursively(parked, '.database-risudat-')).length)
+        .toBeGreaterThan(0)
+      expect(await readdir(victimDir)).toEqual(['.database-risudat-victim.tmp'])
+      expect(await readFile(victimFile, 'utf8')).toBe('must survive runtime activity')
+
+      await writeFile(path.join(gateDir, 'release'), '')
+      await waitForSnapshotCount(client, 1)
+      expect((await readLatestSnapshot(client)).snapshotSpoolRevision)
+        .toBe('runtime-path-pinned')
+      expect(await readFile(victimFile, 'utf8')).toBe('must survive runtime activity')
+    } finally {
+      await rm(victimDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a first-boot clone claims away before touching an already-active source namespace', async () => {
+    const sharedSpoolRoot = await mkdtemp(path.join(tmpdir(), 'risu-initial-clone-spool-'))
+    const copiedAnalyticsId = '62c55932-913a-4387-aa64-e1273931aa82'
+    const copiedOwnerId = '5472d9ad-51fd-499a-a59e-a77575925785'
+    const gateName = 'initial-clone-snapshot-gate'
+    let sourceServer: ServerHandle | null = null
+    let cloneServer: ServerHandle | null = null
+    try {
+      sourceServer = await spawnServer({
+        env: {
+          POCKETRISU_SPOOL_DIR: sharedSpoolRoot,
+          POCKETRISU_BACKUP_INTERVAL_MS: '0',
+          POCKETRISU_SNAPSHOT_ASSEMBLY_TEST_GATE_DIR: gateName,
+        },
+        seedSave: async saveDir => {
+          await writeFile(path.join(saveDir, '__instance_id'), copiedAnalyticsId)
+          await writeFile(path.join(saveDir, '__spool_owner_id'), copiedOwnerId)
+        },
+      })
+      const sourceClient = await createClient(sourceServer.port, sourceServer.password)
+      const gateDir = path.join(sourceServer.cwd, gateName)
+      await mkdir(gateDir, { recursive: true })
+      await writeFile(path.join(gateDir, 'hold'), '')
+      expect((await writeDatabase(sourceClient, 'initial-clone-source')).status).toBe(200)
+      await waitForFile(path.join(gateDir, 'entered'))
+      const sourceActive = await findSpoolFilesRecursively(
+        sharedSpoolRoot,
+        '.database-risudat-',
+      )
+      expect(sourceActive.length).toBeGreaterThan(0)
+
+      cloneServer = await spawnServer({
+        env: { POCKETRISU_SPOOL_DIR: sharedSpoolRoot },
+        seedSave: async saveDir => {
+          await writeFile(path.join(saveDir, '__instance_id'), copiedAnalyticsId)
+          await writeFile(path.join(saveDir, '__spool_owner_id'), copiedOwnerId)
+        },
+      })
+      const cloneOwner = (
+        await readFile(path.join(cloneServer.cwd, 'save', '__spool_owner_id'), 'utf8')
+      ).trim()
+      expect(cloneOwner).toMatch(UUID_PATTERN)
+      expect(cloneOwner).not.toBe(copiedOwnerId)
+      expect(cloneServer.spoolDir).not.toBe(sourceServer.spoolDir)
+      for (const activePath of sourceActive) expect(existsSync(activePath)).toBe(true)
+
+      const cloneOrphan = path.join(
+        cloneServer.spoolDir,
+        '.database-risudat-clone-own-orphan.tmp',
+      )
+      await writeFile(cloneOrphan, 'clone orphan')
+      await cloneServer.restart()
+      expect(existsSync(cloneOrphan)).toBe(false)
+      for (const activePath of sourceActive) expect(existsSync(activePath)).toBe(true)
+
+      await writeFile(path.join(gateDir, 'release'), '')
+      await waitForSnapshotCount(sourceClient, 1)
+      expect((await readLatestSnapshot(sourceClient)).snapshotSpoolRevision)
+        .toBe('initial-clone-source')
+    } finally {
+      if (sourceServer) await sourceServer.cleanup()
+      if (cloneServer) await cloneServer.cleanup()
+      await rm(sharedSpoolRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('concurrent copied-owner startups claim distinct namespaces without cross-cleanup', async () => {
+    const sharedSpoolRoot = await mkdtemp(path.join(tmpdir(), 'risu-concurrent-clone-spool-'))
+    const copiedOwnerId = '766b703f-9340-4626-bc5e-2c121d995af1'
+    let first: ServerHandle | null = null
+    let second: ServerHandle | null = null
+    const options = {
+      env: { POCKETRISU_SPOOL_DIR: sharedSpoolRoot },
+      seedSave: async (saveDir: string) => {
+        await writeFile(path.join(saveDir, '__spool_owner_id'), copiedOwnerId)
+      },
+    }
+    try {
+      ;[first, second] = await Promise.all([spawnServer(options), spawnServer(options)])
+      const firstOwner = (
+        await readFile(path.join(first.cwd, 'save', '__spool_owner_id'), 'utf8')
+      ).trim()
+      const secondOwner = (
+        await readFile(path.join(second.cwd, 'save', '__spool_owner_id'), 'utf8')
+      ).trim()
+      expect(firstOwner).toMatch(UUID_PATTERN)
+      expect(secondOwner).toMatch(UUID_PATTERN)
+      expect(firstOwner).not.toBe(secondOwner)
+      expect(first.spoolDir).not.toBe(second.spoolDir)
+      expect(existsSync(`${first.spoolDir}.claim`)).toBe(true)
+      expect(existsSync(`${second.spoolDir}.claim`)).toBe(true)
+
+      const firstOrphan = path.join(first.spoolDir, '.database-risudat-first-orphan.tmp')
+      const secondOrphan = path.join(second.spoolDir, '.database-risudat-second-orphan.tmp')
+      await writeFile(firstOrphan, 'first orphan')
+      await writeFile(secondOrphan, 'second orphan')
+      await second.restart()
+      expect(existsSync(firstOrphan)).toBe(true)
+      expect(existsSync(secondOrphan)).toBe(false)
+    } finally {
+      if (first) await first.cleanup()
+      if (second) await second.cleanup()
+      await rm(sharedSpoolRoot, { recursive: true, force: true })
+    }
+  })
+
+  test.each([
+    ['copied analytics identity', '62c55932-913a-4387-aa64-e1273931aa82', null],
+    [
+      'copied valid analytics and owner identities',
+      '62c55932-913a-4387-aa64-e1273931aa82',
+      '5472d9ad-51fd-499a-a59e-a77575925785',
+    ],
+    ['copied corrupt identities', 'copied-invalid-analytics', 'copied-invalid-owner'],
+  ])('restarting a peer with %s preserves an active snapshot', async (
+    _identityCase,
+    copiedInstanceId,
+    copiedOwnerId,
+  ) => {
+    const sharedSpoolRoot = await mkdtemp(path.join(tmpdir(), 'risu-shared-spool-'))
+    const gateName = 'shared-spool-snapshot-gate'
+    let snapshotServer: ServerHandle | null = null
+    let restartingServer: ServerHandle | null = null
+    try {
+      snapshotServer = await spawnServer({
+        env: {
+          POCKETRISU_SPOOL_DIR: sharedSpoolRoot,
+          POCKETRISU_BACKUP_INTERVAL_MS: '0',
+          POCKETRISU_SNAPSHOT_ASSEMBLY_TEST_GATE_DIR: gateName,
+        },
+        seedSave: async saveDir => {
+          await writeFile(path.join(saveDir, '__instance_id'), copiedInstanceId, 'utf8')
+          if (copiedOwnerId !== null) {
+            await writeFile(path.join(saveDir, '__spool_owner_id'), copiedOwnerId, 'utf8')
+          }
+        },
+      })
+      restartingServer = await spawnServer({
+        env: { POCKETRISU_SPOOL_DIR: sharedSpoolRoot },
+        seedSave: async saveDir => {
+          await writeFile(path.join(saveDir, '__instance_id'), copiedInstanceId, 'utf8')
+          if (copiedOwnerId !== null) {
+            await writeFile(path.join(saveDir, '__spool_owner_id'), copiedOwnerId, 'utf8')
+          }
+        },
+      })
+      const snapshotClient = await createClient(snapshotServer.port, snapshotServer.password)
+      const snapshotInstanceId = (
+        await readFile(path.join(snapshotServer.cwd, 'save', '__instance_id'), 'utf8')
+      ).trim()
+      const restartingInstanceId = (
+        await readFile(path.join(restartingServer.cwd, 'save', '__instance_id'), 'utf8')
+      ).trim()
+      expect(snapshotInstanceId).toMatch(UUID_PATTERN)
+      expect(restartingInstanceId).toMatch(UUID_PATTERN)
+      if (UUID_PATTERN.test(copiedInstanceId)) {
+        expect(snapshotInstanceId).toBe(copiedInstanceId)
+        expect(restartingInstanceId).toBe(copiedInstanceId)
+      } else {
+        expect(snapshotInstanceId).not.toBe(copiedInstanceId)
+        expect(restartingInstanceId).not.toBe(copiedInstanceId)
+      }
+      const snapshotOwnerId = await readFile(
+        path.join(snapshotServer.cwd, 'save', '__spool_owner_id'),
+        'utf8',
+      ).then(value => value.trim(), () => null)
+      const restartingOwnerId = await readFile(
+        path.join(restartingServer.cwd, 'save', '__spool_owner_id'),
+        'utf8',
+      ).then(value => value.trim(), () => null)
+      if (snapshotOwnerId !== null && restartingOwnerId !== null) {
+        expect(snapshotOwnerId).toMatch(UUID_PATTERN)
+        expect(restartingOwnerId).toMatch(UUID_PATTERN)
+        expect(restartingOwnerId).not.toBe(snapshotOwnerId)
+      }
+
+      const restartingNamespace = restartingServer.spoolDir
+      const gateDir = path.join(snapshotServer.cwd, gateName)
+      await mkdir(gateDir, { recursive: true })
+      await writeFile(path.join(gateDir, 'hold'), '')
+
+      expect((await writeDatabase(snapshotClient, 'shared-spool-survivor')).status).toBe(200)
+      await waitForFile(path.join(gateDir, 'entered'))
+      const activePaths = await findSpoolFilesRecursively(
+        sharedSpoolRoot,
+        '.database-risudat-',
+      )
+      expect(activePaths.length).toBeGreaterThan(0)
+      const peerOrphan = path.join(
+        restartingNamespace,
+        '.database-risudat-peer-crash-orphan.tmp',
+      )
+      const unownedLegacyOrphan = path.join(
+        sharedSpoolRoot,
+        '.database-risudat-unowned-legacy.tmp',
+      )
+      await mkdir(restartingNamespace, { recursive: true })
+      await writeFile(peerOrphan, 'orphan')
+      await writeFile(unownedLegacyOrphan, 'unowned')
+
+      await restartingServer.restart()
+
+      for (const activePath of activePaths) {
+        expect(existsSync(activePath)).toBe(true)
+      }
+      expect(existsSync(peerOrphan)).toBe(false)
+      expect(existsSync(unownedLegacyOrphan)).toBe(true)
+
+      await writeFile(path.join(gateDir, 'release'), '')
+      await waitForSnapshotCount(snapshotClient, 1)
+      expect((await readLatestSnapshot(snapshotClient)).snapshotSpoolRevision)
+        .toBe('shared-spool-survivor')
+    } finally {
+      if (snapshotServer) await snapshotServer.cleanup()
+      if (restartingServer) await restartingServer.cleanup()
+      await rm(sharedSpoolRoot, { recursive: true, force: true })
+    }
   })
 
   test('failed spool does not fail writes or consume the snapshot cooldown', async () => {
@@ -568,5 +893,52 @@ describe('database snapshot spool isolation', () => {
 
     expect((await writeDatabase(client, 'recovered')).status).toBe(200)
     await waitForSnapshotCount(client, 1)
+  })
+
+  test('admitted writes recover after a blocked custom spool root is repaired', async () => {
+    const spoolPath = path.join('save', 'repairable-spool')
+    const server = await spawnServer({
+      env: {
+        POCKETRISU_SPOOL_DIR: spoolPath,
+        POCKETRISU_BACKUP_INTERVAL_MS: '0',
+      },
+      seedSave: async saveDir => {
+        await writeFile(path.join(saveDir, 'repairable-spool'), 'not a directory')
+      },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+
+    const unavailable = await writeDatabase(client, 'blocked-admitted-write')
+    expect(unavailable.status).toBe(503)
+    await expect(unavailable.json()).resolves.toMatchObject({
+      code: 'BUFFERED_INGRESS_BUSY',
+      retryable: true,
+    })
+
+    const absoluteSpoolPath = path.join(server.cwd, spoolPath)
+    await rm(absoluteSpoolPath)
+    await mkdir(absoluteSpoolPath)
+
+    expect((await writeDatabase(client, 'repaired-admitted-write')).status).toBe(200)
+    await waitForSnapshotCount(client, 1)
+    expect(existsSync(server.spoolDir)).toBe(true)
+  })
+
+  test('spawn handle resolves an inherited custom spool root exactly like the child', async () => {
+    const inheritedRoot = await mkdtemp(path.join(tmpdir(), 'risu-inherited-spool-'))
+    const previous = process.env.POCKETRISU_SPOOL_DIR
+    let server: ServerHandle | null = null
+    try {
+      process.env.POCKETRISU_SPOOL_DIR = inheritedRoot
+      server = await spawnServer()
+      expect(path.dirname(server.spoolDir)).toBe(inheritedRoot)
+      expect(existsSync(server.spoolDir)).toBe(true)
+    } finally {
+      if (previous === undefined) delete process.env.POCKETRISU_SPOOL_DIR
+      else process.env.POCKETRISU_SPOOL_DIR = previous
+      if (server) await server.cleanup()
+      await rm(inheritedRoot, { recursive: true, force: true })
+    }
   })
 })

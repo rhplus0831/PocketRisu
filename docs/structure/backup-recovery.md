@@ -264,8 +264,9 @@ Automatic snapshots assemble a self-contained database recovery row under
 `database/dbbackup-*`. They are triggered by eligible committed mutations and rotated by
 count and exclusive chunk cost.
 
-- Snapshot assembly uses the configured DB spool (`POCKETRISU_SPOOL_DIR` or
-  `save/.spool`) and streams the final file through chunk-aware storage.
+- Snapshot assembly uses the installation-owned child of the configured shared DB-spool
+  root (`POCKETRISU_SPOOL_DIR` or `save/.spool`) and streams the final file through
+  chunk-aware storage. Peer owner namespaces are never swept by this installation.
 - The short queued capture phase flushes any pending debounced database persist, opens
   one read-only WAL snapshot, and records a global source token. The token combines the
   database row/chunk revisions and verified logical size, every chat row mutation token
@@ -479,17 +480,40 @@ replacement.
 
 Important private roots:
 
-- `save/.spool/` or `POCKETRISU_SPOOL_DIR`: admitted database/chat/KV request bodies and
-  their private validation stages, database assembly, import-entry/database, plugin-value,
-  and snapshot-restore spools;
+- `save/.spool/` or `POCKETRISU_SPOOL_DIR`: configured shared spool root;
+- `.instance-<sha256(__spool_owner_id)>.claim` below that root: a private durable
+  binding between the owner UUID and the canonical save root. A copied save tree at a
+  different path must reseed its copied UUID before it can claim or sweep a namespace;
+- `.instance-<sha256(__spool_owner_id)>/` below that root: this installation's admitted
+  database/chat/KV request bodies and private validation stages, database assembly,
+  import-entry/database, plugin-value, and snapshot-restore spools. Startup and runtime
+  recovery create/revalidate this real private-mode child without following symlinks.
+  Startup completes the claim before touching the child, atomically quarantines the old
+  child, verifies that the pinned quarantine is the exact pre-rename source, and sweeps
+  recognized artifacts only through pinned old/fresh directory identities. Unrelated
+  regular files publish create-only into the fresh child while the old links and all
+  conflicts remain quarantined. Quarantine pathnames are retained unconditionally after
+  descriptor close; runtime writers and readers use the process-lifetime pinned fresh identity,
+  never the reusable child pathname.
+  Platforms without a validated descriptor-relative directory alias retain the quarantine
+  instead of risking pathname-redirection during deletion;
 - `save/.partial-export-spool/`: private full/partial filesystem pins;
 - `save/.plugin-transition-staging/`: durable plugin mode-transition stages;
 - asset/inlay import staging and rollback directories beside their final stores.
 
 `streamBackupRisuSaveToFile()` and `streamRisuSaveToFile()` create database outputs in
-the database spool. Full and partial exports keep verified filesystem pins and completed
+the owned database-spool child. Full and partial exports keep verified filesystem pins and completed
 partial archives under the partial-export spool. These roots have separate disk-headroom
 checks because an operator may place them on different volumes.
+
+The open [decoded stream-load spool finding](../findings/open/server-backend/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md)
+is the explicit current exception. The confirmed buffer-backed boot-migration
+ingestion path still passes `save/` as its decode `tempDir`, so its `.risu-stream-load-*`
+or legacy decoded temporary can sit outside the configured root. Snapshot restore also
+supplies that fallback, but its source is file-backed and the loader prefers the source
+path in the owned spool. Independently, the boot sweep does not recognize the decoded-name
+family, including decoded artifacts created beside a swept spool source. Pending #1 covers
+both the one confirmed save-root path and that unswept name family.
 
 Admitted-write files use create-only randomized `.admitted-ingress-*` names and private
 `.admitted-write-stage-*` directories. Normal response/failure cleanup removes both;

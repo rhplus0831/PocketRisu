@@ -96,7 +96,19 @@ function createAdmittedIngressSpoolMiddleware({
         if (!shouldSpoolAdmittedIngress(req, policy, { disabled })) return next();
         const expectedBytes = parseContentLength(req.headers['content-length']);
         if (expectedBytes === null) return next(new Error('Admitted ingress lost its Content-Length'));
-        const root = spoolDir();
+        let root;
+        try {
+            root = spoolDir();
+        } catch {
+            metrics.failures++;
+            sendRetryableSpoolRefusal(
+                res,
+                policy,
+                globalBudgetBytes ?? policy.maxBytes,
+                expectedBytes,
+            );
+            return;
+        }
         const freeBytes = await availableBytes(root);
         if (freeBytes !== null && freeBytes < expectedBytes) {
             metrics.failures++;

@@ -26,7 +26,8 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 | `server/node/boundedSessionState.cjs` | Bounded LRU state for per-browser protocol pins. The server uses `createBoundedSessionState()` to retain at most 50 session-scoped plugin-publication read states independently of writer authority. |
 | `server/node/bufferedIngress.cjs` | Pre-parser admission for buffered JSON, octet-stream, and text bodies, plus identity-only admission for bodyless/direct-stream writers. It resolves auth/writer/route-limit policy, rejects retired protocols and mismatched client builds before reading a body, strictly validates uncompressed `Content-Length`, and reserves/relinquishes the process-wide in-flight byte budget without performing a writer-lock transition. |
 | `server/node/buildStamp.cjs` | Loads and validates `dist/build-stamp.json` for writer-mutation admission. `readClientBuildStamp()` returns `null` and logs a warning on any read, parse, or shape failure, deliberately disabling the build check rather than blocking the server. |
-| `server/node/admittedIngressSpool.cjs` | Post-admission disk ingress for raw `/api/write` and raw/JSON chat-row writes. It consumes the already-reserved request in bounded pages, fsyncs a private spool, preserves the reservation through response finish/close, and maps spool-volume pressure to the admission layer's retryable refusal. |
+| `server/node/admittedIngressSpool.cjs` | Post-admission disk ingress for raw `/api/write` and raw/JSON chat-row writes. It consumes the already-reserved request in bounded pages, fsyncs a private spool in the installation-owned configured-spool namespace, preserves the reservation through response finish/close, and maps spool-volume pressure to the admission layer's retryable refusal. |
+| `server/node/spoolOwnership.cjs` | Validates and atomically initializes persistent UUID files, claims a filesystem-safe installation spool namespace with the separate `__spool_owner_id` plus a canonical-save-root binding, and creates/revalidates the owned child of a configured shared root. Missing identities and claims use fsynced exclusive-link publication; invalid identities deterministically converge without a reclaimable lock pathname. Unsafe entries are atomically parked rather than conditionally unlinked. Identity/claim files and owned directories are accepted without following symlinks and hardened to private modes. Boot cleanup quarantines the claimed child and sweeps through pinned old/fresh directory descriptors; runtime consumers receive only a process-lifetime pinned directory alias. Analytics `__instance_id` is not filesystem ownership. |
 | `server/node/chunkPlan.cjs`, `chunkPlanWorker.cjs` | Bounded worker-thread preparation for private file sources. At most two workers by default scan FastCDC boundaries and compute per-chunk SHA-256 plus logical SHA-256/MD5 in one bounded-window pass; queued publication validates the immutable file identity and exact planned bytes. |
 | `server/node/model-jobs.cjs` | Durable upstream model relay. `createModelJobs()` stores non-secret job metadata in `save/model-jobs.db`, records exact provider response bytes in append-only journals under `save/model-jobs/`, tails running streams, supports claims, and owns 48-hour pending-send tombstones. Main jobs are recoverable; auxiliary pipeline requests are relay-only. |
 | `server/node/request-logs.cjs` | Provider request history and token usage in `save/request-logs.db`. `createRequestLogs()` masks/truncates request material, rotates heavy request bodies by byte budget, retains the small usage ledger, exposes query/statistics routes, and closes independently at shutdown. |
@@ -84,9 +85,12 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 4. `server.cjs` installs fatal logging handlers before the rest of its initialization,
    then reads and validates `dist/build-stamp.json`. A valid stamp enables writer build
    admission and is logged; any read/parse/shape failure logs a warning and returns `null`,
-   so build admission is fail-open. The server then creates `save/`, creates/sweeps the database-assembly and admitted-ingress spools, resolves the
+   so build admission is fail-open. The server then creates `save/`, validates or atomically
+   creates its analytics and separate spool-owner identities, completes the canonical-save-root
+   claim/reseed before any owned-child operation, quarantines and descriptor-pins that spool
+   owner's prior database-assembly/admitted-ingress namespace for cleanup, resolves the
    independent chat-history root, migrates legacy history from the configured
-   server-backup directory, reads or creates the password/JWT/instance files, loads
+   server-backup directory, reads or creates the password/JWT files, loads
    persisted direct-asset sessions, initializes the server-backup directory, and registers
    middleware and routes.
 5. `startServer()` resolves interrupted filesystem swaps, then read-only preflights the live database before any migration or epoch write. A valid database gets the epoch bump plus asset, inlay, chat, plugin-stage, and legacy `REMOTE` migrations. A corrupt database skips those mutations and listens in authenticated snapshot-recovery mode so the original bytes remain recoverable. The chat migration first writes `migration-backup/pre-chat-externalization-<timestamp>.bin`, then records `migration/chats-externalized`.
@@ -122,7 +126,7 @@ The server reads configuration directly from `process.env`; it does not load `.e
 | `POCKETRISU_CHAT_BACKUP_DIR` | Overrides the final chat-history directory. Absolute paths are used directly; relative paths resolve from `process.cwd()`. The default is `<savePath>/chat-backups` (normally `save/chat-backups`, or `/app/save/chat-backups` in Docker). This operator setting also applies in hub mode and is independent of the server-file-backup path/API. |
 | `POCKETRISU_CHAT_BACKUP_MAX_BYTES` | Overrides the global per-chat-history budget in bytes. Default 50 MiB; clamped to 1 MiB–50 GiB. It takes precedence over the `config/chat-backup-max-bytes` KV setting. |
 | `POCKETRISU_CHAT_BACKUP_MAX_UNCOMPRESSED_BYTES` | Overrides the per-chat retained uncompressed-byte cap. Default 256 MiB; clamped to 1 MiB–50 GiB. It takes precedence over `config/chat-backup-max-uncompressed-bytes`. The newest recovery point remains protected when it alone exceeds the cap. |
-| `POCKETRISU_SPOOL_DIR` | Relocates database assembly/import/value/restore spools. Default `save/.spool`; it does not relocate filesystem export pins or plugin transition stages. |
+| `POCKETRISU_SPOOL_DIR` | Relocates the shared root for admitted ingress, database assembly, archive/import staging, plugin-value uploads, and snapshot-restore spools. Default `save/.spool`; those consumers use a stable `.instance-<sha256(__spool_owner_id)>/` child, so installations may share the configured root without sharing boot cleanup ownership. A private sibling claim binds that UUID to the canonical save root; a save-tree clone under a different path therefore deterministically reseeds its copied owner UUID before any child validation or cleanup. Identity repair and exclusive claim publication do not use a reclaimable lock pathname. Invalid or unsafe identity objects are regenerated or atomically parked without following symlinks. After boot, all consumers use a process-lifetime pinned fd alias rather than the mutable child pathname; platforms without a validated descriptor-relative alias fail spool readiness safely. Unowned legacy root files and other owner namespaces are preserved. The still-pending [decoded stream-load spool finding](../findings/open/server-backend/decoded-stream-load-spools-bypass-configured-spool-and-orphan-sweep.md) is an explicit exception: the confirmed buffer-backed authoritative boot-migration decode path can still place `.risu-stream-load-*` or legacy decoded temporaries directly under `save/`, and the boot sweep does not recognize the decoded-name family. Snapshot restore is file-backed, so its loader prefers the owned-spool source path rather than the supplied `save/` fallback. This setting does not relocate filesystem export pins or plugin transition stages. |
 | `POCKETRISU_PLUGIN_VALUE_MAX_BYTES` | Per optimized-plugin value cap; default 128 MiB. |
 | `POCKETRISU_PLUGIN_STORAGE_MAX_BYTES` | Aggregate optimized-plugin cap; default 1 GiB. |
 | `POCKETRISU_BUFFERED_INGRESS_MAX_BYTES` | Process-wide budget for concurrently admitted buffered request bodies; default 512 MiB. Every buffered route ceiling is also capped by this value. |
@@ -188,7 +192,8 @@ identity/build/session checks but retain their own body bounds and bypass the
 buffered-body ledger.
 
 After that admission, raw `/api/write` bodies and raw/JSON chat POST bodies are consumed
-into `0600`, create-only files under `POCKETRISU_SPOOL_DIR` in at most 64 KiB pages;
+into `0600`, create-only files under the installation-owned child of
+`POCKETRISU_SPOOL_DIR` in at most 64 KiB pages;
 Express never constructs their payload-sized request `Buffer`. The exact admission
 reservation remains charged until response `finish`/`close`, even when route cleanup
 unlinks the spool earlier, so disk spooling does not increase concurrent admitted bytes.
@@ -216,7 +221,9 @@ inside `queueStorageMutation()` immediately before the transactional publication
 │   │   └── <jobId>.journal            # exact append-only provider response bytes
 │   ├── trace/                           # opt-in TRACE_REQUEST_FOR_DEBUG output
 │   │   └── request-*.json.gz            # newest 500 non-streaming HTTP exchanges
-│   ├── .spool/                         # admitted-write/DB/import/value/restore spools (default)
+│   ├── .spool/                         # configured spool root (default)
+│   │   ├── .instance-<owner-sha256>.claim # canonical-save-root namespace claim
+│   │   └── .instance-<owner-sha256>/   # this installation's swept temporary spools
 │   ├── .partial-export-spool/          # private full/partial filesystem pins
 │   ├── .plugin-transition-staging/     # durable staged plugin mode changes
 │   ├── assets/
@@ -233,6 +240,7 @@ inside `queueStorageMutation()` immediately before the transactional publication
 │   ├── __password
 │   ├── __jwt_secret
 │   ├── __instance_id
+│   ├── __spool_owner_id                # private configured-spool ownership UUID
 │   ├── __sessions
 │   ├── __authcode                     # optional proxy registration token
 │   ├── __sionyw_client_data.json       # optional hub OAuth refresh data
@@ -857,12 +865,23 @@ are sent to the ordinary application log; it adds no provider API.
   deletion because a removed sibling can make shared chunks exclusive to a survivor.
 
 - Snapshot assembly is independent of file backups. Temporary `database.risudat` files
-  belong in `save/.spool` or `POCKETRISU_SPOOL_DIR`, never under the optional server-backup
-  path. Automatic snapshots stream the pinned source into a private finished file outside
+  belong in the installation-owned child of `save/.spool` or `POCKETRISU_SPOOL_DIR`, never
+  under the optional server-backup path. Boot first completes the namespace claim, atomically
+  quarantines only that stable child, creates a fresh private child, compares the pinned old
+  identity to the pre-rename source, and sweeps through pinned old/fresh descriptors. Recognized
+  artifacts are removed through the old fd; unrelated regular files publish create-only into the
+  fresh fd while their original links remain quarantined, and conflicts retain both versions.
+  After pinned work, the quarantine pathname is retained unconditionally; no post-close pathname
+  deletion can target a replacement object. If descriptor-relative access
+  is unavailable, deletion is skipped and runtime spooling remains unavailable. All later spool
+  consumers use the process-lifetime pinned fresh fd. Peer namespaces, pathname replacements,
+  symlink targets, and unowned legacy root files are therefore preserved. Automatic snapshots stream the pinned source into a private finished file outside
   the storage queue, then stream that file through `kvSetFromFile()` only after a queued
   global-token comparison. They contain their own failures; advance `lastBackupTime` only
   after the snapshot row commits so a spool failure retries on the next write. Pending
   database flushes feed this same scheduler rather than assembling against live rows.
+  Buffer-backed decoded stream-load temporaries remain the documented pending exception:
+  they still use `save/` rather than the configured owned child.
 
 - Automatic snapshot timestamps use 100 ms units. Creation divides `Date.now()` by 100;
   listing multiplies the parsed value by 100.

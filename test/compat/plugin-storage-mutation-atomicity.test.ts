@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import { createHash } from 'node:crypto'
-import { readFileSync, readdirSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
@@ -444,7 +444,38 @@ describe('atomic optimized plugin value and owner acknowledgement', () => {
       plugin: 'New Plugin',
       updatedAt: expect.any(Number),
     })
-    expect(readdirSync(path.join(server.cwd, 'save', '.spool')).filter(
+    expect(readdirSync(server.spoolDir).filter(
+      name => name.startsWith('.plugin-value-'),
+    )).toEqual([])
+  })
+
+  test('a streamed plugin set recovers after its custom spool root is repaired', async () => {
+    const spoolPath = path.join('save', 'repairable-plugin-spool')
+    const server = await spawnServer({
+      env: { POCKETRISU_SPOOL_DIR: spoolPath },
+      seedSave: saveDir => {
+        seedRows(saveDir)
+        writeFileSync(path.join(saveDir, 'repairable-plugin-spool'), 'blocked')
+      },
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const value = Buffer.from('{"recovered":true}', 'utf8')
+
+    const unavailable = await mutateStreamedRaw(client, value)
+    expect(unavailable.status).toBe(503)
+    await expect(unavailable.json()).resolves.toMatchObject({
+      code: 'PLUGIN_STORAGE_SPOOL_UNAVAILABLE',
+      retryable: true,
+    })
+
+    const absoluteRoot = path.join(server.cwd, spoolPath)
+    rmSync(absoluteRoot)
+    mkdirSync(absoluteRoot)
+    const recovered = await mutateStreamedRaw(client, value)
+    expect(recovered.status).toBe(200)
+    expect(readRows(server.cwd).value).toEqual(value)
+    expect(readdirSync(server.spoolDir).filter(
       name => name.startsWith('.plugin-value-'),
     )).toEqual([])
   })
@@ -468,7 +499,7 @@ describe('atomic optimized plugin value and owner acknowledgement', () => {
       retryable: false,
     }))
     expect(readRows(server.cwd)).toEqual({ value: OLD_VALUE, owner: OLD_OWNER })
-    expect(readdirSync(path.join(server.cwd, 'save', '.spool')).filter(
+    expect(readdirSync(server.spoolDir).filter(
       name => name.startsWith('.plugin-value-'),
     )).toEqual([])
   })

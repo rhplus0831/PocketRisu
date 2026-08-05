@@ -8,6 +8,7 @@ import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import utilsPkg from '../../../server/node/utils.cjs'
+import spoolOwnershipPkg from '../../../server/node/spoolOwnership.cjs'
 
 const cache = vi.hoisted(() => ({ enabled: false }))
 
@@ -63,11 +64,20 @@ const {
 }
 const serverEntry = path.resolve(process.cwd(), 'server/node/server.cjs')
 const testPassword = crypto.createHash('sha256').update('boot-snapshot-client-test').digest('hex')
+const { resolveOwnedSpoolDirFromSave } = spoolOwnershipPkg as {
+    resolveOwnedSpoolDirFromSave: (savePath: string, spoolRoot?: string) => string
+}
 
 interface RunningServer {
     child: ChildProcessWithoutNullStreams
     origin: string
     logs: () => string
+}
+
+function snapshotRestoreSpoolArtifacts(saveDir: string): string[] {
+    return fs.readdirSync(resolveOwnedSpoolDirFromSave(saveDir)).filter(
+        name => name.includes('snapshot-restore'),
+    )
 }
 
 async function nodeFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
@@ -1066,9 +1076,16 @@ describe('NodeStorage boot snapshot recovery', () => {
             expect(requests.filter(pathname => pathname === '/api/db/read-raw-for-boot')).toHaveLength(1)
             expect(requests).not.toContain('/api/read')
             expect(decode).toHaveBeenCalledOnce()
-            expect(fs.readdirSync(path.join(saveDir, '.spool')).filter(
-                name => name.includes('snapshot-restore'),
-            )).toEqual([])
+            const residueProbe = path.join(
+                resolveOwnedSpoolDirFromSave(saveDir),
+                '.database-risudat-snapshot-restore-residue-probe.tmp',
+            )
+            fs.writeFileSync(residueProbe, 'probe')
+            expect(snapshotRestoreSpoolArtifacts(saveDir)).toEqual([
+                path.basename(residueProbe),
+            ])
+            fs.unlinkSync(residueProbe)
+            expect(snapshotRestoreSpoolArtifacts(saveDir)).toEqual([])
 
             vi.unstubAllGlobals()
             await stopRealServer(server)
@@ -1094,9 +1111,7 @@ describe('NodeStorage boot snapshot recovery', () => {
             const chat = await decodeServerRisuSave(Buffer.from(await chatResponse.arrayBuffer()))
             expect(crypto.createHash('sha256').update(chat.message[0].data).digest('hex'))
                 .toBe(messageHash)
-            expect(fs.readdirSync(path.join(saveDir, '.spool')).filter(
-                name => name.includes('snapshot-restore'),
-            )).toEqual([])
+            expect(snapshotRestoreSpoolArtifacts(saveDir)).toEqual([])
         } finally {
             vi.unstubAllGlobals()
             if (server) await stopRealServer(server)
