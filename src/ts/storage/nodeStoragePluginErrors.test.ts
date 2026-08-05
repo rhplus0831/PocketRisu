@@ -810,6 +810,77 @@ describe('NodeStorage plugin error contract', () => {
         expect(storage._lastDbEtag).toBe(acceptedEtag)
     })
 
+    test.each([
+        { responseDurable: true, expectedDurable: true },
+        { responseDurable: undefined, expectedDurable: false },
+        { responseDurable: false, expectedDurable: false },
+    ])('parses patch durability without treating a missing field as durable', async ({
+        responseDurable,
+        expectedDurable,
+    }) => {
+        const etag = '7'.repeat(32)
+        fetchMock.mockResolvedValueOnce(jsonResponse({
+            success: true,
+            etag,
+            ...(responseDurable === undefined ? {} : { durable: responseDurable }),
+        }))
+
+        const result = await readyStorage().patchItem('database/database.bin', {
+            patch: [{ op: 'replace', path: '/username', value: 'local' }],
+            expectedHash: 'accepted-hash',
+        })
+
+        expect(result).toMatchObject({
+            success: true,
+            durable: expectedDurable,
+            etag,
+        })
+    })
+
+    test('maps durable, checkpoint-busy, and displaced database flush responses', async () => {
+        const etag = '8'.repeat(32)
+        const storage = readyStorage()
+        fetchMock
+            .mockResolvedValueOnce(jsonResponse({
+                success: true,
+                durable: true,
+                checkpoint: { complete: true },
+                etag,
+            }))
+            .mockResolvedValueOnce(jsonResponse({
+                success: false,
+                durable: false,
+                retryable: true,
+                checkpoint: { complete: false },
+                etag,
+            }, 503))
+            .mockResolvedValueOnce(jsonResponse({
+                error: 'Session deactivated',
+                code: 'SESSION_DEACTIVATED',
+                retryable: false,
+            }, 423))
+
+        await expect(storage.flushDatabase()).resolves.toEqual({
+            ok: true,
+            durable: true,
+            etag,
+            retryable: false,
+        })
+        await expect(storage.flushDatabase()).resolves.toEqual({
+            ok: false,
+            durable: false,
+            etag,
+            retryable: true,
+        })
+        await expect(storage.flushDatabase()).resolves.toEqual({
+            ok: false,
+            durable: false,
+            etag: undefined,
+            displaced: true,
+            retryable: false,
+        })
+    })
+
     test('reads a database conflict candidate without accepting its ETag', async () => {
         const acceptedEtag = '5'.repeat(32)
         const candidateEtag = '6'.repeat(32)

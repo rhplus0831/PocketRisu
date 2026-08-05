@@ -866,7 +866,7 @@ describe('atomic database writes with external rows', () => {
     expect(readKv(server.cwd, rowKey)).toEqual(rowBefore)
   })
 
-  test('patch removal keeps its row until database.bin and deletion commit together', async () => {
+  test('patch removal commits database.bin and its row deletion before acknowledgement', async () => {
     const { client, server, strippedDb } = await bootSeeded()
     const removedChat = strippedDb.characters[0].chats[1]
     const removedKey = chatRowKey(strippedDb.characters[0].chaId, removedChat.id)
@@ -875,11 +875,8 @@ describe('atomic database writes with external rows', () => {
     const patchResponse = await removeSecondChat(client, strippedDb)
 
     expect(patchResponse.status).toBe(200)
-    expect(readKv(server.cwd, removedKey)).not.toBeNull()
-    expect(readKv(server.cwd, DB_KEY)).toEqual(databaseBefore)
-
-    const flushResponse = await flushDatabase(client)
-    expect(flushResponse.status).toBe(200)
+    await expect(patchResponse.json()).resolves.toMatchObject({ durable: true })
+    expect(readKv(server.cwd, DB_KEY)).not.toEqual(databaseBefore)
     const storedDb = decodeRisuDat(readKv(server.cwd, DB_KEY)!) as Record<string, any>
     expect(storedDb.characters[0].chats.map((chat: any) => chat.id)).not.toContain(removedChat.id)
     expect(readKv(server.cwd, removedKey)).toBeNull()
@@ -1015,6 +1012,11 @@ describe('atomic database writes with external rows', () => {
 
     const patchResponse = await removeSecondChat(client, strippedDb)
     expect(patchResponse.status).toBe(200)
+    await expect(patchResponse.json()).resolves.toMatchObject({
+      success: true,
+      durable: false,
+      persistWarning: { source: 'patch:database/database.bin' },
+    })
 
     const flushResponse = await flushDatabase(client)
     expect(flushResponse.status).toBe(500)
@@ -1031,6 +1033,11 @@ describe('atomic database writes with external rows', () => {
 
     const patchResponse = await removeSecondChat(client, strippedDb)
     expect(patchResponse.status).toBe(200)
+    await expect(patchResponse.json()).resolves.toMatchObject({
+      success: true,
+      durable: false,
+      persistWarning: { source: 'patch:database/database.bin' },
+    })
 
     const flushResponse = await flushDatabase(client)
     expect(flushResponse.status).toBe(500)

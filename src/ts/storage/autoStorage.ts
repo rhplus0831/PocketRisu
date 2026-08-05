@@ -1,5 +1,6 @@
 import {
     NodeStorage,
+    type FlushDatabaseResult,
     type PatchItemResult,
     type PluginStorageMutationTransport,
     type PluginStorageStagedTransitionBegin,
@@ -269,6 +270,11 @@ export class AutoStorage{
 
     async patchItem(key: string, patchData: { patch: any[], expectedHash: string }): Promise<PatchItemResult> {
         return await this.realStorage.patchItem(key, patchData)
+    }
+
+    async flushDatabase(): Promise<FlushDatabaseResult> {
+        await this.Init()
+        return await this.realStorage.flushDatabase()
     }
 
     async commitPluginStorageMutation(

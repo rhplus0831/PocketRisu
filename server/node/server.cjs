@@ -107,6 +107,14 @@ const { openStageRowDownload } = require('./stageRowDownload.cjs');
 const { createRevisionBoundCache } = require('./revisionBoundCache.cjs');
 const { createPluginStorageManifestCache } = require('./pluginStorageManifestCache.cjs');
 const {
+    DbCachePersistenceGuardError,
+    commitPreparedDbCachePersistence,
+    findStubFlagLossChats,
+    persistDbCacheGenerationSync,
+    prepareDbCachePersistence,
+    runEmergencyDbFlush,
+} = require('./dbCachePersistence.cjs');
+const {
     decodeRisuSave,
     decodeAuthoritativeRisuSave,
     encodeRisuSaveLegacy,
@@ -306,8 +314,41 @@ const os = require('os');
 const { Readable, Transform } = require('stream');
 const { addExtension, Unpackr } = require('msgpackr');
 
+function fatalFlushPendingDatabase() {
+    try {
+        return runEmergencyDbFlush({
+            log: message => console.error(message),
+            isImportInProgress: () => importInProgress || importBarrier.isHeld(),
+            isInTransaction: () => sqliteDb.inTransaction,
+            hasPendingWork: () => Boolean(
+                saveTimers[DB_HEX_KEY] || dbPersistRetryPending
+            ),
+            peekCachedDb: () => peekDbCacheValue(DB_HEX_KEY),
+            getCacheMetadata: () => dbCache.metadata(DB_HEX_KEY),
+            kvGetDatabaseRevision,
+            persist: ({ cachedDb, cacheMetadata }) => persistDbCacheGenerationSync({
+                ...dbCachePersistenceOptions({
+                    filePath: DB_HEX_KEY,
+                    decodedKey: DB_BLOB_KEY,
+                    generation: dbDerivedValueMemo.generation(DB_HEX_KEY),
+                    cachedDb,
+                    cacheMetadata,
+                }),
+                chatRowsToDelete: [],
+            }),
+        });
+    } catch (error) {
+        try {
+            console.error(
+                `[FatalFlush] failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        } catch {}
+        return { status: 'failed', error };
+    }
+}
+
 // Install process-level error handlers before any other init so early crashes get logged.
-installProcessHandlers();
+installProcessHandlers({ onFatalExit: fatalFlushPendingDatabase });
 const expectedClientBuild = readClientBuildStamp({ log: logger });
 if (expectedClientBuild) {
     logger.info(
@@ -1416,9 +1457,8 @@ const CHAT_EXTERNALIZATION_MARKER_VALUE = Buffer.from('done', 'utf-8');
 const CHAT_ORPHAN_GRACE_MS = 60 * 60 * 1000;
 
 // ─── Persist failure tracking (Stage 1 visibility) ───────────────────────────
-// Debounced persist runs in setTimeout, so failures cannot be returned in the
-// triggering response. Record the latest failure here and surface it on the
-// next /api/patch response. Cleared on next successful persist.
+// Debounced failures surface on the next patch; structural-patch failures
+// surface on the current response. Cleared on the next successful persist.
 let lastPersistFailure = null;
 
 function recordPersistFailure(error, source) {
@@ -2510,39 +2550,6 @@ function findChatInternalFieldOps(patch) {
     return violations;
 }
 
-/**
- * Detect chats that lost their `_stub` flag without being upgraded to a real
- * Chat. Persisting such a chat would write metadata-only to disk and silently
- * strip messages — the exact data-loss path reported with PATCH
- * `remove /chats/N/{message,...}` ops.
- *
- * A real Chat has `message` (Array). A real stub has `_stub === true`. Anything
- * with neither is a malformed in-between state; treat as a corruption signal.
- */
-function findStubFlagLossChats(dbObj) {
-    if (!dbObj?.characters) return [];
-    const losses = [];
-    for (let ci = 0; ci < dbObj.characters.length; ci++) {
-        const char = dbObj.characters[ci];
-        if (!char?.chats) continue;
-        for (let chi = 0; chi < char.chats.length; chi++) {
-            const chat = char.chats[chi];
-            if (!chat || typeof chat !== 'object') continue;
-            const isStub = chat._stub === true;
-            const hasMessage = Array.isArray(chat.message);
-            if (!isStub && !hasMessage) {
-                losses.push({
-                    chaId: char.chaId,
-                    charIndex: ci,
-                    chatIndex: chi,
-                    chatId: chat.id || null,
-                });
-            }
-        }
-    }
-    return losses;
-}
-
 function duplicateChatIdSample(duplicates) {
     return duplicates.slice(0, 3).map(duplicate => {
         const characterLabel = duplicate.chaId ?? `character[${duplicate.characterIndex}]`;
@@ -2550,11 +2557,26 @@ function duplicateChatIdSample(duplicates) {
     }).join(', ');
 }
 
-function trackPendingChatRowDeletions(oldStrippedDb, newStrippedDb) {
-    const removedKeys = chatRowStore.removedChatRowKeys(oldStrippedDb, newStrippedDb);
+function diffReferencedChatRowKeys(oldStrippedDb, newStrippedDb) {
+    const oldKeys = chatRowStore.referencedChatRowKeys(oldStrippedDb);
     const newKeys = chatRowStore.referencedChatRowKeys(newStrippedDb);
-    for (const key of removedKeys) pendingChatRowDeletions.add(key);
-    for (const key of newKeys) pendingChatRowDeletions.delete(key);
+    let changed = oldKeys.size !== newKeys.size;
+    for (const key of oldKeys) {
+        if (!newKeys.has(key)) changed = true;
+    }
+    for (const key of newKeys) {
+        if (!oldKeys.has(key)) changed = true;
+    }
+    return { changed, newKeys, oldKeys };
+}
+
+function trackPendingChatRowDeletions({ oldKeys, newKeys }) {
+    for (const key of oldKeys) {
+        if (!newKeys.has(key)) pendingChatRowDeletions.add(key);
+    }
+    for (const key of newKeys) {
+        pendingChatRowDeletions.delete(key);
+    }
 }
 
 async function captureChatDeletionPreImages(chatRowKeys) {
@@ -2597,96 +2619,81 @@ async function persistDbCache(filePath, decodedKey) {
     }
 }
 
+function dbCachePersistenceOptions({
+    filePath,
+    decodedKey,
+    generation,
+    cachedDb,
+    cacheMetadata,
+}) {
+    const assertCurrent = () => {
+        if (decodedKey !== DB_BLOB_KEY) return;
+        if (cacheMetadata?.revision !== kvGetDatabaseRevision()
+            || dbDerivedValueMemo.generation(filePath) !== generation
+            || peekDbCacheValue(filePath) !== cachedDb
+            || dbCache.metadata(filePath)?.revision !== cacheMetadata?.revision) {
+            throw new DatabaseCacheRevisionConflict();
+        }
+    };
+    return {
+        cachedDb,
+        decodedKey,
+        assertCurrent,
+        findDuplicateChatIds,
+        preparePluginStorageExternalization,
+        retainCanonicalEncoding: () => retainDbCacheCanonicalEncoding(filePath),
+        encodeRisuSaveLegacy,
+        sqliteDb,
+        writePluginStorageRows,
+        writePluginStorageManifest,
+        kvSet,
+        kvDel,
+        kvGetDatabaseRevision,
+    };
+}
+
+function handleDbCachePersistenceGuard(error) {
+    if (!(error instanceof DbCachePersistenceGuardError)) return;
+    recordPersistFailure(error, error.guard === 'stub-flag-loss'
+        ? 'persistDbCache:stub-flag-loss'
+        : 'persistDbCache:duplicate-chat-ids');
+    invalidateDbCache();
+}
+
 async function persistDbCacheGeneration(filePath, decodedKey, generation) {
     const cachedDb = peekDbCacheValue(filePath);
     if (!cachedDb) return;
     const cacheMetadata = dbCache.metadata(filePath);
-    if (decodedKey === DB_BLOB_KEY
-        && cacheMetadata?.revision !== kvGetDatabaseRevision()) {
-        throw new DatabaseCacheRevisionConflict();
+    const persistenceOptions = dbCachePersistenceOptions({
+        filePath,
+        decodedKey,
+        generation,
+        cachedDb,
+        cacheMetadata,
+    });
+    let prepared;
+    try {
+        prepared = prepareDbCachePersistence(persistenceOptions);
+    } catch (error) {
+        handleDbCachePersistenceGuard(error);
+        throw error;
     }
-
-    // Disk protection guard: abort persist on metadata-only chats.
-    // Invalidate dbCache so the next request re-reads from disk and rebuilds a
-    // consistent stub view; client receives 409 on next /api/patch via hash mismatch.
-    if (decodedKey === 'database/database.bin') {
-        const losses = findStubFlagLossChats(cachedDb);
-        if (losses.length > 0) {
-            const sample = losses.slice(0, 3).map(l => `${l.chaId}/${l.chatId ?? l.chatIndex}`).join(', ');
-            const err = new Error(
-                `persist aborted: ${losses.length} chat(s) lost _stub flag without upgrade — `
-                + `would silently strip messages on disk. sample=[${sample}]`
-            );
-            recordPersistFailure(err, 'persistDbCache:stub-flag-loss');
-            invalidateDbCache();
-            throw err;
-        }
-        const duplicateChatIds = findDuplicateChatIds(cachedDb);
-        if (duplicateChatIds.length > 0) {
-            const err = new Error(
-                `persist aborted: ${duplicateChatIds.length} duplicate chat id(s) — `
-                + `would alias authoritative rows. sample=[${duplicateChatIdSample(duplicateChatIds)}]`
-            );
-            recordPersistFailure(err, 'persistDbCache:duplicate-chat-ids');
-            invalidateDbCache();
-            throw err;
-        }
-    }
-
-    const pluginExternalization = decodedKey === 'database/database.bin'
-        ? preparePluginStorageExternalization(cachedDb)
-        : { strippedDb: cachedDb, rows: [], changed: false };
-    const strippedDb = pluginExternalization.strippedDb;
-    if (decodedKey === DB_BLOB_KEY && strippedDb !== cachedDb) {
-        throw new Error('Acknowledged database patch cache was not normalized before persistence');
-    }
-    const data = decodedKey === DB_BLOB_KEY
-        ? retainDbCacheCanonicalEncoding(filePath).bytes
-        : Buffer.from(encodeRisuSaveLegacy(strippedDb));
     const referencedChatRows = decodedKey === 'database/database.bin'
-        ? chatRowStore.referencedChatRowKeys(strippedDb)
+        ? chatRowStore.referencedChatRowKeys(prepared.strippedDb)
         : new Set();
     const chatRowsToDelete = decodedKey === 'database/database.bin'
         ? [...pendingChatRowDeletions].filter(key => !referencedChatRows.has(key))
         : [];
     await captureChatDeletionPreImages(chatRowsToDelete);
-    if (decodedKey === DB_BLOB_KEY && (
-        dbDerivedValueMemo.generation(filePath) !== generation
-        || peekDbCacheValue(filePath) !== cachedDb
-        || dbCache.metadata(filePath)?.revision !== cacheMetadata?.revision
-    )) {
-        throw new DatabaseCacheRevisionConflict();
-    }
-    let committedRevision = null;
-    try {
-        // Must stay synchronous: better-sqlite3 commits when this callback returns.
-        sqliteDb.transaction(() => {
-            if (decodedKey === DB_BLOB_KEY
-                && (cacheMetadata?.revision !== kvGetDatabaseRevision()
-                    || dbDerivedValueMemo.generation(filePath) !== generation
-                    || peekDbCacheValue(filePath) !== cachedDb)) {
-                throw new DatabaseCacheRevisionConflict();
-            }
-            writePluginStorageRows(pluginExternalization.rows);
-            writePluginStorageManifest(pluginExternalization.manifest);
-            kvSet(decodedKey, data);
-            for (const key of chatRowsToDelete) kvDel(key);
-            if (decodedKey === DB_BLOB_KEY) {
-                committedRevision = kvGetDatabaseRevision();
-            }
-        })();
-    } catch (err) {
-        // Tag with BLOB size so the visibility layer can surface it to the user.
-        // The dominant failure mode (better-sqlite3 INT_MAX) is size-driven.
-        if (err && typeof err === 'object') {
-            try { err.attemptedSize = data.length; } catch {}
-        }
-        throw err;
-    }
+    const committed = commitPreparedDbCachePersistence({
+        ...persistenceOptions,
+        prepared,
+        chatRowsToDelete,
+    });
     if (decodedKey === 'database/database.bin') {
-        replaceDbCacheValue(filePath, strippedDb, {
-            revision: committedRevision,
-            estimatedBytes: data.length,
+        replaceDbCacheValue(filePath, committed.strippedDb, {
+            revision: committed.committedRevision,
+            estimatedBytes: committed.data.length,
             dirty: false,
             preserveSegmentMemo: true,
         });
@@ -17066,6 +17073,7 @@ app.post('/api/patch', async (req, res, next) => {
             const result = applyPatchAtomic(cachedDb, patch);
             const snapshot = result.newDocument;
             let preserveSegmentMemo = false;
+            let structuralDatabasePatch = false;
             if (decodedKey === 'database/database.bin') {
                 const duplicateChatIds = findDuplicateChatIds(snapshot);
                 if (duplicateChatIds.length > 0) {
@@ -17109,9 +17117,11 @@ app.post('/api/patch', async (req, res, next) => {
                 }
                 // Keep dbCache and the ETag on the same optimized stub shape
                 // that the debounced persist will write.
+                const chatRowReferenceDiff = diffReferencedChatRowKeys(cachedDb, snapshot);
+                structuralDatabasePatch = chatRowReferenceDiff.changed;
                 const externalized = externalizePluginStorageIfNeeded(snapshot);
                 preserveSegmentMemo = true;
-                trackPendingChatRowDeletions(cachedDb, snapshot);
+                trackPendingChatRowDeletions(chatRowReferenceDiff);
                 // A patch with no mutating op (empty, or test-only) returns the
                 // cached object itself, so replaceDbCacheValue sees no identity
                 // change and skips the generation bump. Plugin externalization
@@ -17129,67 +17139,85 @@ app.post('/api/patch', async (req, res, next) => {
                 preserveSegmentMemo,
             });
 
-            // Schedule stubs-only save to KV (debounced).
-            if (saveTimers[filePath]) {
-                clearTimeout(saveTimers[filePath]);
-            }
-            const saveTimer = setTimeout(() => {
-                queueStorageMutation(async () => {
-                    if (saveTimers[filePath] !== saveTimer) return;
-                    try {
-                        if (decodedKey === 'database/database.bin') {
-                            await persistDbCache(filePath, decodedKey);
-                            dbPersistRetryPending = false;
-                        } else {
-                            const data = Buffer.from(encodeRisuSaveLegacy(peekDbCacheValue(filePath)));
-                            try {
-                                kvSet(decodedKey, data);
-                            } catch (err) {
-                                if (err && typeof err === 'object') {
-                                    try { err.attemptedSize = data.length; } catch {}
-                                }
-                                throw err;
-                            }
-                            markDbCacheClean(filePath, { estimatedBytes: data.length });
-                        }
-                        // Persist succeeded — clear before backup so a backup-only
-                        // failure isn't attributed to data loss.
-                        clearPersistFailure();
-                        if (decodedKey === 'database/database.bin') scheduleBackupAndRotate();
-                    } catch (error) {
-                        if (decodedKey === 'database/database.bin') {
-                            // persistDbCache may intentionally invalidate a
-                            // malformed cache. Only retained cache state can be
-                            // retried; otherwise the live database supersedes it.
-                            dbPersistRetryPending = Boolean(peekDbCacheValue(filePath));
-                        }
-                        logger.error(`[Patch] Error saving ${decodedKey}:`, error);
-                        recordPersistFailure(error, `patch:${decodedKey}`);
-                    } finally {
-                        if (saveTimers[filePath] === saveTimer) delete saveTimers[filePath];
-                    }
-                }, 'patch-persist').catch((error) => {
-                    if (saveTimers[filePath] === saveTimer) delete saveTimers[filePath];
-                    if (isImportInProgressError(error)) {
-                        // The import replaces this key wholesale and drops dbCache,
-                        // so the superseded debounced save is not a persist failure.
-                        logger.info(`[Patch] Skipped debounced save for ${decodedKey}: import in progress`);
-                        return;
-                    }
-                    logger.error(`[Patch] Storage queue failed for ${decodedKey}:`, error);
-                });
-            }, SAVE_INTERVAL);
-            saveTimers[filePath] = saveTimer;
-
-            // Update ETag after successful patch (based on stripped version)
+            // Update ETag after successful patch (based on stripped version).
             if (decodedKey === 'database/database.bin') {
                 dbEtag = getDbCacheEtag(filePath, { retainCanonicalEncoding: true });
+            }
+
+            let durable = false;
+            if (structuralDatabasePatch) {
+                if (saveTimers[filePath]) clearTimeout(saveTimers[filePath]);
+                delete saveTimers[filePath];
+                try {
+                    await persistDbCache(filePath, decodedKey);
+                    dbPersistRetryPending = false;
+                    clearPersistFailure();
+                    scheduleBackupAndRotate();
+                    durable = true;
+                } catch (error) {
+                    dbPersistRetryPending = Boolean(peekDbCacheValue(filePath));
+                    logger.error(`[Patch] Error saving ${decodedKey}:`, error);
+                    recordPersistFailure(error, `patch:${decodedKey}`);
+                }
+            } else {
+                // Schedule stubs-only save to KV (debounced).
+                if (saveTimers[filePath]) {
+                    clearTimeout(saveTimers[filePath]);
+                }
+                const saveTimer = setTimeout(() => {
+                    queueStorageMutation(async () => {
+                        if (saveTimers[filePath] !== saveTimer) return;
+                        try {
+                            if (decodedKey === 'database/database.bin') {
+                                await persistDbCache(filePath, decodedKey);
+                                dbPersistRetryPending = false;
+                            } else {
+                                const data = Buffer.from(encodeRisuSaveLegacy(peekDbCacheValue(filePath)));
+                                try {
+                                    kvSet(decodedKey, data);
+                                } catch (err) {
+                                    if (err && typeof err === 'object') {
+                                        try { err.attemptedSize = data.length; } catch {}
+                                    }
+                                    throw err;
+                                }
+                                markDbCacheClean(filePath, { estimatedBytes: data.length });
+                            }
+                            // Persist succeeded — clear before backup so a backup-only
+                            // failure isn't attributed to data loss.
+                            clearPersistFailure();
+                            if (decodedKey === 'database/database.bin') scheduleBackupAndRotate();
+                        } catch (error) {
+                            if (decodedKey === 'database/database.bin') {
+                                // persistDbCache may intentionally invalidate a
+                                // malformed cache. Only retained cache state can be
+                                // retried; otherwise the live database supersedes it.
+                                dbPersistRetryPending = Boolean(peekDbCacheValue(filePath));
+                            }
+                            logger.error(`[Patch] Error saving ${decodedKey}:`, error);
+                            recordPersistFailure(error, `patch:${decodedKey}`);
+                        } finally {
+                            if (saveTimers[filePath] === saveTimer) delete saveTimers[filePath];
+                        }
+                    }, 'patch-persist').catch((error) => {
+                        if (saveTimers[filePath] === saveTimer) delete saveTimers[filePath];
+                        if (isImportInProgressError(error)) {
+                            // The import replaces this key wholesale and drops dbCache,
+                            // so the superseded debounced save is not a persist failure.
+                            logger.info(`[Patch] Skipped debounced save for ${decodedKey}: import in progress`);
+                            return;
+                        }
+                        logger.error(`[Patch] Storage queue failed for ${decodedKey}:`, error);
+                    });
+                }, SAVE_INTERVAL);
+                saveTimers[filePath] = saveTimer;
             }
 
             const responsePayload = {
                 success: true,
                 appliedOperations: result.length,
                 etag: decodedKey === 'database/database.bin' ? dbEtag : undefined,
+                durable,
             };
             const persistWarning = currentPersistWarning();
             if (persistWarning) {

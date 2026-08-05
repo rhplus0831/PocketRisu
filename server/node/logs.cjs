@@ -329,9 +329,21 @@ function countLogs(opts = {}) {
 
 // ─── Global error handlers ──────────────────────────────────────────────────
 let handlersInstalled = false;
-function installProcessHandlers() {
+function installProcessHandlers(options = {}) {
     if (handlersInstalled) return;
     handlersInstalled = true;
+    const onFatalExit = typeof options?.onFatalExit === 'function'
+        ? options.onFatalExit
+        : null;
+
+    function invokeFatalExitCallback() {
+        if (!onFatalExit) return;
+        try {
+            onFatalExit();
+        } catch (error) {
+            try { console.error('[FatalFlush] callback failed:', error); } catch {}
+        }
+    }
 
     process.on('uncaughtException', (err) => {
         try {
@@ -346,6 +358,7 @@ function installProcessHandlers() {
             });
         } catch {}
         console.error('[uncaughtException]', err);
+        invokeFatalExitCallback();
         // Preserve Node's default: terminate after uncaught exception.
         // better-sqlite3 writes synchronously, so the log entry above is already on disk.
         process.exit(1);
@@ -365,6 +378,7 @@ function installProcessHandlers() {
             });
         } catch {}
         console.error('[unhandledRejection]', reason);
+        invokeFatalExitCallback();
         // Node 15+ default: treat unhandled rejection as fatal.
         process.exit(1);
     });

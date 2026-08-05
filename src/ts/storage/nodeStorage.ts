@@ -1465,6 +1465,8 @@ export interface PersistWarning {
 
 export interface PatchItemResult {
     success: boolean
+    /** True only when the server persisted the acknowledged database state. */
+    durable?: boolean
     /** A patch hash mismatch requires an authoritative read/rebase before retrying. */
     conflict?: boolean
     /** Diagnostic candidate only; it is not accepted until its database body is installed. */
@@ -1473,6 +1475,14 @@ export interface PatchItemResult {
     persistWarning?: PersistWarning
     /** Set when the server's chat-internal-field guard rejected the patch. */
     chatGuardRejected?: boolean
+}
+
+export interface FlushDatabaseResult {
+    ok: boolean
+    durable: boolean
+    etag?: string
+    displaced?: boolean
+    retryable?: boolean
 }
 
 export interface DatabaseReadCandidate {
@@ -5390,6 +5400,54 @@ export class NodeStorage{
         }
     }
 
+    async flushDatabase(): Promise<FlushDatabaseResult> {
+        return runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
+            const response = await this.authFetch('/api/db/flush', {
+                method: 'POST',
+                signal,
+            }, true, outcome)
+            // Header receipt is not a durability acknowledgement. Keep the
+            // operation bounded through response-body consumption.
+            outcome.markRequestDispatched()
+
+            const writerEpochChanged = observeWriterEpochResponse(response)
+            let data: Record<string, unknown> | null = null
+            try {
+                const parsed = await awaitWithAbort(response.json(), signal) as unknown
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    data = parsed as Record<string, unknown>
+                }
+            } catch {
+                // A malformed or interrupted confirmation is retryable and
+                // cannot advance the staged acknowledgement watermark.
+            }
+
+            const etag = typeof data?.etag === 'string' ? data.etag : undefined
+            if (response.status === 423 || writerEpochChanged) {
+                outcome.markDefinitiveResponse()
+                return {
+                    ok: false,
+                    durable: false,
+                    etag,
+                    displaced: true,
+                    retryable: false,
+                }
+            }
+
+            const ok = response.ok && data?.success === true
+            const durable = ok && data?.durable === true
+            outcome.markDefinitiveResponse()
+            return {
+                ok,
+                durable,
+                etag,
+                retryable: durable
+                    ? false
+                    : data?.retryable === true || response.status >= 500,
+            }
+        }, 'write', AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS)
+    }
+
     async patchItem(key: string, patchData: { patch: any[], expectedHash: string }): Promise<PatchItemResult> {
         const requestBody = JSON.stringify(patchData)
         return runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
@@ -5456,8 +5514,9 @@ export class NodeStorage{
                 this._lastDbEtag = nextEtag
             }
             const persistWarning = data.persistWarning as PersistWarning | undefined
+            const durable = data.durable === true
             outcome.markDefinitiveResponse()
-            return { success: true, etag: nextEtag, persistWarning }
+            return { success: true, durable, etag: nextEtag, persistWarning }
         }, 'write', AUTHORITATIVE_STORAGE_JOB_TIMEOUT_MS)
     }
 

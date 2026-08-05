@@ -57,6 +57,7 @@ import { watchActiveChatDirty } from "./storage/activeChatDirtyTracker.svelte"
 import { recordConflictRebaseGraphBudget } from "./storage/conflictRebaseBudget"
 import { watchDatabaseDirtyRevisions } from "./storage/databaseDirtyRevisionTracker.svelte"
 import type { RisuSaveDirtyRevisions } from "./storage/databaseDirtyRevisions"
+import { StagedAckTracker } from "./storage/stagedAckTracker"
 import {
     createRequestLogScope, recordRequestLog, fetchRequestLogs,
     type RequestLogCategory, type RequestLogSource, type RequestLogRoute,
@@ -286,6 +287,10 @@ let requestImmediateSaveImpl: ((options?: {
 const dirtyTargetBridge = new DirtyTargetBridge()
 let patchSyncBaseline: Database | null = null
 
+type PersistTrackedChangesResult =
+    | { status: 'saved', durable: boolean, etag?: string }
+    | { status: 'retry' | 'noop' | 'displaced' }
+
 // Surfaces server-side persist failures (Stage 1 visibility — see issues.md).
 // The same failure is re-attached on every patch response until cleared, so we
 // dedupe by timestamp to fire one toast per distinct failure event.
@@ -414,9 +419,16 @@ export function setPatchSyncBaseline(data: Database | null) {
 export async function saveDb() {
     let changed = false
     let gotChannel = false
+    const stagedAckTracker = new StagedAckTracker({
+        flush: () => forageStorage.flushDatabase(),
+        onReplay: () => {
+            changed = true
+        },
+    })
     const claimWriterAccessLoss = () => {
         if (gotChannel) return false
         gotChannel = true
+        stagedAckTracker.replayAll('displaced')
         return true
     }
     const sessionID = v4()
@@ -551,6 +563,7 @@ export async function saveDb() {
         || saving.state
         || hasTrackedChanges(changeTracker)
         || !!databaseDirtyRevisionTracker?.ledger.hasDirty()
+        || stagedAckTracker.hasStaged()
         || get(chatOperationActive)
     ))
 
@@ -848,11 +861,12 @@ export async function saveDb() {
             skipBroadcast?: boolean
             forceChatPersist?: boolean
         }
-    ): Promise<'saved' | 'retry' | 'noop' | 'displaced'> {
+    ): Promise<PersistTrackedChangesResult> {
         if (gotChannel) {
             // Another session owns the server. Keep this page's live state in
             // memory for the read-only recovery UI, but never retry stale data.
-            return 'displaced'
+            stagedAckTracker.replayAll('displaced')
+            return { status: 'displaced' }
         }
         if (channel && !options?.skipBroadcast) {
             channel.postMessage(sessionID)
@@ -861,7 +875,7 @@ export async function saveDb() {
         const db = getDatabase()
         if (!db.characters) {
             await sleep(1000)
-            return 'noop'
+            return { status: 'noop' }
         }
 
         const chatPersistStage = await prepareChatPersistStage({
@@ -888,6 +902,7 @@ export async function saveDb() {
         await activeEncoder.set(db, safeStructuredClone(toSave), dirtyRevisions)
 
         let saved = false
+        let durable = false
         let newEtag: string | undefined
         let conflictRebaseToSave = toSave
 
@@ -1070,7 +1085,7 @@ export async function saveDb() {
                     changed = true
                     return chatPersistStage.completeStubCommit({
                         committed: false,
-                        result: 'retry',
+                        result: { status: 'retry' } as const,
                     })
                 }
                 // Keep the final live-graph guard and dispatch in one synchronous
@@ -1083,6 +1098,7 @@ export async function saveDb() {
                     throw error
                 }
                 saved = patchResult.success
+                durable = patchResult.success && patchResult.durable === true
                 if (patchResult.success) activePatcher.commit(patchData)
                 else activePatcher.discard(patchData)
                 if (patchResult.success && patchResult.etag) {
@@ -1101,13 +1117,17 @@ export async function saveDb() {
                 }
                 if (patchResult.conflict) {
                     console.warn('[Save] Patch conflict detected, rebasing tracked local changes on latest server DB...')
+                    stagedAckTracker.replayAll('conflict')
                     await rebaseTrackedLocalChangesOnLatestServerDb(
                         db,
                         conflictRebaseToSave,
                         revisionProposal,
                     )
                     await sleep(Math.min(500 * (savetrys + 1), 3000))
-                    return chatPersistStage.completeStubCommit({ committed: false, result: 'retry' })
+                    return chatPersistStage.completeStubCommit({
+                        committed: false,
+                        result: { status: 'retry' } as const,
+                    })
                 }
             }
         }
@@ -1126,7 +1146,10 @@ export async function saveDb() {
             const encoded = activeEncoder.encode()
             if (!encoded) {
                 await sleep(1000)
-                return chatPersistStage.completeStubCommit({ committed: false, result: 'noop' })
+                return chatPersistStage.completeStubCommit({
+                    committed: false,
+                    result: { status: 'noop' } as const,
+                })
             }
             const dbData = new Uint8Array(encoded)
 
@@ -1141,7 +1164,7 @@ export async function saveDb() {
                 changed = true
                 return chatPersistStage.completeStubCommit({
                     committed: false,
-                    result: 'retry',
+                    result: { status: 'retry' } as const,
                 })
             }
             // Keep the final live-graph guard and dispatch in one synchronous
@@ -1162,16 +1185,22 @@ export async function saveDb() {
                         activePatcher.discard(dirtyProposal)
                     }
                     console.warn('[Save] Full-write conflict detected, rebasing tracked local changes on latest server DB...')
+                    stagedAckTracker.replayAll('conflict')
                     await rebaseTrackedLocalChangesOnLatestServerDb(
                         db,
                         conflictRebaseToSave,
                         revisionProposal,
                     )
                     await sleep(Math.min(500 * (savetrys + 1), 3000))
-                    return chatPersistStage.completeStubCommit({ committed: false, result: 'retry' })
+                    return chatPersistStage.completeStubCommit({
+                        committed: false,
+                        result: { status: 'retry' } as const,
+                    })
                 }
                 throw conflictErr
             }
+
+            durable = true
 
             // Transfer the exact graph represented by the acknowledged bytes;
             // no decode of our own full-write output is necessary.
@@ -1188,13 +1217,17 @@ export async function saveDb() {
             forageStorage.setDbEtag(newEtag)
         }
 
-        return chatPersistStage.completeStubCommit({ committed: true, result: 'saved' })
+        return chatPersistStage.completeStubCommit({
+            committed: true,
+            result: { status: 'saved', durable, etag: newEtag } as const,
+        })
     }
 
     async function triggerSave(options?: {
         forceFullWrite?: boolean
         skipBroadcast?: boolean
         forceChatPersist?: boolean
+        requireDurable?: boolean
     }): Promise<DatabaseSaveOutcome> {
         return saveCoordinator.run(async () => {
             const toSave = takeTrackedChanges()
@@ -1206,6 +1239,11 @@ export async function saveDb() {
                 ? databaseDirtyRevisionTracker?.ledger.hasDirty(revisionProposal) === true
                 : false
             if (!hasTrackedChanges(toSave) && !hasDirtyRevisions && !options?.forceFullWrite) {
+                if (options?.requireDurable && stagedAckTracker.hasStaged()) {
+                    const confirmed = await stagedAckTracker.confirmNow()
+                    if (confirmed) return { status: 'committed' }
+                    return gotChannel ? { status: 'displaced' } : { status: 'retry' }
+                }
                 return { status: 'committed' }
             }
 
@@ -1217,24 +1255,49 @@ export async function saveDb() {
                     revisionProposal,
                     options,
                 )
-                if (result === 'saved') {
-                    if (revisionProposal) {
-                        databaseDirtyRevisionTracker?.ledger.commit(revisionProposal)
-                    }
+                if (result.status === 'saved' && result.durable) {
+                    stagedAckTracker.confirmAll()
+                    if (revisionProposal) databaseDirtyRevisionTracker?.ledger.commit(revisionProposal)
                     revisionTrustReady = true
                     savetrys = 0
                     return { status: 'committed' }
-                } else if (result === 'retry') {
+                } else if (result.status === 'saved') {
+                    stagedAckTracker.recordStaged({
+                        etag: result.etag,
+                        commit: () => {
+                            if (revisionProposal) {
+                                databaseDirtyRevisionTracker?.ledger.commit(revisionProposal)
+                            }
+                        },
+                        replay: () => {
+                            if (revisionProposal) {
+                                databaseDirtyRevisionTracker?.ledger.discard(revisionProposal)
+                            }
+                            requeueTrackedChanges(toSave)
+                            changed = true
+                        },
+                    })
+                    revisionTrustReady = true
+                    savetrys = 0
+                    if (options?.requireDurable) {
+                        const confirmed = await stagedAckTracker.confirmNow()
+                        if (!confirmed) {
+                            return gotChannel ? { status: 'displaced' } : { status: 'retry' }
+                        }
+                    }
+                    return { status: 'committed' }
+                } else if (result.status === 'retry') {
                     if (revisionProposal) {
                         databaseDirtyRevisionTracker?.ledger.discard(revisionProposal)
                     }
                     return { status: 'retry' }
-                } else if (result === 'displaced') {
+                } else if (result.status === 'displaced') {
+                    stagedAckTracker.replayAll('displaced')
                     if (revisionProposal) {
                         databaseDirtyRevisionTracker?.ledger.discard(revisionProposal)
                     }
                     return { status: 'displaced' }
-                } else if (result === 'noop' && (hasTrackedChanges(toSave) || hasDirtyRevisions)) {
+                } else if (result.status === 'noop' && (hasTrackedChanges(toSave) || hasDirtyRevisions)) {
                     requeueTrackedChanges(toSave)
                     // Once displaced, pause instead of spinning forever. The
                     // frozen page can only leave through an explicit reload.
@@ -1269,7 +1332,9 @@ export async function saveDb() {
         }, {
             // A force request is a durability barrier for its caller. It must
             // run after an older save rather than inherit that save's promise.
-            queueAfterInFlight: options?.forceFullWrite || options?.forceChatPersist,
+            queueAfterInFlight: options?.forceFullWrite
+                || options?.forceChatPersist
+                || options?.requireDurable,
         })
     }
 
@@ -1278,6 +1343,7 @@ export async function saveDb() {
         await tick()
         return triggerSave({
             forceFullWrite: options?.forceFullWrite,
+            requireDurable: true,
         })
     }
 
