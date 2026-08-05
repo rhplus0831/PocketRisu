@@ -9,6 +9,8 @@ when changing code, then use a finding as point-in-time evidence to revalidate.
 
 - [Current work index](WORK-INDEX.md) — every open or deferred finding,
   grouped by the subsystem that owns the fix.
+- [Remediation queue](REMEDIATION-QUEUE.md) — hand-maintained execution order
+  for working the backlog one item at a time.
 - [`open/`](open/) — one canonical report per unique work item. Related failure
   families remain separate when they require different fixes or regression
   proofs.
