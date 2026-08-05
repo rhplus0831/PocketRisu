@@ -12484,8 +12484,12 @@ async function handlePluginStorageViewerPage(req, res, next) {
         closePluginStorageViewerContext(context);
         if (pluginStorageViewerTestGateDir) {
             try {
+                // Temp-then-rename: this write races the test's read (the
+                // response has already ended), so the file must never be
+                // observable half-written.
+                const gateResultPath = path.join(pluginStorageViewerTestGateDir, 'result.json');
                 await fs.writeFile(
-                    path.join(pluginStorageViewerTestGateDir, 'result.json'),
+                    `${gateResultPath}.tmp`,
                     JSON.stringify({
                         manifestParses: metrics.manifestParses,
                         valueReads: metrics.valueReads,
@@ -12497,6 +12501,7 @@ async function handlePluginStorageViewerPage(req, res, next) {
                     }),
                     'utf-8',
                 );
+                await fs.rename(`${gateResultPath}.tmp`, gateResultPath);
             } catch {}
         }
     }

@@ -82,6 +82,21 @@ export async function spawnServer(opts: SpawnServerOptions = {}): Promise<Server
   } as ServerHandle
 
   const launch = async (extraEnv: Record<string, string> = {}) => {
+    // getFreePort closes its probe socket before the child binds the port, so
+    // a concurrently-spawning server can steal it in between. Retry the
+    // collision signature instead of failing the whole test file.
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await launchOnce(extraEnv)
+        return
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (attempt >= 5 || !message.includes('EADDRINUSE')) throw error
+      }
+    }
+  }
+
+  const launchOnce = async (extraEnv: Record<string, string> = {}) => {
     handle.port = await getFreePort()
     let stderrBuf = ''
     const launched = spawn(

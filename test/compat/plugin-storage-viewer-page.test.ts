@@ -406,10 +406,11 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
     const client = await createClient(server.port, server.password)
 
     const cold = await readViewer(await viewer(client, '?page=1'))
-    const coldCounters = JSON.parse(await readFile(
+    // The gate file is written after the response ends; poll instead of racing it.
+    const coldCounters = await waitForJsonFile<Record<string, number>>(
       path.join(gateDir, 'result.json'),
-      'utf-8',
-    ))
+      value => typeof value.backfillPasses === 'number',
+    )
     expect(coldCounters).toMatchObject({ backfillPasses: 1, pageValueReuses: 10 })
 
     const indexed = await readViewer(await viewer(client, '?page=1'))
@@ -437,7 +438,11 @@ describe('PM3 point-in-time plugin storage viewer page', () => {
       readViewer(await viewer(client, `?page=${index % 5}`))
     )))
     expect(results.every(result => result.meta.total === 250)).toBe(true)
-    const counters = JSON.parse(await readFile(path.join(gateDir, 'result.json'), 'utf-8'))
+    // The gate file is written after the response ends; poll instead of racing it.
+    const counters = await waitForJsonFile<Record<string, number>>(
+      path.join(gateDir, 'result.json'),
+      value => typeof value.backfillPasses === 'number',
+    )
     expect(counters.backfillPasses).toBe(1)
   })
 
