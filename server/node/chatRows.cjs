@@ -169,6 +169,18 @@ function normalizeChatOrphanFolderId(chat, validIds) {
     return true;
 }
 
+function countPayloadChats(dbObj) {
+    let count = 0;
+    if (!Array.isArray(dbObj?.characters)) return count;
+    for (const char of dbObj.characters) {
+        if (!Array.isArray(char?.chats)) continue;
+        for (const chat of char.chats) {
+            if (chat && Array.isArray(chat.message)) count++;
+        }
+    }
+    return count;
+}
+
 function hasChatPayloads(dbObj) {
     if (!dbObj?.characters) return false;
     for (const char of dbObj.characters) {
@@ -1126,10 +1138,6 @@ function createChatRowStore(options) {
             }, 0);
     }
 
-    function extractAndWritePayloadChats(dbObj) {
-        return extractPayloadChats(dbObj, writeChatRow, randomUUID);
-    }
-
     function collectReassignedStubRowCopies(reassignments) {
         const copies = [];
         for (const { character, oldChaId, newChaId } of reassignments) {
@@ -1525,9 +1533,9 @@ function createChatRowStore(options) {
         chatBytesForChar,
         chatToStub,
         validateDatabaseShape,
+        countPayloadChats,
         hasChatPayloads,
         referencedChatRowKeys,
-        extractPayloadChats: extractAndWritePayloadChats,
         removedChatRowKeys,
         deleteRemovedChatRows,
         sweepOrphanChatRows,
@@ -1551,6 +1559,7 @@ module.exports = {
     chatToStub,
     validateDatabaseShape,
     mergeChatStubWithFullChat,
+    countPayloadChats,
     hasChatPayloads,
     referencedChatRowKeys,
     removedChatRowKeys,

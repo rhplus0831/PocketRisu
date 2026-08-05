@@ -58,9 +58,9 @@ interface ChatRowStore {
     chatBytesForChar: (chaId: string) => number
     chatToStub: (chat: any) => any
     validateDatabaseShape: (dbObj: any) => any
+    countPayloadChats: (dbObj: any) => number
     hasChatPayloads: (dbObj: any) => boolean
     referencedChatRowKeys: (dbObj: any) => Set<string>
-    extractPayloadChats: (dbObj: any) => number
     deleteRemovedChatRows: (oldStrippedDb: any, newStrippedDb: any) => number
     sweepOrphanChatRows: (
         strippedDb: any,
@@ -134,6 +134,7 @@ const {
     parseChatRowKey,
     chatToStub,
     validateDatabaseShape,
+    countPayloadChats,
     hasChatPayloads,
     splitFullDb,
     findDuplicateChaIds,
@@ -144,6 +145,7 @@ const {
     parseChatRowKey: (key: string) => { chaId: string; chatId: string } | null
     chatToStub: (chat: any) => any
     validateDatabaseShape: ChatRowStore['validateDatabaseShape']
+    countPayloadChats: ChatRowStore['countPayloadChats']
     hasChatPayloads: (dbObj: any) => boolean
     splitFullDb: ChatRowStore['splitFullDb']
     findDuplicateChaIds: ChatRowStore['findDuplicateChaIds']
@@ -623,6 +625,50 @@ describe('chatToStub', () => {
     })
 })
 
+describe('countPayloadChats', () => {
+    it('counts payload and hybrid chats but not bare stubs', () => {
+        const dbObj = {
+            characters: [{
+                chats: [
+                    { id: 'stub', name: 'Stub', _stub: true },
+                    { id: 'payload', name: 'Payload', message: [] },
+                    { id: 'hybrid', name: 'Hybrid', _stub: true, message: [{ data: 'body' }] },
+                    null,
+                ],
+            }],
+        }
+
+        expect(countPayloadChats(dbObj)).toBe(2)
+        expect(hasChatPayloads(dbObj)).toBe(true)
+    })
+
+    it.each([
+        ['missing characters', {}],
+        ['empty characters', { characters: [] }],
+        ['empty chats', { characters: [{ chats: [] }] }],
+    ])('returns zero for %s', (_label, dbObj) => {
+        expect(countPayloadChats(dbObj)).toBe(0)
+        expect(hasChatPayloads(dbObj)).toBe(false)
+    })
+
+    it('does not mutate the scanned database', () => {
+        const { store } = makeHarness()
+        const dbObj = {
+            characters: [{
+                chaId: 'char',
+                chats: [
+                    { id: 'payload', message: [{ role: 'user', data: 'kept' }] },
+                    { id: 'stub', _stub: true },
+                ],
+            }],
+        }
+        const before = structuredClone(dbObj)
+
+        expect(store.countPayloadChats(dbObj)).toBe(1)
+        expect(dbObj).toEqual(before)
+    })
+})
+
 describe('splitFullDb and assembleFullDb', () => {
     it.each([
         ['null root', null],
@@ -648,36 +694,6 @@ describe('splitFullDb and assembleFullDb', () => {
         }
         expect(validateDatabaseShape(value)).toBe(value)
         expect(splitFullDb(value).strippedDb.characters).toEqual(value.characters)
-    })
-
-    it('extracts payload chats into rows and replaces them with unique, healed stubs', async () => {
-        const { store } = makeHarness()
-        const dbObj = {
-            characters: [{
-                chaId: 'char',
-                chats: [
-                    { id: 'duplicate', name: 'First', message: [{ data: 'one' }] },
-                    { id: 'duplicate', name: 'Hybrid', _stub: true, message: [{ data: 'two' }] },
-                    { id: 'pending', name: 'Pending', _stub: true },
-                ],
-            }],
-        }
-
-        expect(hasChatPayloads(dbObj)).toBe(true)
-        expect(store.extractPayloadChats(dbObj)).toBe(2)
-        expect(hasChatPayloads(dbObj)).toBe(false)
-        expect(dbObj.characters[0].chats.every(chat => chat._stub === true)).toBe(true)
-
-        const [first, second] = dbObj.characters[0].chats
-        expect(first.id).toBe('duplicate')
-        expect(second.id).not.toBe('duplicate')
-        expect(await store.readChatRow('char', first.id)).toMatchObject({
-            id: first.id,
-            message: [{ data: 'one' }],
-        })
-        const healed = await store.readChatRow('char', second.id)
-        expect(healed).toMatchObject({ id: second.id, message: [{ data: 'two' }] })
-        expect(healed).not.toHaveProperty('_stub')
     })
 
     it('round-trips a normalized full DB without mutating the input', async () => {

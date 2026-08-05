@@ -320,6 +320,17 @@ async function flushDatabase(client: RisuClient): Promise<Response> {
   })
 }
 
+async function readDatabaseEtag(client: RisuClient): Promise<string> {
+  const response = await client.fetch('/api/read', {
+    headers: { 'file-path': DB_PATH_HEX },
+  })
+  if (!response.ok) throw new Error(`database read failed: ${response.status}`)
+  await response.arrayBuffer()
+  const etag = response.headers.get('x-db-etag')
+  if (!etag) throw new Error('database read returned no ETag')
+  return etag
+}
+
 describe('atomic database writes with external rows', () => {
   test('shares one canonical patch encoding with persistence and preserves ETag bytes', async () => {
     const { client, server } = await bootCanonicalEtagFixture()
@@ -737,6 +748,122 @@ describe('atomic database writes with external rows', () => {
       currentEtag: expect.stringMatching(/^[0-9a-f]{32}$/),
     })
     expect(snapshotExternalRows(server.cwd)).toEqual(before)
+  })
+
+  test('patch rejects two payload chats without committing rows, database bytes, or ETag', async () => {
+    const { client, server, strippedDb } = await bootSeeded()
+    const databaseBefore = readKv(server.cwd, DB_KEY)
+    const etagBefore = await readDatabaseEtag(client)
+    const chaId = strippedDb.characters[0].chaId as string
+    const payloadChats = [
+      {
+        id: 'patch-payload-one',
+        name: 'First rejected payload',
+        message: [{ role: 'user', data: 'must never reach a row' }],
+      },
+      {
+        id: 'patch-payload-two',
+        name: 'Second rejected payload',
+        message: [{ role: 'char', data: 'must not partially commit' }],
+      },
+    ]
+
+    const response = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_PATH_HEX,
+      },
+      body: JSON.stringify({
+        expectedHash: calculateHash(normalizeJSON(strippedDb)).toString(16),
+        patch: payloadChats.map((chat, index) => ({
+          op: 'add',
+          path: `/characters/0/chats/${2 + index}`,
+          value: chat,
+        })),
+      }),
+    })
+
+    expect(response.status).toBe(422)
+    await expect(response.json()).resolves.toEqual({
+      error: 'Patch rejected: whole-chat payloads must be written through /api/chat-content',
+      code: 'CHAT_PAYLOAD_PATCH_UNSUPPORTED',
+      retryable: false,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+      currentEtag: etagBefore,
+    })
+    for (const chat of payloadChats) {
+      expect(readKv(server.cwd, chatRowKey(chaId, chat.id))).toBeNull()
+    }
+    expect(readKv(server.cwd, DB_KEY)).toEqual(databaseBefore)
+    expect(await readDatabaseEtag(client)).toBe(etagBefore)
+  })
+
+  test('patch rejects a payload overwrite and accepts a later stub-only patch', async () => {
+    const { client, server, strippedDb } = await bootSeeded()
+    const existingStub = strippedDb.characters[0].chats[0]
+    const chaId = strippedDb.characters[0].chaId as string
+    const rowKey = chatRowKey(chaId, existingStub.id)
+    const rowBefore = readKv(server.cwd, rowKey)
+    const databaseBefore = readKv(server.cwd, DB_KEY)
+    const etagBefore = await readDatabaseEtag(client)
+    const payloadReplacement = {
+      ...(decodeRisuDat(rowBefore!) as Record<string, any>),
+      name: 'Rejected authoritative overwrite',
+      message: [{ role: 'user', data: 'must not replace the existing row' }],
+    }
+
+    const rejected = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_PATH_HEX,
+      },
+      body: JSON.stringify({
+        expectedHash: calculateHash(normalizeJSON(strippedDb)).toString(16),
+        patch: [{
+          op: 'replace',
+          path: '/characters/0/chats/0',
+          value: payloadReplacement,
+        }],
+      }),
+    })
+
+    expect(rejected.status).toBe(422)
+    await expect(rejected.json()).resolves.toMatchObject({
+      code: 'CHAT_PAYLOAD_PATCH_UNSUPPORTED',
+      retryable: false,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+      currentEtag: etagBefore,
+    })
+    expect(readKv(server.cwd, rowKey)).toEqual(rowBefore)
+    expect(readKv(server.cwd, DB_KEY)).toEqual(databaseBefore)
+    expect(await readDatabaseEtag(client)).toBe(etagBefore)
+
+    const updatedStub = { ...existingStub, name: 'Accepted stub metadata' }
+    const stubOnly = await client.fetch('/api/patch', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'file-path': DB_PATH_HEX,
+      },
+      body: JSON.stringify({
+        expectedHash: calculateHash(normalizeJSON(strippedDb)).toString(16),
+        patch: [{
+          op: 'replace',
+          path: '/characters/0/chats/0',
+          value: updatedStub,
+        }],
+      }),
+    })
+
+    expect(stubOnly.status).toBe(200)
+    expect((await flushDatabase(client)).status).toBe(200)
+    const storedDb = decodeRisuDat(readKv(server.cwd, DB_KEY)!) as Record<string, any>
+    expect(storedDb.characters[0].chats[0]).toEqual(updatedStub)
+    expect(readKv(server.cwd, rowKey)).toEqual(rowBefore)
   })
 
   test('patch removal keeps its row until database.bin and deletion commit together', async () => {

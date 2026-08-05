@@ -17044,19 +17044,40 @@ app.post('/api/patch', async (req, res, next) => {
                     });
                     return;
                 }
+                // Detection must remain pure and precede in-place normalizations:
+                // untouched patch subtrees can still be shared with cachedDb.
+                const payloadChatCount = chatRowStore.countPayloadChats(snapshot);
+                if (payloadChatCount > 0) {
+                    logger.warn(
+                        `[Patch] Rejected ${payloadChatCount} whole-chat payload(s)`
+                    );
+                    let currentEtag;
+                    try {
+                        currentEtag = getDbCacheEtag(filePath);
+                        dbEtag = currentEtag;
+                    } catch {}
+                    res.status(422).send({
+                        error: 'Patch rejected: whole-chat payloads must be written through /api/chat-content',
+                        code: 'CHAT_PAYLOAD_PATCH_UNSUPPORTED',
+                        retryable: false,
+                        commitOutcome: 'not-committed',
+                        commitOutcomeUnknown: false,
+                        currentEtag,
+                    });
+                    return;
+                }
                 // Keep dbCache and the ETag on the same optimized stub shape
                 // that the debounced persist will write.
                 const externalized = externalizePluginStorageIfNeeded(snapshot);
-                const extracted = chatRowStore.extractPayloadChats(snapshot);
-                preserveSegmentMemo = extracted === 0;
+                preserveSegmentMemo = true;
                 trackPendingChatRowDeletions(cachedDb, snapshot);
                 // A patch with no mutating op (empty, or test-only) returns the
                 // cached object itself, so replaceDbCacheValue sees no identity
-                // change and skips the generation bump. These two normalizations
-                // edit in place, so bump explicitly when they actually changed
+                // change and skips the generation bump. Plugin externalization
+                // edits in place, so bump explicitly when it actually changed
                 // something — otherwise the memoized hash/ETag would keep
                 // describing the pre-normalization shape.
-                if (snapshot === cachedDb && (externalized.changed || extracted > 0)) {
+                if (snapshot === cachedDb && externalized.changed) {
                     dbCompositionalHashMemo = new WeakMap();
                     dbDerivedValueMemo.bump(filePath);
                 }
