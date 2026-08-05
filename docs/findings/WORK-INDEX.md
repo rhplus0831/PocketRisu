@@ -5,7 +5,7 @@ Run `pnpm check:docs` after changing a finding, status, path, or link.
 These are point-in-time reports; revalidate their evidence against current code
 before implementation.
 
-Current catalog: **37 open**, **0 deferred**, and **5 accepted decisions**.
+Current catalog: **36 open**, **0 deferred**, and **5 accepted decisions**.
 
 ## Active work by owner
 
@@ -73,7 +73,6 @@ Current catalog: **37 open**, **0 deferred**, and **5 accepted decisions**.
 
 | ID | Finding | Status | Source |
 |---|---|---|---|
-| `FND-nonoptimized-save-storage-acks-before-persistence` | [Non-optimized plugin save storage acknowledges before persistence](open/plugin-storage/nonoptimized-save-storage-acks-before-persistence.md) | Open | 2026-07 data-loss audit |
 | `FND-recovery-use-inline-cannot-serialize-lossless-values` | [Plugin recovery offers an inline repair it cannot serialize](open/plugin-storage/recovery-use-inline-cannot-serialize-lossless-values.md) | Open | delta audit DA-15 |
 | `FND-sparse-array-holes-densified` | [Sparse-array holes are densified in plugin-storage transitions and snapshots](open/plugin-storage/sparse-array-holes-densified.md) | Open | delta audit DA-14 |
 | `FND-v2-plugin-storage-live-aliases` | [V2 storage assignments now always detach caller aliases](open/plugin-storage/v2-plugin-storage-live-aliases.md) | Open | 2026-07 compatibility investigation |

@@ -97,7 +97,7 @@ beta disabled:
   workloads (rows that are never deleted being reapplied on load; cleanup
   routines treating a shared key-namespace prefix as plugin-owned): both
   reproduce with the beta off.
-- [`nonoptimized-save-storage-acks-before-persistence.md`](../../docs/findings/open/plugin-storage/nonoptimized-save-storage-acks-before-persistence.md):
+- [`nonoptimized-save-storage-acks-before-persistence.md`](../findings/2026-08-remediation/fixed/nonoptimized-save-storage-acks-before-persistence.md):
   non-optimized mode by definition.
 
 ## Fixed enabled-mode regressions (historical context)
