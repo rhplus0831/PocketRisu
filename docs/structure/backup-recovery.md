@@ -369,7 +369,10 @@ atomically publishes the exact prior materialized bytes under `<root>/<chaId>/<c
 Log-free capture streams the protected base; logged capture replays the bounded log and
 publishes byte-for-byte what a full-row write of that logical content would have captured,
 then fsyncs and renames it atomically. Ordinary captures are best-effort and
-have a 45-second per-chat cooldown. Explicit edit, delete-message, and reroll actions
+have a 45-second per-chat cooldown. The cooldown applies only to non-negative elapsed
+wall-clock time; a backward clock adjustment permits one capture, which establishes the
+new in-process cooldown baseline while version filenames retain wall-clock timestamps.
+Explicit edit, delete-message, and reroll actions
 attach a sanitized reason for display; small cold-storage placeholder rows are skipped
 using the rebuildable per-row derivative, with a bounded legacy decode fallback when that
 metadata is absent.
