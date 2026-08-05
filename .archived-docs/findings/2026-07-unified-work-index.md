@@ -83,7 +83,7 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [Compatibility suites are absent from CI](../../docs/findings/open/operations-coverage/compatibility-suites-not-run-in-ci.md) | compat | Open | Build and release workflows provide no regression gate for client, server, or compatibility suites. | Every CI run; the gap is pre-existing rather than a runtime regression. |
+| [Compatibility suites are absent from CI](../findings/2026-08-remediation/fixed/compatibility-suites-not-run-in-ci.md) | compat | Open | Build and release workflows provide no regression gate for client, server, or compatibility suites. | Every CI run; the gap is pre-existing rather than a runtime regression. |
 | [Real upstream fixture tests silently skip](../../docs/findings/open/operations-coverage/real-upstream-backup-fixture-skipped.md) | compat | Open | Synthetic fixtures can miss mistakes in archives emitted by real upstream RisuAI. | Every environment without the ignored local fixture, including CI. |
 
 ## Intentional compatibility changes

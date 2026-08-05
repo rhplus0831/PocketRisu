@@ -91,7 +91,7 @@ many users use that path.
 
 ## Coverage gaps
 
-- [Compatibility suites are absent from CI](../../../docs/findings/open/operations-coverage/compatibility-suites-not-run-in-ci.md)
+- [Compatibility suites are absent from CI](../2026-08-remediation/fixed/compatibility-suites-not-run-in-ci.md)
 - [Real upstream fixture tests silently skip](../../../docs/findings/open/operations-coverage/real-upstream-backup-fixture-skipped.md)
 - [Plugin timeout test was self-referential (fixed 2026-07-31)](reports/plugin-timeout-regression-test-is-self-referential.md)
 

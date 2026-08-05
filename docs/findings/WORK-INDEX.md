@@ -5,7 +5,7 @@ Run `pnpm check:docs` after changing a finding, status, path, or link.
 These are point-in-time reports; revalidate their evidence against current code
 before implementation.
 
-Current catalog: **44 open**, **0 deferred**, and **5 accepted decisions**.
+Current catalog: **43 open**, **0 deferred**, and **5 accepted decisions**.
 
 ## Active work by owner
 
@@ -71,7 +71,6 @@ Current catalog: **44 open**, **0 deferred**, and **5 accepted decisions**.
 | ID | Finding | Status | Source |
 |---|---|---|---|
 | `FND-real-upstream-backup-fixture-skipped` | [Real upstream backup tests silently skip without a local fixture](open/operations-coverage/real-upstream-backup-fixture-skipped.md) | Open | 2026-07 compatibility investigation |
-| `FND-compatibility-suites-not-run-in-ci` | [Serve pushes and releases are not gated by the test suites](open/operations-coverage/compatibility-suites-not-run-in-ci.md) | Open | 2026-07 compatibility investigation |
 
 ### plugin storage
 
