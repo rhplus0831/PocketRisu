@@ -39,7 +39,7 @@ None currently open.
 
 | Work item | Source | Status | Impact | Trigger / likelihood |
 |---|---|---|---|---|
-| [Chat-row staging is not bound to the stub snapshot](../../docs/findings/open/server-backend/chat-row-stage-is-not-bound-to-the-committed-stub-snapshot.md) | audit | Open | A whole chat can become a rowless stub or an orphaned row that is later swept. | Requires a chat-creation race during a slow row POST, or client loss after a partial publication. |
+| [Chat-row staging is not bound to the stub snapshot](../findings/2026-08-remediation/fixed/chat-row-stage-is-not-bound-to-the-committed-stub-snapshot.md) | audit | Open | A whole chat can become a rowless stub or an orphaned row that is later swept. | Requires a chat-creation race during a slow row POST, or client loss after a partial publication. |
 | [Card triggers can bulk-delete history](../../docs/findings/open/scripting-extensions/card-triggers-can-bulk-delete-history-without-consent.md) | audit | Open | An entire chat history or lorebook can be wiped without a recoverable pre-image. | Requires a malicious or buggy imported card and a cooldown-skipped pre-image. |
 | [The save loop idles after five failures](../../docs/findings/open/client-storage/save-loop-idles-after-five-failures.md) | audit | Open | All queued unsaved edits can be lost. | Five consecutive save failures followed by connectivity recovery and tab close without another edit. |
 | [Acknowledged patches are not durable](../../docs/findings/open/client-storage/acknowledged-patches-are-not-durable.md) | audit | Deferred | Up to five seconds of metadata, or in the sharpest case a whole new chat, can be lost. | A process/host crash inside the deferred flush window; graceful shutdown is safe. |
