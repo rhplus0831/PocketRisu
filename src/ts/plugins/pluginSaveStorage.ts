@@ -46,10 +46,11 @@ import {
     beginDatabaseSavePause,
     blockDatabaseSavesUntilReload,
     requireCommittedDatabaseSave,
+    type DatabaseSaveOutcome,
 } from "../storage/databaseSave";
 import { StorageError } from "../storage/storageError";
 import type { PluginStorageMutationResult } from "../storage/pluginStorageMutation";
-import { abortReason, awaitWithAbort, throwIfAborted } from "../storage/abort";
+import { abortReason, throwIfAborted } from "../storage/abort";
 import { sha256OwnedBytes } from "../storage/resourceCache";
 import { safeStructuredClone } from "../polyfill";
 import { Packr } from "msgpackr/index-no-eval";
@@ -261,6 +262,16 @@ const storageBarrier = new PluginStorageBarrier();
 let pluginStorageBarrierLatchedUntilReload = false;
 const storageScopeQueues = new Map<string, Promise<void>>();
 let inlinePluginStoragePublishQueue: Promise<void> = Promise.resolve();
+interface InlinePluginStorageDurabilityTicket {
+    joinable: boolean;
+    outcome: Promise<DatabaseSaveOutcome>;
+}
+let inlinePluginStorageDurabilityTicket: InlinePluginStorageDurabilityTicket | null = null;
+
+interface PluginStorageOperationControl {
+    durabilityRequired: boolean;
+    requireDurability(): void;
+}
 let storageEnumerationSnapshot: {
     database: Database;
     optimized: boolean;
@@ -508,6 +519,7 @@ function invalidateStorageEnumerationSnapshot(
 async function withInlinePluginStoragePublishLock<T>(
     operation: () => Promise<T>,
     signal?: AbortSignal | null,
+    control?: PluginStorageOperationControl,
 ): Promise<T> {
     const previous = inlinePluginStoragePublishQueue;
     let resolveResult!: (value: T | PromiseLike<T>) => void;
@@ -526,12 +538,12 @@ async function withInlinePluginStoragePublishLock<T>(
         }
     });
     inlinePluginStoragePublishQueue = current;
-    return await awaitWithAbort(result, signal);
+    return await awaitWithAbortUntilPublication(result, signal, control);
 }
 
 async function withPluginSaveStorageScope<T>(
     scope: string,
-    operation: () => Promise<T>,
+    operation: (control: PluginStorageOperationControl) => Promise<T>,
     signal?: AbortSignal | null,
 ): Promise<T> {
     return withPluginSaveStorageScopes([scope], operation, signal);
@@ -539,7 +551,7 @@ async function withPluginSaveStorageScope<T>(
 
 async function withPluginSaveStorageScopes<T>(
     requestedScopes: readonly string[],
-    operation: () => Promise<T>,
+    operation: (control: PluginStorageOperationControl) => Promise<T>,
     signal?: AbortSignal | null,
 ): Promise<T> {
     const scopes = [...new Set(requestedScopes)].sort();
@@ -558,10 +570,16 @@ async function withPluginSaveStorageScopes<T>(
 
 async function withAdmittedPluginSaveStorageScopes<T>(
     scopes: readonly string[],
-    operation: () => Promise<T>,
+    operation: (control: PluginStorageOperationControl) => Promise<T>,
     releaseBarrier: () => void,
     signal?: AbortSignal | null,
 ): Promise<T> {
+    const control: PluginStorageOperationControl = {
+        durabilityRequired: false,
+        requireDurability() {
+            this.durabilityRequired = true;
+        },
+    };
     const previous = scopes.map(scope => storageScopeQueues.get(scope) ?? Promise.resolve());
     let resolveResult!: (value: T | PromiseLike<T>) => void;
     let rejectResult!: (error: unknown) => void;
@@ -569,8 +587,8 @@ async function withAdmittedPluginSaveStorageScopes<T>(
         resolveResult = resolve;
         rejectResult = reject;
     });
-    // Cancellation may already be observable before awaitWithAbort attaches;
-    // the returned raced promise still carries the error to the caller.
+    // Cancellation may already be observable before the caller-facing wait
+    // attaches; the returned raced promise still carries the error.
     void result.catch(() => undefined);
 
     // The queue token is intentionally separate from the caller-facing
@@ -581,7 +599,7 @@ async function withAdmittedPluginSaveStorageScopes<T>(
         .then(async () => {
             try {
                 throwIfAborted(signal);
-                resolveResult(await operation());
+                resolveResult(await operation(control));
             } catch (error) {
                 rejectResult(error);
             }
@@ -594,7 +612,7 @@ async function withAdmittedPluginSaveStorageScopes<T>(
         releaseBarrier();
     });
 
-    return await awaitWithAbort(result, signal);
+    return await awaitWithAbortUntilPublication(result, signal, control);
 }
 
 /**
@@ -607,7 +625,7 @@ async function withAdmittedPluginSaveStorageScopes<T>(
 function withImmediatelyAdmittedPluginSaveStorageKey<P, T>(
     key: string,
     prepare: () => P,
-    operation: (prepared: P) => Promise<T>,
+    operation: (prepared: P, control: PluginStorageOperationControl) => Promise<T>,
     signal?: AbortSignal | null,
 ): Promise<T> | null {
     const releaseBarrier = storageBarrier.tryAcquireShared(signal);
@@ -621,9 +639,83 @@ function withImmediatelyAdmittedPluginSaveStorageKey<P, T>(
     }
     return withAdmittedPluginSaveStorageScopes(
         [`save:${normalizePluginStorageKey(key)}`],
-        () => operation(prepared),
+        control => operation(prepared, control),
         releaseBarrier,
         signal,
+    );
+}
+
+function awaitWithAbortUntilPublication<T>(
+    operation: PromiseLike<T>,
+    signal?: AbortSignal | null,
+    control?: PluginStorageOperationControl,
+): Promise<T> {
+    if (!signal) return Promise.resolve(operation);
+    if (signal.aborted) return Promise.reject(abortReason(signal));
+    return new Promise<T>((resolve, reject) => {
+        const onAbort = () => {
+            if (!control?.durabilityRequired) reject(abortReason(signal));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        Promise.resolve(operation).then(resolve, reject).finally(() => {
+            signal.removeEventListener("abort", onAbort);
+        });
+    });
+}
+
+async function confirmInlinePluginStorageDurability(operation: string): Promise<void> {
+    let outcome: DatabaseSaveOutcome;
+    try {
+        const {
+            isImmediateDatabaseSaveReady,
+            requestImmediateSave,
+        } = await import("../globalApi.svelte");
+        // capturePreTrackingPluginStorageChanges carries boot writes into the
+        // first save. loadPlugins precedes saveDb, so waiting here would deadlock.
+        if (!isImmediateDatabaseSaveReady()) return;
+
+        let ticket = inlinePluginStorageDurabilityTicket;
+        if (!ticket?.joinable) {
+            let created!: InlinePluginStorageDurabilityTicket;
+            const publicationTail = inlinePluginStoragePublishQueue;
+            created = {
+                joinable: true,
+                outcome: (async () => {
+                    // Include every disjoint publication already queued in this burst.
+                    await publicationTail.catch(() => undefined);
+                    created.joinable = false;
+                    if (inlinePluginStorageDurabilityTicket === created) {
+                        inlinePluginStorageDurabilityTicket = null;
+                    }
+                    return await requestImmediateSave();
+                })(),
+            };
+            inlinePluginStorageDurabilityTicket = created;
+            ticket = created;
+        }
+        outcome = await ticket.outcome;
+    } catch (cause) {
+        throw new StorageError(
+            `The plugin storage value change is staged in browser memory but was not durably saved during ${operation}.`,
+            {
+                code: "PLUGIN_STORAGE_INLINE_DURABILITY",
+                operation,
+                retryable: false,
+                commitOutcomeUnknown: true,
+                cause,
+            },
+        );
+    }
+    if (outcome.status === "committed") return;
+    throw new StorageError(
+        `The plugin storage value change is staged in browser memory but was not durably saved during ${operation} (${outcome.status}).`,
+        {
+            code: "PLUGIN_STORAGE_INLINE_DURABILITY",
+            operation,
+            retryable: false,
+            commitOutcomeUnknown: true,
+            ...(outcome.status === "failed" ? { cause: outcome.error } : {}),
+        },
     );
 }
 
@@ -662,6 +754,14 @@ export function withPluginSaveStorageKeyLock<T>(
     operation: () => Promise<T>,
     signal?: AbortSignal | null,
 ): Promise<T> {
+    return withPluginSaveStorageScope(`save:${key}`, () => operation(), signal);
+}
+
+function withDurabilityAwarePluginSaveStorageKeyLock<T>(
+    key: string,
+    operation: (control: PluginStorageOperationControl) => Promise<T>,
+    signal?: AbortSignal | null,
+): Promise<T> {
     return withPluginSaveStorageScope(`save:${key}`, operation, signal);
 }
 
@@ -669,6 +769,18 @@ export function withPluginSaveStorageKeyLock<T>(
 export function withPluginSaveStorageKeySetLock<T>(
     keys: readonly string[],
     operation: () => Promise<T>,
+    signal?: AbortSignal | null,
+): Promise<T> {
+    return withPluginSaveStorageScopes(
+        keys.map(key => `save:${normalizePluginStorageKey(key)}`),
+        () => operation(),
+        signal,
+    );
+}
+
+function withDurabilityAwarePluginSaveStorageKeySetLock<T>(
+    keys: readonly string[],
+    operation: (control: PluginStorageOperationControl) => Promise<T>,
     signal?: AbortSignal | null,
 ): Promise<T> {
     return withPluginSaveStorageScopes(
@@ -2309,7 +2421,10 @@ export async function setPluginSaveStorageItem<T>(
     throwIfAborted(signal);
     const normalizedKey = normalizePluginStorageKey(key);
     let retainedOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null;
-    const publish = async (invocation: PluginStorageSetInvocation): Promise<void> => {
+    const publish = async (
+        invocation: PluginStorageSetInvocation,
+        control: PluginStorageOperationControl,
+    ): Promise<void> => {
         throwIfAborted(signal);
         const db = getDatabase();
         if (!db.optimizePluginMemory) {
@@ -2322,7 +2437,9 @@ export async function setPluginSaveStorageItem<T>(
                 );
                 definePluginStorageRecordValue(next, normalizedKey, invocation.snapshot);
                 db.pluginCustomStorage = next;
-            }, signal);
+                control.requireDurability();
+            }, signal, control);
+            await confirmInlinePluginStorageDurability("set");
             return;
         }
         if (invocation.mode === "inline") {
@@ -2379,9 +2496,9 @@ export async function setPluginSaveStorageItem<T>(
             await admitted;
         } else {
             const snapshot = safeStructuredClone(value);
-            await withPluginSaveStorageKeyLock(
+            await withDurabilityAwarePluginSaveStorageKeyLock(
                 normalizedKey,
-                () => publish({ mode: "deferred", snapshot }),
+                control => publish({ mode: "deferred", snapshot }, control),
                 signal,
             );
         }
@@ -2402,7 +2519,10 @@ export async function setOwnedPluginSaveStorageItem<T>(
     throwIfAborted(signal);
     const normalizedKey = normalizePluginStorageKey(key);
     let retainedOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null;
-    const publish = async (invocation: PluginStorageSetInvocation): Promise<void> => {
+    const publish = async (
+        invocation: PluginStorageSetInvocation,
+        control: PluginStorageOperationControl,
+    ): Promise<void> => {
         throwIfAborted(signal);
         const db = getDatabase();
         const ownerRecord = createPluginStorageOwnerRecord(owner);
@@ -2502,7 +2622,9 @@ export async function setOwnedPluginSaveStorageItem<T>(
             } else {
                 delete db.pluginStorageMeta;
             }
-        }, signal);
+            control.requireDurability();
+        }, signal, control);
+        await confirmInlinePluginStorageDurability("set");
     };
     try {
         const admitted = withImmediatelyAdmittedPluginSaveStorageKey(
@@ -2515,9 +2637,9 @@ export async function setOwnedPluginSaveStorageItem<T>(
             await admitted;
         } else {
             const snapshot = safeStructuredClone(value);
-            await withPluginSaveStorageKeyLock(
+            await withDurabilityAwarePluginSaveStorageKeyLock(
                 normalizedKey,
-                () => publish({ mode: "deferred", snapshot }),
+                control => publish({ mode: "deferred", snapshot }, control),
                 signal,
             );
         }
@@ -2533,18 +2655,23 @@ export async function removePluginSaveStorageItem(
     const normalizedKey = normalizePluginStorageKey(key);
     let retainedOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null;
     try {
-        await withPluginSaveStorageKeyLock(normalizedKey, async () => {
+        await withDurabilityAwarePluginSaveStorageKeyLock(normalizedKey, async control => {
             throwIfAborted(signal);
             const db = getDatabase();
             if (!db.optimizePluginMemory) {
-                await withInlinePluginStoragePublishLock(async () => {
-                    if (!hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) return;
+                const mutated = await withInlinePluginStoragePublishLock(async () => {
+                    if (!hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) {
+                        return false;
+                    }
                     const next = cloneInlinePluginStorageRecord(
                         db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
                     );
                     delete next[normalizedKey];
                     db.pluginCustomStorage = next;
-                }, signal);
+                    control.requireDurability();
+                    return true;
+                }, signal, control);
+                if (mutated) await confirmInlinePluginStorageDurability("remove");
                 return;
             }
             const storageKey = makeArchiveSafePluginSaveStorageKey(
@@ -2591,7 +2718,7 @@ export async function removeOwnedPluginSaveStorageItem(
     const normalizedKey = normalizePluginStorageKey(key);
     let retainedOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null;
     try {
-        await withPluginSaveStorageKeyLock(normalizedKey, async () => {
+        await withDurabilityAwarePluginSaveStorageKeyLock(normalizedKey, async control => {
             throwIfAborted(signal);
             const db = getDatabase();
             if (db.optimizePluginMemory) {
@@ -2641,7 +2768,7 @@ export async function removeOwnedPluginSaveStorageItem(
                 return;
             }
 
-            await withInlinePluginStoragePublishLock(async () => {
+            const mutated = await withInlinePluginStoragePublishLock(async () => {
                 const nextValues = cloneInlinePluginStorageRecord(
                     db.pluginCustomStorage ?? createDatabasePluginStorageRecord(),
                 );
@@ -2651,16 +2778,22 @@ export async function removeOwnedPluginSaveStorageItem(
                     >(),
                     "pluginStorageMeta",
                 );
+                let published = false;
                 if (hasPluginStorageRecordValue(db.pluginCustomStorage, normalizedKey)) {
                     delete nextValues[normalizedKey];
                     db.pluginCustomStorage = nextValues;
+                    published = true;
                 }
                 if (hasPluginStorageRecordValue(db.pluginStorageMeta, normalizedKey)) {
                     delete nextMeta[normalizedKey];
                     if (getPluginStorageRecordKeys(nextMeta).length > 0) db.pluginStorageMeta = nextMeta;
                     else delete db.pluginStorageMeta;
+                    published = true;
                 }
-            }, signal);
+                if (published) control.requireDurability();
+                return published;
+            }, signal, control);
+            if (mutated) await confirmInlinePluginStorageDurability("remove");
         }, signal);
     } finally {
         invalidateStorageEnumerationSnapshot(retainedOwnershipSnapshot);
@@ -3233,7 +3366,7 @@ export async function atomicBatchOwnedPluginSaveStorage(
     }
     let retainedOwnershipSnapshot: PluginStorageOwnershipSnapshot | null = null;
     try {
-        return await withPluginSaveStorageKeySetLock([...seen], async () => {
+        return await withDurabilityAwarePluginSaveStorageKeySetLock([...seen], async control => {
             throwIfAborted(signal);
             const db = getDatabase();
             if (db.optimizePluginMemory) {
@@ -3304,7 +3437,7 @@ export async function atomicBatchOwnedPluginSaveStorage(
                 }
             }
 
-            return await withInlinePluginStoragePublishLock(async () => {
+            const result = await withInlinePluginStoragePublishLock(async () => {
                 // V2/V2.1 storage writes are intentionally synchronous and
                 // cannot await this mutex. They advance the shared inline
                 // content generation. If one runs while revision hashing is
@@ -3398,9 +3531,12 @@ export async function atomicBatchOwnedPluginSaveStorage(
                     } else {
                         delete inlineDb.pluginStorageMeta;
                     }
+                    control.requireDurability();
                     return { committed: true as const, generation, revisions };
                 }
-            }, signal);
+            }, signal, control);
+            if (result.committed) await confirmInlinePluginStorageDurability("batch");
+            return result;
         }, signal);
     } finally {
         invalidateStorageEnumerationSnapshot(retainedOwnershipSnapshot);
@@ -3413,7 +3549,9 @@ export async function clearPluginSaveStorage(signal?: AbortSignal | null): Promi
             throwIfAborted(signal);
             const db = getDatabase();
             if (!db.optimizePluginMemory) {
+                if (getPluginStorageRecordKeys(db.pluginCustomStorage).length === 0) return;
                 db.pluginCustomStorage = createDatabasePluginStorageRecord();
+                await confirmInlinePluginStorageDurability("clear");
                 return;
             }
             const ownership = await readCurrentOwnership(db, signal, {
@@ -3460,8 +3598,11 @@ export async function clearOwnedPluginSaveStorage(signal?: AbortSignal | null): 
                 );
                 return;
             }
+            if (getPluginStorageRecordKeys(db.pluginCustomStorage).length === 0
+                && getPluginStorageRecordKeys(db.pluginStorageMeta).length === 0) return;
             db.pluginCustomStorage = createDatabasePluginStorageRecord();
             delete db.pluginStorageMeta;
+            await confirmInlinePluginStorageDurability("clear");
         }, signal);
     } finally {
         invalidateStorageEnumerationSnapshot();

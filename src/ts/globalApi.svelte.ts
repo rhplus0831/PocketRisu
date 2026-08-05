@@ -285,6 +285,7 @@ let requestImmediateSaveImpl: ((options?: {
     status: 'failed',
     error: new Error('Database save loop is not initialized'),
 })
+let immediateDatabaseSaveReady = false
 const dirtyTargetBridge = new DirtyTargetBridge()
 let patchSyncBaseline: Database | null = null
 
@@ -397,6 +398,10 @@ export function requestImmediateSave(options?: {
     forceFullWrite?: boolean
 }): Promise<DatabaseSaveOutcome> {
     return requestImmediateSaveImpl(options)
+}
+
+export function isImmediateDatabaseSaveReady(): boolean {
+    return immediateDatabaseSaveReady
 }
 
 // Explicit arbitrary-target writers keep this bridge even though the state
@@ -1362,6 +1367,7 @@ export async function saveDb() {
             requireDurable: true,
         })
     }
+    immediateDatabaseSaveReady = true
 
     // Publish the bridges only after encoder, patcher, and reactive tracking
     // are ready. Calls made during plugin/bootstrap work remain queued above

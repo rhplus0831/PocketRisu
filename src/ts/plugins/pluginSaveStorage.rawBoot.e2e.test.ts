@@ -23,6 +23,7 @@ vi.mock("../globalApi.svelte", () => ({
         getItemCached: (...args: any[]) => bootState.storage.getItemCached(...args),
         keys: (...args: any[]) => bootState.storage.keys(...args),
     },
+    isImmediateDatabaseSaveReady: () => true,
     requestImmediateSave: vi.fn(async () => ({ status: "committed" })),
 }));
 

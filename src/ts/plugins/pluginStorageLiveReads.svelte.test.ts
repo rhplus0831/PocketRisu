@@ -19,8 +19,9 @@ vi.mock("../storage/database.svelte", () => ({
 vi.mock("../globalApi.svelte", () => ({
     fetchNative: vi.fn(),
     globalFetch: vi.fn(),
+    isImmediateDatabaseSaveReady: () => true,
     readImage: vi.fn(),
-    requestImmediateSave: vi.fn(),
+    requestImmediateSave: vi.fn(async () => ({ status: "committed" as const })),
     saveAsset: vi.fn(),
     toGetter: (getter: () => unknown) => getter,
 }));

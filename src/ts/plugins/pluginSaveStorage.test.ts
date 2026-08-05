@@ -8,6 +8,7 @@ type MockV3PluginInitializationOutcome =
 let database: any;
 const persistent = vi.hoisted(() => new Map<string, unknown>());
 const requestImmediateSave = vi.hoisted(() => vi.fn());
+const immediateDatabaseSaveReady = vi.hoisted(() => ({ value: true }));
 const teardownV3PluginsMock = vi.hoisted(() => vi.fn(async () => undefined));
 const loadV3PluginGenerationOutcomesMock = vi.hoisted(() => vi.fn(
     async (plugins: any[]): Promise<MockV3PluginInitializationOutcome[]> => plugins.map(plugin => ({
@@ -30,6 +31,7 @@ vi.mock("../storage/database.svelte", () => ({
 vi.mock("../globalApi.svelte", () => ({
     fetchNative: vi.fn(),
     globalFetch: vi.fn(),
+    isImmediateDatabaseSaveReady: () => immediateDatabaseSaveReady.value,
     readImage: vi.fn(),
     requestImmediateSave,
     setPatchSyncBaseline: vi.fn(),
@@ -49,6 +51,7 @@ vi.mock("../stores.svelte", () => {
         DBState,
         hotReloading: [],
         pluginAlertModalStore: { errors: [], open: false },
+        selIdState: { selId: -1 },
         selectedCharID: { subscribe: (run: (value: number) => void) => {
             run(0);
             return () => undefined;
@@ -436,6 +439,7 @@ vi.mock("../storage/persistentKv", async () => {
 const {
     atomicBatchOwnedPluginSaveStorage,
     clearOwnedPluginSaveStorage,
+    clearPluginSaveStorage,
     countExternalizedPluginStorageEntries,
     getPluginSaveStorageItem,
     getPluginSaveStorageItemWithRevision,
@@ -456,10 +460,12 @@ const {
     reconcilePluginStorageMode,
     reconcilePluginStorageModeForBoot,
     removeOwnedPluginSaveStorageItem,
+    removeOwnedPluginSaveStorageItemWithOutcome,
     removePluginSaveStorageItem,
     rewriteOwnedPluginSaveStorageItem,
     setOwnedPluginSaveStorageItem,
     setOwnedPluginSaveStorageItemFromRead,
+    setOwnedPluginSaveStorageItemWithOutcome,
     setPluginSaveStorageItem,
     transitionPluginStorageMode,
     updateDatabaseWithPluginStorageSnapshot,
@@ -581,6 +587,7 @@ beforeEach(async () => {
     (globalThis as { __PLUGIN_STORAGE_DIAG__?: unknown }).__PLUGIN_STORAGE_DIAG__ = true;
     resetPluginStorageDiagnosticsForTest();
     persistent.clear();
+    immediateDatabaseSaveReady.value = true;
     requestImmediateSave.mockReset().mockResolvedValue({ status: "committed" });
     teardownV3PluginsMock.mockReset().mockResolvedValue(undefined);
     loadV3PluginGenerationOutcomesMock.mockReset().mockImplementation(async (plugins: any[]) => (
@@ -727,6 +734,349 @@ beforeEach(async () => {
     });
     getPersistentPluginStorageTransitionStreamCapabilities.mockResolvedValue(null);
     commitPersistentPluginStorageBulkTransition.mockReset();
+});
+
+describe("inline plugin storage durability", () => {
+    test("publishes boot-window inline mutations without invoking the unready save loop", async () => {
+        immediateDatabaseSaveReady.value = false;
+        database.pluginCustomStorage = { "remove-me": { version: 1 } };
+
+        await expect(setPluginSaveStorageItem("set-at-boot", { version: 1 }))
+            .resolves.toBeUndefined();
+        await expect(removePluginSaveStorageItem("remove-me"))
+            .resolves.toBeUndefined();
+        await expect(atomicBatchOwnedPluginSaveStorage([{
+            type: "set",
+            key: "batch-at-boot",
+            value: { version: 1 },
+        }], "Boot Plugin")).resolves.toMatchObject({ committed: true });
+
+        expect(database.pluginCustomStorage).toMatchObject({
+            "set-at-boot": { version: 1 },
+            "batch-at-boot": { version: 1 },
+        });
+        expect(database.pluginCustomStorage).not.toHaveProperty("remove-me");
+        expect(requestImmediateSave).not.toHaveBeenCalled();
+    });
+
+    test("reports a boot-window inline outcome write as committed", async () => {
+        immediateDatabaseSaveReady.value = false;
+
+        await expect(setOwnedPluginSaveStorageItemWithOutcome(
+            "outcome-at-boot",
+            { version: 1 },
+            "Boot Plugin",
+        )).resolves.toMatchObject({
+            outcome: "committed",
+            operation: "set",
+        });
+
+        expect(database.pluginCustomStorage["outcome-at-boot"])
+            .toEqual({ version: 1 });
+        expect(requestImmediateSave).not.toHaveBeenCalled();
+    });
+
+    test("does not publish or flush no-op inline clears", async () => {
+        requestImmediateSave.mockResolvedValue({
+            status: "failed",
+            error: new Error("must not run"),
+        });
+        database.pluginCustomStorage = {};
+        database.pluginStorageMeta = {
+            orphan: { plugin: "Legacy", updatedAt: 1 },
+        };
+        const values = database.pluginCustomStorage;
+        const meta = database.pluginStorageMeta;
+
+        await expect(clearPluginSaveStorage()).resolves.toBeUndefined();
+        expect(database.pluginCustomStorage).toBe(values);
+        expect(database.pluginStorageMeta).toBe(meta);
+
+        database.pluginStorageMeta = {};
+        const ownedValues = database.pluginCustomStorage;
+        const ownedMeta = database.pluginStorageMeta;
+        await expect(clearOwnedPluginSaveStorage()).resolves.toBeUndefined();
+        expect(database.pluginCustomStorage).toBe(ownedValues);
+        expect(database.pluginStorageMeta).toBe(ownedMeta);
+        expect(requestImmediateSave).not.toHaveBeenCalled();
+    });
+
+    test("does not acknowledge an inline set before its durable save commits", async () => {
+        let resolveSave!: (outcome: { status: "committed" }) => void;
+        const save = new Promise<{ status: "committed" }>(resolve => {
+            resolveSave = resolve;
+        });
+        requestImmediateSave.mockReturnValueOnce(save);
+
+        const controller = new AbortController();
+        let settled = false;
+        const write = setPluginSaveStorageItem("gated", { version: 1 }, controller.signal);
+        void write.then(() => { settled = true; });
+        await vi.waitFor(() => expect(requestImmediateSave).toHaveBeenCalledOnce());
+
+        expect(database.pluginCustomStorage.gated).toEqual({ version: 1 });
+        controller.abort(new DOMException("late cancellation", "AbortError"));
+        await Promise.resolve();
+        expect(settled).toBe(false);
+
+        resolveSave({ status: "committed" });
+        await expect(write).resolves.toBeUndefined();
+        expect(settled).toBe(true);
+    });
+
+    test("keeps a failed inline set published and classifies durability as unknown", async () => {
+        database.pluginCustomStorage = { retained: { version: 1 } };
+        const original = database.pluginCustomStorage;
+        requestImmediateSave.mockResolvedValueOnce({
+            status: "failed",
+            error: new Error("database write failed"),
+        });
+
+        await expect(setPluginSaveStorageItem("retained", { version: 1 }))
+            .rejects.toMatchObject({
+                name: "StorageError",
+                code: "PLUGIN_STORAGE_INLINE_DURABILITY",
+                operation: "set",
+                retryable: false,
+                commitOutcomeUnknown: true,
+            });
+
+        expect(database.pluginCustomStorage).not.toBe(original);
+        await expect(getPluginSaveStorageItem("retained"))
+            .resolves.toEqual({ version: 1 });
+    });
+
+    test("keeps a failed inline removal published without rolling it back", async () => {
+        database.pluginCustomStorage = { removed: { version: 1 }, retained: true };
+        requestImmediateSave.mockResolvedValueOnce({ status: "retry" });
+
+        await expect(removePluginSaveStorageItem("removed"))
+            .rejects.toMatchObject({
+                code: "PLUGIN_STORAGE_INLINE_DURABILITY",
+                operation: "remove",
+                commitOutcomeUnknown: true,
+            });
+
+        await expect(getPluginSaveStorageItem("removed")).resolves.toBeNull();
+        await expect(getPluginSaveStorageItem("retained")).resolves.toBe(true);
+    });
+
+    test("keeps a failed inline clear published without rolling it back", async () => {
+        database.pluginCustomStorage = { alpha: 1, beta: 2 };
+        requestImmediateSave.mockResolvedValueOnce({ status: "displaced" });
+
+        await expect(clearPluginSaveStorage()).rejects.toMatchObject({
+            code: "PLUGIN_STORAGE_INLINE_DURABILITY",
+            operation: "clear",
+            commitOutcomeUnknown: true,
+        });
+
+        await expect(getPluginSaveStorageKeys()).resolves.toEqual([]);
+    });
+
+    test("does not flush an absent inline remove", async () => {
+        await expect(removePluginSaveStorageItem("missing")).resolves.toBeUndefined();
+        expect(requestImmediateSave).not.toHaveBeenCalled();
+    });
+
+    test("gates a committed inline atomic batch but does not flush a conflict", async () => {
+        let resolveSave!: (outcome: { status: "committed" }) => void;
+        requestImmediateSave.mockReturnValueOnce(new Promise(resolve => {
+            resolveSave = resolve;
+        }));
+
+        let settled = false;
+        const batch = atomicBatchOwnedPluginSaveStorage([{
+            type: "set",
+            key: "batch-key",
+            value: { version: 1 },
+        }], "Batch Plugin");
+        void batch.then(() => { settled = true; });
+        await vi.waitFor(() => expect(requestImmediateSave).toHaveBeenCalledOnce());
+        expect(database.pluginCustomStorage["batch-key"]).toEqual({ version: 1 });
+        expect(settled).toBe(false);
+
+        resolveSave({ status: "committed" });
+        await expect(batch).resolves.toMatchObject({ committed: true });
+
+        requestImmediateSave.mockClear();
+        const current = await getPluginSaveStorageItemWithRevision("batch-key");
+        expect(current.status).toBe("value");
+        database.pluginCustomStorage["batch-key"] = { version: 2 };
+        const conflict = await atomicBatchOwnedPluginSaveStorage([{
+            type: "set",
+            key: "batch-key",
+            value: { version: 3 },
+            expectedRevision: current.revision,
+        }], "Batch Plugin");
+
+        expect(conflict).toMatchObject({ committed: false });
+        expect(requestImmediateSave).not.toHaveBeenCalled();
+        expect(database.pluginCustomStorage["batch-key"]).toEqual({ version: 2 });
+    });
+
+    test("reports an inline guarded batch flush failure as an unknown write", async () => {
+        const read = await readPluginSaveStorageItemResult("guarded-key");
+        expect(read.status).toBe("missing");
+        requestImmediateSave.mockResolvedValueOnce({
+            status: "failed",
+            error: new Error("guarded database write failed"),
+        });
+
+        await expect(setOwnedPluginSaveStorageItemFromRead(
+            read,
+            { published: true },
+            "Guarded Plugin",
+        )).resolves.toMatchObject({
+            status: "failed",
+            stage: "write",
+            error: {
+                code: "PLUGIN_STORAGE_INLINE_DURABILITY",
+                operation: "batch",
+                retryable: false,
+                commitOutcomeUnknown: true,
+            },
+        });
+        await expect(getPluginSaveStorageItem("guarded-key"))
+            .resolves.toEqual({ published: true });
+    });
+
+    test("maps inline outcome writes to unknown on flush failure and committed on success", async () => {
+        requestImmediateSave.mockResolvedValueOnce({
+            status: "failed",
+            error: new Error("database write failed"),
+        });
+
+        await expect(setOwnedPluginSaveStorageItemWithOutcome(
+            "outcome-key",
+            { version: 1 },
+            "Outcome Plugin",
+        )).resolves.toMatchObject({
+            outcome: "unknown",
+            operation: "set",
+            code: "PLUGIN_STORAGE_INLINE_DURABILITY",
+            retryable: false,
+            commitOutcomeUnknown: true,
+        });
+        await expect(getPluginSaveStorageItem("outcome-key"))
+            .resolves.toEqual({ version: 1 });
+
+        await expect(setOwnedPluginSaveStorageItemWithOutcome(
+            "outcome-key",
+            { version: 2 },
+            "Outcome Plugin",
+        )).resolves.toMatchObject({
+            outcome: "committed",
+            operation: "set",
+        });
+
+        requestImmediateSave.mockResolvedValueOnce({ status: "displaced" });
+        await expect(removeOwnedPluginSaveStorageItemWithOutcome("outcome-key"))
+            .resolves.toMatchObject({
+                outcome: "unknown",
+                operation: "remove",
+                code: "PLUGIN_STORAGE_INLINE_DURABILITY",
+                retryable: false,
+                commitOutcomeUnknown: true,
+            });
+        await expect(getPluginSaveStorageItem("outcome-key")).resolves.toBeNull();
+    });
+
+    test("coalesces same-turn disjoint inline publications into one durable save", async () => {
+        const first = setPluginSaveStorageItem("first", 1);
+        const second = setPluginSaveStorageItem("second", 2);
+
+        await Promise.all([first, second]);
+
+        expect(requestImmediateSave).toHaveBeenCalledOnce();
+        expect(database.pluginCustomStorage).toMatchObject({ first: 1, second: 2 });
+    });
+
+    test("optimized set and remove keep their dedicated commit path", async () => {
+        database.optimizePluginMemory = true;
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "optimized");
+        persistent.set(valueKey, { version: 1 });
+        installOwnershipManifest("optimized-durability-generation", [valueKey], []);
+
+        await setPluginSaveStorageItem("optimized", { version: 2 });
+        await removePluginSaveStorageItem("optimized");
+
+        expect(requestImmediateSave).not.toHaveBeenCalled();
+        expect(persistent.has(valueKey)).toBe(false);
+    });
+
+    test("keeps optimized outcome writes on their existing acknowledgement path", async () => {
+        database.optimizePluginMemory = true;
+        installOwnershipManifest("optimized-outcome-generation", [], []);
+        const { mutatePersistentPluginStorage } = vi.mocked(
+            await import("../storage/persistentKv"),
+        );
+        mutatePersistentPluginStorage.mockRejectedValueOnce(Object.assign(
+            new Error("optimized acknowledgement lost"),
+            {
+                code: "COMMIT_OUTCOME_UNKNOWN",
+                operation: "set",
+                retryable: false,
+                commitOutcomeUnknown: true,
+            },
+        ));
+
+        await expect(setOwnedPluginSaveStorageItemWithOutcome(
+            "optimized-outcome",
+            { version: 1 },
+            "Outcome Plugin",
+        )).resolves.toMatchObject({
+            outcome: "unknown",
+            operation: "set",
+            code: "COMMIT_OUTCOME_UNKNOWN",
+            commitOutcomeUnknown: true,
+        });
+        await expect(setOwnedPluginSaveStorageItemWithOutcome(
+            "optimized-outcome",
+            { version: 2 },
+            "Outcome Plugin",
+        )).resolves.toMatchObject({
+            outcome: "committed",
+            operation: "set",
+        });
+        expect(requestImmediateSave).not.toHaveBeenCalled();
+    });
+
+    test("optimized mutation failures never fall through to the inline save path", async () => {
+        database.optimizePluginMemory = true;
+        const valueKey = encoded(PLUGIN_SAVE_PREFIX, "optimized");
+        const metaKey = encoded(PLUGIN_SAVE_META_PREFIX, "optimized");
+        persistent.set(valueKey, { version: 1 });
+        persistent.set(metaKey, { plugin: "Optimized", updatedAt: 1 });
+        installOwnershipManifest(
+            "optimized-failure-generation",
+            [valueKey],
+            [metaKey],
+        );
+        const {
+            commitPersistentPluginStorageMutation,
+            removePersistentPluginStoragePreservingOwner,
+            setPreparedPersistentPluginStoragePreservingOwner,
+        } = vi.mocked(await import("../storage/persistentKv"));
+
+        setPreparedPersistentPluginStoragePreservingOwner
+            .mockRejectedValueOnce(new Error("optimized set failed"));
+        await expect(setPluginSaveStorageItem("optimized", { version: 1 }))
+            .rejects.toThrow("optimized set failed");
+
+        removePersistentPluginStoragePreservingOwner
+            .mockRejectedValueOnce(new Error("optimized remove failed"));
+        await expect(removePluginSaveStorageItem("optimized"))
+            .rejects.toThrow("optimized remove failed");
+
+        commitPersistentPluginStorageMutation
+            .mockRejectedValueOnce(new Error("optimized clear failed"));
+        await expect(clearOwnedPluginSaveStorage())
+            .rejects.toThrow("optimized clear failed");
+
+        expect(requestImmediateSave).not.toHaveBeenCalled();
+        expect(persistent.get(valueKey)).toEqual({ version: 1 });
+    });
 });
 
 describe("AA3 versioned atomic plugin storage", () => {

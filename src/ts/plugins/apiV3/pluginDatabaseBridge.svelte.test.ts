@@ -60,10 +60,11 @@ vi.mock("../../globalApi.svelte", () => ({
     forageStorage: { realStorage: null },
     getFetchLogs: vi.fn(async () => []),
     globalFetch: unloadFinalizationMocks.globalFetch,
+    isImmediateDatabaseSaveReady: () => true,
     markCharacterDirty: dirtyTargetMocks.markCharacterDirty,
     markChatDirty: dirtyTargetMocks.markChatDirty,
     readImage: vi.fn(),
-    requestImmediateSave: vi.fn(),
+    requestImmediateSave: vi.fn(async () => ({ status: "committed" as const })),
     saveAsset: unloadFinalizationMocks.saveAsset,
     toGetter: (getter: () => unknown) => ({ get value() { return getter(); } }),
 }));

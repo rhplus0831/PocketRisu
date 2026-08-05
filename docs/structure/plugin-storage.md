@@ -184,6 +184,21 @@ An outcome of `unknown` means the request may already have committed. Never repl
 blindly. Re-read authoritative state, or reload when a generation/transition outcome
 cannot be proven.
 
+Inline (non-optimized) V3 mutations are durability-gated like their optimized
+counterparts: after the detached in-memory publication, set/remove, guarded batches,
+rewrites, viewer edits, and clears await a `requireDurable` database save and resolve —
+or report `committed` — only when that save commits. Concurrent inline publications
+coalesce into one shared save whose `requestImmediateSave()` call is provably issued
+after every joined publication. A non-committed save outcome raises
+`PLUGIN_STORAGE_INLINE_DURABILITY` with `commitOutcomeUnknown`, and the published
+memory state is deliberately not rolled back: the ordinary save loop keeps retrying
+it, so the honest public outcome is `unknown`, not `not-committed`. No-op inline
+removes and clears skip the flush. Writes made before `saveDb()` installs the save
+loop are the bounded boot-window exception — they resolve staged, and pre-tracking
+capture carries them into the first ordinary save; blocking there would deadlock
+because `loadPlugins()` precedes `saveDb()`. V2/V2.1 synchronous writes remain
+outside this gate by design.
+
 Current optimized versioned reads use `/api/plugin-storage/state/raw`. A present row is
 the exact stored byte sequence; headers carry either `json-v1` or `lossless-json-v1`
 plus its content type, byte length, SHA-256 content digest, opaque row
