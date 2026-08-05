@@ -58,6 +58,7 @@ import { recordConflictRebaseGraphBudget } from "./storage/conflictRebaseBudget"
 import { watchDatabaseDirtyRevisions } from "./storage/databaseDirtyRevisionTracker.svelte"
 import type { RisuSaveDirtyRevisions } from "./storage/databaseDirtyRevisions"
 import { StagedAckTracker } from "./storage/stagedAckTracker"
+import { SaveRetryScheduler } from "./storage/saveRetryScheduler"
 import {
     createRequestLogScope, recordRequestLog, fetchRequestLogs,
     type RequestLogCategory, type RequestLogSource, type RequestLogRoute,
@@ -425,6 +426,7 @@ export async function saveDb() {
             changed = true
         },
     })
+    const saveRetryScheduler = new SaveRetryScheduler()
     const claimWriterAccessLoss = () => {
         if (gotChannel) return false
         gotChannel = true
@@ -558,11 +560,24 @@ export async function saveDb() {
         )
     }
 
+    const hasQueuedDirtyState = () => (
+        hasTrackedChanges(changeTracker)
+        || !!databaseDirtyRevisionTracker?.ledger.hasDirty()
+    )
+
+    // A five-failure outage enters slow mode; reconnecting wakes the queued
+    // save immediately instead of waiting for the capped retry interval.
+    window.addEventListener('online', () => {
+        if (gotChannel) return
+        if (hasQueuedDirtyState() && saveRetryScheduler.expediteOnline()) {
+            changed = true
+        }
+    })
+
     setClientBuildDirtyStateProbe(() => (
         changed
         || saving.state
-        || hasTrackedChanges(changeTracker)
-        || !!databaseDirtyRevisionTracker?.ledger.hasDirty()
+        || hasQueuedDirtyState()
         || stagedAckTracker.hasStaged()
         || get(chatOperationActive)
     ))
@@ -1123,7 +1138,7 @@ export async function saveDb() {
                         conflictRebaseToSave,
                         revisionProposal,
                     )
-                    await sleep(Math.min(500 * (savetrys + 1), 3000))
+                    await sleep(saveRetryScheduler.conflictBackoffMs())
                     return chatPersistStage.completeStubCommit({
                         committed: false,
                         result: { status: 'retry' } as const,
@@ -1191,7 +1206,7 @@ export async function saveDb() {
                         conflictRebaseToSave,
                         revisionProposal,
                     )
-                    await sleep(Math.min(500 * (savetrys + 1), 3000))
+                    await sleep(saveRetryScheduler.conflictBackoffMs())
                     return chatPersistStage.completeStubCommit({
                         committed: false,
                         result: { status: 'retry' } as const,
@@ -1259,7 +1274,7 @@ export async function saveDb() {
                     stagedAckTracker.confirmAll()
                     if (revisionProposal) databaseDirtyRevisionTracker?.ledger.commit(revisionProposal)
                     revisionTrustReady = true
-                    savetrys = 0
+                    saveRetryScheduler.recordSuccess()
                     return { status: 'committed' }
                 } else if (result.status === 'saved') {
                     stagedAckTracker.recordStaged({
@@ -1278,7 +1293,7 @@ export async function saveDb() {
                         },
                     })
                     revisionTrustReady = true
-                    savetrys = 0
+                    saveRetryScheduler.recordSuccess()
                     if (options?.requireDurable) {
                         const confirmed = await stagedAckTracker.confirmNow()
                         if (!confirmed) {
@@ -1315,15 +1330,16 @@ export async function saveDb() {
                     databaseDirtyRevisionTracker?.ledger.discard(revisionProposal)
                 }
                 requeueTrackedChanges(toSave)
-                savetrys += 1
-                if (savetrys > 4) {
-                    alertError(error)
-                    savetrys = 0
-                }
-                else {
+                const retryPlan = saveRetryScheduler.recordFailure()
+                if (retryPlan.kind === 'quick') {
                     console.error(error)
-                    await sleep(Math.min(500 * savetrys, 3000))
+                    await sleep(retryPlan.delayMs)
                     changed = true
+                } else {
+                    if (retryPlan.alert) alertError(error)
+                    else console.error(error)
+                    // No sleep here: slow-mode pacing must not hold the save
+                    // coordinator. The idle-loop watchdog re-arms `changed`.
                 }
                 return { status: 'failed', error }
             } finally {
@@ -1367,11 +1383,18 @@ export async function saveDb() {
         },
     })
 
-    let savetrys = 0
     while (true) {
         if (!changed) {
-            await sleep(200)
-            continue
+            if (
+                !gotChannel
+                && hasQueuedDirtyState()
+                && saveRetryScheduler.shouldWakeIdleLoop()
+            ) {
+                changed = true
+            } else {
+                await sleep(200)
+                continue
+            }
         }
         changed = false
         if (requiresFullEncoderReload.state) {
