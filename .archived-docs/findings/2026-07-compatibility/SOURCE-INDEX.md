@@ -80,7 +80,7 @@ many users use that path.
 - [RISUSAVE block databases over 64 MiB were rejected (fixed 2026-07-30)](reports/legacy-risusave-64mib-import-cap.md)
 - [Large buffered backup/save-folder rows were rejected (fixed 2026-07-30)](reports/save-folder-opaque-row-32mib-cap.md)
 - [Save-folder restore had a fixed deadline (fixed 2026-07-30)](reports/save-folder-restore-fixed-deadline.md)
-- [Upstream export can emit a PocketRisu-only version byte](../../../docs/findings/open/plugin-storage/upstream-export-plugin-proto-header.md)
+- [Upstream export can emit a PocketRisu-only version byte](../2026-08-remediation/fixed/upstream-export-plugin-proto-header.md)
 
 ## Intentional deployment breaks
 

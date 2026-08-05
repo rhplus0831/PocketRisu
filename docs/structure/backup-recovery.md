@@ -109,6 +109,12 @@ therefore become unresolved. Use the normal Node export for PocketRisu restore. 
 accepts supported unencrypted upstream `.bin` data, not encrypted risuai.xyz account
 backups.
 
+Upstream decodes only the legacy version-7/8/9 and `RISUSAVE` block headers. A plugin
+key such as `__proto__` or ill-formed Unicode that requires PocketRisu's newer
+escape-aware save header makes the export fail with a definitive 409 before archive
+headers are published, exactly like the main target below; it is never mislabeled as
+upstream-compatible.
+
 #### PocketRisu main-target downgrade
 
 `target=main` is the supported non-destructive path for rolling a `serve` installation
