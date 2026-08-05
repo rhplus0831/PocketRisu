@@ -1333,6 +1333,210 @@ describe('NodeStorage availability bounds', () => {
         })
     })
 
+    it('returns globally ordered outcomes across bounded server requests', async () => {
+        const entries = Array.from({ length: 21 }, (_, index) => ({
+            key: `assets/example-${index}`,
+            value: new Uint8Array([index]),
+        }))
+        const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+            const requestEntries = JSON.parse(String(init?.body)) as Array<{ key: string }>
+            return new Response(JSON.stringify({
+                results: requestEntries.map((entry, index) => index === 10
+                    ? {
+                        index,
+                        key: entry.key,
+                        status: 'not-committed',
+                        reconciled: true,
+                        retryable: true,
+                        code: 'BULK_ENTRY_WRITE_FAILED',
+                    }
+                    : {
+                        index,
+                        key: entry.key,
+                        status: 'committed',
+                        changed: true,
+                        retryable: false,
+                    }),
+            }), {
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+            })
+        })
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+
+        const outcomes = await storage.setItems(entries)
+
+        expect(fetchMock).toHaveBeenCalledTimes(2)
+        expect(outcomes).toHaveLength(entries.length)
+        expect(outcomes[10]).toEqual({
+            index: 10,
+            key: entries[10].key,
+            status: 'not-committed',
+            reconciled: true,
+            retryable: true,
+            code: 'BULK_ENTRY_WRITE_FAILED',
+        })
+        expect(outcomes[20]).toMatchObject({
+            index: 20,
+            key: entries[20].key,
+            status: 'committed',
+        })
+    })
+
+    it('classifies a generic legacy bulk acknowledgement as outcome unknown', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+            success: true,
+            count: 1,
+        }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+        })))
+        const storage = readyStorage()
+
+        await expect(storage.setItems([{
+            key: 'assets/example',
+            value: new Uint8Array([1, 2, 3]),
+        }])).rejects.toMatchObject({
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            commitOutcomeUnknown: true,
+            retryable: false,
+            operation: 'write',
+        })
+    })
+
+    it.each([
+        ['malformed optional field', {
+            results: [{
+                index: 0,
+                key: 'assets/one',
+                status: 'committed',
+                changed: 'yes',
+                retryable: false,
+            }],
+        }],
+        ['contradictory committed fields', {
+            results: [{
+                index: 0,
+                key: 'assets/one',
+                status: 'committed',
+                changed: true,
+                reconciled: true,
+                retryable: false,
+            }],
+        }],
+        ['reordered results', {
+            results: [
+                {
+                    index: 1,
+                    key: 'assets/two',
+                    status: 'committed',
+                    changed: true,
+                    retryable: false,
+                },
+                {
+                    index: 0,
+                    key: 'assets/one',
+                    status: 'committed',
+                    changed: true,
+                    retryable: false,
+                },
+            ],
+        }],
+        ['incomplete results', {
+            results: [{
+                index: 0,
+                key: 'assets/one',
+                status: 'committed',
+                changed: true,
+                retryable: false,
+            }],
+        }],
+        ['extra response field', {
+            results: [{
+                index: 0,
+                key: 'assets/one',
+                status: 'committed',
+                changed: true,
+                retryable: false,
+            }],
+            success: true,
+        }],
+    ])('rejects %s in a bulk acknowledgement', async (_label, acknowledgement) => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(
+            JSON.stringify(acknowledgement),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+        )))
+        const storage = readyStorage()
+        const entries = acknowledgement.results.length === 2
+            || _label === 'incomplete results'
+            ? [
+                { key: 'assets/one', value: new Uint8Array([1]) },
+                { key: 'assets/two', value: new Uint8Array([2]) },
+            ]
+            : [{ key: 'assets/one', value: new Uint8Array([1]) }]
+
+        await expect(storage.setItems(entries)).rejects.toMatchObject({
+            name: 'BulkWriteError',
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            commitOutcomeUnknown: true,
+            outcomes: expect.arrayContaining([
+                expect.objectContaining({ status: 'unknown' }),
+            ]),
+        })
+    })
+
+    it('preserves prior chunk outcomes when the next response body is lost', async () => {
+        const entries = Array.from({ length: 21 }, (_, index) => ({
+            key: `assets/chunk-${index}`,
+            value: new Uint8Array([index]),
+        }))
+        let requests = 0
+        vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+            requests++
+            if (requests === 2) return new Response(null, { status: 200 })
+            const requestEntries = JSON.parse(String(init?.body)) as Array<{ key: string }>
+            return new Response(JSON.stringify({
+                results: requestEntries.map((entry, index) => ({
+                    index,
+                    key: entry.key,
+                    status: 'committed',
+                    changed: true,
+                    retryable: false,
+                })),
+            }), { status: 200, headers: { 'content-type': 'application/json' } })
+        }))
+        const storage = readyStorage()
+
+        await expect(storage.setItems(entries)).rejects.toMatchObject({
+            name: 'BulkWriteError',
+            code: 'COMMIT_OUTCOME_UNKNOWN',
+            outcomes: [
+                ...Array.from({ length: 20 }, (_, index) => expect.objectContaining({
+                    index,
+                    status: 'committed',
+                })),
+                expect.objectContaining({ index: 20, status: 'unknown' }),
+            ],
+        })
+    })
+
+    it('rejects duplicate keys before dispatching any bounded request', async () => {
+        const fetchMock = vi.fn()
+        vi.stubGlobal('fetch', fetchMock)
+        const storage = readyStorage()
+
+        await expect(storage.setItems([
+            { key: 'assets/duplicate', value: new Uint8Array([1]) },
+            { key: 'assets/duplicate', value: new Uint8Array([2]) },
+        ])).rejects.toMatchObject({
+            code: 'DUPLICATE_BULK_WRITE_KEY',
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        })
+        expect(fetchMock).not.toHaveBeenCalled()
+    })
+
     it('classifies a timed-out cleanup as commit-outcome unknown', async () => {
         vi.useFakeTimers()
         vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => undefined)))

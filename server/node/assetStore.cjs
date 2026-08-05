@@ -208,7 +208,8 @@ function createAssetStore(options = {}) {
         }
     }
 
-    function writeAssetFile(name, buffer) {
+    function writeAssetFile(name, buffer, options = {}) {
+        const { beforePublish = null, afterPublish = null } = options;
         const destination = assetPathFor(name);
         const data = Buffer.from(buffer);
         ensureAssetDir();
@@ -234,11 +235,13 @@ function createAssetStore(options = {}) {
             fsOps.closeSync(fd);
             fd = undefined;
 
+            if (beforePublish) beforePublish();
             fsOps.renameSync(tempPath, destination);
             tempPath = undefined;
 
             // Persist the directory-entry swap where the platform supports it.
             fsyncDirectory(assetDir);
+            if (afterPublish) afterPublish();
         } finally {
             if (fd !== undefined) {
                 try { fsOps.closeSync(fd); } catch {}
@@ -249,7 +252,7 @@ function createAssetStore(options = {}) {
         }
     }
 
-    function writeAssetFileIfChanged(name, buffer) {
+    function writeAssetFileIfChanged(name, buffer, options = {}) {
         const data = Buffer.from(buffer);
         if (assetFileSize(name) === data.length) {
             // Equal length is only a fast path: stale or corrupt files keep
@@ -257,7 +260,7 @@ function createAssetStore(options = {}) {
             const existing = readAssetFile(name);
             if (existing !== null && existing.equals(data)) return false;
         }
-        writeAssetFile(name, data);
+        writeAssetFile(name, data, options);
         return true;
     }
 

@@ -1148,6 +1148,42 @@ const pluginStorageMutationFailpoint = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_PLUGIN_MUTATION_FAILPOINT ?? '').trim()
     : '';
 
+// Test-only boundaries for the per-entry bulk-write contract. The suffix is
+// the zero-based request index, for example `before-asset-publish:1`.
+const bulkWriteFailpoints = new Set(process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_BULK_WRITE_FAILPOINT ?? '')
+        .split(',')
+        .map(value => value.trim())
+        .filter(Boolean)
+    : []);
+const bulkWriteTestGateDir = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_BULK_WRITE_GATE_DIR ?? '').trim()
+    : '';
+
+function hitBulkWriteFailpoint(boundary, index) {
+    if (!bulkWriteFailpoints.has(`${boundary}:${index}`)
+        && !bulkWriteFailpoints.has(`${boundary}:*`)) return;
+    const error = new Error(`Injected bulk write failure at ${boundary}:${index}`);
+    error.code = 'POCKETRISU_TEST_BULK_WRITE_FAILURE';
+    throw error;
+}
+
+async function waitAtBulkWriteValidationTestGate() {
+    if (!bulkWriteTestGateDir) return;
+    const holdPath = path.join(bulkWriteTestGateDir, 'hold');
+    if (!existsSync(holdPath)) return;
+    await fs.mkdir(bulkWriteTestGateDir, { recursive: true });
+    await fs.writeFile(
+        path.join(bulkWriteTestGateDir, 'entered'),
+        'before-queued-validation',
+        'utf-8',
+    );
+    const releasePath = path.join(bulkWriteTestGateDir, 'release');
+    while (existsSync(holdPath) && !existsSync(releasePath)) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+    }
+}
+
 // Test-only recovery transaction/acknowledgement boundaries. Both are after
 // snapshot validation; before-commit must roll back every publication row,
 // while response simulates an acknowledgement lost after COMMIT.
@@ -4543,18 +4579,31 @@ function verifyAssetHashForWrite(key, value) {
 }
 
 function writeAssetValue(key, value, options = {}) {
-    const { skipIfUnchanged = false, legacyHashMismatch = false } = options;
+    const {
+        skipIfUnchanged = false,
+        legacyHashMismatch = false,
+        publishHooks = {},
+        metadataHooks = {},
+    } = options;
     const name = assetNameForKey(key);
     if (name !== null && isSafeAssetName(name)) {
         if (legacyHashMismatch) markLegacyHashAsset(name);
         let wrote = true;
         if (skipIfUnchanged) {
-            wrote = writeAssetFileIfChanged(name, value);
+            wrote = writeAssetFileIfChanged(name, value, publishHooks);
         } else {
-            writeAssetFile(name, value);
+            writeAssetFile(name, value, publishHooks);
         }
         const verification = verifyAssetHash(key, value);
-        if (verification.ok) clearLegacyHashAsset(name);
+        if (verification.claimed !== null && verification.ok) {
+            if (metadataHooks.beforeLegacyHashClear) {
+                metadataHooks.beforeLegacyHashClear();
+            }
+            clearLegacyHashAsset(name);
+            if (metadataHooks.afterLegacyHashClear) {
+                metadataHooks.afterLegacyHashClear();
+            }
+        }
         // A crash between the file rename and this delete is harmless: reads
         // prefer the file, and the startup migration removes the duplicate.
         kvDel(key);
@@ -17324,15 +17373,73 @@ app.post('/api/assets/bulk-read', async (req, res, next) => {
     } catch(error){ next(error); }
 });
 
+function bulkWriteNotCommitted(body, { retryable = false } = {}) {
+    return {
+        ...body,
+        retryable,
+        commitOutcome: 'not-committed',
+        commitOutcomeUnknown: false,
+    };
+}
+
+function bulkWriteEntryMatchesAuthoritativeState(entry) {
+    const { key, buffer, verification } = entry;
+    const authoritative = key.startsWith('assets/')
+        ? readAssetValue(key)
+        : kvGet(key);
+    if (authoritative === null || !Buffer.from(authoritative).equals(buffer)) return false;
+
+    // A hash-named asset's legacy exemption is write-admission metadata, not
+    // auxiliary cleanup. Canonical bytes must clear it; a historical mismatch
+    // must retain it. Do not call a byte-only readback a committed entry when
+    // this invariant is inconsistent.
+    if (verification && verification.claimed !== null) {
+        const name = assetNameForKey(key);
+        const markedLegacy = name !== null && isLegacyHashAsset(name);
+        if (verification.ok && markedLegacy) return false;
+        if (verification.legacyHashMismatch && !markedLegacy) return false;
+    }
+    return true;
+}
+
 app.post('/api/assets/bulk-write', async (req, res, next) => {
     if(!await checkAuth(req, res)){ return; }
     if (!checkActiveSession(req, res)) return;
     try {
         const entries = req.body; // {key: string, value: base64}[]
         if(!Array.isArray(entries)){
-            res.status(400).send({ error: 'Body must be a JSON array of {key, value}' });
+            res.status(400).send(bulkWriteNotCommitted({
+                error: 'Body must be a JSON array of {key, value}',
+                code: 'INVALID_BULK_WRITE',
+            }));
             return;
         }
+        if (entries.some(entry => !entry
+            || typeof entry !== 'object'
+            || Array.isArray(entry)
+            || typeof entry.key !== 'string'
+            || typeof entry.value !== 'string')) {
+            res.status(400).json(bulkWriteNotCommitted({
+                error: 'Every bulk write entry must contain string key and value fields',
+                code: 'INVALID_BULK_WRITE_ENTRY',
+            }));
+            return;
+        }
+        const seenKeys = new Set();
+        const duplicateKeys = [];
+        for (const { key } of entries) {
+            if (seenKeys.has(key) && !duplicateKeys.includes(key)) duplicateKeys.push(key);
+            seenKeys.add(key);
+        }
+        if (duplicateKeys.length > 0) {
+            res.status(400).json(bulkWriteNotCommitted({
+                error: 'A bulk write cannot contain duplicate keys',
+                code: 'DUPLICATE_BULK_WRITE_KEY',
+                keys: duplicateKeys,
+            }));
+            return;
+        }
+
         const decodedEntries = entries.map(({ key, value }) => {
             const buffer = Buffer.from(value, 'base64');
             const verification = typeof key === 'string' && key.startsWith('assets/')
@@ -17340,6 +17447,35 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
                 : null;
             return { key, buffer, verification };
         });
+        for (const { key, buffer } of decodedEntries) {
+            if (!key.startsWith(PLUGIN_SAVE_PREFIX)
+                && !key.startsWith(PLUGIN_SAVE_META_PREFIX)) continue;
+            try {
+                assertArchiveSafePluginSaveStorageKey(key);
+            } catch (error) {
+                res.status(400).json(bulkWriteNotCommitted({
+                    error: error?.message || 'Invalid plugin storage key',
+                    code: 'invalid_plugin_storage_key',
+                }));
+                return;
+            }
+            try {
+                validatePluginStorageRow(key, buffer);
+            } catch (error) {
+                const diagnostic = logPluginStorageValidationFailure(
+                    '[PluginStorage] Rejected invalid bulk row write',
+                    error,
+                ) ?? {
+                    error: 'Invalid plugin storage JSON row',
+                    code: 'INVALID_PLUGIN_STORAGE_ROW',
+                    encodedKey: key.startsWith(PLUGIN_SAVE_META_PREFIX)
+                        ? PLUGIN_SAVE_META_PREFIX
+                        : PLUGIN_SAVE_PREFIX,
+                };
+                res.status(400).json(bulkWriteNotCommitted(diagnostic));
+                return;
+            }
+        }
         const mismatches = decodedEntries
             .filter((entry) => entry.verification
                 && !entry.verification.ok
@@ -17350,17 +17486,42 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
                 actual: entry.verification.actual,
             }));
         if (mismatches.length > 0) {
-            res.status(400).json({
+            res.status(400).json(bulkWriteNotCommitted({
                 error: 'asset content does not match its SHA-256 name',
+                code: 'ASSET_HASH_MISMATCH',
                 keys: mismatches.map((entry) => entry.key),
                 mismatches,
-            });
+            }));
             return;
         }
 
-        // One mutation for every batch: a partially-applied bulk write must not
-        // straddle the point where an import claims the barrier.
+        const results = [];
+
+        // Hold one queue slot for the whole request so an import cannot split
+        // its ordered outcomes. Entries deliberately commit independently:
+        // each write is idempotent and reports its own durable outcome.
         await queueStorageMutation(async () => {
+            await waitAtBulkWriteValidationTestGate();
+            const queuedMismatches = [];
+            for (const entry of decodedEntries) {
+                if (!entry.key.startsWith('assets/')) continue;
+                entry.verification = verifyAssetHashForWrite(entry.key, entry.buffer);
+                if (!entry.verification.ok && !entry.verification.legacyHashMismatch) {
+                    queuedMismatches.push({
+                        key: entry.key,
+                        expected: entry.verification.claimed,
+                        actual: entry.verification.actual,
+                    });
+                }
+            }
+            if (queuedMismatches.length > 0) {
+                return res.status(409).json(bulkWriteNotCommitted({
+                    error: 'Asset hash identity changed while the bulk write was queued',
+                    code: 'ASSET_HASH_STATE_CONFLICT',
+                    keys: queuedMismatches.map(entry => entry.key),
+                    mismatches: queuedMismatches,
+                }));
+            }
             const protectedEntries = decodedEntries.filter(({ key }) => (
                 key === 'database/database.bin'
                 || key === PLUGIN_STORAGE_MANIFEST_KEY
@@ -17368,7 +17529,6 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
             ));
             if (protectedEntries.length > 0) {
                 const publication = await readLivePluginStoragePublication();
-                const seenPluginKeys = new Set();
                 try {
                     for (const { key } of protectedEntries) {
                         if (key === 'database/database.bin') {
@@ -17376,40 +17536,97 @@ app.post('/api/assets/bulk-write', async (req, res, next) => {
                                 'database.bin cannot be changed through the bulk asset endpoint',
                             );
                         }
-                        if (seenPluginKeys.has(key)) {
-                            throw pluginStorageNamespaceConflict(
-                                'A bulk write cannot repeat a plugin storage row',
-                            );
-                        }
-                        seenPluginKeys.add(key);
                         assertGenericPluginStorageMutationAllowed(key, publication);
                     }
                 } catch (error) {
                     if (error?.pluginStorageNamespaceConflict) {
-                        return res.status(409).json({ error: error.message });
+                        return res.status(409).json(bulkWriteNotCommitted({
+                            error: error.message,
+                            code: 'PLUGIN_STORAGE_NAMESPACE_CONFLICT',
+                        }));
                     }
                     throw error;
                 }
             }
-            for(let i = 0; i < decodedEntries.length; i += BULK_BATCH){
-                const batch = decodedEntries.slice(i, i + BULK_BATCH);
-                const writeBatch = sqliteDb.transaction(() => {
-                    for(const { key, buffer, verification } of batch){
+            for (let index = 0; index < decodedEntries.length; index++) {
+                const { key, buffer, verification } = decodedEntries[index];
+                try {
+                    let changed = true;
+                    const writeEntry = sqliteDb.transaction(() => {
                         if (typeof key === 'string' && key.startsWith('assets/')) {
-                            writeAssetValue(key, buffer, {
+                            changed = writeAssetValue(key, buffer, {
                                 skipIfUnchanged: verification.claimed !== null,
                                 legacyHashMismatch: verification.legacyHashMismatch,
+                                publishHooks: {
+                                    beforePublish: () => hitBulkWriteFailpoint(
+                                        'before-asset-publish',
+                                        index,
+                                    ),
+                                    afterPublish: () => hitBulkWriteFailpoint(
+                                        'after-asset-publish',
+                                        index,
+                                    ),
+                                },
+                                metadataHooks: {
+                                    beforeLegacyHashClear: () => hitBulkWriteFailpoint(
+                                        'before-legacy-hash-clear',
+                                        index,
+                                    ),
+                                    afterLegacyHashClear: () => hitBulkWriteFailpoint(
+                                        'after-legacy-hash-clear',
+                                        index,
+                                    ),
+                                },
                             });
                         } else {
                             kvSet(key, buffer);
                         }
+                        hitBulkWriteFailpoint('before-sqlite-commit', index);
+                    });
+                    writeEntry();
+                    hitBulkWriteFailpoint('after-sqlite-commit', index);
+                    results.push({
+                        index,
+                        key,
+                        status: 'committed',
+                        changed,
+                        retryable: false,
+                    });
+                } catch (error) {
+                    let status = 'unknown';
+                    try {
+                        hitBulkWriteFailpoint('reconciliation-read', index);
+                        status = bulkWriteEntryMatchesAuthoritativeState(decodedEntries[index])
+                            ? 'committed'
+                            : 'not-committed';
+                    } catch (readError) {
+                        logger.error(
+                            `[BulkWrite] Could not reconcile entry ${index} (${String(key)}):`,
+                            readError,
+                        );
                     }
-                });
-                writeBatch();
+                    logger.warn(
+                        `[BulkWrite] Entry ${index} (${String(key)}) failed at a commit boundary; `
+                        + `reconciled as ${status}:`,
+                        error?.message || error,
+                    );
+                    results.push({
+                        index,
+                        key,
+                        status,
+                        reconciled: status !== 'unknown',
+                        retryable: status === 'not-committed',
+                        code: status === 'unknown'
+                            ? 'BULK_ENTRY_OUTCOME_UNKNOWN'
+                            : status === 'not-committed'
+                                ? 'BULK_ENTRY_WRITE_FAILED'
+                                : undefined,
+                    });
+                }
             }
         });
         if (res.headersSent) return;
-        res.json({ success: true, count: entries.length });
+        res.json({ results });
     } catch(error){
         if (isImportInProgressError(error)) return sendImportBusy(res);
         next(error);

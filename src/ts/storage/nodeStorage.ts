@@ -1581,9 +1581,102 @@ async function listCacheDelete(prefixes: readonly string[]): Promise<void> {
     }
 }
 
+export type BulkWriteEntryStatus = 'committed' | 'not-committed' | 'unknown'
+
+export interface BulkWriteEntryOutcome {
+    index: number
+    key: string
+    status: BulkWriteEntryStatus
+    changed?: boolean
+    reconciled?: boolean
+    retryable: boolean
+    code?: 'BULK_ENTRY_WRITE_FAILED'
+        | 'BULK_ENTRY_OUTCOME_UNKNOWN'
+        | 'BULK_ENTRY_REQUEST_REJECTED'
+        | 'BULK_ENTRY_NOT_DISPATCHED'
+}
+
+function hasOnlyBulkWriteKeys(
+    value: Record<string, unknown>,
+    allowed: readonly string[],
+): boolean {
+    const allowedKeys = new Set(allowed)
+    return Object.keys(value).every(key => allowedKeys.has(key))
+}
+
+function parseBulkWriteAcknowledgement(
+    acknowledgement: unknown,
+    entries: ReadonlyArray<{ key: string }>,
+): BulkWriteEntryOutcome[] | null {
+    if (!acknowledgement || typeof acknowledgement !== 'object'
+        || Array.isArray(acknowledgement)
+        || !hasOnlyBulkWriteKeys(acknowledgement as Record<string, unknown>, ['results'])
+        || !Array.isArray((acknowledgement as { results?: unknown }).results)) return null
+    const results = (acknowledgement as { results: unknown[] }).results
+    if (results.length !== entries.length) return null
+    const parsed: BulkWriteEntryOutcome[] = []
+    for (let index = 0; index < results.length; index++) {
+        const result = results[index]
+        if (!result || typeof result !== 'object') return null
+        const candidate = result as Record<string, unknown>
+        if (candidate.index !== index
+            || candidate.key !== entries[index].key
+            || (candidate.status !== 'committed'
+                && candidate.status !== 'not-committed'
+                && candidate.status !== 'unknown')
+            || typeof candidate.retryable !== 'boolean') return null
+        if (candidate.status === 'committed') {
+            const normalCommit = typeof candidate.changed === 'boolean'
+                && candidate.reconciled === undefined
+            const reconciledCommit = candidate.changed === undefined
+                && candidate.reconciled === true
+            if (!hasOnlyBulkWriteKeys(candidate, [
+                'index', 'key', 'status', 'changed', 'reconciled', 'retryable',
+            ])
+                || candidate.retryable !== false
+                || (!normalCommit && !reconciledCommit)) return null
+        } else if (candidate.status === 'not-committed') {
+            if (!hasOnlyBulkWriteKeys(candidate, [
+                'index', 'key', 'status', 'reconciled', 'retryable', 'code',
+            ])
+                || candidate.reconciled !== true
+                || candidate.retryable !== true
+                || candidate.code !== 'BULK_ENTRY_WRITE_FAILED') return null
+        } else if (!hasOnlyBulkWriteKeys(candidate, [
+            'index', 'key', 'status', 'reconciled', 'retryable', 'code',
+        ])
+            || candidate.reconciled !== false
+            || candidate.retryable !== false
+            || candidate.code !== 'BULK_ENTRY_OUTCOME_UNKNOWN') return null
+        parsed.push(candidate as unknown as BulkWriteEntryOutcome)
+    }
+    return parsed
+}
+
+export class BulkWriteError extends StorageError {
+    readonly outcomes: BulkWriteEntryOutcome[]
+
+    constructor(error: StorageError, outcomes: BulkWriteEntryOutcome[]) {
+        super(error.message, {
+            status: error.status,
+            code: error.code,
+            retryAfter: error.retryAfter,
+            retryable: error.retryable,
+            commitOutcomeUnknown: error.commitOutcomeUnknown,
+            commitOutcome: error.commitOutcome,
+            operation: error.operation,
+            limit: error.limit,
+            actual: error.actual,
+            cause: error,
+        })
+        this.name = 'BulkWriteError'
+        this.outcomes = outcomes
+    }
+}
+
 export class NodeStorage{
     private static readonly BULK_WRITE_CLIENT_BATCH = 20
-
+    private static readonly BULK_WRITE_CLIENT_MAX_JSON_BYTES = 90 * 1024 * 1024
     // Cross-device single-writer lock identity. Persisted in sessionStorage so
     // a reload or an OS tab restore of the SAME tab keeps the same identity —
     // a phone tab resurrected in the background must not look like a new
@@ -5558,51 +5651,156 @@ export class NodeStorage{
         }, 'read', AUTHORITATIVE_STORAGE_PAYLOAD_MAX_TIMEOUT_MS)
     }
 
-    async setItems(entries: {key: string, value: Uint8Array}[]) {
-        for (let i = 0; i < entries.length; i += NodeStorage.BULK_WRITE_CLIENT_BATCH) {
-            const batch = entries.slice(i, i + NodeStorage.BULK_WRITE_CLIENT_BATCH)
-            const body = batch.map(e => ({
-                key: e.key,
-                value: Buffer.from(e.value).toString('base64')
-            }))
-            const requestBody = JSON.stringify(body)
-            await runBoundedAuthoritativeStorageOperation(async (signal, outcome) => {
-                const da = await this.authFetch('/api/assets/bulk-write', {
-                    method: 'POST',
-                    body: requestBody,
-                    headers: {
-                        'content-type': 'application/json'
+    async setItems(
+        entries: {key: string, value: Uint8Array}[],
+    ): Promise<BulkWriteEntryOutcome[]> {
+        if (entries.length === 0) return []
+        const seenKeys = new Set<string>()
+        for (const entry of entries) {
+            if (seenKeys.has(entry.key)) {
+                throw new StorageError('Bulk asset writes cannot contain duplicate keys.', {
+                    code: 'DUPLICATE_BULK_WRITE_KEY',
+                    retryable: false,
+                    commitOutcome: 'not-committed',
+                    commitOutcomeUnknown: false,
+                    operation: 'write',
+                })
+            }
+            seenKeys.add(entry.key)
+        }
+
+        const body = entries.map((e, index) => ({
+            index,
+            key: e.key,
+            value: Buffer.from(e.value).toString('base64')
+        }))
+        const chunks: Array<{
+            start: number
+            body: Array<{ index: number; key: string; value: string }>
+            requestBody: string
+        }> = []
+        for (let offset = 0; offset < body.length;) {
+            let chunk = body.slice(offset, offset + NodeStorage.BULK_WRITE_CLIENT_BATCH)
+            let requestBody = JSON.stringify(chunk.map(({ key, value }) => ({ key, value })))
+            while (chunk.length > 1
+                && new TextEncoder().encode(requestBody).byteLength
+                    > NodeStorage.BULK_WRITE_CLIENT_MAX_JSON_BYTES) {
+                chunk = chunk.slice(0, Math.ceil(chunk.length / 2))
+                requestBody = JSON.stringify(chunk.map(({ key, value }) => ({ key, value })))
+            }
+            const requestBytes = new TextEncoder().encode(requestBody).byteLength
+            if (requestBytes > NodeStorage.BULK_WRITE_CLIENT_MAX_JSON_BYTES) {
+                const error = new StorageError(
+                    'A bulk asset entry exceeds the bounded JSON request limit.',
+                    {
+                        code: 'BULK_WRITE_ENTRY_TOO_LARGE',
+                        retryable: false,
+                        commitOutcome: 'not-committed',
+                        commitOutcomeUnknown: false,
+                        operation: 'write',
+                        limit: NodeStorage.BULK_WRITE_CLIENT_MAX_JSON_BYTES,
+                        actual: requestBytes,
                     },
-                    signal,
-                }, true, outcome)
-                outcome.markRequestDispatched()
-                if (da.status < 200 || da.status >= 300) {
-                    const storageError = await this.parseStorageFailureResponse(
-                        da,
-                        'write',
-                        true,
-                        signal,
-                    )
-                    if (!storageError.commitOutcomeUnknown) outcome.markDefinitiveResponse()
-                    throw storageError
-                }
-                const acknowledgement = await awaitWithAbort(da.json(), signal) as unknown
-                if (!acknowledgement || typeof acknowledgement !== 'object'
-                    || (acknowledgement as any).success !== true
-                    || (acknowledgement as any).count !== batch.length) {
-                    throw new StorageError('Bulk asset write returned an invalid acknowledgement.', {
-                        status: da.status,
+                )
+                throw new BulkWriteError(error, entries.map((entry, index) => ({
+                    index,
+                    key: entry.key,
+                    status: 'not-committed',
+                    reconciled: true,
+                    retryable: false,
+                    code: 'BULK_ENTRY_NOT_DISPATCHED',
+                })))
+            }
+            chunks.push({ start: offset, body: chunk, requestBody })
+            offset += chunk.length
+        }
+
+        const outcomes: BulkWriteEntryOutcome[] = []
+        for (const chunk of chunks) {
+            try {
+                const localEntries = chunk.body.map(({ key }) => ({ key }))
+                const localResults = await runBoundedAuthoritativeStorageOperation(
+                    async (signal, outcome) => {
+                        const da = await this.authFetch('/api/assets/bulk-write', {
+                            method: 'POST',
+                            body: chunk.requestBody,
+                            headers: { 'content-type': 'application/json' },
+                            signal,
+                        }, true, outcome)
+                        outcome.markRequestDispatched()
+                        if (da.status < 200 || da.status >= 300) {
+                            const storageError = await this.parseStorageFailureResponse(
+                                da,
+                                'write',
+                                true,
+                                signal,
+                            )
+                            if (!storageError.commitOutcomeUnknown) {
+                                outcome.markDefinitiveResponse()
+                            }
+                            throw storageError
+                        }
+                        const acknowledgement = await awaitWithAbort(da.json(), signal) as unknown
+                        const results = parseBulkWriteAcknowledgement(
+                            acknowledgement,
+                            localEntries,
+                        )
+                        if (!results) {
+                            throw new StorageError(
+                                'Bulk asset write returned an invalid acknowledgement.',
+                                {
+                                    status: da.status,
+                                    code: 'COMMIT_OUTCOME_UNKNOWN',
+                                    retryable: false,
+                                    commitOutcome: 'unknown',
+                                    commitOutcomeUnknown: true,
+                                    operation: 'write',
+                                },
+                            )
+                        }
+                        outcome.markDefinitiveResponse()
+                        return results
+                    },
+                    'write',
+                    authoritativeStoragePayloadTimeoutMs(
+                        new TextEncoder().encode(chunk.requestBody).byteLength,
+                    ),
+                )
+                outcomes.push(...localResults.map((result, localIndex) => ({
+                    ...result,
+                    index: chunk.start + localIndex,
+                })))
+            } catch (error) {
+                const storageError = error instanceof StorageError
+                    ? error
+                    : new StorageError(getThrownMessage(error, 'Bulk asset write failed.'), {
                         code: 'COMMIT_OUTCOME_UNKNOWN',
                         retryable: false,
+                        commitOutcome: 'unknown',
                         commitOutcomeUnknown: true,
                         operation: 'write',
+                        cause: error,
+                    })
+                for (let index = chunk.start; index < entries.length; index++) {
+                    const inFailedChunk = index < chunk.start + chunk.body.length
+                    const unknown = inFailedChunk && storageError.commitOutcomeUnknown
+                    outcomes.push({
+                        index,
+                        key: entries[index].key,
+                        status: unknown ? 'unknown' : 'not-committed',
+                        reconciled: !unknown,
+                        retryable: inFailedChunk && storageError.retryable,
+                        code: unknown
+                            ? 'BULK_ENTRY_OUTCOME_UNKNOWN'
+                            : inFailedChunk
+                                ? 'BULK_ENTRY_REQUEST_REJECTED'
+                                : 'BULK_ENTRY_NOT_DISPATCHED',
                     })
                 }
-                outcome.markDefinitiveResponse()
-            }, 'write', authoritativeStoragePayloadTimeoutMs(
-                new TextEncoder().encode(requestBody).byteLength,
-            ))
+                throw new BulkWriteError(storageError, outcomes)
+            }
         }
+        return outcomes
     }
 
     async exportBackup(

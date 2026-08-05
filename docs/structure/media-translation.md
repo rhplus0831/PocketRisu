@@ -187,7 +187,10 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 
   - `setItem`, `getItem`, `keys`, and `removeItem` use `/api/write`, `/api/read`,
     `/api/list`, and `/api/remove`; `getItems()` and `setItems()` use the bulk asset
-    endpoints.
+    endpoints. `setItems()` uses bounded requests and returns globally ordered per-entry
+    `committed`/`not-committed`/`unknown` outcomes. A later request failure carries the
+    already-known outcomes on `BulkWriteError`; a lost or invalid acknowledgement marks
+    only the dispatched request unknown and marks later entries not dispatched.
   - `NodeStorage.initSession()` establishes the cookie required for direct `<img>`,
     `<audio>`, and `<video>` URLs.
 
@@ -209,7 +212,10 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
     `/api/remove` path applies the same reference guard to inlays.
   - `/api/read`, `/api/remove`, `/api/list`, and `/api/write` special-case physical inlay
     payloads and sidecars. `/api/assets/bulk-read` and `/api/assets/bulk-write` support
-    batched metadata/KV access; `/api/inlays/compress` streams WebP recompression progress.
+    batched metadata/KV access. Bulk writes reject duplicates and invalid reserved rows
+    before mutation, revalidate state-dependent legacy exemptions in the queue, commit
+    idempotently per entry, and return ordered durable outcomes;
+    `/api/inlays/compress` streams WebP recompression progress.
 
 - `server/node/db.cjs` — SQLite KV implementation.
 

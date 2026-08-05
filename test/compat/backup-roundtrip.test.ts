@@ -558,7 +558,24 @@ describe('asset upload hash verification', () => {
       ]),
     })
     expect(bulkWrite.status).toBe(200)
-    expect(await bulkWrite.json()).toEqual({ success: true, count: 2 })
+    expect(await bulkWrite.json()).toEqual({
+      results: [
+        {
+          index: 0,
+          key: legacyKey,
+          status: 'committed',
+          changed: true,
+          retryable: false,
+        },
+        {
+          index: 1,
+          key: 'assets/ordinary.png',
+          status: 'committed',
+          changed: true,
+          retryable: false,
+        },
+      ],
+    })
     expect(await readFile(path.join(srv.cwd, 'save', 'assets', legacyName)))
       .toEqual(bulkReplacement)
     expect(await readFile(path.join(srv.cwd, 'save', 'assets', 'ordinary.png')))

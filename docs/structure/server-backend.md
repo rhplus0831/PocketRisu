@@ -483,6 +483,26 @@ plan.
 #### Assets and inlays
 
 - Ordinary assets are filesystem files in `save/assets/` when the key's basename is a safe filename (`server/node/assetStore.cjs`); unsafe names stay as raw `assets/*` KV rows, and so do names the portable-identity preflight rejects — Windows-reserved basenames, trailing dots, and groups that collide under `portableAssetNameKey()` case folding (the startup migration skips every member of a colliding group; backup/save-folder imports demote an already-staged file when a colliding entry arrives). Reads/lists/stats/backups merge both sources. Writes are fsynced temp-file + rename (never in place — files may be hardlinked across instances by `scripts/dedup-assets.sh`). A same-size destination is skipped only after byte comparison, so migration and a valid re-upload repair equal-length corruption. Uploads whose name matches `assets/<64-hex>.<ext>` are SHA-256-verified on `/api/write` and `/api/assets/bulk-write`. Historical mismatches accepted by main are explicitly marked under `save/assets/.legacy-hash-assets/`; only marked keys may retain mismatched bytes, and writing canonical bytes clears the exemption. Backup/save-folder imports classify mismatches during staging, while a bounded one-time scan (`.legacy_hash_identity_v1`) backfills files migrated by older builds. The original safe-row migration marker remains `save/assets/.migrated_to_fs`.
+- `/api/assets/bulk-write` rejects malformed entries, every duplicate key, hash mismatch,
+  invalid reserved plugin row/key/payload, and protected plugin/database namespace before
+  the first mutation. Because legacy hash exemptions are state-dependent, it revalidates
+  them after acquiring its one storage-queue/import-barrier slot. It then commits each
+  ordered entry as an independent idempotent set. Its acknowledgement is `{results}`
+  rather than batch success/failure: every input index is `committed`, `not-committed`, or
+  `unknown`. If a filesystem or SQLite boundary throws, the server rereads that key's
+  authoritative filesystem/KV value and reports the reconciled durable outcome; only an
+  unreadable value remains `unknown`. For hash-shaped assets, the legacy-exemption marker
+  is part of that authoritative invariant: canonical bytes with a retained marker are
+  `not-committed` and safely retryable. The SQLite shadow-row/deletion-journal cleanup is
+  auxiliary after a durable file rename—reads, listings, exports, and restart prefer the
+  file—so rollback of that cleanup does not contradict `committed`.
+- `NodeStorage.setItems()` keeps requests below both 20 entries and 90 MiB of JSON, maps
+  each response back to global input indexes, and returns the aggregate outcomes. A later
+  request failure throws `BulkWriteError` with the full known prefix, per-entry `unknown`
+  statuses for an acknowledgement-lost request, and `not-committed` statuses for entries
+  never dispatched. Its acknowledgement parser requires the exact response/result schema;
+  malformed, reordered, incomplete, contradictory, or body-lost responses remain
+  `COMMIT_OUTCOME_UNKNOWN` instead of collapsing prior outcomes into generic failure.
 - Inlays are migrated from legacy `inlay/*` KV JSON to `save/inlays/<id>.<ext>` plus a
   sidecar by `migrateInlaysToFilesystem()`.
 - `writeInlayFile()` stages and fsyncs both payload and sidecar, atomically renames and
@@ -611,7 +631,7 @@ are sent to the ordinary application log; it adds no provider API.
 | Durable model requests | `POST /api/model-jobs`; filtered active/unclaimed `GET /api/model-jobs`; `GET /api/model-jobs/:id` and `.../stream`; claim and delete routes; plus create/list/delete/atomic-claim routes under `/api/pending-sends`. | Model-preset job transport and `src/ts/process/request/jobRecovery.ts`. |
 | Key/value storage | `GET /api/read`, raw recovery `GET /api/db/read-raw-for-boot`, segmented `POST /api/db/read-cached`, create-only `POST /api/db/create-if-absent`, `GET /api/remove`, full/delta `GET /api/list`, `POST /api/write`, `POST /api/patch`, and cookie-authenticated `POST /api/db/flush`. | `NodeStorage`, bootstrap, and the save loop. |
 | Plugin storage | Boot reconcile; proof-bound recovery inspection/download/resolve; state, viewer-page, manifest, mutate, batch, clear, capacity/size; consolidated `/api/plugin-storage/transition/bulk`; and staged begin/upload/row/status/finalize/abort routes. Manifest reads in `state` mode explicitly send `Cache-Control: no-store`. The retired direct `/api/plugin-storage/transition` remains registered only as a pre-body `426 CLIENT_UPGRADE_REQUIRED` rejection. Generic KV routes guard the reserved publication roots. | `NodeStorage`, `persistentKv.ts`, `pluginSaveStorage.ts`, bootstrap, and Plugin Settings/Viewer. |
-| Asset serving/bulk | `GET /api/asset/:hexKey`, `POST /api/assets/bulk-read`, `POST /api/assets/bulk-write`, and maintenance `POST /api/assets/cleanup`. | Direct URLs from `src/ts/globalApi.svelte.ts`; bulk methods and System dashboard. |
+| Asset serving/bulk | `GET /api/asset/:hexKey`, `POST /api/assets/bulk-read`, ordered per-entry/idempotent `POST /api/assets/bulk-write`, and maintenance `POST /api/assets/cleanup`. | Direct URLs from `src/ts/globalApi.svelte.ts`; bulk methods and System dashboard. |
 | Diagnostic logs | `POST /api/logs` ingests client batches, `GET /api/logs` filters/paginates, and writer-guarded `DELETE /api/logs` clears. | Batch uploader in `src/ts/log.ts`; settings queries in `SystemSettings.svelte`. |
 | Provider request logs | `POST/GET /api/request-logs`, `GET /api/request-logs/usage`, `/stats`, and `/:id`, plus writer-guarded `DELETE /api/request-logs` with optional usage deletion. See [request logging and observability](#request-logging-and-observability). | `src/ts/requestLog.ts` and request-log/statistics settings UI. |
 | Portable backup | Strict full/upstream/main `GET /api/backup/export`, bounded import preparation/streaming, and cancellable partial-export job create/status/delete/download routes under `/api/backup/export/jobs`. | `NodeStorage` and `backuplocal.ts`; see [Backup and recovery](backup-recovery.md). |
