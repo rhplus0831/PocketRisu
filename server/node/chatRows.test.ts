@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { createHash } from 'node:crypto'
 import chatRowsPkg from './chatRows.cjs'
@@ -64,8 +64,16 @@ interface ChatRowStore {
     deleteRemovedChatRows: (oldStrippedDb: any, newStrippedDb: any) => number
     sweepOrphanChatRows: (
         strippedDb: any,
-        opts?: { now?: number; graceMs?: number },
-    ) => { deleted: number; skippedRecent: number }
+        opts?: {
+            now?: number
+            graceMs?: number
+            capturePreImage?: (identity: {
+                chaId: string
+                chatId: string
+                key: string
+            }) => Promise<string> | string
+        },
+    ) => Promise<{ deleted: number; skippedRecent: number; skippedPreImage: number }>
     splitFullDb: (dbObj: any) => {
         strippedDb: any
         chatEntries: Array<{ chaId: string; chatId: string; chat: any }>
@@ -886,14 +894,20 @@ describe('chat row orphan deletion', () => {
         setUpdatedAt.run(now - 2 * hour, store.chatRowKey('char', 'old-orphan'))
         setUpdatedAt.run(now - 30 * 60 * 1000, store.chatRowKey('char', 'recent-orphan'))
 
-        const result = store.sweepOrphanChatRows({
+        const capturePreImage = vi.fn(async () => 'captured')
+        const result = await store.sweepOrphanChatRows({
             characters: [{
                 chaId: 'char',
                 chats: [{ id: 'referenced', _stub: true }],
             }],
-        }, { now, graceMs: hour })
+        }, { now, graceMs: hour, capturePreImage })
 
-        expect(result).toEqual({ deleted: 1, skippedRecent: 1 })
+        expect(result).toEqual({ deleted: 1, skippedRecent: 1, skippedPreImage: 0 })
+        expect(capturePreImage).toHaveBeenCalledWith({
+            chaId: 'char',
+            chatId: 'old-orphan',
+            key: store.chatRowKey('char', 'old-orphan'),
+        })
         expect(await store.readChatRow('char', 'referenced')).not.toBeNull()
         expect(await store.readChatRow('char', 'old-orphan')).toBeNull()
         expect(await store.readChatRow('char', 'recent-orphan')).not.toBeNull()

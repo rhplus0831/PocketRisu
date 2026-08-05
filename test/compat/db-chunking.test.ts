@@ -87,6 +87,57 @@ function hugeChatDbBlob(): Buffer {
   return Buffer.concat([MAGIC_RAW, packr.encode(database)])
 }
 const DB_BLOB_HEX = Buffer.from('database/database.bin', 'utf-8').toString('hex')
+
+async function seedOrphanSweepRows(
+  client: RisuClient,
+  srv: ServerHandle,
+): Promise<{ sqlitePath: string; oldOrphanBytes: Buffer }> {
+  const strippedDb = {
+    characters: [{ chaId: 'gc-char', name: 'GC', chats: [] }],
+    apiType: 'openai',
+    personas: [],
+    botPresets: [],
+    botPresetsId: 0,
+    selectedCharacter: 0,
+  }
+  const write = await client.fetch('/api/write', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'file-path': DB_BLOB_HEX,
+    },
+    body: new Uint8Array(Buffer.concat([MAGIC_RAW, packr.encode(strippedDb)])),
+  })
+  expect(write.status).toBe(200)
+
+  let oldOrphanBytes = Buffer.alloc(0)
+  for (const chatId of ['old-orphan', 'recent-orphan']) {
+    const chat = {
+      id: chatId,
+      name: chatId,
+      message: [{ role: 'user', data: chatId }],
+    }
+    const chatBytes = Buffer.concat([MAGIC_RAW, packr.encode(chat)])
+    if (chatId === 'old-orphan') oldOrphanBytes = chatBytes
+    const post = await client.fetch('/api/chat-content/gc-char/0', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-chat-id': chatId,
+      },
+      body: new Uint8Array(chatBytes),
+    })
+    expect(post.status).toBe(200)
+  }
+
+  const sqlitePath = path.join(srv.cwd, 'save', 'risuai.db')
+  const db = new Database(sqlitePath)
+  db.prepare("UPDATE kv SET updated_at = ? WHERE key = 'chats/gc-char/old-orphan'")
+    .run(Date.now() - 2 * 60 * 60 * 1000)
+  db.close()
+  return { sqlitePath, oldOrphanBytes }
+}
+
 function saveFolderZip(blob: Buffer): Buffer {
   return Buffer.from(zipSync({ [DB_BLOB_HEX]: new Uint8Array(blob) }))
 }
@@ -363,56 +414,19 @@ describe('chunking lifecycle (real server, low threshold)', () => {
     expect(typeof body.chunksReclaimed).toBe('number')
     expect(typeof body.orphanChatRowsDeleted).toBe('number')
     expect(typeof body.orphanChatRowsSkippedRecent).toBe('number')
+    expect(typeof body.orphanChatRowsSkippedPreImage).toBe('number')
   })
 
-  test('optimize sweeps old orphan chat rows but preserves recent transient rows', async () => {
+  test('optimize backs up and sweeps old orphan chat rows but preserves recent transient rows', async () => {
     const { client, srv } = await boot()
-    const strippedDb = {
-      characters: [{ chaId: 'gc-char', name: 'GC', chats: [] }],
-      apiType: 'openai',
-      personas: [],
-      botPresets: [],
-      botPresetsId: 0,
-      selectedCharacter: 0,
-    }
-    const write = await client.fetch('/api/write', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/octet-stream',
-        'file-path': DB_BLOB_HEX,
-      },
-      body: new Uint8Array(Buffer.concat([MAGIC_RAW, packr.encode(strippedDb)])),
-    })
-    expect(write.status).toBe(200)
-
-    for (const chatId of ['old-orphan', 'recent-orphan']) {
-      const chat = {
-        id: chatId,
-        name: chatId,
-        message: [{ role: 'user', data: chatId }],
-      }
-      const post = await client.fetch('/api/chat-content/gc-char/0', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/octet-stream',
-          'x-chat-id': chatId,
-        },
-        body: new Uint8Array(Buffer.concat([MAGIC_RAW, packr.encode(chat)])),
-      })
-      expect(post.status).toBe(200)
-    }
-
-    const sqlitePath = path.join(srv.cwd, 'save', 'risuai.db')
-    const db = new Database(sqlitePath)
-    db.prepare("UPDATE kv SET updated_at = ? WHERE key = 'chats/gc-char/old-orphan'")
-      .run(Date.now() - 2 * 60 * 60 * 1000)
-    db.close()
+    const { sqlitePath, oldOrphanBytes } = await seedOrphanSweepRows(client, srv)
 
     const optimize = await client.fetch('/api/db/optimize', { method: 'POST' })
     expect(optimize.status).toBe(200)
     const result = await optimize.json()
     expect(result.orphanChatRowsDeleted).toBe(1)
     expect(result.orphanChatRowsSkippedRecent).toBe(1)
+    expect(result.orphanChatRowsSkippedPreImage).toBe(0)
 
     const verifyDb = new Database(sqlitePath, { readonly: true })
     const remaining = verifyDb.prepare("SELECT key FROM kv WHERE key LIKE 'chats/%' ORDER BY key")
@@ -420,6 +434,52 @@ describe('chunking lifecycle (real server, low threshold)', () => {
       .map((row: any) => row.key)
     verifyDb.close()
     expect(remaining).toEqual(['chats/gc-char/recent-orphan'])
+
+    const historyResponse = await client.fetch('/api/chat-backups/gc-char/old-orphan')
+    expect(historyResponse.status).toBe(200)
+    const history = await historyResponse.json() as {
+      versions: Array<{ versionId: string; reason: string; size: number }>
+    }
+    expect(history.versions).toHaveLength(1)
+    expect(history.versions[0]).toMatchObject({
+      reason: 'orphan-sweep',
+      size: oldOrphanBytes.length,
+    })
+    const versionResponse = await client.fetch(
+      `/api/chat-backups/gc-char/old-orphan/${history.versions[0].versionId}`,
+    )
+    expect(versionResponse.status).toBe(200)
+    expect(Buffer.from(await versionResponse.arrayBuffer())).toEqual(oldOrphanBytes)
+  })
+
+  test('optimize leaves an old orphan row when its required pre-image cannot be captured', async () => {
+    const srv = await spawnServer({
+      env: {
+        ...CHUNK_ENV,
+        POCKETRISU_CHAT_BACKUP_DIR: 'save/chat-backups-blocked',
+      },
+      seedSave: saveDir => writeFile(
+        path.join(saveDir, 'chat-backups-blocked'),
+        'not a directory',
+      ),
+    })
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const { sqlitePath } = await seedOrphanSweepRows(client, srv)
+
+    const optimize = await client.fetch('/api/db/optimize', { method: 'POST' })
+    expect(optimize.status).toBe(200)
+    const result = await optimize.json()
+    expect(result.orphanChatRowsDeleted).toBe(0)
+    expect(result.orphanChatRowsSkippedRecent).toBe(1)
+    expect(result.orphanChatRowsSkippedPreImage).toBe(1)
+
+    const verifyDb = new Database(sqlitePath, { readonly: true })
+    const oldOrphan = verifyDb.prepare(
+      "SELECT value FROM kv WHERE key = 'chats/gc-char/old-orphan'",
+    ).get()
+    verifyDb.close()
+    expect(oldOrphan).toBeDefined()
   })
 
   // The two save-folder import paths were where the raw-bind regressions hid.

@@ -15,6 +15,7 @@ export interface DuplicateChatId {
 // The server throttles chat pre-image backups to 45s per chat, so 20s client
 // checkpoints improve crash durability without creating a backup per fragment.
 export const CHECKPOINT_INTERVAL_MS = 20_000
+export const MAX_CHAT_PERSIST_DISCOVERY_ITERATIONS = 10
 
 export function chatPersistKey(chaId: string, chatId: string): string {
     return `${chaId}|${chatId}`
@@ -151,6 +152,39 @@ export function collectChatsToPersist(
 }
 
 /**
+ * Find full chat bodies in the live graph that have no durable row proof.
+ */
+export function rediscoverUnbackedFullChats(
+    db: Pick<Database, 'characters'>,
+    knownChatIdsByCharacter: Map<string, Set<string>>,
+    durableChatKeys: ReadonlySet<string>,
+): ChatPersistId[] {
+    const unbackedChats: ChatPersistId[] = []
+    const seen = new Set<string>()
+
+    for (const character of db.characters ?? []) {
+        const chaId = character?.chaId
+        if (!chaId) continue
+        const knownChatIds = knownChatIdsByCharacter.get(chaId) ?? new Set<string>()
+
+        for (const chat of character.chats ?? []) {
+            const chatId = chat?.id
+            if (!chatId || chat._placeholder || !Array.isArray(chat.message)) {
+                // A real wire stub has no body. Writing it as a row would replace
+                // the authoritative row with metadata-only content.
+                continue
+            }
+            const key = chatPersistKey(chaId, chatId)
+            if (seen.has(key) || knownChatIds.has(chatId) || durableChatKeys.has(key)) continue
+            seen.add(key)
+            unbackedChats.push([chaId, chatId])
+        }
+    }
+
+    return unbackedChats
+}
+
+/**
  * Update the discovery baseline only after database.bin has committed.
  *
  * A chat can enter the known set only if it was already known (and still
@@ -236,6 +270,7 @@ export interface ChatPersistStageOptions<T> extends ChatRowPersistStageOptions {
 }
 
 export interface PreparedChatPersistStage {
+    durableChatKeys: ReadonlySet<string>
     completeStubCommit: <T>(commitResult: StubCommitResult<T>) => T
 }
 
@@ -252,60 +287,84 @@ export async function prepareChatPersistStage(
         throw new DuplicateChatIdError(duplicateChatIds)
     }
 
-    const chatsToPersist = collectChatsToPersist(
+    let chatsToPersist = collectChatsToPersist(
         options.db,
         options.toSave,
         options.knownChatIdsByCharacter,
     )
     const isThrottledGenerationSave = options.doingChat && !options.forceChatPersist
-    if (isThrottledGenerationSave) {
-        // Keep every candidate dirty so the true -> false transition writes
-        // the authoritative final response even after successful checkpoints.
-        options.requeueChats(chatsToPersist)
-    }
-
     const now = options.now ?? Date.now
     const durableChats: ChatPersistId[] = []
-    const failedChats: ChatPersistId[] = []
-
-    for (const [chaId, chatId] of chatsToPersist) {
-        const char = options.db.characters.find(character => character?.chaId === chaId)
-        if (!char) continue
-        const chatIndex = char.chats.findIndex(chat => chat?.id === chatId)
-        if (chatIndex === -1) continue
-        const chat = char.chats[chatIndex]
-        // Placeholders carry no authoritative content; their server row was
-        // established before hydration and is represented by the known set.
-        if (!chat || chat._placeholder) continue
-
+    const durableChatKeys = new Set<string>()
+    const markDurable = (chaId: string, chatId: string) => {
         const key = chatPersistKey(chaId, chatId)
-        const lastCheckpointMs = options.generationCheckpoints.get(key)
-        const shouldWrite = !isThrottledGenerationSave
-            || lastCheckpointMs === undefined
-            || now() - lastCheckpointMs >= CHECKPOINT_INTERVAL_MS
-
-        if (!shouldWrite) {
-            // A checkpoint entry is explicit proof that this row was written
-            // successfully earlier in the same generation.
-            durableChats.push([chaId, chatId])
-            continue
-        }
-
-        try {
-            await options.saveChat(chaId, chatIndex, chatId, chat)
-            options.generationCheckpoints.set(key, now())
-            durableChats.push([chaId, chatId])
-        } catch (error) {
-            options.onRowWriteFailure?.(chaId, chatId, error)
-            failedChats.push([chaId, chatId])
-        }
+        if (durableChatKeys.has(key)) return
+        durableChatKeys.add(key)
+        durableChats.push([chaId, chatId])
     }
 
-    if (failedChats.length > 0) {
-        throw new ChatRowPersistError(failedChats)
+    let discoveryIterations = 0
+    while (true) {
+        if (chatsToPersist.length > 0) {
+            if (discoveryIterations >= MAX_CHAT_PERSIST_DISCOVERY_ITERATIONS) {
+                options.requeueChats(chatsToPersist)
+                throw new ChatRowPersistError(chatsToPersist)
+            }
+            discoveryIterations++
+
+            if (isThrottledGenerationSave) {
+                // Keep every candidate dirty so the true -> false transition writes
+                // the authoritative final response even after successful checkpoints.
+                options.requeueChats(chatsToPersist)
+            }
+
+            const failedChats: ChatPersistId[] = []
+            for (const [chaId, chatId] of chatsToPersist) {
+                const char = options.db.characters.find(character => character?.chaId === chaId)
+                if (!char) continue
+                const chatIndex = char.chats.findIndex(chat => chat?.id === chatId)
+                if (chatIndex === -1) continue
+                const chat = char.chats[chatIndex]
+                if (!chat || chat._placeholder || !Array.isArray(chat.message)) continue
+
+                const key = chatPersistKey(chaId, chatId)
+                const lastCheckpointMs = options.generationCheckpoints.get(key)
+                const shouldWrite = !isThrottledGenerationSave
+                    || lastCheckpointMs === undefined
+                    || now() - lastCheckpointMs >= CHECKPOINT_INTERVAL_MS
+
+                if (!shouldWrite) {
+                    // A checkpoint entry is explicit proof that this row was written
+                    // successfully earlier in the same generation.
+                    markDurable(chaId, chatId)
+                    continue
+                }
+
+                try {
+                    await options.saveChat(chaId, chatIndex, chatId, chat)
+                    options.generationCheckpoints.set(key, now())
+                    markDurable(chaId, chatId)
+                } catch (error) {
+                    options.onRowWriteFailure?.(chaId, chatId, error)
+                    failedChats.push([chaId, chatId])
+                }
+            }
+
+            if (failedChats.length > 0) {
+                throw new ChatRowPersistError(failedChats)
+            }
+        }
+
+        chatsToPersist = rediscoverUnbackedFullChats(
+            options.db,
+            options.knownChatIdsByCharacter,
+            durableChatKeys,
+        )
+        if (chatsToPersist.length === 0) break
     }
 
     return {
+        durableChatKeys,
         completeStubCommit: <T>(commitResult: StubCommitResult<T>): T => {
             if (commitResult.committed) {
                 updateKnownChatsAfterSuccessfulSave(

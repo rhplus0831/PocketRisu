@@ -18,6 +18,7 @@ import {
     capturePreTrackingFullChatChanges,
     CHECKPOINT_INTERVAL_MS,
     prepareChatPersistStage,
+    rediscoverUnbackedFullChats,
 } from "./storage/chatPersistStage";
 import { AutoStorage } from "./storage/autoStorage";
 import { ConflictError, type PersistWarning } from "./storage/nodeStorage";
@@ -1058,6 +1059,22 @@ export async function saveDb() {
                 activePatcher.discard(patchData)
                 // Leave saved=false so the full-write path below kicks in.
             } else {
+                const unbackedChats = rediscoverUnbackedFullChats(
+                    db,
+                    knownChatIdsByCharacter,
+                    chatPersistStage.durableChatKeys,
+                )
+                if (unbackedChats.length > 0) {
+                    activePatcher.discard(patchData)
+                    requeueChatChanges(unbackedChats)
+                    changed = true
+                    return chatPersistStage.completeStubCommit({
+                        committed: false,
+                        result: 'retry',
+                    })
+                }
+                // Keep the final live-graph guard and dispatch in one synchronous
+                // turn. Later mutations cannot enter this already-computed patch.
                 let patchResult
                 try {
                     patchResult = await forageStorage.patchItem('database/database.bin', patchData)
@@ -1112,6 +1129,23 @@ export async function saveDb() {
                 return chatPersistStage.completeStubCommit({ committed: false, result: 'noop' })
             }
             const dbData = new Uint8Array(encoded)
+
+            const unbackedChats = rediscoverUnbackedFullChats(
+                db,
+                knownChatIdsByCharacter,
+                chatPersistStage.durableChatKeys,
+            )
+            if (unbackedChats.length > 0) {
+                activeEncoder.discardNormalizedBaseline()
+                requeueChatChanges(unbackedChats)
+                changed = true
+                return chatPersistStage.completeStubCommit({
+                    committed: false,
+                    result: 'retry',
+                })
+            }
+            // Keep the final live-graph guard and dispatch in one synchronous
+            // turn. Later mutations cannot enter these already-encoded bytes.
 
             try {
                 await forageStorage.setItem('database/database.bin', dbData, currentEtag ?? undefined)

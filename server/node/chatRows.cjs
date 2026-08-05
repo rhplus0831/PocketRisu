@@ -1155,13 +1155,14 @@ function createChatRowStore(options) {
         return removedKeys.length;
     }
 
-    function sweepOrphanChatRows(strippedDb, opts = {}) {
+    async function sweepOrphanChatRows(strippedDb, opts = {}) {
         const now = opts.now ?? Date.now();
         const graceMs = opts.graceMs ?? 60 * 60 * 1000;
         const cutoff = now - graceMs;
         const referencedKeys = referencedChatRowKeys(strippedDb);
         const deleteKeys = [];
         let skippedRecent = 0;
+        let skippedPreImage = 0;
 
         for (const key of listAllChatRowKeys()) {
             if (referencedKeys.has(key)) continue;
@@ -1170,6 +1171,24 @@ function createChatRowStore(options) {
                 skippedRecent++;
                 continue;
             }
+
+            const identity = parseChatRowKey(key);
+            if (!identity || typeof opts.capturePreImage !== 'function') {
+                skippedPreImage++;
+                continue;
+            }
+            try {
+                const captureResult = await opts.capturePreImage({ ...identity, key });
+                if (captureResult !== 'captured' && captureResult !== 'skipped-no-row') {
+                    skippedPreImage++;
+                    continue;
+                }
+            } catch (error) {
+                skippedPreImage++;
+                opts.onPreImageCaptureFailure?.(identity, error);
+                continue;
+            }
+            // The sweep may unlink a row only after its durable recovery copy exists.
             deleteKeys.push(key);
         }
 
@@ -1178,7 +1197,7 @@ function createChatRowStore(options) {
                 for (const key of deleteKeys) kvDel(key);
             })();
         }
-        return { deleted: deleteKeys.length, skippedRecent };
+        return { deleted: deleteKeys.length, skippedRecent, skippedPreImage };
     }
 
     async function assembleFullDb(strippedDb) {

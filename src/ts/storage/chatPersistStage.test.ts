@@ -9,6 +9,9 @@ import {
     chatPersistKey,
     DuplicateChatIdError,
     findDuplicateChatIdsByCharacter,
+    MAX_CHAT_PERSIST_DISCOVERY_ITERATIONS,
+    prepareChatPersistStage,
+    rediscoverUnbackedFullChats,
     runChatPersistStage,
 } from './chatPersistStage'
 
@@ -174,6 +177,99 @@ describe('chat persistence stage', () => {
                 `${chat.id} stub must resolve after reload`,
             ).toBe(true)
         }
+    })
+
+    test('rediscovers and persists a chat created during a paused row write', async () => {
+        const firstChat = makeChat('chat-first')
+        const db = makeDatabaseWithChats([firstChat])
+        const knownChatIdsByCharacter = new Map<string, Set<string>>()
+        const savedChatIds: string[] = []
+        let signalFirstSaveStarted = () => {}
+        let releaseFirstSave = () => {}
+        const firstSaveStarted = new Promise<void>(resolve => {
+            signalFirstSaveStarted = resolve
+        })
+        const firstSaveDeferred = new Promise<void>(resolve => {
+            releaseFirstSave = resolve
+        })
+
+        const stagePromise = prepareChatPersistStage({
+            db,
+            toSave: makeTrackedChanges({ character: ['char-1'] }),
+            doingChat: false,
+            knownChatIdsByCharacter,
+            generationCheckpoints: new Map(),
+            requeueChats: vi.fn(),
+            saveChat: async (_chaId, _chatIndex, chatId) => {
+                savedChatIds.push(chatId)
+                if (chatId === 'chat-first') {
+                    signalFirstSaveStarted()
+                    await firstSaveDeferred
+                }
+            },
+        })
+
+        await firstSaveStarted
+        db.characters[0].chats.push(makeChat('chat-during-save'))
+        releaseFirstSave()
+
+        const preparedStage = await stagePromise
+        expect(savedChatIds).toEqual(['chat-first', 'chat-during-save'])
+        expect(knownChatIdsByCharacter.get('char-1')).toBeUndefined()
+
+        preparedStage.completeStubCommit({ committed: true, result: undefined })
+        expect(knownChatIdsByCharacter.get('char-1')).toEqual(
+            new Set(['chat-first', 'chat-during-save']),
+        )
+    })
+
+    test('rediscovers only full-bodied chats without row durability proof', () => {
+        const db = makeDatabaseWithChats([
+            makePlaceholder('chat-placeholder'),
+            makeStub('chat-stub'),
+            makeChat('chat-known'),
+            makeChat('chat-durable'),
+            makeChat('chat-unbacked'),
+        ])
+
+        expect(rediscoverUnbackedFullChats(
+            db,
+            new Map([['char-1', new Set(['chat-known'])]]),
+            new Set([chatPersistKey('char-1', 'chat-durable')]),
+        )).toEqual([['char-1', 'chat-unbacked']])
+    })
+
+    test('rejects without committing stubs when live-chat rediscovery does not converge', async () => {
+        const db = makeDatabaseWithChats([makeChat('chat-0')])
+        const commitStubDatabase = vi.fn(async () => ({ committed: true, result: undefined }))
+        const requeueChats = vi.fn()
+        let nextChat = 1
+        const saveChat = vi.fn(async () => {
+            db.characters[0].chats.push(makeChat(`chat-${nextChat++}`))
+        })
+
+        const attempt = runChatPersistStage({
+            db,
+            toSave: makeTrackedChanges({ character: ['char-1'] }),
+            doingChat: false,
+            knownChatIdsByCharacter: new Map(),
+            generationCheckpoints: new Map(),
+            requeueChats,
+            saveChat,
+            commitStubDatabase,
+        })
+
+        await expect(attempt).rejects.toEqual(
+            expect.objectContaining<Partial<ChatRowPersistError>>({
+                name: 'ChatRowPersistError',
+                failedChats: [['char-1', `chat-${MAX_CHAT_PERSIST_DISCOVERY_ITERATIONS}`]],
+            }),
+        )
+        expect(saveChat).toHaveBeenCalledTimes(MAX_CHAT_PERSIST_DISCOVERY_ITERATIONS)
+        expect(requeueChats).toHaveBeenCalledWith([
+            ['char-1', `chat-${MAX_CHAT_PERSIST_DISCOVERY_ITERATIONS}`],
+        ])
+        expect(commitStubDatabase).not.toHaveBeenCalled()
     })
 
     test('persists a startup chat whose id was repaired before promoting the repaired id', async () => {

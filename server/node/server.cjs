@@ -20206,12 +20206,25 @@ app.post('/api/db/optimize', async (req, res, next) => {
                 ? getCurrentDatabaseCacheValue(DB_HEX_KEY)
                     || await loadStrippedDatabase(rawDb, 'Optimize')
                 : { characters: [] };
-            const chatSweep = chatRowStore.sweepOrphanChatRows(strippedDb, {
+            const chatSweep = await chatRowStore.sweepOrphanChatRows(strippedDb, {
                 graceMs: CHAT_ORPHAN_GRACE_MS,
+                capturePreImage: identity => chatBackupStore.captureChatPreImage({
+                    ...identity,
+                    reason: 'orphan-sweep',
+                    force: true,
+                    required: true,
+                }),
+                onPreImageCaptureFailure: (identity, error) => {
+                    logger.warn(
+                        `[Optimize] Skipping orphan chat row ${identity.chaId}/${identity.chatId}; `
+                        + `required pre-image capture failed: ${error?.message || error}`
+                    );
+                },
             });
             logger.info(
                 `[Optimize] Chat row sweep deleted ${chatSweep.deleted} orphan row(s); `
-                + `skipped ${chatSweep.skippedRecent} recent row(s)`
+                + `skipped ${chatSweep.skippedRecent} recent row(s) and `
+                + `${chatSweep.skippedPreImage} row(s) without a captured pre-image`
             );
             // Reclaim chunks orphaned by edits/snapshot rotation before VACUUM, so
             // their pages get compacted in the same pass. Serialized with saves by
@@ -20234,6 +20247,7 @@ app.post('/api/db/optimize', async (req, res, next) => {
                 chunksReclaimed: gcDeleted,
                 orphanChatRowsDeleted: chatSweep.deleted,
                 orphanChatRowsSkippedRecent: chatSweep.skippedRecent,
+                orphanChatRowsSkippedPreImage: chatSweep.skippedPreImage,
             };
         });
         res.json(result);
