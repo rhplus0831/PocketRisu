@@ -297,6 +297,7 @@ const {
     resolveChatBackupDir,
     resolveChatBackupMaxBytes,
     resolveChatBackupMaxUncompressedBytes,
+    isDestructiveBackupReason,
 } = require('./chatBackups.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
@@ -18549,6 +18550,35 @@ function scheduleChatDeltaCompaction(chaId, chatId) {
     });
 }
 
+async function captureChatContentPreImage(req, res, chaId, chatId) {
+    const reason = req.headers['x-chat-backup-reason'];
+    if (!isDestructiveBackupReason(reason)) {
+        await chatBackupStore.captureChatPreImage({ chaId, chatId, reason });
+        return true;
+    }
+
+    try {
+        await chatBackupStore.captureChatPreImage({
+            chaId,
+            chatId,
+            reason,
+            force: true,
+            required: true,
+        });
+        return true;
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+            code: 'CHAT_PREIMAGE_CAPTURE_FAILED',
+            error: error?.message || String(error),
+            retryable: true,
+        });
+        return false;
+    }
+}
+
 async function handleChatDeltaWrite(req, res, next) {
     let shouldCreateBackup = false;
     let shouldCompact = false;
@@ -18583,11 +18613,7 @@ async function handleChatDeltaWrite(req, res, next) {
 
             // As on a full-row write, capture the exact prior logical bytes
             // after queue admission and immediately before the atomic append.
-            await chatBackupStore.captureChatPreImage({
-                chaId,
-                chatId: expectedChatId,
-                reason: req.headers['x-chat-backup-reason'],
-            });
+            if (!await captureChatContentPreImage(req, res, chaId, expectedChatId)) return;
             let result;
             try {
                 result = chatRowStore.appendChatDelta(
@@ -18657,11 +18683,7 @@ async function handleSpooledChatWrite(req, res, next, spool) {
             if (!checkChatRowBasePrecondition(req, res, chaId, expectedChatId)) return;
             // Keep the exact old ordering: the prior authoritative row is
             // captured after queue admission and immediately before publish.
-            await chatBackupStore.captureChatPreImage({
-                chaId,
-                chatId: expectedChatId,
-                reason: req.headers['x-chat-backup-reason'],
-            });
+            if (!await captureChatContentPreImage(req, res, chaId, expectedChatId)) return;
             const hash = chatRowStore.writeChatRowFromFile(
                 chaId,
                 expectedChatId,
@@ -18763,11 +18785,7 @@ app.post('/api/chat-content/:chaId/:chatIndex', async (req, res, next) => {
 
             // This must remain immediately before the row write: every version
             // is the exact state the incoming save was about to replace.
-            await chatBackupStore.captureChatPreImage({
-                chaId,
-                chatId: expectedChatId,
-                reason: req.headers['x-chat-backup-reason'],
-            });
+            if (!await captureChatContentPreImage(req, res, chaId, expectedChatId)) return;
             let hash;
             if (isRawBinary && !healedHybrid) {
                 hash = chatRowStore.writeChatRowRawOwned(chaId, expectedChatId, req.body, {

@@ -97,17 +97,21 @@ function chatKey(chaId: string, chatId: string): string {
     return `${chaId}/${chatId}`
 }
 
-const pendingChatBackupReasons = new Map<string, string>()
+interface PendingChatBackupReason {
+    reason: string
+}
+
+const pendingChatBackupReasons = new Map<string, PendingChatBackupReason>()
 
 export function setChatBackupReason(chaId: string, chatId: string, reason: string): void {
-    pendingChatBackupReasons.set(chatKey(chaId, chatId), reason)
+    pendingChatBackupReasons.set(chatKey(chaId, chatId), { reason })
 }
 
 export function consumeChatBackupReason(chaId: string, chatId: string): string | undefined {
     const key = chatKey(chaId, chatId)
-    const reason = pendingChatBackupReasons.get(key)
+    const pending = pendingChatBackupReasons.get(key)
     pendingChatBackupReasons.delete(key)
-    return reason
+    return pending?.reason
 }
 
 /** Hydration in progress — suppress dirty tracking */
@@ -128,8 +132,12 @@ export async function fetchChatFromServer(chaId: string, chatIndex: number, chat
 
 export async function saveChatToServer(chaId: string, chatIndex: number, chatId: string, chat: Chat): Promise<void> {
     const storage = forageStorage.realStorage
-    const backupReason = consumeChatBackupReason(chaId, chatId)
-    await storage.saveChatContent(chaId, chatIndex, chatId, chat, backupReason)
+    const key = chatKey(chaId, chatId)
+    const pendingReason = pendingChatBackupReasons.get(key)
+    await storage.saveChatContent(chaId, chatIndex, chatId, chat, pendingReason?.reason)
+    if (pendingReason && pendingChatBackupReasons.get(key) === pendingReason) {
+        pendingChatBackupReasons.delete(key)
+    }
 }
 
 // ── Backup import ───────────────────────────────────────────────────────────

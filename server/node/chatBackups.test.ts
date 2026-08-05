@@ -62,6 +62,7 @@ const {
     resolveChatBackupMaxBytes,
     resolveChatBackupMaxUncompressedBytes,
     sanitizeBackupReason,
+    isDestructiveBackupReason,
     CHAT_BACKUP_MAX_BYTES_KEY,
     CHAT_BACKUP_MAX_UNCOMPRESSED_BYTES_KEY,
     FRAME_FORMAT,
@@ -78,6 +79,7 @@ const {
     resolveChatBackupMaxBytes: (options?: any) => number
     resolveChatBackupMaxUncompressedBytes: (options?: any) => number
     sanitizeBackupReason: (reason?: unknown) => string
+    isDestructiveBackupReason: (reason?: unknown) => boolean
     CHAT_BACKUP_MAX_BYTES_KEY: string
     CHAT_BACKUP_MAX_UNCOMPRESSED_BYTES_KEY: string
     FRAME_FORMAT: string
@@ -615,6 +617,15 @@ describe('chat backup capture', () => {
             'v-123456-0-manual-save.bin',
             'v-123456-1-unknown.bin',
         ])
+    })
+
+    it('classifies only sanitized destructive row-overwrite reasons', () => {
+        expect(isDestructiveBackupReason('reroll')).toBe(true)
+        expect(isDestructiveBackupReason(' DELETE MESSAGE!! ')).toBe(true)
+        expect(isDestructiveBackupReason('Delete Swipe')).toBe(true)
+        expect(isDestructiveBackupReason('edit-message')).toBe(false)
+        expect(isDestructiveBackupReason('delete-chat')).toBe(false)
+        expect(isDestructiveBackupReason(undefined)).toBe(false)
     })
 
     it('skips small cold-storage stubs and never decodes large rows', async () => {

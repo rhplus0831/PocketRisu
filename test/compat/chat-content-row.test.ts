@@ -664,7 +664,86 @@ describe('chat content row serving', () => {
     expect(Buffer.from(await get.arrayBuffer())).toEqual(encoded[2])
   })
 
-  test('POST overwrite history returns the byte-exact streamed pre-image', async () => {
+  test('destructive overwrites capture every pre-image within the cooldown', async () => {
+    const server = await spawnServer()
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const initial = {
+      id: 'destructive-pre-image-chat',
+      name: 'Initial state',
+      message: [{ role: 'user', data: 'initial prompt' }],
+    }
+    const preReroll = {
+      id: 'destructive-pre-image-chat',
+      name: 'Pre-reroll state',
+      message: [
+        { role: 'user', data: 'prompt to preserve' },
+        {
+          role: 'char',
+          data: 'discarded response',
+          swipes: ['first response', 'discarded response'],
+          swipeId: 1,
+        },
+      ],
+    }
+    const firstTruncated = {
+      ...preReroll,
+      name: 'First truncated state',
+      message: [preReroll.message[0]],
+    }
+    const secondTruncated = {
+      ...preReroll,
+      name: 'Second truncated state',
+      message: [],
+    }
+    const writes = [
+      { value: initial },
+      { value: preReroll, reason: 'edit-message' },
+      { value: firstTruncated, reason: 'reroll' },
+      { value: secondTruncated, reason: 'reroll' },
+    ]
+
+    for (const { value, reason } of writes) {
+      const response = await client.fetch('/api/chat-content/destructive-pre-image-char/0', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-chat-id': 'destructive-pre-image-chat',
+          ...(reason ? { 'x-chat-backup-reason': reason } : {}),
+        },
+        body: new Uint8Array(encodeRisuDat(value)),
+      })
+      expect(response.status).toBe(200)
+    }
+
+    const historyResponse = await client.fetch(
+      '/api/chat-backups/destructive-pre-image-char/destructive-pre-image-chat',
+    )
+    expect(historyResponse.status).toBe(200)
+    const history = await historyResponse.json() as {
+      versions: Array<{ versionId: string; reason: string; size: number }>
+    }
+    expect(history.versions).toHaveLength(3)
+    const destructiveVersions = history.versions.filter(version => version.reason === 'reroll')
+    expect(destructiveVersions).toHaveLength(2)
+
+    const recovered: unknown[] = []
+    for (const version of destructiveVersions) {
+      const response = await client.fetch(
+        `/api/chat-backups/destructive-pre-image-char/destructive-pre-image-chat/${version.versionId}`,
+      )
+      expect(response.status).toBe(200)
+      recovered.push(decodeRisuDat(Buffer.from(await response.arrayBuffer())))
+    }
+    expect(recovered).toContainEqual(preReroll)
+    expect(recovered).toContainEqual(firstTruncated)
+    expect(rawKvRow(
+      server.cwd,
+      'chats/destructive-pre-image-char/destructive-pre-image-chat',
+    )).toEqual(encodeRisuDat(secondTruncated))
+  })
+
+  test('ordinary overwrites remain subject to the pre-image cooldown', async () => {
     const server = await spawnServer()
     servers.push(server)
     const client = await createClient(server.port, server.password)
@@ -678,7 +757,12 @@ describe('chat content row serving', () => {
       name: 'Second state',
       message: [{ role: 'user', data: 'replacement state' }],
     })
-    for (const bytes of [first, second]) {
+    const third = encodeRisuDat({
+      id: 'pre-image-chat',
+      name: 'Third state',
+      message: [{ role: 'user', data: 'cooldown-skipped replacement' }],
+    })
+    for (const bytes of [first, second, third]) {
       const response = await client.fetch('/api/chat-content/pre-image-char/0', {
         method: 'POST',
         headers: {
@@ -706,6 +790,75 @@ describe('chat content row serving', () => {
     )
     expect(versionResponse.status).toBe(200)
     expect(Buffer.from(await versionResponse.arrayBuffer())).toEqual(first)
+    expect(rawKvRow(server.cwd, 'chats/pre-image-char/pre-image-chat')).toEqual(third)
+  })
+
+  test('destructive capture failure aborts the overwrite while ordinary saves still commit', async () => {
+    const server = await spawnServer({
+      env: { POCKETRISU_CHAT_BACKUP_DIR: 'save/chat-backups-blocked' },
+      seedSave: saveDir => writeFile(path.join(saveDir, 'chat-backups-blocked'), 'not a directory'),
+    })
+    servers.push(server)
+    const client = await createClient(server.port, server.password)
+    const rowKey = 'chats/pre-image-failure-char/pre-image-failure-chat'
+    const original = encodeRisuDat({
+      id: 'pre-image-failure-chat',
+      name: 'Authoritative original',
+      message: [{ role: 'char', data: 'must survive failed capture' }],
+    })
+    const destructiveReplacement = encodeRisuDat({
+      id: 'pre-image-failure-chat',
+      name: 'Destructive replacement',
+      message: [],
+    })
+    const ordinaryReplacement = encodeRisuDat({
+      id: 'pre-image-failure-chat',
+      name: 'Ordinary replacement',
+      message: [{ role: 'char', data: 'ordinary save still commits' }],
+    })
+
+    const initialResponse = await client.fetch('/api/chat-content/pre-image-failure-char/0', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-chat-id': 'pre-image-failure-chat',
+        'x-chat-backup-reason': 'reroll',
+      },
+      body: new Uint8Array(original),
+    })
+    expect(initialResponse.status).toBe(200)
+
+    const destructiveResponse = await client.fetch('/api/chat-content/pre-image-failure-char/0', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-chat-id': 'pre-image-failure-chat',
+        'x-chat-backup-reason': 'delete-swipe',
+      },
+      body: new Uint8Array(destructiveReplacement),
+    })
+    expect(destructiveResponse.status).toBe(500)
+    expect(await destructiveResponse.json()).toEqual({
+      success: false,
+      commitOutcome: 'not-committed',
+      commitOutcomeUnknown: false,
+      code: 'CHAT_PREIMAGE_CAPTURE_FAILED',
+      error: expect.any(String),
+      retryable: true,
+    })
+    expect(rawKvRow(server.cwd, rowKey)).toEqual(original)
+
+    const ordinaryResponse = await client.fetch('/api/chat-content/pre-image-failure-char/0', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'x-chat-id': 'pre-image-failure-chat',
+        'x-chat-backup-reason': 'edit-message',
+      },
+      body: new Uint8Array(ordinaryReplacement),
+    })
+    expect(ordinaryResponse.status).toBe(200)
+    expect(rawKvRow(server.cwd, rowKey)).toEqual(ordinaryReplacement)
   })
 
   test('GET selects one raw row and never calls the decoded row reader on its warm path', () => {

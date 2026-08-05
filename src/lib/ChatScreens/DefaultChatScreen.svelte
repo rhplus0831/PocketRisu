@@ -556,10 +556,16 @@ import { isMobile } from 'src/ts/platform'
     }
 
     function deleteSwipe() {
-        const lastMsg = getLastCharMsg()
+        const target = captureChatSendTarget(DBState.db, $selectedCharID)
+        if (!target) return
+        const resolvedTarget = resolveChatSendTarget(DBState.db, target)
+        if (!resolvedTarget || resolvedTarget.chat._placeholder) return
+
+        const lastMsg = findLastCharacterMessage(resolvedTarget.chat.message)
         if (!lastMsg || !lastMsg.swipes || lastMsg.swipes.length <= 1) return
 
         const idx = lastMsg.swipeId ?? 0
+        setChatBackupReason(target.chaId, target.chatId, 'delete-swipe')
         lastMsg.swipes.splice(idx, 1)
 
         if (idx >= lastMsg.swipes.length) {
@@ -571,7 +577,7 @@ import { isMobile } from 'src/ts/platform'
             delete lastMsg.swipes
             delete lastMsg.swipeId
         }
-        DBState.db.characters[$selectedCharID].reloadKeys += 1
+        resolvedTarget.character.reloadKeys += 1
     }
 
     // The per-chat generation map is the authoritative send lifecycle. The

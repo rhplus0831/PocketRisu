@@ -98,6 +98,56 @@ describe('pending chat backup reasons', () => {
             undefined,
         )
     })
+
+    test('retains a pending reason after failure and consumes it after success', async () => {
+        const chat = blankChat({ id: 'retry-chat' })
+        mockSaveChatContent
+            .mockRejectedValueOnce(new Error('save failed'))
+            .mockResolvedValue(undefined)
+        setChatBackupReason('char-retry', chat.id, 'reroll')
+
+        await expect(saveChatToServer('char-retry', 0, chat.id, chat))
+            .rejects.toThrow('save failed')
+        await saveChatToServer('char-retry', 0, chat.id, chat)
+        await saveChatToServer('char-retry', 0, chat.id, chat)
+
+        expect(mockSaveChatContent.mock.calls.map(call => call[4])).toEqual([
+            'reroll',
+            'reroll',
+            undefined,
+        ])
+    })
+
+    test('does not consume a newer reason set during an in-flight save', async () => {
+        const chat = blankChat({ id: 'in-flight-chat' })
+        let finishSave: (() => void) | undefined
+        mockSaveChatContent.mockImplementationOnce(() => new Promise<void>(resolve => {
+            finishSave = resolve
+        }))
+        setChatBackupReason('char-flight', chat.id, 'reroll')
+
+        const firstSave = saveChatToServer('char-flight', 0, chat.id, chat)
+        expect(mockSaveChatContent).toHaveBeenCalledWith(
+            'char-flight',
+            0,
+            chat.id,
+            chat,
+            'reroll',
+        )
+        setChatBackupReason('char-flight', chat.id, 'delete-swipe')
+        finishSave?.()
+        await firstSave
+        await saveChatToServer('char-flight', 0, chat.id, chat)
+
+        expect(mockSaveChatContent).toHaveBeenNthCalledWith(
+            2,
+            'char-flight',
+            0,
+            chat.id,
+            chat,
+            'delete-swipe',
+        )
+    })
 })
 
 describe('chat backup import transformation', () => {

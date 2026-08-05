@@ -344,6 +344,16 @@ function sanitizeBackupReason(reason) {
     return sanitized || 'unknown';
 }
 
+const DESTRUCTIVE_BACKUP_REASONS = new Set([
+    'reroll',
+    'delete-message',
+    'delete-swipe',
+]);
+
+function isDestructiveBackupReason(reason) {
+    return DESTRUCTIVE_BACKUP_REASONS.has(sanitizeBackupReason(reason));
+}
+
 function encodePathComponent(value) {
     // encodeURIComponent leaves traversal-only dot components literal.
     const encoded = encodeURIComponent(String(value));
@@ -1705,6 +1715,7 @@ module.exports = {
     resolveChatBackupMaxBytes,
     resolveChatBackupMaxUncompressedBytes,
     sanitizeBackupReason,
+    isDestructiveBackupReason,
     CHAT_BACKUP_DIRNAME,
     CHAT_BACKUP_DIR_ENV,
     CHAT_BACKUP_MAX_BYTES_KEY,
