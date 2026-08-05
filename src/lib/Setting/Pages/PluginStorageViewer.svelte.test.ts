@@ -183,7 +183,11 @@ function openEntry(target: HTMLElement, key: string): void {
     click(row)
 }
 
-afterEach(() => {
+afterEach(async () => {
+    // bits-ui's body-scroll-lock schedules a ~24 ms cleanup timer when the
+    // last dialog unmounts; let it fire while `document` still exists, or it
+    // crashes the worker after environment teardown on slow runners.
+    await new Promise(resolve => setTimeout(resolve, 50))
     viewerPage.mockReset()
     atomicBatch.mockReset()
     rewriteItem.mockReset()
