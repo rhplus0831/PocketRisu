@@ -5,7 +5,7 @@ Run `pnpm check:docs` after changing a finding, status, path, or link.
 These are point-in-time reports; revalidate their evidence against current code
 before implementation.
 
-Current catalog: **44 open**, **1 deferred**, and **5 accepted decisions**.
+Current catalog: **45 open**, **0 deferred**, and **5 accepted decisions**.
 
 ## Active work by owner
 
@@ -45,7 +45,7 @@ Current catalog: **44 open**, **1 deferred**, and **5 accepted decisions**.
 
 | ID | Finding | Status | Source |
 |---|---|---|---|
-| `FND-acknowledged-patches-are-not-durable` | [Acknowledged database patches are not durable for up to five seconds](open/client-storage/acknowledged-patches-are-not-durable.md) | Deferred | 2026-07 data-loss audit |
+| `FND-acknowledged-patches-are-not-durable` | [Acknowledged database patches are not durable for up to five seconds](open/client-storage/acknowledged-patches-are-not-durable.md) | Open | 2026-07 data-loss audit |
 | `FND-build-mismatch-reload-can-discard-composer-draft` | [Build-mismatch reload can discard an undurable composer draft](open/client-storage/build-mismatch-reload-can-discard-composer-draft.md) | Open | delta audit DA-12 |
 | `FND-draft-save-failures-have-no-retry-or-signal` | [Draft-save failures have no retry or user signal](open/client-storage/draft-save-failures-have-no-retry-or-signal.md) | Open | delta audit DA-9 |
 | `FND-save-loop-idles-after-five-failures` | [The save loop stops retrying after five consecutive failures](open/client-storage/save-loop-idles-after-five-failures.md) | Open | 2026-07 data-loss audit |

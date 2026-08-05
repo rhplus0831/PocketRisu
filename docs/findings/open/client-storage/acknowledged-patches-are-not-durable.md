@@ -1,12 +1,13 @@
 # Acknowledged database patches are not durable for up to five seconds
 
-- Status: Deferred
+- Status: Open
 - Owner: client storage
 - Source: [2026-07 data-loss audit](../../../../.archived-docs/findings/2026-07-data-loss-audit/PRIORITY-INDEX.md)
 - Severity: High
 - Area: server persistence core
 - Affected code: `server/node/server.cjs:139` (`SAVE_INTERVAL` = 5 s), `server/node/server.cjs:4475-4553` (patch applied to `dbCache`, persistence deferred, success returned), `server/node/server.cjs:753-804` (`persistDbCache` commits later), `server/node/logs.cjs:323-356` (uncaught-exception/unhandled-rejection handlers `process.exit(1)` without flushing), `src/ts/globalApi.svelte.ts:1043-1057` (client clears dirty tracking on ack)
 - Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
+- Decision: 2026-08-05 — reopened from Deferred; implement via the staged/durable-ack protocol (see below)
 
 ## Risk
 
@@ -34,11 +35,26 @@ deferred timer; the ack-before-durable window itself was never addressed.
 
 ## Required fix and coverage
 
-Either commit the patched database before acknowledging, or split the protocol
-into staged/durable acknowledgements so the client retains dirty state until a
-flush confirmation. Cheaper interim hardenings: flush `dbCache` in the fatal
-process handlers before exit, and shrink the window after structural patches
-(new/removed chats) by flushing those synchronously.
+Decided 2026-08-05: implement the staged/durable-ack protocol. `/api/patch`
+keeps its five-second server-side coalescing, but its acknowledgement means
+"staged" only; the client retains its dirty tracking until a durable flush
+confirmation instead of dropping it when the ack arrives. Existing
+infrastructure to build on: `POST /api/db/flush` already returns an explicit
+`durable: true/false` verdict behind a tracked WAL checkpoint, and callers
+already have the committed-save outcome contract
+(`requestImmediateSave().status === 'committed'`).
 
-Cover with a kill-based compat test: patch (new chat stub + row), SIGKILL
-before the timer, restart, and assert the chat is reachable.
+The commit-before-ack alternative was rejected for performance: patches arrive
+roughly every 0.7–2 s during active use, so committing each one would lose the
+coalescing window's write batching and stall the event loop with a synchronous
+full-blob SQLite transaction per save.
+
+The interim hardenings remain compatible with this design and can land as
+cheap defense-in-depth: flush `dbCache` in the fatal process handlers before
+exit, and flush structural patches (new/removed chats) synchronously so the
+orphan sweep can never collect a just-created chat.
+
+Cover with a client protocol test (dirty tracking survives a staged ack that
+never receives a flush confirmation and is replayed) plus the kill-based
+compat test: patch (new chat stub + row), SIGKILL before the timer, restart,
+and assert the chat is reachable.
