@@ -19,6 +19,7 @@ const {
       onStage?: (stage: string, detail?: Record<string, any>) => void
       onLocksAcquired?: (locks: MaintenanceLock[]) => void
       releaseLock?: (lock: MaintenanceLock) => void
+      fsOps?: typeof fs
     },
   ) => Promise<{ directories: number; scanned: number; linked: number; recovered: number }>
 }
@@ -62,6 +63,45 @@ function replaceFile(filePath: string, bytes: Buffer) {
   const temp = `${filePath}.replacement`
   fs.writeFileSync(temp, bytes)
   fs.renameSync(temp, filePath)
+}
+
+type StatMetadata = Pick<fs.Stats, 'uid' | 'gid' | 'mode'>
+
+function cloneStatWithMetadata(stat: fs.Stats, overrides: Partial<StatMetadata>) {
+  return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, overrides) as fs.Stats
+}
+
+function makeMetadataFsOps(options: {
+  lstatOverrides?: Map<string, Partial<StatMetadata>>
+  fstatOverride?: (stat: fs.Stats) => Partial<StatMetadata> | null
+  mutations?: { links: number; renames: number; unlinks: number }
+} = {}) {
+  const fsOps = Object.create(fs) as typeof fs
+  fsOps.lstatSync = ((target: fs.PathLike, ...args: any[]) => {
+    const stat = (fs.lstatSync as any)(target, ...args) as fs.Stats
+    const override = options.lstatOverrides?.get(path.resolve(String(target)))
+    return override ? cloneStatWithMetadata(stat, override) : stat
+  }) as typeof fs.lstatSync
+  fsOps.fstatSync = ((descriptor: number, ...args: any[]) => {
+    const stat = (fs.fstatSync as any)(descriptor, ...args) as fs.Stats
+    const override = options.fstatOverride?.(stat)
+    return override ? cloneStatWithMetadata(stat, override) : stat
+  }) as typeof fs.fstatSync
+  if (options.mutations) {
+    fsOps.linkSync = ((existingPath: fs.PathLike, newPath: fs.PathLike) => {
+      options.mutations!.links++
+      return fs.linkSync(existingPath, newPath)
+    }) as typeof fs.linkSync
+    fsOps.renameSync = ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+      options.mutations!.renames++
+      return fs.renameSync(oldPath, newPath)
+    }) as typeof fs.renameSync
+    fsOps.unlinkSync = ((target: fs.PathLike) => {
+      options.mutations!.unlinks++
+      return fs.unlinkSync(target)
+    }) as typeof fs.unlinkSync
+  }
+  return fsOps
 }
 
 afterEach(() => {
@@ -251,6 +291,109 @@ describe('controlled asset deduplication', () => {
     expect(fs.existsSync(interrupted)).toBe(false)
   })
 
+  it.each(['uid', 'gid'] as const)(
+    'fails closed on mixed target-directory %s before recovery or publication',
+    async (field) => {
+      const { left, right } = makeTree()
+      const interrupted = path.join(
+        left,
+        `${ASSET_DEDUP_TEMP_PREFIX}7-00000000-0000-4000-8000-000000000000`,
+      )
+      fs.writeFileSync(interrupted, payload)
+      const leftFile = path.join(left, 'left.png')
+      const rightFile = path.join(right, 'right.png')
+      const before = [fs.statSync(leftFile).ino, fs.statSync(rightFile).ino]
+      const rightStat = fs.lstatSync(right)
+      const mutations = { links: 0, renames: 0, unlinks: 0 }
+      const fsOps = makeMetadataFsOps({
+        lstatOverrides: new Map([
+          [right, { [field]: rightStat[field] + 1 }],
+        ]),
+        mutations,
+      })
+
+      await expect(deduplicateAssetDirectories([left, right], { fsOps }))
+        .rejects.toMatchObject({ code: 'ASSET_DEDUP_METADATA_MISMATCH' })
+
+      expect(mutations).toEqual({ links: 0, renames: 0, unlinks: 0 })
+      expect(fs.existsSync(interrupted)).toBe(true)
+      expect([fs.statSync(leftFile).ino, fs.statSync(rightFile).ino]).toEqual(before)
+    },
+  )
+
+  it.each(['uid', 'gid'] as const)(
+    'fails closed on mixed candidate-file %s before recovery or publication',
+    async (field) => {
+      const { left, right } = makeTree()
+      const interrupted = path.join(
+        left,
+        `${ASSET_DEDUP_TEMP_PREFIX}7-00000000-0000-4000-8000-000000000000`,
+      )
+      const leftFile = path.join(left, 'left.png')
+      const rightFile = path.join(right, 'right.png')
+      fs.writeFileSync(interrupted, payload)
+      const before = [fs.statSync(leftFile).ino, fs.statSync(rightFile).ino]
+      const rightStat = fs.lstatSync(rightFile)
+      const mutations = { links: 0, renames: 0, unlinks: 0 }
+      const fsOps = makeMetadataFsOps({
+        lstatOverrides: new Map([
+          [rightFile, { [field]: rightStat[field] + 1 }],
+        ]),
+        mutations,
+      })
+
+      await expect(deduplicateAssetDirectories([left, right], { fsOps }))
+        .rejects.toMatchObject({ code: 'ASSET_DEDUP_METADATA_MISMATCH' })
+
+      expect(mutations).toEqual({ links: 0, renames: 0, unlinks: 0 })
+      expect(fs.existsSync(interrupted)).toBe(true)
+      expect([fs.statSync(leftFile).ino, fs.statSync(rightFile).ino]).toEqual(before)
+    },
+  )
+
+  it('fails closed on mixed target-directory permission modes before recovery or publication', async () => {
+    const { left, right } = makeTree()
+    const interrupted = path.join(
+      left,
+      `${ASSET_DEDUP_TEMP_PREFIX}7-00000000-0000-4000-8000-000000000000`,
+    )
+    const leftFile = path.join(left, 'left.png')
+    const rightFile = path.join(right, 'right.png')
+    fs.writeFileSync(interrupted, payload)
+    fs.chmodSync(left, 0o750)
+    fs.chmodSync(right, 0o755)
+    const before = [fs.statSync(leftFile).ino, fs.statSync(rightFile).ino]
+    const mutations = { links: 0, renames: 0, unlinks: 0 }
+
+    await expect(deduplicateAssetDirectories([left, right], {
+      fsOps: makeMetadataFsOps({ mutations }),
+    })).rejects.toMatchObject({ code: 'ASSET_DEDUP_METADATA_MISMATCH' })
+
+    expect(mutations).toEqual({ links: 0, renames: 0, unlinks: 0 })
+    expect(fs.existsSync(interrupted)).toBe(true)
+    expect([fs.statSync(leftFile).ino, fs.statSync(rightFile).ino]).toEqual(before)
+  })
+
+  it('preflights the mode of every candidate, including non-duplicates', async () => {
+    const { left, right } = makeTree()
+    const leftFile = path.join(left, 'left.png')
+    const rightFile = path.join(right, 'right.png')
+    const unique = path.join(right, 'unique.png')
+    fs.chmodSync(leftFile, 0o600)
+    fs.chmodSync(rightFile, 0o600)
+    fs.writeFileSync(unique, 'not a duplicate', { mode: 0o640 })
+    fs.chmodSync(unique, 0o640)
+    const before = [fs.statSync(leftFile).ino, fs.statSync(rightFile).ino]
+    const mutations = { links: 0, renames: 0, unlinks: 0 }
+
+    await expect(deduplicateAssetDirectories([left, right], {
+      fsOps: makeMetadataFsOps({ mutations }),
+    })).rejects.toMatchObject({ code: 'ASSET_DEDUP_METADATA_MISMATCH' })
+
+    expect(mutations).toEqual({ links: 0, renames: 0, unlinks: 0 })
+    expect([fs.statSync(leftFile).ino, fs.statSync(rightFile).ino]).toEqual(before)
+  })
+
   it('recovers tool temps, excludes every hidden/server temp, and atomically hardlinks bytes', async () => {
     const { left, right } = makeTree()
     fs.writeFileSync(path.join(left, '.tmp-live-publication'), payload)
@@ -329,6 +472,42 @@ describe('controlled asset deduplication', () => {
     expect(fs.readdirSync(right).filter((name) => name.startsWith(ASSET_DEDUP_TEMP_PREFIX)))
       .toEqual([])
   })
+
+  it.each(['uid', 'gid', 'mode'] as const)(
+    'revalidates candidate %s metadata at the hardlink publication boundary',
+    async (field) => {
+      const { left, right } = makeTree()
+      const leftFile = path.join(left, 'left.png')
+      const rightFile = path.join(right, 'right.png')
+      const destinationBefore = fs.statSync(rightFile)
+      let sourceInode: number | null = null
+      let injectMetadataRace = false
+      const fsOps = makeMetadataFsOps({
+        fstatOverride(stat) {
+          if (!injectMetadataRace || stat.ino !== sourceInode) return null
+          if (field === 'mode') {
+            return { mode: (stat.mode & ~0o7777) | ((stat.mode & 0o7777) ^ 0o040) }
+          }
+          return { [field]: stat[field] + 1 }
+        },
+      })
+
+      await expect(deduplicateAssetDirectories([left, right], {
+        fsOps,
+        onStage(stage, detail) {
+          if (stage === 'before-link') {
+            sourceInode = fs.statSync(detail!.source.filePath).ino
+          }
+          if (stage === 'after-revalidate') injectMetadataRace = true
+        },
+      })).rejects.toThrow(/changed before revalidation|metadata changed/)
+
+      expect(sourceInode).not.toBeNull()
+      expect(fs.statSync(rightFile).ino).toBe(destinationBefore.ino)
+      expect(fs.readdirSync(right).filter(name => name.startsWith(ASSET_DEDUP_TEMP_PREFIX)))
+        .toEqual([])
+    },
+  )
 
   it('attempts every target release and preserves a primary failure', async () => {
     const { left, right } = makeTree()

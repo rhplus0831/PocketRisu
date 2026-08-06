@@ -14,6 +14,10 @@ const {
 const ASSET_DEDUP_TEMP_PREFIX = '.pocketrisu-dedup-tmp-v1-';
 const ASSET_DEDUP_TEMP_RE = /^\.pocketrisu-dedup-tmp-v1-[0-9]+-[0-9a-f-]{36}$/;
 const HASH_PAGE_BYTES = 256 * 1024;
+// Compare every permission and special bit, but not the file-type bits. The
+// latter are validated explicitly, and directories and regular files must be
+// allowed to have their naturally different types and permission policies.
+const STAT_PERMISSION_MODE_MASK = 0o7777;
 
 function comparePathBytes(left, right) {
     return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
@@ -50,11 +54,55 @@ function fsyncDirectorySync(directory, fsOps = fs) {
     }
 }
 
+function dedupMetadataFromStat(stat, label = 'Filesystem entry') {
+    const metadata = {
+        uid: stat?.uid,
+        gid: stat?.gid,
+        mode: Number.isInteger(stat?.mode) ? stat.mode & STAT_PERMISSION_MODE_MASK : NaN,
+    };
+    if (!Number.isInteger(metadata.uid) || metadata.uid < 0
+        || !Number.isInteger(metadata.gid) || metadata.gid < 0
+        || !Number.isInteger(metadata.mode)) {
+        const error = new Error(`${label} has unavailable ownership or mode metadata`);
+        error.code = 'ASSET_DEDUP_METADATA_MISMATCH';
+        throw error;
+    }
+    return metadata;
+}
+
+function sameDedupMetadata(left, right) {
+    const leftMetadata = dedupMetadataFromStat(left);
+    const rightMetadata = dedupMetadataFromStat(right);
+    return leftMetadata.uid === rightMetadata.uid
+        && leftMetadata.gid === rightMetadata.gid
+        && leftMetadata.mode === rightMetadata.mode;
+}
+
+function formatDedupMetadata(metadata) {
+    return `uid=${metadata.uid}, gid=${metadata.gid}, mode=0${metadata.mode.toString(8)}`;
+}
+
+function assertDedupMetadata(stat, expected, label) {
+    const actual = dedupMetadataFromStat(stat, label);
+    if (actual.uid === expected.uid
+        && actual.gid === expected.gid
+        && actual.mode === expected.mode) {
+        return actual;
+    }
+    const error = new Error(
+        `Asset dedup metadata mismatch for ${label}: expected ${formatDedupMetadata(expected)}; `
+        + `received ${formatDedupMetadata(actual)}`,
+    );
+    error.code = 'ASSET_DEDUP_METADATA_MISMATCH';
+    throw error;
+}
+
 function samePinnedIdentity(left, right) {
     return left.dev === right.dev
         && left.ino === right.ino
         && left.size === right.size
-        && left.mtimeMs === right.mtimeMs;
+        && left.mtimeMs === right.mtimeMs
+        && sameDedupMetadata(left, right);
 }
 
 function assertRegularFileStat(stat, label) {
@@ -165,6 +213,98 @@ function listDedupCandidates(assetDirs, fsOps = fs) {
     return candidates.sort((left, right) => comparePathBytes(left.filePath, right.filePath));
 }
 
+function preflightDedupEligibility(assetDirs, candidates, fsOps = fs) {
+    const directoryStats = new Map();
+    let directoryMetadata = null;
+    let device = null;
+    for (const assetDir of assetDirs) {
+        const stat = fsOps.lstatSync(assetDir);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) {
+            throw invalidAssetDirectoryError(assetDir, 'operand is no longer a directory');
+        }
+        if (device === null) device = stat.dev;
+        if (stat.dev !== device) {
+            throw new Error('All asset directories must be on the same filesystem');
+        }
+        if (directoryMetadata === null) {
+            directoryMetadata = dedupMetadataFromStat(stat, `asset directory ${assetDir}`);
+        } else {
+            assertDedupMetadata(stat, directoryMetadata, `asset directory ${assetDir}`);
+        }
+        directoryStats.set(assetDir, stat);
+    }
+
+    let candidateMetadata = null;
+    for (const candidate of candidates) {
+        const containingDirectory = directoryStats.get(candidate.assetDir);
+        const containingMetadata = dedupMetadataFromStat(
+            containingDirectory,
+            `asset directory ${candidate.assetDir}`,
+        );
+        const actual = dedupMetadataFromStat(candidate.stat, `asset candidate ${candidate.filePath}`);
+        if (actual.uid !== containingMetadata.uid || actual.gid !== containingMetadata.gid) {
+            const expected = {
+                uid: containingMetadata.uid,
+                gid: containingMetadata.gid,
+                mode: actual.mode,
+            };
+            assertDedupMetadata(candidate.stat, expected, `asset candidate ${candidate.filePath}`);
+        }
+        if (candidateMetadata === null) {
+            candidateMetadata = actual;
+        } else {
+            assertDedupMetadata(candidate.stat, candidateMetadata, `asset candidate ${candidate.filePath}`);
+        }
+    }
+    return { directoryMetadata, candidateMetadata };
+}
+
+function assertPublicationEligibility(source, destination, sourceStat, destinationStat, options = {}) {
+    const fsOps = options.fsOps ?? fs;
+    const expected = options.eligibility ?? {};
+    const sourceDirectoryStat = fsOps.lstatSync(source.assetDir);
+    const destinationDirectoryStat = fsOps.lstatSync(destination.assetDir);
+    if (!sourceDirectoryStat.isDirectory() || sourceDirectoryStat.isSymbolicLink()
+        || !destinationDirectoryStat.isDirectory() || destinationDirectoryStat.isSymbolicLink()) {
+        throw new Error('Asset directory changed before hardlink publication');
+    }
+    if (sourceDirectoryStat.dev !== destinationDirectoryStat.dev) {
+        throw new Error('Asset directories changed filesystem before hardlink publication');
+    }
+    const directoryMetadata = expected.directoryMetadata
+        ?? dedupMetadataFromStat(sourceDirectoryStat, `asset directory ${source.assetDir}`);
+    assertDedupMetadata(
+        sourceDirectoryStat,
+        directoryMetadata,
+        `asset directory ${source.assetDir}`,
+    );
+    assertDedupMetadata(
+        destinationDirectoryStat,
+        directoryMetadata,
+        `asset directory ${destination.assetDir}`,
+    );
+
+    const candidateMetadata = expected.candidateMetadata
+        ?? dedupMetadataFromStat(sourceStat, `asset candidate ${source.filePath}`);
+    assertDedupMetadata(sourceStat, candidateMetadata, `asset candidate ${source.filePath}`);
+    assertDedupMetadata(
+        destinationStat,
+        candidateMetadata,
+        `asset candidate ${destination.filePath}`,
+    );
+    if (candidateMetadata.uid !== directoryMetadata.uid
+        || candidateMetadata.gid !== directoryMetadata.gid) {
+        const error = new Error(
+            `Asset candidates must share their target directories' ownership: `
+            + `${formatDedupMetadata(candidateMetadata)} versus `
+            + `${formatDedupMetadata(directoryMetadata)}`,
+        );
+        error.code = 'ASSET_DEDUP_METADATA_MISMATCH';
+        throw error;
+    }
+    return { directoryMetadata, candidateMetadata };
+}
+
 function publishDedupHardlink(source, destination, expectedHash, options = {}) {
     const fsOps = options.fsOps ?? fs;
     const onStage = options.onStage ?? (() => {});
@@ -177,6 +317,13 @@ function publishDedupHardlink(source, destination, expectedHash, options = {}) {
     if (sourceBefore.dev !== destinationBefore.dev) {
         throw new Error(`Cannot hardlink assets across filesystems: ${source.filePath} -> ${destination.filePath}`);
     }
+    const eligibility = assertPublicationEligibility(
+        source,
+        destination,
+        sourceBefore,
+        destinationBefore,
+        { fsOps, eligibility: options.eligibility },
+    );
 
     const sourceHash = hashPinnedFile(source.filePath, sourceBefore, fsOps);
     const destinationHash = hashPinnedFile(destination.filePath, destinationBefore, fsOps);
@@ -210,7 +357,8 @@ function publishDedupHardlink(source, destination, expectedHash, options = {}) {
             || !samePinnedIdentity(destinationBefore, destinationNow)
             || sourceNow.dev !== tempNow.dev
             || sourceNow.ino !== tempNow.ino
-            || sourceNow.size !== tempNow.size) {
+            || sourceNow.size !== tempNow.size
+            || !sameDedupMetadata(sourceNow, tempNow)) {
             throw new Error('Dedup candidate inode changed before atomic publication');
         }
         onStage('before-revalidate', { source, destination, tempPath });
@@ -257,6 +405,32 @@ function publishDedupHardlink(source, destination, expectedHash, options = {}) {
             )) {
             throw new Error('Dedup candidate changed immediately before atomic publication');
         }
+
+        // This is the metadata publication boundary. Re-read all path metadata
+        // after the final descriptor-pinned content checks, then permit no
+        // callback or asynchronous boundary before rename.
+        const boundarySource = fsOps.lstatSync(source.filePath);
+        const boundaryDestination = fsOps.lstatSync(destination.filePath);
+        const boundaryTemp = fsOps.lstatSync(tempPath);
+        if (!samePinnedIdentity(finalSource.stat, boundarySource)
+            || !samePinnedIdentity(finalDestination.stat, boundaryDestination)
+            || !samePinnedIdentity(finalTemp.stat, boundaryTemp)
+            || boundarySource.dev !== boundaryTemp.dev
+            || boundarySource.ino !== boundaryTemp.ino) {
+            throw new Error('Dedup candidate metadata changed at the publication boundary');
+        }
+        assertPublicationEligibility(
+            source,
+            destination,
+            boundarySource,
+            boundaryDestination,
+            { fsOps, eligibility },
+        );
+        assertDedupMetadata(
+            boundaryTemp,
+            eligibility.candidateMetadata,
+            `dedup publication temp ${tempPath}`,
+        );
         fsOps.renameSync(tempPath, destination.filePath);
         tempExists = false;
         published = true;
@@ -267,6 +441,7 @@ function publishDedupHardlink(source, destination, expectedHash, options = {}) {
         const publishedStat = fsOps.lstatSync(destination.filePath);
         if (publishedStat.dev !== sourceRevalidated.stat.dev
             || publishedStat.ino !== sourceRevalidated.stat.ino
+            || !sameDedupMetadata(publishedStat, eligibility.candidateMetadata)
             || hashPinnedFile(destination.filePath, publishedStat, fsOps).hash !== expectedHash) {
             throw new Error('Published dedup hardlink failed post-publication validation');
         }
@@ -390,10 +565,8 @@ async function deduplicateAssetDirectories(assetDirs, options = {}) {
     try {
         options.onLocksAcquired?.(locks);
         onStage('after-locks-acquired', { assetDirs: normalizedDirs });
-        const devices = new Set(normalizedDirs.map((assetDir) => fsOps.lstatSync(assetDir).dev));
-        if (devices.size !== 1) {
-            throw new Error('All asset directories must be on the same filesystem');
-        }
+        const candidates = listDedupCandidates(normalizedDirs, fsOps);
+        const eligibility = preflightDedupEligibility(normalizedDirs, candidates, fsOps);
         let recovered = 0;
         for (const assetDir of normalizedDirs) {
             recovered += recoverInterruptedDedupNames(assetDir, fsOps);
@@ -403,7 +576,6 @@ async function deduplicateAssetDirectories(assetDirs, options = {}) {
             return { directories: normalizedDirs.length, scanned: 0, linked: 0, recovered };
         }
 
-        const candidates = listDedupCandidates(normalizedDirs, fsOps);
         const sizeGroups = new Map();
         for (const candidate of candidates) {
             const group = sizeGroups.get(candidate.stat.size) ?? [];
@@ -427,7 +599,11 @@ async function deduplicateAssetDirectories(assetDirs, options = {}) {
             if (group.length < 2) continue;
             const source = group[0];
             for (const destination of group.slice(1)) {
-                if (publishDedupHardlink(source, destination, hash, { fsOps, onStage })) {
+                if (publishDedupHardlink(source, destination, hash, {
+                    fsOps,
+                    onStage,
+                    eligibility,
+                })) {
                     linked++;
                 }
             }
@@ -451,10 +627,12 @@ module.exports = {
     ASSET_DEDUP_TEMP_RE,
     comparePathBytes,
     deduplicateAssetDirectories,
+    dedupMetadataFromStat,
     filesEqualPinned,
     hashPinnedFile,
     listDedupCandidates,
     normalizeAssetDirectories,
+    preflightDedupEligibility,
     publishDedupHardlink,
     recoverInterruptedDedupNames,
     releaseAllAssetMaintenanceLocks,

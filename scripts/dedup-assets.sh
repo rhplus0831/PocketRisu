@@ -14,6 +14,8 @@
 # Requirements:
 #   - All instance directories must be on the SAME filesystem (hardlinks cannot
 #     cross mount points).
+#   - All target directories and candidate assets must have one UID/GID, with
+#     one directory mode and one candidate-file mode. Mixed metadata is refused.
 #   - Node.js 22.12 or newer (the same runtime PocketRisu requires).
 #   - Every live instance must run a build with the shared asset-maintenance
 #     lock contract. Runtime writes that meet maintenance are refused retryably.
