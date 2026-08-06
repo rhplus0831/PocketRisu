@@ -8,8 +8,8 @@ import { createClient, type RisuClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { encodeBackup } from './helpers/encode.js'
 import utilsPkg from '../../server/node/utils.cjs'
-import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
-import pluginStorageJsonPkg from '../../server/node/pluginStorageJson.cjs'
+import pluginSaveKeysPkg from '../../server/node/plugin-storage/pluginSaveKeys.cjs'
+import pluginStorageJsonPkg from '../../server/node/plugin-storage/pluginStorageJson.cjs'
 
 const { encodeRisuSaveLegacy } = utilsPkg as {
   encodeRisuSaveLegacy: (value: unknown) => Uint8Array

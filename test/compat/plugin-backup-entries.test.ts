@@ -13,7 +13,7 @@ import { decodeBackup } from './helpers/decode.js'
 import { encodeBackup } from './helpers/encode.js'
 import { decodeRisuDat } from './helpers/normalize.js'
 import utilsPkg from '../../server/node/utils.cjs'
-import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
+import pluginSaveKeysPkg from '../../server/node/plugin-storage/pluginSaveKeys.cjs'
 
 const MAGIC_RAW = Buffer.from([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7])
 const PLUGIN_TRANSITION_MAGIC = Buffer.from('PRISUT01', 'ascii')

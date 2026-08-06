@@ -8,7 +8,7 @@ import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import utilsPkg from '../../../server/node/utils.cjs'
-import spoolOwnershipPkg from '../../../server/node/spoolOwnership.cjs'
+import spoolOwnershipPkg from '../../../server/node/backup/spoolOwnership.cjs'
 
 const cache = vi.hoisted(() => ({ enabled: false }))
 

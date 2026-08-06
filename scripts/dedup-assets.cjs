@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const {
     deduplicateAssetDirectories,
-} = require('../server/node/assetDedup.cjs');
+} = require('../server/node/assets/assetDedup.cjs');
 
 function usage() {
     console.error('usage: dedup-assets.sh <assets-dir> [<assets-dir> ...]');

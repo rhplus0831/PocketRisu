@@ -18,7 +18,7 @@ const https = require('https');
 const nodeCrypto = require('crypto');
 const { setTimeout: sleep } = require('timers/promises');
 const { once } = require('events');
-const { normalizeForwardHeaders } = require('./utils.cjs');
+const { normalizeForwardHeaders } = require('../utils.cjs');
 
 const MODEL_JOB_DEFAULT_TIMEOUT_MS = 600000;
 const MODEL_JOB_MAX_TIMEOUT_MS = 3600000;

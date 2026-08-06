@@ -23,7 +23,7 @@ const {
 } = fsSync;
 const fs = require('fs/promises')
 const nodeCrypto = require('crypto')
-const { createSessionLock } = require('./session-lock.cjs')
+const { createSessionLock } = require('./runtime/session-lock.cjs')
 const zlib = require('zlib')
 const v8 = require('v8')
 const rateLimit = require('express-rate-limit')
@@ -52,9 +52,9 @@ const { kvGet, kvGetAsync, kvWriteToFile, kvSet, kvSetFromFile, kvDel, kvList,
         getPluginStorageMutationVersion, withPluginStorageQuotaPlan,
         isLegacyHexMigrationComplete, markLegacyHexMigrationComplete,
         publishLegacyHexMigrationMarker,
-        db: sqliteDb } = require('./db.cjs');
-const { CHUNK_MARKER } = require('./chunkStore.cjs');
-const { buildListResponse } = require('./listDelta.cjs');
+        db: sqliteDb } = require('./db/db.cjs');
+const { CHUNK_MARKER } = require('./db/chunkStore.cjs');
+const { buildListResponse } = require('./db/listDelta.cjs');
 const {
     assetDir,
     migrationMarkerPath: assetMigrationMarker,
@@ -84,37 +84,37 @@ const {
     swapDirectoryFromStaging,
     migrateAssetRowsToFilesystem,
     verifyAssetHash,
-} = require('./assetStore.cjs');
+} = require('./assets/assetStore.cjs');
 const {
     collectReferencedAssetKeys,
     createAssetGcCandidateStore,
     planAssetGc,
-} = require('./assetGc.cjs');
+} = require('./assets/assetGc.cjs');
 const {
     writeImportJournal,
     readImportJournal,
     clearImportJournal,
     fsyncDirectoryTree,
     recoverImportSwap,
-} = require('./importJournal.cjs');
-const { createImportBarrier } = require('./importBarrier.cjs');
+} = require('./backup/importJournal.cjs');
+const { createImportBarrier } = require('./backup/importBarrier.cjs');
 const {
     acquireAssetMaintenanceLockSync,
     isAssetMaintenanceLockedError,
     releaseAssetMaintenanceLockHandle,
     sameAssetDirectoryIdentitySync,
-} = require('./assetMaintenanceLock.cjs');
+} = require('./assets/assetMaintenanceLock.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
     logger, installProcessHandlers, expressErrorMiddleware,
-} = require('./logs.cjs');
-const { createRequestLogs } = require('./request-logs.cjs');
-const { createRequestTracer, isRequestTracingEnabled } = require('./request-trace.cjs');
-const { applyPatchAtomic } = require('./atomicJsonPatch.cjs');
-const { createGenerationMemo } = require('./generationMemo.cjs');
-const { openStageRowDownload } = require('./stageRowDownload.cjs');
-const { createRevisionBoundCache } = require('./revisionBoundCache.cjs');
-const { createPluginStorageManifestCache } = require('./pluginStorageManifestCache.cjs');
+} = require('./runtime/logs.cjs');
+const { createRequestLogs } = require('./runtime/request-logs.cjs');
+const { createRequestTracer, isRequestTracingEnabled } = require('./runtime/request-trace.cjs');
+const { applyPatchAtomic } = require('./db/atomicJsonPatch.cjs');
+const { createGenerationMemo } = require('./db/generationMemo.cjs');
+const { openStageRowDownload } = require('./db/stageRowDownload.cjs');
+const { createRevisionBoundCache } = require('./db/revisionBoundCache.cjs');
+const { createPluginStorageManifestCache } = require('./plugin-storage/pluginStorageManifestCache.cjs');
 const {
     DbCachePersistenceGuardError,
     commitPreparedDbCachePersistence,
@@ -122,7 +122,7 @@ const {
     persistDbCacheGenerationSync,
     prepareDbCachePersistence,
     runEmergencyDbFlush,
-} = require('./dbCachePersistence.cjs');
+} = require('./db/dbCachePersistence.cjs');
 const {
     decodeRisuSave,
     decodeAuthoritativeRisuSave,
@@ -141,7 +141,7 @@ const {
     prepareDatabaseReadPayload,
     encodeCachedDbReadEnvelope,
     createDatabaseSegmentMemo,
-} = require('./dbCachedRead.cjs');
+} = require('./db/dbCachedRead.cjs');
 const {
     createChatRowStore,
     chatRowKey,
@@ -151,35 +151,35 @@ const {
     findDuplicateChaIds,
     findDuplicateChatIds,
     validateDatabaseShape,
-} = require('./chatRows.cjs');
+} = require('./chat/chatRows.cjs');
 const {
     CHARACTER_DEFAULTS_MARKER_KEY,
     CHARACTER_DEFAULTS_MARKER_VALUE,
     applyDatabaseCharacterDefaults,
-} = require('./characterDefaults.cjs');
+} = require('./chat/characterDefaults.cjs');
 const {
     CHAT_DELTA_CONTENT_TYPE,
     ChatDeltaValidationError,
-} = require('./chatDelta.cjs');
-const { streamRisuSaveToFile } = require('./streamRisuSave.cjs');
+} = require('./chat/chatDelta.cjs');
+const { streamRisuSaveToFile } = require('./backup/streamRisuSave.cjs');
 const {
     MCP_TOOL_CALL_CACHE_PREFIX,
     mcpToolCallStorageKey,
     parseMcpToolCallSnapshotKey,
     parseMcpToolCallStorageKey,
     scanMcpToolCallIdsFromFile,
-} = require('./mcpToolCallRecovery.cjs');
-const { validateJsonSource } = require('./streamJsonToMsgpack.cjs');
+} = require('./backup/mcpToolCallRecovery.cjs');
+const { validateJsonSource } = require('./backup/streamJsonToMsgpack.cjs');
 const {
     pluginStorageViewerDisplaySize,
     pluginStorageViewerDisplaySizeFromMetadata,
     pluginStorageViewerValueText,
-} = require('./pluginStorageViewerFacets.cjs');
+} = require('./plugin-storage/pluginStorageViewerFacets.cjs');
 const {
     convertBlockRisuSaveToMessagePack,
     readBlockRisuSaveTopLevelFields,
     streamBackupRisuSaveToFile,
-} = require('./streamBackupRisuSave.cjs');
+} = require('./backup/streamBackupRisuSave.cjs');
 const {
     DECODED_SPOOL_FILE_PREFIXES,
     RisuSavePreparationError,
@@ -189,7 +189,7 @@ const {
     readRisuSaveTopLevelFields,
     shouldStreamRisuSave,
     walkRisuSave,
-} = require('./streamRisuLoad.cjs');
+} = require('./backup/streamRisuLoad.cjs');
 
 async function readBackupRisuSaveTopLevelFields(input, requestedKeys, options = {}) {
     const inspection = await inspectRisuSaveSource(input);
@@ -236,12 +236,12 @@ const {
     validateJsonFileStreaming,
     inspectZipFile,
     extractZipEntries,
-} = require('./importSpool.cjs');
+} = require('./backup/importSpool.cjs');
 const {
     assertProxyTargetAllowed,
     isProxyTargetBlockedError,
     resolveHubProxyTarget,
-} = require('./proxyTarget.cjs');
+} = require('./runtime/proxyTarget.cjs');
 const {
     BACKUP_ENTRY_NAME_MAX_BYTES,
     PLUGIN_SAVE_PREFIX,
@@ -259,14 +259,14 @@ const {
     mergePluginStorageKeyMappings,
     pluginSaveStorageKeyMappingComponent,
     pluginStorageManifestMappingMap,
-} = require('./pluginSaveKeys.cjs');
+} = require('./plugin-storage/pluginSaveKeys.cjs');
 const {
     assertBackupEntryNameWithinLimit,
     encodeBackupEntryHeader,
     backupEntrySize,
     preflightBackupEntries,
-} = require('./backupEntryFormat.cjs');
-const { createBackupImportIndex } = require('./backupImportIndex.cjs');
+} = require('./backup/backupEntryFormat.cjs');
+const { createBackupImportIndex } = require('./backup/backupImportIndex.cjs');
 const {
     PluginStorageValidationError,
     PLUGIN_STORAGE_JSON_CODEC,
@@ -284,12 +284,12 @@ const {
     serializePluginStorageRow,
     snapshotPluginStorageRecord,
     validatePluginStorageRow,
-} = require('./pluginStorageJson.cjs');
+} = require('./plugin-storage/pluginStorageJson.cjs');
 const {
     PLUGIN_VALUE_MAX_BYTES,
     PLUGIN_STORAGE_MAX_BYTES,
     PluginStorageLimitError,
-} = require('./pluginStorageLimits.cjs');
+} = require('./plugin-storage/pluginStorageLimits.cjs');
 const {
     BUFFERED_INGRESS_POLICY,
     createBufferedIngressLimits,
@@ -298,7 +298,7 @@ const {
     createBufferedIngressMiddleware,
     isStreamedIngress,
     sendClientUpgradeRequired,
-} = require('./bufferedIngress.cjs');
+} = require('./chat/bufferedIngress.cjs');
 const {
     ADMITTED_INGRESS_SPOOL,
     ADMITTED_INGRESS_SPOOL_PREFIX,
@@ -307,9 +307,9 @@ const {
     disposeAdmittedIngressSpool,
     isAdmittedSpoolPressureError,
     sendRetryableSpoolRefusal,
-} = require('./admittedIngressSpool.cjs');
-const { prepareFileChunkPlan } = require('./chunkPlan.cjs');
-const { readClientBuildStamp } = require('./buildStamp.cjs');
+} = require('./chat/admittedIngressSpool.cjs');
+const { prepareFileChunkPlan } = require('./db/chunkPlan.cjs');
+const { readClientBuildStamp } = require('./runtime/buildStamp.cjs');
 const {
     SPOOL_OWNER_ID_FILENAME,
     readOrCreatePersistentUuid,
@@ -318,7 +318,7 @@ const {
     ensureOwnedSpoolDirSync,
     openPinnedOwnedSpoolDirSync,
     withQuarantinedOwnedSpoolDirSync,
-} = require('./spoolOwnership.cjs');
+} = require('./backup/spoolOwnership.cjs');
 const {
     CHAT_BACKUP_DIRNAME,
     createChatBackupStore,
@@ -327,7 +327,7 @@ const {
     resolveChatBackupMaxBytes,
     resolveChatBackupMaxUncompressedBytes,
     isDestructiveBackupReason,
-} = require('./chatBackups.cjs');
+} = require('./chat/chatBackups.cjs');
 const {
     RECOVERY_PATH_STARTUP_QUARANTINE_NAME,
     RECOVERY_PATH_STATE_HANDOFF_NAME,
@@ -6408,7 +6408,7 @@ async function checkDiskSpace(requiredBytes, targetPath = path.join(process.cwd(
 // Mirrors the BroadcastChannel-based tab lock on the server side so that the
 // same protection extends across devices. Page loads register without stealing
 // the lock; a recent user gesture allows a freshly booted session to take over.
-const { createBoundedSessionState } = require('./boundedSessionState.cjs');
+const { createBoundedSessionState } = require('./runtime/boundedSessionState.cjs');
 const PLUGIN_STORAGE_READ_SESSION_MAX_ENTRIES = 50;
 const pluginStorageReadStateStatsPath = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_PLUGIN_READ_STATE_STATS_PATH ?? '').trim() || null
@@ -10080,7 +10080,7 @@ async function validatePinnedColdStorage(destination, entry, signal) {
             await new Promise((resolve, reject) => {
                 throwIfBackupExportAborted(signal);
                 const worker = spawn(process.execPath, [
-                    path.join(__dirname, 'jsonValidateWorker.cjs'),
+                    path.join(__dirname, 'backup', 'jsonValidateWorker.cjs'),
                     destination,
                     String(entry.size),
                     String(BACKUP_IMPORT_MAX_BYTES),
@@ -12212,7 +12212,7 @@ app.delete('/proxy-stream-jobs/:jobId', async (req, res) => {
 
 // Durable model-preset relay. Provider bytes are streamed to the client and
 // journaled so an interrupted tab can resume or recover the response.
-const { createModelJobs } = require('./model-jobs.cjs');
+const { createModelJobs } = require('./runtime/model-jobs.cjs');
 const modelJobs = createModelJobs({ saveDir: savePath, logger });
 modelJobs.registerRoutes(app, { auth: checkProxyAuth });
 

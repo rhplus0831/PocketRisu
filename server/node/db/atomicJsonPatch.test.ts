@@ -8,7 +8,7 @@ const { applyPatch } = jsonPatchPkg
 const { applyPatchAtomic } = atomicPatchPkg as {
     applyPatchAtomic: (document: unknown, patch: unknown[]) => Array<unknown> & { newDocument: any }
 }
-const { calculateHash } = require('./utils.cjs') as {
+const { calculateHash } = require('../utils.cjs') as {
     calculateHash: (value: unknown, memo?: WeakMap<object, number>) => number
 }
 

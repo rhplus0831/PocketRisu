@@ -7,7 +7,7 @@ import { createClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { createSeedBackup } from './helpers/seed.js'
 import { decodeRisuDat } from './helpers/normalize.js'
-import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
+import pluginSaveKeysPkg from '../../server/node/plugin-storage/pluginSaveKeys.cjs'
 
 const { encodePluginSaveStorageKey } = pluginSaveKeysPkg as {
   encodePluginSaveStorageKey: (rawKey: string, prefix: string) => string

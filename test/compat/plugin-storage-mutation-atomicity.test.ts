@@ -12,7 +12,7 @@ import {
   type PluginStorageMutationResult,
 } from '../../src/ts/storage/pluginStorageMutation.js'
 import utilsPkg from '../../server/node/utils.cjs'
-import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
+import pluginSaveKeysPkg from '../../server/node/plugin-storage/pluginSaveKeys.cjs'
 
 const { encodeRisuSaveLegacy } = utilsPkg as {
   encodeRisuSaveLegacy: (value: unknown) => Uint8Array

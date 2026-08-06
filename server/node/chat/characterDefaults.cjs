@@ -1,6 +1,6 @@
 'use strict';
 
-const policy = require('../../shared/character-defaults-policy.json');
+const policy = require('../../../shared/character-defaults-policy.json');
 
 const CHARACTER_DEFAULTS_MARKER_KEY = 'migration/character-defaults-normalized';
 const CHARACTER_DEFAULTS_MARKER_VALUE = Buffer.from('done', 'utf-8');

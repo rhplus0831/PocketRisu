@@ -2,8 +2,8 @@ import { describe, expect, it, vi } from 'vitest'
 import Database from 'better-sqlite3'
 import { createHash } from 'node:crypto'
 import chatRowsPkg from './chatRows.cjs'
-import chunkStorePkg from './chunkStore.cjs'
-import utilsPkg from './utils.cjs'
+import chunkStorePkg from '../db/chunkStore.cjs'
+import utilsPkg from '../utils.cjs'
 
 interface ChatRowStore {
     chatRowKey: (chaId: string, chatId: string) => string

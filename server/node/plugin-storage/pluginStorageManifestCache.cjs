@@ -1,6 +1,6 @@
 'use strict';
 
-const { createRevisionBoundCache } = require('./revisionBoundCache.cjs');
+const { createRevisionBoundCache } = require('../db/revisionBoundCache.cjs');
 const {
     PLUGIN_SAVE_PREFIX,
     PLUGIN_SAVE_META_PREFIX,

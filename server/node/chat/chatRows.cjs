@@ -7,8 +7,8 @@ const {
     decodeRisuSave,
     encodeRisuSaveLegacy,
     normalizeJSON,
-} = require('./utils.cjs');
-const { walkRisuSave } = require('./streamRisuLoad.cjs');
+} = require('../utils.cjs');
+const { walkRisuSave } = require('../backup/streamRisuLoad.cjs');
 const {
     CHARACTER_DEFAULTS_MARKER_KEY,
     CHARACTER_DEFAULTS_MARKER_VALUE,

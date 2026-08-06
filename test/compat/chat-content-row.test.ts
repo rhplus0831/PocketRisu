@@ -932,7 +932,7 @@ describe('chat content row serving', () => {
     expect(serverSource.slice(storeStart, storeEnd)).toContain('streamChatRowRawToFile')
 
     const backupSource = readFileSync(
-      new URL('../../server/node/chatBackups.cjs', import.meta.url),
+      new URL('../../server/node/chat/chatBackups.cjs', import.meta.url),
       'utf-8',
     )
     const captureStart = backupSource.indexOf('async function captureChatPreImage')

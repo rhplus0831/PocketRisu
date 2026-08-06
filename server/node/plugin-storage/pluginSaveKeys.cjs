@@ -1,4 +1,4 @@
-const policy = require('../../shared/plugin-save-key-policy.json');
+const policy = require('../../../shared/plugin-save-key-policy.json');
 const { createHash } = require('crypto');
 
 const BACKUP_ENTRY_NAME_MAX_BYTES = policy.backupEntryNameMaxBytes;

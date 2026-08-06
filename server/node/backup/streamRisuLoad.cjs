@@ -23,18 +23,18 @@ const {
     parseLegacyPluginStorageEnvelope,
     pluginStorageLegacyEscapeField,
     restoreLegacyPluginStorageKeys,
-} = require('./utils.cjs');
+} = require('../utils.cjs');
 const {
     PLUGIN_SAVE_PREFIX,
     PLUGIN_SAVE_META_PREFIX,
     PLUGIN_STORAGE_FOLDED_MARKER,
-} = require('./pluginSaveKeys.cjs');
+} = require('../plugin-storage/pluginSaveKeys.cjs');
 const {
     PluginStorageValidationError,
     encodeValidatedPluginStorageKey,
     snapshotPluginStorageJson,
     snapshotPluginStorageRecord,
-} = require('./pluginStorageJson.cjs');
+} = require('../plugin-storage/pluginStorageJson.cjs');
 const {
     MCP_TOOL_CALL_SNAPSHOT_FIELD,
     MCP_TOOL_CALL_SNAPSHOT_MARKER,

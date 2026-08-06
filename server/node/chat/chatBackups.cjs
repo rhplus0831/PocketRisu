@@ -23,7 +23,7 @@ const path = require('node:path');
 const zlib = require('node:zlib');
 const crypto = require('node:crypto');
 const { pipeline } = require('node:stream/promises');
-const { decodeRisuSave } = require('./utils.cjs');
+const { decodeRisuSave } = require('../utils.cjs');
 
 const CHAT_BACKUP_DIRNAME = 'chat-backups';
 const CHAT_BACKUP_DIR_ENV = 'POCKETRISU_CHAT_BACKUP_DIR';

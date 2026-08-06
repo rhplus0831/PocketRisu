@@ -4,8 +4,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, test } from 'vitest'
-import bufferedIngressPkg from '../../server/node/bufferedIngress.cjs'
-import admittedSpoolPkg from '../../server/node/admittedIngressSpool.cjs'
+import bufferedIngressPkg from '../../server/node/chat/bufferedIngress.cjs'
+import admittedSpoolPkg from '../../server/node/chat/admittedIngressSpool.cjs'
 
 const {
   BUFFERED_INGRESS_POLICY,

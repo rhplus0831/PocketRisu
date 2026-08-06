@@ -4,7 +4,7 @@ const { createHash, randomUUID } = require('crypto');
 const zlib = require('zlib');
 const { Readable, Writable } = require('stream');
 const { pipeline } = require('stream/promises');
-const { logger } = require('./logs.cjs');
+const { logger } = require('./runtime/logs.cjs');
 
 // Magic headers for different save formats
 const magicHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7]);

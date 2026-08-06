@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const dbModulePath = path.resolve(process.cwd(), 'server/node/db.cjs')
+const dbModulePath = path.resolve(process.cwd(), 'server/node/db/db.cjs')
 
 describe('db list-delta wrappers', () => {
     it('tracks logical deletes, escapes prefixes, clears tombstones on every write, and rotates epochs', () => {

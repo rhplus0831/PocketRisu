@@ -9,7 +9,7 @@ const require = createRequire(import.meta.url)
 const {
   streamBackupRisuSaveToFile,
   readBlockRisuSaveTopLevelFields,
-} = require('../../server/node/streamBackupRisuSave.cjs') as {
+} = require('../../server/node/backup/streamBackupRisuSave.cjs') as {
   streamBackupRisuSaveToFile: (options: Record<string, unknown>) => Promise<{
     filePath: string
     size: number

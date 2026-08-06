@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const dbModulePath = path.resolve(process.cwd(), 'server/node/db.cjs')
+const dbModulePath = path.resolve(process.cwd(), 'server/node/db/db.cjs')
 
 describe('optimized plugin storage capacity', () => {
     test('chunks rows, accounts logical bytes atomically, and clears manifests', () => {

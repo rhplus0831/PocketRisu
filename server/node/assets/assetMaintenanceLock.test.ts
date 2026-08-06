@@ -339,7 +339,7 @@ describe('asset maintenance lock', () => {
     const root = path.dirname(path.dirname(assetDir))
     const ready = path.join(root, 'ready')
     const release = path.join(root, 'release')
-    const helperPath = path.resolve('server/node/assetMaintenanceLock.cjs')
+    const helperPath = path.resolve('server/node/assets/assetMaintenanceLock.cjs')
     const holderCode = `
       const fs = require('fs');
       const helper = require(${JSON.stringify(helperPath)});
@@ -376,7 +376,7 @@ describe('asset maintenance lock', () => {
 
   it('reconciles a killed published-owner stage before stale-owner recovery', () => {
     const assetDir = makeAssetDir()
-    const helperPath = path.resolve('server/node/assetMaintenanceLock.cjs')
+    const helperPath = path.resolve('server/node/assets/assetMaintenanceLock.cjs')
     const killed = spawnSync(process.execPath, ['-e', `
       const helper = require(${JSON.stringify(helperPath)});
       helper.acquireAssetMaintenanceLockSync(${JSON.stringify(assetDir)}, {
@@ -406,7 +406,7 @@ describe('asset maintenance lock', () => {
     const ready = path.join(root, 'stage-ready')
     const proceed = path.join(root, 'stage-proceed')
     const acquired = path.join(root, 'stage-acquired')
-    const helperPath = path.resolve('server/node/assetMaintenanceLock.cjs')
+    const helperPath = path.resolve('server/node/assets/assetMaintenanceLock.cjs')
     const child = spawn(process.execPath, ['-e', `
       const fs = require('fs');
       const helper = require(${JSON.stringify(helperPath)});
@@ -439,7 +439,7 @@ describe('asset maintenance lock', () => {
   it('elects one concurrent stale remover and never unlinks its replacement owner', async () => {
     const assetDir = makeAssetDir()
     const root = path.dirname(path.dirname(assetDir))
-    const helperPath = path.resolve('server/node/assetMaintenanceLock.cjs')
+    const helperPath = path.resolve('server/node/assets/assetMaintenanceLock.cjs')
     const stale = spawnSync(process.execPath, ['-e', `
       const helper = require(${JSON.stringify(helperPath)});
       helper.acquireAssetMaintenanceLockSync(${JSON.stringify(assetDir)}, {

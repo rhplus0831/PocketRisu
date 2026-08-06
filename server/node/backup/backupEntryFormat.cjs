@@ -1,6 +1,6 @@
 const {
     BACKUP_ENTRY_NAME_MAX_BYTES,
-} = require('./pluginSaveKeys.cjs');
+} = require('../plugin-storage/pluginSaveKeys.cjs');
 
 const BACKUP_ENTRY_DATA_MAX_BYTES = 0xffffffff;
 

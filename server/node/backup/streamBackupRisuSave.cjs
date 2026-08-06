@@ -17,7 +17,7 @@ const {
     presetTemplate,
     pluginStorageLegacyEscapeField,
     pluginStorageLegacyEscapeMarker,
-} = require('./utils.cjs');
+} = require('../utils.cjs');
 const { mapHeader, arrayHeader } = require('./streamRisuSave.cjs');
 const {
     inspectRisuSaveSource,
@@ -27,8 +27,8 @@ const {
     decodeDescriptor,
     skipMessagePackValue,
 } = require('./streamRisuLoad.cjs');
-const { PLUGIN_STORAGE_FOLDED_MARKER } = require('./pluginSaveKeys.cjs');
-const { PluginStorageValidationError } = require('./pluginStorageJson.cjs');
+const { PLUGIN_STORAGE_FOLDED_MARKER } = require('../plugin-storage/pluginSaveKeys.cjs');
+const { PluginStorageValidationError } = require('../plugin-storage/pluginStorageJson.cjs');
 const {
     MCP_TOOL_CALL_SNAPSHOT_FIELD,
     MCP_TOOL_CALL_SNAPSHOT_MARKER,

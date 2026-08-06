@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import policy from '../../shared/character-defaults-policy.json'
+import policy from '../../../shared/character-defaults-policy.json'
 import {
     BOT_PRESET_ID_ASSIGNMENT as CLIENT_BOT_PRESET_ID_ASSIGNMENT,
     CHARACTER_DEFAULTS as CLIENT_CHARACTER_DEFAULTS,
@@ -10,7 +10,7 @@ import {
     assignCharacterId,
     assignPersonaId,
     fillCharacterDefaults as fillClientCharacterDefaults,
-} from '../../src/ts/storage/characterDefaults'
+} from '../../../src/ts/storage/characterDefaults'
 import serverDefaultsPkg from './characterDefaults.cjs'
 
 const {

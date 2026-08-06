@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import chatBackupsPkg from './chatBackups.cjs'
-import utilsPkg from './utils.cjs'
+import utilsPkg from '../utils.cjs'
 
 interface BackupVersion {
     versionId: string
@@ -2418,7 +2418,7 @@ describe('chat backup reconcile and reads', () => {
         expect(fs.existsSync(path.join(tree, 'stale-char'))).toBe(false)
         expect(fs.existsSync(path.join(tree, 'empty-char'))).toBe(false)
 
-        const source = fs.readFileSync(path.join(process.cwd(), 'server/node/chatBackups.cjs'), 'utf-8')
+        const source = fs.readFileSync(path.join(process.cwd(), 'server/node/chat/chatBackups.cjs'), 'utf-8')
         expect(source).not.toContain('gzipSync')
         expect(source).not.toContain('gunzipSync')
         expect(source).not.toContain('Buffer.concat(rawEntries)')

@@ -1,18 +1,18 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
 import cachedReadPkg from './dbCachedRead.cjs'
-import utilsPkg from './utils.cjs'
+import utilsPkg from '../utils.cjs'
 import {
     DB_CACHE_GROUPS,
     decodeAndAssembleCachedDbRead,
     type DbCacheInventory,
-} from '../../src/ts/storage/dbCachedRead'
+} from '../../../src/ts/storage/dbCachedRead'
 
-vi.mock('../../src/ts/storage/database.svelte', () => ({}))
-vi.mock('../../src/ts/storage/chatStorage', () => ({ chatToStub: (chat: any) => chat }))
-vi.mock('../../src/ts/globalApi.svelte', () => ({ forageStorage: { realStorage: null } }))
+vi.mock('../../../src/ts/storage/database.svelte', () => ({}))
+vi.mock('../../../src/ts/storage/chatStorage', () => ({ chatToStub: (chat: any) => chat }))
+vi.mock('../../../src/ts/globalApi.svelte', () => ({ forageStorage: { realStorage: null } }))
 
-const clientRisuSave = await import('../../src/ts/storage/risuSave')
+const clientRisuSave = await import('../../../src/ts/storage/risuSave')
 
 const {
     DB_CACHE_MAX_HASHES,

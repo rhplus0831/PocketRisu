@@ -14,7 +14,7 @@ const { readRisuSaveTopLevelFields } = require('./streamRisuLoad.cjs') as {
     options?: Record<string, unknown>,
   ) => Promise<Record<string, unknown>>
 }
-const { magicStreamCompressedHeader } = require('./utils.cjs') as {
+const { magicStreamCompressedHeader } = require('../utils.cjs') as {
   magicStreamCompressedHeader: Uint8Array
 }
 

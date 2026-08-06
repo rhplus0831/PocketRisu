@@ -3,9 +3,9 @@ import Database from 'better-sqlite3'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import chatRowsPkg from '../../server/node/chatRows.cjs'
-import streamRisuLoadPkg from '../../server/node/streamRisuLoad.cjs'
-import streamRisuSavePkg from '../../server/node/streamRisuSave.cjs'
+import chatRowsPkg from '../../server/node/chat/chatRows.cjs'
+import streamRisuLoadPkg from '../../server/node/backup/streamRisuLoad.cjs'
+import streamRisuSavePkg from '../../server/node/backup/streamRisuSave.cjs'
 import utilsPkg from '../../server/node/utils.cjs'
 
 const { createChatRowStore } = chatRowsPkg as {

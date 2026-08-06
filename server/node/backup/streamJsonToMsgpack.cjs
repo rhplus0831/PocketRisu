@@ -7,7 +7,7 @@ const { Packr } = require('msgpackr');
 const { Unpackr } = require('msgpackr');
 const {
     PLUGIN_STORAGE_LOSSLESS_MAGIC,
-} = require('./pluginStorageJson.cjs');
+} = require('../plugin-storage/pluginStorageJson.cjs');
 
 const PAGE_BYTES = 64 * 1024;
 const MAX_JSON_DEPTH = 1024;

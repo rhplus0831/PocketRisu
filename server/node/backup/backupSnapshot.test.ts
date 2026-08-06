@@ -5,10 +5,10 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import Database from 'better-sqlite3'
 import { afterEach, describe, expect, test } from 'vitest'
-import chunkStorePkg from './chunkStore.cjs'
+import chunkStorePkg from '../db/chunkStore.cjs'
 import streamBackupPkg from './streamBackupRisuSave.cjs'
 import streamSavePkg from './streamRisuSave.cjs'
-import utilsPkg from './utils.cjs'
+import utilsPkg from '../utils.cjs'
 
 const execFileAsync = promisify(execFile)
 const { createChunkStore, createSnapshotReader } = chunkStorePkg as {
@@ -61,7 +61,7 @@ function createKvSchema(db: Database.Database): void {
 
 describe('backup snapshot assembly', () => {
     test('automatic snapshot existence is probed through verified metadata, not database kvGet', async () => {
-        const source = await readFile(path.resolve(import.meta.dirname, 'server.cjs'), 'utf8')
+        const source = await readFile(path.resolve(import.meta.dirname, '../server.cjs'), 'utf8')
         const captureStart = source.indexOf('async function captureAutomaticSnapshotSource')
         const assemblyStart = source.indexOf('async function assembleAutomaticSnapshotSource')
         expect(captureStart).toBeGreaterThanOrEqual(0)
@@ -166,7 +166,7 @@ describe('backup snapshot assembly', () => {
     test('createKvSnapshot reads raw and chunked values from its pinned WAL snapshot', async () => {
         const cwd = await mkdtemp(path.join(tmpdir(), 'risu-kv-snapshot-'))
         tempDirs.push(cwd)
-        const dbModule = path.resolve(import.meta.dirname, 'db.cjs')
+        const dbModule = path.resolve(import.meta.dirname, '../db/db.cjs')
         const script = String.raw`
             const { db, kvGet, kvSet, kvDel, kvList, createKvSnapshot, checkpointWal } = require(process.argv[1]);
             const oldChunk = Buffer.alloc(200000, 0x41);

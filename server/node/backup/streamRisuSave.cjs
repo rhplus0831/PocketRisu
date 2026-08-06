@@ -7,9 +7,9 @@ const {
     magicPluginStorageHeader,
     pluginStorageLegacyEscapeField,
     pluginStorageLegacyEscapeMarker,
-} = require('./utils.cjs');
-const { mergeChatStubWithFullChat } = require('./chatRows.cjs');
-const { PLUGIN_STORAGE_FOLDED_MARKER } = require('./pluginSaveKeys.cjs');
+} = require('../utils.cjs');
+const { mergeChatStubWithFullChat } = require('../chat/chatRows.cjs');
+const { PLUGIN_STORAGE_FOLDED_MARKER } = require('../plugin-storage/pluginSaveKeys.cjs');
 const {
     MCP_TOOL_CALL_SNAPSHOT_FIELD,
     MCP_TOOL_CALL_SNAPSHOT_MARKER,

@@ -17,13 +17,13 @@ const { streamJsonFileToMessagePack, validateJsonSource } = require('./streamJso
   ) => Promise<{ type: string; length?: number; jsonSize?: number }>
 }
 const { pluginStorageViewerDisplaySizeFromMetadata } = require(
-  './pluginStorageViewerFacets.cjs',
+  '../plugin-storage/pluginStorageViewerFacets.cjs',
 ) as {
   pluginStorageViewerDisplaySizeFromMetadata: (
     metadata: { type: string; length?: number; jsonSize?: number },
   ) => number
 }
-const { serializeLosslessPluginStorageRow } = require('./pluginStorageJson.cjs') as {
+const { serializeLosslessPluginStorageRow } = require('../plugin-storage/pluginStorageJson.cjs') as {
   serializeLosslessPluginStorageRow: (storageKey: string, value: unknown) => Buffer
 }
 const unpackr = new Unpackr({ int64AsType: 'number', useRecords: false })

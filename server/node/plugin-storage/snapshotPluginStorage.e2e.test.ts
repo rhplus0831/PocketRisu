@@ -9,11 +9,11 @@ import path from 'node:path'
 import { gzipSync } from 'node:zlib'
 import Database from 'better-sqlite3'
 import { Packr } from 'msgpackr'
-import utilsPkg from './utils.cjs'
+import utilsPkg from '../utils.cjs'
 import pluginSaveKeysPkg from './pluginSaveKeys.cjs'
-import streamLoadPkg from './streamRisuLoad.cjs'
-import spoolOwnershipPkg from './spoolOwnership.cjs'
-import { encodeBackup } from '../../test/compat/helpers/encode.js'
+import streamLoadPkg from '../backup/streamRisuLoad.cjs'
+import spoolOwnershipPkg from '../backup/spoolOwnership.cjs'
+import { encodeBackup } from '../../../test/compat/helpers/encode.js'
 
 const {
     decodeRisuSave,

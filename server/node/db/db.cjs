@@ -12,19 +12,19 @@ const {
 const {
     createPluginStorageOwnerScanner,
     validatePluginStorageRow,
-} = require('./pluginStorageJson.cjs');
+} = require('../plugin-storage/pluginStorageJson.cjs');
 const {
     createPluginStorageViewerFacetSnapshot,
     createPluginStorageViewerFacetStore,
     pluginStorageViewerDisplaySize,
-} = require('./pluginStorageViewerFacets.cjs');
+} = require('../plugin-storage/pluginStorageViewerFacets.cjs');
 const {
     PLUGIN_VALUE_MAX_BYTES,
     PLUGIN_STORAGE_MAX_BYTES,
     isPluginValueKey,
     assertPluginValueSize,
     assertPluginStorageTotal,
-} = require('./pluginStorageLimits.cjs');
+} = require('../plugin-storage/pluginStorageLimits.cjs');
 
 const saveDir = path.join(process.cwd(), 'save');
 if (!fs.existsSync(saveDir)) {

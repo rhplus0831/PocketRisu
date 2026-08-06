@@ -1,6 +1,6 @@
 const { Packr, Unpackr } = require('msgpackr');
 const nodeCrypto = require('crypto');
-const { encodeRisuSaveLegacy, sha256Hex } = require('./utils.cjs');
+const { encodeRisuSaveLegacy, sha256Hex } = require('../utils.cjs');
 
 const DB_CACHE_VERSION = 1;
 const DB_CACHE_MAX_HASHES = 8192;

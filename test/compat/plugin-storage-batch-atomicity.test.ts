@@ -11,7 +11,7 @@ import { createClient, type RisuClient } from './helpers/client.js'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { encodeBackup } from './helpers/encode.js'
 import utilsPkg from '../../server/node/utils.cjs'
-import pluginSaveKeysPkg from '../../server/node/pluginSaveKeys.cjs'
+import pluginSaveKeysPkg from '../../server/node/plugin-storage/pluginSaveKeys.cjs'
 
 const { encodeRisuSaveLegacy, decodeRisuSave, magicCompressedHeader } = utilsPkg as {
   encodeRisuSaveLegacy: (value: unknown) => Uint8Array
