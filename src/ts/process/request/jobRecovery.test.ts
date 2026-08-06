@@ -94,6 +94,8 @@ interface ServerBehavior {
     pendingSends?: any[]
     /** journal body per job id (string, replayed as one chunk) */
     journals?: Record<string, string>
+    /** optional gate held before a journal response is returned */
+    journalWaits?: Record<string, Promise<void>>
     /** override the stream endpoint's HTTP status per job id */
     streamStatus?: Record<string, number>
     /** successive GET /api/model-jobs/:id responses (last one repeats) */
@@ -126,6 +128,7 @@ function setupServer(behavior: ServerBehavior) {
         const streamMatch = url.match(/^\/api\/model-jobs\/([^/]+)\/stream$/)
         if (streamMatch) {
             const id = streamMatch[1]
+            await behavior.journalWaits?.[id]
             const status = behavior.streamStatus?.[id] ?? 200
             if (status !== 200) return new Response('down', { status })
             return new Response(sseStream(behavior.journals?.[id] ?? ''), {
@@ -228,6 +231,75 @@ describe('recoverTerminalJob', () => {
         expect(claims()).toEqual([])
         expect(calls.some((call) => call.url.endsWith('/stream'))).toBe(false)
         genState.endGeneration('chat-1')
+    })
+
+    test('defers to an unrelated background owner without releasing or reading the journal', async () => {
+        const { recovery, genState } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        const { claims, calls } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+        const unrelatedOwnership = genState.startGeneration('chat-1', 'gen-newer', 'background')
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(chat.message).toHaveLength(0)
+        expect(claims()).toEqual([])
+        expect(calls.some((call) => call.url.endsWith('/stream'))).toBe(false)
+        expect(get(genState.generationStates).get('chat-1')?.ownership).toBe(unrelatedOwnership)
+        expect(genState.endGenerationIfOwned('chat-1', unrelatedOwnership)).toBe(true)
+    })
+
+    test('re-resolves generation identity after journal replay instead of filling a stale slot', async () => {
+        const { recovery, genState } = await loadModules()
+        const staleChat = makeChat({ message: [{
+            role: 'char',
+            data: 'Hel',
+            chatId: 'gen-1',
+            generationInfo: { generationId: 'gen-1' },
+        }] })
+        const char = makeChar(staleChat)
+        mocks.db.characters = [char]
+        let releaseJournal!: () => void
+        const journalWait = new Promise<void>((resolve) => { releaseJournal = resolve })
+        const { calls, claims } = setupServer({
+            journals: { 'job-1': OPENAI_SSE },
+            journalWaits: { 'job-1': journalWait },
+        })
+
+        const recovering = recovery.recoverTerminalJob(makeJob() as any)
+        await vi.waitFor(() => {
+            expect(calls.some((call) => call.url.endsWith('/stream'))).toBe(true)
+        })
+        expect(get(genState.generationStates).get('chat-1')).toMatchObject({
+            generationId: 'gen-1',
+            kind: 'background',
+        })
+
+        // Model the stale-index failure directly: while journal replay is
+        // suspended, the chat proxy and slot zero are replaced by a reroll.
+        const newerChat = makeChat({ message: [{
+            role: 'char',
+            data: 'newer generation survives',
+            chatId: 'gen-2',
+            generationInfo: { generationId: 'gen-2' },
+        }] })
+        char.chats[0] = newerChat
+        releaseJournal()
+        await recovering
+
+        expect(newerChat.message).toHaveLength(2)
+        expect(newerChat.message[0]).toMatchObject({
+            data: 'newer generation survives',
+            generationInfo: { generationId: 'gen-2' },
+        })
+        expect(newerChat.message[1]).toMatchObject({
+            data: 'Hello',
+            generationInfo: { generationId: 'gen-1' },
+        })
+        expect(staleChat.message[0].data).toBe('Hel')
+        expect(mocks.saveChatToServer).toHaveBeenCalledWith('cha-1', 0, 'chat-1', newerChat)
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+        expect(genState.isChatGenerating('chat-1')).toBe(false)
     })
 
     test('concurrent discovery defers an exact live-owned terminal job until ownership releases', async () => {

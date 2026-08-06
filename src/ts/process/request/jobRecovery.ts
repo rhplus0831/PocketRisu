@@ -417,76 +417,133 @@ function fillPartialMessage(loc: LocatedChat, index: number, text: string): bool
     return true
 }
 
+function findRecoveredGenerationIndex(chat: Chat, generationId: string | null | undefined): number {
+    if (!generationId) return -1
+    return chat.message.findIndex((message) =>
+        message?.generationInfo?.generationId === generationId
+        || message?.chatId === generationId)
+}
+
+interface TerminalRecoveryOwnership {
+    genKey: string
+    ownership: GenerationOwnershipToken
+    releaseOnExit: boolean
+}
+
+// Terminal recovery performs several suspending operations before it can
+// publish the journal into the chat. Hold the same real Chat.id keyed guard as
+// a normal send across that entire interval. A running-job poll may lend its
+// exact background ownership to the terminal pass; every other existing owner
+// is unrelated and must be left alone for a later discovery pass.
+function acquireTerminalRecoveryOwnership(
+    job: ModelJobRecord,
+    existingOwnership?: GenerationOwnershipToken,
+): TerminalRecoveryOwnership | undefined {
+    const genKey = chatGenKey(job.chatId)
+    const current = get(generationStates).get(genKey)
+    if (existingOwnership) {
+        if (current?.kind !== 'background'
+            || current.ownership !== existingOwnership
+            || (job.generationId && current.generationId !== job.generationId)) return undefined
+        return { genKey, ownership: existingOwnership, releaseOnExit: false }
+    }
+    if (current) return undefined
+    const ownership = startGeneration(genKey, job.generationId ?? uuidv4(), 'background')
+    return { genKey, ownership, releaseOnExit: true }
+}
+
 // Slot one terminal job into its chat. Idempotent (design §4 safety rule 2):
 // an existing message with this generationId is never duplicated — it is either
 // left alone or filled in from the journal (see fillPartialMessage).
-export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
+export async function recoverTerminalJob(
+    job: ModelJobRecord,
+    existingOwnership?: GenerationOwnershipToken,
+): Promise<void> {
     if (isModelJobOwnedByLiveSend(job)) {
         diag(`recover ${job.id.slice(0, 8)}: deferred to live owner`, `generationId=${job.generationId ?? ''}`)
         return
     }
-    const loc = await locateChat(job.chatId)
-    if (!loc) {
-        // Chat was deleted while the job ran — nothing to slot into.
-        console.warn('[ModelJobRecovery] chat missing for job', job.id, '- claiming without slot-in')
-        diag(`recover ${job.id.slice(0, 8)}: chat missing -> claim only`, `chatId=${job.chatId}`)
-        await claimJob(job.id)
+    const recoveryOwnership = acquireTerminalRecoveryOwnership(job, existingOwnership)
+    if (!recoveryOwnership) {
+        diag(`recover ${job.id.slice(0, 8)}: deferred to generation owner`, `chatId=${job.chatId}`)
         return
     }
-    // Secondary match on the message-level chatId (the live push stamps it
-    // with the generationId and it is never rewritten): a continue restamps
-    // generationInfo to the NEW generation, which would otherwise orphan an
-    // unclaimed job of the ORIGINAL one and insert its full response as a
-    // duplicate message.
-    const existingIdx = job.generationId
-        ? loc.chat.message.findIndex((m) => m?.generationInfo?.generationId === job.generationId
-            || m?.chatId === job.generationId)
-        : -1
-    if (job.status === 'failed') {
-        // With the live message already in the chat the user saw this failure as
-        // it happened; an error block on top would only duplicate it.
-        diag(`recover ${job.id.slice(0, 8)}: failed job, existingIdx=${existingIdx}`)
-        const mutated = existingIdx === -1 && insertJobError(loc, job, job.error ?? 'Model request failed')
-        if (needsSave(mutated, existingIdx) && !(await persistRecoveredChat(loc, job))) return
-        await claimJob(job.id)
-        return
-    }
-    if (job.status !== 'done') return
-    const result = await readJobResult(job)
-    let mutated = false
-    if (result.ok === true) {
-        if (existingIdx === -1) {
-            insertRecoveredMessage(loc, job, result.text)
-            mutated = true
-            diag(`recover ${job.id.slice(0, 8)}: inserted len=${result.text.length}`)
-        } else {
-            const before = loc.chat.message[existingIdx]?.data?.length ?? 0
-            mutated = fillPartialMessage(loc, existingIdx, result.text)
-            const after = loc.chat.message[existingIdx]?.data?.length ?? 0
-            // Independent read-back through a FRESH proxied lookup: proves the
-            // write is visible to the reactive graph, not only to our local
-            // reference (the exact failure mode of the raw-object field bug).
-            let fresh = -1
-            try {
-                for (const c of getDatabase()?.characters ?? []) {
-                    const ch = c?.chats?.find((x) => x?.id === job.chatId)
-                    if (ch) { fresh = ch.message?.[existingIdx]?.data?.length ?? -1; break }
-                }
-            } catch { /* diagnostics only */ }
-            diag(`recover ${job.id.slice(0, 8)}: fill idx=${existingIdx} before=${before} decoded=${result.text.length} after=${after} fresh=${fresh}`)
+    try {
+        let loc = await locateChat(job.chatId)
+        if (!loc) {
+            // Chat was deleted while the job ran — nothing to slot into.
+            console.warn('[ModelJobRecovery] chat missing for job', job.id, '- claiming without slot-in')
+            diag(`recover ${job.id.slice(0, 8)}: chat missing -> claim only`, `chatId=${job.chatId}`)
+            await claimJob(job.id)
+            return
         }
-    } else {
-        diag(`recover ${job.id.slice(0, 8)}: journal decode failed, existingIdx=${existingIdx}`, result.error)
-        if (existingIdx === -1) mutated = insertJobError(loc, job, result.error)
+        if (job.status === 'failed') {
+            // Resolve only after hydration has completed. Secondary matching on
+            // Message.chatId preserves the original identity after a continue
+            // restamps generationInfo with its newer generation.
+            const existingIdx = findRecoveredGenerationIndex(loc.chat, job.generationId)
+            // With the live message already in the chat the user saw this failure as
+            // it happened; an error block on top would only duplicate it.
+            diag(`recover ${job.id.slice(0, 8)}: failed job, existingIdx=${existingIdx}`)
+            const mutated = existingIdx === -1 && insertJobError(loc, job, job.error ?? 'Model request failed')
+            if (needsSave(mutated, existingIdx) && !(await persistRecoveredChat(loc, job))) return
+            await claimJob(job.id)
+            return
+        }
+        if (job.status !== 'done') return
+        const result = await readJobResult(job)
+
+        // Journal replay can take long enough for the message array (or even
+        // the hydrated chat proxy) to be replaced. Re-locate the real chat and
+        // resolve the recovered generation's dual identity again; never carry
+        // a numeric message index across the await.
+        loc = await locateChat(job.chatId)
+        if (!loc) {
+            console.warn('[ModelJobRecovery] chat missing after journal read for job', job.id, '- claiming without slot-in')
+            diag(`recover ${job.id.slice(0, 8)}: chat vanished after journal -> claim only`, `chatId=${job.chatId}`)
+            await claimJob(job.id)
+            return
+        }
+        const existingIdx = findRecoveredGenerationIndex(loc.chat, job.generationId)
+        let mutated = false
+        if (result.ok === true) {
+            if (existingIdx === -1) {
+                insertRecoveredMessage(loc, job, result.text)
+                mutated = true
+                diag(`recover ${job.id.slice(0, 8)}: inserted len=${result.text.length}`)
+            } else {
+                const before = loc.chat.message[existingIdx]?.data?.length ?? 0
+                mutated = fillPartialMessage(loc, existingIdx, result.text)
+                const after = loc.chat.message[existingIdx]?.data?.length ?? 0
+                // Independent read-back through a FRESH proxied lookup: proves the
+                // write is visible to the reactive graph, not only to our local
+                // reference (the exact failure mode of the raw-object field bug).
+                let fresh = -1
+                try {
+                    for (const c of getDatabase()?.characters ?? []) {
+                        const ch = c?.chats?.find((x) => x?.id === job.chatId)
+                        if (ch) { fresh = ch.message?.[existingIdx]?.data?.length ?? -1; break }
+                    }
+                } catch { /* diagnostics only */ }
+                diag(`recover ${job.id.slice(0, 8)}: fill idx=${existingIdx} before=${before} decoded=${result.text.length} after=${after} fresh=${fresh}`)
+            }
+        } else {
+            diag(`recover ${job.id.slice(0, 8)}: journal decode failed, existingIdx=${existingIdx}`, result.error)
+            if (existingIdx === -1) mutated = insertJobError(loc, job, result.error)
+        }
+        if (needsSave(mutated, existingIdx) && !(await persistRecoveredChat(loc, job))) return
+        // A job recovered at boot never reached the live path's log flush (the tab
+        // died mid-request). Record it only after serve's external chat row has
+        // committed: a failed save deliberately leaves the job unclaimed for a
+        // later retry, and logging before that retry point would double-count the
+        // same provider request in usage statistics.
+        recordJobRecoveryLog(job, result)
+        await claimJob(job.id)
+    } finally {
+        if (recoveryOwnership.releaseOnExit) {
+            endGenerationIfOwned(recoveryOwnership.genKey, recoveryOwnership.ownership)
+        }
     }
-    if (needsSave(mutated, existingIdx) && !(await persistRecoveredChat(loc, job))) return
-    // A job recovered at boot never reached the live path's log flush (the tab
-    // died mid-request). Record it only after serve's external chat row has
-    // committed: a failed save deliberately leaves the job unclaimed for a
-    // later retry, and logging before that retry point would double-count the
-    // same provider request in usage statistics.
-    recordJobRecoveryLog(job, result)
-    await claimJob(job.id)
 }
 
 // --- running jobs -----------------------------------------------------------
@@ -503,18 +560,19 @@ export function attachRunningJob(job: ModelJobRecord): void {
     const genKey = chatGenKey(job.chatId)
     const registeredGenId = job.generationId ?? uuidv4()
     if (attachedJobs.has(job.id)) return
-    // A LIVE send still owns this chat — the job is this tab's own in-flight
-    // request (a mid-generation return to the tab), not an orphan. Taking it
-    // over would end the live generation's guard out from under it when the
-    // poll finishes. The live path claims the job itself on completion.
-    if (get(generationStates).get(genKey)?.kind === 'live') return
+    // Reuse only the exact matching background registration from an existing
+    // poll. Any live owner or different background owner makes this job a
+    // later discovery pass's responsibility.
+    const existingGeneration = get(generationStates).get(genKey)
+    if (existingGeneration
+        && (existingGeneration.kind !== 'background'
+            || existingGeneration.generationId !== registeredGenId)) return
     attachedJobs.add(job.id)
     diag(`attach ${job.id.slice(0, 8)}: running job reattached`, `chatId=${job.chatId}`)
     // 'background' kind: holds the per-chat send guard without flipping the
     // global doingChat (which would lock every send UI for up to the poll
     // deadline). Survives endAllGenerations cleanup writes for the same reason.
     let controller: AbortController | undefined
-    const existingGeneration = get(generationStates).get(genKey)
     let generationOwnership: GenerationOwnershipToken | undefined
     if (!existingGeneration) {
         generationOwnership = startGeneration(genKey, registeredGenId, 'background')
@@ -594,7 +652,7 @@ async function pollRunningJob(
         diag(`poll ${job.id.slice(0, 8)}: terminal status=${current.status}`)
         if (current.status !== 'aborted') {
             try {
-                await recoverTerminalJob({ ...job, ...current })
+                await recoverTerminalJob({ ...job, ...current }, generationOwnership)
             } catch (err) {
                 console.warn('[ModelJobRecovery] slot-in after poll failed', job.id, err)
                 diag(`poll ${job.id.slice(0, 8)}: slot-in threw`, String(err))
