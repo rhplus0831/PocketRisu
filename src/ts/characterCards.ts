@@ -1076,39 +1076,47 @@ function convertCharbook(arg:{
 
 
 
-function createBaseV2(char:character) {
-    
-    let charBook:charBookEntry[] = []
-    for(const lore of char.globalLore){
-        let ext:{
-            risu_case_sensitive?: boolean;
-            risu_activationPercent?: number
-            risu_loreCache?: {
-                key:string
-                data:string[]
-            }
-        } = safeStructuredClone(lore.extentions ?? {})
+// Extended LorebookEntry with Risuai specific fields shared by CCv2 and CCv3.
+type RisuLorebookEntry = LorebookEntry & {
+    mode?: string;
+    folder?: string;
+}
 
-        let caseSensitive = ext.risu_case_sensitive ?? false
-        ext.risu_activationPercent = lore.activationPercent
-        ext.risu_loreCache = lore.loreCache
-
-        charBook.push({
-            keys: lore.key.split(',').map(r => r.trim()),
-            secondary_keys: lore.selective ? lore.secondkey.split(',').map(r => r.trim()) : undefined,
-            content: lore.content,
-            extensions: ext,
-            enabled: true,
-            insertion_order: lore.insertorder,
-            constant: lore.alwaysActive,
-            selective:lore.selective,
-            name: lore.comment,
-            comment: lore.comment,
-            case_sensitive: caseSensitive,
-            mode: lore.mode ?? "normal",
-            folder: lore.folder,
-        })
+type RisuLorebookExtensions = Record<string, any> & {
+    risu_case_sensitive?: boolean;
+    risu_activationPercent?: number
+    risu_loreCache?: {
+        key:string
+        data:string[]
     }
+}
+
+function adaptLorebookEntryForCard(lore:loreBook):RisuLorebookEntry {
+    const extensions:RisuLorebookExtensions = safeStructuredClone(lore.extentions ?? {})
+    const caseSensitive = extensions.risu_case_sensitive ?? false
+    extensions.risu_activationPercent = lore.activationPercent
+    extensions.risu_loreCache = lore.loreCache
+
+    return {
+        keys: lore.key.split(',').map(r => r.trim()),
+        secondary_keys: lore.selective ? lore.secondkey.split(',').map(r => r.trim()) : undefined,
+        content: lore.content,
+        extensions,
+        enabled: true,
+        insertion_order: lore.insertorder,
+        constant: lore.alwaysActive,
+        selective: lore.selective,
+        name: lore.comment,
+        comment: lore.comment,
+        case_sensitive: caseSensitive,
+        use_regex: lore.useRegex ?? false,
+        mode: lore.mode ?? "normal",
+        folder: lore.folder,
+    }
+}
+
+function createBaseV2(char:character) {
+    const charBook = char.globalLore.map(adaptLorebookEntryForCard)
     char.loreExt ??= {}
 
     char.loreExt.risu_fullWordMatching = char.loreSettings?.fullWordMatching ?? false
@@ -1448,15 +1456,7 @@ export async function exportCharacterCard(char:character, type:'png'|'json'|'cha
     }
 }
 
-// Extended LorebookEntry with Risuai specific fields
-type RisuLorebookEntry = LorebookEntry & {
-    mode?: string;
-    folder?: string;
-}
-
 export function createBaseV3(char:character){
-    
-    let charBook:RisuLorebookEntry[] = []
     let assets:Array<{
         type: string
         uri: string
@@ -1493,39 +1493,7 @@ export function createBaseV3(char:character){
         })
     }
 
-    for(const lore of char.globalLore){
-        let ext:{
-            risu_case_sensitive?: boolean;
-            risu_activationPercent?: number
-            risu_loreCache?: {
-                key:string
-                data:string[]
-            }
-        } = safeStructuredClone(lore.extentions ?? {})
-
-        let caseSensitive = ext.risu_case_sensitive ?? false
-        ext.risu_activationPercent = lore.activationPercent
-        ext.risu_loreCache = lore.loreCache
-
-        charBook.push({
-            ...{
-                keys: lore.key.split(',').map(r => r.trim()),
-                secondary_keys: lore.selective ? lore.secondkey.split(',').map(r => r.trim()) : undefined,
-                content: lore.content,
-                extensions: ext,
-                enabled: true,
-                insertion_order: lore.insertorder,
-                constant: lore.alwaysActive,
-                selective:lore.selective,
-                name: lore.comment,
-                comment: lore.comment,
-                case_sensitive: caseSensitive,
-                use_regex: lore.useRegex ?? false,
-            } as LorebookEntry,
-            mode: lore.mode ?? "normal",
-            folder: lore.folder,
-        })
-    }
+    const charBook = char.globalLore.map(adaptLorebookEntryForCard)
     char.loreExt ??= {}
 
     char.loreExt.risu_fullWordMatching = char.loreSettings?.fullWordMatching ?? false

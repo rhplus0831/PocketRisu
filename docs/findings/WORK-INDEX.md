@@ -5,7 +5,7 @@ Run `pnpm check:docs` after changing a finding, status, path, or link.
 These are point-in-time reports; revalidate their evidence against current code
 before implementation.
 
-Current catalog: **23 open**, **0 deferred**, and **5 accepted decisions**.
+Current catalog: **22 open**, **0 deferred**, and **5 accepted decisions**.
 
 ## Active work by owner
 
@@ -21,7 +21,6 @@ Current catalog: **23 open**, **0 deferred**, and **5 accepted decisions**.
 
 | ID | Finding | Status | Source |
 |---|---|---|---|
-| `FND-ccv2-export-drops-regex-lore-semantics` | [CCv2 export drops regex lore semantics](open/characters-personas/ccv2-export-drops-regex-lore-semantics.md) | Open | 2026-07 data-loss audit |
 | `FND-character-package-remaps-chat-ids-without-remapping-inlay-metadata` | [Character package remaps chat IDs without remapping inlay metadata](open/characters-personas/character-package-remaps-chat-ids-without-remapping-inlay-metadata.md) | Open | 2026-07 data-loss audit |
 | `FND-charx-importer-mistakes-json-assets-for-metadata` | [CharX importer mistakes JSON assets for metadata](open/characters-personas/charx-importer-mistakes-json-assets-for-metadata.md) | Open | 2026-07 data-loss audit |
 | `FND-module-charx-export-drops-namespace-and-cjs` | [Module CharX export drops `namespace` and `cjs`](open/characters-personas/module-charx-export-drops-namespace-and-cjs.md) | Open | 2026-07 data-loss audit |
