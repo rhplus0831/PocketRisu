@@ -15,7 +15,7 @@
     import { chatProcessStage, sendChat } from "../../ts/process/index.svelte";
     import { ensureChatHydrated, setChatBackupReason } from "../../ts/storage/chatStorage";
     import { abortGeneration, captureGenerationOwnership, chatGenKey, concludeGenerationAttempt, generationStates, registerAbort } from "../../ts/process/generationState";
-    import { claimPendingSend, clearPendingSend, markResumable, resumableSends, takeResumable } from "../../ts/process/request/pendingSends";
+    import { claimPendingSend, markResumable, resumableSends, takeResumable } from "../../ts/process/request/pendingSends";
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
     import { isExpTranslator, translate } from "../../ts/translator/translator";
@@ -642,14 +642,11 @@ import { isMobile } from 'src/ts/platform'
             console.error(error)
             alertError(error)
         } finally {
-            if(concludeGenerationAttempt(
+            concludeGenerationAttempt(
                 genKey,
                 generationOwnership,
                 sendAbortController,
-            )){
-                // This attempt, rather than a replacement owner, concluded.
-                clearPendingSend(genKey)
-            }
+            )
             if (abortController === sendAbortController) abortController = null
         }
         if(DBState.db.playMessage){
@@ -696,13 +693,11 @@ import { isMobile } from 'src/ts/platform'
         } catch (error) {
             console.error(error)
         } finally {
-            if(concludeGenerationAttempt(
+            concludeGenerationAttempt(
                 chatId,
                 generationOwnership,
                 abortController,
-            )){
-                clearPendingSend(chatId)
-            }
+            )
         }
     }
 

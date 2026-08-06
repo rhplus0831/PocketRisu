@@ -1,5 +1,8 @@
 import { forageStorage } from 'src/ts/globalApi.svelte'
 import { language } from 'src/lang'
+import { ModelJobConnectionLostError } from './modelJobErrors'
+
+export { ModelJobConnectionLostError } from './modelJobErrors'
 
 // Server-side model-preset requests — job-based fetchImpl (Stage 3 of
 // .agent/notes/model-preset-server-side-requests.md).
@@ -35,13 +38,6 @@ export class ModelJobBusyError extends Error {
  *  Worded as "still generating, it will resume" rather than as a failure: the
  *  user is looking at what appears to be an error while the generation is in
  *  fact fine, and a re-send would only hit the per-chat job guard (409). */
-export class ModelJobConnectionLostError extends Error {
-    constructor() {
-        super(language.errors.modelJobConnectionLost)
-        this.name = 'ModelJobConnectionLostError'
-    }
-}
-
 export interface JobFetchOptions {
     /** Job key: the real chat.id for main generations (server enforces one
      *  running main job per chat on it). Aux side requests pass their unique
@@ -67,6 +63,16 @@ export interface JobFetchOptions {
      *  5xx — older or misbehaving server): the request transparently falls
      *  back to the direct proxied path. NOT used after the job exists. */
     fallbackFetch: typeof fetch
+    /** Live main-chat sends defer terminal claim until their published chat
+     *  state has crossed a committed save barrier. Aux jobs and callers that
+     *  omit this hook retain the transport-owned claim behavior. */
+    onTerminalJob?: (job: TerminalModelJob) => void
+}
+
+export interface TerminalModelJob {
+    jobId: string
+    status: 'done' | 'failed'
+    claim: () => Promise<void>
 }
 
 // Reattach policy. Attempts are per reconnect cycle (reset once a stream is
@@ -209,10 +215,22 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
             return false
         }
 
-        const claim = () => {
-            void (async () => {
-                await fetch(`/api/model-jobs/${jobId}/claim`, { method: 'POST', headers: await authHeader() })
-            })().catch(() => {})
+        const claim = async () => {
+            const res = await fetch(`/api/model-jobs/${jobId}/claim`, { method: 'POST', headers: await authHeader() })
+            if (!res.ok) throw new Error(`model job claim failed (HTTP ${res.status})`)
+        }
+        const finalizeTerminal = (status: TerminalModelJob['status']) => {
+            if ((opts.jobKind ?? 'main') === 'main' && opts.onTerminalJob) {
+                try {
+                    opts.onTerminalJob({ jobId, status, claim })
+                } catch (error) {
+                    // A broken owner hook must leave the job recoverable rather
+                    // than reverting to an unsafe early claim.
+                    console.warn('[ModelJob] terminal-job handoff failed; job left unclaimed', error)
+                }
+                return
+            }
+            void claim().catch(() => {})
         }
 
         const wrapped = new ReadableStream<Uint8Array>({
@@ -263,10 +281,7 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
                     if (job?.status === 'done') {
                         detach()
                         controller.close()
-                        // Claim fire-and-forget: marks the job as collected so
-                        // Stage 4's discovery skips it. The tiny crash window
-                        // before the claim lands is covered by genId idempotency.
-                        claim()
+                        finalizeTerminal('done')
                         return
                     }
                     if (job?.status === 'failed' || job?.status === 'aborted') {
@@ -276,7 +291,7 @@ export function makeJobFetch(opts: JobFetchOptions): typeof fetch {
                             // next boot's discovery doesn't insert a duplicate
                             // error into the chat. ('aborted' is excluded from
                             // the unclaimed list; nothing to do.)
-                            claim()
+                            finalizeTerminal('failed')
                         }
                         controller.error(new Error(job.error ?? `model job ${job.status}`))
                         return

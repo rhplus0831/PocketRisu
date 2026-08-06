@@ -253,6 +253,9 @@ function createModelJobs(opts = {}) {
         ON CONFLICT(chat_id) DO UPDATE SET generation_id = excluded.generation_id, created_at = excluded.created_at
     `);
     const stmtPendingDelete = db.prepare(`DELETE FROM pending_sends WHERE chat_id = ?`);
+    const stmtPendingDeleteGeneration = db.prepare(`
+        DELETE FROM pending_sends WHERE chat_id = ? AND generation_id = ?
+    `);
     const stmtPendingList = db.prepare(`SELECT * FROM pending_sends ORDER BY created_at ASC`);
     // A pending send this old is noise (the one-shot resume window has long
     // passed); swept by the same out-of-band cleanup timer as terminal jobs.
@@ -364,8 +367,16 @@ function createModelJobs(opts = {}) {
     }
 
     function clearPendingSend(chatId) {
-        stmtPendingDelete.run(chatId);
-        return { success: true };
+        const info = stmtPendingDelete.run(chatId);
+        return { success: true, cleared: info.changes > 0 };
+    }
+
+    // Live sends must only conclude the tombstone they registered. A newer
+    // send (possibly from another device) may upsert the same chat while the
+    // older owner waits for its durability barrier.
+    function clearPendingSendGeneration(chatId, generationId) {
+        const info = stmtPendingDeleteGeneration.run(chatId, generationId);
+        return { success: true, cleared: info.changes > 0 };
     }
 
     // Atomic take: delete-and-report in one statement, so among concurrent
@@ -723,6 +734,11 @@ function createModelJobs(opts = {}) {
             res.send(clearPendingSend(req.params.chatId));
         });
 
+        app.delete('/api/pending-sends/:chatId/generation/:generationId', async (req, res) => {
+            if (!await auth(req, res)) return;
+            res.send(clearPendingSendGeneration(req.params.chatId, req.params.generationId));
+        });
+
         app.post('/api/pending-sends/:chatId/claim', async (req, res) => {
             if (!await auth(req, res)) return;
             res.send(claimPendingSend(req.params.chatId));
@@ -744,6 +760,7 @@ function createModelJobs(opts = {}) {
         getJob,
         listJobs,
         claimJob,
+        clearPendingSendGeneration,
         deleteJob,
         streamJob,
         registerPendingSend,

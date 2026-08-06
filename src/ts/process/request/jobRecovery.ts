@@ -17,6 +17,7 @@ import { parseGeminiResponse, parseGeminiStreamDelta } from 'src/ts/preset/adapt
 import { extractErrorMessage } from 'src/ts/preset/adapter/error'
 import { formatReasoningParts } from 'src/ts/preset/adapter/reasoning'
 import type { AdapterChatStreamDelta, AdapterUsage } from 'src/ts/preset/adapter/types'
+import { isModelJobOwnedByLiveSend } from './liveModelJobOwnership'
 
 // Bootstrap recovery for server-side model jobs (Stage 4 of
 // .agent/notes/model-preset-server-side-requests.md, §3 "복귀" / §5 row 4).
@@ -420,6 +421,10 @@ function fillPartialMessage(loc: LocatedChat, index: number, text: string): bool
 // an existing message with this generationId is never duplicated — it is either
 // left alone or filled in from the journal (see fillPartialMessage).
 export async function recoverTerminalJob(job: ModelJobRecord): Promise<void> {
+    if (isModelJobOwnedByLiveSend(job)) {
+        diag(`recover ${job.id.slice(0, 8)}: deferred to live owner`, `generationId=${job.generationId ?? ''}`)
+        return
+    }
     const loc = await locateChat(job.chatId)
     if (!loc) {
         // Chat was deleted while the job ran — nothing to slot into.

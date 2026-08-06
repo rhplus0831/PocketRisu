@@ -34,7 +34,7 @@ import {
 import { formatReasoningParts } from "src/ts/preset/adapter/reasoning";
 import { TOOL_CAPABLE_ADAPTER_KINDS, VISION_CAPABLE_ADAPTER_KINDS, type AdapterKind, type ModelPreset } from "src/ts/preset/types";
 import { pumpPresetStream } from "./presetStreamPump";
-import { makeJobFetch } from "./jobFetch";
+import { makeJobFetch, type TerminalModelJob } from "./jobFetch";
 import { resolveChatModelBinding, buildModelPresetCredential, applyPromptPresetParams } from "./modelPresetBinding";
 import { expandAdapterMessages, toAdapterMessage, toolResponseText } from "./modelPresetMessages";
 import { isLocalNetworkUrl } from "src/ts/network/localNetwork";
@@ -43,6 +43,7 @@ import {
     startStatus, appendText, endStatus, setStatusTokenCounter, addBadge,
     type RequestKind,
 } from "src/ts/status/requestStatus";
+import { isRecoverableModelJobFailure, recoveryDispositionForModelJobRequestError, type ModelJobRecoveryDisposition } from './modelJobDisposition';
 
 export type ToolCall = {
     name: string;
@@ -85,6 +86,8 @@ interface requestDataArgument{
     // it to the ModelPreset bound to that module (db.moduleModelBindings).
     // Absent for character-owned scripts and normal chat sends.
     moduleId?: string
+    /** Main live-send owner hook. Never supplied to aux or preview calls. */
+    onTerminalModelJob?: (job: TerminalModelJob) => void
 }
 
 export interface RequestDataArgumentExtended extends requestDataArgument{
@@ -114,6 +117,7 @@ export type requestDataResponse = {
         emotion?: string
     },
     failByServerError?: boolean
+    recoveryDisposition?: ModelJobRecoveryDisposition
     model?: string
 }|{
     type: "streaming",
@@ -201,6 +205,16 @@ export async function requestChatData(arg:requestDataArgument, model:ModelModeEx
                 staticModel: fallBackModels[fallbackIndex],
                 tools: tools,
             }, model, abortSignal)
+
+            // A lost live tail is not an ordinary provider failure: retrying or
+            // falling back could double-generate, and flattening it would let
+            // send conclusion erase the pending-send recovery marker.
+            if (da.type === 'fail' && isRecoverableModelJobFailure(da)) {
+                return {
+                    ...da,
+                    model: fallBackModels[fallbackIndex] || da.model,
+                }
+            }
 
             // A ModelPreset response that already executed tools must be returned
             // as-is and NEVER re-run: the side effects (possibly writes) are done.
@@ -782,6 +796,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             streaming: resolvePresetStreaming(preset, arg),
             timeoutMs: (getDatabase().localNetworkTimeoutSec ?? 600) * 1000,
             fallbackFetch: proxiedFetch,
+            onTerminalJob: arg.realChatId ? arg.onTerminalModelJob : undefined,
         })
         : proxiedFetch
 
@@ -1031,6 +1046,7 @@ async function requestModelPreset(arg:RequestDataArgumentExtended, preset:ModelP
             type: 'fail',
             result: err instanceof Error ? err.message : String(err),
             model: preset.name,
+            recoveryDisposition: recoveryDispositionForModelJobRequestError(err, arg.realChatId),
         }
     }
 }

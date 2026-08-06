@@ -43,7 +43,8 @@ async function loadModules() {
     const genState = await import('src/ts/process/generationState')
     const status = await import('src/ts/status/requestStatus')
     const pending = await import('./pendingSends')
-    return { recovery, genState, status, pending }
+    const liveOwnership = await import('./liveModelJobOwnership')
+    return { recovery, genState, status, pending, liveOwnership }
 }
 
 // --- fixtures ---------------------------------------------------------------
@@ -214,6 +215,39 @@ describe('journal decoding', () => {
 // --- terminal job slot-in ---------------------------------------------------
 
 describe('recoverTerminalJob', () => {
+    test('defers the server-terminal to transport-EOF race to the matching live generation', async () => {
+        const { recovery, genState } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        const { claims, calls } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+        genState.startGeneration('chat-1', 'gen-1', 'live')
+
+        await recovery.recoverTerminalJob(makeJob() as any)
+
+        expect(chat.message).toHaveLength(0)
+        expect(claims()).toEqual([])
+        expect(calls.some((call) => call.url.endsWith('/stream'))).toBe(false)
+        genState.endGeneration('chat-1')
+    })
+
+    test('concurrent discovery defers an exact live-owned terminal job until ownership releases', async () => {
+        const { recovery, liveOwnership } = await loadModules()
+        const chat = makeChat()
+        mocks.db.characters = [makeChar(chat)]
+        const job = makeJob()
+        const { claims } = setupServer({ unclaimed: [job], journals: { 'job-1': OPENAI_SSE } })
+        liveOwnership.ownLiveTerminalModelJob('job-1')
+
+        await recovery.recoverModelJobs()
+        expect(chat.message).toHaveLength(0)
+        expect(claims()).toEqual([])
+
+        liveOwnership.releaseLiveTerminalModelJob('job-1')
+        await recovery.recoverModelJobs()
+        expect(chat.message).toHaveLength(1)
+        expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+    })
+
     test('done job slots exactly one char message with generationInfo, then claims', async () => {
         const { recovery } = await loadModules()
         const chat = makeChat()
@@ -247,6 +281,33 @@ describe('recoverTerminalJob', () => {
         expect(chat.message).toHaveLength(1)
         expect(chat.message[0].data).toBe('Hello, and then some more') // recovered 'Hello' is shorter
         expect(claims()).toEqual(['/api/model-jobs/job-1/claim'])
+    })
+
+    test('dual identity prevents duplicate recovery after a failed second-generation barrier', async () => {
+        const { recovery } = await loadModules()
+        const chat = makeChat({ message: [{
+            role: 'char',
+            data: 'Hello\n```risuerror\nretry failed\n```',
+            chatId: 'gen-1',
+            generationInfo: { generationId: 'gen-2' },
+        }] })
+        mocks.db.characters = [makeChar(chat)]
+        const first = makeJob({ id: 'job-1', generationId: 'gen-1', status: 'done' })
+        const second = makeJob({ id: 'job-2', generationId: 'gen-2', status: 'failed', error: 'retry failed' })
+        const { claims } = setupServer({ journals: { 'job-1': OPENAI_SSE } })
+
+        await recovery.recoverTerminalJob(first as any)
+        await recovery.recoverTerminalJob(second as any)
+
+        expect(chat.message).toHaveLength(1)
+        expect(chat.message[0]).toMatchObject({
+            chatId: 'gen-1',
+            generationInfo: { generationId: 'gen-2' },
+        })
+        expect(claims()).toEqual([
+            '/api/model-jobs/job-1/claim',
+            '/api/model-jobs/job-2/claim',
+        ])
     })
 
     test('fills a partial message left by a client that died mid-stream', async () => {

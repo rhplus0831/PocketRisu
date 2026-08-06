@@ -26,7 +26,7 @@ import { getModelInfo, LLMFlags } from "../model/modellist";
 import { resolveChatModelBinding, resolvePresetMaxOutputTokens } from "./request/modelPresetBinding";
 import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
-import { readImage } from "../globalApi.svelte";
+import { markChatDirty, readImage, requestImmediateSave } from "../globalApi.svelte";
 import { captureChatPublicationGuard, publishTriggerChatToTarget, resolveChatExecutionTarget, resolveChatSendTarget, type ChatSendTarget } from './chatSendTarget';
 import {
     getActiveChatSendTransaction,
@@ -43,9 +43,11 @@ import {
     startGeneration,
     type GenerationHandoff,
 } from "./generationState";
-import { clearPendingSend, registerPendingSend } from "./request/pendingSends";
+import { clearPendingSendConfirmed, clearPendingSendGeneration, registerPendingSend } from "./request/pendingSends";
+import { appendFailedGenerationToMessage, LiveModelJobSendOwner } from './request/liveModelJobSend';
 import { setChatBackupReason } from "../storage/chatStorage";
 import { SCRIPT_BULK_CHAT_BACKUP_REASON } from "./scriptCapabilities";
+import { throwRecoverableModelJobFailure } from './request/modelJobDisposition';
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -89,7 +91,41 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     transaction?:ChatSendTransaction
     /** Scoped ownership/controller transfer for auto-continue or resend. */
     generationHandoff?:GenerationHandoff
+    /** Shared only by recursive auto-continue/resend calls. */
+    liveFinalization?:LiveModelJobSendOwner
 } = {}):Promise<boolean> {
+    const liveFinalization = arg.liveFinalization ?? new LiveModelJobSendOwner()
+    liveFinalization.enter()
+    let threw = true
+    try {
+        const result = await sendChatImpl(chatProcessIndex, { ...arg, liveFinalization })
+        threw = false
+        if (result) liveFinalization.markPublished()
+        return result
+    } finally {
+        await liveFinalization.leave({
+            preserveArtifacts: threw || arg.signal?.aborted === true,
+        }, {
+            markChatDirty,
+            save: (options) => requestImmediateSave(options),
+            clearPendingSendFireAndForget: clearPendingSendGeneration,
+            clearPendingSend: clearPendingSendConfirmed,
+        })
+    }
+}
+
+async function sendChatImpl(chatProcessIndex = -1,arg:{
+    chatAdditonalTokens?:number,
+    signal?:AbortSignal,
+    continue?:boolean,
+    usedContinueTokens?:number,
+    preview?:boolean
+    previewPrompt?:boolean
+    target?:ChatSendTarget
+    transaction?:ChatSendTransaction
+    generationHandoff?:GenerationHandoff
+    liveFinalization:LiveModelJobSendOwner
+}):Promise<boolean> {
 
     chatProcessStage.set(0)
     const abortSignal = arg.signal ?? (new AbortController()).signal
@@ -148,10 +184,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         return data.trim()
     }
 
-    function throwError(error:string){
+    function throwError(error:string): boolean {
         if(!DBState?.db?.inlayErrorResponse){
             alertError(error)
-            return
+            return false
         }
 
         try{
@@ -162,22 +198,20 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             const charRoom = db.characters?.[sc]
             if(!charRoom){
                 alertError(error)
-                return
+                return false
             }
             const st = selectedChat >= 0 ? selectedChat : charRoom.chatPage
             const chatRoom = charRoom.chats?.[st]
             if(!chatRoom || !Array.isArray(chatRoom.message)){
                 alertError(error)
-                return
+                return false
             }
 
             const messages = chatRoom.message
             const last = messages[messages.length - 1]
-            const suffix = `\n\`\`\`risuerror\n${error}\n\`\`\``
 
-            if(last?.role === 'char'){
-                last.data += suffix
-                return
+            if(appendFailedGenerationToMessage(last, error, generationInfo)){
+                return true
             }
 
             const m:Message = {
@@ -192,12 +226,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 m.generationInfo = generationInfo
             }
             messages.push(m)
-            return
+            return true
         }
         catch(e){
             console.error(e)
             alertError(error)
-            return
+            return false
         }
     }
 
@@ -241,7 +275,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     // register (they end without a message, which would read as resumable).
     // No-op unless the server-side requests toggle is on.
     if (realChatId && !arg.preview && !arg.previewPrompt) {
-        registerPendingSend(realChatId, generationId)
+        if (registerPendingSend(realChatId, generationId)) {
+            arg.liveFinalization.registerPending(guardChar?.chaId, realChatId, generationId)
+        }
     }
 
     if(chatProcessIndex === -1 && DBState.db.presetChain){
@@ -265,9 +301,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     if(target){
         const resolvedTarget = resolveChatSendTarget(DBState.db, target)
         if(!resolvedTarget){
-            if(endGenerationIfOwned(genKey, generationOwnership) && realChatId){
-                clearPendingSend(realChatId)
-            }
+            endGenerationIfOwned(genKey, generationOwnership)
             return false
         }
         selectedChar = resolvedTarget.characterIndex
@@ -284,9 +318,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     // Block send if chat is still a placeholder (hydration not complete)
     if (nowChatroom.chats[selectedChat]?._placeholder) {
         alertError('Chat is still loading. Please wait a moment.')
-        if(endGenerationIfOwned(genKey, generationOwnership) && realChatId){
-            clearPendingSend(realChatId)
-        }
+        endGenerationIfOwned(genKey, generationOwnership)
         return false
     }
     nowChatroom.chats[selectedChat].message = nowChatroom.chats[selectedChat].message.map((v) => {
@@ -918,9 +950,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             )
             : null
         if(!publishedTarget){
-            if(endGenerationIfOwned(genKey, generationOwnership) && realChatId){
-                clearPendingSend(realChatId)
-            }
+            endGenerationIfOwned(genKey, generationOwnership)
             return false
         }
         selectedChar = publishedTarget.characterIndex
@@ -931,9 +961,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         ms = makeMs(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
-            if(endGenerationIfOwned(genKey, generationOwnership) && realChatId){
-                clearPendingSend(realChatId)
-            }
+            endGenerationIfOwned(genKey, generationOwnership)
             return false
         }
     }
@@ -1106,7 +1134,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }
             console.log(sp)
             throwError(sp.error)
-            if (realChatId) clearPendingSend(realChatId)
             return false
         }
         chats = sp.chats
@@ -1124,8 +1151,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         while(currentTokens > maxContextTokens){
             if(chats.length <= 1){
                 throwError(language.errors.toomuchtoken + "\n\nRequired Tokens: " + currentTokens)
-
-                if (realChatId) clearPendingSend(realChatId)
                 return false
             }
 
@@ -1504,7 +1529,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         while(inputTokens > maxContextTokens){
             if(pointer >= formated.length){
                 throwError(language.errors.toomuchtoken + "\n\nAt token rechecking. Required Tokens: " + inputTokens)
-                if (realChatId) clearPendingSend(realChatId)
                 return false
             }
             if(formated[pointer].removable){
@@ -1570,6 +1594,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         realChatId: realChatId,
         imageResponse: DBState.db.outputImageModal,
         previewBody: arg.previewPrompt,
+        onTerminalModelJob: (job) => arg.liveFinalization.registerTerminal(job),
         escape: nowChatroom.type === 'character' && nowChatroom.escapeOutput,
         rememberToolUsage: DBState.db.rememberToolUsage,
     }, 'model', abortSignal)
@@ -1590,12 +1615,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     let resendChat = false
     
     if(abortSignal.aborted === true){
-        if (realChatId) clearPendingSend(realChatId)
         return false
     }
     if(req.type === 'fail'){
-        throwError(req.result)
-        if (realChatId) clearPendingSend(realChatId)
+        throwRecoverableModelJobFailure(req)
+        if (throwError(req.result)) arg.liveFinalization.markPublished()
         return false
     }
     else if(req.type === 'streaming'){
@@ -1761,7 +1785,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
 
         if(streamAborted || abortSignal.aborted){
-            if (realChatId) clearPendingSend(realChatId)
             return false
         }
 
@@ -1787,7 +1810,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 )
                 : null
             if(!publishedTarget){
-                if (realChatId) clearPendingSend(realChatId)
                 return false
             }
             selectedChar = publishedTarget.characterIndex
@@ -1900,7 +1922,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 )
                 : null
             if(!publishedTarget){
-                if (realChatId) clearPendingSend(realChatId)
                 return false
             }
             selectedChar = publishedTarget.characterIndex
@@ -1936,6 +1957,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             target,
             transaction: activeTransaction ?? undefined,
             generationHandoff,
+            liveFinalization: arg.liveFinalization,
         })
     }
 
@@ -1981,6 +2003,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             target,
             transaction: activeTransaction ?? undefined,
             generationHandoff,
+            liveFinalization: arg.liveFinalization,
         })
     }
 
@@ -2085,7 +2108,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
                 
 
-                if (realChatId) clearPendingSend(realChatId)
                 return true
             }
 
@@ -2147,7 +2169,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }, 'emotion', abortSignal)
 
             if(rq.type === 'fail'){
-                if (realChatId) clearPendingSend(realChatId)
                 if(abortSignal.aborted){
                     return true
                 }
@@ -2155,7 +2176,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 return true
             }
             if(rq.type === 'streaming' || rq.type === 'multiline'){
-                if (realChatId) clearPendingSend(realChatId)
                 if(abortSignal.aborted){
                     return true
                 }
@@ -2201,12 +2221,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     }
                 } catch (error) {
                     throwError(language.errors.httpError + `${error}`)
-                    if (realChatId) clearPendingSend(realChatId)
                     return true
                 }
             }
             
-            if (realChatId) clearPendingSend(realChatId)
             return true
 
 
@@ -2243,7 +2261,6 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
     }
 
-    if (realChatId) clearPendingSend(realChatId)
     return true
 }
 

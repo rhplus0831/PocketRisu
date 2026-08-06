@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from 'vitest'
-import { makeJobFetch, ModelJobBusyError, ModelJobConnectionLostError, type JobFetchOptions } from './jobFetch'
+import { makeJobFetch, ModelJobBusyError, ModelJobConnectionLostError, type JobFetchOptions, type TerminalModelJob } from './jobFetch'
 
 vi.mock('src/ts/globalApi.svelte', () => ({
     forageStorage: { createAuth: async () => 'test-auth' },
@@ -155,6 +155,22 @@ describe('makeJobFetch', () => {
         })
     })
 
+    test('hands a terminal main job to the live-send owner without claiming early', async () => {
+        const { calls } = setupServer({ streamChunks: ['done'], job: { status: 'done' } })
+        let terminal: TerminalModelJob | undefined
+        const res = await makeJobFetch(makeOpts({ onTerminalJob: (job) => { terminal = job } }))(
+            'https://provider.example/v1/chat',
+            { method: 'POST', body: '{}' },
+        )
+
+        expect(await res.text()).toBe('done')
+        expect(terminal).toMatchObject({ jobId: 'job-1', status: 'done' })
+        expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(0)
+
+        await terminal!.claim()
+        expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(1)
+    })
+
     test('mirrors the upstream status onto the returned Response', async () => {
         setupServer({
             streamChunks: ['{"error":"rate limited"}'],
@@ -206,9 +222,15 @@ describe('makeJobFetch', () => {
 
     test('aux jobs forward kind and their own unique key', async () => {
         const { calls } = setupServer({ streamChunks: ['{"ok":true}'], job: { status: 'done' } })
-        await makeJobFetch(makeOpts({ jobKind: 'aux', realChatId: 'aux-gen-9' }))('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
+        const onTerminalJob = vi.fn()
+        const res = await makeJobFetch(makeOpts({ jobKind: 'aux', realChatId: 'aux-gen-9', onTerminalJob }))('https://provider.example/v1/chat', { method: 'POST', body: '{}' })
+        await res.text()
         const [create] = callsFor(calls, '/api/model-jobs', 'POST')
         expect(JSON.parse(create.init?.body as string)).toMatchObject({ kind: 'aux', chatId: 'aux-gen-9' })
+        expect(onTerminalJob).not.toHaveBeenCalled()
+        await vi.waitFor(() => {
+            expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(1)
+        })
     })
 
     test('stream end with failed job errors the body with the job error and claims it', async () => {
@@ -220,6 +242,19 @@ describe('makeJobFetch', () => {
         await vi.waitFor(() => {
             expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(1)
         })
+    })
+
+    test('hands a failed main job to the live-send owner without claiming early', async () => {
+        const { calls } = setupServer({ streamChunks: ['par'], job: { status: 'failed', error: 'upstream timeout' } })
+        let terminal: TerminalModelJob | undefined
+        const res = await makeJobFetch(makeOpts({ onTerminalJob: (job) => { terminal = job } }))(
+            'https://provider.example/v1/chat',
+            { method: 'POST', body: '{}' },
+        )
+
+        await expect(drain(res)).rejects.toThrow('upstream timeout')
+        expect(terminal).toMatchObject({ jobId: 'job-1', status: 'failed' })
+        expect(callsFor(calls, '/api/model-jobs/job-1/claim', 'POST')).toHaveLength(0)
     })
 
     test('stream end with aborted job does not claim', async () => {

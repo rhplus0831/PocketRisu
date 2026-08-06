@@ -5,7 +5,7 @@ Run `pnpm check:docs` after changing a finding, status, path, or link.
 These are point-in-time reports; revalidate their evidence against current code
 before implementation.
 
-Current catalog: **21 open**, **0 deferred**, and **5 accepted decisions**.
+Current catalog: **20 open**, **0 deferred**, and **5 accepted decisions**.
 
 ## Active work by owner
 
@@ -29,7 +29,6 @@ Current catalog: **21 open**, **0 deferred**, and **5 accepted decisions**.
 
 | ID | Finding | Status | Source |
 |---|---|---|---|
-| `FND-model-job-claim-precedes-chat-durability` | [Live model-job claim precedes chat-row durability](open/chat-pipeline/model-job-claim-precedes-chat-durability.md) | Open | delta audit DA-5 |
 | `FND-streaming-checkpoint-rearm-can-absorb-unsaved-tokens` | [Streaming checkpoint re-arm can absorb unsaved tokens](open/chat-pipeline/streaming-checkpoint-rearm-can-absorb-unsaved-tokens.md) | Open | delta audit DA-8 |
 | `FND-terminal-job-recovery-uses-stale-message-index` | [Terminal job recovery can overwrite a newer generation by stale index](open/chat-pipeline/terminal-job-recovery-uses-stale-message-index.md) | Open | delta audit DA-6 |
 

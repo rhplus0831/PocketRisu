@@ -43,8 +43,8 @@ function chained<T>(chatId: string, op: () => Promise<T>, fallback: T): Promise<
     return next
 }
 
-export function registerPendingSend(chatId: string, generationId: string): void {
-    if (!enabled()) return
+export function registerPendingSend(chatId: string, generationId: string): boolean {
+    if (!enabled()) return false
     void chained(chatId, async () => {
         await fetch('/api/pending-sends', {
             method: 'POST',
@@ -52,6 +52,7 @@ export function registerPendingSend(chatId: string, generationId: string): void 
             body: JSON.stringify({ chatId, generationId }),
         })
     }, undefined)
+    return true
 }
 
 /** Clear the tombstone (send concluded) and drop any local resume flag.
@@ -70,6 +71,50 @@ export function clearPendingSend(chatId: string): void {
             headers: await authHeader(),
         })
     }, undefined)
+}
+
+/** Generation-owned fire-and-forget conclusion for sends that never created a
+ * terminal main job (default/direct/proxy fallback behavior). */
+export function clearPendingSendGeneration(chatId: string, generationId: string): void {
+    resumableSends.update((m) => {
+        const local = m.get(chatId)
+        if (!local || (local.generationId && local.generationId !== generationId)) return m
+        const next = new Map(m)
+        next.delete(chatId)
+        return next
+    })
+    void chained(chatId, async () => {
+        await fetch(
+            `/api/pending-sends/${encodeURIComponent(chatId)}/generation/${encodeURIComponent(generationId)}`,
+            { method: 'DELETE', headers: await authHeader() },
+        )
+    }, undefined)
+}
+
+/** Delete a tombstone with an observed successful acknowledgement. Durability
+ *  barriers use this instead of the fire-and-forget compatibility helper so a
+ *  failed cleanup leaves the recovery marker available on the next boot. */
+export function clearPendingSendConfirmed(chatId: string, generationId: string): Promise<boolean> {
+    return chained(chatId, async () => {
+        const res = await fetch(
+            `/api/pending-sends/${encodeURIComponent(chatId)}/generation/${encodeURIComponent(generationId)}`,
+            {
+                method: 'DELETE',
+                headers: await authHeader(),
+            },
+        )
+        if (!res.ok) return false
+        const body = await res.json().catch(() => null)
+        if (body?.cleared !== true) return false
+        resumableSends.update((m) => {
+            const local = m.get(chatId)
+            if (!local || (local.generationId && local.generationId !== generationId)) return m
+            const next = new Map(m)
+            next.delete(chatId)
+            return next
+        })
+        return true
+    }, false)
 }
 
 /** Atomically take the tombstone before resuming: the server deletes it and

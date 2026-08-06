@@ -38,7 +38,7 @@ describe('pendingSends', () => {
         }))
         const pending = await loadModule()
 
-        pending.registerPendingSend('chat-1', 'gen-1')
+        expect(pending.registerPendingSend('chat-1', 'gen-1')).toBe(true)
         pending.clearPendingSend('chat-1')
         await new Promise((r) => setTimeout(r, 10))
         expect(order).toEqual([]) // clear queued behind the stalled register
@@ -55,7 +55,7 @@ describe('pendingSends', () => {
         mocks.db = { nodeOnlyServerSideRequests: false }
         const pending = await loadModule()
 
-        pending.registerPendingSend('chat-1', 'gen-1')
+        expect(pending.registerPendingSend('chat-1', 'gen-1')).toBe(false)
         pending.clearPendingSend('chat-1')
         await vi.waitFor(() => expect(calls).toEqual(['DELETE']))
     })
@@ -73,6 +73,19 @@ describe('pendingSends', () => {
 
         vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('down') }))
         expect(await pending.claimPendingSend('chat-1')).toBe(false)
+    })
+
+    test('confirmed clear retains the local recovery flag unless DELETE succeeds', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 503 })))
+        const pending = await loadModule()
+        pending.markResumable('chat-1', 'gen-1')
+
+        expect(await pending.clearPendingSendConfirmed('chat-1', 'gen-1')).toBe(false)
+        expect(get(pending.resumableSends).has('chat-1')).toBe(true)
+
+        vi.stubGlobal('fetch', vi.fn(async () => new Response('{"success":true,"cleared":true}', { status: 200 })))
+        expect(await pending.clearPendingSendConfirmed('chat-1', 'gen-1')).toBe(true)
+        expect(get(pending.resumableSends).has('chat-1')).toBe(false)
     })
 
     test('takeResumable consumes exactly once; markResumable restores', async () => {

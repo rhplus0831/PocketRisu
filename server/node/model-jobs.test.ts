@@ -518,6 +518,33 @@ describe('model-jobs', () => {
         expect((await second.json()).claimed).toBe(false)
     })
 
+    it('generation-aware clear cannot delete a replacement tombstone', async () => {
+        const chatId = 'chat-generation-clear'
+        const register = (generationId: string) => fetch(`${base}/api/pending-sends`, {
+            method: 'POST',
+            headers: { 'risu-auth': AUTH_TOKEN, 'content-type': 'application/json' },
+            body: JSON.stringify({ chatId, generationId }),
+        })
+        await register('old-generation')
+        await register('new-generation')
+
+        const stale = await fetch(
+            `${base}/api/pending-sends/${chatId}/generation/old-generation`,
+            { method: 'DELETE', headers: { 'risu-auth': AUTH_TOKEN } },
+        )
+        expect(await stale.json()).toMatchObject({ success: true, cleared: false })
+        expect(store.listPendingSends()).toEqual(expect.arrayContaining([
+            expect.objectContaining({ chatId, generationId: 'new-generation' }),
+        ]))
+
+        const owned = await fetch(
+            `${base}/api/pending-sends/${chatId}/generation/new-generation`,
+            { method: 'DELETE', headers: { 'risu-auth': AUTH_TOKEN } },
+        )
+        expect(await owned.json()).toMatchObject({ success: true, cleared: true })
+        expect(store.listPendingSends().some((record: { chatId: string }) => record.chatId === chatId)).toBe(false)
+    })
+
     it('expired pending sends are swept by the cleanup pass', () => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-jobs-ps-'))
         const localStore = createModelJobs({ saveDir: dir })

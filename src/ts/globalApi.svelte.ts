@@ -281,6 +281,7 @@ export let requiresFullEncoderReload = $state({
 
 let requestImmediateSaveImpl: ((options?: {
     forceFullWrite?: boolean
+    forceChatPersist?: boolean
 }) => Promise<DatabaseSaveOutcome>) = async () => ({
     status: 'failed',
     error: new Error('Database save loop is not initialized'),
@@ -396,6 +397,7 @@ export function previewPersistFailureToast() {
 
 export function requestImmediateSave(options?: {
     forceFullWrite?: boolean
+    forceChatPersist?: boolean
 }): Promise<DatabaseSaveOutcome> {
     return requestImmediateSaveImpl(options)
 }
@@ -1364,6 +1366,7 @@ export async function saveDb() {
         await tick()
         return triggerSave({
             forceFullWrite: options?.forceFullWrite,
+            forceChatPersist: options?.forceChatPersist,
             requireDurable: true,
         })
     }
