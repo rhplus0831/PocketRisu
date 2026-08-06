@@ -38,4 +38,14 @@ describe('backup entry 32-bit size boundary', () => {
       /32-bit archive size limit/,
     )
   })
+
+  test('rejects duplicate planned names before archive emission', () => {
+    expect(() => preflightBackupEntries([
+      { backupName: 'inlay/x.meta.json', size: 1 },
+      { backupName: 'inlay/x.meta.json', size: 2 },
+    ])).toThrowError(expect.objectContaining({
+      code: 'DUPLICATE_BACKUP_ENTRY',
+      statusCode: 409,
+    }))
+  })
 })

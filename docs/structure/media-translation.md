@@ -198,9 +198,26 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
 
 - `server/node/server.cjs` — relevant storage code is distributed through the server.
 
-  - Current inlays are stored under `save/inlays`; safe ID/extension validation and path
-    construction are centralized in `isSafeInlayId()`, `normalizeInlayExt()`, and the
-    `getInlay*Path()` helpers.
+  - Current inlays are stored below the versioned
+    `save/inlays/.inlay-objects-v1/{payload,sidecar}` namespace. Logical IDs and
+    normalized extensions are encoded as lowercase UTF-8 hex and split into bounded
+    120-character path components. Payloads use
+    `payload/i/<id chunks>/e/<extension chunks>/data`; sidecars use
+    `sidecar/i/<id chunks>/meta.json`. The fixed marker/file components and disjoint
+    directories make the physical mapping injective for dotted IDs, reserve the
+    metadata namespace, avoid case-fold aliases, and keep every component within
+    portable filesystem name limits. Admission preserves the historical envelope:
+    UTF-8 `id + ".meta.json"` and `id + "." + normalized extension` must each fit
+    the 255-byte legacy filename limit, so sharding cannot create unbounded total
+    path depth for oversized live or imported values. Limits are counted in bytes,
+    not JavaScript characters.
+    `isSafeInlayId()`, `normalizeInlayExt()`, and the canonical path/parser helpers own
+    that contract.
+  - Deployed root-level `<id>.<ext>` and `<id>.meta.json` files remain readable through
+    exact parsed-ID compatibility resolution. Canonical files win; sidecar evidence can
+    disambiguate a dotted legacy payload such as `x.meta`/`json`, while missing-sidecar
+    fallback never selects a prefix-sharing ID. Startup rewrites resolvable legacy files
+    into the canonical namespace.
   - `writeInlayFile()` durably stages both payload and sidecar, publishes payload first,
     then commits an extension-changing replacement by renaming the sidecar. It removes
     the old extension only after that commit and cleans temporary files on failure.
@@ -453,6 +470,10 @@ network call.
 - `compressImage()` can route GIF through canvas recompression, which collapses animated input to a rasterized frame.
 - Current inlay payloads are filesystem files despite the client-facing `NodeStorage` KV
   abstraction. Explorer info maps to sidecars; ownership/time metadata remains in SQLite.
+- Physical inlay accounting recursively totals every regular file below `save/inlays/`,
+  including retained crash-orphan payloads, while excluding only the migration marker
+  and recognized publication temporaries. It must not derive byte totals solely from
+  the currently selected logical payload/sidecar pair.
 - Atomic-publication guarantees apply only to the server's physical payload/sidecar
   protocol. The subsequent client writes to `inlay_info/<id>` and
   `inlay_meta/<id>` are separate; a successful payload response does not make all three
@@ -471,12 +492,21 @@ network call.
   union from one pinned cut. A resolved filesystem payload and matching readable
   sidecar take precedence; legacy payload/info rows fill only missing components.
   Unsafe legacy IDs fail lossless export because they cannot pass the archive
-  path contract. Upstream-target and partial exports intentionally omit inlays.
+  path contract. Archive payload names retain `inlay/<id>.<ext>` for dot-free
+  normalized extensions and use the injective
+  `inlay_v2/<lowercase UTF-8 ID hex>--<lowercase UTF-8 extension hex>` form when the
+  extension itself contains a dot. Imports accept both forms. Upstream-target and
+  partial exports intentionally omit inlays.
 - Direct asset URLs use one-year `immutable` caching. Reusing and overwriting an explicit
   inlay ID can leave a browser with a stale cached URL; new content normally needs a new
   ID.
 - `isSafeInlayId()` rejects separators, NULs, and traversal components before filesystem
-  access.
+  access. It also enforces the legacy 255-byte sidecar filename envelope; payload
+  publication and archive import validate the full ID/normalized-extension tuple before
+  creating canonical path components or staging entry bodies.
+- Every hex-key route, including direct `/api/asset/:hexKey` media URLs, accepts only
+  even-length hex whose decoded bytes round-trip exactly through UTF-8. Malformed bytes
+  cannot alias a literal replacement-character key.
 - `/api/asset/:hexKey` requires the session cookie, not the normal `risu-auth` request header. Initialization of `/api/session` is part of asset rendering, not merely login housekeeping.
 - `src/ts/3d/threeload.ts` is legacy and has no current consumers. Do not treat it as the live 3D rendering entry point.
 - Most image providers follow the inlay-vs-`CharEmotion` return contract, but branches are not perfectly uniform; verify a provider branch before relying on its return value.

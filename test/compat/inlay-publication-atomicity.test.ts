@@ -4,6 +4,7 @@ import {
   access,
   mkdir,
   readdir,
+  stat,
   writeFile,
 } from 'node:fs/promises'
 import { afterAll, describe, expect, test } from 'vitest'
@@ -22,6 +23,37 @@ function hexPath(key: string): string {
 
 function isInlayTemporaryFile(entry: string): boolean {
   return /^\.inlay-publish-\d+-[0-9a-f-]{36}-(?:payload|sidecar)$/i.test(entry)
+}
+
+function canonicalInlayPayloadPath(cwd: string, id: string, ext: string): string {
+  const idChunks = Buffer.from(id).toString('hex').match(/.{1,120}/g)!
+  const extChunks = Buffer.from(ext).toString('hex').match(/.{1,120}/g)!
+  return path.join(
+    cwd,
+    'save',
+    'inlays',
+    '.inlay-objects-v1',
+    'payload',
+    'i',
+    ...idChunks,
+    'e',
+    ...extChunks,
+    'data',
+  )
+}
+
+function canonicalInlaySidecarPath(cwd: string, id: string): string {
+  const idChunks = Buffer.from(id).toString('hex').match(/.{1,120}/g)!
+  return path.join(
+    cwd,
+    'save',
+    'inlays',
+    '.inlay-objects-v1',
+    'sidecar',
+    'i',
+    ...idChunks,
+    'meta.json',
+  )
 }
 
 function inlayPayload(id: string, ext: string, data: Buffer): Buffer {
@@ -150,9 +182,11 @@ describe('atomic inlay publication', () => {
       ext: 'png',
       data: original,
     })
+    await expect(access(canonicalInlayPayloadPath(server.cwd, id, 'png'))).resolves
+      .toBeUndefined()
+    await expect(access(canonicalInlayPayloadPath(server.cwd, id, 'jpeg'))).rejects
+      .toMatchObject({ code: 'ENOENT' })
     const entries = await readdir(path.join(server.cwd, 'save', 'inlays'))
-    expect(entries).toContain(`${id}.png`)
-    expect(entries).not.toContain(`${id}.jpeg`)
     expect(entries.some(isInlayTemporaryFile)).toBe(false)
   }, 60_000)
 
@@ -191,8 +225,9 @@ describe('atomic inlay publication', () => {
       ext: 'png',
       data: original,
     })
+    await expect(access(canonicalInlayPayloadPath(server.cwd, 'compress-failure', 'webp')))
+      .rejects.toMatchObject({ code: 'ENOENT' })
     const entries = await readdir(path.join(server.cwd, 'save', 'inlays'))
-    expect(entries).not.toContain('compress-failure.webp')
     expect(entries.some(isInlayTemporaryFile)).toBe(false)
   }, 120_000)
 
@@ -227,8 +262,18 @@ describe('atomic inlay publication', () => {
       ext: 'png',
       data: original,
     })
+    await expect(access(canonicalInlayPayloadPath(server.cwd, 'crash', 'png'))).resolves
+      .toBeUndefined()
+    await expect(access(canonicalInlayPayloadPath(server.cwd, 'crash', 'jpeg'))).resolves
+      .toBeUndefined()
     const entries = await readdir(path.join(server.cwd, 'save', 'inlays'))
-    expect(entries).toContain('crash.png')
     expect(entries.some(isInlayTemporaryFile)).toBe(false)
+
+    const sidecarSize = (await stat(canonicalInlaySidecarPath(server.cwd, 'crash'))).size
+    const statsResponse = await client.fetch('/api/db/stats')
+    expect(statsResponse.status).toBe(200)
+    await expect(statsResponse.json()).resolves.toMatchObject({
+      inlayFsBytes: original.length + replacement.length + sidecarSize,
+    })
   }, 90_000)
 })

@@ -127,6 +127,37 @@ function readKvValue(cwd: string, key: string): Buffer | null {
   }
 }
 
+function canonicalInlayPayloadPath(cwd: string, id: string, ext: string): string {
+  const idChunks = Buffer.from(id).toString('hex').match(/.{1,120}/g)!
+  const extChunks = Buffer.from(ext).toString('hex').match(/.{1,120}/g)!
+  return path.join(
+    cwd,
+    'save',
+    'inlays',
+    '.inlay-objects-v1',
+    'payload',
+    'i',
+    ...idChunks,
+    'e',
+    ...extChunks,
+    'data',
+  )
+}
+
+function canonicalInlaySidecarPath(cwd: string, id: string): string {
+  const idChunks = Buffer.from(id).toString('hex').match(/.{1,120}/g)!
+  return path.join(
+    cwd,
+    'save',
+    'inlays',
+    '.inlay-objects-v1',
+    'sidecar',
+    'i',
+    ...idChunks,
+    'meta.json',
+  )
+}
+
 describe('legacy KV inlay backup fallback', () => {
   test('full and server-file backups union KV fallbacks with authoritative filesystem inlays', async () => {
     const source = await spawnServer()
@@ -259,9 +290,9 @@ describe('legacy KV inlay backup fallback', () => {
     await access(marker)
     expect(readKvValue(server.cwd, 'inlay/retry')).toBeNull()
     expect(readKvValue(server.cwd, 'inlay_info/retry')).toBeNull()
-    expect(await readFile(path.join(server.cwd, 'save', 'inlays', 'retry.png'))).toEqual(bytes)
+    expect(await readFile(canonicalInlayPayloadPath(server.cwd, 'retry', 'png'))).toEqual(bytes)
     expect(JSON.parse(
-      await readFile(path.join(server.cwd, 'save', 'inlays', 'retry.meta.json'), 'utf8'),
+      await readFile(canonicalInlaySidecarPath(server.cwd, 'retry'), 'utf8'),
     )).toMatchObject({ name: 'retry-info.png', width: 7, height: 8 })
   }, 60_000)
 

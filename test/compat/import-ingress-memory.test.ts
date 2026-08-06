@@ -21,6 +21,23 @@ const DEFAULT_IMPORT_LIMIT = 2 * 1024 * 1024 * 1024
 const BUFFERED_ROW_LIMIT = 32 * 1024 * 1024
 const LEGACY_DATABASE_LIMIT = 64 * 1024 * 1024
 
+function canonicalInlayPayloadPath(cwd: string, id: string, ext: string): string {
+  const idChunks = Buffer.from(id).toString('hex').match(/.{1,120}/g)!
+  const extChunks = Buffer.from(ext).toString('hex').match(/.{1,120}/g)!
+  return path.join(
+    cwd,
+    'save',
+    'inlays',
+    '.inlay-objects-v1',
+    'payload',
+    'i',
+    ...idChunks,
+    'e',
+    ...extChunks,
+    'data',
+  )
+}
+
 async function boot(env: Record<string, string> = {}): Promise<{
   server: ServerHandle
   client: RisuClient
@@ -474,7 +491,7 @@ describe('bounded archive and save-folder ingress (real server)', () => {
 
     expect((await client.importBackup(archive)).ok).toBe(true)
     await expectNote(client, 'large-streamed-backup-categories')
-    expect((await stat(path.join(server.cwd, 'save', 'inlays', 'large-inlay.bin'))).size)
+    expect((await stat(canonicalInlayPayloadPath(server.cwd, 'large-inlay', 'bin'))).size)
       .toBe(inlay.length)
     const coldResponse = await client.fetch('/api/read', {
       headers: { 'file-path': Buffer.from('coldstorage/large-character').toString('hex') },

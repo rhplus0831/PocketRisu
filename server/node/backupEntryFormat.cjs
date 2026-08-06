@@ -38,9 +38,17 @@ function backupEntrySize(name, dataSize) {
 }
 
 function preflightBackupEntries(entries) {
+    const names = new Set();
     for (const entry of entries) {
         assertBackupEntryNameWithinLimit(entry.backupName);
         assertBackupEntrySizeWithinLimit(entry.size);
+        if (names.has(entry.backupName)) {
+            const error = new Error(`Duplicate planned backup entry: ${entry.backupName}`);
+            error.code = 'DUPLICATE_BACKUP_ENTRY';
+            error.statusCode = 409;
+            throw error;
+        }
+        names.add(entry.backupName);
     }
 }
 

@@ -3792,6 +3792,23 @@ if (existsSync(jwtSecretPath)) {
 const authCodePath = path.join(process.cwd(), 'save', '__authcode')
 const inlayDir = path.join(savePath, 'inlays')
 const inlayMigrationMarker = path.join(inlayDir, '.migrated_to_fs')
+const INLAY_CANONICAL_ROOT_NAME = '.inlay-objects-v1'
+const INLAY_CANONICAL_PAYLOAD_DIR_NAME = 'payload'
+const INLAY_CANONICAL_SIDECAR_DIR_NAME = 'sidecar'
+const INLAY_CANONICAL_ID_MARKER = 'i'
+const INLAY_CANONICAL_EXT_MARKER = 'e'
+const INLAY_CANONICAL_PAYLOAD_FILE = 'data'
+const INLAY_CANONICAL_SIDECAR_FILE = 'meta.json'
+const INLAY_CANONICAL_HEX_CHUNK_LENGTH = 120
+const inlayCanonicalRoot = path.join(inlayDir, INLAY_CANONICAL_ROOT_NAME)
+const inlayCanonicalPayloadDir = path.join(
+    inlayCanonicalRoot,
+    INLAY_CANONICAL_PAYLOAD_DIR_NAME,
+)
+const inlayCanonicalSidecarDir = path.join(
+    inlayCanonicalRoot,
+    INLAY_CANONICAL_SIDECAR_DIR_NAME,
+)
 const INLAY_TEMP_PREFIX = '.inlay-publish-'
 const INLAY_TEMP_NAME_PATTERN = /^\.inlay-publish-\d+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-(?:payload|sidecar)$/i
 const inlayPublishFailpoint = process.env.NODE_ENV === 'test'
@@ -4310,14 +4327,63 @@ function getSelfUpdateAssetInfo(version) {
     return { platformName, arch, ext, filename, url };
 }
 
+const INLAY_LEGACY_NAME_MAX_BYTES = 255;
+const INLAY_LEGACY_SIDECAR_SUFFIX = '.meta.json';
+
+function isWellFormedUtf8Text(value) {
+    return typeof value === 'string'
+        && Buffer.from(value, 'utf-8').toString('utf-8') === value;
+}
+
 function isSafeInlayId(id) {
-    return typeof id === 'string' &&
+    return isWellFormedUtf8Text(id) &&
         id.length > 0 &&
         !id.includes('\0') &&
         !id.includes('/') &&
         !id.includes('\\') &&
         id !== '.' &&
-        id !== '..';
+        id !== '..' &&
+        Buffer.byteLength(id, 'utf-8')
+            + Buffer.byteLength(INLAY_LEGACY_SIDECAR_SUFFIX, 'utf-8')
+            <= INLAY_LEGACY_NAME_MAX_BYTES;
+}
+
+function normalizedInlayTupleExtension(id, ext) {
+    if (!isSafeInlayId(id)) return null;
+    const normalizedExt = normalizeInlayExt(ext);
+    if (!isWellFormedUtf8Text(normalizedExt)
+        || Buffer.byteLength(id, 'utf-8')
+            + 1
+            + Buffer.byteLength(normalizedExt, 'utf-8')
+            > INLAY_LEGACY_NAME_MAX_BYTES) return null;
+    return normalizedExt;
+}
+
+function isSafeInlayTuple(id, ext) {
+    return normalizedInlayTupleExtension(id, ext) !== null;
+}
+
+function invalidInlayTupleError(id, ext = null) {
+    const error = new Error(
+        ext === null
+            ? 'Invalid inlay ID or ID exceeds the portable filename limit'
+            : 'Invalid inlay ID/extension tuple or tuple exceeds the portable filename limit',
+    );
+    error.code = 'INVALID_INLAY_TUPLE';
+    error.statusCode = 400;
+    error.id = id;
+    error.ext = ext;
+    return error;
+}
+
+function assertSafeInlayTuple(id, ext) {
+    if (arguments.length === 1) {
+        if (!isSafeInlayId(id)) throw invalidInlayTupleError(id);
+        return null;
+    }
+    const normalizedExt = normalizedInlayTupleExtension(id, ext);
+    if (normalizedExt === null) throw invalidInlayTupleError(id, ext);
+    return normalizedExt;
 }
 
 const MAX_INLAY_DELETE_BATCH = 1000;
@@ -4456,34 +4522,221 @@ function assertInsideInlayDir(filePath) {
     }
 }
 
+function encodeInlayPhysicalComponent(value) {
+    const encoded = Buffer.from(value, 'utf-8');
+    if (encoded.toString('utf-8') !== value) {
+        throw new Error('Inlay physical names require well-formed UTF-8 text');
+    }
+    return encoded.toString('hex');
+}
+
+function decodeInlayPhysicalComponent(value) {
+    if (typeof value !== 'string'
+        || value.length === 0
+        || value.length % 2 !== 0
+        || !/^[0-9a-f]+$/.test(value)) return null;
+    const decoded = Buffer.from(value, 'hex').toString('utf-8');
+    return encodeInlayPhysicalComponent(decoded) === value ? decoded : null;
+}
+
+function chunkInlayPhysicalComponent(value) {
+    const encoded = encodeInlayPhysicalComponent(value);
+    const chunks = [];
+    for (let offset = 0; offset < encoded.length; offset += INLAY_CANONICAL_HEX_CHUNK_LENGTH) {
+        chunks.push(encoded.slice(offset, offset + INLAY_CANONICAL_HEX_CHUNK_LENGTH));
+    }
+    return chunks;
+}
+
+function decodeInlayPhysicalChunks(chunks) {
+    if (!Array.isArray(chunks) || chunks.length === 0) return null;
+    for (let index = 0; index < chunks.length; index++) {
+        const chunk = chunks[index];
+        const expectedLength = index === chunks.length - 1
+            ? chunk.length
+            : INLAY_CANONICAL_HEX_CHUNK_LENGTH;
+        if (typeof chunk !== 'string'
+            || chunk.length === 0
+            || chunk.length % 2 !== 0
+            || chunk.length > INLAY_CANONICAL_HEX_CHUNK_LENGTH
+            || chunk.length !== expectedLength
+            || !/^[0-9a-f]+$/.test(chunk)) return null;
+    }
+    return decodeInlayPhysicalComponent(chunks.join(''));
+}
+
+function canonicalInlayPaths(baseDir, id, ext = null) {
+    const normalizedExt = ext === null
+        ? assertSafeInlayTuple(id)
+        : assertSafeInlayTuple(id, ext);
+    const root = path.join(baseDir, INLAY_CANONICAL_ROOT_NAME);
+    const idChunks = chunkInlayPhysicalComponent(id);
+    const sidecarPath = path.join(
+        root,
+        INLAY_CANONICAL_SIDECAR_DIR_NAME,
+        INLAY_CANONICAL_ID_MARKER,
+        ...idChunks,
+        INLAY_CANONICAL_SIDECAR_FILE,
+    );
+    const payloadPath = ext === null
+        ? null
+        : path.join(
+            root,
+            INLAY_CANONICAL_PAYLOAD_DIR_NAME,
+            INLAY_CANONICAL_ID_MARKER,
+            ...idChunks,
+            INLAY_CANONICAL_EXT_MARKER,
+            ...chunkInlayPhysicalComponent(normalizedExt),
+            INLAY_CANONICAL_PAYLOAD_FILE,
+        );
+    if (baseDir === inlayDir) {
+        assertInsideInlayDir(sidecarPath);
+        if (payloadPath) assertInsideInlayDir(payloadPath);
+    }
+    return { root, payloadPath, sidecarPath };
+}
+
+function ensurePortableInlayDirectory(directory, baseDir) {
+    const relative = path.relative(baseDir, directory);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+        if (relative === '') return;
+        throw new Error(`Inlay canonical directory escapes namespace: ${directory}`);
+    }
+    let current = baseDir;
+    for (const segment of relative.split(path.sep)) {
+        const entries = readdirSync(current, { withFileTypes: true });
+        const aliases = entries.filter((entry) => entry.name.toLowerCase() === segment.toLowerCase());
+        const collision = aliases.find((entry) => entry.name !== segment || !entry.isDirectory());
+        if (collision) {
+            const error = new Error(
+                `Inlay physical directory collision: ${segment} conflicts with ${collision.name}`,
+            );
+            error.code = 'INLAY_PHYSICAL_COLLISION';
+            throw error;
+        }
+        const next = path.join(current, segment);
+        if (aliases.length === 0) {
+            mkdirSync(next, { recursive: false });
+            fsyncDirectoryPathSync(current);
+        }
+        current = next;
+    }
+}
+
 function getInlayFilePath(id, ext) {
-    if (!isSafeInlayId(id)) throw new Error(`Invalid inlay id: ${id}`);
-    const p = path.join(inlayDir, `${id}.${normalizeInlayExt(ext)}`);
+    return canonicalInlayPaths(inlayDir, id, ext).payloadPath;
+}
+
+function getInlaySidecarPath(id) {
+    return canonicalInlayPaths(inlayDir, id).sidecarPath;
+}
+
+function getLegacyInlayFilePath(id, ext) {
+    const normalizedExt = assertSafeInlayTuple(id, ext);
+    const p = path.join(inlayDir, `${id}.${normalizedExt}`);
     assertInsideInlayDir(p);
     return p;
 }
 
-function getInlaySidecarPath(id) {
-    if (!isSafeInlayId(id)) throw new Error(`Invalid inlay id: ${id}`);
+function getLegacyInlaySidecarPath(id) {
+    assertSafeInlayTuple(id);
     const p = path.join(inlayDir, `${id}.meta.json`);
     assertInsideInlayDir(p);
     return p;
 }
 
+function assertExactPortableInlayTarget(directory, name) {
+    let entries;
+    try {
+        entries = readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+        if (error?.code === 'ENOENT') return;
+        throw error;
+    }
+    const portableName = name.toLowerCase();
+    const aliases = entries.filter((entry) => entry.name.toLowerCase() === portableName);
+    const collision = aliases.find((entry) => entry.name !== name || !entry.isFile());
+    if (collision) {
+        const error = new Error(
+            `Inlay physical target collision: ${name} conflicts with ${collision.name}`,
+        );
+        error.code = 'INLAY_PHYSICAL_COLLISION';
+        throw error;
+    }
+}
+
+function assertCanonicalInlayNamespace(baseDir) {
+    const rootEntries = readdirSync(baseDir, { withFileTypes: true });
+    const rootAlias = rootEntries.find((entry) => (
+        entry.name.toLowerCase() === INLAY_CANONICAL_ROOT_NAME
+        && (entry.name !== INLAY_CANONICAL_ROOT_NAME || !entry.isDirectory())
+    ));
+    if (rootAlias) {
+        const error = new Error(
+            `Inlay canonical namespace collision: ${rootAlias.name}`,
+        );
+        error.code = 'INLAY_PHYSICAL_COLLISION';
+        throw error;
+    }
+    const root = path.join(baseDir, INLAY_CANONICAL_ROOT_NAME);
+    if (!existsSync(root)) {
+        mkdirSync(root, { recursive: false });
+        fsyncDirectoryPathSync(baseDir);
+    }
+    for (const name of [INLAY_CANONICAL_PAYLOAD_DIR_NAME, INLAY_CANONICAL_SIDECAR_DIR_NAME]) {
+        const entries = readdirSync(root, { withFileTypes: true });
+        const alias = entries.find((entry) => (
+            entry.name.toLowerCase() === name
+            && (entry.name !== name || !entry.isDirectory())
+        ));
+        if (alias) {
+            const error = new Error(
+                `Inlay canonical namespace collision: ${alias.name}`,
+            );
+            error.code = 'INLAY_PHYSICAL_COLLISION';
+            throw error;
+        }
+        const directory = path.join(root, name);
+        if (!existsSync(directory)) {
+            mkdirSync(directory, { recursive: false });
+            fsyncDirectoryPathSync(root);
+        }
+    }
+}
+
+function assertCanonicalInlayWriteTargets(baseDir, id, ext = null) {
+    const paths = canonicalInlayPaths(baseDir, id, ext);
+    const canonicalRoot = path.join(baseDir, INLAY_CANONICAL_ROOT_NAME);
+    ensurePortableInlayDirectory(path.dirname(paths.sidecarPath), canonicalRoot);
+    assertExactPortableInlayTarget(
+        path.dirname(paths.sidecarPath),
+        path.basename(paths.sidecarPath),
+    );
+    if (paths.payloadPath) {
+        ensurePortableInlayDirectory(path.dirname(paths.payloadPath), canonicalRoot);
+        assertExactPortableInlayTarget(
+            path.dirname(paths.payloadPath),
+            path.basename(paths.payloadPath),
+        );
+    }
+}
+
 async function ensureInlayDir() {
     await fs.mkdir(inlayDir, { recursive: true });
+    assertCanonicalInlayNamespace(inlayDir);
 }
 
 function ensureInlayDirSync() {
     if (!existsSync(inlayDir)) {
         mkdirSync(inlayDir, { recursive: true });
     }
+    assertCanonicalInlayNamespace(inlayDir);
 }
 
-async function fsyncInlayDirectory() {
+async function fsyncDirectoryPath(directory) {
     let directoryHandle;
     try {
-        directoryHandle = await fs.open(inlayDir, 'r');
+        directoryHandle = await fs.open(directory, 'r');
         await directoryHandle.sync();
     } catch {
         // Some platforms do not allow directory handles to be opened or synced.
@@ -4493,10 +4746,14 @@ async function fsyncInlayDirectory() {
     }
 }
 
-function fsyncInlayDirectorySync() {
+async function fsyncInlayDirectory() {
+    return fsyncDirectoryPath(inlayDir);
+}
+
+function fsyncDirectoryPathSync(directory) {
     let directoryDescriptor;
     try {
-        directoryDescriptor = openSync(inlayDir, 'r');
+        directoryDescriptor = openSync(directory, 'r');
         fsyncSync(directoryDescriptor);
     } catch {
         // Directory fsync is unavailable on some platforms.
@@ -4505,6 +4762,10 @@ function fsyncInlayDirectorySync() {
             try { closeSync(directoryDescriptor); } catch {}
         }
     }
+}
+
+function fsyncInlayDirectorySync() {
+    return fsyncDirectoryPathSync(inlayDir);
 }
 
 function newInlayTempPath(label) {
@@ -4641,12 +4902,13 @@ function encodeDataUri(buffer, mime) {
     return `data:${mime || 'application/octet-stream'};base64,${Buffer.from(buffer).toString('base64')}`;
 }
 
-async function readInlaySidecar(id) {
+function parseInlaySidecarData(raw, id) {
     try {
-        const raw = await fs.readFile(getInlaySidecarPath(id), 'utf-8');
-        const parsed = JSON.parse(raw);
+        const parsed = JSON.parse(Buffer.isBuffer(raw) ? raw.toString('utf-8') : raw);
+        const ext = normalizedInlayTupleExtension(id, parsed?.ext);
+        if (ext === null) return null;
         return {
-            ext: normalizeInlayExt(parsed?.ext),
+            ext,
             name: typeof parsed?.name === 'string' ? parsed.name : id,
             type: typeof parsed?.type === 'string' ? parsed.type : 'image',
             height: typeof parsed?.height === 'number' ? parsed.height : undefined,
@@ -4657,54 +4919,395 @@ async function readInlaySidecar(id) {
     }
 }
 
-async function resolveInlayFilePath(id) {
-    if (!isSafeInlayId(id)) return null;
-    const sidecar = await readInlaySidecar(id);
-    if (sidecar) {
-        const candidate = getInlayFilePath(id, sidecar.ext);
-        try { await fs.access(candidate); return candidate; } catch {}
-    }
-    // Fallback: scan directory (covers pre-sidecar files or mismatched ext)
+async function exactRegularFileExists(filePath) {
     try {
-        const entries = await fs.readdir(inlayDir, { withFileTypes: true });
-        const match = entries.find((entry) => (
-            entry.isFile() &&
-            entry.name.startsWith(`${id}.`) &&
-            entry.name !== `${id}.meta.json`
-        ));
-        return match ? path.join(inlayDir, match.name) : null;
-    } catch {
-        return null;
+        const entries = await fs.readdir(path.dirname(filePath), { withFileTypes: true });
+        return entries.some((entry) => entry.name === path.basename(filePath) && entry.isFile());
+    } catch (error) {
+        if (error?.code === 'ENOENT') return false;
+        throw error;
     }
+}
+
+function exactRegularFileExistsSync(filePath) {
+    try {
+        return readdirSync(path.dirname(filePath), { withFileTypes: true })
+            .some((entry) => entry.name === path.basename(filePath) && entry.isFile());
+    } catch (error) {
+        if (error?.code === 'ENOENT') return false;
+        throw error;
+    }
+}
+
+async function readSidecarFileState(filePath, id) {
+    if (!await exactRegularFileExists(filePath)) {
+        return { exists: false, info: null, filePath };
+    }
+    try {
+        return {
+            exists: true,
+            info: parseInlaySidecarData(await fs.readFile(filePath), id),
+            filePath,
+        };
+    } catch (error) {
+        if (error?.code === 'ENOENT') return { exists: false, info: null, filePath };
+        return { exists: true, info: null, filePath };
+    }
+}
+
+function readSidecarFileStateSync(filePath, id) {
+    if (!exactRegularFileExistsSync(filePath)) {
+        return { exists: false, info: null, filePath };
+    }
+    try {
+        return {
+            exists: true,
+            info: parseInlaySidecarData(readFileSync(filePath), id),
+            filePath,
+        };
+    } catch (error) {
+        if (error?.code === 'ENOENT') return { exists: false, info: null, filePath };
+        return { exists: true, info: null, filePath };
+    }
+}
+
+async function readLegacyInlaySidecarState(id, seen = new Set()) {
+    const filePath = getLegacyInlaySidecarPath(id);
+    const own = await readSidecarFileState(filePath, id);
+    if (!own.exists || seen.has(id)) return own;
+    const claimantId = `${id}.meta`;
+    if (isSafeInlayId(claimantId)) {
+        const nextSeen = new Set(seen);
+        nextSeen.add(id);
+        const claimant = await readLegacyInlaySidecarState(claimantId, nextSeen);
+        if (claimant.info?.ext === 'json') {
+            return { exists: true, info: null, filePath, claimedAsPayload: true };
+        }
+    }
+    return own;
+}
+
+function readLegacyInlaySidecarStateSync(id, seen = new Set()) {
+    const filePath = getLegacyInlaySidecarPath(id);
+    const own = readSidecarFileStateSync(filePath, id);
+    if (!own.exists || seen.has(id)) return own;
+    const claimantId = `${id}.meta`;
+    if (isSafeInlayId(claimantId)) {
+        const nextSeen = new Set(seen);
+        nextSeen.add(id);
+        const claimant = readLegacyInlaySidecarStateSync(claimantId, nextSeen);
+        if (claimant.info?.ext === 'json') {
+            return { exists: true, info: null, filePath, claimedAsPayload: true };
+        }
+    }
+    return own;
+}
+
+async function readInlaySidecarState(id) {
+    const canonical = await readSidecarFileState(getInlaySidecarPath(id), id);
+    if (canonical.exists) return { ...canonical, canonical: true };
+    const legacy = await readLegacyInlaySidecarState(id);
+    return { ...legacy, canonical: false };
+}
+
+function readInlaySidecarStateSync(id) {
+    const canonical = readSidecarFileStateSync(getInlaySidecarPath(id), id);
+    if (canonical.exists) return { ...canonical, canonical: true };
+    const legacy = readLegacyInlaySidecarStateSync(id);
+    return { ...legacy, canonical: false };
+}
+
+async function readInlaySidecar(id) {
+    if (!isSafeInlayId(id)) return null;
+    return (await readInlaySidecarState(id)).info;
+}
+
+function parseCanonicalInlayPayloadPath(filePath, payloadDir = inlayCanonicalPayloadDir) {
+    const relative = path.relative(payloadDir, filePath);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null;
+    const segments = relative.split(path.sep);
+    if (segments[0] !== INLAY_CANONICAL_ID_MARKER
+        || segments.at(-1) !== INLAY_CANONICAL_PAYLOAD_FILE) return null;
+    const extMarker = segments.indexOf(INLAY_CANONICAL_EXT_MARKER, 2);
+    if (extMarker < 2 || extMarker >= segments.length - 2) return null;
+    const id = decodeInlayPhysicalChunks(segments.slice(1, extMarker));
+    const ext = decodeInlayPhysicalChunks(segments.slice(extMarker + 1, -1));
+    if (!isSafeInlayTuple(id, ext) || normalizeInlayExt(ext) !== ext) return null;
+    return { id, ext };
+}
+
+function parseCanonicalInlaySidecarPath(filePath, sidecarDir = inlayCanonicalSidecarDir) {
+    const relative = path.relative(sidecarDir, filePath);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return null;
+    const segments = relative.split(path.sep);
+    if (segments[0] !== INLAY_CANONICAL_ID_MARKER
+        || segments.at(-1) !== INLAY_CANONICAL_SIDECAR_FILE) return null;
+    const id = decodeInlayPhysicalChunks(segments.slice(1, -1));
+    return isSafeInlayId(id) ? { id } : null;
+}
+
+async function listRegularFilesRecursive(directory) {
+    const files = [];
+    const pending = [directory];
+    while (pending.length > 0) {
+        const current = pending.pop();
+        let entries;
+        try {
+            entries = await fs.readdir(current, { withFileTypes: true });
+        } catch (error) {
+            if (error?.code === 'ENOENT') continue;
+            throw error;
+        }
+        for (const entry of entries) {
+            const entryPath = path.join(current, entry.name);
+            if (entry.isDirectory()) pending.push(entryPath);
+            else if (entry.isFile()) files.push(entryPath);
+        }
+    }
+    return files;
+}
+
+function listRegularFilesRecursiveSync(directory) {
+    const files = [];
+    const pending = [directory];
+    while (pending.length > 0) {
+        const current = pending.pop();
+        let entries;
+        try {
+            entries = readdirSync(current, { withFileTypes: true });
+        } catch (error) {
+            if (error?.code === 'ENOENT') continue;
+            throw error;
+        }
+        for (const entry of entries) {
+            const entryPath = path.join(current, entry.name);
+            if (entry.isDirectory()) pending.push(entryPath);
+            else if (entry.isFile()) files.push(entryPath);
+        }
+    }
+    return files;
+}
+
+function parseLegacyInlayPayloadName(name) {
+    if (typeof name !== 'string'
+        || name === '.migrated_to_fs'
+        || isInlayTemporaryFileName(name)
+        || name.endsWith('.meta.json')) return null;
+    const dot = name.lastIndexOf('.');
+    if (dot <= 0 || dot === name.length - 1) return null;
+    const id = name.slice(0, dot);
+    const rawExt = name.slice(dot + 1);
+    if (!isSafeInlayTuple(id, rawExt) || normalizeInlayExt(rawExt) !== rawExt) return null;
+    return { id, ext: rawExt };
+}
+
+async function listCanonicalInlayPayloads(id = null) {
+    return (await listRegularFilesRecursive(inlayCanonicalPayloadDir))
+        .map((filePath) => ({ filePath, parsed: parseCanonicalInlayPayloadPath(filePath) }))
+        .filter(({ parsed }) => parsed && (id === null || parsed.id === id))
+        .map(({ filePath, parsed }) => ({
+            ...parsed,
+            filePath,
+            canonical: true,
+        }))
+        .sort((left, right) => left.filePath.localeCompare(right.filePath));
+}
+
+function listCanonicalInlayPayloadsSync(id = null) {
+    return listRegularFilesRecursiveSync(inlayCanonicalPayloadDir)
+        .map((filePath) => ({ filePath, parsed: parseCanonicalInlayPayloadPath(filePath) }))
+        .filter(({ parsed }) => parsed && (id === null || parsed.id === id))
+        .map(({ filePath, parsed }) => ({
+            ...parsed,
+            filePath,
+            canonical: true,
+        }))
+        .sort((left, right) => left.filePath.localeCompare(right.filePath));
+}
+
+async function listCanonicalInlaySidecars() {
+    return Promise.all((await listRegularFilesRecursive(inlayCanonicalSidecarDir))
+        .map(async (filePath) => {
+            const parsed = parseCanonicalInlaySidecarPath(filePath);
+            if (!parsed) return null;
+            let info = null;
+            try {
+                info = parseInlaySidecarData(await fs.readFile(filePath), parsed.id);
+            } catch {}
+            return { ...parsed, filePath, info, canonical: true };
+        }))
+        .then((states) => states.filter(Boolean));
+}
+
+async function legacyPayloadCandidateFromInfo(id, info) {
+    if (!info) return null;
+    const filePath = getLegacyInlayFilePath(id, info.ext);
+    if (filePath === getLegacyInlaySidecarPath(id)
+        || !await exactRegularFileExists(filePath)) return null;
+    if (path.basename(filePath).endsWith('.meta.json')) {
+        const possibleSidecarId = path.basename(filePath).slice(0, -'.meta.json'.length);
+        if (isSafeInlayId(possibleSidecarId)) {
+            const sidecar = await readLegacyInlaySidecarState(possibleSidecarId);
+            if (sidecar.info && sidecar.filePath === filePath) return null;
+        }
+    }
+    return { id, ext: normalizeInlayExt(info.ext), filePath, canonical: false };
+}
+
+function legacyPayloadCandidateFromInfoSync(id, info) {
+    if (!info) return null;
+    const filePath = getLegacyInlayFilePath(id, info.ext);
+    if (filePath === getLegacyInlaySidecarPath(id)
+        || !exactRegularFileExistsSync(filePath)) return null;
+    if (path.basename(filePath).endsWith('.meta.json')) {
+        const possibleSidecarId = path.basename(filePath).slice(0, -'.meta.json'.length);
+        if (isSafeInlayId(possibleSidecarId)) {
+            const sidecar = readLegacyInlaySidecarStateSync(possibleSidecarId);
+            if (sidecar.info && sidecar.filePath === filePath) return null;
+        }
+    }
+    return { id, ext: normalizeInlayExt(info.ext), filePath, canonical: false };
+}
+
+async function listLegacyFallbackPayloads(id = null) {
+    let entries;
+    try {
+        entries = await fs.readdir(inlayDir, { withFileTypes: true });
+    } catch (error) {
+        if (error?.code === 'ENOENT') return [];
+        throw error;
+    }
+    return entries
+        .filter((entry) => entry.isFile())
+        .map((entry) => ({ entry, parsed: parseLegacyInlayPayloadName(entry.name) }))
+        .filter(({ parsed }) => parsed && (id === null || parsed.id === id))
+        .map(({ entry, parsed }) => ({
+            ...parsed,
+            filePath: path.join(inlayDir, entry.name),
+            canonical: false,
+        }))
+        .sort((left, right) => left.filePath.localeCompare(right.filePath));
+}
+
+function listLegacyFallbackPayloadsSync(id = null) {
+    let entries;
+    try {
+        entries = readdirSync(inlayDir, { withFileTypes: true });
+    } catch (error) {
+        if (error?.code === 'ENOENT') return [];
+        throw error;
+    }
+    return entries
+        .filter((entry) => entry.isFile())
+        .map((entry) => ({ entry, parsed: parseLegacyInlayPayloadName(entry.name) }))
+        .filter(({ parsed }) => parsed && (id === null || parsed.id === id))
+        .map(({ entry, parsed }) => ({
+            ...parsed,
+            filePath: path.join(inlayDir, entry.name),
+            canonical: false,
+        }))
+        .sort((left, right) => left.filePath.localeCompare(right.filePath));
+}
+
+async function listLegacyInlayPayloads(id) {
+    const sidecar = await readLegacyInlaySidecarState(id);
+    const evidenced = await legacyPayloadCandidateFromInfo(id, sidecar.info);
+    const fallback = await listLegacyFallbackPayloads(id);
+    const byPath = new Map(fallback.map((entry) => [entry.filePath, entry]));
+    if (evidenced) byPath.set(evidenced.filePath, evidenced);
+    return [...byPath.values()].sort((left, right) => left.filePath.localeCompare(right.filePath));
+}
+
+function listLegacyInlayPayloadsSync(id) {
+    const sidecar = readLegacyInlaySidecarStateSync(id);
+    const evidenced = legacyPayloadCandidateFromInfoSync(id, sidecar.info);
+    const fallback = listLegacyFallbackPayloadsSync(id);
+    const byPath = new Map(fallback.map((entry) => [entry.filePath, entry]));
+    if (evidenced) byPath.set(evidenced.filePath, evidenced);
+    return [...byPath.values()].sort((left, right) => left.filePath.localeCompare(right.filePath));
+}
+
+async function listAllInlayPayloadsForId(id) {
+    return [
+        ...await listCanonicalInlayPayloads(id),
+        ...await listLegacyInlayPayloads(id),
+    ];
+}
+
+function listAllInlayPayloadsForIdSync(id) {
+    return [
+        ...listCanonicalInlayPayloadsSync(id),
+        ...listLegacyInlayPayloadsSync(id),
+    ];
+}
+
+async function resolveInlayPayload(id) {
+    if (!isSafeInlayId(id)) return null;
+    const canonicalSidecar = await readSidecarFileState(getInlaySidecarPath(id), id);
+    const canonicalPayloads = await listCanonicalInlayPayloads(id);
+    const legacySidecar = await readLegacyInlaySidecarState(id);
+
+    if (canonicalSidecar.info) {
+        const preferred = canonicalPayloads.find((entry) => entry.ext === canonicalSidecar.info.ext);
+        if (preferred) return preferred;
+        if (canonicalPayloads.length > 0) return canonicalPayloads[0];
+        const legacy = await legacyPayloadCandidateFromInfo(id, canonicalSidecar.info);
+        if (legacy) return legacy;
+    } else if (!canonicalSidecar.exists && legacySidecar.info) {
+        // A deployed legacy sidecar remains the commit point until the canonical
+        // sidecar is published. This keeps a crash after payload rename from
+        // exposing an incomplete replacement.
+        const legacy = await legacyPayloadCandidateFromInfo(id, legacySidecar.info);
+        if (legacy) return legacy;
+        if (canonicalPayloads.length > 0) return canonicalPayloads[0];
+    } else if (canonicalPayloads.length > 0) {
+        return canonicalPayloads[0];
+    }
+
+    const legacyFallbacks = await listLegacyFallbackPayloads(id);
+    return legacyFallbacks[0] || null;
+}
+
+function resolveInlayPayloadSync(id) {
+    if (!isSafeInlayId(id)) return null;
+    const canonicalSidecar = readSidecarFileStateSync(getInlaySidecarPath(id), id);
+    const canonicalPayloads = listCanonicalInlayPayloadsSync(id);
+    const legacySidecar = readLegacyInlaySidecarStateSync(id);
+
+    if (canonicalSidecar.info) {
+        const preferred = canonicalPayloads.find((entry) => entry.ext === canonicalSidecar.info.ext);
+        if (preferred) return preferred;
+        if (canonicalPayloads.length > 0) return canonicalPayloads[0];
+        const legacy = legacyPayloadCandidateFromInfoSync(id, canonicalSidecar.info);
+        if (legacy) return legacy;
+    } else if (!canonicalSidecar.exists && legacySidecar.info) {
+        const legacy = legacyPayloadCandidateFromInfoSync(id, legacySidecar.info);
+        if (legacy) return legacy;
+        if (canonicalPayloads.length > 0) return canonicalPayloads[0];
+    } else if (canonicalPayloads.length > 0) {
+        return canonicalPayloads[0];
+    }
+
+    return listLegacyFallbackPayloadsSync(id)[0] || null;
+}
+
+async function resolveInlayFilePath(id) {
+    return (await resolveInlayPayload(id))?.filePath || null;
 }
 
 function resolveInlayFilePathSync(id) {
-    if (!isSafeInlayId(id)) return null;
-    try {
-        const raw = readFileSync(getInlaySidecarPath(id), 'utf-8');
-        const parsed = JSON.parse(raw);
-        const ext = normalizeInlayExt(parsed?.ext);
-        const candidate = getInlayFilePath(id, ext);
-        if (existsSync(candidate)) return candidate;
-    } catch {}
-    // Fallback: scan directory
-    try {
-        const entries = readdirSync(inlayDir, { withFileTypes: true });
-        const match = entries.find((entry) => (
-            entry.isFile() &&
-            entry.name.startsWith(`${id}.`) &&
-            entry.name !== `${id}.meta.json`
-        ));
-        return match ? path.join(inlayDir, match.name) : null;
-    } catch {
-        return null;
-    }
+    return resolveInlayPayloadSync(id)?.filePath || null;
+}
+
+async function resolveInlaySidecarPath(id) {
+    const state = await readInlaySidecarState(id);
+    return state.info ? state.filePath : null;
 }
 
 async function readInlayFile(id) {
-    const filePath = await resolveInlayFilePath(id);
-    if (!filePath) return null;
-    const ext = normalizeInlayExt(path.extname(filePath).slice(1));
+    const payload = await resolveInlayPayload(id);
+    if (!payload) return null;
+    const { filePath, ext } = payload;
     const buffer = await fs.readFile(filePath);
     const stat = await fs.stat(filePath);
     return {
@@ -4717,32 +5320,117 @@ async function readInlayFile(id) {
 }
 
 async function writeInlaySidecar(id, info) {
+    const normalizedExt = assertSafeInlayTuple(id, info?.ext);
+    const normalizedInfo = { ...(info || {}), ext: normalizedExt };
     await ensureInlayDir();
+    assertCanonicalInlayWriteTargets(inlayDir, id);
     const temporaryPath = newInlayTempPath('sidecar');
     try {
-        await writeDurableInlayTempFile(temporaryPath, inlaySidecarValue(id, info));
-        await fs.rename(temporaryPath, getInlaySidecarPath(id));
-        await fsyncInlayDirectory();
+        await writeDurableInlayTempFile(temporaryPath, inlaySidecarValue(id, normalizedInfo));
+        const destinationPath = getInlaySidecarPath(id);
+        await fs.rename(temporaryPath, destinationPath);
+        await fsyncDirectoryPath(path.dirname(destinationPath));
+        const legacy = await readLegacyInlaySidecarState(id);
+        if (legacy.info) {
+            try {
+                await fs.unlink(legacy.filePath);
+                await fsyncInlayDirectory();
+            } catch (error) {
+                if (error?.code !== 'ENOENT') {
+                    logger.warn(
+                        `[InlayFS] Failed to remove legacy sidecar for ${id}:`,
+                        error?.message || error,
+                    );
+                }
+            }
+        }
     } finally {
         await fs.unlink(temporaryPath).catch(() => {});
     }
 }
 
 function writeInlaySidecarSync(id, info) {
+    const normalizedExt = assertSafeInlayTuple(id, info?.ext);
+    const normalizedInfo = { ...(info || {}), ext: normalizedExt };
     ensureInlayDirSync();
+    assertCanonicalInlayWriteTargets(inlayDir, id);
     const temporaryPath = newInlayTempPath('sidecar');
     try {
-        writeDurableInlayTempFileSync(temporaryPath, inlaySidecarValue(id, info));
-        renameSync(temporaryPath, getInlaySidecarPath(id));
-        fsyncInlayDirectorySync();
+        writeDurableInlayTempFileSync(temporaryPath, inlaySidecarValue(id, normalizedInfo));
+        const destinationPath = getInlaySidecarPath(id);
+        renameSync(temporaryPath, destinationPath);
+        fsyncDirectoryPathSync(path.dirname(destinationPath));
+        const legacy = readLegacyInlaySidecarStateSync(id);
+        if (legacy.info) {
+            try {
+                unlinkSync(legacy.filePath);
+                fsyncInlayDirectorySync();
+            } catch (error) {
+                if (error?.code !== 'ENOENT') {
+                    logger.warn(
+                        `[InlayFS] Failed to remove legacy sidecar for ${id}:`,
+                        error?.message || error,
+                    );
+                }
+            }
+        }
     } finally {
         try { unlinkSync(temporaryPath); } catch {}
     }
 }
 
+async function removeObsoleteInlayFiles(id, destinationPath) {
+    const obsolete = (await listAllInlayPayloadsForId(id))
+        .filter((entry) => entry.filePath !== destinationPath);
+    const touchedDirectories = new Set();
+    for (const entry of obsolete) {
+        try {
+            await fs.unlink(entry.filePath);
+            touchedDirectories.add(path.dirname(entry.filePath));
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+    }
+    const legacySidecar = await readLegacyInlaySidecarState(id);
+    if (legacySidecar.info) {
+        try {
+            await fs.unlink(legacySidecar.filePath);
+            touchedDirectories.add(path.dirname(legacySidecar.filePath));
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+    }
+    for (const directory of touchedDirectories) await fsyncDirectoryPath(directory);
+}
+
+function removeObsoleteInlayFilesSync(id, destinationPath) {
+    const obsolete = listAllInlayPayloadsForIdSync(id)
+        .filter((entry) => entry.filePath !== destinationPath);
+    const touchedDirectories = new Set();
+    for (const entry of obsolete) {
+        try {
+            unlinkSync(entry.filePath);
+            touchedDirectories.add(path.dirname(entry.filePath));
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+    }
+    const legacySidecar = readLegacyInlaySidecarStateSync(id);
+    if (legacySidecar.info) {
+        try {
+            unlinkSync(legacySidecar.filePath);
+            touchedDirectories.add(path.dirname(legacySidecar.filePath));
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+    }
+    for (const directory of touchedDirectories) fsyncDirectoryPathSync(directory);
+}
+
 async function writeInlayFile(id, ext, buffer, info = null) {
+    const normalizedExt = assertSafeInlayTuple(id, ext);
     await ensureInlayDir();
-    const normalizedExt = normalizeInlayExt(ext);
+    assertCanonicalInlayWriteTargets(inlayDir, id, normalizedExt);
     const destinationPath = getInlayFilePath(id, normalizedExt);
     const sidecarPath = getInlaySidecarPath(id);
     const previousPath = await resolveInlayFilePath(id);
@@ -4767,25 +5455,20 @@ async function writeInlayFile(id, ext, buffer, info = null) {
         // point for extension-changing replacements.
         await fs.rename(payloadTemporaryPath, destinationPath);
         payloadPublished = true;
-        await fsyncInlayDirectory();
+        await fsyncDirectoryPath(path.dirname(destinationPath));
         await reachInlayPublishTestBoundary('after-payload-publish', id);
 
         await fs.rename(sidecarTemporaryPath, sidecarPath);
         sidecarPublished = true;
-        await fsyncInlayDirectory();
+        await fsyncDirectoryPath(path.dirname(sidecarPath));
 
         // Only a committed sidecar can make the prior extension obsolete.
         // Failures here retain an extra recoverable copy rather than removing
         // the only valid one.
-        if (previousPath && previousPath !== destinationPath) {
-            try {
-                await fs.unlink(previousPath);
-                await fsyncInlayDirectory();
-            } catch (error) {
-                if (error?.code !== 'ENOENT') {
-                    logger.warn(`[InlayFS] Failed to remove obsolete payload for ${id}:`, error?.message || error);
-                }
-            }
+        try {
+            await removeObsoleteInlayFiles(id, destinationPath);
+        } catch (error) {
+            logger.warn(`[InlayFS] Failed to remove obsolete files for ${id}:`, error?.message || error);
         }
     } catch (error) {
         // If an extension-changing replacement did not reach its sidecar commit
@@ -4795,7 +5478,7 @@ async function writeInlayFile(id, ext, buffer, info = null) {
         if (payloadPublished && !sidecarPublished && previousPath !== destinationPath) {
             try {
                 await fs.unlink(destinationPath);
-                await fsyncInlayDirectory();
+                await fsyncDirectoryPath(path.dirname(destinationPath));
             } catch (rollbackError) {
                 if (rollbackError?.code !== 'ENOENT') {
                     logger.warn(
@@ -4814,8 +5497,9 @@ async function writeInlayFile(id, ext, buffer, info = null) {
 }
 
 async function writeInlayFileFromFile(id, ext, sourcePath, info = null) {
+    const normalizedExt = assertSafeInlayTuple(id, ext);
     await ensureInlayDir();
-    const normalizedExt = normalizeInlayExt(ext);
+    assertCanonicalInlayWriteTargets(inlayDir, id, normalizedExt);
     const destinationPath = getInlayFilePath(id, normalizedExt);
     const sidecarPath = getInlaySidecarPath(id);
     const previousPath = await resolveInlayFilePath(id);
@@ -4833,26 +5517,21 @@ async function writeInlayFileFromFile(id, ext, sourcePath, info = null) {
         await reachInlayPublishTestBoundary('before-payload-publish', id);
         await fs.rename(payloadTemporaryPath, destinationPath);
         payloadPublished = true;
-        await fsyncInlayDirectory();
+        await fsyncDirectoryPath(path.dirname(destinationPath));
         await reachInlayPublishTestBoundary('after-payload-publish', id);
         await fs.rename(sidecarTemporaryPath, sidecarPath);
         sidecarPublished = true;
-        await fsyncInlayDirectory();
-        if (previousPath && previousPath !== destinationPath) {
-            try {
-                await fs.unlink(previousPath);
-                await fsyncInlayDirectory();
-            } catch (error) {
-                if (error?.code !== 'ENOENT') {
-                    logger.warn(`[InlayFS] Failed to remove obsolete payload for ${id}:`, error?.message || error);
-                }
-            }
+        await fsyncDirectoryPath(path.dirname(sidecarPath));
+        try {
+            await removeObsoleteInlayFiles(id, destinationPath);
+        } catch (error) {
+            logger.warn(`[InlayFS] Failed to remove obsolete files for ${id}:`, error?.message || error);
         }
     } catch (error) {
         if (payloadPublished && !sidecarPublished && previousPath !== destinationPath) {
             try {
                 await fs.unlink(destinationPath);
-                await fsyncInlayDirectory();
+                await fsyncDirectoryPath(path.dirname(destinationPath));
             } catch (rollbackError) {
                 if (rollbackError?.code !== 'ENOENT') {
                     logger.warn(
@@ -4871,8 +5550,9 @@ async function writeInlayFileFromFile(id, ext, sourcePath, info = null) {
 }
 
 function writeInlayFileSync(id, ext, buffer, info = null) {
+    const normalizedExt = assertSafeInlayTuple(id, ext);
     ensureInlayDirSync();
-    const normalizedExt = normalizeInlayExt(ext);
+    assertCanonicalInlayWriteTargets(inlayDir, id, normalizedExt);
     const destinationPath = getInlayFilePath(id, normalizedExt);
     const sidecarPath = getInlaySidecarPath(id);
     const previousPath = resolveInlayFilePathSync(id);
@@ -4889,25 +5569,20 @@ function writeInlayFileSync(id, ext, buffer, info = null) {
         writeDurableInlayTempFileSync(sidecarTemporaryPath, sidecarValue);
         renameSync(payloadTemporaryPath, destinationPath);
         payloadPublished = true;
-        fsyncInlayDirectorySync();
+        fsyncDirectoryPathSync(path.dirname(destinationPath));
         renameSync(sidecarTemporaryPath, sidecarPath);
         sidecarPublished = true;
-        fsyncInlayDirectorySync();
-        if (previousPath && previousPath !== destinationPath) {
-            try {
-                unlinkSync(previousPath);
-                fsyncInlayDirectorySync();
-            } catch (error) {
-                if (error?.code !== 'ENOENT') {
-                    logger.warn(`[InlayFS] Failed to remove obsolete payload for ${id}:`, error?.message || error);
-                }
-            }
+        fsyncDirectoryPathSync(path.dirname(sidecarPath));
+        try {
+            removeObsoleteInlayFilesSync(id, destinationPath);
+        } catch (error) {
+            logger.warn(`[InlayFS] Failed to remove obsolete files for ${id}:`, error?.message || error);
         }
     } catch (error) {
         if (payloadPublished && !sidecarPublished && previousPath !== destinationPath) {
             try {
                 unlinkSync(destinationPath);
-                fsyncInlayDirectorySync();
+                fsyncDirectoryPathSync(path.dirname(destinationPath));
             } catch (rollbackError) {
                 if (rollbackError?.code !== 'ENOENT') {
                     logger.warn(
@@ -4926,51 +5601,118 @@ function writeInlayFileSync(id, ext, buffer, info = null) {
 }
 
 async function deleteInlayRawFile(id) {
-    const filePath = await resolveInlayFilePath(id);
-    if (!filePath) return;
-    await fs.unlink(filePath).catch(() => {});
+    const touchedDirectories = new Set();
+    for (const entry of await listAllInlayPayloadsForId(id)) {
+        try {
+            await fs.unlink(entry.filePath);
+            touchedDirectories.add(path.dirname(entry.filePath));
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+    }
+    for (const directory of touchedDirectories) await fsyncDirectoryPath(directory);
 }
 
 function deleteInlayRawFileSync(id) {
-    const filePath = resolveInlayFilePathSync(id);
-    if (!filePath) return;
-    try {
-        unlinkSync(filePath);
-    } catch {
-        // ignore
+    const touchedDirectories = new Set();
+    for (const entry of listAllInlayPayloadsForIdSync(id)) {
+        try {
+            unlinkSync(entry.filePath);
+            touchedDirectories.add(path.dirname(entry.filePath));
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
     }
+    for (const directory of touchedDirectories) fsyncDirectoryPathSync(directory);
 }
 
 async function deleteInlayFile(id) {
     await deleteInlayRawFile(id);
-    await fs.unlink(getInlaySidecarPath(id)).catch(() => {});
+    await deleteInlaySidecars(id);
+}
+
+async function deleteInlaySidecars(id) {
+    const sidecarPaths = [getInlaySidecarPath(id)];
+    const legacy = await readLegacyInlaySidecarState(id);
+    if (legacy.info) sidecarPaths.push(legacy.filePath);
+    const touchedDirectories = new Set();
+    for (const sidecarPath of new Set(sidecarPaths)) {
+        try {
+            await fs.unlink(sidecarPath);
+            touchedDirectories.add(path.dirname(sidecarPath));
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+    }
+    for (const directory of touchedDirectories) await fsyncDirectoryPath(directory);
 }
 
 function deleteInlayFileSync(id) {
     deleteInlayRawFileSync(id);
-    try {
-        unlinkSync(getInlaySidecarPath(id));
-    } catch {
-        // ignore
+    deleteInlaySidecarsSync(id);
+}
+
+function deleteInlaySidecarsSync(id) {
+    const sidecarPaths = [getInlaySidecarPath(id)];
+    const legacy = readLegacyInlaySidecarStateSync(id);
+    if (legacy.info) sidecarPaths.push(legacy.filePath);
+    const touchedDirectories = new Set();
+    for (const sidecarPath of new Set(sidecarPaths)) {
+        try {
+            unlinkSync(sidecarPath);
+            touchedDirectories.add(path.dirname(sidecarPath));
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
     }
+    for (const directory of touchedDirectories) fsyncDirectoryPathSync(directory);
 }
 
 async function listInlayFiles() {
     await ensureInlayDir();
-    const entries = await fs.readdir(inlayDir, { withFileTypes: true });
-    return entries
-        .filter((entry) => (
-            entry.isFile() &&
-            entry.name !== '.migrated_to_fs' &&
-            !isInlayTemporaryFileName(entry.name) &&
-            !entry.name.endsWith('.meta.json')
-        ))
-        .map((entry) => {
-            const ext = normalizeInlayExt(path.extname(entry.name).slice(1));
-            const id = entry.name.slice(0, -(ext.length + 1));
-            return { id, ext, filePath: path.join(inlayDir, entry.name) };
-        })
-        .filter((entry) => isSafeInlayId(entry.id));
+    const canonical = await listCanonicalInlayPayloads();
+    const canonicalSidecars = new Map(
+        (await listCanonicalInlaySidecars()).map((entry) => [entry.id, entry]),
+    );
+    const rootEntries = await fs.readdir(inlayDir, { withFileTypes: true });
+    const rootFileNames = new Set(
+        rootEntries.filter((entry) => entry.isFile()).map((entry) => entry.name),
+    );
+    const canonicalById = new Map();
+    for (const entry of canonical) {
+        const group = canonicalById.get(entry.id) || [];
+        group.push(entry);
+        canonicalById.set(entry.id, group);
+    }
+    const resolvedCanonical = [];
+    for (const [id, group] of canonicalById) {
+        const sidecar = canonicalSidecars.get(id);
+        if (sidecar) {
+            resolvedCanonical.push(
+                group.find((entry) => entry.ext === sidecar.info?.ext) || group[0],
+            );
+        } else if (rootFileNames.has(`${id}.meta.json`)) {
+            const resolved = await resolveInlayPayload(id);
+            if (resolved) resolvedCanonical.push(resolved);
+        } else {
+            resolvedCanonical.push(group[0]);
+        }
+    }
+
+    const legacyIds = new Set();
+    for (const entry of await listLegacyFallbackPayloads()) legacyIds.add(entry.id);
+    for (const entry of rootEntries) {
+        if (!entry.isFile() || !entry.name.endsWith('.meta.json')) continue;
+        const id = entry.name.slice(0, -'.meta.json'.length);
+        if (isSafeInlayId(id)) legacyIds.add(id);
+    }
+    for (const id of canonicalById.keys()) legacyIds.delete(id);
+    const resolvedLegacy = await Promise.all(
+        [...legacyIds].map((id) => resolveInlayPayload(id)),
+    );
+    return [...resolvedCanonical, ...resolvedLegacy]
+        .filter(Boolean)
+        .sort((left, right) => left.id.localeCompare(right.id));
 }
 
 async function readInlayLegacyInfo(id) {
@@ -5018,8 +5760,38 @@ async function readInlayAssetPayload(id) {
     }));
 }
 
+async function canonicalizeLegacyInlayFiles() {
+    const entries = await listInlayFiles();
+    for (const entry of entries) {
+        try {
+            if (entry.canonical) {
+                const canonicalSidecar = await readSidecarFileState(
+                    getInlaySidecarPath(entry.id),
+                    entry.id,
+                );
+                if (canonicalSidecar.exists) continue;
+            }
+            const info = (await readInlaySidecar(entry.id)) || {
+                ext: entry.ext,
+                name: entry.id,
+                type: 'image',
+            };
+            await writeInlayFileFromFile(entry.id, entry.ext, entry.filePath, {
+                ...info,
+                ext: entry.ext,
+            });
+        } catch (error) {
+            logger.warn(
+                `[InlayFS] Failed to canonicalize legacy inlay ${entry.id}:`,
+                error?.message || error,
+            );
+        }
+    }
+}
+
 async function migrateInlaysToFilesystem() {
     await reconcileInterruptedInlayPublications();
+    await canonicalizeLegacyInlayFiles();
     const keys = kvList('inlay/');
     if (keys.length === 0) {
         if (!existsSync(inlayMigrationMarker)) {
@@ -5732,10 +6504,25 @@ const loginRouteLimiter = rateLimit({
 });
 
 function isHex(str) {
-    return hexRegex.test(str.toUpperCase().trim()) || str === '__password';
+    if (str === '__password') return true;
+    if (typeof str !== 'string'
+        || str.length === 0
+        || str.length % 2 !== 0
+        || !hexRegex.test(str)) return false;
+    const bytes = Buffer.from(str, 'hex');
+    const decoded = bytes.toString('utf-8');
+    return Buffer.from(decoded, 'utf-8').equals(bytes);
 }
 
 function decodeAndCanonicalizeHexPath(filePath) {
+    if (filePath === '__password') {
+        return { canonicalPath: '__password', decodedKey: '__password' };
+    }
+    if (!isHex(filePath)) {
+        const error = new Error('Invalid canonical UTF-8 hex path');
+        error.code = 'INVALID_HEX_PATH';
+        throw error;
+    }
     const pathBytes = Buffer.from(filePath, 'hex');
     return {
         canonicalPath: pathBytes.toString('hex'),
@@ -6299,18 +7086,38 @@ function isInvalidBackupPathSegment(name) {
     );
 }
 
+const INLAY_ARCHIVE_V2_PREFIX = 'inlay_v2/';
+
+function toInlayBackupName(id, ext) {
+    const normalizedExt = assertSafeInlayTuple(id, ext);
+    if (!normalizedExt.includes('.')) return `inlay/${id}.${normalizedExt}`;
+    return `${INLAY_ARCHIVE_V2_PREFIX}${encodeInlayPhysicalComponent(id)}`
+        + `--${encodeInlayPhysicalComponent(normalizedExt)}`;
+}
+
 function parseInlayBackupName(name) {
+    if (name.startsWith(INLAY_ARCHIVE_V2_PREFIX)) {
+        const suffix = name.slice(INLAY_ARCHIVE_V2_PREFIX.length);
+        if (!suffix || suffix.includes('/')) return null;
+        const separator = suffix.indexOf('--');
+        if (separator <= 0 || suffix.indexOf('--', separator + 2) !== -1) return null;
+        const id = decodeInlayPhysicalComponent(suffix.slice(0, separator));
+        const ext = decodeInlayPhysicalComponent(suffix.slice(separator + 2));
+        if (!isSafeInlayTuple(id, ext) || normalizeInlayExt(ext) !== ext) return null;
+        return { id, ext, encoded: true };
+    }
     if (!name.startsWith('inlay/')) return null;
     const suffix = name.slice('inlay/'.length);
     if (!suffix || suffix.includes('/')) return null;
     const dotIdx = suffix.lastIndexOf('.');
     if (dotIdx <= 0) {
-        return { id: suffix, ext: null };
+        return isSafeInlayId(suffix) ? { id: suffix, ext: null } : null;
     }
-    return {
-        id: suffix.slice(0, dotIdx),
-        ext: suffix.slice(dotIdx + 1),
-    };
+    const id = suffix.slice(0, dotIdx);
+    const ext = suffix.slice(dotIdx + 1);
+    return isSafeInlayTuple(id, ext) && normalizeInlayExt(ext) === ext
+        ? { id, ext }
+        : null;
 }
 
 function parseInlaySidecarBackupName(name) {
@@ -8897,21 +9704,17 @@ async function planFullBackupFilesystemEntries(snapshot, target) {
     // The PocketRisu main rollback target can, so retain them there.
     if (target === 'upstream') return entries;
 
-    const physicalInlayIds = new Set(
-        (await listInlayFiles()).map((inlay) => inlay.id),
-    );
+    const physicalInlays = await listInlayFiles();
     const filesystemPayloadIds = new Set();
     const filesystemSidecarIds = new Set();
-    for (const id of [...physicalInlayIds].sort((a, b) => a.localeCompare(b))) {
-        const sourcePath = await resolveInlayFilePath(id);
-        if (!sourcePath) continue;
-        const ext = normalizeInlayExt(path.extname(sourcePath).slice(1));
+    for (const payload of physicalInlays.sort((left, right) => left.id.localeCompare(right.id))) {
+        const { id, filePath: sourcePath, ext } = payload;
         const sourceStat = await fs.stat(sourcePath);
         entries.push({
             kind: 'source-file',
             sourcePath,
             sourceStat,
-            backupName: `inlay/${id}.${ext}`,
+            backupName: toInlayBackupName(id, ext),
             sortKey: `inlay/${id}`,
             size: sourceStat.size,
         });
@@ -8919,7 +9722,8 @@ async function planFullBackupFilesystemEntries(snapshot, target) {
 
         const sidecar = await readInlaySidecar(id);
         if (!sidecar || normalizeInlayExt(sidecar.ext) !== ext) continue;
-        const sidecarPath = getInlaySidecarPath(id);
+        const sidecarPath = await resolveInlaySidecarPath(id);
+        if (!sidecarPath) continue;
         try {
             const sidecarStat = await fs.stat(sidecarPath);
             entries.push({
@@ -10121,10 +10925,13 @@ function resolveBackupStorageKey(name) {
         return name;
     }
 
-    if (name.startsWith('inlay/')) {
+    if (name.startsWith('inlay/') || name.startsWith(INLAY_ARCHIVE_V2_PREFIX)) {
         const parsed = parseInlayBackupName(name);
         if (!parsed || !isSafeInlayId(parsed.id)) {
-            throw new Error(`Invalid inlay backup entry name: ${name}`);
+            throw importFormatError(
+                `Invalid inlay backup entry name or tuple exceeds the portable limit: ${name}`,
+                'INVALID_INLAY_BACKUP_ENTRY',
+            );
         }
         return name;
     }
@@ -10132,7 +10939,10 @@ function resolveBackupStorageKey(name) {
     if (name.startsWith('inlay_sidecar/')) {
         const parsed = parseInlaySidecarBackupName(name);
         if (!parsed) {
-            throw new Error(`Invalid inlay sidecar backup entry name: ${name}`);
+            throw importFormatError(
+                `Invalid inlay sidecar backup entry name or ID exceeds the portable limit: ${name}`,
+                'INVALID_INLAY_BACKUP_ENTRY',
+            );
         }
         return name;
     }
@@ -10183,6 +10993,24 @@ function resolveBackupStorageKey(name) {
     return `assets/${name}`;
 }
 
+function validateInlayBackupEntryNameBeforeStaging(name) {
+    if (name.startsWith('inlay/')
+        || name.startsWith(INLAY_ARCHIVE_V2_PREFIX)
+        || name.startsWith('inlay_sidecar/')) {
+        resolveBackupStorageKey(name);
+        return;
+    }
+    if (name.startsWith('inlay_info/')) {
+        const id = name.slice('inlay_info/'.length);
+        if (!isSafeInlayId(id)) {
+            throw importFormatError(
+                `Invalid legacy inlay info entry name or ID exceeds the portable limit: ${name}`,
+                'INVALID_INLAY_BACKUP_ENTRY',
+            );
+        }
+    }
+}
+
 // ─── Shared backup import logic ─────────────────────────────────────────────
 // Accepts any async iterable of Buffer chunks (HTTP request body, file stream, etc.)
 async function importBackupFromSource(dataSource, {
@@ -10225,6 +11053,7 @@ async function importBackupFromSource(dataSource, {
     await fs.rm(stagingDir, { recursive: true, force: true });
     await fs.rm(backupInlayDir, { recursive: true, force: true });
     await fs.mkdir(stagingDir, { recursive: true });
+    assertCanonicalInlayNamespace(stagingDir);
     let assetStage;
     try {
         assetStage = await prepareAssetImportStage();
@@ -10235,14 +11064,28 @@ async function importBackupFromSource(dataSource, {
     }
 
     function stagingInlayFilePath(id, ext) {
-        return path.join(stagingDir, `${id}.${normalizeInlayExt(ext)}`);
+        return canonicalInlayPaths(stagingDir, id, ext).payloadPath;
     }
     function stagingSidecarPath(id) {
-        return path.join(stagingDir, `${id}.meta.json`);
+        return canonicalInlayPaths(stagingDir, id).sidecarPath;
+    }
+    function removeObsoleteStagingPayloadsSync(id, destinationPath) {
+        const payloadDir = path.join(
+            stagingDir,
+            INLAY_CANONICAL_ROOT_NAME,
+            INLAY_CANONICAL_PAYLOAD_DIR_NAME,
+        );
+        for (const entryPath of listRegularFilesRecursiveSync(payloadDir)) {
+            const parsed = parseCanonicalInlayPayloadPath(entryPath, payloadDir);
+            if (parsed?.id === id && entryPath !== destinationPath) unlinkSync(entryPath);
+        }
     }
     function writeStagingInlayFileSync(id, ext, buffer, info) {
-        const normalizedExt = normalizeInlayExt(ext);
-        writeFileSync(stagingInlayFilePath(id, normalizedExt), Buffer.from(buffer));
+        const normalizedExt = assertSafeInlayTuple(id, ext);
+        assertCanonicalInlayWriteTargets(stagingDir, id, normalizedExt);
+        const destinationPath = stagingInlayFilePath(id, normalizedExt);
+        writeFileSync(destinationPath, Buffer.from(buffer));
+        removeObsoleteStagingPayloadsSync(id, destinationPath);
         const sidecar = {
             ext: normalizedExt,
             name: typeof info?.name === 'string' ? info.name : id,
@@ -10253,17 +11096,22 @@ async function importBackupFromSource(dataSource, {
         writeFileSync(stagingSidecarPath(id), JSON.stringify(sidecar));
     }
     async function writeStagingInlayFileFromSource(id, ext, source, info) {
-        const normalizedExt = normalizeInlayExt(ext);
+        const normalizedExt = assertSafeInlayTuple(id, ext);
+        assertCanonicalInlayWriteTargets(stagingDir, id, normalizedExt);
+        const destinationPath = stagingInlayFilePath(id, normalizedExt);
         await copyFileToSpool(
             source.filePath,
-            stagingInlayFilePath(id, normalizedExt),
+            destinationPath,
             { maxBytes, signal },
         );
+        removeObsoleteStagingPayloadsSync(id, destinationPath);
         writeStagingSidecarSync(id, { ...(info || {}), ext: normalizedExt });
     }
     function writeStagingSidecarSync(id, info) {
+        const normalizedExt = assertSafeInlayTuple(id, info?.ext);
+        assertCanonicalInlayWriteTargets(stagingDir, id);
         const sidecar = {
-            ext: normalizeInlayExt(info?.ext),
+            ext: normalizedExt,
             name: typeof info?.name === 'string' ? info.name : id,
             type: typeof info?.type === 'string' ? info.type : 'image',
             height: typeof info?.height === 'number' ? info.height : undefined,
@@ -10507,6 +11355,7 @@ async function importBackupFromSource(dataSource, {
                         const dataLength = buffer.readUInt32LE(4 + nameLength);
                         assertImportSize(dataLength, maxBytes, `Backup entry ${name}`);
                         buffer = buffer.subarray(headerLength);
+                        validateInlayBackupEntryNameBeforeStaging(name);
 
                         if (!entryIndex.addEntry(name)) {
                             throw importFormatError(`Duplicate backup entry: ${name}`, 'DUPLICATE_BACKUP_ENTRY');
@@ -10525,7 +11374,6 @@ async function importBackupFromSource(dataSource, {
                                 'ENCRYPTED_BACKUP_UNSUPPORTED',
                             );
                         }
-
                         let filePath;
                         if (name === 'database.risudat') {
                             filePath = path.join(
@@ -11547,7 +12395,18 @@ async function generateThumbnail(buffer) {
 
 app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
     try {
-        const key = Buffer.from(req.params.hexKey, 'hex').toString('utf-8')
+        let key;
+        try {
+            ({ decodedKey: key } = decodeAndCanonicalizeHexPath(req.params.hexKey));
+        } catch (error) {
+            if (error?.code === 'INVALID_HEX_PATH') {
+                return res.status(400).set('Cache-Control', 'no-store').json({
+                    error: 'Invalid canonical UTF-8 hex path',
+                    code: error.code,
+                });
+            }
+            throw error;
+        }
 
         if (key.startsWith('inlay/')) {
             const id = key.slice('inlay/'.length)
@@ -12196,7 +13055,7 @@ app.get('/api/remove', async (req, res, next) => {
                         commitOutcomeUnknown: false,
                     });
                 }
-                await fs.unlink(getInlaySidecarPath(id)).catch(() => {});
+                await deleteInlaySidecars(id);
             }
             if (key.startsWith('inlay_meta/')) {
                 const id = key.slice('inlay_meta/'.length);
@@ -17029,6 +17888,7 @@ async function prepareSpooledGenericKvWrite(key, spool) {
         if (key.startsWith('inlay/')) {
             const id = key.slice('inlay/'.length);
             parsedInlay = JSON.parse(await fs.readFile(spool.filePath, 'utf-8'));
+            assertSafeInlayTuple(id, parsedInlay?.ext);
             const type = typeof parsedInlay?.type === 'string' ? parsedInlay.type : 'image';
             const payload = type === 'signature'
                 ? Buffer.from(typeof parsedInlay?.data === 'string' ? parsedInlay.data : '', 'utf-8')
@@ -17037,7 +17897,9 @@ async function prepareSpooledGenericKvWrite(key, spool) {
             inlayPayloadPath = path.join(stageDir, 'inlay-payload');
             await writePrivateAdmittedStageFile(inlayPayloadPath, payload);
         } else if (key.startsWith('inlay_info/')) {
+            const id = key.slice('inlay_info/'.length);
             parsedInlayInfo = JSON.parse(await fs.readFile(spool.filePath, 'utf-8'));
+            assertSafeInlayTuple(id, parsedInlayInfo?.ext);
         }
         const chunkPlan = key.startsWith('inlay/') || key.startsWith('inlay_info/')
             ? null
@@ -20615,17 +21477,13 @@ async function diskFreeStat(dirPath) {
 async function sumInlayFsBytes() {
     let total = 0;
     try {
-        const inlayFiles = await listInlayFiles();
-        await Promise.all(inlayFiles.map(async (entry) => {
-            try {
-                const st = await fs.stat(entry.filePath);
-                total += st.size;
-            } catch { /* missing — skip */ }
-            try {
-                const sst = await fs.stat(getInlaySidecarPath(entry.id));
-                total += sst.size;
-            } catch { /* sidecar may not exist */ }
+        const files = await listRegularFilesRecursive(inlayDir);
+        const sizes = await Promise.all(files.map(async (filePath) => {
+            const name = path.basename(filePath);
+            if (filePath === inlayMigrationMarker || isInlayTemporaryFileName(name)) return 0;
+            try { return (await fs.stat(filePath)).size; } catch { return 0; }
         }));
+        total = sizes.reduce((sum, size) => sum + size, 0);
     } catch { /* dir missing */ }
     return total;
 }
@@ -22605,6 +23463,12 @@ app.use((err, req, res, next) => {
             key: err.key,
             expected: err.expected,
             actual: err.actual,
+        });
+    }
+    if (err?.code === 'INVALID_INLAY_TUPLE') {
+        return res.status(400).json({
+            error: err.message,
+            code: err.code,
         });
     }
     if (isAssetMaintenanceLockedError(err)) {

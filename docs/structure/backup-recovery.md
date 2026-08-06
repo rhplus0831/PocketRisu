@@ -67,6 +67,15 @@ framing format. The live stubs-only database is an internal representation; port
 is assembled at export boundaries by joining the external rows. The finished database is
 a disk spool, not one aggregate JavaScript object or response buffer.
 
+Inlay payload archives preserve the compatibility name `inlay/<id>.<ext>` when the
+normalized extension contains no dot. Dotted extensions use the injective
+`inlay_v2/<lowercase UTF-8 ID hex>--<lowercase UTF-8 extension hex>` form, which keeps
+the `(ID, extension)` tuple unambiguous even when both fields contain dots. Imports
+accept both forms. Archive planning rejects any duplicate final entry name before a
+header is published. Import validates the encoded inlay tuple as soon as its entry header
+is available, before staging that entry body. IDs and normalized extensions retain the
+legacy portable envelope: both `<id>.meta.json` and `<id>.<ext>` must fit 255 UTF-8 bytes.
+
 ### Full and server-file exports
 
 Full download and server-file export share a strict point-in-time protocol:

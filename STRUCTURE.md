@@ -182,7 +182,7 @@ export process chat JSON incrementally instead of materializing every chat row a
 | `ModelPreset` | Installed model configuration with a frozen profile snapshot, selected through per-chat bindings or optional global per-module overrides |
 | Prompt preset / `botPreset` | RisuAI-format prompt template selected through `botPresetsId` |
 | Ordinary asset | `assets/*`; safe names are normally files under `save/assets/` |
-| Inlay | Payload under `save/inlays/` with a physical `<id>.meta.json` display/file sidecar; logical `inlay_meta/<id>` KV separately tracks timestamps and character/chat ownership |
+| Inlay | Payload under the versioned `save/inlays/.inlay-objects-v1/` physical namespace with disjoint, bounded, lowercase-hex payload/sidecar paths; logical `inlay_meta/<id>` KV separately tracks timestamps and character/chat ownership |
 
 ## Cross-cutting contracts
 
