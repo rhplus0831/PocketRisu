@@ -53,6 +53,11 @@ interface AssetStore {
     portableAssetNameKey: (name: string) => string
     isPortableAssetName: (name: unknown) => boolean
     isHashShapedAssetName: (name: unknown) => boolean
+    runtimeAssetFileDisposition: (name: unknown) => {
+        eligible: boolean
+        reason: 'non-portable' | 'collision' | null
+        existingName: string | null
+    }
     assetPathFor: (name: string) => string
     legacyHashMarkerPathFor: (name: string) => string
     isLegacyHashAsset: (name: string) => boolean
@@ -93,6 +98,7 @@ function makeCaseInsensitiveStore(): AssetStore {
     tempDirs.push(root)
     const assetDir = path.join(root, 'save', 'assets')
     const fsImpl = Object.create(fs) as typeof fs
+    const displayedNames = new Map<string, string>()
     const foldPath = (filePath: fs.PathLike): fs.PathLike => {
         if (typeof filePath !== 'string') return filePath
         const relative = path.relative(assetDir, filePath)
@@ -105,7 +111,28 @@ function makeCaseInsensitiveStore(): AssetStore {
     )) as typeof fs.openSync
     fsImpl.renameSync = ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
         fs.renameSync(foldPath(oldPath), foldPath(newPath))
+        if (typeof newPath === 'string' && path.dirname(newPath) === assetDir) {
+            const name = path.basename(newPath)
+            displayedNames.set(name.toLowerCase(), name)
+        }
     }) as typeof fs.renameSync
+    fsImpl.readdirSync = ((directory: fs.PathLike, ...args: unknown[]) => {
+        const entries = Reflect.apply(fs.readdirSync, fs, [directory, ...args])
+        if (typeof directory !== 'string' || path.resolve(directory) !== assetDir
+            || !Array.isArray(entries)) return entries
+        return entries.map((entry) => {
+            if (typeof entry !== 'object' || entry === null || !('name' in entry)) return entry
+            const displayedName = displayedNames.get(String(entry.name).toLowerCase())
+            if (!displayedName || displayedName === entry.name) return entry
+            return new Proxy(entry, {
+                get(target, property, receiver) {
+                    return property === 'name'
+                        ? displayedName
+                        : Reflect.get(target, property, receiver)
+                },
+            })
+        })
+    }) as typeof fs.readdirSync
     fsImpl.lstatSync = ((filePath: fs.PathLike, ...args: unknown[]) => (
         Reflect.apply(fs.lstatSync, fs, [foldPath(filePath), ...args])
     )) as typeof fs.lstatSync
@@ -120,6 +147,9 @@ function makeCaseInsensitiveStore(): AssetStore {
     )) as typeof fs.readFileSync
     fsImpl.unlinkSync = ((filePath: fs.PathLike) => {
         fs.unlinkSync(foldPath(filePath))
+        if (typeof filePath === 'string' && path.dirname(filePath) === assetDir) {
+            displayedNames.delete(path.basename(filePath).toLowerCase())
+        }
     }) as typeof fs.unlinkSync
     fsImpl.writeFileSync = ((filePath: fs.PathOrFileDescriptor, ...args: unknown[]) => (
         Reflect.apply(fs.writeFileSync, fs, [
@@ -195,6 +225,18 @@ describe('asset filename safety', () => {
         expect(portableAssetNameKey('Foo.PNG')).toBe('foo.png')
         expect(portableAssetNameKey('Mixed.Name...')).toBe('mixed.name')
         expect(portableAssetNameKey('already-portable')).toBe('already-portable')
+    })
+
+    it('keeps non-portable runtime names out of the filesystem', () => {
+        const store = makeStore()
+        for (const name of ['CON.png', 'trailing.', 'unsafe name.png']) {
+            expect(store.runtimeAssetFileDisposition(name)).toEqual({
+                eligible: false,
+                reason: 'non-portable',
+                existingName: null,
+            })
+        }
+        expect(store.listAssetFiles()).toEqual([])
     })
 })
 
@@ -301,6 +343,30 @@ describe('legacy hash-shaped asset identity', () => {
 })
 
 describe('asset file operations', () => {
+    it('requires exact entry identity and rejects a case-folded runtime collision', () => {
+        const store = makeCaseInsensitiveStore()
+        const original = Buffer.from('original bytes')
+        store.writeAssetFile('Foo.png', original)
+
+        expect(store.runtimeAssetFileDisposition('Foo.png')).toEqual({
+            eligible: true,
+            reason: null,
+            existingName: 'Foo.png',
+        })
+        expect(store.runtimeAssetFileDisposition('foo.png')).toEqual({
+            eligible: false,
+            reason: 'collision',
+            existingName: 'Foo.png',
+        })
+        expect(store.readAssetFile('Foo.png')).toEqual(original)
+        expect(store.readAssetFile('foo.png')).toBeNull()
+        expect(store.assetFileExists('foo.png')).toBe(false)
+        expect(store.assetFileSize('foo.png')).toBeNull()
+        expect(store.assetFileMtimeMs('foo.png')).toBeNull()
+        expect(store.deleteAssetFile('foo.png')).toBe(false)
+        expect(store.readAssetFile('Foo.png')).toEqual(original)
+    })
+
     it('round-trips write, read, list, metadata, and delete', () => {
         const store = makeStore()
         const value = Buffer.from('asset bytes')

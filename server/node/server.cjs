@@ -64,6 +64,8 @@ const {
     isSafeAssetName,
     portableAssetNameKey,
     isPortableAssetName,
+    runtimeAssetFileDisposition,
+    runtimeAssetFileDispositions,
     assetPathFor,
     isLegacyHashAsset,
     markLegacyHashAsset,
@@ -5004,6 +5006,11 @@ function assetNameForKey(key) {
 function readAssetValue(key, reader = { kvGet }) {
     const name = assetNameForKey(key);
     if (name !== null && isSafeAssetName(name)) {
+        const fileDisposition = runtimeAssetFileDisposition(name);
+        if (!fileDisposition.eligible) {
+            const rowValue = reader.kvGet(key);
+            if (rowValue !== null) return rowValue;
+        }
         const fileValue = readAssetFile(name);
         if (fileValue !== null) return fileValue;
     }
@@ -5027,7 +5034,10 @@ function writeAssetValue(key, value, options = {}) {
         metadataHooks = {},
     } = options;
     const name = assetNameForKey(key);
-    if (name !== null && isSafeAssetName(name)) {
+    const fileDisposition = name === null
+        ? null
+        : runtimeAssetFileDisposition(name);
+    if (fileDisposition?.eligible) {
         if (legacyHashMismatch) markLegacyHashAsset(name);
         let wrote = true;
         if (skipIfUnchanged) {
@@ -5079,8 +5089,13 @@ function listAssetEntriesWithSizes(reader = { kvListWithSizes, kvGetUpdatedAt })
             legacyHash: isLegacyHashAsset(file.name),
         });
     }
-    for (const row of reader.kvListWithSizes('assets/')) {
-        if (!entries.has(row.key)) {
+    const rows = reader.kvListWithSizes('assets/');
+    const names = rows.map((row) => assetNameForKey(row.key));
+    const fileDispositions = runtimeAssetFileDispositions(names);
+    for (let index = 0; index < rows.length; index++) {
+        const row = rows[index];
+        const fileDisposition = fileDispositions.get(names[index]);
+        if (!entries.has(row.key) || !fileDisposition?.eligible) {
             entries.set(row.key, {
                 key: row.key,
                 size: row.size,
@@ -11443,20 +11458,24 @@ app.get('/api/asset/:hexKey', sessionAuthMiddleware, async (req, res) => {
         if (key.startsWith('assets/')) {
             const name = assetNameForKey(key)
             if (isSafeAssetName(name)) {
-                const data = readAssetFile(name)
-                const mtimeMs = assetFileMtimeMs(name)
-                if (data !== null && mtimeMs !== null) {
-                    const etag = `"${Math.floor(mtimeMs)}"`
-                    if (req.headers['if-none-match'] === etag) {
-                        return res.status(304).set('Cache-Control', 'public, max-age=31536000, immutable').end()
+                const fileDisposition = runtimeAssetFileDisposition(name)
+                const kvLeads = !fileDisposition.eligible && kvGetUpdatedAt(key) !== null
+                if (!kvLeads) {
+                    const data = readAssetFile(name)
+                    const mtimeMs = assetFileMtimeMs(name)
+                    if (data !== null && mtimeMs !== null) {
+                        const etag = `"${Math.floor(mtimeMs)}"`
+                        if (req.headers['if-none-match'] === etag) {
+                            return res.status(304).set('Cache-Control', 'public, max-age=31536000, immutable').end()
+                        }
+                        const { binary, contentType } = resolveAssetPayload(key, data)
+                        res.set({
+                            'Content-Type': contentType,
+                            'Cache-Control': 'public, max-age=31536000, immutable',
+                            'ETag': etag,
+                        })
+                        return res.send(binary)
                     }
-                    const { binary, contentType } = resolveAssetPayload(key, data)
-                    res.set({
-                        'Content-Type': contentType,
-                        'Cache-Control': 'public, max-age=31536000, immutable',
-                        'ETag': etag,
-                    })
-                    return res.send(binary)
                 }
             }
         }
@@ -16829,7 +16848,10 @@ function verifyAssetHashFromDigest(key, digest) {
 
 function writeAssetValueFromSpool(key, spool, verification) {
     const name = assetNameForKey(key);
-    if (name !== null && isSafeAssetName(name)) {
+    const fileDisposition = name === null
+        ? null
+        : runtimeAssetFileDisposition(name);
+    if (fileDisposition?.eligible) {
         if (verification.legacyHashMismatch) markLegacyHashAsset(name);
         const wrote = writeAssetFileFromFile(name, spool.filePath, {
             skipIfUnchanged: verification.claimed !== null,

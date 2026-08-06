@@ -139,6 +139,67 @@ function createAssetStore(options = {}) {
         }
     }
 
+    function findExactAssetFileEntry(name) {
+        if (!isSafeAssetName(name)) return null;
+        let entry;
+        try {
+            entry = fsOps.readdirSync(assetDir, { withFileTypes: true })
+                .find((candidate) => candidate.name === name);
+        } catch (error) {
+            if (error?.code === 'ENOENT') return null;
+            throw error;
+        }
+        return entry?.isFile() ? entry : null;
+    }
+
+    function runtimeAssetFileDispositions(names) {
+        const dispositions = new Map();
+        const portableNames = names.filter((name) => {
+            if (isPortableAssetName(name)) return true;
+            dispositions.set(name, {
+                eligible: false,
+                reason: 'non-portable',
+                existingName: null,
+            });
+            return false;
+        });
+        if (portableNames.length === 0) return dispositions;
+
+        ensureAssetDir();
+        const entriesByPortableKey = new Map();
+        for (const entry of fsOps.readdirSync(assetDir, { withFileTypes: true })) {
+            if (!isSafeAssetName(entry.name)) continue;
+            const portableKey = portableAssetNameKey(entry.name);
+            const entries = entriesByPortableKey.get(portableKey) || [];
+            entries.push(entry);
+            entriesByPortableKey.set(portableKey, entries);
+        }
+
+        for (const name of portableNames) {
+            const entries = entriesByPortableKey.get(portableAssetNameKey(name)) || [];
+            const exactEntry = entries.find((entry) => entry.name === name) ?? null;
+            const collisionEntry = entries.find((entry) => entry.name !== name) ?? null;
+            if (collisionEntry || (exactEntry && !exactEntry.isFile())) {
+                dispositions.set(name, {
+                    eligible: false,
+                    reason: 'collision',
+                    existingName: collisionEntry?.name ?? exactEntry.name,
+                });
+            } else {
+                dispositions.set(name, {
+                    eligible: true,
+                    reason: null,
+                    existingName: exactEntry?.name ?? null,
+                });
+            }
+        }
+        return dispositions;
+    }
+
+    function runtimeAssetFileDisposition(name) {
+        return runtimeAssetFileDispositions([name]).get(name);
+    }
+
     function writeMarkerFile(filePath, value) {
         const directory = path.dirname(filePath);
         fsOps.mkdirSync(directory, { recursive: true });
@@ -198,7 +259,11 @@ function createAssetStore(options = {}) {
     }
 
     function fileStat(name) {
-        if (!isSafeAssetName(name)) return null;
+        // A path lookup alone is insufficient on a case-insensitive volume:
+        // `foo.png` can resolve to the directory entry `Foo.png`. Filesystem
+        // authority is therefore granted only to an exact directory-entry
+        // name; a differently cased logical key can safely fall back to KV.
+        if (!findExactAssetFileEntry(name)) return null;
         try {
             const stat = fsOps.lstatSync(assetPathFor(name));
             return stat.isFile() ? stat : null;
@@ -439,7 +504,7 @@ function createAssetStore(options = {}) {
     }
 
     function deleteAssetFile(name) {
-        if (!isSafeAssetName(name)) return false;
+        if (!findExactAssetFileEntry(name)) return false;
         let removed = false;
         try {
             fsOps.unlinkSync(assetPathFor(name));
@@ -515,6 +580,8 @@ function createAssetStore(options = {}) {
         portableAssetNameKey,
         isPortableAssetName,
         isHashShapedAssetName,
+        runtimeAssetFileDisposition,
+        runtimeAssetFileDispositions,
         assetPathFor,
         legacyHashMarkerPathFor,
         isLegacyHashAsset,

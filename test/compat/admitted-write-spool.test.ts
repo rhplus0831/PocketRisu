@@ -6,6 +6,7 @@ import { gzipSync } from 'node:zlib'
 import path from 'node:path'
 import { createRequire } from 'node:module'
 import { Packr } from 'msgpackr'
+import Database from 'better-sqlite3'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
 import { createClient, type RisuClient } from './helpers/client.js'
 
@@ -61,6 +62,49 @@ async function responseSnapshot(response: Response) {
   return { status: response.status, body: await response.text() }
 }
 
+async function writeAsset(client: RisuClient, key: string, value: Buffer) {
+  return client.fetch('/api/write', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'file-path': Buffer.from(key, 'utf8').toString('hex'),
+    },
+    body: new Uint8Array(value),
+  })
+}
+
+async function readAsset(client: RisuClient, key: string): Promise<Buffer> {
+  const response = await client.fetch('/api/read', {
+    headers: { 'file-path': Buffer.from(key, 'utf8').toString('hex') },
+  })
+  expect(response.status).toBe(200)
+  return Buffer.from(await response.arrayBuffer())
+}
+
+async function readDirectAsset(client: RisuClient, key: string): Promise<Buffer> {
+  const session = await client.fetch('/api/session', { method: 'POST' })
+  expect(session.status).toBe(200)
+  const cookie = session.headers.get('set-cookie')?.split(';', 1)[0]
+  expect(cookie).toBeTruthy()
+  const response = await client.fetch(
+    `/api/asset/${Buffer.from(key, 'utf8').toString('hex')}`,
+    { headers: { cookie: cookie! } },
+  )
+  expect(response.status).toBe(200)
+  return Buffer.from(await response.arrayBuffer())
+}
+
+function readKvValue(server: ServerHandle, key: string): Buffer | null {
+  const database = new Database(path.join(server.cwd, 'save', 'risuai.db'), { readonly: true })
+  try {
+    const row = database.prepare('SELECT value FROM kv WHERE key = ?')
+      .get(key) as { value: Buffer } | undefined
+    return row ? Buffer.from(row.value) : null
+  } finally {
+    database.close()
+  }
+}
+
 async function admittedArtifacts(server: ServerHandle): Promise<string[]> {
   const entries = await readdir(await databaseSpoolDir(server)).catch(() => [])
   return entries.filter(name => (
@@ -82,6 +126,44 @@ async function waitFor(pathname: string) {
 }
 
 describe('admitted database/chat/KV write spooling', () => {
+  test('buffered and spooled asset writes preserve case collisions and keep reserved names in KV', async () => {
+    const spooled = await boot()
+    const buffered = await boot({ POCKETRISU_TEST_DISABLE_ADMITTED_SPOOL: '1' })
+
+    for (const { server, client } of [spooled, buffered]) {
+      const upperKey = 'assets/Foo.png'
+      const lowerKey = 'assets/foo.png'
+      const reservedKey = 'assets/CON.png'
+      const upperValue = Buffer.from('upper filesystem payload')
+      const lowerValue = Buffer.from('lower KV payload')
+      const reservedValue = Buffer.from('reserved KV payload')
+
+      expect((await writeAsset(client, upperKey, upperValue)).status).toBe(200)
+      expect((await writeAsset(client, lowerKey, lowerValue)).status).toBe(200)
+      expect((await writeAsset(client, reservedKey, reservedValue)).status).toBe(200)
+
+      const assetDir = path.join(server.cwd, 'save', 'assets')
+      const entries = await readdir(assetDir)
+      expect(entries).toContain('Foo.png')
+      expect(entries).not.toContain('foo.png')
+      expect(entries).not.toContain('CON.png')
+      expect(await readFile(path.join(assetDir, 'Foo.png'))).toEqual(upperValue)
+      expect(readKvValue(server, upperKey)).toBeNull()
+      expect(readKvValue(server, lowerKey)).toEqual(lowerValue)
+      expect(readKvValue(server, reservedKey)).toEqual(reservedValue)
+      const staleReservedFile = Buffer.from('stale reserved filesystem payload')
+      await writeFile(path.join(assetDir, 'CON.png'), staleReservedFile)
+      expect(await readFile(path.join(assetDir, 'CON.png'))).toEqual(staleReservedFile)
+      expect(await readAsset(client, upperKey)).toEqual(upperValue)
+      expect(await readAsset(client, lowerKey)).toEqual(lowerValue)
+      expect(await readAsset(client, reservedKey)).toEqual(reservedValue)
+      expect(await readDirectAsset(client, upperKey)).toEqual(upperValue)
+      expect(await readDirectAsset(client, lowerKey)).toEqual(lowerValue)
+      expect(await readDirectAsset(client, reservedKey)).toEqual(reservedValue)
+      expect(await admittedArtifacts(server)).toEqual([])
+    }
+  })
+
   test('new, legacy-buffered, and worker-degraded paths return byte-identical responses', async () => {
     const current = await boot({ POCKETRISU_CHUNK_THRESHOLD: '1024' })
     const legacy = await boot({

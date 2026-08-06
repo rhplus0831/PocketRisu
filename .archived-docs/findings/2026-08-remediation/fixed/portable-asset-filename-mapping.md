@@ -23,7 +23,8 @@
   `writeImportedAsset` helper was removed. Generated lowercase content hashes
   were never affected. The runtime write path was deliberately left out of
   scope and is tracked as the follow-up finding
-  [runtime asset writes can replace a case-colliding asset](../../../../docs/findings/open/media-translation/runtime-asset-writes-can-case-fold-clobber.md).
+  [runtime asset writes can replace a case-colliding asset](runtime-asset-writes-can-case-fold-clobber.md),
+  which was subsequently fixed by the remediation queue.
 - Regression coverage: `server/node/assetStore.test.ts` (portable-name
   predicates incl. reserved basenames and trailing dots; preflight matrix —
   row/row and row/file collisions, exact-name idempotent re-run, non-portable
