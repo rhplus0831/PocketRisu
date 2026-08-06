@@ -114,7 +114,7 @@ In the legacy regime, `LLMModel.format` selects the wire protocol while `provide
   - `attachRunningJob()` installs a background per-chat guard and polls the server to terminal state.
   - `recoverModelJobs()` discovers work; `initModelJobRecovery()` runs it at boot, on visibility return, and when the browser comes online.
 
-- `server/node/model-jobs.cjs` — Express-side raw response recorder and pending-send store.
+- `server/node/runtime/model-jobs.cjs` — Express-side raw response recorder and pending-send store.
   - Metadata lives in `save/model-jobs.db`; raw provider bytes are append-only journals under `save/model-jobs/`.
   - `createModelJobs()` registers authenticated `/api/model-jobs` and `/api/pending-sends` routes, enforces one running main job per chat, and rotates terminal records.
 
@@ -122,7 +122,7 @@ In the legacy regime, `LLMModel.format` selects the wire protocol while `provide
   - `createRequestLogScope()` wraps a transport, tees response bodies, associates routes and authoritative adapter usage, and flushes one entry per request.
   - Query/statistics helpers read the server-backed request and usage log APIs.
 
-- `server/node/request-logs.cjs` — persistent provider diagnostics and token-usage store.
+- `server/node/runtime/request-logs.cjs` — persistent provider diagnostics and token-usage store.
   - `createRequestLogs()` owns the independent `save/request-logs.db`: heavy `requests` rows retain masked/truncated headers and bodies, while compact LLM `usage` rows retain model/source/token/duration statistics.
   - Request/response bodies are capped at 2 MiB, headers at 16 KiB, and ingest batches at 50 entries. `requests` rotates toward a 256 MiB body budget while always keeping at least 50 newest rows; rotation runs every 20 inserted rows and at server startup. `usage` is not rotated.
   - `registerRoutes()` provides authenticated batch ingest, filtered/cursor-paged request listing, single-entry body lookup, usage aggregation/dimensions, and storage statistics under `/api/request-logs`. Deletion additionally requires the active writer session and removes usage only when `?usage=1` is requested (`server/node/server.cjs:13560`).
@@ -394,7 +394,7 @@ Explicit local-network routing changes the behavior:
 - Inlay storage persists Gemini-generated images/audio and thought signatures.
 - Plugins can transform prompts/results or provide complete model implementations.
 - `globalFetch()`/`fetchNative()` provide logging, interception, timeout, direct-fetch, and proxy behavior.
-- `makeJobFetch()` and `server/node/model-jobs.cjs` provide durable ModelPreset transport, while `jobRecovery.ts` hydrates/saves recovered chats and publishes recovered usage.
+- `makeJobFetch()` and `server/node/runtime/model-jobs.cjs` provide durable ModelPreset transport, while `jobRecovery.ts` hydrates/saves recovered chats and publishes recovered usage.
 - `src/ts/requestLog.ts` supplies provider metadata and parsed usage to the generic
   request-log path; [server backend](server-backend.md#request-logging-and-observability)
   owns masking, retention, persistence, and routes.
@@ -536,7 +536,7 @@ Explicit local-network routing changes the behavior:
 
 - To tune preset streaming render frequency or backpressure behavior, inspect `STREAM_FLUSH_INTERVAL_MS` (`src/ts/process/request/request.ts:689`) and `pumpPresetStream()` (`src/ts/process/request/presetStreamPump.ts:109`).
 
-- To change ModelPreset server routing or stream reattachment, inspect `makeJobFetch()` in `src/ts/process/request/jobFetch.ts`; to change recording, guards, retention, or route behavior, inspect `createModelJobs()` in `server/node/model-jobs.cjs`.
+- To change ModelPreset server routing or stream reattachment, inspect `makeJobFetch()` in `src/ts/process/request/jobFetch.ts`; to change recording, guards, retention, or route behavior, inspect `createModelJobs()` in `server/node/runtime/model-jobs.cjs`.
 
 - To change recovery decoding or chat slot-in, inspect `decodeStreamingJournalDetailed()`, `recoverTerminalJob()`, and `attachRunningJob()` in `src/ts/process/request/jobRecovery.ts`. Keep recovery parsers aligned with live adapter parsers.
 

@@ -158,7 +158,7 @@ Character metadata lives inside the main database object, while image and other 
   - `saveAsset()` hashes bytes and stores them under `assets/<hash>.<extension>` at `src/ts/globalApi.svelte.ts:203`.
   - Ordinary-asset cleanup is server-owned. `collectDatabaseAssetReferences()` scans the complete stripped database plus the active optimized plugin publication, so character/persona/module fields do not require a parallel client allowlist.
 
-- `server/node/db.cjs` stores unsafe, non-portable, and host-case-colliding asset keys as BLOBs in `save/risuai.db`; safe-named legacy hash mismatches remain filesystem-backed with explicit identity markers. Database creation and the `kv` table are at `server/node/db.cjs:9-14` and `server/node/db.cjs:29`.
+- `server/node/db/db.cjs` stores unsafe, non-portable, and host-case-colliding asset keys as BLOBs in `save/risuai.db`; safe-named legacy hash mismatches remain filesystem-backed with explicit identity markers. Database creation and the `kv` table are at `server/node/db/db.cjs:9-14` and `server/node/db/db.cjs:29`.
 
 - `server/node/server.cjs` serves asset keys through the authenticated direct-asset endpoint at `server/node/server.cjs:3747` and proxies `/hub-proxy/*` to `https://sv.risuai.xyz` at `server/node/server.cjs:3436-3546`.
 
@@ -423,7 +423,7 @@ The Node server forwards `/hub-proxy/*` to `https://sv.risuai.xyz` while streami
 - To change the character portrait/alternate-icon swap behavior, inspect `src/ts/characters.ts:61`, `src/ts/characters.ts:107`, and `src/ts/characters.ts:124`.
 - To change emotion upload behavior, inspect `src/ts/characters.ts:137` and its UI at `src/lib/SideBars/CharConfig.svelte:399`.
 - To change additional-asset upload and tuple semantics, inspect `src/lib/SideBars/CharConfig.svelte:485` and `src/ts/characterCards.ts:1440`.
-- To change how asset binaries are named or stored, edit `src/ts/globalApi.svelte.ts:203`, `server/node/assetStore.cjs`, and the canonical reference matching in `server/node/assetGc.cjs`.
+- To change how asset binaries are named or stored, edit `src/ts/globalApi.svelte.ts:203`, `server/node/assets/assetStore.cjs`, and the canonical reference matching in `server/node/assets/assetGc.cjs`.
 - To change CharX members or streaming behavior, inspect `src/ts/process/processzip.ts:46`, `src/ts/process/processzip.ts:160`, and V3 archive writing at `src/ts/characterCards.ts:1389`.
 - To change the Risu-specific module embedded in CharX, inspect `src/ts/characterCards.ts:1389` and `src/ts/process/modules.ts:61`.
 - To change `.risum` compatibility framing, edit `src/ts/process/modules.ts:61` and its inverse at `src/ts/process/modules.ts:125`.

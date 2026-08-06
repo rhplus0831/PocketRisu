@@ -25,9 +25,9 @@ metadata/control plane and moves the two unbounded-growth payloads out of it:
 | Optimized plugin values (opt-in, V3-only) | `pluginsave/<base64url(key)>.json` + `pluginsave-meta/…` + `plugin-storage/manifest.json`, selected by `Database.pluginStorageGeneration` | Per-key JSON mutations, atomic batches, staged transitions |
 
 All three planes live in one `better-sqlite3` database at `save/risuai.db`
-(`server/node/db.cjs`), in a `kv(key, value BLOB, updated_at)` table. Values larger
+(`server/node/db/db.cjs`), in a `kv(key, value BLOB, updated_at)` table. Values larger
 than 16 MiB are transparently split into SHA-256-addressed, content-defined chunks
-(4–64 KiB, ~16 KiB average) with protected manifests (`server/node/chunkStore.cjs`);
+(4–64 KiB, ~16 KiB average) with protected manifests (`server/node/db/chunkStore.cjs`);
 the KV row then holds only a `\0RISUCHUNKED\0` marker. Chunks are deduplicated, which
 makes the live database, chat rows, and automatic snapshots share unchanged bytes.
 
@@ -36,7 +36,7 @@ Supporting tables: `deleted_keys` (7-day deletion journal for list deltas),
 `plugin_storage_usage` / `plugin_storage_owners` (derived plugin quota/owner indexes,
 rebuilt at every boot), and the chunk manifest tables. `save/logs.db` is a separate
 bounded log database (~5,000 rows retained). Legacy `characters`/`chats`/`settings`
-tables from very old installs are orphaned and unused (`server/node/db.cjs:72-75`).
+tables from very old installs are orphaned and unused (`server/node/db/db.cjs:72-75`).
 
 The browser holds the whole decoded `Database` in `DBState.db` (Svelte 5 `$state`).
 Unopened chats are runtime `_placeholder` objects; `_stub` is the wire marker. The
@@ -65,7 +65,7 @@ are disposable performance layers.
   stubs-only view and ETag as `/api/read`, MessagePack-encodes each group member
   separately, and returns one MessagePack envelope where each member is either
   `{hash}` (client already has it) or `{bytes}` (miss)
-  (`server/node/dbCachedRead.cjs`, `src/ts/storage/dbCachedRead.ts`). The client
+  (`server/node/db/dbCachedRead.cjs`, `src/ts/storage/dbCachedRead.ts`). The client
   re-hashes every cached segment before use and verifies the envelope ETag; any
   anomaly falls back to the raw read.
 
@@ -109,7 +109,7 @@ after the fetch, and is suppressed from dirty tracking.
 
 ### 2.4 Key listings
 
-`GET /api/list` supports full and delta responses (`server/node/listDelta.cjs`). A
+`GET /api/list` supports full and delta responses (`server/node/db/listDelta.cjs`). A
 client with a cached prefix listing sends `x-last-sync` + `x-list-epoch`; the server
 returns `{added, deleted}` if the baseline is under six days old and the epoch matches,
 otherwise a full listing. Sources are `kv.updated_at`, the `deleted_keys` journal
@@ -238,7 +238,7 @@ Auth → writer-ownership check → storage-mutation FIFO → plugin-publication
 (patches touching `pluginCustomStorage`/`pluginStorageGeneration`/manifest roots are
 rejected with 409 — those fields belong to the dedicated plugin protocols) →
 `expectedHash` compared against a memoized compositional hash of the cached stubs-only
-database → `applyPatchAtomic()` (`server/node/atomicJsonPatch.cjs`) applies operations
+database → `applyPatchAtomic()` (`server/node/db/atomicJsonPatch.cjs`) applies operations
 with path-scoped copy-on-write (only mutation-path ancestors are cloned — this is the
 recent "stop O(database) work per patch" fix) → payload-bearing whole-chat operations
 are externalized to chat rows immediately, removed stub references are queued →
@@ -307,7 +307,7 @@ automatic; space reclamation is mostly operator-triggered.
 | Mechanism | Behavior |
 |---|---|
 | **Automatic snapshots** | Event-driven (after full writes, debounced patch persists, chat writes, before destructive imports; plugin publications set a durable dirty token that retries until satisfied). Cooldown 5 min (`POCKETRISU_BACKUP_INTERVAL_MS`). Each snapshot is a *self-contained* database (chat rows and selected plugin generation folded back in, streamed via the disk spool, never monolithized in RAM). Retention: 20 snapshots / 500 MiB by default; the byte cap measures **marginal physical chunk cost after dedup**, and the newest snapshot is always kept. Missing chat rows are preserved as bare stubs so damaged state still gets a recovery point. |
-| **Chat version backups** (`server/node/chatBackups.cjs`) | Pre-image capture immediately before each `/api/chat-content` overwrite (45 s per-chat cooldown; skipped for cold-storage placeholders). Loose `v-*.bin` files are gzipped, folded into 25-version solid bundles, max 4 bundles/chat (≈124 recognized versions), global 50 MiB budget with oldest-first eviction that never removes a chat's newest version. Reconciliation runs at startup and 7.5 s after captures — not periodically. Full-write/import chat writes bypass capture. |
+| **Chat version backups** (`server/node/chat/chatBackups.cjs`) | Pre-image capture immediately before each `/api/chat-content` overwrite (45 s per-chat cooldown; skipped for cold-storage placeholders). Loose `v-*.bin` files are gzipped, folded into 25-version solid bundles, max 4 bundles/chat (≈124 recognized versions), global 50 MiB budget with oldest-first eviction that never removes a chat's newest version. Reconciliation runs at startup and 7.5 s after captures — not periodically. Full-write/import chat writes bypass capture. |
 | **Startup recovery** | Import-journal replay (finalize or roll back staged filesystem swaps), spool/stage/temp sweeps, plugin transition receipt reconciliation (24 h stage TTL), chat-externalization migration with a pre-migration safety copy, read-only database preflight — a corrupt database boots into authenticated snapshot-recovery mode instead of being mutated. Snapshot restore is operator/browser-chosen, not automatic. |
 | **WAL checkpointing** | Background scheduler in all modes (TRUNCATE maintenance checkpoints every 1–5 min depending on durability mode, busy retries); flush verifies FULL; shutdown truncates. |
 | **Plugin derived state** | Quota counter and owner index rebuilt from physical rows at every boot. Manifest-based quarantine is automatic *logically* (unmanifested rows read as absent) but their bytes are not deleted. |
@@ -508,7 +508,7 @@ Ranked by expected impact; all are grounded in the findings above.
    re-decodes, re-encodes, re-segments, and re-hashes the whole database on every
    boot even when the client has everything. Segments are immutable between mutations;
    memoizing them per cache generation (like the ETag memo) makes warm boots cheap on
-   the server too (`server/node/dbCachedRead.cjs`).
+   the server too (`server/node/db/dbCachedRead.cjs`).
 6. **Make plugin manifest membership incremental.** Store membership in normalized
    SQLite rows (or maintain the manifest index incrementally) instead of parse → clone
    → rewrite → reread of the full key list per single-value mutation; nudge plugin

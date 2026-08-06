@@ -16,43 +16,43 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 | File | Role and important symbols |
 |---|---|
 | `server/node/server.cjs` | Executable Express backend and route/lifecycle monolith. It composes auth/writer fencing, storage queues, chat/filesystem stores, proxy jobs, plugin publication, export/import, snapshot restore, maintenance, and update behavior. `startServer()` performs recovery/preflight/migrations before selecting HTTP/HTTPS and `HOST`/`PORT`; loading the module starts the application. |
-| `server/node/db.cjs` | Opens `save/risuai.db`, applies SQLite pragmas, owns KV/delta-list primitives, pins read-only WAL snapshots, initializes chunks, and maintains derived plugin usage/owner indexes and atomic quota plans. |
-| `server/node/chunkStore.cjs` | Protected content-defined storage for the live DB, automatic snapshots, chat rows, and plugin values. It owns manifest metadata/publications, logical size/SHA verification, bounded raw-row streaming, snapshot sharing/cost, and mark/sweep GC. |
-| `server/node/chatRows.cjs` | Injected chat-row store and the monolith-ingestion boundary. It owns encoded chat keys, missing/duplicate-ID repair, stub semantics, referenced-row diff/sweep helpers, split/assembly, and the transactional `ingestFullDatabase()` and `ingestStreamingDatabase()` paths. Duplicate `chaId` repair happens before row keys are finalized. |
-| `server/node/chatBackups.cjs` | Per-chat pre-image history. Ordinary overwrites are best-effort and enforce a 45-second per-chat cooldown; structural chat deletion forces a cooldown-exempt capture and fails closed. Reconciliation streams each loose version into an atomic, self-describing `.frame` containing one independent gzip member, enforces the exact 125-version default plus a 256 MiB per-chat uncompressed-byte default, applies the separate globally age-ordered compressed-disk budget, and restores exact raw bytes by inflating only the selected frame. Legacy solid v1 bundles remain readable and migrate through bounded one-pass extraction without becoming authoritative until every replacement is durable. |
-| `server/node/importBarrier.cjs` | Abort-aware exclusive import gate. `acquire()` claims a FIFO turn before draining older mutations; abandoned waiters are removed safely, later writes are refused, and stable reads can wait with an `AbortSignal`. |
-| `server/node/importJournal.cjs` | Durable bridge between SQLite import transactions and filesystem asset/inlay directory swaps. It atomically writes/fsyncs `save/import_journal.json`, fsyncs staged trees, and recovers by finalizing committed swaps or restoring pre-import directories. |
-| `server/node/session-lock.cjs` | In-memory single-writer authority. `register()` records a boot without stealing; `checkWrite()` distinguishes the active writer, fresh gesture-backed takeover, fresh passive compatibility writes, and stale rejection; `peek()` provides a side-effect-free foreground status. |
-| `server/node/boundedSessionState.cjs` | Bounded LRU state for per-browser protocol pins. The server uses `createBoundedSessionState()` to retain at most 50 session-scoped plugin-publication read states independently of writer authority. |
-| `server/node/bufferedIngress.cjs` | Pre-parser admission for buffered JSON, octet-stream, and text bodies, plus identity-only admission for bodyless/direct-stream writers. It resolves auth/writer/route-limit policy, rejects retired protocols and mismatched client builds before reading a body, strictly validates uncompressed `Content-Length`, and reserves/relinquishes the process-wide in-flight byte budget without performing a writer-lock transition. |
-| `server/node/buildStamp.cjs` | Loads and validates `dist/build-stamp.json` for writer-mutation admission. `readClientBuildStamp()` returns `null` and logs a warning on any read, parse, or shape failure, deliberately disabling the build check rather than blocking the server. |
-| `server/node/admittedIngressSpool.cjs` | Post-admission disk ingress for raw `/api/write` and raw/JSON chat-row writes. It consumes the already-reserved request in bounded pages, fsyncs a private spool in the installation-owned configured-spool namespace, preserves the reservation through response finish/close, and maps spool-volume pressure to the admission layer's retryable refusal. |
-| `server/node/spoolOwnership.cjs` | Validates and atomically initializes persistent UUID files, claims a filesystem-safe installation spool namespace with the separate `__spool_owner_id` plus a canonical-save-root binding, and creates/revalidates the owned child of a configured shared root. Missing identities and claims use fsynced exclusive-link publication; invalid identities deterministically converge without a reclaimable lock pathname. Unsafe entries are atomically parked rather than conditionally unlinked. Identity/claim files and owned directories are accepted without following symlinks and hardened to private modes. Boot cleanup quarantines the claimed child and sweeps through pinned old/fresh directory descriptors; runtime consumers receive only a process-lifetime pinned directory alias. Analytics `__instance_id` is not filesystem ownership. |
-| `server/node/chunkPlan.cjs`, `chunkPlanWorker.cjs` | Bounded worker-thread preparation for private file sources. At most two workers by default scan FastCDC boundaries and compute per-chunk SHA-256 plus logical SHA-256/MD5 in one bounded-window pass; queued publication validates the immutable file identity and exact planned bytes. |
-| `server/node/model-jobs.cjs` | Durable upstream model relay. `createModelJobs()` stores non-secret job metadata in `save/model-jobs.db`, records exact provider response bytes in append-only journals under `save/model-jobs/`, tails running streams, supports claims, and owns 48-hour pending-send tombstones. Main jobs are recoverable; auxiliary pipeline requests are relay-only. |
-| `server/node/request-logs.cjs` | Provider request history and token usage in `save/request-logs.db`. `createRequestLogs()` masks/truncates request material, rotates heavy request bodies by byte budget, retains the small usage ledger, exposes query/statistics routes, and closes independently at shutdown. |
-| `server/node/request-trace.cjs` | Opt-in whole-exchange debug tracing. `createRequestTracer()` captures only completed non-streaming HTTP exchanges, writes atomic gzip files under `save/trace`, and retains the newest 500 without affecting request handling on trace failures. |
-| `server/node/pluginSaveKeys.cjs` | Canonical optimized-plugin prefixes, manifest/folded markers, and lossless physical-key policy: UTF-8/base64url, tagged ill-formed UTF-16, or manifest-v3-mapped archive-safe hashes. |
-| `server/node/pluginStorageJson.cjs`, `pluginStorageLimits.cjs` | Strict and lossless plugin-row codecs, key/row validation, and authoritative per-value and aggregate optimized-storage limits. `lossless-json-v1` is distinguished by the `PRISUL01` frame magic; metadata remains strict-JSON-only. |
-| `server/node/stageRowDownload.cjs` | Opens one validated read-only descriptor for a staged plugin transition row and streams from that same descriptor, avoiding a validation/reopen race. |
-| `server/node/dbCachedRead.cjs` | Server half of the optional segmented boot-read protocol. It validates the client's hash inventory, splits the stubs-only database into root/character/preset/module/persona MessagePack segments, and emits bytes only for cache misses while preserving the full-view ETag. |
-| `server/node/databaseRevision.cjs`, `revisionBoundCache.cjs` | Transactional generation tracking and bounded decoded-cache reuse for `database.bin`. SQLite triggers advance a monotonic operational revision on insert, key/value update, and delete; clean decoded entries are revision-checked and LRU/size/heap-pressure evictable, while acknowledged dirty patch state remains pinned until persistence or explicit invalidation. |
-| `server/node/dbCachePersistence.cjs` | Synchronous core of dirty database-cache persistence, extracted from `persistDbCacheGeneration()`: graph guards (`findStubFlagLossChats`, duplicate chat IDs), plugin externalization, canonical encoding, and the single commit transaction. `runEmergencyDbFlush()` is the guarded fatal-exit variant: it skips on import, owned transaction, no pending work, stale/empty/non-normalized cache, or guard rejection, and never deletes chat rows because pre-image capture is asynchronous. |
-| `server/node/listDelta.cjs` | Builds full or delta `/api/list` responses from KV modification timestamps, the deletion journal, filesystem mtimes, and the list epoch. Delta eligibility is capped at six days. |
-| `server/node/assetStore.cjs` | Filesystem-backed implementation for safe `assets/*` keys, including atomic write/rename, SHA-256 filename verification, dual-source listing, migration, clear, and import staging helpers. |
-| `server/node/assetMaintenanceLock.cjs`, `assetDedup.cjs` | Cross-process exclusion shared by live asset mutations, destructive import swaps, journal recovery, and the controlled multi-instance dedup worker. Ancestor symlinks canonicalize to one identity; the swappable `assets` leaf itself may not be a symlink. Lock state lives beside that directory; dedup uses strict target and same-UID/GID/mode validation, locale-independent UTF-8 byte ordering, byte verification, link-to-hidden-temp, final inode/content/metadata revalidation, atomic rename, and directory fsync. |
-| `server/node/assetGc.cjs` | Bounded recursive asset-reference discovery, persisted candidate bookkeeping, and two-pass grace planning for server-owned ordinary-asset garbage collection. |
-| `server/node/streamRisuSave.cjs` | Object-based legacy encoder for already-materialized database state and compatibility export paths. |
-| `server/node/streamBackupRisuSave.cjs` | Seekable source-to-source transformer for point-in-time full/partial export and automatic snapshots, including folded external chat/plugin/MCP rows without monolithizing state in memory. |
-| `server/node/streamRisuLoad.cjs` | Bounded streaming inspector/decoder for supported RisuSave formats and snapshot/import ingestion. |
-| `server/node/streamJsonToMsgpack.cjs`, `jsonValidateWorker.cjs` | Bounded JSON validation and streaming conversion used by import/restore compatibility paths. |
-| `server/node/backupEntryFormat.cjs` | Archive header/framing, entry name/body bounds, byte-size planning, and preflight. |
-| `server/node/importSpool.cjs` | Private bounded upload/file/ZIP ingress, central-directory/CRC validation, entry staging, cancellation, and cleanup. |
+| `server/node/db/db.cjs` | Opens `save/risuai.db`, applies SQLite pragmas, owns KV/delta-list primitives, pins read-only WAL snapshots, initializes chunks, and maintains derived plugin usage/owner indexes and atomic quota plans. |
+| `server/node/db/chunkStore.cjs` | Protected content-defined storage for the live DB, automatic snapshots, chat rows, and plugin values. It owns manifest metadata/publications, logical size/SHA verification, bounded raw-row streaming, snapshot sharing/cost, and mark/sweep GC. |
+| `server/node/chat/chatRows.cjs` | Injected chat-row store and the monolith-ingestion boundary. It owns encoded chat keys, missing/duplicate-ID repair, stub semantics, referenced-row diff/sweep helpers, split/assembly, and the transactional `ingestFullDatabase()` and `ingestStreamingDatabase()` paths. Duplicate `chaId` repair happens before row keys are finalized. |
+| `server/node/chat/chatBackups.cjs` | Per-chat pre-image history. Ordinary overwrites are best-effort and enforce a 45-second per-chat cooldown; structural chat deletion forces a cooldown-exempt capture and fails closed. Reconciliation streams each loose version into an atomic, self-describing `.frame` containing one independent gzip member, enforces the exact 125-version default plus a 256 MiB per-chat uncompressed-byte default, applies the separate globally age-ordered compressed-disk budget, and restores exact raw bytes by inflating only the selected frame. Legacy solid v1 bundles remain readable and migrate through bounded one-pass extraction without becoming authoritative until every replacement is durable. |
+| `server/node/backup/importBarrier.cjs` | Abort-aware exclusive import gate. `acquire()` claims a FIFO turn before draining older mutations; abandoned waiters are removed safely, later writes are refused, and stable reads can wait with an `AbortSignal`. |
+| `server/node/backup/importJournal.cjs` | Durable bridge between SQLite import transactions and filesystem asset/inlay directory swaps. It atomically writes/fsyncs `save/import_journal.json`, fsyncs staged trees, and recovers by finalizing committed swaps or restoring pre-import directories. |
+| `server/node/runtime/session-lock.cjs` | In-memory single-writer authority. `register()` records a boot without stealing; `checkWrite()` distinguishes the active writer, fresh gesture-backed takeover, fresh passive compatibility writes, and stale rejection; `peek()` provides a side-effect-free foreground status. |
+| `server/node/runtime/boundedSessionState.cjs` | Bounded LRU state for per-browser protocol pins. The server uses `createBoundedSessionState()` to retain at most 50 session-scoped plugin-publication read states independently of writer authority. |
+| `server/node/chat/bufferedIngress.cjs` | Pre-parser admission for buffered JSON, octet-stream, and text bodies, plus identity-only admission for bodyless/direct-stream writers. It resolves auth/writer/route-limit policy, rejects retired protocols and mismatched client builds before reading a body, strictly validates uncompressed `Content-Length`, and reserves/relinquishes the process-wide in-flight byte budget without performing a writer-lock transition. |
+| `server/node/runtime/buildStamp.cjs` | Loads and validates `dist/build-stamp.json` for writer-mutation admission. `readClientBuildStamp()` returns `null` and logs a warning on any read, parse, or shape failure, deliberately disabling the build check rather than blocking the server. |
+| `server/node/chat/admittedIngressSpool.cjs` | Post-admission disk ingress for raw `/api/write` and raw/JSON chat-row writes. It consumes the already-reserved request in bounded pages, fsyncs a private spool in the installation-owned configured-spool namespace, preserves the reservation through response finish/close, and maps spool-volume pressure to the admission layer's retryable refusal. |
+| `server/node/backup/spoolOwnership.cjs` | Validates and atomically initializes persistent UUID files, claims a filesystem-safe installation spool namespace with the separate `__spool_owner_id` plus a canonical-save-root binding, and creates/revalidates the owned child of a configured shared root. Missing identities and claims use fsynced exclusive-link publication; invalid identities deterministically converge without a reclaimable lock pathname. Unsafe entries are atomically parked rather than conditionally unlinked. Identity/claim files and owned directories are accepted without following symlinks and hardened to private modes. Boot cleanup quarantines the claimed child and sweeps through pinned old/fresh directory descriptors; runtime consumers receive only a process-lifetime pinned directory alias. Analytics `__instance_id` is not filesystem ownership. |
+| `server/node/db/chunkPlan.cjs`, `chunkPlanWorker.cjs` | Bounded worker-thread preparation for private file sources. At most two workers by default scan FastCDC boundaries and compute per-chunk SHA-256 plus logical SHA-256/MD5 in one bounded-window pass; queued publication validates the immutable file identity and exact planned bytes. |
+| `server/node/runtime/model-jobs.cjs` | Durable upstream model relay. `createModelJobs()` stores non-secret job metadata in `save/model-jobs.db`, records exact provider response bytes in append-only journals under `save/model-jobs/`, tails running streams, supports claims, and owns 48-hour pending-send tombstones. Main jobs are recoverable; auxiliary pipeline requests are relay-only. |
+| `server/node/runtime/request-logs.cjs` | Provider request history and token usage in `save/request-logs.db`. `createRequestLogs()` masks/truncates request material, rotates heavy request bodies by byte budget, retains the small usage ledger, exposes query/statistics routes, and closes independently at shutdown. |
+| `server/node/runtime/request-trace.cjs` | Opt-in whole-exchange debug tracing. `createRequestTracer()` captures only completed non-streaming HTTP exchanges, writes atomic gzip files under `save/trace`, and retains the newest 500 without affecting request handling on trace failures. |
+| `server/node/plugin-storage/pluginSaveKeys.cjs` | Canonical optimized-plugin prefixes, manifest/folded markers, and lossless physical-key policy: UTF-8/base64url, tagged ill-formed UTF-16, or manifest-v3-mapped archive-safe hashes. |
+| `server/node/plugin-storage/pluginStorageJson.cjs`, `pluginStorageLimits.cjs` | Strict and lossless plugin-row codecs, key/row validation, and authoritative per-value and aggregate optimized-storage limits. `lossless-json-v1` is distinguished by the `PRISUL01` frame magic; metadata remains strict-JSON-only. |
+| `server/node/db/stageRowDownload.cjs` | Opens one validated read-only descriptor for a staged plugin transition row and streams from that same descriptor, avoiding a validation/reopen race. |
+| `server/node/db/dbCachedRead.cjs` | Server half of the optional segmented boot-read protocol. It validates the client's hash inventory, splits the stubs-only database into root/character/preset/module/persona MessagePack segments, and emits bytes only for cache misses while preserving the full-view ETag. |
+| `server/node/db/databaseRevision.cjs`, `revisionBoundCache.cjs` | Transactional generation tracking and bounded decoded-cache reuse for `database.bin`. SQLite triggers advance a monotonic operational revision on insert, key/value update, and delete; clean decoded entries are revision-checked and LRU/size/heap-pressure evictable, while acknowledged dirty patch state remains pinned until persistence or explicit invalidation. |
+| `server/node/db/dbCachePersistence.cjs` | Synchronous core of dirty database-cache persistence, extracted from `persistDbCacheGeneration()`: graph guards (`findStubFlagLossChats`, duplicate chat IDs), plugin externalization, canonical encoding, and the single commit transaction. `runEmergencyDbFlush()` is the guarded fatal-exit variant: it skips on import, owned transaction, no pending work, stale/empty/non-normalized cache, or guard rejection, and never deletes chat rows because pre-image capture is asynchronous. |
+| `server/node/db/listDelta.cjs` | Builds full or delta `/api/list` responses from KV modification timestamps, the deletion journal, filesystem mtimes, and the list epoch. Delta eligibility is capped at six days. |
+| `server/node/assets/assetStore.cjs` | Filesystem-backed implementation for safe `assets/*` keys, including atomic write/rename, SHA-256 filename verification, dual-source listing, migration, clear, and import staging helpers. |
+| `server/node/assets/assetMaintenanceLock.cjs`, `assetDedup.cjs` | Cross-process exclusion shared by live asset mutations, destructive import swaps, journal recovery, and the controlled multi-instance dedup worker. Ancestor symlinks canonicalize to one identity; the swappable `assets` leaf itself may not be a symlink. Lock state lives beside that directory; dedup uses strict target and same-UID/GID/mode validation, locale-independent UTF-8 byte ordering, byte verification, link-to-hidden-temp, final inode/content/metadata revalidation, atomic rename, and directory fsync. |
+| `server/node/assets/assetGc.cjs` | Bounded recursive asset-reference discovery, persisted candidate bookkeeping, and two-pass grace planning for server-owned ordinary-asset garbage collection. |
+| `server/node/backup/streamRisuSave.cjs` | Object-based legacy encoder for already-materialized database state and compatibility export paths. |
+| `server/node/backup/streamBackupRisuSave.cjs` | Seekable source-to-source transformer for point-in-time full/partial export and automatic snapshots, including folded external chat/plugin/MCP rows without monolithizing state in memory. |
+| `server/node/backup/streamRisuLoad.cjs` | Bounded streaming inspector/decoder for supported RisuSave formats and snapshot/import ingestion. |
+| `server/node/backup/streamJsonToMsgpack.cjs`, `jsonValidateWorker.cjs` | Bounded JSON validation and streaming conversion used by import/restore compatibility paths. |
+| `server/node/backup/backupEntryFormat.cjs` | Archive header/framing, entry name/body bounds, byte-size planning, and preflight. |
+| `server/node/backup/importSpool.cjs` | Private bounded upload/file/ZIP ingress, central-directory/CRC validation, entry staging, cancellation, and cleanup. |
 | `server/node/backupSnapshot.test.ts`, `test/compat/export-concurrent-mutation.test.ts` | Prove pinned snapshot reads survive live updates/deletes, missing referenced chats abort exports, concurrent plugin changes cannot corrupt archive framing, and completed exports re-import exactly. |
 | `server/node/importBarrier.test.ts`, `server/node/importJournal.test.ts`, `test/compat/import-mutation-barrier.test.ts` | Cover hold-before-drain ordering, retryable mutation refusal, late import rollback, crash recovery for directory swaps, and list-epoch invalidation. |
 | `server/node/snapshotPluginStorage.e2e.test.ts`, `test/compat/snapshot-spool.test.ts` | Cover exact optimized-plugin recovery (including folded-empty/pre-marker cases), chunk-streamed snapshot writes, save-volume spooling, orphan cleanup, and non-fatal snapshot-only failures. |
 | `server/node/bufferedIngress.test.ts`, `session-lock.test.ts`, `model-jobs.test.ts`, `request-logs.test.ts` | Cover pre-parser admission/limits/concurrent byte accounting, writer registration/takeover compatibility, recoverable versus auxiliary job lifecycle and retention, journal streaming/security, pending sends, request masking/truncation/rotation, usage retention, route guards, and database closure. Real-server ingress ordering and abort release are covered by `test/compat/buffered-ingress-admission.test.ts`. |
-| `server/node/logs.cjs` | Separate SQLite-backed client/server diagnostic log sink in `save/logs.db`. It masks credentials, batches writes, builds the server logger, installs fatal process handlers (accepting an `onFatalExit` callback that `server.cjs` wires to the emergency database flush), and records otherwise-unlogged Express errors. This is distinct from provider request history and usage in `request-logs.cjs`. |
+| `server/node/runtime/logs.cjs` | Separate SQLite-backed client/server diagnostic log sink in `save/logs.db`. It masks credentials, batches writes, builds the server logger, installs fatal process handlers (accepting an `onFatalExit` callback that `server.cjs` wires to the emergency database flush), and records otherwise-unlogged Express errors. This is distinct from provider request history and usage in `request-logs.cjs`. |
 | `server/node/utils.cjs` | Server-side implementation of RisuAI save formats, cached-read hash parsing, and patch-sync hashing. `RisuSaveType` must match the client enum; `decodeRisuSave()` accepts legacy raw, compressed, stream-compressed, and block formats; `calculateHash()`/`normalizeJSON()` must remain behaviorally aligned with the client. |
 | `server/node/readme.md` | Declares this tree as PocketRisu's production backend, documents root-CWD startup, and explicitly distinguishes the incomplete Hono scaffold. |
 | `server/node/ssl/Generate Certificate.sh` | Generates a local CA and server certificate into `server/node/ssl/certificate/`; see `server/node/ssl/Generate Certificate.sh:2`. |
@@ -82,7 +82,7 @@ Persistent application data is primarily stored in SQLite through a binary-compa
 2. CommonJS evaluation loads `db.cjs` and `logs.cjs`; those modules synchronously
    create/open `risuai.db` and `logs.db`. Route initialization later creates the
    independent `model-jobs.db` and `request-logs.db` stores.
-3. `db.cjs` creates `save/`, opens `save/risuai.db`, enables WAL with the power-loss-durable `synchronous=FULL` default, and applies performance and lock pragmas near `server/node/db.cjs:23`. It creates the `kv`, deletion-journal, epoch, and operational migration-state tables, initializes the chunk store, then attempts legacy save-folder migration. Legacy values and their `storage_migrations` completion row commit together; `.migrated_to_sqlite` is an atomically published rollback/UI compatibility marker that startup reconciles against that state. `server.cjs` may apply only an explicit persisted or administrator-managed downgrade after this safe startup boundary.
+3. `db.cjs` creates `save/`, opens `save/risuai.db`, enables WAL with the power-loss-durable `synchronous=FULL` default, and applies performance and lock pragmas near `server/node/db/db.cjs:23`. It creates the `kv`, deletion-journal, epoch, and operational migration-state tables, initializes the chunk store, then attempts legacy save-folder migration. Legacy values and their `storage_migrations` completion row commit together; `.migrated_to_sqlite` is an atomically published rollback/UI compatibility marker that startup reconciles against that state. `server.cjs` may apply only an explicit persisted or administrator-managed downgrade after this safe startup boundary.
 4. `server.cjs` installs fatal logging handlers before the rest of its initialization,
    then reads and validates `dist/build-stamp.json`. A valid stamp enables writer build
    admission and is logged; any read/parse/shape failure logs a warning and returns `null`,
@@ -260,11 +260,11 @@ inside `queueStorageMutation()` immediately before the transactional publication
 `risuai.db` contains:
 
 - `kv(key TEXT PRIMARY KEY, value BLOB, updated_at INTEGER)`, with a covering
-  `(updated_at, key)` delta-list index, created at `server/node/db.cjs:29`.
+  `(updated_at, key)` delta-list index, created at `server/node/db/db.cjs:29`.
 - `deleted_keys(key TEXT PRIMARY KEY, deleted_at INTEGER)`, a seven-day deletion journal used by delta key listings.
 - `sync_meta(id = 1, list_epoch TEXT)`, whose random epoch invalidates incompatible browser list caches.
-- `chunks(hash TEXT PRIMARY KEY, data BLOB)`, created at `server/node/chunkStore.cjs:117-121`.
-- `manifest_chunks(manifest_key, seq, hash)`, mapping logical values to ordered chunks at `server/node/chunkStore.cjs:122-128`.
+- `chunks(hash TEXT PRIMARY KEY, data BLOB)`, created at `server/node/db/chunkStore.cjs:117-121`.
+- `manifest_chunks(manifest_key, seq, hash)`, mapping logical values to ordered chunks at `server/node/db/chunkStore.cjs:122-128`.
 - `chunk_manifest_meta`, `chunk_manifest_protection`, and
   `chunk_manifest_publications`, which bind marker rows to complete chunk counts,
   logical length, and whole-value SHA-256 before readers accept them.
@@ -292,14 +292,14 @@ inside `queueStorageMutation()` immediately before the transactional publication
   is required.
 - `storage_migrations`, the authoritative completion/version record for legacy save-folder
   ingestion; `.migrated_to_sqlite` is only its filesystem compatibility marker.
-- Possibly orphaned historical entity tables (`characters`, `chats`, `settings`, `presets`, `modules`); new installations do not create or use them, as documented at `server/node/db.cjs:51-54`.
+- Possibly orphaned historical entity tables (`characters`, `chats`, `settings`, `presets`, `modules`); new installations do not create or use them, as documented at `server/node/db/db.cjs:51-54`.
 
 Important KV namespaces include:
 
 - `database/database.bin`: canonical stubs-only database save; chat bodies are not stored inline.
 - `chats/<encodeURIComponent(chaId)>/<encodeURIComponent(chatId)>`: one legacy-encoded
   base chat body per row, optionally followed logically by `chat_row_operations`; every
-  public reader sees the exact materialized legacy row. Managed by `server/node/chatRows.cjs`.
+  public reader sees the exact materialized legacy row. Managed by `server/node/chat/chatRows.cjs`.
 - `pluginsave/<physicalName>`: one codec-discriminated optimized plugin VALUE row per key.
   `json-v1` is unframed UTF-8 strict JSON; `lossless-json-v1` starts with ASCII
   `PRISUL01` and carries a tagged JSON payload that preserves values such as `undefined`
@@ -335,7 +335,7 @@ only with a protected, complete manifest; readers verify chunk hashes, sequence/
 logical size, and whole-value SHA-256. This namespace-independent rule ensures that an
 extension-defined row accepted by the generic API remains restorable from a save folder.
 
-Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB, approximately 16 KiB average, and SHA-256 content hashes at `server/node/chunkStore.cjs:18`. Values larger than 16 MiB are represented in `kv.value` by `CHUNK_MARKER`; reads concatenate manifest chunks through the bound store created at `server/node/chunkStore.cjs:114`.
+Chunks use deterministic FastCDC-style boundaries: minimum 4 KiB, maximum 64 KiB, approximately 16 KiB average, and SHA-256 content hashes at `server/node/db/chunkStore.cjs:18`. Values larger than 16 MiB are represented in `kv.value` by `CHUNK_MARKER`; reads concatenate manifest chunks through the bound store created at `server/node/db/chunkStore.cjs:114`.
 
 For admitted file-source writes, bounded workers produce the FastCDC plan and per-chunk
 and whole-value digests outside the event loop. The logical digest is advanced from each
@@ -492,7 +492,7 @@ plan.
 
 #### Assets and inlays
 
-- Ordinary assets are filesystem files in `save/assets/` when the key's basename is a safe filename (`server/node/assetStore.cjs`); unsafe names stay as raw `assets/*` KV rows, and so do names the portable-identity preflight rejects — Windows-reserved basenames, trailing dots, and groups that collide under `portableAssetNameKey()` case folding (the startup migration skips every member of a colliding group; backup/save-folder imports demote an already-staged file when a colliding entry arrives). Reads/lists/stats/backups merge both sources. Writes are fsynced temp-file + rename (never in place — files may be hardlinked across instances by `scripts/dedup-assets.sh`). For ordinary and spooled writes, filesystem eligibility/case-collision admission, legacy-marker changes, payload publication, and KV shadow cleanup run under one stable sibling `save/__asset_maintenance.lock` ownership scope. That lock also serializes deletes, import swaps and journal recovery, and external dedup without moving with `assets/`; imports retain ownership until journal-aware finalization or rollback succeeds, and a failed in-process or live pending-journal recovery keeps the live token so runtime writes and external dedup fail closed until restart recovery. Runtime, recovery, and dedup canonicalize ancestor symlinks to the same asset identity, but reject a symlinked `assets` leaf because swapping it would change that identity. Owner metadata is completed and fsynced in a unique private staging inode before atomic hard-link publication at `owner.json`, so a pre-identity failure cannot expose an empty live owner. Failed publication cleanup requires both the exact created inode and a complete matching-token owner record; in-place corruption and copied-token replacement inodes are preserved fail-closed. Same-host creator/PID-labelled stages are removed only after their creator is inactive. Stale recovery atomically publishes one complete fixed-name intent to elect a remover, then revalidates the observed token and inode immediately before unlink; intent reconciliation never deletes owner state. Recovery/dedup cleanup retains the primary error while attempting same-owner releases. The dedup worker rejects blank operands, every existing non-directory, and targets not named `assets`; only a missing path lexically ending in `assets` is ignored for documented unmatched-glob compatibility. It locks every canonical target in locale-independent UTF-8 byte order, then requires one UID/GID across all targets and candidate files, one `stat.mode & 0o7777` value for target directories, and one for regular-file candidates; candidate ownership must match its containing directory. Metadata mismatch fails before interrupted-temp recovery or publication. It excludes hidden server/tool names, recovers its interrupted temps, byte-compares duplicates, then publishes link-to-temp with final inode/content/metadata revalidation, atomic rename, and directory fsync. Same-host dead owners are recoverable; live and foreign-host ownership fails closed, while malformed metadata requires verified operator cleanup of the exact owner file. A same-size destination is skipped only after byte comparison, so migration and a valid re-upload repair equal-length corruption. Uploads whose name matches `assets/<64-hex>.<ext>` are SHA-256-verified on `/api/write` and `/api/assets/bulk-write`. Historical mismatches accepted by main are explicitly marked under `save/assets/.legacy-hash-assets/`; only marked keys may retain mismatched bytes, and writing canonical bytes clears the exemption. Backup/save-folder imports classify mismatches during staging, while a bounded one-time scan (`.legacy_hash_identity_v1`) backfills files migrated by older builds. The original safe-row migration marker remains `save/assets/.migrated_to_fs`.
+- Ordinary assets are filesystem files in `save/assets/` when the key's basename is a safe filename (`server/node/assets/assetStore.cjs`); unsafe names stay as raw `assets/*` KV rows, and so do names the portable-identity preflight rejects — Windows-reserved basenames, trailing dots, and groups that collide under `portableAssetNameKey()` case folding (the startup migration skips every member of a colliding group; backup/save-folder imports demote an already-staged file when a colliding entry arrives). Reads/lists/stats/backups merge both sources. Writes are fsynced temp-file + rename (never in place — files may be hardlinked across instances by `scripts/dedup-assets.sh`). For ordinary and spooled writes, filesystem eligibility/case-collision admission, legacy-marker changes, payload publication, and KV shadow cleanup run under one stable sibling `save/__asset_maintenance.lock` ownership scope. That lock also serializes deletes, import swaps and journal recovery, and external dedup without moving with `assets/`; imports retain ownership until journal-aware finalization or rollback succeeds, and a failed in-process or live pending-journal recovery keeps the live token so runtime writes and external dedup fail closed until restart recovery. Runtime, recovery, and dedup canonicalize ancestor symlinks to the same asset identity, but reject a symlinked `assets` leaf because swapping it would change that identity. Owner metadata is completed and fsynced in a unique private staging inode before atomic hard-link publication at `owner.json`, so a pre-identity failure cannot expose an empty live owner. Failed publication cleanup requires both the exact created inode and a complete matching-token owner record; in-place corruption and copied-token replacement inodes are preserved fail-closed. Same-host creator/PID-labelled stages are removed only after their creator is inactive. Stale recovery atomically publishes one complete fixed-name intent to elect a remover, then revalidates the observed token and inode immediately before unlink; intent reconciliation never deletes owner state. Recovery/dedup cleanup retains the primary error while attempting same-owner releases. The dedup worker rejects blank operands, every existing non-directory, and targets not named `assets`; only a missing path lexically ending in `assets` is ignored for documented unmatched-glob compatibility. It locks every canonical target in locale-independent UTF-8 byte order, then requires one UID/GID across all targets and candidate files, one `stat.mode & 0o7777` value for target directories, and one for regular-file candidates; candidate ownership must match its containing directory. Metadata mismatch fails before interrupted-temp recovery or publication. It excludes hidden server/tool names, recovers its interrupted temps, byte-compares duplicates, then publishes link-to-temp with final inode/content/metadata revalidation, atomic rename, and directory fsync. Same-host dead owners are recoverable; live and foreign-host ownership fails closed, while malformed metadata requires verified operator cleanup of the exact owner file. A same-size destination is skipped only after byte comparison, so migration and a valid re-upload repair equal-length corruption. Uploads whose name matches `assets/<64-hex>.<ext>` are SHA-256-verified on `/api/write` and `/api/assets/bulk-write`. Historical mismatches accepted by main are explicitly marked under `save/assets/.legacy-hash-assets/`; only marked keys may retain mismatched bytes, and writing canonical bytes clears the exemption. Backup/save-folder imports classify mismatches during staging, while a bounded one-time scan (`.legacy_hash_identity_v1`) backfills files migrated by older builds. The original safe-row migration marker remains `save/assets/.migrated_to_fs`.
 - `/api/assets/bulk-write` rejects malformed entries, every duplicate key, hash mismatch,
   invalid reserved plugin row/key/payload, and protected plugin/database namespace before
   the first mutation. Because legacy hash exemptions are state-dependent, it revalidates
@@ -722,14 +722,14 @@ are sent to the ordinary application log; it adds no provider API.
   metadata field must be added to shared `chatToStub()`/merge semantics, the server
   `STUB_METADATA_FIELDS` allowlist, and the client conversion.
 
-- Key presence is semantically meaningful for stub metadata. Explicit `null`/`undefined` means “the user cleared this value”; it must overwrite the full chat. Do not replace the `in` checks in `mergeChatStubWithFullChat()` with nullish checks (`server/node/chatRows.cjs:218`).
+- Key presence is semantically meaningful for stub metadata. Explicit `null`/`undefined` means “the user cleared this value”; it must overwrite the full chat. Do not replace the `in` checks in `mergeChatStubWithFullChat()` with nullish checks (`server/node/chat/chatRows.cjs:218`).
 
 - There are multiple chat-corruption guards. Field-level patch operations outside the stub
   allowlist are rejected through `findChatInternalFieldOps()`; debounced stripped writes
   and full `/api/write` requests both reject metadata-only chats through
   `findStubFlagLossChats()`. Removing one reopens the silent message-loss path.
 
-- Chat rows must go through `chatRows.cjs`. Key components are URI-encoded, large rows may have chunk manifests, and the row wire format must match `/api/chat-content`. Use `readChatRow()`, `writeChatRow()`/`writeChatRowRaw()`, and `deleteChatRow()` instead of hand-built keys or direct SQL (`server/node/chatRows.cjs:16`, `server/node/chatRows.cjs:246-266`).
+- Chat rows must go through `chatRows.cjs`. Key components are URI-encoded, large rows may have chunk manifests, and the row wire format must match `/api/chat-content`. Use `readChatRow()`, `writeChatRow()`/`writeChatRowRaw()`, and `deleteChatRow()` instead of hand-built keys or direct SQL (`server/node/chat/chatRows.cjs:16`, `server/node/chat/chatRows.cjs:246-266`).
 
 - Raw chat writers make ownership explicit. `writeChatRowRaw()` preserves the caller's
   ownership by copying; `writeChatRowRawOwned()` consumes a Buffer and returns the SHA-256
@@ -915,7 +915,7 @@ are sent to the ordinary application log; it adds no provider API.
   hosts through `sanitizeTargetUrl()`. Do not reuse the unrestricted proxy path for the
   local-network feature.
 
-- Hosted proxy policy lives in `server/node/proxyTarget.cjs`. With
+- Hosted proxy policy lives in `server/node/runtime/proxyTarget.cjs`. With
   `POCKETRISU_HUB_HOSTING` enabled, general proxy requests use a DNS-pinning undici
   dispatcher that rejects non-public resolutions and blocked literal redirect targets on
   every connection; local proxy-stream job creation/WebSocket upgrades are disabled.
@@ -933,9 +933,9 @@ are sent to the ordinary application log; it adds no provider API.
   deployment can enter the replacement flow. The keep sets, rollback staging, Windows
   locked-binary handling, and restart logic are data-safety behavior.
 
-- Logs are a separate bounded database. Rows are rotated to approximately 5,000, descriptions are truncated, and common JWT/API-key patterns are masked before persistence (`server/node/logs.cjs:8`, `server/node/logs.cjs:62`). Keep the server `BACKGROUND_SOURCES` list synchronized with the frontend logs settings as noted at `server/node/logs.cjs:55`.
+- Logs are a separate bounded database. Rows are rotated to approximately 5,000, descriptions are truncated, and common JWT/API-key patterns are masked before persistence (`server/node/runtime/logs.cjs:8`, `server/node/runtime/logs.cjs:62`). Keep the server `BACKGROUND_SOURCES` list synchronized with the frontend logs settings as noted at `server/node/runtime/logs.cjs:55`.
 
-- Fatal logging intentionally terminates the process. `uncaughtException` and `unhandledRejection` synchronously persist a record, run the guarded emergency database flush (`runEmergencyDbFlush()` in `dbCachePersistence.cjs`, wired through `installProcessHandlers({ onFatalExit })`), and call `process.exit(1)` (`server/node/logs.cjs:332-384`).
+- Fatal logging intentionally terminates the process. `uncaughtException` and `unhandledRejection` synchronously persist a record, run the guarded emergency database flush (`runEmergencyDbFlush()` in `dbCachePersistence.cjs`, wired through `installProcessHandlers({ onFatalExit })`), and call `process.exit(1)` (`server/node/runtime/logs.cjs:332-384`).
 
 - The SSL helper is local-development oriented. Its certificate SANs cover only localhost, and the shell helper sets private keys to mode `0644` at `server/node/ssl/Generate Certificate.sh:7`; do not treat it as a hardened public-deployment certificate setup.
 
@@ -956,18 +956,18 @@ are sent to the ordinary application log; it adds no provider API.
 - To change authentication or direct-asset sessions, update `createServerJwt()`,
   `checkAuth()`, `sessionAuthMiddleware`, `/api/session`, and `NodeStorage` together.
 
-- To change writer authority, update `server/node/session-lock.cjs`,
+- To change writer authority, update `server/node/runtime/session-lock.cjs`,
   `checkActiveSession()`, `/api/session/lock-status`, and the client session/activity
   headers together.
 
 - To change generic KV behavior, pinned WAL readers, list epochs, or SQLite tuning, start
-  in `server/node/db.cjs`. Large-blob thresholds, FastCDC boundaries, protected
-  publication, snapshot sharing, and GC live in `server/node/chunkStore.cjs`.
+  in `server/node/db/db.cjs`. Large-blob thresholds, FastCDC boundaries, protected
+  publication, snapshot sharing, and GC live in `server/node/db/chunkStore.cjs`.
 
 - To change boot/read/write synchronization, inspect `/api/read`,
   `/api/db/read-cached`, `/api/db/read-raw-for-boot`,
   `/api/db/create-if-absent`, `/api/plugin-storage/reconcile-boot`,
-  `server/node/dbCachedRead.cjs`, and `NodeStorage.readDatabaseForBoot()` together.
+  `server/node/db/dbCachedRead.cjs`, and `NodeStorage.readDatabaseForBoot()` together.
 
 - To change optimized plugin recovery management, update the inspection/download/resolve
   routes, their proof token and atomic publication helpers, the matching `NodeStorage`
@@ -978,8 +978,8 @@ are sent to the ordinary application log; it adds no provider API.
   `sha256Hex()` in `server/node/utils.cjs`, the hash-aware database/KV/chat routes, and
   `src/ts/storage/resourceCache.ts` together.
 
-- To change key-list deltas, update `server/node/listDelta.cjs`, deletion/epoch helpers in
-  `server/node/db.cjs`, `/api/list`, replacement epoch bumps, and `NodeStorage.keys()`.
+- To change key-list deltas, update `server/node/db/listDelta.cjs`, deletion/epoch helpers in
+  `server/node/db/db.cjs`, `/api/list`, replacement epoch bumps, and `NodeStorage.keys()`.
 
 - To change patch sync, inspect `findChatInternalFieldOps()`, `persistDbCache()`,
   `/api/patch`, and the matching `RisuSavePatcher`/normalization code.
@@ -987,23 +987,23 @@ are sent to the ordinary application log; it adds no provider API.
 - To add chat-level metadata, update `chatToStub()`/`mergeChatStubWithFullChat()` in
   `chatRows.cjs`, both `STUB_METADATA_FIELDS` allowlists, and the client conversions.
   Chat-row identity, ingestion, assembly, and orphan cleanup also start in
-  `server/node/chatRows.cjs`.
+  `server/node/chat/chatRows.cjs`.
 
 - To change chat hydration or row persistence, inspect `/api/chat-content`,
   `NodeStorage.fetchChatContent()`/`saveChatContent()`, `chatPersistStage.ts`, and
   `ensureChatHydrated()`. Per-chat pre-image formats and retention live in
-  `server/node/chatBackups.cjs`.
+  `server/node/chat/chatBackups.cjs`.
 
-- To change recoverable provider requests, inspect `server/node/model-jobs.cjs`,
+- To change recoverable provider requests, inspect `server/node/runtime/model-jobs.cjs`,
   `src/ts/process/request/jobRecovery.ts`, and the model-preset transport together.
   Preserve the external chat-row save before request logging and claim.
 
 - To change provider diagnostics or token accounting, inspect
-  `server/node/request-logs.cjs` and `src/ts/requestLog.ts`. Diagnostic application logs
-  remain separately owned by `server/node/logs.cjs`.
+  `server/node/runtime/request-logs.cjs` and `src/ts/requestLog.ts`. Diagnostic application logs
+  remain separately owned by `server/node/runtime/logs.cjs`.
 
 - To change RisuAI format compatibility or monolith ingestion, inspect
-  `server/node/utils.cjs`, `server/node/streamRisuLoad.cjs`, `ingestDatabase()`,
+  `server/node/utils.cjs`, `server/node/backup/streamRisuLoad.cjs`, `ingestDatabase()`,
   `ingestFullDatabase()`, and `ingestStreamingDatabase()`; compare client codecs before
   changing constants.
 
@@ -1011,20 +1011,20 @@ are sent to the ordinary application log; it adds no provider API.
   `migrateRemoteBlocksIfNeeded()`, `externalizePluginStorageIfNeeded()`, and
   `migrateInlaysToFilesystem()` as appropriate.
 
-- To change asset storage or cleanup, inspect `server/node/assetStore.cjs`,
-  `server/node/assetGc.cjs`, `collectDatabaseAssetReferences()`, and
+- To change asset storage or cleanup, inspect `server/node/assets/assetStore.cjs`,
+  `server/node/assets/assetGc.cjs`, `collectDatabaseAssetReferences()`, and
   `runServerAssetCleanup()`. Statistics and deletion deliberately share the same
   plugin-aware reachability scan.
 
-- To change backup framing/import, inspect `server/node/backupEntryFormat.cjs`,
-  `importBackupFromSource()`, `server/node/importSpool.cjs`,
-  `server/node/importBarrier.cjs`, and `server/node/importJournal.cjs`.
+- To change backup framing/import, inspect `server/node/backup/backupEntryFormat.cjs`,
+  `importBackupFromSource()`, `server/node/backup/importSpool.cjs`,
+  `server/node/backup/importBarrier.cjs`, and `server/node/backup/importJournal.cjs`.
 
 - To change snapshot creation, plugin folding, spooling, retention, or cost, inspect
-  `createBackupAndRotate()`, `snapshotFootprint()`, `server/node/pluginSaveKeys.cjs`, and
+  `createBackupAndRotate()`, `snapshotFootprint()`, `server/node/plugin-storage/pluginSaveKeys.cjs`, and
   the snapshot routes.
 
-- To change proxy target policy, inspect `server/node/proxyTarget.cjs`,
+- To change proxy target policy, inspect `server/node/runtime/proxyTarget.cjs`,
   `sanitizeTargetUrl()`, general proxy handlers, model jobs, and proxy-stream WebSockets;
   each transport has a different target policy.
 

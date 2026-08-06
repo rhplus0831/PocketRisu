@@ -310,7 +310,7 @@ The server persists `database/database.bin` as the same stubs-only shape sent to
 browser, while each full body is a separate `chats/<encodeURIComponent(chaId)>/<encodeURIComponent(chatId)>`
 SQLite KV row. `/api/read` therefore decodes and caches the small stripped row directly;
 monolith imports, snapshots, and backups are split or assembled only at explicit
-boundaries in `server/node/chatRows.cjs`.
+boundaries in `server/node/chat/chatRows.cjs`.
 
 A stub contains only `id`, `name`, optional `lastDate`, `folderId`, `modules`, and `_stub: true` (`src/ts/storage/chatStub.ts:13-20`). At boot, `convertStubsToPlaceholders()` changes it into a type-compatible `Chat` with empty `message`, `note`, and `localLore`, plus `_placeholder: true` (`src/ts/storage/chatStorage.ts:17-30`, `:63-71`). Runtime code therefore normally sees `Chat`, never `ChatStub`.
 
@@ -439,8 +439,8 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
 - `fast-json-patch` is loaded lazily by `RisuSavePatcher.set()`.
 - `NodeStorage` calls Express endpoints for auth/session/build negotiation, KV, cached database reads, full/delta key lists, patching, chat bodies, chat history, backups, assets, save-folder migration, and plugin-storage recovery/manifest/viewer administration.
 - `jobRecovery.ts` calls the durable `/api/model-jobs` discovery, journal, and claim routes; request logging is published only after its chat-row save succeeds.
-- `server/node/server.cjs` owns SQLite persistence, ETags, session locking, chat-row routing, backup framing, and the server-side copies of chat guards; `server/node/chatRows.cjs` owns split/assembly and row semantics.
-- Browser WebCrypto and IndexedDB back `resourceCache.ts`; `server/node/dbCachedRead.cjs` is its database-segmentation counterpart, while server `x-content-hash`/`x-cached-hashes` handling covers KV/chat entries.
+- `server/node/server.cjs` owns SQLite persistence, ETags, session locking, chat-row routing, backup framing, and the server-side copies of chat guards; `server/node/chat/chatRows.cjs` owns split/assembly and row semantics.
+- Browser WebCrypto and IndexedDB back `resourceCache.ts`; `server/node/db/dbCachedRead.cjs` is its database-segmentation counterpart, while server `x-content-hash`/`x-cached-hashes` handling covers KV/chat entries.
 - `streamSaver` is used for large streamed downloads in `backuplocal.ts` and
   `globalApi.svelte.ts`.
 
@@ -460,7 +460,7 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
 
 - `convertStubsToPlaceholders()` self-heals hybrids by removing `_stub` and retaining the payload (`src/ts/storage/chatStorage.ts:57-70`). Changing this behavior can turn historical corruption into actual message loss.
 
-- `chatToStub()` and `stubToPlaceholder()` preserve whether `lastDate`, `folderId`, and `modules` keys exist, even when their value is `null` or `undefined` (`src/ts/storage/chatStorage.ts:12-15`, `:27-29`, `:36-49`). Server snapshot/backup assembly uses the same `in` semantics so “explicitly cleared” differs from “not supplied” (`server/node/chatRows.cjs:218-231`).
+- `chatToStub()` and `stubToPlaceholder()` preserve whether `lastDate`, `folderId`, and `modules` keys exist, even when their value is `null` or `undefined` (`src/ts/storage/chatStorage.ts:12-15`, `:27-29`, `:36-49`). Server snapshot/backup assembly uses the same `in` semantics so “explicitly cleared” differs from “not supplied” (`server/node/chat/chatRows.cjs:218-231`).
 
 - Keep the stub metadata allowlist synchronized across `chatToStub()`, client
   `STUB_METADATA_FIELDS`, and server `STUB_METADATA_FIELDS`.
@@ -578,7 +578,7 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
 - To change staged-acknowledgement retention, durable confirmation timing, or
   replay policy, start at `stagedAckTracker.ts` and its `triggerSave()`
   integration; the server's structural/staged split lives in `/api/patch` and
-  `server/node/dbCachePersistence.cjs`.
+  `server/node/db/dbCachePersistence.cjs`.
 
 - To change structural array diffing for modules or presets, start at
   `diffArrayWithIdGuard()` and `risuSavePatcher.test.ts`.
@@ -593,7 +593,7 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
   decode, inspect `payloadCodecClient.ts`, `payloadCodecService.ts`,
   `payloadCodecOperations.ts`, and `payloadCodec.worker.ts` together.
 
-- To change writer takeover, inspect `server/node/session-lock.cjs`, `NodeStorage`'s session
+- To change writer takeover, inspect `server/node/runtime/session-lock.cjs`, `NodeStorage`'s session
   headers, `checkWriterTakeoverOnReturn()`, and `writerTakeover.ts` together; registration,
   passive compatibility writes, and gesture-backed acquisition are distinct cases.
 
@@ -602,10 +602,10 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
   headers together.
 
 - To change crash recovery for model requests, inspect
-  `src/ts/process/request/jobRecovery.ts`, `server/node/model-jobs.cjs`, and
-  `server/node/request-logs.cjs`; preserve chat-row publication before logging/claiming.
+  `src/ts/process/request/jobRecovery.ts`, `server/node/runtime/model-jobs.cjs`, and
+  `server/node/runtime/request-logs.cjs`; preserve chat-row publication before logging/claiming.
 
-- To change database boot caching, update `NodeStorage.readDatabaseForBoot()`, `src/ts/storage/dbCachedRead.ts`, `src/ts/storage/rawMsgpack.ts`, `server/node/dbCachedRead.cjs`, and `/api/db/read-cached` as one protocol.
+- To change database boot caching, update `NodeStorage.readDatabaseForBoot()`, `src/ts/storage/dbCachedRead.ts`, `src/ts/storage/rawMsgpack.ts`, `server/node/db/dbCachedRead.cjs`, and `/api/db/read-cached` as one protocol.
 
 - To change chat/plugin cache limits, verification, retention, or UI, start in `src/ts/storage/resourceCache.ts` and its tests; coordinate hash headers and response hashes with the server routes.
 
@@ -613,7 +613,7 @@ See [Backup and recovery](backup-recovery.md) for archive, pinning, import, snap
   paging, start with [Plugin storage](plugin-storage.md) and then update the corresponding
   `NodeStorage`/`AutoStorage` methods and Settings consumers.
 
-- To change delta key listing, update `NodeStorage.keys()`, its `risu-list-cache` schema, `server/node/listDelta.cjs`, and the deletion-journal/epoch helpers in `server/node/db.cjs`.
+- To change delta key listing, update `NodeStorage.keys()`, its `risu-list-cache` schema, `server/node/db/listDelta.cjs`, and the deletion-journal/epoch helpers in `server/node/db/db.cjs`.
 
 - To change chat-version import semantics, inspect `transformChatBackupForImport()`/`importChatBackup()` in `chatStorage.ts`, `markCharacterDirty()` in `globalApi.svelte.ts`, and `ChatBackupList.svelte`.
 

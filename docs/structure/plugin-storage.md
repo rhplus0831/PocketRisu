@@ -135,16 +135,16 @@ Express + SQLite
 
 ### Server, UI, and shared policy
 
-- `server/node/pluginSaveKeys.cjs` owns server key parsing and namespace constants.
-- `server/node/pluginStorageJson.cjs` validates raw keys, canonical encoded names, and
+- `server/node/plugin-storage/pluginSaveKeys.cjs` owns server key parsing and namespace constants.
+- `server/node/plugin-storage/pluginStorageJson.cjs` validates raw keys, canonical encoded names, and
   strict JSON rows, and performs server-owned compatible-value transition conversion.
-- `server/node/pluginStorageManifestCache.cjs` retains one parsed live manifest entry
+- `server/node/plugin-storage/pluginStorageManifestCache.cjs` retains one parsed live manifest entry
   only for the exact trigger-backed publication revision.
-- `server/node/pluginStorageViewerFacets.cjs` owns rebuildable display-size/owner facet
+- `server/node/plugin-storage/pluginStorageViewerFacets.cjs` owns rebuildable display-size/owner facet
   validity, streaming display-size semantics, and pinned-snapshot facet queries.
-- `server/node/pluginStorageLimits.cjs` owns authoritative per-value and aggregate
+- `server/node/plugin-storage/pluginStorageLimits.cjs` owns authoritative per-value and aggregate
   limits. Defaults are 128 MiB per value and 1 GiB total optimized storage.
-- `server/node/db.cjs` owns atomic quota/owner accounting and the derived
+- `server/node/db/db.cjs` owns atomic quota/owner accounting and the derived
   `plugin_storage_usage` and `plugin_storage_owners` tables.
 - `server/node/server.cjs` owns manifest, mutation, viewer, transition, capacity, and
   recovery routes, including proof-bound affected-row inspection/download/resolution;

@@ -237,11 +237,11 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
     idempotently per entry, and return ordered durable outcomes;
     `/api/inlays/compress` streams WebP recompression progress.
 
-- `server/node/db.cjs` — SQLite KV implementation.
+- `server/node/db/db.cjs` — SQLite KV implementation.
 
-  - It opens `save/risuai.db` with `better-sqlite3` (`server/node/db.cjs:3`, `:13-16`).
-  - The `kv` table stores key, BLOB value, and update timestamp (`server/node/db.cjs:29-36`).
-  - Generic unsafe/legacy assets, `inlay_meta`, translation cache entries, and other ordinary storage keys use direct KV rows. Large live database, automatic-snapshot, and chat-row values use the chunk store (`server/node/db.cjs:103-109`; `server/node/chunkStore.cjs:51-55`).
+  - It opens `save/risuai.db` with `better-sqlite3` (`server/node/db/db.cjs:3`, `:13-16`).
+  - The `kv` table stores key, BLOB value, and update timestamp (`server/node/db/db.cjs:29-36`).
+  - Generic unsafe/legacy assets, `inlay_meta`, translation cache entries, and other ordinary storage keys use direct KV rows. Large live database, automatic-snapshot, and chat-row values use the chunk store (`server/node/db/db.cjs:103-109`; `server/node/db/chunkStore.cjs:51-55`).
 
 ## 3. Architecture & data flow
 

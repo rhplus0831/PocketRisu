@@ -54,10 +54,10 @@ The exported application graph spans:
   `inlay/<id>` and `inlay_info/<id>` snapshot rows filling any component that
   has no verified filesystem source.
 
-`server/node/backupEntryFormat.cjs` defines entry header framing and bounds.
-`server/node/streamBackupRisuSave.cjs` rewrites seekable RisuSave sources without
+`server/node/backup/backupEntryFormat.cjs` defines entry header framing and bounds.
+`server/node/backup/streamBackupRisuSave.cjs` rewrites seekable RisuSave sources without
 materializing the full database object. `streamRisuSaveToFile()` in
-`server/node/streamRisuSave.cjs` accepts an already-decoded top-level database but writes
+`server/node/backup/streamRisuSave.cjs` accepts an already-decoded top-level database but writes
 chat bodies, plugin values, remembered MCP values, and escape envelopes to a private file
 one row/page at a time. `streamJsonToMsgpack.cjs`, `jsonValidateWorker.cjs`,
 `streamRisuLoad.cjs`, and `utils.cjs` own bounded compatibility validation and conversion.
@@ -198,7 +198,7 @@ queued mutations. Later authoritative writes receive retryable
 `503 IMPORT_IN_PROGRESS`. Stable reads/pins wait behind the same barrier and re-check
 inside the storage queue.
 
-`server/node/importSpool.cjs` owns private disk ingress:
+`server/node/backup/importSpool.cjs` owns private disk ingress:
 
 - the complete HTTP upload is spooled before it is reread;
 - ZIP end-of-directory, central/local headers, encryption, duplicates, CRCs, and entry
@@ -382,7 +382,7 @@ Client ownership lives in:
 
 ### Per-chat pre-image history
 
-`createChatBackupStore()` in `server/node/chatBackups.cjs` manages a filesystem history
+`createChatBackupStore()` in `server/node/chat/chatBackups.cjs` manages a filesystem history
 separate from RisuSave archives and database snapshots. Immediately before
 `POST /api/chat-content/:chaId/:chatIndex` replaces or extends an existing row, it
 atomically publishes the exact prior materialized bytes under `<root>/<chaId>/<chatId>/`.
