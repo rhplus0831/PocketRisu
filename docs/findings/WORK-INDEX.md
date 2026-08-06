@@ -5,7 +5,7 @@ Run `pnpm check:docs` after changing a finding, status, path, or link.
 These are point-in-time reports; revalidate their evidence against current code
 before implementation.
 
-Current catalog: **31 open**, **0 deferred**, and **5 accepted decisions**.
+Current catalog: **30 open**, **0 deferred**, and **5 accepted decisions**.
 
 ## Active work by owner
 
@@ -13,7 +13,6 @@ Current catalog: **31 open**, **0 deferred**, and **5 accepted decisions**.
 
 | ID | Finding | Status | Source |
 |---|---|---|---|
-| `FND-changing-chat-backup-root-hides-all-existing-version-history` | [Changing the chat-backup root hides all existing version history](open/backup-recovery/changing-chat-backup-root-hides-all-existing-version-history.md) | Open | 2026-07 data-loss audit |
 | `FND-chat-version-backups-do-not-keep-referenced-inlays-live` | [Chat-version backups do not keep referenced inlays live](open/backup-recovery/chat-version-backups-do-not-keep-referenced-inlays-live.md) | Open | 2026-07 data-loss audit |
 | `FND-chat-version-import-acknowledges-before-save` | [Chat-version import reports success before anything is persisted](open/backup-recovery/chat-version-import-acknowledges-before-save.md) | Open | 2026-07 data-loss audit |
 | `FND-unmigrated-kv-inlays-are-omitted-from-backups` | [Inlays still served from KV fallback are omitted from backups and cleared on restore](open/backup-recovery/unmigrated-kv-inlays-are-omitted-from-backups.md) | Open | 2026-07 data-loss audit |

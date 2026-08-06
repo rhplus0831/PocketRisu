@@ -12,7 +12,7 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
 import { createServer as createHttpServer } from 'node:http'
-import { access, chmod, copyFile, link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { access, chmod, copyFile, link, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import Database from 'better-sqlite3'
 import { zipSync } from 'fflate'
@@ -219,6 +219,118 @@ describe('server smoke', () => {
     servers.push(srv)
     const client = await createClient(srv.port, srv.password)
     expect(client.token).toBeTruthy()
+  })
+
+  test('authenticated chat history survives A to B and B to default root changes', async () => {
+    const rootA = 'chat-history-a'
+    const rootB = 'chat-history-b'
+    const srv = await spawnServer({
+      env: { POCKETRISU_CHAT_BACKUP_DIR: rootA },
+    })
+    servers.push(srv)
+    const chaId = 'root-chain-char'
+    const chatId = 'root-chain-chat'
+    const firstVersion = 'v-10000-0-root-a'
+    const secondVersion = 'v-10001-0-root-b'
+    const first = Buffer.from('history captured under root A')
+    const second = Buffer.from('history captured under root B')
+    const versionDirectory = (root: string) => path.join(srv.cwd, root, chaId, chatId)
+    const readHistory = async (client: Awaited<ReturnType<typeof createClient>>) => {
+      const response = await client.fetch(`/api/chat-backups/${chaId}/${chatId}`)
+      expect(response.status).toBe(200)
+      return (await response.json() as { versions: Array<{ versionId: string }> }).versions
+    }
+
+    await mkdir(versionDirectory(rootA), { recursive: true })
+    await writeFile(path.join(versionDirectory(rootA), `${firstVersion}.bin`), first)
+    let client = await createClient(srv.port, srv.password)
+    expect((await readHistory(client)).map(version => version.versionId)).toEqual([firstVersion])
+
+    await srv.restart({ POCKETRISU_CHAT_BACKUP_DIR: rootB })
+    client = await createClient(srv.port, srv.password)
+    expect((await readHistory(client)).map(version => version.versionId)).toEqual([firstVersion])
+    const firstResponse = await client.fetch(
+      `/api/chat-backups/${chaId}/${chatId}/${firstVersion}`,
+    )
+    expect(firstResponse.status).toBe(200)
+    expect(Buffer.from(await firstResponse.arrayBuffer())).toEqual(first)
+
+    await mkdir(versionDirectory(rootB), { recursive: true })
+    await writeFile(path.join(versionDirectory(rootB), `${secondVersion}.bin`), second)
+    await srv.restart({ POCKETRISU_CHAT_BACKUP_DIR: '' })
+    client = await createClient(srv.port, srv.password)
+    expect((await readHistory(client)).map(version => version.versionId))
+      .toEqual([secondVersion, firstVersion])
+    for (const [versionId, expected] of [[firstVersion, first], [secondVersion, second]] as const) {
+      const response = await client.fetch(`/api/chat-backups/${chaId}/${chatId}/${versionId}`)
+      expect(response.status).toBe(200)
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(expected)
+    }
+
+    expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__chat_backup_path')))
+      .toEqual([
+        path.join(srv.cwd, rootA),
+        path.join(srv.cwd, rootB),
+        path.join(srv.cwd, 'save', 'chat-backups'),
+      ])
+  })
+
+  test('a retained server-backup root can return after an unavailable restart', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    let client = await createClient(srv.port, srv.password)
+    const { historicalRoot, currentRoot } = await configureCustomRecoveryHistory(srv, client)
+    const laterRoot = path.join(srv.cwd, 'later-recovery', 'backups')
+    const chaId = 'retained-server-root-char'
+    const chatId = 'retained-server-root-chat'
+    const versionId = 'v-11000-0-server-root'
+    const expected = Buffer.from('legacy chat history beneath an old server-backup root')
+    const legacyVersion = path.join(
+      historicalRoot,
+      'chat-backups',
+      chaId,
+      chatId,
+      `${versionId}.bin`,
+    )
+    await mkdir(path.dirname(legacyVersion), { recursive: true })
+    await writeFile(legacyVersion, expected)
+
+    const offlineRoot = `${historicalRoot}-offline`
+    await rename(historicalRoot, offlineRoot)
+    await srv.restart()
+    client = await createClient(srv.port, srv.password)
+    const whileOffline = await client.fetch(`/api/chat-backups/${chaId}/${chatId}`)
+    expect(whileOffline.status).toBe(200)
+    expect((await whileOffline.json() as { versions: unknown[] }).versions).toEqual([])
+
+    await rename(offlineRoot, historicalRoot)
+    const changed = await client.fetch('/api/backup/server/path', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: laterRoot }),
+    })
+    expect(changed.status).toBe(200)
+    await srv.restart()
+    client = await createClient(srv.port, srv.password)
+
+    const history = await client.fetch(`/api/chat-backups/${chaId}/${chatId}`)
+    expect(history.status).toBe(200)
+    expect((await history.json() as { versions: Array<{ versionId: string }> }).versions)
+      .toEqual([{ versionId, ts: 11000, reason: 'server-root', size: expected.length, storage: 'bundle', bundleFile: `${versionId}.frame` }])
+    const restored = await client.fetch(`/api/chat-backups/${chaId}/${chatId}/${versionId}`)
+    expect(restored.status).toBe(200)
+    expect(Buffer.from(await restored.arrayBuffer())).toEqual(expected)
+    expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+      .toEqual([
+        path.join(srv.cwd, 'backups'),
+        historicalRoot,
+        currentRoot,
+        laterRoot,
+      ])
+    expect(await readdir(path.dirname(legacyVersion))).toEqual(expect.arrayContaining([
+      `${versionId}.bin`,
+      `${versionId}.frame`,
+    ]))
   })
 
   test('backup path config rejects app-managed dirs and records safe custom dirs', async () => {

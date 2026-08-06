@@ -47,6 +47,10 @@ const VERSION_FILE_RE = /^v-(\d+)-(\d+)-([a-z0-9_-]{1,24})\.bin(\.gz)?$/;
 const VERSION_ID_RE = /^v-(\d+)-(\d+)-([a-z0-9_-]{1,24})$/;
 const FRAME_FILE_RE = /^(v-\d+-\d+-[a-z0-9_-]{1,24})\.frame$/;
 const BUNDLE_FILE_RE = /^archive-(\d+)-(\d+)\.bundle$/;
+// encodePathComponent() cannot produce this physical directory name, so it
+// cannot collide with a character identity while remaining portable.
+const ROOT_HISTORY_DIRNAME = '%2Eroot-history';
+const MIGRATED_ROOT_HISTORY_NAMESPACE_RE = /^[a-f0-9]{16}(?:-\d+)?$/;
 const FRAME_FORMAT = 'pocketrisu-chat-version-frame-v1';
 const FRAME_CONTENT_TYPE = 'application/vnd.pocketrisu.chat-row';
 const FRAME_MAGIC = Buffer.from('PRCHATF1', 'ascii');
@@ -177,10 +181,123 @@ function filesHaveIdenticalBytes(firstPath, secondPath) {
     }
 }
 
+const UNSUPPORTED_DIRECTORY_FSYNC_CODES = new Set([
+    'EBADF',
+    'EINVAL',
+    'EISDIR',
+    'ENOTSUP',
+    'EPERM',
+]);
+
+function syncDirectoryForMigration(directory) {
+    let fd;
+    try {
+        fd = fs.openSync(directory, 'r');
+        fs.fsyncSync(fd);
+        return true;
+    } catch (error) {
+        if (UNSUPPORTED_DIRECTORY_FSYNC_CODES.has(error?.code)) return false;
+        throw error;
+    } finally {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch {}
+        }
+    }
+}
+
+function syncFileForMigration(filename) {
+    let fd;
+    try {
+        fd = fs.openSync(filename, 'r');
+        fs.fsyncSync(fd);
+    } finally {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch {}
+        }
+    }
+}
+
+function ensureDirectoryDurableSync(directory) {
+    const absolute = path.resolve(directory);
+    const missing = [];
+    let cursor = absolute;
+    while (!fs.existsSync(cursor)) {
+        missing.push(cursor);
+        const parent = path.dirname(cursor);
+        if (parent === cursor) break;
+        cursor = parent;
+    }
+    if (fs.existsSync(cursor) && !fs.statSync(cursor).isDirectory()) {
+        throw new Error(`Migration parent is not a directory: ${cursor}`);
+    }
+    for (const next of missing.reverse()) {
+        try { fs.mkdirSync(next); }
+        catch (error) {
+            if (error?.code !== 'EEXIST' || !fs.statSync(next).isDirectory()) throw error;
+        }
+        syncDirectoryForMigration(path.dirname(next));
+        syncDirectoryForMigration(next);
+    }
+}
+
+function rootsReferToSameDirectory(firstRoot, secondRoot) {
+    if (firstRoot === secondRoot) return true;
+    try {
+        const first = fs.statSync(firstRoot);
+        const second = fs.statSync(secondRoot);
+        return first.isDirectory() && second.isDirectory()
+            && first.dev === second.dev && first.ino === second.ino;
+    } catch {
+        return false;
+    }
+}
+
+function versionClaimsForFiles(directory, filenames) {
+    const claims = new Set();
+    for (const filename of filenames) {
+        const loose = parseVersionFile(filename);
+        if (loose) {
+            claims.add(loose.versionId);
+            continue;
+        }
+        const frame = FRAME_FILE_RE.exec(filename);
+        if (frame) {
+            claims.add(frame[1]);
+            continue;
+        }
+        if (!/^archive-\d+-\d+\.meta\.json$/.test(filename)) continue;
+        try {
+            const meta = JSON.parse(fs.readFileSync(path.join(directory, filename), 'utf8'));
+            if (!Array.isArray(meta?.entries)) continue;
+            for (const entry of meta.entries) {
+                if (parseVersionId(entry?.versionId)) claims.add(entry.versionId);
+            }
+        } catch {
+            // An invalid bundle remains a physical file group but claims no
+            // logical version; filename collision handling still preserves it.
+        }
+    }
+    return claims;
+}
+
+function directoryVersionClaims(directory) {
+    let filenames = [];
+    try { filenames = fs.readdirSync(directory); }
+    catch { return new Set(); }
+    return versionClaimsForFiles(directory, filenames);
+}
+
+function hasVersionClaimCollision(sourceDirectory, destinationDirectory, filenames) {
+    const sourceClaims = versionClaimsForFiles(sourceDirectory, filenames);
+    if (sourceClaims.size === 0) return false;
+    const destinationClaims = directoryVersionClaims(destinationDirectory);
+    return [...sourceClaims].some(versionId => destinationClaims.has(versionId));
+}
+
 function migrateLegacyChatBackups(options = {}) {
     const logger = options.logger ?? console;
     const stats = {
-        moved: 0,
+        copied: 0,
         deduplicated: 0,
         conflicts: 0,
         failed: 0,
@@ -200,7 +317,9 @@ function migrateLegacyChatBackups(options = {}) {
         return stats;
     }
 
-    if (legacyRoot === destinationRoot || !fs.existsSync(legacyRoot)) return stats;
+    if (legacyRoot === destinationRoot
+        || rootsReferToSameDirectory(legacyRoot, destinationRoot)
+        || !fs.existsSync(legacyRoot)) return stats;
 
     const destinationRelativeToLegacy = path.relative(legacyRoot, destinationRoot);
     if (destinationRelativeToLegacy
@@ -215,44 +334,193 @@ function migrateLegacyChatBackups(options = {}) {
         return stats;
     }
 
-    function pruneIfEmpty(directory) {
-        try {
-            if (fs.readdirSync(directory).length === 0) fs.rmdirSync(directory);
-        } catch (error) {
-            if (error?.code !== 'ENOENT' && error?.code !== 'ENOTEMPTY') {
-                stats.failed++;
-                migrationLog(logger, 'warn', `[ChatBackups] Could not prune legacy directory ${directory}:`, error);
+    function conflictDestinationDirectory(sourceDirectory, attempt) {
+        let relative = path.relative(legacyRoot, sourceDirectory);
+        const relativeParts = relative.split(path.sep);
+        if (relativeParts[0] === ROOT_HISTORY_DIRNAME && relativeParts.length >= 2) {
+            // A conflict namespace copied from an earlier root stays a direct
+            // federated read root instead of becoming an undiscoverable nest.
+            relative = relativeParts.slice(2).join(path.sep);
+        }
+        const sourceKey = crypto.createHash('sha256')
+            .update(legacyRoot)
+            .digest('hex')
+            .slice(0, 16);
+        const namespace = attempt === 0 ? sourceKey : `${sourceKey}-${attempt}`;
+        return path.join(destinationRoot, ROOT_HISTORY_DIRNAME, namespace, relative);
+    }
+
+    function stageDurableRecoveryGroup(sourceDirectory, filenames) {
+        for (let attempt = 0; ; attempt++) {
+            const targetDirectory = conflictDestinationDirectory(sourceDirectory, attempt);
+            ensureDirectoryDurableSync(targetDirectory);
+            const entries = [];
+            let collision = false;
+            for (const filename of filenames) {
+                const source = path.join(sourceDirectory, filename);
+                const recovery = path.join(targetDirectory, filename);
+                try {
+                    fs.copyFileSync(source, recovery, fs.constants.COPYFILE_EXCL);
+                } catch (error) {
+                    if (error?.code !== 'EEXIST') throw error;
+                }
+                if (!filesHaveIdenticalBytes(source, recovery)) {
+                    collision = true;
+                    break;
+                }
+                syncFileForMigration(recovery);
+                entries.push({ filename, source, recovery });
             }
+            if (collision) continue;
+            syncDirectoryForMigration(targetDirectory);
+            return { targetDirectory, entries };
         }
     }
 
-    function copyAcrossDevices(source, destination) {
-        let destinationCreated = false;
+    function publishCreateOnlyFromRecovery(recovery, destination) {
+        let created = false;
         try {
-            fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
-            destinationCreated = true;
-            let destinationFd;
-            try {
-                destinationFd = fs.openSync(destination, 'r');
-                fs.fsyncSync(destinationFd);
-            } catch {
-                // Byte verification below is authoritative; fsync is best-effort.
-            } finally {
-                if (destinationFd !== undefined) {
-                    try { fs.closeSync(destinationFd); } catch {}
-                }
+            // Always materialize independent bytes. A hardlink would let an
+            // in-place write through the ordinary path mutate protected history.
+            fs.copyFileSync(recovery, destination, fs.constants.COPYFILE_EXCL);
+            created = true;
+        } catch (error) {
+            if (error?.code !== 'EEXIST') throw error;
+        }
+        if (!filesHaveIdenticalBytes(recovery, destination)) {
+            return { created, exact: false };
+        }
+        syncFileForMigration(destination);
+        return { created, exact: true };
+    }
+
+    function directGroupIsDurableAndExact(recoveryGroup, destinationDirectory) {
+        try {
+            for (const entry of recoveryGroup.entries) {
+                const destination = path.join(destinationDirectory, entry.filename);
+                if (!filesHaveIdenticalBytes(entry.recovery, destination)) return false;
+                syncFileForMigration(destination);
             }
-            if (!filesHaveIdenticalBytes(source, destination)) {
-                throw new Error('copied bytes did not match the legacy source');
-            }
-            fs.unlinkSync(source);
-            stats.moved++;
+            syncDirectoryForMigration(destinationDirectory);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    function preserveStagedRecovery(recoveryGroup, conflictCount) {
+        stats.copied += recoveryGroup.entries.length;
+        stats.conflicts += conflictCount;
+        migrationLog(
+            logger,
+            'warn',
+            `[ChatBackups] Preserved conflicting legacy history under ${recoveryGroup.targetDirectory}`,
+        );
+    }
+
+    function publishCompleteFileGroup(sourceDirectory, destinationDirectory, filenames) {
+        const recoveryGroup = stageDurableRecoveryGroup(sourceDirectory, filenames);
+        ensureDirectoryDurableSync(destinationDirectory);
+        let created = 0;
+        let directConflict = false;
+        for (const entry of recoveryGroup.entries) {
+            const publication = publishCreateOnlyFromRecovery(
+                entry.recovery,
+                path.join(destinationDirectory, entry.filename),
+            );
+            if (publication.created) created++;
+            if (!publication.exact) directConflict = true;
+        }
+        syncDirectoryForMigration(destinationDirectory);
+
+        // The historical source path is retained and the protected decoded
+        // history stays durable (normalization may change its representation).
+        // No compare-then-unlink protocol can safely remove a source path that
+        // arbitrary filesystem peers may replace.
+        if (directConflict || !directGroupIsDurableAndExact(
+            recoveryGroup,
+            destinationDirectory,
+        )) {
+            preserveStagedRecovery(recoveryGroup, 1);
+            return;
+        }
+
+        stats.copied += created;
+        stats.deduplicated += recoveryGroup.entries.length - created;
+    }
+
+    function preserveConflictGroup(sourceDirectory, filenames, conflictCount) {
+        try {
+            const recoveryGroup = stageDurableRecoveryGroup(sourceDirectory, filenames);
+            preserveStagedRecovery(recoveryGroup, conflictCount);
+        } catch (error) {
+            stats.failed++;
+            migrationLog(
+                logger,
+                'error',
+                `[ChatBackups] Could not preserve conflicting legacy history from ${sourceDirectory}:`,
+                error,
+            );
+        }
+    }
+
+    function moveFile(source, destination) {
+        const sourceDirectory = path.dirname(source);
+        const destinationDirectory = path.dirname(destination);
+        const filename = path.basename(source);
+        const destinationExact = fs.existsSync(destination)
+            && filesHaveIdenticalBytes(source, destination);
+        if (!destinationExact
+            && hasVersionClaimCollision(sourceDirectory, destinationDirectory, [filename])) {
+            preserveConflictGroup(sourceDirectory, [filename], 1);
+            return;
+        }
+        if (!destinationExact && fs.existsSync(destination)) {
+            preserveConflictGroup(sourceDirectory, [filename], 1);
+            return;
+        }
+
+        try {
+            publishCompleteFileGroup(sourceDirectory, destinationDirectory, [filename]);
         } catch (error) {
             stats.failed++;
             migrationLog(logger, 'error', `[ChatBackups] Could not copy legacy file ${source} to ${destination}:`, error);
-            if (destinationCreated && fs.existsSync(source)) {
-                try { fs.unlinkSync(destination); } catch {}
+        }
+    }
+
+    function moveFileGroup(sourceDirectory, destinationDirectory, filenames) {
+        const allDestinationsExact = filenames.every((filename) => {
+            const source = path.join(sourceDirectory, filename);
+            const destination = path.join(destinationDirectory, filename);
+            return fs.existsSync(destination) && filesHaveIdenticalBytes(source, destination);
+        });
+        if (allDestinationsExact) {
+            try {
+                publishCompleteFileGroup(sourceDirectory, destinationDirectory, filenames);
+            } catch (error) {
+                stats.failed++;
+                migrationLog(logger, 'error', `[ChatBackups] Could not reuse duplicate legacy bundle group from ${sourceDirectory}:`, error);
             }
+            return;
+        }
+        if (hasVersionClaimCollision(sourceDirectory, destinationDirectory, filenames)) {
+            preserveConflictGroup(sourceDirectory, filenames, 1);
+            return;
+        }
+        if (filenames.some(filename => fs.existsSync(path.join(destinationDirectory, filename)))) {
+            preserveConflictGroup(sourceDirectory, filenames, 1);
+            return;
+        }
+        try {
+            publishCompleteFileGroup(sourceDirectory, destinationDirectory, filenames);
+        } catch (error) {
+            stats.failed++;
+            migrationLog(
+                logger,
+                'error',
+                `[ChatBackups] Could not publish complete legacy bundle group from ${sourceDirectory}:`,
+                error,
+            );
         }
     }
 
@@ -260,19 +528,18 @@ function migrateLegacyChatBackups(options = {}) {
         let entries;
         try {
             entries = fs.readdirSync(sourceDirectory, { withFileTypes: true });
-            fs.mkdirSync(destinationDirectory, { recursive: true });
+            ensureDirectoryDurableSync(destinationDirectory);
         } catch (error) {
             stats.failed++;
             migrationLog(logger, 'error', `[ChatBackups] Could not prepare legacy directory ${sourceDirectory}:`, error);
             return;
         }
 
+        const handledFiles = new Set();
         for (const entry of entries) {
             const source = path.join(sourceDirectory, entry.name);
-            const destination = path.join(destinationDirectory, entry.name);
             if (entry.isDirectory()) {
-                moveDirectory(source, destination);
-                pruneIfEmpty(source);
+                moveDirectory(source, path.join(destinationDirectory, entry.name));
                 continue;
             }
             if (!entry.isFile()) {
@@ -280,55 +547,37 @@ function migrateLegacyChatBackups(options = {}) {
                 migrationLog(logger, 'warn', `[ChatBackups] Leaving unsupported legacy entry in place: ${source}`);
                 continue;
             }
+            if (handledFiles.has(entry.name)) continue;
 
-            if (fs.existsSync(destination)) {
-                if (filesHaveIdenticalBytes(source, destination)) {
-                    try {
-                        fs.unlinkSync(source);
-                        stats.deduplicated++;
-                    } catch (error) {
-                        stats.failed++;
-                        migrationLog(logger, 'warn', `[ChatBackups] Could not remove duplicate legacy file ${source}:`, error);
-                    }
-                } else {
-                    stats.conflicts++;
-                    migrationLog(
-                        logger,
-                        'warn',
-                        `[ChatBackups] Legacy file conflicts with the destination and was left in place: ${source}`,
-                    );
-                }
+            const bundleMatch = /^(archive-\d+-\d+)\.(bundle|meta\.json)$/.exec(entry.name);
+            if (bundleMatch) {
+                const group = [`${bundleMatch[1]}.bundle`, `${bundleMatch[1]}.meta.json`]
+                    .filter(filename => entries.some(candidate => (
+                        candidate.isFile() && candidate.name === filename
+                    )));
+                for (const filename of group) handledFiles.add(filename);
+                moveFileGroup(sourceDirectory, destinationDirectory, group);
                 continue;
             }
 
-            try {
-                fs.renameSync(source, destination);
-                stats.moved++;
-            } catch (error) {
-                if (error?.code === 'EXDEV') copyAcrossDevices(source, destination);
-                else {
-                    stats.failed++;
-                    migrationLog(logger, 'error', `[ChatBackups] Could not move legacy file ${source} to ${destination}:`, error);
-                }
-            }
+            handledFiles.add(entry.name);
+            moveFile(source, path.join(destinationDirectory, entry.name));
         }
-        pruneIfEmpty(sourceDirectory);
     }
 
     try {
         moveDirectory(legacyRoot, destinationRoot);
-        pruneIfEmpty(legacyRoot);
     } catch (error) {
         stats.failed++;
         migrationLog(logger, 'error', '[ChatBackups] Unexpected legacy migration failure:', error);
     }
 
-    if (stats.moved || stats.deduplicated || stats.conflicts || stats.failed) {
+    if (stats.copied || stats.deduplicated || stats.conflicts || stats.failed) {
         migrationLog(
             logger,
             stats.conflicts || stats.failed ? 'warn' : 'info',
-            `[ChatBackups] Legacy migration complete: ${stats.moved} moved, `
-            + `${stats.deduplicated} duplicate(s) removed, ${stats.conflicts} conflict(s), `
+            `[ChatBackups] Legacy copy complete: ${stats.copied} copied, `
+            + `${stats.deduplicated} duplicate(s) reused, ${stats.conflicts} conflict(s), `
             + `${stats.failed} failure(s)`,
         );
     }
@@ -402,6 +651,7 @@ function createChatBackupStore(options) {
     const config = options || {};
     const {
         getChatBackupsRoot,
+        getChatBackupsReadRoots,
         inspectChatRow,
         readChatRowRaw,
         readChatRowRawWithMetadata,
@@ -479,6 +729,8 @@ function createChatBackupStore(options) {
         Number.MAX_SAFE_INTEGER,
     );
     const newestByChatDir = new Map();
+    const verifiedFrameSemantics = new Map();
+    const verifiedSourceSemantics = new Map();
     let tempCounter = 0;
     let reconcileTimer = null;
     let localReconcileQueue = Promise.resolve();
@@ -508,12 +760,84 @@ function createChatBackupStore(options) {
         return path.resolve(String(getChatBackupsRoot()));
     }
 
-    function chatDirectory(chaId, chatId) {
+    function backupsReadRootRecords() {
+        const activeRoot = backupsTreeRoot();
+        let configured = [];
+        if (typeof getChatBackupsReadRoots === 'function') {
+            try {
+                const selected = getChatBackupsReadRoots();
+                if (Array.isArray(selected)) configured = selected;
+            } catch (error) {
+                log('warn', '[ChatBackups] Could not resolve historical chat-backup roots:', error);
+            }
+        }
+
+        const records = [];
+        const identities = new Set();
+        function addRoot(candidate, options = {}) {
+            let absolute;
+            try { absolute = path.resolve(String(candidate)); }
+            catch { return; }
+            let identity = `path:${process.platform === 'win32' ? absolute.toLowerCase() : absolute}`;
+            try {
+                const stat = fs.statSync(absolute);
+                if (stat.isDirectory()) identity = `inode:${stat.dev}:${stat.ino}`;
+            } catch {
+                // An offline historical root remains in the set by lexical identity.
+            }
+            if (identities.has(identity)) return;
+            identities.add(identity);
+            const stableIdentity = options.identity
+                ?? `historical:${crypto.createHash('sha256').update(absolute).digest('hex').slice(0, 20)}`;
+            records.push({
+                root: absolute,
+                identity: stableIdentity,
+                active: options.active === true,
+                originalEligible: options.originalEligible === true
+                    || options.active === true,
+            });
+        }
+
+        addRoot(activeRoot, { active: true, identity: 'active' });
+        for (const candidate of configured) addRoot(candidate);
+        for (const record of [...records]) {
+            const conflictRoot = path.join(record.root, ROOT_HISTORY_DIRNAME);
+            let entries = [];
+            try { entries = fs.readdirSync(conflictRoot, { withFileTypes: true }); }
+            catch { continue; }
+            for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+                if (entry.isDirectory()) {
+                    addRoot(path.join(conflictRoot, entry.name), {
+                        identity: `conflict:${entry.name}`,
+                        // Root-migration recovery namespaces use a 16-hex
+                        // source identity. Content-derived normalization
+                        // namespaces use 20 hex and must not outrank the
+                        // historical source whose alias they stabilize.
+                        originalEligible: record.active
+                            && MIGRATED_ROOT_HISTORY_NAMESPACE_RE.test(entry.name),
+                    });
+                }
+            }
+        }
+        const [active, ...historical] = records;
+        return [active, ...historical.sort((a, b) => a.identity.localeCompare(b.identity))]
+            .filter(Boolean);
+    }
+
+    function backupsReadRoots() {
+        return backupsReadRootRecords().map(record => record.root);
+    }
+
+    function chatDirectoryAt(root, chaId, chatId) {
         return path.join(
-            backupsTreeRoot(),
+            root,
             encodePathComponent(chaId),
             encodePathComponent(chatId),
         );
+    }
+
+    function chatDirectory(chaId, chatId) {
+        return chatDirectoryAt(backupsTreeRoot(), chaId, chatId);
     }
 
     async function writeFileAtomicFromSource(destination, writeSource) {
@@ -573,8 +897,19 @@ function createChatBackupStore(options) {
         } finally {
             if (fileFd !== undefined) fs.closeSync(fileFd);
         }
-        fs.renameSync(temp, destination);
-        syncDirectory(path.dirname(destination));
+        ensureDirectoryDurableSync(path.dirname(destination));
+        try {
+            fs.linkSync(temp, destination);
+        } catch (error) {
+            if (error?.code === 'EPERM') {
+                fs.copyFileSync(temp, destination, fs.constants.COPYFILE_EXCL);
+                syncFileForMigration(destination);
+            } else {
+                throw error;
+            }
+        }
+        syncDirectoryForMigration(path.dirname(destination));
+        fs.unlinkSync(temp);
     }
 
     function unlinkAndSync(filename) {
@@ -659,6 +994,117 @@ function createChatBackupStore(options) {
             if (fd !== undefined) {
                 try { fs.closeSync(fd); } catch {}
             }
+        }
+    }
+
+    function frameFileFingerprint(filename) {
+        const stat = fs.statSync(filename);
+        return {
+            dev: stat.dev,
+            ino: stat.ino,
+            size: stat.size,
+            mtimeMs: stat.mtimeMs,
+            ctimeMs: stat.ctimeMs,
+        };
+    }
+
+    function frameFingerprintsMatch(first, second) {
+        return first.dev === second.dev
+            && first.ino === second.ino
+            && first.size === second.size
+            && first.mtimeMs === second.mtimeMs
+            && first.ctimeMs === second.ctimeMs;
+    }
+
+    async function readWithStableFrameIdentity(filename, reader) {
+        const before = frameFileFingerprint(filename);
+        const value = await reader();
+        const after = frameFileFingerprint(filename);
+        return {
+            value,
+            fingerprint: after,
+            stable: frameFingerprintsMatch(before, after),
+        };
+    }
+
+    function rememberVerifiedFrame(filename, frame, rawInfo, fingerprint) {
+        const absolute = path.resolve(filename);
+        verifiedFrameSemantics.set(absolute, {
+            ...fingerprint,
+            semanticIdentity: `${rawInfo.size}:${rawInfo.sha256}`,
+            versionId: frame.versionId,
+        });
+    }
+
+    function knownVerifiedFrameSemantic(filename, frame) {
+        const absolute = path.resolve(filename);
+        const cached = verifiedFrameSemantics.get(absolute);
+        if (!cached || cached.versionId !== frame.versionId) return null;
+        try {
+            const current = frameFileFingerprint(absolute);
+            if (!frameFingerprintsMatch(cached, current)) {
+                verifiedFrameSemantics.delete(absolute);
+                return null;
+            }
+            return cached.semanticIdentity;
+        } catch {
+            verifiedFrameSemantics.delete(absolute);
+            return null;
+        }
+    }
+
+    function sourceSemanticCacheKey(filenames, versionId) {
+        return `${versionId}\0${filenames.map(filename => path.resolve(filename)).join('\0')}`;
+    }
+
+    function rememberVerifiedSourceSemantic(filenames, versionId, rawInfo) {
+        const absoluteFiles = filenames.map(filename => path.resolve(filename));
+        const key = sourceSemanticCacheKey(absoluteFiles, versionId);
+        try {
+            verifiedSourceSemantics.set(key, {
+                files: absoluteFiles.map((filename) => {
+                    const stat = fs.statSync(filename);
+                    return {
+                        filename,
+                        dev: stat.dev,
+                        ino: stat.ino,
+                        size: stat.size,
+                        mtimeMs: stat.mtimeMs,
+                        ctimeMs: stat.ctimeMs,
+                        sha256: hashFileBytes(filename),
+                    };
+                }),
+                semanticIdentity: `${rawInfo.size}:${rawInfo.sha256}`,
+            });
+        } catch {
+            verifiedSourceSemantics.delete(key);
+        }
+    }
+
+    function knownVerifiedSourceSemantic(filenames, versionId) {
+        const absoluteFiles = filenames.map(filename => path.resolve(filename));
+        const key = sourceSemanticCacheKey(absoluteFiles, versionId);
+        const cached = verifiedSourceSemantics.get(key);
+        if (!cached || cached.files.length !== absoluteFiles.length) return null;
+        try {
+            for (let index = 0; index < absoluteFiles.length; index++) {
+                const expected = cached.files[index];
+                const stat = fs.statSync(absoluteFiles[index]);
+                if (expected.filename !== absoluteFiles[index]
+                    || expected.dev !== stat.dev
+                    || expected.ino !== stat.ino
+                    || expected.size !== stat.size
+                    || expected.mtimeMs !== stat.mtimeMs
+                    || expected.ctimeMs !== stat.ctimeMs
+                    || expected.sha256 !== hashFileBytes(absoluteFiles[index])) {
+                    verifiedSourceSemantics.delete(key);
+                    return null;
+                }
+            }
+            return cached.semanticIdentity;
+        } catch {
+            verifiedSourceSemantics.delete(key);
+            return null;
         }
     }
 
@@ -907,14 +1353,15 @@ function createChatBackupStore(options) {
         }
     }
 
-    function cleanupStaleTemps(directory) {
+    function cleanupStaleTemps(directory, options = {}) {
         let entries = [];
         try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch { return 0; }
         let removed = 0;
         for (const entry of entries) {
             const fullPath = path.join(directory, entry.name);
             if (entry.isDirectory()) {
-                removed += cleanupStaleTemps(fullPath);
+                if (options.skipRootHistory && entry.name === ROOT_HISTORY_DIRNAME) continue;
+                removed += cleanupStaleTemps(fullPath, options);
             } else if (entry.isFile() && entry.name.endsWith('.tmp')) {
                 try {
                     fs.unlinkSync(fullPath);
@@ -930,12 +1377,12 @@ function createChatBackupStore(options) {
         let charEntries = [];
         try { charEntries = fs.readdirSync(root, { withFileTypes: true }); } catch { return result; }
         for (const charEntry of charEntries) {
-            if (!charEntry.isDirectory()) continue;
+            if (!charEntry.isDirectory() || charEntry.name === ROOT_HISTORY_DIRNAME) continue;
             const charDir = path.join(root, charEntry.name);
             let chatEntries = [];
             try { chatEntries = fs.readdirSync(charDir, { withFileTypes: true }); } catch { continue; }
             for (const chatEntry of chatEntries) {
-                if (!chatEntry.isDirectory()) continue;
+                if (!chatEntry.isDirectory() || chatEntry.name === ROOT_HISTORY_DIRNAME) continue;
                 result.push({
                     chaId: decodePathComponent(charEntry.name),
                     chatId: decodePathComponent(chatEntry.name),
@@ -1011,41 +1458,61 @@ function createChatBackupStore(options) {
         const frame = readFrameHeader(filename);
         if (!frameMetadataMatches(frame, entry, rawInfo)) return false;
         try {
-            const decoded = await inspectFramePayload(filename, frame, operation);
-            return decoded.size === rawInfo.size && decoded.sha256 === rawInfo.sha256;
+            const verification = await readWithStableFrameIdentity(
+                filename,
+                () => inspectFramePayload(filename, frame, operation),
+            );
+            if (!verification.stable) return false;
+            const decoded = verification.value;
+            const matches = decoded.size === rawInfo.size && decoded.sha256 === rawInfo.sha256;
+            if (matches) {
+                rememberVerifiedFrame(filename, frame, decoded, verification.fingerprint);
+            }
+            return matches;
         } catch {
             return false;
         }
     }
 
-    async function createFrameFromLoose(chatDir, entry) {
-        const source = path.join(chatDir, entry.filename);
-        const destination = path.join(chatDir, `${entry.versionId}.frame`);
-        const rawInfo = entry.compressed
-            ? await inspectGzipFile(source, {
-                operation: 'reconcile-source',
-                versionId: entry.versionId,
-                storage: 'legacy-loose-gzip',
-            })
-            : await inspectRawFile(source);
-
-        if (await verifiedFrameMatches(
-            destination,
-            entry,
-            rawInfo,
-            'reconcile-existing-frame',
-        )) {
-            unlinkAndSync(source);
-            return { created: false, sourceRemoved: true };
+    async function validateFramesInDirectory(chatDir, operation = 'startup-normalize-frame') {
+        let verified = 0;
+        let failed = 0;
+        for (const frame of scanChatDirectory(chatDir).frames) {
+            const filename = path.join(chatDir, frame.filename);
+            try {
+                const verification = await readWithStableFrameIdentity(
+                    filename,
+                    () => inspectFramePayload(filename, frame, operation),
+                );
+                if (!verification.stable) {
+                    throw new Error(`Frame changed while it was being validated: ${frame.versionId}`);
+                }
+                const decoded = verification.value;
+                if (decoded.size !== frame.size || decoded.sha256 !== frame.sha256) {
+                    throw new Error(`Frame payload does not match its header: ${frame.versionId}`);
+                }
+                rememberVerifiedFrame(filename, frame, decoded, verification.fingerprint);
+                verified++;
+            } catch (error) {
+                verifiedFrameSemantics.delete(path.resolve(filename));
+                failed++;
+                log('warn', `[ChatBackups] Failed to validate ${frame.filename}:`, error);
+            }
         }
+        return { verified, failed };
+    }
 
+    async function writeFrameFromSource(source, sourceCompressed, destination, entry, rawInfo) {
+        ensureDirectoryDurableSync(path.dirname(destination));
         const header = encodeFrameHeader(entry, rawInfo);
         const prefix = framePrefix(header.length);
         const temp = `${destination}.${process.pid}-${tempCounter++}.tmp`;
+        let ownsTemp = false;
         try {
             fs.writeFileSync(temp, Buffer.concat([prefix, header]), { flag: 'wx' });
+            ownsTemp = true;
             const output = fs.createWriteStream(temp, { flags: 'a' });
-            if (entry.compressed) {
+            if (sourceCompressed) {
                 await pipeline(fs.createReadStream(source), output);
             } else {
                 await pipeline(fs.createReadStream(source), zlib.createGzip(), output);
@@ -1073,47 +1540,204 @@ function createChatBackupStore(options) {
             )) {
                 throw new Error(`Published frame validation failed for ${entry.versionId}`);
             }
-            unlinkAndSync(source);
-            return { created: true, sourceRemoved: true };
+            return true;
         } catch (error) {
-            try { fs.unlinkSync(temp); } catch {}
+            if (ownsTemp) {
+                try { fs.unlinkSync(temp); } catch {}
+            } else if (error?.code === 'EEXIST') {
+                error.chatBackupTempCollision = true;
+            }
             throw error;
         }
     }
 
-    async function createFramesFromLoose(chatDir) {
+    async function conflictFrameDestination(chatDir, sourceRoot, entry, rawInfo) {
+        const relativeChatDir = path.relative(sourceRoot, chatDir);
+        const activeRoot = backupsTreeRoot();
+        const sourceIsActive = path.resolve(sourceRoot) === path.resolve(activeRoot)
+            || rootsReferToSameDirectory(sourceRoot, activeRoot);
+        // Active-source recovery is eligible to retain the original public ID
+        // if its invalid/divergent ordinary destination disappears. Derived
+        // copies of non-active sources use a distinct 20-hex namespace and
+        // never outrank their source's stable alias.
+        const contentKey = rawInfo.sha256.slice(0, sourceIsActive ? 16 : 20);
+        for (let attempt = 0; ; attempt++) {
+            const namespace = attempt === 0 ? contentKey : `${contentKey}-${attempt}`;
+            const destination = path.join(
+                backupsTreeRoot(),
+                ROOT_HISTORY_DIRNAME,
+                namespace,
+                relativeChatDir,
+                `${entry.versionId}.frame`,
+            );
+            if (!fs.existsSync(destination)) return { destination, existing: false };
+            if (await verifiedFrameMatches(
+                destination,
+                entry,
+                rawInfo,
+                'reconcile-existing-conflict-frame',
+            )) return { destination, existing: true };
+        }
+    }
+
+    function finalizeNormalizedSource(source, policy, details) {
+        observe('normalization-source-finalize', {
+            ...details,
+            source,
+            retainSource: policy.retainSource,
+        });
+        if (policy.retainSource) return false;
+        unlinkAndSync(source);
+        return true;
+    }
+
+    async function createFrameFromLoose(
+        chatDir,
+        entry,
+        sourceRoot = backupsTreeRoot(),
+        policy = { retainSource: false },
+    ) {
+        const source = path.join(chatDir, entry.filename);
+        const normalDestination = path.join(chatDir, `${entry.versionId}.frame`);
+        const rawInfo = entry.compressed
+            ? await inspectGzipFile(source, {
+                operation: 'reconcile-source',
+                versionId: entry.versionId,
+                storage: 'legacy-loose-gzip',
+            })
+            : await inspectRawFile(source);
+        rememberVerifiedSourceSemantic([source], entry.versionId, rawInfo);
+
+        if (await verifiedFrameMatches(
+            normalDestination,
+            entry,
+            rawInfo,
+            'reconcile-existing-frame',
+        )) {
+            const sourceRemoved = finalizeNormalizedSource(source, policy, {
+                sourceStorage: entry.compressed ? 'loose-gzip' : 'loose',
+                versionId: entry.versionId,
+            });
+            return { created: false, sourceRemoved, conflicted: false };
+        }
+
+        let destination = normalDestination;
+        let conflicted = fs.existsSync(normalDestination);
+        if (conflicted) {
+            const selected = await conflictFrameDestination(chatDir, sourceRoot, entry, rawInfo);
+            if (selected.existing) {
+                const sourceRemoved = finalizeNormalizedSource(source, policy, {
+                    sourceStorage: entry.compressed ? 'loose-gzip' : 'loose',
+                    versionId: entry.versionId,
+                });
+                return { created: false, sourceRemoved, conflicted: true };
+            }
+            destination = selected.destination;
+        }
+        ensureDirectoryDurableSync(path.dirname(destination));
+        try {
+            await writeFrameFromSource(source, entry.compressed, destination, entry, rawInfo);
+        } catch (error) {
+            if (error?.code !== 'EEXIST' || error?.chatBackupTempCollision) throw error;
+            if (await verifiedFrameMatches(
+                destination,
+                entry,
+                rawInfo,
+                'reconcile-raced-frame',
+            )) {
+                const sourceRemoved = finalizeNormalizedSource(source, policy, {
+                    sourceStorage: entry.compressed ? 'loose-gzip' : 'loose',
+                    versionId: entry.versionId,
+                });
+                return { created: false, sourceRemoved, conflicted };
+            }
+            const selected = await conflictFrameDestination(chatDir, sourceRoot, entry, rawInfo);
+            if (!selected.existing) {
+                await writeFrameFromSource(
+                    source,
+                    entry.compressed,
+                    selected.destination,
+                    entry,
+                    rawInfo,
+                );
+            }
+            conflicted = true;
+        }
+        const sourceRemoved = finalizeNormalizedSource(source, policy, {
+            sourceStorage: entry.compressed ? 'loose-gzip' : 'loose',
+            versionId: entry.versionId,
+        });
+        return { created: true, sourceRemoved, conflicted };
+    }
+
+    async function createFramesFromLoose(
+        chatDir,
+        sourceRoot = backupsTreeRoot(),
+        policy = { retainSource: false },
+    ) {
         let converted = 0;
         let created = 0;
+        let conflicted = 0;
         let filenames = [];
-        try { filenames = fs.readdirSync(chatDir); } catch { return { converted, created }; }
+        try { filenames = fs.readdirSync(chatDir); }
+        catch { return { converted, created, conflicted }; }
         const entries = filenames
             .map(parseVersionFile)
             .filter(Boolean)
             .sort(compareVersionsOldest);
         for (const entry of entries) {
             try {
-                const result = await createFrameFromLoose(chatDir, entry);
+                const result = await createFrameFromLoose(chatDir, entry, sourceRoot, policy);
                 if (result.sourceRemoved) converted++;
                 if (result.created) created++;
+                if (result.conflicted) conflicted++;
             } catch (error) {
                 log('warn', `[ChatBackups] Failed to frame ${entry.filename}:`, error);
             }
         }
-        return { converted, created };
+        return { converted, created, conflicted };
     }
 
-    async function publishExtractedTemp(temp, destination) {
+    async function publishExtractedTemp(temp, destination, chatDir, entry, sourceRoot) {
         if (fs.existsSync(destination)) {
-            if (!filesHaveIdenticalBytes(temp, destination)) {
-                throw new Error(`Extracted legacy version conflicts with ${path.basename(destination)}`);
+            if (filesHaveIdenticalBytes(temp, destination)) {
+                fs.unlinkSync(temp);
+                return;
+            }
+            const rawInfo = await inspectRawFile(temp);
+            const selected = await conflictFrameDestination(
+                chatDir,
+                sourceRoot,
+                entry,
+                rawInfo,
+            );
+            if (!selected.existing) {
+                ensureDirectoryDurableSync(path.dirname(selected.destination));
+                await writeFrameFromSource(
+                    temp,
+                    false,
+                    selected.destination,
+                    entry,
+                    rawInfo,
+                );
             }
             fs.unlinkSync(temp);
             return;
         }
-        durablePublishTemp(temp, destination);
+        try {
+            durablePublishTemp(temp, destination);
+        } catch (error) {
+            if (error?.code !== 'EEXIST') throw error;
+            return publishExtractedTemp(temp, destination, chatDir, entry, sourceRoot);
+        }
     }
 
-    async function migrateLegacyBundleToLoose(chatDir, bundle) {
+    async function migrateLegacyBundleToLoose(
+        chatDir,
+        bundle,
+        sourceRoot = backupsTreeRoot(),
+        policy = { retainSource: false },
+    ) {
         const ordered = [...bundle.entries].sort((a, b) => a.offset - b.offset
             || compareVersionsOldest(a, b));
         let previousEnd = 0;
@@ -1148,7 +1772,19 @@ function createChatBackupStore(options) {
             const completed = current;
             await completed.handle.sync();
             await completed.handle.close();
-            await publishExtractedTemp(completed.temp, completed.destination);
+            const rawInfo = await inspectRawFile(completed.temp);
+            await publishExtractedTemp(
+                completed.temp,
+                completed.destination,
+                chatDir,
+                completed.entry,
+                sourceRoot,
+            );
+            rememberVerifiedSourceSemantic(
+                [bundlePath, path.join(chatDir, bundle.metaFile)],
+                completed.entry.versionId,
+                rawInfo,
+            );
             current = null;
             index++;
         }
@@ -1226,25 +1862,50 @@ function createChatBackupStore(options) {
             });
         }
 
-        // Every raw entry is durable before the legacy index is withdrawn. A
-        // crash before this point leaves the bundle readable; a crash after it
-        // leaves the exact loose entries readable and ready for framing.
-        unlinkAndSync(path.join(chatDir, bundle.metaFile));
-        try { unlinkAndSync(bundlePath); } catch {}
+        // Active-root compaction may withdraw a bundle only after every raw
+        // entry is durable. Federated historical/protected roots are retained:
+        // no compare-then-unlink protocol can protect a peer replacement.
+        observe('normalization-source-finalize', {
+            source: bundlePath,
+            metadataSource: path.join(chatDir, bundle.metaFile),
+            sourceStorage: 'legacy-bundle',
+            bundleFile: bundle.bundleFile,
+            retainSource: policy.retainSource,
+        });
+        const bundleSources = [bundlePath, path.join(chatDir, bundle.metaFile)];
+        const sourceChanged = policy.retainSource && ordered.some(entry => (
+            knownVerifiedSourceSemantic(bundleSources, entry.versionId) === null
+        ));
+        if (!policy.retainSource) {
+            unlinkAndSync(path.join(chatDir, bundle.metaFile));
+            try { unlinkAndSync(bundlePath); } catch {}
+        }
+        return { sourceChanged };
     }
 
-    async function migrateLegacyBundles(chatDir) {
+    async function migrateLegacyBundles(
+        chatDir,
+        sourceRoot = backupsTreeRoot(),
+        policy = { retainSource: false },
+    ) {
         let migrated = 0;
+        let sourcesChanged = 0;
         const bundles = scanChatDirectory(chatDir).bundles;
         for (const bundle of bundles) {
             try {
-                await migrateLegacyBundleToLoose(chatDir, bundle);
+                const result = await migrateLegacyBundleToLoose(
+                    chatDir,
+                    bundle,
+                    sourceRoot,
+                    policy,
+                );
                 migrated++;
+                if (result.sourceChanged) sourcesChanged++;
             } catch (error) {
                 log('warn', `[ChatBackups] Failed to migrate ${bundle.bundleFile}:`, error);
             }
         }
-        return migrated;
+        return { migrated, sourcesChanged };
     }
 
     function uniqueVersions(scan) {
@@ -1404,6 +2065,9 @@ function createChatBackupStore(options) {
     }
 
     function pruneEmptyDirectories(directory, keepRoot = directory) {
+        if (path.resolve(directory) === path.resolve(path.join(keepRoot, ROOT_HISTORY_DIRNAME))) {
+            return;
+        }
         let entries = [];
         try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch { return; }
         for (const entry of entries) {
@@ -1421,7 +2085,7 @@ function createChatBackupStore(options) {
         const root = backupsTreeRoot();
         fs.mkdirSync(root, { recursive: true });
         const stats = {
-            staleTempsRemoved: cleanupStaleTemps(root),
+            staleTempsRemoved: cleanupStaleTemps(root, { skipRootHistory: true }),
             gzipped: 0,
             framesCreated: 0,
             bundlesCreated: 0,
@@ -1441,12 +2105,13 @@ function createChatBackupStore(options) {
             const initialFrames = await createFramesFromLoose(chatDir);
             stats.gzipped += initialFrames.converted;
             stats.framesCreated += initialFrames.created;
-            const legacyMigrated = await migrateLegacyBundles(chatDir);
-            stats.legacyBundlesMigrated += legacyMigrated;
-            stats.bundlesRotated += legacyMigrated;
+            const legacy = await migrateLegacyBundles(chatDir);
+            stats.legacyBundlesMigrated += legacy.migrated;
+            stats.bundlesRotated += legacy.migrated;
             const migratedFrames = await createFramesFromLoose(chatDir);
             stats.gzipped += migratedFrames.converted;
             stats.framesCreated += migratedFrames.created;
+            await validateFramesInDirectory(chatDir, 'reconcile-frame-validation');
             const retention = await enforceChatVersionLimit(chatDir);
             stats.versionsTrimmed += retention.versionsRemoved;
             stats.bundlesRotated += retention.bundlesRemoved;
@@ -1462,6 +2127,59 @@ function createChatBackupStore(options) {
         return stats;
     }
 
+    async function normalizeFederatedHistoryOnDisk() {
+        const stats = {
+            rootsVisited: 0,
+            staleTempsRemoved: 0,
+            looseVersionsConverted: 0,
+            framesCreated: 0,
+            conflictsPreserved: 0,
+            legacyBundlesMigrated: 0,
+            framesVerified: 0,
+            framesInvalid: 0,
+        };
+        // Resolve the read federation once. Conflict namespaces created during
+        // this pass already contain payload-verified frames.
+        for (const rootRecord of backupsReadRootRecords()) {
+            const root = rootRecord.root;
+            let rootStat;
+            try { rootStat = fs.statSync(root); }
+            catch { continue; }
+            if (!rootStat.isDirectory()) continue;
+            stats.rootsVisited++;
+            const policy = { retainSource: !rootRecord.active };
+            if (rootRecord.active) {
+                stats.staleTempsRemoved += cleanupStaleTemps(root, {
+                    skipRootHistory: true,
+                });
+            }
+            for (const { chatDir } of collectChatDirectories(root)) {
+                const initialFrames = await createFramesFromLoose(chatDir, root, policy);
+                stats.looseVersionsConverted += initialFrames.converted;
+                stats.framesCreated += initialFrames.created;
+                stats.conflictsPreserved += initialFrames.conflicted;
+                const legacy = await migrateLegacyBundles(chatDir, root, policy);
+                stats.legacyBundlesMigrated += legacy.migrated;
+                const migratedFrames = await createFramesFromLoose(chatDir, root, policy);
+                stats.looseVersionsConverted += migratedFrames.converted;
+                stats.framesCreated += migratedFrames.created;
+                stats.conflictsPreserved += migratedFrames.conflicted;
+                if (policy.retainSource && legacy.sourcesChanged > 0) {
+                    const retriedLegacy = await migrateLegacyBundles(chatDir, root, policy);
+                    stats.legacyBundlesMigrated += retriedLegacy.migrated;
+                    const retriedFrames = await createFramesFromLoose(chatDir, root, policy);
+                    stats.looseVersionsConverted += retriedFrames.converted;
+                    stats.framesCreated += retriedFrames.created;
+                    stats.conflictsPreserved += retriedFrames.conflicted;
+                }
+                const validation = await validateFramesInDirectory(chatDir);
+                stats.framesVerified += validation.verified;
+                stats.framesInvalid += validation.failed;
+            }
+        }
+        return stats;
+    }
+
     function reconcileChatBackups() {
         const operation = () => reconcileOnDisk();
         if (typeof runStorageOperation === 'function') {
@@ -1474,56 +2192,226 @@ function createChatBackupStore(options) {
         return run;
     }
 
-    function listChatBackups(chaId, chatId) {
-        const chatDir = chatDirectory(chaId, chatId);
+    function normalizeChatBackups() {
+        const operation = () => normalizeFederatedHistoryOnDisk();
+        if (typeof runStorageOperation === 'function') {
+            return Promise.resolve().then(() => (
+                runStorageOperation(operation, 'chat-backup-normalize-history')
+            ));
+        }
+        const run = localReconcileQueue.then(operation, operation);
+        localReconcileQueue = run.catch(() => {});
+        return run;
+    }
+
+    function versionsInChatDirectory(chatDir) {
         const scan = scanChatDirectory(chatDir);
-        const byId = new Map();
+        const versions = [];
 
         for (const bundle of scan.bundles) {
             for (const entry of bundle.entries) {
-                byId.set(entry.versionId, {
+                const sourceFiles = [bundle.bundleFile, bundle.metaFile];
+                versions.push({
                     versionId: entry.versionId,
                     ts: entry.ts,
                     reason: entry.reason,
                     size: entry.size,
                     storage: 'bundle',
                     bundleFile: bundle.bundleFile,
+                    sourceStorage: 'legacy-bundle',
+                    sourceFiles,
                     seq: entry.seq,
+                    semanticIdentity: knownVerifiedSourceSemantic(
+                        sourceFiles.map(filename => path.join(chatDir, filename)),
+                        entry.versionId,
+                    ),
                 });
             }
         }
         for (const entry of scan.frames) {
-            byId.set(entry.versionId, {
+            const filename = path.join(chatDir, entry.filename);
+            versions.push({
                 versionId: entry.versionId,
                 ts: entry.ts,
                 reason: entry.reason,
                 size: entry.size,
                 storage: 'bundle',
                 bundleFile: entry.filename,
+                sourceStorage: 'frame',
+                sourceFiles: [entry.filename],
                 seq: entry.seq,
+                semanticIdentity: knownVerifiedFrameSemantic(filename, entry),
             });
         }
         for (const entry of scan.loose) {
-            byId.set(entry.versionId, {
+            const filename = path.join(chatDir, entry.filename);
+            let semanticIdentity = null;
+            if (!entry.compressed) {
+                try {
+                    semanticIdentity = `${entry.size}:${hashFileBytes(filename)}`;
+                } catch {}
+            } else {
+                semanticIdentity = knownVerifiedSourceSemantic([filename], entry.versionId);
+            }
+            versions.push({
                 versionId: entry.versionId,
                 ts: entry.ts,
                 reason: entry.reason,
                 size: entry.size,
                 storage: 'loose',
+                sourceStorage: entry.compressed ? 'loose-gzip' : 'loose',
+                sourceFiles: [entry.filename],
                 seq: entry.seq,
+                semanticIdentity,
             });
         }
 
-        return [...byId.values()]
-            .sort((a, b) => compareVersionsOldest(b, a))
-            .map(({ seq, ...entry }) => entry);
+        return versions;
+    }
+
+    function hashFileBytes(filename) {
+        const hash = crypto.createHash('sha256');
+        const chunk = Buffer.allocUnsafe(64 * 1024);
+        let fd;
+        try {
+            fd = fs.openSync(filename, 'r');
+            let offset = 0;
+            while (true) {
+                const read = fs.readSync(fd, chunk, 0, chunk.length, offset);
+                if (read === 0) break;
+                hash.update(chunk.subarray(0, read));
+                offset += read;
+            }
+            return hash.digest('hex');
+        } finally {
+            if (fd !== undefined) {
+                try { fs.closeSync(fd); } catch {}
+            }
+        }
+    }
+
+    function physicalCandidateIdentity(candidate) {
+        const hash = crypto.createHash('sha256');
+        for (const filename of candidate.sourceFiles) {
+            hash.update(filename);
+            hash.update('\0');
+            try { hash.update(hashFileBytes(path.join(candidate.chatDir, filename))); }
+            catch { hash.update('unreadable'); }
+            hash.update('\0');
+        }
+        return hash.digest('hex');
+    }
+
+    function versionFilesMatch(first, second) {
+        if (first.semanticIdentity && first.semanticIdentity === second.semanticIdentity) {
+            return true;
+        }
+        if (first.sourceStorage !== second.sourceStorage
+            || first.sourceFiles.length !== second.sourceFiles.length) return false;
+        return first.sourceFiles.every((filename, index) => (
+            filesHaveIdenticalBytes(
+                path.join(first.chatDir, filename),
+                path.join(second.chatDir, second.sourceFiles[index]),
+            )
+        ));
+    }
+
+    function resolveChatBackupVersions(chaId, chatId) {
+        const candidates = backupsReadRootRecords().flatMap((rootRecord) => {
+            const chatDir = chatDirectoryAt(rootRecord.root, chaId, chatId);
+            return versionsInChatDirectory(chatDir).map(entry => ({
+                ...entry,
+                chatDir,
+                rootIdentity: rootRecord.identity,
+                activeRoot: rootRecord.active,
+                originalEligible: rootRecord.originalEligible,
+                sourceVersionId: entry.versionId,
+            }));
+        });
+        const reservedIds = new Set(candidates.map(entry => entry.sourceVersionId));
+        const acceptedBySourceId = new Map();
+        const resolved = [];
+
+        for (const candidate of candidates) {
+            candidate.candidateIdentity = crypto.createHash('sha256')
+                .update(candidate.sourceVersionId)
+                .update('\0')
+                .update(candidate.semanticIdentity ?? physicalCandidateIdentity(candidate))
+                .digest('hex');
+        }
+
+        for (const candidate of candidates.sort((a, b) => (
+            Number(b.activeRoot) - Number(a.activeRoot)
+            || Number(b.originalEligible) - Number(a.originalEligible)
+            || a.candidateIdentity.localeCompare(b.candidateIdentity)
+        ))) {
+            const siblings = acceptedBySourceId.get(candidate.sourceVersionId) ?? [];
+            if (siblings.some(existing => versionFilesMatch(existing, candidate))) continue;
+
+            let publicVersionId = candidate.sourceVersionId;
+            if (!candidate.originalEligible || siblings.length > 0) {
+                let salt = 0;
+                do {
+                    const digest = crypto.createHash('sha256')
+                        .update(candidate.candidateIdentity)
+                        .update(`:${salt++}`)
+                        .digest('hex');
+                    const sequence = Number.parseInt(digest.slice(0, 13), 16);
+                    publicVersionId = `v-${candidate.ts}-${sequence}-${candidate.reason}`;
+                } while (reservedIds.has(publicVersionId));
+                if (!parseVersionId(publicVersionId)) {
+                    throw new Error('Could not derive a safe chat-backup conflict alias');
+                }
+                reservedIds.add(publicVersionId);
+            }
+            const accepted = { ...candidate, publicVersionId };
+            siblings.push(accepted);
+            acceptedBySourceId.set(candidate.sourceVersionId, siblings);
+            resolved.push(accepted);
+        }
+
+        return resolved.sort((a, b) => compareVersionsOldest(
+            { ...b, versionId: b.publicVersionId },
+            { ...a, versionId: a.publicVersionId },
+        ));
+    }
+
+    function listChatBackups(chaId, chatId) {
+        return resolveChatBackupVersions(chaId, chatId)
+            .map(({
+                publicVersionId,
+                ts,
+                reason,
+                size,
+                storage,
+                bundleFile,
+            }) => ({
+                versionId: publicVersionId,
+                ts,
+                reason,
+                size,
+                storage,
+                ...(bundleFile ? { bundleFile } : {}),
+            }));
     }
 
     function listChatBackupChats() {
-        const root = backupsTreeRoot();
+        const chatIdentities = new Map();
+        for (const root of backupsReadRoots()) {
+            for (const item of collectChatDirectories(root)) {
+                if (item.chaId === null || item.chatId === null) continue;
+                const key = JSON.stringify([item.chaId, item.chatId]);
+                const current = chatIdentities.get(key) ?? {
+                    chaId: item.chaId,
+                    chatId: item.chatId,
+                    chatDirs: [],
+                };
+                current.chatDirs.push(item.chatDir);
+                chatIdentities.set(key, current);
+            }
+        }
         const summaries = [];
-        for (const item of collectChatDirectories(root)) {
-            if (item.chaId === null || item.chatId === null) continue;
+        for (const item of chatIdentities.values()) {
             const versions = listChatBackups(item.chaId, item.chatId);
             if (versions.length === 0) continue;
             summaries.push({
@@ -1532,7 +2420,10 @@ function createChatBackupStore(options) {
                 versionCount: versions.length,
                 newestTs: versions[0].ts,
                 oldestTs: versions[versions.length - 1].ts,
-                totalBytes: treeBytes(item.chatDir),
+                totalBytes: item.chatDirs.reduce(
+                    (total, chatDir) => total + treeBytes(chatDir),
+                    0,
+                ),
             });
         }
         return summaries.sort((a, b) => b.newestTs - a.newestTs
@@ -1642,15 +2533,20 @@ function createChatBackupStore(options) {
         }
     }
 
-    async function readChatBackup(chaId, chatId, versionId) {
-        if (!parseVersionId(versionId)) return null;
-        const chatDir = chatDirectory(chaId, chatId);
-        const rawPath = path.join(chatDir, `${versionId}.bin`);
-        const gzipPath = `${rawPath}.gz`;
+    async function readChatBackupCandidate(candidate) {
+        const {
+            chatDir,
+            sourceVersionId: versionId,
+            sourceStorage,
+            sourceFiles,
+        } = candidate;
         try {
-            if (fs.existsSync(rawPath)) return await fs.promises.readFile(rawPath);
-            if (fs.existsSync(gzipPath)) {
-                return await readGzipVersion(gzipPath, gzipRawSize(gzipPath), {
+            if (sourceStorage === 'loose') {
+                return await fs.promises.readFile(path.join(chatDir, sourceFiles[0]));
+            }
+            if (sourceStorage === 'loose-gzip') {
+                const gzipPath = path.join(chatDir, sourceFiles[0]);
+                return await readGzipVersion(gzipPath, candidate.size, {
                     operation: 'read',
                     versionId,
                     storage: 'legacy-loose-gzip',
@@ -1661,29 +2557,55 @@ function createChatBackupStore(options) {
             return null;
         }
 
-        const scan = scanChatDirectory(chatDir);
-        const frame = scan.frames.find(candidate => candidate.versionId === versionId);
-        if (frame) {
-            try {
-                const end = frame.payloadOffset + frame.compressedBytes - 1;
-                const gunzip = createGunzipReadStream(path.join(chatDir, frame.filename), {
-                    start: frame.payloadOffset,
-                    end,
-                });
-                return await readDecodedToBuffer(gunzip, frame.size, {
-                    operation: 'read',
-                    versionId,
-                    storage: 'frame',
-                    frameFile: frame.filename,
-                }, frame.sha256);
-            } catch (error) {
-                log('warn', `[ChatBackups] Failed to read framed version ${versionId}:`, error);
-                return null;
+        if (sourceStorage === 'frame') {
+            const framePath = path.join(chatDir, sourceFiles[0]);
+            let lastError = null;
+            for (let attempt = 0; attempt < 2; attempt++) {
+                const frame = readFrameHeader(framePath);
+                if (!frame || frame.versionId !== versionId) {
+                    lastError = new Error(`Frame header changed while reading ${versionId}`);
+                    continue;
+                }
+                try {
+                    const verification = await readWithStableFrameIdentity(
+                        framePath,
+                        async () => {
+                            const end = frame.payloadOffset + frame.compressedBytes - 1;
+                            const gunzip = createGunzipReadStream(framePath, {
+                                start: frame.payloadOffset,
+                                end,
+                            });
+                            return readDecodedToBuffer(gunzip, frame.size, {
+                                operation: 'read',
+                                versionId,
+                                storage: 'frame',
+                                frameFile: frame.filename,
+                            }, frame.sha256);
+                        },
+                    );
+                    if (!verification.stable) {
+                        lastError = new Error(`Frame changed while reading ${versionId}`);
+                        continue;
+                    }
+                    rememberVerifiedFrame(
+                        framePath,
+                        frame,
+                        frame,
+                        verification.fingerprint,
+                    );
+                    return verification.value;
+                } catch (error) {
+                    lastError = error;
+                }
             }
+            log('warn', `[ChatBackups] Failed to read framed version ${versionId}:`, lastError);
+            return null;
         }
-        for (const bundle of scan.bundles) {
-            const entry = bundle.entries.find(candidate => candidate.versionId === versionId);
-            if (!entry) continue;
+
+        if (sourceStorage === 'legacy-bundle') {
+            const bundle = readBundleMeta(chatDir, candidate.bundleFile);
+            const entry = bundle?.entries.find(item => item.versionId === versionId);
+            if (!bundle || !entry) return null;
             try {
                 return await readLegacyBundleEntry(chatDir, bundle, entry);
             } catch (error) {
@@ -1692,6 +2614,14 @@ function createChatBackupStore(options) {
             }
         }
         return null;
+    }
+
+    async function readChatBackup(chaId, chatId, versionId) {
+        if (!parseVersionId(versionId)) return null;
+        const selected = resolveChatBackupVersions(chaId, chatId)
+            .find(candidate => candidate.publicVersionId === versionId);
+        if (!selected) return null;
+        return readChatBackupCandidate(selected);
     }
 
     function close() {
@@ -1703,6 +2633,7 @@ function createChatBackupStore(options) {
 
     return {
         captureChatPreImage,
+        normalizeChatBackups,
         reconcileChatBackups,
         listChatBackupChats,
         listChatBackups,

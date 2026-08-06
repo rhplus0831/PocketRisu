@@ -418,8 +418,51 @@ frames without changing logical readers; today's deferred per-row `chats/` archi
 remain deferred, so exports materialize base+log into `database.risudat`.
 
 The default root is `save/chat-backups`; `POCKETRISU_CHAT_BACKUP_DIR` may relocate it.
-Startup migrates the legacy `<server-backup-root>/chat-backups` tree, deduplicating
-byte-identical files and leaving conflicting legacy files in place. Authenticated
+Startup reads the complete validated `save/__chat_backup_path` history before publishing
+the current marker set, then merges every prior root and the legacy
+`<server-backup-root>/chat-backups` tree beneath every validated, marker-retained server
+backup root into the active root. Byte-identical files are deduplicated. A divergent
+same-path or same-version claim, including a complete legacy bundle group, is copied into
+the active root's reserved physical `%2Eroot-history/<source-id>/` namespace. Every copy
+first stages and fsyncs a private, federated copy there, then publishes an independent
+ordinary-destination copy create-only. Root migration never unlinks historical source
+members: a compare-then-unlink sequence cannot be atomic against a peer replacing the
+source path. Protected recovery history is permanent at the decoded-content level.
+Normalization compacts ordinary active-root loose, gzip, and bundle representations only
+after every decoded entry is durable. Historical and protected/conflict roots are
+non-destructive inputs: normalization may derive and validate frames for them, but never
+withdraws their source loose, gzip, bundle, or metadata files. Retained source and derived
+representations are semantically deduplicated at the API boundary. Active reconciliation,
+retention, stale-temp cleanup, and empty-directory pruning exclude the entire reserved
+namespace. Frame publication removes only a temporary file that it created exclusively.
+Federation hides protected history while the ordinary destination has identical decoded
+content, and naturally exposes it as conflict history if that destination is replaced
+later. Newly created directory hierarchy is also fsynced. Interrupted copies,
+destination-creation or replacement races, unavailable historical roots, fsync failures,
+and cross-device copies retain a readable source or recovery copy and are retried on a
+later startup.
+
+Captures and reconciliation always target only the active root. Authenticated list and
+body reads federate the active tree, conflict namespaces, and every retained historical
+root that is currently mounted. Divergent entries that originally shared one version
+ID receive content-derived, safe-integer aliases that remain stable across root ordering,
+restart, temporary root unavailability, representation changes, and in-place writes that
+preserve size and mtime. Startup validates loose, gzip, framed, and
+legacy-bundle representations, and binds each decoded frame hash to an unchanged
+before/after physical-file fingerprint before caching it. It non-destructively
+derives frames for non-active roots before exact decoded duplicates appear once at the API
+boundary. A source replaced while normalization is finalizing remains in place; the next
+bounded pass or startup exposes it as stable conflict history.
+Retention and the global budget do not mutate historical or conflict trees, preventing a
+root copy from evicting its only surviving recovery point. As with the protected
+newest version of each chat, the tree may remain above budget when only protected normal
+or conflict history remains. Copy-only migration initially creates independent ordinary
+and protected copies while leaving the source mounted, so newly migrated content can
+approach three physical copies, plus retained content from earlier root changes and
+non-destructively derived frames. Ordinary active representations may be compacted to
+frames, while historical and protected source representations remain. This storage cost
+is the deliberate tradeoff for race-safe recovery without a filesystem-wide lock.
+Authenticated
 list/version/body routes live under `/api/chat-backups`. **System → Backups** can browse
 deleted identities and import a selected pre-image as a new chat with a fresh ID; it
 never overwrites the source or current chat.
@@ -552,8 +595,11 @@ Server-file archives default to `<app>/backups`. **System → Backups** reads an
 path, rejects the app root and managed code directories, creates/probes the destination,
 and leaves existing archives at the previous path. Chat history defaults to
 `save/chat-backups` and can instead use `POCKETRISU_CHAT_BACKUP_DIR`; a relative value is
-resolved from the application working directory. Chat-root creation/capture is
-best-effort and has no equivalent path-management route or managed-root validation.
+resolved from the application working directory. A root change is an automatic merge:
+new captures use only the new root, while marker-retained prior roots remain read
+fallbacks whenever they are mounted. Startup non-destructively copies their history into
+independent ordinary and protected storage under the new root. Chat-root creation/capture
+is best-effort and has no equivalent path-management route or managed-root validation.
 
 The server records both resolved roots in `save/__backup_path` and
 `save/__chat_backup_path`. Each publication writes and fsyncs a private same-directory

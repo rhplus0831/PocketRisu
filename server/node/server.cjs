@@ -1519,6 +1519,7 @@ async function readPluginStorageState(valueKey, ownerKey) {
 // backup state or race a chat-row overwrite.
 const chatBackupStore = createChatBackupStore({
     getChatBackupsRoot: () => chatBackupsDir,
+    getChatBackupsReadRoots: () => chatBackupReadRoots,
     logger,
     inspectChatRow: (chaId, chatId) => (
         chatRowStore.inspectChatRowForBackup(chaId, chatId)
@@ -3577,6 +3578,8 @@ function isManagedBackupPath(absPath) {
 
 let backupsDir;
 let chatBackupsDir;
+let chatBackupReadRoots = [];
+let serverBackupReadRoots = [];
 // Publish the configured root before creating, sweeping, or otherwise relying
 // on it. If the configured destination is temporarily unavailable and runtime
 // falls back to the default, the marker intentionally remains conservative and
@@ -3640,6 +3643,15 @@ withRecoveryPathInterprocessLockSync('server startup recovery-marker publication
             CHAT_BACKUP_PATH_MARKER,
             quarantinedTargets.__chat_backup_path,
         );
+        // Captures always target chatBackupsDir. Historical marker roots remain
+        // readable until their files have been merged successfully, including
+        // when a conflicting or interrupted migration leaves a source behind.
+        serverBackupReadRoots = [...quarantinedTargets.__backup_path];
+        chatBackupReadRoots = [
+            chatBackupsDir,
+            ...quarantinedTargets.__chat_backup_path,
+            ...serverBackupReadRoots.map(root => path.join(root, CHAT_BACKUP_DIRNAME)),
+        ];
         clearRecoveryPathStartupQuarantineSync(savePath);
     } catch (publicationError) {
         throw new AggregateError(
@@ -3689,11 +3701,16 @@ try {
     // override must not make the authoritative database unavailable.
     logger.error('[ChatBackups] Could not create the chat-backup directory:', error?.message || error);
 }
-migrateLegacyChatBackups({
-    legacyRoot: path.join(path.resolve(backupsDir), CHAT_BACKUP_DIRNAME),
-    destinationRoot: chatBackupsDir,
-    logger,
-});
+for (const historicalRoot of [
+    path.join(path.resolve(backupsDir), CHAT_BACKUP_DIRNAME),
+    ...chatBackupReadRoots,
+]) {
+    migrateLegacyChatBackups({
+        legacyRoot: historicalRoot,
+        destinationRoot: chatBackupsDir,
+        logger,
+    });
+}
 const BACKUP_FILENAME_REGEX = /^risu-backup-\d+\.bin$/;
 const CHAT_BACKUP_VERSION_ID_REGEX = /^v-\d+-\d+-[a-z0-9_-]{1,24}$/;
 
@@ -22434,6 +22451,15 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
         }
         prunePartialExportCancellationTombstones(now);
     }, Math.min(PROXY_STREAM_GC_INTERVAL_MS, PARTIAL_EXPORT_GC_INTERVAL_MS));
+
+    const normalizedChatHistory = await chatBackupStore.normalizeChatBackups();
+    logger.info(
+        `[ChatBackups] Startup history normalization complete: `
+        + `${normalizedChatHistory.rootsVisited} root(s), `
+        + `${normalizedChatHistory.framesCreated} frame(s), `
+        + `${normalizedChatHistory.conflictsPreserved} conflict(s) preserved, `
+        + `${normalizedChatHistory.framesInvalid} invalid frame(s) retained`,
+    );
 
     await startServer();
     startSqliteDurabilityCheckpointScheduler();
