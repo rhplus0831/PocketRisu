@@ -12,6 +12,13 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
+const {
+    RECOVERY_PATH_STATE_HANDOFF_NAME,
+    acquireRecoveryPathStateLockSync,
+    addRecoveryPathMarkerKeepEntriesSync,
+    publishRecoveryPathStateLockHandoffSync,
+    recoveryPathKeepSetHas,
+} = require('../server/node/recoveryPathMarkers.cjs');
 
 const REPO = 'PocketRisu/PocketRisu';
 const ROOT = path.resolve(__dirname, '..');
@@ -20,10 +27,56 @@ const isWin = process.platform === 'win32';
 const REQUIRED_ENTRIES = ['dist', 'server', 'package.json'];
 const REQUIRED_DIST_FILES = ['index.html'];
 const REQUIRED_WIN_ENTRIES = ['bin'];
-const MANAGED_BACKUP_PATH_ROOTS = new Set(['server', 'dist', 'scripts', 'bin', 'node_modules', '.update-tmp']);
 
 function log(msg) { process.stdout.write(`[updater] ${msg}\n`); }
 function error(msg) { process.stderr.write(`[ERROR] ${msg}\n`); process.exit(1); }
+
+function updaterTestFixturePath(name) {
+    if (process.env.NODE_ENV !== 'test') return '';
+    const configured = String(process.env[name] || '').trim();
+    return configured ? path.resolve(configured) : '';
+}
+
+function waitAtUpdaterTestGate(stage) {
+    if (process.env.NODE_ENV !== 'test') return;
+    const configured = String(process.env.POCKETRISU_TEST_UPDATER_GATE_DIR || '').trim();
+    if (!configured) return;
+    const gateDir = path.resolve(configured);
+    let selectedStage;
+    try { selectedStage = fs.readFileSync(path.join(gateDir, 'stage'), 'utf8').trim(); }
+    catch { return; }
+    if (selectedStage !== stage || !fs.existsSync(path.join(gateDir, 'hold'))) return;
+    fs.writeFileSync(path.join(gateDir, 'entered'), stage);
+    const sleeper = new Int32Array(new SharedArrayBuffer(4));
+    while (fs.existsSync(path.join(gateDir, 'hold'))
+        && !fs.existsSync(path.join(gateDir, 'release'))) {
+        Atomics.wait(sleeper, 0, 0, 10);
+    }
+}
+
+function addPortableUpdaterRecoveryKeeps(keep, onKeep) {
+    return addRecoveryPathMarkerKeepEntriesSync({
+        root: ROOT,
+        markerDirectory: path.join(ROOT, 'save'),
+        keep,
+        onKeep,
+        platform: recoveryPathPlatform(),
+    });
+}
+
+function recoveryPathPlatform() {
+    if (process.env.NODE_ENV === 'test'
+        && process.env.POCKETRISU_TEST_RECOVERY_PLATFORM === 'win32') {
+        return 'win32';
+    }
+    return process.platform;
+}
+
+function windowsLockHandoffRequested() {
+    if (isWin) return process.env.POCKETRISU_WINDOWS_UPDATE_FINALIZER === '1';
+    return process.env.NODE_ENV === 'test'
+        && process.env.POCKETRISU_TEST_WINDOWS_LOCK_HANDOFF === 'true';
+}
 
 function getCurrentVersion() {
     const markerPath = path.join(ROOT, '.installed-version');
@@ -35,31 +88,6 @@ function getCurrentVersion() {
         return 'v' + pkg.version;
     } catch {
         return 'unknown';
-    }
-}
-
-// If a filesystem-backed recovery directory lives inside ROOT, the server
-// writes its absolute path under save/ so the updater can preserve the
-// top-level segment instead of wiping it. Outside-ROOT paths need no keep.
-function getCustomDataKeepEntry(markerName, label) {
-    const markerPath = path.join(ROOT, 'save', markerName);
-    try {
-        if (!fs.existsSync(markerPath)) return null;
-        const raw = fs.readFileSync(markerPath, 'utf-8').trim();
-        if (!raw) return null;
-        const abs = path.resolve(raw);
-        const rel = path.relative(ROOT, abs);
-        if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
-        if (!rel) {
-            error(`${label} points at the PocketRisu app root. Move it to a separate folder before updating.`);
-        }
-        const top = rel.split(path.sep)[0];
-        if (MANAGED_BACKUP_PATH_ROOTS.has(top)) {
-            error(`${label} is inside PocketRisu app files (${rel}). Move it to a separate folder such as data/backups before updating.`);
-        }
-        return top || null;
-    } catch {
-        return null;
     }
 }
 
@@ -207,9 +235,20 @@ function areDirectoriesEquivalent(a, b) {
 async function main() {
     const current = getCurrentVersion();
     log(`Current version: ${current}`);
+    // The filesystem lock is shared with every server path transition and
+    // self-update. It stays held through destructive replacement, so a second
+    // process cannot publish/select a root after our preservation snapshot.
+    recoveryPathStateLock = acquireRecoveryPathStateLockSync(path.join(ROOT, 'save'), {
+        purpose: 'standalone portable updater',
+    });
+    // Refuse missing or malformed metadata before doing network work.
+    const recoveryKeepSnapshot = addPortableUpdaterRecoveryKeeps(new Set());
     log('Checking for updates...');
 
-    const data = await httpsGet(`https://api.github.com/repos/${REPO}/releases/latest`);
+    const releaseFixture = updaterTestFixturePath('POCKETRISU_TEST_UPDATER_RELEASE_JSON_PATH');
+    const data = releaseFixture
+        ? fs.readFileSync(releaseFixture)
+        : await httpsGet(`https://api.github.com/repos/${REPO}/releases/latest`);
     const release = JSON.parse(data.toString());
     const latest = release.tag_name;
 
@@ -241,7 +280,9 @@ async function main() {
 
     const downloadPath = path.join(tmpDir, asset.name);
     log(`Downloading ${asset.name}...`);
-    await downloadToFile(asset.browser_download_url, downloadPath);
+    const assetFixture = updaterTestFixturePath('POCKETRISU_TEST_UPDATER_ASSET_PATH');
+    if (assetFixture) fs.copyFileSync(assetFixture, downloadPath);
+    else await downloadToFile(asset.browser_download_url, downloadPath);
 
     log('Extracting...');
     const extractedPath = path.join(tmpDir, 'extracted');
@@ -268,21 +309,16 @@ async function main() {
     log('Replacing files...');
     const keep = new Set(['save', 'backups', '.installed-version', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
     if (isWin || skipBinReplacement) keep.add('bin');
-    for (const [markerName, label] of [
-        ['__backup_path', 'Server-backup directory'],
-        ['__chat_backup_path', 'Chat-backup directory'],
-    ]) {
-        const customKeep = getCustomDataKeepEntry(markerName, label);
-        if (customKeep && !keep.has(customKeep)) {
-            log(`Preserving ${label.toLowerCase()}: ${customKeep}/`);
-            keep.add(customKeep);
-        }
-    }
+    for (const entry of recoveryKeepSnapshot) keep.add(entry);
+    addPortableUpdaterRecoveryKeeps(keep, (entry, label) => {
+        log(`Preserving ${label.toLowerCase()}: ${entry}/`);
+    });
+    waitAtUpdaterTestGate('before-destructive-enumeration');
     const backupDir = path.join(tmpDir, 'backup');
     fs.mkdirSync(backupDir, { recursive: true });
 
     for (const entry of fs.readdirSync(ROOT)) {
-        if (keep.has(entry)) continue;
+        if (recoveryPathKeepSetHas(keep, entry, recoveryPathPlatform())) continue;
         try {
             fs.renameSync(path.join(ROOT, entry), path.join(backupDir, entry));
         } catch (e) {
@@ -366,11 +402,21 @@ async function main() {
     }
 
     // Cleanup
-    if (isWin) {
+    if (isWin || windowsLockHandoffRequested()) {
         log('Leaving .update-tmp for update.bat post-step cleanup.');
     } else {
         try { fs.rmSync(tmpDir, { recursive: true, force: true }); }
         catch { log('Warning: could not remove .update-tmp, you can delete it manually.'); }
+    }
+
+    if (windowsLockHandoffRequested()) {
+        publishRecoveryPathStateLockHandoffSync(
+            path.join(tmpDir, RECOVERY_PATH_STATE_HANDOFF_NAME),
+            path.join(ROOT, 'save'),
+            recoveryPathStateLock.token,
+        );
+        recoveryPathStateLockHandedOff = true;
+        log('Handed recovery-path exclusion to update.bat finalization.');
     }
 
     log(`Update complete! ${current} → ${latest}`);
@@ -382,4 +428,18 @@ async function main() {
     }
 }
 
-main().catch((e) => error(e.message));
+let recoveryPathStateLock = null;
+let recoveryPathStateLockHandedOff = false;
+function releaseRecoveryPathStateLock() {
+    const activeLock = recoveryPathStateLock;
+    recoveryPathStateLock = null;
+    if (recoveryPathStateLockHandedOff) return;
+    if (activeLock) activeLock.release();
+}
+process.once('exit', () => {
+    try { releaseRecoveryPathStateLock(); } catch {}
+});
+
+main()
+    .finally(() => releaseRecoveryPathStateLock())
+    .catch((e) => error(e.message));

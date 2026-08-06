@@ -319,6 +319,21 @@ const {
     resolveChatBackupMaxUncompressedBytes,
     isDestructiveBackupReason,
 } = require('./chatBackups.cjs');
+const {
+    RECOVERY_PATH_STARTUP_QUARANTINE_NAME,
+    RECOVERY_PATH_STATE_HANDOFF_NAME,
+    acquireRecoveryPathStateLockSync,
+    addRecoveryPathMarkerKeepEntriesSync,
+    canonicalizePathWithExistingPrefixSync,
+    clearRecoveryPathStartupQuarantineSync,
+    publishRecoveryPathMarkerSetSync,
+    publishRecoveryPathStartupQuarantineSync,
+    publishRecoveryPathStateLockHandoffSync,
+    readRecoveryPathMarkerTargetsSync,
+    readRecoveryPathStartupQuarantineSync,
+    recoveryPathKeepEntries,
+    recoveryPathKeepSetHas,
+} = require('./recoveryPathMarkers.cjs');
 const { spawn, execSync } = require('child_process');
 const os = require('os');
 const { Readable, Transform } = require('stream');
@@ -3378,12 +3393,46 @@ function sweepStalePluginTransitionStages() {
 // stay where they were); only future backups land at the new path.
 const DEFAULT_BACKUPS_DIR = path.join(process.cwd(), "backups");
 const BACKUP_PATH_CONFIG_KEY = 'config/server-backup-path';
-const MANAGED_BACKUP_PATH_ROOTS = new Set(['server', 'dist', 'scripts', 'bin', 'node_modules', '.update-tmp']);
 // Plaintext marker the updater reads to preserve a custom in-tree backup dir
 // during in-place updates. KV lives inside the SQLite DB so the updater (which
 // runs without npm deps) can't read it; this marker bridges that gap.
 const BACKUP_PATH_MARKER = path.join(savePath, '__backup_path');
 const CHAT_BACKUP_PATH_MARKER = path.join(savePath, '__chat_backup_path');
+let selfUpdateInProgress = false;
+let recoveryPathStateLockTail = Promise.resolve();
+
+function withLocalRecoveryPathStateLock(operation) {
+    const predecessor = recoveryPathStateLockTail;
+    let release;
+    recoveryPathStateLockTail = new Promise(resolve => { release = resolve; });
+    return predecessor.then(operation).finally(() => release());
+}
+
+function withRecoveryPathStateLock(operation) {
+    return withLocalRecoveryPathStateLock(async () => {
+        const interprocessLock = acquireRecoveryPathStateLockSync(savePath, {
+            purpose: 'server backup-path transition',
+        });
+        try {
+            return await operation();
+        } finally {
+            interprocessLock.release();
+        }
+    });
+}
+
+function withRecoveryPathInterprocessLockSync(purpose, operation) {
+    const interprocessLock = acquireRecoveryPathStateLockSync(savePath, { purpose });
+    let releaseLock = true;
+    try {
+        return operation();
+    } catch (error) {
+        if (error?.retainRecoveryPathStateLock === true) releaseLock = false;
+        throw error;
+    } finally {
+        if (releaseLock) interprocessLock.release();
+    }
+}
 
 function readBackupsDirConfig() {
     try {
@@ -3394,56 +3443,226 @@ function readBackupsDirConfig() {
     } catch { return DEFAULT_BACKUPS_DIR; }
 }
 
-function writeBackupPathMarker(absPath) {
-    try {
-        require('fs').writeFileSync(BACKUP_PATH_MARKER, path.resolve(absPath), 'utf-8');
-    } catch {
-        // Best-effort; marker absence only means the updater falls back to the
-        // hard-coded `backups` keep — same as before this feature existed.
+function publishConfiguredUpdaterPathMarker(markerPath, absPath) {
+    let existingTargets = [];
+    try { existingTargets = readRecoveryPathMarkerTargetsSync(markerPath); }
+    catch {
+        // Missing/malformed legacy metadata is repaired from the authoritative
+        // configured root. Once a valid set exists, later publications retain
+        // it so archives deliberately left at prior roots remain protected.
+    }
+    return publishUpdaterPathMarkerSet(markerPath, [...existingTargets, absPath]);
+}
+
+function publishUpdaterPathMarkerSet(markerPath, targetPaths) {
+    const identityTargets = [];
+    for (const targetPath of targetPaths) {
+        const absolute = path.resolve(targetPath);
+        identityTargets.push(absolute);
+        try {
+            if (process.env.NODE_ENV === 'test') {
+                const injected = JSON.parse(String(
+                    process.env.POCKETRISU_TEST_RECOVERY_CANONICALIZE_FAIL_PATHS ?? '[]',
+                ));
+                if (Array.isArray(injected) && injected.includes(absolute)) {
+                    const error = new Error(`Injected inaccessible recovery path: ${absolute}`);
+                    error.code = 'EACCES';
+                    throw error;
+                }
+            }
+            identityTargets.push(canonicalizePathWithExistingPrefixSync(absolute));
+        } catch (error) {
+            // Marker publication is conservative and may retain offline UNC,
+            // removable-drive, or permission-denied historical roots. Preserve
+            // their authoritative lexical identities so startup can continue;
+            // updater consumption still canonicalizes every entry and refuses
+            // destructive replacement if an identity remains ambiguous.
+            logger.warn(
+                `[RecoveryPath] Could not canonicalize ${absolute} while publishing preservation metadata; retaining its lexical identity:`,
+                error?.message || error,
+            );
+        }
+    }
+    return publishRecoveryPathMarkerSetSync(markerPath, identityTargets, {
+        onStage: recoveryPathPublicationFaultHandler(markerPath),
+    });
+}
+
+function recoveryPathPublicationFaultHandler(targetPath) {
+    return (stage) => {
+        if (process.env.NODE_ENV !== 'test') return;
+        const faultDirectory = String(
+            process.env.POCKETRISU_TEST_RECOVERY_PATH_MARKER_FAULT_DIR ?? '',
+        ).trim();
+        if (!faultDirectory) return;
+        const faultPath = path.join(
+            path.resolve(faultDirectory),
+            `${path.basename(targetPath)}.${stage}`,
+        );
+        if (existsSync(faultPath)) {
+            const kind = path.basename(targetPath) === RECOVERY_PATH_STARTUP_QUARANTINE_NAME
+                ? 'startup quarantine'
+                : 'marker';
+            throw new Error(`Injected recovery-path ${kind} publication failure at ${stage}`);
+        }
+    };
+}
+
+async function waitAtRecoveryPathStateTestGate(stage) {
+    if (process.env.NODE_ENV !== 'test') return;
+    const configured = String(
+        process.env.POCKETRISU_TEST_RECOVERY_PATH_STATE_GATE_DIR ?? '',
+    ).trim();
+    if (!configured) return;
+    const gateDir = path.resolve(configured);
+    let selectedStage;
+    try { selectedStage = (await fs.readFile(path.join(gateDir, 'stage'), 'utf8')).trim(); }
+    catch { return; }
+    if (selectedStage !== stage || !existsSync(path.join(gateDir, 'hold'))) return;
+    await fs.mkdir(gateDir, { recursive: true });
+    await fs.writeFile(path.join(gateDir, 'entered'), stage, 'utf8');
+    const releasePath = path.join(gateDir, 'release');
+    while (existsSync(path.join(gateDir, 'hold')) && !existsSync(releasePath)) {
+        await new Promise(resolve => setTimeout(resolve, 10));
     }
 }
 
-function writeChatBackupPathMarker(absPath) {
-    try {
-        require('fs').writeFileSync(CHAT_BACKUP_PATH_MARKER, path.resolve(absPath), 'utf-8');
-    } catch {
-        // Best-effort. The default is already under save/, which every updater
-        // preserves; this marker protects an in-tree operator override.
+function waitAtRecoveryPathStartupTestGateSync(stage) {
+    if (process.env.NODE_ENV !== 'test') return;
+    const configured = String(
+        process.env.POCKETRISU_TEST_RECOVERY_PATH_STARTUP_GATE_DIR ?? '',
+    ).trim();
+    if (!configured) return;
+    const gateDir = path.resolve(configured);
+    let selectedStage;
+    try { selectedStage = readFileSync(path.join(gateDir, 'stage'), 'utf8').trim(); }
+    catch { return; }
+    if (selectedStage !== stage || !existsSync(path.join(gateDir, 'hold'))) return;
+    writeFileSync(path.join(gateDir, 'entered'), stage, 'utf8');
+    const sleeper = new Int32Array(new SharedArrayBuffer(4));
+    while (existsSync(path.join(gateDir, 'hold'))
+        && !existsSync(path.join(gateDir, 'release'))) {
+        Atomics.wait(sleeper, 0, 0, 10);
     }
 }
 
-function updaterKeepEntryFromMarker(markerPath, label) {
-    try {
-        if (!existsSync(markerPath)) return null;
-        const raw = readFileSync(markerPath, 'utf-8').trim();
-        if (!raw) return null;
-        const absolute = path.resolve(raw);
-        const relative = path.relative(process.cwd(), absolute);
-        if (relative.startsWith('..') || path.isAbsolute(relative)) return null;
-        if (!relative) {
-            throw new Error(`${label} points at the PocketRisu app root; relocate it before updating.`);
-        }
-        const top = relative.split(path.sep)[0];
-        if (MANAGED_BACKUP_PATH_ROOTS.has(top)) {
-            throw new Error(`${label} is inside managed app files (${relative}); relocate it before updating.`);
-        }
-        return top || null;
-    } catch (error) {
-        if (error?.code === 'ENOENT') return null;
-        throw error;
+function addUpdaterRecoveryKeeps(keep, onKeep) {
+    return addRecoveryPathMarkerKeepEntriesSync({
+        root: process.cwd(),
+        markerDirectory: savePath,
+        keep,
+        onKeep,
+        platform: recoveryPathPlatform(),
+    });
+}
+
+function recoveryPathPlatform() {
+    if (process.env.NODE_ENV === 'test'
+        && process.env.POCKETRISU_TEST_RECOVERY_PLATFORM === 'win32') {
+        return 'win32';
     }
+    return process.platform;
 }
 
 function isManagedBackupPath(absPath) {
-    const rel = path.relative(process.cwd(), absPath);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) return false;
-    if (!rel) return true;
-    return MANAGED_BACKUP_PATH_ROOTS.has(rel.split(path.sep)[0]);
+    try {
+        recoveryPathKeepEntries(process.cwd(), absPath, 'Backup path', {
+            platform: recoveryPathPlatform(),
+        });
+        return false;
+    } catch {
+        return true;
+    }
 }
 
-let backupsDir = readBackupsDirConfig();
+let backupsDir;
+let chatBackupsDir;
+// Publish the configured root before creating, sweeping, or otherwise relying
+// on it. If the configured destination is temporarily unavailable and runtime
+// falls back to the default, the marker intentionally remains conservative and
+// still preserves the configured in-tree root.
+// Backup and chat metadata share one admission: no updater or second server can
+// observe the old split-publication window between these durable writes.
+waitAtRecoveryPathStartupTestGateSync('before-startup-lock-acquire');
+withRecoveryPathInterprocessLockSync('server startup recovery-marker publication', () => {
+    // Select the authoritative roots only after acquiring the same admission
+    // used by PUT transitions. Carry these exact values into marker publication
+    // and all subsequent startup work.
+    backupsDir = readBackupsDirConfig();
+    chatBackupsDir = resolveChatBackupDir({ savePath });
+    let previousQuarantine;
+    try {
+        previousQuarantine = readRecoveryPathStartupQuarantineSync(savePath);
+    } catch (error) {
+        error.retainRecoveryPathStateLock = true;
+        throw error;
+    }
+    const plannedTargets = {};
+    for (const [markerName, markerPath, authoritativeRoot] of [
+        ['__backup_path', BACKUP_PATH_MARKER, backupsDir],
+        ['__chat_backup_path', CHAT_BACKUP_PATH_MARKER, chatBackupsDir],
+    ]) {
+        const historicalTargets = previousQuarantine?.markers?.[markerName] ?? [];
+        try {
+            historicalTargets.push(...readRecoveryPathMarkerTargetsSync(markerPath));
+        } catch {
+            // A valid quarantine is authoritative recovery history after a
+            // partial startup. Without one, legacy missing/malformed metadata
+            // is repaired conservatively from the current configured root.
+        }
+        plannedTargets[markerName] = [...historicalTargets, authoritativeRoot];
+    }
+    let quarantinedTargets;
+    try {
+        quarantinedTargets = publishRecoveryPathStartupQuarantineSync(
+            savePath,
+            plannedTargets,
+            {
+                onStage: recoveryPathPublicationFaultHandler(
+                    path.join(savePath, RECOVERY_PATH_STARTUP_QUARANTINE_NAME),
+                ),
+            },
+        );
+    } catch (error) {
+        // No marker is changed before this record is durable. If its atomic
+        // publication is uncertain, retain the exact token-owned lock rather
+        // than allowing an updater to guess whether fail-closed state exists.
+        error.retainRecoveryPathStateLock = true;
+        throw error;
+    }
+    try {
+        publishUpdaterPathMarkerSet(
+            BACKUP_PATH_MARKER,
+            quarantinedTargets.__backup_path,
+        );
+        waitAtRecoveryPathStartupTestGateSync('after-backup-before-chat-marker');
+        publishUpdaterPathMarkerSet(
+            CHAT_BACKUP_PATH_MARKER,
+            quarantinedTargets.__chat_backup_path,
+        );
+        clearRecoveryPathStartupQuarantineSync(savePath);
+    } catch (publicationError) {
+        throw new AggregateError(
+            [publicationError],
+            'Startup recovery-marker publication failed; durable recovery history remains quarantined fail-closed',
+        );
+    }
+});
 if(!HUB_HOSTING_MODE && !existsSync(backupsDir)){
-    try { mkdirSync(backupsDir, { recursive: true }); }
+    try {
+        if (process.env.NODE_ENV === 'test') {
+            const injectedUnavailable = JSON.parse(String(
+                process.env.POCKETRISU_TEST_RECOVERY_UNAVAILABLE_PATHS ?? '[]',
+            ));
+            if (Array.isArray(injectedUnavailable)
+                && injectedUnavailable.includes(path.resolve(backupsDir))) {
+                const error = new Error(`Injected unavailable backup root: ${backupsDir}`);
+                error.code = 'EACCES';
+                throw error;
+            }
+        }
+        mkdirSync(backupsDir, { recursive: true });
+    }
     catch { backupsDir = DEFAULT_BACKUPS_DIR; mkdirSync(backupsDir, { recursive: true }); }
 }
 function sweepServerBackupTemps(directory) {
@@ -3463,9 +3682,6 @@ function sweepServerBackupTemps(directory) {
     }
 }
 sweepServerBackupTemps(backupsDir);
-writeBackupPathMarker(backupsDir);
-const chatBackupsDir = resolveChatBackupDir({ savePath });
-writeChatBackupPathMarker(chatBackupsDir);
 try {
     mkdirSync(chatBackupsDir, { recursive: true });
 } catch (error) {
@@ -3928,7 +4144,11 @@ function getSelfUpdateAssetInfo(version) {
     const arch = process.arch; // x64, arm64
     const ext = process.platform === 'win32' ? 'zip' : 'tar.gz';
     const filename = `PocketRisu-v${version}-${platformName}-${arch}.${ext}`;
-    const url = `https://github.com/${GITHUB_REPO}/releases/download/v${version}/${filename}`;
+    const testUrl = process.env.NODE_ENV === 'test'
+        ? String(process.env.POCKETRISU_TEST_SELF_UPDATE_ASSET_URL ?? '').trim()
+        : '';
+    const url = testUrl
+        || `https://github.com/${GITHUB_REPO}/releases/download/v${version}/${filename}`;
     return { platformName, arch, ext, filename, url };
 }
 
@@ -21281,42 +21501,83 @@ app.put('/api/backup/server/path', async (req, res, next) => {
     if (!checkActiveSession(req, res)) return;
     if (HUB_HOSTING_MODE) return res.status(403).json({ error: 'Server backups are disabled on this instance' });
     try {
-        const next = typeof req.body?.path === 'string' ? req.body.path.trim() : '';
-        if (!next) {
-            return res.status(400).json({ error: 'Path required' });
-        }
-        const resolved = path.resolve(next);
-        if (isManagedBackupPath(resolved)) {
-            return res.status(400).json({
-                error: 'Backup path cannot be inside PocketRisu app files. Choose a separate folder such as data/backups.',
-            });
-        }
-        // Ensure parent exists / target is writable. Create the dir if missing.
-        try {
-            if (!existsSync(resolved)) {
-                mkdirSync(resolved, { recursive: true });
+        const transition = await withRecoveryPathStateLock(async () => {
+            if (selfUpdateInProgress) {
+                return {
+                    status: 409,
+                    body: { error: 'Backup path cannot change while a self-update is in progress' },
+                };
             }
-            // Probe writability with a tmpfile.
-            const probe = path.join(resolved, `.risu-write-probe-${Date.now()}`);
-            require('fs').writeFileSync(probe, '');
-            require('fs').unlinkSync(probe);
-        } catch (e) {
-            return res.status(400).json({ error: 'Path is not writable: ' + (e?.message || String(e)) });
-        }
-        const previous = backupsDir;
-        await queueStorageMutation(() => {
-            kvSet(BACKUP_PATH_CONFIG_KEY, Buffer.from(resolved, 'utf-8'));
+            const nextPath = typeof req.body?.path === 'string' ? req.body.path.trim() : '';
+            if (!nextPath) return { status: 400, body: { error: 'Path required' } };
+            const resolved = path.resolve(nextPath);
+            if (isManagedBackupPath(resolved)) {
+                return {
+                    status: 400,
+                    body: {
+                        error: 'Backup path cannot be inside PocketRisu app files. Choose a separate folder such as data/backups.',
+                    },
+                };
+            }
+            // Admission, writability probing, marker/KV publication, and live
+            // state movement share the same lock as self-update preservation.
+            try {
+                if (!existsSync(resolved)) mkdirSync(resolved, { recursive: true });
+                const probe = path.join(resolved, `.risu-write-probe-${Date.now()}`);
+                require('fs').writeFileSync(probe, '');
+                require('fs').unlinkSync(probe);
+            } catch (error) {
+                return {
+                    status: 400,
+                    body: { error: 'Path is not writable: ' + (error?.message || String(error)) },
+                };
+            }
+            const previous = backupsDir;
+            const previousMarkerTargets = readRecoveryPathMarkerTargetsSync(BACKUP_PATH_MARKER);
+            const transitionTargets = [
+                ...previousMarkerTargets,
+                path.resolve(previous),
+                resolved,
+            ];
+            // The durable transition record is a conservative union: until KV
+            // and live state both move, every updater preserves both old and new
+            // roots. A crash at either test boundary therefore cannot strand the
+            // root still used by the running or most recently durable config.
+            publishUpdaterPathMarkerSet(BACKUP_PATH_MARKER, transitionTargets);
+            await waitAtRecoveryPathStateTestGate('after-transition-marker');
+            try {
+                await queueStorageMutation(() => {
+                    kvSet(BACKUP_PATH_CONFIG_KEY, Buffer.from(resolved, 'utf-8'));
+                });
+            } catch (configurationError) {
+                try {
+                    publishUpdaterPathMarkerSet(BACKUP_PATH_MARKER, previousMarkerTargets);
+                } catch (markerRollbackError) {
+                    throw new AggregateError(
+                        [configurationError, markerRollbackError],
+                        'Backup-path configuration failed; preservation metadata remains conservative or fail-closed',
+                    );
+                }
+                throw configurationError;
+            }
+            await waitAtRecoveryPathStateTestGate('after-kv-before-live');
+            backupsDir = resolved;
+            sweepServerBackupTemps(backupsDir);
+            return {
+                status: 200,
+                body: {
+                    path: backupsDir,
+                    previous,
+                    default: DEFAULT_BACKUPS_DIR,
+                    isDefault: backupsDir === DEFAULT_BACKUPS_DIR,
+                },
+            };
         });
-        backupsDir = resolved;
-        sweepServerBackupTemps(backupsDir);
-        writeBackupPathMarker(resolved);
-        res.json({
-            path: backupsDir,
-            previous,
-            default: DEFAULT_BACKUPS_DIR,
-            isDefault: backupsDir === DEFAULT_BACKUPS_DIR,
-        });
+        res.status(transition.status).json(transition.body);
     } catch (err) {
+        if (err?.code === 'RECOVERY_PATH_STATE_LOCKED') {
+            return res.status(409).json({ error: err.message });
+        }
         if (isImportInProgressError(err)) return sendImportBusy(res);
         next(err);
     }
@@ -21514,8 +21775,6 @@ app.get('/api/update-check', async (req, res) => {
 });
 
 // ── Self-update endpoint (portable only) ─────────────────────────────────────
-let selfUpdateInProgress = false;
-
 app.post('/api/self-update', async (req, res) => {
     if (!await checkAuth(req, res)) return;
 
@@ -21523,11 +21782,51 @@ app.post('/api/self-update', async (req, res) => {
         res.status(400).json({ error: 'Self-update is only available for portable deployments' });
         return;
     }
-    if (selfUpdateInProgress) {
-        res.status(409).json({ error: 'Update already in progress' });
+    let recoveryKeepSnapshot;
+    let recoveryPathInterprocessLock = null;
+    let recoveryPathInterprocessLockHandedOff = false;
+    const windowsPostUpdateFinalizer = process.platform === 'win32'
+        || (process.env.NODE_ENV === 'test'
+            && process.env.POCKETRISU_TEST_SELF_UPDATE_WINDOWS_FINALIZER === 'true');
+    const releaseSelfUpdateAdmission = () => {
+        selfUpdateInProgress = false;
+        const activeLock = recoveryPathInterprocessLock;
+        recoveryPathInterprocessLock = null;
+        if (recoveryPathInterprocessLockHandedOff) return;
+        if (activeLock) {
+            try { activeLock.release(); }
+            catch (error) {
+                // A failed release leaves the exact lock fail-closed for the
+                // next operation; do not hide the update's primary outcome.
+                logger.error('[RecoveryPath] Could not release self-update state lock:', error);
+            }
+        }
+    };
+    try {
+        const admission = await withLocalRecoveryPathStateLock(async () => {
+            if (selfUpdateInProgress) return { updateConflict: true };
+            recoveryPathInterprocessLock = acquireRecoveryPathStateLockSync(savePath, {
+                purpose: 'server self-update',
+            });
+            try {
+                const snapshot = addUpdaterRecoveryKeeps(new Set());
+                selfUpdateInProgress = true;
+                await waitAtRecoveryPathStateTestGate('self-update-admitted');
+                return { updateConflict: false, snapshot };
+            } catch (error) {
+                releaseSelfUpdateAdmission();
+                throw error;
+            }
+        });
+        if (admission.updateConflict) {
+            res.status(409).json({ error: 'Update already in progress' });
+            return;
+        }
+        recoveryKeepSnapshot = admission.snapshot;
+    } catch (error) {
+        res.status(409).json({ error: error?.message || 'Recovery metadata is unavailable' });
         return;
     }
-    selfUpdateInProgress = true;
 
     // Track client disconnect — used to abort download, but NOT to release the lock.
     // The lock stays held until the update fully completes or fails, preventing
@@ -21556,7 +21855,7 @@ app.post('/api/self-update', async (req, res) => {
         if (!updateInfo?.hasUpdate) {
             send('done', 100, 'Already up to date.');
             res.end();
-            selfUpdateInProgress = false;
+            releaseSelfUpdateAdmission();
             return;
         }
 
@@ -21637,7 +21936,7 @@ app.post('/api/self-update', async (req, res) => {
             try { await fs.access(path.join(sourceDir, 'dist', file)); }
             catch { throw new Error(`Downloaded package is missing dist/${file}`); }
         }
-        if (process.platform === 'win32') {
+        if (windowsPostUpdateFinalizer) {
             try { await fs.access(path.join(sourceDir, 'bin')); }
             catch { throw new Error('Downloaded Windows package is missing bin/'); }
         }
@@ -21645,7 +21944,7 @@ app.post('/api/self-update', async (req, res) => {
         // 5. Replace files (follows updater.cjs Phase 1-4 pattern)
         send('replacing', null, 'Replacing files...');
         const appDir = process.cwd();
-        const isWin = process.platform === 'win32';
+        const isWin = windowsPostUpdateFinalizer;
         const updateTmp = path.join(appDir, '.update-tmp');
 
         // Restore from a previous interrupted update if leftover exists
@@ -21670,13 +21969,10 @@ app.post('/api/self-update', async (req, res) => {
         // Keep set — matches updater.cjs + user data/config that must survive updates
         const keep = new Set(['save', 'backups', '.installed-version', '.update-tmp', 'scripts', '.env', '.npmrc', '.portable']);
         if (isWin) keep.add('bin');
-        for (const [markerPath, label] of [
-            [BACKUP_PATH_MARKER, 'Server-backup directory'],
-            [CHAT_BACKUP_PATH_MARKER, 'Chat-backup directory'],
-        ]) {
-            const customKeep = updaterKeepEntryFromMarker(markerPath, label);
-            if (customKeep) keep.add(customKeep);
-        }
+        for (const entry of recoveryKeepSnapshot) keep.add(entry);
+        addUpdaterRecoveryKeeps(keep, (entry, label) => {
+            logger.info(`[Update] Preserving ${label.toLowerCase()}: ${entry}/`);
+        });
 
         // Phase 1: move old files to backup — rollback immediately on any failure
         const backupDir = path.join(updateTmp, 'backup');
@@ -21684,7 +21980,7 @@ app.post('/api/self-update', async (req, res) => {
 
         const oldEntries = await fs.readdir(appDir);
         for (const e of oldEntries) {
-            if (keep.has(e)) continue;
+            if (recoveryPathKeepSetHas(keep, e, recoveryPathPlatform())) continue;
             try {
                 await fs.rename(path.join(appDir, e), path.join(backupDir, e));
             } catch (backupErr) {
@@ -21760,6 +22056,13 @@ app.post('/api/self-update', async (req, res) => {
         send('restarting', 100, 'Update complete. Restarting...');
         res.end();
 
+        if (process.env.NODE_ENV === 'test'
+            && process.env.POCKETRISU_TEST_SELF_UPDATE_SKIP_RESTART === 'true'
+            && !windowsPostUpdateFinalizer) {
+            releaseSelfUpdateAdmission();
+            return;
+        }
+
         // 6. Flush DB and restart
         setTimeout(async () => {
             try {
@@ -21779,11 +22082,59 @@ app.post('/api/self-update', async (req, res) => {
             if (isWin) {
                 // Windows: use a .bat script to apply bin/, finalize version, and restart.
                 // A bat script can replace bin/node.exe after the Node process exits,
-                // avoiding file-lock issues that a Node child process would hit.
+                // avoiding file-lock issues that a Node child process would hit. The
+                // token handoff keeps recovery-path exclusion continuously owned until
+                // xcopy/version finalization has completed.
                 const batScript = path.join(os.tmpdir(), `risu-restart-${Date.now()}.bat`);
                 const utmp = path.join(appDir, '.update-tmp');
                 const binDir = path.join(appDir, 'bin');
                 const binBackup = path.join(utmp, 'old-bin');
+                const handoffPath = path.join(utmp, RECOVERY_PATH_STATE_HANDOFF_NAME);
+                const finalizerScript = path.join(
+                    appDir,
+                    'scripts',
+                    'recoveryPathLockFinalizer.cjs',
+                );
+                publishRecoveryPathStateLockHandoffSync(
+                    handoffPath,
+                    savePath,
+                    recoveryPathInterprocessLock.token,
+                );
+
+                if (process.env.NODE_ENV === 'test'
+                    && process.env.POCKETRISU_TEST_SELF_UPDATE_WINDOWS_FINALIZER === 'true') {
+                    // Exercise the same post-parent ordering on non-Windows CI:
+                    // bin copy and version finalize precede token-verified release.
+                    await fs.cp(path.join(utmp, 'new-bin'), binDir, {
+                        recursive: true,
+                        force: true,
+                    });
+                    await fs.copyFile(
+                        path.join(utmp, 'latest-version'),
+                        path.join(appDir, '.installed-version'),
+                    );
+                    const finalizer = spawn(process.execPath, [finalizerScript, handoffPath], {
+                        cwd: appDir,
+                        env: { ...process.env },
+                        stdio: ['ignore', 'ignore', 'pipe'],
+                    });
+                    recoveryPathInterprocessLockHandedOff = true;
+                    let finalizerError = '';
+                    finalizer.stderr?.on('data', chunk => { finalizerError += chunk.toString(); });
+                    const finalizerExit = await new Promise((resolve, reject) => {
+                        finalizer.once('error', reject);
+                        finalizer.once('exit', resolve);
+                    });
+                    if (finalizerExit !== 0) {
+                        throw new Error(
+                            `Windows recovery-lock finalizer failed (${finalizerExit}): ${finalizerError}`,
+                        );
+                    }
+                    await fs.rm(utmp, { recursive: true, force: true });
+                    releaseSelfUpdateAdmission();
+                    return;
+                }
+
                 const batLines = [
                     '@echo off',
                     'timeout /t 3 /nobreak >nul',
@@ -21799,13 +22150,16 @@ app.post('/api/self-update', async (req, res) => {
                     `      xcopy /E /I /Y "${binBackup}\\*" "${binDir}\\" >nul`,
                     `    )`,
                     `    echo [Update] bin/ restored. Staged files kept for retry.`,
-                    `    goto start`,
+                    `    goto finalize`,
                     `  )`,
                     `)`,
                     // Finalize version marker only after successful bin/ copy
                     `if exist "${path.join(utmp, 'latest-version')}" (`,
                     `  copy /Y "${path.join(utmp, 'latest-version')}" "${path.join(appDir, '.installed-version')}" >nul`,
                     `)`,
+                    ':finalize',
+                    `"${path.join(binDir, 'node.exe')}" "${finalizerScript}" "${handoffPath}"`,
+                    `if errorlevel 1 exit /b 1`,
                     // Cleanup .update-tmp (includes old-bin backup)
                     `rmdir /s /q "${utmp}" 2>nul`,
                     ':start',
@@ -21816,6 +22170,7 @@ app.post('/api/self-update', async (req, res) => {
                 ];
                 writeFileSync(batScript, batLines.join('\r\n'));
                 spawn('cmd.exe', ['/c', batScript], { detached: true, stdio: 'ignore' }).unref();
+                recoveryPathInterprocessLockHandedOff = true;
             } else {
                 // Unix: Node restart helper with port-check to avoid clashing with process managers
                 const restartScript = path.join(os.tmpdir(), `risu-restart-${Date.now()}.cjs`);
@@ -21840,10 +22195,11 @@ app.post('/api/self-update', async (req, res) => {
                 ].join('\n'));
                 spawn(process.execPath, [restartScript], { detached: true, stdio: 'ignore' }).unref();
             }
+            releaseSelfUpdateAdmission();
             process.exit(0);
             } catch (restartErr) {
                 logger.error('[Update] Restart failed:', restartErr);
-                selfUpdateInProgress = false;
+                releaseSelfUpdateAdmission();
             }
         }, 500);
 
@@ -21851,7 +22207,7 @@ app.post('/api/self-update', async (req, res) => {
         logger.error('[Update] Self-update failed:', e);
         send('error', null, `Update failed: ${e.message}`);
         res.end();
-        selfUpdateInProgress = false;
+        releaseSelfUpdateAdmission();
         if (tmpDir) fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
 });

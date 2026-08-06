@@ -10,7 +10,10 @@
 import { describe, test, expect, afterAll } from 'vitest'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
-import { link, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { spawn, spawnSync } from 'node:child_process'
+import { createServer as createHttpServer } from 'node:http'
+import { access, chmod, copyFile, link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import Database from 'better-sqlite3'
 import { zipSync } from 'fflate'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
@@ -46,8 +49,151 @@ function readKvValue(cwd: string, key: string): Buffer | null {
   }
 }
 
+function writeKvValue(cwd: string, key: string, value: Buffer): void {
+  const db = new Database(path.join(cwd, 'save', 'risuai.db'))
+  try {
+    db.prepare(`
+      INSERT INTO kv (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(key, value)
+  } finally {
+    db.close()
+  }
+}
+
 async function expectMissing(filePath: string): Promise<void> {
   await expect(readFile(filePath)).rejects.toMatchObject({ code: 'ENOENT' })
+}
+
+async function waitForPath(filePath: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      await access(filePath)
+      return
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Timed out waiting for ${filePath}`)
+}
+
+async function readMarkerTargets(markerPath: string): Promise<string[]> {
+  const raw = (await readFile(markerPath, 'utf8')).trim()
+  if (!raw.startsWith('{')) return [raw]
+  const parsed = JSON.parse(raw) as { version: number; paths: string[] }
+  expect(parsed.version).toBe(1)
+  return parsed.paths
+}
+
+async function releaseGate(gateDir: string): Promise<void> {
+  await rm(path.join(gateDir, 'hold'), { force: true })
+  await writeFile(path.join(gateDir, 'release'), 'release')
+}
+
+async function configureCustomRecoveryHistory(
+  srv: ServerHandle,
+  client: Awaited<ReturnType<typeof createClient>>,
+): Promise<{ defaultRoot: string; historicalRoot: string; currentRoot: string }> {
+  const defaultRoot = path.join(srv.cwd, 'backups')
+  const historicalRoot = path.join(srv.cwd, 'historical-recovery', 'backups')
+  const currentRoot = path.join(srv.cwd, 'current-recovery', 'backups')
+  for (const nextRoot of [historicalRoot, currentRoot]) {
+    const changed = await client.fetch('/api/backup/server/path', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: nextRoot }),
+    })
+    expect(changed.status).toBe(200)
+  }
+  expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+    .toEqual([defaultRoot, historicalRoot, currentRoot])
+  return { defaultRoot, historicalRoot, currentRoot }
+}
+
+async function createPortableUpdaterSuccessFixture(): Promise<{
+  root: string
+  releaseJson: string
+  asset: string
+}> {
+  const root = await mkdtemp(path.join(tmpdir(), 'pocketrisu-portable-success-fixture-'))
+  const releaseRoot = path.join(root, 'release')
+  const releaseDir = path.join(releaseRoot, 'PocketRisu-v-test')
+  await mkdir(path.join(releaseDir, 'dist'), { recursive: true })
+  await mkdir(path.join(releaseDir, 'server'), { recursive: true })
+  await writeFile(path.join(releaseDir, 'dist', 'index.html'), '<!doctype html>')
+  await writeFile(path.join(releaseDir, 'server', 'new-server.txt'), 'new server')
+  await writeFile(path.join(releaseDir, 'package.json'), '{"version":"2.0.0"}\n')
+  await writeFile(path.join(releaseDir, 'new-release.txt'), 'new release')
+  const platformName = process.platform === 'darwin' ? 'macos' : process.platform
+  const suffix = `${platformName}-${process.arch === 'arm64' ? 'arm64' : 'x64'}`
+  const assetName = `PocketRisu-v-test-${suffix}.tar.gz`
+  const asset = path.join(root, assetName)
+  const tarResult = spawnSync(
+    'tar',
+    ['-czf', asset, '-C', releaseRoot, path.basename(releaseDir)],
+    { encoding: 'utf8' },
+  )
+  expect(tarResult.status, tarResult.stderr).toBe(0)
+  const releaseJson = path.join(root, 'release.json')
+  await writeFile(releaseJson, JSON.stringify({
+    tag_name: 'v-test',
+    html_url: 'https://example.invalid/release',
+    assets: [{ name: assetName, browser_download_url: 'https://example.invalid/asset' }],
+  }))
+  return { root, releaseJson, asset }
+}
+
+async function createUpdateShellSuccessFixture(): Promise<{
+  root: string
+  environment: NodeJS.ProcessEnv
+}> {
+  const root = await mkdtemp(path.join(tmpdir(), 'pocketrisu-update-sh-success-fixture-'))
+  const releaseRoot = path.join(root, 'release')
+  const releaseDir = path.join(releaseRoot, 'PocketRisu-v-test')
+  const fakeBin = path.join(root, 'bin')
+  const tarball = path.join(root, 'release.tar.gz')
+  await mkdir(path.join(releaseDir, 'server', 'node'), { recursive: true })
+  await mkdir(fakeBin, { recursive: true })
+  await copyFile(path.resolve(import.meta.dirname, '../../update.sh'), path.join(releaseDir, 'update.sh'))
+  await copyFile(
+    path.resolve(import.meta.dirname, '../../server/node/recoveryPathMarkers.cjs'),
+    path.join(releaseDir, 'server', 'node', 'recoveryPathMarkers.cjs'),
+  )
+  await writeFile(path.join(releaseDir, 'package.json'), '{"version":"2.0.0"}\n')
+  await writeFile(path.join(releaseDir, 'new-release.txt'), 'new release')
+  const tarResult = spawnSync(
+    'tar',
+    ['-czf', tarball, '-C', releaseRoot, path.basename(releaseDir)],
+    { encoding: 'utf8' },
+  )
+  expect(tarResult.status, tarResult.stderr).toBe(0)
+  const curlPath = path.join(fakeBin, 'curl')
+  await writeFile(curlPath, [
+    '#!/usr/bin/env bash',
+    'set -euo pipefail',
+    'if [[ "$*" == *"api.github.com"* ]]; then',
+    '  printf \'%s\\n\' \'{"tag_name":"v-test"}\'',
+    '  exit 0',
+    'fi',
+    'destination=""',
+    'while [ "$#" -gt 0 ]; do',
+    '  if [ "$1" = "-o" ]; then shift; destination="$1"; fi',
+    '  shift',
+    'done',
+    'cp "$UPDATE_TEST_TARBALL" "$destination"',
+  ].join('\n'))
+  await chmod(curlPath, 0o755)
+  const pnpmPath = path.join(fakeBin, 'pnpm')
+  await writeFile(pnpmPath, '#!/usr/bin/env bash\nexit 0\n')
+  await chmod(pnpmPath, 0o755)
+  return {
+    root,
+    environment: {
+      ...process.env,
+      PATH: `${fakeBin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
+      UPDATE_TEST_TARBALL: tarball,
+    },
+  }
 }
 
 function mainV181AcceptsBackupEntryName(name: string): boolean {
@@ -106,8 +252,1035 @@ describe('server smoke', () => {
     expect(safeBody.path).toBe(safePath)
     expect(safeBody.isDefault).toBe(false)
 
-    const marker = await readFile(path.join(srv.cwd, 'save', '__backup_path'), 'utf-8')
-    expect(marker.trim()).toBe(safePath)
+    expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+      .toEqual([pathInfo.default, safePath])
+    const chatMarker = await readFile(path.join(srv.cwd, 'save', '__chat_backup_path'), 'utf-8')
+    expect(chatMarker.trim()).toBe(path.join(srv.cwd, 'save', 'chat-backups'))
+  })
+
+  test('backup path marker publication failure leaves config, live path, and marker rolled back', async () => {
+    const faultDir = await mkdtemp(path.join(tmpdir(), 'pocketrisu-marker-fault-'))
+    try {
+      const srv = await spawnServer({
+        env: { POCKETRISU_TEST_RECOVERY_PATH_MARKER_FAULT_DIR: faultDir },
+      })
+      servers.push(srv)
+      const client = await createClient(srv.port, srv.password)
+      const markerPath = path.join(srv.cwd, 'save', '__backup_path')
+      const previousMarker = await readFile(markerPath, 'utf8')
+      const beforeRes = await client.fetch('/api/backup/server/path')
+      const before = await beforeRes.json() as { path: string; isDefault: boolean }
+      expect(before.isDefault).toBe(true)
+
+      await writeFile(path.join(faultDir, '__backup_path.before-rename'), 'fail')
+      const rejectedPath = path.join(srv.cwd, 'data', 'backups')
+      const rejectedRes = await client.fetch('/api/backup/server/path', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: rejectedPath }),
+      })
+      expect(rejectedRes.status).toBe(500)
+      expect((await rejectedRes.json() as { error: string }).error)
+        .toContain('Injected recovery-path marker publication failure')
+
+      const afterRes = await client.fetch('/api/backup/server/path')
+      const after = await afterRes.json() as { path: string; isDefault: boolean }
+      expect(after).toEqual(before)
+      expect(readKvValue(srv.cwd, 'config/server-backup-path')).toBeNull()
+      await expect(readFile(markerPath, 'utf8')).resolves.toBe(previousMarker)
+    } finally {
+      await rm(faultDir, { recursive: true, force: true })
+    }
+  })
+
+  test('backup path KV failure durably restores the previous preservation marker', async () => {
+    const srv = await spawnServer({
+      env: { POCKETRISU_TEST_FAILPOINT: 'key:config/server-backup-path' },
+    })
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const markerPath = path.join(srv.cwd, 'save', '__backup_path')
+    const previousMarker = await readFile(markerPath, 'utf8')
+    const beforeRes = await client.fetch('/api/backup/server/path')
+    const before = await beforeRes.json()
+
+    const rejectedRes = await client.fetch('/api/backup/server/path', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: path.join(srv.cwd, 'data', 'backups') }),
+    })
+    expect(rejectedRes.status).toBe(500)
+    expect((await rejectedRes.json() as { error: string }).error)
+      .toContain('Injected kvSet failure for key config/server-backup-path')
+
+    const afterRes = await client.fetch('/api/backup/server/path')
+    expect(await afterRes.json()).toEqual(before)
+    expect(readKvValue(srv.cwd, 'config/server-backup-path')).toBeNull()
+    await expect(readFile(markerPath, 'utf8')).resolves.toBe(previousMarker)
+  })
+
+  test('startup retains inaccessible lexical history and falls back from an unavailable configured root', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const defaultRoot = path.join(srv.cwd, 'backups')
+    const historicalRoot = path.join(srv.cwd, 'OfflineDrive', 'old-backups')
+    const unavailableRoot = path.join(
+      path.dirname(srv.cwd),
+      `pocketrisu-unavailable-${path.basename(srv.cwd)}`,
+      'backups',
+    )
+    await srv.crash()
+    writeKvValue(
+      srv.cwd,
+      'config/server-backup-path',
+      Buffer.from(unavailableRoot, 'utf8'),
+    )
+    await writeFile(path.join(srv.cwd, 'save', '__backup_path'), JSON.stringify({
+      version: 1,
+      paths: [defaultRoot, historicalRoot],
+    }))
+
+    await srv.restart({
+      POCKETRISU_TEST_RECOVERY_CANONICALIZE_FAIL_PATHS: JSON.stringify([
+        historicalRoot,
+        unavailableRoot,
+      ]),
+      POCKETRISU_TEST_RECOVERY_UNAVAILABLE_PATHS: JSON.stringify([unavailableRoot]),
+    })
+    const restarted = await createClient(srv.port, srv.password)
+    const state = await (await restarted.fetch('/api/backup/server/path')).json() as {
+      path: string
+      isDefault: boolean
+    }
+
+    expect(state).toMatchObject({ path: defaultRoot, isDefault: true })
+    expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+      .toEqual([defaultRoot, historicalRoot, unavailableRoot])
+  })
+
+  test('startup holds one interprocess admission across backup and chat marker publication', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'pocketrisu-startup-marker-lock-'))
+    const gateDir = await mkdtemp(path.join(tmpdir(), 'pocketrisu-startup-marker-gate-'))
+    const serverScript = path.resolve(import.meta.dirname, '../../server/node/server.cjs')
+    let child: ReturnType<typeof spawn> | null = null
+    try {
+      await mkdir(path.join(root, 'save'), { recursive: true })
+      await mkdir(path.join(root, 'backups'), { recursive: true })
+      await mkdir(path.join(root, 'scripts'), { recursive: true })
+      await mkdir(path.join(root, 'server', 'node'), { recursive: true })
+      await writeFile(path.join(root, 'save', '__password'), 'compat-test-pass')
+      await writeFile(path.join(root, '.installed-version'), 'v-old')
+      await copyFile(
+        path.resolve(import.meta.dirname, '../../scripts/updater.cjs'),
+        path.join(root, 'scripts', 'updater.cjs'),
+      )
+      await copyFile(
+        path.resolve(import.meta.dirname, '../../server/node/recoveryPathMarkers.cjs'),
+        path.join(root, 'server', 'node', 'recoveryPathMarkers.cjs'),
+      )
+      await writeFile(path.join(gateDir, 'stage'), 'after-backup-before-chat-marker')
+      await writeFile(path.join(gateDir, 'hold'), 'hold')
+
+      child = spawn(process.execPath, [serverScript], {
+        cwd: root,
+        env: {
+          ...process.env,
+          NODE_ENV: 'test',
+          PORT: '0',
+          POCKETRISU_TEST_RECOVERY_PATH_STARTUP_GATE_DIR: gateDir,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let firstOutput = ''
+      child.stdout?.on('data', chunk => { firstOutput += chunk.toString() })
+      child.stderr?.on('data', chunk => { firstOutput += chunk.toString() })
+      await waitForPath(path.join(gateDir, 'entered'))
+
+      await expect(readFile(path.join(root, 'save', '__backup_path'), 'utf8'))
+        .resolves.toBe(path.join(root, 'backups'))
+      await expectMissing(path.join(root, 'save', '__chat_backup_path'))
+      await expectMissing(path.join(root, 'save', 'chat-backups'))
+
+      const updaterContender = spawnSync(
+        process.execPath,
+        [path.join(root, 'scripts', 'updater.cjs')],
+        { cwd: root, encoding: 'utf8', timeout: 5000 },
+      )
+      expect(updaterContender.status).not.toBe(0)
+      expect(updaterContender.stderr).toContain('server startup recovery-marker publication')
+
+      const secondServer = spawnSync(process.execPath, [serverScript], {
+        cwd: root,
+        encoding: 'utf8',
+        timeout: 5000,
+        env: { ...process.env, NODE_ENV: 'test', PORT: '0' },
+      })
+      expect(secondServer.status).not.toBe(0)
+      expect(secondServer.stderr).toContain('server startup recovery-marker publication')
+
+      await releaseGate(gateDir)
+      const deadline = Date.now() + 10_000
+      while (!firstOutput.includes('server is running') && Date.now() < deadline) {
+        if (child.exitCode !== null) throw new Error(`startup server exited early: ${firstOutput}`)
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      expect(firstOutput).toContain('server is running')
+      await expect(readFile(path.join(root, 'save', '__chat_backup_path'), 'utf8'))
+        .resolves.toBe(path.join(root, 'save', 'chat-backups'))
+    } finally {
+      if (child && child.exitCode === null) {
+        child.kill('SIGKILL')
+        await new Promise(resolve => child?.once('exit', resolve))
+      }
+      await rm(root, { recursive: true, force: true })
+      await rm(gateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('startup selects the latest configured root only after acquiring recovery-path admission', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const gateDir = await mkdtemp(path.join(tmpdir(), 'pocketrisu-startup-prelock-gate-'))
+    const serverScript = path.resolve(import.meta.dirname, '../../server/node/server.cjs')
+    let child: ReturnType<typeof spawn> | null = null
+    let output = ''
+    try {
+      await writeFile(path.join(gateDir, 'stage'), 'before-startup-lock-acquire')
+      await writeFile(path.join(gateDir, 'hold'), 'hold')
+      child = spawn(process.execPath, [serverScript], {
+        cwd: srv.cwd,
+        env: {
+          ...process.env,
+          NODE_ENV: 'test',
+          PORT: '0',
+          POCKETRISU_TEST_RECOVERY_PATH_STARTUP_GATE_DIR: gateDir,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      child.stdout?.on('data', chunk => { output += chunk.toString() })
+      child.stderr?.on('data', chunk => { output += chunk.toString() })
+      await waitForPath(path.join(gateDir, 'entered'))
+
+      const oldRoot = path.join(srv.cwd, 'backups')
+      const latestRoot = path.join(srv.cwd, 'latest-recovery', 'backups')
+      const changed = await client.fetch('/api/backup/server/path', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: latestRoot }),
+      })
+      expect(changed.status).toBe(200)
+      const oldTemp = path.join(oldRoot, '.risu-backup-save-old.tmp')
+      const latestTemp = path.join(latestRoot, '.risu-backup-save-latest.tmp')
+      await writeFile(oldTemp, 'old-root orphan')
+      await writeFile(latestTemp, 'latest-root orphan')
+
+      await releaseGate(gateDir)
+      const deadline = Date.now() + 10_000
+      while (!output.includes('server is running') && Date.now() < deadline) {
+        if (child.exitCode !== null) throw new Error(`second startup exited early: ${output}`)
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      expect(output).toContain('server is running')
+      expect(Buffer.from(readKvValue(srv.cwd, 'config/server-backup-path') ?? []).toString('utf8'))
+        .toBe(latestRoot)
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([oldRoot, latestRoot])
+      await expect(readFile(oldTemp, 'utf8')).resolves.toBe('old-root orphan')
+      await expectMissing(latestTemp)
+    } finally {
+      if (child && child.exitCode === null) {
+        child.kill('SIGKILL')
+        await new Promise(resolve => child?.once('exit', resolve))
+      }
+      await rm(gateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('startup first-marker failure recovers custom history before a real portable replacement', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const { defaultRoot, historicalRoot, currentRoot } = await configureCustomRecoveryHistory(
+      srv,
+      client,
+    )
+    const faultDir = await mkdtemp(path.join(tmpdir(), 'pocketrisu-startup-backup-fault-'))
+    let updaterFixture: Awaited<ReturnType<typeof createPortableUpdaterSuccessFixture>> | null = null
+    try {
+      await writeFile(path.join(historicalRoot, 'historical-recovery.bin'), 'historical recovery')
+      await writeFile(path.join(currentRoot, 'current-recovery.bin'), 'current recovery')
+      await writeFile(path.join(srv.cwd, 'old-release.txt'), 'old release')
+      await writeFile(path.join(srv.cwd, '.installed-version'), 'v-old\n')
+      await mkdir(path.join(srv.cwd, 'scripts'), { recursive: true })
+      await mkdir(path.join(srv.cwd, 'server', 'node'), { recursive: true })
+      await copyFile(
+        path.resolve(import.meta.dirname, '../../scripts/updater.cjs'),
+        path.join(srv.cwd, 'scripts', 'updater.cjs'),
+      )
+      await copyFile(
+        path.resolve(import.meta.dirname, '../../server/node/recoveryPathMarkers.cjs'),
+        path.join(srv.cwd, 'server', 'node', 'recoveryPathMarkers.cjs'),
+      )
+
+      await srv.crash()
+      await writeFile(path.join(faultDir, '__backup_path.before-rename'), 'fail')
+      await expect(srv.restart({
+        POCKETRISU_TEST_RECOVERY_PATH_MARKER_FAULT_DIR: faultDir,
+      })).rejects.toThrow('durable recovery history remains quarantined fail-closed')
+
+      expect(Buffer.from(readKvValue(srv.cwd, 'config/server-backup-path') ?? []).toString('utf8'))
+        .toBe(currentRoot)
+      const quarantinePath = path.join(srv.cwd, 'save', '__recovery_path_startup_quarantine')
+      const quarantine = JSON.parse(await readFile(quarantinePath, 'utf8')) as {
+        markers: Record<string, string[]>
+      }
+      expect(quarantine.markers.__backup_path)
+        .toEqual([defaultRoot, historicalRoot, currentRoot])
+      const refusedUpdater = spawnSync(
+        process.execPath,
+        [path.join(srv.cwd, 'scripts', 'updater.cjs')],
+        { cwd: srv.cwd, encoding: 'utf8', timeout: 5000 },
+      )
+      expect(refusedUpdater.status).not.toBe(0)
+      expect(refusedUpdater.stderr).toContain('startup quarantine exists')
+      await expect(readFile(path.join(srv.cwd, 'old-release.txt'), 'utf8'))
+        .resolves.toBe('old release')
+
+      await srv.restart()
+      await expectMissing(quarantinePath)
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([defaultRoot, historicalRoot, currentRoot])
+      await srv.crash()
+
+      updaterFixture = await createPortableUpdaterSuccessFixture()
+      const successfulUpdater = spawnSync(
+        process.execPath,
+        [path.join(srv.cwd, 'scripts', 'updater.cjs')],
+        {
+          cwd: srv.cwd,
+          encoding: 'utf8',
+          timeout: 10_000,
+          env: {
+            ...process.env,
+            NODE_ENV: 'test',
+            POCKETRISU_TEST_UPDATER_RELEASE_JSON_PATH: updaterFixture.releaseJson,
+            POCKETRISU_TEST_UPDATER_ASSET_PATH: updaterFixture.asset,
+          },
+        },
+      )
+      expect(successfulUpdater.status, successfulUpdater.stderr).toBe(0)
+      expect(successfulUpdater.stdout).toContain('Update complete!')
+      await expect(readFile(path.join(srv.cwd, 'new-release.txt'), 'utf8'))
+        .resolves.toBe('new release')
+      await expect(readFile(path.join(historicalRoot, 'historical-recovery.bin'), 'utf8'))
+        .resolves.toBe('historical recovery')
+      await expect(readFile(path.join(currentRoot, 'current-recovery.bin'), 'utf8'))
+        .resolves.toBe('current recovery')
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([defaultRoot, historicalRoot, currentRoot])
+    } finally {
+      await rm(faultDir, { recursive: true, force: true })
+      if (updaterFixture) await rm(updaterFixture.root, { recursive: true, force: true })
+    }
+  })
+
+  test('uncertain startup quarantine publication retains a durable fail-closed lock', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const { defaultRoot, historicalRoot, currentRoot } = await configureCustomRecoveryHistory(
+      srv,
+      client,
+    )
+    const faultDir = await mkdtemp(path.join(tmpdir(), 'pocketrisu-startup-quarantine-fault-'))
+    try {
+      await mkdir(path.join(srv.cwd, 'scripts'), { recursive: true })
+      await mkdir(path.join(srv.cwd, 'server', 'node'), { recursive: true })
+      await copyFile(
+        path.resolve(import.meta.dirname, '../../scripts/updater.cjs'),
+        path.join(srv.cwd, 'scripts', 'updater.cjs'),
+      )
+      await copyFile(
+        path.resolve(import.meta.dirname, '../../server/node/recoveryPathMarkers.cjs'),
+        path.join(srv.cwd, 'server', 'node', 'recoveryPathMarkers.cjs'),
+      )
+
+      await srv.crash()
+      await writeFile(
+        path.join(faultDir, '__recovery_path_startup_quarantine.before-directory-fsync'),
+        'fail',
+      )
+      await expect(srv.restart({
+        POCKETRISU_TEST_RECOVERY_PATH_MARKER_FAULT_DIR: faultDir,
+      })).rejects.toThrow('Injected recovery-path startup quarantine publication failure')
+
+      expect(Buffer.from(readKvValue(srv.cwd, 'config/server-backup-path') ?? []).toString('utf8'))
+        .toBe(currentRoot)
+      const quarantine = JSON.parse(await readFile(path.join(
+        srv.cwd,
+        'save',
+        '__recovery_path_startup_quarantine',
+      ), 'utf8')) as { markers: Record<string, string[]> }
+      expect(quarantine.markers.__backup_path)
+        .toEqual([defaultRoot, historicalRoot, currentRoot])
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([defaultRoot, historicalRoot, currentRoot])
+      const owner = JSON.parse(await readFile(path.join(
+        srv.cwd,
+        'save',
+        '__recovery_path_state.lock',
+        'owner.json',
+      ), 'utf8')) as { token: string; purpose: string }
+      expect(owner.token).toMatch(/^[0-9a-f]{64}$/)
+      expect(owner.purpose).toBe('server startup recovery-marker publication')
+
+      const updater = spawnSync(
+        process.execPath,
+        [path.join(srv.cwd, 'scripts', 'updater.cjs')],
+        { cwd: srv.cwd, encoding: 'utf8', timeout: 5000 },
+      )
+      expect(updater.status).not.toBe(0)
+      expect(updater.stderr).toContain('server startup recovery-marker publication')
+      expect(updater.stderr).toContain('never removed automatically')
+    } finally {
+      await rm(faultDir, { recursive: true, force: true })
+    }
+  })
+
+  test('corrupted startup quarantine remains persistently fail-closed without changing marker history', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const { defaultRoot, historicalRoot, currentRoot } = await configureCustomRecoveryHistory(
+      srv,
+      client,
+    )
+    await srv.crash()
+    const quarantinePath = path.join(srv.cwd, 'save', '__recovery_path_startup_quarantine')
+    await writeFile(quarantinePath, '{"version":1,"corrupted":true}')
+
+    await expect(srv.restart()).rejects.toThrow('unsupported schema')
+    expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+      .toEqual([defaultRoot, historicalRoot, currentRoot])
+    await rm(path.join(srv.cwd, 'save', '__recovery_path_state.lock'), {
+      recursive: true,
+      force: true,
+    })
+    await expect(srv.restart()).rejects.toThrow('unsupported schema')
+    await expect(readFile(quarantinePath, 'utf8'))
+      .resolves.toBe('{"version":1,"corrupted":true}')
+    await expect(readFile(path.join(
+      srv.cwd,
+      'save',
+      '__recovery_path_state.lock',
+      'owner.json',
+    ), 'utf8')).resolves.toContain('server startup recovery-marker publication')
+  })
+
+  test('startup second-marker failure recovers custom history before a real update.sh replacement', async () => {
+    const srv = await spawnServer()
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const { defaultRoot, historicalRoot, currentRoot } = await configureCustomRecoveryHistory(
+      srv,
+      client,
+    )
+    const faultDir = await mkdtemp(path.join(tmpdir(), 'pocketrisu-startup-chat-fault-'))
+    let updateFixture: Awaited<ReturnType<typeof createUpdateShellSuccessFixture>> | null = null
+    try {
+      await writeFile(path.join(historicalRoot, 'historical-recovery.bin'), 'historical recovery')
+      await writeFile(path.join(currentRoot, 'current-recovery.bin'), 'current recovery')
+      await writeFile(path.join(srv.cwd, 'old-release.txt'), 'old release')
+      await writeFile(path.join(srv.cwd, '.installed-version'), 'v-old\n')
+      await mkdir(path.join(srv.cwd, 'server', 'node'), { recursive: true })
+      await copyFile(
+        path.resolve(import.meta.dirname, '../../update.sh'),
+        path.join(srv.cwd, 'update.sh'),
+      )
+      await chmod(path.join(srv.cwd, 'update.sh'), 0o755)
+      await copyFile(
+        path.resolve(import.meta.dirname, '../../server/node/recoveryPathMarkers.cjs'),
+        path.join(srv.cwd, 'server', 'node', 'recoveryPathMarkers.cjs'),
+      )
+
+      await srv.crash()
+      await writeFile(path.join(faultDir, '__chat_backup_path.before-rename'), 'fail')
+      await expect(srv.restart({
+        POCKETRISU_TEST_RECOVERY_PATH_MARKER_FAULT_DIR: faultDir,
+      })).rejects.toThrow('durable recovery history remains quarantined fail-closed')
+
+      expect(Buffer.from(readKvValue(srv.cwd, 'config/server-backup-path') ?? []).toString('utf8'))
+        .toBe(currentRoot)
+      const quarantinePath = path.join(srv.cwd, 'save', '__recovery_path_startup_quarantine')
+      const quarantine = JSON.parse(await readFile(quarantinePath, 'utf8')) as {
+        markers: Record<string, string[]>
+      }
+      expect(quarantine.markers.__backup_path)
+        .toEqual([defaultRoot, historicalRoot, currentRoot])
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([defaultRoot, historicalRoot, currentRoot])
+
+      updateFixture = await createUpdateShellSuccessFixture()
+      const refusedUpdate = spawnSync('bash', [path.join(srv.cwd, 'update.sh')], {
+        cwd: srv.cwd,
+        encoding: 'utf8',
+        input: '\n',
+        timeout: 10_000,
+        env: updateFixture.environment,
+      })
+      expect(refusedUpdate.status).not.toBe(0)
+      expect(refusedUpdate.stderr).toContain('startup quarantine exists')
+      await expect(readFile(path.join(srv.cwd, 'old-release.txt'), 'utf8'))
+        .resolves.toBe('old release')
+
+      await srv.restart()
+      await expectMissing(quarantinePath)
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([defaultRoot, historicalRoot, currentRoot])
+      await srv.crash()
+      const successfulUpdate = spawnSync('bash', [path.join(srv.cwd, 'update.sh')], {
+        cwd: srv.cwd,
+        encoding: 'utf8',
+        input: '\n',
+        timeout: 10_000,
+        env: updateFixture.environment,
+      })
+      expect(successfulUpdate.status, successfulUpdate.stderr).toBe(0)
+      expect(successfulUpdate.stdout).toContain('Update complete!')
+      await expect(readFile(path.join(srv.cwd, 'new-release.txt'), 'utf8'))
+        .resolves.toBe('new release')
+      await expect(readFile(path.join(historicalRoot, 'historical-recovery.bin'), 'utf8'))
+        .resolves.toBe('historical recovery')
+      await expect(readFile(path.join(currentRoot, 'current-recovery.bin'), 'utf8'))
+        .resolves.toBe('current recovery')
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([defaultRoot, historicalRoot, currentRoot])
+    } finally {
+      await rm(faultDir, { recursive: true, force: true })
+      if (updateFixture) await rm(updateFixture.root, { recursive: true, force: true })
+    }
+  })
+
+  test('crash after transition-marker publication preserves old and new roots with old KV/live state', async () => {
+    const gateDir = await mkdtemp(path.join(tmpdir(), 'pocketrisu-path-state-gate-'))
+    await writeFile(path.join(gateDir, 'stage'), 'after-transition-marker')
+    await writeFile(path.join(gateDir, 'hold'), 'hold')
+    try {
+      const srv = await spawnServer({
+        env: { POCKETRISU_TEST_RECOVERY_PATH_STATE_GATE_DIR: gateDir },
+      })
+      servers.push(srv)
+      const client = await createClient(srv.port, srv.password)
+      const oldRoot = path.join(srv.cwd, 'backups')
+      const nextRoot = path.join(srv.cwd, 'next-recovery', 'backups')
+      const oldArchive = path.join(oldRoot, 'old.bin')
+      await writeFile(oldArchive, 'old recovery')
+
+      const pendingPut = client.fetch('/api/backup/server/path', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: nextRoot }),
+      }).catch(() => undefined)
+      await waitForPath(path.join(gateDir, 'entered'))
+
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([oldRoot, nextRoot])
+      expect(readKvValue(srv.cwd, 'config/server-backup-path')).toBeNull()
+      const pausedLive = await (await client.fetch('/api/backup/server/path')).json() as { path: string }
+      expect(pausedLive.path).toBe(oldRoot)
+      await expect(readFile(oldArchive, 'utf8')).resolves.toBe('old recovery')
+
+      await srv.crash()
+      await pendingPut
+      // Crash-stale interprocess locks deliberately require explicit recovery;
+      // the marker union above is verified before simulating that operator step.
+      await rm(path.join(srv.cwd, 'save', '__recovery_path_state.lock'), {
+        recursive: true,
+        force: true,
+      })
+      await srv.restart()
+      const restarted = await createClient(srv.port, srv.password)
+      const restartedState = await (await restarted.fetch('/api/backup/server/path')).json() as { path: string }
+      expect(restartedState.path).toBe(oldRoot)
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([oldRoot, nextRoot])
+      await expect(readFile(oldArchive, 'utf8')).resolves.toBe('old recovery')
+    } finally {
+      await rm(gateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('crash after KV commit keeps the old live root preserved and resumes on the new root', async () => {
+    const gateDir = await mkdtemp(path.join(tmpdir(), 'pocketrisu-path-state-gate-'))
+    await writeFile(path.join(gateDir, 'stage'), 'after-kv-before-live')
+    await writeFile(path.join(gateDir, 'hold'), 'hold')
+    try {
+      const srv = await spawnServer({
+        env: { POCKETRISU_TEST_RECOVERY_PATH_STATE_GATE_DIR: gateDir },
+      })
+      servers.push(srv)
+      const client = await createClient(srv.port, srv.password)
+      const oldRoot = path.join(srv.cwd, 'backups')
+      const nextRoot = path.join(srv.cwd, 'next-recovery', 'backups')
+      const oldArchive = path.join(oldRoot, 'old.bin')
+      await writeFile(oldArchive, 'old recovery')
+
+      const pendingPut = client.fetch('/api/backup/server/path', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: nextRoot }),
+      }).catch(() => undefined)
+      await waitForPath(path.join(gateDir, 'entered'))
+
+      expect(Buffer.from(readKvValue(srv.cwd, 'config/server-backup-path') ?? []).toString())
+        .toBe(nextRoot)
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([oldRoot, nextRoot])
+      const pausedLive = await (await client.fetch('/api/backup/server/path')).json() as { path: string }
+      expect(pausedLive.path).toBe(oldRoot)
+      await expect(readFile(oldArchive, 'utf8')).resolves.toBe('old recovery')
+
+      await srv.crash()
+      await pendingPut
+      // Crash-stale interprocess locks deliberately require explicit recovery;
+      // never infer staleness from elapsed time/PID liveness before deletion.
+      await rm(path.join(srv.cwd, 'save', '__recovery_path_state.lock'), {
+        recursive: true,
+        force: true,
+      })
+      await srv.restart()
+      const restarted = await createClient(srv.port, srv.password)
+      const restartedState = await (await restarted.fetch('/api/backup/server/path')).json() as { path: string }
+      expect(restartedState.path).toBe(nextRoot)
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([oldRoot, nextRoot])
+      await expect(readFile(oldArchive, 'utf8')).resolves.toBe('old recovery')
+    } finally {
+      await rm(gateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('concurrent backup path PUTs serialize marker, KV, and live state transitions', async () => {
+    const gateDir = await mkdtemp(path.join(tmpdir(), 'pocketrisu-path-state-gate-'))
+    await writeFile(path.join(gateDir, 'stage'), 'after-transition-marker')
+    await writeFile(path.join(gateDir, 'hold'), 'hold')
+    try {
+      const srv = await spawnServer({
+        env: { POCKETRISU_TEST_RECOVERY_PATH_STATE_GATE_DIR: gateDir },
+      })
+      servers.push(srv)
+      const client = await createClient(srv.port, srv.password)
+      const oldRoot = path.join(srv.cwd, 'backups')
+      const firstRoot = path.join(srv.cwd, 'first-recovery', 'backups')
+      const secondRoot = path.join(srv.cwd, 'second-recovery', 'backups')
+      const put = (target: string) => client.fetch('/api/backup/server/path', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: target }),
+      })
+
+      const firstPending = put(firstRoot)
+      await waitForPath(path.join(gateDir, 'entered'))
+      const secondPending = put(secondRoot)
+      await new Promise(resolve => setTimeout(resolve, 50))
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([oldRoot, firstRoot])
+      expect(readKvValue(srv.cwd, 'config/server-backup-path')).toBeNull()
+
+      await releaseGate(gateDir)
+      const firstRes = await firstPending
+      const secondRes = await secondPending
+      expect(firstRes.status).toBe(200)
+      expect(secondRes.status).toBe(200)
+      expect((await firstRes.json() as { previous: string; path: string }))
+        .toMatchObject({ previous: oldRoot, path: firstRoot })
+      expect((await secondRes.json() as { previous: string; path: string }))
+        .toMatchObject({ previous: firstRoot, path: secondRoot })
+      expect(Buffer.from(readKvValue(srv.cwd, 'config/server-backup-path') ?? []).toString())
+        .toBe(secondRoot)
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([oldRoot, firstRoot, secondRoot])
+      const live = await (await client.fetch('/api/backup/server/path')).json() as { path: string }
+      expect(live.path).toBe(secondRoot)
+    } finally {
+      await rm(gateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('backup path admission rejects an outside symlink alias into managed app files', async () => {
+    const srv = await spawnServer({
+      seedRoot: async root => { await mkdir(path.join(root, 'server'), { recursive: true }) },
+    })
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const alias = path.join(path.dirname(srv.cwd), `${path.basename(srv.cwd)}-server-alias`)
+    await symlink(path.join(srv.cwd, 'server'), alias, 'dir')
+    try {
+      const response = await client.fetch('/api/backup/server/path', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: path.join(alias, 'backups') }),
+      })
+      expect(response.status).toBe(400)
+      expect((await response.json() as { error: string }).error).toContain('PocketRisu app files')
+      expect(readKvValue(srv.cwd, 'config/server-backup-path')).toBeNull()
+    } finally {
+      await rm(alias, { force: true })
+    }
+  })
+
+  test('backup path publication records canonical in-tree identity behind a safe outside alias', async () => {
+    const srv = await spawnServer({
+      seedRoot: async root => { await mkdir(path.join(root, 'data'), { recursive: true }) },
+    })
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const alias = path.join(path.dirname(srv.cwd), `${path.basename(srv.cwd)}-data-alias`)
+    await symlink(path.join(srv.cwd, 'data'), alias, 'dir')
+    try {
+      const aliasTarget = path.join(alias, 'backups')
+      const canonicalTarget = path.join(srv.cwd, 'data', 'backups')
+      const response = await client.fetch('/api/backup/server/path', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: aliasTarget }),
+      })
+      expect(response.status).toBe(200)
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([path.join(srv.cwd, 'backups'), aliasTarget, canonicalTarget])
+      await writeFile(path.join(canonicalTarget, 'recovery.bin'), 'recovery')
+      await rm(alias)
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([path.join(srv.cwd, 'backups'), aliasTarget, canonicalTarget])
+      await expect(readFile(path.join(canonicalTarget, 'recovery.bin'), 'utf8')).resolves.toBe('recovery')
+    } finally {
+      await rm(alias, { force: true })
+    }
+  })
+
+  test('in-process self-update refuses missing or unreadable recovery metadata before replacement', async () => {
+    const srv = await spawnServer({
+      env: {
+        RISU_UPDATE_CHECK: 'false',
+        POCKETRISU_CHAT_BACKUP_DIR: 'history/chat-backups',
+      },
+      seedRoot: async root => {
+        await writeFile(path.join(root, '.portable'), '')
+        await writeFile(path.join(root, 'old-release.txt'), 'old release')
+      },
+    })
+    servers.push(srv)
+    const client = await createClient(srv.port, srv.password)
+    const serverMarker = path.join(srv.cwd, 'save', '__backup_path')
+    const chatMarker = path.join(srv.cwd, 'save', '__chat_backup_path')
+    const chatMarkerValue = await readFile(chatMarker, 'utf8')
+    const recoveryFile = path.join(srv.cwd, 'history', 'chat-backups', 'chat-version.bin.gz')
+    await writeFile(recoveryFile, 'recovery')
+
+    await rm(chatMarker)
+    const missingRes = await client.fetch('/api/self-update', { method: 'POST' })
+    expect(missingRes.status).toBe(409)
+    expect((await missingRes.json() as { error: string }).error).toContain('marker is missing')
+    await expect(readFile(recoveryFile, 'utf8')).resolves.toBe('recovery')
+    await expect(readFile(path.join(srv.cwd, 'old-release.txt'), 'utf8')).resolves.toBe('old release')
+
+    await writeFile(chatMarker, chatMarkerValue)
+    await rm(serverMarker)
+    await mkdir(serverMarker)
+    const unreadableRes = await client.fetch('/api/self-update', { method: 'POST' })
+    expect(unreadableRes.status).toBe(409)
+    expect((await unreadableRes.json() as { error: string }).error).toContain('not a regular file')
+    await expect(readFile(recoveryFile, 'utf8')).resolves.toBe('recovery')
+    await expect(readFile(path.join(srv.cwd, 'old-release.txt'), 'utf8')).resolves.toBe('old release')
+  })
+
+  test('self-update admission waits for an already-admitted backup path transition', async () => {
+    const gateDir = await mkdtemp(path.join(tmpdir(), 'pocketrisu-path-state-gate-'))
+    await writeFile(path.join(gateDir, 'stage'), 'after-transition-marker')
+    await writeFile(path.join(gateDir, 'hold'), 'hold')
+    try {
+      const srv = await spawnServer({
+        env: {
+          RISU_UPDATE_CHECK: 'false',
+          POCKETRISU_TEST_RECOVERY_PATH_STATE_GATE_DIR: gateDir,
+        },
+        seedRoot: async root => { await writeFile(path.join(root, '.portable'), '') },
+      })
+      servers.push(srv)
+      const client = await createClient(srv.port, srv.password)
+      const nextRoot = path.join(srv.cwd, 'next-recovery', 'backups')
+      const putPending = client.fetch('/api/backup/server/path', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: nextRoot }),
+      })
+      await waitForPath(path.join(gateDir, 'entered'))
+      const selfUpdatePending = client.fetch('/api/self-update', { method: 'POST' })
+
+      await releaseGate(gateDir)
+      const putRes = await putPending
+      const selfUpdateRes = await selfUpdatePending
+      expect(putRes.status).toBe(200)
+      expect(selfUpdateRes.status).toBe(200)
+      expect(await selfUpdateRes.text()).toContain('Already up to date')
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path')))
+        .toEqual([path.join(srv.cwd, 'backups'), nextRoot])
+      const live = await (await client.fetch('/api/backup/server/path')).json() as { path: string }
+      expect(live.path).toBe(nextRoot)
+    } finally {
+      await rm(gateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('backup path PUT cannot overlap an admitted self-update preservation snapshot', async () => {
+    const gateDir = await mkdtemp(path.join(tmpdir(), 'pocketrisu-path-state-gate-'))
+    await writeFile(path.join(gateDir, 'stage'), 'self-update-admitted')
+    await writeFile(path.join(gateDir, 'hold'), 'hold')
+    try {
+      const srv = await spawnServer({
+        env: {
+          RISU_UPDATE_CHECK: 'false',
+          POCKETRISU_TEST_RECOVERY_PATH_STATE_GATE_DIR: gateDir,
+        },
+        seedRoot: async root => { await writeFile(path.join(root, '.portable'), '') },
+      })
+      servers.push(srv)
+      const client = await createClient(srv.port, srv.password)
+      const defaultRoot = path.join(srv.cwd, 'backups')
+      const selfUpdatePending = client.fetch('/api/self-update', { method: 'POST' })
+      await waitForPath(path.join(gateDir, 'entered'))
+      const putPending = client.fetch('/api/backup/server/path', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: path.join(srv.cwd, 'late-recovery', 'backups') }),
+      })
+
+      await releaseGate(gateDir)
+      const [selfUpdateRes, putRes] = await Promise.all([selfUpdatePending, putPending])
+      expect(selfUpdateRes.status).toBe(200)
+      expect(await selfUpdateRes.text()).toContain('Already up to date')
+      expect(putRes.status).toBe(409)
+      expect((await putRes.json() as { error: string }).error).toContain('self-update')
+      expect(readKvValue(srv.cwd, 'config/server-backup-path')).toBeNull()
+      expect(await readMarkerTargets(path.join(srv.cwd, 'save', '__backup_path'))).toEqual([defaultRoot])
+      await expectMissing(path.join(srv.cwd, 'late-recovery'))
+    } finally {
+      await rm(gateDir, { recursive: true, force: true })
+    }
+  })
+
+  test('standalone updater excludes a live cross-process backup-path transition through destructive enumeration', async () => {
+    const fixtureRoot = await mkdtemp(path.join(tmpdir(), 'pocketrisu-standalone-overlap-'))
+    const gateDir = path.join(fixtureRoot, 'gate')
+    const releaseRoot = path.join(fixtureRoot, 'release')
+    const releaseDir = path.join(releaseRoot, 'PocketRisu-v-next')
+    const assetPath = path.join(fixtureRoot, 'release.tar.gz')
+    const releaseJson = path.join(fixtureRoot, 'release.json')
+    await mkdir(gateDir, { recursive: true })
+    await mkdir(path.join(releaseDir, 'dist'), { recursive: true })
+    await mkdir(path.join(releaseDir, 'server', 'node'), { recursive: true })
+    await writeFile(path.join(releaseDir, 'dist', 'index.html'), '<html>new</html>')
+    await writeFile(path.join(releaseDir, 'server', 'node', 'server.cjs'), '// new server')
+    await copyFile(
+      path.resolve(import.meta.dirname, '../../server/node/recoveryPathMarkers.cjs'),
+      path.join(releaseDir, 'server', 'node', 'recoveryPathMarkers.cjs'),
+    )
+    await writeFile(path.join(releaseDir, 'package.json'), '{"version":"2.0.0"}\n')
+    await writeFile(path.join(releaseDir, 'new-release.txt'), 'new release')
+    const assetName = `PocketRisu-vnext-${process.platform === 'darwin' ? 'macos' : 'linux'}-${process.arch}.tar.gz`
+    const tar = spawnSync('tar', ['-czf', assetPath, '-C', releaseRoot, path.basename(releaseDir)], {
+      encoding: 'utf8',
+    })
+    expect(tar.status, tar.stderr).toBe(0)
+    await writeFile(releaseJson, JSON.stringify({
+      tag_name: 'v-next',
+      assets: [{ name: assetName, browser_download_url: 'fixture://asset' }],
+    }))
+    await writeFile(path.join(gateDir, 'stage'), 'before-destructive-enumeration')
+    await writeFile(path.join(gateDir, 'hold'), 'hold')
+
+    try {
+      const srv = await spawnServer({
+        seedRoot: async root => {
+          await mkdir(path.join(root, 'scripts'), { recursive: true })
+          await mkdir(path.join(root, 'server', 'node'), { recursive: true })
+          await copyFile(
+            path.resolve(import.meta.dirname, '../../scripts/updater.cjs'),
+            path.join(root, 'scripts', 'updater.cjs'),
+          )
+          await copyFile(
+            path.resolve(import.meta.dirname, '../../server/node/recoveryPathMarkers.cjs'),
+            path.join(root, 'server', 'node', 'recoveryPathMarkers.cjs'),
+          )
+          await writeFile(path.join(root, '.installed-version'), 'v-old')
+          await writeFile(path.join(root, 'old-release.txt'), 'old release')
+        },
+      })
+      servers.push(srv)
+      const client = await createClient(srv.port, srv.password)
+      const child = spawn(process.execPath, [path.join(srv.cwd, 'scripts', 'updater.cjs')], {
+        cwd: srv.cwd,
+        env: {
+          ...process.env,
+          NODE_ENV: 'test',
+          POCKETRISU_TEST_UPDATER_RELEASE_JSON_PATH: releaseJson,
+          POCKETRISU_TEST_UPDATER_ASSET_PATH: assetPath,
+          POCKETRISU_TEST_UPDATER_GATE_DIR: gateDir,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let output = ''
+      child.stdout?.on('data', chunk => { output += chunk.toString() })
+      child.stderr?.on('data', chunk => { output += chunk.toString() })
+      await waitForPath(path.join(gateDir, 'entered'))
+
+      const lateRoot = path.join(srv.cwd, 'LateRecovery', 'backups')
+      const putRes = await client.fetch('/api/backup/server/path', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: lateRoot }),
+      })
+      expect(putRes.status).toBe(409)
+      expect((await putRes.json() as { error: string }).error).toContain('standalone portable updater')
+      expect(readKvValue(srv.cwd, 'config/server-backup-path')).toBeNull()
+      await expectMissing(path.join(srv.cwd, 'LateRecovery'))
+
+      await releaseGate(gateDir)
+      const exitCode = await new Promise<number | null>((resolve, reject) => {
+        child.once('error', reject)
+        child.once('exit', resolve)
+      })
+      expect(exitCode, output).toBe(0)
+      await expect(readFile(path.join(srv.cwd, 'new-release.txt'), 'utf8')).resolves.toBe('new release')
+      await expect(readFile(path.join(srv.cwd, 'old-release.txt'), 'utf8')).rejects.toThrow()
+    } finally {
+      await rm(fixtureRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('Windows self-update handoff holds exclusion through post-step finalization', async () => {
+    const fixtureRoot = await mkdtemp(path.join(tmpdir(), 'pocketrisu-self-update-fixture-'))
+    const gateDir = path.join(fixtureRoot, 'windows-finalizer-gate')
+    const releaseDir = path.join(fixtureRoot, 'PocketRisu-v9.9.9')
+    const assetPath = path.join(fixtureRoot, 'release.tar.gz')
+    await mkdir(gateDir, { recursive: true })
+    await mkdir(path.join(releaseDir, 'dist'), { recursive: true })
+    await mkdir(path.join(releaseDir, 'server', 'node'), { recursive: true })
+    await mkdir(path.join(releaseDir, 'scripts'), { recursive: true })
+    await mkdir(path.join(releaseDir, 'bin'), { recursive: true })
+    await writeFile(path.join(releaseDir, 'dist', 'index.html'), '<html>new</html>')
+    await writeFile(path.join(releaseDir, 'server', 'node', 'server.cjs'), '// new server')
+    await copyFile(
+      path.resolve(import.meta.dirname, '../../server/node/recoveryPathMarkers.cjs'),
+      path.join(releaseDir, 'server', 'node', 'recoveryPathMarkers.cjs'),
+    )
+    await copyFile(
+      path.resolve(import.meta.dirname, '../../scripts/recoveryPathLockFinalizer.cjs'),
+      path.join(releaseDir, 'scripts', 'recoveryPathLockFinalizer.cjs'),
+    )
+    await writeFile(path.join(releaseDir, 'bin', 'node.exe'), 'new node')
+    await writeFile(path.join(releaseDir, 'package.json'), '{"version":"9.9.9"}\n')
+    await writeFile(path.join(releaseDir, 'new-release.txt'), 'new release')
+    const tar = spawnSync('tar', ['-czf', assetPath, '-C', fixtureRoot, path.basename(releaseDir)], {
+      encoding: 'utf8',
+    })
+    expect(tar.status, tar.stderr).toBe(0)
+    await writeFile(path.join(gateDir, 'stage'), 'windows-finalizer-before-release')
+    await writeFile(path.join(gateDir, 'hold'), 'hold')
+    const asset = await readFile(assetPath)
+    const fixtureServer = createHttpServer((req, res) => {
+      if (req.url?.startsWith('/check')) {
+        res.setHeader('content-type', 'application/json')
+        res.end(JSON.stringify({ hasUpdate: true, latestVersion: '9.9.9', severity: 'feature' }))
+        return
+      }
+      if (req.url === '/asset') {
+        res.setHeader('content-type', 'application/gzip')
+        res.setHeader('content-length', String(asset.length))
+        res.end(asset)
+        return
+      }
+      res.statusCode = 404
+      res.end()
+    })
+    await new Promise<void>((resolve, reject) => {
+      fixtureServer.once('error', reject)
+      fixtureServer.listen(0, '127.0.0.1', () => resolve())
+    })
+    const address = fixtureServer.address()
+    if (!address || typeof address === 'string') throw new Error('fixture server did not bind')
+    const origin = `http://127.0.0.1:${address.port}`
+    try {
+      const srv = await spawnServer({
+        env: {
+          RISU_UPDATE_URL: `${origin}/check`,
+          POCKETRISU_CHAT_BACKUP_DIR: 'chat-history',
+          POCKETRISU_TEST_RECOVERY_PLATFORM: 'win32',
+          POCKETRISU_TEST_SELF_UPDATE_ASSET_URL: `${origin}/asset`,
+          POCKETRISU_TEST_SELF_UPDATE_SKIP_RESTART: 'true',
+          POCKETRISU_TEST_SELF_UPDATE_WINDOWS_FINALIZER: 'true',
+          POCKETRISU_TEST_WINDOWS_FINALIZER_GATE_DIR: gateDir,
+        },
+        seedRoot: async root => {
+          await writeFile(path.join(root, '.portable'), '')
+          await writeFile(path.join(root, 'old-release.txt'), 'old release')
+        },
+      })
+      servers.push(srv)
+      const client = await createClient(srv.port, srv.password)
+      const serverRecovery = path.join(srv.cwd, 'RecoveryData', 'backups')
+      const chatRecovery = path.join(srv.cwd, 'chat-history')
+      const pathRes = await client.fetch('/api/backup/server/path', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: serverRecovery }),
+      })
+      expect(pathRes.status).toBe(200)
+      await writeFile(path.join(serverRecovery, 'server.bin'), 'server recovery')
+      await writeFile(path.join(chatRecovery, 'chat.gz'), 'chat recovery')
+
+      const updateRes = await client.fetch('/api/self-update', { method: 'POST' })
+      expect(updateRes.status).toBe(200)
+      expect(await updateRes.text()).toContain('Update complete')
+      await waitForPath(path.join(gateDir, 'entered'))
+      await expect(readFile(path.join(srv.cwd, 'bin', 'node.exe'), 'utf8'))
+        .resolves.toBe('new node')
+      await expect(readFile(path.join(srv.cwd, '.installed-version'), 'utf8'))
+        .resolves.toBe('v9.9.9')
+      const blockedPut = await client.fetch('/api/backup/server/path', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: path.join(srv.cwd, 'post-step-recovery', 'backups') }),
+      })
+      expect(blockedPut.status).toBe(409)
+      expect((await blockedPut.json() as { error: string }).error).toContain('server self-update')
+
+      await releaseGate(gateDir)
+      const lockOwnerPath = path.join(
+        srv.cwd,
+        'save',
+        '__recovery_path_state.lock',
+        'owner.json',
+      )
+      const releaseDeadline = Date.now() + 5000
+      while (Date.now() < releaseDeadline) {
+        try {
+          await access(lockOwnerPath)
+          await new Promise(resolve => setTimeout(resolve, 10))
+        } catch {
+          break
+        }
+      }
+      await expectMissing(lockOwnerPath)
+      await expect(readFile(path.join(srv.cwd, 'new-release.txt'), 'utf8')).resolves.toBe('new release')
+      await expect(readFile(path.join(serverRecovery, 'server.bin'), 'utf8')).resolves.toBe('server recovery')
+      await expect(readFile(path.join(chatRecovery, 'chat.gz'), 'utf8')).resolves.toBe('chat recovery')
+      await expect(readFile(path.join(srv.cwd, 'old-release.txt'), 'utf8')).rejects.toThrow()
+    } finally {
+      await new Promise<void>(resolve => fixtureServer.close(() => resolve()))
+      await rm(fixtureRoot, { recursive: true, force: true })
+    }
   })
 })
 

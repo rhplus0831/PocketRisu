@@ -47,6 +47,8 @@ __pycache__/
 dist.zip
 /scripts/*
 !/scripts/updater.cjs
+!/scripts/windows-update.bat
+!/scripts/recoveryPathLockFinalizer.cjs
 !/scripts/portable/
 !/scripts/termux/
 !/scripts/check-help-keys.mjs

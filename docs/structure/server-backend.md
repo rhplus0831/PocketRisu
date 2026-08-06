@@ -244,8 +244,9 @@ inside `queueStorageMutation()` immediately before the transactional publication
 │   ├── __sessions
 │   ├── __authcode                     # optional proxy registration token
 │   ├── __sionyw_client_data.json       # optional hub OAuth refresh data
-│   ├── __backup_path                  # updater-visible backup path marker
-│   ├── __chat_backup_path             # updater-visible chat-history path marker
+│   ├── __backup_path                  # durable, mandatory updater preservation marker
+│   ├── __chat_backup_path             # durable, mandatory updater preservation marker
+│   ├── __recovery_path_startup_quarantine # fail-closed, recoverable startup transaction
 │   ├── import_journal.json             # present only across import publication/recovery
 │   └── .migrated_to_sqlite             # legacy hex-file rollback/UI compatibility marker
 ├── backups/
@@ -1022,7 +1023,25 @@ are sent to the ordinary application log; it adds no provider API.
   each transport has a different target policy.
 
 - To change update checks or portable replacement, inspect `fetchLatestRelease()`, the
-  public/update routes, `src/ts/update.ts`, and `scripts/updater.cjs` together.
+  public/update routes, `src/ts/update.ts`, `scripts/updater.cjs`, `update.sh`, and
+  `server/node/recoveryPathMarkers.cjs` together. All destructive updater paths require
+  an absent startup-quarantine transaction plus both durable recovery-root markers, and
+  fail closed when any of that preservation state cannot be validated.
+  Backup-path mutation and self-update admission share an in-process queue plus the
+  token-owned `save/__recovery_path_state.lock` exclusion used by standalone updaters
+  and second server processes; the former uses a durable old/new marker set across its
+  KV and live-root transition. Startup first records the union of prior quarantine,
+  marker history, and current authoritative roots in the atomic/fsynced
+  `save/__recovery_path_startup_quarantine`, then publishes both recovery marker sets
+  under one acquisition before any root fallback/use, clearing the transaction only
+  after both markers are durable. Marker failure is therefore recoverable on the next
+  clean startup; corrupt/uncertain quarantine state retains the token lock. Source updates never replace live `save/`;
+  Windows parent processes atomically hand the token to the batch finalizer, which keeps
+  ownership through bin/version work and performs the only release. Never age/PID-steal an ambiguous crash-stale lock: verify
+  the owner is gone and remove that exact directory explicitly. Marker publication may
+  retain inaccessible historical paths lexically so startup can fall back, but updater
+  consumption must still canonicalize them or refuse replacement. Preserve actual
+  directory-entry casing and use platform-aware comparison in every destructive loop.
 
 - To make Hono functional, begin with `server/hono/src/app/index.ts`, but plan explicit
   replacements for authentication, SQLite/chunk storage, backup streaming, WebSockets,
@@ -1044,4 +1063,7 @@ are sent to the ordinary application log; it adds no provider API.
 - [Characters and personas](characters-personas.md) owns card/package interchange and
   character-specific asset references.
 - `scripts/updater.cjs` is the standalone portable update path parallel to the in-server
-  `/api/self-update`; `docs/*/remote.md` documents external Tailscale setup.
+  `/api/self-update`; `update.sh` is the source-install replacement path. All three share
+  the recovery-marker fail-closed contract described in
+  [backup and recovery](backup-recovery.md#backup-roots-updater-docker-and-hub-hosting).
+  `docs/*/remote.md` documents external Tailscale setup.

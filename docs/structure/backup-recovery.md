@@ -556,10 +556,64 @@ resolved from the application working directory. Chat-root creation/capture is
 best-effort and has no equivalent path-management route or managed-root validation.
 
 The server records both resolved roots in `save/__backup_path` and
-`save/__chat_backup_path`. `update.sh` uses those dependency-free markers to preserve a
-safe custom top-level directory inside the application tree. A root outside the tree
-needs no updater exception; a marker that points at the app root or a managed code root
-stops the update before replacement.
+`save/__chat_backup_path`. Each publication writes and fsyncs a private same-directory
+temporary file, atomically renames it, and fsyncs the parent directory where the platform
+supports directory handles. A failed publication restores the previous regular marker;
+if restoration also fails, it invalidates the marker so updaters refuse replacement.
+Startup first atomically publishes `save/__recovery_path_startup_quarantine`, a bounded,
+strictly versioned transaction record containing the complete target history recovered
+from any prior quarantine, both still-valid markers, and the current authoritative roots.
+Every updater rejects replacement while that pathname exists, including when its content
+is corrupt. Startup then publishes both markers before using their configured recovery
+roots and removes the quarantine only after both publications are durable. A first- or
+second-marker failure leaves the record for the next clean startup to recover; corrupt or
+uncertain quarantine publication retains the token-owned filesystem lock for explicit
+operator recovery rather than discarding historical custom roots. Markers
+accept the legacy single absolute path and use a versioned path set once multiple roots
+or identities must be retained. The set persists prior configured roots because path
+changes deliberately leave their archives in place, and it retains distinct lexical and
+canonical identities when symlink aliases differ. Publication retains an authoritative
+lexical identity when an offline drive, UNC share, or permission boundary temporarily
+prevents canonical resolution; startup may then fall back to its default live root.
+Destructive updater consumption remains strict and refuses an inaccessible or ambiguous
+identity rather than trusting the lexical fallback.
+
+The complete server-backup path admission—including validation/probing, a durable
+`old + new` transition marker, the `config/server-backup-path` commit, the live-root
+switch, and retained preservation set—is serialized with self-update admission. The
+same operation also holds a durable filesystem exclusion shared with second server
+processes, `scripts/updater.cjs`, `update.sh`, and the complete in-process self-update
+replacement phase. Startup holds one acquisition while publishing both server- and
+chat-root marker sets, before creating, falling back to, sweeping, or otherwise using
+either recovery root. Thus no external updater can take a preservation snapshot while a
+path transition is admitted, and no server can publish/select a new in-tree root between
+an updater snapshot and destructive enumeration. A crash-stale or incomplete lock is
+never guessed safe from age or PID liveness: startup, path changes, and updaters stop
+fail-closed and identify the exact lock directory. After verifying no server/update
+operation is active, an operator must remove only `save/__recovery_path_state.lock` and
+retry. A crash before
+the KV commit restarts on the old root, while a crash after it restarts on the new root;
+the marker set preserves both roots in either case and continues protecting archives at
+the old root after success. KV failure restores the prior marker set. Self-update captures
+its preservation set under the same lock, keeps that
+snapshot through replacement, and refuses later path changes until update completion.
+
+`update.sh`, `scripts/updater.cjs`, and the in-process `/api/self-update` replacement all
+require the startup quarantine to be absent and treat both markers as mandatory
+preservation metadata. Before destructive replacement
+they reject missing, unreadable, non-regular, malformed, app-root, and managed-code-root
+markers. Classification checks lexical paths and canonical deepest-existing-prefix
+identities, including symlink aliases and Windows case folding. Every safe in-tree
+identity in a transition preserves its top-level entry with filesystem casing intact,
+and updater enumeration performs platform-aware keep comparisons; the default `save`/`backups`
+roots remain in the normal keep set, while a genuinely outside-tree identity needs no
+updater exception. The source updater backs up `save/` but never recursively replaces or
+merges the live tree; release-provided `save/` content is discarded, so the active lock
+and database remain continuously present even if the updater is killed. Windows portable
+and in-process updates atomically publish a token handoff under `.update-tmp`; the batch
+post-step retains that exact logical ownership through bundled-Node copy and version
+finalization, then the packaged dependency-free finalizer verifies the token and releases
+the lock exactly once. A killed or broken post-step leaves the lock fail-closed.
 
 Docker Compose persists `/app/save` and `/app/backups` in separate explicitly named
 volumes. Default chat history under `/app/save/chat-backups` and default server archives
@@ -617,6 +671,7 @@ Representative guarantees live in:
 - `server/node/chatBackups.test.ts`
 - `server/node/importJournal.test.ts`
 - `server/node/updateScript.test.ts`
+- `server/node/windowsRecoveryLockFinalizer.test.ts`
 - `server/node/snapshotPluginStorage.e2e.test.ts`
 - `src/ts/storage/nodeStorage.bootRecovery.test.ts`
 - `src/ts/storage/nodeStorageAvailability.test.ts`
