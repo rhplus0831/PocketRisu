@@ -62,6 +62,16 @@ interface ChatBackupStore {
         chatId: string,
         versionId: string,
     ) => Promise<Buffer | null>
+    scanChatBackupVersions: (
+        visitor: (raw: Buffer, identity: {
+            chaId: string
+            chatId: string
+            versionId: string
+            sourceVersionId: string
+            storage: 'loose' | 'loose-gzip' | 'frame' | 'legacy-bundle'
+            rootIdentity: string
+        }) => Promise<void> | void,
+    ) => Promise<{ totalVersions: number }>
     close: () => void
 }
 
@@ -1718,6 +1728,271 @@ describe('chat backup root and legacy migration', () => {
         expect(historicalVersion).toBeDefined()
         expect(await store.readChatBackup('old-char', 'old-chat', historicalVersion.versionId))
             .toEqual(onlyHistorical)
+    })
+})
+
+describe('chat backup reachability scan', () => {
+    it('visits loose, gzip, frame, bundle, and federated-root versions', async () => {
+        const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-history-scan-'))
+        tempRoots.push(appRoot)
+        const activeRoot = path.join(appRoot, 'active')
+        const historicalRoot = path.join(appRoot, 'historical')
+        const activeDir = path.join(activeRoot, 'char', 'chat')
+        const historicalDir = path.join(historicalRoot, 'char', 'chat')
+        fs.mkdirSync(activeDir, { recursive: true })
+        fs.mkdirSync(historicalDir, { recursive: true })
+
+        const fixtures = [
+            { versionId: 'v-51000-0-loose', raw: rawChat(510, 'loose') },
+            { versionId: 'v-51001-0-gzip', raw: rawChat(511, 'gzip') },
+            { versionId: 'v-51002-0-frame', raw: rawChat(512, 'frame') },
+            { versionId: 'v-51003-0-bundle', raw: rawChat(513, 'bundle') },
+            { versionId: 'v-51004-0-federated', raw: rawChat(514, 'federated') },
+        ]
+        fs.writeFileSync(
+            path.join(activeDir, `${fixtures[0].versionId}.bin`),
+            fixtures[0].raw,
+        )
+        fs.writeFileSync(
+            path.join(activeDir, `${fixtures[1].versionId}.bin.gz`),
+            zlib.gzipSync(fixtures[1].raw),
+        )
+        writeFrameFixture(activeDir, fixtures[2].versionId, fixtures[2].raw)
+        writeLegacySolidBundle(activeDir, [fixtures[3]])
+        fs.writeFileSync(
+            path.join(historicalDir, `${fixtures[4].versionId}.bin`),
+            fixtures[4].raw,
+        )
+
+        const store = createChatBackupStore({
+            getChatBackupsRoot: () => activeRoot,
+            getChatBackupsReadRoots: () => [activeRoot, historicalRoot],
+            readChatRowRaw: () => null,
+            autoReconcile: false,
+        }) as ChatBackupStore
+        stores.push(store)
+
+        const observed: Array<{
+            text: string
+            versionId: string
+            sourceVersionId: string
+            storage: string
+            rootIdentity: string
+        }> = []
+        const result = await store.scanChatBackupVersions(async (raw, identity) => {
+            const chat = await decodeRisuSave(raw)
+            observed.push({
+                text: chat.message[0].data,
+                versionId: identity.versionId,
+                sourceVersionId: identity.sourceVersionId,
+                storage: identity.storage,
+                rootIdentity: identity.rootIdentity,
+            })
+        })
+
+        expect(result.totalVersions).toBe(5)
+        expect(observed.map(item => item.sourceVersionId).sort())
+            .toEqual(fixtures.map(item => item.versionId).sort())
+        expect(new Set(observed.map(item => item.storage))).toEqual(new Set([
+            'loose',
+            'loose-gzip',
+            'frame',
+            'legacy-bundle',
+        ]))
+        expect(new Set(observed.map(item => item.rootIdentity)).size).toBe(2)
+        expect(observed.map(item => item.text)).toEqual(expect.arrayContaining(
+            fixtures.map((item, index) => `message-${510 + index}-${item.versionId.split('-').at(-1)}`),
+        ))
+    })
+
+    it('fails closed when a retained version becomes unreadable', async () => {
+        const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-history-unreadable-'))
+        tempRoots.push(appRoot)
+        const activeRoot = path.join(appRoot, 'active')
+        const activeDir = path.join(activeRoot, 'char', 'chat')
+        fs.mkdirSync(activeDir, { recursive: true })
+        fs.writeFileSync(
+            path.join(activeDir, 'v-52000-0-corrupt.bin.gz'),
+            Buffer.from('not gzip data'),
+        )
+        const store = createChatBackupStore({
+            getChatBackupsRoot: () => activeRoot,
+            readChatRowRaw: () => null,
+            autoReconcile: false,
+        }) as ChatBackupStore
+        stores.push(store)
+
+        await expect(store.scanChatBackupVersions(() => {}))
+            .rejects.toThrow('Cannot verify retained chat backup char/chat/v-52000-0-corrupt')
+    })
+
+    it('fails closed when a physical chat directory cannot be inventoried', async () => {
+        const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-history-dir-error-'))
+        tempRoots.push(appRoot)
+        const activeRoot = path.join(appRoot, 'active')
+        const activeDir = path.join(activeRoot, 'char', 'chat')
+        fs.mkdirSync(activeDir, { recursive: true })
+        fs.writeFileSync(path.join(activeDir, 'v-52100-0-readable.bin'), rawChat(521))
+        const store = createChatBackupStore({
+            getChatBackupsRoot: () => activeRoot,
+            readChatRowRaw: () => null,
+            autoReconcile: false,
+        }) as ChatBackupStore
+        stores.push(store)
+
+        const realReaddir = fs.readdirSync.bind(fs)
+        const spy = vi.spyOn(fs, 'readdirSync').mockImplementation(((directory, options) => {
+            if (path.resolve(String(directory)) === path.resolve(activeDir)) {
+                throw Object.assign(new Error('injected chat-directory read failure'), {
+                    code: 'EACCES',
+                })
+            }
+            return realReaddir(directory, options as never)
+        }) as typeof fs.readdirSync)
+        try {
+            await expect(store.scanChatBackupVersions(() => {}))
+                .rejects.toThrow(`Cannot verify retained chat-backup directory ${activeDir}`)
+        } finally {
+            spy.mockRestore()
+        }
+    })
+
+    it('fails closed for recognized malformed frame and bundle metadata', async () => {
+        const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-history-invalid-'))
+        tempRoots.push(appRoot)
+        const activeRoot = path.join(appRoot, 'active')
+        const activeDir = path.join(activeRoot, 'char', 'chat')
+        fs.mkdirSync(activeDir, { recursive: true })
+        const store = createChatBackupStore({
+            getChatBackupsRoot: () => activeRoot,
+            readChatRowRaw: () => null,
+            autoReconcile: false,
+        }) as ChatBackupStore
+        stores.push(store)
+
+        const framePath = path.join(activeDir, 'v-52200-0-malformed.frame')
+        fs.writeFileSync(framePath, Buffer.from('not a frame'))
+        await expect(store.scanChatBackupVersions(() => {}))
+            .rejects.toThrow(`Cannot verify retained chat-backup frame ${framePath}`)
+        fs.unlinkSync(framePath)
+
+        const bundlePath = path.join(activeDir, 'archive-52201-52201.bundle')
+        const metaPath = bundlePath.replace(/\.bundle$/, '.meta.json')
+        fs.writeFileSync(bundlePath, zlib.gzipSync(rawChat(522)))
+        fs.writeFileSync(metaPath, '{"format":"broken","entries":')
+        await expect(store.scanChatBackupVersions(() => {}))
+            .rejects.toThrow(`Cannot verify retained chat-backup bundle metadata ${metaPath}`)
+    })
+
+    it('fails closed when an inventoried candidate disappears before its read', async () => {
+        const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-history-race-'))
+        tempRoots.push(appRoot)
+        const activeRoot = path.join(appRoot, 'active')
+        const activeDir = path.join(activeRoot, 'char', 'chat')
+        const versionPath = path.join(activeDir, 'v-52300-0-disappears.bin')
+        fs.mkdirSync(activeDir, { recursive: true })
+        fs.writeFileSync(versionPath, rawChat(523))
+        const store = createChatBackupStore({
+            getChatBackupsRoot: () => activeRoot,
+            readChatRowRaw: () => null,
+            autoReconcile: false,
+            diagnostics: {
+                onEvent(event: Record<string, unknown>) {
+                    if (event.event === 'reachability-inventory-complete') {
+                        fs.unlinkSync(versionPath)
+                    }
+                },
+            },
+        }) as ChatBackupStore
+        stores.push(store)
+
+        await expect(store.scanChatBackupVersions(() => {}))
+            .rejects.toThrow('Cannot verify retained chat backup char/chat/v-52300-0-disappears')
+    })
+
+    it('fails closed when a required historical root is unavailable', async () => {
+        const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-history-offline-'))
+        tempRoots.push(appRoot)
+        const activeRoot = path.join(appRoot, 'active')
+        const historicalRoot = path.join(appRoot, 'historical')
+        fs.mkdirSync(activeRoot, { recursive: true })
+        fs.mkdirSync(historicalRoot, { recursive: true })
+        const store = createChatBackupStore({
+            getChatBackupsRoot: () => activeRoot,
+            getChatBackupsReadRoots: () => [{ root: historicalRoot, required: true }],
+            readChatRowRaw: () => null,
+            autoReconcile: false,
+        }) as ChatBackupStore
+        stores.push(store)
+        fs.renameSync(historicalRoot, `${historicalRoot}-offline`)
+
+        await expect(store.scanChatBackupVersions(() => {}))
+            .rejects.toThrow(`Cannot verify retained chat-backup root ${historicalRoot}`)
+    })
+
+    it('strictly discovers protected conflict containers without changing permissive listing', async () => {
+        const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-conflict-container-'))
+        tempRoots.push(appRoot)
+        const activeRoot = path.join(appRoot, 'active')
+        const conflictRoot = path.join(activeRoot, '%2Eroot-history')
+        const protectedDir = path.join(conflictRoot, 'protected', 'char', 'chat')
+        fs.mkdirSync(protectedDir, { recursive: true })
+        fs.writeFileSync(
+            path.join(protectedDir, 'v-52400-0-protected.bin'),
+            rawChat(524, '{{inlay::protected-conflict}}'),
+        )
+        const store = createChatBackupStore({
+            getChatBackupsRoot: () => activeRoot,
+            readChatRowRaw: () => null,
+            autoReconcile: false,
+        }) as ChatBackupStore
+        stores.push(store)
+
+        const realReaddir = fs.readdirSync.bind(fs)
+        const spy = vi.spyOn(fs, 'readdirSync').mockImplementation(((directory, options) => {
+            if (path.resolve(String(directory)) === path.resolve(conflictRoot)) {
+                throw Object.assign(new Error('injected protected-container failure'), {
+                    code: 'EACCES',
+                })
+            }
+            return realReaddir(directory, options as never)
+        }) as typeof fs.readdirSync)
+        try {
+            expect(store.listChatBackupChats()).toEqual([])
+            await expect(store.scanChatBackupVersions(() => {}))
+                .rejects.toThrow(`Cannot verify protected chat-backup container ${conflictRoot}`)
+        } finally {
+            spy.mockRestore()
+        }
+    })
+
+    it('fails closed when a discovered protected conflict root disappears before inventory', async () => {
+        const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketrisu-conflict-race-'))
+        tempRoots.push(appRoot)
+        const activeRoot = path.join(appRoot, 'active')
+        const protectedRoot = path.join(activeRoot, '%2Eroot-history', 'protected')
+        const protectedDir = path.join(protectedRoot, 'char', 'chat')
+        fs.mkdirSync(protectedDir, { recursive: true })
+        fs.writeFileSync(
+            path.join(protectedDir, 'v-52500-0-protected.bin'),
+            rawChat(525, '{{inlay::protected-race}}'),
+        )
+        const store = createChatBackupStore({
+            getChatBackupsRoot: () => activeRoot,
+            readChatRowRaw: () => null,
+            autoReconcile: false,
+            diagnostics: {
+                onEvent(event: Record<string, unknown>) {
+                    if (event.event === 'reachability-roots-discovered') {
+                        fs.rmSync(protectedRoot, { recursive: true, force: true })
+                    }
+                },
+            },
+        }) as ChatBackupStore
+        stores.push(store)
+
+        await expect(store.scanChatBackupVersions(() => {}))
+            .rejects.toThrow(`Cannot verify retained chat-backup root ${protectedRoot}`)
     })
 })
 

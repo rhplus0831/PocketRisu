@@ -1517,9 +1517,38 @@ async function readPluginStorageState(valueKey, ownerKey) {
 // Captures run inside the endpoint's storage operation. Reconcile enters the
 // same queue through runStorageOperation, so neither can observe half-written
 // backup state or race a chat-row overwrite.
+function observeChatBackupTestEvent(event) {
+    if (process.env.NODE_ENV !== 'test'
+        || event?.event !== 'reachability-inventory-complete') return;
+    const configured = String(
+        process.env.POCKETRISU_TEST_CHAT_BACKUP_REACHABILITY_GATE_DIR ?? '',
+    ).trim();
+    if (!configured) return;
+    const gateDir = path.resolve(configured);
+    const holdPath = path.join(gateDir, 'hold');
+    if (!existsSync(holdPath)) return;
+    mkdirSync(gateDir, { recursive: true });
+    writeFileSync(path.join(gateDir, 'entered'), String(event.totalCandidates), 'utf8');
+    const releasePath = path.join(gateDir, 'release');
+    const deadline = Date.now() + 30_000;
+    const sleeper = new Int32Array(new SharedArrayBuffer(4));
+    while (existsSync(holdPath) && !existsSync(releasePath)) {
+        if (Date.now() >= deadline) {
+            throw new Error('Timed out at chat-backup reachability test gate');
+        }
+        Atomics.wait(sleeper, 0, 0, 10);
+    }
+}
+
 const chatBackupStore = createChatBackupStore({
     getChatBackupsRoot: () => chatBackupsDir,
-    getChatBackupsReadRoots: () => chatBackupReadRoots,
+    getChatBackupsReadRoots: () => {
+        const required = new Set(chatBackupRequiredReadRoots.map(root => path.resolve(root)));
+        return chatBackupReadRoots.map(root => ({
+            root,
+            required: required.has(path.resolve(root)),
+        }));
+    },
     logger,
     inspectChatRow: (chaId, chatId) => (
         chatRowStore.inspectChatRowForBackup(chaId, chatId)
@@ -1537,6 +1566,9 @@ const chatBackupStore = createChatBackupStore({
     getByteBudget: () => resolveChatBackupMaxBytes({ kvGet }),
     getUncompressedByteBudget: () => resolveChatBackupMaxUncompressedBytes({ kvGet }),
     runStorageOperation: queueStorageOperation,
+    diagnostics: process.env.NODE_ENV === 'test'
+        ? { onEvent: observeChatBackupTestEvent }
+        : null,
 });
 
 const DB_CACHE_TEST_DIAGNOSTICS = process.env.NODE_ENV === 'test';
@@ -3579,6 +3611,7 @@ function isManagedBackupPath(absPath) {
 let backupsDir;
 let chatBackupsDir;
 let chatBackupReadRoots = [];
+let chatBackupRequiredReadRoots = [];
 let serverBackupReadRoots = [];
 // Publish the configured root before creating, sweeping, or otherwise relying
 // on it. If the configured destination is temporarily unavailable and runtime
@@ -3647,10 +3680,20 @@ withRecoveryPathInterprocessLockSync('server startup recovery-marker publication
         // readable until their files have been merged successfully, including
         // when a conflicting or interrupted migration leaves a source behind.
         serverBackupReadRoots = [...quarantinedTargets.__backup_path];
-        chatBackupReadRoots = [
+        const serverChatBackupReadRoots = serverBackupReadRoots.map(
+            root => path.join(root, CHAT_BACKUP_DIRNAME),
+        );
+        chatBackupRequiredReadRoots = [
             chatBackupsDir,
             ...quarantinedTargets.__chat_backup_path,
-            ...serverBackupReadRoots.map(root => path.join(root, CHAT_BACKUP_DIRNAME)),
+            // A derived legacy tree that is present at startup is now a known
+            // history root. If it later disappears, destructive reachability
+            // scans must fail closed rather than reinterpret it as empty.
+            ...serverChatBackupReadRoots.filter(root => existsSync(root)),
+        ];
+        chatBackupReadRoots = [
+            ...chatBackupRequiredReadRoots,
+            ...serverChatBackupReadRoots,
         ];
         clearRecoveryPathStartupQuarantineSync(savePath);
     } catch (publicationError) {
@@ -4217,6 +4260,7 @@ function addInlayReferencesFromChat(chat, refCounts) {
 async function scanAuthoritativeInlayReferences() {
     const refCounts = new Map();
     let totalMessages = 0;
+    let totalHistoryVersions = 0;
 
     for (const key of chatRowStore.listAllChatRowKeys()) {
         const identity = chatRowStore.parseChatRowKey(key);
@@ -4229,9 +4273,31 @@ async function scanAuthoritativeInlayReferences() {
         totalMessages += addInlayReferencesFromChat(chat, refCounts);
     }
 
+    const history = await chatBackupStore.scanChatBackupVersions(async (raw, identity) => {
+        let chat;
+        try {
+            chat = await decodeAuthoritativeRisuSave(raw);
+        } catch (error) {
+            throw new Error(
+                `Cannot decode retained chat backup ${identity.chaId}/${identity.chatId}`
+                + `/${identity.versionId}: ${error?.message || error}`,
+                { cause: error },
+            );
+        }
+        if (isColdStorageChat(chat) && !restoreColdStorageChat(chat)) {
+            throw new Error(
+                `Cannot verify inlay references in cold-storage chat backup `
+                + `${identity.chaId}/${identity.chatId}/${identity.versionId}`,
+            );
+        }
+        totalMessages += addInlayReferencesFromChat(chat, refCounts);
+    });
+    totalHistoryVersions = history.totalVersions;
+
     return {
         scannedAt: Date.now(),
         totalMessages,
+        totalHistoryVersions,
         refCounts: Object.fromEntries([...refCounts.entries()].sort(([left], [right]) => (
             left.localeCompare(right)
         ))),

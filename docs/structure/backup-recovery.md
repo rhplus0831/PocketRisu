@@ -467,6 +467,22 @@ list/version/body routes live under `/api/chat-backups`. **System → Backups** 
 deleted identities and import a selected pre-image as a new chat with a fresh ID; it
 never overwrites the source or current chat.
 
+Retained pre-images are also authoritative reachability roots for inlay deletion.
+`scanChatBackupVersions()` visits each independently restorable loose, gzip, frame, or
+legacy-bundle version across the same active, historical, and protected conflict roots
+used by list/restore. The inlay scanner decodes and releases one version at a time and
+counts message and swipe tokens together with live chat rows. Both gallery
+classification and queued deletion use this combined proof; a retained candidate that
+cannot be read or decoded, an unreadable or empty physical chat directory, recognized
+malformed frame/bundle metadata, inventory-to-read disappearance, or an explicitly
+retained history root that is unavailable fails the operation closed before any selected
+inlay is removed. Destructive discovery also treats every discovered protected conflict
+namespace as required: a non-`ENOENT` failure while enumerating its reserved container,
+or disappearance of a discovered namespace before inventory, aborts the proof. Public
+list/restore discovery remains permissive around damaged entries; destructive
+reachability alone uses strict root discovery and inventory. Loaded unsaved chats remain
+an additional browser-provided keep-set.
+
 ### Plugin recovery contract
 
 [Plugin storage](plugin-storage.md) is canonical for persisted modes, generation/manifest

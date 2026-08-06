@@ -143,7 +143,9 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
   - `removeInlayAsset()` delegates to `removeInlayAssets()`. Bulk deletion deduplicates
     IDs and submits at most `INLAY_DELETE_BATCH_SIZE` (1,000) per guarded server
     mutation, refreshing the loaded/unsaved-chat keep-set for every batch.
-  - `scanInlayReferences()` scans authoritative server chat rows and merges token references from loaded chats so placeholders and unsaved edits are both covered (`src/ts/process/files/inlays.ts:716`).
+  - `scanInlayReferences()` scans authoritative server chat rows plus retained
+    chat-version history, then merges token references from loaded chats so placeholders,
+    restorable pre-images, and unsaved edits are covered (`src/ts/process/files/inlays.ts:716`).
   - `supportsInlayImage()` checks the current model’s `hasImageInput` flag (`src/ts/process/files/inlays.ts:697`).
   - `src/ts/process/files/tests/inlays.test.ts` exercises storage round trips, explorer
     metadata, uploads, resizing, and deletion.
@@ -206,7 +208,8 @@ There are no dedicated audio or video modules under `src/ts/media/`; upload clas
     during the filesystem migration/bootstrap path.
   - `/api/session` issues the direct-asset cookie; `/api/asset/:hexKey` serves assets and
     inlays with MIME, ETag, and one-year immutable caching.
-  - `/api/inlays/references` scans authoritative chat rows;
+  - `/api/inlays/references` scans authoritative chat rows and strictly inventoried
+    retained chat-version history;
     `/api/inlays/delete-unreferenced` requires the active writer, accepts no more than
     `MAX_INLAY_DELETE_BATCH`, and revalidates within the storage queue. The compatibility
     `/api/remove` path applies the same reference guard to inlays.
@@ -340,10 +343,13 @@ network call.
    the `risu-session` cookie and streams the raw payload with detected MIME type.
 10. `removeInlayAssets()` deduplicates requests and loops over 1,000-ID batches. Before
     every batch it refreshes loaded/unsaved chat references; the active-writer server
-    mutation rescans all authoritative chat rows, deletes only unreferenced payload,
-    sidecar, legacy thumbnail/info, and ownership records, and reports removed/referenced
-    IDs. Results accumulate across successful batches and the explorer cache is invalidated
-    in `finally`; a later-batch failure does not undo earlier committed batches.
+    mutation rescans all authoritative chat rows and every strictly inventoried retained
+    history version, deletes only unreferenced payload, sidecar, legacy thumbnail/info,
+    and ownership records, and reports removed/referenced IDs. Invalid or unreadable
+    history, inaccessible protected conflict containers, and discovered conflict roots
+    that disappear before inventory fail the current batch before deletion. Results accumulate across successful
+    batches and the explorer cache is invalidated in `finally`; a later-batch failure does
+    not undo earlier committed batches.
 
 ### Image generation and view screens
 
@@ -431,8 +437,11 @@ network call.
   - `{{inlayeddata::<id>}}` carries assistant-side multimodal/signature data.
 
 - Chat messages store IDs, never embedded bytes. Every gallery deletion batch therefore
-  revalidates authoritative chat rows under the storage queue and preserves references
-  from loaded, unsaved chats as an additional keep-set.
+  revalidates authoritative live chat rows and every retained loose, gzip, frame, or
+  legacy-bundle pre-image across federated history roots under the storage queue.
+  Unreadable retained history, unavailable retained history roots, and protected conflict
+  namespaces that cannot be enumerated or disappear after discovery fail deletion closed,
+  and loaded, unsaved chats remain an additional keep-set.
 - Bulk inlay deletion is chunked, not globally atomic. Successful earlier batches remain
   deleted if a later request fails; callers receive only a result after all batches finish.
 - `scanInlayReferences()` is server-aware and fail-closed in both gallery surfaces: no assets are classified as message-orphans until the authoritative scan succeeds.
@@ -497,8 +506,8 @@ network call.
   `writeInlaySidecar()`, `reconcileInterruptedInlayPublications()`, and the `inlay/`
   branch of `/api/write` together.
 - To change deletion chunking or reference safety, inspect `INLAY_DELETE_BATCH_SIZE`,
-  `removeInlayAssets()`, `MAX_INLAY_DELETE_BATCH`, and
-  `/api/inlays/delete-unreferenced`.
+  `removeInlayAssets()`, `MAX_INLAY_DELETE_BATCH`,
+  `scanChatBackupVersions()`, and `/api/inlays/delete-unreferenced`.
 - To change direct asset authentication or caching, inspect `/api/session`,
   `/api/asset/:hexKey`, and `NodeStorage.initSession()`.
 - To change bulk gallery metadata loading, inspect `listInlayExplorerItems()` and the

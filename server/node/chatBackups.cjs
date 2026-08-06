@@ -47,6 +47,7 @@ const VERSION_FILE_RE = /^v-(\d+)-(\d+)-([a-z0-9_-]{1,24})\.bin(\.gz)?$/;
 const VERSION_ID_RE = /^v-(\d+)-(\d+)-([a-z0-9_-]{1,24})$/;
 const FRAME_FILE_RE = /^(v-\d+-\d+-[a-z0-9_-]{1,24})\.frame$/;
 const BUNDLE_FILE_RE = /^archive-(\d+)-(\d+)\.bundle$/;
+const BUNDLE_META_FILE_RE = /^archive-(\d+)-(\d+)\.meta\.json$/;
 // encodePathComponent() cannot produce this physical directory name, so it
 // cannot collide with a character identity while remaining portable.
 const ROOT_HISTORY_DIRNAME = '%2Eroot-history';
@@ -760,7 +761,7 @@ function createChatBackupStore(options) {
         return path.resolve(String(getChatBackupsRoot()));
     }
 
-    function backupsReadRootRecords() {
+    function backupsReadRootRecords({ strictReachability = false } = {}) {
         const activeRoot = backupsTreeRoot();
         let configured = [];
         if (typeof getChatBackupsReadRoots === 'function') {
@@ -768,15 +769,24 @@ function createChatBackupStore(options) {
                 const selected = getChatBackupsReadRoots();
                 if (Array.isArray(selected)) configured = selected;
             } catch (error) {
+                if (strictReachability) {
+                    throw new Error(
+                        `Cannot resolve retained chat-backup roots: ${error?.message || error}`,
+                        { cause: error },
+                    );
+                }
                 log('warn', '[ChatBackups] Could not resolve historical chat-backup roots:', error);
             }
         }
 
         const records = [];
-        const identities = new Set();
+        const recordsByIdentity = new Map();
         function addRoot(candidate, options = {}) {
+            const descriptor = candidate && typeof candidate === 'object'
+                ? candidate
+                : { root: candidate };
             let absolute;
-            try { absolute = path.resolve(String(candidate)); }
+            try { absolute = path.resolve(String(descriptor.root)); }
             catch { return; }
             let identity = `path:${process.platform === 'win32' ? absolute.toLowerCase() : absolute}`;
             try {
@@ -785,17 +795,27 @@ function createChatBackupStore(options) {
             } catch {
                 // An offline historical root remains in the set by lexical identity.
             }
-            if (identities.has(identity)) return;
-            identities.add(identity);
+            const existing = recordsByIdentity.get(identity);
+            if (existing) {
+                if (options.required === true || descriptor.required === true) {
+                    existing.required = true;
+                }
+                return;
+            }
             const stableIdentity = options.identity
                 ?? `historical:${crypto.createHash('sha256').update(absolute).digest('hex').slice(0, 20)}`;
-            records.push({
+            const record = {
                 root: absolute,
                 identity: stableIdentity,
                 active: options.active === true,
+                required: options.active === true
+                    || options.required === true
+                    || descriptor.required === true,
                 originalEligible: options.originalEligible === true
                     || options.active === true,
-            });
+            };
+            records.push(record);
+            recordsByIdentity.set(identity, record);
         }
 
         addRoot(activeRoot, { active: true, identity: 'active' });
@@ -804,11 +824,25 @@ function createChatBackupStore(options) {
             const conflictRoot = path.join(record.root, ROOT_HISTORY_DIRNAME);
             let entries = [];
             try { entries = fs.readdirSync(conflictRoot, { withFileTypes: true }); }
-            catch { continue; }
+            catch (error) {
+                if (error?.code === 'ENOENT') continue;
+                if (strictReachability) {
+                    throw new Error(
+                        `Cannot verify protected chat-backup container ${conflictRoot}: `
+                        + `${error?.message || error}`,
+                        { cause: error },
+                    );
+                }
+                continue;
+            }
             for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
                 if (entry.isDirectory()) {
                     addRoot(path.join(conflictRoot, entry.name), {
                         identity: `conflict:${entry.name}`,
+                        // Once a protected namespace has been observed by a
+                        // destructive proof, disappearance before inventory
+                        // cannot be reinterpreted as an empty reference set.
+                        required: strictReachability || record.required,
                         // Root-migration recovery namespaces use a 16-hex
                         // source identity. Content-derived normalization
                         // namespaces use 20 hex and must not outrank the
@@ -1229,6 +1263,129 @@ function createChatBackupStore(options) {
         };
     }
 
+    function requireReachabilityFile(filename, description) {
+        let stat;
+        try { stat = fs.statSync(filename); }
+        catch (error) {
+            throw new Error(
+                `Cannot verify ${description} ${filename}: ${error?.message || error}`,
+                { cause: error },
+            );
+        }
+        if (!stat.isFile()) {
+            throw new Error(`Cannot verify ${description} ${filename}: not a regular file`);
+        }
+        return stat;
+    }
+
+    function readBundleMetaForReachability(chatDir, bundleFile) {
+        const bundlePath = path.join(chatDir, bundleFile);
+        const metaFile = bundleFile.replace(/\.bundle$/, '.meta.json');
+        const metaPath = path.join(chatDir, metaFile);
+        requireReachabilityFile(bundlePath, 'retained chat-backup bundle');
+        requireReachabilityFile(metaPath, 'retained chat-backup bundle metadata');
+        const bundle = readBundleMeta(chatDir, bundleFile);
+        if (!bundle || bundle.format !== 'pocketrisu-chat-backup-bundle-v1') {
+            throw new Error(`Cannot verify retained chat-backup bundle metadata ${metaPath}`);
+        }
+        let previousEnd = 0;
+        for (const entry of [...bundle.entries].sort((left, right) => left.offset - right.offset)) {
+            const end = entry.offset + entry.size;
+            if (!Number.isSafeInteger(end) || entry.offset < previousEnd) {
+                throw new Error(`Cannot verify retained chat-backup bundle metadata ${metaPath}`);
+            }
+            previousEnd = end;
+        }
+        return bundle;
+    }
+
+    /**
+     * Destructive reachability uses a strict inventory that is deliberately
+     * separate from permissive list/restore discovery. A physical chat
+     * directory is evidence that retained history exists; unreadable, empty,
+     * or recognized-but-invalid representations cannot be reinterpreted as an
+     * empty reference set.
+     */
+    function scanChatDirectoryForReachability(chatDir) {
+        let filenames;
+        try { filenames = fs.readdirSync(chatDir); }
+        catch (error) {
+            throw new Error(
+                `Cannot verify retained chat-backup directory ${chatDir}: `
+                + `${error?.message || error}`,
+                { cause: error },
+            );
+        }
+        const filenameSet = new Set(filenames);
+        const loose = new Map();
+        const frames = [];
+        const bundles = [];
+
+        for (const filename of filenames) {
+            const frameMatch = FRAME_FILE_RE.exec(filename);
+            if (frameMatch) {
+                const framePath = path.join(chatDir, filename);
+                requireReachabilityFile(framePath, 'retained chat-backup frame');
+                const parsed = readFrameHeader(framePath);
+                if (!parsed || parsed.versionId !== frameMatch[1]) {
+                    throw new Error(`Cannot verify retained chat-backup frame ${framePath}`);
+                }
+                frames.push({ ...parsed, storage: 'frame' });
+                continue;
+            }
+            const parsed = parseVersionFile(filename);
+            if (!parsed) continue;
+            const fullPath = path.join(chatDir, filename);
+            const stat = requireReachabilityFile(fullPath, 'retained loose chat backup');
+            const existing = loose.get(parsed.versionId);
+            if (!existing || parsed.compressed) {
+                loose.set(parsed.versionId, {
+                    ...parsed,
+                    size: parsed.compressed ? gzipRawSize(fullPath) : stat.size,
+                    diskBytes: stat.size,
+                    storage: 'loose',
+                });
+            }
+        }
+
+        for (const filename of filenames) {
+            if (BUNDLE_META_FILE_RE.test(filename)) {
+                const bundleFile = filename.replace(/\.meta\.json$/, '.bundle');
+                if (!filenameSet.has(bundleFile)) {
+                    throw new Error(
+                        `Cannot verify retained chat-backup bundle metadata `
+                        + `${path.join(chatDir, filename)}: bundle is missing`,
+                    );
+                }
+                continue;
+            }
+            if (!BUNDLE_FILE_RE.test(filename)) continue;
+            const bundle = readBundleMetaForReachability(chatDir, filename);
+            bundles.push({
+                ...bundle,
+                diskBytes: requireReachabilityFile(
+                    path.join(chatDir, bundle.bundleFile),
+                    'retained chat-backup bundle',
+                ).size + requireReachabilityFile(
+                    path.join(chatDir, bundle.metaFile),
+                    'retained chat-backup bundle metadata',
+                ).size,
+            });
+        }
+
+        const scan = {
+            loose: [...loose.values()].sort(compareVersionsOldest),
+            frames: frames.sort(compareVersionsOldest),
+            bundles,
+        };
+        const versionCount = scan.loose.length + scan.frames.length
+            + scan.bundles.reduce((total, bundle) => total + bundle.entries.length, 0);
+        if (versionCount === 0) {
+            throw new Error(`Cannot verify retained chat-backup directory ${chatDir}: no versions`);
+        }
+        return scan;
+    }
+
     function newestTimestampOnDisk(chatDir) {
         const scan = scanChatDirectory(chatDir);
         let newest = null;
@@ -1381,6 +1538,44 @@ function createChatBackupStore(options) {
             const charDir = path.join(root, charEntry.name);
             let chatEntries = [];
             try { chatEntries = fs.readdirSync(charDir, { withFileTypes: true }); } catch { continue; }
+            for (const chatEntry of chatEntries) {
+                if (!chatEntry.isDirectory() || chatEntry.name === ROOT_HISTORY_DIRNAME) continue;
+                result.push({
+                    chaId: decodePathComponent(charEntry.name),
+                    chatId: decodePathComponent(chatEntry.name),
+                    chatDir: path.join(charDir, chatEntry.name),
+                });
+            }
+        }
+        return result;
+    }
+
+    function collectChatDirectoriesForReachability(rootRecord) {
+        const result = [];
+        let charEntries;
+        try {
+            charEntries = fs.readdirSync(rootRecord.root, { withFileTypes: true });
+        } catch (error) {
+            if (error?.code === 'ENOENT' && !rootRecord.required) return result;
+            throw new Error(
+                `Cannot verify retained chat-backup root ${rootRecord.root}: `
+                + `${error?.message || error}`,
+                { cause: error },
+            );
+        }
+        for (const charEntry of charEntries) {
+            if (!charEntry.isDirectory() || charEntry.name === ROOT_HISTORY_DIRNAME) continue;
+            const charDir = path.join(rootRecord.root, charEntry.name);
+            let chatEntries;
+            try {
+                chatEntries = fs.readdirSync(charDir, { withFileTypes: true });
+            } catch (error) {
+                throw new Error(
+                    `Cannot verify retained chat-backup directory ${charDir}: `
+                    + `${error?.message || error}`,
+                    { cause: error },
+                );
+            }
             for (const chatEntry of chatEntries) {
                 if (!chatEntry.isDirectory() || chatEntry.name === ROOT_HISTORY_DIRNAME) continue;
                 result.push({
@@ -2204,8 +2399,7 @@ function createChatBackupStore(options) {
         return run;
     }
 
-    function versionsInChatDirectory(chatDir) {
-        const scan = scanChatDirectory(chatDir);
+    function versionsFromChatDirectoryScan(chatDir, scan, { strict = false } = {}) {
         const versions = [];
 
         for (const bundle of scan.bundles) {
@@ -2249,7 +2443,15 @@ function createChatBackupStore(options) {
             if (!entry.compressed) {
                 try {
                     semanticIdentity = `${entry.size}:${hashFileBytes(filename)}`;
-                } catch {}
+                } catch (error) {
+                    if (strict) {
+                        throw new Error(
+                            `Cannot verify retained loose chat backup ${filename}: `
+                            + `${error?.message || error}`,
+                            { cause: error },
+                        );
+                    }
+                }
             } else {
                 semanticIdentity = knownVerifiedSourceSemantic([filename], entry.versionId);
             }
@@ -2267,6 +2469,10 @@ function createChatBackupStore(options) {
         }
 
         return versions;
+    }
+
+    function versionsInChatDirectory(chatDir) {
+        return versionsFromChatDirectoryScan(chatDir, scanChatDirectory(chatDir));
     }
 
     function hashFileBytes(filename) {
@@ -2429,6 +2635,83 @@ function createChatBackupStore(options) {
         return summaries.sort((a, b) => b.newestTs - a.newestTs
             || a.chaId.localeCompare(b.chaId)
             || a.chatId.localeCompare(b.chatId));
+    }
+
+    /**
+     * Visit every independently restorable version across the active and
+     * federated historical roots. Callers use this for reachability proofs
+     * that must cover recovery history as well as the live chat-row store.
+     *
+     * A listed version becoming unreadable is an error here rather than a
+     * missing result: treating unreadable retained history as empty would let
+     * a destructive cleanup sever references that become visible again after
+     * the underlying path or file recovers.
+     */
+    async function scanChatBackupVersions(visitor) {
+        if (typeof visitor !== 'function') {
+            throw new TypeError('chat-backup version visitor must be a function');
+        }
+
+        const candidates = [];
+        const rootRecords = backupsReadRootRecords({ strictReachability: true });
+        observe('reachability-roots-discovered', {
+            roots: rootRecords.map(record => ({
+                root: record.root,
+                identity: record.identity,
+                required: record.required,
+            })),
+        });
+        for (const rootRecord of rootRecords) {
+            for (const item of collectChatDirectoriesForReachability(rootRecord)) {
+                if (item.chaId === null || item.chatId === null) continue;
+                const scan = scanChatDirectoryForReachability(item.chatDir);
+                for (const entry of versionsFromChatDirectoryScan(
+                    item.chatDir,
+                    scan,
+                    { strict: true },
+                )) {
+                    candidates.push({
+                        ...entry,
+                        chaId: item.chaId,
+                        chatId: item.chatId,
+                        chatDir: item.chatDir,
+                        rootIdentity: rootRecord.identity,
+                        sourceVersionId: entry.versionId,
+                    });
+                }
+            }
+        }
+
+        candidates.sort((left, right) => (
+            left.chaId.localeCompare(right.chaId)
+            || left.chatId.localeCompare(right.chatId)
+            || compareVersionsOldest(left, right)
+            || left.rootIdentity.localeCompare(right.rootIdentity)
+        ));
+        observe('reachability-inventory-complete', {
+            totalCandidates: candidates.length,
+            totalDirectories: new Set(candidates.map(candidate => candidate.chatDir)).size,
+        });
+        let totalVersions = 0;
+        for (const candidate of candidates) {
+            const raw = await readChatBackupCandidate(candidate);
+            if (raw === null) {
+                throw new Error(
+                    `Cannot verify retained chat backup ${candidate.chaId}/${candidate.chatId}`
+                    + `/${candidate.sourceVersionId}`,
+                );
+            }
+            await visitor(raw, {
+                chaId: candidate.chaId,
+                chatId: candidate.chatId,
+                versionId: candidate.sourceVersionId,
+                sourceVersionId: candidate.sourceVersionId,
+                storage: candidate.sourceStorage,
+                rootIdentity: candidate.rootIdentity,
+            });
+            totalVersions++;
+        }
+        return { totalVersions };
     }
 
     async function readDecodedToBuffer(readable, expectedSize, context, expectedSha256 = null) {
@@ -2638,6 +2921,7 @@ function createChatBackupStore(options) {
         listChatBackupChats,
         listChatBackups,
         readChatBackup,
+        scanChatBackupVersions,
         close,
     };
 }

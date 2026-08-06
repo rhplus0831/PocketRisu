@@ -523,10 +523,15 @@ plan.
 - Legacy key/value APIs synthesize the old JSON payload through
   `readInlayAssetPayload()`.
 - `POST /api/inlays/delete-unreferenced` accepts at most 1,000 safe IDs (and at most
-  1,000 client-protected IDs), then rescans every authoritative physical chat row inside
-  the storage queue. It removes filesystem and legacy KV representations only for IDs
-  that are neither referenced nor client-protected; generic single-inlay removal applies
-  the same guard.
+  1,000 client-protected IDs), then rescans every authoritative physical chat row and
+  strictly inventories every retained chat pre-image inside the storage queue. The
+  history proof covers loose, gzip, frame, and legacy-bundle versions across active and
+  federated roots; unreadable directories, recognized malformed representations,
+  disappearing candidates, unavailable known roots, inaccessible reserved conflict
+  containers, and disappearance of an already discovered protected conflict namespace
+  fail closed. Public history list/restore keeps its permissive discovery behavior. It removes
+  filesystem and legacy KV representations only for IDs that are neither referenced nor
+  client-protected; generic single-inlay removal applies the same guard.
 - `GET /api/asset/:hexKey` serves assets with a cookie-authenticated direct URL, MIME
   detection, immutable caching, and `updated_at` or filesystem-mtime ETags.
 - Inlay thumbnails are generated on demand with `wasm-vips`; bulk WebP conversion is
