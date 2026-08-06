@@ -1171,11 +1171,6 @@ import ShButton from "../UI/GUI/ShButton.svelte";
         </div>
 
         <div class="flex items-center mt-4">
-            <Check bind:check={DBState.db.characters[$selectedCharID].destructiveAccess} name={language.destructiveAccess}/>
-            <span> <Help key="destructiveAccess" name={language.destructiveAccess}/></span>
-        </div>
-
-        <div class="flex items-center mt-4">
             <Check bind:check={DBState.db.characters[$selectedCharID].hideChatIcon} name={language.hideChatIcon}/>
         </div>
 

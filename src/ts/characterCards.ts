@@ -16,7 +16,6 @@ import { PngChunk } from "./pngChunk"
 import type { OnnxModelFiles } from "./process/transformers"
 import { CharXImporter, CharXSkippableChecker, CharXWriter, type StreamingByteWriter } from "./process/processzip"
 import { confirmImportedModuleCapabilities, exportModuleLegacy, readModule, type RisuModule } from "./process/modules"
-import { authorizeImportedDestructiveAccess, mergeEmbeddedModuleDestructiveAccess } from "./process/scriptCapabilities"
 
 
 const EXTERNAL_HUB_URL = 'https://sv.risuai.xyz';
@@ -99,7 +98,6 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
             const md = await readModule(Buffer.from(importer.moduleData))
             card.data.extensions ??= {}
             card.data.extensions.risuai ??= {}
-            mergeEmbeddedModuleDestructiveAccess(card.data.extensions.risuai, md)
             card.data.extensions.risuai.triggerscript = md.trigger ?? []
             card.data.extensions.risuai.customScripts = md.regex ?? []
             if(md.lorebook){
@@ -841,16 +839,6 @@ async function importCharacterCardSpec<T extends boolean = false>(card:Character
             return false
         }
     }
-    const destructiveCapability = {
-        destructiveAccess: risuext?.destructiveAccess,
-        triggerscript: data?.extensions?.risuai?.triggerscript,
-    }
-    if(!await authorizeImportedDestructiveAccess(
-        destructiveCapability,
-        () => alertConfirm(language.destructiveAccessConfirm),
-    )){
-        return false
-    }
     const charbook = data.character_book
     let lorebook:loreBook[] = overrideLorebook ?? []
     let loresettings:undefined|loreSettings = undefined
@@ -940,7 +928,6 @@ async function importCharacterCardSpec<T extends boolean = false>(card:Character
         source: card?.data?.extensions?.risuai?.source ?? [],
         ccAssets: ccAssets,
         lowLevelAccess: risuext?.lowLevelAccess === true,
-        destructiveAccess: destructiveCapability.destructiveAccess ?? false,
         defaultVariables: data?.extensions?.risuai?.defaultVariables ?? '',
         chatFolders: [],
         prebuiltAssetCommand: data?.extensions?.risuai?.prebuiltAssetCommand ?? '',
@@ -1157,7 +1144,6 @@ function createBaseV2(char:character) {
                     backgroundHTML: char.backgroundHTML,
                     license: char.license,
                     triggerscript: char.triggerscript,
-                    destructiveAccess: char.destructiveAccess ?? false,
                     additionalText: char.additionalText,
                     virtualscript: '', //removed dude to security issue
                     largePortrait: char.largePortrait,
@@ -1539,7 +1525,6 @@ export function createBaseV3(char:character){
                     newGenData: char.newGenData,
                     vits: {},
                     lowLevelAccess: char.lowLevelAccess ?? false,
-                    destructiveAccess: char.destructiveAccess ?? false,
                     defaultVariables: char.defaultVariables ?? '',
                     prebuiltAssetCommand: char.prebuiltAssetCommand ?? '',
                     prebuiltAssetExclude: char.prebuiltAssetExclude ?? [],
@@ -1749,7 +1734,6 @@ type CharacterCardV2Risu = {
                 backgroundHTML?:string,
                 license?:string,
                 triggerscript?:triggerscript[]
-                destructiveAccess?:boolean
                 private?:boolean
                 additionalText?:string
                 virtualscript?:string

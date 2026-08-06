@@ -95,3 +95,11 @@ or defective third-party content, but importing shared cards is routine.
 Classify bulk-destructive effects (whole-array chat replacement/cuts,
 lorebook deletion) as consent-requiring capabilities at import, and force a
 cooldown-exempt pre-image before committing any script-driven bulk mutation.
+
+## Subsequent decision (2026-08-07)
+
+The consent-capability portion of this resolution was deliberately withdrawn by the
+[accepted no-consent-gate decision](../../../../docs/findings/decisions/destructive-triggers-run-without-consent-gate.md).
+It silently broke existing imported cards and has no upstream RisuAI equivalent. The
+guarded publication, stale-target rejection, generation ownership, destructive mutation
+marking, and forced `script-bulk-chat` pre-image portions remain in place.

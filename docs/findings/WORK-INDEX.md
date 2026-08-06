@@ -5,7 +5,7 @@ Run `pnpm check:docs` after changing a finding, status, path, or link.
 These are point-in-time reports; revalidate their evidence against current code
 before implementation.
 
-Current catalog: **19 open**, **0 deferred**, and **5 accepted decisions**.
+Current catalog: **19 open**, **0 deferred**, and **6 accepted decisions**.
 
 ## Active work by owner
 
@@ -85,6 +85,7 @@ Current catalog: **19 open**, **0 deferred**, and **5 accepted decisions**.
 | [Cloudflare Quick Tunnel UI and API were removed](decisions/cloudflare-quick-tunnel-removed.md) | server backend | 2026-07 compatibility investigation |
 | [Custom hub proxy targets are now rejected](decisions/hub-proxy-custom-targets-rejected.md) | server backend | 2026-07 compatibility investigation |
 | [DB-only snapshots do not preserve assets](decisions/db-only-snapshots-exclude-assets.md) | backup and recovery | 2026-07 data-loss audit |
+| [Destructive trigger operations run without a PocketRisu consent gate](decisions/destructive-triggers-run-without-consent-gate.md) | scripting and extensions | 2026-08 remediation finding |
 | [Remote plain-HTTP deployments no longer boot](decisions/remote-http-requires-explicit-override.md) | server backend | 2026-07 compatibility investigation |
 | [The generic HOST environment variable now changes server binding](decisions/generic-host-controls-listen-address.md) | server backend | 2026-07 compatibility investigation |
 

@@ -11,7 +11,10 @@ import { HideIconStore, moduleBackgroundEmbedding, ReloadGUIPointer } from "../s
 import {get} from "svelte/store"
 import { convertCharacterToModule, convertModuleToCharacter } from "../interchangeability"
 import { exportCharacterCard, importCharacterProcess } from "../characterCards"
-import { authorizeImportedDestructiveAccess } from "./scriptCapabilities"
+
+function dropRetiredDestructiveAccess(value: object): void {
+    delete (value as Record<string, unknown>).destructiveAccess
+}
 
 export interface MCPModule{
     url: string
@@ -26,7 +29,6 @@ export interface RisuModule{
     trigger?: triggerscript[]
     id: string
     lowLevelAccess?: boolean
-    destructiveAccess?: boolean
     hideIcon?: boolean
     backgroundEmbedding?:string
     assets?:[string,string,string][]
@@ -37,6 +39,7 @@ export interface RisuModule{
 }
 
 export async function confirmImportedModuleCapabilities(module:RisuModule):Promise<boolean> {
+    dropRetiredDestructiveAccess(module)
     const requestsLowLevelAccess = module.lowLevelAccess === true
     module.lowLevelAccess = false
     if(requestsLowLevelAccess){
@@ -46,10 +49,7 @@ export async function confirmImportedModuleCapabilities(module:RisuModule):Promi
         }
         module.lowLevelAccess = true
     }
-    return authorizeImportedDestructiveAccess(
-        module,
-        () => alertConfirm(language.destructiveAccessConfirm),
-    )
+    return true
 }
 
 export async function exportModule(module:RisuModule, arg:{
@@ -97,6 +97,7 @@ export async function exportModuleLegacy(module:RisuModule, arg:{
 
     const assets = module.assets ?? []
     module = safeStructuredClone(module)
+    dropRetiredDestructiveAccess(module)
     module.assets ??= []
     module.assets = module.assets.map((asset) => {
         return [asset[0], '', asset[2]] as [string,string,string]
@@ -184,6 +185,7 @@ export async function readModule(buf:Buffer):Promise<RisuModule> {
     }
 
     let module = main.module
+    dropRetiredDestructiveAccess(module)
 
     const maxConcurrentAssetSaves = 10
     const retryDelayMs = 5000
@@ -494,7 +496,6 @@ export function getModuleTriggers() {
             triggers = triggers.concat(module.trigger.map((t) => ({
                 ...t,
                 lowLevelAccess: module.lowLevelAccess === true,
-                destructiveAccess: module.destructiveAccess === true,
                 moduleId: module.id,
             })))
         }

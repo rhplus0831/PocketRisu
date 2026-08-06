@@ -86,12 +86,11 @@ function setup() {
     return { selectedChat, ownerChat, selectedCharacter, ownerCharacter }
 }
 
-function context(ownerCharacter: any, ownerChat: any, destructiveAccess: boolean) {
+function context(ownerCharacter: any, ownerChat: any) {
     return {
         target: { chaId: ownerCharacter.chaId, chatId: ownerChat.id },
         character: structuredClone(ownerCharacter),
         chat: structuredClone(ownerChat),
-        destructiveAccess,
         chatPublicationGuard: captureChatPublicationGuard(ownerChat),
     }
 }
@@ -123,43 +122,12 @@ beforeEach(() => {
 
 describe('target-aware trigger commands', () => {
     test.each([
-        '/cut 1-3',
-        '/del 1',
-        '/multisend clear|||replacement',
-    ])('denies destructive command %s without the separate grant', async command => {
-        const { selectedChat, ownerChat, ownerCharacter } = setup()
-
-        const result = await processTriggerMultiCommand(
-            command,
-            context(ownerCharacter, ownerChat, false),
-        )
-
-        expect(result.chat.message).toEqual(messages())
-        expect(result.destructiveChatMutation).toBe(false)
-        expect(ownerChat.message).toEqual(messages())
-        expect(selectedChat.message).toEqual(messages())
-        expect(runtime.sendChat).not.toHaveBeenCalled()
-        expect(runtime.backupReason).not.toHaveBeenCalled()
-    })
-
-    test('treats a malformed truthy trigger grant as denied', async () => {
-        const { ownerChat, ownerCharacter } = setup()
-        const execution = context(ownerCharacter, ownerChat, false) as any
-        execution.destructiveAccess = 'false'
-
-        const result = await processTriggerMultiCommand('/cut 1-3', execution)
-
-        expect(result.chat.message).toEqual(messages())
-        expect(result.destructiveChatMutation).toBe(false)
-    })
-
-    test.each([
         ['/cut 1-3', ['two', 'three']],
         ['/cut two', ['one', 'three']],
         ['/del 1', ['three']],
-    ])('allows and marks %s without touching the selected chat', async (command, expected) => {
+    ])('runs and marks %s without a consent grant or touching the selected chat', async (command, expected) => {
         const { selectedChat, ownerChat, ownerCharacter } = setup()
-        const execution = context(ownerCharacter, ownerChat, true)
+        const execution = context(ownerCharacter, ownerChat)
 
         const result = await processTriggerMultiCommand(command as string, execution)
 
@@ -190,7 +158,19 @@ describe('target-aware trigger commands', () => {
         )
     })
 
-    test('targets and backs up an approved multisend clear before its nested send', async () => {
+    test('ignores a stale false character capability for /cut', async () => {
+        const { ownerChat, ownerCharacter } = setup()
+        const execution = context(ownerCharacter, ownerChat)
+        Object.assign(execution.character, { destructiveAccess: false })
+
+        const result = await processTriggerMultiCommand('/cut 1-3', execution)
+
+        expect(result.chat.message.map((message: any) => message.data))
+            .toEqual(['two', 'three'])
+        expect(result.destructiveChatMutation).toBe(true)
+    })
+
+    test('targets and backs up an ungated multisend clear before its nested send', async () => {
         const { selectedChat, ownerChat, ownerCharacter } = setup()
         runtime.sendChat.mockImplementation(async (_index: number, options: any) => {
             const resolved = resolveChatSendTarget(runtime.db, options.target)
@@ -200,7 +180,7 @@ describe('target-aware trigger commands', () => {
 
         const result = await processTriggerMultiCommand(
             '/multisend clear|||replacement',
-            context(ownerCharacter, ownerChat, true),
+            context(ownerCharacter, ownerChat),
         )
 
         expect(result.destructiveChatMutation).toBe(true)
@@ -214,7 +194,7 @@ describe('target-aware trigger commands', () => {
             .toEqual(['replacement', 'generated'])
         expect(publishTriggerChatToTarget(
             runtime.db,
-            context(ownerCharacter, ownerChat, true).target,
+            context(ownerCharacter, ownerChat).target,
             result,
             undefined,
             result.chatPublicationGuard,
@@ -240,7 +220,7 @@ describe('target-aware trigger commands', () => {
 
         const result = await processTriggerMultiCommand(
             '/multisend clear|||replacement',
-            context(ownerCharacter, ownerChat, true),
+            context(ownerCharacter, ownerChat),
         )
 
         expect(result.result).toBe(false)
@@ -262,7 +242,7 @@ describe('target-aware trigger commands', () => {
 
         const result = await processTriggerMultiCommand(
             '/multisend replacement',
-            context(ownerCharacter, ownerChat, true),
+            context(ownerCharacter, ownerChat),
         )
 
         expect(result.result).toBe('')
@@ -283,7 +263,7 @@ describe('target-aware trigger commands', () => {
 
         const result = await processTriggerMultiCommand(
             '/multisend replacement',
-            context(ownerCharacter, ownerChat, true),
+            context(ownerCharacter, ownerChat),
         )
 
         expect(result.result).toBe(false)
@@ -304,7 +284,7 @@ describe('target-aware trigger commands', () => {
 
         await expect(processTriggerMultiCommand(
             '/multisend replacement',
-            context(ownerCharacter, ownerChat, true),
+            context(ownerCharacter, ownerChat),
         )).rejects.toThrow('nested send failed')
 
         expect(runtime.generations.has('owner-chat')).toBe(false)
@@ -328,7 +308,7 @@ describe('target-aware trigger commands', () => {
 
         const command = processTriggerMultiCommand(
             '/multisend replacement',
-            context(ownerCharacter, ownerChat, true),
+            context(ownerCharacter, ownerChat),
         )
         expect(runtime.generations.get('owner-chat')?.ownership).toBe(nestedOwnership)
 
@@ -391,7 +371,7 @@ describe('target-aware trigger commands', () => {
 
     test('queues the mandatory reason before publishing a destructive snapshot', async () => {
         const { ownerChat, ownerCharacter } = setup()
-        const execution = context(ownerCharacter, ownerChat, true)
+        const execution = context(ownerCharacter, ownerChat)
         const result = await processTriggerMultiCommand('/cut 1-3', execution)
         let durableDataAtBackup: string[] | undefined
         runtime.backupReason.mockImplementationOnce(() => {
@@ -423,7 +403,7 @@ describe('target-aware trigger commands', () => {
         runtime.alertInput.mockImplementationOnce(() => new Promise<string>(resolve => {
             release = resolve
         }))
-        const execution = context(ownerCharacter, ownerChat, true)
+        const execution = context(ownerCharacter, ownerChat)
         const command = processTriggerMultiCommand('/input | /cut 1-3', execution)
 
         runtime.selectedIndex = 0
@@ -450,7 +430,7 @@ describe('target-aware trigger commands', () => {
         }))
         const command = processTriggerMultiCommand(
             '/input | /cut 1-3',
-            context(ownerCharacter, ownerChat, true),
+            context(ownerCharacter, ownerChat),
         )
 
         runtime.db.characters.pop()
@@ -469,7 +449,7 @@ describe('target-aware trigger commands', () => {
         runtime.alertInput.mockImplementationOnce(() => new Promise<string>(resolve => {
             release = resolve
         }))
-        const execution = context(ownerCharacter, ownerChat, true)
+        const execution = context(ownerCharacter, ownerChat)
         const command = processTriggerMultiCommand(
             '/input | /multisend clear|||replacement',
             execution,
@@ -497,7 +477,7 @@ describe('target-aware trigger commands', () => {
 
     test('propagates a nested trigger refreshed guard into later pipeline publication', async () => {
         const { ownerChat, ownerCharacter } = setup()
-        const execution = context(ownerCharacter, ownerChat, true)
+        const execution = context(ownerCharacter, ownerChat)
         const initialGuard = execution.chatPublicationGuard
         runtime.runTrigger.mockImplementationOnce(async (_character, _mode, arg) => {
             const ownedSource = structuredClone(ownerChat)
@@ -552,7 +532,7 @@ describe('target-aware trigger commands', () => {
 
         const result = await processTriggerMultiCommand(
             '/cut missing',
-            context(ownerCharacter, ownerChat, true),
+            context(ownerCharacter, ownerChat),
         )
 
         expect(result.chat.message).toEqual(messages())
@@ -564,7 +544,7 @@ describe('target-aware trigger commands', () => {
 
         const result = await processTriggerMultiCommand(
             '/multisend clear',
-            context(ownerCharacter, ownerChat, true),
+            context(ownerCharacter, ownerChat),
         )
 
         expect(result.chat.message).toEqual(messages())

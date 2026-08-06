@@ -388,29 +388,23 @@ production per-request root uses it (`src/ts/process/generationState.ts`,
 `src/ts/plugins/apiV3/pluginChatSend.ts`, `src/ts/hotkey.ts`,
 `src/lib/SideBars/DevTool.svelte`, `src/ts/process/files/multisend.ts`).
 
-Character triggers inherit the character’s separate `lowLevelAccess` and
-`destructiveAccess` capabilities; cloned module triggers carry their owning module's
-flags and runtime-only `moduleId` (`src/ts/process/triggers.ts`,
-`src/ts/process/modules.ts`). Card, module, and CharX imports inspect V1/V2 cuts, V2 lore
-deletion, Lua `cutChat`/`removeChat`/`setFullChat` APIs, and literal trigger-command
-pipelines containing `/cut`, `/del`, or `/multisend clear`; these require explicit
-destructive consent. Dynamically computed V1/V2 commands are reclassified and gated at
-execution. Trigger commands execute against the chat snapshot and durable character/chat
-IDs captured at trigger start, never the mutable UI selection. CharX also preserves an embedded module's declared request before
-clearing it for that consent decision, covering dynamically aliased Lua calls that a
-static scan cannot identify. Capability grants are recognized only when the owner value
-is the literal boolean `true`. That consent does not grant model, network, UI, or other
-low-level APIs. Display/request modes operate on temporary state and
-explicit allowlists, preventing most chat, network, UI, and model side effects
+Character triggers inherit the character's `lowLevelAccess`; cloned module triggers carry
+their owning module's low-level flag and runtime-only `moduleId`
+(`src/ts/process/triggers.ts`, `src/ts/process/modules.ts`). V1/V2 cuts, V2 lore deletion,
+Lua `cutChat`/`removeChat`/`setFullChat`, and trigger-command pipelines containing `/cut`,
+`/del`, or `/multisend clear` run without a separate PocketRisu consent capability.
+Card, module, and CharX imports do not scan or prompt for those operations. Trigger
+commands still execute against the chat snapshot and durable character/chat IDs captured
+at trigger start, never the mutable UI selection. Display/request modes operate on
+temporary state and explicit allowlists, preventing most chat, network, UI, and model side effects
 (`src/ts/process/triggers.ts:1178`, `src/ts/process/triggers.ts:1308`).
 
 ### Lua flow
 
 `runScripted()` reuses one engine per mode, recreating it only when source changes
 (`src/ts/process/scriptings.ts:78`, `src/ts/process/scriptings.ts:91`). It injects host
-functions, loads the wrapped Lua source, grants per-run safe, low-level, and destructive
-access keys, and invokes the mode callback. Safe, low-level, and destructive keys are
-removed after normal completion; edit-display keys
+functions, loads the wrapped Lua source, grants per-run safe and low-level access keys,
+and invokes the mode callback. Safe and low-level keys are removed after normal completion; edit-display keys
 are currently not removed from `ScriptingEditDisplayIds`
 (`src/ts/process/scriptings.ts:1041-1143`).
 
@@ -588,12 +582,11 @@ non-preview ModelPreset requests are eligible (`src/ts/process/request/request.t
 
 - A Lua trigger whose first effect is `triggerlua` bypasses the ordinary event-type filter and is offered the current mode callback (`src/ts/process/triggers.ts:1206`). The Lua code decides which mode-named function exists.
 
-- Character low-level and destructive access are independent owner capabilities. Module
-  trigger access follows `module.lowLevelAccess` and `module.destructiveAccess`; do not
-  trust arbitrary stored per-trigger flags independently of their owner. V1/V2 cuts, V2
-  lore deletion, Lua whole-chat/removal APIs, and destructive trigger-command variants
-  must retain the destructive runtime gate. Command pipelines use `|`; `|||` remains the
-  multisend field delimiter and must not be split as a pipeline boundary.
+- Module trigger low-level access follows `module.lowLevelAccess`; do not trust arbitrary
+  stored per-trigger flags independently of their owner. V1/V2 cuts, V2 lore deletion,
+  Lua whole-chat/removal APIs, and destructive trigger-command variants are otherwise
+  ungated. Command pipelines use `|`; `|||` remains the multisend field delimiter and
+  must not be split as a pipeline boundary.
 
 - Display and request trigger effects are allowlisted by effect type (`src/ts/process/triggers.ts:1301`). New V2 effects will silently do nothing in those modes unless explicitly added to the correct allowlist.
 
@@ -714,10 +707,9 @@ non-preview ModelPreset requests are eligible (`src/ts/process/request/request.t
   `src/ts/process/scriptings.ts:1041-1143` and every host API’s
   `ScriptingLowLevelIds` guard.
 
-- To change destructive script access, coordinate import scanning/consent in
-  `scriptCapabilities.ts`, owner propagation in characters/modules, runtime guards in
-  `triggers.ts` and `scriptings.ts`, and the publication-bound `script-bulk-chat` backup
-  reason.
+- To change bulk script mutation behavior, coordinate mutation marking in `command.ts`,
+  `triggers.ts`, and `scriptings.ts` with guarded publication and the publication-bound
+  `script-bulk-chat` backup reason.
 
 - To add a V2 trigger action, define its type near the existing V2 types, add it to
   `triggerEffectV2`, and implement its case in `runTrigger()`'s effect switch.

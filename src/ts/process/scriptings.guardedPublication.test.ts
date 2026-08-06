@@ -6,6 +6,7 @@ const fakeLua = vi.hoisted(() => ({
 }))
 const runtime = vi.hoisted(() => ({
     db: { characters: [] } as any,
+    modules: [] as any[],
     selectedCharacterIndex: 0,
     backupReason: vi.fn(),
     delay: null as any,
@@ -99,7 +100,13 @@ vi.mock('./files/inlays', () => ({
 vi.mock('./request/request', () => ({ requestChatData: vi.fn() }))
 vi.mock('./modules', () => ({
     getModuleLorebooks: () => [],
-    getModuleTriggers: () => [],
+    getModuleTriggers: () => runtime.modules.flatMap(module =>
+        (module.trigger ?? []).map((trigger: any) => ({
+            ...trigger,
+            lowLevelAccess: module.lowLevelAccess === true,
+            moduleId: module.id,
+        })),
+    ),
 }))
 vi.mock('../tokenizer', () => ({ tokenize: vi.fn(async () => 0) }))
 vi.mock('../globalApi.svelte', () => ({
@@ -137,62 +144,58 @@ function delayedExecution() {
     return { started, release }
 }
 
+function useLuaModule(code: string, staleCapability = false) {
+    const module: Record<string, unknown> = {
+        id: 'module',
+        trigger: [{ effect: [{ type: 'triggerlua', code }] }],
+    }
+    if(staleCapability){
+        module.destructiveAccess = false
+    }
+    runtime.modules = [module]
+}
+
 beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('return {}')))
     runtime.db = { characters: [] }
+    runtime.modules = []
     runtime.selectedCharacterIndex = 0
     runtime.backupReason.mockReset()
     runtime.delay = null
 })
 
-describe('Lua destructive chat API gating', () => {
-    test.each([
-        ['cutChat', '-- TEST_CUT'],
-        ['removeChat', '-- TEST_REMOVE'],
-        ['setFullChat', '-- TEST_REPLACE'],
-    ])('blocks %s without destructive access', async (_api, code) => {
-        const original = chat()
-
-        const result = await runScripted(code, {
-            chat: original,
-            mode: 'input',
-            destructiveAccess: false,
-        })
-
-        expect(result.chat.message.map((message: any) => message.data))
-            .toEqual(['one', 'two', 'three'])
-        expect(result.destructiveChatMutation).toBe(false)
-    })
-
+describe('Lua execution and guarded publication', () => {
     test.each([
         ['cutChat', '-- TEST_CUT', ['two', 'three']],
         ['removeChat', '-- TEST_REMOVE', ['one', 'three']],
         ['setFullChat', '-- TEST_REPLACE', ['replacement']],
-    ])('allows and marks %s with destructive access', async (_api, code, expected) => {
+    ])('runs and marks %s without a consent grant', async (_api, code, expected) => {
         const original = chat()
 
         const result = await runScripted(code as string, {
             chat: original,
             mode: 'input',
-            destructiveAccess: true,
         })
 
         expect(result.chat.message.map((message: any) => message.data)).toEqual(expected)
         expect(result.destructiveChatMutation).toBe(true)
     })
 
-    test('treats malformed truthy per-run grants as denied', async () => {
+    test.each([
+        ['cutChat', '-- TEST_CUT', ['two', 'three']],
+        ['removeChat', '-- TEST_REMOVE', ['one', 'three']],
+        ['setFullChat', '-- TEST_REPLACE', ['replacement']],
+    ])('ignores a stale false per-run capability for %s', async (_api, code, expected) => {
         const original = chat()
 
-        const result = await runScripted('-- TEST_CUT', {
+        const result = await runScripted(code as string, {
             chat: original,
             mode: 'input',
-            destructiveAccess: 'false' as any,
-        })
+            destructiveAccess: false,
+        } as any)
 
-        expect(result.chat.message.map((message: any) => message.data))
-            .toEqual(['one', 'two', 'three'])
-        expect(result.destructiveChatMutation).toBe(false)
+        expect(result.chat.message.map((message: any) => message.data)).toEqual(expected)
+        expect(result.destructiveChatMutation).toBe(true)
     })
 
     test('binds a nonselected edit hook to its explicit durable owner target', async () => {
@@ -211,7 +214,6 @@ describe('Lua destructive chat API gating', () => {
             chatPage: 0,
             chats: [ownerChat],
             triggerscript: [{ effect: [{ type: 'triggerlua', code: '-- TEST_CUT' }] }],
-            destructiveAccess: true,
         }
         runtime.db = { characters: [selectedCharacter, ownerCharacter] }
 
@@ -234,7 +236,7 @@ describe('Lua destructive chat API gating', () => {
         )
     })
 
-    test('treats malformed truthy owner grants as denied', async () => {
+    test('ignores a stale false character capability and queues the forced reason', async () => {
         const ownerChat = { ...chat(), id: 'owner-chat' }
         const ownerCharacter = {
             type: 'character',
@@ -242,7 +244,7 @@ describe('Lua destructive chat API gating', () => {
             chatPage: 0,
             chats: [ownerChat],
             triggerscript: [{ effect: [{ type: 'triggerlua', code: '-- TEST_CUT' }] }],
-            destructiveAccess: 'false',
+            destructiveAccess: false,
         }
         runtime.db = { characters: [ownerCharacter] }
 
@@ -252,9 +254,47 @@ describe('Lua destructive chat API gating', () => {
             chat: ownerChat as any,
         })
 
-        expect(ownerChat.message.map((message: any) => message.data))
-            .toEqual(['one', 'two', 'three'])
-        expect(runtime.backupReason).not.toHaveBeenCalled()
+        expect(runtime.db.characters[0].chats[0].message.map((message: any) => message.data))
+            .toEqual(['two', 'three'])
+        expect(runtime.backupReason).toHaveBeenCalledWith(
+            'owner-character',
+            'owner-chat',
+            'script-bulk-chat',
+        )
+    })
+
+    test.each([
+        ['without the retired field', 'cutChat', false, '-- TEST_CUT', ['two', 'three']],
+        ['without the retired field', 'removeChat', false, '-- TEST_REMOVE', ['one', 'three']],
+        ['without the retired field', 'setFullChat', false, '-- TEST_REPLACE', ['replacement']],
+        ['with a stale false field', 'cutChat', true, '-- TEST_CUT', ['two', 'three']],
+        ['with a stale false field', 'removeChat', true, '-- TEST_REMOVE', ['one', 'three']],
+        ['with a stale false field', 'setFullChat', true, '-- TEST_REPLACE', ['replacement']],
+    ])('runs module %s %s', async (_name, _api, staleCapability, code, expected) => {
+        const ownerChat = { ...chat(), id: 'owner-chat' }
+        const ownerCharacter = {
+            type: 'character',
+            chaId: 'owner-character',
+            chatPage: 0,
+            chats: [ownerChat],
+            triggerscript: [],
+        }
+        runtime.db = { characters: [ownerCharacter] }
+        useLuaModule(code as string, staleCapability as boolean)
+
+        await runLuaEditTrigger(ownerCharacter as any, 'editinput', 'payload', {}, {
+            chaId: ownerCharacter.chaId,
+            chatId: ownerChat.id,
+            chat: ownerChat as any,
+        })
+
+        expect(runtime.db.characters[0].chats[0].message.map((message: any) => message.data))
+            .toEqual(expected)
+        expect(runtime.backupReason).toHaveBeenCalledWith(
+            'owner-character',
+            'owner-chat',
+            'script-bulk-chat',
+        )
     })
 
     test('isolates a delayed destructive edit hook and queues backup before replacement', async () => {
@@ -268,7 +308,6 @@ describe('Lua destructive chat API gating', () => {
             triggerscript: [{
                 effect: [{ type: 'triggerlua', code: '-- TEST_CUT\n-- TEST_DELAY' }],
             }],
-            destructiveAccess: true,
         }
         runtime.db = {
             characters: [
@@ -325,7 +364,6 @@ describe('Lua destructive chat API gating', () => {
                     code: '-- TEST_REMOVE\n-- TEST_DELAY\n-- TEST_STALE_BUTTON',
                 }],
             }],
-            destructiveAccess: true,
         }
         runtime.db = {
             characters: [
@@ -380,7 +418,6 @@ describe('Lua destructive chat API gating', () => {
             triggerscript: [{
                 effect: [{ type: 'triggerlua', code: '-- TEST_CUT\n-- TEST_DELAY' }],
             }],
-            destructiveAccess: true,
         }
         runtime.db = { characters: [ownerCharacter] }
         const delay = delayedExecution()
@@ -408,7 +445,6 @@ describe('Lua destructive chat API gating', () => {
             chatPage: 0,
             chats: [ownerChat],
             triggerscript: [{ effect: [{ type: 'triggerlua', code: '-- TEST_SET' }] }],
-            destructiveAccess: false,
         }
         runtime.db = { characters: [ownerCharacter] }
 
@@ -433,7 +469,6 @@ describe('Lua destructive chat API gating', () => {
             chatPage: 0,
             chats: [ownerChat],
             triggerscript: [{ effect: [{ type: 'triggerlua', code: '-- TEST_ADD' }] }],
-            destructiveAccess: false,
         }
         runtime.db = { characters: [ownerCharacter] }
         const target = { chaId: ownerCharacter.chaId, chatId: ownerChat.id }
@@ -479,7 +514,6 @@ describe('Lua destructive chat API gating', () => {
             triggerscript: [{
                 effect: [{ type: 'triggerlua', code: '-- TEST_CUT\n-- TEST_DELAY' }],
             }],
-            destructiveAccess: true,
         }
         runtime.db = { characters: [ownerCharacter] }
         const delay = delayedExecution()
@@ -512,7 +546,6 @@ describe('Lua destructive chat API gating', () => {
             triggerscript: [{
                 effect: [{ type: 'triggerlua', code: '-- TEST_REMOVE\n-- TEST_DELAY' }],
             }],
-            destructiveAccess: true,
         }
         runtime.db = { characters: [ownerCharacter] }
         const delay = delayedExecution()

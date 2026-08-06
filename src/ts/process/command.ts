@@ -15,7 +15,6 @@ import { loadLoreBookV3Prompt } from "./lorebook.svelte";
 import { runTrigger } from "./triggers";
 import { setChatBackupReason } from "../storage/chatStorage";
 import {
-    isDestructiveScriptCommand,
     SCRIPT_BULK_CHAT_BACKUP_REASON,
     splitScriptCommandPipeline,
 } from "./scriptCapabilities";
@@ -32,7 +31,6 @@ export interface TriggerCommandContext {
     target: ChatSendTarget
     character: character
     chat: Chat
-    destructiveAccess: boolean
     chatPublicationGuard: ChatPublicationGuard
 }
 
@@ -157,12 +155,6 @@ async function processCommand(
         namedArg[key] = risuChatParser(namedArg[key], {
             chara: currentChar.type === 'character' ? currentChar : null
         })
-    }
-
-    if(state.trigger
-        && isDestructiveScriptCommand(commandName, arg)
-        && state.trigger.destructiveAccess !== true){
-        return pipe
     }
 
     const commitOrdinaryMutation = () => {

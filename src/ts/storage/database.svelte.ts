@@ -1862,7 +1862,6 @@ export interface character{
     }>
     defaultVariables?:string
     lowLevelAccess?:boolean
-    destructiveAccess?:boolean
     hideChatIcon?:boolean
     lastInteraction?:number
     translatorNote?:string

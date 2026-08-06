@@ -30,7 +30,6 @@ let luaFactory:LuaFactory
 let ScriptingSafeIds = new Set<string>()
 let ScriptingEditDisplayIds = new Set<string>()
 let ScriptingLowLevelIds = new Set<string>()
-let ScriptingDestructiveIds = new Set<string>()
 let lastRequestResetTime = 0
 let lastRequestsCount = 0
 
@@ -74,7 +73,6 @@ export async function runScripted(code:string, arg:{
     setVar?: (key:string, value:string) => void,
     getVar?: (key:string) => string,
     lowLevelAccess?: boolean,
-    destructiveAccess?: boolean,
     meta?: object,
     mode?: string,
     type?: 'lua'|'py',
@@ -91,7 +89,6 @@ export async function runScripted(code:string, arg:{
     let chat = arg.chat ?? getCurrentChat()
     let stopSending = false
     let lowLevelAccess = arg.lowLevelAccess === true
-    let destructiveAccess = arg.destructiveAccess === true
 
     if(type === 'lua'){
         await ensureLuaFactory()
@@ -215,7 +212,7 @@ export async function runScripted(code:string, arg:{
                 }
             })
             declareAPI('cutChat', (id:string, start:number, end:number) => {
-                if(!ScriptingSafeIds.has(id) || !ScriptingDestructiveIds.has(id)){
+                if(!ScriptingSafeIds.has(id)){
                     return
                 }
                 const previousMessages = ScriptingEngineState.chat.message
@@ -229,7 +226,7 @@ export async function runScripted(code:string, arg:{
                 }
             })
             declareAPI('removeChat', (id:string, index:number) => {
-                if(!ScriptingSafeIds.has(id) || !ScriptingDestructiveIds.has(id)){
+                if(!ScriptingSafeIds.has(id)){
                     return
                 }
                 if(!ScriptingEngineState.chat.message.at(index)){
@@ -294,7 +291,7 @@ export async function runScripted(code:string, arg:{
             })
             
             declareAPI('setFullChatMain', (id:string, value:string) => {
-                if(!ScriptingSafeIds.has(id) || !ScriptingDestructiveIds.has(id)){
+                if(!ScriptingSafeIds.has(id)){
                     return
                 }
                 const realValue = JSON.parse(value)
@@ -1087,9 +1084,6 @@ export async function runScripted(code:string, arg:{
             if(lowLevelAccess){
                 ScriptingLowLevelIds.add(accessKey)
             }
-            if(destructiveAccess){
-                ScriptingDestructiveIds.add(accessKey)
-            }
         }
         let res:any
         if(ScriptingEngineState.type === 'lua'){
@@ -1184,7 +1178,6 @@ export async function runScripted(code:string, arg:{
         }
         ScriptingSafeIds.delete(accessKey)
         ScriptingLowLevelIds.delete(accessKey)
-        ScriptingDestructiveIds.delete(accessKey)
         chat = ScriptingEngineState.chat
 
         return {
@@ -1453,10 +1446,6 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(
                 ? { chaId: char.chaId, chatId: currentChat.id, chat: currentChat }
                 : undefined
         )
-        const targetMatchesOwner = capturedTarget !== undefined
-            && char.type !== 'simple'
-            && capturedTarget.chaId === char.chaId
-            && capturedTarget.chatId === capturedTarget.chat?.id
         let workingChat = capturedTarget?.chat
             ? safeStructuredClone(capturedTarget.chat)
             : currentChat
@@ -1471,7 +1460,6 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(
         const triggers = char.triggerscript.map<triggerscript>((v) => ({
             ...v,
             lowLevelAccess: false,
-            destructiveAccess: targetMatchesOwner && char.destructiveAccess === true,
         })).concat(getModuleTriggers())
     
         for(let trigger of triggers){
@@ -1480,7 +1468,6 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(
                     char: char,
                     chat: workingChat,
                     lowLevelAccess: false,
-                    destructiveAccess: targetMatchesOwner && trigger.destructiveAccess === true,
                     mode: mode,
                     data,
                     meta,
@@ -1534,10 +1521,6 @@ export async function runLuaButtonTrigger(
                 ? { chaId: char.chaId, chatId: currentChat.id, chat: currentChat }
                 : undefined
         )
-        const targetMatchesOwner = capturedTarget !== undefined
-            && char.type !== 'simple'
-            && capturedTarget.chaId === char.chaId
-            && capturedTarget.chatId === capturedTarget.chat?.id
         let workingChat = capturedTarget?.chat
             ? safeStructuredClone(capturedTarget.chat)
             : currentChat
@@ -1549,7 +1532,6 @@ export async function runLuaButtonTrigger(
         const triggers = char.triggerscript.map<triggerscript>((v) => ({
             ...v,
             lowLevelAccess: char.type !== 'simple' && char.lowLevelAccess === true,
-            destructiveAccess: targetMatchesOwner && char.destructiveAccess === true,
         })).concat(getModuleTriggers())
 
         for(let trigger of triggers){
@@ -1558,7 +1540,6 @@ export async function runLuaButtonTrigger(
                     char: char,
                     chat: workingChat,
                     lowLevelAccess: trigger.lowLevelAccess,
-                    destructiveAccess: targetMatchesOwner && trigger.destructiveAccess === true,
                     mode: 'onButtonClick',
                     data: data,
                     moduleId: trigger.moduleId,

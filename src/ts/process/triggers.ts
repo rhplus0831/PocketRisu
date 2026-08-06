@@ -29,7 +29,6 @@ export interface triggerscript{
     conditions: triggerCondition[]
     effect:triggerEffect[]
     lowLevelAccess?: boolean
-    destructiveAccess?: boolean
     /**
      * Runtime-only: set by getModuleTriggers() on the copy it hands out, so LLM
      * calls made by this trigger can be attributed to the module that shipped
@@ -1069,7 +1068,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     let varChanged = false
     let stopSending = arg.stopSending ?? false
     const CharacterlowLevelAccess = char.lowLevelAccess === true
-    const characterDestructiveAccess = char.destructiveAccess === true
     let sendAIprompt = false
     let destructiveChatMutation = false
     let chatPublicationGuard = arg.chatPublicationGuard ?? (
@@ -1084,7 +1082,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     }
     const triggers = char.triggerscript.map((v) => {
         v.lowLevelAccess = CharacterlowLevelAccess
-        v.destructiveAccess = characterDestructiveAccess
         return v
     }).concat(getModuleTriggers())
     const db = getDatabase()
@@ -1399,7 +1396,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         target: triggerTarget,
                         character: char,
                         chat,
-                        destructiveAccess: trigger.destructiveAccess === true,
                         chatPublicationGuard: chatPublicationGuard!,
                     })
                     chat = commandResult.chat
@@ -1436,9 +1432,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     break
                 }
                 case 'cutchat':{
-                    if(trigger.destructiveAccess !== true){
-                        break
-                    }
                     const start = Number(risuChatParser(effect.start,{chara:char}))
                     const end = Number(risuChatParser(effect.end,{chara:char}))
                     chat.message = chat.message.slice(start,end)
@@ -1579,7 +1572,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 case 'triggerlua':{
                     const triggerCodeResult = await runScripted(effect.code,{
                         lowLevelAccess: trigger.lowLevelAccess,
-                        destructiveAccess: trigger.destructiveAccess,
                         mode: mode === 'manual' ? arg.manualName : mode,
                         setVar: setVar,
                         getVar: getVar,
@@ -1855,9 +1847,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     break
                 }
                 case 'v2CutChat':{
-                    if(trigger.destructiveAccess !== true){
-                        break
-                    }
                     let start = effect.startType === 'value' ? Number(risuChatParser(effect.start,{chara:char})) : Number(getVar(risuChatParser(effect.start,{chara:char})))
                     let end = effect.endType === 'value' ? Number(risuChatParser(effect.end,{chara:char})) : Number(getVar(risuChatParser(effect.end,{chara:char})))
                     if(isNaN(start)){
@@ -1903,7 +1892,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         target: triggerTarget,
                         character: char,
                         chat,
-                        destructiveAccess: trigger.destructiveAccess === true,
                         chatPublicationGuard: chatPublicationGuard!,
                     })
                     chat = commandResult.chat
@@ -2598,9 +2586,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                     break
                 }
                 case 'v2DeleteLorebookByIndex':{
-                    if(trigger.destructiveAccess !== true){
-                        break
-                    }
                     char.globalLore = char.globalLore ?? []
                     let index = effect.indexType === 'value' ? Number(risuChatParser(effect.index,{chara:char})) : Number(getVar(risuChatParser(effect.index,{chara:char})))
                     

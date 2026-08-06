@@ -3,6 +3,7 @@ import { writable } from 'svelte/store'
 
 const state = vi.hoisted(() => ({
     db: null as any,
+    modules: [] as any[],
     processTriggerMultiCommand: vi.fn(),
 }))
 
@@ -17,7 +18,15 @@ vi.mock('../storage/database.svelte', () => ({
     setCurrentCharacter: (character: any) => { state.db.characters[0] = character },
     setDatabase: (db: any) => { state.db = db },
 }))
-vi.mock('./modules', () => ({ getModuleTriggers: () => [] }))
+vi.mock('./modules', () => ({
+    getModuleTriggers: () => state.modules.flatMap(module =>
+        (module.trigger ?? []).map((trigger: any) => ({
+            ...trigger,
+            lowLevelAccess: module.lowLevelAccess === true,
+            moduleId: module.id,
+        })),
+    ),
+}))
 vi.mock('../stores.svelte', () => ({
     ReloadChatPointer: writable(0),
     ReloadGUIPointer: writable(0),
@@ -50,7 +59,7 @@ const {
     resolveChatExecutionTarget,
 } = await import('./chatSendTarget')
 
-function makeState(effect: Record<string, unknown>, destructiveAccess: unknown) {
+function makeState(effect: Record<string, unknown>) {
     const chat = {
         id: 'chat',
         message: [
@@ -76,7 +85,6 @@ function makeState(effect: Record<string, unknown>, destructiveAccess: unknown) 
             conditions: [],
             effect: [effect],
         }],
-        destructiveAccess,
     }
     state.db = {
         characters: [character],
@@ -85,21 +93,35 @@ function makeState(effect: Record<string, unknown>, destructiveAccess: unknown) 
     return { character, chat }
 }
 
+function useModuleTrigger(
+    character: { triggerscript: unknown[] },
+    effect: Record<string, unknown>,
+    staleCapability = false,
+) {
+    character.triggerscript = []
+    const module: Record<string, unknown> = {
+        id: 'module',
+        trigger: [{
+            comment: 'module destructive test',
+            type: 'input',
+            conditions: [],
+            effect: [effect],
+        }],
+    }
+    if(staleCapability){
+        module.destructiveAccess = false
+    }
+    state.modules = [module]
+}
+
 beforeEach(() => {
     state.db = null
+    state.modules = []
     state.processTriggerMultiCommand.mockReset()
     state.processTriggerMultiCommand.mockImplementation(async (command: string, context: any) => {
         const destructive = command.startsWith('/cut')
             || command.startsWith('/del')
             || command.startsWith('/multisend clear')
-        if(destructive && context.destructiveAccess !== true){
-            return {
-                result: '',
-                chat: context.chat,
-                destructiveChatMutation: false,
-                targetMissing: false,
-            }
-        }
         const chat = structuredClone(context.chat)
         if(command.startsWith('/cut')){
             chat.message = chat.message.slice(1, 3)
@@ -113,7 +135,7 @@ beforeEach(() => {
     })
 })
 
-describe('destructive trigger runtime gating', () => {
+describe('trigger execution and guarded publication', () => {
     test.each([
         { type: 'cutchat', start: '1', end: '3' },
         {
@@ -124,48 +146,8 @@ describe('destructive trigger runtime gating', () => {
             endType: 'value',
             indent: 0,
         },
-    ])('blocks $type without destructive access', async effect => {
-        const { character, chat } = makeState(effect, false)
-
-        const result = await runTrigger(character as any, 'input', { chat: chat as any })
-
-        expect(result?.chat.message.map((message: any) => message.data))
-            .toEqual(['one', 'two', 'three'])
-        expect(result?.destructiveChatMutation).toBe(false)
-    })
-
-    test.each([
-        { type: 'cutchat', start: '1', end: '3' },
-        {
-            type: 'v2CutChat',
-            start: '1',
-            end: '3',
-            startType: 'value',
-            endType: 'value',
-            indent: 0,
-        },
-    ])('treats malformed truthy owner access as denied for $type', async effect => {
-        const { character, chat } = makeState(effect, 'false')
-
-        const result = await runTrigger(character as any, 'input', { chat: chat as any })
-
-        expect(result?.chat.message.map((message: any) => message.data))
-            .toEqual(['one', 'two', 'three'])
-        expect(result?.destructiveChatMutation).toBe(false)
-    })
-
-    test.each([
-        { type: 'cutchat', start: '1', end: '3' },
-        {
-            type: 'v2CutChat',
-            start: '1',
-            end: '3',
-            startType: 'value',
-            endType: 'value',
-            indent: 0,
-        },
-    ])('allows and marks $type with destructive access', async effect => {
-        const { character, chat } = makeState(effect, true)
+    ])('runs and marks $type without a consent grant', async effect => {
+        const { character, chat } = makeState(effect)
 
         const result = await runTrigger(character as any, 'input', { chat: chat as any })
 
@@ -174,22 +156,121 @@ describe('destructive trigger runtime gating', () => {
         expect(result?.destructiveChatMutation).toBe(true)
     })
 
-    test('gates V2 lorebook deletion on the same separate capability', async () => {
+    test('runs V2 lorebook deletion without a consent grant', async () => {
         const effect = {
             type: 'v2DeleteLorebookByIndex',
             index: '1',
             indexType: 'value',
             indent: 0,
         }
-        const denied = makeState(effect, false)
-        await runTrigger(denied.character as any, 'input', { chat: denied.chat as any })
-        expect(state.db.characters[0].globalLore.map((entry: any) => entry.comment))
-            .toEqual(['keep', 'delete'])
-
-        const allowed = makeState(effect, true)
+        const allowed = makeState(effect)
         await runTrigger(allowed.character as any, 'input', { chat: allowed.chat as any })
         expect(state.db.characters[0].globalLore.map((entry: any) => entry.comment))
             .toEqual(['keep'])
+    })
+
+    test.each([
+        { type: 'cutchat', start: '1', end: '3' },
+        {
+            type: 'v2CutChat',
+            start: '1',
+            end: '3',
+            startType: 'value',
+            endType: 'value',
+            indent: 0,
+        },
+    ])('ignores a stale false character capability for $type', async effect => {
+        const { character, chat } = makeState(effect)
+        Object.assign(character, { destructiveAccess: false })
+
+        const result = await runTrigger(character as any, 'input', { chat: chat as any })
+
+        expect(result?.chat.message.map((message: any) => message.data))
+            .toEqual(['two', 'three'])
+        expect(result?.destructiveChatMutation).toBe(true)
+    })
+
+    test('ignores a stale false character capability for V2 lorebook deletion', async () => {
+        const effect = {
+            type: 'v2DeleteLorebookByIndex',
+            index: '1',
+            indexType: 'value',
+            indent: 0,
+        }
+        const { character, chat } = makeState(effect)
+        Object.assign(character, { destructiveAccess: false })
+
+        await runTrigger(character as any, 'input', { chat: chat as any })
+
+        expect(state.db.characters[0].globalLore.map((entry: any) => entry.comment))
+            .toEqual(['keep'])
+    })
+
+    test.each([
+        ['without the retired field', false],
+        ['with a stale false field', true],
+    ])('runs cut and lore-deletion effects from a module %s', async (_name, staleCapability) => {
+        for(const effect of [
+            { type: 'cutchat', start: '1', end: '3' },
+            {
+                type: 'v2CutChat',
+                start: '1',
+                end: '3',
+                startType: 'value',
+                endType: 'value',
+                indent: 0,
+            },
+        ]){
+            const { character, chat } = makeState(effect)
+            useModuleTrigger(character, effect, staleCapability)
+
+            const result = await runTrigger(character as any, 'input', { chat: chat as any })
+
+            expect(result?.chat.message.map((message: any) => message.data))
+                .toEqual(['two', 'three'])
+            expect(result?.destructiveChatMutation).toBe(true)
+        }
+
+        const loreEffect = {
+            type: 'v2DeleteLorebookByIndex',
+            index: '1',
+            indexType: 'value',
+            indent: 0,
+        }
+        const { character, chat } = makeState(loreEffect)
+        useModuleTrigger(character, loreEffect, staleCapability)
+
+        await runTrigger(character as any, 'input', { chat: chat as any })
+
+        expect(state.db.characters[0].globalLore.map((entry: any) => entry.comment))
+            .toEqual(['keep'])
+    })
+
+    test.each([
+        ['without the retired field', false],
+        ['with a stale false field', true],
+    ])('queues the forced reason when an ungated cut is published %s', async (_name, staleCapability) => {
+        const { character, chat } = makeState({ type: 'cutchat', start: '1', end: '3' })
+        if(staleCapability){
+            Object.assign(character, { destructiveAccess: false })
+        }
+        const guard = captureChatPublicationGuard(chat as any)
+        const result = await runTrigger(character as any, 'input', { chat: chat as any })
+        const backupReason = vi.fn()
+
+        publishTriggerChatToTarget(
+            state.db,
+            { chaId: character.chaId, chatId: chat.id },
+            result,
+            target => backupReason(target, 'script-bulk-chat'),
+            guard,
+        )
+
+        expect(result?.destructiveChatMutation).toBe(true)
+        expect(backupReason).toHaveBeenCalledWith(
+            { chaId: 'character', chatId: 'chat' },
+            'script-bulk-chat',
+        )
     })
 
     test('publishes V2 lorebook deletion to the owning nonselected character', async () => {
@@ -199,7 +280,7 @@ describe('destructive trigger runtime gating', () => {
             indexType: 'value',
             indent: 0,
         }
-        const { character: owner, chat } = makeState(effect, true)
+        const { character: owner, chat } = makeState(effect)
         const selectedCharacter = {
             ...structuredClone(owner),
             chaId: 'selected-character',
@@ -223,7 +304,7 @@ describe('destructive trigger runtime gating', () => {
             indexType: 'value',
             indent: 0,
         }
-        const { character: owner, chat } = makeState(effect, true)
+        const { character: owner, chat } = makeState(effect)
         const remainingCharacter = {
             ...structuredClone(owner),
             chaId: 'remaining-character',
@@ -244,7 +325,7 @@ describe('destructive trigger runtime gating', () => {
             value: '42',
             operator: '=',
         }
-        const { character: owner, chat: ownerChat } = makeState(effect, false)
+        const { character: owner, chat: ownerChat } = makeState(effect)
         owner.chaId = 'owner-character'
         ownerChat.id = 'owner-chat'
         const selectedCharacter = {
@@ -294,7 +375,7 @@ describe('destructive trigger runtime gating', () => {
             expected: { $messageCount: '3' },
         },
     ])('publishes input $name once and appends the user message', async ({ effect, expected }) => {
-        const { character, chat } = makeState(effect, false)
+        const { character, chat } = makeState(effect)
 
         const applied = await applyChatInputToTarget({
             getDatabase: () => state.db,
@@ -322,7 +403,7 @@ describe('destructive trigger runtime gating', () => {
             value: 'isolated note',
             valueType: 'value',
             indent: 0,
-        }, false)
+        })
 
         const applied = await applyChatInputToTarget({
             getDatabase: () => state.db,
@@ -342,7 +423,7 @@ describe('destructive trigger runtime gating', () => {
         const { character, chat } = makeState({
             type: 'command',
             value: '/cut 1-3',
-        }, true)
+        })
         let release!: () => void
         let markStarted!: () => void
         const started = new Promise<void>(resolve => { markStarted = resolve })
@@ -393,7 +474,7 @@ describe('destructive trigger runtime gating', () => {
             value: '42',
             operator: '=',
         }
-        const { character, chat } = makeState(effect, false)
+        const { character, chat } = makeState(effect)
         character.triggerscript[0].type = 'output'
         const target = { chaId: character.chaId, chatId: chat.id }
 
@@ -438,7 +519,7 @@ describe('destructive trigger runtime gating', () => {
             const { character, chat } = makeState({
                 type: 'command',
                 value: '/cut 1-3',
-            }, true)
+            })
             if(mode !== 'manual') character.triggerscript[0].type = mode
             let release!: () => void
             let markStarted!: () => void
@@ -507,24 +588,8 @@ describe('destructive trigger runtime gating', () => {
             },
             prepare: (chat: any) => { chat.scriptstate.$dynamicCommand = '/cut 1-3' },
         },
-    ])('passes owner access and durable target into $name execution', async ({ effect, prepare }) => {
-        const denied = makeState(effect, false)
-        prepare(denied.chat)
-        const deniedResult = await runTrigger(denied.character as any, 'input', {
-            chat: denied.chat as any,
-        })
-        expect(deniedResult?.chat.message.map((message: any) => message.data))
-            .toEqual(['one', 'two', 'three'])
-        expect(deniedResult?.destructiveChatMutation).toBe(false)
-        expect(state.processTriggerMultiCommand).toHaveBeenLastCalledWith(
-            '/cut 1-3',
-            expect.objectContaining({
-                target: { chaId: 'character', chatId: 'chat' },
-                destructiveAccess: false,
-            }),
-        )
-
-        const allowed = makeState(effect, true)
+    ])('runs $name without a consent grant against its durable target', async ({ effect, prepare }) => {
+        const allowed = makeState(effect)
         prepare(allowed.chat)
         const allowedResult = await runTrigger(allowed.character as any, 'input', {
             chat: allowed.chat as any,
@@ -536,8 +601,54 @@ describe('destructive trigger runtime gating', () => {
             '/cut 1-3',
             expect.objectContaining({
                 target: { chaId: 'character', chatId: 'chat' },
-                destructiveAccess: true,
             }),
         )
+    })
+
+    test.each([
+        {
+            name: 'V1 literal command',
+            effect: { type: 'command', value: '/cut 1-3' },
+            prepare: (_chat: any) => {},
+        },
+        {
+            name: 'V2 dynamic command',
+            effect: {
+                type: 'v2Command',
+                value: 'dynamicCommand',
+                valueType: 'var',
+                indent: 0,
+            },
+            prepare: (chat: any) => { chat.scriptstate.$dynamicCommand = '/cut 1-3' },
+        },
+    ])('ignores a stale false character capability for $name', async ({ effect, prepare }) => {
+        const execution = makeState(effect)
+        Object.assign(execution.character, { destructiveAccess: false })
+        prepare(execution.chat)
+
+        const result = await runTrigger(execution.character as any, 'input', {
+            chat: execution.chat as any,
+        })
+
+        expect(result?.chat.message.map((message: any) => message.data))
+            .toEqual(['two', 'three'])
+        expect(result?.destructiveChatMutation).toBe(true)
+    })
+
+    test.each([
+        ['without the retired field', false],
+        ['with a stale false field', true],
+    ])('runs a /cut command from a module %s', async (_name, staleCapability) => {
+        const effect = { type: 'command', value: '/cut 1-3' }
+        const execution = makeState(effect)
+        useModuleTrigger(execution.character, effect, staleCapability)
+
+        const result = await runTrigger(execution.character as any, 'input', {
+            chat: execution.chat as any,
+        })
+
+        expect(result?.chat.message.map((message: any) => message.data))
+            .toEqual(['two', 'three'])
+        expect(result?.destructiveChatMutation).toBe(true)
     })
 })

@@ -124,10 +124,6 @@ vi.mock('./process/modules', () => ({
     exportModuleLegacy: vi.fn(),
     readModule: vi.fn(),
 }))
-vi.mock('./process/scriptCapabilities', () => ({
-    authorizeImportedDestructiveAccess: vi.fn(async () => true),
-    mergeEmbeddedModuleDestructiveAccess: vi.fn(),
-}))
 
 const { createBaseV3, exportCharacterCard, importCharacterProcess } = await import('./characterCards')
 

@@ -329,8 +329,4 @@
         <Check bind:check={currentModule.lowLevelAccess} name={language.lowLevelAccess}/>
         <span> <Help key="lowLevelAccess" name={language.lowLevelAccess}/></span>
     </div>
-    <div class="flex items-center mt-4">
-        <Check bind:check={currentModule.destructiveAccess} name={language.destructiveAccess}/>
-        <span> <Help key="destructiveAccess" name={language.destructiveAccess}/></span>
-    </div>
 {/if}
