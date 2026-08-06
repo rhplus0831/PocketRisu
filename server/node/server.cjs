@@ -66,6 +66,7 @@ const {
     isPortableAssetName,
     runtimeAssetFileDisposition,
     runtimeAssetFileDispositions,
+    withAssetFileMutationAdmission,
     assetPathFor,
     isLegacyHashAsset,
     markLegacyHashAsset,
@@ -97,6 +98,12 @@ const {
     recoverImportSwap,
 } = require('./importJournal.cjs');
 const { createImportBarrier } = require('./importBarrier.cjs');
+const {
+    acquireAssetMaintenanceLockSync,
+    isAssetMaintenanceLockedError,
+    releaseAssetMaintenanceLockHandle,
+    sameAssetDirectoryIdentitySync,
+} = require('./assetMaintenanceLock.cjs');
 const {
     addLogBatch, queryLogs, clearLogs, countLogs,
     logger, installProcessHandlers, expressErrorMiddleware,
@@ -1248,6 +1255,9 @@ const backupImportFailpoint = process.env.NODE_ENV === 'test'
     : '';
 const saveFolderImportFailpoint = process.env.NODE_ENV === 'test'
     ? String(process.env.POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT ?? '').trim()
+    : '';
+const importRecoveryFailpoint = process.env.NODE_ENV === 'test'
+    ? String(process.env.POCKETRISU_TEST_IMPORT_RECOVERY_FAILPOINT ?? '').trim()
     : '';
 
 function hasSaveFolderImportFailpoint(name) {
@@ -4141,28 +4151,114 @@ async function assertImportDiskSpace(sourceBytes, targetPath = databaseSpoolDir)
     return disk;
 }
 
+function attachImportSettlementError(primaryError, settlementError) {
+    if (!primaryError || typeof primaryError !== 'object') return;
+    if (!Array.isArray(primaryError.cleanupErrors)) primaryError.cleanupErrors = [];
+    primaryError.cleanupErrors.push(settlementError);
+}
+
+function settleJournaledImportAssetSwap({
+    journal,
+    assetSwap,
+    transactionCommitted,
+    databaseSettled,
+    source,
+    primaryError = null,
+    beforeRecovery = null,
+}) {
+    if (!journal || !assetSwap || assetSwap.isMaintenanceReleased()) {
+        return { settled: true, journal };
+    }
+    if (!databaseSettled) {
+        const settlementError = new Error(
+            `${source} cannot settle the asset swap because database recovery is incomplete`,
+        );
+        settlementError.code = 'IMPORT_DATABASE_RECOVERY_INCOMPLETE';
+        if (primaryError) {
+            attachImportSettlementError(primaryError, settlementError);
+            return { settled: false, journal };
+        }
+        throw settlementError;
+    }
+
+    try {
+        beforeRecovery?.();
+        let durableJournal = journal;
+        if (transactionCommitted && durableJournal.phase !== 'committed') {
+            durableJournal = { ...durableJournal, phase: 'committed' };
+            writeImportJournal(IMPORT_JOURNAL_PATH, durableJournal);
+        }
+        const markerValue = kvGet(IMPORT_JOURNAL_MARKER_KEY);
+        const markerPresent = transactionCommitted || (
+            markerValue !== null
+            && Buffer.from(markerValue).toString('utf-8') === durableJournal.id
+        );
+        recoverImportSwap({
+            journal: durableJournal,
+            markerPresent,
+            fs: fsSync,
+        });
+        if (markerValue !== null) kvDel(IMPORT_JOURNAL_MARKER_KEY);
+        clearImportJournal(IMPORT_JOURNAL_PATH);
+        const released = assetSwap.releaseAfterRecovery(primaryError);
+        return { settled: released, journal: durableJournal };
+    } catch (settlementError) {
+        if (primaryError) {
+            attachImportSettlementError(primaryError, settlementError);
+            return { settled: false, journal };
+        }
+        throw settlementError;
+    }
+}
+
 function recoverPendingImportSwap(source) {
     const journal = readImportJournal(IMPORT_JOURNAL_PATH);
     if (!journal) return null;
 
-    const markerValue = kvGet(IMPORT_JOURNAL_MARKER_KEY);
-    const markerPresent = markerValue !== null
-        && Buffer.from(markerValue).toString('utf-8') === journal.id;
-    const summary = recoverImportSwap({ journal, markerPresent, fs: fsSync });
-    logger.warn(
-        `[Import Recovery] ${source}: ${summary.action} ${summary.directories} `
-        + `directory swap(s) for journal ${journal.id} `
-        + `(phase=${journal.phase}, markerPresent=${markerPresent})`
-    );
+    const touchesLiveAssets = journal.dirs.some((entry) => (
+        sameAssetDirectoryIdentitySync(entry.liveDir, assetDir, fsSync)
+    ));
+    const assetMaintenanceLock = touchesLiveAssets
+        ? acquireAssetMaintenanceLockSync(assetDir, {
+            purpose: `import-journal recovery (${source})`,
+        })
+        : null;
 
-    // Once backups have been finalized, marker deletion must not make a
-    // repeated recovery interpret the imported live directories as uncommitted.
-    if (summary.action === 'finalized' && journal.phase !== 'committed') {
-        writeImportJournal(IMPORT_JOURNAL_PATH, { ...journal, phase: 'committed' });
+    let recoveryComplete = false;
+    try {
+        if (importRecoveryFailpoint === 'after-lock-acquired') {
+            const error = new Error('Injected import-journal recovery failure after lock acquisition');
+            error.code = 'IMPORT_RECOVERY_INJECTED_FAILURE';
+            throw error;
+        }
+        const markerValue = kvGet(IMPORT_JOURNAL_MARKER_KEY);
+        const markerPresent = markerValue !== null
+            && Buffer.from(markerValue).toString('utf-8') === journal.id;
+        const summary = recoverImportSwap({ journal, markerPresent, fs: fsSync });
+        logger.warn(
+            `[Import Recovery] ${source}: ${summary.action} ${summary.directories} `
+            + `directory swap(s) for journal ${journal.id} `
+            + `(phase=${journal.phase}, markerPresent=${markerPresent})`
+        );
+
+        // Once backups have been finalized, marker deletion must not make a
+        // repeated recovery interpret the imported live directories as uncommitted.
+        if (summary.action === 'finalized' && journal.phase !== 'committed') {
+            writeImportJournal(IMPORT_JOURNAL_PATH, { ...journal, phase: 'committed' });
+        }
+        if (markerValue !== null) kvDel(IMPORT_JOURNAL_MARKER_KEY);
+        clearImportJournal(IMPORT_JOURNAL_PATH);
+        recoveryComplete = true;
+        return summary;
+    } finally {
+        // An unresolved live recovery must keep exclusion in this process.
+        // Releasing here would admit writes/dedup against a partially restored
+        // directory. Startup can recover the retained same-host owner after
+        // this process exits, then retry the durable journal.
+        if (recoveryComplete) {
+            releaseAssetMaintenanceLockHandle(assetMaintenanceLock);
+        }
     }
-    if (markerValue !== null) kvDel(IMPORT_JOURNAL_MARKER_KEY);
-    clearImportJournal(IMPORT_JOURNAL_PATH);
-    return summary;
 }
 
 // ── Update check ─────────────────────────────────────────────────────────────
@@ -5029,44 +5125,60 @@ function verifyAssetHashForWrite(key, value) {
 function writeAssetValue(key, value, options = {}) {
     const {
         skipIfUnchanged = false,
-        legacyHashMismatch = false,
         publishHooks = {},
         metadataHooks = {},
     } = options;
     const name = assetNameForKey(key);
-    const fileDisposition = name === null
-        ? null
-        : runtimeAssetFileDisposition(name);
-    if (fileDisposition?.eligible) {
-        if (legacyHashMismatch) markLegacyHashAsset(name);
-        let wrote = true;
-        if (skipIfUnchanged) {
-            wrote = writeAssetFileIfChanged(name, value, publishHooks);
-        } else {
-            writeAssetFile(name, value, publishHooks);
-        }
-        const verification = verifyAssetHash(key, value);
-        if (verification.claimed !== null && verification.ok) {
-            if (metadataHooks.beforeLegacyHashClear) {
-                metadataHooks.beforeLegacyHashClear();
-            }
-            clearLegacyHashAsset(name);
-            if (metadataHooks.afterLegacyHashClear) {
-                metadataHooks.afterLegacyHashClear();
-            }
-        }
-        // A crash between the file rename and this delete is harmless: reads
-        // prefer the file, and the startup migration removes the duplicate.
-        kvDel(key);
-        // kvDel records logical removals automatically, but this delete only
-        // removes the shadow kv row; the freshly written file remains live.
-        kvClearDeletion(key);
+    if (name === null) {
+        kvSet(key, value);
         assetGcCandidateStore.remove(key);
-        return wrote;
+        return true;
     }
-    kvSet(key, value);
-    assetGcCandidateStore.remove(key);
-    return true;
+    return withAssetFileMutationAdmission(
+        name,
+        `admitted asset write ${name}`,
+        (fileDisposition, unlocked) => {
+            if (fileDisposition?.eligible) {
+                const verification = verifyAssetHash(key, value);
+                const legacyHashMismatch = !verification.ok && isLegacyHashAsset(name);
+                if (!verification.ok && !legacyHashMismatch) {
+                    const error = new Error('asset content does not match its SHA-256 name');
+                    error.code = 'ASSET_HASH_MISMATCH';
+                    error.key = key;
+                    error.expected = verification.claimed;
+                    error.actual = verification.actual;
+                    throw error;
+                }
+                if (legacyHashMismatch) markLegacyHashAsset(name);
+                let wrote = true;
+                if (skipIfUnchanged) {
+                    wrote = unlocked.writeAssetFileIfChanged(name, value, publishHooks);
+                } else {
+                    unlocked.writeAssetFile(name, value, publishHooks);
+                }
+                if (verification.claimed !== null && verification.ok) {
+                    if (metadataHooks.beforeLegacyHashClear) {
+                        metadataHooks.beforeLegacyHashClear();
+                    }
+                    clearLegacyHashAsset(name);
+                    if (metadataHooks.afterLegacyHashClear) {
+                        metadataHooks.afterLegacyHashClear();
+                    }
+                }
+                // Admission, legacy-marker mutation, payload publication, and
+                // shadow-row cleanup share one lock ownership interval. An
+                // import cannot install a portable-name collision between the
+                // disposition check and the final publication.
+                kvDel(key);
+                kvClearDeletion(key);
+                assetGcCandidateStore.remove(key);
+                return wrote;
+            }
+            kvSet(key, value);
+            assetGcCandidateStore.remove(key);
+            return true;
+        },
+    );
 }
 
 function deleteAssetValue(key) {
@@ -5118,7 +5230,13 @@ async function prepareAssetImportStage() {
     recoverPendingImportSwap('Asset import preparation');
     await fs.rm(assetImportStagingDir, { recursive: true, force: true });
     await fs.rm(assetImportBackupDir, { recursive: true, force: true });
-    const store = createAssetStore({ assetDir: assetImportStagingDir });
+    const store = createAssetStore({
+        assetDir: assetImportStagingDir,
+        // Detached staging is not observable by dedup. The live-directory
+        // swap acquires and retains the stable save-level lock through the
+        // import journal's finalize/rollback boundary.
+        maintenanceLock: false,
+    });
     store.ensureAssetDir();
     writeFileSync(store.migrationMarkerPath, new Date().toISOString(), 'utf-8');
     store.reconcileLegacyHashAssetIdentity({ discover: true });
@@ -10300,6 +10418,8 @@ async function importBackupFromSource(dataSource, {
     let inlaySwap = null;
     let journal = null;
     let transactionCommitted = false;
+    let databaseSettled = false;
+    let importPrimaryError = null;
     try {
         sqliteDb.exec('BEGIN');
         // Prefix deletes can only journal kv rows. Record filesystem-backed
@@ -10577,22 +10697,28 @@ async function importBackupFromSource(dataSource, {
         throwIfImportAborted(signal);
         sqliteDb.exec('COMMIT');
         transactionCommitted = true;
+        databaseSettled = true;
 
         applySqliteDurabilityMode();
         runTrackedWalCheckpoint('TRUNCATE', 'backup-import-commit');
-        journal = { ...journal, phase: 'committed' };
-        writeImportJournal(IMPORT_JOURNAL_PATH, journal);
-        assetSwap.finalize();
-        inlaySwap.finalize();
-        kvDel(IMPORT_JOURNAL_MARKER_KEY);
-        clearImportJournal(IMPORT_JOURNAL_PATH);
+        const settlement = settleJournaledImportAssetSwap({
+            journal,
+            assetSwap,
+            transactionCommitted,
+            databaseSettled,
+            source: 'Backup import finalization',
+        });
+        journal = settlement.journal;
     } catch (error) {
+        importPrimaryError = error;
         if (!transactionCommitted) {
-            let rollbackSucceeded = !error?.restoreError;
+            let rollbackSucceeded = true;
             try {
                 sqliteDb.exec('ROLLBACK');
+                databaseSettled = true;
             } catch (rollbackError) {
                 rollbackSucceeded = false;
+                attachImportSettlementError(error, rollbackError);
                 logger.error('[Backup Import] Failed to roll back SQLite transaction:', rollbackError);
             }
             try {
@@ -10600,37 +10726,31 @@ async function importBackupFromSource(dataSource, {
             } catch (epochError) {
                 logger.error('[Backup Import] Failed to bump list epoch after rollback:', epochError);
             }
-            if (inlaySwap) {
-                try { inlaySwap.rollback(); } catch (rollbackError) {
-                    rollbackSucceeded = false;
-                    logger.error('[Backup Import] Failed to restore previous inlay directory:', rollbackError);
-                }
+            if (journal && assetSwap) {
+                const settlement = settleJournaledImportAssetSwap({
+                    journal,
+                    assetSwap,
+                    transactionCommitted,
+                    databaseSettled,
+                    source: 'Backup import rollback',
+                    primaryError: error,
+                });
+                journal = settlement.journal;
+                rollbackSucceeded = rollbackSucceeded && settlement.settled;
             } else {
                 try {
                     await fs.rm(stagingDir, { recursive: true, force: true });
                 } catch (cleanupError) {
                     rollbackSucceeded = false;
+                    attachImportSettlementError(error, cleanupError);
                     logger.error('[Backup Import] Failed to remove inlay staging directory:', cleanupError);
                 }
-            }
-            if (assetSwap) {
-                try { assetSwap.rollback(); } catch (rollbackError) {
-                    rollbackSucceeded = false;
-                    logger.error('[Backup Import] Failed to restore previous asset directory:', rollbackError);
-                }
-            } else {
                 try {
                     await fs.rm(assetImportStagingDir, { recursive: true, force: true });
                 } catch (cleanupError) {
                     rollbackSucceeded = false;
+                    attachImportSettlementError(error, cleanupError);
                     logger.error('[Backup Import] Failed to remove asset staging directory:', cleanupError);
-                }
-            }
-            if (journal && rollbackSucceeded) {
-                try {
-                    clearImportJournal(IMPORT_JOURNAL_PATH);
-                } catch (cleanupError) {
-                    logger.error('[Backup Import] Failed to clear rolled-back import journal:', cleanupError);
                 }
             }
             if (error instanceof ImportIngressError && !rollbackSucceeded) {
@@ -10648,6 +10768,19 @@ async function importBackupFromSource(dataSource, {
         }
         throw error;
     } finally {
+        if (assetSwap && !assetSwap.isMaintenanceReleased()) {
+            const fallbackError = importPrimaryError
+                ?? new Error('Backup import left its asset swap unsettled');
+            const settlement = settleJournaledImportAssetSwap({
+                journal,
+                assetSwap,
+                transactionCommitted,
+                databaseSettled,
+                source: 'Backup import final settlement',
+                primaryError: fallbackError,
+            });
+            journal = settlement.journal;
+        }
         applySqliteDurabilityMode();
         if (activeEntryWriteStream) {
             activeEntryWriteStream.destroy();
@@ -16848,23 +16981,40 @@ function verifyAssetHashFromDigest(key, digest) {
 
 function writeAssetValueFromSpool(key, spool, verification) {
     const name = assetNameForKey(key);
-    const fileDisposition = name === null
-        ? null
-        : runtimeAssetFileDisposition(name);
-    if (fileDisposition?.eligible) {
-        if (verification.legacyHashMismatch) markLegacyHashAsset(name);
-        const wrote = writeAssetFileFromFile(name, spool.filePath, {
-            skipIfUnchanged: verification.claimed !== null,
-        });
-        if (verification.ok) clearLegacyHashAsset(name);
-        kvDel(key);
-        kvClearDeletion(key);
+    if (name === null) {
+        kvSetFromFile(key, spool.filePath, { chunkPlan: spool.chunkPlan });
         assetGcCandidateStore.remove(key);
-        return wrote;
+        return true;
     }
-    kvSetFromFile(key, spool.filePath, { chunkPlan: spool.chunkPlan });
-    assetGcCandidateStore.remove(key);
-    return true;
+    return withAssetFileMutationAdmission(
+        name,
+        `admitted spooled asset write ${name}`,
+        (fileDisposition, unlocked) => {
+            if (fileDisposition?.eligible) {
+                const legacyHashMismatch = !verification.ok && isLegacyHashAsset(name);
+                if (!verification.ok && !legacyHashMismatch) {
+                    const error = new Error('asset content does not match its SHA-256 name');
+                    error.code = 'ASSET_HASH_MISMATCH';
+                    error.key = key;
+                    error.expected = verification.claimed;
+                    error.actual = verification.actual;
+                    throw error;
+                }
+                if (legacyHashMismatch) markLegacyHashAsset(name);
+                const wrote = unlocked.writeAssetFileFromFile(name, spool.filePath, {
+                    skipIfUnchanged: verification.claimed !== null,
+                });
+                if (verification.ok) clearLegacyHashAsset(name);
+                kvDel(key);
+                kvClearDeletion(key);
+                assetGcCandidateStore.remove(key);
+                return wrote;
+            }
+            kvSetFromFile(key, spool.filePath, { chunkPlan: spool.chunkPlan });
+            assetGcCandidateStore.remove(key);
+            return true;
+        },
+    );
 }
 
 async function prepareSpooledGenericKvWrite(key, spool) {
@@ -17050,20 +17200,7 @@ async function handleSpooledKvWrite(req, res, next, {
             } else if (key.startsWith('assets/')) {
                 const digest = prepared.chunkPlan?.sha256
                     ?? await hashFile(spool.filePath, 'sha256');
-                const baseVerification = verifyAssetHashFromDigest(key, digest);
-                const assetVerification = {
-                    ...baseVerification,
-                    legacyHashMismatch: !baseVerification.ok
-                        && isLegacyHashAsset(key.slice('assets/'.length)),
-                };
-                if (!assetVerification.ok && !assetVerification.legacyHashMismatch) {
-                    return res.status(400).json({
-                        error: 'asset content does not match its SHA-256 name',
-                        key,
-                        expected: assetVerification.claimed,
-                        actual: assetVerification.actual,
-                    });
-                }
+                const assetVerification = verifyAssetHashFromDigest(key, digest);
                 writeAssetValueFromSpool(key, {
                     ...spool,
                     chunkPlan: prepared.chunkPlan,
@@ -17172,19 +17309,8 @@ app.post('/api/write', async (req, res, next) => {
                 }
             }
             const assetVerification = key.startsWith('assets/')
-                ? verifyAssetHashForWrite(key, fileContent)
+                ? verifyAssetHash(key, fileContent)
                 : null;
-            if (assetVerification
-                && !assetVerification.ok
-                && !assetVerification.legacyHashMismatch) {
-                res.status(400).json({
-                    error: 'asset content does not match its SHA-256 name',
-                    key,
-                    expected: assetVerification.claimed,
-                    actual: assetVerification.actual,
-                });
-                return;
-            }
             if (key.startsWith(PLUGIN_SAVE_PREFIX)
                 || key.startsWith(PLUGIN_SAVE_META_PREFIX)) {
                 try {
@@ -19752,6 +19878,8 @@ async function importLegacySaveEntries(
     const deferredDraftEntries = [];
     let journal = null;
     let transactionCommitted = false;
+    let databaseSettled = false;
+    let importPrimaryError = null;
 
     try {
         sqliteDb.exec('BEGIN');
@@ -19865,18 +19993,22 @@ async function importLegacySaveEntries(
         });
         sqliteDb.exec('COMMIT');
         transactionCommitted = true;
+        databaseSettled = true;
 
         runTrackedWalCheckpoint('TRUNCATE', 'save-folder-import');
-        journal = { ...journal, phase: 'committed' };
-        writeImportJournal(IMPORT_JOURNAL_PATH, journal);
         if (hasSaveFolderImportFailpoint('post-commit-cleanup')) {
             const failure = new Error('Injected save-folder cleanup failure after commit');
             failure.code = 'SAVE_FOLDER_IMPORT_POST_COMMIT_CLEANUP_FAILED';
             throw failure;
         }
-        assetSwap.finalize();
-        kvDel(IMPORT_JOURNAL_MARKER_KEY);
-        clearImportJournal(IMPORT_JOURNAL_PATH);
+        const settlement = settleJournaledImportAssetSwap({
+            journal,
+            assetSwap,
+            transactionCommitted,
+            databaseSettled,
+            source: 'Save-folder import finalization',
+        });
+        journal = settlement.journal;
         if (hasSaveFolderImportFailpoint('migration-marker')) {
             const failure = new Error('Injected save-folder migration-marker failure after commit');
             failure.code = 'SAVE_FOLDER_IMPORT_MIGRATION_MARKER_FAILED';
@@ -19884,12 +20016,15 @@ async function importLegacySaveEntries(
         }
         publishLegacyHexMigrationMarker();
     } catch (error) {
+        importPrimaryError = error;
         if (!transactionCommitted) {
-            let rollbackSucceeded = !error?.restoreError;
+            let rollbackSucceeded = true;
             try {
                 sqliteDb.exec('ROLLBACK');
+                databaseSettled = true;
             } catch (rollbackError) {
                 rollbackSucceeded = false;
+                attachImportSettlementError(error, rollbackError);
                 logger.error('[Save-folder Import] Failed to roll back SQLite transaction:', rollbackError);
             }
             try {
@@ -19897,16 +20032,22 @@ async function importLegacySaveEntries(
             } catch (epochError) {
                 logger.error('[Save-folder Import] Failed to bump list epoch after rollback:', epochError);
             }
-            if (assetSwap) {
-                try {
-                    if (hasSaveFolderImportFailpoint('rollback-cleanup')) {
-                        throw new Error('Injected save-folder asset rollback failure');
-                    }
-                    assetSwap.rollback();
-                } catch (rollbackError) {
-                    rollbackSucceeded = false;
-                    logger.error('[Save-folder Import] Failed to restore previous asset directory:', rollbackError);
-                }
+            if (journal && assetSwap) {
+                const settlement = settleJournaledImportAssetSwap({
+                    journal,
+                    assetSwap,
+                    transactionCommitted,
+                    databaseSettled,
+                    source: 'Save-folder import rollback',
+                    primaryError: error,
+                    beforeRecovery() {
+                        if (hasSaveFolderImportFailpoint('rollback-cleanup')) {
+                            throw new Error('Injected save-folder asset rollback failure');
+                        }
+                    },
+                });
+                journal = settlement.journal;
+                rollbackSucceeded = rollbackSucceeded && settlement.settled;
             } else {
                 try {
                     if (hasSaveFolderImportFailpoint('rollback-cleanup')) {
@@ -19915,19 +20056,11 @@ async function importLegacySaveEntries(
                     await fs.rm(assetImportStagingDir, { recursive: true, force: true });
                 } catch (cleanupError) {
                     rollbackSucceeded = false;
+                    attachImportSettlementError(error, cleanupError);
                     logger.error('[Save-folder Import] Failed to remove asset staging directory:', cleanupError);
                 }
             }
-            if (journal && rollbackSucceeded) {
-                try {
-                    clearImportJournal(IMPORT_JOURNAL_PATH);
-                } catch (cleanupError) {
-                    logger.error('[Save-folder Import] Failed to clear rolled-back import journal:', cleanupError);
-                }
-            }
             if (!rollbackSucceeded && error && typeof error === 'object') {
-                error.message = 'Save-folder import outcome is unknown because rollback recovery failed';
-                error.code = 'SAVE_FOLDER_IMPORT_OUTCOME_UNKNOWN';
                 error.commitOutcome = 'unknown';
                 error.commitOutcomeUnknown = true;
                 error.statusCode = 500;
@@ -19944,6 +20077,26 @@ async function importLegacySaveEntries(
             error.retryable = false;
         }
         throw error;
+    } finally {
+        if (assetSwap && !assetSwap.isMaintenanceReleased()) {
+            const fallbackError = importPrimaryError
+                ?? new Error('Save-folder import left its asset swap unsettled');
+            const settlement = settleJournaledImportAssetSwap({
+                journal,
+                assetSwap,
+                transactionCommitted,
+                databaseSettled,
+                source: 'Save-folder import final settlement',
+                primaryError: fallbackError,
+                beforeRecovery() {
+                    if (!transactionCommitted
+                        && hasSaveFolderImportFailpoint('rollback-cleanup')) {
+                        throw new Error('Injected save-folder asset rollback failure');
+                    }
+                },
+            });
+            journal = settlement.journal;
+        }
     }
 
     return { imported: sources.length };
@@ -22441,6 +22594,26 @@ app.use((err, req, res, next) => {
             limit: err.limit,
             actual: err.actual,
             retryable: false,
+            commitOutcome: 'not-committed',
+            commitOutcomeUnknown: false,
+        });
+    }
+    if (err?.code === 'ASSET_HASH_MISMATCH') {
+        return res.status(400).json({
+            error: err.message,
+            code: err.code,
+            key: err.key,
+            expected: err.expected,
+            actual: err.actual,
+        });
+    }
+    if (isAssetMaintenanceLockedError(err)) {
+        res.setHeader('Retry-After', '5');
+        return res.status(503).json({
+            error: 'Asset maintenance is in progress; retry this write after it completes',
+            code: err.code,
+            retryAfter: 5,
+            retryable: true,
             commitOutcome: 'not-committed',
             commitOutcomeUnknown: false,
         });

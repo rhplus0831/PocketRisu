@@ -5,7 +5,7 @@ Run `pnpm check:docs` after changing a finding, status, path, or link.
 These are point-in-time reports; revalidate their evidence against current code
 before implementation.
 
-Current catalog: **27 open**, **0 deferred**, and **5 accepted decisions**.
+Current catalog: **26 open**, **0 deferred**, and **5 accepted decisions**.
 
 ## Active work by owner
 
@@ -47,7 +47,6 @@ Current catalog: **27 open**, **0 deferred**, and **5 accepted decisions**.
 | ID | Finding | Status | Source |
 |---|---|---|---|
 | `FND-interrupted-inlay-migration-discards-the-source-row` | [A crash during inlay migration can discard inlay metadata](open/media-translation/interrupted-inlay-migration-discards-the-source-row.md) | Open | 2026-07 data-loss audit |
-| `FND-external-dedup-can-strand-or-overwrite-a-live-asset` | [External dedup can strand or overwrite a live asset](open/media-translation/external-dedup-can-strand-or-overwrite-a-live-asset.md) | Open | 2026-07 data-loss audit |
 | `FND-inlay-filename-mapping-is-not-injective` | [Inlay filename mapping is not injective](open/media-translation/inlay-filename-mapping-is-not-injective.md) | Open | 2026-07 data-loss audit |
 | `FND-preferred-jdupes-merges-cross-instance-ownership` | [Preferred jdupes merges cross-instance ownership](open/media-translation/preferred-jdupes-merges-cross-instance-ownership.md) | Open | 2026-07 data-loss audit |
 

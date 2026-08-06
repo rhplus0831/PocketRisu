@@ -1,7 +1,8 @@
 import { afterAll, describe, expect, test } from 'vitest'
 import http from 'node:http'
+import { spawnSync } from 'node:child_process'
 import path from 'node:path'
-import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import Database from 'better-sqlite3'
 import { zipSync } from 'fflate'
 import { spawnServer, type ServerHandle } from './helpers/spawnServer.js'
@@ -118,6 +119,35 @@ async function uploadSaveFolder(client: RisuClient, zip: Buffer): Promise<Respon
     headers: { 'content-type': 'application/zip' },
     body: new Uint8Array(zip),
   })
+}
+
+async function writeRuntimeAsset(client: RisuClient, key: string, value: Buffer): Promise<Response> {
+  return client.fetch('/api/write', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'file-path': Buffer.from(key, 'utf8').toString('hex'),
+    },
+    body: new Uint8Array(value),
+  })
+}
+
+async function runExternalDedup(server: ServerHandle): Promise<ReturnType<typeof spawnSync>> {
+  const peer = path.join(server.cwd, 'external-dedup-peer', 'save', 'assets')
+  await mkdir(peer, { recursive: true })
+  await writeFile(path.join(peer, 'peer.bin'), Buffer.from('external dedup peer'))
+  return spawnSync(
+    'bash',
+    [path.resolve('scripts/dedup-assets.sh'), path.join(server.cwd, 'save', 'assets'), peer],
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        NODE_ENV: 'test',
+        POCKETRISU_TEST_ASSET_DEDUP_LOCK_TIMEOUT_MS: '0',
+      },
+    },
+  )
 }
 
 async function readDatabase(client: RisuClient): Promise<Record<string, any>> {
@@ -805,6 +835,68 @@ describe('bounded archive and save-folder ingress (real server)', () => {
     await waitForNoImportSpools(server)
   }, 60_000)
 
+  test('live pending-import recovery failure retains exclusion until restart recovery', async () => {
+    const { server, client } = await boot({
+      POCKETRISU_TEST_IMPORT_RECOVERY_FAILPOINT: 'after-lock-acquired',
+    })
+    const baselineKey = 'assets/recovery-retained.bin'
+    const baselineValue = Buffer.from('pre-recovery live asset')
+    expect((await writeRuntimeAsset(client, baselineKey, baselineValue)).status).toBe(200)
+
+    const saveDir = path.join(server.cwd, 'save')
+    const liveDir = path.join(saveDir, 'assets')
+    const backupDir = path.join(saveDir, 'assets_import_backup')
+    const stagingDir = path.join(saveDir, 'assets_import_staging')
+    await rm(backupDir, { recursive: true, force: true })
+    await rm(stagingDir, { recursive: true, force: true })
+    await rename(liveDir, backupDir)
+    await mkdir(liveDir, { recursive: true })
+    await writeFile(path.join(liveDir, 'uncommitted.bin'), 'uncommitted replacement')
+    await mkdir(stagingDir, { recursive: true })
+    const journal = {
+      id: 'injected-live-recovery-failure',
+      phase: 'swapped',
+      dirs: [{ liveDir, backupDir, stagingDir, liveExisted: true }],
+    }
+    await writeFile(path.join(saveDir, 'import_journal.json'), JSON.stringify(journal))
+
+    const trigger = await uploadSaveFolder(
+      client,
+      saveFolderZip(databaseEntry(createSeedBackup({
+        databaseFields: { globalNote: 'must-not-start-while-recovery-failed' },
+      }))),
+    )
+    const triggerBody = await trigger.json()
+    expect(trigger.status, JSON.stringify(triggerBody)).toBe(400)
+    expect(triggerBody).toMatchObject({
+      error: 'Injected import-journal recovery failure after lock acquisition',
+    })
+
+    const blockedWrite = await writeRuntimeAsset(
+      client,
+      'assets/recovery-window-write.bin',
+      Buffer.from('must remain blocked'),
+    )
+    expect(blockedWrite.status).toBe(503)
+    const blockedDedup = await runExternalDedup(server)
+    expect(blockedDedup.status, blockedDedup.stderr).toBe(4)
+    expect(blockedDedup.stderr).toContain('locked by owner pid')
+
+    await server.restart({ POCKETRISU_TEST_IMPORT_RECOVERY_FAILPOINT: '' })
+    const restarted = await createClient(server.port, server.password)
+    expect(await readFile(path.join(saveDir, baselineKey))).toEqual(baselineValue)
+    await expect(stat(path.join(liveDir, 'uncommitted.bin')))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readdir(saveDir)).not.toContain('import_journal.json')
+    expect((await writeRuntimeAsset(
+      restarted,
+      'assets/recovery-window-write.bin',
+      Buffer.from('service restored'),
+    )).status).toBe(200)
+    const recoveredDedup = await runExternalDedup(server)
+    expect(recoveredDedup.status, recoveredDedup.stderr).toBe(0)
+  }, 60_000)
+
   test('validation failure reports unknown when rollback cleanup cannot be proven', async () => {
     const { server, client } = await boot()
     const oldDatabase = databaseEntry(createSeedBackup({
@@ -829,8 +921,8 @@ describe('bounded archive and save-folder ingress (real server)', () => {
     const response = await uploadSaveFolder(failingClient, saveFolderZip(invalidDatabase))
     expect(response.status).toBe(500)
     await expect(response.json()).resolves.toEqual({
-      error: 'Save-folder import outcome is unknown because rollback recovery failed',
-      code: 'SAVE_FOLDER_IMPORT_OUTCOME_UNKNOWN',
+      error: 'Invalid plugin storage JSON row',
+      code: 'INVALID_PLUGIN_STORAGE_ROW',
       retryable: false,
       commitOutcome: 'unknown',
       commitOutcomeUnknown: true,
@@ -871,8 +963,8 @@ describe('bounded archive and save-folder ingress (real server)', () => {
     )
     expect(response.status).toBe(500)
     await expect(response.json()).resolves.toEqual({
-      error: 'Save-folder import outcome is unknown because rollback recovery failed',
-      code: 'SAVE_FOLDER_IMPORT_OUTCOME_UNKNOWN',
+      error: 'Save-folder import was rolled back before publication',
+      code: 'SAVE_FOLDER_IMPORT_NOT_COMMITTED',
       retryable: false,
       commitOutcome: 'unknown',
       commitOutcomeUnknown: true,
@@ -881,6 +973,20 @@ describe('bounded archive and save-folder ingress (real server)', () => {
     // uncertain mixed view until journal recovery runs at restart.
     await expectNote(failingClient, 'before-generic-rollback-ambiguity')
     expect(await readFile(path.join(server.cwd, 'save', assetKey))).toEqual(candidateAsset)
+    const blockedWrite = await writeRuntimeAsset(
+      failingClient,
+      'assets/runtime-must-remain-blocked.bin',
+      Buffer.from('must not publish before recovery'),
+    )
+    expect(blockedWrite.status).toBe(503)
+    await expect(blockedWrite.json()).resolves.toMatchObject({
+      code: 'ASSET_MAINTENANCE_LOCKED',
+      retryable: true,
+      commitOutcome: 'not-committed',
+    })
+    const blockedDedup = await runExternalDedup(server)
+    expect(blockedDedup.status, blockedDedup.stderr).toBe(4)
+    expect(blockedDedup.stderr).toContain('locked by owner pid')
 
     await server.restart({ POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT: '' })
     const restarted = await createClient(server.port, server.password)
@@ -926,6 +1032,15 @@ describe('bounded archive and save-folder ingress (real server)', () => {
     })
     await expectNote(failingClient, 'committed-post-commit-cleanup')
     expect(await readFile(path.join(server.cwd, 'save', assetKey))).toEqual(candidateAsset)
+    const postCommitWrite = await writeRuntimeAsset(
+      failingClient,
+      'assets/post-commit-runtime.bin',
+      Buffer.from('safe after in-process finalization'),
+    )
+    expect(postCommitWrite.status).toBe(200)
+    const postCommitDedup = await runExternalDedup(server)
+    expect(postCommitDedup.status, postCommitDedup.stderr).toBe(0)
+    expect(await readdir(path.join(server.cwd, 'save'))).not.toContain('import_journal.json')
 
     await server.restart({ POCKETRISU_TEST_SAVE_FOLDER_IMPORT_FAILPOINT: '' })
     const restarted = await createClient(server.port, server.password)

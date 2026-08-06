@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import pkg from './assetStore.cjs'
+import lockPkg from './assetMaintenanceLock.cjs'
 
 const {
     ASSET_TEMP_PREFIX,
@@ -16,7 +17,11 @@ const {
 } = pkg as {
     ASSET_TEMP_PREFIX: string
     HASH_NAME_RE: RegExp
-    createAssetStore: (options: { assetDir: string; fs?: typeof fs }) => AssetStore
+    createAssetStore: (options: {
+        assetDir: string
+        fs?: typeof fs
+        maintenanceLock?: boolean
+    }) => AssetStore
     portableAssetNameKey: (name: string) => string
     isPortableAssetName: (name: unknown) => boolean
     migrateAssetRowsToFilesystem: (options: {
@@ -41,6 +46,11 @@ const {
         key: string,
         value: Buffer,
     ) => { claimed: string | null; actual: string | null; ok: boolean }
+}
+const { acquireAssetMaintenanceLockSync } = lockPkg as {
+    acquireAssetMaintenanceLockSync: (
+        assetDir: string,
+    ) => { release: () => void }
 }
 
 interface AssetStore {
@@ -68,6 +78,31 @@ interface AssetStore {
     ) => { marked: number; cleared: number }
     writeAssetFile: (name: string, buffer: Buffer) => void
     writeAssetFileIfChanged: (name: string, buffer: Buffer) => boolean
+    writeAssetFileFromFile: (
+        name: string,
+        sourcePath: string,
+        options?: { skipIfUnchanged?: boolean },
+    ) => boolean
+    withAssetFileMutationAdmission: <T>(
+        name: string,
+        purpose: string,
+        operation: (
+            disposition: {
+                eligible: boolean
+                reason: 'non-portable' | 'collision' | null
+                existingName: string | null
+            },
+            unlocked: {
+                writeAssetFile: (name: string, buffer: Buffer) => void
+                writeAssetFileIfChanged: (name: string, buffer: Buffer) => boolean
+                writeAssetFileFromFile: (
+                    name: string,
+                    sourcePath: string,
+                    options?: { skipIfUnchanged?: boolean },
+                ) => boolean
+            },
+        ) => T,
+    ) => T
     readAssetFile: (name: string) => Buffer | null
     verifyStoredAssetHash: (
         name: string,
@@ -82,7 +117,12 @@ interface AssetStore {
     swapAssetDirectoryFromStaging: (
         stagingDir: string,
         backupDir: string,
-    ) => { rollback: () => void; finalize: () => void }
+    ) => {
+        rollback: (options?: { retainLock?: boolean }) => void
+        finalize: (options?: { retainLock?: boolean }) => void
+        releaseAfterRecovery: (primaryError?: Error | null) => boolean
+        isMaintenanceReleased: () => boolean
+    }
 }
 
 const tempDirs: string[] = []
@@ -523,6 +563,170 @@ describe('asset directory staging', () => {
         expect(store.readAssetFile('old.bin')).toEqual(Buffer.from('old asset'))
         expect(store.readAssetFile('new.bin')).toBeNull()
         expect(fs.existsSync(backupDir)).toBe(false)
+    })
+
+    it('releases maintenance ownership after successful finalization', () => {
+        const store = makeStore()
+        store.writeAssetFile('old.bin', Buffer.from('old asset'))
+        const stagingDir = path.join(path.dirname(store.assetDir), 'assets_import_staging')
+        const backupDir = path.join(path.dirname(store.assetDir), 'assets_import_backup')
+        const stagingStore = createAssetStore({ assetDir: stagingDir, maintenanceLock: false })
+        stagingStore.writeAssetFile('new.bin', Buffer.from('new asset'))
+
+        const swap = store.swapAssetDirectoryFromStaging(stagingDir, backupDir)
+        swap.finalize()
+
+        expect(store.readAssetFile('new.bin')).toEqual(Buffer.from('new asset'))
+        expect(fs.existsSync(backupDir)).toBe(false)
+        const probe = acquireAssetMaintenanceLockSync(store.assetDir)
+        probe.release()
+    })
+
+    it('retains maintenance ownership until failed finalization is retried successfully', () => {
+        const fsImpl = Object.create(fs) as typeof fs
+        const store = makeStore(fsImpl)
+        store.writeAssetFile('old.bin', Buffer.from('old asset'))
+        const stagingDir = path.join(path.dirname(store.assetDir), 'assets_import_staging')
+        const backupDir = path.join(path.dirname(store.assetDir), 'assets_import_backup')
+        const stagingStore = createAssetStore({ assetDir: stagingDir, maintenanceLock: false })
+        stagingStore.writeAssetFile('new.bin', Buffer.from('new asset'))
+        let failFinalize = false
+        fsImpl.rmSync = ((target: fs.PathLike, options?: fs.RmDirOptions) => {
+            if (failFinalize && path.resolve(String(target)) === path.resolve(backupDir)) {
+                throw new Error('injected finalize cleanup failure')
+            }
+            return fs.rmSync(target, options as never)
+        }) as typeof fs.rmSync
+
+        const swap = store.swapAssetDirectoryFromStaging(stagingDir, backupDir)
+        failFinalize = true
+        expect(() => swap.finalize()).toThrow('injected finalize cleanup failure')
+        expect(() => acquireAssetMaintenanceLockSync(store.assetDir)).toThrow(/locked by owner pid/)
+        failFinalize = false
+        swap.finalize()
+        const probe = acquireAssetMaintenanceLockSync(store.assetDir)
+        probe.release()
+    })
+
+    it('retains maintenance ownership until failed rollback is retried successfully', () => {
+        const fsImpl = Object.create(fs) as typeof fs
+        const store = makeStore(fsImpl)
+        store.writeAssetFile('old.bin', Buffer.from('old asset'))
+        const stagingDir = path.join(path.dirname(store.assetDir), 'assets_import_staging')
+        const backupDir = path.join(path.dirname(store.assetDir), 'assets_import_backup')
+        const stagingStore = createAssetStore({ assetDir: stagingDir, maintenanceLock: false })
+        stagingStore.writeAssetFile('new.bin', Buffer.from('new asset'))
+        let failRestore = false
+        fsImpl.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+            if (failRestore && path.resolve(String(from)) === path.resolve(backupDir)) {
+                throw new Error('injected rollback restoration failure')
+            }
+            fs.renameSync(from, to)
+        }) as typeof fs.renameSync
+
+        const swap = store.swapAssetDirectoryFromStaging(stagingDir, backupDir)
+        failRestore = true
+        expect(() => swap.rollback()).toThrow('injected rollback restoration failure')
+        expect(() => acquireAssetMaintenanceLockSync(store.assetDir)).toThrow(/locked by owner pid/)
+        failRestore = false
+        swap.rollback()
+        const probe = acquireAssetMaintenanceLockSync(store.assetDir)
+        probe.release()
+    })
+
+    it.each(['ordinary', 'spooled'] as const)(
+        'holds %s write admission through publication so an import cannot enter between them',
+        (kind) => {
+            const store = makeStore()
+            const saveDir = path.dirname(store.assetDir)
+            const stagingDir = path.join(saveDir, 'assets_import_staging')
+            const backupDir = path.join(saveDir, 'assets_import_backup')
+            const stagingStore = createAssetStore({ assetDir: stagingDir, maintenanceLock: false })
+            stagingStore.writeAssetFile('Foo.png', Buffer.from('imported collision'))
+            const spoolPath = path.join(saveDir, 'runtime.spool')
+            fs.writeFileSync(spoolPath, Buffer.from('runtime payload'))
+
+            store.withAssetFileMutationAdmission(
+                'foo.png',
+                `${kind} writer-first admission`,
+                (disposition, unlocked) => {
+                    expect(disposition).toMatchObject({ eligible: true, existingName: null })
+                    expect(() => store.swapAssetDirectoryFromStaging(stagingDir, backupDir))
+                        .toThrow(/locked by owner pid/)
+                    if (kind === 'ordinary') {
+                        unlocked.writeAssetFile('foo.png', Buffer.from('runtime payload'))
+                    } else {
+                        unlocked.writeAssetFileFromFile('foo.png', spoolPath)
+                    }
+                },
+            )
+
+            expect(store.readAssetFile('foo.png')).toEqual(Buffer.from('runtime payload'))
+            expect(store.runtimeAssetFileDisposition('Foo.png')).toMatchObject({
+                eligible: false,
+                reason: 'collision',
+                existingName: 'foo.png',
+            })
+        },
+    )
+
+    it.each(['ordinary', 'spooled'] as const)(
+        'makes a %s writer wait for import ownership and then revalidates its case collision',
+        (kind) => {
+            const store = makeStore()
+            const saveDir = path.dirname(store.assetDir)
+            const stagingDir = path.join(saveDir, 'assets_import_staging')
+            const backupDir = path.join(saveDir, 'assets_import_backup')
+            const stagingStore = createAssetStore({ assetDir: stagingDir, maintenanceLock: false })
+            stagingStore.writeAssetFile('Foo.png', Buffer.from('imported collision'))
+            const spoolPath = path.join(saveDir, 'runtime.spool')
+            fs.writeFileSync(spoolPath, Buffer.from('must remain unpublished'))
+
+            const swap = store.swapAssetDirectoryFromStaging(stagingDir, backupDir)
+            expect(() => store.withAssetFileMutationAdmission(
+                'foo.png',
+                `${kind} import-first admission`,
+                () => { throw new Error('writer entered while import owned lock') },
+            )).toThrow(/locked by owner pid/)
+            swap.finalize()
+
+            const disposition = store.withAssetFileMutationAdmission(
+                'foo.png',
+                `${kind} collision revalidation`,
+                value => value,
+            )
+            expect(disposition).toMatchObject({
+                eligible: false,
+                reason: 'collision',
+                existingName: 'Foo.png',
+            })
+            expect(store.readAssetFile('Foo.png')).toEqual(Buffer.from('imported collision'))
+            expect(store.readAssetFile('foo.png')).toBeNull()
+        },
+    )
+
+    it('retries idempotent same-owner release after a transient unlink failure', () => {
+        const fsImpl = Object.create(fs) as typeof fs
+        const store = makeStore(fsImpl)
+        store.writeAssetFile('old.bin', Buffer.from('old asset'))
+        const stagingDir = path.join(path.dirname(store.assetDir), 'assets_import_staging')
+        const backupDir = path.join(path.dirname(store.assetDir), 'assets_import_backup')
+        const stagingStore = createAssetStore({ assetDir: stagingDir, maintenanceLock: false })
+        stagingStore.writeAssetFile('new.bin', Buffer.from('new asset'))
+        const originalUnlink = fsImpl.unlinkSync.bind(fsImpl)
+        let ownerUnlinkAttempts = 0
+        fsImpl.unlinkSync = ((target: fs.PathLike) => {
+            if (path.basename(String(target)) === 'owner.json' && ownerUnlinkAttempts++ === 0) {
+                throw new Error('injected transient owner unlink failure')
+            }
+            return originalUnlink(target)
+        }) as typeof fs.unlinkSync
+
+        const swap = store.swapAssetDirectoryFromStaging(stagingDir, backupDir)
+        expect(() => swap.finalize()).not.toThrow()
+        expect(ownerUnlinkAttempts).toBeGreaterThanOrEqual(2)
+        const probe = acquireAssetMaintenanceLockSync(store.assetDir)
+        probe.release()
     })
 })
 

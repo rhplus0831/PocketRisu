@@ -14,9 +14,9 @@
 # Requirements:
 #   - All instance directories must be on the SAME filesystem (hardlinks cannot
 #     cross mount points).
-#   - jdupes (preferred) or util-linux `hardlink` must be installed.
-#   - Safe to run while instances are live: PocketRisu writes assets via
-#     temp-file + rename, never in place, so a shared inode is never mutated.
+#   - Node.js 22.12 or newer (the same runtime PocketRisu requires).
+#   - Every live instance must run a build with the shared asset-maintenance
+#     lock contract. Runtime writes that meet maintenance are refused retryably.
 #
 # Usage:
 #   scripts/dedup-assets.sh /srv/pocketrisu/*/save/assets
@@ -25,36 +25,5 @@
 #   30 4 * * * /srv/pocketrisu/scripts/dedup-assets.sh /srv/pocketrisu/*/save/assets
 set -euo pipefail
 
-if [ "$#" -lt 1 ]; then
-    echo "usage: $0 <assets-dir> [<assets-dir> ...]" >&2
-    echo "example: $0 /srv/pocketrisu/*/save/assets" >&2
-    exit 2
-fi
-
-# Keep only directories that actually exist (globs for not-yet-created instances).
-dirs=()
-for d in "$@"; do
-    [ -d "$d" ] && dirs+=("$d")
-done
-if [ "${#dirs[@]}" -lt 2 ]; then
-    echo "[dedup-assets] fewer than two existing asset directories — nothing to dedup." >&2
-    exit 0
-fi
-
-if command -v jdupes >/dev/null 2>&1; then
-    # -L: replace duplicates with hardlinks; -r: recurse; -A: exclude hidden
-    # files (PocketRisu's .tmp-* staging files and .migrated_to_fs marker).
-    exec jdupes -r -A -L "${dirs[@]}"
-elif command -v hardlink >/dev/null 2>&1; then
-    # util-linux hardlink byte-compares before linking, but by default refuses
-    # to merge files whose mtime or mode differ. PocketRisu writes assets via
-    # temp-file + rename, so identical content across instances always has
-    # different timestamps — ignore them (-t) and mode (-p). Owner differences
-    # still block linking on purpose: run all instances as one user, or a
-    # merged inode would be accessible to only one of them.
-    exec hardlink -t -p -m "${dirs[@]}"
-else
-    echo "[dedup-assets] neither 'jdupes' nor 'hardlink' found." >&2
-    echo "install one of them, e.g.: apt install jdupes   (or: apt install util-linux)" >&2
-    exit 3
-fi
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec node "$script_dir/dedup-assets.cjs" "$@"

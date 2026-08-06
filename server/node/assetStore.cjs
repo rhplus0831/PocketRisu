@@ -3,6 +3,12 @@
 const fs = require('fs');
 const path = require('path');
 const { createHash, randomUUID } = require('crypto');
+const {
+    acquireAssetMaintenanceLockSync,
+    canonicalAssetDirectoryIdentitySync,
+    releaseAssetMaintenanceLockHandle,
+    withAssetMaintenanceLockSync,
+} = require('./assetMaintenanceLock.cjs');
 
 const ASSET_MIGRATION_MARKER = '.migrated_to_fs';
 const ASSET_TEMP_PREFIX = '.tmp-';
@@ -98,14 +104,26 @@ function swapDirectoryFromStaging(options) {
 }
 
 function createAssetStore(options = {}) {
-    const assetDir = path.resolve(options.assetDir || path.join(process.cwd(), 'save', 'assets'));
     const fsOps = options.fs || fs;
+    const assetDir = canonicalAssetDirectoryIdentitySync(
+        options.assetDir || path.join(process.cwd(), 'save', 'assets'),
+        fsOps,
+    );
+    const maintenanceLockEnabled = options.maintenanceLock !== false;
     const resolvedAssetDir = assetDir + path.sep;
     const legacyHashMarkerDir = path.join(assetDir, LEGACY_HASH_MARKER_DIR);
     const legacyHashIdentityMarkerPath = path.join(assetDir, LEGACY_HASH_IDENTITY_MARKER);
 
     function ensureAssetDir() {
         fsOps.mkdirSync(assetDir, { recursive: true });
+    }
+
+    function withAssetMutationLock(operation, purpose) {
+        if (!maintenanceLockEnabled) return operation();
+        return withAssetMaintenanceLockSync(assetDir, operation, {
+            fsOps,
+            purpose,
+        });
     }
 
     function assetPathFor(name) {
@@ -273,7 +291,7 @@ function createAssetStore(options = {}) {
         }
     }
 
-    function writeAssetFile(name, buffer, options = {}) {
+    function writeAssetFileUnlocked(name, buffer, options = {}) {
         const { beforePublish = null, afterPublish = null } = options;
         const destination = assetPathFor(name);
         const data = Buffer.from(buffer);
@@ -317,7 +335,14 @@ function createAssetStore(options = {}) {
         }
     }
 
-    function writeAssetFileIfChanged(name, buffer, options = {}) {
+    function writeAssetFile(name, buffer, options = {}) {
+        return withAssetMutationLock(
+            () => writeAssetFileUnlocked(name, buffer, options),
+            `asset write ${name}`,
+        );
+    }
+
+    function writeAssetFileIfChangedUnlocked(name, buffer, options = {}) {
         const data = Buffer.from(buffer);
         if (assetFileSize(name) === data.length) {
             // Equal length is only a fast path: stale or corrupt files keep
@@ -325,8 +350,15 @@ function createAssetStore(options = {}) {
             const existing = readAssetFile(name);
             if (existing !== null && existing.equals(data)) return false;
         }
-        writeAssetFile(name, data, options);
+        writeAssetFileUnlocked(name, data, options);
         return true;
+    }
+
+    function writeAssetFileIfChanged(name, buffer, options = {}) {
+        return withAssetMutationLock(
+            () => writeAssetFileIfChangedUnlocked(name, buffer, options),
+            `conditional asset write ${name}`,
+        );
     }
 
     function filesEqual(leftPath, rightPath, size) {
@@ -353,7 +385,7 @@ function createAssetStore(options = {}) {
         }
     }
 
-    function writeAssetFileFromFile(name, sourcePath, { skipIfUnchanged = false } = {}) {
+    function writeAssetFileFromFileUnlocked(name, sourcePath, { skipIfUnchanged = false } = {}) {
         const destination = assetPathFor(name);
         const sourceStat = fsOps.statSync(sourcePath);
         if (!sourceStat.isFile()) throw new Error('Asset spool source must be a regular file');
@@ -418,6 +450,24 @@ function createAssetStore(options = {}) {
                 try { fsOps.unlinkSync(tempPath); } catch {}
             }
         }
+    }
+
+    function writeAssetFileFromFile(name, sourcePath, options = {}) {
+        return withAssetMutationLock(
+            () => writeAssetFileFromFileUnlocked(name, sourcePath, options),
+            `spooled asset write ${name}`,
+        );
+    }
+
+    function withAssetFileMutationAdmission(name, purpose, operation) {
+        return withAssetMutationLock(() => operation(
+            runtimeAssetFileDisposition(name),
+            {
+                writeAssetFile: writeAssetFileUnlocked,
+                writeAssetFileIfChanged: writeAssetFileIfChangedUnlocked,
+                writeAssetFileFromFile: writeAssetFileFromFileUnlocked,
+            },
+        ), purpose);
     }
 
     function readAssetFile(name) {
@@ -504,16 +554,18 @@ function createAssetStore(options = {}) {
     }
 
     function deleteAssetFile(name) {
-        if (!findExactAssetFileEntry(name)) return false;
-        let removed = false;
-        try {
-            fsOps.unlinkSync(assetPathFor(name));
-            removed = true;
-        } catch (error) {
-            if (error?.code !== 'ENOENT') throw error;
-        }
-        clearLegacyHashAsset(name);
-        return removed;
+        return withAssetMutationLock(() => {
+            if (!findExactAssetFileEntry(name)) return false;
+            let removed = false;
+            try {
+                fsOps.unlinkSync(assetPathFor(name));
+                removed = true;
+            } catch (error) {
+                if (error?.code !== 'ENOENT') throw error;
+            }
+            clearLegacyHashAsset(name);
+            return removed;
+        }, `asset delete ${name}`);
     }
 
     function listAssetFiles() {
@@ -543,35 +595,82 @@ function createAssetStore(options = {}) {
     }
 
     function clearAssetFiles() {
-        ensureAssetDir();
-        let removed = 0;
-        for (const entry of fsOps.readdirSync(assetDir, { withFileTypes: true })) {
-            if (entry.name === ASSET_MIGRATION_MARKER
-                || entry.name === LEGACY_HASH_IDENTITY_MARKER
-                || entry.name === LEGACY_HASH_MARKER_DIR) continue;
-            if (!entry.isFile() && !entry.isSymbolicLink()) continue;
-            try {
-                fsOps.unlinkSync(path.join(assetDir, entry.name));
-                removed++;
-            } catch (error) {
-                if (error?.code !== 'ENOENT') throw error;
+        return withAssetMutationLock(() => {
+            ensureAssetDir();
+            let removed = 0;
+            for (const entry of fsOps.readdirSync(assetDir, { withFileTypes: true })) {
+                if (entry.name === ASSET_MIGRATION_MARKER
+                    || entry.name === LEGACY_HASH_IDENTITY_MARKER
+                    || entry.name === LEGACY_HASH_MARKER_DIR) continue;
+                if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+                try {
+                    fsOps.unlinkSync(path.join(assetDir, entry.name));
+                    removed++;
+                } catch (error) {
+                    if (error?.code !== 'ENOENT') throw error;
+                }
             }
-        }
-        fsOps.rmSync(legacyHashMarkerDir, { recursive: true, force: true });
-        return removed;
+            fsOps.rmSync(legacyHashMarkerDir, { recursive: true, force: true });
+            return removed;
+        }, 'asset store clear');
     }
 
     function swapAssetDirectoryFromStaging(stagingDir, backupDir) {
-        return swapDirectoryFromStaging({
-            liveDir: assetDir,
-            stagingDir,
-            backupDir,
-            fs: fsOps,
-        });
+        const maintenanceLock = maintenanceLockEnabled
+            ? acquireAssetMaintenanceLockSync(assetDir, {
+                fsOps,
+                purpose: 'destructive asset import swap',
+            })
+            : null;
+        let publication;
+        try {
+            publication = swapDirectoryFromStaging({
+                liveDir: assetDir,
+                stagingDir,
+                backupDir,
+                fs: fsOps,
+            });
+        } catch (error) {
+            releaseAssetMaintenanceLockHandle(maintenanceLock, error);
+            throw error;
+        }
+        let directorySettled = false;
+        let maintenanceReleased = maintenanceLock === null;
+        function releaseAfterSettlement(primaryError = null) {
+            if (maintenanceReleased) return true;
+            const released = releaseAssetMaintenanceLockHandle(maintenanceLock, primaryError);
+            if (released) maintenanceReleased = true;
+            return released;
+        }
+        function settle(operation, options = {}) {
+            if (!directorySettled) {
+                // A failed finalize/rollback is deliberately retryable and
+                // retains the live owner token. Releasing here would expose a
+                // half-restored or half-finalized directory to runtime writes
+                // and external maintenance.
+                operation();
+                directorySettled = true;
+            }
+            if (options.retainLock !== true) releaseAfterSettlement();
+        }
+        return {
+            rollback(options) { settle(publication.rollback, options); },
+            finalize(options) { settle(publication.finalize, options); },
+            releaseAfterRecovery(primaryError = null) {
+                // Journal recovery may settle more than the asset directory
+                // (for example the paired inlay swap). It owns the proof that
+                // recovery is complete; this method only releases the retained
+                // asset exclusion after that proof succeeds.
+                directorySettled = true;
+                return releaseAfterSettlement(primaryError);
+            },
+            isMaintenanceReleased() { return maintenanceReleased; },
+        };
     }
 
     return {
         assetDir,
+        maintenanceLockEnabled,
         migrationMarkerPath: path.join(assetDir, ASSET_MIGRATION_MARKER),
         legacyHashIdentityMarkerPath,
         legacyHashMarkerDir,
@@ -582,6 +681,7 @@ function createAssetStore(options = {}) {
         isHashShapedAssetName,
         runtimeAssetFileDisposition,
         runtimeAssetFileDispositions,
+        withAssetFileMutationAdmission,
         assetPathFor,
         legacyHashMarkerPathFor,
         isLegacyHashAsset,

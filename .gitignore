@@ -55,6 +55,7 @@ dist.zip
 !/scripts/check-docs.mjs
 !/scripts/check-compat-skips.mjs
 !/scripts/dedup-assets.sh
+!/scripts/dedup-assets.cjs
 !/scripts/run-performance-tests.mjs
 !/scripts/run-performance-extreme-tests.mjs
 .env

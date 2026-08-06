@@ -6,33 +6,29 @@
 - Severity: Medium
 - Lens: D4
 - Area: Area 7 — server file stores
-- Affected code: `scripts/dedup-assets.sh:14-19`, `scripts/dedup-assets.sh:44-55`, `server/node/assetStore.cjs:125-140`
+- Affected code: `server/node/assetDedup.cjs`, `scripts/dedup-assets.sh`, `server/node/assetStore.cjs`
 - Revalidated: 2026-08-05 against `57b7ea41` — dual-track pass, see the [revalidation register](../../../../.archived-docs/findings/2026-08-revalidation/README.md)
 
 ## Risk
 
-PocketRisu creates asset files with mode `0600`. The preferred `jdupes` command
-omits `-p`, so byte-equal files with different owners, groups, or modes may be
-collapsed onto the first inode. Hardlinks share ownership and permissions; the
-destination cannot retain its prior metadata.
+PocketRisu creates asset files with mode `0600`. The controlled dedup worker
+does not yet enforce a same-UID, same-GID, and same-mode eligibility policy, so
+byte-equal files with different owners, groups, or modes may be collapsed onto
+the first inode. Hardlinks share ownership and permissions; the destination
+cannot retain its prior metadata.
 
 When a root cron spans per-user instances, selecting user A's inode for user B's
 asset can make B unable to read or export it. Chowning the shared inode back to B
-would break A instead. The fallback deliberately respects ownership, so behavior
-also changes with the installed dedup executable.
+would break A instead.
 
-Revalidation caveat: the script (unchanged since `7f853d93`) pins the flags,
-not the binary, and `jdupes` is neither vendored nor version-pinned. Omitting
-`-p` permits cross-owner merging under documented jdupes semantics, and with
-mode-`0600` files one side loses access whichever owner survives, so the risk
-holds under any merge order; the exact attribute behavior of a deployed binary
-was still not runtime-verified. Optional evidence hardening: run the deployed
-jdupes as root over same-filesystem byte-equal files differing in UID, GID,
-and mode, then compare inode identity, ownership, and each user's readability.
+The external-dedup atomicity remediation replaced `jdupes` with a repository-owned
+worker but intentionally left this distinct ownership policy unresolved. Its
+link-to-temp plus rename makes publication crash-safe; it does not make
+cross-principal inode sharing safe.
 
 ## Required fix and coverage
 
-Add `-p` and perform an explicit same-UID/GID/mode preflight for every directory.
+Perform an explicit same-UID/GID/mode preflight for every directory and candidate.
 Make same-user ownership a hard requirement and fail closed on mismatch.
 
 Test mixed-owner/mode trees and assert no cross-principal hardlinks are created.
