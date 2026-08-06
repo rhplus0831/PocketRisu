@@ -16,6 +16,105 @@ const MAX_CONCURRENT_ASSET_SAVES = 10;
 const HTTP_STATUS_OK_MIN = 200;
 const HTTP_STATUS_OK_MAX = 300;
 
+type CharXPendingFile = {
+    id:string
+    data:Uint8Array
+    aliases?:string[]
+}
+
+function normalizeZipPath(fileName:string):string {
+    const absolute = fileName.startsWith('/')
+    const directory = fileName.endsWith('/')
+    const segments:string[] = []
+    for(const segment of fileName.split('/')){
+        if(!segment || segment === '.'){
+            continue
+        }
+        if(segment === '..'){
+            if(segments.length > 0 && segments[segments.length - 1] !== '..'){
+                segments.pop()
+            }
+            else if(!absolute){
+                segments.push(segment)
+            }
+            continue
+        }
+        segments.push(segment)
+    }
+
+    let normalized = `${absolute ? '/' : ''}${segments.join('/')}`
+    if(directory && normalized && normalized !== '/'){
+        normalized += '/'
+    }
+    return normalized
+}
+
+function isXMetaPath(fileName:string):boolean {
+    return normalizeZipPath(fileName).startsWith('x_meta/')
+}
+
+function getEmbeddedAssetPaths(cardData:string|undefined):Set<string> {
+    if(!cardData){
+        return new Set()
+    }
+
+    try{
+        const card = JSON.parse(cardData) as {
+            data?: {
+                assets?: Array<{uri?:unknown}>
+            }
+        }
+        if(!Array.isArray(card?.data?.assets)){
+            return new Set()
+        }
+
+        return new Set(card.data.assets.flatMap(asset => {
+            if(typeof asset?.uri !== 'string' || !asset.uri.startsWith('embeded://')){
+                return []
+            }
+            return [asset.uri.slice('embeded://'.length)]
+        }))
+    }
+    catch{
+        // The card parser reports malformed card.json to the caller. Metadata
+        // classification stays fail-closed until that happens.
+        return new Set()
+    }
+}
+
+function getReferencedAssetAliases(fileName:string, embeddedAssetPaths:Set<string>):string[] {
+    const normalizedFileName = normalizeZipPath(fileName)
+    return [...embeddedAssetPaths].filter(path => (
+        path === fileName || normalizeZipPath(path) === normalizedFileName
+    ))
+}
+
+function validateXMeta(file:CharXPendingFile):Error|null {
+    const normalizedPath = normalizeZipPath(file.id)
+    if(normalizedPath === 'x_meta/' || !normalizedPath.endsWith('.json')){
+        return new Error(`Unknown CharX metadata member: ${file.id}`)
+    }
+
+    try{
+        const decoded = new TextDecoder('utf-8', { fatal: true }).decode(file.data)
+        const metadata = JSON.parse(decoded)
+        if(
+            !metadata
+            || typeof metadata !== 'object'
+            || Array.isArray(metadata)
+            || !Object.values(metadata).every(value => typeof value === 'string')
+        ){
+            throw new Error('metadata must be an object with string values')
+        }
+    }
+    catch(error){
+        const reason = error instanceof Error ? error.message : String(error)
+        return new Error(`Invalid CharX metadata member ${file.id}: ${reason}`)
+    }
+
+    return null
+}
+
 export async function processZip(dataArray: Uint8Array): Promise<string> {
     const unzipped = await new Promise<fflate.Unzipped>((resolve, reject) => {
         fflate.unzip(dataArray, (err, data) => {
@@ -253,6 +352,14 @@ export class CharXImporter{
     // Temporary buffers for accumulating file chunks during streaming
     assetBuffers:{[key:string]:AppendableBuffer} = {}
 
+    // Exporters write card.json last, so x_meta candidates must wait until its
+    // embedded asset references are available.
+    private pendingXMetaFiles:CharXPendingFile[] = []
+
+    // Distinct raw names with one normalized identity make metadata and card
+    // references ambiguous, so the archive must not import successfully.
+    private archivePathsByNormalizedName:Map<string,string> = new Map()
+
     // Files excluded due to size limits (> MAX_ASSET_SIZE_BYTES)
     excludedFiles:string[] = []
 
@@ -406,6 +513,16 @@ export class CharXImporter{
      */
     #handleFile(file: fflate.UnzipFile) {
         const assetIndex = file.name
+        const normalizedName = normalizeZipPath(assetIndex)
+        if(this.archivePathsByNormalizedName.has(normalizedName)){
+            const previousName = this.archivePathsByNormalizedName.get(normalizedName)
+            this.errors.push(new Error(
+                `Ambiguous CharX member paths normalize to ${normalizedName}: ${previousName}, ${assetIndex}`
+            ))
+        }
+        else{
+            this.archivePathsByNormalizedName.set(normalizedName, assetIndex)
+        }
         this.assetBuffers[assetIndex] = new AppendableBuffer()
 
         file.ondata = (_err, dat, final) => this.#handleFileData(assetIndex, dat, final)
@@ -429,7 +546,7 @@ export class CharXImporter{
 
     /**
      * Called when a file has been completely read from the ZIP.
-     * Routes files to appropriate handlers based on filename/extension.
+     * Routes files to appropriate handlers based on their reserved paths.
      */
     #handleFileComplete(fileName: string) {
         const assetData = this.assetBuffers[fileName].buffer
@@ -443,11 +560,14 @@ export class CharXImporter{
         else if(fileName === 'module.risum'){
             this.moduleData = assetData
         }
-        else if(fileName.endsWith('.json')){
-            // Ignore other JSON files
+        else if(isXMetaPath(fileName)){
+            this.pendingXMetaFiles.push({
+                id: fileName,
+                data: assetData
+            })
         }
         else{
-            // All other files are treated as assets (images, etc.)
+            // Extension does not determine whether a member is an asset.
             this.#processAssetQueue({
                 id: fileName,
                 data: assetData
@@ -460,7 +580,7 @@ export class CharXImporter{
     /**
      * Queues an asset for saving with concurrency control.
      */
-    async #processAssetQueue(asset:{id:string, data:Uint8Array}){
+    async #processAssetQueue(asset:CharXPendingFile){
         this.totalEnqueued += 1
         let acquired = false
         try {
@@ -471,6 +591,9 @@ export class CharXImporter{
                 : await saveAsset(asset.data)
 
             this.assets[asset.id] = assetSaveId
+            for(const alias of asset.aliases ?? []){
+                this.assets[alias] = assetSaveId
+            }
         } catch (error) {
             this.errors.push(error instanceof Error ? error : new Error(String(error)))
         } finally {
@@ -488,6 +611,23 @@ export class CharXImporter{
      * Saves hash signal if needed and marks the queue as complete.
      */
     async #finalize(){
+        const embeddedAssetPaths = getEmbeddedAssetPaths(this.cardData)
+        for(const file of this.pendingXMetaFiles){
+            const referencedAliases = getReferencedAssetAliases(file.id, embeddedAssetPaths)
+            if(referencedAliases.length > 0){
+                this.#processAssetQueue({
+                    ...file,
+                    aliases: referencedAliases.filter(path => path !== file.id),
+                })
+                continue
+            }
+
+            const metadataError = validateXMeta(file)
+            if(metadataError){
+                this.errors.push(metadataError)
+            }
+        }
+        this.pendingXMetaFiles = []
         // Save hash signal for server sync if needed
         if(this.hashSignal){
             await saveAsset(new TextEncoder().encode(this.hashSignal))
